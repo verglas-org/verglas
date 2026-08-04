@@ -61,50 +61,97 @@ jobs:
         working-directory: sdks/typescript
         run: npm ci && npm run typecheck && npm test
 
-      - name: Test Rust SDK
-        run: cargo test -p verglas-sdk
-
-  ci:
+  rust-changes:
     runs-on: ubuntu-latest
+    outputs:
+      has-packages: ${{ steps.packages.outputs.has-packages }}
+      packages: ${{ steps.packages.outputs.packages }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Package selection compares the pull request head with its merge
+          # base. Both histories must be present for that comparison.
+          fetch-depth: 0
 
       # rustup reads rust-toolchain.toml and installs the pinned toolchain,
       # so CI always matches dev machines exactly.
       - name: Install pinned toolchain
         run: rustup show
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          # A failed gate still caches whatever it compiled, so the fix-up
-          # push does not pay for the same compilation twice.
-          cache-on-failure: true
-
       - name: Format
         run: cargo fmt --all --check
 
-      # Two gates, one compilation. There is deliberately NO standalone build
-      # step: `cargo test` compiles the entire workspace anyway (a broken
-      # build fails the Test step with the same diagnostics), and the old
-      # `cargo build --workspace` step actively made things worse — it
-      # resolved features WITHOUT dev-dependencies while clippy
-      # `--all-targets` and `cargo test` resolve WITH them, so each step saw
-      # a different dep graph and recompiled the same crates under a
-      # different feature set (~5 billed minutes apiece). Clippy first is the
-      # cheap early type-check of the whole graph; Test then does the one
-      # codegen pass, sharing dep artifacts with clippy's via the same
-      # target/ dir and rust-cache across runs.
-      - name: Lint
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test package selection
+        run: bash scripts/tests/changed-cargo-packages.sh
 
-      # No MinIO, no docker, no external services (see the standing test
-      # policy at the top of this file): the backend fill contract runs
-      # against the in-process stub origin
-      # (crates/verglas-backend/tests/fills.rs) on every `cargo test`. The
-      # real-S3 mirror (tests/minio.rs) is #[ignore]d and opt-in, run locally
-      # against a MinIO when the origin itself is in question.
-      - name: Test
-        run: cargo test --workspace
+      - name: Select Cargo packages
+        id: packages
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            packages="$(scripts/changed-cargo-packages.sh "$BASE_SHA" "$HEAD_SHA")"
+          else
+            packages="$(scripts/changed-cargo-packages.sh --all)"
+          fi
+          echo "packages=$packages" >> "$GITHUB_OUTPUT"
+          if [[ "$packages" == "[]" ]]; then
+            echo "has-packages=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has-packages=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  crate-tests:
+    name: crate (${{ matrix.package }})
+    needs: rust-changes
+    if: needs.rust-changes.outputs.has-packages == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: ${{ fromJSON(needs.rust-changes.outputs.packages) }}
+    env:
+      # sccache cannot cache incremental Rust compilation. CI jobs start from
+      # clean runners, so reusable compiler results are the useful cache.
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Restore compiler cache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      # Each changed package owns one independent job. Clippy and tests share
+      # that runner while sccache reuses unchanged dependency compilation from
+      # previous workflow runs.
+      - name: Lint ${{ matrix.package }}
+        run: cargo clippy -p "${{ matrix.package }}" --all-targets -- -D warnings
+
+      # No MinIO, docker, or external services (see the standing test policy
+      # at the top of this file). Real-service mirrors remain explicit opt-ins.
+      - name: Test ${{ matrix.package }}
+        run: cargo test -p "${{ matrix.package }}"
+
+  ci:
+    # Keep one stable required-check name while the actual package checks are
+    # a dynamic matrix whose labels vary with every pull request.
+    if: always()
+    needs: [rust-changes, crate-tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require Rust gates
+        env:
+          CRATE_TESTS_RESULT: ${{ needs.crate-tests.result }}
+          RUST_CHANGES_RESULT: ${{ needs.rust-changes.result }}
+        run: |
+          [[ "$RUST_CHANGES_RESULT" == "success" ]]
+          [[ "$CRATE_TESTS_RESULT" == "success" || "$CRATE_TESTS_RESULT" == "skipped" ]]
 
   coverage:
     # Coverage is expensive (a full llvm-cov instrumented build). Run it
