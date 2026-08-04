@@ -1,7 +1,7 @@
 //! `verglas query` — SQL over Iceberg tables through the server (issue #287).
 //!
-//! Posts the SQL to the server's `POST /v1/query` (#323); the engine runs
-//! inside the server over its private upstream catalog, so warm reads stay local and
+//! Posts the SQL to the server's `POST /v1/query` (#323); the server dispatches
+//! it to an isolated query role whose object reads return through Verglas, and
 //! the CLI embeds nothing. `--at <ref> <table>` pins a table to a snapshot for
 //! time travel. Output is `--output json` (a stable `{columns, rows,
 //! row_count}` shape) or a human-readable table.

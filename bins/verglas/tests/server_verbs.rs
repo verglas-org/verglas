@@ -1,11 +1,9 @@
-//! The CLI data-plane verbs speak the server HTTP API and nothing else (#323).
+//! The CLI keeps catalog metadata and Verglas execution on separate paths (#3).
 //!
-//! These stand up a local mock of the server's admin API (an axum server bound
-//! to an ephemeral loopback port) and drive the real binary against it, so the
-//! wire calls each verb makes are asserted end to end — no engine embedded in
-//! the CLI, no server-less fallback. The server-down test proves the other
-//! half: with nothing listening, every data-plane verb fails with a clear
-//! error naming the endpoint, having sent zero traffic anywhere else.
+//! These stand up separate server and catalog routes on one ephemeral mock and
+//! drive the real binary against it. Metadata reads go directly to the Iceberg
+//! REST routes while execution requests go to Verglas. The server-down test
+//! proves execution has no embedded fallback.
 
 use std::net::TcpListener;
 use std::process::Command;
@@ -35,6 +33,47 @@ struct MockState {
 /// verbs are expected to call.
 fn mock_server(state: MockState) -> Router {
     Router::new()
+        .route(
+            "/v1/config",
+            get(|| async { Json(json!({"defaults": {}, "overrides": {}})) }),
+        )
+        .route(
+            "/v1/namespaces",
+            get(|| async { Json(json!({"namespaces": [["sales"]]})) }),
+        )
+        .route(
+            "/v1/namespaces/{ns}/tables",
+            get(|AxumPath(ns): AxumPath<String>| async move {
+                Json(json!({"identifiers": [{"namespace": [ns], "name": "orders"}]}))
+            }),
+        )
+        .route(
+            "/v1/namespaces/{ns}/tables/{name}",
+            get(
+                |AxumPath((_ns, _name)): AxumPath<(String, String)>| async move {
+                    Json(json!({"metadata": {
+                        "current-schema-id": 0,
+                        "schemas": [{
+                            "schema-id": 0,
+                            "fields": [{"id": 1, "name": "id", "type": "long", "required": true}]
+                        }],
+                        "default-spec-id": 0,
+                        "partition-specs": [{"spec-id": 0, "fields": []}],
+                        "current-snapshot-id": 42,
+                        "snapshots": [{
+                            "snapshot-id": 42,
+                            "timestamp-ms": 1753305600000i64,
+                            "summary": {
+                                "operation": "append",
+                                "total-records": "3",
+                                "total-data-files": "1",
+                                "total-files-size": "128"
+                            }
+                        }]
+                    }}))
+                },
+            ),
+        )
         .route(
             "/v1/tables",
             get(|| async { Json(json!({"tables": [{"namespace": "sales", "name": "orders"}]})) }),
@@ -72,7 +111,7 @@ fn mock_server(state: MockState) -> Router {
             }),
         )
         .route(
-            "/v1/tables/{name}/ingest",
+            "/v1/ingest/{name}",
             post(
                 |AxumPath(name): AxumPath<String>,
                  Query(query): Query<Value>,
@@ -236,10 +275,19 @@ fn spawn_mock(state: MockState) -> String {
 
 /// Runs the CLI against `endpoint` and returns (status, stdout, stderr).
 fn run_cli(endpoint: &str, args: &[&str]) -> (std::process::ExitStatus, String, String) {
+    let home = tempfile::tempdir().expect("temporary CLI home");
+    let config_dir = home.path().join(".verglas");
+    std::fs::create_dir_all(&config_dir).expect("create config directory");
+    std::fs::write(
+        config_dir.join("config.toml"),
+        format!("[catalog]\nuri = \"{endpoint}\"\n"),
+    )
+    .expect("write catalog config");
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .arg("--server-endpoint")
         .arg(endpoint)
         .args(args)
+        .env("HOME", home.path())
         .output()
         .expect("run verglas");
     (
@@ -249,11 +297,10 @@ fn run_cli(endpoint: &str, args: &[&str]) -> (std::process::ExitStatus, String, 
     )
 }
 
-/// Every table verb speaks the server routes: list/show/history read the
-/// inspect routes, create streams the source file to the ingest route, and
-/// query posts to /v1/query — all rendered from the server's JSON.
+/// Metadata reads speak Iceberg REST directly, while create, append, and query
+/// use the server execution routes.
 #[test]
-fn table_and_query_verbs_speak_the_server_api() {
+fn metadata_uses_catalog_and_execution_uses_server() {
     let state = MockState::default();
     let endpoint = spawn_mock(state.clone());
 
@@ -463,7 +510,7 @@ fn server_down_is_a_clear_error_with_no_fallback() {
     // A dead port: nothing listens here.
     let endpoint = "http://127.0.0.1:9";
     for args in [
-        vec!["table", "list"],
+        vec!["table", "compact"],
         vec!["query", "SELECT 1"],
         vec!["graph", "show", "kg"],
         vec!["graph", "neighbors", "kg", "a"],

@@ -1,11 +1,8 @@
-//! Direct Iceberg REST catalog access for `verglas table delete`.
+//! Direct Iceberg REST catalog access for table metadata and deletion.
 //!
-//! Every other table verb goes through the local server, but dropping a table is
-//! a catalog control-plane operation: it removes the table's entry from the
-//! tenant's Iceberg REST catalog (the per-tenant `catalogd`). This module reads
-//! the `[catalog]` section of `~/.verglas/config.toml` — the same uri and bearer
-//! the server's catalog watcher uses — resolves the route prefix from
-//! `/v1/config`, and issues the REST `DELETE .../namespaces/{ns}/tables/{table}`.
+//! List, show, history, and delete are catalog operations, so they bypass
+//! Verglas and communicate with the configured customer catalog. This module
+//! resolves the catalog's REST prefix and applies its bearer token directly.
 
 use std::error::Error;
 use std::time::Duration;

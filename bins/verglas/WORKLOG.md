@@ -723,3 +723,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #91: Renamed the local process and CLI terminology from `verglasd` and
   daemon to `verglas-server` and server. The endpoint flag is now
   `--server-endpoint`; no compatibility alias remains.
+- #3: Corrected the execution-boundary tests after rebasing the isolated roles:
+  table metadata reads now exercise the customer Iceberg REST catalog directly,
+  while create, append, query, graph, and maintenance requests exercise Verglas.
