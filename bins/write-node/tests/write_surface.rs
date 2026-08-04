@@ -14,7 +14,16 @@ use verglas_write_node::admin::{AppState, BatchCommitter, router};
 #[derive(Default)]
 struct FakeCommitter {
     calls: Mutex<Vec<(String, usize, Option<String>)>>,
-    ingests: Mutex<Vec<(String, String, String, Option<String>, usize)>>,
+    ingests: Mutex<Vec<IngestCall>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IngestCall {
+    table: String,
+    mode: String,
+    format: String,
+    partition_by: Option<String>,
+    body_len: usize,
 }
 
 #[async_trait]
@@ -46,13 +55,13 @@ impl BatchCommitter for FakeCommitter {
         partition_by: Option<&str>,
         body: axum::body::Bytes,
     ) -> Result<serde_json::Value, String> {
-        self.ingests.lock().expect("ingests").push((
-            table.to_owned(),
-            mode.to_owned(),
-            format.to_owned(),
-            partition_by.map(str::to_owned),
-            body.len(),
-        ));
+        self.ingests.lock().expect("ingests").push(IngestCall {
+            table: table.to_owned(),
+            mode: mode.to_owned(),
+            format: format.to_owned(),
+            partition_by: partition_by.map(str::to_owned),
+            body_len: body.len(),
+        });
         Ok(serde_json::json!({"operation": "append"}))
     }
 }
@@ -73,13 +82,13 @@ async fn source_file_ingest_is_dispatched_to_the_writer() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         committer.ingests.lock().expect("ingests").as_slice(),
-        &[(
-            "sdk.events".to_owned(),
-            "create".to_owned(),
-            "csv".to_owned(),
-            Some("day".to_owned()),
-            20,
-        )]
+        &[IngestCall {
+            table: "sdk.events".to_owned(),
+            mode: "create".to_owned(),
+            format: "csv".to_owned(),
+            partition_by: Some("day".to_owned()),
+            body_len: 20,
+        }]
     );
 }
 

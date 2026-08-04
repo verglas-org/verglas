@@ -5,7 +5,7 @@
       "operation": "connect",
       "routes": [],
       "guarantees": ["bearer-auth", "bounded-request-start"],
-      "symbol": "pub fn connect"
+      "symbol": "pub async fn connect"
     },
     {
       "operation": "ensure_table",
