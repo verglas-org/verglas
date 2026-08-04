@@ -1,0 +1,122 @@
+name: engine-matrix
+
+# The result-diffing tripwire (issue #23): two real query engines (DuckDB and
+# Polars) read the same Iceberg fixture direct-from-MinIO and through the
+# Verglas endpoint, and the results are diffed at the Arrow level (schema +
+# values). Wrong results are Verglas's existential risk; this runs on every PR
+# and fails the build on any difference. Kept a distinct workflow so it stays on
+# the PR path independent of the main `ci` workflow.
+#
+# Runs all three #23 fixture variants (#159): Parquet (pyiceberg), and Avro +
+# mixed-format, whose data files are written by the plain-Java iceberg-core
+# builder in tests/engine-matrix/fixture-jvm/ (pyiceberg and DuckDB write Parquet
+# data files only). The JVM builder is compiled once with a cached Gradle build.
+
+# Heavy (docker MinIO + DuckDB + Polars). Runs nightly and on demand, and
+# should be run locally before a PR that touches the S3 or read path. Not on
+# every PR push, to keep Actions spend down.
+on:
+  schedule:
+    - cron: "0 7 * * *"        # 07:00 UTC nightly
+  workflow_dispatch:
+
+concurrency:
+  group: engine-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # MinIO static creds; the daemon and the direct leg both read the origin here.
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+  AWS_ENDPOINT: http://127.0.0.1:9000
+  AWS_ALLOW_HTTP: "true"
+  AWS_VIRTUAL_HOSTED_STYLE_REQUEST: "false"
+
+jobs:
+  engine-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Java + Gradle for the Avro/mixed fixture builder. The dependency and
+      # wrapper caches keep the one-time jar build to ~10-30s on a warm cache.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: gradle
+
+      # Only the two binaries the harness drives — keeps the build well under
+      # the ~5-minute PR-time budget.
+      - name: Build daemon + CLI
+        run: cargo build -p verglasd -p verglas
+
+      # Compile the plain-Java iceberg-core fixture builder into one runnable jar
+      # (no Spark). Runs once; the matrix reuses it for the avro and mixed variants.
+      - name: Build Avro/mixed fixture builder (iceberg-core, no Spark)
+        working-directory: tests/engine-matrix/fixture-jvm
+        run: ./gradlew --no-daemon shadowJar
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio server /data
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/ready && break
+            sleep 1
+          done
+          docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
+            "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && \
+             mc mb --ignore-existing local/verglas-test"
+
+      - name: Start Verglas daemon against MinIO
+        run: |
+          mkdir -p "$RUNNER_TEMP/vg-cache"
+          cat > "$RUNNER_TEMP/verglas-matrix.toml" <<EOF
+          [listen]
+          s3_port = 8333
+          admin_port = 8334
+
+          [cache]
+          dir = "$RUNNER_TEMP/vg-cache"
+          capacity_bytes = "2GB"
+          dram_bytes = "512MB"
+
+          [auth]
+          access_key_id = "matrixdev"
+          secret_access_key = "matrixdevsecret"
+          EOF
+          ./target/debug/verglasd --config "$RUNNER_TEMP/verglas-matrix.toml" \
+            > "$RUNNER_TEMP/verglasd.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8334/admin/healthz && break
+            sleep 1
+          done
+          echo "daemon log:"; cat "$RUNNER_TEMP/verglasd.log"
+
+      # Guard the comparator itself: a tripwire that can't trip is worthless.
+      - name: Comparator selftest
+        run: tests/engine-matrix/run.sh --selftest
+
+      - name: Engine matrix (DuckDB + Polars; parquet, avro, mixed; miss + hit)
+        run: |
+          tests/engine-matrix/run.sh \
+            --endpoint http://127.0.0.1:8333 \
+            --access-key-id matrixdev \
+            --secret-key matrixdevsecret
+
+      - name: Daemon log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/verglasd.log" || true

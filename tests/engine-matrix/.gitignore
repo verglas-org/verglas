@@ -1,0 +1,12 @@
+# Local venv and generated artifacts — never committed.
+.venv/
+catalog.db
+*.db
+fixture.json
+fixture-*.json
+
+# JVM fixture builder: Gradle build outputs and caches. The source, build
+# files, and the committed wrapper (gradlew, gradle/wrapper/) ARE tracked; the
+# generated jar, class files, and Gradle's local cache are not.
+fixture-jvm/.gradle/
+fixture-jvm/build/

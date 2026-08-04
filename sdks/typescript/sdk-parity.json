@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "capabilities": [
+    {
+      "operation": "connect",
+      "routes": [],
+      "guarantees": ["bearer-auth", "bounded-request-start"],
+      "symbol": "export function connect"
+    },
+    {
+      "operation": "ensure_table",
+      "routes": ["GET /v1/tables/{name}/definition", "POST /v1/tables/{name}"],
+      "guarantees": ["create-if-missing", "exact-definition-validation"],
+      "symbol": "async ensureTable"
+    },
+    {
+      "operation": "query",
+      "routes": ["POST /v1/query"],
+      "guarantees": ["sql", "ordered-columns"],
+      "symbol": "query(sql: string)"
+    },
+    {
+      "operation": "append",
+      "routes": ["POST /v1/tables/{name}/commit"],
+      "guarantees": ["bounded-batches", "idempotency-key"],
+      "symbol": "async append(rows:"
+    },
+    {
+      "operation": "follow",
+      "routes": ["WS /v1/catalog/feed"],
+      "guarantees": ["cursor-expiry-distinct", "exactly-once-sequence", "resume-after-drop"],
+      "symbol": "follow(table:"
+    }
+  ]
+}

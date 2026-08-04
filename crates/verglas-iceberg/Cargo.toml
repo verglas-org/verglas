@@ -1,0 +1,39 @@
+[package]
+name = "verglas-iceberg"
+description = "The pure-client Iceberg engine: catalog open, CAS write path, DataFusion query, retention, and the daemon table API (#320)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-api.workspace = true
+iceberg.workspace = true
+iceberg-catalog-rest.workspace = true
+iceberg-datafusion.workspace = true
+iceberg-storage-opendal.workspace = true
+datafusion.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+typetag.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-csv.workspace = true
+arrow-json.workspace = true
+arrow-cast.workspace = true
+parquet.workspace = true
+uuid.workspace = true
+futures.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "time"] }
+
+[dev-dependencies]
+async-trait.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "time"] }
+
+[lints]
+workspace = true

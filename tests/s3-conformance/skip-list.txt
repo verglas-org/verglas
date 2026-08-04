@@ -1,0 +1,364 @@
+# Verglas ⇄ Ceph s3-tests — curated skip list (the compatibility contract).
+#
+# THIS FILE IS THE DOCUMENTED S3-COMPATIBILITY SURFACE OF VERGLAS.
+# Every entry is a test that does NOT pass against the current daemon, grouped
+# under a stated reason. Two kinds of reason:
+#
+#   • UNSUPPORTED / BY DESIGN / DEVIATION / OUT OF SCOPE / BACKEND SEMANTICS —
+#     Verglas does not implement (or deliberately delegates) the feature. These
+#     define what "S3-compatible" means for Verglas today.
+#   • BLOCKED BY #NNN — a real Verglas bug on the *supported* surface, filed as
+#     an issue. When the fix lands, delete the entry (the test must then pass).
+#
+# CHANGES TO THIS FILE REQUIRE REVIEW. Adding an entry narrows Verglas's stated
+# compatibility; do it only with a reason a future contributor can act on. The
+# harness deselects EXACTLY these nodeids (no prefix matching) and, in the
+# nightly run (VG_SKIP_LIST_STRICT), warns if any entry no longer matches a
+# collected test — so the list cannot silently rot.
+#
+# Whole unsupported feature GROUPS (versioning, tagging, lifecycle, encryption,
+# object-lock, policy, website, sse, iam/sts, s3select, s3control, sns, ...) are
+# excluded by pytest MARKER in run.sh, not listed here; this file carries the
+# per-test residue that markers don't cover.
+#
+# Format: one pytest nodeid per line; "# ..." starts a comment.
+
+# --- UNSUPPORTED: object/bucket ACLs. Verglas serves a single static keypair with no ACL model (whitepaper: no per-object ACLs in the cluster-of-one).
+s3tests/functional/test_headers.py::test_bucket_put_bad_canned_acl
+s3tests/functional/test_s3.py::test_100_continue
+s3tests/functional/test_s3.py::test_access_bucket_private_object_private
+s3tests/functional/test_s3.py::test_access_bucket_private_object_publicread
+s3tests/functional/test_s3.py::test_access_bucket_private_object_publicreadwrite
+s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_private
+s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicread
+s3tests/functional/test_s3.py::test_access_bucket_private_objectv2_publicreadwrite
+s3tests/functional/test_s3.py::test_access_bucket_publicread_object_private
+s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicread
+s3tests/functional/test_s3.py::test_access_bucket_publicread_object_publicreadwrite
+s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_private
+s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_publicread
+s3tests/functional/test_s3.py::test_access_bucket_publicreadwrite_object_publicreadwrite
+s3tests/functional/test_s3.py::test_block_public_object_canned_acls
+s3tests/functional/test_s3.py::test_block_public_put_bucket_acls
+s3tests/functional/test_s3.py::test_bucket_acl_canned
+s3tests/functional/test_s3.py::test_bucket_acl_canned_authenticatedread
+s3tests/functional/test_s3.py::test_bucket_acl_canned_during_create
+s3tests/functional/test_s3.py::test_bucket_acl_canned_private_to_private
+s3tests/functional/test_s3.py::test_bucket_acl_canned_publicreadwrite
+s3tests/functional/test_s3.py::test_bucket_acl_default
+s3tests/functional/test_s3.py::test_bucket_acl_grant_email
+s3tests/functional/test_s3.py::test_bucket_acl_grant_email_not_exist
+s3tests/functional/test_s3.py::test_bucket_acl_grant_nonexist_user
+s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_fullcontrol
+s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_read
+s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_readacp
+s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_write
+s3tests/functional/test_s3.py::test_bucket_acl_grant_userid_writeacp
+s3tests/functional/test_s3.py::test_bucket_acl_revoke_all
+s3tests/functional/test_s3.py::test_bucket_concurrent_set_canned_acl
+s3tests/functional/test_s3.py::test_bucket_header_acl_grants
+s3tests/functional/test_s3.py::test_bucket_list_objects_anonymous
+s3tests/functional/test_s3.py::test_bucket_list_return_data
+s3tests/functional/test_s3.py::test_bucket_listv2_objects_anonymous
+s3tests/functional/test_s3.py::test_bucket_recreate_new_acl
+s3tests/functional/test_s3.py::test_bucket_recreate_overwrite_acl
+s3tests/functional/test_s3.py::test_expected_bucket_owner
+s3tests/functional/test_s3.py::test_get_authpublic_acl_bucket_policy_status
+s3tests/functional/test_s3.py::test_get_nonpublicpolicy_acl_bucket_policy_status
+s3tests/functional/test_s3.py::test_get_public_acl_bucket_policy_status
+s3tests/functional/test_s3.py::test_get_publicpolicy_acl_bucket_policy_status
+s3tests/functional/test_s3.py::test_ignore_public_acls
+s3tests/functional/test_s3.py::test_list_multipart_upload_owner
+s3tests/functional/test_s3.py::test_object_acl
+s3tests/functional/test_s3.py::test_object_acl_canned
+s3tests/functional/test_s3.py::test_object_acl_canned_authenticatedread
+s3tests/functional/test_s3.py::test_object_acl_canned_bucketownerfullcontrol
+s3tests/functional/test_s3.py::test_object_acl_canned_bucketownerread
+s3tests/functional/test_s3.py::test_object_acl_canned_during_create
+s3tests/functional/test_s3.py::test_object_acl_canned_publicreadwrite
+s3tests/functional/test_s3.py::test_object_acl_default
+s3tests/functional/test_s3.py::test_object_acl_full_control_verify_attributes
+s3tests/functional/test_s3.py::test_object_acl_full_control_verify_owner
+s3tests/functional/test_s3.py::test_object_acl_read
+s3tests/functional/test_s3.py::test_object_acl_readacp
+s3tests/functional/test_s3.py::test_object_acl_write
+s3tests/functional/test_s3.py::test_object_acl_writeacp
+s3tests/functional/test_s3.py::test_object_copy_not_owned_object_bucket
+s3tests/functional/test_s3.py::test_object_header_acl_grants
+s3tests/functional/test_s3.py::test_object_raw_get_bucket_acl
+s3tests/functional/test_s3.py::test_put_bucket_acl_grant_group_read
+
+# --- UNSUPPORTED: S3 Object Lock / retention / legal hold. Not implemented in the frontend; no WORM surface.
+s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_compliance
+s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_governance_with_bypass
+s3tests/functional/test_s3.py::test_object_lock_changing_mode_from_governance_without_bypass
+s3tests/functional/test_s3.py::test_object_lock_delete_multipart_object_with_legal_hold_on
+s3tests/functional/test_s3.py::test_object_lock_delete_multipart_object_with_retention
+s3tests/functional/test_s3.py::test_object_lock_delete_object_with_legal_hold_off
+s3tests/functional/test_s3.py::test_object_lock_delete_object_with_legal_hold_on
+s3tests/functional/test_s3.py::test_object_lock_delete_object_with_retention
+s3tests/functional/test_s3.py::test_object_lock_delete_object_with_retention_and_marker
+s3tests/functional/test_s3.py::test_object_lock_get_legal_hold
+s3tests/functional/test_s3.py::test_object_lock_get_legal_hold_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_get_obj_lock
+s3tests/functional/test_s3.py::test_object_lock_get_obj_lock_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_get_obj_metadata
+s3tests/functional/test_s3.py::test_object_lock_get_obj_retention
+s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_get_obj_retention_iso8601
+s3tests/functional/test_s3.py::test_object_lock_multi_delete_object_with_retention
+s3tests/functional/test_s3.py::test_object_lock_put_legal_hold
+s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_put_legal_hold_invalid_status
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_enable_after_create
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_days
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_mode
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_status
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_invalid_years
+s3tests/functional/test_s3.py::test_object_lock_put_obj_lock_with_days_and_years
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_increase_period
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_bucket
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_invalid_mode
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_override_default_retention
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_shorten_period
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_shorten_period_bypass
+s3tests/functional/test_s3.py::test_object_lock_put_obj_retention_versionid
+s3tests/functional/test_s3.py::test_object_lock_suspend_versioning
+s3tests/functional/test_s3.py::test_object_lock_uploading_obj
+
+# --- UNSUPPORTED: bucket/object versioning. No versioning machinery (frontend serves the current object only).
+s3tests/functional/test_s3.py::test_bucket_list_return_data_versioning
+s3tests/functional/test_s3.py::test_get_versioned_object_attributes
+s3tests/functional/test_s3.py::test_multipart_copy_versioned
+s3tests/functional/test_s3.py::test_object_copy_versioned_bucket
+s3tests/functional/test_s3.py::test_object_copy_versioned_url_encoding
+s3tests/functional/test_s3.py::test_object_copy_versioning_multipart_upload
+s3tests/functional/test_s3.py::test_object_put_acl_mtime
+s3tests/functional/test_s3.py::test_versioned_concurrent_object_create_and_remove
+s3tests/functional/test_s3.py::test_versioned_concurrent_object_create_concurrent_remove
+s3tests/functional/test_s3.py::test_versioned_object_acl
+s3tests/functional/test_s3.py::test_versioned_object_acl_no_version_specified
+s3tests/functional/test_s3.py::test_versioning_bucket_atomic_upload_return_version_id
+s3tests/functional/test_s3.py::test_versioning_bucket_create_suspend
+s3tests/functional/test_s3.py::test_versioning_bucket_multipart_upload_return_version_id
+s3tests/functional/test_s3.py::test_versioning_concurrent_multi_object_delete
+s3tests/functional/test_s3.py::test_versioning_copy_obj_version
+s3tests/functional/test_s3.py::test_versioning_multi_object_delete
+s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker
+s3tests/functional/test_s3.py::test_versioning_multi_object_delete_with_marker_create
+s3tests/functional/test_s3.py::test_versioning_obj_create_overwrite_multipart
+s3tests/functional/test_s3.py::test_versioning_obj_create_read_remove
+s3tests/functional/test_s3.py::test_versioning_obj_create_read_remove_head
+s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_all
+s3tests/functional/test_s3.py::test_versioning_obj_create_versions_remove_special_names
+s3tests/functional/test_s3.py::test_versioning_obj_list_marker
+s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_overwrite
+s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_overwrite_suspended
+s3tests/functional/test_s3.py::test_versioning_obj_plain_null_version_removal
+s3tests/functional/test_s3.py::test_versioning_obj_suspend_versions
+s3tests/functional/test_s3.py::test_versioning_obj_suspended_copy
+s3tests/functional/test_s3.py::test_versioning_stack_delete_merkers
+
+# --- UNSUPPORTED: bucket policies and public-access-block. No policy engine.
+s3tests/functional/test_s3.py::test_block_public_policy
+s3tests/functional/test_s3.py::test_block_public_policy_with_principal
+s3tests/functional/test_s3.py::test_block_public_restrict_public_buckets
+s3tests/functional/test_s3.py::test_bucket_policy_allow_notprincipal
+s3tests/functional/test_s3.py::test_get_bucket_policy_status
+s3tests/functional/test_s3.py::test_get_nonpublicpolicy_principal_bucket_policy_status
+s3tests/functional/test_s3.py::test_get_public_block_deny_bucket_policy
+s3tests/functional/test_s3.py::test_get_undefined_public_block
+s3tests/functional/test_s3.py::test_head_object_404_with_policy_prefix
+s3tests/functional/test_s3.py::test_multipart_upload_on_a_bucket_with_policy
+s3tests/functional/test_s3.py::test_put_get_delete_public_block
+s3tests/functional/test_s3.py::test_put_public_block
+
+# --- UNSUPPORTED: SigV2 (aws2) request signing. Verglas authenticates SigV4 only.
+s3tests/functional/test_headers.py::test_bucket_create_bad_date_after_today_aws2
+s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_epoch_aws2
+s3tests/functional/test_headers.py::test_bucket_create_bad_date_before_today_aws2
+s3tests/functional/test_headers.py::test_bucket_create_bad_date_empty_aws2
+s3tests/functional/test_headers.py::test_bucket_create_bad_date_invalid_aws2
+s3tests/functional/test_headers.py::test_object_create_bad_date_after_end_aws2
+s3tests/functional/test_headers.py::test_object_create_bad_date_before_epoch_aws2
+s3tests/functional/test_headers.py::test_object_create_bad_date_before_today_aws2
+s3tests/functional/test_headers.py::test_object_create_bad_date_empty_aws2
+s3tests/functional/test_headers.py::test_object_create_bad_date_invalid_aws2
+s3tests/functional/test_headers.py::test_object_create_bad_md5_invalid_garbage_aws2
+
+# --- UNSUPPORTED: browser-based POST form uploads (multipart/form-data). Not implemented.
+s3tests/functional/test_s3.py::test_post_object_anonymous_request
+s3tests/functional/test_s3.py::test_post_object_invalid_date_format
+s3tests/functional/test_s3.py::test_post_object_invalid_request_field_value
+s3tests/functional/test_s3.py::test_post_object_missing_policy_condition
+s3tests/functional/test_s3.py::test_post_object_request_missing_policy_specified_field
+s3tests/functional/test_s3.py::test_post_object_set_invalid_success_code
+s3tests/functional/test_s3.py::test_post_object_set_key_from_filename
+s3tests/functional/test_s3.py::test_post_object_set_success_code
+s3tests/functional/test_s3.py::test_post_object_success_redirect_action
+s3tests/functional/test_s3.py::test_post_object_upload_checksum
+s3tests/functional/test_s3.py::test_post_object_wrong_bucket
+
+# --- UNSUPPORTED: anonymous / public (unsigned) access. Every request must carry a valid SigV4 signature.
+s3tests/functional/test_s3.py::test_list_buckets_anonymous
+s3tests/functional/test_s3.py::test_object_anon_put_write_access
+s3tests/functional/test_s3.py::test_object_raw_get
+s3tests/functional/test_s3.py::test_object_raw_get_bucket_gone
+s3tests/functional/test_s3.py::test_object_raw_get_object_gone
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_not_expired
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_not_expired_tenant
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_max_range
+s3tests/functional/test_s3.py::test_object_raw_get_x_amz_expires_out_positive_range
+s3tests/functional/test_s3.py::test_object_raw_put_authenticated_expired
+
+# --- UNSUPPORTED: CORS configuration and preflight. Not implemented.
+s3tests/functional/test_s3.py::test_cors_header_option
+s3tests/functional/test_s3.py::test_cors_origin_response
+s3tests/functional/test_s3.py::test_cors_origin_wildcard
+s3tests/functional/test_s3.py::test_cors_presigned_get_object
+s3tests/functional/test_s3.py::test_cors_presigned_get_object_tenant
+s3tests/functional/test_s3.py::test_cors_presigned_put_object
+s3tests/functional/test_s3.py::test_cors_presigned_put_object_tenant
+s3tests/functional/test_s3.py::test_cors_presigned_put_object_tenant_with_acl
+s3tests/functional/test_s3.py::test_cors_presigned_put_object_with_acl
+s3tests/functional/test_s3.py::test_set_cors
+
+# --- UNSUPPORTED: conditional WRITES (If-Match / If-None-Match on PutObject).
+# Issue #10 implements conditional READS (GET/HEAD) — the four
+# test_get_object_if* cases below now pass and are no longer skipped.
+# Conditional writes are a separate feature (S3's conditional_write group) not
+# in #10's scope; these four are the residue the conditional_write marker does
+# not cover, so they stay skipped until conditional writes land.
+s3tests/functional/test_s3.py::test_put_object_ifmatch_failed
+s3tests/functional/test_s3.py::test_put_object_ifmatch_nonexisted_failed
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_failed
+s3tests/functional/test_s3.py::test_put_object_ifnonmatch_overwrite_existed_failed
+
+# --- OUT OF SCOPE: bucket create/delete SEMANTICS. Verglas does not own bucket lifecycle (wildcard model, ListBuckets empty); the harness services CreateBucket/DeleteBucket directly against the origin so object tests can run. These tests assert lifecycle behaviour that belongs to the origin, not Verglas.
+s3tests/functional/test_headers.py::test_bucket_create_bad_contentlength_negative
+s3tests/functional/test_s3.py::test_bucket_create_delete
+s3tests/functional/test_s3.py::test_bucket_create_exists_nonowner
+s3tests/functional/test_s3.py::test_bucket_create_special_key_names
+s3tests/functional/test_s3.py::test_bucket_delete_notexist
+
+# --- BACKEND SEMANTICS: HeadBucket is now forwarded verbatim to the origin
+# (issue #152), so test_bucket_head (200) and test_bucket_head_notexist (404)
+# pass and are no longer skipped. These two remaining cases assert RGW-specific
+# read-stats response headers (x-rgw-object-count, x-rgw-bytes-used, the
+# read-stats param) that MinIO does not emit; they are marked fails_on_aws
+# upstream and cannot pass against a non-RGW origin.s3tests/functional/test_s3.py::test_bucket_head_extended
+s3tests/functional/test_s3.py::test_head_bucket_usage
+
+# --- #153: UploadPartCopy (server-side multipart copy, cross-bucket included)
+# is now implemented as origin passthrough, so four of its five tests are
+# removed from here. test_multipart_copy_invalid_range stays: it asserts
+# error_code == 'InvalidRange' for an out-of-range copy-source-range, but the
+# origin (MinIO) answers that with `400 InvalidArgument`, not InvalidRange — a
+# backend-semantics difference Verglas forwards faithfully (as a 400), so the
+# AWS-shaped assertion cannot hold on a MinIO backend.
+s3tests/functional/test_s3.py::test_multipart_copy_invalid_range
+
+# --- #153: partNumber reads (GET/HEAD of an individual part) are now
+# implemented as origin passthrough, so their three tests are removed from here.
+
+# --- UNSUPPORTED: the RGW `allow-unordered` listing extension. Not an AWS S3 feature.
+s3tests/functional/test_s3.py::test_bucket_list_unordered
+s3tests/functional/test_s3.py::test_bucket_listv2_unordered
+
+# --- BACKEND SEMANTICS: multipart re-complete / resend behaviour reflects the origin (MinIO), which returns NoSuchUpload/InvalidPart where AWS is idempotent. Multipart is a straight passthrough.
+s3tests/functional/test_s3.py::test_multipart_resend_first_finishes_last
+s3tests/functional/test_s3.py::test_multipart_upload
+s3tests/functional/test_s3.py::test_multipart_upload_small
+
+# --- #208: Per-part and composite checksum FORWARDING is implemented and runs
+# (the `checksum` marker group is no longer excluded, and run.sh uses boto3's
+# modern checksum default). Verglas threads the checksum algorithm/type through
+# create, forwards each part's checksum on upload, carries per-part checksums
+# into the completion manifest, restates the FULL_OBJECT type on completion, and
+# echoes the origin's composite — never recomputing. The rest of the checksum
+# group passes. The ten tests below assert AWS-SPECIFIC ORIGIN BEHAVIOUR that
+# current MinIO does not reproduce, so they cannot pass on a MinIO backend
+# without Verglas fabricating a response the origin never returned (which the
+# "never wrong / forward faithfully" invariant forbids). Each was verified by
+# probing MinIO directly:
+#
+#   1. Bad-checksum error code. AWS returns `BadDigest` (400) when a supplied
+#      checksum does not match; MinIO returns `InvalidArgument` (400). Verglas
+#      forwards MinIO's code. (Same class as test_multipart_copy_invalid_range.)
+s3tests/functional/test_s3.py::test_object_checksum_sha256
+s3tests/functional/test_s3.py::test_object_checksum_crc64nvme
+s3tests/functional/test_s3.py::test_multipart_checksum_sha256
+#   2. Composite checksum in GetObjectAttributes. AWS reports the COMPOSITE
+#      checksum WITH its `-<partcount>` suffix in the GetObjectAttributes
+#      `Checksum` block; MinIO drops the suffix there (but keeps it on
+#      complete/head). Verglas forwards MinIO's suffix-less value verbatim.
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha256
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_sha1
+s3tests/functional/test_s3.py::test_get_multipart_checksum_object_attributes
+#   3. ChecksumType on a partNumber GET. AWS returns `x-amz-checksum-type` on a
+#      `GET ?partNumber=` of a checksummed object; MinIO omits the header
+#      entirely (even with checksum-mode ENABLED). Verglas cannot report a type
+#      the origin did not send. These three cover the FULL_OBJECT CRC helpers,
+#      which otherwise complete correctly (create/upload/complete all pass).
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc32c
+s3tests/functional/test_s3.py::test_multipart_use_cksum_helper_crc64nvme
+#   4. Idempotent completion retry. AWS re-completes an already-completed upload
+#      idempotently; MinIO returns NoSuchUpload once the upload ID is consumed
+#      (same origin behaviour as the multipart re-complete block above).
+s3tests/functional/test_s3.py::test_multipart_reupload_checksum_and_etag
+
+# --- UNSUPPORTED: account-usage / admin reporting API. Not part of the S3 data-plane surface.
+s3tests/functional/test_s3.py::test_account_usage
+
+# --- UNSUPPORTED: chunked Transfer-Encoding upload without Content-Length (aws-chunked streaming with unknown length).
+s3tests/functional/test_s3.py::test_object_write_with_chunked_transfer_encoding
+
+# --- BY DESIGN: this asserts an *unsigned* (anonymous) delete against a gone
+# bucket returns 404 NoSuchBucket. Verglas requires a valid SigV4 signature on
+# every request (the same invariant that excludes the whole anonymous-access
+# group above), so it rejects the unsigned request at the auth layer (403)
+# before any bucket-existence check — an auth-vs-existence precedence that AWS
+# resolves the other way only because it serves anonymous public reads, which
+# Verglas does not. #155 landed Content-MD5 and the DeleteObjects cap; this
+# third item is a documented design boundary, not a bug.
+s3tests/functional/test_s3.py::test_object_delete_key_bucket_gone
+
+# --- BACKEND SEMANTICS: GetBucketLocation is now forwarded verbatim to the
+# origin (issue #152), but this test cannot pass in the harness: it asserts the
+# LocationConstraint equals the configured api_name, while the harness's
+# CreateBucket interceptor services bucket creation directly against MinIO and
+# drops the CreateBucketConfiguration, so MinIO answers its own region (null for
+# us-east-1). The forwarding itself is covered by verglas-backend and
+# verglas-s3 unit tests.
+s3tests/functional/test_s3.py::test_bucket_get_location
+
+# --- BY DESIGN: ListBuckets returns an empty list (wildcard model — buckets are addressed, not enumerated). Tests that enumerate created buckets cannot pass.
+s3tests/functional/test_s3.py::test_buckets_create_then_list
+s3tests/functional/test_s3.py::test_list_buckets_paginated
+
+# --- UNSUPPORTED: cross-bucket CopyObject. Deliberately returns NotImplemented (same-bucket copy only).
+s3tests/functional/test_s3.py::test_object_copy_diff_bucket
+
+# --- UNSUPPORTED: cross-account access. Single static account only.
+s3tests/functional/test_s3.py::test_object_copy_not_owned_bucket
+
+# --- #153: ListMultipartUploads is now implemented as origin passthrough, so
+# its test is removed from here (test_list_multipart_upload_owner stays under
+# the ACL group above — it asserts the upload's Owner, which Verglas does not
+# model).
+
+# --- #156: Versioned reads (GET/HEAD ?versionId=) forward the parameter to the
+# origin and serve the response (serve-only in v1 — a version's bytes are
+# immutable, so caching is safe but not yet wired). No s3-tests are unskipped
+# here: every versioning test in this file also drives PutBucketVersioning /
+# ListObjectVersions / delete-markers, which stay unsupported (config surface
+# belongs to the passthrough umbrella issue). Byte-identical cold/warm versioned
+# reads are proven by crates/verglas-s3/tests/versioned_reads.rs against a
+# versioning-enabled MinIO bucket instead.
+
+# --- UNSUPPORTED: GetObjectTorrent. Legacy/never-implemented S3 feature.
+s3tests/functional/test_s3.py::test_get_object_torrent

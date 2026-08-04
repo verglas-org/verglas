@@ -1,0 +1,32 @@
+[package]
+name = "verglas-cluster"
+description = "Gossip membership (chitchat) and the live weighted rendezvous ring for a Verglas pod"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-core.workspace = true
+chitchat = "0.11.1"
+arc-swap = "1.9.2"
+tokio.workspace = true
+thiserror.workspace = true
+# Cross-node trace correlation (#61): the peer block server logs its cache
+# lookups under the originating request id carried in the peer header.
+tracing = "0.1.44"
+# Peer-fetch RPC (#29): the block-transfer server (axum/hyper) and client
+# (reqwest, HTTP/2 multiplexed) that turn N nodes into one logical cache.
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+crc32c.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "time"] }
+
+[lints]
+workspace = true

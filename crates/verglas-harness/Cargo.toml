@@ -1,0 +1,42 @@
+[package]
+name = "verglas-harness"
+description = "Shared harness runtime for the worker executor: idempotent commits + watermark store, the cron matcher, guard policy, and the local queue (#324-#327)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-iceberg.workspace = true
+verglas-sdk.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+iceberg = "0.9.1"
+# The durable watermark store writes each deployment's cursor as a small object
+# in the warehouse bucket over the S3/R2 keypair the harness already holds.
+opendal.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing = "0.1"
+uuid.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "rt", "macros", "time", "sync"] }
+# Liveness probes and process-group handling for the guard policy (ported from
+# the agentmem runaway-worker controls).
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "process", "time"] }
+iceberg-catalog-sql = "0.9.1"
+# The hermetic follow-mode test runs a SQLite-backed catalog; sqlx needs its
+# tokio runtime feature enabled for the pool to start.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
+serde = { workspace = true }
+# Sets segment file mtimes in the queue TTL-cleanup test.
+filetime = "0.2"
+
+[lints]
+workspace = true

@@ -1,0 +1,57 @@
+name: s3-conformance
+
+# Ceph s3-tests conformance harness (issue #22).
+#
+# The FULL suite runs nightly (and on demand) — it is comprehensive and the
+# authoritative signal, but building release verglasd + MinIO + the Python suite
+# is too heavy to sit on every PR's critical path.
+#
+# A fast SMOKE subset runs on PRs, but ONLY when the protocol surface or the
+# harness itself changes (path-filtered) — so normal PRs are not slowed, while a
+# change to the S3 front-end still gets an external-conformance check. The full
+# suite is what blocks: it is required for the nightly branch protection, not the
+# per-PR gate.
+
+on:
+  schedule:
+    - cron: "0 7 * * *"        # 07:00 UTC nightly
+  workflow_dispatch:
+
+concurrency:
+  group: s3-conformance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast PR-path smoke: a handful of core GET/PUT/LIST/multipart/copy/delete/
+  # error tests. Only triggers on the path filter above. Debug build for speed.
+  smoke:
+    # Fast subset for a quick manual check. The full suite below is authoritative.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Smoke subset
+        run: ./tests/s3-conformance/run.sh --smoke --debug
+
+  # Nightly / on-demand full suite: the authoritative conformance signal.
+  full:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Full conformance suite (markers excluded, skip-list applied)
+        run: ./tests/s3-conformance/run.sh --full

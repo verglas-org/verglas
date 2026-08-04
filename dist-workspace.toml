@@ -1,0 +1,55 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist' (cargo-dist): the cross-platform prebuilt-binary release
+# pipeline. `git tag vX.Y.Z && git push --tags` triggers .github/workflows/
+# release.yml, which builds every target below, assembles one archive per
+# platform (all four binaries: verglas, verglasd, verglas-mcp,
+# verglas-consolidate), generates the installers, and publishes a GitHub Release
+# with checksums. No crates.io publishing: the workspace patches iceberg from
+# the verglas-org/iceberg-rust fork ([patch.crates-io]), so distribution is
+# GitHub Releases only.
+[dist]
+# The dist version CI pins itself to, so releases are reproducible.
+cargo-dist-version = "0.32.0"
+# CI backend that runs the release workflow.
+ci = "github"
+# One-line installers users curl | sh (shell, mac/linux) or iwr | iex
+# (powershell, windows). The homebrew installer generates a formula artifact
+# into each GitHub Release; see the deferred `tap` note below.
+installers = ["shell", "powershell", "homebrew"]
+# Target platforms. musl is intentionally NOT built: the memory embedder pulls
+# the ONNX Runtime (via fastembed -> ort, download-binaries) which ships only
+# glibc/macOS/windows prebuilts and has no musl build, and aws-lc-sys (S3 TLS)
+# adds further musl-static friction. Linux ships glibc (gnu) instead, which
+# covers the mainstream distros. windows-msvc is the real compile gate for the
+# cfg-audited unix-only paths (service install, SIGHUP reload, process groups).
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
+# SHA-256 checksum file alongside every archive.
+checksum = "sha256"
+# No release-plan job on PRs: releases are explicit tag pushes only.
+pr-run-mode = "skip"
+# Link the DYNAMIC MSVC CRT on windows. cargo-dist defaults to +crt-static,
+# but the ONNX Runtime objects (fastembed -> ort, prebuilt) are compiled
+# against the dynamic CRT — static linking fails with LNK2001 unresolved
+# __imp_* symbols (seen on the v0.1.0 run). The UCRT ships with Windows 10+,
+# so dynamic is safe for users.
+msvc-crt-static = false
+# Releases publish to this same public repo (verglas-org/verglas). No separate
+# releases-only override.
+
+# Homebrew tap publishing is DEFERRED until the tap repo exists. The homebrew
+# installer above still generates the formula as a release artifact (users can
+# install the raw formula file); it is only the automatic push to a tap repo
+# that is turned off. To enable it once `verglas-org/homebrew-tap` exists:
+#   1. Create the (public) github.com/verglas-org/homebrew-tap repo.
+#   2. Add a HOMEBREW_TAP_TOKEN repo secret (a PAT with contents:write on the tap).
+#   3. Uncomment the line below and re-run `dist init` / `dist generate` to add
+#      the publish-homebrew-formula job to release.yml.
+# tap = "verglas-org/homebrew-tap"

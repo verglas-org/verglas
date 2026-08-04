@@ -1,0 +1,144 @@
+name: ci
+
+# Post-merge pushes to main deliberately do NOT build: every change lands via
+# a PR that already ran this same job, so the merge run was a duplicate spend
+# on billed private-repo minutes. Explicit runs: workflow_dispatch.
+#
+# Standing test policy (operator, 2026-08-03): tests must not have long waits
+# and must not build or pull containers. External services are replaced with
+# in-process mocks (the in-process S3 stub in
+# crates/verglas-backend/tests/common/mod.rs is the pattern). Timing-dependent
+# behavior waits on conditions with tight polls, never fixed sleeps. Anything
+# that genuinely needs a real external service goes behind #[ignore] as an
+# explicit opt-in, never in the default `cargo test` path.
+on:
+  pull_request:
+  schedule:
+    - cron: "0 7 * * *"        # 07:00 UTC nightly: the heavier coverage job
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The full-workspace test link once outgrew the runner (ld died with a bus
+  # error mid-link). Debug info is the bulk of the target/ tree and of linker
+  # memory, and CI never reads it — no debugger ever attaches here; a failed
+  # test's backtrace still names symbols. Dropping it roughly halves link
+  # inputs and disk, which is also what lets this job run WITHOUT the old
+  # "free disk space" reclaim step now that MinIO/docker are gone from the
+  # pipeline. Local builds are unaffected.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  sdk-parity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup show
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+
+      # The TypeScript SDK includes an executable trajectory adapter whose
+      # integration tests invoke the repository's supported Bun runtime.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.8"
+
+      - name: Compare SDK semantic surfaces
+        run: node scripts/check-sdk-parity.mjs && bash scripts/check-cli-thin.sh
+
+      - name: Test TypeScript SDK
+        working-directory: sdks/typescript
+        run: npm ci && npm run typecheck && npm test
+
+      - name: Test Rust SDK
+        run: cargo test -p verglas-sdk
+
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml and installs the pinned toolchain,
+      # so CI always matches dev machines exactly.
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # A failed gate still caches whatever it compiled, so the fix-up
+          # push does not pay for the same compilation twice.
+          cache-on-failure: true
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Two gates, one compilation. There is deliberately NO standalone build
+      # step: `cargo test` compiles the entire workspace anyway (a broken
+      # build fails the Test step with the same diagnostics), and the old
+      # `cargo build --workspace` step actively made things worse — it
+      # resolved features WITHOUT dev-dependencies while clippy
+      # `--all-targets` and `cargo test` resolve WITH them, so each step saw
+      # a different dep graph and recompiled the same crates under a
+      # different feature set (~5 billed minutes apiece). Clippy first is the
+      # cheap early type-check of the whole graph; Test then does the one
+      # codegen pass, sharing dep artifacts with clippy's via the same
+      # target/ dir and rust-cache across runs.
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No MinIO, no docker, no external services (see the standing test
+      # policy at the top of this file): the backend fill contract runs
+      # against the in-process stub origin
+      # (crates/verglas-backend/tests/fills.rs) on every `cargo test`. The
+      # real-S3 mirror (tests/minio.rs) is #[ignore]d and opt-in, run locally
+      # against a MinIO when the origin itself is in question.
+      - name: Test
+        run: cargo test --workspace
+
+  coverage:
+    # Coverage is expensive (a full llvm-cov instrumented build). Run it
+    # nightly and on demand only; run it locally before opening a PR. The cheap
+    # lint+test `ci` job above is the default per-PR gate.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show && rustup component add llvm-tools-preview
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@cargo-llvm-cov
+
+      # The backend fill test covering the per-bucket concurrency limiter's
+      # per-operation guards runs against the in-process stub origin
+      # (crates/verglas-backend/tests/fills.rs), so no MinIO here either.
+      # The floor ratchets upward: when a PR raises overall coverage, it must
+      # also raise this number to just below the new value (see AGENTS.md,
+      # "Coverage"). Long-term target: >=90 lines.
+      # (The Iceberg REST catalog service — verglas-catalog / verglas-catalogd —
+      # moved to the verglas-cloud repo; the daemon is a catalog CLIENT only, so
+      # nothing here stands up a catalog server.)
+      - name: Coverage (fails under the floor)
+        run: cargo llvm-cov --workspace --fail-under-lines 88 --lcov --output-path lcov.info
+
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info

@@ -1,0 +1,27 @@
+[package]
+name = "verglas-vector"
+description = "The streaming Vamana/FreshDiskANN ANN engine: incremental insert/delete/consolidate over an embedding field, serialized to a `verglas-vamana-v1` Puffin blob in the cluster-local shadow store (#88/#91, cluster-local divergence)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-iceberg.workspace = true
+iceberg.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "sync", "time"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "sync", "time"] }
+
+[lints]
+workspace = true

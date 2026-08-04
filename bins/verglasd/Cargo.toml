@@ -1,0 +1,122 @@
+[package]
+name = "verglasd"
+description = "The Verglas cache daemon: an Iceberg-aware S3 read-through cache"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-core.workspace = true
+verglas-backend.workspace = true
+verglas-cache.workspace = true
+verglas-cluster.workspace = true
+# The cache instance as a first-class ring member: the transaction seam
+# (CommitLog) and the ring-membership interface (RingMembership), with the
+# single-node local defaults the daemon runs on. The fleet's PG-quorum commit
+# log and clustered ring plug in behind these traits.
+verglas-instance.workspace = true
+verglas-s3.workspace = true
+verglas-tables.workspace = true
+verglas-writeback.workspace = true
+# verglas-iceberg is the engine (catalog open, the SDK table API, retention);
+# verglas-platform owns the system catalog (the workers registry + watermarks).
+verglas-iceberg.workspace = true
+verglas-platform.workspace = true
+# The `/v1/graphs/...` admin routes wrap the graph-over-Iceberg engine over the
+# same loopback catalog handle as the table routes: create the two backing
+# tables, insert nodes/edges, build the Puffin adjacency index, and answer
+# traversal queries (index with scan fallback). verglas-sdk carries the wire
+# shapes these routes serve.
+verglas-graph.workspace = true
+# The streaming Vamana ANN engine + its shadow-store service, backing the
+# `/v1/tables|graphs/{..}/indexes` declare/search routes. Local-only: index
+# blobs live in the cluster shadow store, never the source table (#95 / #91
+# divergence).
+verglas-vector.workspace = true
+# The shared worker runtime the daemon hosts: the watermark store trait, run
+# logging, the queue segment log, the cron matcher, the guard policy, and the
+# worker subprocess executor. verglas-sdk carries the worker/trigger contract.
+verglas-harness.workspace = true
+verglas-sdk.workspace = true
+async-trait.workspace = true
+chrono = "0.4.44"
+# The SDK table routes (`/v1/tables/...`) commit and read Iceberg tables
+# through an in-process catalog handle, so the daemon links the catalog type
+# and serde for the request query/body shapes.
+iceberg.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+axum.workspace = true
+# `ServiceExt::oneshot` drives the `/v1` serving router once per edge-forwarded
+# request when the SigV4 S3 surface answers `/v1/query` and `/v1/tables/...`.
+tower = { version = "0.5.3", features = ["util"] }
+tokio.workspace = true
+futures.workspace = true
+# The query-worker dispatcher relays the standalone role's streamed
+# `/v1/query` response straight through (never buffers it) — same use as
+# `bins/query-node`'s own streaming response.
+async-stream = "0.3"
+arrow-ipc = "57"
+# Control-plane node reporting (daemon-instance tracking): the detached
+# register/heartbeat task POSTs small JSON bodies to the tenant's control plane
+# when the machine is logged in. json + rustls-tls come from the workspace pin.
+reqwest.workspace = true
+thiserror.workspace = true
+tracing = "0.1.44"
+# `json` for the one-object-per-line output (#61); `env-filter` for RUST_LOG and
+# the hot-reloadable filter; `fmt` for the human-pretty `verglas dev` format.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
+# Non-blocking log writer (#61): per-request logging must never block a fill, so
+# the subscriber writes through a background worker with a bounded, drop-on-full
+# queue. A stalled or slow log consumer drops log lines, it never stalls serving.
+tracing-appender = "0.2.3"
+# TLS termination for the S3 endpoint (#11): axum-server serves the router over
+# rustls and hot-reloads the cert on SIGHUP without dropping connections. rustls
+# is pulled in directly only to install the aws-lc-rs crypto provider as the
+# process default (both aws-lc-rs and ring are in the dep graph, so the default
+# must be chosen explicitly).
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = "0.23"
+
+[target.'cfg(unix)'.dependencies]
+# getppid for the parent-death watch (issue #170); already in the lock via
+# verglas-core, so this adds no new dependency.
+libc.workspace = true
+
+[dev-dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+bytes.workspace = true
+chrono = "0.4.44"
+futures.workspace = true
+hex = "0.4.3"
+hmac = "0.12.1"
+object_store.workspace = true
+rcgen = "0.13"
+reqwest.workspace = true
+sha2 = "0.10.9"
+toml.workspace = true
+tower = { version = "0.5.3", features = ["util"] }
+urlencoding = "2.1.3"
+# The platform executor integration test (#328) drives the supervisor against a
+# hermetic SQLite-backed Iceberg catalog (no docker, no network), the same
+# fixture the source-harness tests use.
+async-trait.workspace = true
+iceberg-catalog-sql = "0.9.1"
+# The SQLite catalog needs an async runtime feature selected explicitly.
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "runtime-tokio"] }
+verglas-harness.workspace = true
+verglas-sdk.workspace = true
+
+[lints]
+workspace = true
+
+# Ship this binary in the cargo-dist release archives (workspace packages set
+# `publish = false` for the crates.io ban — the iceberg-rust fork patch forbids
+# publishing — so dist would otherwise skip them). Distribution is GitHub
+# Releases only; see dist-workspace.toml.
+[package.metadata.dist]
+dist = true

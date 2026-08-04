@@ -1,0 +1,534 @@
+// The client and Table handle: the whole read/write surface an artifact uses.
+
+import { makeTransport, type Transport } from "./http";
+import { VerglasHttpError } from "./http";
+import { CatalogFeed, feedUrl, globalWebSocket } from "./feed";
+import type {
+  AddIndexOptions,
+  ChangeHandler,
+  CommitOptions,
+  CommitResult,
+  ConnectOptions,
+  CreateTableResult,
+  EnsureTableResult,
+  DeltaResult,
+  FeedSubscription,
+  FollowFeedOptions,
+  FollowRowsOptions,
+  IndexInfo,
+  IndexReport,
+  FollowHandler,
+  GraphCreateResult,
+  GraphEdgeInput,
+  GraphIndexResult,
+  GraphInsertResult,
+  GraphKHopOptions,
+  GraphNeighbor,
+  GraphNodeInput,
+  GraphPath,
+  GraphPathsOptions,
+  GraphReadOptions,
+  GraphReached,
+  GraphShowResult,
+  QueueEnqueueResult,
+  QueuePollResult,
+  QueryResult,
+  Row,
+  ScanOptions,
+  ScanResult,
+  SearchIndexOptions,
+  SearchResult,
+  Snapshot,
+  TableDefinition,
+  Watermark,
+} from "./types";
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/**
+ * Opens a client against a Verglas endpoint. The endpoint is either the local
+ * daemon's base URL or a cloud Verglas endpoint; the interface is identical.
+ */
+export function connect(opts: ConnectOptions): VerglasClient {
+  if (!opts.endpoint) throw new Error("connect: endpoint is required");
+  if (!opts.token) throw new Error("connect: token is required");
+  const fetchImpl = opts.fetch ?? globalThis.fetch;
+  if (typeof fetchImpl !== "function") {
+    throw new Error("connect: no global fetch; pass one via ConnectOptions.fetch");
+  }
+  const transport = makeTransport(opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return new VerglasClient(transport, opts.endpoint, opts.token);
+}
+
+/** A connected Verglas client. Cheap to hold; makes no requests until used. */
+export class VerglasClient {
+  /** The shared change-feed socket, opened lazily on the first `follow`. */
+  private feed?: CatalogFeed;
+
+  /** @internal */
+  constructor(
+    private readonly transport: Transport,
+    /** The endpoint this client is bound to (for logging/diagnostics). */
+    readonly endpoint: string,
+    /** Bearer token, reused to authenticate the change-feed websocket. */
+    private readonly token: string,
+  ) {}
+
+  /**
+   * Follows table-commit notifications over the platform's edge change feed and
+   * invokes `handler` for each commit to the named table(s). One websocket per
+   * client carries every follow (multiplexed and filtered client-side), so this
+   * never opens a long-lived connection to a tenant backend — the backend scales
+   * to zero and the edge holds the socket while it sleeps.
+   *
+   * A `ChangeEvent` is a *notification* (seq, table, snapshot id, commit time),
+   * not the rows. To read what changed, `delta` the table from a watermark. Pass
+   * `opts.cursor` to replay past changes (an int seq) or omit it for live-only;
+   * pass `opts.onResync` to learn when the edge drops replay history and the feed
+   * falls back to live. Returns a handle — call `close()` (or abort
+   * `opts.signal`) to end this follow; the socket closes with the last one.
+   *
+   * This is distinct from `Table.follow`, which polls the backend for *rows*.
+   */
+  follow(table: string | string[], handler: ChangeHandler, opts?: FollowFeedOptions): FeedSubscription {
+    const tables = Array.isArray(table) ? table : [table];
+    if (tables.length === 0 || tables.some((t) => !t)) {
+      throw new Error("follow: at least one non-empty table name is required");
+    }
+    if (!this.feed) {
+      this.feed = new CatalogFeed(feedUrl(this.endpoint), this.token, globalWebSocket());
+    }
+    return this.feed.follow(tables, handler, opts);
+  }
+
+  /**
+   * Follows a table's ROWS, driven by the change feed instead of interval polling.
+   * Subscribes to the table's commit notifications (`follow` above) and, on each
+   * commit, delta-reads the newly committed rows and invokes
+   * `handler(newRows, watermark)`. This is the row subscription primitive workers
+   * and consumers use — a commit notification wakes a bounded `delta` read, so an
+   * idle table costs nothing (the edge holds the socket while the backend sleeps).
+   *
+   * Starts from `opts.fromWatermark`, or the table's current snapshot when omitted
+   * (only rows committed from here on are delivered). Batches are delivered in
+   * commit order and `handler` is awaited before the next drain, so a slow handler
+   * applies natural backpressure. If `handler` (or a delta read) throws and no
+   * `onError` is given, the subscription closes and `closed` rejects. Call
+   * `close()` (or abort `opts.signal`) to stop.
+   */
+  followRows<T extends Row = Row>(
+    table: string,
+    handler: FollowHandler<T>,
+    opts?: FollowRowsOptions,
+  ): FeedSubscription {
+    if (!table) throw new Error("followRows: a non-empty table name is required");
+    const handle = this.table<T>(table);
+
+    // The tracked position. When no starting watermark is given, capture the
+    // current snapshot EAGERLY (at call time, before any later commit lands), so
+    // we deliver exactly the rows committed from here on — not from first change.
+    let watermark: Watermark | undefined = opts?.fromWatermark;
+    const started: Promise<void> =
+      opts?.fromWatermark !== undefined
+        ? Promise.resolve()
+        : handle.snapshot().then((s) => void (watermark = s.watermark));
+
+    // Serialize drains so commits are processed one at a time, in order, with the
+    // handler awaited (backpressure). A pending drain coalesces further changes.
+    let draining: Promise<void> = Promise.resolve();
+    let closed = false;
+    let rejectClosed: ((err: unknown) => void) | undefined;
+
+    const drain = async (): Promise<void> => {
+      await started;
+      for (;;) {
+        if (closed) return;
+        const d: DeltaResult<T> = await handle.delta(watermark as Watermark, { limit: opts?.batchSize });
+        watermark = d.watermark;
+        if (d.rows.length === 0) return;
+        await handler(d.rows, d.watermark);
+      }
+    };
+
+    const onChange: ChangeHandler = () => {
+      draining = draining.then(drain).catch((err) => {
+        if (opts?.onError) {
+          opts.onError(err);
+          return;
+        }
+        closed = true;
+        sub.close();
+        rejectClosed?.(err);
+      });
+    };
+
+    const sub = this.follow(table, onChange, {
+      cursor: opts?.cursor,
+      onResync: opts?.onResync,
+      signal: opts?.signal,
+    });
+
+    // Wrap the feed subscription's `closed` so an unhandled error rejects it, the
+    // way the old row-poller's `done` promise rejected.
+    const closedPromise = new Promise<void>((resolve, reject) => {
+      rejectClosed = reject;
+      sub.closed.then(resolve, reject);
+    });
+    return {
+      close: () => {
+        closed = true;
+        sub.close();
+      },
+      closed: closedPromise,
+    };
+  }
+
+  /** A handle to one table by fully-qualified name (e.g. `cloud.job_runs`). */
+  table<T extends Row = Row>(name: string): Table<T> {
+    if (!name) throw new Error("table: name is required");
+    return new Table<T>(this.transport, name);
+  }
+
+  /**
+   * A handle to one queue by name — the queue a worker can target instead of a
+   * Table. Locally the queue is a durable segment log; in
+   * the cloud it is a managed queue. The verb is identical for both placements;
+   * the endpoint owns the substrate.
+   */
+  queue<T extends Row = Row>(name: string): Queue<T> {
+    if (!name) throw new Error("queue: name is required");
+    return new Queue<T>(this.transport, name);
+  }
+
+  /**
+   * A handle to one property graph by namespace. A graph is not a new storage
+   * primitive — it is a namespace holding two plain Iceberg tables (`nodes` and
+   * `edges`) plus a snapshot-bound adjacency index. The handle parallels
+   * `table`: create it, insert nodes/edges, build the index, and traverse.
+   */
+  graph(namespace: string): Graph {
+    if (!namespace) throw new Error("graph: namespace is required");
+    return new Graph(this.transport, namespace);
+  }
+
+  /**
+   * Creates a table from an explicit schema and partition spec. Use this when the
+   * table needs exact column types (decimals, dates), per-column nullability, or
+   * a partition spec (month transform, several columns) that the schema inference
+   * on the first commit cannot express. The SDK does not build the table in JS —
+   * it POSTs the definition to the endpoint, which owns the catalog. Returns the
+   * table name and its final column list.
+   */
+  createTable(name: string, def: TableDefinition): Promise<CreateTableResult> {
+    if (!name) throw new Error("createTable: name is required");
+    if (!def?.schema?.length) throw new Error("createTable: schema is required");
+    const body = { schema: def.schema, partitions: def.partitions ?? [] };
+    return this.transport.request<CreateTableResult>(
+      "POST",
+      `/v1/tables/${encodeURIComponent(name)}`,
+      { body },
+    );
+  }
+
+  /** Creates a missing table or verifies its exact existing definition. */
+  async ensureTable(name: string, def: TableDefinition): Promise<EnsureTableResult> {
+    if (!name) throw new Error("ensureTable: name is required");
+    const expected = { schema: def.schema, partitions: def.partitions ?? [] };
+    try {
+      const actual = await this.transport.request<TableDefinition>(
+        "GET",
+        `/v1/tables/${encodeURIComponent(name)}/definition`,
+      );
+      const normalized = { schema: actual.schema, partitions: actual.partitions ?? [] };
+      if (JSON.stringify(normalized) !== JSON.stringify(expected)) {
+        throw new Error(`ensureTable: ${name} definition mismatch`);
+      }
+      return "existing";
+    } catch (error) {
+      if (!(error instanceof VerglasHttpError) || error.status !== 404) throw error;
+      await this.createTable(name, expected);
+      return "created";
+    }
+  }
+
+  /** Executes SQL through the endpoint's language-neutral JSON representation. */
+  query(sql: string): Promise<QueryResult> {
+    if (!sql) throw new Error("query: sql is required");
+    return this.transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
+  }
+
+  /**
+   * The durable cross-run watermark for the calling deployment, or null when
+   * none has been set yet. A cloud source worker is a fresh isolate on every
+   * dispatch, so it reads this at run start to resume where the last dispatch
+   * left off. The bearer token identifies the deployment — there is no id in the
+   * path. Not implemented by the local daemon; only the cloud endpoint serves it.
+   */
+  async watermark(): Promise<Watermark | null> {
+    const r = await this.transport.request<{ watermark: Watermark | null }>("GET", "/v1/watermark");
+    return r?.watermark ?? null;
+  }
+
+  /**
+   * Stores the calling deployment's durable cross-run watermark, overwriting any
+   * prior value. A cloud source worker calls this after a successful run so the
+   * next dispatch resumes strictly after it. The token identifies the deployment.
+   */
+  async setWatermark(w: Watermark): Promise<void> {
+    await this.transport.request<void>("PUT", "/v1/watermark", { body: { watermark: w } });
+  }
+}
+
+/** A read/write handle to a single Verglas table. */
+export class Table<T extends Row = Row> {
+  /** @internal */
+  constructor(
+    private readonly transport: Transport,
+    readonly name: string,
+  ) {}
+
+  private base(): string {
+    return `/v1/tables/${encodeURIComponent(this.name)}`;
+  }
+
+  /** The current snapshot's metadata — a cheap poll, reads no rows. */
+  snapshot(): Promise<Snapshot> {
+    return this.transport.request<Snapshot>("GET", `${this.base()}/snapshot`);
+  }
+
+  /** Reads a page of rows from the current snapshot. */
+  scan(opts?: ScanOptions): Promise<ScanResult<T>> {
+    return this.transport.request<ScanResult<T>>("GET", `${this.base()}/rows`, {
+      query: { limit: opts?.limit, cursor: opts?.cursor },
+    });
+  }
+
+  /**
+   * Reads rows committed after `sinceWatermark`. Pass the previous
+   * `DeltaResult.watermark` (or a `ScanResult.watermark`) to walk forward. When
+   * nothing new has committed, `rows` is empty and the watermark is unchanged.
+   */
+  delta(sinceWatermark: Watermark, opts?: { limit?: number }): Promise<DeltaResult<T>> {
+    return this.transport.request<DeltaResult<T>>("GET", `${this.base()}/delta`, {
+      query: { since: sinceWatermark, limit: opts?.limit },
+    });
+  }
+
+  /**
+   * Appends a batch of rows. The SDK does NOT build Parquet or run an Iceberg
+   * commit in JS — it POSTs the batch to the endpoint's commit service, which
+   * owns the content-addressed write path. Each `append` commits its own batch
+   * synchronously (this is what replaces the old global "drain"). Returns the
+   * snapshot id, rows committed, and the new watermark.
+   */
+  /**
+   * Declares a real-time-maintained vector (ANN) index on an embedding field and
+   * runs the initial build. The index is a streaming Vamana (DiskANN) graph,
+   * maintained incrementally and served from the cluster-local shadow store — it is
+   * never committed to this table's Iceberg snapshot.
+   */
+  addIndex(field: string, opts?: AddIndexOptions): Promise<IndexReport> {
+    return this.transport.request<IndexReport>("POST", `${this.base()}/indexes`, {
+      body: {
+        field,
+        metric: opts?.metric ?? "cosine",
+        idField: opts?.idField,
+        params: opts?.params,
+      },
+    });
+  }
+
+  /** Lists the vector indexes declared on this table. */
+  async listIndexes(): Promise<IndexInfo[]> {
+    const res = await this.transport.request<{ indexes: IndexInfo[] }>(
+      "GET",
+      `${this.base()}/indexes`,
+    );
+    return res.indexes;
+  }
+
+  /**
+   * Searches an embedding field for the `k` nearest neighbors of `vector`.
+   * Serves from the maintained index, or falls back to brute force over the
+   * column when no index exists (`result.source` reports which).
+   */
+  searchIndex(field: string, vector: number[], opts?: SearchIndexOptions): Promise<SearchResult> {
+    return this.transport.request<SearchResult>(
+      "POST",
+      `${this.base()}/indexes/${encodeURIComponent(field)}/search`,
+      { body: { vector, k: opts?.k ?? 10, l: opts?.l } },
+    );
+  }
+
+  async append(rows: T[], opts?: CommitOptions): Promise<CommitResult> {
+    const body: { rows: T[]; idempotencyKey?: string } = { rows };
+    if (opts?.idempotencyKey) body.idempotencyKey = opts.idempotencyKey;
+    return this.transport.request<CommitResult>("POST", `${this.base()}/commit`, {
+      body,
+      headers: opts?.idempotencyKey ? { "idempotency-key": opts.idempotencyKey } : undefined,
+    });
+  }
+}
+
+/**
+ * A read/write handle to a single Verglas queue — the queue output type.
+ *
+ * A queue is a durable, ordered log of rows consumed by named consumer groups.
+ * `enqueue` appends; `poll` reads a group's un-acked records from its watermark;
+ * `ack` advances the group's watermark after the consumer has committed its work.
+ *
+ * # Semantics: at-least-once with consumer-side idempotency
+ *
+ * A record is durable before any consumer sees it, and a group's watermark
+ * advances only on an explicit `ack` after the consumer's downstream commit. A
+ * crash between `poll` and `ack` re-serves the same records, so delivery is
+ * **at-least-once**; a consumer that must not act twice records what it has
+ * already handled (dedupe on `QueueRecord.position`, say) — the same discipline
+ * the commit path enforces with idempotency keys. `ack` is monotone: a
+ * regressing position is ignored.
+ */
+export class Queue<T extends Row = Row> {
+  /** @internal */
+  constructor(
+    private readonly transport: Transport,
+    readonly name: string,
+  ) {}
+
+  private base(): string {
+    return `/v1/queues/${encodeURIComponent(this.name)}`;
+  }
+
+  /** Appends rows to the queue. */
+  enqueue(rows: T[]): Promise<QueueEnqueueResult> {
+    return this.transport.request<QueueEnqueueResult>("POST", `${this.base()}/enqueue`, {
+      body: { rows },
+    });
+  }
+
+  /**
+   * Reads up to `max` records for consumer group `group`, starting at the
+   * group's watermark. Reads without an `ack` re-serve the same records
+   * (at-least-once); pass `max` to bound one poll.
+   */
+  poll(group: string, opts?: { max?: number }): Promise<QueuePollResult<T>> {
+    if (!group) throw new Error("poll: group is required");
+    return this.transport.request<QueuePollResult<T>>("GET", `${this.base()}/poll`, {
+      query: { group, max: opts?.max },
+    });
+  }
+
+  /**
+   * Advances `group`'s watermark to `position` (typically the last polled
+   * record's position + 1) after the consumer has committed its work. Monotone:
+   * a regressing position is ignored.
+   */
+  ack(group: string, position: number): Promise<{ watermark: number }> {
+    if (!group) throw new Error("ack: group is required");
+    return this.transport.request<{ watermark: number }>("POST", `${this.base()}/ack`, {
+      body: { group, position },
+    });
+  }
+}
+
+/** The traversal-query response the graph query route returns. Internal — the
+ *  `Graph` read methods unwrap the field matching the op. */
+interface GraphQueryResponse {
+  op: string;
+  backend: string;
+  snapshotId: number;
+  neighbors?: GraphNeighbor[];
+  reached?: GraphReached[];
+  paths?: GraphPath[];
+}
+
+/**
+ * A handle to a single Verglas property graph — the graph equivalent of
+ * `Table`, parallel to the CLI's `graph` verbs and the daemon's `/v1/graphs/...`
+ * routes.
+ *
+ * A graph is a namespace holding two plain Iceberg tables (`nodes` and `edges`)
+ * plus a snapshot-bound adjacency index. Reads prefer the index and fall back to
+ * a table scan when none is built, returning the same answer either way — the
+ * SDK does no graph work in JS, it POSTs to the endpoint which owns the engine.
+ */
+export class Graph {
+  /** @internal */
+  constructor(
+    private readonly transport: Transport,
+    readonly namespace: string,
+  ) {}
+
+  private base(): string {
+    return `/v1/graphs/${encodeURIComponent(this.namespace)}`;
+  }
+
+  /** Creates the graph: ensures its nodes and edges tables exist. Idempotent. */
+  create(): Promise<GraphCreateResult> {
+    return this.transport.request<GraphCreateResult>("POST", this.base(), { body: {} });
+  }
+
+  /** Appends a batch of nodes; returns the new nodes-table snapshot and count. */
+  insertNodes(nodes: GraphNodeInput[]): Promise<GraphInsertResult> {
+    return this.transport.request<GraphInsertResult>("POST", `${this.base()}/nodes`, {
+      body: { nodes },
+    });
+  }
+
+  /** Appends a batch of edges; returns the new edges-table snapshot and count. */
+  insertEdges(edges: GraphEdgeInput[]): Promise<GraphInsertResult> {
+    return this.transport.request<GraphInsertResult>("POST", `${this.base()}/edges`, {
+      body: { edges },
+    });
+  }
+
+  /** Builds or refreshes the adjacency index for the current edge snapshot. */
+  buildIndex(): Promise<GraphIndexResult> {
+    return this.transport.request<GraphIndexResult>("POST", `${this.base()}/index`, { body: {} });
+  }
+
+  /** Shows the backing tables, live counts, and whether an index is bound. */
+  show(): Promise<GraphShowResult> {
+    return this.transport.request<GraphShowResult>("GET", this.base());
+  }
+
+  /** The direct neighbors of `node`. */
+  async neighbors(node: string, opts?: GraphReadOptions): Promise<GraphNeighbor[]> {
+    const r = await this.query({ op: "neighbors", start: node, ...this.readBody(opts) });
+    return r.neighbors ?? [];
+  }
+
+  /** Every node reached within `opts.hops` hops of `node`. */
+  async kHop(node: string, opts: GraphKHopOptions): Promise<GraphReached[]> {
+    const r = await this.query({ op: "kHop", start: node, k: opts.hops, ...this.readBody(opts) });
+    return r.reached ?? [];
+  }
+
+  /** The shortest path from `src` to `dst` within `opts.maxHops` hops. */
+  async paths(src: string, dst: string, opts: GraphPathsOptions): Promise<GraphPath[]> {
+    const r = await this.query({
+      op: "paths",
+      start: src,
+      dst,
+      maxHops: opts.maxHops,
+      ...this.readBody(opts),
+    });
+    return r.paths ?? [];
+  }
+
+  /** Assembles the shared read fields (direction, filter, time travel). */
+  private readBody(opts?: GraphReadOptions): Record<string, unknown> {
+    const body: Record<string, unknown> = {};
+    if (opts?.direction) body.direction = opts.direction;
+    if (opts?.asOf !== undefined) body.asOf = opts.asOf;
+    const filter: Record<string, unknown> = {};
+    if (opts?.predicate !== undefined) filter.predicate = opts.predicate;
+    if (opts?.minConfidence !== undefined) filter.minConfidence = opts.minConfidence;
+    if (Object.keys(filter).length > 0) body.filter = filter;
+    return body;
+  }
+
+  /** POSTs one traversal request to the graph query route. */
+  private query(body: Record<string, unknown>): Promise<GraphQueryResponse> {
+    return this.transport.request<GraphQueryResponse>("POST", `${this.base()}/query`, { body });
+  }
+}

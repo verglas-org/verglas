@@ -1,0 +1,85 @@
+// Build for the engine-matrix fixture builder.
+//
+// Why this exists: pyiceberg and DuckDB both write Parquet data files only
+// (verified against pyiceberg 0.11.1 and DuckDB-Iceberg, mid-2026). Producing
+// spec-complete Iceberg tables whose *data* files are Avro needs Iceberg's own
+// writers, so this is a tiny plain-Java program on iceberg-core + iceberg-data
+// (no Spark). It is built once and run in the engine-matrix CI job.
+//
+// The shadow plugin bundles everything into one runnable jar so CI just does
+// `java -jar build/libs/fixture-jvm-all.jar ...` after a cached Gradle build.
+plugins {
+    id 'java'
+    id 'application'
+    id 'com.gradleup.shadow' version '8.3.6'
+}
+
+// Iceberg 1.9.x runs on Java 11/17/21; we build and run on 21 (CI setup-java).
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+ext {
+    icebergVersion = '1.9.2'
+    awsSdkVersion = '2.31.6'
+    parquetVersion = '1.15.1'
+    hadoopVersion = '3.4.1'
+    avroVersion = '1.12.0'
+}
+
+dependencies {
+    // Iceberg table API, the generic (Spark-free) record writers, the S3 FileIO,
+    // and the JDBC (SQLite) catalog.
+    implementation "org.apache.iceberg:iceberg-core:${icebergVersion}"
+    implementation "org.apache.iceberg:iceberg-data:${icebergVersion}"
+    implementation "org.apache.iceberg:iceberg-parquet:${icebergVersion}"
+    implementation "org.apache.iceberg:iceberg-aws:${icebergVersion}"
+
+    // Avro and Parquet writers the GenericAppenderFactory drives.
+    implementation "org.apache.avro:avro:${avroVersion}"
+    implementation "org.apache.parquet:parquet-avro:${parquetVersion}"
+    implementation "org.apache.parquet:parquet-column:${parquetVersion}"
+    implementation "org.apache.parquet:parquet-hadoop:${parquetVersion}"
+
+    // Hadoop supplies the Configuration class Iceberg's Parquet writer wants.
+    // Only the config/io glue is used — no HDFS, no Hadoop S3.
+    implementation("org.apache.hadoop:hadoop-common:${hadoopVersion}") {
+        exclude group: 'org.slf4j'
+        exclude group: 'org.apache.hadoop', module: 'hadoop-auth'
+        exclude group: 'javax.servlet'
+        exclude group: 'org.eclipse.jetty'
+    }
+
+    // AWS SDK v2 for S3FileIO (talks to MinIO over path-style S3).
+    implementation platform("software.amazon.awssdk:bom:${awsSdkVersion}")
+    implementation 'software.amazon.awssdk:s3'
+    implementation 'software.amazon.awssdk:sts'
+    implementation 'software.amazon.awssdk:apache-client'
+
+    // SQLite JDBC for the Iceberg JDBC catalog (mirrors the Parquet leg's
+    // pyiceberg SqlCatalog; the matrix itself reads tables by metadata location,
+    // not through this catalog).
+    implementation 'org.xerial:sqlite-jdbc:3.49.1.0'
+
+    // A no-op SLF4J binding keeps the JVM quiet (findings must be readable).
+    implementation 'org.slf4j:slf4j-api:2.0.16'
+    runtimeOnly 'org.slf4j:slf4j-nop:2.0.16'
+}
+
+application {
+    mainClass = 'verglas.fixture.FixtureBuilder'
+}
+
+// One stable jar name the run.sh / workflow invoke.
+shadowJar {
+    archiveBaseName = 'fixture-jvm'
+    archiveClassifier = 'all'
+    archiveVersion = ''
+    mergeServiceFiles()
+}

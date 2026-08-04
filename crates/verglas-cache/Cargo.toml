@@ -1,0 +1,54 @@
+[package]
+name = "verglas-cache"
+description = "Cache engine wrapper (hybrid memory + NVMe cache, foyer integration)"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The `ObjectRead`/`Invalidation` interfaces this engine implements live in core;
+# no dependency on the protocol crate.
+verglas-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+# Default features only. foyer's `serde` feature installs a blanket
+# `Code for T: Serialize` impl that would conflict with the manual `Code`
+# impls in src/entry.rs — do not enable it anywhere in the workspace.
+foyer.workspace = true
+# foyer's metrics registry trait, used to surface foyer's silent
+# `storage_queue_buffer_overflow` drops as a verglas counter and WARN (#278).
+mixtrics.workspace = true
+futures.workspace = true
+thiserror.workspace = true
+# Structured origin-fill-failure events (#61): a cold read whose origin GET/HEAD
+# fails is logged with the request id and a redacted key hash, so a failure like
+# #245/#233 is visible instead of degrading silently.
+tracing = "0.1.44"
+# SIMD Reed-Solomon codec for the write-back erasure tier (#180). Chosen over
+# reed-solomon-erasure by the throughput comparison in examples/codec_throughput.rs.
+reed-solomon-simd.workspace = true
+# Per-fragment CRC32C integrity check for the write-back codec (#220): a bad
+# fragment fails verification and is treated as an erasure, so Reed-Solomon
+# reconstructs from the good fragments instead of returning silent garbage.
+crc32c.workspace = true
+# The singleflight fill map (#19) runs each deduplicated fill in a detached
+# task (waiter-cancellation safety) and shares its result across waiters —
+# needs the tokio runtime handle for `spawn`.
+tokio.workspace = true
+
+[dev-dependencies]
+# Tests fill through verglas-s3's passthrough; dev-only, so the library
+# dependency graph stays cache -> core <- s3.
+verglas-s3.workspace = true
+object_store.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+# Captures the structured fill-failure events for the #61 logging test.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }
+serde_json.workspace = true
+# Only for the codec throughput comparison example (#180); never a library dep.
+reed-solomon-erasure.workspace = true
+
+[lints]
+workspace = true

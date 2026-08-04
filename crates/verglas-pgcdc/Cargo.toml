@@ -1,0 +1,38 @@
+[package]
+name = "verglas-pgcdc"
+description = "PostgreSQL logical-replication (pgoutput) to Iceberg change-log tables: the CDC runner behind Verglas Cloud's zero-ETL feature"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The Iceberg engine: catalog open, table create, and the CAS append path the
+# CDC sink writes change rows through. The iceberg-rust fork patch (the
+# `from_parts` constructor used for hand-rolled schema-evolution commits) is
+# transparent here.
+verglas-iceberg.workspace = true
+# The Iceberg spec types (Schema, NestedField, TableCommit, TableUpdate,
+# TableRequirement) the add-column evolution commit is built from directly.
+iceberg.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+# Postgres access for the live PgSource (publication/slot management, the
+# `pg_logical_slot_peek_binary_changes` drain, and full-table resync SELECTs).
+# Mirrors verglas-catalog's line: sqlx 0.8 with no macros so the build needs no
+# live database.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "chrono"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

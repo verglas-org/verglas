@@ -1,0 +1,41 @@
+[package]
+name = "verglas-block"
+description = "Durable, cache-served virtual block devices for microVMs (#382): a content-addressed 2 MiB chunk store that write-throughs to the cache's backing bucket under a dedicated `blocks/` prefix, one manifest object per device version, and a read path that hits NVMe first and fills from the backend. The stateful layer behind stateless workload VMs."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The durability seam is `object_store`: chunks and manifests are plain objects
+# in the cache's configured backing bucket. verglas-block never holds a bucket
+# name or credentials — the caller hands it a built store.
+object_store.workspace = true
+bytes.workspace = true
+sha2.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "sync", "io-util"] }
+# The block flush write-back plane reuses the SAME erasure-coding + quorum
+# substrate the object write-back tier (#180/#286) and the EC append log (#372)
+# are built on — the Reed-Solomon codec, the local fragment store, the peer
+# fragment transport, and the live-membership view. This crate adds the block
+# flush write-back (seal the dirty set, EC it across the ring, ack on a quorum,
+# drain to R2 in the background) over them; it re-implements none of them.
+verglas-core.workspace = true
+verglas-cache.workspace = true
+verglas-cluster.workspace = true
+verglas-writeback.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "sync", "io-util"] }
+
+[lints]
+workspace = true

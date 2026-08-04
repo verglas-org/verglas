@@ -1,0 +1,34 @@
+[package]
+name = "verglas-core"
+description = "Core types shared across Verglas: configuration, errors, and logical cache keys"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+libc.workspace = true
+prometheus.workspace = true
+thiserror.workspace = true
+# Task-local request id shared across the serving path (#61): the id lives in a
+# `tokio::task_local!` so no serving-path signature has to carry it.
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+schemars.workspace = true
+toml.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+criterion = "0.5"
+
+[[bench]]
+name = "telemetry_tape"
+harness = false
+
+[lints]
+workspace = true

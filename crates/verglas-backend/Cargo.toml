@@ -1,0 +1,32 @@
+[package]
+name = "verglas-backend"
+description = "Backend object-store client: provider selection, IAM credential chain, and a per-bucket concurrency limiter"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-core.workspace = true
+async-trait.workspace = true
+aws-config.workspace = true
+aws-credential-types.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex = "0.4.3"
+hmac = "0.12.1"
+object_store.workspace = true
+percent-encoding = "2.3.2"
+reqwest.workspace = true
+sha2 = "0.10.9"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "sync"] }
+
+[dev-dependencies]
+axum.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "time"] }
+toml.workspace = true
+
+[lints]
+workspace = true
