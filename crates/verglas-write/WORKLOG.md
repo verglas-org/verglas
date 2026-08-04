@@ -75,3 +75,4 @@
   proves the object was ABSENT from S3 at crash time, so this is genuine
   ack-then-crash-then-replay. It kills only its own daemon PID and stops MinIO by
   a unique container name.
+- #3: Renamed the crate from `verglas-writeback` to `verglas-write`; write-back and synchronous write-through are internal durability modes of one logical write subsystem.

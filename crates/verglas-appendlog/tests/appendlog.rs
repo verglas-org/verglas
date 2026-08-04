@@ -117,7 +117,7 @@ impl FragmentTransport for MemoryTransport {
         &self,
         _node: &NodeId,
         _key: FragmentKey,
-        _shards: verglas_writeback::transport::ShardStream,
+        _shards: verglas_write::transport::ShardStream,
     ) -> Result<(), TransportError> {
         // The append log encodes each buffered append and uses `place`, never the
         // streaming placement path.

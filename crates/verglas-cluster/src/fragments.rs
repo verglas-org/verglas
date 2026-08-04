@@ -3,7 +3,7 @@
 //! A node persists erasure-coded fragments it is assigned as fsynced files
 //! under its cache directory. This module owns only the on-disk blob store and
 //! the fragment identity types; the journal, quorum, placement, and origin
-//! propagation live in `verglas-writeback`, and the fragment transport lives in
+//! propagation live in `verglas-write`, and the fragment transport lives in
 //! [`crate::peer`]. Returning `Ok` from [`LocalFragmentStore::store_fragment`]
 //! means the bytes are durable on this node's NVMe — that is the unit the
 //! write-back ack counts.

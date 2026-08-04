@@ -1974,8 +1974,8 @@ pub fn router<R: ObjectRead, W: ObjectWrite>(
 ///   operations (HeadBucket, GetBucketLocation) are forwarded to the origin
 ///   resolved through `stores` before s3s's typed dispatch would 501 them.
 ///   `None` keeps s3s's default 501 for unmodeled operations.
-/// - `serving_api`: when `Some`, the daemon's `/v1` serving API (`POST
-///   /v1/query` and the `/v1/tables/...` group) is served on this SigV4-gated
+/// - `serving_api`: when `Some`, the daemon's query and logical-write execution
+///   API is served on this SigV4-gated
 ///   surface too, forwarded to the given handler before s3s's typed dispatch.
 ///   Unsigned requests are rejected with `AccessDenied` by the route's default
 ///   access check, exactly as for a modeled S3 request. `None` leaves the `/v1`

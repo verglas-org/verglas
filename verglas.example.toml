@@ -99,6 +99,14 @@ heat_epoch_secs = 300     # heat-ledger EWMA epoch (5 minutes)
 heat_table_cap = 65536    # bounded heat entries per table
 heat_channel_capacity = 16384 # drop-on-full request-path sample channel depth
 
+# SQL and logical writes execute in isolated role processes. The daemon only
+# dispatches bounded requests; it contains no embedded query or table writer.
+[query_worker]
+binary = "/usr/local/bin/verglas-query"
+
+[write_worker]
+binary = "/usr/local/bin/verglas-write"
+
 # Erasure-coded NVMe write-back tier (#180). OFF by default and disabled here.
 # When enabled, a PUT to an opted-in key prefix is acked once `w` Reed-Solomon
 # fragments (`k` data + `m` parity, any `k` reconstruct) are fsynced on `w`

@@ -91,3 +91,4 @@
   `x-verglas-request-id` header; the block server adopts it for the handler, so
   a block one node cold-fills on a peer's behalf logs under the id the client
   saw — the cross-node trace correlation key.
+- #3: Updated logical-write references for the `verglas-write` package rename.

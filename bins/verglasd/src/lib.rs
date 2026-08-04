@@ -28,6 +28,7 @@ pub mod node_report;
 pub mod platform;
 pub mod query_worker;
 pub mod shadow;
+pub mod write_worker;
 
 /// The daemon version, from the package manifest. Reported by `/admin/version`
 /// and stamped on operator log lines.

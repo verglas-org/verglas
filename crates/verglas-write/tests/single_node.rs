@@ -38,12 +38,12 @@ use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
-use verglas_writeback::barrier::{BarrierError, CommitBarrier, JournalBarrier};
-use verglas_writeback::coordinator::WriteCoordinator;
-use verglas_writeback::journal::JournalStore;
-use verglas_writeback::membership::SingleNodeMembership;
-use verglas_writeback::metrics::WritebackMetrics;
-use verglas_writeback::transport::{FragmentTransport, TransportError};
+use verglas_write::barrier::{BarrierError, CommitBarrier, JournalBarrier};
+use verglas_write::coordinator::WriteCoordinator;
+use verglas_write::journal::JournalStore;
+use verglas_write::membership::SingleNodeMembership;
+use verglas_write::metrics::WritebackMetrics;
+use verglas_write::transport::{FragmentTransport, TransportError};
 
 const SELF: &str = "solo-node";
 
@@ -98,7 +98,7 @@ impl FragmentTransport for MemoryTransport {
         &self,
         _node: &NodeId,
         key: FragmentKey,
-        mut shards: verglas_writeback::transport::ShardStream,
+        mut shards: verglas_write::transport::ShardStream,
     ) -> Result<(), TransportError> {
         {
             let inner = self.inner.lock().expect("lock");

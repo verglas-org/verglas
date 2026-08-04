@@ -1,5 +1,5 @@
 [package]
-name = "verglas-writeback"
+name = "verglas-write"
 description = "Erasure-coded NVMe write-back tier: quorum ack, propagation, repair (#180)"
 version.workspace = true
 edition.workspace = true

@@ -29,7 +29,7 @@ use verglas_block::{
 };
 use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment};
 use verglas_core::node::NodeId;
-use verglas_writeback::transport::ShardStream;
+use verglas_write::transport::ShardStream;
 
 // ---- controllable in-memory R2 backend --------------------------------------
 

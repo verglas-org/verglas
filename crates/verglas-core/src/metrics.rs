@@ -421,37 +421,37 @@ pub fn render(metrics: &NodeMetrics, snapshot: &MetricsSnapshot) -> String {
     if let Some(wb) = &snapshot.writeback {
         header(
             &mut out,
-            "verglas_writeback_fragments_scrubbed_total",
+            "verglas_write_fragments_scrubbed_total",
             "counter",
             "Write-back fragments the background scrubber verified (#220).",
         );
         line(
             &mut out,
-            "verglas_writeback_fragments_scrubbed_total",
+            "verglas_write_fragments_scrubbed_total",
             &[],
             wb.fragments_scrubbed,
         );
         header(
             &mut out,
-            "verglas_writeback_fragments_repaired_total",
+            "verglas_write_fragments_repaired_total",
             "counter",
             "Write-back fragments re-encoded after failing verification (#220).",
         );
         line(
             &mut out,
-            "verglas_writeback_fragments_repaired_total",
+            "verglas_write_fragments_repaired_total",
             &[],
             wb.fragments_repaired,
         );
         header(
             &mut out,
-            "verglas_writeback_corrupt_fragments_found_total",
+            "verglas_write_corrupt_fragments_found_total",
             "counter",
             "Write-back fragments found corrupt during reassembly, repair, or scrub (#220).",
         );
         line(
             &mut out,
-            "verglas_writeback_corrupt_fragments_found_total",
+            "verglas_write_corrupt_fragments_found_total",
             &[],
             wb.corrupt_fragments_found,
         );
@@ -542,9 +542,9 @@ mod tests {
         assert!(text.contains("verglas_circuit_breaker_state{state=\"open\"} 0"));
 
         // Write-back fragment-integrity families (#220).
-        assert!(text.contains("verglas_writeback_fragments_scrubbed_total 11"));
-        assert!(text.contains("verglas_writeback_fragments_repaired_total 6"));
-        assert!(text.contains("verglas_writeback_corrupt_fragments_found_total 3"));
+        assert!(text.contains("verglas_write_fragments_scrubbed_total 11"));
+        assert!(text.contains("verglas_write_fragments_repaired_total 6"));
+        assert!(text.contains("verglas_write_corrupt_fragments_found_total 3"));
 
         // Every counter family carries a TYPE header.
         assert!(text.contains("# TYPE verglas_bytes_served_total counter"));
@@ -559,8 +559,8 @@ mod tests {
         let mut snap = sample_snapshot();
         snap.writeback = None;
         let text = render(&metrics, &snap);
-        assert!(!text.contains("verglas_writeback_fragments_scrubbed_total"));
-        assert!(!text.contains("verglas_writeback_corrupt_fragments_found_total"));
+        assert!(!text.contains("verglas_write_fragments_scrubbed_total"));
+        assert!(!text.contains("verglas_write_corrupt_fragments_found_total"));
     }
 
     /// Counters move as requests are observed: two GETs put a count of 2 under

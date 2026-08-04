@@ -9,8 +9,6 @@ publish.workspace = true
 [dependencies]
 verglas-api.workspace = true
 verglas-core.workspace = true
-verglas-iceberg.workspace = true
-iceberg.workspace = true
 arrow-array.workspace = true
 arrow-buffer = "57"
 arrow-schema.workspace = true

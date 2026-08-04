@@ -33,3 +33,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   the ring quorum not R2 (proven with a failing backend), originator-crash peer
   reconstruct-and-drain committing the version exactly once, quorum-short fallback
   to the synchronous barrier, and the device-level single-node read-back.
+- #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.

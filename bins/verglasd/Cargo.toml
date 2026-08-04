@@ -19,7 +19,7 @@ verglas-cluster.workspace = true
 verglas-instance.workspace = true
 verglas-s3.workspace = true
 verglas-tables.workspace = true
-verglas-writeback.workspace = true
+verglas-write.workspace = true
 # verglas-iceberg is the engine (catalog open, the SDK table API, retention);
 # verglas-platform owns the system catalog (the workers registry + watermarks).
 verglas-iceberg.workspace = true

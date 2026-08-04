@@ -82,7 +82,7 @@ pub trait RingMembership: Send + Sync + 'static {
 
     /// Whether this is an architecturally single-node ring (no peers, ever).
     /// Defaults to `false`; [`LocalRing`] overrides it. Mirrors
-    /// [`verglas_writeback`-style single-node detection] so the write-back tier
+    /// [`verglas_write`-style single-node detection] so the write-back tier
     /// and the ring agree on "genuinely one node."
     fn is_single_node(&self) -> bool {
         false

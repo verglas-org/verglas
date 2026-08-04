@@ -1,0 +1,45 @@
+[package]
+name = "verglas-write-node"
+description = "The isolated Verglas logical table write role"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+name = "verglas_write_node"
+path = "src/lib.rs"
+
+[[bin]]
+name = "verglas-write"
+path = "src/main.rs"
+
+[dependencies]
+verglas-api.workspace = true
+verglas-backend.workspace = true
+verglas-core.workspace = true
+verglas-iceberg.workspace = true
+arrow-array.workspace = true
+arrow-ipc = "57"
+async-trait.workspace = true
+axum.workspace = true
+bytes.workspace = true
+futures.workspace = true
+iceberg.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tempfile.workspace = true
+tracing = "0.1.44"
+rustls = "0.23"
+
+[dev-dependencies]
+arrow-schema.workspace = true
+tower = { version = "0.5.3", features = ["util"] }
+
+[lints]
+workspace = true
+
+[package.metadata.dist]
+dist = true

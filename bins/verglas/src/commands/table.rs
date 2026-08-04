@@ -1,10 +1,8 @@
 //! `verglas table` — create, append, list, show, and history (issue #287).
 //!
-//! Every verb calls the local daemon's HTTP API (#323): create and append
-//! stream the source file's bytes to the ingest route, list/show/history read
-//! the inspect routes. The daemon is the only local write authority — the CLI
-//! embeds no engine and has no daemon-less path; with no daemon listening each
-//! verb fails with a clear error naming the endpoint. Results render as
+//! File writes are dispatched to the isolated write role through the daemon;
+//! list/show/history/delete speak Iceberg REST directly. The CLI embeds no
+//! query or write engine. Results render as
 //! `--output json` (the stable shape the skill parses) or a human summary.
 
 use std::error::Error;
@@ -26,11 +24,28 @@ pub async fn run(
     daemon_endpoint: &str,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    // `delete` speaks the Iceberg REST catalog directly and `metrics` builds its
-    // own daemon client, so neither needs — nor should fail on — the data-plane
-    // client the other verbs open.
+    // Catalog metadata verbs bypass the daemon; execution and operational verbs
+    // use its thin transport.
     match command {
         TableCommand::Delete(args) => return run_delete(args, json).await,
+        TableCommand::List(args) => {
+            let report = crate::commands::catalog::CatalogClient::from_agent_config()?
+                .list_tables(args.namespace.as_deref())
+                .await?;
+            return emit(&report, json, render_list);
+        }
+        TableCommand::Show(args) => {
+            let report = crate::commands::catalog::CatalogClient::from_agent_config()?
+                .show_table(&args.table)
+                .await?;
+            return emit(&report, json, render_show);
+        }
+        TableCommand::History(args) => {
+            let report = crate::commands::catalog::CatalogClient::from_agent_config()?
+                .table_history(&args.table)
+                .await?;
+            return emit(&report, json, render_history);
+        }
         TableCommand::Metrics => {
             return crate::commands::table_metrics::run(daemon_endpoint, json).await;
         }
@@ -55,26 +70,6 @@ pub async fn run(
                 .await?;
             emit(&report, json, render_append)
         }
-        TableCommand::List(args) => {
-            let path = match &args.namespace {
-                Some(ns) => format!("/v1/tables?namespace={ns}"),
-                None => "/v1/tables".to_owned(),
-            };
-            let report: ListReport = client.get(&path).await?;
-            emit(&report, json, render_list)
-        }
-        TableCommand::Show(args) => {
-            let report: ShowReport = client
-                .get(&format!("/v1/tables/{}/describe", args.table))
-                .await?;
-            emit(&report, json, render_show)
-        }
-        TableCommand::History(args) => {
-            let report: HistoryReport = client
-                .get(&format!("/v1/tables/{}/history", args.table))
-                .await?;
-            emit(&report, json, render_history)
-        }
         TableCommand::Compact => {
             let report: CompactionReport = client
                 .post_json("/admin/compact", &serde_json::json!({}))
@@ -82,7 +77,11 @@ pub async fn run(
             emit(&report, json, render_compact)
         }
         // Handled above, before the data-plane client was built.
-        TableCommand::Delete(_) | TableCommand::Metrics => {
+        TableCommand::Delete(_)
+        | TableCommand::List(_)
+        | TableCommand::Show(_)
+        | TableCommand::History(_)
+        | TableCommand::Metrics => {
             unreachable!("delete and metrics are dispatched before the daemon client")
         }
     }

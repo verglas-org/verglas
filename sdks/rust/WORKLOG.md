@@ -63,4 +63,4 @@
 - chore: Move the Rust SDK from crates/verglas-sdk to sdks/rust so both language SDKs live under sdks/.
 - chore: Delete the connector/protocol/conformance stack and the Source/Sink/Mv Job traits. Keep Row/Logger/JobError for the worker contract.
 - #393: Dropped `_LOGS` run-logging references from the worker contract; catalog-side lakekeeping owns telemetry.
-
+- #3: Kept the SDK thin: direct Iceberg REST metadata, Arrow query/write role transport, and no embedded Iceberg, DataFusion, or Parquet writer.

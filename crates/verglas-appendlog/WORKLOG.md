@@ -15,3 +15,4 @@
   service wrapper and no verglasd wiring yet — the pageserver fork consumes it as
   a library. Tests: 9 multi-node contract/recovery tests + 3 single-node tests.
 - chore: Remove docs/ cross-references after deleting the docs directory. Crate module docs are the reference now.
+- #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.

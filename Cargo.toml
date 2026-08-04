@@ -10,7 +10,7 @@ members = [
     "crates/verglas-instance",
     "crates/verglas-s3",
     "crates/verglas-tables",
-    "crates/verglas-writeback",
+    "crates/verglas-write",
     "crates/verglas-appendlog",
     "crates/verglas-iceberg",
     "crates/verglas-graph",
@@ -24,6 +24,7 @@ members = [
     "crates/verglas-pgcdc",
     "bins/verglas-pgcdc",
     "bins/query-node",
+    "bins/write-node",
 ]
 # Language SDKs live under sdks/. The TypeScript package is not a Cargo crate.
 exclude = [
@@ -48,7 +49,7 @@ verglas-cache = { path = "crates/verglas-cache" }
 verglas-instance = { path = "crates/verglas-instance" }
 verglas-s3 = { path = "crates/verglas-s3" }
 verglas-tables = { path = "crates/verglas-tables" }
-verglas-writeback = { path = "crates/verglas-writeback" }
+verglas-write = { path = "crates/verglas-write" }
 verglas-appendlog = { path = "crates/verglas-appendlog" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }

@@ -7060,7 +7060,7 @@ dependencies = [
  "verglas-cache",
  "verglas-cluster",
  "verglas-core",
- "verglas-writeback",
+ "verglas-write",
 ]
 
 [[package]]
@@ -7104,7 +7104,7 @@ dependencies = [
  "verglas-cache",
  "verglas-cluster",
  "verglas-core",
- "verglas-writeback",
+ "verglas-write",
 ]
 
 [[package]]
@@ -7332,6 +7332,8 @@ dependencies = [
 name = "verglas-query"
 version = "0.1.1"
 dependencies = [
+ "arrow-array 57.3.1",
+ "arrow-ipc 57.3.1",
  "async-stream",
  "axum",
  "bytes",
@@ -7396,7 +7398,6 @@ dependencies = [
  "axum",
  "bytes",
  "futures",
- "iceberg",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -7405,7 +7406,6 @@ dependencies = [
  "tokio-tungstenite",
  "verglas-api",
  "verglas-core",
- "verglas-iceberg",
 ]
 
 [[package]]
@@ -7464,7 +7464,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "verglas-writeback"
+name = "verglas-write"
 version = "0.1.1"
 dependencies = [
  "async-trait",
@@ -7479,6 +7479,32 @@ dependencies = [
  "verglas-cluster",
  "verglas-core",
  "xxhash-rust",
+]
+
+[[package]]
+name = "verglas-write-node"
+version = "0.1.1"
+dependencies = [
+ "arrow-array 57.3.1",
+ "arrow-ipc 57.3.1",
+ "arrow-schema 57.3.1",
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures",
+ "iceberg",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "verglas-api",
+ "verglas-backend",
+ "verglas-core",
+ "verglas-iceberg",
 ]
 
 [[package]]
@@ -7530,7 +7556,7 @@ dependencies = [
  "verglas-sdk",
  "verglas-tables",
  "verglas-vector",
- "verglas-writeback",
+ "verglas-write",
 ]
 
 [[package]]

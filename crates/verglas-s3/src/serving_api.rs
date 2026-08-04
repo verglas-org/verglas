@@ -1,7 +1,7 @@
 //! The SigV4-gated `/v1` serving surface on the S3 data port.
 //!
-//! The daemon models a small non-S3 API — `POST /v1/query` and the
-//! `/v1/tables/...` group — that until now lived only on the loopback admin
+//! The daemon models a small non-S3 execution API — `POST /v1/query`,
+//! `/v1/write/...`, and `/v1/ingest/...` — that also lives on the loopback admin
 //! listener. The Cloudflare edge re-signs a cache-pathed `/v1` request with the
 //! cache keypair and forwards it to this data port, so the same routes must also
 //! answer here, gated by SigV4. This module supplies the s3s custom route that
@@ -77,7 +77,7 @@ pub trait ServingApi: Send + Sync + 'static {
     async fn handle(&self, req: ApiRequest) -> ApiResponse;
 }
 
-/// The s3s custom route that forwards `/v1/query` and `/v1/tables/...` to the
+/// The s3s custom route that forwards query and logical-write execution to the
 /// injected [`ServingApi`]. Checked before s3s's typed dispatch; SigV4-gated by
 /// the trait's default [`check_access`](S3Route::check_access) (not overridden).
 pub struct V1ServingRoute {
@@ -91,11 +91,10 @@ impl V1ServingRoute {
         V1ServingRoute { api }
     }
 
-    /// Whether `uri` names a served `/v1` path: exactly `/v1/query`, or anything
-    /// under the `/v1/tables` prefix.
+    /// Whether `uri` names a served execution path.
     fn path_matches(uri: &Uri) -> bool {
         let path = uri.path();
-        path == "/v1/query" || path.starts_with("/v1/tables")
+        path == "/v1/query" || path.starts_with("/v1/write/") || path.starts_with("/v1/ingest/")
     }
 }
 
@@ -226,14 +225,15 @@ mod tests {
         s.parse().expect("valid uri")
     }
 
-    /// The served `/v1` paths match: `/v1/query` exactly and anything under the
-    /// `/v1/tables` prefix.
+    /// The served execution paths match exactly their role prefixes.
     #[test]
     fn matches_served_v1_paths() {
         assert!(V1ServingRoute::path_matches(&uri("/v1/query")));
-        assert!(V1ServingRoute::path_matches(&uri("/v1/tables")));
         assert!(V1ServingRoute::path_matches(&uri(
-            "/v1/tables/analytics.events/commit"
+            "/v1/write/analytics.events"
+        )));
+        assert!(V1ServingRoute::path_matches(&uri(
+            "/v1/ingest/analytics.events?mode=append&format=parquet"
         )));
         assert!(V1ServingRoute::path_matches(&uri("/v1/query?ignored=1")));
     }
@@ -244,6 +244,7 @@ mod tests {
         assert!(!V1ServingRoute::path_matches(&uri("/mybucket/data/foo")));
         assert!(!V1ServingRoute::path_matches(&uri("/v1")));
         assert!(!V1ServingRoute::path_matches(&uri("/v1/queryextra")));
+        assert!(!V1ServingRoute::path_matches(&uri("/v1/tables")));
         assert!(!V1ServingRoute::path_matches(&uri("/")));
         // A real bucket whose name merely starts with `v1` is not a served path.
         assert!(!V1ServingRoute::path_matches(&uri("/v1tables/object")));

@@ -30,7 +30,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "sync
 verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-cluster.workspace = true
-verglas-writeback.workspace = true
+verglas-write.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

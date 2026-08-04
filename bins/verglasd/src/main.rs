@@ -22,7 +22,7 @@ use verglas_core::admin::{
 };
 use verglas_core::node::NodeId;
 use verglas_s3::{PassthroughRead, PassthroughWrite};
-use verglas_writeback::{
+use verglas_write::{
     AgentMembership, LiveMembership, PeerFragmentTransport, PrefixRule, SingleNodeMembership,
     WriteCoordinator, WritebackMetrics, WritebackPolicy, WritebackTier,
 };
@@ -712,41 +712,71 @@ fn build_query_worker_dispatcher(
     resolved_s3_port: u16,
 ) -> Option<Arc<verglasd::query_worker::QueryWorkerDispatcher>> {
     let query_worker = config.query_worker.as_ref()?;
-    let dir = config.cache.dir.join("query-worker");
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!(
-            "verglasd {VERSION} could not create query worker dir {}: {e} — /v1/query stays embedded",
-            dir.display()
-        );
-        return None;
-    }
+    let config_path =
+        match render_execution_worker_config(config, credentials, resolved_s3_port, "query-worker")
+        {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("verglasd {VERSION} cannot configure query worker: {error}");
+                return None;
+            }
+        };
+    Some(Arc::new(
+        verglasd::query_worker::QueryWorkerDispatcher::new(
+            std::path::PathBuf::from(&query_worker.binary),
+            config_path,
+        ),
+    ))
+}
 
-    // The same endpoint keypair the embedded path signs loopback requests
-    // with, written to a mode-0600 AWS-INI file — never inlined into the
-    // rendered TOML.
+/// Builds the isolated logical write-role dispatcher.
+fn build_write_worker_dispatcher(
+    config: &verglas_core::config::Config,
+    credentials: &(String, String),
+    resolved_s3_port: u16,
+) -> Option<Arc<verglasd::write_worker::WriteWorkerDispatcher>> {
+    let write_worker = config.write_worker.as_ref()?;
+    let config_path =
+        match render_execution_worker_config(config, credentials, resolved_s3_port, "write-worker")
+        {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("verglasd {VERSION} cannot configure write worker: {error}");
+                return None;
+            }
+        };
+    Some(Arc::new(
+        verglasd::write_worker::WriteWorkerDispatcher::new(
+            std::path::PathBuf::from(&write_worker.binary),
+            config_path,
+        ),
+    ))
+}
+
+/// Renders the common cache and catalog connection used by execution roles.
+fn render_execution_worker_config(
+    config: &verglas_core::config::Config,
+    credentials: &(String, String),
+    resolved_s3_port: u16,
+    directory: &str,
+) -> Result<std::path::PathBuf, String> {
+    let dir = config.cache.dir.join(directory);
+    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let credentials_path = dir.join("credentials");
-    let credentials_text = format!(
-        "[default]\naws_access_key_id = {}\naws_secret_access_key = {}\n",
-        credentials.0, credentials.1
-    );
-    if let Err(e) = std::fs::write(&credentials_path, credentials_text) {
-        eprintln!(
-            "verglasd {VERSION} could not write query worker credentials file: {e} — /v1/query stays embedded"
-        );
-        return None;
-    }
+    std::fs::write(
+        &credentials_path,
+        format!(
+            "[default]\naws_access_key_id = {}\naws_secret_access_key = {}\n",
+            credentials.0, credentials.1
+        ),
+    )
+    .map_err(|error| format!("write role credentials: {error}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            std::fs::set_permissions(&credentials_path, std::fs::Permissions::from_mode(0o600))
-        {
-            eprintln!(
-                "verglasd {VERSION} could not restrict query worker credentials file permissions: {e}"
-            );
-        }
+        std::fs::set_permissions(&credentials_path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("restrict role credentials: {error}"))?;
     }
-
     let scheme = if config.listen.tls.is_some() {
         "https"
     } else {
@@ -757,16 +787,12 @@ fn build_query_worker_dispatcher(
         .region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_owned());
-    let catalog = config.catalog.as_ref()?;
-    let catalog_toml = match toml::to_string(catalog) {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!(
-                "verglasd {VERSION} could not render private query worker catalog config: {e} — /v1/query stays embedded"
-            );
-            return None;
-        }
-    };
+    let catalog = config
+        .catalog
+        .as_ref()
+        .ok_or_else(|| "execution roles require [catalog]".to_owned())?;
+    let catalog_toml =
+        toml::to_string(catalog).map_err(|error| format!("serialize role catalog: {error}"))?;
     let rendered = format!(
         "[listen]\nadmin_port = 0\n\n\
          [cache]\ns3_endpoint = \"{scheme}://127.0.0.1:{resolved_s3_port}\"\nregion = \"{region}\"\ncredentials_file = \"{credentials}\"\n\n\
@@ -774,25 +800,13 @@ fn build_query_worker_dispatcher(
         credentials = credentials_path.display(),
     );
     let config_path = dir.join("config.toml");
-    if let Err(e) = std::fs::write(&config_path, rendered) {
-        eprintln!(
-            "verglasd {VERSION} could not write query worker config: {e} — /v1/query stays embedded"
-        );
-        return None;
-    }
-
-    Some(Arc::new(
-        verglasd::query_worker::QueryWorkerDispatcher::new(
-            std::path::PathBuf::from(&query_worker.binary),
-            config_path,
-        ),
-    ))
+    std::fs::write(&config_path, rendered)
+        .map_err(|error| format!("write role config: {error}"))?;
+    Ok(config_path)
 }
 
-/// Opens the in-process catalog handle the SDK table routes (`/v1/tables/...`)
-/// commit and read through, over the daemon's own loopback gateway. Opening can
-/// fail (an unreachable or misconfigured catalog); that leaves the routes
-/// answering 503, like the other engine-dependent routes.
+/// Opens the internal catalog handle used by compaction, graph, vector, and
+/// worker subsystems. Public clients speak to the Iceberg REST catalog directly.
 async fn build_tables_catalog(
     config: &verglas_core::config::Config,
     credentials: &(String, String),
@@ -813,9 +827,9 @@ fn admin_listen_addr(config: Option<&verglas_core::config::Config>) -> String {
     })
 }
 
-/// Drives the daemon's `/v1` serving router as a [`verglas_s3::ServingApi`], so
-/// the SigV4-gated S3 data port answers the same `/v1/query` and
-/// `/v1/tables/...` requests the loopback admin listener does. The Cloudflare
+/// Drives the daemon's execution gateway as a [`verglas_s3::ServingApi`], so
+/// the SigV4-gated S3 data port answers the same query and write requests as
+/// the loopback admin listener. The Cloudflare
 /// edge re-signs a cache-pathed `/v1` request with the cache keypair and
 /// forwards it to the data port; the s3s route validates the signature and hands
 /// the buffered request here. This reconstructs an axum request, runs it through
@@ -823,7 +837,7 @@ fn admin_listen_addr(config: Option<&verglas_core::config::Config>) -> String {
 /// from the same [`admin::TablesSlot`] the admin listener uses, so both surfaces
 /// observe the catalog handle the moment it is wired after recovery.
 struct V1ServingApi {
-    /// The state-erased `/v1` router (`tables` + `query`), shared-catalog-backed.
+    /// The state-erased query/write dispatch router.
     router: axum::Router,
 }
 
@@ -1118,7 +1132,7 @@ fn build_writeback_tier(
 > {
     let wb = &config.cache.writeback;
     let policy = Arc::new(build_writeback_policy(wb));
-    let journals = Arc::new(verglas_writeback::JournalStore::open(&config.cache.dir)?);
+    let journals = Arc::new(verglas_write::JournalStore::open(&config.cache.dir)?);
     let fragment_client = build_fragment_client(config, agent.as_ref());
     let transport = Arc::new(PeerFragmentTransport::new(
         node_id.clone(),
@@ -1141,7 +1155,7 @@ fn build_writeback_tier(
     // Repair only makes progress when membership can change; a single-node
     // daemon never opens the window.
     if agent.is_some() {
-        let _repair = verglas_writeback::spawn_repair_loop(
+        let _repair = verglas_write::spawn_repair_loop(
             Arc::clone(&coordinator),
             membership,
             std::time::Duration::from_secs(2),
@@ -1150,7 +1164,7 @@ fn build_writeback_tier(
     // The scrubber runs regardless of cluster mode: silent bit-rot has no
     // membership event, so even a single node must scrub its fragments to catch
     // corruption before it accumulates past `m` (#220).
-    let _scrub = verglas_writeback::spawn_scrub_loop(
+    let _scrub = verglas_write::spawn_scrub_loop(
         Arc::clone(&coordinator),
         std::time::Duration::from_secs(wb.scrub_interval_secs),
     );
@@ -1312,9 +1326,8 @@ async fn serve(
         config.cluster.is_some().then(|| Arc::new(OnceLock::new()));
     let drain_slot: Option<admin::DrainSlot> =
         config.cluster.is_some().then(|| Arc::new(OnceLock::new()));
-    // The SDK table routes (`/v1/tables/...`) and `/v1/query` commit and read
-    // through the same loopback catalog, so they exist only when a catalog is
-    // configured. Filled after recovery, answering 503 until then.
+    // Internal engine subsystems share one catalog handle. Public catalog
+    // metadata calls bypass the daemon and use Iceberg REST directly.
     let tables_slot: Option<admin::TablesSlot> =
         config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
     // The `graph` verb-family routes (`/v1/graphs/...`) drive the
@@ -1386,12 +1399,12 @@ async fn serve(
     // The standalone query worker dispatcher (opt-in, `[query_worker]`): a
     // config file + credentials file rendered once here, pointing the worker
     // at this daemon's own just-resolved loopback surface with the same
-    // signing keypair the embedded path uses. `None` (the common case) when
-    // `[query_worker]` is unset or the files could not be rendered — then
-    // `/v1/query` stays embedded. A rendering failure here is logged, not
-    // fatal.
+    // signing keypair the cache path uses. With no configured worker the
+    // execution route returns 503; there is no embedded-engine fallback.
     let query_worker_dispatcher =
         build_query_worker_dispatcher(config, &credentials, resolved_s3_port);
+    let write_worker_dispatcher =
+        build_write_worker_dispatcher(config, &credentials, resolved_s3_port);
 
     let admin_fut = serve_admin(
         admin_listener,
@@ -1411,6 +1424,7 @@ async fn serve(
             queues: Some(queue_dir.clone()),
             platform: platform_slot.clone(),
             query_worker: query_worker_dispatcher.clone(),
+            write_worker: write_worker_dispatcher.clone(),
         },
     );
 
@@ -1557,14 +1571,15 @@ async fn serve(
         let s3_agent = agent.clone();
         let s3_writeback_metrics = writeback_metrics.clone();
         let s3_node_metrics = node_metrics.clone();
-        // When a catalog is configured, the SigV4-gated S3 port also serves the
-        // daemon's `/v1` API (query and tables), driving a router built from the
-        // same catalog slot the loopback admin listener uses. The edge re-signs
-        // cache-pathed `/v1` forwards with the cache keypair; they land there.
+        // The SigV4-gated S3 port can also dispatch configured execution roles.
+        // Catalog metadata never passes through this surface.
         let s3_serving_api: Option<Arc<dyn verglas_s3::ServingApi>> =
-            tables_slot.clone().map(|tables| {
+            (query_worker_dispatcher.is_some() || write_worker_dispatcher.is_some()).then(|| {
                 Arc::new(V1ServingApi {
-                    router: admin::v1_serving_router(tables, query_worker_dispatcher.clone()),
+                    router: admin::v1_serving_router(
+                        query_worker_dispatcher.clone(),
+                        write_worker_dispatcher.clone(),
+                    ),
                 }) as Arc<dyn verglas_s3::ServingApi>
             });
         let s3_task = tokio::spawn(async move {
@@ -1635,9 +1650,7 @@ async fn serve(
                 .unwrap_or(0);
             let _ = slot.set(drain_source(agent.clone(), default_timeout));
         }
-        // The SDK table routes read and commit through the loopback catalog too.
-        // Opening it can fail; that leaves
-        // the routes at 503 rather than failing the daemon.
+        // Internal engine services share a cache-pathed catalog handle.
         if let Some(slot) = &tables_slot {
             match build_tables_catalog(config, &credentials, resolved_s3_port).await {
                 Ok(catalog) => {
@@ -1727,9 +1740,7 @@ async fn serve(
                     }
                     let _ = slot.set(catalog);
                 }
-                Err(e) => eprintln!(
-                    "verglasd {VERSION} table API unavailable: {e} — /v1/tables answers 503 until the catalog is reachable"
-                ),
+                Err(e) => eprintln!("verglasd {VERSION} internal catalog unavailable: {e}"),
             }
         }
         health.mark_ready();

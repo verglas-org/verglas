@@ -575,4 +575,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #393: Switched from in-tree `vendor/iceberg` to the pinned `verglas-org/iceberg-rust` fork (`verglas/v0.9.1` @ a40f9268) for `TableCommit::from_parts`. Same patch, maintained out of tree; drop when upstream exposes overwrite/replace commits.
 - #393: Removed platform `_LOGS` run logging and day-partition retention from Verglas. Catalog-side lakekeeping owns telemetry write/TTL; this crate keeps only the compact-adjacent APIs (snapshot expiry where applicable). Harness no longer writes `verglas_logs.<name>_LOGS`; verglasd no longer runs the hourly prune loop.
 - #1 (verglas-org/verglas): Removed the fleet `verglas-compact` one-shot binary and its workspace/dist membership. Compaction stays in `verglas-iceberg` + daemon `POST /admin/compact` / `verglas table compact` until the async maintenance API lands; e2e retargeted to that path.
-
+- #3: Removed the daemon catalog/table proxy and embedded execution fallbacks. The daemon now dispatches bounded requests to isolated `verglas-query` and `verglas-write` roles.
