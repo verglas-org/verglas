@@ -9,13 +9,13 @@
 # workspace packages), so there is no single native "install everything"
 # script -- this wrapper is that entry point. To install one tool only, run its
 # own installer, e.g.:
-#   irm https://github.com/cascade-labs/verglas/releases/latest/download/verglas-installer.ps1 | iex
+#   irm https://github.com/verglas-org/verglas/releases/latest/download/verglas-installer.ps1 | iex
 #
 # NOTE: installing verglasd as a Windows service is not supported yet; run the
 # daemon in the foreground (`verglasd --config <path>`).
 $ErrorActionPreference = 'Stop'
 
-$base = if ($env:VERGLAS_RELEASE_BASE) { $env:VERGLAS_RELEASE_BASE } else { 'https://github.com/cascade-labs/verglas/releases/latest/download' }
+$base = if ($env:VERGLAS_RELEASE_BASE) { $env:VERGLAS_RELEASE_BASE } else { 'https://github.com/verglas-org/verglas/releases/latest/download' }
 $apps = @('verglas', 'verglasd', 'verglas-mcp', 'verglas-consolidate')
 
 foreach ($app in $apps) {

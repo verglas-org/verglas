@@ -4,7 +4,7 @@ Engine-neutral, Iceberg-aware S3 read-through cache. Point your query engine's
 S3 endpoint at Verglas and hot reads come back in about a millisecond from local
 NVMe instead of a round trip to the origin bucket.
 
-[![ci](https://github.com/cascade-labs/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/cascade-labs/verglas/actions/workflows/ci.yml)
+[![ci](https://github.com/verglas-org/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 
 > Prototype — pre-release. On-disk layouts, wire formats, and config keys may
 > change between commits.
@@ -42,13 +42,13 @@ Rust toolchain is required**. Each release ships four binaries for macOS
 macOS / Linux:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/cascade-labs/verglas/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/verglas-org/verglas/main/install.sh | sh
 ```
 
 Windows (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/cascade-labs/verglas/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/verglas-org/verglas/main/install.ps1 | iex
 ```
 
 Both wrappers just run the per-binary installers that
@@ -58,7 +58,7 @@ verifies a SHA-256 checksum. To install a single tool instead, run its own
 installer directly, e.g. the CLI:
 
 ```sh
-curl -fsSL https://github.com/cascade-labs/verglas-releases/releases/latest/download/verglas-installer.sh | sh
+curl -fsSL https://github.com/verglas-org/verglas/releases/latest/download/verglas-installer.sh | sh
 ```
 
 > **Windows note.** All four binaries run on Windows, but installing `verglasd`
@@ -70,10 +70,10 @@ curl -fsSL https://github.com/cascade-labs/verglas-releases/releases/latest/down
 ### Homebrew (coming soon)
 
 A Homebrew formula is generated into each release. The public tap is not
-published yet; once `cascade-labs/homebrew-tap` is live, install with:
+published yet; once `verglas-org/homebrew-tap` is live, install with:
 
 ```sh
-brew install cascade-labs/tap/verglas
+brew install verglas-org/tap/verglas
 ```
 
 ### Build from source (fallback)
@@ -83,7 +83,7 @@ Verglas is a Rust workspace; the toolchain is pinned in
 `rustup` installs it automatically on first build.
 
 ```sh
-git clone https://github.com/cascade-labs/verglas.git
+git clone https://github.com/verglas-org/verglas.git
 cd verglas
 cargo build --workspace --release
 ```
@@ -171,16 +171,16 @@ macOS (per-user LaunchAgent, the default):
 
 ```sh
 verglas stop
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.cascade-labs.verglas.plist
-rm ~/Library/LaunchAgents/com.cascade-labs.verglas.plist
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/org.verglas.verglas.plist
+rm ~/Library/LaunchAgents/org.verglas.verglas.plist
 ```
 
 macOS (system LaunchDaemon, installed with `--system`):
 
 ```sh
 verglas stop --system
-sudo launchctl bootout system /Library/LaunchDaemons/com.cascade-labs.verglas.plist
-sudo rm /Library/LaunchDaemons/com.cascade-labs.verglas.plist
+sudo launchctl bootout system /Library/LaunchDaemons/org.verglas.verglas.plist
+sudo rm /Library/LaunchDaemons/org.verglas.verglas.plist
 ```
 
 Linux (per-user systemd unit, the default):

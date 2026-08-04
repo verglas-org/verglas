@@ -3,7 +3,7 @@
 This branch (`feat/fleet-catalog`) removes the source/MV/sink primitives and the
 in-daemon memory workflow, and refocuses `verglasd` on the core engine (cache,
 S3 serving, tables/catalog, and the local **worker** runtime). The live daemon
-serves trading on **admin 8334 / S3 8333** under launchd **`com.cascade-labs.verglas`**.
+serves trading on **admin 8334 / S3 8333** under launchd **`org.verglas.verglas`**.
 Do the swap in an off-hours window (market opens **Monday 13:30 UTC**). **The
 operator runs the swap — not an agent.** Never touch the live daemon's ports or
 launchd job until the swap step.
@@ -117,7 +117,7 @@ Coordinated swap of `verglasd` + `verglas`, and **removal** of the deleted
 memory binaries. Off-hours only.
 
 ```
-LABEL=com.cascade-labs.verglas
+LABEL=org.verglas.verglas
 STAMP=$(date +%Y%m%d)
 
 # 1. Stop the live daemon (frees 8333/8334).

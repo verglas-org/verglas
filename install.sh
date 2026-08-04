@@ -11,10 +11,10 @@
 # workspace packages), so there is no single native "install everything"
 # script — this wrapper is that entry point. To install one tool only, run its
 # own installer, e.g.:
-#   curl -fsSL https://github.com/cascade-labs/verglas/releases/latest/download/verglas-installer.sh | sh
+#   curl -fsSL https://github.com/verglas-org/verglas/releases/latest/download/verglas-installer.sh | sh
 set -eu
 
-BASE="${VERGLAS_RELEASE_BASE:-https://github.com/cascade-labs/verglas/releases/latest/download}"
+BASE="${VERGLAS_RELEASE_BASE:-https://github.com/verglas-org/verglas/releases/latest/download}"
 APPS="verglas verglasd verglas-mcp verglas-consolidate"
 
 for app in $APPS; do

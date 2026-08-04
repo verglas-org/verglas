@@ -26,7 +26,7 @@ fn verglas_bin() -> PathBuf {
 
 /// The launchd service label the CLI installs. Kept in sync with the const in
 /// `service::launchd`; the test addresses the same job.
-const SERVICE_LABEL: &str = "com.cascade-labs.verglas";
+const SERVICE_LABEL: &str = "org.verglas.verglas";
 
 /// The GUI-domain service target `launchctl print` addresses.
 fn service_target() -> String {

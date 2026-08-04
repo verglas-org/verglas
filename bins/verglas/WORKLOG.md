@@ -710,4 +710,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - chore: Require the unified worker spec for cloud create (no legacy JSON passthrough). Drop dead /v1/sources mock routes from daemon_verbs.
 - #393: Switched from in-tree `vendor/iceberg` to the pinned `verglas-org/iceberg-rust` fork (`verglas/v0.9.1` @ a40f9268) for `TableCommit::from_parts`. Same patch, maintained out of tree; drop when upstream exposes overwrite/replace commits.
 - #1 (verglas-org/verglas): Removed the fleet `verglas-compact` one-shot binary and its workspace/dist membership. Compaction stays in `verglas-iceberg` + daemon `POST /admin/compact` / `verglas table compact` until the async maintenance API lands; e2e retargeted to that path.
+- chore: Point install/docs/release at `verglas-org/verglas` (drop cascade-labs URLs and the external releases repo). macOS launchd label is now `org.verglas.verglas`.
 

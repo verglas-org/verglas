@@ -14,7 +14,7 @@ use super::{Scope, ServiceError, ServiceManager, ServiceSpec, ServiceState, chec
 
 /// The launchd service label. Reverse-DNS by convention; the plist filename is
 /// `<label>.plist` and `launchctl` addresses the service by it.
-pub const SERVICE_LABEL: &str = "com.cascade-labs.verglas";
+pub const SERVICE_LABEL: &str = "org.verglas.verglas";
 
 /// The macOS service manager. Holds the scope so every operation targets the
 /// right domain (`gui/<uid>` for a LaunchAgent, `system` for a LaunchDaemon).
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn print_state_running_when_a_live_pid_is_present() {
         // A `launchctl print` record with a live pid means the job is running.
-        let running = "com.cascade-labs.verglas = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n";
+        let running = "org.verglas.verglas = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n";
         assert_eq!(parse_print_state(running), ServiceState::Running);
     }
 
@@ -465,7 +465,7 @@ mod tests {
     fn print_state_stopped_when_no_pid_line() {
         // A loaded-but-idle job has no pid line; that is stopped, not running.
         let stopped =
-            "com.cascade-labs.verglas = {\n\tactive count = 0\n\tstate = not running\n}\n";
+            "org.verglas.verglas = {\n\tactive count = 0\n\tstate = not running\n}\n";
         assert_eq!(parse_print_state(stopped), ServiceState::Stopped);
     }
 
