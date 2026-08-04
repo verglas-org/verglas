@@ -1,0 +1,134 @@
+---
+title: "Workers"
+description: "Build bounded, event-driven workloads that run locally or in Verglas Cloud."
+icon: "workflow"
+---
+
+A worker combines code, a trigger, output tables, configuration, secrets, and resource hints. One dispatch invokes one bounded run. The same portable specification can register on a local server or in Verglas Cloud.
+
+## Worker invariants
+
+Design every worker around the following rules:
+
+- Treat the trigger and committed table data as the complete input to a run.
+- Keep no durable process state between runs.
+- Use the cron event's half-open interval `[intervalStart, intervalEnd)` for incremental pulls.
+- Read output table names from deployment configuration instead of hard-coding them.
+- Make every commit idempotent so a replay does not duplicate data.
+- Read secrets from the runtime environment and never write them to logs.
+
+## Worker lifecycle
+
+```mermaid
+sequenceDiagram
+    participant T as Trigger
+    participant P as Verglas platform
+    participant W as Worker
+    participant I as Iceberg table
+
+    T->>P: Dispatch event
+    P->>W: Context, endpoint, token, outputs, secrets
+    W->>I: Read committed input
+    W->>I: Append with idempotency key
+    I-->>W: Snapshot and watermark
+    W-->>P: rowsWritten summary
+    P->>P: Record structured run logs
+```
+
+## Current trigger surfaces
+
+The SDK contract defines the following trigger events:
+
+| Trigger | Dispatch payload | Typical use |
+| --- | --- | --- |
+| `cron` | Logical date and interval bounds | Scheduled ingestion and backfill |
+| `webhook` | An inbound `Request` | HTTP ingestion |
+| `websocket` | One data frame | Event-driven socket workloads |
+| `data_change` | A table commit notification | Incremental transformations |
+| `kafka` | Topic, partition, offset, key, and value | Stream ingestion |
+
+The portable CLI manifest currently registers `cron` and `manual` cloud workers. It also registers local-only `follow` workers. The SDK types the broader trigger contract used by the platform runtime.
+
+## Create a portable worker
+
+The current manifest supports JSON and TOML. This filled TOML example packages a Python entrypoint and a referenced secret:
+
+```toml metrics-worker.toml
+spec_version = 1
+name = "metrics-collector"
+exec = ["python3", "collector.py"]
+cwd = "/app"
+target_tables = ["observability.host_metrics"]
+
+[files]
+"collector.py" = "# packaged worker entrypoint\n"
+
+[env]
+METRICS_URL = "https://metrics.example.com/v1/samples"
+METRICS_TOKEN = "@secret:METRICS_TOKEN"
+
+[trigger]
+type = "cron"
+cron = "*/10 * * * *"
+
+[resources]
+vcpus = 0.5
+mem_mib = 512
+```
+
+Create the secret and worker in the cloud:
+
+```bash
+printf '%s' "$METRICS_TOKEN" | verglas secrets set METRICS_TOKEN
+verglas workers create --file ./metrics-worker.toml
+```
+
+Register the same file locally:
+
+```bash
+verglas workers create --file ./metrics-worker.toml --local
+verglas workers push metrics-collector
+```
+
+## Inspect and operate workers
+
+```bash
+verglas workers list
+verglas workers get metrics-collector
+verglas workers run metrics-collector
+verglas workers logs metrics-collector
+verglas workers update metrics-collector --schedule '0 * * * *'
+verglas workers update metrics-collector --status paused
+verglas workers delete metrics-collector
+```
+
+Pass `--json` before `workers` when a script needs a stable machine-readable response.
+
+## Backfill with logical time
+
+The TypeScript worker contract supports `startDate` and `catchup` on cron trigger definitions:
+
+```ts
+triggers: [
+  {
+    type: "cron",
+    schedule: "0 * * * *",
+    startDate: "2026-08-01T00:00:00Z",
+    catchup: "sequential",
+  },
+]
+```
+
+Each replayed run receives its own logical interval. Range the upstream request over that interval. Do not store a cross-run watermark in the worker.
+
+## Use idempotency keys
+
+Use a stable input identifier as the commit idempotency key. A `data_change` worker can use the input snapshot ID:
+
+```ts
+const result = await ctx.client.table(ctx.output).append(rows, {
+  idempotencyKey: `analytics.orders@${ctx.trigger.change.snapshotId}`,
+});
+```
+
+If the platform replays the trigger, the duplicate commit becomes a no-op instead of appending the same rows twice.

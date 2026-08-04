@@ -1,0 +1,168 @@
+---
+title: "Self-host Verglas"
+description: "Run a single-node Verglas cache server with Docker Compose."
+icon: "server"
+---
+
+Self-hosting runs the Verglas cache and admin API on your infrastructure. Your object store remains the system of record, and your query engine continues to use its existing Iceberg catalog.
+
+## Ports and data
+
+The Docker example exposes the following endpoints:
+
+| Port | Endpoint | Used by |
+| --- | --- | --- |
+| `8333` | S3-compatible data endpoint | Query engines and S3 clients |
+| `8334` | Admin and data API | The `verglas` CLI and SDK |
+
+The container stores cache data under `/var/lib/verglas`. Mount that path on local NVMe or another fast, persistent volume.
+
+## Start a single server
+
+<Steps>
+  <Step title="Create local configuration files">
+    From the Verglas repository, create an ignored working directory:
+
+    ```bash
+    mkdir -p .verglas-selfhost/credentials .verglas-selfhost/cache
+    cp deploy/docker/verglas.toml .verglas-selfhost/verglas.toml
+    ```
+
+    Edit `.verglas-selfhost/verglas.toml` with your origin bucket and region. The following filled example uses an AWS S3 bucket named `acme-lakehouse-prod`:
+
+    ```toml .verglas-selfhost/verglas.toml
+    [listen]
+    s3_port = 8333
+    admin_port = 8334
+
+    [log]
+    format = "json"
+    level = "info"
+
+    [cache]
+    dir = "/var/lib/verglas"
+    capacity_bytes = "200GB"
+    dram_bytes = "4GB"
+
+    [backend]
+    provider = "s3"
+    bucket = "acme-lakehouse-prod"
+    region = "us-west-2"
+    credentials_file = "/etc/verglas/credentials/backend"
+
+    [auth]
+    credentials_file = "/etc/verglas/credentials/endpoint"
+
+    [catalog]
+    uri = "https://catalog.example.com"
+    warehouse = "acme-production"
+    include = ["analytics.*"]
+    exclude = ["analytics.scratch_*"]
+    credentials_file = "/etc/verglas/credentials/catalog.token"
+    ```
+
+    Remove the `[catalog]` section when you only need a byte cache. Verglas then skips table watching and metadata warming.
+  </Step>
+
+  <Step title="Write credentials">
+    Write the origin credentials that Verglas uses on cache misses:
+
+    ```ini .verglas-selfhost/credentials/backend
+    [default]
+    aws_access_key_id = AKIA_REPLACE_ME
+    aws_secret_access_key = REPLACE_ME
+    ```
+
+    Write a separate keypair for clients that connect to the Verglas S3 endpoint:
+
+    ```ini .verglas-selfhost/credentials/endpoint
+    [default]
+    aws_access_key_id = verglas-local
+    aws_secret_access_key = replace-with-a-long-random-secret
+    ```
+
+    If the catalog uses a bearer token, write only that token to `.verglas-selfhost/credentials/catalog.token`.
+
+    ```bash
+    chmod 600 .verglas-selfhost/credentials/*
+    ```
+
+    <Warning>
+    Never reuse the origin keypair as the client-facing endpoint keypair. Never commit either credential file.
+    </Warning>
+  </Step>
+
+  <Step title="Override the Compose mounts">
+    Save the following file as `docker-compose.override.yml`:
+
+    ```yaml docker-compose.override.yml
+    services:
+      verglas-server:
+        volumes:
+          - ./.verglas-selfhost/verglas.toml:/etc/verglas/config.toml:ro
+          - ./.verglas-selfhost/credentials:/etc/verglas/credentials:ro
+          - ./.verglas-selfhost/cache:/var/lib/verglas
+    ```
+  </Step>
+
+  <Step title="Start and verify the server">
+    Build the image and start the server:
+
+    ```bash
+    docker compose up -d --build
+    docker compose logs -f verglas-server
+    ```
+
+    In a second terminal, point the CLI at the admin API:
+
+    ```bash
+    export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+    verglas status
+    ```
+
+    A healthy response includes the server version and cache state.
+  </Step>
+
+  <Step title="Point a client at the cache">
+    Configure an S3 client with the endpoint keypair and fetch an object:
+
+    ```bash
+    export AWS_ACCESS_KEY_ID=verglas-local
+    export AWS_SECRET_ACCESS_KEY=replace-with-a-long-random-secret
+
+    aws s3 cp s3://acme-lakehouse-prod/analytics/orders/data.parquet /tmp/orders.parquet \
+      --endpoint-url http://127.0.0.1:8333
+    ```
+
+    Configure DuckDB with path-style addressing:
+
+    ```sql
+    SET s3_endpoint = '127.0.0.1:8333';
+    SET s3_use_ssl = false;
+    SET s3_url_style = 'path';
+    SET s3_access_key_id = 'verglas-local';
+    SET s3_secret_access_key = 'replace-with-a-long-random-secret';
+
+    SELECT count(*)
+    FROM 's3://acme-lakehouse-prod/analytics/orders/*.parquet';
+    ```
+  </Step>
+</Steps>
+
+## Operate the server
+
+Use the following commands during normal operation:
+
+```bash
+docker compose logs -f verglas-server
+verglas status
+curl -fsS http://127.0.0.1:8334/metrics
+verglas drain --timeout 10m
+docker compose down
+```
+
+`verglas drain` stops new cache ownership, donates warm blocks to peers, and then exits. Use it before removing a node from a multi-node pod.
+
+## Configure production deployments
+
+The Docker quickstart uses plaintext loopback endpoints. Production deployments must add TLS, restrict the admin listener, mount a persistent cache directory, and give the server only the origin and catalog permissions it needs. See the annotated `verglas.example.toml` in the repository for every supported key.

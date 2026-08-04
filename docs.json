@@ -1,0 +1,71 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "name": "Verglas documentation",
+  "description": "Run cache-pathed lakehouse workloads with Verglas Cloud or a self-hosted Verglas server.",
+  "colors": {
+    "primary": "#2563EB",
+    "light": "#60A5FA",
+    "dark": "#1D4ED8"
+  },
+  "navigation": {
+    "groups": [
+      {
+        "group": "Get started",
+        "icon": "rocket",
+        "pages": [
+          "docs/index",
+          "docs/get-started/cloud-quickstart",
+          "docs/get-started/self-host"
+        ]
+      },
+      {
+        "group": "Build",
+        "icon": "blocks",
+        "pages": [
+          "docs/platform/workers",
+          "docs/platform/containers",
+          "docs/platform/follow"
+        ]
+      },
+      {
+        "group": "SDKs",
+        "icon": "code-2",
+        "pages": [
+          "docs/sdk/overview",
+          "docs/sdk/typescript",
+          "docs/sdk/rust"
+        ]
+      },
+      {
+        "group": "Reference",
+        "icon": "book-open",
+        "pages": [
+          "docs/reference/cli",
+          "docs/reference/worker-spec"
+        ]
+      }
+    ]
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/verglas-org/verglas"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Open Verglas Cloud",
+      "href": "https://verglas.dev"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/verglas-org/verglas"
+    }
+  },
+  "styling": {
+    "eyebrows": "breadcrumbs"
+  }
+}

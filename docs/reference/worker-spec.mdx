@@ -1,0 +1,114 @@
+---
+title: "Worker specification"
+description: "Reference for the portable JSON and TOML worker manifest."
+icon: "file-code-2"
+---
+
+The portable worker manifest is the input to `verglas workers create --file`. Use the same file for local registration and cloud creation.
+
+## Complete example
+
+```toml worker.toml
+spec_version = 1
+name = "orders-ingest"
+exec = ["python3", "collector.py"]
+cwd = "/app"
+target_tables = ["analytics.orders_raw"]
+
+[files]
+"collector.py" = "# bundled worker entrypoint\n"
+
+[env]
+ORDERS_URL = "https://api.example.com/v1/orders"
+ORDERS_KEY = "@secret:ORDERS_KEY"
+
+[trigger]
+type = "cron"
+cron = "*/5 * * * *"
+
+[resources]
+vcpus = 0.25
+mem_mib = 256
+```
+
+## Fields
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `spec_version` | No | Current manifest format. Defaults to `1`. |
+| `name` | Yes | Worker name. Must not be empty. |
+| `exec` | Usually | Program and arguments. A file-follow worker may omit it. |
+| `cwd` | No | Working directory for the command and bundled files. |
+| `files` | No | Map from relative path to bundled text content. |
+| `env` | No | Environment map. Use `@secret:NAME` for a secret reference. |
+| `trigger` | No | One of `manual`, `cron`, or local-only `follow`. Defaults to `manual`. |
+| `target_tables` | No | Iceberg tables the worker writes. The first table becomes the primary local output. |
+| `resources.vcpus` | No | Fractional vCPU hint for cloud placement. |
+| `resources.mem_mib` | No | Memory hint in MiB for cloud placement. |
+
+## Trigger forms
+
+<Tabs>
+  <Tab title="Manual">
+    ```toml
+    [trigger]
+    type = "manual"
+    ```
+  </Tab>
+  <Tab title="Cron">
+    ```toml
+    [trigger]
+    type = "cron"
+    cron = "0 * * * *"
+    ```
+  </Tab>
+  <Tab title="Follow a command">
+    ```toml
+    exec = ["./server", "--port", "8080"]
+
+    [trigger]
+    type = "follow"
+    ```
+  </Tab>
+  <Tab title="Follow a file">
+    ```toml
+    [trigger]
+    type = "follow"
+    file = "/var/log/acme/app.jsonl"
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+A follow manifest can register only on a local server. `verglas workers push` rejects it.
+</Warning>
+
+## Secret references
+
+The manifest stores only the secret name:
+
+```toml
+[env]
+API_KEY = "@secret:API_KEY"
+```
+
+Create the named secret separately in each destination plane. `push` and `pull` never copy secret values.
+
+## Override manifest values
+
+Override the name or cron schedule while creating a worker:
+
+```bash
+verglas workers create \
+  --file ./worker.toml \
+  --name orders-ingest-canary \
+  --schedule '*/15 * * * *'
+```
+
+Update an existing worker with a replacement file or common overrides:
+
+```bash
+verglas workers update orders-ingest --file ./worker.toml
+verglas workers update orders-ingest --schedule '0 * * * *'
+verglas workers update orders-ingest --status paused
+```
