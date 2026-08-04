@@ -8,7 +8,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Json, Router};
 use futures::{StreamExt, stream};
 use serde_json::json;
@@ -28,8 +28,7 @@ struct Captured {
 async fn ensure_append_and_query_use_one_authenticated_streaming_contract() {
     let captured = Captured::default();
     let app = Router::new()
-        .route("/v1/tables/{name}/definition", get(definition_missing))
-        .route("/v1/tables/{name}", post(create_table))
+        .route("/v1/tables/{name}", post(ensure_table))
         .route("/v1/tables/{name}/commit", post(commit_arrow))
         .route("/v1/query", post(query_arrow))
         .with_state(captured.clone());
@@ -91,12 +90,7 @@ async fn ensure_append_and_query_use_one_authenticated_streaming_contract() {
             .lock()
             .expect("auth lock")
             .as_slice(),
-        [
-            "Bearer sdk-token",
-            "Bearer sdk-token",
-            "Bearer sdk-token",
-            "Bearer sdk-token"
-        ]
+        ["Bearer sdk-token", "Bearer sdk-token", "Bearer sdk-token"]
     );
     assert_eq!(
         captured
@@ -112,12 +106,18 @@ async fn ensure_append_and_query_use_one_authenticated_streaming_contract() {
 #[tokio::test]
 async fn ensure_table_rejects_definition_drift() {
     let app = Router::new().route(
-        "/v1/tables/{name}/definition",
-        get(|| async {
-            Json(json!({
-                "schema": [{"name":"id", "type":"utf8", "nullable":false}],
-                "partitions": []
-            }))
+        "/v1/tables/{name}",
+        post(|| async {
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "created": false,
+                    "definition": {
+                        "schema": [{"name":"id", "type":"utf8", "nullable":false}],
+                        "partitions": []
+                    }
+                })),
+            )
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
@@ -137,17 +137,8 @@ async fn ensure_table_rejects_definition_drift() {
     assert!(error.to_string().contains("definition mismatch"));
 }
 
-/// Returns the missing-table response used by the ensure contract.
-async fn definition_missing(
-    State(captured): State<Captured>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
-    capture_auth(&captured, &headers);
-    (StatusCode::NOT_FOUND, "missing")
-}
-
-/// Validates and acknowledges a create-table request.
-async fn create_table(
+/// Validates and acknowledges an idempotent ensure-table request.
+async fn ensure_table(
     State(captured): State<Captured>,
     headers: HeaderMap,
     Path(name): Path<String>,
@@ -156,7 +147,13 @@ async fn create_table(
     capture_auth(&captured, &headers);
     assert_eq!(name, "sdk.events");
     assert_eq!(body["schema"][0]["name"], "id");
-    Json(json!({"table":"sdk.events","columns":["id","value"]}))
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "created": true,
+            "definition": body
+        })),
+    )
 }
 
 /// Decodes and acknowledges a streamed Arrow append.

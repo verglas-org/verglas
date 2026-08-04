@@ -20,7 +20,7 @@ use thiserror::Error;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use verglas_api::table::CommitResponse;
+use verglas_api::table::{CommitResponse, EnsureTableResponse};
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
 
@@ -198,25 +198,24 @@ impl Client {
         table: &str,
         definition: &TableDefinition,
     ) -> Result<EnsureTable, ClientError> {
-        let url = self.url(&format!("/v1/tables/{table}/definition"));
-        let response = self.send(self.authorize(self.http.get(url))).await?;
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            let create_url = self.url(&format!("/v1/tables/{table}"));
-            let response = self
-                .send(self.authorize(self.http.post(create_url)).json(definition))
-                .await?;
-            Self::require_success(response).await?;
-            return Ok(EnsureTable::Created);
-        }
-        let response = Self::require_success(response).await?;
-        let actual: TableDefinition = response.json().await?;
-        if &actual == definition {
-            Ok(EnsureTable::Existing)
-        } else {
+        let url = self.url(&format!("/v1/tables/{table}"));
+        let response = self
+            .send(self.authorize(self.http.post(url)).json(definition))
+            .await?;
+        if response.status() == reqwest::StatusCode::CONFLICT {
+            let actual: EnsureTableResponse = response.json().await?;
             Err(ClientError::DefinitionMismatch {
                 table: table.to_owned(),
                 expected: definition.clone(),
-                actual,
+                actual: actual.definition,
+            })
+        } else {
+            let response = Self::require_success(response).await?;
+            let result: EnsureTableResponse = response.json().await?;
+            Ok(if result.created {
+                EnsureTable::Created
+            } else {
+                EnsureTable::Existing
             })
         }
     }

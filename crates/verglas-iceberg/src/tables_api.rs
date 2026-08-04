@@ -26,8 +26,9 @@ use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
 use serde_json::Value;
 pub use verglas_api::table::{
-    ColumnSpec, CommitRequest, CommitResponse, CreateTableResponse, DeltaResponse, PartitionSpec,
-    RowsResponse, SnapshotResponse, TableDefinition as CreateTableRequest,
+    ColumnSpec, CommitRequest, CommitResponse, CreateTableResponse, DeltaResponse,
+    EnsureTableResponse, PartitionSpec, RowsResponse, SnapshotResponse,
+    TableDefinition as CreateTableRequest,
 };
 
 use crate::error::{AgentError, Result};

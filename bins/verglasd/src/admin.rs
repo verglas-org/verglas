@@ -519,7 +519,6 @@ fn tables_router(tables: TablesSlot) -> Router {
     Router::new()
         .route("/v1/tables", get(tables_list))
         .route("/v1/tables/{name}", post(tables_create))
-        .route("/v1/tables/{name}/definition", get(tables_definition))
         .route("/v1/tables/{name}/commit", post(tables_commit))
         .route("/v1/tables/{name}/snapshot", get(tables_snapshot))
         .route("/v1/tables/{name}/rows", get(tables_rows))
@@ -729,25 +728,53 @@ async fn tables_create(
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
-    match tables_api::create_table(catalog.as_ref(), &ident, request).await {
-        Ok(response) => Json(response).into_response(),
-        Err(error) => table_error(error),
-    }
-}
-
-/// `GET /v1/tables/{name}/definition`: returns the exact schema and partition
-/// transforms used by [`verglas_sdk::Client::ensure_table`].
-async fn tables_definition(State(tables): State<TablesSlot>, Path(name): Path<String>) -> Response {
-    let Some(catalog) = tables.get() else {
-        return recovering();
-    };
-    let ident = match parse_table_ident(&name) {
-        Ok(ident) => ident,
-        Err(error) => return table_error(error),
-    };
-    match tables_api::definition(catalog.as_ref(), &ident).await {
-        Ok(definition) => Json(definition).into_response(),
-        Err(error) => table_error(error),
+    match catalog.table_exists(&ident).await {
+        Ok(true) => match tables_api::definition(catalog.as_ref(), &ident).await {
+            Ok(actual) if actual == request => Json(tables_api::EnsureTableResponse {
+                created: false,
+                definition: actual,
+            })
+            .into_response(),
+            Ok(actual) => (
+                StatusCode::CONFLICT,
+                Json(tables_api::EnsureTableResponse {
+                    created: false,
+                    definition: actual,
+                }),
+            )
+                .into_response(),
+            Err(error) => table_error(error),
+        },
+        Ok(false) => {
+            match tables_api::create_table(catalog.as_ref(), &ident, request.clone()).await {
+                Ok(_) => (
+                    StatusCode::CREATED,
+                    Json(tables_api::EnsureTableResponse {
+                        created: true,
+                        definition: request,
+                    }),
+                )
+                    .into_response(),
+                Err(error) => table_error(error),
+            }
+        }
+        Err(error)
+            if error.kind() == iceberg::ErrorKind::TableNotFound
+                || error.kind() == iceberg::ErrorKind::NamespaceNotFound =>
+        {
+            match tables_api::create_table(catalog.as_ref(), &ident, request.clone()).await {
+                Ok(_) => (
+                    StatusCode::CREATED,
+                    Json(tables_api::EnsureTableResponse {
+                        created: true,
+                        definition: request,
+                    }),
+                )
+                    .into_response(),
+                Err(error) => table_error(error),
+            }
+        }
+        Err(error) => table_error(AgentError::Iceberg(error)),
     }
 }
 
@@ -3109,12 +3136,6 @@ mod tests {
             )
         };
 
-        let definition =
-            json_body(call(router_of(), "GET", "/v1/tables/sdk.events/definition").await).await;
-        assert_eq!(definition["schema"][0]["name"], "id");
-        assert_eq!(definition["schema"][0]["type"], "int64");
-        assert_eq!(definition["partitions"], serde_json::json!([]));
-
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, false),
@@ -3182,6 +3203,41 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .expect("query batches");
         assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+    }
+
+    #[tokio::test]
+    async fn ensure_table_is_one_idempotent_post_without_a_definition_route() {
+        let slot = tables_slot_with_table().await;
+        let router_of = || {
+            router(
+                VERSION,
+                Health::ready(),
+                Slots {
+                    tables: Some(slot.clone()),
+                    ..Slots::default()
+                },
+            )
+        };
+        let exact = serde_json::json!({
+            "schema": [
+                {"name":"id", "type":"int64", "nullable":true},
+                {"name":"name", "type":"utf8", "nullable":true}
+            ],
+            "partitions": []
+        });
+        let response = call_json(router_of(), "POST", "/v1/tables/sdk.events", exact).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!json_body(response).await["created"].as_bool().unwrap());
+
+        let mismatch = serde_json::json!({
+            "schema": [{"name":"id", "type":"utf8", "nullable":false}],
+            "partitions": []
+        });
+        let response = call_json(router_of(), "POST", "/v1/tables/sdk.events", mismatch).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        let response = call(router_of(), "GET", "/v1/tables/sdk.events/definition").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// A repeated idempotency key over HTTP replays the original result and the
