@@ -457,15 +457,15 @@ mod tests {
     #[test]
     fn print_state_running_when_a_live_pid_is_present() {
         // A `launchctl print` record with a live pid means the job is running.
-        let running = "org.verglas.verglas = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n";
+        let running =
+            "org.verglas.verglas = {\n\tactive count = 1\n\tpid = 4242\n\tstate = running\n}\n";
         assert_eq!(parse_print_state(running), ServiceState::Running);
     }
 
     #[test]
     fn print_state_stopped_when_no_pid_line() {
         // A loaded-but-idle job has no pid line; that is stopped, not running.
-        let stopped =
-            "org.verglas.verglas = {\n\tactive count = 0\n\tstate = not running\n}\n";
+        let stopped = "org.verglas.verglas = {\n\tactive count = 0\n\tstate = not running\n}\n";
         assert_eq!(parse_print_state(stopped), ServiceState::Stopped);
     }
 
