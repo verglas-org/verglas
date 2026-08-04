@@ -9,18 +9,15 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use arrow_array::RecordBatch;
-use arrow_buffer::Buffer;
-use arrow_ipc::reader::StreamDecoder;
-use arrow_ipc::writer::StreamWriter;
-use bytes::Bytes;
-use futures::{SinkExt, Stream, StreamExt, TryStream, stream};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
-use serde::{Deserialize, Serialize};
+use futures::{SinkExt, Stream, StreamExt, TryStream, TryStreamExt, stream};
+use serde::Deserialize;
 use thiserror::Error;
+use tokio::sync::OnceCell;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use verglas_api::table::{CommitResponse, EnsureTableResponse};
+use verglas_core::admin::{ACCESS_PATH, LocalAccess};
+use verglas_iceberg::Connection;
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
 
@@ -40,6 +37,12 @@ pub type FollowStream = Pin<Box<dyn Stream<Item = Result<ChangeEvent, ClientErro
 pub struct ConnectOptions {
     endpoint: String,
     token: Option<String>,
+    catalog_uri: Option<String>,
+    warehouse: Option<String>,
+    s3_endpoint: Option<String>,
+    region: String,
+    access_key_id: Option<String>,
+    secret_access_key: Option<String>,
     connect_timeout: Duration,
     request_timeout: Duration,
 }
@@ -50,6 +53,12 @@ impl ConnectOptions {
         Self {
             endpoint: endpoint.into(),
             token: None,
+            catalog_uri: None,
+            warehouse: None,
+            s3_endpoint: None,
+            region: "us-east-1".to_owned(),
+            access_key_id: None,
+            secret_access_key: None,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(30),
         }
@@ -64,8 +73,15 @@ impl ConnectOptions {
         let endpoint = std::env::var("VERGLAS_ENDPOINT")
             .unwrap_or_else(|_| "http://127.0.0.1:8334".to_owned());
         let mut options = Self::new(endpoint);
-        if let Ok(token) = std::env::var("VERGLAS_TOKEN")
-            && !token.is_empty()
+        options.catalog_uri = nonempty_env("VERGLAS_CATALOG_URI");
+        options.warehouse = nonempty_env("VERGLAS_WAREHOUSE");
+        options.s3_endpoint = nonempty_env("VERGLAS_S3_ENDPOINT");
+        options.region =
+            nonempty_env("VERGLAS_S3_REGION").unwrap_or_else(|| "us-east-1".to_owned());
+        options.access_key_id = nonempty_env("VERGLAS_S3_ACCESS_KEY_ID");
+        options.secret_access_key = nonempty_env("VERGLAS_S3_SECRET_ACCESS_KEY");
+        if let Some(token) =
+            nonempty_env("VERGLAS_CATALOG_TOKEN").or_else(|| nonempty_env("VERGLAS_TOKEN"))
         {
             options.token = Some(token);
         }
@@ -76,6 +92,41 @@ impl ConnectOptions {
     #[must_use]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
+        self
+    }
+
+    /// Supplies the upstream Iceberg REST catalog explicitly.
+    #[must_use]
+    pub fn with_catalog_uri(mut self, catalog_uri: impl Into<String>) -> Self {
+        self.catalog_uri = Some(catalog_uri.into());
+        self
+    }
+
+    /// Supplies the Iceberg warehouse identifier explicitly.
+    #[must_use]
+    pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> Self {
+        self.warehouse = Some(warehouse.into());
+        self
+    }
+
+    /// Supplies the S3 cache endpoint used for every data-file read and write.
+    #[must_use]
+    pub fn with_s3_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.s3_endpoint = Some(endpoint.into());
+        self
+    }
+
+    /// Supplies the cache endpoint SigV4 region and keypair.
+    #[must_use]
+    pub fn with_s3_credentials(
+        mut self,
+        region: impl Into<String>,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        self.region = region.into();
+        self.access_key_id = Some(access_key_id.into());
+        self.secret_access_key = Some(secret_access_key.into());
         self
     }
 
@@ -150,6 +201,9 @@ pub enum ClientError {
     /// The websocket change feed could not connect or exchanged invalid data.
     #[error("catalog change feed failed: {0}")]
     Feed(String),
+    /// The Iceberg catalog, table writer, or query engine failed.
+    #[error("Verglas catalog operation failed: {0}")]
+    Catalog(String),
     /// The requested replay cursor has aged out of feed retention.
     #[error("catalog change feed cursor expired: {reason}")]
     CursorExpired {
@@ -159,37 +213,88 @@ pub enum ClientError {
 }
 
 /// Reusable authenticated client for a Verglas daemon.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Client {
-    endpoint: String,
     raw_token: Option<String>,
-    token: Option<HeaderValue>,
-    request_timeout: Duration,
-    http: reqwest::Client,
+    connection: Connection,
+    catalog: std::sync::Arc<OnceCell<std::sync::Arc<dyn iceberg::Catalog>>>,
 }
 
 impl Client {
     /// Constructs a reusable client and connection pool.
-    pub fn connect(options: ConnectOptions) -> Result<Self, ClientError> {
+    pub async fn connect(options: ConnectOptions) -> Result<Self, ClientError> {
         let endpoint = options.endpoint.trim_end_matches('/').to_owned();
         reqwest::Url::parse(&endpoint)
-            .map_err(|error| ClientError::Configuration(error.to_string()))?;
-        let raw_token = options.token;
-        let token = raw_token
-            .clone()
-            .map(|token| HeaderValue::from_str(&format!("Bearer {token}")))
-            .transpose()
             .map_err(|error| ClientError::Configuration(error.to_string()))?;
         let http = reqwest::Client::builder()
             .connect_timeout(options.connect_timeout)
             .build()?;
+        let access = if options.catalog_uri.is_none() || options.s3_endpoint.is_none() {
+            let url = format!("{endpoint}{ACCESS_PATH}");
+            let response = tokio::time::timeout(options.request_timeout, http.get(url).send())
+                .await
+                .map_err(|_| ClientError::RequestTimeout)??;
+            if !response.status().is_success() {
+                return Err(ClientError::Configuration(format!(
+                    "daemon access discovery returned HTTP {}",
+                    response.status()
+                )));
+            }
+            Some(response.json::<LocalAccess>().await?)
+        } else {
+            None
+        };
+        let catalog_uri = options
+            .catalog_uri
+            .or_else(|| access.as_ref().and_then(|access| access.catalog_uri.clone()))
+            .ok_or_else(|| {
+                ClientError::Configuration(
+                    "no Iceberg catalog URI: set VERGLAS_CATALOG_URI or configure the daemon catalog"
+                        .to_owned(),
+                )
+            })?;
+        let s3_endpoint = options
+            .s3_endpoint
+            .or_else(|| access.as_ref().map(|access| access.s3_endpoint.clone()))
+            .ok_or_else(|| {
+                ClientError::Configuration(
+                    "no Verglas S3 cache endpoint: set VERGLAS_S3_ENDPOINT or connect to a daemon"
+                        .to_owned(),
+                )
+            })?;
+        let connection = Connection {
+            catalog_uri,
+            token: options.token.clone(),
+            warehouse: options
+                .warehouse
+                .or_else(|| access.as_ref().and_then(|access| access.warehouse.clone())),
+            s3_endpoint: Some(s3_endpoint),
+            region: access
+                .as_ref()
+                .map(|access| access.region.clone())
+                .unwrap_or(options.region),
+            access_key_id: options.access_key_id.or_else(|| {
+                access
+                    .as_ref()
+                    .and_then(|access| access.access_key_id.clone())
+            }),
+            secret_access_key: options.secret_access_key,
+        };
         Ok(Self {
-            endpoint,
-            raw_token,
-            token,
-            request_timeout: options.request_timeout,
-            http,
+            raw_token: options.token,
+            connection,
+            catalog: std::sync::Arc::new(OnceCell::new()),
         })
+    }
+
+    /// Returns the resolved upstream Iceberg REST catalog URI.
+    pub fn catalog_uri(&self) -> &str {
+        &self.connection.catalog_uri
+    }
+
+    /// Returns the resolved Verglas S3 cache endpoint.
+    pub fn s3_endpoint(&self) -> Option<&str> {
+        self.connection.s3_endpoint.as_deref()
     }
 
     /// Creates a missing table or verifies the exact existing definition.
@@ -198,25 +303,29 @@ impl Client {
         table: &str,
         definition: &TableDefinition,
     ) -> Result<EnsureTable, ClientError> {
-        let url = self.url(&format!("/v1/tables/{table}"));
-        let response = self
-            .send(self.authorize(self.http.post(url)).json(definition))
-            .await?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            let actual: EnsureTableResponse = response.json().await?;
-            Err(ClientError::DefinitionMismatch {
-                table: table.to_owned(),
-                expected: definition.clone(),
-                actual: actual.definition,
-            })
+        let catalog = self.catalog().await?;
+        let ident = verglas_iceberg::parse_table_ident(table)
+            .map_err(|error| ClientError::Catalog(error.to_string()))?;
+        if catalog
+            .table_exists(&ident)
+            .await
+            .map_err(|error| ClientError::Catalog(error.to_string()))?
+        {
+            verify_definition(catalog.as_ref(), &ident, table, definition).await
         } else {
-            let response = Self::require_success(response).await?;
-            let result: EnsureTableResponse = response.json().await?;
-            Ok(if result.created {
-                EnsureTable::Created
-            } else {
-                EnsureTable::Existing
-            })
+            match verglas_iceberg::tables_api::create_table(
+                catalog.as_ref(),
+                &ident,
+                definition.clone(),
+            )
+            .await
+            {
+                Ok(_) => Ok(EnsureTable::Created),
+                Err(_create_error) if catalog.table_exists(&ident).await.unwrap_or(false) => {
+                    verify_definition(catalog.as_ref(), &ident, table, definition).await
+                }
+                Err(error) => Err(ClientError::Catalog(error.to_string())),
+            }
         }
     }
 
@@ -240,16 +349,18 @@ impl Client {
                 .await
                 .transpose()?
         {
-            let bytes = encode_batch(&batch)?;
             let commit_key = format!("{idempotency_key}:{}", result.commits);
-            let url = self.url(&format!("/v1/tables/{table}/commit"));
-            let request = self
-                .authorize(self.http.post(url))
-                .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
-                .header("idempotency-key", commit_key)
-                .body(bytes);
-            let response = Self::require_success(self.send(request).await?).await?;
-            let commit: CommitResponse = response.json().await?;
+            let catalog = self.catalog().await?;
+            let ident = verglas_iceberg::parse_table_ident(table)
+                .map_err(|error| ClientError::Catalog(error.to_string()))?;
+            let commit = verglas_iceberg::tables_api::commit_batches(
+                catalog.as_ref(),
+                &ident,
+                vec![batch],
+                Some(commit_key),
+            )
+            .await
+            .map_err(|error| ClientError::Catalog(error.to_string()))?;
             result.rows_committed += commit.rows_committed;
             result.commits += 1;
         }
@@ -258,19 +369,15 @@ impl Client {
 
     /// Executes SQL and incrementally decodes the Arrow IPC response.
     pub async fn query_stream(&self, sql: &str) -> Result<QueryStream, ClientError> {
-        let request = self
-            .authorize(self.http.post(self.url("/v1/query")))
-            .header(ACCEPT, ARROW_STREAM_CONTENT_TYPE)
-            .json(&QueryRequest { sql });
-        let response = Self::require_success(self.send(request).await?).await?;
-        let chunks = response.bytes_stream();
-        let state = DecodeState {
-            chunks: Box::pin(chunks),
-            decoder: StreamDecoder::new(),
-            buffer: Buffer::from(Vec::<u8>::new()),
-            finished: false,
-        };
-        Ok(Box::pin(stream::try_unfold(state, decode_next)))
+        let catalog = self.catalog().await?;
+        let execution = verglas_iceberg::query_stream(catalog, sql, None)
+            .await
+            .map_err(|error| ClientError::Catalog(error.to_string()))?;
+        Ok(Box::pin(
+            execution
+                .batches
+                .map_err(|error| ClientError::Catalog(error.to_string())),
+        ))
     }
 
     /// Follows commit notifications for the named tables, reconnecting from
@@ -287,7 +394,7 @@ impl Client {
             ));
         }
         let state = FollowState {
-            url: feed_url(&self.endpoint)?,
+            url: feed_url(&self.connection.catalog_uri)?,
             token: self.raw_token.clone(),
             tables,
             cursor,
@@ -299,53 +406,18 @@ impl Client {
         Ok(Box::pin(stream::try_unfold(state, follow_next)))
     }
 
-    /// Adds authentication to a request when configured.
-    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.token {
-            Some(token) => request.header(AUTHORIZATION, token.clone()),
-            None => request,
-        }
-    }
-
-    /// Sends a request with a deadline only for response headers.
-    async fn send(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<reqwest::Response, ClientError> {
-        tokio::time::timeout(self.request_timeout, request.send())
+    /// Opens the real Iceberg REST catalog once. Its FileIO remains pinned to
+    /// the daemon's S3 endpoint, so the daemon is only the cache passthrough.
+    async fn catalog(&self) -> Result<std::sync::Arc<dyn iceberg::Catalog>, ClientError> {
+        self.catalog
+            .get_or_try_init(|| async {
+                verglas_iceberg::catalog::open_catalog(&self.connection)
+                    .await
+                    .map_err(|error| ClientError::Catalog(error.to_string()))
+            })
             .await
-            .map_err(|_| ClientError::RequestTimeout)?
-            .map_err(ClientError::Transport)
+            .cloned()
     }
-
-    /// Converts a non-success response into a diagnostic error.
-    async fn require_success(
-        response: reqwest::Response,
-    ) -> Result<reqwest::Response, ClientError> {
-        let status = response.status();
-        if status.is_success() {
-            return Ok(response);
-        }
-        let message = response.text().await.unwrap_or_default();
-        Err(ClientError::Http { status, message })
-    }
-
-    /// Joins an API path to the configured endpoint.
-    fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.endpoint)
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct QueryRequest<'a> {
-    sql: &'a str,
-}
-
-struct DecodeState {
-    chunks: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
-    decoder: StreamDecoder,
-    buffer: Buffer,
-    finished: bool,
 }
 
 /// Connected websocket type used by the change feed.
@@ -522,34 +594,98 @@ fn feed_url(endpoint: &str) -> Result<String, ClientError> {
     Ok(url.to_string())
 }
 
-/// Decodes one batch while retaining decoder state across arbitrary HTTP chunks.
-async fn decode_next(
-    mut state: DecodeState,
-) -> Result<Option<(RecordBatch, DecodeState)>, ClientError> {
-    loop {
-        if !state.buffer.is_empty()
-            && let Some(batch) = state.decoder.decode(&mut state.buffer)?
-        {
-            return Ok(Some((batch, state)));
-        }
-        if state.finished {
-            state.decoder.finish()?;
-            return Ok(None);
-        }
-        match state.chunks.next().await {
-            Some(chunk) => state.buffer = Buffer::from(chunk?.to_vec()),
-            None => state.finished = true,
-        }
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+async fn verify_definition(
+    catalog: &dyn iceberg::Catalog,
+    ident: &iceberg::TableIdent,
+    table: &str,
+    expected: &TableDefinition,
+) -> Result<EnsureTable, ClientError> {
+    let actual = verglas_iceberg::tables_api::definition(catalog, ident)
+        .await
+        .map_err(|error| ClientError::Catalog(error.to_string()))?;
+    if actual == *expected {
+        Ok(EnsureTable::Existing)
+    } else {
+        Err(ClientError::DefinitionMismatch {
+            table: table.to_owned(),
+            expected: expected.clone(),
+            actual,
+        })
     }
 }
 
-/// Encodes one bounded record batch as a complete Arrow IPC stream.
-fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ClientError> {
-    let mut bytes = Vec::new();
-    {
-        let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema())?;
-        writer.write(batch)?;
-        writer.finish()?;
+#[cfg(test)]
+mod tests {
+    use axum::{Json, Router, routing::get};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_catalog_and_cache_skip_daemon_discovery() {
+        let client = Client::connect(
+            ConnectOptions::new("http://127.0.0.1:1")
+                .with_catalog_uri("https://tenant.catalog.verglas.dev")
+                .with_warehouse("s3://warehouse/tenant")
+                .with_s3_endpoint("http://127.0.0.1:8333"),
+        )
+        .await
+        .expect("fully explicit connection does not contact the daemon");
+
+        assert_eq!(
+            client.connection.catalog_uri,
+            "https://tenant.catalog.verglas.dev"
+        );
+        assert_eq!(
+            client.connection.s3_endpoint.as_deref(),
+            Some("http://127.0.0.1:8333")
+        );
     }
-    Ok(bytes)
+
+    #[tokio::test]
+    async fn connect_discovers_catalog_coordinates_from_daemon() {
+        let access = LocalAccess {
+            s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+            catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
+            warehouse: Some("s3://warehouse/tenant".to_owned()),
+            region: "auto".to_owned(),
+            bucket: Some("warehouse".to_owned()),
+            access_key_id: Some("VGKEY".to_owned()),
+        };
+        let app = Router::new().route(
+            ACCESS_PATH,
+            get({
+                let access = access.clone();
+                move || async move { Json(access) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+        let client = Client::connect(ConnectOptions::new(format!("http://{address}")))
+            .await
+            .expect("discovered connection");
+        assert_eq!(client.connection.catalog_uri, access.catalog_uri.unwrap());
+        assert_eq!(client.connection.warehouse, access.warehouse);
+        assert_eq!(
+            client.connection.s3_endpoint.as_deref(),
+            Some(access.s3_endpoint.as_str())
+        );
+        assert_eq!(client.connection.region, "auto");
+        assert_eq!(client.connection.access_key_id.as_deref(), Some("VGKEY"));
+    }
+
+    #[test]
+    fn follow_uses_catalog_origin() {
+        assert_eq!(
+            feed_url("https://tenant.catalog.verglas.dev").expect("feed URL"),
+            "wss://tenant.catalog.verglas.dev/v1/catalog/feed"
+        );
+    }
 }

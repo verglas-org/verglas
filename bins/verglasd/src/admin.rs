@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
@@ -54,7 +54,6 @@ use verglas_core::admin::{
     PURGE_PATH, STATS_PATH, StatsInfo, TABLE_METRICS_PATH, VERSION_PATH, VersionInfo,
 };
 use verglas_core::metrics::EXPOSITION_CONTENT_TYPE;
-use verglas_tables::catalog::CatalogGateway;
 
 /// Readiness gate for serve-gating (#16). Starts reporting `starting` and flips
 /// to `ok` once the cache engine's disk recovery completes, so a load balancer
@@ -219,8 +218,6 @@ pub struct Slots {
     pub members: Option<MembersSlot>,
     /// Drain control (`POST /admin/drain`).
     pub drain: Option<DrainSlot>,
-    /// The loopback Iceberg REST gateway (`/catalog/...`).
-    pub catalog: Option<CatalogGateway>,
     /// The local-access snapshot (`GET /admin/access`).
     pub access: Option<LocalAccess>,
     /// The SDK table routes and `/v1/query` (`/v1/tables/...`, `POST /v1/query`).
@@ -266,7 +263,6 @@ pub fn router(daemon_version: &'static str, health: Health, slots: Slots) -> Rou
         table_metrics,
         members,
         drain,
-        catalog,
         access,
         tables,
         graphs,
@@ -400,9 +396,6 @@ pub fn router(daemon_version: &'static str, health: Health, slots: Slots) -> Rou
     if let Some(platform) = platform {
         app = app.merge(platform_router(platform));
     }
-    if let Some(catalog) = catalog {
-        app = app.merge(catalog_router(catalog));
-    }
     app
 }
 
@@ -420,73 +413,6 @@ fn purge_router(purger: PurgerSlot) -> Router {
     Router::new()
         .route(PURGE_PATH, post(purge))
         .with_state(purger)
-}
-
-/// The loopback Iceberg REST surface. The catch-all preserves the catalog
-/// request target after the private `/catalog` mount point.
-fn catalog_router(catalog: CatalogGateway) -> Router {
-    Router::new()
-        .route("/catalog/{*path}", axum::routing::any(catalog_request))
-        .with_state(catalog)
-}
-
-/// Serves or forwards one Iceberg REST request through the shared catalog
-/// gateway. Upstream transport failures map to 502; upstream HTTP statuses and
-/// bodies pass through unchanged.
-///
-/// COMMIT BARRIER SEAM (#286). This is where a table commit is forwarded to the
-/// catalog, and so where the write-back commit barrier belongs: before
-/// forwarding a mutating commit (the `POST .../tables/{table}` updateTable and
-/// the create/register mutations that publish metadata), await propagation of
-/// the write-back data files the commit references, so the catalog never points
-/// at files still buffered locally. The primitive is built and tested:
-/// `verglas_writeback::JournalBarrier` over the coordinator's shared journal
-/// (both the §6 EC-quorum and the #286 single-node backends record durability
-/// there), exposed as `verglas_writeback::CommitBarrier`. Wiring is a small
-/// follow-up: the write-back tier is built in the data-plane scope while this
-/// router is assembled in the admin scope, so the barrier reaches here through a
-/// deferred [`OnceLock`] slot (like [`PurgerSlot`] and the other engine-dependent
-/// routes). With the slot filled, a mutating catalog request calls
-/// `barrier.await_all_dirty(deadline)` (the conservative, exact-refs-not-parsed
-/// form) and returns a clear 5xx on [`verglas_writeback::BarrierError::Timeout`]
-/// so the commit fails and the table stays consistent. Left as a documented seam
-/// rather than wired now: threading the deferred slot across the two scopes plus
-/// its own real-catalog integration test is disproportionate to this PR, whose
-/// core is the fast-ack path and the barrier primitive.
-async fn catalog_request(
-    State(catalog): State<CatalogGateway>,
-    OriginalUri(uri): OriginalUri,
-    method: Method,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let Some(path_and_query) = uri.path_and_query().map(|value| value.as_str()) else {
-        return (StatusCode::BAD_REQUEST, "catalog request has no path").into_response();
-    };
-    let Some(upstream_path) = path_and_query.strip_prefix("/catalog") else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "catalog request is outside its mount",
-        )
-            .into_response();
-    };
-    match catalog.request(method, upstream_path, headers, body).await {
-        Ok(result) => {
-            let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            let mut response = Response::new(axum::body::Body::from(result.body));
-            *response.status_mut() = status;
-            *response.headers_mut() = result.headers;
-            response
-        }
-        Err(error) => {
-            eprintln!("verglasd catalog gateway request failed: {error}");
-            (
-                StatusCode::BAD_GATEWAY,
-                format!("catalog gateway error: {error}"),
-            )
-                .into_response()
-        }
-    }
 }
 
 /// The commit-body ceiling for the tables routes. Axum's default is 2 MiB — a
@@ -2589,7 +2515,6 @@ mod tests {
     use verglas_core::admin::PurgeReport;
     use verglas_core::config::{ByteSize, Cache as CacheConfig};
     use verglas_s3::PassthroughRead;
-    use verglas_tables::catalog::CatalogGateway;
 
     /// Builds a real cluster-of-one engine over an empty in-memory origin,
     /// erased to `Arc<dyn CachePurger>` — the same handle the daemon hands the
@@ -2631,45 +2556,6 @@ mod tests {
         .expect("router responds")
     }
 
-    /// The loopback catalog route forwards through the configured gateway and
-    /// is absent from config-less daemons.
-    #[tokio::test]
-    async fn catalog_gateway_route_is_present_only_when_configured() {
-        let upstream = Router::new().route(
-            "/iceberg/v1/config",
-            get(|| async { Json(json!({"defaults": {}, "overrides": {}})) }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind catalog fixture");
-        let addr = listener.local_addr().expect("fixture addr");
-        tokio::spawn(async move {
-            axum::serve(listener, upstream)
-                .await
-                .expect("fixture serves");
-        });
-        let catalog: verglas_core::config::Catalog = toml::de::from_str(&format!(
-            "uri = \"http://{addr}/iceberg\"\npoll_interval_secs = 30\n"
-        ))
-        .expect("catalog config");
-        let gateway = CatalogGateway::from_config(&catalog).expect("gateway");
-
-        let configured = router(
-            VERSION,
-            Health::ready(),
-            Slots {
-                catalog: Some(gateway),
-                ..Slots::default()
-            },
-        );
-        let response = call(configured, "GET", "/catalog/v1/config").await;
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let absent = router(VERSION, Health::ready(), Slots::default());
-        let response = call(absent, "GET", "/catalog/v1/config").await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
     /// `GET /admin/access` (issue #287) returns the local-access snapshot when
     /// one is configured, and the route is absent otherwise so an older/config-
     /// less daemon simply 404s (the CLI then falls back to flags/env). The served
@@ -2680,7 +2566,8 @@ mod tests {
     async fn access_route_serves_the_snapshot_without_the_secret() {
         let access = LocalAccess {
             s3_endpoint: "http://127.0.0.1:8333".to_owned(),
-            catalog_path: Some("/catalog".to_owned()),
+            catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
+            warehouse: Some("s3://warehouse/tenant".to_owned()),
             region: "us-east-1".to_owned(),
             bucket: Some("warehouse".to_owned()),
             access_key_id: Some("VGKEY".to_owned()),
@@ -2705,7 +2592,8 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("access json value");
         for key in [
             "s3_endpoint",
-            "catalog_path",
+            "catalog_uri",
+            "warehouse",
             "region",
             "bucket",
             "access_key_id",

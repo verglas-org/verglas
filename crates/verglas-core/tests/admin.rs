@@ -13,7 +13,8 @@ fn local_access_carries_the_discovery_fields_but_never_the_secret() {
     // unauthenticated and host-scoped (see the security fix).
     let access = LocalAccess {
         s3_endpoint: "http://127.0.0.1:8333".to_owned(),
-        catalog_path: Some("/catalog".to_owned()),
+        catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
+        warehouse: Some("s3://warehouse/tenant".to_owned()),
         region: "us-east-1".to_owned(),
         bucket: Some("warehouse".to_owned()),
         access_key_id: Some("VGKEY".to_owned()),
@@ -25,7 +26,8 @@ fn local_access_carries_the_discovery_fields_but_never_the_secret() {
     let value: serde_json::Value = serde_json::from_str(&encoded).expect("json");
     for key in [
         "s3_endpoint",
-        "catalog_path",
+        "catalog_uri",
+        "warehouse",
         "region",
         "bucket",
         "access_key_id",
@@ -46,9 +48,10 @@ fn local_access_carries_the_discovery_fields_but_never_the_secret() {
 fn local_access_without_a_catalog_or_keys_still_decodes() {
     // A daemon with no catalog and no auth keypair reports nulls; the CLI must
     // still decode the snapshot (and then fall back to flags/env).
-    let json = r#"{"s3_endpoint":"http://127.0.0.1:8333","catalog_path":null,"region":"us-east-1","bucket":null,"access_key_id":null}"#;
+    let json = r#"{"s3_endpoint":"http://127.0.0.1:8333","catalog_uri":null,"warehouse":null,"region":"us-east-1","bucket":null,"access_key_id":null}"#;
     let decoded: LocalAccess = serde_json::from_str(json).expect("decode");
-    assert!(decoded.catalog_path.is_none());
+    assert!(decoded.catalog_uri.is_none());
+    assert!(decoded.warehouse.is_none());
     assert!(decoded.access_key_id.is_none());
 }
 

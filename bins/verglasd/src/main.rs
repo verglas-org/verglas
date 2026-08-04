@@ -269,7 +269,6 @@ struct LifecycleHooks {
 fn spawn_lifecycle(
     config: &verglas_core::config::Config,
     engine: DaemonEngine,
-    catalog_gateway: Option<verglas_tables::catalog::CatalogGateway>,
 ) -> Result<LifecycleHooks, verglas_core::config::ConfigError> {
     let Some(catalog) = config.catalog.as_ref() else {
         return Ok(LifecycleHooks::default());
@@ -280,10 +279,7 @@ fn spawn_lifecycle(
     // One watcher, one byte budget shared by warming and prefetch. Resolving the
     // bearer token can fail (missing credentials file); config validation has
     // already caught that at load, so this only surfaces a late file change.
-    let source = match catalog_gateway {
-        Some(gateway) => gateway.source(),
-        None => RestCatalogSource::from_config(catalog)?,
-    };
+    let source = RestCatalogSource::from_config(catalog)?;
     let options = WatcherOptions::from_config(catalog);
     // Transport selection carries no config knob: attempt a websocket upgrade at
     // the catalog origin (the default when the upstream is the Verglas catalog
@@ -635,10 +631,9 @@ fn resolve_auth(config: &verglas_core::config::Config) -> Result<(String, String
 /// Builds the [`LocalAccess`](verglas_core::admin::LocalAccess) snapshot the
 /// `/admin/access` probe returns (issue #287) from the daemon's resolved config
 /// and the endpoint access key id. The S3 endpoint is the loopback data port
-/// (with the `https` scheme when the endpoint terminates TLS); the catalog mount
-/// is present only when a catalog is watched (the loopback gateway route exists
-/// only then); the region falls back to `us-east-1` when the backend leaves it
-/// unset, matching what a dev endpoint accepts.
+/// (with the `https` scheme when the endpoint terminates TLS); the upstream
+/// catalog URI and warehouse are advertised as non-secret coordinates. Region
+/// falls back to `us-east-1` when the backend leaves it unset.
 ///
 /// Takes only the access key id, never the secret: the admin surface is
 /// unauthenticated and host-scoped, so the paired secret must never travel over
@@ -655,7 +650,11 @@ fn build_local_access(
     };
     verglas_core::admin::LocalAccess {
         s3_endpoint: format!("{scheme}://127.0.0.1:{s3_port}"),
-        catalog_path: config.catalog.as_ref().map(|_| "/catalog".to_owned()),
+        catalog_uri: config.catalog.as_ref().map(|catalog| catalog.uri.clone()),
+        warehouse: config
+            .catalog
+            .as_ref()
+            .and_then(|catalog| catalog.warehouse.clone()),
         region: config
             .backend
             .region
@@ -666,27 +665,29 @@ fn build_local_access(
     }
 }
 
-/// Builds the connection the daemon uses to reach its own tables in-process: its
-/// loopback catalog gateway on the admin port and its S3 endpoint on the data
-/// port, signed with the endpoint credentials. The loopback catalog is always
-/// plain HTTP (the admin surface never terminates TLS); the S3 scheme follows the
-/// data-plane's TLS setting. Shared by the SDK table
-/// routes.
-fn loopback_connection(
+/// Builds the private connection used for internal table-aware work: the real
+/// upstream catalog plus the daemon's loopback S3 cache endpoint.
+fn internal_connection(
     config: &verglas_core::config::Config,
     credentials: &(String, String),
-    admin_port: u16,
     s3_port: u16,
-) -> verglas_iceberg::Connection {
+) -> Result<verglas_iceberg::Connection, Box<dyn std::error::Error>> {
+    let catalog = config
+        .catalog
+        .as_ref()
+        .ok_or("internal catalog connection requested without [catalog]")?;
+    if catalog.sigv4_enabled() {
+        return Err("private table/query operations do not yet support SigV4 catalogs".into());
+    }
     let scheme = if config.listen.tls.is_some() {
         "https"
     } else {
         "http"
     };
-    verglas_iceberg::Connection {
-        catalog_uri: format!("http://127.0.0.1:{admin_port}/catalog"),
-        token: None,
-        warehouse: config.catalog.as_ref().and_then(|c| c.warehouse.clone()),
+    Ok(verglas_iceberg::Connection {
+        catalog_uri: catalog.uri.clone(),
+        token: catalog.resolve_bearer_token()?,
+        warehouse: catalog.warehouse.clone(),
         s3_endpoint: Some(format!("{scheme}://127.0.0.1:{s3_port}")),
         region: config
             .backend
@@ -695,12 +696,12 @@ fn loopback_connection(
             .unwrap_or_else(|| "us-east-1".to_owned()),
         access_key_id: Some(credentials.0.clone()),
         secret_access_key: Some(credentials.1.clone()),
-    }
+    })
 }
 
 /// Renders a `verglas-query` config (plus a credentials file carrying the same
-/// endpoint keypair) pointing the worker at this daemon's own loopback
-/// cache/catalog surface, and returns the dispatcher that spawns it on
+/// endpoint keypair) pointing the worker at the daemon's S3 cache endpoint and
+/// the configured upstream catalog, and returns the dispatcher that spawns it on
 /// demand — or `None` when `[query_worker]` is unset or the files could not
 /// be rendered. When this returns `Some`, `/v1/query` uses the worker only
 /// (dispatch failure is a hard error). When `None`, `/v1/query` uses the
@@ -708,7 +709,6 @@ fn loopback_connection(
 fn build_query_worker_dispatcher(
     config: &verglas_core::config::Config,
     credentials: &(String, String),
-    resolved_admin_port: u16,
     resolved_s3_port: u16,
 ) -> Option<Arc<verglasd::query_worker::QueryWorkerDispatcher>> {
     let query_worker = config.query_worker.as_ref()?;
@@ -757,16 +757,20 @@ fn build_query_worker_dispatcher(
         .region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_owned());
-    let warehouse_line = config
-        .catalog
-        .as_ref()
-        .and_then(|c| c.warehouse.clone())
-        .map(|w| format!("warehouse = \"{w}\"\n"))
-        .unwrap_or_default();
+    let catalog = config.catalog.as_ref()?;
+    let catalog_toml = match toml::to_string(catalog) {
+        Ok(value) => value,
+        Err(e) => {
+            eprintln!(
+                "verglasd {VERSION} could not render private query worker catalog config: {e} — /v1/query stays embedded"
+            );
+            return None;
+        }
+    };
     let rendered = format!(
         "[listen]\nadmin_port = 0\n\n\
          [cache]\ns3_endpoint = \"{scheme}://127.0.0.1:{resolved_s3_port}\"\nregion = \"{region}\"\ncredentials_file = \"{credentials}\"\n\n\
-         [catalog]\nuri = \"http://127.0.0.1:{resolved_admin_port}/catalog\"\n{warehouse_line}",
+         [catalog]\n{catalog_toml}",
         credentials = credentials_path.display(),
     );
     let config_path = dir.join("config.toml");
@@ -792,10 +796,9 @@ fn build_query_worker_dispatcher(
 async fn build_tables_catalog(
     config: &verglas_core::config::Config,
     credentials: &(String, String),
-    admin_port: u16,
     s3_port: u16,
 ) -> Result<Arc<dyn iceberg::Catalog>, Box<dyn std::error::Error>> {
-    let connection = loopback_connection(config, credentials, admin_port, s3_port);
+    let connection = internal_connection(config, credentials, s3_port)?;
     Ok(verglas_iceberg::catalog::open_catalog(&connection).await?)
 }
 
@@ -1309,11 +1312,6 @@ async fn serve(
         config.cluster.is_some().then(|| Arc::new(OnceLock::new()));
     let drain_slot: Option<admin::DrainSlot> =
         config.cluster.is_some().then(|| Arc::new(OnceLock::new()));
-    let catalog_gateway = config
-        .catalog
-        .as_ref()
-        .map(verglas_tables::catalog::CatalogGateway::from_config)
-        .transpose()?;
     // The SDK table routes (`/v1/tables/...`) and `/v1/query` commit and read
     // through the same loopback catalog, so they exist only when a catalog is
     // configured. Filled after recovery, answering 503 until then.
@@ -1393,7 +1391,7 @@ async fn serve(
     // `/v1/query` stays embedded. A rendering failure here is logged, not
     // fatal.
     let query_worker_dispatcher =
-        build_query_worker_dispatcher(config, &credentials, resolved_admin_port, resolved_s3_port);
+        build_query_worker_dispatcher(config, &credentials, resolved_s3_port);
 
     let admin_fut = serve_admin(
         admin_listener,
@@ -1405,7 +1403,6 @@ async fn serve(
             table_metrics: Some(table_metrics_slot.clone()),
             members: members_slot.clone(),
             drain: drain_slot.clone(),
-            catalog: catalog_gateway.clone(),
             access,
             tables: tables_slot.clone(),
             graphs: graphs_slot.clone(),
@@ -1539,7 +1536,7 @@ async fn serve(
         // cache after each compaction commit. Returns the warming progress for
         // /admin/stats and the serving-path heat/yield hooks (all None when no
         // catalog is configured or the features are off).
-        let hooks = spawn_lifecycle(config, reader.clone(), catalog_gateway)?;
+        let hooks = spawn_lifecycle(config, reader.clone())?;
         let warming = hooks.warming;
 
         // Start accepting loopback S3 requests before opening any Iceberg
@@ -1642,9 +1639,7 @@ async fn serve(
         // Opening it can fail; that leaves
         // the routes at 503 rather than failing the daemon.
         if let Some(slot) = &tables_slot {
-            match build_tables_catalog(config, &credentials, resolved_admin_port, resolved_s3_port)
-                .await
-            {
+            match build_tables_catalog(config, &credentials, resolved_s3_port).await {
                 Ok(catalog) => {
                     // The registry/watermark routes (#322) share the handle:
                     // one loopback catalog, one write authority.
@@ -2330,11 +2325,12 @@ mod tests {
 [listen]\ns3_port = 9333\nadmin_port = 9334\n\
 [cache]\ndir = \"/tmp/vg\"\ncapacity_bytes = \"64MB\"\n\
 [backend]\nbucket = \"warehouse\"\nregion = \"eu-west-2\"\n\
-[catalog]\nuri = \"http://127.0.0.1:8181\"\n";
+[catalog]\nuri = \"http://127.0.0.1:8181\"\nwarehouse = \"s3://warehouse/tenant\"\n";
         let config = verglas_core::config::Config::from_toml_str(toml).expect("valid config");
         let access = build_local_access(&config, "VGKEY", config.listen.s3_port);
         assert_eq!(access.s3_endpoint, "http://127.0.0.1:9333");
-        assert_eq!(access.catalog_path.as_deref(), Some("/catalog"));
+        assert_eq!(access.catalog_uri.as_deref(), Some("http://127.0.0.1:8181"));
+        assert_eq!(access.warehouse.as_deref(), Some("s3://warehouse/tenant"));
         assert_eq!(access.region, "eu-west-2");
         assert_eq!(access.bucket.as_deref(), Some("warehouse"));
         assert_eq!(access.access_key_id.as_deref(), Some("VGKEY"));
@@ -2352,7 +2348,8 @@ mod tests {
 [backend]\nbucket = \"b\"\n";
         let config = verglas_core::config::Config::from_toml_str(toml_no_catalog).expect("valid");
         let access = build_local_access(&config, "a", config.listen.s3_port);
-        assert!(access.catalog_path.is_none());
+        assert!(access.catalog_uri.is_none());
+        assert!(access.warehouse.is_none());
         // Region falls back to us-east-1 when the backend leaves it unset.
         assert_eq!(access.region, "us-east-1");
     }

@@ -69,10 +69,9 @@ pub const DRAIN_PATH: &str = "/admin/drain";
 pub const LOG_PATH: &str = "/admin/log";
 
 /// Path for the local-access probe (`GET`, issue #287). Returns the non-secret
-/// connection details the agent-facing CLI verbs (`verglas table`, `verglas
-/// query`) need to reach this daemon with zero configuration: the S3 data
-/// endpoint URL, the loopback Iceberg REST catalog mount, the signing region and
-/// served bucket, and the endpoint access key id. The paired secret access key
+/// connection details SDK clients need with zero configuration: the daemon's S3
+/// cache endpoint and the real upstream Iceberg REST catalog coordinates. The
+/// daemon advertises that catalog but never re-hosts it. The paired secret access key
 /// is deliberately NOT served here: the admin listener is unauthenticated and
 /// binds loopback, which is host-scoped, so any local process could otherwise
 /// read a lakehouse read/write key without opening the daemon's 0600 credentials
@@ -185,11 +184,8 @@ impl HealthzInfo {
 ///
 /// Everything here is resolved from the daemon's own config and is safe to hand
 /// out over the unauthenticated, host-scoped loopback admin socket: the S3
-/// endpoint the verbs write data files and run queries through (so warm reads
-/// stay local), the loopback Iceberg REST catalog mount, the signing region and
-/// served bucket, and the endpoint access key id. `catalog_path` is present only
-/// when the daemon watches a catalog (the loopback gateway route exists only
-/// then); `access_key_id` only when the daemon has an endpoint auth keypair.
+/// cache endpoint, the upstream Iceberg REST catalog URI and warehouse, the
+/// signing region and served bucket, and the endpoint access key id.
 ///
 /// The paired **secret access key is intentionally absent**. Serving it here
 /// would leak a lakehouse read/write credential to any local process that can
@@ -201,10 +197,11 @@ pub struct LocalAccess {
     /// Data files are written and queries are read through it so a daemon in the
     /// path gives cache residency and write-back.
     pub s3_endpoint: String,
-    /// Admin-relative mount of the loopback Iceberg REST catalog (`/catalog`),
-    /// or `None` when the daemon watches no catalog. The CLI joins it onto the
-    /// admin base URL to reach the signed catalog gateway.
-    pub catalog_path: Option<String>,
+    /// Upstream Iceberg REST catalog URI, or `None` when no catalog is configured.
+    /// This is a non-secret coordinate; authentication remains caller supplied.
+    pub catalog_uri: Option<String>,
+    /// Optional warehouse identifier supplied to the Iceberg REST catalog.
+    pub warehouse: Option<String>,
     /// SigV4 signing region the endpoint expects (e.g. `us-east-1`).
     pub region: String,
     /// The one bucket the daemon serves, when configured.

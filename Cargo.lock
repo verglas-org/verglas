@@ -7396,6 +7396,7 @@ dependencies = [
  "axum",
  "bytes",
  "futures",
+ "iceberg",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -7403,6 +7404,8 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "verglas-api",
+ "verglas-core",
+ "verglas-iceberg",
 ]
 
 [[package]]
