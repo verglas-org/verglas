@@ -127,7 +127,7 @@ impl DaemonClient {
         })?;
         let mut url = format!(
             "{}?mode={mode}&format={format}",
-            self.url(&format!("/v1/tables/{table}/ingest"))
+            self.url(&format!("/v1/ingest/{table}"))
         );
         if let Some(column) = partition_by {
             url.push_str(&format!("&partition_by={column}"));

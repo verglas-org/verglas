@@ -10,7 +10,7 @@
 //!
 //! This module owns only byte splitting and reassembly. Placement, journals,
 //! peer transport, quorum, and origin propagation live above it in
-//! `verglas-writeback`.
+//! `verglas-write`.
 //!
 //! Backend: `reed-solomon-simd` (Leopard, O(n log n), SIMD on x86-64 and
 //! AArch64). The comparison against `reed-solomon-erasure` that justifies the

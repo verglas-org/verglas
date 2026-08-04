@@ -308,10 +308,9 @@ impl WorkerSupervisor {
             endpoint: &self.endpoint,
             token: "",
         };
-        let guarded = verglas_harness::run_guarded(&self.guard_dir, name, || {
-            run_worker(&run, &exec, &event)
-        })
-        .await;
+        let guarded =
+            verglas_harness::run_guarded(&self.guard_dir, name, || run_worker(&run, &exec, &event))
+                .await;
         match guarded {
             verglas_harness::Guarded::Ran(result) => result.map(|outcome| outcome.rows_produced),
             verglas_harness::Guarded::Skipped(reason) => Err(HarnessError::Job(format!(

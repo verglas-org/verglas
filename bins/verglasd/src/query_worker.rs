@@ -94,7 +94,12 @@ impl QueryWorkerDispatcher {
     /// caller when this dispatcher is configured. Anything the worker itself
     /// answered (success or error) comes back as `Ok` and is relayed
     /// verbatim.
-    pub async fn dispatch(&self, sql: &str, at: Option<TimeTravel>) -> Result<Response, String> {
+    pub async fn dispatch(
+        &self,
+        sql: &str,
+        at: Option<TimeTravel>,
+        accept_arrow: bool,
+    ) -> Result<Response, String> {
         // Owned (not borrowed from `self`), so it can move into the streamed
         // response body below and outlive this call.
         let guard = self.lock.clone().lock_owned().await;
@@ -128,7 +133,7 @@ impl QueryWorkerDispatcher {
             }
         };
 
-        let response = post_query_streaming(port, sql, at).await;
+        let response = post_query_streaming(port, sql, at, accept_arrow).await;
         let response = match response {
             Ok(response) => response,
             Err(e) => {
@@ -191,7 +196,7 @@ pub(crate) fn relay_response(
 /// Polls `ports_file` for the `admin <ip:port>` line `verglas-query` appends
 /// once it binds (the same convention `verglasd --ports-file` writes), or
 /// bails early if the child exits first.
-async fn wait_for_port(
+pub(crate) async fn wait_for_port(
     child: &mut tokio::process::Child,
     ports_file: &std::path::Path,
 ) -> Result<u16, String> {
@@ -242,6 +247,7 @@ async fn post_query_streaming(
     port: u16,
     sql: &str,
     at: Option<TimeTravel>,
+    accept_arrow: bool,
 ) -> Result<reqwest::Response, String> {
     let body = QueryRequest {
         sql: sql.to_owned(),
@@ -250,9 +256,14 @@ async fn post_query_streaming(
             table: t.table,
         }),
     };
-    let client = reqwest::Client::new();
-    client
-        .post(format!("http://127.0.0.1:{port}/v1/query"))
+    let mut request = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/query"));
+    if accept_arrow {
+        request = request.header(
+            reqwest::header::ACCEPT,
+            verglas_sdk::ARROW_STREAM_CONTENT_TYPE,
+        );
+    }
+    request
         .json(&body)
         .send()
         .await

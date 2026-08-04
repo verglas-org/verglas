@@ -68,7 +68,7 @@ impl FragmentTransport for MemoryTransport {
         &self,
         _node: &NodeId,
         _key: FragmentKey,
-        _shards: verglas_writeback::transport::ShardStream,
+        _shards: verglas_write::transport::ShardStream,
     ) -> Result<(), TransportError> {
         Err(TransportError::Local(FragmentIoError::Io(
             "unused".to_owned(),

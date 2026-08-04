@@ -402,3 +402,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #379: Make the validated daemon configuration cloneable so the S3 serving task can own an immutable startup snapshot. This lets loopback S3 begin serving before catalog-backed bootstrap without adding shared mutable configuration.
 - chore: Remove docs/ cross-references after deleting the docs directory. Crate module docs are the reference now.
 - chore: Remove the unused DashboardInfo / DASHBOARD_PATH admin surface after the daemon probe was deleted.
+- #3: Added explicit query/write role configuration and validation; neither role has an embedded daemon fallback.

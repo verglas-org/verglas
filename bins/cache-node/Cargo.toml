@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 # The cache serving path, and nothing off it. No verglas-cluster (single-node
-# rendezvous ring of one owns every key), no verglas-writeback (the fleet cache
+# rendezvous ring of one owns every key), no verglas-write (the fleet cache
 # image never enables it), no verglas-tables/platform/memory/iceberg (no catalog,
 # no jobs, no query engine).
 verglas-core.workspace = true

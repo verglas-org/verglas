@@ -249,3 +249,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   before the handler runs. Added `tests/serving_route.rs` (unsigned → 403, and
   SigV4-signed `/v1/query` and `/v1/tables/{t}/commit` reaching a stub and
   round-tripping) plus unit tests for path matching and the name validation.
+- #3: Restricted the SigV4 serving extension to query, write, and ingest execution routes; catalog metadata paths are no longer proxied.

@@ -83,6 +83,16 @@ pub struct CreateTableResponse {
     pub columns: Vec<String>,
 }
 
+/// Result of idempotently ensuring an exact table contract.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EnsureTableResponse {
+    /// Whether this request created the table.
+    pub created: bool,
+    /// Exact contract now stored in the catalog.
+    pub definition: TableDefinition,
+}
+
 /// JSON-row commit request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

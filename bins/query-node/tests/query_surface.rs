@@ -156,6 +156,36 @@ async fn query_runs_sql_over_http() {
     assert_eq!(report.rows[0].get("n").and_then(|v| v.as_i64()), Some(25));
 }
 
+/// Arrow clients receive a bounded IPC stream directly from the query role.
+#[tokio::test]
+async fn query_streams_arrow_ipc_when_requested() {
+    let ident = parse_table_ident("sales.orders").expect("ident");
+    let catalog = catalog_with_table(&ident, 25).await;
+    let (base, _state) = serve(catalog, 64 * 1024 * 1024).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/query"))
+        .header("accept", "application/vnd.apache.arrow.stream")
+        .json(&serde_json::json!({"sql": "SELECT * FROM sales.orders"}))
+        .send()
+        .await
+        .expect("request");
+    assert!(response.status().is_success());
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/vnd.apache.arrow.stream")
+    );
+    let bytes = response.bytes().await.expect("Arrow body");
+    let rows = arrow_ipc::reader::StreamReader::try_new(bytes.as_ref(), None)
+        .expect("Arrow stream")
+        .map(|batch| batch.expect("batch").num_rows())
+        .sum::<usize>();
+    assert_eq!(rows, 25);
+}
+
 /// A statement the engine cannot plan is a 400 — the caller's bad input, not a
 /// server error — matching the embedded daemon path's behavior.
 #[tokio::test]

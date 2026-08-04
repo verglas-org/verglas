@@ -51,8 +51,14 @@ async fn follow_reconnects_and_resumes_exactly_once() {
         .await;
     });
 
-    let client =
-        Client::connect(ConnectOptions::new(endpoint).with_token("feed-token")).expect("client");
+    let client = Client::connect(
+        ConnectOptions::new("http://127.0.0.1:1")
+            .with_catalog_uri(&endpoint)
+            .with_s3_endpoint("http://127.0.0.1:8333")
+            .with_token("feed-token"),
+    )
+    .await
+    .expect("client");
     let mut changes = client
         .follow(["sdk.events"], Some(5))
         .expect("follow stream");
@@ -77,7 +83,13 @@ async fn follow_reports_cursor_expiry_distinctly() {
         )
         .await;
     });
-    let client = Client::connect(ConnectOptions::new(endpoint)).expect("client");
+    let client = Client::connect(
+        ConnectOptions::new("http://127.0.0.1:1")
+            .with_catalog_uri(&endpoint)
+            .with_s3_endpoint("http://127.0.0.1:8333"),
+    )
+    .await
+    .expect("client");
     let mut changes = client.follow(["sdk.events"], Some(1)).expect("follow");
     let error = changes
         .next()

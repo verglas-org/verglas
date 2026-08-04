@@ -39,3 +39,4 @@
   peerless cluster-of-one; only the block tier reaches verglas-cluster's fragment
   store and peer RPC. `DeviceRegistry` gained an optional ring plane it attaches
   once at startup; ensure/get route flushes through it when present.
+- #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.

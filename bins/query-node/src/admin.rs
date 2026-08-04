@@ -23,13 +23,14 @@
 //! daemon's own dispatcher, streaming this response straight through to its
 //! own caller) does not need to know which of the two is answering.
 
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -133,7 +134,11 @@ impl QueryRequest {
 /// error, not a planning error) cannot change an already-sent 200; it
 /// truncates the body and is logged server-side instead — an unavoidable
 /// property of not buffering the whole result first, not a bug.
-async fn query_sql(State(state): State<AppState>, Json(request): Json<QueryRequest>) -> Response {
+async fn query_sql(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<QueryRequest>,
+) -> Response {
     state.touch();
     let at = request.time_travel();
 
@@ -149,13 +154,19 @@ async fn query_sql(State(state): State<AppState>, Json(request): Json<QueryReque
         .await;
     }
 
+    let execution =
+        match verglas_iceberg::query_stream(state.catalog.clone(), &request.sql, at).await {
+            Ok(v) => v,
+            Err(error) => return query_error(error),
+        };
+
+    if accepts_arrow(&headers) {
+        return arrow_query_response(execution);
+    }
     let verglas_iceberg::QueryExecution {
         columns,
         mut batches,
-    } = match verglas_iceberg::query_stream(state.catalog.clone(), &request.sql, at).await {
-        Ok(v) => v,
-        Err(error) => return query_error(error),
-    };
+    } = execution;
 
     let columns_json = serde_json::to_string(&columns).unwrap_or_else(|_| "[]".to_owned());
     let body = async_stream::stream! {
@@ -198,6 +209,96 @@ async fn query_sql(State(state): State<AppState>, Json(request): Json<QueryReque
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from_stream(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// True when the caller requests Arrow IPC rather than JSON rows.
+fn accepts_arrow(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.contains("application/vnd.apache.arrow.stream"))
+}
+
+/// Streams the query batches as one Arrow IPC stream without collecting them.
+fn arrow_query_response(execution: verglas_iceberg::QueryExecution) -> Response {
+    let (sender, receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let output = ChannelWriter(buffer.clone());
+        let schema = execution.batches.schema();
+        let mut batches = execution.batches;
+        let mut writer = match arrow_ipc::writer::StreamWriter::try_new(output, &schema) {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = sender.send(Err(io::Error::other(error.to_string()))).await;
+                return;
+            }
+        };
+        if !send_arrow_fragment(&sender, &buffer).await {
+            return;
+        }
+        while let Some(batch) = batches.next().await {
+            match batch {
+                Ok(batch) => {
+                    if let Err(error) = writer.write(&batch) {
+                        let _ = sender.send(Err(io::Error::other(error.to_string()))).await;
+                        return;
+                    }
+                    if !send_arrow_fragment(&sender, &buffer).await {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(io::Error::other(error.to_string()))).await;
+                    return;
+                }
+            }
+        }
+        if let Err(error) = writer.finish() {
+            let _ = sender.send(Err(io::Error::other(error.to_string()))).await;
+            return;
+        }
+        let _ = send_arrow_fragment(&sender, &buffer).await;
+    });
+    let stream = futures::stream::unfold(receiver, |mut receiver| async move {
+        receiver.recv().await.map(|item| (item, receiver))
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.apache.arrow.stream")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+/// Sends bytes produced since the previous batch through the bounded channel.
+async fn send_arrow_fragment(
+    sender: &tokio::sync::mpsc::Sender<Result<Bytes, io::Error>>,
+    buffer: &std::sync::Mutex<Vec<u8>>,
+) -> bool {
+    let bytes = match buffer.lock() {
+        Ok(mut buffer) => std::mem::take(&mut *buffer),
+        Err(_) => return false,
+    };
+    bytes.is_empty() || sender.send(Ok(Bytes::from(bytes))).await.is_ok()
+}
+
+/// Blocking writer used only by Arrow's synchronous stream encoder.
+struct ChannelWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for ChannelWriter {
+    /// Appends encoded bytes to the current response fragment.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("Arrow response buffer poisoned"))?
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    /// The async sender controls response flushing.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// `POST /v1/query/estimate`: answers the plan-based memory estimate for

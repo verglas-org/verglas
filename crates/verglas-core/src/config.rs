@@ -69,6 +69,8 @@ pub struct Config {
     /// loopback surface and its own resolved auth — the same values the
     /// embedded path already uses.
     pub query_worker: Option<QueryWorker>,
+    /// Isolated logical table writer launched by the daemon for Arrow commits.
+    pub write_worker: Option<WriteWorker>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
     /// Agent-side identity and local state (#295): the settings the memory and
@@ -1156,6 +1158,27 @@ pub struct QueryWorker {
     pub binary: String,
 }
 
+/// The standalone logical write worker a daemon dispatches Arrow commits to.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct WriteWorker {
+    /// Path to the `verglas-write` binary spawned on demand.
+    pub binary: String,
+}
+
+impl WriteWorker {
+    /// Validates the configured role binary before the first write request.
+    fn validate(&self) -> Result<(), ConfigError> {
+        if !Path::new(&self.binary).is_file() {
+            return Err(ConfigError::Invalid(
+                "write_worker.binary",
+                format!("{} does not exist or is not a readable file", self.binary),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl QueryWorker {
     /// The binary exists as a readable file. Failing here first turns a
     /// typo'd path into an actionable startup error instead of a dispatch
@@ -1534,6 +1557,9 @@ impl Config {
         if let Some(query_worker) = &self.query_worker {
             query_worker.validate()?;
         }
+        if let Some(write_worker) = &self.write_worker {
+            write_worker.validate()?;
+        }
         if let Some(cluster) = &self.cluster {
             cluster.validate()?;
         }
@@ -1568,7 +1594,7 @@ impl Config {
     /// One-line startup summary so operators can eyeball what loaded.
     pub fn summary(&self) -> String {
         format!(
-            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} cluster={} query_worker={}",
+            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} cluster={} query_worker={} write_worker={}",
             self.listen.s3_port,
             self.listen.admin_port,
             if self.listen.tls.is_some() {
@@ -1596,6 +1622,9 @@ impl Config {
             self.query_worker
                 .as_ref()
                 .map_or("off", |q| q.binary.as_str()),
+            self.write_worker
+                .as_ref()
+                .map_or("off", |w| w.binary.as_str()),
         )
     }
 }

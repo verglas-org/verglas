@@ -147,5 +147,5 @@ pub use log::EcAppendLog;
 // object write-back tier (#180/#286) is built on — this crate adds the ordered,
 // LSN-addressed append log over them, it does not re-implement any codec, store,
 // or transport.
-pub use verglas_writeback::membership::{AgentMembership, LiveMembership, SingleNodeMembership};
-pub use verglas_writeback::transport::{FragmentTransport, PeerFragmentTransport, TransportError};
+pub use verglas_write::membership::{AgentMembership, LiveMembership, SingleNodeMembership};
+pub use verglas_write::transport::{FragmentTransport, PeerFragmentTransport, TransportError};

@@ -29,12 +29,12 @@ use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
-use verglas_writeback::coordinator::WriteCoordinator;
-use verglas_writeback::journal::JournalStore;
-use verglas_writeback::membership::LiveMembership;
-use verglas_writeback::metrics::WritebackMetrics;
-use verglas_writeback::reader::WritebackReader;
-use verglas_writeback::transport::{FragmentTransport, TransportError};
+use verglas_write::coordinator::WriteCoordinator;
+use verglas_write::journal::JournalStore;
+use verglas_write::membership::LiveMembership;
+use verglas_write::metrics::WritebackMetrics;
+use verglas_write::reader::WritebackReader;
+use verglas_write::transport::{FragmentTransport, TransportError};
 
 // ---- in-memory fragment transport ----------------------------------------
 
@@ -141,7 +141,7 @@ impl FragmentTransport for MemoryTransport {
         &self,
         node: &NodeId,
         key: verglas_cluster::fragments::FragmentKey,
-        mut shards: verglas_writeback::transport::ShardStream,
+        mut shards: verglas_write::transport::ShardStream,
     ) -> Result<(), TransportError> {
         use futures::StreamExt;
         // Accumulate the streamed shards into the whole fragment, mirroring what

@@ -1,12 +1,12 @@
 //! The `/v1` serving surface on the SigV4-gated S3 port.
 //!
-//! `POST /v1/query` and the `/v1/tables/...` group are served on the same s3s
+//! Query and logical-write execution are served on the same s3s
 //! surface engines point at, gated by the existing SigV4 auth path. These tests
 //! prove the two halves of that contract with a stub serving API:
 //!
 //! - an unsigned `/v1` request is rejected with `AccessDenied` before the stub
 //!   ever runs (the s3s route's default access check is the gate), and
-//! - a SigV4-signed `/v1/query` and `/v1/tables/{t}/commit` reach the stub and
+//! - a SigV4-signed `/v1/query` and `/v1/write/{t}` reach the stub and
 //!   round-trip its response verbatim.
 
 mod support;
@@ -150,9 +150,9 @@ async fn signed_v1_query_reaches_the_stub() {
 }
 
 #[tokio::test]
-async fn signed_v1_tables_commit_reaches_the_stub() {
+async fn signed_v1_write_reaches_the_stub() {
     let (base, seen) = serve_with_stub().await;
-    let path = "/v1/tables/analytics.events/commit";
+    let path = "/v1/write/analytics.events";
     let url = format!("{base}{path}");
     let body = r#"{"rows":[{"a":1}]}"#;
     let headers = sign_headers(

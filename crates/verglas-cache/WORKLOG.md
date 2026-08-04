@@ -476,3 +476,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   handle, so no path can reach a customer table or bucket. TDD: tests/shadow.rs
   written first (put/get/list/latest round-trip, budget ceiling evict+refuse,
   durability across reopen, the never-writes-outside-its-root property).
+- #3: Kept erasure coding as an internal write mode while the owning package became `verglas-write`.
