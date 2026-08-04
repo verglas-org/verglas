@@ -539,7 +539,7 @@ impl RingWriteback {
 
     /// One takeover pass over the descriptors this node holds: for every one past
     /// its drain lease, reconstruct the flush and complete the drain the presumed
-    /// -dead originator did not. Wired to a background interval by the daemon (the
+    /// -dead originator did not. Wired to a background interval by the server (the
     /// same shape as the object tier's repair/scrub loops). Duplicate takeovers
     /// across holders are harmless — the drain is idempotent.
     ///

@@ -2,7 +2,7 @@
 //!
 //! Before this fix, a failed typed-client build silently fell back to an
 //! `object_store::memory::InMemory`, so every read answered `NotFound`
-//! (NoSuchKey) while the daemon looked healthy — every read was wrong. This test
+//! (NoSuchKey) while the server looked healthy — every read was wrong. This test
 //! pins the invariant: a build failure surfaces as an error, it is never hidden
 //! behind an empty store.
 
@@ -12,7 +12,7 @@ use verglas_core::config::{Backend, BackendProvider};
 /// A build failure for the configured bucket must surface from `store_for`
 /// rather than resolving to an empty in-memory store. An `http://` endpoint
 /// without `allow_http` forces the S3 client build to fail deterministically;
-/// the daemon must see that failure, not a store that answers NoSuchKey for
+/// the server must see that failure, not a store that answers NoSuchKey for
 /// every GET.
 #[test]
 fn build_failure_does_not_fall_back_to_an_empty_in_memory_store() {

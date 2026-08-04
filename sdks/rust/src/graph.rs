@@ -1,12 +1,12 @@
 //! The `graph` verb-family wire types: the request bodies and result reports the
-//! daemon's `/v1/graphs/...` routes serve and the CLI and TypeScript SDK speak.
+//! server's `/v1/graphs/...` routes serve and the CLI and TypeScript SDK speak.
 //!
 //! A graph is a namespace holding two plain Iceberg tables (`<ns>.nodes` and
 //! `<ns>.edges`) plus a snapshot-bound Puffin adjacency index. These types are
 //! the transport contract only — they mirror the `verglas-graph` engine's model
 //! (`Node`, `Edge`, `Neighbor`, `Reached`, `Path`, `Subgraph`) but stay
 //! independent of it so the CLI (which never opens a catalog) and external
-//! callers depend on the SDK, not the engine. The daemon owns the conversion
+//! callers depend on the SDK, not the engine. The server owns the conversion
 //! between these shapes and the engine types.
 //!
 //! Every field is camelCase on the wire, matching the `tables_api` SDK shapes,

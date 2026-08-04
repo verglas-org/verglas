@@ -1,6 +1,6 @@
 //! `verglas table` — create, append, list, show, and history (issue #287).
 //!
-//! File writes are dispatched to the isolated write role through the daemon;
+//! File writes are dispatched to the isolated write role through the server;
 //! list/show/history/delete speak Iceberg REST directly. The CLI embeds no
 //! query or write engine. Results render as
 //! `--output json` (the stable shape the skill parses) or a human summary.
@@ -12,8 +12,7 @@ use verglas_sdk::report::{
     AppendReport, CreateReport, FieldInfo, HistoryReport, ListReport, ShowReport,
 };
 use verglas_sdk::vector::{
-    DeclareIndexRequest, IndexListResponse, IndexParams, IndexReport, RegistryIndexListResponse,
-    SearchRequest, SearchResponse,
+    DeclareIndexRequest, IndexListResponse, IndexParams, IndexReport, SearchRequest, SearchResponse,
 };
 
 use crate::cli::{IndexCommand, TableCommand, TableDeleteArgs};
@@ -21,10 +20,10 @@ use crate::cli::{IndexCommand, TableCommand, TableDeleteArgs};
 /// Dispatches a `verglas table` subcommand.
 pub async fn run(
     command: TableCommand,
-    daemon_endpoint: &str,
+    server_endpoint: &str,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    // Catalog metadata verbs bypass the daemon; execution and operational verbs
+    // Catalog metadata verbs bypass the server; execution and operational verbs
     // use its thin transport.
     match command {
         TableCommand::Delete(args) => return run_delete(args, json).await,
@@ -47,11 +46,11 @@ pub async fn run(
             return emit(&report, json, render_history);
         }
         TableCommand::Metrics => {
-            return crate::commands::table_metrics::run(daemon_endpoint, json).await;
+            return crate::commands::table_metrics::run(server_endpoint, json).await;
         }
         _ => {}
     }
-    let client = crate::backend::daemon(daemon_endpoint)?;
+    let client = crate::backend::server(server_endpoint)?;
     match command {
         TableCommand::Create(args) => {
             let report: CreateReport = client
@@ -82,13 +81,13 @@ pub async fn run(
         | TableCommand::Show(_)
         | TableCommand::History(_)
         | TableCommand::Metrics => {
-            unreachable!("delete and metrics are dispatched before the daemon client")
+            unreachable!("catalog metadata and metrics are dispatched before the server client")
         }
     }
 }
 
 /// Drops a table via the tenant's Iceberg REST catalog. This is the one table
-/// verb that does not go through the daemon: dropping a table is a catalog
+/// verb that does not go through the server: dropping a table is a catalog
 /// control-plane operation, so it reads the `[catalog]` uri and bearer from
 /// `~/.verglas/config.toml` and issues the REST drop-table call. Requires
 /// `--yes` or an interactive `y` confirmation; prints exactly what will be
@@ -130,29 +129,21 @@ async fn run_delete(args: TableDeleteArgs, json: bool) -> Result<(), Box<dyn Err
 }
 
 /// Dispatches a `verglas index` subcommand: the one command group for vector
-/// indexes. `list` reads the durable registry (or one table's indexes); `add`
-/// and `search` are the table-scoped index operations. Every verb calls the
-/// daemon's data-plane API.
+/// indexes. Every operation is table-scoped and calls the server's data-plane
+/// API.
 pub async fn run_index_registry(
     command: IndexCommand,
-    daemon_endpoint: &str,
+    server_endpoint: &str,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::daemon(daemon_endpoint)?;
+    let client = crate::backend::server(server_endpoint)?;
     match command {
-        IndexCommand::List(args) => match args.table {
-            // No table: the durable registry across tables, graphs, and clusters.
-            None => {
-                let response: RegistryIndexListResponse = client.get("/v1/indexes").await?;
-                emit(&response, json, render_registry_index_list)
-            }
-            // A table: just that table's declared indexes.
-            Some(table) => {
-                let response: IndexListResponse =
-                    client.get(&format!("/v1/tables/{table}/indexes")).await?;
-                emit(&response, json, render_index_list)
-            }
-        },
+        IndexCommand::List(args) => {
+            let response: IndexListResponse = client
+                .get(&format!("/v1/tables/{}/indexes", args.table))
+                .await?;
+            emit(&response, json, render_index_list)
+        }
         IndexCommand::Add(args) => {
             let request = DeclareIndexRequest {
                 field: args.field.clone(),
@@ -188,24 +179,6 @@ pub async fn run_index_registry(
                 .await?;
             emit(&response, json, render_search)
         }
-    }
-}
-
-/// Human summary for `index list` (the durable registry).
-fn render_registry_index_list(response: &RegistryIndexListResponse) {
-    if response.indexes.is_empty() {
-        println!("(no indexes)");
-        return;
-    }
-    for index in &response.indexes {
-        let snapshot = index
-            .reflected_snapshot
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| "-".to_owned());
-        println!(
-            "{}.{} [{}]  cluster {}  {}  snapshot {}",
-            index.target, index.field, index.metric, index.cluster_id, index.state, snapshot
-        );
     }
 }
 

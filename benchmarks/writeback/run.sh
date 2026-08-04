@@ -2,7 +2,7 @@
 # Write-back tier write-path benchmark (#180). Boots a local 3-node dev pod with
 # the erasure-coded write-back tier OFF (write-through) and then ON (quorum ack),
 # and measures seed-phase PUT p50 and single 32/128 MiB PUT ack latency against
-# a live origin, plus a direct-to-origin baseline. It kills only the verglasd
+# a live origin, plus a direct-to-origin baseline. It kills only the verglas-server
 # children it spawned (matched by its own cache dir) so a benchmark running in
 # benchmarks/tpch is never touched.
 #
@@ -34,7 +34,7 @@ DEV_PID=""
 
 require() { command -v "$1" >/dev/null 2>&1 || { echo "need $1" >&2; exit 1; }; }
 require aws; require python3; require curl
-[ -x "$VERGLAS" ] || { echo "build first: cargo build --release -p verglas -p verglasd" >&2; exit 1; }
+[ -x "$VERGLAS" ] || { echo "build first: cargo build --release -p verglas -p verglas-server" >&2; exit 1; }
 : "${AWS_ENDPOINT:?source your .env first}"
 
 now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
@@ -63,12 +63,12 @@ boot_pod() {
   SEC=$(grep -m1 'secret_access_key=' "$cache/dev.log" | sed -E 's/.*secret_access_key=([A-Za-z0-9]+).*/\1/')
 }
 
-# Kills only the verglasd children under this run's cache dir, then the dev
+# Kills only the verglas-server children under this run's cache dir, then the dev
 # parent. Never touches another pod.
 teardown_pod() {
   [ -n "$DEV_PID" ] && kill "$DEV_PID" 2>/dev/null || true
   sleep 2
-  pkill -f "verglasd.*$RUN_ROOT" 2>/dev/null || true
+  pkill -f "verglas-server.*$RUN_ROOT" 2>/dev/null || true
   sleep 1
   DEV_PID=""
 }

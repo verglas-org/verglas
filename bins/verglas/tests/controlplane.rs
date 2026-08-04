@@ -120,7 +120,7 @@ fn lakehouse_json() -> Value {
 }
 
 /// `GET /v1/lakehouse` — the tenant's scoped lakehouse config. `verglas login`
-/// writes the daemon config and its 0600 credential files from this.
+/// writes the server config and its 0600 credential files from this.
 async fn lakehouse(
     headers: HeaderMap,
     State(state): State<MockState>,
@@ -436,8 +436,8 @@ fn login_stores_token_0600_and_url_and_confirms_the_account() {
 }
 
 #[test]
-fn login_writes_the_daemon_config_and_scoped_credential_files() {
-    // After login, the daemon is fully configured for the tenant from
+fn login_writes_the_server_config_and_scoped_credential_files() {
+    // After login, the server is fully configured for the tenant from
     // `/v1/lakehouse`: [backend] and [catalog] point at the tenant's bucket and
     // catalog, and the scoped S3 key pair + catalog token land in 0600 credential
     // files. The secret values are never printed.
@@ -453,7 +453,7 @@ fn login_writes_the_daemon_config_and_scoped_credential_files() {
     assert!(out.status.success(), "login must succeed: {stderr}");
     let stdout = String::from_utf8(out.stdout).expect("utf8");
 
-    // The daemon config carries the scoped backend + catalog, pointing at the
+    // The server config carries the scoped backend + catalog, pointing at the
     // credential files (never inlining the secret values).
     let config = std::fs::read_to_string(config_path(home.path())).expect("config file");
     assert!(

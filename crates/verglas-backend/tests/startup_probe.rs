@@ -1,5 +1,5 @@
 //! The startup probe fails fast when a configured backend cannot be reached or
-//! authenticated (#233). The daemon calls [`BackendStore::probe`] before it
+//! authenticated (#233). The server calls [`BackendStore::probe`] before it
 //! serves; a credential or reachability failure must surface as an error so the
 //! process exits with a clear message rather than serving an empty store.
 
@@ -108,7 +108,7 @@ async fn probe_passes_when_the_origin_answers() {
 
 /// A glob-only config has no single named bucket to HEAD, so the probe is a
 /// no-op success — it never builds a client for a glob pattern (the factory
-/// here panics if the probe touches it) and never blocks such a daemon.
+/// here panics if the probe touches it) and never blocks such a server.
 #[tokio::test]
 async fn probe_is_a_noop_without_a_single_bucket() {
     let store = BackendStore::with_glob_factory(

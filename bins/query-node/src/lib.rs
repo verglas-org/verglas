@@ -1,7 +1,7 @@
 //! The `verglas-query` library surface: the pieces of the query role that are
 //! exercised directly by integration tests and shared with the binary.
 //!
-//! Mirrors `bins/verglasd`'s lib+bin split for the same reason: `main.rs` owns
+//! Mirrors `bins/verglas-server`'s lib+bin split for the same reason: `main.rs` owns
 //! process startup and argv parsing, this library exposes the HTTP router,
 //! config, sizing, and connection-building logic so tests can drive them
 //! without spawning a process (though `tests/` also spawns the real binary for

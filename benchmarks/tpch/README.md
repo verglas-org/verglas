@@ -20,12 +20,12 @@ are run manually or by the future benchmark rig.
    write path.
 2. **Query** — the 22 canonical TPC-H queries (text taken verbatim from the
    extension's own `tpch_queries()`) run against the Iceberg tables on three
-   legs: direct-to-origin, Verglas cold (first touch, empty daemon cache),
+   legs: direct-to-origin, Verglas cold (first touch, empty server cache),
    Verglas warm (immediate re-run).
 3. **Report** — per-query `direct / cold / warm` milliseconds plus the
    `direct ÷ warm` speedup, totals, and machine + cache-medium context. Every
-   report also carries its **tier context** — the daemon's DRAM/disk budget and
-   a `profile` label, read from the daemon's `/admin/stats` so no number is ever
+   report also carries its **tier context** — the server's DRAM/disk budget and
+   a `profile` label, read from the server's `/admin/stats` so no number is ever
    published without the cache sizing that produced it (issue #141). Text table
    by default; `--json` for machine-readable output.
 4. **Teardown** — prefix-scoped delete of every object under the prefix (guarded
@@ -36,9 +36,9 @@ are run manually or by the future benchmark rig.
 
 - **Python 3** (3.13 recommended; the pinned wheels are verified there — 3.14
   may lack wheels for some deps). `run.sh` prefers `python3.13` if present.
-- A **built `verglas` binary** with `verglasd` beside it:
-  `cargo build --release -p verglas -p verglasd` → `target/release/{verglas,verglasd}`.
-- A running **`verglas dev`** daemon (it prints the endpoint URL and dev keys).
+- A **built `verglas` binary** with `verglas-server` beside it:
+  `cargo build --release -p verglas -p verglas-server` → `target/release/{verglas,verglas-server}`.
+- A running **`verglas dev`** server (it prints the endpoint URL and dev keys).
 - An **S3-compatible origin** reachable via the standard `AWS_*` environment
   (an `.env` exporting `AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`,
   `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`). The bucket must already exist.
@@ -62,11 +62,11 @@ everything. No global Python state is touched.
 | Read mode | `--read-mode MODE` | `TPCH_READ_MODE` | `auto` |
 | Cache-medium note | `--cache-note TEXT` | `TPCH_CACHE_NOTE` | (generic) |
 | Tier profile label | `--profile LABEL` | `TPCH_PROFILE` | `unspecified` |
-| Daemon admin URL | `--admin-endpoint URL` | `TPCH_ADMIN_ENDPOINT` | (endpoint's next port) |
+| Server admin URL | `--admin-endpoint URL` | `TPCH_ADMIN_ENDPOINT` | (endpoint's next port) |
 | JSON output | `--json` | — | off |
 
-The **`--profile`** label and the daemon's cache budgets are recorded on the
-report; the budgets and the read-path counters come from the daemon's
+The **`--profile`** label and the server's cache budgets are recorded on the
+report; the budgets and the read-path counters come from the server's
 `/admin/stats` (`--admin-endpoint`, which defaults to the S3 endpoint's next
 port — the layout `verglas dev` uses). If the admin surface is unreachable the
 report prints `cache budget: unavailable` rather than guessing.
@@ -81,11 +81,11 @@ environment; the **Verglas** legs use the dev endpoint + dev keys.
 
 ```bash
 # 1. Build the binaries (once).
-cargo build --release -p verglas -p verglasd
+cargo build --release -p verglas -p verglas-server
 
 # 2. Start the local endpoint in another shell (leave it running).
 #    It prints the endpoint URL and the dev access/secret keys.
-set -a; source .env; set +a          # origin creds for the daemon's backend
+set -a; source .env; set +a          # origin creds for the server's backend
 ./target/release/verglas dev --cache-dir /tmp/vg-tpch-cache
 
 # 3. Run the benchmark (this shell). Load .env for the direct leg, then paste
@@ -116,7 +116,7 @@ unmerged, so a clean cache means a new `--cache-dir`), and pass the matching
 
 The engine DRAM floor is **80 MiB** (48 MiB write pipeline + 16 MiB metadata
 cache + a 2-block, 16 MiB memory tier); `--dram 80MB` is the smallest budget that
-boots. Below it the daemon exits at startup with the engine's budget error.
+boots. Below it the server exits at startup with the engine's budget error.
 
 ### 1. dram-resident (best case, upper bound)
 
@@ -168,8 +168,8 @@ benchmarks/tpch/run.sh --profile constrained \
   --cache-note "APFS on NVMe — constrained (disk 122 MB ≈ 50% of SF1 footprint)"
 ```
 
-Each profile is a **separate daemon** with its own fresh `--cache-dir`. Seed once
-per daemon (or reuse a seeded prefix across the query legs with `--query-only`, as
+Each profile is a **separate server** with its own fresh `--cache-dir`. Seed once
+per server (or reuse a seeded prefix across the query legs with `--query-only`, as
 below); the query phase's cold-before-warm ordering does the rest.
 
 **Resident-biased admission (issue #164).** The warm leg of the constrained
@@ -205,10 +205,10 @@ leg (immediate re-run, cache populated) — a cold-before-warm ordering.
 
 A **truly cold** measurement needs an empty cache. Two ways to get one:
 restart `verglas dev` (or point `--cache-dir` at a fresh directory) between
-invocations, or purge the running daemon: the harness issues
+invocations, or purge the running server: the harness issues
 `POST /cache/purge` on the admin API (the S3 port plus one, printed by
 `verglas dev`) between the direct and cold legs — the cold leg then matches a
-fresh-daemon cold leg within noise, and the report labels it purged (issue
+fresh-server cold leg within noise, and the report labels it purged (issue
 #138). Re-running `--query-only` with neither measures warm-over-warm — useful
 for the **two-run stability** check on the direct and warm legs (which do not
 depend on cache state).
@@ -258,7 +258,7 @@ Larger scale factors grow roughly linearly. See the numbers posted on issue #136
 for the full per-query table.
 
 The **cold** leg is only genuinely cold on the first query pass after a fresh
-`verglas dev` or a `--purge`; a second pass against the same daemon without
+`verglas dev` or a `--purge`; a second pass against the same server without
 either reports warm numbers for the cold column (cache persisted).
 
 ## Files

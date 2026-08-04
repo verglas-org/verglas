@@ -61,4 +61,5 @@
   protocol round-trip tests now that Source/Sink/MV are gone.
 - chore: Delete the framed-stdio connector transport and the retired KIND_SOURCE/MV/SINK runlog constants. Worker exec accepts the unified exec array only.
 - #393: Removed platform `_LOGS` run logging and day-partition retention from Verglas. Catalog-side lakekeeping owns telemetry write/TTL; harness no longer writes `verglas_logs.<name>_LOGS`.
-
+- #91: Renamed harness process documentation and error guidance from daemon to
+  server. Worker execution contracts otherwise remain unchanged.

@@ -73,8 +73,8 @@ class MockTable {
     return { rows: slice.map((r) => r.row), watermark: this.watermark, snapshotId: this.snapshotId, nextCursor };
   }
 
-  // --- vector indexes: a brute-force stand-in for the daemon's Vamana engine,
-  // enough to exercise the SDK's declare/search/list contract end to end.
+  // --- vector indexes: exact search stands in for Vamana only after an index
+  // attachment has been declared.
   indexes = new Map<string, { metric: string; idField: string }>();
 
   private liveVectors(field: string, idField: string): { id: number; vec: number[] }[] {
@@ -104,15 +104,16 @@ class MockTable {
       consolidated: false,
       liveCount: live.length,
       tombstones: 0,
-      blobLocation: `mem://tbl:${name}/${field}/${this.snapshotN}`,
+      blobLocation: `s3://warehouse/${name}/metadata/verglas-vamana-${this.snapshotN}.puffin`,
       blobBytes: 128 + live.length * 8,
     };
   }
 
   searchIndex(field: string, vector: number[], k: number, idField: string) {
     const declared = this.indexes.get(field);
-    const idCol = declared?.idField ?? idField;
-    const metric = declared?.metric ?? "l2";
+    if (!declared) return undefined;
+    const idCol = declared.idField ?? idField;
+    const metric = declared.metric;
     const dist = (a: number[], b: number[]) => {
       if (metric === "cosine") {
         let dot = 0, na = 0, nb = 0;
@@ -127,7 +128,7 @@ class MockTable {
       .map(({ id, vec }) => ({ id, distance: dist(vector, vec) }))
       .sort((x, y) => x.distance - y.distance)
       .slice(0, k);
-    return { source: declared ? "index" : "bruteForce", neighbors };
+    return { source: "index" as const, neighbors };
   }
 
   listIndexes(name: string) {
@@ -174,7 +175,7 @@ class MockQueue {
   }
 }
 
-/** An in-memory graph mirroring the daemon's `/v1/graphs/...` routes: two node
+/** An in-memory graph mirroring the server's `/v1/graphs/...` routes: two node
  *  and edge lists plus an "index built" flag, with a scan-vs-index traversal
  *  that returns the same answers either way (the turn-off contract). */
 class MockGraph {
@@ -442,7 +443,7 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
       return send(405, { error: "method not allowed" });
     }
 
-    // POST /v1/tables/:name/indexes/:field/search — ANN search / brute-force.
+    // POST /v1/tables/:name/indexes/:field/search — indexed ANN search.
     const idxSearch = url.pathname.match(/^\/v1\/tables\/([^/]+)\/indexes\/([^/]+)\/search$/);
     if (idxSearch && req.method === "POST") {
       const name = decodeURIComponent(idxSearch[1]);
@@ -453,7 +454,9 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
       req.on("end", () => {
         const body = raw ? JSON.parse(raw) : {};
         requests.push({ method: "POST", path: url.pathname, body });
-        send(200, table.searchIndex(field, body.vector ?? [], body.k ?? 10, "id"));
+        const result = table.searchIndex(field, body.vector ?? [], body.k ?? 10, "id");
+        if (!result) return send(404, { error: "no Vamana index attachment" });
+        send(200, result);
       });
       return;
     }

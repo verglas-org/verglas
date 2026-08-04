@@ -104,7 +104,7 @@ pub async fn commit_batches_keyed(
 ///
 /// The value is opaque to the store — a harness serializes whatever position it
 /// needs (a snapshot id, a cron cursor) as a string. Locally this is the
-/// `verglas_sys.watermarks` table behind the daemon's `/v1/watermark`; the
+/// `verglas_sys.watermarks` table behind the server's `/v1/watermark`; the
 /// in-memory store here backs the tests.
 #[async_trait]
 pub trait WatermarkStore: Send + Sync {

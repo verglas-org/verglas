@@ -1650,7 +1650,7 @@ async fn range_resolution_matches_s3_semantics() {
         Err(ReadError::NoSuchKey) => {}
         other => panic!("missing key must be NoSuchKey, got {other:?}"),
     }
-    // The daemon serves a configured bucket set (#235). A request for a bucket
+    // The server serves a configured bucket set (#235). A request for a bucket
     // outside the set is rejected with NoSuchBucket before it reaches the origin.
     let other_bucket = CacheKey {
         bucket: "other-bucket".to_owned(),

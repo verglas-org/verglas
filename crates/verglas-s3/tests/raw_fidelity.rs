@@ -1,5 +1,5 @@
 //! Proxy round-trip fidelity tests (issue #189): keys and headers must pass
-//! through the daemon byte-exactly where `object_store`'s typed abstractions
+//! through the server byte-exactly where `object_store`'s typed abstractions
 //! drop data. A signature-ignoring mock S3 origin stores objects keyed by the
 //! EXACT decoded bytes of the request path; the front-end is served over a
 //! production-shaped `BackendStore::from_config` (typed + raw clients, both

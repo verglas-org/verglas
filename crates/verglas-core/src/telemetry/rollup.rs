@@ -89,7 +89,7 @@ fn ewma(prev: f64, x: f64, initialised: bool) -> f64 {
     }
 }
 
-/// The aggregated telemetry state. Cumulative since daemon start; the metering
+/// The aggregated telemetry state. Cumulative since server start; the metering
 /// exporter takes deltas against its own last snapshot, so this never needs
 /// resetting.
 pub struct Rollup {

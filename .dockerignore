@@ -1,0 +1,16 @@
+.git
+.github
+benchmarks
+tests
+target
+**/target
+target-*
+deploy/docker/credentials/*
+!deploy/docker/credentials/.gitignore
+!deploy/docker/credentials/*.example
+**/.env
+**/.venv
+**/out
+**/results
+**/__pycache__
+*.log

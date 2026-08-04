@@ -3,7 +3,7 @@
 //! These map to the issue's acceptance criteria, with in-memory fakes so the
 //! fast-ack path, backpressure, the commit barrier's ordering, and
 //! recovery-gates-serving are exercised without a network or a live origin. The
-//! real crash-durability evidence (kill -9 the daemon between ack and flush,
+//! real crash-durability evidence (kill -9 the server between ack and flush,
 //! restart, segment reaches S3) lives in `tests/writeback-recovery/run.sh`.
 //!
 //! - `single_node_fast_acks_from_local_durability`: a one-node deployment acks a

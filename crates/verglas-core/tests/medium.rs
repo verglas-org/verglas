@@ -1,5 +1,5 @@
 //! Tests for cache-medium detection: the hardware context Verglas discloses so
-//! published numbers (issue #26) and the `verglas dev` banner (issue #25) carry
+//! published numbers (issue #26) and local diagnostic output carry
 //! their platform. Derived from the acceptance criteria before implementation.
 
 use verglas_core::medium::{CacheMedium, IoMode};

@@ -2,7 +2,7 @@
 //
 // The SDK is deliberately thin: it never reads Parquet or writes Iceberg in JS.
 // It speaks a small HTTP contract to a Verglas *endpoint* — either the local
-// daemon or a cloud Verglas endpoint — and moves rows as JSON. The endpoint owns
+// server or a cloud Verglas endpoint — and moves rows as JSON. The endpoint owns
 // the catalog, the snapshots, and the content-addressed write path.
 
 /** One row. Shapes are table-specific; callers narrow with a generic. */
@@ -19,7 +19,7 @@ export type Watermark = string;
 /** Options for `connect`. */
 export interface ConnectOptions {
   /**
-   * The Verglas endpoint base URL. Local: the daemon's base URL (e.g.
+   * The Verglas endpoint base URL. Local: the server's base URL (e.g.
    * `http://127.0.0.1:8334`). Cloud: the tenant's Verglas endpoint. The SDK
    * abstracts over the two — same interface, different endpoint.
    */
@@ -258,7 +258,7 @@ export interface QueryResult {
 // ----- Graph verb family -----
 //
 // A graph is a namespace holding two plain Iceberg tables (nodes and edges) plus
-// a snapshot-bound adjacency index. These shapes mirror the daemon's
+// a snapshot-bound adjacency index. These shapes mirror the server's
 // `/v1/graphs/...` wire contract; the `Graph` handle in `client.ts` speaks them.
 
 /** The direction to follow edges relative to a node. */
@@ -430,10 +430,10 @@ export interface SearchIndexOptions {
   l?: number;
 }
 
-/** The result of a search: neighbors and whether an index or brute force served it. */
+/** The result of an indexed ANN search. */
 export interface SearchResult {
-  /** "index" or "bruteForce". */
-  source: string;
+  /** Always "index"; a missing exact-snapshot attachment is an error. */
+  source: "index";
   neighbors: SearchHit[];
 }
 

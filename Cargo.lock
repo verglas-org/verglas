@@ -7023,7 +7023,6 @@ dependencies = [
  "chrono",
  "clap",
  "getrandom 0.2.17",
- "libc",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -7409,6 +7408,58 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-server"
+version = "0.1.1"
+dependencies = [
+ "arrow-array 57.3.1",
+ "arrow-ipc 57.3.1",
+ "arrow-schema 57.3.1",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "axum-server",
+ "bytes",
+ "chrono",
+ "futures",
+ "hex",
+ "hmac 0.12.1",
+ "iceberg",
+ "iceberg-catalog-sql",
+ "libc",
+ "object_store 0.14.0",
+ "rcgen",
+ "reqwest 0.12.28",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "urlencoding",
+ "verglas-backend",
+ "verglas-cache",
+ "verglas-cluster",
+ "verglas-core",
+ "verglas-graph",
+ "verglas-harness",
+ "verglas-iceberg",
+ "verglas-instance",
+ "verglas-platform",
+ "verglas-s3",
+ "verglas-sdk",
+ "verglas-tables",
+ "verglas-vector",
+ "verglas-write",
+]
+
+[[package]]
 name = "verglas-tables"
 version = "0.1.1"
 dependencies = [
@@ -7451,7 +7502,6 @@ version = "0.1.1"
 dependencies = [
  "arrow-array 57.3.1",
  "arrow-schema 57.3.1",
- "async-trait",
  "bytes",
  "iceberg",
  "serde",
@@ -7505,58 +7555,6 @@ dependencies = [
  "verglas-backend",
  "verglas-core",
  "verglas-iceberg",
-]
-
-[[package]]
-name = "verglasd"
-version = "0.1.1"
-dependencies = [
- "arrow-array 57.3.1",
- "arrow-ipc 57.3.1",
- "arrow-schema 57.3.1",
- "async-stream",
- "async-trait",
- "axum",
- "axum-server",
- "bytes",
- "chrono",
- "futures",
- "hex",
- "hmac 0.12.1",
- "iceberg",
- "iceberg-catalog-sql",
- "libc",
- "object_store 0.14.0",
- "rcgen",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "urlencoding",
- "verglas-backend",
- "verglas-cache",
- "verglas-cluster",
- "verglas-core",
- "verglas-graph",
- "verglas-harness",
- "verglas-iceberg",
- "verglas-instance",
- "verglas-platform",
- "verglas-s3",
- "verglas-sdk",
- "verglas-tables",
- "verglas-vector",
- "verglas-write",
 ]
 
 [[package]]

@@ -1486,7 +1486,7 @@ async fn content_md5_is_validated_at_the_edge() {
     assert!(text.contains("<Code>InvalidDigest</Code>"), "got: {text}");
     // (An *empty* Content-MD5 is also InvalidDigest — decoding "" yields zero
     // bytes, not a 128-bit digest — but reqwest drops an empty-valued header
-    // before it reaches the daemon, so that case is covered by the conformance
+    // before it reaches the server, so that case is covered by the conformance
     // suite's boto client rather than here.)
 }
 

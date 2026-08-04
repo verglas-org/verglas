@@ -46,7 +46,7 @@ const CATALOG_NAME: &str = "verglas";
 /// This is the shared streaming primitive: `query`'s buffered `QueryReport`
 /// is just `query_stream` collected, and every non-collecting caller (the
 /// standalone query role's own `/v1/query` in `bins/query-node`, its
-/// `estimate` module walking a plan without executing it, and the daemon's
+/// `estimate` module walking a plan without executing it, and the server's
 /// embedded Arrow-IPC response path) is built on this same call, not a
 /// second copy of it.
 pub struct QueryExecution {
@@ -347,7 +347,7 @@ fn batches_to_rows(
 /// Serializes one [`arrow_array::RecordBatch`] to the *inner* bytes of a JSON
 /// row-object array — `{"a":1,"b":2},{"c":3,"d":4}`, with no enclosing `[`/`]`
 /// — plus its row count. A streaming caller ([`crate::estimate`] does not use
-/// this; the HTTP layer in `bins/query-node`/`bins/verglasd` does) splices
+/// this; the HTTP layer in `bins/query-node`/`bins/verglas-server` does) splices
 /// this between its own `[`/`]` as batches arrive, one call per batch, so
 /// nothing beyond one batch is ever held in memory building the response body.
 /// An empty batch returns empty bytes and `0`, never a bare `[]`.

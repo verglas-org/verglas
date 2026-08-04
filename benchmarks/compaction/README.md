@@ -26,12 +26,12 @@ Both the **Parquet** fixture and (per the Avro addendum) an **Avro-format**
 fixture are run. Each config:
 
 1. seeds the table on Polaris (data on the origin S3), if not present;
-2. starts verglasd watching Polaris, warms the metadata;
+2. starts verglas-server watching Polaris, warms the metadata;
 3. drives a **steady read load** through the Verglas endpoint — this is what
    makes the queried columns *hot* in the heat ledger;
 4. runs `rewrite_data_files` (compaction) through pyiceberg on Polaris;
 5. waits one watcher interval for the coordinator to observe the commit;
-6. drives the **first post-compaction query wave** and records the daemon's
+6. drives the **first post-compaction query wave** and records the server's
    `/admin/stats` counter delta (`dram_hits`/`disk_hits` vs `backend_fills`) —
    the hit-rate-recovery number.
 
@@ -57,7 +57,7 @@ Pinned Polaris image digest matches `benchmarks/polaris` and
 
 ```bash
 # from the repo root, with a live S3-compatible origin in .env
-cargo build --release -p verglasd
+cargo build --release -p verglas-server
 benchmarks/compaction/run.sh
 ```
 
@@ -70,6 +70,6 @@ baseline cold-misses the rewritten files.
 
 ## Reuse
 
-`compaction_demo.py` imports the Polaris/verglasd/counter helpers from
+`compaction_demo.py` imports the Polaris/verglas-server/counter helpers from
 `benchmarks/warming/warming_demo.py` (same catalog bring-up, same
 `/admin/stats` reading), so this demo shares one Polaris machinery with warming.

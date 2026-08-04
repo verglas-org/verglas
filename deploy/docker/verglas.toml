@@ -1,0 +1,31 @@
+# Minimal server config for the Docker self-host path.
+# Mount over /etc/verglas/config.toml (see docker-compose.yml).
+# Annotated reference: ../../verglas.example.toml
+
+[listen]
+s3_port = 8333
+admin_port = 8334
+
+[log]
+format = "json"
+level = "info"
+
+[cache]
+dir = "/var/lib/verglas"
+capacity_bytes = "6TB"
+dram_bytes = "1GB"
+
+[backend]
+provider = "s3"
+bucket = "cascadelabs"
+region = "auto"
+endpoint = "https://856387ff129d6ed69bf6fc5abe57ab22.r2.cloudflarestorage.com"
+credentials_file = "/etc/verglas/credentials/backend"
+
+[auth]
+credentials_file = "/etc/verglas/credentials/endpoint"
+
+[catalog]
+uri = "https://catalog.cloudflarestorage.com/856387ff129d6ed69bf6fc5abe57ab22/cascadelabs"
+credentials_file = "/etc/verglas/credentials/catalog.token"
+warehouse = "856387ff129d6ed69bf6fc5abe57ab22_cascadelabs"

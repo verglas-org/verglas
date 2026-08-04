@@ -1,5 +1,5 @@
 # MinIO plays the capacity tier / origin bucket store for the conformance run.
-# verglasd (the system under test) is NOT containerised: it is built from THIS
+# verglas-server (the system under test) is NOT containerised: it is built from THIS
 # repo and run as a local process by run.sh (mirroring `verglas dev`), so there
 # is no Rust image to build and no libc/musl story to manage. Compose owns only
 # the origin.

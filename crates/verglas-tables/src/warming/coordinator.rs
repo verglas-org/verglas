@@ -20,7 +20,7 @@ use super::{WarmTarget, Warmer};
 
 /// Drives a [`Warmer`] from a [`CatalogWatcher`]'s events.
 pub struct WarmingCoordinator<W> {
-    /// The warming job (shared so the daemon can read its progress).
+    /// The warming job (shared so the server can read its progress).
     warmer: Arc<Warmer>,
     /// The catalog watcher whose pointer swings trigger refreshes.
     watcher: Arc<W>,

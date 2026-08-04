@@ -65,7 +65,7 @@ fn tls_missing_cert_is_rejected_naming_the_field() {
 
 #[test]
 fn plain_http_is_the_dev_default() {
-    // No [listen.tls] and no domain: the daemon serves plain HTTP path-style,
+    // No [listen.tls] and no domain: the server serves plain HTTP path-style,
     // the local-dev default.
     let dir = scratch_dir("plain");
     let toml = format!(

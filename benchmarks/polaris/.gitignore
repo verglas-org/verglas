@@ -15,7 +15,7 @@ results/
 # Full run transcripts (nohup output).
 *.out
 
-# Daemon logs captured while parsing the dev-key banner.
+# Server logs captured while parsing the dev-key banner.
 *.log
 
 # Python bytecode from the stdlib report script.

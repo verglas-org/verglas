@@ -2,18 +2,18 @@
 //!
 //! This crate is the engine behind every Verglas table operation: catalog open,
 //! the CAS write path, the DataFusion query path, table inspection, compaction,
-//! and the commit/snapshot/rows/delta table API the daemon serves to
+//! and the commit/snapshot/rows/delta table API the server serves to
 //! `@verglas/sdk`. It is purely a client — it speaks to any Iceberg REST catalog
-//! (a real one or the daemon's loopback gateway) and reads and writes data files
-//! through an S3 endpoint. It links no daemon internals and no cache: it reads
-//! and writes wherever its endpoint points (WHITEPAPER §7.4). The daemon points
+//! (a real one or the server's loopback gateway) and reads and writes data files
+//! through an S3 endpoint. It links no server internals and no cache: it reads
+//! and writes wherever its endpoint points (WHITEPAPER §7.4). The server points
 //! it at its own S3 surface for cache residency; the cloud committer points it
 //! straight at object storage.
 //!
 //! The moving parts:
 //!
 //! - [`conn`]: the resolved [`Connection`] the engine opens a catalog from (the
-//!   CLI resolves flags/environment/daemon-probe into one).
+//!   CLI resolves flags/environment/server-probe into one).
 //! - [`catalog`]: build a REST catalog wired to the endpoint.
 //! - [`storage`]: the fixed-part S3 storage factory (fixed-part multipart uploads for strict S3-compatible stores).
 //! - [`ingest`]: read a CSV / JSONL / Parquet source into Arrow batches with an
@@ -27,7 +27,7 @@
 //!   (used after compaction; catalog-side queues own telemetry retention).
 //! - [`compaction`]: small-file compaction (bin-pack / sort) via REPLACE commits,
 //!   snapshot expiry after each pass, and conservative orphan-file cleanup.
-//! - [`tables_api`]: the commit/snapshot/rows/delta contract the daemon serves.
+//! - [`tables_api`]: the commit/snapshot/rows/delta contract the server serves.
 //! - [`ident`]: parse `namespace.name` table identifiers.
 //! - [`error`]: the one error enum shared across every operation.
 //! - [`report`]: the stable `--output json` result data shapes (the CLI renders

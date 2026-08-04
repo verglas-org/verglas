@@ -11,9 +11,9 @@
 //! never touched.
 //!
 //! These run fully in-process against an Iceberg `MemoryCatalog` over a temp
-//! warehouse — no daemon, no network. Compaction commits through
+//! warehouse — no server, no network. Compaction commits through
 //! `Catalog::update_table` with a `RefSnapshotIdMatch` requirement, the same
-//! trait method + CAS the REST catalog serves, so the daemon-backed path
+//! trait method + CAS the REST catalog serves, so the server-backed path
 //! exercises the same code.
 
 use std::collections::HashMap;

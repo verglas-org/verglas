@@ -165,7 +165,7 @@ impl Heat {
 }
 
 /// Maps wall-clock time onto epoch numbers. Monotonic base so tests can drive
-/// epochs deterministically and the daemon uses the process clock.
+/// epochs deterministically and the server uses the process clock.
 #[derive(Debug, Clone, Copy)]
 pub struct EpochClock {
     /// Unix-seconds origin epoch 0 is measured from.
@@ -420,7 +420,7 @@ impl<R: ObjectRead> HeatFeed<R> {
     }
 
     /// Wraps `inner` with optional heat feeding, an optional organic-yield gate,
-    /// and optional per-table telemetry — the daemon's constructor.
+    /// and optional per-table telemetry — the server's constructor.
     ///
     /// When `telemetry` is present it is paired with the live `mapper`: each
     /// served GET classifies its key once (the mapper's lock-free, allocation-

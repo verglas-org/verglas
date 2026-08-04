@@ -1,8 +1,8 @@
-//! `verglas drain`: gracefully drain the LOCAL daemon (issue #31).
+//! `verglas drain`: gracefully drain the LOCAL server (issue #31).
 //!
 //! The CLI operates on the local node only — it POSTs `POST /admin/drain` to
 //! this machine's admin endpoint and never resolves or targets other nodes
-//! (cluster operations are not a CLI concern, #288). The daemon marks itself
+//! (cluster operations are not a CLI concern, #288). The server marks itself
 //! `draining`: it gossips the state so peers shed its ownership to their
 //! successors, keeps serving what it holds as a donor while they warm from it,
 //! then exits so the ring rebalances — no client-visible error spike.
@@ -21,8 +21,8 @@ pub enum DrainError {
 
 /// Runs `verglas drain [--timeout <dur>]`.
 ///
-/// POSTs `POST /admin/drain` to the local daemon at `endpoint` with the
-/// optional timeout. The drain is asynchronous: the ack confirms the daemon is
+/// POSTs `POST /admin/drain` to the local server at `endpoint` with the
+/// optional timeout. The drain is asynchronous: the ack confirms the server is
 /// now `draining`; it exits once its keys are re-owned warm or the timeout
 /// elapses, so `verglas status` will show it leave.
 pub async fn run(

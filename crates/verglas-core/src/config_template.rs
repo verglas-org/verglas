@@ -11,7 +11,7 @@ use crate::config::Config;
 use serde_json::Value;
 use std::fmt::Write as _;
 
-/// Values `verglas init` injects into the generated config, overriding the
+/// Values a config scaffold injects into the generated config, overriding the
 /// struct defaults. Anything left `None` keeps the default. The required
 /// backend trio (bucket/endpoint/region) stays commented out when its override
 /// is `None`, so a blank scaffold names the fields without writing bogus values.
@@ -96,7 +96,7 @@ const SECTION_ORDER: &[&str] = &[
 ];
 
 /// The settings the generated config actually shows: the ones an operator sets.
-/// Everything else the daemon reads keeps its default and is left out of the
+/// Everything else the server reads keeps its default and is left out of the
 /// file — those are internal tuning knobs, not deployment settings, and dumping
 /// them in the config only obscures the handful that matter. The struct still
 /// defines and documents them; they are simply not surfaced here. A section is
@@ -406,7 +406,7 @@ mod tests {
     }
 
     /// A blank scaffold (no overrides) PARSES — every default is present and the
-    /// backend bucket fields stay commented — but does NOT validate: the daemon
+    /// backend bucket fields stay commented — but does NOT validate: the server
     /// needs at least one of `backend.bucket` / `backend.bucket_globs`, so a
     /// scaffold with neither is refused at startup, the error naming
     /// `backend.bucket`. A scaffold WITH a bucket override validates. `cache.dir`

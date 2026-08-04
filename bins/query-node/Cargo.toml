@@ -20,7 +20,7 @@ path = "src/main.rs"
 # tier, no S3 frontend — this binary is a client of a cache node, never a
 # cache itself), no verglas-cluster/writeback/tables/platform (no ring, no
 # write-back, no mapper, no jobs/worker executor). verglas-core is reused only
-# for its `[log]`/`[catalog]` config shapes, the same ones verglasd's schema
+# for its `[log]`/`[catalog]` config shapes, the same ones verglas-server's schema
 # uses, so a fleet image renders one familiar TOML dialect for every role.
 verglas-core.workspace = true
 verglas-iceberg.workspace = true

@@ -150,14 +150,14 @@ pub enum TriggerSpec {
     /// output line to the worker's target table as a row.
     ///
     /// This trigger runs the worker as a long-lived local process rather than a
-    /// one-shot subprocess. When `file` is set the daemon tails that file; when
-    /// it is absent the daemon runs the worker's own `exec` command and captures
+    /// one-shot subprocess. When `file` is set the server tails that file; when
+    /// it is absent the server runs the worker's own `exec` command and captures
     /// its stdout and stderr. It is LOCAL ONLY: a follow worker tails something
-    /// on the machine the daemon runs on, so the cloud rejects it for fleet
-    /// placement. When the daemon is logged in, the rows still stream into the
-    /// tenant's cloud lakehouse, because the daemon's catalog points there.
+    /// on the machine the server runs on, so the cloud rejects it for fleet
+    /// placement. When the server is logged in, the rows still stream into the
+    /// tenant's cloud lakehouse, because the server's catalog points there.
     Follow {
-        /// A file to tail. When absent, the daemon wraps the worker's `exec`
+        /// A file to tail. When absent, the server wraps the worker's `exec`
         /// command and captures its stdout and stderr instead.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file: Option<String>,
@@ -225,7 +225,7 @@ pub struct ChangeEvent {
 /// The event that invoked one worker run. Mirrors the TS `TriggerEvent`; the
 /// `type` field is the discriminant. Webhook/websocket bodies reach a
 /// subprocess worker through its own client, so the Rust event carries only what
-/// the daemon knows.
+/// the server knows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TriggerEvent {
@@ -297,7 +297,7 @@ pub struct WorkerResult {
 }
 
 /// The result JSON a subprocess worker writes to [`ENV_RESULT_PATH`], and the
-/// daemon reads back. Mirrors the TS `EndpointRunResult`: `{"rows": n,
+/// server reads back. Mirrors the TS `EndpointRunResult`: `{"rows": n,
 /// "error": null}` on success, `{"rows": 0, "error": "<message>"}` on failure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunResult {

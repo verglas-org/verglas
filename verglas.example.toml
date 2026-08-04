@@ -1,7 +1,7 @@
-# verglas.example.toml — annotated reference configuration for `verglasd`.
+# verglas.example.toml — annotated reference configuration for `verglas-server`.
 #
-# Copy, edit, and pass with `verglasd --config /etc/verglas/verglas.toml`.
-# The file is validated at startup: a bad config makes the daemon exit
+# Copy, edit, and pass with `verglas-server --config /etc/verglas/verglas.toml`.
+# The file is validated at startup: a bad config makes the server exit
 # non-zero with a message naming the exact field, and unknown fields are
 # rejected so typos fail fast instead of silently taking defaults.
 #
@@ -16,7 +16,7 @@ admin_port = 8334
 # Virtual-hosted-style addressing (#11). Set the endpoint's base domain to accept
 # `https://bucket.<domain>/key` alongside the always-supported path style
 # `https://<domain>/bucket/key`. Optional: absent means path-style only, which is
-# the `verglas dev` (localhost) default and works with any DNS setup.
+# the local Docker default and works with any DNS setup.
 #
 # Virtual-hosted style in production requires wildcard DNS `*.<domain>` pointing
 # at the L4 load balancer (NLB), so `bucket.<domain>` resolves for every bucket.
@@ -25,23 +25,23 @@ admin_port = 8334
 
 # TLS termination for the S3 endpoint (#11). Absent means plain HTTP — for local
 # dev on localhost only. The production deployment puts an L4 NLB (TCP
-# passthrough) in front of the daemons, so TLS terminates HERE, at the daemon:
+# passthrough) in front of the servers, so TLS terminates HERE, at the server:
 # the NLB never sees plaintext and SigV4's signed Host header survives intact.
 #
 # Point cert_path at the PEM certificate chain (leaf first) and key_path at the
-# PEM private key. The daemon reloads both on SIGHUP without dropping live
+# PEM private key. The server reloads both on SIGHUP without dropping live
 # connections, so a production cert rotation causes zero failed requests: rotate
-# the files on disk, then `kill -HUP <verglasd-pid>`.
+# the files on disk, then `kill -HUP <verglas-server-pid>`.
 #[listen.tls]
 #cert_path = "/etc/verglas/tls/fullchain.pem"
 #key_path = "/etc/verglas/tls/privkey.pem"
 
-# Structured logging (#61). The daemon installs one `tracing` subscriber from
+# Structured logging (#61). The server installs one `tracing` subscriber from
 # this section.
 [log]
 # Output format. `json` emits one JSON object per line for log pipelines
-# (jq / CloudWatch / Loki); `pretty` emits human-readable lines. `verglas dev`
-# forces `pretty` regardless of this setting.
+# (jq / CloudWatch / Loki); `pretty` emits human-readable lines for local
+# diagnostics.
 format = "json"
 # Default verbosity filter, in RUST_LOG syntax (e.g. `info`, or a per-target
 # filter like `verglas_cache=debug,info`). `RUST_LOG` in the environment
@@ -51,17 +51,12 @@ level = "info"
 
 [cache]
 # Directory holding cached data. Must already exist and be writable by the
-# daemon user.
+# server user.
 dir = "/var/lib/verglas"
 # Size ceilings. Byte fields take human-size strings — suffixes B/KB/MB/GB/TB
 # (binary multiples) — or a bare number of bytes.
 capacity_bytes = "20GB"   # on-disk cache
 dram_bytes = "1GB"        # in-memory cache
-# Hard ceiling for the shadow store: the cache-managed, on-disk store of
-# Verglas-derived Puffin artifacts (vector indexes today), kept separate from the
-# block cache above. Over-ceiling writes evict the least-recently-written
-# artifact; a single artifact larger than the ceiling is refused. Default 1GB.
-shadow_capacity_bytes = "1GB"
 # Data-cache fill/alignment geometry. The 2 MiB default matches typical
 # DuckDB Parquet ranges; choose a power of two from 1MB through 8MB.
 data_block_bytes = "2MB"
@@ -84,7 +79,7 @@ mutable_mapping_ttl_secs = 5
 enabled = true            # false = admit every fetched block (debugging only)
 frequency_threshold = 2   # admit on the second sighting (1 = admit everything)
 
-# Snapshot-driven prefetch (#51). On a compaction (`replace`) commit the daemon
+# Snapshot-driven prefetch (#51). On a compaction (`replace`) commit the server
 # prefetches the rewritten files' hot column chunks — scored against a heat
 # ledger fed from the request path — so the cache hit rate recovers before
 # queries re-earn it from the origin. Prefetch shares the warming byte budget and
@@ -99,7 +94,7 @@ heat_epoch_secs = 300     # heat-ledger EWMA epoch (5 minutes)
 heat_table_cap = 65536    # bounded heat entries per table
 heat_channel_capacity = 16384 # drop-on-full request-path sample channel depth
 
-# SQL and logical writes execute in isolated role processes. The daemon only
+# SQL and logical writes execute in isolated role processes. The server only
 # dispatches bounded requests; it contains no embedded query or table writer.
 [query_worker]
 binary = "/usr/local/bin/verglas-query"
@@ -139,7 +134,7 @@ ack_deadline_ms = 2000    # gather w durable fragments within this, else write-t
 # uncommitted files. COMMITTED table state is never affected: the commit barrier
 # orders propagation before a table publishes, so the catalog never points at
 # files missing from the origin. (The deployment story puts the buffer directory
-# on a cloud-replicated block volume; the daemon neither knows nor relies on it.)
+# on a cloud-replicated block volume; the server neither knows nor relies on it.)
 # There is no fragment size setting (#223): fragments share the one NVMe budget
 # (cache.capacity_bytes) with the read cache, first come, first served.
 # Fragments are transient — held only until the object propagates to the
@@ -161,9 +156,9 @@ ack_deadline_ms = 2000    # gather w durable fragments within this, else write-t
 # w = 9
 
 [backend]
-# The buckets this daemon serves. It serves a SET: the single `bucket` below
+# The buckets this server serves. It serves a SET: the single `bucket` below
 # and/or the `bucket_globs` patterns. At least one of the two is REQUIRED — the
-# daemon refuses to start without a bucket set. A request whose bucket is in the
+# server refuses to start without a bucket set. A request whose bucket is in the
 # set is served; any other bucket returns NoSuchBucket. On a cache miss a served
 # bucket is read through to its origin using the node's credential chain (the
 # ambient AWS role/keys, or the credentials file below); one credential set
@@ -200,8 +195,8 @@ min_samples = 20          # outcomes needed before the rate is trusted
 cooldown_ms = 5000        # open duration before probing
 half_open_max_probes = 3  # probe successes required to close again
 
-# Static access keys engines present to the daemon's S3 endpoint. Optional:
-# if the whole [auth] table is absent, the daemon generates a keypair at
+# Static access keys engines present to the server's S3 endpoint. Optional:
+# if the whole [auth] table is absent, the server generates a keypair at
 # startup and prints it once.
 #[auth]
 #access_key_id = "dev"
@@ -227,7 +222,7 @@ half_open_max_probes = 3  # probe successes required to close again
 #warehouse = "lake"              # multi-warehouse catalogs; S3 Tables: the table-bucket ARN
 
 # Gossip cluster membership (#27) and the weighted rendezvous ring (#28).
-# Optional: if the whole [cluster] table is absent the daemon is a
+# Optional: if the whole [cluster] table is absent the server is a
 # cluster-of-one — no gossip runs, the ring has one member, and behaviour is
 # identical to a single-node deployment. When present, the node joins the pod
 # over `chitchat` gossip and takes a weighted share of the keyspace.
@@ -242,17 +237,3 @@ half_open_max_probes = 3  # probe successes required to close again
 #suspicion_secs = 5                    # failure-detection window: a silent node is dropped within a small multiple
 #warm_from_peers_secs = 300            # after joining, pull owned cold-miss blocks from their previous holder for this long (#30; 0 disables)
 #drain_timeout_secs = 600             # `verglas drain` donor window before the node exits so the ring rebalances (#31)
-
-# Agent-side identity and local state (#295): the settings the memory and
-# platform binaries (CLI verbs, MCP server, MV executor, capture hooks) read
-# from this same file. The daemon itself does not use them. The daemon
-# endpoint, warehouse, and region are NOT repeated here — the binaries derive
-# them from [listen], [catalog], and [backend] above; that is the point of one
-# config. Optional: absent, the agent id is `default` and the dirs derive from
-# the config directory.
-#[agent]
-#agent_id = "default"                  # owning agent id stamped on memory rows
-#memory_namespace = "work"             # default namespace tag for memory rows
-#spool_dir = "~/.verglas/agent/spool"  # event queue + executor guard (default: <config dir>/agent/spool)
-#model_cache = "~/.verglas/models"     # embedding model cache (default: <config dir>/models)
-#aws_profile = "my-profile"            # AWS profile for direct-AWS access (standard chain; never secrets)

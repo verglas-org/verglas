@@ -41,7 +41,7 @@ impl ObjectRead for FailingOrigin {
 }
 
 /// A `MakeWriter` that appends every formatted log line to a shared buffer, so
-/// the test can read back the JSON the daemon would emit.
+/// the test can read back the JSON the server would emit.
 #[derive(Clone, Default)]
 struct SharedBuf(Arc<Mutex<Vec<u8>>>);
 

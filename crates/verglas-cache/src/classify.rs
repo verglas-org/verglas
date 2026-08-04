@@ -11,7 +11,7 @@
 //!    `*/snap-*.avro`, and a *suffix*-range GET against a `*.parquet` key (a
 //!    Parquet footer read: engines read the last N bytes, a distinctive shape).
 //! 2. **The mapper** (#49), consulted through the [`MetaClassifier`] trait when
-//!    the daemon wires one in: it says `TableMetadata` for catalogued
+//!    the server wires one in: it says `TableMetadata` for catalogued
 //!    manifests, manifest lists, and resolved footer ranges of watched tables.
 //!
 //! Avro *data* files never route here: they carry no footer, so the suffix
@@ -79,7 +79,7 @@ pub enum MetaClass {
     Data,
 }
 
-/// The mapper-backed classification trait (#49 → #50). The daemon wires an
+/// The mapper-backed classification trait (#49 → #50). The server wires an
 /// adapter over the logical-key mapper; the cache crate depends only on this
 /// trait, never on `verglas-tables`, so the layering stays acyclic.
 ///
@@ -99,7 +99,7 @@ pub trait MetaClassifier: Send + Sync {
 /// behind an `Arc` in the engine.
 #[derive(Clone, Default)]
 pub struct MetaRouter {
-    /// The mapper hook, when the daemon has wired one in. Absent means
+    /// The mapper hook, when the server has wired one in. Absent means
     /// heuristics-only routing — still catches every un-onboarded table's
     /// planning objects, which is what the cold-start value depends on.
     classifier: Option<std::sync::Arc<dyn MetaClassifier>>,
@@ -107,7 +107,7 @@ pub struct MetaRouter {
 
 impl MetaRouter {
     /// A router with no mapper hook: routes purely on the pre-mapper
-    /// heuristics. This is what a daemon without a live catalog watcher uses.
+    /// heuristics. This is what a server without a live catalog watcher uses.
     pub fn heuristics_only() -> MetaRouter {
         MetaRouter { classifier: None }
     }

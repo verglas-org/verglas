@@ -4,7 +4,7 @@
 //! This is the compute-side half of auto-compaction. The catalog service signals
 //! which tables are over threshold (its `maintenance/candidates` endpoint); this
 //! module does the rewriting on real compute — reading the small data files
-//! through the engine (cache-pathed when a daemon is in the path), writing new
+//! through the engine (cache-pathed when a server is in the path), writing new
 //! target-sized files to the table location, and committing a REPLACE that
 //! removes the old files and adds the new ones. It never runs in the catalog's
 //! Durable Object, whose CPU and memory cannot open Parquet.
@@ -747,7 +747,7 @@ async fn live_files_by_partition(table: &Table) -> Result<HashMap<PartitionKey, 
 }
 
 /// Reads Iceberg-planned tasks into Arrow batches through the table's FileIO.
-/// Those tasks carry applicable row deletes and schema projection; a daemon in
+/// Those tasks carry applicable row deletes and schema projection; a server in
 /// the path still serves the underlying blocks.
 async fn read_data_files(file_io: &FileIO, files: &[LiveFile]) -> Result<Vec<RecordBatch>> {
     let tasks: Vec<std::result::Result<FileScanTask, iceberg::Error>> = files

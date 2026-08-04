@@ -1,4 +1,4 @@
-//! The M1 daemon configuration: a small TOML schema with defaults, human-size
+//! The M1 server configuration: a small TOML schema with defaults, human-size
 //! byte strings, and startup validation that names the exact field. Fields for
 //! unbuilt features do not exist here — a config field lands in the same PR as
 //! the feature it configures.
@@ -34,12 +34,12 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// Root of the daemon configuration. Unknown fields anywhere are rejected at
+/// Root of the server configuration. Unknown fields anywhere are rejected at
 /// parse time so a typo cannot silently become a default.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Ports the daemon binds and the S3 endpoint's TLS and addressing.
+    /// Ports the server binds and the S3 endpoint's TLS and addressing.
     #[serde(default)]
     pub listen: Listen,
     /// Structured-logging output format and default verbosity (#61).
@@ -59,29 +59,24 @@ pub struct Config {
     /// Iceberg REST catalog to track for table commits. Unset leaves Iceberg
     /// awareness off.
     pub catalog: Option<Catalog>,
-    /// The standalone query role this daemon can dispatch `POST /v1/query` to
+    /// The standalone query role this server can dispatch `POST /v1/query` to
     /// instead of running it embedded (a `verglas-query` worker, launched on
     /// demand and killed after use). Unset keeps every query embedded —
     /// nothing about an existing deployment changes, and a dispatch failure
     /// for any reason still falls back to the embedded path. Everything the
     /// worker needs beyond this binary path (the cache S3 endpoint, the
-    /// catalog URI, the signing keypair) the daemon derives from its own
+    /// catalog URI, the signing keypair) the server derives from its own
     /// loopback surface and its own resolved auth — the same values the
     /// embedded path already uses.
     pub query_worker: Option<QueryWorker>,
-    /// Isolated logical table writer launched by the daemon for Arrow commits.
+    /// Isolated logical table writer launched by the server for Arrow commits.
     pub write_worker: Option<WriteWorker>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
-    /// Agent-side identity and local state (#295): the settings the memory and
-    /// platform binaries (CLI verbs, MCP server, MV executor, capture hooks)
-    /// read from this same file. The daemon itself does not use them.
-    #[serde(default)]
-    pub agent: Agent,
     /// The control plane the CLI authenticates against for cross-node and cloud
     /// deployment visibility. Written by `verglas login`; unset otherwise. The
-    /// daemon does not use it, and the CLI's local commands never require it —
-    /// only `verglas deployments` does.
+    /// server does not use it, and the CLI's local commands never require it —
+    /// only cloud verbs do.
     #[serde(default)]
     pub control_plane: Option<ControlPlane>,
 }
@@ -93,11 +88,11 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub struct ControlPlane {
     /// Base URL of the control plane API (for example
-    /// `https://api.verglas.cloud`).
+    /// `https://api.verglas.dev`).
     pub url: String,
 }
 
-/// Ports the daemon binds: the S3 endpoint and the private admin API, plus the
+/// Ports the server binds: the S3 endpoint and the private admin API, plus the
 /// S3 endpoint's TLS termination and virtual-hosted addressing (issue #11).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
@@ -111,7 +106,7 @@ pub struct Listen {
     /// addressing only.
     #[serde(default)]
     pub domain: Option<String>,
-    /// TLS for the S3 endpoint. Unset serves plain HTTP. The daemon reloads the
+    /// TLS for the S3 endpoint. Unset serves plain HTTP. The server reloads the
     /// PEM files on SIGHUP without dropping connections.
     #[serde(default)]
     pub tls: Option<Tls>,
@@ -130,15 +125,15 @@ impl Default for Listen {
     }
 }
 
-/// Structured-logging output format and default verbosity (#61). The daemon
+/// Structured-logging output format and default verbosity (#61). The server
 /// installs one `tracing` subscriber from this; the level is hot-reloadable via
 /// the admin API and overridable at startup by `RUST_LOG`.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields, default)]
 pub struct Log {
     /// Output format. `json` emits one JSON object per line for log pipelines
-    /// (jq / CloudWatch / Loki); `pretty` emits human-readable lines for
-    /// `verglas dev`.
+    /// (jq / CloudWatch / Loki); `pretty` emits human-readable lines for local
+    /// diagnostics.
     pub format: LogFormat,
     /// Default verbosity filter in `RUST_LOG` syntax (e.g. `info`, or
     /// `verglas_cache=debug,info`). `RUST_LOG` in the environment overrides it
@@ -177,11 +172,11 @@ impl Log {
 pub enum LogFormat {
     /// One JSON object per line, for log pipelines.
     Json,
-    /// Human-readable lines, for `verglas dev`.
+    /// Human-readable lines for local diagnostics.
     Pretty,
 }
 
-/// TLS termination for the S3 endpoint (issue #11). The daemon reads the leaf
+/// TLS termination for the S3 endpoint (issue #11). The server reads the leaf
 /// certificate chain and private key from these PEM files and reloads them on
 /// SIGHUP so a production cert rotation drops no connections.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -249,13 +244,6 @@ pub struct Cache {
     pub capacity_bytes: ByteSize,
     /// Max memory (DRAM) used for the cache.
     pub dram_bytes: ByteSize,
-    /// Hard byte ceiling for the shadow store: the cache-managed, NVMe-resident
-    /// store of Verglas-derived Puffin artifacts (vector indexes today, #95),
-    /// separate from the block cache's `capacity_bytes`. A derived artifact that
-    /// would push shadow usage over this ceiling evicts the least-recently-written
-    /// artifacts to make room; one larger than the whole ceiling is refused.
-    #[serde(default = "default_shadow_capacity_bytes")]
-    pub shadow_capacity_bytes: ByteSize,
     /// Alignment and maximum fill size for data-cache blocks. Smaller blocks
     /// reduce Parquet range-read amplification; larger blocks reduce origin
     /// request count. Metadata uses its own store and is unaffected.
@@ -434,13 +422,6 @@ fn default_data_block_bytes() -> ByteSize {
     ByteSize(DEFAULT_DATA_BLOCK_BYTES)
 }
 
-/// The default shadow-store ceiling: 1 GB. Derived Puffin artifacts (vector
-/// indexes today) are whole-artifact and modest next to the block cache, so a
-/// gigabyte holds many versions without starving the NVMe budget.
-fn default_shadow_capacity_bytes() -> ByteSize {
-    ByteSize(GB)
-}
-
 impl Default for Cache {
     /// The documented defaults: `/var/lib/verglas`, 20 GB disk, 1 GB DRAM,
     /// 2 MiB data blocks, and scan-resistant admission on.
@@ -449,7 +430,6 @@ impl Default for Cache {
             dir: PathBuf::from("/var/lib/verglas"),
             capacity_bytes: ByteSize(20 * GB),
             dram_bytes: ByteSize(GB),
-            shadow_capacity_bytes: default_shadow_capacity_bytes(),
             data_block_bytes: default_data_block_bytes(),
             meta_fraction: default_meta_fraction(),
             mutable_mapping_ttl_secs: default_mutable_mapping_ttl_secs(),
@@ -481,7 +461,7 @@ impl Cache {
 }
 
 /// Snapshot-driven prefetch tuning (#51). On a compaction (`replace`) commit the
-/// daemon prefetches the rewritten files' hot column chunks — scored against a
+/// server prefetches the rewritten files' hot column chunks — scored against a
 /// heat ledger fed from the request path — so the cache hit rate recovers before
 /// queries re-earn it from the origin. One policy struct in `[cache]`; defaults
 /// are conservative and polite.
@@ -693,7 +673,7 @@ pub enum BackendProvider {
     Gcp,
 }
 
-/// Origin object-store settings. The daemon serves a configured SET of buckets
+/// Origin object-store settings. The server serves a configured SET of buckets
 /// (#235): the single `bucket` for the common one-bucket case, plus
 /// `bucket_globs` — glob patterns (`*` matches any run of characters) for
 /// dynamic families like AWS S3 Tables' `*--table-s3` buckets. A request whose
@@ -717,12 +697,12 @@ pub struct Backend {
     /// Circuit breaker: sheds load from an origin that keeps failing, while
     /// cache hits keep serving.
     pub breaker: BreakerPolicy,
-    /// A single bucket or container this daemon serves, no scheme prefix. The
+    /// A single bucket or container this server serves, no scheme prefix. The
     /// common one-bucket case. At least one of `bucket` / `bucket_globs` is
     /// required; the served set is their union.
     #[serde(default)]
     pub bucket: Option<String>,
-    /// Glob patterns naming a family of buckets this daemon serves. `*` matches
+    /// Glob patterns naming a family of buckets this server serves. `*` matches
     /// any run of characters, so `"*--table-s3"` serves every AWS S3 Tables
     /// underlying bucket under one credential set. A request whose bucket matches
     /// any glob is served; anything outside the set returns NoSuchBucket.
@@ -775,7 +755,7 @@ impl Default for Backend {
 }
 
 impl Backend {
-    /// Whether this daemon serves `bucket`: it equals the single `bucket` or
+    /// Whether this server serves `bucket`: it equals the single `bucket` or
     /// matches one of the `bucket_globs` (#235). The one gate every serving path
     /// consults so a request outside the configured set is rejected loudly.
     pub fn serves_bucket(&self, bucket: &str) -> bool {
@@ -806,7 +786,7 @@ impl Backend {
     }
 
     /// Semantic checks on the origin settings: at least one of `bucket` /
-    /// `bucket_globs` is set (the daemon needs a bucket set to serve and refuses
+    /// `bucket_globs` is set (the server needs a bucket set to serve and refuses
     /// to start without one), no glob pattern is empty, a configured `http://`
     /// endpoint must set `allow_http`, and a configured endpoint must be a
     /// parseable `http`/`https` URL. The endpoint checks are provider-agnostic —
@@ -818,7 +798,7 @@ impl Backend {
         if !has_bucket && self.bucket_globs.is_empty() {
             return Err(ConfigError::Invalid(
                 "backend.bucket",
-                "at least one of backend.bucket or backend.bucket_globs is required: name the bucket(s) this daemon serves (no scheme prefix)"
+                "at least one of backend.bucket or backend.bucket_globs is required: name the bucket(s) this server serves (no scheme prefix)"
                     .into(),
             ));
         }
@@ -1150,15 +1130,15 @@ fn default_poll_interval_secs() -> u64 {
     30
 }
 
-/// The standalone query worker a daemon can dispatch to (see [`Config::query_worker`]).
+/// The standalone query worker a server can dispatch to (see [`Config::query_worker`]).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct QueryWorker {
-    /// Path to the `verglas-query` binary this daemon spawns on demand.
+    /// Path to the `verglas-query` binary this server spawns on demand.
     pub binary: String,
 }
 
-/// The standalone logical write worker a daemon dispatches Arrow commits to.
+/// The standalone logical write worker a server dispatches Arrow commits to.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteWorker {
@@ -1199,16 +1179,14 @@ impl QueryWorker {
 ///
 /// A node advertises its identity and capacity over `chitchat` gossip and
 /// takes a weighted-rendezvous share of the pod's keyspace. The whole table is
-/// optional: without it a daemon is a cluster-of-one. These fields land with
-/// the feature — the daemon reads them only when gossip is wired up.
+/// optional: without it a server is a cluster-of-one. These fields land with
+/// the feature — the server reads them only when gossip is wired up.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Cluster {
-    /// Cluster identity for the vector-index registry: the value a daemon
-    /// stamps on the `verglas_sys.indexes` rows it writes and filters by on
-    /// reboot, so the same target+field on two clusters are independent rows.
-    /// Unset (or no `[cluster]` table at all) falls back to the machine
-    /// hostname; the `VERGLAS_CLUSTER_ID` environment variable overrides both.
+    /// Stable cluster identity used in node reports. Unset (or no `[cluster]`
+    /// table at all) falls back to the machine hostname; the
+    /// `VERGLAS_CLUSTER_ID` environment variable overrides both.
     #[serde(default)]
     pub id: Option<String>,
     /// Pod identity. Peers join only within the same pod.
@@ -1454,7 +1432,7 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 }
 
 impl Config {
-    /// Reads, parses, and validates a config file — the one call `verglasd`
+    /// Reads, parses, and validates a config file — the one call `verglas-server`
     /// startup makes. Any error is ready to print and exit on.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text =
@@ -1470,10 +1448,10 @@ impl Config {
         toml::from_str(text).map_err(|e| ConfigError::Parse(Box::new(e)))
     }
 
-    /// Resolves the cluster id this daemon stamps on the vector-index registry
+    /// Resolves the cluster id this server stamps on the vector-index registry
     /// rows it writes (and filters by on reboot): the `VERGLAS_CLUSTER_ID`
     /// environment variable if set, else the configured `[cluster].id`, else the
-    /// machine hostname, else `"localhost"`. Resolved once at daemon start.
+    /// machine hostname, else `"localhost"`. Resolved once at server start.
     pub fn resolve_cluster_id(&self) -> String {
         let env = std::env::var(CLUSTER_ID_ENV).ok();
         let configured = self.cluster.as_ref().and_then(|c| c.id.clone());
@@ -1527,7 +1505,7 @@ impl Config {
                     format!("cannot write to {}: {e}", self.cache.dir.display()),
                 )
             })?;
-        // Refuse a budget bigger than the disk (#96): a daemon that reserves more
+        // Refuse a budget bigger than the disk (#96): a server that reserves more
         // NVMe than the cache filesystem can hold would run the disk out. Bytes
         // the cache already holds count toward the budget (#298) — on restart
         // they are what consumed the free space, and a config that booted cold
@@ -1629,124 +1607,13 @@ impl Config {
     }
 }
 
-/// Agent-side settings (#295): identity and local state for the memory and
-/// platform binaries. Everything else those binaries need — the daemon
-/// endpoint, the catalog warehouse, the region — is derived from the other
-/// sections of this same file ([`agent_env_pairs`]); that is the point of one
-/// config. No secrets ever live here; `aws_profile` names a profile resolved
-/// through the standard AWS chain.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields, default)]
-pub struct Agent {
-    /// The owning agent id stamped on memory rows and used to scope recall.
-    pub agent_id: String,
-    /// Default namespace tag for memory rows. Unset leaves rows untagged.
-    pub memory_namespace: Option<String>,
-    /// The agent spool directory (the event queue and executor guard live
-    /// under it). Unset derives `<config dir>/agent/spool`.
-    pub spool_dir: Option<PathBuf>,
-    /// On-disk cache directory for the local embedding model. Unset derives
-    /// `<config dir>/models`.
-    pub model_cache: Option<PathBuf>,
-    /// AWS profile the agent binaries use for direct-AWS access (standard AWS
-    /// chain; never credentials).
-    pub aws_profile: Option<String>,
-}
-
-impl Default for Agent {
-    /// A blank identity: agent id `default`, everything else derived or unset.
-    fn default() -> Self {
-        Agent {
-            agent_id: "default".to_owned(),
-            memory_namespace: None,
-            spool_dir: None,
-            model_cache: None,
-            aws_profile: None,
-        }
-    }
-}
-
-/// The environment pairs the agent binaries apply at startup, derived from the
-/// one config: daemon endpoint from `[listen]` (localhost + admin port),
-/// warehouse from `[catalog]`, region from `[backend]`, identity and local
-/// dirs from `[agent]` (dirs defaulting under `config_dir`). The caller
-/// ([`apply_agent_env`]) never overrides a variable already present in the
-/// process environment, so env vars keep working as dev overrides.
-pub fn agent_env_pairs(config: &Config, config_dir: &Path) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = Vec::new();
-    pairs.push((
-        "VERGLAS_ENDPOINT".to_owned(),
-        format!("http://127.0.0.1:{}", config.listen.admin_port),
-    ));
-    if let Some(catalog) = &config.catalog
-        && let Some(warehouse) = &catalog.warehouse
-    {
-        pairs.push(("VERGLAS_WAREHOUSE".to_owned(), warehouse.clone()));
-    }
-    if let Some(region) = &config.backend.region {
-        pairs.push(("VERGLAS_REGION".to_owned(), region.clone()));
-    }
-    pairs.push(("VERGLAS_AGENT_ID".to_owned(), config.agent.agent_id.clone()));
-    if let Some(ns) = &config.agent.memory_namespace {
-        pairs.push(("VERGLAS_MEMORY_NAMESPACE".to_owned(), ns.clone()));
-    }
-    let spool = config
-        .agent
-        .spool_dir
-        .clone()
-        .unwrap_or_else(|| config_dir.join("agent/spool"));
-    pairs.push(("VERGLAS_SPOOL_DIR".to_owned(), spool.display().to_string()));
-    let models = config
-        .agent
-        .model_cache
-        .clone()
-        .unwrap_or_else(|| config_dir.join("models"));
-    pairs.push((
-        "VERGLAS_MODEL_CACHE".to_owned(),
-        models.display().to_string(),
-    ));
-    if let Some(profile) = &config.agent.aws_profile {
-        pairs.push(("AWS_PROFILE".to_owned(), profile.clone()));
-        if let Some(region) = &config.backend.region {
-            pairs.push(("AWS_REGION".to_owned(), region.clone()));
-        }
-    }
-    pairs
-}
-
-/// The config file the agent binaries read: `$VERGLAS_CONFIG` when set, else
+/// The operator config file: `$VERGLAS_CONFIG` when set, else
 /// `~/.verglas/config.toml`. `None` when neither resolves to a path.
-pub fn agent_config_path() -> Option<PathBuf> {
+pub fn user_config_path() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("VERGLAS_CONFIG") {
         return Some(PathBuf::from(p));
     }
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".verglas/config.toml"))
-}
-
-/// Reads the agent settings from the one config file and applies them to the
-/// process environment — each variable only when not already set, so env vars
-/// stay usable as dev overrides. A missing or unparsable file applies nothing
-/// (the binaries then run on flags/env/defaults alone; the daemon is what
-/// reports a broken config loudly). Called once at each agent binary's start,
-/// before argument parsing and before any threads.
-pub fn apply_agent_env() {
-    let Some(path) = agent_config_path() else {
-        return;
-    };
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(config) = Config::from_toml_str(&text) else {
-        return;
-    };
-    let config_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-    for (key, value) in agent_env_pairs(&config, &config_dir) {
-        if std::env::var_os(&key).is_none() {
-            // SAFETY: called at process start, before any other threads exist
-            // (each agent binary's main invokes this first).
-            unsafe { std::env::set_var(&key, &value) };
-        }
-    }
 }
 
 #[cfg(test)]

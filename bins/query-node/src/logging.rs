@@ -1,7 +1,7 @@
 //! The query role's `tracing` subscriber.
 //!
 //! Copied down from `bins/cache-node/src/logging.rs` (itself copied from
-//! `bins/verglasd/src/logging.rs`): same output shapes (`json` for pipelines,
+//! `bins/verglas-server/src/logging.rs`): same output shapes (`json` for pipelines,
 //! `pretty` for local dev), the same `RUST_LOG`/`VERGLAS_LOG_FORMAT`
 //! overrides, and the same non-blocking writer so a stalled log consumer
 //! drops lines rather than back-pressuring a query.
@@ -13,7 +13,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use verglas_core::config::LogFormat;
 
-/// Env var overriding the configured format, matching verglasd/cache-node.
+/// Env var overriding the configured format, matching verglas-server/cache-node.
 const LOG_FORMAT_ENV: &str = "VERGLAS_LOG_FORMAT";
 
 /// Keeps the non-blocking writer's background worker alive for the process.

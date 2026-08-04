@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TPC-H constrained PROFILE on a multi-node dev pod (issues #160, #29, #141).
 #
-# The single-node "constrained" profile (benchmarks/tpch) sizes one daemon's
+# The single-node "constrained" profile (benchmarks/tpch) sizes one server's
 # disk to ~50% of the SF1 footprint and measures eviction pressure. This pod
 # profile runs the SAME three legs through NODE 0 of an N-node `verglas dev` pod
 # where EACH node carries the constrained per-node budget — so the pod's
@@ -100,10 +100,10 @@ fi
 # ---- locate the verglas binaries (built once: cargo build --release) ------ #
 BIN=""
 for cand in "$HERE/../../target/release" "$HERE/../../target/debug"; do
-  if [[ -x "$cand/verglas" && -x "$cand/verglasd" ]]; then BIN="$cand"; break; fi
+  if [[ -x "$cand/verglas" && -x "$cand/verglas-server" ]]; then BIN="$cand"; break; fi
 done
 if [[ -z "$BIN" ]]; then
-  echo "error: verglas/verglasd not found under target/{release,debug}." >&2
+  echo "error: verglas/verglas-server not found under target/{release,debug}." >&2
   echo "       Build them once: cargo build --release" >&2
   exit 2
 fi
@@ -185,7 +185,7 @@ wait_ready() { # $1=admin-port
 
 # ---- boot the pod (background); teardown by launcher pid on exit ---------- #
 POD_CACHE="$(mktemp -d "${TMPDIR:-/tmp}/verglas-pod-XXXXXX")"
-POD_LOG="$OUT_DIR/pod-daemon.log"
+POD_LOG="$OUT_DIR/pod-server.log"
 # The ${arr[@]+...} guard keeps an EMPTY array from tripping `set -u` under
 # macOS's stock bash 3.2 (empty arrays count as unset there).
 ADMIT_FLAG=(); [[ -n "$ADMIT_PROB" ]] && ADMIT_FLAG=(--admit-probability "$ADMIT_PROB")
@@ -196,7 +196,7 @@ LAUNCHER=$!
 
 teardown_pod() {
   kill "$LAUNCHER" 2>/dev/null
-  # The #170 parent-death watch reaps the verglasd children; wait for node 0's
+  # The #170 parent-death watch reaps the verglas-server children; wait for node 0's
   # admin to stop answering, then remove the ephemeral pod cache.
   for _ in $(seq 1 50); do curl -sf "$NODE0_ADMIN/admin/healthz" >/dev/null 2>&1 || break; sleep 0.2; done
   rm -rf "$POD_CACHE"

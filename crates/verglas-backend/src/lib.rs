@@ -1,10 +1,10 @@
 //! Backend object-store client construction and policy.
 //!
 //! On a cache miss Verglas fills from the customer's real bucket ("the
-//! backend"). The daemon serves a configured SET of buckets (#235): the single
+//! backend"). The server serves a configured SET of buckets (#235): the single
 //! `backend.bucket` plus `backend.bucket_globs` (glob patterns like
 //! `*--table-s3` for AWS S3 Tables). A request whose bucket is in the set is
-//! served; any other bucket is rejected with `NoSuchBucket` — the daemon never
+//! served; any other bucket is rejected with `NoSuchBucket` — the server never
 //! builds a client for a bucket outside the set. Each served bucket's client is
 //! built lazily on first request and memoized, so a dynamic family (S3 Tables
 //! buckets appearing as tables are created) costs nothing until touched. Every
@@ -65,7 +65,7 @@ use resilience::RetryMetrics;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialMode {
     /// `[backend] credentials_file` names an AWS-format credentials file (#221):
-    /// the daemon reads the keys from there, no env needed.
+    /// the server reads the keys from there, no env needed.
     CredentialsFile,
     /// `AWS_ACCESS_KEY_ID` present: static keys from the environment (dev/CI,
     /// including MinIO).
@@ -122,7 +122,7 @@ pub enum BackendError {
         /// The `object_store` builder error.
         source: object_store::Error,
     },
-    /// A request named a bucket outside the daemon's configured bucket set
+    /// A request named a bucket outside the server's configured bucket set
     /// (`backend.bucket` / `backend.bucket_globs`). It gets `NoSuchBucket`,
     /// surfaced at the front-end as S3's 404.
     #[error("this node does not serve bucket `{requested}` (served set: {configured})")]
@@ -140,7 +140,7 @@ pub enum BackendError {
 const STARTUP_PROBE_KEY: &str = ".verglas-startup-probe";
 
 /// A startup-probe failure (#233): the configured backend bucket could not be
-/// built, reached, or authenticated before serving. The daemon fails to start on
+/// built, reached, or authenticated before serving. The server fails to start on
 /// this rather than degrading to an empty in-memory store. Each variant names
 /// the bucket and the credential chain that was tried so the operator can act.
 #[derive(Debug, thiserror::Error)]
@@ -153,7 +153,7 @@ pub enum StartupProbeError {
     Build {
         /// The configured bucket that failed to build.
         bucket: String,
-        /// The credential chain the daemon resolved for the startup log.
+        /// The credential chain the server resolved for the startup log.
         credential_chain: &'static str,
         /// The underlying build failure.
         #[source]
@@ -168,7 +168,7 @@ pub enum StartupProbeError {
     Unreachable {
         /// The configured bucket the probe could not reach.
         bucket: String,
-        /// The credential chain the daemon resolved for the startup log.
+        /// The credential chain the server resolved for the startup log.
         credential_chain: &'static str,
         /// The underlying request failure from the probe HEAD.
         #[source]
@@ -177,7 +177,7 @@ pub enum StartupProbeError {
 }
 
 /// Resolves the concurrency-limited backend store for a bucket named in a
-/// request. The daemon serves a configured bucket set (#235); a request naming a
+/// request. The server serves a configured bucket set (#235); a request naming a
 /// bucket outside it is rejected with [`BackendError::NoSuchBucket`]. The trait
 /// is the front-end seam so `verglas-s3` can route by the request's bucket
 /// without depending on the concrete [`BackendStore`].
@@ -296,7 +296,7 @@ type ClientBuilder = Box<dyn Fn(&str) -> Result<BucketClients, BackendError> + S
 /// The backend store. Serves a [`BucketSet`], building each served bucket's
 /// [`BucketClients`] lazily on first request and memoizing them. A request for a
 /// bucket outside the set is rejected with [`BackendError::NoSuchBucket`]; the
-/// daemon never builds a client for a bucket it does not serve.
+/// server never builds a client for a bucket it does not serve.
 pub struct BackendStore {
     /// The buckets this node serves.
     set: BucketSet,
@@ -497,7 +497,7 @@ impl BackendStore {
             .sum()
     }
 
-    /// A one-line description of the backend for the daemon's startup log: the
+    /// A one-line description of the backend for the server's startup log: the
     /// served bucket set, annotated with the resolved credential source.
     pub fn describe(&self) -> String {
         format!("{}/{}", self.set.describe(), self.credential_mode.label())
@@ -514,7 +514,7 @@ impl BackendStore {
     ///
     /// A glob-only or bucketless config (dev/test, or an injected store with no
     /// single named bucket) has no concrete bucket to HEAD, so the probe is a
-    /// no-op success. The daemon runs this once at startup and exits on the
+    /// no-op success. The server runs this once at startup and exits on the
     /// error.
     pub async fn probe(&self) -> Result<(), StartupProbeError> {
         let Some(bucket) = self.set.bucket.clone() else {
@@ -629,7 +629,7 @@ impl BackendStores for BackendStore {
 /// exists only for the S3 provider; azure and gcp return an error here and the
 /// caller keeps `raw = None`, routing every request through the typed client.
 /// A malformed endpoint fails here; credentials resolve later, for each signed
-/// origin request, so temporary sessions can refresh in the running daemon.
+/// origin request, so temporary sessions can refresh in the running server.
 fn build_raw(bucket: &str, backend: &Backend) -> Result<Arc<RawS3>, BackendError> {
     if backend.provider != BackendProvider::S3 {
         return Err(BackendError::Build {

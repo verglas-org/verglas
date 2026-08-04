@@ -1,0 +1,23 @@
+# Self-hosted Verglas cache server.
+#
+# 1. Copy deploy/docker/verglas.toml and fill [backend] (bucket/region/endpoint)
+#    plus credentials under deploy/docker/credentials/ (see that directory).
+# 2. docker compose up -d
+# 3. Point the CLI at the admin port:
+#      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+#    Engines point S3 at http://127.0.0.1:8333.
+
+services:
+  verglas-server:
+    build: .
+    image: verglas/verglas-server:local
+    ports:
+      - "8333:8333" # S3 endpoint
+      - "8334:8334" # admin API (CLI)
+    environment:
+      VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
+    volumes:
+      - ./deploy/docker/verglas.toml:/etc/verglas/config.toml:ro
+      - ./deploy/docker/credentials:/etc/verglas/credentials:ro
+      - /Volumes/data_cache/verglas:/var/lib/verglas
+    restart: unless-stopped

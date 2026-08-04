@@ -11,7 +11,7 @@ Two responsibilities, one per subcommand:
 
 * ``table`` — merge the ``direct`` and ``verglas`` per-leg JSONs into the
   comparison the issue asks for: per-operation p50/p95/p99 for
-  ``direct`` vs ``verglas-cold`` vs ``verglas-warm``, plus the daemon's
+  ``direct`` vs ``verglas-cold`` vs ``verglas-warm``, plus the server's
   ``/admin/stats`` meta counters for the warm leg (the mechanism evidence).
 
 Nothing here runs in CI. It is pure stdlib so ``run.sh`` needs no venv.

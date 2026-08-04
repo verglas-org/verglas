@@ -1,7 +1,7 @@
 # Verglas ⇄ Ceph s3-tests — curated skip list (the compatibility contract).
 #
 # THIS FILE IS THE DOCUMENTED S3-COMPATIBILITY SURFACE OF VERGLAS.
-# Every entry is a test that does NOT pass against the current daemon, grouped
+# Every entry is a test that does NOT pass against the current server, grouped
 # under a stated reason. Two kinds of reason:
 #
 #   • UNSUPPORTED / BY DESIGN / DEVIATION / OUT OF SCOPE / BACKEND SEMANTICS —

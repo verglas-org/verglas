@@ -92,3 +92,5 @@
   a block one node cold-fills on a peer's behalf logs under the id the client
   saw — the cross-node trace correlation key.
 - #3: Updated logical-write references for the `verglas-write` package rename.
+- #91: Updated cluster process and test terminology from daemon to server for
+  the `verglas-server` rename. Membership and routing behavior are unchanged.

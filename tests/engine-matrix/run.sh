@@ -20,7 +20,7 @@ NAMESPACE="${MATRIX_NAMESPACE:-matrix}"
 CATALOG_DB="${MATRIX_CATALOG_DB:-$HERE/catalog.db}"
 SIDECAR="${MATRIX_SIDECAR:-$HERE/fixture.json}"
 
-# Verglas endpoint + dev keys (static config for the CI daemon).
+# Verglas endpoint + dev keys (static config for the CI server).
 VERGLAS_ENDPOINT="${VERGLAS_ENDPOINT:-http://127.0.0.1:8333}"
 VG_KEY="${VERGLAS_ACCESS_KEY_ID:-}"
 VG_SECRET="${VERGLAS_SECRET_ACCESS_KEY:-}"
@@ -160,7 +160,7 @@ ensure_jar() {
   if [[ -f "$JAR" ]]; then return 0; fi
   if [[ -x "$HERE/fixture-jvm/gradlew" ]]; then
     echo "[setup] building fixture-jvm jar (one-time)" >&2
-    ( cd "$HERE/fixture-jvm" && ./gradlew --no-daemon shadowJar >&2 )
+    ( cd "$HERE/fixture-jvm" && ./gradlew --no-server shadowJar >&2 )
   else
     echo "error: $JAR missing and fixture-jvm/gradlew not found." >&2
     exit 2

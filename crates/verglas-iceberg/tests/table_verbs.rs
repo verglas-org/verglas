@@ -6,7 +6,7 @@
 //! create → append → list/show/history → query → time-travel path is exercised
 //! by `cargo test` alone. The REST-catalog + endpoint wiring is the same code
 //! path (the operations take a `&dyn Catalog`); it is proven end-to-end by the
-//! daemon-backed example session in the PR.
+//! server-backed example session in the PR.
 
 use std::collections::HashMap;
 use std::io::Write;

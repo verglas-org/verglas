@@ -1,7 +1,6 @@
 //! Extracting `(id, vector)` rows from an Arrow `RecordBatch`.
 //!
-//! Shared by the maintenance MV (reads the source delta) and the brute-force
-//! fallback (reads the whole column). An embedding stored as a
+//! Used by the maintenance MV to decode source deltas. An embedding stored as a
 //! `FixedSizeList<Float32>` or `List<Float32>` decodes to a vector; a **null**
 //! embedding is a *tombstone* — the append-only-friendly delete signal the
 //! maintenance MV consumes (a row re-appended with a null vector deletes that

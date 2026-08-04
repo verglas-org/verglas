@@ -3,7 +3,7 @@
 mod support;
 
 use support::TestCatalog;
-use verglas_platform::{SystemCatalog, SystemState, WorkerSpec};
+use verglas_platform::{PlatformError, SystemCatalog, SystemState, WorkerSpec};
 
 /// A worker declares, lists as active, pauses to a new revision, and reads back
 /// with its triggers and output intact.
@@ -44,4 +44,22 @@ async fn worker_declare_list_and_pause() {
         .expect("get")
         .expect("row");
     assert_eq!(current.state, SystemState::Paused);
+}
+
+/// A missing worker is reported as a worker error without legacy declaration
+/// kinds from the retired source, MV, and sink registries.
+#[tokio::test]
+async fn missing_worker_error_has_no_legacy_kind() {
+    let tc = TestCatalog::new().await;
+    let sys = SystemCatalog::new(tc.catalog.clone());
+
+    let error = sys
+        .set_worker_state("missing", SystemState::Paused)
+        .await
+        .expect_err("missing worker must fail");
+
+    match error {
+        PlatformError::NotFound { name } => assert_eq!(name, "missing"),
+        other => panic!("expected worker not-found error, got {other}"),
+    }
 }

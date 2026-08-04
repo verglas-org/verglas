@@ -7,3 +7,5 @@
 - Preserved PR #387's `QueryMemoryEstimate` as a shared API response while
   rebasing the SDK/engine split, instead of leaving that wire type owned by the
   Iceberg implementation.
+- #91: Updated API ownership documentation to call the foreground process the
+  server. Wire behavior is unchanged by the executable rename.

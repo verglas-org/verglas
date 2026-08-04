@@ -239,7 +239,7 @@ pub fn demotions_for_commit(
 /// The persisted retirement state (#305): the demotion schedule plus the
 /// per-table replay watermarks the coordinator maintains. Written atomically
 /// (tmp + rename) after every change; loaded at startup so a restart cannot
-/// amnesty dead bytes and commits made while the daemon was down are replayed
+/// amnesty dead bytes and commits made while the server was down are replayed
 /// rather than lost.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RetireState {

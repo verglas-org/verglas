@@ -8,7 +8,7 @@
 //! JSON chunk per batch as it arrives — `{"columns":[...],"rows":[` first,
 //! then each batch's rows, then `],"row_count":N}` once the stream is
 //! exhausted — so the *shape* on the wire is exactly the same
-//! `{columns, rows, row_count}` object `verglasd`'s embedded `/v1/query`
+//! `{columns, rows, row_count}` object `verglas-server`'s embedded `/v1/query`
 //! returns in one shot, byte-for-byte reconstructable by any client that
 //! reads to EOF and parses the whole body as JSON, but nothing on the server
 //! side ever holds the whole result in memory to produce it. Peak worker
@@ -19,8 +19,8 @@
 //! that nothing *requires* full materialization for a large one.
 //!
 //! The request wire shape (`{sql, at: {reference, table}}`) is byte-for-byte
-//! the same as `verglasd`'s embedded `/v1/query`, so a client (or the
-//! daemon's own dispatcher, streaming this response straight through to its
+//! the same as `verglas-server`'s embedded `/v1/query`, so a client (or the
+//! server's own dispatcher, streaming this response straight through to its
 //! own caller) does not need to know which of the two is answering.
 
 use std::io::{self, Write};
@@ -90,7 +90,7 @@ async fn healthz() -> &'static str {
 }
 
 /// The body of `POST /v1/query` and `POST /v1/query/estimate`: identical to
-/// `verglasd`'s embedded `/v1/query` request shape.
+/// `verglas-server`'s embedded `/v1/query` request shape.
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
     /// The SQL to run (or, for `/estimate`, to plan without running).
@@ -121,7 +121,7 @@ impl QueryRequest {
 /// `POST /v1/query`: streams SQL results as `{columns, rows, row_count}`, one
 /// JSON chunk per `RecordBatch` as DataFusion produces it — see the module
 /// doc comment for why, and for exactly what stays byte-compatible with the
-/// embedded daemon's buffered response.
+/// embedded server's buffered response.
 ///
 /// Before running, this estimates the query's memory need and grows the held
 /// grant to cover it if the current grant falls short (grow-only, the escape

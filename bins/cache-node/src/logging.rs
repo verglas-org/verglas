@@ -1,9 +1,9 @@
 //! The cache node's `tracing` subscriber.
 //!
-//! Copied down from `bins/verglasd/src/logging.rs`, dropping the runtime reload
+//! Copied down from `bins/verglas-server/src/logging.rs`, dropping the runtime reload
 //! handle: the cache node has no `/admin/log` route to hot-reload the filter, so
 //! the subscriber is installed once from the `[log]` config and left alone. Same
-//! output shapes as verglasd (`json` for pipelines, `pretty` for local dev), the
+//! output shapes as verglas-server (`json` for pipelines, `pretty` for local dev), the
 //! same `RUST_LOG`/`VERGLAS_LOG_FORMAT` overrides, and the same non-blocking
 //! writer so a stalled log consumer drops lines rather than back-pressuring a
 //! serving task (a standing invariant: logging never blocks a fill).
@@ -15,13 +15,13 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 use verglas_core::config::LogFormat;
 
-/// Env var overriding the configured format, matching verglasd so a `VERGLAS_LOG_FORMAT=pretty`
+/// Env var overriding the configured format, matching verglas-server so a `VERGLAS_LOG_FORMAT=pretty`
 /// works the same way against either binary.
 const LOG_FORMAT_ENV: &str = "VERGLAS_LOG_FORMAT";
 
 /// Keeps the non-blocking writer's background worker alive for the process. The
 /// worker flushes and stops when this guard drops, so it is parked here for the
-/// daemon's lifetime rather than dropped at the end of [`install`].
+/// server's lifetime rather than dropped at the end of [`install`].
 static WRITER_GUARD: OnceLock<WorkerGuard> = OnceLock::new();
 
 /// The format the subscriber uses, after the `VERGLAS_LOG_FORMAT` override is
@@ -36,7 +36,7 @@ fn effective_format(configured: LogFormat) -> LogFormat {
 
 /// Builds the startup filter: `RUST_LOG` when set, otherwise the configured
 /// level. An unparseable value in either falls back to `info` so a typo never
-/// silences the daemon.
+/// silences the server.
 fn startup_filter(level: &str) -> EnvFilter {
     if let Ok(from_env) = EnvFilter::try_from_default_env() {
         return from_env;

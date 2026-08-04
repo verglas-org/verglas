@@ -36,7 +36,7 @@ TABLES_PER_NS="${POLARIS_TABLES_PER_NS:-5}"
 VIEWS_PER_NS="${POLARIS_VIEWS_PER_NS:-3}"
 READ_WRITE_RATIO="${POLARIS_READ_WRITE_RATIO:-0.8}"   # ReadUpdateTreeDataset
 
-# Verglas dev daemon (leg B). Ports: S3 on VG_PORT, admin on VG_PORT+1.
+# Verglas dev server (leg B). Ports: S3 on VG_PORT, admin on VG_PORT+1.
 VG_PORT="${POLARIS_VG_PORT:-8455}"
 VG_DRAM="${POLARIS_VG_DRAM:-1GB}"
 VG_DISK="${POLARIS_VG_DISK:-20GB}"
@@ -80,7 +80,7 @@ Options (also env, see README):
   --ns-width / --ns-depth / --tables-per-ns / --views-per-ns / --read-write-ratio
 
 Origin creds come from the ambient AWS_* env (load .env first). The Verglas dev
-keys are generated and parsed automatically from the daemon banner.
+keys are generated and parsed automatically from the server banner.
 EOF
 }
 
@@ -162,7 +162,7 @@ patch_gatling_indicators() {
 }
 
 # --------------------------------------------------------------------------- #
-# Verglas dev daemon (leg B only)
+# Verglas dev server (leg B only)
 # --------------------------------------------------------------------------- #
 
 VG_PARENT_PID=""
@@ -179,12 +179,12 @@ check_port_free() {
 }
 
 start_verglas() {
-  [[ -x "$VERGLAS_BIN" ]] || { echo "error: verglas binary not found at $VERGLAS_BIN; run: cargo build --release -p verglas -p verglasd" >&2; exit 2; }
+  [[ -x "$VERGLAS_BIN" ]] || { echo "error: verglas binary not found at $VERGLAS_BIN; run: cargo build --release -p verglas -p verglas-server" >&2; exit 2; }
   # #170: use ports nothing else holds. Check both S3 and admin ports up front.
   check_port_free "$VG_PORT"
   check_port_free "$((VG_PORT + 1))"
   rm -rf "$VG_CACHE_DIR"; mkdir -p "$VG_CACHE_DIR"
-  echo "[verglas] starting dev daemon on 127.0.0.1:${VG_PORT} (admin $((VG_PORT + 1)))" >&2
+  echo "[verglas] starting dev server on 127.0.0.1:${VG_PORT} (admin $((VG_PORT + 1)))" >&2
   : > "$VG_LOG"
   "$VERGLAS_BIN" dev --port "$VG_PORT" --cache-dir "$VG_CACHE_DIR" \
     --dram "$VG_DRAM" --cache-size "$VG_DISK" >"$VG_LOG" 2>&1 &
@@ -209,10 +209,10 @@ start_verglas() {
 
 stop_verglas() {
   [[ -n "$VG_PARENT_PID" ]] || return 0
-  echo "[verglas] stopping dev daemon (#170: killing verglasd children explicitly)" >&2
-  # #170: verglasd children survive the parent's SIGTERM, so the parent alone is
+  echo "[verglas] stopping dev server (#170: killing verglas-server children explicitly)" >&2
+  # #170: verglas-server children survive the parent's SIGTERM, so the parent alone is
   # never enough. Loop with escalating signals against every PID holding our S3
-  # or admin port (the verglasd listener) plus the dev parent, until the S3 port
+  # or admin port (the verglas-server listener) plus the dev parent, until the S3 port
   # is actually free — then nothing is orphaned for the next leg's port guard.
   kill "$VG_PARENT_PID" 2>/dev/null || true
   local attempt sig p pids
@@ -335,7 +335,7 @@ gatling_run() {
     -e GRADLE_USER_HOME=/gradle-cache \
     -w /work/benchmarks \
     "$GATLING_JDK_IMAGE" \
-    ./gradlew --no-daemon --console=plain gatlingRun \
+    ./gradlew --no-server --console=plain gatlingRun \
       --simulation "org.apache.polaris.benchmarks.simulations.${sim}" \
       -Dconfig.file=/work/benchmarks/application.conf
   # Newest report dir for this simulation (Gatling lowercases the class name).

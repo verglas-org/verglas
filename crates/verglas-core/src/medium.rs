@@ -3,8 +3,8 @@
 //!
 //! Warm-path performance depends on what backs the cache directory (laptop
 //! SSD vs workstation NVMe vs instance-store) and on whether the OS serves the
-//! cache device with `O_DIRECT` or buffered IO. `verglas dev` prints this at
-//! startup (issue #25) and the benchmarks under `benchmarks/` record it
+//! cache device with `O_DIRECT` or buffered IO. Local diagnostics print this at
+//! startup and the benchmarks under `benchmarks/` record it
 //! alongside their results, so two runs on different machines are never
 //! conflated.
 

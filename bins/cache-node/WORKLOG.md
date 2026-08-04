@@ -40,3 +40,6 @@
   store and peer RPC. `DeviceRegistry` gained an optional ring plane it attaches
   once at startup; ensure/get route flushes through it when present.
 - #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.
+- #91: Renamed the full local process from `verglasd` to `verglas-server` in
+  cache-node parity documentation. The comparison now names the foreground
+  server binary used by self-hosted deployments.

@@ -3,7 +3,7 @@
 //!
 //! On each catalog change the coordinator resolves the table's new snapshot,
 //! replays every commit since its persisted watermark (#305 — commits made
-//! while the daemon was down are diffed too, not just the latest), and — for a
+//! while the server was down are diffed too, not just the latest), and — for a
 //! content-preserving-or-shifting operation (`replace`/`overwrite`/`delete`) —
 //! plans the rewritten files' hot chunks against the heat ledger and submits
 //! them to the shared executor at compaction-repair priority. Every processed
@@ -39,7 +39,7 @@ use crate::mapper::Mapper;
 pub struct PrefetchCoordinator<W, F> {
     /// The catalog watcher whose commits trigger repairs.
     watcher: Arc<W>,
-    /// The metadata reader (through the cache in the daemon) for diffs + footers.
+    /// The metadata reader (through the cache in the server) for diffs + footers.
     fetch: Arc<F>,
     /// The live logical-key map (for the table id and, via the aggregator, heat).
     mapper: Arc<Mapper>,
@@ -97,7 +97,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
         }
     }
 
-    /// The retirement scheduler (for the daemon's hard-eviction sweep and tests).
+    /// The retirement scheduler (for the server's hard-eviction sweep and tests).
     pub fn retire(&self) -> &Arc<RetirementScheduler> {
         &self.retire
     }
@@ -106,7 +106,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
     /// schedule, re-demotes every grace-pending object in the engine (a
     /// restart must not amnesty dead bytes), reloads the watermarks, and
     /// immediately reclaims anything whose grace window closed while the
-    /// daemon was down. Call once at startup, before [`Self::spawn`].
+    /// server was down. Call once at startup, before [`Self::spawn`].
     pub fn restore(&self, now_ms: u64) {
         let Some(path) = &self.state_path else {
             return;
@@ -137,7 +137,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
         if reclaimed > 0 {
             tracing::info!(
                 files = reclaimed,
-                "reclaimed retirements that expired while the daemon was down"
+                "reclaimed retirements that expired while the server was down"
             );
         }
     }
@@ -147,7 +147,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
     /// remove** their blocks from the cache stores, so a retired file's bytes
     /// return to the shared budget once its snapshots have expired and time
     /// travel no longer needs them — no eviction pressure required. Returns
-    /// how many files were swept. The daemon calls this on a timer; a test
+    /// how many files were swept. The server calls this on a timer; a test
     /// drives `now_ms` directly. Off the request hot path.
     pub fn sweep_expired(&self, now_ms: u64) -> usize {
         let expired = self.retire.drain_expired(now_ms);

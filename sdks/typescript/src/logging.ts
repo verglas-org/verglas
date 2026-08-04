@@ -370,7 +370,7 @@ export interface WorkerObservability {
  * observability with no per-worker wiring.
  *
  * Log retention is not the SDK's concern: every `<name>_LOGS` table is pruned to
- * the platform's standard TTL by the serving runtime (the daemon's housekeeping,
+ * the platform's standard TTL by the serving runtime (the server's housekeeping,
  * and the cloud committer's daily tick), not by anything computed here.
  */
 export function observabilityFor(name: string): WorkerObservability {

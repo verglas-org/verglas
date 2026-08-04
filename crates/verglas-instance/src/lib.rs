@@ -6,7 +6,7 @@
 //! funnel through a shared transaction layer. This crate gives that instance a
 //! clean crate home, separate from the cache mechanics ([`verglas_cache`]), the
 //! gossip/ring transport ([`verglas_cluster`]), the metadata/warming tier
-//! ([`verglas_tables`]), and the daemon binary — so both the local daemon and
+//! ([`verglas_tables`]), and the server binary — so both the local server and
 //! the fleet's host-agent instantiate the *same* library type.
 //!
 //! It exposes two interfaces as **traits with a working local default**, so a
@@ -23,7 +23,7 @@
 //!   no peers); the fleet supplies gossip membership + peer RPC (and later
 //!   RDMA) behind the same trait, transport-agnostic like the catalog
 //!   change-feed pattern. [`RingAdapter`] bridges any existing key-ownership
-//!   [`verglas_core::ring::Ring`] (e.g. the daemon's live gossip ring) into the
+//!   [`verglas_core::ring::Ring`] (e.g. the server's live gossip ring) into the
 //!   interface for placement.
 //!
 //! [`CacheInstance`] composes the two into the deployable unit. The cache engine

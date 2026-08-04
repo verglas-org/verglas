@@ -9,16 +9,14 @@ use verglas_core::admin::{DEFAULT_ENDPOINT, ENDPOINT_ENV};
 #[derive(Debug, Parser)]
 #[command(name = "verglas", version, about = "Verglas operator CLI")]
 pub struct Cli {
-    /// Admin API base URL for the target daemon. Named `--daemon-endpoint` (with
-    /// a distinct arg id) so it does not collide with `verglas init --endpoint`
-    /// (the backend origin URL).
+    /// Admin API base URL for the target server (`VERGLAS_ENDPOINT`).
     #[arg(
- id = "daemon_endpoint",
- long = "daemon-endpoint",
- env = ENDPOINT_ENV,
- default_value = DEFAULT_ENDPOINT,
- global = true
- )]
+        id = "server_endpoint",
+        long = "server-endpoint",
+        env = ENDPOINT_ENV,
+        default_value = DEFAULT_ENDPOINT,
+        global = true
+    )]
     pub endpoint: String,
 
     /// Emit machine-readable JSON instead of human-readable tables.
@@ -31,37 +29,24 @@ pub struct Cli {
 
 /// Top-level `verglas` subcommands.
 ///
-/// Local commands operate against the selected daemon and Iceberg catalog.
+/// Local commands operate against the selected server and Iceberg catalog.
 /// Logged-in commands manage the tenant's container and worker deployments
 /// through the control plane. Workers are the single scheduled/event-driven
 /// compute primitive; there are no source, MV, or sink command groups.
 ///
 /// The CLI's own version is a flag (`-V`/`--version`), not a subcommand; the
-/// running daemon's version is reported by `verglas status`.
+/// running server's version is reported by `verglas status`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Log in to the Verglas control plane with an API key so container and
-    /// worker deployments can be managed. Stores the key locally (mode 0600)
-    /// and the control-plane URL in config. Local commands keep working without
-    /// it; re-run to update either value.
+    /// Log in to Verglas Cloud (browser by default). Stores the API key locally
+    /// (mode 0600) and the control-plane URL in config. Local commands keep
+    /// working without it; re-run to refresh credentials.
     Login(LoginArgs),
-    /// Run a local cluster-of-one against one bucket (`--bucket`).
-    Dev(DevArgs),
     /// Drain this node: stop taking new cache ownership, donate warmth to
     /// peers, then exit.
     Drain(DrainArgs),
-    /// Install Verglas as an OS service against a bucket.
-    Init(crate::commands::lifecycle::InitArgs),
-    /// Start the installed Verglas service.
-    Start(crate::commands::lifecycle::ScopeArgs),
-    /// Stop the running Verglas service.
-    Stop(crate::commands::lifecycle::ScopeArgs),
-    /// Restart the Verglas service.
-    Restart(crate::commands::lifecycle::ScopeArgs),
-    /// Show service state, daemon health, version, and cache warmth.
-    Status(crate::commands::lifecycle::ScopeArgs),
-    /// Tail the Verglas service log.
-    Logs(crate::commands::lifecycle::LogsArgs),
+    /// Probe the server at `--server-endpoint` (health, version, cache warmth).
+    Status,
     /// Create, append to, inspect, and drop agent-managed Iceberg tables, and
     /// read their local per-table cache metrics.
     #[command(subcommand)]
@@ -73,11 +58,8 @@ pub enum Command {
     Graph(GraphCommand),
     /// Run an embedded SQL query over Iceberg tables.
     Query(QueryArgs),
-    /// Vector (ANN) indexes — the one command group for indexes across tables,
-    /// graphs, and clusters. `list` with no table shows every declared index from
-    /// the durable registry (cluster id, state, reflected snapshot); `list <table>`
-    /// shows one table's indexes. `add` declares an index on a table's embedding
-    /// field and runs the initial build; `search` queries an indexed field.
+    /// Table-scoped vector (ANN) indexes. `list <table>` discovers attachments
+    /// from the current snapshot; `add` builds one and `search` queries it.
     #[command(subcommand)]
     Index(IndexCommand),
     /// Cloud workers — scheduled or event-driven container executions on the
@@ -112,40 +94,6 @@ pub enum Command {
     /// `verglas login`.
     #[command(subcommand)]
     Secrets(SecretsCommand),
-    /// Install the Verglas agent skill and lifecycle hooks that speak to your
-    /// tenant's memory MCP (recall/remember/session_context) — so a session
-    /// loads prior context on start, recalls per prompt, and consolidates at
-    /// close. Run `verglas login` first. Idempotent; re-run any time.
-    #[command(subcommand)]
-    Skills(SkillsCommand),
-}
-
-/// `verglas skills` subcommands.
-#[derive(Debug, Subcommand)]
-pub enum SkillsCommand {
-    /// Install (or refresh) the skill + hooks for one or more agent harnesses.
-    Install(SkillsInstallArgs),
-}
-
-/// Arguments for `verglas skills install`.
-#[derive(Debug, Args)]
-pub struct SkillsInstallArgs {
-    /// Which harness to install for: `claude` (default), `codex`, `cursor`, or
-    /// `all`. The hook scripts are shared; this selects which harness's skill
-    /// file and hook wiring are written.
-    #[arg(long, default_value = "claude")]
-    pub harness: String,
-
-    /// Override the agent base directory (default `~/.verglas/agent`). Mainly for
-    /// tests; the hook scripts live under `<base>/hooks`.
-    #[arg(long)]
-    pub base_dir: Option<std::path::PathBuf>,
-
-    /// Override the memory MCP endpoint URL instead of discovering it from the
-    /// control plane. The bearer is never taken from a flag (never a secret on
-    /// the command line) — set `VERGLAS_MCP_BEARER` with this for offline installs.
-    #[arg(long)]
-    pub endpoint: Option<String>,
 }
 
 /// `verglas secrets` subcommands. Secrets are control-plane resources; every verb
@@ -200,7 +148,7 @@ pub enum WorkersCommand {
     Get(WorkerRefArgs),
     /// Register a worker from a portable spec file (`--file`, JSON or TOML). The
     /// same file registers on the cloud (the default) or, with `--local`, on the
-    /// local daemon. `--name`/`--schedule` override the matching spec fields.
+    /// local server. `--name`/`--schedule` override the matching spec fields.
     Create(WorkerCreateArgs),
     /// Update a worker from a spec file (`--file`) and/or the common overrides
     /// (`--schedule`, `--status`). Accepts the worker's id or name.
@@ -214,7 +162,7 @@ pub enum WorkersCommand {
     /// Follow a local process or file and stream every captured line into a table
     /// as rows. Wraps a command after `--`, or tails `--file <path>`. Streams
     /// until Ctrl-C, then tears the worker down; `--keep` leaves it registered.
-    /// When the daemon is logged in, the rows land in your cloud lakehouse.
+    /// When the server is logged in, the rows land in your cloud lakehouse.
     Follow(WorkerFollowArgs),
     /// Push a locally-registered worker (its spec and bundled files) to the cloud
     /// as a deployment. Secrets never ride along — a missing `@secret:` reference
@@ -238,7 +186,7 @@ pub struct WorkerCreateArgs {
     /// The portable worker spec, a JSON (`.json`) or TOML (`.toml`) object.
     #[arg(long)]
     pub file: PathBuf,
-    /// Register on the LOCAL daemon instead of the cloud. The same spec file works
+    /// Register on the LOCAL server instead of the cloud. The same spec file works
     /// for both — develop and test locally, then push (or create) to the cloud.
     #[arg(long)]
     pub local: bool,
@@ -510,17 +458,12 @@ pub struct VolumeResizeArgs {
     pub size: String,
 }
 
-/// `verglas index` subcommands: the one command group for vector (ANN) indexes.
-/// `list` reads the durable `verglas_sys.indexes` registry; `add` and `search`
-/// are table-scoped operations declared here rather than under `verglas table`.
+/// `verglas index` subcommands for table-scoped vector (ANN) indexes.
 #[derive(Debug, Subcommand)]
 pub enum IndexCommand {
-    /// List declared vector indexes. With no table, lists every index across
-    /// tables, graphs, and clusters from the durable registry. With a table
-    /// (`namespace.name`), lists just that table's indexes.
+    /// List vector indexes attached to a table's current snapshot.
     ///
-    /// JSON (`--json`), no table: {"indexes":[{"name","targetKind","target",
-    /// "field","metric","clusterId","state","reflectedSnapshot"}]}. With a table:
+    /// JSON (`--json`):
     /// {"indexes":[{"target","field","metric","reflectedSnapshot","liveCount"}]}.
     List(IndexListArgs),
     /// Declare a vector (ANN) index on a table's embedding field and run the
@@ -531,7 +474,7 @@ pub enum IndexCommand {
     /// "blobBytes"}.
     Add(IndexAddArgs),
     /// Search an indexed field for the nearest neighbors of a query vector.
-    /// Falls back to brute force over the column when no index exists.
+    /// The table's current snapshot must have an attached index.
     ///
     /// JSON (`--json`): {"source","neighbors":[{"id","distance"}]}.
     Search(IndexSearchArgs),
@@ -540,9 +483,8 @@ pub enum IndexCommand {
 /// Arguments for `verglas index list`.
 #[derive(Debug, Args)]
 pub struct IndexListArgs {
-    /// The table (`namespace.name`) to list indexes for. Omit to list every
-    /// declared index across tables, graphs, and clusters from the registry.
-    pub table: Option<String>,
+    /// The table (`namespace.name`) whose current-snapshot indexes are listed.
+    pub table: String,
 }
 
 /// `verglas table` subcommands. Every verb takes `--output json` via the global
@@ -578,7 +520,7 @@ pub enum TableCommand {
     History(TableInspectArgs),
     /// Compact tables now: rewrite accumulated small data files into fewer,
     /// larger ones and commit the result. A one-shot manual pass over every
-    /// table — the daemon runs no compaction on its own. Progress ratchets one
+    /// table — the server runs no compaction on its own. Progress ratchets one
     /// commit per group and the pass is time-bounded, so on a large backlog it
     /// may stop partway; run it again to continue.
     ///
@@ -594,7 +536,7 @@ pub enum TableCommand {
     ///
     /// JSON (`--json`): {"table","dropped":true}.
     Delete(TableDeleteArgs),
-    /// Per-table cache metrics from the local daemon (hit rate, cached bytes,
+    /// Per-table cache metrics from the local server (hit rate, cached bytes,
     /// backend requests avoided, and a dollar-savings ESTIMATE at published S3 GET
     /// list pricing).
     Metrics,
@@ -693,7 +635,7 @@ pub struct TableInspectArgs {
 
 /// `verglas graph` subcommands. A graph lives in one namespace; its data is two
 /// plain Iceberg tables (`<namespace>.nodes` and `<namespace>.edges`) plus a
-/// snapshot-bound adjacency index. Every verb calls the daemon; every verb takes
+/// snapshot-bound adjacency index. Every verb calls the server; every verb takes
 /// `--json` for a stable machine-readable shape.
 #[derive(Debug, Subcommand)]
 pub enum GraphCommand {
@@ -836,8 +778,8 @@ pub struct QueryArgs {
 /// automation.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// The control plane base URL to authenticate against. Omit to reuse the URL
-    /// from a previous login.
+    /// Override the control plane URL. Default is Verglas Cloud
+    /// (`https://api.verglas.dev`); omit for a normal login.
     #[arg(long)]
     pub url: Option<String>,
 
@@ -856,135 +798,14 @@ pub struct LoginArgs {
     pub api_key: Option<String>,
 }
 
-/// Arguments for `verglas dev`: the local cluster-of-one.
-///
-/// `--bucket` names the one bucket the endpoint serves (required); the daemon
-/// reads it through to its origin using the ambient AWS credential chain.
-/// Backend credentials come from that environment, never from flags.
-/// (Multi-bucket serving is deferred to issue.)
-#[derive(Debug, Args)]
-pub struct DevArgs {
-    /// The bucket the local endpoint serves (`s3://name` or a bare `name`).
-    /// Required — the daemon serves exactly this one bucket; a request for any
-    /// other bucket returns NoSuchBucket.
-    #[arg(long)]
-    pub bucket: String,
-
-    /// Origin S3 endpoint URL (e.g. the OCI/MinIO/AWS endpoint the daemon
-    /// caches). Required — dev serves nothing without a real backend.
-    #[arg(long)]
-    pub endpoint: String,
-
-    /// Origin signing region. Required.
-    #[arg(long)]
-    pub region: String,
-
-    /// Path to the origin credentials file (AWS credentials-file format, mode
-    /// 0600) — the keys the daemon uses to reach the backend. Required.
-    #[arg(long)]
-    pub credentials_file: PathBuf,
-
-    /// Profile to read from `--credentials-file`. Unset uses `default`.
-    #[arg(long)]
-    pub credentials_profile: Option<String>,
-
-    /// Allow a plaintext `http://` origin endpoint (MinIO/dev). Off by default.
-    #[arg(long, default_value_t = false)]
-    pub allow_http: bool,
-
-    /// Iceberg REST catalog URI the dev daemon proxies on its loopback gateway
-    ///. Setting it turns on the daemon's `[catalog]`, so the
-    /// agent-facing verbs (`verglas table`, `verglas query`) work zero-config
-    /// against this daemon. Unset leaves Iceberg awareness off.
-    #[arg(long)]
-    pub catalog_uri: Option<String>,
-
-    /// Bearer token for the proxied catalog (`--catalog-uri`). Written to an
-    /// ephemeral mode-0600 file in the cache dir, never inline in the config.
-    #[arg(long)]
-    pub catalog_token: Option<String>,
-
-    /// Directory for the on-disk cache. Omit for a temp dir removed on Ctrl-C;
-    /// point it at an NVMe path for real NVMe performance.
-    #[arg(long)]
-    pub cache_dir: Option<PathBuf>,
-
-    /// On-disk cache size ceiling (`20GB`, `512MB`, or a byte count).
-    #[arg(long, default_value = "20GB")]
-    pub cache_size: String,
-
-    /// In-memory (DRAM) cache size ceiling (`1GB`, `80MB`, or a byte count).
-    /// The default keeps an SF1-class dataset resident in DRAM; lower it to the
-    /// engine floor (`80MB`) to measure NVMe-resident serving. A value below the
-    /// floor fails fast at startup with the engine's budget error.
-    #[arg(long, default_value = "1GB")]
-    pub dram: String,
-
-    /// Base port for the local S3 endpoint engines point at (admin API binds the
-    /// next port; a pod's later nodes take consecutive blocks). The default `0`
-    /// asks the kernel for free ports and prints the ones it assigned — no
-    /// probe-then-bind race. Pass an explicit non-zero port to pin
-    /// it; an explicit port that is taken fails loudly rather than silently
-    /// sliding to another.
-    #[arg(long, default_value_t = 0)]
-    pub port: u16,
-
-    /// Write the resolved node endpoints to this file, one line per node
-    /// (`node <i> s3=<addr> admin=<addr>`), once the pod is up.
-    /// Lets a script or test learn the kernel-assigned ports without parsing the
-    /// banner. Omit to only print them.
-    #[arg(long)]
-    pub ports_file: Option<PathBuf>,
-
-    /// Resident-biased admission fraction under sustained cache pressure
-    ///. When the cache is full, a block that clears the frequency
-    /// doorkeeper is admitted only with this probability, so a cyclic scan
-    /// (repeatedly sweeping tables larger than the cache) is thinned to a stable
-    /// resident subset instead of cyclically overwriting itself. Must lie in
-    /// `(0, 1]`; omit to take the config default (`1.0`, no thinning). Lower it
-    /// (e.g. `0.1`) on a disk-constrained profile to cut warm-leg backend fills.
-    #[arg(long)]
-    pub admit_probability: Option<f64>,
-
-    /// Number of `verglasd` nodes to spawn as one local pod. The
-    /// default `1` is the single-node cluster-of-one, byte-for-byte unchanged.
-    /// `N > 1` boots N daemons on consecutive port blocks, each with its own
-    /// cache dir and its own `--dram`/`--cache-size` budgets, wired into one
-    /// gossip pod whose seed is node 0. Engines point at node 0; any node
-    /// serves any key through the ring.
-    #[arg(long, default_value_t = 1)]
-    pub nodes: usize,
-
-    /// Enable the erasure-coded write-back tier for every key, so PUTs
-    /// ack once a fragment quorum lands on distinct pod nodes and propagate to
-    /// the origin in the background. Off by default (write-through). On a pod
-    /// smaller than `w` the write degrades to write-through automatically. Use
-    /// with `--nodes 3` (the default geometry k=2/m=1/w=3 fits a 3-node pod).
-    #[arg(long, default_value_t = false)]
-    pub writeback: bool,
-
-    /// Write-back data fragments `k` (see `--writeback`).
-    #[arg(long, default_value_t = 2)]
-    pub writeback_k: usize,
-
-    /// Write-back parity fragments `m` (see `--writeback`).
-    #[arg(long, default_value_t = 1)]
-    pub writeback_m: usize,
-
-    /// Write-back quorum width `w`: fragments durable on distinct live nodes to
-    /// ack (`k <= w <= k+m`). Defaults to `k+m` so a full 3-node pod acks.
-    #[arg(long, default_value_t = 3)]
-    pub writeback_w: usize,
-}
-
 /// Arguments for `verglas drain` (issue, local-only since): drain the
-/// LOCAL daemon. The CLI takes no target — it POSTs `/admin/drain` on this
+/// LOCAL server. The CLI takes no target — it POSTs `/admin/drain` on this
 /// machine's admin endpoint (the loopback default, `VERGLAS_ENDPOINT` /
-/// `--daemon-endpoint` override), never resolving or addressing other nodes.
+/// `--server-endpoint` override), never resolving or addressing other nodes.
 #[derive(Debug, Args)]
 pub struct DrainArgs {
     /// Maximum time to keep serving as a donor before exiting, e.g. `10m`,
-    /// `30s`, `1h`, or a plain seconds count. Omit to take the daemon's
+    /// `30s`, `1h`, or a plain seconds count. Omit to take the server's
     /// configured drain timeout.
     #[arg(long)]
     pub timeout: Option<String>,

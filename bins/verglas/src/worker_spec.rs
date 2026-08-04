@@ -3,7 +3,7 @@
 //! A single versioned file (TOML or JSON) describes a worker completely: its
 //! name, the command to run, the files it bundles, its environment (with
 //! `@secret:` references), its trigger, its target tables, and its resource
-//! hints. The SAME file drives `verglas workers create` against the local daemon
+//! hints. The SAME file drives `verglas workers create` against the local server
 //! AND `verglas workers push` to the cloud — the CLI translates it into each
 //! plane's request body, so the spec round-trips with no edits.
 //!
@@ -11,7 +11,7 @@
 //! starts with `bun`. Nothing here assumes a runtime.
 //!
 //! Secrets never travel in the spec beyond a NAME. An env value of the form
-//! `@secret:NAME` is a reference the daemon or the cloud resolves from its own
+//! `@secret:NAME` is a reference the server or the cloud resolves from its own
 //! secret store at run time; the value is never in the file and never printed.
 
 use std::collections::BTreeMap;
@@ -24,7 +24,7 @@ use serde_json::{Value, json};
 /// The spec version this CLI writes and understands.
 pub const SPEC_VERSION: u32 = 1;
 
-/// The namespace a bare follow target table lands in (mirrors the daemon).
+/// The namespace a bare follow target table lands in (mirrors the server).
 pub const FOLLOW_NAMESPACE: &str = "follow";
 
 /// The prefix marking an env value as a reference to a named secret.
@@ -203,7 +203,7 @@ impl WorkerManifest {
         Value::String(Value::Object(config).to_string())
     }
 
-    /// Translates this spec into the local daemon's `POST /v1/workers` body.
+    /// Translates this spec into the local server's `POST /v1/workers` body.
     pub fn to_local_worker(&self) -> Value {
         let mut body = json!({
             "name": self.name,
@@ -264,7 +264,7 @@ impl WorkerManifest {
         body
     }
 
-    /// Rebuilds a spec from a worker row read back from the local daemon (the
+    /// Rebuilds a spec from a worker row read back from the local server (the
     /// `pull` and round-trip path). `code`, `triggers`, and `config` are JSON
     /// strings on the row.
     pub fn from_local_worker(row: &Value) -> Result<WorkerManifest, Box<dyn Error>> {

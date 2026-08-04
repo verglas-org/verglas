@@ -17,3 +17,5 @@
   and the cache S3 endpoint made REQUIRED so a run without the cache refuses to
   start (no direct-R2 branch). Dropped the `PG_DSN`/`VERGLAS_CATALOG_URI`
   alternates per the no-fallbacks rule.
+- #91: Updated the CDC runner's local endpoint documentation for the renamed
+  `verglas-server` process. No legacy executable or endpoint spelling remains.

@@ -1,4 +1,4 @@
-//! Shared runtime the daemon's worker executor builds on (WHITEPAPER §7.2).
+//! Shared runtime the server's worker executor builds on (WHITEPAPER §7.2).
 //!
 //! The worker executor runs one deployment per trigger, but the machinery around
 //! the run is stable: load the watermark, invoke the code, commit under an

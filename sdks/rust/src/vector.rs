@@ -1,12 +1,11 @@
 //! The `indexes` verb-family wire types: the request bodies and reports the
-//! daemon's `/v1/tables/{t}/indexes...` and `/v1/graphs/{ns}/indexes...` routes
+//! server's `/v1/tables/{t}/indexes...` and `/v1/graphs/{ns}/indexes...` routes
 //! serve, and the CLI and TypeScript SDK speak.
 //!
 //! A vector index is a streaming Vamana (DiskANN/FreshDiskANN) ANN index over an
-//! embedding field, maintained by an MV and served from the cluster-local shadow
-//! store (never committed to the source table — the deliberate divergence from
-//! issue #91). These types are the transport contract only; the daemon owns the
-//! conversion to the `verglas-vector` engine types.
+//! embedding field, maintained by an MV and attached to the reflected Iceberg
+//! snapshot as a Puffin statistics file. These types are the transport contract
+//! only; the server owns the conversion to the engine types.
 //!
 //! Every field is camelCase on the wire, matching the other SDK shapes.
 
@@ -76,7 +75,7 @@ pub struct IndexReport {
     pub live_count: usize,
     /// Tombstones remaining in the persisted blob.
     pub tombstones: usize,
-    /// Where the blob was persisted in the shadow store.
+    /// The customer-table Puffin statistics-file location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub blob_location: Option<String>,
     /// The persisted Puffin file size in bytes.
@@ -106,12 +105,11 @@ pub struct SearchRequest {
     pub l: Option<usize>,
 }
 
-/// The search response: neighbors and whether they came from the ANN index or
-/// the brute-force fallback (the turn-off path when no index exists).
+/// The indexed ANN search response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchResponse {
-    /// `"index"` or `"bruteForce"`.
+    /// Always `"index"`; a missing exact-snapshot attachment is an error.
     pub source: String,
     /// Nearest-first neighbors.
     pub neighbors: Vec<SearchHit>,
@@ -141,39 +139,4 @@ pub struct IndexInfo {
 pub struct IndexListResponse {
     /// The declared indexes.
     pub indexes: Vec<IndexInfo>,
-}
-
-/// One row of the durable index registry, as listed by `GET /v1/indexes` (and
-/// `verglas index list`). Unlike [`IndexInfo`] (the in-memory serving
-/// projection for one table), this comes straight from `verglas_sys.indexes`, so
-/// it carries the registry key, cluster id, and lifecycle state across every
-/// table, graph, and cluster.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistryIndexInfo {
-    /// The registry key (`<cluster_id>/<target>/<field>`).
-    pub name: String,
-    /// `table` or `graph`.
-    pub target_kind: String,
-    /// The logical target (`tbl:ns.table` or `graph:ns`).
-    pub target: String,
-    /// The indexed field.
-    pub field: String,
-    /// The distance metric.
-    pub metric: String,
-    /// The cluster this index is served from.
-    pub cluster_id: String,
-    /// The lifecycle state (`running`, `paused`, ...).
-    pub state: String,
-    /// The reflected source snapshot, or absent before the first build.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reflected_snapshot: Option<i64>,
-}
-
-/// The `GET /v1/indexes` response: the durable index registry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RegistryIndexListResponse {
-    /// Every declared index, across tables, graphs, and clusters.
-    pub indexes: Vec<RegistryIndexInfo>,
 }

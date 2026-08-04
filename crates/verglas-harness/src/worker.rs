@@ -1,6 +1,6 @@
 //! The worker executor: run one worker as a subprocess, env-in / result-file-out.
 //!
-//! This is the run loop the daemon drives for every deployment now that Source /
+//! This is the run loop the server drives for every deployment now that Source /
 //! Sink / MV are gone. It mirrors the TypeScript SDK's `endpoint-run` harness:
 //! the parent sets the run's environment ([`verglas_sdk::worker`] `VERGLAS_*`
 //! bindings, `DEPLOYMENT`, `TARGET`, the endpoint and token), spawns the child,
@@ -36,7 +36,7 @@ impl WorkerExec {
     /// Parses a worker exec spec from its `code` JSON:
     /// `{"exec":["bun","shim.ts"],"cwd":"/tmp"}`. Element 0 is the command, the
     /// rest are its arguments. An empty or missing `exec` is an error — the
-    /// daemon can only run subprocess workers.
+    /// server can only run subprocess workers.
     pub fn from_config(name: &str, config: &str) -> Result<WorkerExec, HarnessError> {
         let value: serde_json::Value = serde_json::from_str(config)
             .map_err(|e| HarnessError::Job(format!("worker {name} config is not JSON: {e}")))?;
@@ -46,14 +46,14 @@ impl WorkerExec {
             .and_then(|v| v.as_array())
             .ok_or_else(|| {
                 HarnessError::Job(format!(
-                    "worker {name} has no `exec` array in its config; the daemon can only run \
+                    "worker {name} has no `exec` array in its config; the server can only run \
                  subprocess workers"
                 ))
             })?;
         let mut parts = exec.iter().filter_map(|v| v.as_str().map(str::to_owned));
         let command = parts.next().ok_or_else(|| {
             HarnessError::Job(format!(
-                "worker {name} has an empty `exec` array; the daemon can only run \
+                "worker {name} has an empty `exec` array; the server can only run \
                  subprocess workers"
             ))
         })?;
@@ -193,7 +193,7 @@ mod tests {
     use std::collections::HashMap;
     use verglas_sdk::worker::CronInterval;
 
-    /// A worker with no `exec` is rejected — the daemon only runs subprocess
+    /// A worker with no `exec` is rejected — the server only runs subprocess
     /// workers.
     #[test]
     fn exec_requires_exec_array() {

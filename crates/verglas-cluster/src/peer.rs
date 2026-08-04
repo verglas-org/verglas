@@ -7,7 +7,7 @@
 //! §3.3). This module is both halves of that rung:
 //!
 //! - [`PeerServer`] listens on this node's advertised peer address and serves
-//!   blocks **from the local cache tiers only** (a callback the daemon wires to
+//!   blocks **from the local cache tiers only** (a callback the server wires to
 //!   the engine). A miss is a clean miss — it never fills from the backend, so
 //!   a peer request can never trigger a fill (no recursion, no fill
 //!   amplification), and it matches the full [`BlockKey`] (ETag included) so it
@@ -115,7 +115,7 @@ pub trait PeerResolver: Send + Sync {
     fn resolve(&self, node: &NodeId) -> Option<SocketAddr>;
 }
 
-/// A fixed node→address map, for wiring a single-node daemon (empty, so it
+/// A fixed node→address map, for wiring a single-node server (empty, so it
 /// resolves nothing) and for tests that point a client at a known server.
 #[derive(Debug, Default, Clone)]
 pub struct StaticResolver {
@@ -168,7 +168,7 @@ impl PeerResolver for GossipResolver {
 /// A cache-only lookup of one block by its exact [`BlockKey`], returning the
 /// bytes if this node has them resident and `None` otherwise.
 ///
-/// Invariant the daemon must uphold when it wires this: **never fill from the
+/// Invariant the server must uphold when it wires this: **never fill from the
 /// backend here.** A peer miss must return a miss so the requester fills once
 /// at the owner — filling on a peer request would recurse and amplify fills.
 pub type LocalBlockFn =
@@ -218,7 +218,7 @@ impl BlockRequest {
 }
 
 /// Stores one write-back fragment durably on this node, returning `Ok` once it
-/// is on NVMe (#180). Wired by the daemon to the local fragment store.
+/// is on NVMe (#180). Wired by the server to the local fragment store.
 pub type FragmentStoreFn = Arc<
     dyn Fn(FragmentRecord) -> Pin<Box<dyn Future<Output = Result<(), FragmentIoError>> + Send>>
         + Send
@@ -263,7 +263,7 @@ pub type FragmentStoreStreamFn = Arc<
         + Sync,
 >;
 
-/// The fragment callbacks the daemon wires to the local fragment store when the
+/// The fragment callbacks the server wires to the local fragment store when the
 /// write-back tier is enabled.
 #[derive(Clone)]
 pub struct FragmentHandlers {
@@ -358,7 +358,7 @@ impl PeerServer {
         });
         let task = tokio::spawn(async move {
             // A serving error tears down only the peer surface; the ladder
-            // degrades to backend fills, so the daemon keeps serving.
+            // degrades to backend fills, so the server keeps serving.
             let _ = axum::serve(listener, app).await;
         });
         Ok(Self { task, local_addr })

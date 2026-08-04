@@ -4,7 +4,7 @@
 //! ring — its identity, its ring membership (placement + read-from-peer), and
 //! its transaction seam (where a committed write is recorded through the shared
 //! transaction layer). It is what the fleet's host-agent launches three of per
-//! tenant, and what the local daemon builds one of; the same type, chosen
+//! tenant, and what the local server builds one of; the same type, chosen
 //! defaults apart.
 //!
 //! It deliberately does **not** own the cache engine or the S3 surface: those
@@ -70,7 +70,7 @@ impl CacheInstance {
     }
 
     /// Whether this instance records commits through a real quorum (fleet) or
-    /// the local no-quorum default (single node). Reported at daemon startup so
+    /// the local no-quorum default (single node). Reported at server startup so
     /// the operator sees which mode is live.
     pub fn is_quorum(&self) -> bool {
         self.commit_log.is_quorum()

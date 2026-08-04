@@ -3,7 +3,7 @@
 //!
 //! The mapper never talks to object storage directly. It reads every manifest
 //! list, manifest, and footer through [`MetadataFetch`], so the same parsing
-//! code runs two ways: in the daemon it reads *through the cache* (an
+//! code runs two ways: in the server it reads *through the cache* (an
 //! [`ObjectRead`] implementation, so metadata fetches populate the metadata
 //! store — reading through the cache itself, #50), and offline it reads through
 //! a plain `object_store` client. This one trait is what makes the whole
@@ -116,7 +116,7 @@ impl MetadataFetch for ObjectStoreFetch {
     }
 }
 
-/// Daemon `MetadataFetch` that reads *through the cache*: it wraps any
+/// Server `MetadataFetch` that reads *through the cache*: it wraps any
 /// [`ObjectRead`] (the cache engine's, #12), so every manifest/footer fetch
 /// flows through the same fill path as data and lands in the metadata store
 /// (#50). This is where we read through the cache ourselves — metadata is cached like everything

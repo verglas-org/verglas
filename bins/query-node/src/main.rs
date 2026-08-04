@@ -4,7 +4,7 @@
 //! DataFusion engine), reading every table's data through a configured cache
 //! S3 endpoint — never a direct object-store path. There is no cache tier, no
 //! S3 frontend, no source/sink/jobs code, and no catalog write path in this
-//! binary; the embedded copy in `verglasd` stays the fallback for a daemon
+//! binary; the embedded copy in `verglas-server` stays the fallback for a server
 //! with no query worker configured.
 //!
 //! This binary is meant to be launched on demand — by the workers/jobs
@@ -86,7 +86,7 @@ fn parse_args() -> Result<Invocation, String> {
         match arg.as_str() {
             "--config" => config_path = Some(require_value(&mut iter, "--config")?),
             "--for-query" => for_query = Some(require_value(&mut iter, "--for-query")?),
-            // Same convention `verglasd --ports-file` uses (issue #194): bind
+            // Same convention `verglas-server --ports-file` uses (issue #194): bind
             // an ephemeral port, then append `<role> <ip:port>` lines so a
             // parent that spawned this worker learns the real port without a
             // probe-then-bind race.

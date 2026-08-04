@@ -19,7 +19,7 @@ Phases
                 selective range predicate, few-column projection, snapshot time
                 travel) run three legs and diff at the Arrow level:
                   * direct-to-MinIO           (baseline; never touches Verglas)
-                  * Verglas pass 1 (MISS path; daemon cache starts empty)
+                  * Verglas pass 1 (MISS path; server cache starts empty)
                   * Verglas pass 2 (HIT  path; immediate re-run, cache warm)
                 Every result is sorted deterministically, then schema and values
                 are compared exactly. Any diff fails with a readable dump.
@@ -373,7 +373,7 @@ def duckdb_conn_for(target: S3Target) -> duckdb.DuckDBPyConnection:
 
     The S3 settings are per-connection, so each (leg, pass) gets its own
     connection and every scan re-issues GETs to exactly one endpoint — the
-    Verglas hit pass genuinely re-fetches (served from the daemon's cache).
+    Verglas hit pass genuinely re-fetches (served from the server's cache).
     """
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -686,7 +686,7 @@ def _read_object(props: dict, path: str) -> bytes:
     """Fetch one object's raw bytes through the endpoint in ``props``.
 
     A fresh FileIO per call so the Verglas hit leg genuinely re-fetches (served
-    from the daemon cache) rather than reusing an open handle.
+    from the server cache) rather than reusing an open handle.
     """
     from pyiceberg.io.pyarrow import PyArrowFileIO
 
@@ -700,7 +700,7 @@ def phase_datafile_bytes(cfg: Config, sidecar: dict) -> tuple[list[str], int]:
 
     This is the Verglas tripwire that does not depend on an engine decoding the
     format: for the Avro and mixed variants — which neither DuckDB nor pyiceberg
-    can read (see the per-engine findings) — it still proves the daemon serves the
+    can read (see the per-engine findings) — it still proves the server serves the
     exact same Avro data-file bytes as the origin, on both a cold and a warm
     cache. For the Parquet variant it complements the engine-level diff. The data
     files are enumerated through the spec-complete manifests the JVM builder wrote.

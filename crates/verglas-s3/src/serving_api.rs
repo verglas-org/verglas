@@ -1,6 +1,6 @@
 //! The SigV4-gated `/v1` serving surface on the S3 data port.
 //!
-//! The daemon models a small non-S3 execution API — `POST /v1/query`,
+//! The server models a small non-S3 execution API — `POST /v1/query`,
 //! `/v1/write/...`, and `/v1/ingest/...` — that also lives on the loopback admin
 //! listener. The Cloudflare edge re-signs a cache-pathed `/v1` request with the
 //! cache keypair and forwards it to this data port, so the same routes must also
@@ -25,11 +25,11 @@
 //! authenticated) is rejected with `AccessDenied` before [`call`](S3Route::call)
 //! runs. That default is exactly the gate the edge relies on.
 //!
-//! # Keeping this crate free of daemon types
+//! # Keeping this crate free of server types
 //!
-//! The route talks to the daemon through the [`ServingApi`] trait over an owned
+//! The route talks to the server through the [`ServingApi`] trait over an owned
 //! [`ApiRequest`]/[`ApiResponse`] pair (bytes, not streams), so this protocol
-//! crate never depends on verglasd's router or state types. The daemon supplies
+//! crate never depends on verglas-server's router or state types. The server supplies
 //! an implementation that drives its existing axum `/v1` router.
 
 use std::sync::Arc;
@@ -69,8 +69,8 @@ pub struct ApiResponse {
     pub body: Bytes,
 }
 
-/// The daemon's `/v1` serving API, behind an owned request/response pair so the
-/// protocol crate depends on none of the daemon's router or state types.
+/// The server's `/v1` serving API, behind an owned request/response pair so the
+/// protocol crate depends on none of the server's router or state types.
 #[async_trait::async_trait]
 pub trait ServingApi: Send + Sync + 'static {
     /// Handles one buffered `/v1` request and returns the buffered response.
@@ -81,12 +81,12 @@ pub trait ServingApi: Send + Sync + 'static {
 /// injected [`ServingApi`]. Checked before s3s's typed dispatch; SigV4-gated by
 /// the trait's default [`check_access`](S3Route::check_access) (not overridden).
 pub struct V1ServingRoute {
-    /// The daemon-side handler the matched request is dispatched to.
+    /// The server-side handler the matched request is dispatched to.
     api: Arc<dyn ServingApi>,
 }
 
 impl V1ServingRoute {
-    /// Builds the route over the daemon's serving API.
+    /// Builds the route over the server's serving API.
     pub fn new(api: Arc<dyn ServingApi>) -> Self {
         V1ServingRoute { api }
     }

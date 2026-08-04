@@ -1,5 +1,5 @@
 //! Restart-recovery integration tests for the hybrid cache engine (issue #16),
-//! mapped to the acceptance criteria: a daemon restart on the same directory
+//! mapped to the acceptance criteria: a server restart on the same directory
 //! cache re-opens foyer's disk tier and rebuilds the in-memory index, so
 //! previously cached keys serve from NVMe with **zero backend block re-fills**;
 //! an unclean crash (a torn write, simulated here by corrupting the

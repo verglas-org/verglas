@@ -26,7 +26,7 @@ pub struct WatcherOptions {
     /// Time between successful poll cycles.
     pub interval: Duration,
     /// Maximum random delay added to each cycle (de-synchronizes a fleet of
-    /// daemons polling the same catalog).
+    /// servers polling the same catalog).
     pub jitter: Duration,
     /// Ceiling for the exponential backoff while the catalog is unreachable.
     pub max_backoff: Duration,
@@ -51,7 +51,7 @@ impl Default for WatcherOptions {
 }
 
 impl WatcherOptions {
-    /// Maps the daemon's `[catalog]` config section onto options: the
+    /// Maps the server's `[catalog]` config section onto options: the
     /// configured interval, 10% of it as jitter, and the config's filters.
     pub fn from_config(config: &config::Catalog) -> WatcherOptions {
         let interval = Duration::from_secs(config.poll_interval_secs);
@@ -217,7 +217,7 @@ impl CatalogWatcher for PollingWatcher {
     }
 }
 
-/// The catalog change feed the daemon runs (#47 transport selection): the same
+/// The catalog change feed the server runs (#47 transport selection): the same
 /// [`CatalogWatcher`] surface, driven by either the websocket transport or
 /// polling.
 ///

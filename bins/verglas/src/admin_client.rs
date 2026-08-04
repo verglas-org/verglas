@@ -1,6 +1,6 @@
-//! Admin API client for talking to the local running `verglasd`.
+//! Admin API client for talking to the local running `verglas-server`.
 //!
-//! Resolves the daemon base URL from CLI flags or `VERGLAS_ENDPOINT` and
+//! Resolves the server base URL from CLI flags or `VERGLAS_ENDPOINT` and
 //! performs typed HTTP calls against the private admin surface. The CLI
 //! operates on the local node only, so no membership or remote-node calls
 //! live here.
@@ -9,7 +9,7 @@ use reqwest::StatusCode;
 use thiserror::Error;
 use verglas_core::admin::{DRAIN_PATH, DrainAck, DrainRequest, VERSION_PATH, VersionInfo};
 
-/// HTTP client for the daemon admin API.
+/// HTTP client for the server admin API.
 #[derive(Debug, Clone)]
 pub struct AdminClient {
     base_url: reqwest::Url,
@@ -25,10 +25,10 @@ pub enum AdminClientError {
     /// The request could not be sent.
     #[error("admin request failed: {0}")]
     RequestFailed(reqwest::Error),
-    /// The daemon returned a non-success HTTP status.
+    /// The server returned a non-success HTTP status.
     #[error("admin API returned HTTP {status} for {path}")]
     UnexpectedStatus {
-        /// HTTP status returned by the daemon.
+        /// HTTP status returned by the server.
         status: StatusCode,
         /// Request path that failed.
         path: &'static str,
@@ -53,13 +53,13 @@ impl AdminClient {
         Ok(Self { base_url, http })
     }
 
-    /// Fetches daemon version metadata from `GET /admin/version`.
+    /// Fetches server version metadata from `GET /admin/version`.
     pub async fn version(&self) -> Result<VersionInfo, AdminClientError> {
         self.get(VERSION_PATH).await
     }
 
-    /// Initiates a graceful drain of the local daemon via
-    /// `POST /admin/drain` (#31), returning the daemon's ack.
+    /// Initiates a graceful drain of the local server via
+    /// `POST /admin/drain` (#31), returning the server's ack.
     pub async fn drain(&self, request: &DrainRequest) -> Result<DrainAck, AdminClientError> {
         self.post(DRAIN_PATH, request).await
     }

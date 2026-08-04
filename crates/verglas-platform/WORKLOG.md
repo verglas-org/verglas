@@ -43,3 +43,11 @@
   translated) so the boot path logs them loudly. Legacy row types stay readable
   only for that one-time translation.
 - chore: Remove the legacy sources/mvs/sinks registry, translate_legacy_to_workers, and injection_allowed. Workers, watermarks, and indexes are the only verglas_sys surfaces.
+- #91: Removed `verglas_sys.indexes` and its cluster-local blob references.
+  Iceberg table statistics metadata is now the sole durable vector-index
+  registry and snapshot binding.
+- #91: Removed the final generic declaration error and documentation left by
+  the retired source, MV, and sink registries. The platform catalog now exposes
+  only its worker registry and durable worker watermarks.
+- #91: Updated platform runtime terminology for the `verglas-server` process.
+  Worker registration, triggers, and watermarks retain their existing behavior.

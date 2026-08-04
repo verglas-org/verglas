@@ -10,3 +10,8 @@
   time-travel via Iceberg snapshots. Framework only — no CLI/SDK or memory
   pipeline wiring. Design rationale and citations in docs/design/graph-engine.md.
 - chore: Remove docs/ cross-references after deleting the docs directory. Crate module docs are the reference now.
+- #91: Removed stale shadow-store extension notes from the graph attachment
+  implementation. Graph and Vamana indexes now share the same authoritative
+  table-FileIO plus snapshot StatisticsFile model.
+- #91: Updated graph route documentation to identify `verglas-server` as the
+  serving process. Graph storage and traversal behavior are unchanged.

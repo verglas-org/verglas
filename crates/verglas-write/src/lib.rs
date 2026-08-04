@@ -83,9 +83,9 @@ use std::time::Duration;
 use verglas_core::write::ObjectWrite;
 
 /// The assembled write-back tier: a shared coordinator plus the reader and
-/// writer wrappers the daemon inserts into the S3 read and write paths.
+/// writer wrappers the server inserts into the S3 read and write paths.
 ///
-/// Built once at construction. When no prefix opts in, the daemon does not
+/// Built once at construction. When no prefix opts in, the server does not
 /// build this at all and the read/write paths are exactly today's — the tier
 /// adds zero hot-path cost when disabled.
 pub struct WritebackTier<R, W: ObjectWrite> {
@@ -125,7 +125,7 @@ where
 
 /// Spawns the background repair loop: on each membership-epoch change, repair
 /// every dirty object that lost a fragment node. Returns the task handle so the
-/// daemon can abort it on shutdown.
+/// server can abort it on shutdown.
 pub fn spawn_repair_loop<W: ObjectWrite>(
     coordinator: Arc<WriteCoordinator<W>>,
     membership: Arc<dyn LiveMembership>,
@@ -150,7 +150,7 @@ pub fn spawn_repair_loop<W: ObjectWrite>(
 /// fragments, verify each checksum, and re-encode any that are corrupt or
 /// missing before the object drops below `k`. This catches silent bit-rot, which
 /// (unlike node loss) fires no membership event for the repair loop. Returns the
-/// task handle so the daemon can abort it on shutdown.
+/// task handle so the server can abort it on shutdown.
 ///
 /// The pass yields between objects so it never monopolizes the runtime ahead of
 /// organic serving traffic. The interval is the durability knob: it must be

@@ -7,7 +7,7 @@
 #   2. a virtual-hosted-style request (`bucket.<domain>`) resolves the SAME
 #      object as the path-style request (`<domain>/bucket`).
 #
-# TLS terminates at the daemon by design (production fronts it with an L4 NLB in
+# TLS terminates at the server by design (production fronts it with an L4 NLB in
 # TCP passthrough), so this is where HTTPS and the signed Host header meet.
 #
 # Requires: docker (compose v2), openssl, curl with --aws-sigv4 (>= 7.75), a
@@ -67,13 +67,13 @@ head -c 50000 /dev/urandom > "$BODY"
 aws --endpoint-url "$MINIO" s3api put-object \
   --bucket "$BUCKET" --key "$KEY" --body "$BODY" >/dev/null
 
-# ---- daemon (system under test) over TLS ---------------------------------- #
-echo "[daemon] building verglasd" >&2
-( cd "$REPO" && cargo build -q -p verglasd )
-VGD="$REPO/target/debug/verglasd"
+# ---- server (system under test) over TLS ---------------------------------- #
+echo "[server] building verglas-server" >&2
+( cd "$REPO" && cargo build -q -p verglas-server )
+VGD="$REPO/target/debug/verglas-server"
 
 CACHE_DIR="$WORK/cache"; mkdir -p "$CACHE_DIR"
-cat > "$WORK/verglasd.toml" <<TOML
+cat > "$WORK/verglas-server.toml" <<TOML
 [listen]
 s3_port = $S3_PORT
 admin_port = $ADMIN_PORT
@@ -95,17 +95,17 @@ access_key_id = "$DEV_AK"
 secret_access_key = "$DEV_SK"
 TOML
 
-echo "[daemon] starting verglasd (TLS) -> MinIO" >&2
+echo "[server] starting verglas-server (TLS) -> MinIO" >&2
 AWS_ENDPOINT="$MINIO" \
 AWS_ACCESS_KEY_ID="$ORIGIN_AK" AWS_SECRET_ACCESS_KEY="$ORIGIN_SK" \
 AWS_REGION="$REGION" AWS_ALLOW_HTTP=true \
 VERGLAS_S3_ADDR="127.0.0.1:$S3_PORT" VERGLAS_ADMIN_ADDR="127.0.0.1:$ADMIN_PORT" \
-  "$VGD" --config "$WORK/verglasd.toml" &
+  "$VGD" --config "$WORK/verglas-server.toml" &
 VGD_PID=$!
 
 for _ in $(seq 1 100); do
   curl -sf "http://127.0.0.1:$ADMIN_PORT/admin/healthz" >/dev/null && break
-  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglasd died on startup" >&2; exit 1; }
+  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglas-server died on startup" >&2; exit 1; }
   sleep 0.1
 done
 

@@ -188,7 +188,7 @@ pub async fn plan_prefetch(
 /// The shared inputs for planning one file's fills, bundled so the per-file
 /// planners take few arguments.
 struct PlanCtx<'a> {
-    /// Metadata reader (footer fetch runs through it — through-cache in daemon).
+    /// Metadata reader (footer fetch runs through it — through-cache in server).
     fetch: &'a dyn MetadataFetch,
     /// The heat ledger scored against.
     ledger: &'a HeatLedger,
@@ -433,7 +433,7 @@ impl PrefetchExecutor {
     /// Builds an executor over `reader`, sharing `budget` with warming, and
     /// spawns `config.concurrency` worker tasks. The workers live for the
     /// process (the returned handle owns the `Arc`; dropping it does not stop
-    /// them, matching the daemon's detached-task model).
+    /// them, matching the server's detached-task model).
     pub fn spawn(
         reader: Arc<dyn WarmSource>,
         budget: Arc<TokenBucket>,

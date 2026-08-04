@@ -18,14 +18,14 @@ use crate::fetch::MetadataFetch;
 use crate::iceberg;
 
 /// Drives map rebuilds off catalog events. Generic over the watcher and fetch
-/// implementations so the daemon (REST watcher + through-cache fetch) and tests
+/// implementations so the server (REST watcher + through-cache fetch) and tests
 /// (mock watcher + object_store fetch) share it.
 pub struct MapUpdater<W: CatalogWatcher, F: MetadataFetch> {
     /// The map to keep current.
     mapper: Arc<Mapper>,
     /// Source of last-known table pointers and lineage.
     watcher: Arc<W>,
-    /// How metadata is read (through the cache in the daemon).
+    /// How metadata is read (through the cache in the server).
     fetch: Arc<F>,
 }
 

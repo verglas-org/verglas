@@ -10,8 +10,8 @@
 //!
 //! Rows are batched (bounded by a row count and a flush interval) and committed
 //! through the shared CAS append path ([`verglas_iceberg::write`]). Because the
-//! append goes through the daemon's own catalog, the destination follows the
-//! daemon's login state with no branch here: logged in, the catalog points at the
+//! append goes through the server's own catalog, the destination follows the
+//! server's login state with no branch here: logged in, the catalog points at the
 //! tenant's cloud lakehouse and the lines stream off the machine into the cloud;
 //! logged out, they land in the local lakehouse.
 //!

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # Query-worker end to end: the standalone `verglas-query` binary AND
-# verglasd's spawn-per-query dispatcher, both against a real Iceberg REST
-# catalog + real S3 (MinIO) + a real verglasd cache instance. Never a real
+# verglas-server's spawn-per-query dispatcher, both against a real Iceberg REST
+# catalog + real S3 (MinIO) + a real verglas-server cache instance. Never a real
 # tenant — high ports, temp dirs, torn down on exit.
 #
 # Proves: /healthz, /v1/query/estimate (near-zero working set for a large
@@ -10,7 +10,7 @@
 # aggregate, and a large (tens-of-thousands-of-rows) result that must arrive
 # as multiple HTTP chunks (verified by parsing the raw chunked-transfer-
 # encoding wire format, not just checking the request succeeded), row-exact
-# results, and the verglasd dispatcher spawning + killing a worker per query.
+# results, and the verglas-server dispatcher spawning + killing a worker per query.
 #
 # Skips cleanly (exit 0) when docker is unavailable. Requires python3, curl.
 set -euo pipefail
@@ -44,20 +44,20 @@ REST_C="vg-query-e2e-rest-$sfx"
 WORK="$(mktemp -d)"
 export HOME="$WORK/home"; mkdir -p "$HOME"
 CACHE="$WORK/cache"; mkdir -p "$CACHE"
-DAEMON_PID=""; QUERY_PID=""; DISPATCH_DAEMON_PID=""
+SERVER_PID=""; QUERY_PID=""; DISPATCH_SERVER_PID=""
 
 cleanup() {
   set +e
-  [ -n "$DAEMON_PID" ] && { kill "$DAEMON_PID" 2>/dev/null; wait "$DAEMON_PID" 2>/dev/null; }
+  [ -n "$SERVER_PID" ] && { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; }
   [ -n "$QUERY_PID" ] && { kill "$QUERY_PID" 2>/dev/null; wait "$QUERY_PID" 2>/dev/null; }
-  [ -n "$DISPATCH_DAEMON_PID" ] && { kill "$DISPATCH_DAEMON_PID" 2>/dev/null; wait "$DISPATCH_DAEMON_PID" 2>/dev/null; }
+  [ -n "$DISPATCH_SERVER_PID" ] && { kill "$DISPATCH_SERVER_PID" 2>/dev/null; wait "$DISPATCH_SERVER_PID" 2>/dev/null; }
   docker rm -f "$REST_C" "$MINIO_C" >/dev/null 2>&1
   docker network rm "$NET" >/dev/null 2>&1
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 
-fail() { echo "FAIL: $*" >&2; for f in "$WORK/daemon.log" "$WORK/query.log" "$WORK/dispatch/daemon.log"; do [ -f "$f" ] && { echo "--- $f tail ---" >&2; tail -40 "$f" >&2; }; done; exit 1; }
+fail() { echo "FAIL: $*" >&2; for f in "$WORK/server.log" "$WORK/query.log" "$WORK/dispatch/server.log"; do [ -f "$f" ] && { echo "--- $f tail ---" >&2; tail -40 "$f" >&2; }; done; exit 1; }
 wait_for() { local url="$1" n="${2:-60}"; for _ in $(seq 1 "$n"); do curl -sf "$url" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
 
 echo "== 1. docker MinIO + Iceberg REST catalog on high ports =="
@@ -76,7 +76,7 @@ docker run -d --name "$REST_C" --network "$NET" -p "127.0.0.1:$REST_PORT:8181" \
   "$REST_IMAGE" >/dev/null
 wait_for "http://127.0.0.1:$REST_PORT/v1/config?warehouse=$WAREHOUSE" 60 || fail "Iceberg REST catalog did not come up"
 
-echo "== 2. build + run the branch verglasd (cache) + verglas + verglas-query =="
+echo "== 2. build + run the branch verglas-server (cache) + verglas + verglas-query =="
 cat > "$WORK/minio.creds" <<EOF
 [default]
 aws_access_key_id = minioadmin
@@ -110,14 +110,14 @@ warehouse = "$WAREHOUSE"
 poll_interval_secs = 2
 EOF
 
-cargo build --release -p verglasd -p verglas -p verglas-query --manifest-path "$root/Cargo.toml" 2>&1 | tail -3
-DBIN="$root/target/release/verglasd"
+cargo build --release -p verglas-server -p verglas -p verglas-query --manifest-path "$root/Cargo.toml" 2>&1 | tail -3
+DBIN="$root/target/release/verglas-server"
 CLI="$root/target/release/verglas"
 QBIN="$root/target/release/verglas-query"
 
-"$DBIN" --config "$WORK/verglas.toml" >>"$WORK/daemon.log" 2>&1 &
-DAEMON_PID=$!
-wait_for "http://127.0.0.1:$DADMIN/admin/healthz" 60 || fail "cache daemon did not become healthy"
+"$DBIN" --config "$WORK/verglas.toml" >>"$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+wait_for "http://127.0.0.1:$DADMIN/admin/healthz" 60 || fail "cache server did not become healthy"
 EP="http://127.0.0.1:$DADMIN"
 
 echo "== 3. seed a large table ($NUM_ROWS rows, one commit) =="
@@ -129,7 +129,7 @@ with open(f"{WORK}/big.jsonl", "w") as f:
     for i in range(1, n + 1):
         f.write(json.dumps({"id": i, "batch": i % 50, "value": round(random.uniform(0, 1000), 4), "label": f"row-{i}"}) + "\n")
 PY
-"$CLI" --daemon-endpoint "$EP" table create qa.big "$WORK/big.jsonl" --json >/dev/null || fail "table create failed"
+"$CLI" --server-endpoint "$EP" table create qa.big "$WORK/big.jsonl" --json >/dev/null || fail "table create failed"
 
 echo "== 4. verglas-query standalone: healthz, estimate, query =="
 cat > "$WORK/query.toml" <<EOF
@@ -180,7 +180,7 @@ CHUNK_RESULT=$(python3 "$here/chunk_probe.py" "$QADMIN" "select * from qa.big")
 echo "$CHUNK_RESULT"
 echo "$CHUNK_RESULT" | grep -q "STRUCTURAL PROOF" || fail "large result did not prove multi-chunk streamed arrival"
 
-echo "== 5. verglasd dispatcher: spawn-worker-per-query =="
+echo "== 5. verglas-server dispatcher: spawn-worker-per-query =="
 DISPATCH_WORK="$WORK/dispatch"; mkdir -p "$DISPATCH_WORK/cache" "$DISPATCH_WORK/home"
 cat > "$DISPATCH_WORK/verglas.toml" <<EOF
 [listen]
@@ -204,12 +204,12 @@ poll_interval_secs = 2
 [query_worker]
 binary = "$QBIN"
 EOF
-# A SEPARATE $HOME from the primary daemon — two verglasd instances sharing
-# one $HOME can collide on per-home state; each daemon in this script gets
+# A SEPARATE $HOME from the primary server — two verglas-server instances sharing
+# one $HOME can collide on per-home state; each server in this script gets
 # its own.
-HOME="$DISPATCH_WORK/home" "$DBIN" --config "$DISPATCH_WORK/verglas.toml" >>"$DISPATCH_WORK/daemon.log" 2>&1 &
-DISPATCH_DAEMON_PID=$!
-wait_for "http://127.0.0.1:$DISPATCH_ADMIN/admin/healthz" 60 || fail "dispatcher daemon did not become healthy"
+HOME="$DISPATCH_WORK/home" "$DBIN" --config "$DISPATCH_WORK/verglas.toml" >>"$DISPATCH_WORK/server.log" 2>&1 &
+DISPATCH_SERVER_PID=$!
+wait_for "http://127.0.0.1:$DISPATCH_ADMIN/admin/healthz" 60 || fail "dispatcher server did not become healthy"
 DD="http://127.0.0.1:$DISPATCH_ADMIN"
 
 BEFORE_WORKERS=$(pgrep -f "$QBIN --config $DISPATCH_WORK" | wc -l | tr -d ' '; true)  # pgrep exits 1 on zero matches (expected here); pipefail would otherwise kill the script
@@ -226,4 +226,4 @@ CHUNK_RESULT2=$(python3 "$here/chunk_probe.py" "$DISPATCH_ADMIN" "select * from 
 echo "$CHUNK_RESULT2" | grep -q "STRUCTURAL PROOF" || fail "dispatcher relay did not preserve multi-chunk streamed arrival"
 
 echo ""
-echo "PASS: query e2e — standalone verglas-query + verglasd dispatcher, estimate sanity (scan=0, agg=$AGG_WS, join=$JOIN_WS), $NUM_ROWS rows exact, large result proven multi-chunk both directly and through the dispatcher relay"
+echo "PASS: query e2e — standalone verglas-query + verglas-server dispatcher, estimate sanity (scan=0, agg=$AGG_WS, join=$JOIN_WS), $NUM_ROWS rows exact, large result proven multi-chunk both directly and through the dispatcher relay"

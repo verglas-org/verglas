@@ -14,7 +14,7 @@ coordinator (#51) repairs the cache — no benchmark shortcut. The heat that
 decides *which* chunks to prefetch is earned by the steady read load that runs
 before the compaction.
 
-Reuses ``benchmarks/warming/warming_demo.py`` for all Polaris/verglasd/counter
+Reuses ``benchmarks/warming/warming_demo.py`` for all Polaris/verglas-server/counter
 plumbing (catalog bootstrap, REST catalog open, origin/Verglas S3 profiles,
 ``/admin/stats`` reading), so both demos share one machinery.
 
@@ -29,7 +29,7 @@ loads ``.env`` and never logs secrets):
 - ``compact``    rewrite the table's data files (pyiceberg optimize, or an
                  overwrite fallback) — the commit the watcher observes.
 - ``measure``    the first post-compaction read wave through Verglas, recording
-                 the daemon's /admin/stats counter delta as the recovery number.
+                 the server's /admin/stats counter delta as the recovery number.
 - ``report``     render the A/B (prefetch off/on) recovery table.
 
 Never reads secrets from anywhere but the flags/environment handed to it.
@@ -48,7 +48,7 @@ from typing import Optional
 import pyarrow as pa
 import requests
 
-# Reuse the warming demo's proven Polaris/verglasd/counter helpers.
+# Reuse the warming demo's proven Polaris/verglas-server/counter helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "warming"))
 import warming_demo as w  # noqa: E402
 
@@ -179,7 +179,7 @@ def phase_compact(args: argparse.Namespace) -> dict:
 
 
 def phase_measure(args: argparse.Namespace) -> dict:
-    """The first post-compaction read wave through Verglas, with the daemon's
+    """The first post-compaction read wave through Verglas, with the server's
     /admin/stats counter delta recorded as the recovery number.
 
     Waits ``settle_secs`` first so the watcher observes the commit and the

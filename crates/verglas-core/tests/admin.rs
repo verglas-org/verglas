@@ -46,8 +46,8 @@ fn local_access_carries_the_discovery_fields_but_never_the_secret() {
 
 #[test]
 fn local_access_without_a_catalog_or_keys_still_decodes() {
-    // A daemon with no catalog and no auth keypair reports nulls; the CLI must
-    // still decode the snapshot (and then fall back to flags/env).
+    // A server with no catalog or auth keypair reports nulls; the CLI must
+    // still decode the snapshot.
     let json = r#"{"s3_endpoint":"http://127.0.0.1:8333","catalog_uri":null,"warehouse":null,"region":"us-east-1","bucket":null,"access_key_id":null}"#;
     let decoded: LocalAccess = serde_json::from_str(json).expect("decode");
     assert!(decoded.catalog_uri.is_none());
@@ -57,7 +57,7 @@ fn local_access_without_a_catalog_or_keys_still_decodes() {
 
 #[test]
 fn version_info_round_trips_through_json() {
-    let info = VersionInfo::for_daemon("0.1.0-test");
+    let info = VersionInfo::for_server("0.1.0-test");
     let encoded = serde_json::to_string(&info).expect("encode");
     let decoded: VersionInfo = serde_json::from_str(&encoded).expect("decode");
 
@@ -147,7 +147,7 @@ fn stats_info_round_trips_and_exposes_config_and_counters() {
         5
     );
 
-    // A stats body without the warming field (older daemon) still decodes.
+    // A stats body without the warming field (older server) still decodes.
     let no_warming = r#"{"cache":{"dir":"/c","capacity_bytes":1,"dram_bytes":1},"counters":{"dram_hits":0,"dram_misses":0,"disk_hits":0,"disk_misses":0,"peer_hits":0,"peer_misses":0,"peer_errors":0,"peer_served_blocks":0,"peer_served_bytes":0,"dram_bytes_served":0,"disk_bytes_served":0,"peer_bytes_served":0,"backend_bytes_served":0,"backend_fills":0,"backend_fill_bytes":0,"backend_heads":0,"non_cacheable_passthroughs":0,"meta_hits":0,"meta_misses":0,"meta_bytes_served":0,"retired_bytes_pending":0,"retired_bytes_reclaimed":0,"retired_files_reclaimed":0},"dram_usage_bytes":0}"#;
     let decoded: StatsInfo = serde_json::from_str(no_warming).expect("decode without warming");
     assert!(decoded.warming.is_none());

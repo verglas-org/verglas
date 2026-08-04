@@ -176,7 +176,7 @@ jobs:
       # also raise this number to just below the new value (see AGENTS.md,
       # "Coverage"). Long-term target: >=90 lines.
       # (The Iceberg REST catalog service — verglas-catalog / verglas-catalogd —
-      # moved to the verglas-cloud repo; the daemon is a catalog CLIENT only, so
+      # moved to the verglas-cloud repo; the server is a catalog CLIENT only, so
       # nothing here stands up a catalog server.)
       - name: Coverage (fails under the floor)
         run: cargo llvm-cov --workspace --fail-under-lines 88 --lcov --output-path lcov.info

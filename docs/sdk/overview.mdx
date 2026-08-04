@@ -1,0 +1,59 @@
+---
+title: "SDK overview"
+description: "Choose the TypeScript or Rust SDK and understand the shared data-plane contract."
+icon: "braces"
+---
+
+The Verglas SDKs expose the same endpoint contract against a local server and Verglas Cloud. A worker receives a connected client. A standalone application connects with an endpoint and bearer token.
+
+<Warning>
+The SDK packages are private workspace packages in the current prototype. Install them from this repository until published packages become available.
+</Warning>
+
+## Choose an SDK
+
+<CardGroup cols={2}>
+  <Card title="TypeScript" icon="code" href="/docs/sdk/typescript">
+    Use the fetch-only client and `defineWorker` contract in Bun, Node.js, and edge runtimes.
+  </Card>
+  <Card title="Rust" icon="boxes" href="/docs/sdk/rust">
+    Use streaming Arrow reads and writes, exact table definitions, commit following, and the native worker trait.
+  </Card>
+</CardGroup>
+
+## Shared capabilities
+
+| Capability | TypeScript | Rust |
+| --- | --- | --- |
+| Connect to local or cloud endpoints | `connect` | `Client::connect` |
+| Create or verify a table definition | `createTable`, `ensureTable` | `ensure_table` |
+| Read current rows | `table.scan` | `query_stream` |
+| Read rows after a cursor | `table.delta` | Query or table API contracts |
+| Append idempotently | `table.append` | `append_stream` |
+| Run SQL | `client.query` | `query_stream` |
+| Follow table commits | `client.follow`, `followRows` | `follow` |
+| Queue operations | `queue.enqueue`, `poll`, `ack` | Shared contracts; client surface pending |
+| Property graphs | `graph.create`, insert, index, traverse | Graph contracts and helpers |
+| Vector indexes | Add, list, and search on a table | Vector contracts and helpers |
+| Worker authoring | `defineWorker`, `runWorker` | `Worker` trait and `WorkerContext` |
+
+## Endpoint model
+
+The SDK separates three destinations:
+
+- The **Verglas endpoint** handles query and logical write execution.
+- The **Iceberg REST catalog** handles table metadata and table creation.
+- The **S3-compatible cache endpoint** handles object bytes.
+
+Local clients can discover the catalog and S3 endpoint from the server. Cloud runtimes receive all connection values from the platform.
+
+## Authentication
+
+Do not hard-code a token. Workers receive a connected client and secret bindings through their context. Standalone applications read `VERGLAS_ENDPOINT` and `VERGLAS_TOKEN` from their environment.
+
+```bash
+export VERGLAS_ENDPOINT=https://tenant.query.verglas.dev
+export VERGLAS_TOKEN=replace-with-a-scoped-token
+```
+
+The control-plane token written by `verglas login` manages tenant resources. A worker runtime receives a separate, scoped data-plane token for its table grants.

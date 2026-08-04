@@ -1,22 +1,8 @@
 //! Puffin container framing for the Vamana index.
 //!
-//! Issue #95's standing rule — "any persisted artifact that is (a) derived from
-//! a specific table snapshot and (b) outlives one process is serialized as a
-//! Puffin blob with a versioned `verglas-*` blob type" — applies to the vector
-//! index. We reuse the upstream `iceberg::puffin` writer/reader exactly as the
-//! graph adjacency index does (`crates/verglas-graph/src/index.rs`), so the
-//! index is a first-class Puffin artifact inspectable by the same tooling.
-//!
-//! **Divergence from #91 (deliberate, operator-directed).** #91 binds the index
-//! blob to the source table's Iceberg snapshot via a `StatisticsFile` and
-//! commits it through the catalog. We do NOT: the index is a cluster-local,
-//! derived, serving artifact (#90 says a serving ANN index is NVMe/cluster
-//! bound), and the standing invariant forbids Verglas writing customer tables
-//! autonomously (#95). So the same Puffin blob is produced here but persisted to
-//! the cluster-local shadow store (see `store.rs`), keyed by
-//! `(table-or-graph, field, reflected-snapshot)`, and never referenced from the
-//! source snapshot or the catalog. The blob still carries its `snapshot_id`
-//! (the reflected watermark) so it is self-describing about what it indexes.
+//! Vamana uses the same first-class Iceberg attachment model as graph adjacency:
+//! the blob carries the source snapshot and [`crate::attachment`] publishes the
+//! completed Puffin file as that snapshot's `StatisticsFile`.
 
 use std::collections::HashMap;
 
@@ -29,8 +15,8 @@ use crate::error::{Result, VectorError};
 use crate::vamana::VamanaIndex;
 
 /// A fixed in-memory path used to round-trip the Puffin bytes through the
-/// upstream writer/reader without touching disk. The shadow store owns real
-/// placement.
+/// upstream writer/reader without touching disk. Durable placement is handled
+/// by [`crate::attachment`].
 const MEM_PATH: &str = "memory:///verglas-vamana.puffin";
 
 /// Serializes `index` into a complete Puffin file (as bytes) carrying one

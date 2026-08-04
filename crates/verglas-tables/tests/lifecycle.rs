@@ -308,7 +308,6 @@ async fn build_engine(store: Arc<InMemory>, dir: &TempDir) -> (Arc<Engine>, Back
         dir: dir.path().to_path_buf(),
         capacity_bytes: ByteSize(256 * 1024 * 1024),
         dram_bytes: ByteSize(128 * 1024 * 1024),
-        shadow_capacity_bytes: ByteSize(1024 * 1024),
         ..CacheConfig::default()
     };
     let engine = Arc::new(
@@ -866,7 +865,7 @@ async fn wait_until(cond: impl Fn() -> bool) {
     panic!("condition not met within the deadline");
 }
 
-// ---- Watcher-driven coordinator (daemon wiring) -----------------------------
+// ---- Watcher-driven coordinator (server wiring) -----------------------------
 
 /// A hand-driven watcher: state set directly, events pushed on demand.
 struct FakeWatcher {

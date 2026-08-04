@@ -1,5 +1,5 @@
 //! Node-level Prometheus metrics (#46): the live request instruments and the
-//! text-exposition renderer for the daemon's `/metrics` endpoint.
+//! text-exposition renderer for the server's `/metrics` endpoint.
 //!
 //! Two halves meet here. [`NodeMetrics`] owns a `prometheus::Registry` and the
 //! metric families that must be emitted *live* from the serving path — the
@@ -8,7 +8,7 @@
 //! counts (cache hits/misses, bytes-served-by-tier, admission, fill inflight,
 //! backend health) is *read at scrape time* from the running engine and backend
 //! and appended as plain exposition text by [`render`], keyed off a
-//! [`MetricsSnapshot`] the daemon fills. Keeping the snapshot half text-only
+//! [`MetricsSnapshot`] the server fills. Keeping the snapshot half text-only
 //! means this crate needs no handle on the cache or backend types.
 //!
 //! The metric names are a stability contract: dashboards and (later) the billing
@@ -78,7 +78,7 @@ pub struct NodeMetrics {
 impl NodeMetrics {
     /// Builds the live instruments and registers them. Fails only if a metric
     /// name collides in the registry, which is a programming error (fixed
-    /// names), so the daemon treats a failure as fatal at startup.
+    /// names), so the server treats a failure as fatal at startup.
     pub fn new() -> Result<Self, prometheus::Error> {
         let registry = Registry::new();
         let request_duration = HistogramVec::new(
@@ -150,7 +150,7 @@ pub struct TierSize {
     pub capacity: u64,
 }
 
-/// The scrape-time snapshot the daemon fills from the running engine and backend
+/// The scrape-time snapshot the server fills from the running engine and backend
 /// (#46). Everything here is a value Verglas already counts; [`render`] turns it
 /// into the counter/gauge exposition families that sit alongside the live
 /// request families. Plain numbers so this crate needs no cache/backend types.

@@ -104,9 +104,9 @@ pub trait CommitBarrier: Send + Sync {
     ) -> Result<BarrierOutcome, BarrierError>;
 
     /// Await propagation of *every* currently-dirty write-back object. The
-    /// conservative barrier a commit uses when it has not resolved its exact
-    /// referenced keys (the loopback catalog POST path, where parsing the commit
-    /// body's manifests to enumerate data files would be disproportionate): a
+    /// conservative barrier a customer-invoked commit uses when it has not
+    /// resolved its exact referenced keys (where parsing the commit body's
+    /// manifests to enumerate data files would be disproportionate): a
     /// correct superset of [`await_referenced`], since a commit can only
     /// reference files that were written before it, and all such buffered files
     /// are in the dirty set.

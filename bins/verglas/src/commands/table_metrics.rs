@@ -1,13 +1,13 @@
 //! `verglas table metrics` — per-table cache metrics.
 //!
-//! Reads the local daemon's per-table telemetry report and prints one line per
+//! Reads the local server's per-table telemetry report and prints one line per
 //! watched table: hit rate, cached bytes, backend requests avoided, and a
-//! dollar-savings ESTIMATE. The daemon is the only source; with no daemon
+//! dollar-savings ESTIMATE. The server is the only source; with no server
 //! listening the verb fails with a clear error naming the endpoint.
 //!
 //! # Dollars are presentation-only
 //!
-//! The daemon stores raw counts, never money — baking a price into a counter
+//! The server stores raw counts, never money — baking a price into a counter
 //! freezes wrong history when prices change. This command multiplies avoided
 //! requests by a fixed published rate at display time, so the estimate always
 //! reflects the current rate and is always labelled an estimate.
@@ -24,8 +24,8 @@ use verglas_core::telemetry::TablesReport;
 const S3_GET_PRICE_PER_1K: f64 = 0.0004;
 
 /// Dispatches `verglas table metrics`: the local per-table cache metrics view.
-pub async fn run(daemon_endpoint: &str, json: bool) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::daemon(daemon_endpoint)?;
+pub async fn run(server_endpoint: &str, json: bool) -> Result<(), Box<dyn Error>> {
+    let client = crate::backend::server(server_endpoint)?;
     let report: TablesReport = client.get(TABLE_METRICS_PATH).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&json_view(&report))?);

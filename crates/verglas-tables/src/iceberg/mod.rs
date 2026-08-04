@@ -4,7 +4,7 @@
 //! Reads only what the mapper needs to build its lookup structures — each data
 //! file's key, format, size, partition tuple, and status — via the
 //! [`MetadataFetch`](crate::fetch::MetadataFetch) interface, so it works the same in
-//! the daemon (through the cache) and offline (through `object_store`).
+//! the server (through the cache) and offline (through `object_store`).
 //!
 //! # iceberg-rust vs. apache-avro
 //!

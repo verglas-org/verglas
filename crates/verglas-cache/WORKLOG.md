@@ -477,3 +477,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   written first (put/get/list/latest round-trip, budget ceiling evict+refuse,
   durability across reopen, the never-writes-outside-its-root property).
 - #3: Kept erasure coding as an internal write mode while the owning package became `verglas-write`.
+- #91: Removed the standalone derived-artifact shadow store and its private
+  eviction budget. Snapshot-bound Vamana Puffin files now use customer table
+  storage and the regular S3 cache path.
+- #91: Updated cache-engine integration documentation to name the foreground
+  `verglas-server` process. No cache behavior or on-disk compatibility path was
+  added.

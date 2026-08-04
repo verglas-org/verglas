@@ -1,7 +1,7 @@
 //! Eager metadata warming (#168): walk a watched table's live snapshot and
 //! pull its planning metadata — `metadata.json`, the manifest list, the
 //! manifests, and every Parquet footer — through the cache *before* an engine
-//! asks, so a cold planning walk collapses toward a warm one (the daemon
+//! asks, so a cold planning walk collapses toward a warm one (the server
 //! already walked the metadata).
 //!
 //! The job reads through the same cache [`ObjectRead`] a client would use, so
@@ -86,7 +86,7 @@ pub struct WarmConfig {
 
 impl Default for WarmConfig {
     /// Concurrency 64, a 64 KiB footer window, and an effectively unbounded
-    /// budget (the daemon narrows it to the metadata store's real capacity).
+    /// budget (the server narrows it to the metadata store's real capacity).
     fn default() -> WarmConfig {
         WarmConfig {
             concurrency: DEFAULT_WARM_CONCURRENCY,
@@ -230,7 +230,7 @@ pub enum WarmError {
 /// The cache-side read a warm issues: `range` of `key`, body collected.
 ///
 /// Boxed (`async_trait`) rather than generic over [`ObjectRead`] on purpose:
-/// the daemon spawns warming on a background task, and an *opaque* RPITIT
+/// the server spawns warming on a background task, and an *opaque* RPITIT
 /// future trips the compiler's "Send not general enough" check across a
 /// `tokio::spawn` for a generic reader. Boxing every read future — the same
 /// trick the crate's other IO traits use — keeps the whole warming job `Send`.
@@ -257,7 +257,7 @@ impl<R: ObjectRead> WarmSource for R {
 }
 
 /// The eager warming job. Holds the cache reader plus the shared politeness
-/// controls (semaphore + byte budget) so the daemon can point many table warms
+/// controls (semaphore + byte budget) so the server can point many table warms
 /// at one budget.
 pub struct Warmer {
     /// The cache-backed reader warming fills flow through.

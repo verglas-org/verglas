@@ -712,3 +712,17 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #1 (verglas-org/verglas): Removed the fleet `verglas-compact` one-shot binary and its workspace/dist membership. Compaction stays in `verglas-iceberg` + daemon `POST /admin/compact` / `verglas table compact` until the async maintenance API lands; e2e retargeted to that path.
 - chore: Point install/docs/release at `verglas-org/verglas` (drop cascade-labs URLs and the external releases repo). macOS launchd label is now `org.verglas.verglas`.
 - #3: Routed file ingestion through `verglas-write` and moved list/show/history metadata calls directly to Iceberg REST.
+- chore: Remove durable agent memory from the CLI — delete `verglas skills` (cognee MCP hooks/skill assets), drop mcp/consolidate from install docs, and stop applying a memory `[agent]` env at startup.
+- chore: Remove OS service daemonization (`init`/`start`/`stop`/`restart`/`logs`, launchd/systemd). Self-host is Docker; `verglas status` probes admin HTTP only. README quickstart is login@verglas.dev or compose + `VERGLAS_ENDPOINT`.
+- chore: `verglas login` defaults to Verglas Cloud (`https://api.verglas.dev`); `--url` is only an override.
+- chore: Remove `verglas dev` from the shipped CLI because the client release no longer bundles the sibling daemon binary it launched. Self-hosted daemons run in Docker; repository benchmarks remain separate tooling.
+- #263: Corrected query command documentation to describe the daemon's private upstream catalog client instead of a loopback catalog service. Query data still travels through the Verglas S3 endpoint.
+- #91: Made `verglas index list` explicitly table-scoped and removed the global
+  `verglas_sys.indexes` path. Search now requires an exact-snapshot Vamana
+  attachment instead of silently scanning the embedding column.
+- #91: Renamed the local process and CLI terminology from `verglasd` and
+  daemon to `verglas-server` and server. The endpoint flag is now
+  `--server-endpoint`; no compatibility alias remains.
+- #3: Corrected the execution-boundary tests after rebasing the isolated roles:
+  table metadata reads now exercise the customer Iceberg REST catalog directly,
+  while create, append, query, graph, and maintenance requests exercise Verglas.
