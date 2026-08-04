@@ -1,6 +1,6 @@
 //! End-to-end tests for `verglas table delete`.
 //!
-//! Unlike the other table verbs (which speak the daemon), `delete` drops a table
+//! Unlike the other table verbs (which speak the server), `delete` drops a table
 //! through the tenant's Iceberg REST catalog. These stand up a local mock catalog
 //! (an axum server on an ephemeral port) and drive the real binary against it,
 //! with HOME redirected to a tempdir whose `~/.verglas/config.toml` points its

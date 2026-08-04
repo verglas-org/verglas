@@ -11,11 +11,11 @@
 //! - `GET /admin/stats` — the JSON read-path counter snapshot the benchmarks read.
 //! - `GET /metrics` — the Prometheus exposition the metrics VM self-scrapes.
 //!
-//! Everything else verglasd's admin router carries (purge, members, drain, the
+//! Everything else verglas-server's admin router carries (purge, members, drain, the
 //! catalog/table/graph/vector/platform/recall verb families) is deliberately
 //! absent: the cache node runs no catalog, no cluster, and no jobs, so those
 //! surfaces have nothing to answer. The `Health` gate and the deferred stats/
-//! metrics slots mirror verglasd's serve-gating shape (origin: `bins/verglasd/src/admin.rs`).
+//! metrics slots mirror verglas-server's serve-gating shape (origin: `bins/verglas-server/src/admin.rs`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -92,7 +92,7 @@ async fn healthz(State(health): State<Health>) -> Response {
 /// Assembles the admin router. `version` names this binary in `/admin/version`;
 /// the two slots are filled by the serve path the instant recovery completes, so
 /// `/admin/stats` and `/metrics` answer 503 (not 404) until then, exactly like
-/// verglasd's deferred routes.
+/// verglas-server's deferred routes.
 pub fn router(
     version: &'static str,
     health: Health,

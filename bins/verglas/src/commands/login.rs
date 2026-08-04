@@ -1,5 +1,5 @@
 //! `verglas login`: authenticate the CLI to the control plane and configure the
-//! local daemon for the tenant's lakehouse.
+//! local server for the tenant's lakehouse.
 //!
 //! Three modes, one result. The default browser flow opens a browser to an
 //! authorization-code + PKCE(S256) grant and completes over a loopback redirect.
@@ -8,7 +8,7 @@
 //! automation path. All three end at the same provisioning: they obtain the
 //! tenant's long-lived api key and SCOPED lakehouse config and, on success, write:
 //!   * the api key to `~/.verglas/credentials/control-plane-token` (mode 0600),
-//!   * the daemon config `~/.verglas/config.toml` — `[control_plane]` (url),
+//!   * the server config `~/.verglas/config.toml` — `[control_plane]` (url),
 //!     `[backend]` (S3 endpoint/bucket/region + credentials_file), and
 //!     `[catalog]` (uri/warehouse + credentials_file),
 //!   * the tenant's scoped S3 key pair to a 0600 AWS-INI backend credentials
@@ -16,7 +16,7 @@
 //!
 //! Every write happens only after authorization and provisioning succeed, so a
 //! rejected login leaves no trace. Re-running overwrites in place, so a re-login
-//! is idempotent. After login the daemon is fully configured for the tenant with
+//! is idempotent. After login the server is fully configured for the tenant with
 //! credentials scoped to ONLY its bucket — no account-wide creds.
 //!
 //! Secret values (the OAuth access token, the api key, the S3 secret key, the
@@ -45,7 +45,7 @@ const NO_BROWSER_ENV: &str = "VERGLAS_LOGIN_NO_BROWSER";
 
 /// Runs `verglas login`. Resolves the URL, dispatches to the requested mode
 /// (browser by default, `--device`, or `--api-key`), and on success writes the
-/// token / daemon config / credential files and prints a non-secret summary.
+/// token / server config / credential files and prints a non-secret summary.
 pub async fn run(args: LoginArgs) -> Result<(), Box<dyn Error>> {
     let url = resolve_url(args.url)?;
     if args.api_key_mode {
@@ -231,11 +231,11 @@ async fn provision(
 
 /// Writes everything a successful login persists: the api key to the 0600 token
 /// file, the scoped S3 key pair and catalog token to their 0600 credential files,
-/// and the daemon config sections. Shared by all three flows. Nothing here runs
+/// and the server config sections. Shared by all three flows. Nothing here runs
 /// until authorization and provisioning have succeeded.
 /// Persist just the key + control-plane URL for a tenant with no per-tenant
 /// lakehouse row (the shared-bucket model): cloud resource groups work; the
-/// daemon's backend/catalog files are left untouched.
+/// server's backend/catalog files are left untouched.
 fn persist_key_only(url: &str, api_key: &str) -> Result<(), Box<dyn Error>> {
     write_token(api_key)?;
     let path = controlplane::config_path()?;
@@ -251,7 +251,7 @@ fn persist(url: &str, api_key: &str, lakehouse: &Lakehouse) -> Result<(), Box<dy
     let catalog_creds = controlplane::catalog_credentials_path()?;
     write_backend_credentials(&backend_creds, lakehouse)?;
     write_catalog_credentials(&catalog_creds, lakehouse)?;
-    write_daemon_config(url, lakehouse, &backend_creds, &catalog_creds)?;
+    write_server_config(url, lakehouse, &backend_creds, &catalog_creds)?;
     Ok(())
 }
 
@@ -264,7 +264,7 @@ fn print_summary(email: &str, tenant: &str, lake: &Lakehouse) -> Result<(), Box<
     let catalog_creds = controlplane::catalog_credentials_path()?;
     println!("logged in as {email} (tenant {tenant})");
     println!(
-        "configured the daemon for bucket {} (warehouse {})",
+        "configured the server for bucket {} (warehouse {})",
         lake.bucket, lake.warehouse
     );
     println!(
@@ -275,7 +275,9 @@ fn print_summary(email: &str, tenant: &str, lake: &Lakehouse) -> Result<(), Box<
     println!("  control-plane token:  {} (0600)", token.display());
     println!("  backend credentials:  {} (0600)", backend_creds.display());
     println!("  catalog credentials:  {} (0600)", catalog_creds.display());
-    println!("run `verglas init` then `verglas start` next");
+    println!(
+        "next: use cloud verbs (`verglas workers`, …), or point a self-hosted server with VERGLAS_ENDPOINT"
+    );
     Ok(())
 }
 
@@ -428,8 +430,8 @@ fn write_catalog_credentials(path: &Path, lake: &Lakehouse) -> Result<(), Box<dy
     Ok(())
 }
 
-/// Resolves the control plane URL: the `--url` flag if given, else the URL from
-/// a prior login. Errors when neither is available.
+/// Resolves the control plane URL: `--url` if given, else a prior login's URL,
+/// else Verglas Cloud ([`controlplane::DEFAULT_CONTROL_PLANE_URL`]).
 fn resolve_url(flag: Option<String>) -> Result<String, Box<dyn Error>> {
     if let Some(url) = flag {
         let url = url.trim().to_owned();
@@ -437,10 +439,10 @@ fn resolve_url(flag: Option<String>) -> Result<String, Box<dyn Error>> {
             return Ok(url);
         }
     }
-    if let Some(url) = controlplane::stored_url()? {
+    if let Ok(Some(url)) = controlplane::stored_url() {
         return Ok(url);
     }
-    Err("no control plane URL configured; pass --url <control_plane_url>".into())
+    Ok(controlplane::DEFAULT_CONTROL_PLANE_URL.to_owned())
 }
 
 /// Resolves the API key: the positional argument if given, else one line from
@@ -497,11 +499,11 @@ fn write_private(path: &Path, contents: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Writes the daemon config: merges `[control_plane]`, `[backend]`, and
-/// `[catalog]` into `~/.verglas/config.toml`, each pointing the daemon at the
+/// Writes the server config: merges `[control_plane]`, `[backend]`, and
+/// `[catalog]` into `~/.verglas/config.toml`, each pointing the server at the
 /// tenant's scoped lakehouse. Every other section, comment, and byte of an
 /// existing config survives; re-running replaces these three in place.
-fn write_daemon_config(
+fn write_server_config(
     url: &str,
     lake: &Lakehouse,
     backend_creds: &Path,
@@ -534,7 +536,7 @@ fn control_plane_block(url: &str) -> String {
     format!("[control_plane]\n{}", toml_line("url", url))
 }
 
-/// The `[backend]` section body pointing the daemon at the tenant's bucket over
+/// The `[backend]` section body pointing the server at the tenant's bucket over
 /// its scoped S3 credentials file.
 fn backend_block(lake: &Lakehouse, creds: &Path) -> String {
     let mut block = String::from("[backend]\n");
@@ -545,7 +547,7 @@ fn backend_block(lake: &Lakehouse, creds: &Path) -> String {
     block
 }
 
-/// The `[catalog]` section body pointing the daemon at the tenant's Iceberg
+/// The `[catalog]` section body pointing the server at the tenant's Iceberg
 /// catalog over its scoped bearer-token file.
 fn catalog_block(lake: &Lakehouse, creds: &Path) -> String {
     let mut block = String::from("[catalog]\n");
@@ -598,27 +600,59 @@ fn replace_or_append_section(existing: &str, header: &str, block: &str) -> Strin
 mod tests {
     use super::*;
 
+    /// With no flag and no stored URL, login targets Verglas Cloud.
+    #[test]
+    fn resolve_url_defaults_to_verglas_cloud() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prev_home = std::env::var_os("HOME");
+        let prev_config = std::env::var_os("VERGLAS_CONFIG");
+        // SAFETY: unit test, no other threads in this test.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+            std::env::remove_var("VERGLAS_CONFIG");
+        }
+        let url = resolve_url(None).expect("default URL");
+        assert_eq!(url, controlplane::DEFAULT_CONTROL_PLANE_URL);
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_config {
+                Some(v) => std::env::set_var("VERGLAS_CONFIG", v),
+                None => std::env::remove_var("VERGLAS_CONFIG"),
+            }
+        }
+    }
+
+    /// An explicit `--url` wins over the cloud default.
+    #[test]
+    fn resolve_url_flag_wins() {
+        let url = resolve_url(Some("https://cp.example.test".into())).expect("flag");
+        assert_eq!(url, "https://cp.example.test");
+    }
+
     /// Merging a section touches only that section: other sections and their
     /// comments survive byte-for-byte, a re-merge with the same body is a no-op,
     /// and an existing section is replaced in place.
     #[test]
     fn section_merge_is_additive_and_idempotent() {
-        let existing = "# my daemon config\n\
+        let existing = "# my server config\n\
                         [listen]\ns3_port = 8333\n\n\
                         [cache]\n# precious comment\ndir = \"/tmp/c\"\n";
 
         let merged = replace_or_append_section(
             existing,
             "control_plane",
-            &control_plane_block("https://api.verglas.cloud"),
+            &control_plane_block("https://api.verglas.dev"),
         );
         assert!(merged.starts_with(existing), "other sections untouched");
-        assert!(merged.contains("[control_plane]\nurl = \"https://api.verglas.cloud\""));
+        assert!(merged.contains("[control_plane]\nurl = \"https://api.verglas.dev\""));
 
         let again = replace_or_append_section(
             &merged,
             "control_plane",
-            &control_plane_block("https://api.verglas.cloud"),
+            &control_plane_block("https://api.verglas.dev"),
         );
         assert_eq!(again, merged, "same body, identical output");
     }

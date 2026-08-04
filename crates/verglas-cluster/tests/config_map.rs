@@ -1,8 +1,8 @@
-//! Unit tests for the pure daemon-facing mapping in the cluster crate:
+//! Unit tests for the pure server-facing mapping in the cluster crate:
 //! deriving an [`AgentConfig`] from the `[cluster]` config (#27), the node-state
 //! wire vocabulary (§3.5), and the spawn error path. These run in-process (the
-//! subprocess daemon tests exercise the same code but do not contribute
-//! coverage), and pin the defaulting rules the daemon depends on.
+//! subprocess server tests exercise the same code but do not contribute
+//! coverage), and pin the defaulting rules the server depends on.
 
 use std::time::Duration;
 
@@ -32,7 +32,7 @@ fn from_config_applies_documented_defaults() {
     assert_eq!(agent.pod_id, "default");
     // Weight defaults to the configured NVMe budget — capacity is the weight.
     assert_eq!(agent.capacity_bytes, 32 * 1024 * 1024);
-    // The admin address is derived from the daemon's admin port (loopback).
+    // The admin address is derived from the server's admin port (loopback).
     assert_eq!(
         agent.admin_addr,
         Some("127.0.0.1:9099".parse().expect("addr"))

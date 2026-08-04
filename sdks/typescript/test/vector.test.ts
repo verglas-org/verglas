@@ -51,14 +51,10 @@ describe("table vector index handle", () => {
     expect(res.neighbors[0].distance).toBeLessThanOrEqual(res.neighbors[1].distance);
   });
 
-  it("searchIndex falls back to brute force when no index is declared (turn-off path)", async () => {
+  it("searchIndex rejects a missing snapshot attachment", async () => {
     const t = client.table("docs");
     await t.append(corpus);
-    // No addIndex call.
-    const res = await t.searchIndex("embedding", [0.1, 0.9], { k: 1 });
-    expect(res.source).toBe("bruteForce");
-    // Nearest to (0.1, 0.9) is id 3 at (0,1).
-    expect(res.neighbors[0].id).toBe(3);
+    await expect(t.searchIndex("embedding", [0.1, 0.9], { k: 1 })).rejects.toThrow();
   });
 
   it("listIndexes returns the declared indexes", async () => {

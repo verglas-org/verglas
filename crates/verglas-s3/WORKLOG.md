@@ -250,3 +250,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   SigV4-signed `/v1/query` and `/v1/tables/{t}/commit` reaching a stub and
   round-tripping) plus unit tests for path matching and the name validation.
 - #3: Restricted the SigV4 serving extension to query, write, and ingest execution routes; catalog metadata paths are no longer proxied.
+- #91: Updated S3 serving and authentication documentation for the renamed
+  `verglas-server` process. The protocol surface is unchanged by the process
+  rename.

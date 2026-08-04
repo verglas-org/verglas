@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use s3s::auth::{S3Auth, SecretKey};
 use s3s::{S3Error, S3ErrorCode, S3Result};
 
-/// In-memory `S3Auth` backed by the daemon config's static key list.
+/// In-memory `S3Auth` backed by the server config's static key list.
 #[derive(Debug)]
 pub struct StaticAuth {
     /// Access key ID to secret map.
@@ -31,7 +31,7 @@ impl StaticAuth {
         StaticAuth { keys }
     }
 
-    /// Convenience constructor for the single dev keypair `verglasd` configures today.
+    /// Convenience constructor for the single dev keypair `verglas-server` configures today.
     pub fn from_single(
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,

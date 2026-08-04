@@ -1,15 +1,15 @@
 //! Building an Iceberg REST catalog from a resolved [`Connection`].
 //!
-//! Production verbs speak to an Iceberg REST catalog — either a real one named
-//! by `--catalog-uri` or the daemon's loopback gateway. Data files are read and
-//! written through the S3 endpoint the connection names (the daemon endpoint, by
+//! Production verbs speak directly to the configured Iceberg REST catalog.
+//! Data files are read and
+//! written through the S3 endpoint the connection names (the server endpoint, by
 //! default), so a warm query stays local and a write gets cache residency and
 //! write-back. The storage factory is the S3 OpenDAL backend configured with
 //! that endpoint and the endpoint keypair.
 //!
 //! Hermetic tests build their own [`iceberg::Catalog`] (a `MemoryCatalog` over a
 //! local filesystem warehouse) and call the operation functions directly, so
-//! this REST wiring is exercised by the daemon-backed integration path.
+//! this REST wiring is exercised by the server-backed integration path.
 
 use std::collections::HashMap;
 use std::sync::Arc;

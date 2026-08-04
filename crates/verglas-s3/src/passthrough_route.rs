@@ -26,7 +26,7 @@
 //! blind-forwarding anything unrecognized. It expands one group at a time as
 //! the conformance suite proves each; the classifier below is the single place
 //! a new op is added. Path-style addressing only (`/{bucket}[/{key}]`), which is
-//! what the raw client and the whole daemon use.
+//! what the raw client and the whole server use.
 //!
 //! # Cache correctness
 //!
@@ -129,7 +129,7 @@ pub struct BucketConfigPassthrough {
 }
 
 impl BucketConfigPassthrough {
-    /// Builds the route over the backend store the daemon already shares
+    /// Builds the route over the backend store the server already shares
     /// with the read/write passthroughs.
     pub fn new(stores: Arc<dyn BackendStores>) -> Self {
         BucketConfigPassthrough { stores }

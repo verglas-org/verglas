@@ -40,7 +40,7 @@
 //! The backing files are *sparse*: their logical length is the budget, but
 //! physical (allocated) disk grows only as blocks are admitted. That is what
 //! lets the write-back fragment store share the one NVMe budget first come,
-//! first served (#223): the daemon's disk poll reads
+//! first served (#223): the server's disk poll reads
 //! [`HybridCacheEngine::disk_growth_room_bytes`] — the logical capacity the
 //! stores have not physically consumed — and lets fragments take exactly
 //! that, pausing block admission before it would grow into fragment-held
@@ -70,7 +70,7 @@
 //!
 //! Both foyer stores (the data block cache and the #50 metadata store) persist
 //! their disk tiers across a process restart and rebuild their in-memory index
-//! from the on-disk Foyer metadata on the next open, so a restarting daemon
+//! from the on-disk Foyer metadata on the next open, so a restarting server
 //! comes back serving its warm NVMe cache instead of re-fetching from the
 //! origin. Two knobs make that work end-to-end:
 //!
@@ -114,7 +114,7 @@
 //! the purge method doc. Extension point: the per-table generation vector of #51
 //! is the general case of which this whole-cache generation is the degenerate.
 //!
-//! Serve-gating lives in the daemon, not here: `verglasd` reports `starting` on
+//! Serve-gating lives in the server, not here: `verglas-server` reports `starting` on
 //! `/admin/healthz` until the engine has finished building (recovery included),
 //! so a load balancer never routes to a node that would cold-miss everything.
 //! Compression stays off — block payloads are typically already-compressed
@@ -843,10 +843,10 @@ struct Inner<B, P, R> {
     /// anything here.
     meta_store: MetaStore,
     /// Routes each read to the metadata store or the data store (#50). Pure and
-    /// deterministic; consults the mapper hook (#49) when the daemon wires one.
+    /// deterministic; consults the mapper hook (#49) when the server wires one.
     router: MetaRouter,
     /// Fill source: on a full miss, blocks are fetched from here. In the
-    /// daemon this is #117's passthrough over the origin bucket.
+    /// server this is #117's passthrough over the origin bucket.
     backend: B,
     /// Peer rung of the miss ladder ([`NoopPeerFetch`] while N=1).
     peers: P,
@@ -920,7 +920,7 @@ struct Inner<B, P, R> {
     /// Runtime disk-full guardrail (#96). When set, [`Inner::admit_block`]
     /// admits nothing: reads still serve (from what is resident, then the
     /// origin), but the cache stops writing new blocks so a full disk never
-    /// crashes the node. The daemon's background free-space poll raises and
+    /// crashes the node. The server's background free-space poll raises and
     /// clears this; the fill path pays one relaxed atomic load to read it, never
     /// a syscall. Shared behind an `Arc` so the poll and the engine see one flag.
     caching_paused: Arc<AtomicBool>,
@@ -980,7 +980,7 @@ where
     }
 
     /// Builds the engine with a caller-sized lane for aligned fill tails that
-    /// continue after requested bytes are ready. Daemons derive this from the
+    /// continue after requested bytes are ready. Servers derive this from the
     /// configured backend concurrency so background cache work always leaves
     /// most origin capacity available to user reads.
     pub async fn new_with_background_fill_limit(
@@ -1005,7 +1005,7 @@ where
     }
 
     /// Builds the engine with an explicit metadata router (#50) — the hook the
-    /// daemon uses to wire the logical-key mapper (#49) in as a classifier, so
+    /// server uses to wire the logical-key mapper (#49) in as a classifier, so
     /// catalogued metadata routes to the pinned store on top of the always-on
     /// pre-mapper heuristics. `new` uses the heuristics-only router, which
     /// already pins every un-onboarded table's planning objects. Must be called
@@ -1100,7 +1100,7 @@ where
         &self.inner.counters
     }
 
-    /// The shared runtime disk-full flag (#96). The daemon's background
+    /// The shared runtime disk-full flag (#96). The server's background
     /// free-space poll owns raising and clearing it; while it is set the engine
     /// admits no new blocks and serves reads from what is resident plus origin
     /// fills. Handed out as a clone of the `Arc` so the poll and the engine
@@ -1117,7 +1117,7 @@ where
 
     /// Bytes of this engine's logical disk capacity its sparse device files
     /// have not physically consumed yet (#223) — the share of the one NVMe
-    /// budget still unclaimed by the block and metadata stores. The daemon's
+    /// budget still unclaimed by the block and metadata stores. The server's
     /// disk poll grants the write-back fragment store exactly this, so the two
     /// share `cache.capacity_bytes` first come, first served. Two `stat` calls;
     /// only ever called from the background poll, never on a request path.
@@ -1133,8 +1133,8 @@ where
     /// open, an *owned* block this node misses locally is pulled from its
     /// previous holder over the peer network before a cold backend fill, so a
     /// freshly-joined node recovers its hit rate from the pod instead of from
-    /// the backend. The daemon calls this at startup when it joins a pod; a
-    /// single-node daemon never does, so its read path is unchanged. The window
+    /// the backend. The server calls this at startup when it joins a pod; a
+    /// single-node server never does, so its read path is unchanged. The window
     /// auto-expires (a deadline, no timer); calling again extends it. A draining
     /// donor is warmed from regardless of this window (that pull is
     /// unconditional), so drain (#31) does not depend on it.
@@ -1149,7 +1149,7 @@ where
     }
 
     /// Whether the warm-from-peers window is currently open (#30) — exposed so
-    /// the daemon and tests can observe the join warm-up state.
+    /// the server and tests can observe the join warm-up state.
     pub fn is_warming(&self) -> bool {
         self.inner.is_warming()
     }
@@ -1275,7 +1275,7 @@ where
         receipts
     }
 
-    /// Hard-evicts expired demotions (#198/#305): the daemon's grace-window
+    /// Hard-evicts expired demotions (#198/#305): the server's grace-window
     /// sweep calls this once a retired file's snapshots have expired. Each
     /// eviction with a known ETag has its block entries **physically removed**
     /// from the stores — data blocks and pinned metadata blocks alike — so the
@@ -1434,7 +1434,7 @@ where
     /// (issue #178), an O(1) logical clear that returns immediately. Not on the
     /// read path — the admin control surface calls this so a repeat-cold
     /// benchmark leg (or an operator recovering from a bad state) needs no
-    /// daemon restart.
+    /// server restart.
     ///
     /// # Generation-epoch purge (no racy `clear()`)
     ///
@@ -1470,7 +1470,7 @@ where
     ///   epoching it) keeps mappings keyed by logical identity, which the ring
     ///   and #14 revalidation rely on.
     /// - **Reset the scan-resistant admission policy (#15)** to cold, so a
-    ///   repeat-cold leg admits freely again, exactly as a fresh daemon would.
+    ///   repeat-cold leg admits freely again, exactly as a fresh server would.
     ///
     /// # Capacity: how post-purge DRAM/NVMe converge
     ///
@@ -1543,8 +1543,8 @@ where
     }
 }
 
-/// Object-safe purge surface the daemon's admin listener holds as
-/// `Arc<dyn CachePurger>` (issue #138) — so `verglasd`'s admin router can call
+/// Object-safe purge surface the server's admin listener holds as
+/// `Arc<dyn CachePurger>` (issue #138) — so `verglas-server`'s admin router can call
 /// [`HybridCacheEngine::purge`] without carrying the engine's `B, P, R` type
 /// parameters. The only implementor is the engine.
 #[async_trait::async_trait]
@@ -1601,7 +1601,7 @@ pub struct HardEviction {
 
 /// Object-safe evict-first demotion surface (issue #198). Retirement in
 /// verglas-tables holds an `Arc<dyn BlockDemoter>` so the compaction coordinator
-/// can demote orphaned files and the daemon's grace sweep can hard-evict them
+/// can demote orphaned files and the server's grace sweep can hard-evict them
 /// without carrying the engine's `B, P, R` type parameters. The only implementor
 /// is the engine.
 pub trait BlockDemoter: Send + Sync {
@@ -1732,7 +1732,7 @@ async fn build_caches(
     // The write-back fragment store gets no carve (#223): the block cache's
     // logical capacity is the full remainder, and fragments share the budget
     // first come, first served by accounting — the device file is sparse, so
-    // the daemon's disk poll grants fragments exactly the bytes this store has
+    // the server's disk poll grants fragments exactly the bytes this store has
     // not physically grown into (see `disk_growth_room_bytes`), and pauses
     // admission before the store would grow into fragment-held bytes.
     let disk_capacity =
@@ -3157,7 +3157,7 @@ where
     }
 
     /// Whether the warm-from-peers window is currently open (#30): the stored
-    /// deadline is in the future. `0` (never armed, or a single-node daemon) is
+    /// deadline is in the future. `0` (never armed, or a single-node server) is
     /// always closed. Relaxed — an approximate gate, never a correctness anchor
     /// (a stale read only costs, or saves, one peer hop).
     fn is_warming(&self) -> bool {

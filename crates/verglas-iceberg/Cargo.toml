@@ -1,6 +1,6 @@
 [package]
 name = "verglas-iceberg"
-description = "The pure-client Iceberg engine: catalog open, CAS write path, DataFusion query, retention, and the daemon table API (#320)"
+description = "The pure-client Iceberg engine: catalog open, CAS write path, DataFusion query, retention, and the server table API (#320)"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

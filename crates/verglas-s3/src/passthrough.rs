@@ -69,7 +69,7 @@ fn passthrough_tier() -> TierCell {
 }
 
 /// Maps a backend resolution failure onto the read interface's error space. A
-/// request for a bucket other than the one this daemon serves is
+/// request for a bucket other than the one this server serves is
 /// `NoSuchBucket`; a construction failure is an internal backend error.
 fn read_backend_error(error: BackendError) -> ReadError {
     match error {
@@ -305,7 +305,7 @@ fn to_raw_range(range: ReadRange) -> RawRange {
 /// `verglas_backend::BackendStore`; tests inject an in-memory-backed store.
 pub struct PassthroughRead {
     /// The backend seam; the store for a request's bucket is resolved here.
-    /// The daemon serves a configured bucket set (a bucket outside it is
+    /// The server serves a configured bucket set (a bucket outside it is
     /// `NoSuchBucket`).
     stores: Arc<dyn BackendStores>,
 }
@@ -644,7 +644,7 @@ struct TrackedUpload {
 /// front-end's ack ordering (issue #21) leans on that.
 pub struct PassthroughWrite {
     /// The backend seam; the store for a request's bucket is resolved here.
-    /// The daemon serves a configured bucket set (a bucket outside it is
+    /// The server serves a configured bucket set (a bucket outside it is
     /// `NoSuchBucket`). Clients expose the low-level multipart API so backend
     /// upload IDs round-trip to the client.
     stores: Arc<dyn BackendStores>,
@@ -653,7 +653,7 @@ pub struct PassthroughWrite {
     /// operation is stateless: upload IDs are the backend's own, so
     /// UploadPart/Complete/Abort work even for uploads this map has never
     /// seen. M1 is a cluster of one, so an upload ID missing here means the
-    /// upload does not exist — except across a daemon restart, where
+    /// upload does not exist — except across a server restart, where
     /// ListParts (only) forgets live uploads until the backend client forwards
     /// it natively. Keyed by upload ID alone; the tracked entry carries the
     /// bucket so an ID cannot be replayed against the wrong bucket.
@@ -671,7 +671,7 @@ impl PassthroughWrite {
     }
 
     /// Resolves the origin store for `bucket`. A bucket other than the one this
-    /// daemon serves is `NoSuchBucket`.
+    /// server serves is `NoSuchBucket`.
     fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, WriteError> {
         self.stores.store_for(bucket).map_err(write_backend_error)
     }
@@ -1713,7 +1713,7 @@ fn classify(key: &str, prefix: &str, delimiter: Option<&str>) -> ListEntry {
 /// `object_store`'s ordered listing stream.
 pub struct PassthroughList {
     /// The backend seam; the store for a request's bucket is resolved here.
-    /// The daemon serves a configured bucket set (a bucket outside it is
+    /// The server serves a configured bucket set (a bucket outside it is
     /// `NoSuchBucket`).
     stores: Arc<dyn BackendStores>,
 }
@@ -1726,7 +1726,7 @@ impl PassthroughList {
     }
 
     /// Resolves the origin store for `bucket`. A bucket other than the one this
-    /// daemon serves is `NoSuchBucket`; a construction failure is a backend
+    /// server serves is `NoSuchBucket`; a construction failure is a backend
     /// error.
     fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, ListError> {
         self.stores.store_for(bucket).map_err(list_backend_error)

@@ -1,16 +1,16 @@
-//! `verglas-cache-node` — the standalone Verglas cache serving daemon.
+//! `verglas-cache-node` — the standalone Verglas cache serving server.
 //!
 //! One job: run the cache. It loads the same TOML subset the fleet cache image
 //! renders (`[listen] [log] [cache] [backend] [auth]`), verifies SigV4 against
 //! the `[auth]` credentials file, serves the S3 endpoint from the local foyer
 //! cache tiers, and reads through / writes through to the origin bucket. There
 //! is no catalog, no cluster, no jobs framework, no query engine, and no
-//! platform executor — those live in `verglasd`. This binary is the cloud
+//! platform executor — those live in `verglas-server`. This binary is the cloud
 //! fleet's cache image (`fleet/images/Dockerfile.cache`), built small enough for
 //! a 256 MB VM.
 //!
 //! The config schema and its validation are `verglas-core`'s, reused verbatim,
-//! so this binary accepts exactly the config `verglasd` does and the fleet image
+//! so this binary accepts exactly the config `verglas-server` does and the fleet image
 //! swaps binaries without a boot-script change (`--config <path>`, same flag).
 
 use verglas_core::config::Config;
@@ -22,12 +22,12 @@ mod nbd;
 mod ring;
 mod serve;
 
-/// The daemon version, from the package manifest. Reported by `/admin/version`
+/// The server version, from the package manifest. Reported by `/admin/version`
 /// and stamped on operator log lines.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Parses `--config <path>` from the command line, loading and validating the
-/// file. The cache node always requires a config (unlike verglasd's config-less
+/// file. The cache node always requires a config (unlike verglas-server's config-less
 /// admin-only smoke mode): with no origin bucket and no auth there is nothing to
 /// serve. Exits non-zero with the loader's actionable message on any failure.
 fn load_config_from_args() -> Config {
@@ -54,7 +54,7 @@ fn load_config_from_args() -> Config {
 
 /// Generates a dev access keypair for a cache node started without `[auth]`. The
 /// caller prints it once so an engine can still be pointed at this node. Copied
-/// from `bins/verglasd/src/main.rs::generate_auth`.
+/// from `bins/verglas-server/src/main.rs::generate_auth`.
 fn generate_auth() -> (String, String) {
     use std::hash::{BuildHasher, RandomState};
     // RandomState is seeded from OS entropy; good enough for dev keys.
@@ -68,9 +68,9 @@ fn generate_auth() -> (String, String) {
 /// Resolves the static keypair the S3 endpoint accepts. When `[auth]` names a
 /// credentials file the keypair is read from it (AWS-INI, mode 0600) — the
 /// secret never lives in `config.toml`. With no `[auth]` an ephemeral pair is
-/// generated and printed once. Copied from `bins/verglasd/src/main.rs::resolve_auth`
+/// generated and printed once. Copied from `bins/verglas-server/src/main.rs::resolve_auth`
 /// (uses `verglas_backend::read_aws_keypair`), so the SigV4 credential handling
-/// is identical to verglasd's.
+/// is identical to verglas-server's.
 fn resolve_auth(config: &Config) -> Result<(String, String), String> {
     match &config.auth {
         Some(auth) => {
@@ -167,7 +167,7 @@ mod tests {
     /// with a backend credentials file and an `[auth]` credentials file — and
     /// asserts `verglas-core`'s loader accepts it and resolves each field. This
     /// is the binary-swap contract: the image renders one config and both
-    /// `verglasd` and `verglas-cache-node` must load it identically. If this
+    /// `verglas-server` and `verglas-cache-node` must load it identically. If this
     /// fails, the image cannot swap binaries without a boot-script change.
     #[test]
     fn loads_the_exact_config_the_cache_image_renders() {
@@ -245,7 +245,7 @@ mod tests {
         assert_eq!(secret, "enginesecret");
     }
 
-    /// With no `[auth]`, an ephemeral keypair is generated (matching verglasd's
+    /// With no `[auth]`, an ephemeral keypair is generated (matching verglas-server's
     /// no-config-auth behaviour) rather than failing startup.
     #[test]
     fn generates_a_keypair_when_auth_is_absent() {

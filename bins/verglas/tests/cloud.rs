@@ -165,7 +165,7 @@ async fn container_scale(
     ))
 }
 
-/// The curated catalog the mock returns: one headless MCP default (memory) and one
+/// The curated catalog the mock returns: one headless MCP default and one
 /// UI-only app (netdata), so the CLI's yes/no columns are exercised both ways.
 async fn catalog_list(
     headers: HeaderMap,
@@ -174,9 +174,9 @@ async fn catalog_list(
     authorize(&headers, &state)?;
     Ok(Json(json!({ "catalog": [
         {
-            "id": "memory", "name": "Memory (cognee)", "description": "Durable agent memory via MCP.",
+            "id": "tools", "name": "Tools (MCP)", "description": "Headless MCP tools container.",
             "has_ui": false, "has_mcp": true, "is_default": true,
-            "hostname": null, "mcp_endpoint": "https://memory-acme.verglas.dev/mcp"
+            "hostname": null, "mcp_endpoint": "https://tools-acme.verglas.dev/mcp"
         },
         {
             "id": "netdata", "name": "Netdata", "description": "Per-node metrics dashboard.",
@@ -186,7 +186,7 @@ async fn catalog_list(
     ] })))
 }
 
-/// Deploy a catalog app. `rill` is a fresh UI app (201, created); `memory` is a
+/// Deploy a catalog app. `rill` is a fresh UI app (201, created); `tools` is a
 /// headless MCP app reported as already deployed (200, created:false) so the CLI's
 /// idempotent branch, UI line, and MCP line are all exercised.
 async fn catalog_deploy(
@@ -203,21 +203,21 @@ async fn catalog_deploy(
                 "hostname": "rill-acme.verglas.dev", "mcp_endpoint": null, "created": true
             })),
         )),
-        "memory" => Ok((
+        "tools" => Ok((
             StatusCode::OK,
             Json(json!({
-                "id": "c-mem", "name": "memory", "catalog_id": "memory", "has_ui": false,
-                "hostname": null, "mcp_endpoint": "https://memory-acme.verglas.dev/mcp", "created": false
+                "id": "c-tools", "name": "tools", "catalog_id": "tools", "has_ui": false,
+                "hostname": null, "mcp_endpoint": "https://tools-acme.verglas.dev/mcp", "created": false
             })),
         )),
         _ => Err(StatusCode::NOT_FOUND),
     }
 }
 
-/// A config-schema response for the memory container: a locked default mode plus a
-/// bring-your-own mode carrying a secret field, so the CLI can learn which keys are
-/// secret. `web1` is a non-configurable container.
-fn memory_config(mode: &str, values: &Value) -> Value {
+/// A config-schema response for a configurable container: a locked default mode
+/// plus a bring-your-own mode carrying a secret field, so the CLI can learn which
+/// keys are secret. `web1` is a non-configurable container.
+fn configurable_config(mode: &str, values: &Value) -> Value {
     // Reflect only the NON-secret provided values; report the secret as set when it
     // was provided — the value itself is never returned.
     let llm_endpoint = values.get("LLM_ENDPOINT").cloned().unwrap_or(Value::Null);
@@ -249,7 +249,7 @@ async fn container_config_get(
 ) -> Result<Json<Value>, StatusCode> {
     authorize(&headers, &state)?;
     match id.as_str() {
-        "mem1" => Ok(Json(memory_config("default", &json!({})))),
+        "cfg1" => Ok(Json(configurable_config("default", &json!({})))),
         "web1" => Ok(Json(json!({ "configurable": false }))),
         _ => Err(StatusCode::NOT_FOUND),
     }
@@ -262,7 +262,7 @@ async fn container_config_put(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, StatusCode> {
     authorize(&headers, &state)?;
-    if id != "mem1" {
+    if id != "cfg1" {
         return Err(StatusCode::BAD_REQUEST);
     }
     let mode = body["mode"].as_str().unwrap_or("");
@@ -277,7 +277,7 @@ async fn container_config_put(
     {
         return Err(StatusCode::BAD_REQUEST);
     }
-    Ok(Json(memory_config(mode, values)))
+    Ok(Json(configurable_config(mode, values)))
 }
 
 async fn dbs_list(
@@ -664,7 +664,7 @@ fn workers_create_sends_the_spec_with_overrides() {
     let spec = home.path().join("worker.json");
     std::fs::write(
         &spec,
-        r#"{"kind":"source","name":"from_spec","trigger":"cron","placement":"cloud","code":"x"}"#,
+        r#"{"name":"from_spec","exec":["x"],"trigger":{"type":"cron","cron":"0 0 * * *"}}"#,
     )
     .expect("write spec");
 
@@ -1127,7 +1127,7 @@ fn containers_catalog_lists_with_yes_no_columns() {
             && stdout.contains("DEFAULT")
     );
     assert!(
-        stdout.contains("memory") && stdout.contains("netdata"),
+        stdout.contains("tools") && stdout.contains("netdata"),
         "rows: {stdout}"
     );
     // The booleans render as yes/no, not true/false.
@@ -1166,14 +1166,14 @@ fn containers_deploy_reports_created_ui_and_idempotent_mcp() {
 
     // An already-deployed headless MCP app: reported as already deployed (exit 0)
     // with its MCP endpoint, no UI line.
-    let (ok, stdout, stderr) = run(home.path(), &["containers", "deploy", "memory"]);
-    assert!(ok, "deploy memory (idempotent) must still exit 0: {stderr}");
+    let (ok, stdout, stderr) = run(home.path(), &["containers", "deploy", "tools"]);
+    assert!(ok, "deploy tools (idempotent) must still exit 0: {stderr}");
     assert!(
         stdout.contains("already deployed"),
         "idempotent line: {stdout}"
     );
     assert!(
-        stdout.contains("MCP: https://memory-acme.verglas.dev/mcp"),
+        stdout.contains("MCP: https://tools-acme.verglas.dev/mcp"),
         "MCP line: {stdout}"
     );
     assert!(
@@ -1188,7 +1188,7 @@ fn containers_config_shows_the_schema_and_mode() {
     let home = tempfile::tempdir().expect("tempdir");
     write_login(home.path(), &url);
 
-    let (ok, stdout, stderr) = run(home.path(), &["--json", "containers", "config", "mem1"]);
+    let (ok, stdout, stderr) = run(home.path(), &["--json", "containers", "config", "cfg1"]);
     assert!(ok, "config show must succeed: {stderr}");
     let value: Value = serde_json::from_str(&stdout).expect("json");
     assert_eq!(value["configurable"], true);
@@ -1211,7 +1211,7 @@ fn containers_config_sets_fields_with_a_stdin_secret_without_echoing_it() {
             "--json",
             "containers",
             "config",
-            "mem1",
+            "cfg1",
             "--set",
             "LLM_ENDPOINT=https://byo.example.com/v1",
             "--set",
@@ -1244,7 +1244,7 @@ fn containers_config_warns_when_a_secret_is_set_inline() {
         &[
             "containers",
             "config",
-            "mem1",
+            "cfg1",
             "--set",
             &format!("LLM_API_KEY={SECRET_VALUE}"),
             "--mode",
@@ -1304,8 +1304,8 @@ fn cloud_verbs_require_a_login() {
 
 // --- portable workers: create --local, push, pull, containers push ----------
 
-/// A local worker row the mock DAEMON returns (its JSON string columns match the
-/// daemon's `verglas_sys.workers` shape).
+/// A local worker row the mock SERVER returns (its JSON string columns match the
+/// server's `verglas_sys.workers` shape).
 fn local_worker_row() -> Value {
     json!({
         "name": "collector",
@@ -1321,8 +1321,8 @@ fn local_worker_row() -> Value {
     })
 }
 
-/// A stand-in for the LOCAL daemon: only the worker read route the push path uses.
-fn daemon_router(_state: MockState) -> Router {
+/// A stand-in for the LOCAL server: only the worker read route the push path uses.
+fn server_router(_state: MockState) -> Router {
     async fn worker_get(AxumPath(name): AxumPath<String>) -> Result<Json<Value>, StatusCode> {
         if name == "collector" {
             Ok(Json(local_worker_row()))
@@ -1340,15 +1340,15 @@ fn daemon_router(_state: MockState) -> Router {
 #[test]
 fn workers_push_translates_a_local_worker_to_a_cloud_deployment() {
     let cp = spawn_with(full_router);
-    let daemon = spawn_with(daemon_router);
+    let server = spawn_with(server_router);
     let home = tempfile::tempdir().expect("tempdir");
     write_login(home.path(), &cp);
 
     let (ok, stdout, stderr) = run(
         home.path(),
         &[
-            "--daemon-endpoint",
-            &daemon,
+            "--server-endpoint",
+            &server,
             "--json",
             "workers",
             "push",
@@ -1387,7 +1387,7 @@ fn workers_pull_writes_a_portable_spec() {
 #[test]
 fn workers_follow_needs_a_command_or_file() {
     let home = tempfile::tempdir().expect("tempdir");
-    // No `-- <command>` and no `--file`: a clear error, no daemon contacted.
+    // No `-- <command>` and no `--file`: a clear error, no server contacted.
     let (ok, _stdout, stderr) = run(home.path(), &["workers", "follow"]);
     assert!(!ok, "follow with no target must fail");
     assert!(

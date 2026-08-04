@@ -179,9 +179,9 @@ async fn idle_shutdown_watch(last_activity: Arc<AtomicU64>) {
     }
 }
 
-/// Appends `<role> <ip:port>` to the ports file a parent (`bins/verglasd`'s
+/// Appends `<role> <ip:port>` to the ports file a parent (`bins/verglas-server`'s
 /// query-worker dispatcher, or a test) named with `--ports-file`, matching the
-/// exact convention `verglasd --ports-file` uses (issue #194) so a poller
+/// exact convention `verglas-server --ports-file` uses (issue #194) so a poller
 /// written against one works against both. Best-effort: a write failure is
 /// logged and swallowed — it never fails startup, since serving does not
 /// depend on the parent learning the port.

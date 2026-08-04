@@ -64,3 +64,13 @@
 - chore: Delete the connector/protocol/conformance stack and the Source/Sink/Mv Job traits. Keep Row/Logger/JobError for the worker contract.
 - #393: Dropped `_LOGS` run-logging references from the worker contract; catalog-side lakekeeping owns telemetry.
 - #3: Kept the SDK thin: direct Iceberg REST metadata, Arrow query/write role transport, and no embedded Iceberg, DataFusion, or Parquet writer.
+- chore: Daemon unreachable errors point at a configured remote, cloud, or Docker daemon. The CLI no longer suggests host lifecycle commands.
+- #91: Updated vector wire documentation for snapshot-bound Puffin attachments
+  and removed the obsolete global cluster index-registry response types.
+- #91: Renamed the local SDK process helpers from `daemon` to `server` and
+  updated endpoint terminology for `verglas-server`. The retired module and
+  names have no compatibility re-exports.
+- #3: Let authenticated clients discover the configured upstream catalog URI
+  and warehouse alongside the Verglas S3 endpoint. Clients communicate with
+  the catalog directly; the server advertises coordinates but never hosts or
+  proxies it.

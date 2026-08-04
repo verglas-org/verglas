@@ -121,3 +121,8 @@
 - #393: Removed platform `_LOGS` run logging and day-partition retention from Verglas. Catalog-side lakekeeping owns telemetry write/TTL; this crate keeps only the compact-adjacent APIs (snapshot expiry where applicable). Harness no longer writes `verglas_logs.<name>_LOGS`; verglasd no longer runs the hourly prune loop.
 
 - #1 (verglas-org/verglas): Removed the fleet `verglas-compact` one-shot binary and its workspace/dist membership. Compaction stays in `verglas-iceberg` + daemon `POST /admin/compact` / `verglas table compact` until the async maintenance API lands; e2e retargeted to that path.
+- chore: Update the no-connection diagnostic to direct self-hosted users to the Docker daemon after removing the CLI's local launcher.
+- #263: Clarified that production catalog handles connect directly to the configured upstream Iceberg REST service. Verglas supplies only the S3 cache endpoint and does not provide a catalog gateway.
+- #91: Updated engine integration and test documentation for the renamed
+  `verglas-server` process. The engine continues to connect directly to the
+  customer's catalog and use the server only as its S3 endpoint.

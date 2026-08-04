@@ -2,7 +2,6 @@
 //! insert/delete/consolidate, and blob round-trips.
 
 use verglas_vector::codec;
-use verglas_vector::store::{InMemoryShadowStore, IndexKey, LocalDirShadowStore, ShadowBlobStore};
 use verglas_vector::vamana::{VamanaIndex, VamanaParams};
 use verglas_vector::{Metric, brute_force_search, puffin};
 
@@ -229,7 +228,7 @@ fn codec_round_trips_with_tombstones() {
 }
 
 #[tokio::test]
-async fn puffin_round_trip_through_shadow_store() {
+async fn puffin_container_round_trip() {
     let dim = 20;
     let data = synth(400, dim, 88);
     let mut index =
@@ -241,45 +240,9 @@ async fn puffin_round_trip_through_shadow_store() {
         .await
         .expect("vector test op");
 
-    // In-memory store: put, latest, snapshots.
-    let store = InMemoryShadowStore::new();
-    let key = IndexKey::table("default.docs", "embedding");
-    store
-        .put(&key, 555, bytes.clone())
-        .await
-        .expect("vector test op");
-    let latest = store
-        .latest(&key)
-        .await
-        .expect("vector test op")
-        .expect("vector test op");
-    assert_eq!(latest.snapshot, 555);
-    let restored = puffin::from_puffin_bytes(&latest.bytes)
+    let restored = puffin::from_puffin_bytes(&bytes)
         .await
         .expect("vector test op");
     assert_eq!(restored.len(), 400);
     assert_eq!(restored.reflected_snapshot(), 555);
-
-    // Local-dir store round-trip + version listing.
-    let dir = tempfile::tempdir().expect("vector test op");
-    let disk = LocalDirShadowStore::at(dir.path());
-    disk.put(&key, 555, bytes.clone())
-        .await
-        .expect("vector test op");
-    disk.put(&key, 600, bytes.clone())
-        .await
-        .expect("vector test op");
-    assert_eq!(
-        disk.snapshots(&key).await.expect("vector test op"),
-        vec![555, 600]
-    );
-    assert_eq!(
-        disk.latest(&key)
-            .await
-            .expect("vector test op")
-            .expect("vector test op")
-            .snapshot,
-        600
-    );
-    assert!(disk.get(&key, 999).await.expect("vector test op").is_none());
 }

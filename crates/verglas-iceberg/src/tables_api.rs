@@ -1,10 +1,10 @@
-//! The SDK-facing table API the daemon serves to `@verglas/sdk`.
+//! The SDK-facing table API the server serves to `@verglas/sdk`.
 //!
 //! `@verglas/sdk` reads and writes Iceberg tables through a small HTTP contract
 //! — commit rows, read the current snapshot, page the current rows, and pull the
 //! delta since a watermark. This module is the domain-neutral engine behind that
 //! contract, written against a `&dyn Catalog` so it is exercised hermetically and
-//! wrapped by thin admin routes in the daemon.
+//! wrapped by thin admin routes in the server.
 //!
 //! Every write goes through [`crate::write::append_batches`], the one CAS append
 //! path — JSON rows are converted to Arrow against the target table's schema and

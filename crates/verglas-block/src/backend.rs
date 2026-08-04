@@ -5,7 +5,7 @@
 //! bucket — "the same backend path the cache already uses" (#382). This module
 //! defines [`ObjectBackend`], the minimal put/get/exists surface the rest of the
 //! crate needs, and [`ObjectStoreBackend`], the adapter over an `object_store`
-//! handle the daemon already builds per bucket. verglas-block never names a
+//! handle the server already builds per bucket. verglas-block never names a
 //! bucket or holds credentials; the caller hands it a built store.
 
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ pub trait ObjectBackend: Send + Sync {
 }
 
 /// [`ObjectBackend`] over any `object_store` handle. Generic (and `?Sized`) so
-/// the daemon can pass an `Arc<dyn MultipartObjectStore>` — a trait object that
+/// the server can pass an `Arc<dyn MultipartObjectStore>` — a trait object that
 /// implements `ObjectStore` through its supertrait — without an extra wrapper.
 pub struct ObjectStoreBackend<S: ObjectStore + ?Sized> {
     /// The built store for the cache's backing bucket.

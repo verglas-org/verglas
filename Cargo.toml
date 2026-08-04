@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "bins/verglasd",
+    "bins/verglas-server",
     "bins/verglas",
     "crates/verglas-backend",
     "crates/verglas-core",
@@ -62,13 +62,13 @@ verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 # Client-side Iceberg read/write for the agent-facing CLI verbs (#287). The
 # write path (create/append/commit) and the embedded query engine are new; they
-# speak to any Iceberg REST catalog, including the daemon's loopback gateway.
+# speak to any Iceberg REST catalog, including the server's loopback gateway.
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
 # S3/fs/memory storage backends for Iceberg FileIO. RestCatalog requires an
 # explicit StorageFactory; the S3 one routes data-file writes and reads through
-# the configured (daemon) S3 endpoint.
+# the configured (server) S3 endpoint.
 iceberg-storage-opendal = "0.9.1"
 # Direct OpenDAL S3 client for the harness's durable watermark store: small
 # per-deployment cursor objects in the warehouse bucket, written with the same

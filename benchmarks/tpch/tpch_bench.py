@@ -131,10 +131,10 @@ class Config:
 
 
 def fetch_stats(admin_endpoint: str) -> Optional[dict]:
-    """Read the daemon's ``/admin/stats`` (cache budgets + read-path counters).
+    """Read the server's ``/admin/stats`` (cache budgets + read-path counters).
 
     This is the single source of truth for a run's tier context: the report
-    stamps the daemon's actual ``dram_bytes``/``capacity_bytes`` from here rather
+    stamps the server's actual ``dram_bytes``/``capacity_bytes`` from here rather
     than guessing, and the nvme-resident/constrained profiles read the counters
     to prove where warm reads were served from and whether eviction happened.
     Returns ``None`` (never a fabricated value) if the admin surface is
@@ -405,7 +405,7 @@ def phase_query(cfg: Config) -> dict:
     """Run the three legs (direct, Verglas cold, Verglas warm) and assemble a report.
 
     Order matters: the direct leg first (never touches Verglas), then the cold
-    leg (first Verglas touch = genuine cold with an empty daemon cache), then
+    leg (first Verglas touch = genuine cold with an empty server cache), then
     the warm leg (immediate re-run, cache populated). This mirrors the
     cold-before-warm discipline of ``verglas bench``.
     """
@@ -421,7 +421,7 @@ def phase_query(cfg: Config) -> dict:
     direct_mode, direct = run_leg(cfg, cfg.origin, queries, cfg.read_mode, meta)
     print("[query] Verglas cold leg …", flush=True)
     cold_mode, cold = run_leg(cfg, cfg.verglas, queries, cfg.read_mode, meta)
-    # Snapshot the daemon counters between the cold and warm legs so the warm
+    # Snapshot the server counters between the cold and warm legs so the warm
     # leg's own deltas isolate where its reads came from (DRAM vs disk) and
     # whether eviction forced backend refills — the per-profile evidence.
     stats_pre_warm = fetch_stats(cfg.admin_endpoint)
@@ -465,7 +465,7 @@ def phase_query(cfg: Config) -> dict:
 def cache_stats_report(pre_warm: Optional[dict], post_warm: Optional[dict]) -> dict:
     """Assemble the tier-context evidence from the counter snapshots.
 
-    Records the daemon's configured budgets, the DRAM-tier occupancy after the
+    Records the server's configured budgets, the DRAM-tier occupancy after the
     warm leg, and the warm-leg-only counter deltas. The warm-leg deltas are what
     prove the profile's claim: ``disk_hits > 0`` means warm reads were served
     from NVMe (nvme-resident), and ``backend_fills > 0`` on the warm leg means
@@ -489,9 +489,9 @@ def cache_stats_report(pre_warm: Optional[dict], post_warm: Optional[dict]) -> d
 def machine_context(cfg: Config) -> dict:
     """Machine + cache-medium context recorded alongside the numbers.
 
-    The cache medium is a property of the daemon's ``--cache-dir``, which this
+    The cache medium is a property of the server's ``--cache-dir``, which this
     process does not own; ``run.sh`` passes a note describing it (default: the
-    daemon's ephemeral temp dir).
+    server's ephemeral temp dir).
     """
     return {
         "platform": platform.platform(),
@@ -567,12 +567,12 @@ def render_cache_stats(stats: dict) -> list[str]:
     omitting the context or inventing a value.
     """
     if not stats or not stats.get("available"):
-        return ["  cache budget: unavailable (daemon /admin/stats not reachable)"]
+        return ["  cache budget: unavailable (server /admin/stats not reachable)"]
     cfg = stats.get("cache_config", {})
     delta = stats.get("warm_leg_counter_delta", {})
     lines = [
         f"  cache budget: DRAM {_mib(cfg.get('dram_bytes'))} / "
-        f"disk {_mib(cfg.get('capacity_bytes'))} (from daemon /admin/stats)",
+        f"disk {_mib(cfg.get('capacity_bytes'))} (from server /admin/stats)",
         f"  DRAM tier in use after warm: {_mib(stats.get('dram_usage_bytes_after_warm'))}",
     ]
     if delta:
@@ -630,7 +630,7 @@ def render_query_table(report: dict) -> str:
 
 
 def derive_admin_endpoint(verglas_endpoint: str) -> str:
-    """Derive the daemon admin URL from the Verglas S3 endpoint (next port).
+    """Derive the server admin URL from the Verglas S3 endpoint (next port).
 
     ``verglas dev`` binds the admin API on ``s3_port + 1``; mirroring that here
     keeps the report's tier context working with the default local setup and no
@@ -704,7 +704,7 @@ def main() -> int:
         choices=["auto", "duckdb-iceberg", "pyiceberg-arrow"],
         default="auto",
     )
-    p.add_argument("--cache-note", default="daemon --cache-dir (medium unspecified)")
+    p.add_argument("--cache-note", default="server --cache-dir (medium unspecified)")
     p.add_argument(
         "--profile",
         default="unspecified",
@@ -713,7 +713,7 @@ def main() -> int:
     p.add_argument(
         "--admin-endpoint",
         default="",
-        help="daemon admin URL for /admin/stats (cache budgets + counters); "
+        help="server admin URL for /admin/stats (cache budgets + counters); "
         "empty derives it from the Verglas endpoint's next port",
     )
     p.add_argument("--json", action="store_true")

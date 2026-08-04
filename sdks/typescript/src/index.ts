@@ -6,10 +6,9 @@
 //      plus the change feed (client.follow) and change-driven row follow
 //      (client.followRows).
 //   2. The worker contract — defineWorker() + the trigger types.
-// Internals the runner uses on the author's behalf (run logging, trajectory
-// normalization, reference examples) are NOT re-exported here; reach them
-// explicitly via the `@verglas/sdk/logging`, `@verglas/sdk/trajectory`, and
-// `@verglas/sdk/examples` subpaths.
+// Internals the runner uses on the author's behalf (run logging, reference
+// examples) are NOT re-exported here; reach them explicitly via the
+// `@verglas/sdk/logging` and `@verglas/sdk/examples` subpaths.
 
 export { connect, VerglasClient, Table, Queue, Graph } from "./client";
 export { VerglasHttpError } from "./http";

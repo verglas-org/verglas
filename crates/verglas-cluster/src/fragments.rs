@@ -144,7 +144,7 @@ impl FragmentIoError {
 /// which is what keeps an un-propagated fragment (the only durable copy of acked
 /// data) safe until propagation deletes it explicitly.
 ///
-/// The ceiling is **dynamic** (#223): a shared atomic the daemon's disk poll
+/// The ceiling is **dynamic** (#223): a shared atomic the server's disk poll
 /// updates each tick to what the store holds plus the share of the one NVMe
 /// budget (`cache.capacity_bytes`) the block cache is not physically using —
 /// first come, first served, no carve and no fraction. Fragments are transient,
@@ -160,7 +160,7 @@ pub struct LocalFragmentStore {
     /// Root holding all fragment blobs for this node.
     root: Arc<PathBuf>,
     /// Live ceiling on total fragment bytes; `u64::MAX` means unbudgeted. Shared
-    /// so the daemon's disk poll can raise or lower it while placements run.
+    /// so the server's disk poll can raise or lower it while placements run.
     ceiling: Arc<AtomicU64>,
     /// Live fragment bytes on disk, charged on store and released on delete.
     used: Arc<AtomicU64>,
@@ -180,7 +180,7 @@ impl LocalFragmentStore {
         Self::with_dynamic_ceiling(cache_dir, Arc::new(AtomicU64::new(budget)))
     }
 
-    /// Creates a store whose ceiling is a shared atomic the daemon's disk poll
+    /// Creates a store whose ceiling is a shared atomic the server's disk poll
     /// updates dynamically (#223), rebuilding the used-byte count from any
     /// fragments a previous run left on disk so the bound holds across a restart.
     pub fn with_dynamic_ceiling(cache_dir: impl AsRef<Path>, ceiling: Arc<AtomicU64>) -> Self {
@@ -1055,7 +1055,7 @@ mod tests {
     }
 
     /// The fragment store's ceiling is dynamic (#223): a shared atomic the
-    /// daemon's disk poll updates. A write burst is absorbed up to the current
+    /// server's disk poll updates. A write burst is absorbed up to the current
     /// ceiling (far past the retired flat 10% cap); raising the ceiling (free
     /// NVMe appeared) lets the burst continue; lowering it below what is already
     /// stored refuses new writes but never drops an acked fragment; and

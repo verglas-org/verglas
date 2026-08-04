@@ -11,7 +11,7 @@
 //!   byte range cut into fixed chunks, each named by the SHA-256 of its bytes so
 //!   identical chunks dedup across devices and versions.
 //! - [`backend`] — the durability seam: a minimal object backend, with an
-//!   adapter over the `object_store` handle the daemon already builds per bucket.
+//!   adapter over the `object_store` handle the server already builds per bucket.
 //!   Chunks and manifests persist through the same backing bucket the cache uses,
 //!   under dedicated prefixes.
 //! - [`store`] — the content-addressed chunk store: an NVMe-local hit path in

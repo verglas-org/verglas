@@ -2,7 +2,7 @@
 
 The fourth tier profile for the TPC-H-over-Iceberg benchmark (issues #160, #29,
 #141). The three single-node profiles in `benchmarks/tpch` (dram-resident,
-nvme-resident, constrained) each measure **one** daemon. This profile measures a
+nvme-resident, constrained) each measure **one** server. This profile measures a
 **pod**: an N-node `verglas dev` cluster where every node carries the
 **constrained per-node budget**, so the pod's *aggregate* cache is N x per-node.
 
@@ -64,7 +64,7 @@ the pod with resident-biased admission; it is off by default.
 
 Identical to `benchmarks/tpch`:
 
-- Built binaries: `cargo build --release` → `target/release/{verglas,verglasd}`.
+- Built binaries: `cargo build --release` → `target/release/{verglas,verglas-server}`.
 - Python 3 (3.13 recommended); `run.sh` reuses `benchmarks/tpch/.venv` and its
   pinned `requirements.txt` (created on first run if absent).
 - An S3-compatible origin reachable via the ambient `AWS_*` environment
@@ -75,7 +75,7 @@ Identical to `benchmarks/tpch`:
   is skipped with a note.
 
 The pod is booted **by this script** (`verglas dev --nodes N ...`) — you do not
-start a daemon yourself. The dev keys are parsed from the pod's banner.
+start a server yourself. The dev keys are parsed from the pod's banner.
 
 ## Ports (uncontended, #194)
 

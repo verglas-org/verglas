@@ -38,7 +38,7 @@ Each leg drives three official suites, pinned to a polaris-tools commit:
    (default 0.8). `Update Table` commits a **new** `metadata.json`.
 
 The report merges Gatling's own latency percentiles (p50/p95/p99) per operation
-across **direct / verglas-cold / verglas-warm**, plus the daemon's
+across **direct / verglas-cold / verglas-warm**, plus the server's
 `/admin/stats` **meta counters** for the warm leg (the mechanism evidence:
 `meta_hits` / `meta_misses` = the metadata hit rate), plus a correctness gate
 that both legs passed their Gatling assertions with zero failed requests.
@@ -55,7 +55,7 @@ that both legs passed their Gatling assertions with zero failed requests.
 ```
 
 Polaris and the Gatling runner share a Docker network (`polaris:8181`). The
-Verglas dev daemon runs on the **host**; the Polaris container reaches it via
+Verglas dev server runs on the **host**; the Polaris container reaches it via
 `host.docker.internal` (Docker Desktop for Mac forwards this to host loopback,
 verified). The Gatling client only ever talks to Polaris's catalog API — it
 never touches S3 directly. **Only Polaris does S3 IO**, so this benchmark
@@ -68,8 +68,8 @@ design — `benchmarks/tpch` covers that).
 - An **S3-compatible origin** reachable via the standard `AWS_*` environment
   (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`).
   The bucket must already exist. Path-style addressing is used throughout.
-- A **built `verglas` binary** with `verglasd` beside it:
-  `cargo build --release -p verglas -p verglasd` → `target/release/{verglas,verglasd}`.
+- A **built `verglas` binary** with `verglas-server` beside it:
+  `cargo build --release -p verglas -p verglas-server` → `target/release/{verglas,verglas-server}`.
 - **aws CLI** (teardown only) and **python3** (stdlib only — no venv).
 
 No JDK on the host is required: the Gatling suites build and run inside a pinned
@@ -115,8 +115,8 @@ must be non-empty** — the guard refuses the bucket root.
 ## Copy-paste invocation
 
 ```bash
-# 0. Build the daemon binaries (once).
-cargo build --release -p verglas -p verglasd
+# 0. Build the server binaries (once).
+cargo build --release -p verglas -p verglas-server
 
 # 1. Load origin creds (used by the direct leg's Polaris and by Verglas's backend).
 cp /path/to/.env benchmarks/polaris/.env      # never committed; guarded in run.sh
@@ -259,7 +259,7 @@ context block.
   official suite drives is byte-for-byte unchanged; only which percentiles the
   HTML report tabulates differs.
 - **Cold vs warm discipline — and why cold ≈ warm here.** `run.sh` issues
-  `POST /cache/purge` on the daemon admin API between the write suite and the
+  `POST /cache/purge` on the server admin API between the write suite and the
   cold read suite. The purge clears the block cache tiers, but the #50 metadata
   store is **hard-isolated and pinned** — and the metadata was pinned **at write
   time**, when `CreateTreeDataset`'s `metadata.json` writes flowed through the

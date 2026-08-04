@@ -14,7 +14,7 @@
 //! same trait — see [`CommitLog`] for the exact contract an implementation must
 //! satisfy. Keeping the seam here, independent of the write-back tier, lets the
 //! single-node lakehouse run for free and lets the fleet plug its quorum in
-//! without a source change to the cache or the daemon.
+//! without a source change to the cache or the server.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -106,10 +106,10 @@ pub enum CommitLogError {
 ///   highest `record` sequence the quorum has agreed.
 /// - [`is_quorum`](CommitLog::is_quorum) reports whether this log reaches a
 ///   real quorum. The local default returns `false`; a PG-backed log returns
-///   `true`. The daemon logs it at startup so the operator sees which mode is
+///   `true`. The server logs it at startup so the operator sees which mode is
 ///   live.
 ///
-/// The trait is object-safe (`Arc<dyn CommitLog>`) so the daemon holds one and
+/// The trait is object-safe (`Arc<dyn CommitLog>`) so the server holds one and
 /// the concrete log — local or quorum — is chosen once at construction.
 #[async_trait]
 pub trait CommitLog: Send + Sync + 'static {

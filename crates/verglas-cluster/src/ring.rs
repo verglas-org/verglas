@@ -315,7 +315,7 @@ impl LiveRing {
     }
 
     /// Builds the degenerate single-member ring: one node owns every key. This
-    /// is the N=1 case a daemon boots with before (or without) gossip — the
+    /// is the N=1 case a server boots with before (or without) gossip — the
     /// weight is irrelevant when there is only one member.
     pub fn single(node: NodeId, weight: u64) -> Self {
         // Infallible: a one-element vector is never empty.

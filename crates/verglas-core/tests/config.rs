@@ -14,7 +14,7 @@ fn scratch_dir(tag: &str) -> PathBuf {
 }
 
 /// A minimal valid document: a real cache dir and the required `backend.bucket`
-/// (the daemon serves exactly one bucket and refuses to start without it).
+/// (the server serves exactly one bucket and refuses to start without it).
 /// Pins a tiny `capacity_bytes`: `validate()` gates the budget against the
 /// real free space backing `cache.dir`, and the multi-GB default would fail on
 /// a nearly-full CI runner. Tests that need a different budget replace the
@@ -109,7 +109,7 @@ fn data_block_bytes_accepts_aligned_sizes_and_rejects_invalid_geometry() {
 #[test]
 fn auth_names_a_credentials_file_and_carries_no_inline_secret() {
     // `[auth]` is file-based (#221): it names an AWS-format credentials file the
-    // daemon reads the endpoint keypair from, with an optional profile. The
+    // server reads the endpoint keypair from, with an optional profile. The
     // keypair never lives inline in the config.
     let toml = format!(
         "{}[auth]\ncredentials_file = \"/home/op/.verglas/credentials/endpoint\"\ncredentials_profile = \"default\"\n",
@@ -129,7 +129,7 @@ fn auth_names_a_credentials_file_and_carries_no_inline_secret() {
 
 #[test]
 fn auth_credentials_profile_defaults_to_none() {
-    // The profile is optional; absent means the daemon reads the default profile.
+    // The profile is optional; absent means the server reads the default profile.
     let toml = format!(
         "{}[auth]\ncredentials_file = \"/home/op/.verglas/credentials/endpoint\"\n",
         valid_toml("auth-noprofile"),
@@ -360,7 +360,7 @@ fn typoed_field_error_names_it() {
 
 #[test]
 fn backend_bucket_is_required_and_gates_validation() {
-    // The daemon serves a configured set of buckets (#235). The common single
+    // The server serves a configured set of buckets (#235). The common single
     // case names one `bucket`; a config with a bucket set validates.
     let with_bucket = Config::from_toml_str(&format!(
         "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket = \"my-lake\"\n",
@@ -376,7 +376,7 @@ fn backend_bucket_is_required_and_gates_validation() {
 #[test]
 fn backend_bucket_globs_alone_validate() {
     // A config that names only `bucket_globs` (no single `bucket`) validates:
-    // the daemon serves any bucket matching a glob (#235, the S3 Tables case).
+    // the server serves any bucket matching a glob (#235, the S3 Tables case).
     let config = Config::from_toml_str(&format!(
         "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket_globs = [\"*--table-s3\"]\n",
         scratch_dir("globs-only").display()
@@ -410,7 +410,7 @@ fn backend_bucket_and_globs_together_validate() {
 fn missing_backend_bucket_fails_validation() {
     // A blank `[backend]` (or no table at all) PARSES — both bucket fields are
     // optional in the schema so a scaffold can leave them commented — but does
-    // NOT validate: the daemon needs at least one bucket or glob to serve. The
+    // NOT validate: the server needs at least one bucket or glob to serve. The
     // error names the fields.
     let toml = format!(
         "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n",
@@ -766,7 +766,7 @@ fn bad_size_suffix_is_a_parse_error() {
 // --- [cluster] gossip membership (#27) ---------------------------------------
 
 /// Absent `[cluster]` is single-node: no gossip, no membership — the turn-off
-/// path where a lone daemon behaves exactly as before this feature landed.
+/// path where a lone server behaves exactly as before this feature landed.
 #[test]
 fn cluster_absent_means_single_node() {
     let config = Config::from_toml_str(&valid_toml("no-cluster")).expect("parses");
@@ -1073,7 +1073,7 @@ fn writeback_rejects_removed_fragment_fraction_field() {
 
 /// There is one NVMe budget and no fragment sizing knob (#223): enabling the
 /// write-back tier adds no size field — fragments share `cache.capacity_bytes`
-/// with the block cache first come, first served, enforced by the daemon's
+/// with the block cache first come, first served, enforced by the server's
 /// accounting. Any attempted sizing field is rejected as unknown.
 #[test]
 fn writeback_has_no_fragment_sizing_knob() {
@@ -1102,7 +1102,7 @@ fn writeback_has_no_fragment_sizing_knob() {
 
 /// Startup refuses a `cache.capacity_bytes` larger than the free space on the
 /// filesystem backing `cache.dir`, naming the field, the configured size, and
-/// the available space (#96). A daemon that would run the disk out never boots.
+/// the available space (#96). A server that would run the disk out never boots.
 #[test]
 fn rejects_capacity_bytes_larger_than_free_disk() {
     // 1 EiB — larger than any real test filesystem's free space.
@@ -1130,7 +1130,7 @@ fn rejects_capacity_bytes_larger_than_free_disk() {
 /// A warm cache must be able to restart (#298): bytes already held by files
 /// under `cache.dir` count toward the capacity check, so a budget larger than
 /// free space alone but within free + already-owned validates. Regression: a
-/// daemon with a 4 TB budget and 3.6 TB cached was refused on reboot because
+/// server with a 4 TB budget and 3.6 TB cached was refused on reboot because
 /// the gate compared the budget against free space only.
 #[test]
 fn warm_cache_contents_count_toward_the_capacity_check() {

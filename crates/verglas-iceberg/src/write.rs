@@ -8,7 +8,7 @@
 //! view's result) through the same coerce/validate/commit path, and can stamp
 //! snapshot-summary properties (the MV's consumed watermark). Data files are
 //! written through the table's FileIO — the S3 endpoint the catalog was opened
-//! with — so a daemon in the path gives cache residency and write-back.
+//! with — so a server in the path gives cache residency and write-back.
 
 use std::collections::HashMap;
 use std::path::Path;

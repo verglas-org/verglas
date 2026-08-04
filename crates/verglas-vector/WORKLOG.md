@@ -32,3 +32,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   maintenance config at boot before its source table exists; the build lands on
   the first `refresh`/rehydration once rows exist.
 - chore: Remove docs/ cross-references after deleting the docs directory. Crate module docs are the reference now.
+- #91: Replaced the cluster-local shadow-store Vamana format with a first-class
+  Iceberg Puffin statistics attachment bound to the exact reflected snapshot.
+  Search and refresh now discover state from table metadata and reject missing
+  or stale attachments without rebuilding or scanning.
+- #91: Updated vector route documentation for the renamed `verglas-server`
+  process. Snapshot-bound Puffin attachment behavior is unchanged.

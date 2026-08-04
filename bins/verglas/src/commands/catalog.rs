@@ -1,10 +1,10 @@
 //! Direct Iceberg REST catalog access for `verglas table delete`.
 //!
-//! Every other table verb goes through the local daemon, but dropping a table is
+//! Every other table verb goes through the local server, but dropping a table is
 //! a catalog control-plane operation: it removes the table's entry from the
 //! tenant's Iceberg REST catalog (the per-tenant `catalogd`). This module reads
 //! the `[catalog]` section of `~/.verglas/config.toml` — the same uri and bearer
-//! the daemon's catalog watcher uses — resolves the route prefix from
+//! the server's catalog watcher uses — resolves the route prefix from
 //! `/v1/config`, and issues the REST `DELETE .../namespaces/{ns}/tables/{table}`.
 
 use std::error::Error;
@@ -42,16 +42,16 @@ struct ConfigResponse {
 }
 
 impl CatalogClient {
-    /// Builds a client from the `[catalog]` section of the agent config file
+    /// Builds a client from the `[catalog]` section of the user config file
     /// (`$VERGLAS_CONFIG` or `~/.verglas/config.toml`). A missing file, a missing
     /// `[catalog]` section, or an unresolvable bearer token each fails with a
     /// clear message rather than a silent no-auth request.
     pub fn from_agent_config() -> Result<CatalogClient, Box<dyn Error>> {
-        let path = config::agent_config_path()
+        let path = config::user_config_path()
             .ok_or("no config file: set VERGLAS_CONFIG or HOME to locate ~/.verglas/config.toml")?;
         let text = std::fs::read_to_string(&path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-        // Parse only the `[catalog]` table; the rest of the daemon config (which
+        // Parse only the `[catalog]` table; the rest of the server config (which
         // the CLI does not need) is ignored.
         #[derive(Deserialize)]
         struct CatalogOnly {
@@ -88,7 +88,7 @@ impl CatalogClient {
 
     /// Resolves the route root (`{base}/v1` or `{base}/v1/{prefix}`) by reading
     /// `/v1/config` once. The tenant catalogd advertises its prefix there, so the
-    /// drop-table path is built the same way the daemon's catalog client builds
+    /// drop-table path is built the same way the server's catalog client builds
     /// it.
     async fn route_root(&self) -> Result<String, Box<dyn Error>> {
         let mut url = format!("{}/v1/config", self.base);

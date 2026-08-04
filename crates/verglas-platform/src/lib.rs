@@ -2,7 +2,7 @@
 //! declarations that describe the agent-data platform's dataflow.
 //!
 //! This crate is the local projection of the unified deployment record
-//! (WHITEPAPER §7.1). It is not memory-specific — the daemon supervisor and the
+//! (WHITEPAPER §7.1). It is not memory-specific — the server supervisor and the
 //! CLI both read and write it — so it lives on its own, below the harnesses and
 //! the memory workflow.
 //!
@@ -20,7 +20,6 @@
 //! - `verglas_sys.workers` — the single deployment registry (code + triggers +
 //!   output). What the worker runtime reads each tick.
 //! - `verglas_sys.watermarks` — each deployment's durable cross-run watermark.
-//! - `verglas_sys.indexes` — vector/graph index declarations.
 //!
 //! [`Deployment`] is the canonical projection of a worker row into the unified
 //! record shape shared with the cloud control plane.
@@ -49,8 +48,7 @@ use parquet::file::properties::WriterProperties;
 use serde::{Serialize, Serializer};
 
 pub use rows::{
-    INDEXES_TABLE, IndexRow, IndexSpec, PLACEMENT_LOCAL, TARGET_KIND_GRAPH, TARGET_KIND_TABLE,
-    WATERMARKS_TABLE, WORKERS_TABLE, WatermarkRow, WorkerRow, WorkerSpec,
+    PLACEMENT_LOCAL, WATERMARKS_TABLE, WORKERS_TABLE, WatermarkRow, WorkerRow, WorkerSpec,
 };
 
 pub const SYSTEM_NAMESPACE: &str = "verglas_sys";
@@ -124,18 +122,15 @@ pub enum PlatformError {
     /// A scanned row did not match the expected schema.
     #[error("decode: {0}")]
     Decode(String),
-    /// A state change named a declaration that does not exist.
-    #[error("not found: no {kind} named {name}")]
+    /// A state change named a worker that does not exist.
+    #[error("not found: no worker named {name}")]
     NotFound {
-        /// The declaration kind (`source`, `mv`, `sink`).
-        kind: &'static str,
-        /// The requested name.
+        /// The requested worker name.
         name: String,
     },
 }
 
-/// The control plane over one catalog: declare and inspect sources, MVs, and
-/// sinks, and pause/resume them.
+/// The control plane over one catalog's worker registry and durable watermarks.
 pub struct SystemCatalog {
     catalog: Arc<dyn Catalog>,
 }
@@ -294,7 +289,6 @@ impl SystemCatalog {
             self.current_worker(&table, name)
                 .await?
                 .ok_or_else(|| PlatformError::NotFound {
-                    kind: "worker",
                     name: name.to_owned(),
                 })?;
         let next = WorkerRow {
@@ -337,7 +331,7 @@ impl SystemCatalog {
 
     /// The current durable watermark for one deployment: the highest-revision
     /// row of `verglas_sys.watermarks`, or `None` before the first set. This
-    /// backs the daemon's `GET /v1/watermark` (#322).
+    /// backs the server's `GET /v1/watermark` (#322).
     pub async fn get_watermark(
         &self,
         deployment: &str,
@@ -350,7 +344,7 @@ impl SystemCatalog {
 
     /// Stores a deployment's durable watermark by appending the next revision —
     /// never a mutation, so the snapshot log records every advance. This backs
-    /// the daemon's `PUT /v1/watermark` (#322).
+    /// the server's `PUT /v1/watermark` (#322).
     pub async fn set_watermark(
         &self,
         deployment: &str,
@@ -392,199 +386,6 @@ impl SystemCatalog {
             .filter(|r| r.deployment == deployment)
             .max_by_key(|r| r.revision))
     }
-
-    // --- vector indexes --------------------------------------------------
-
-    /// Declares a vector index, appending a new revision (revision 1 in
-    /// `Running` on the first declaration; a redeclare bumps the revision and
-    /// preserves the original `created_at`). The blob never travels through here
-    /// — only its shadow-store `blob_ref` and reflected snapshot, so a reboot
-    /// knows whether to rehydrate or rebuild.
-    pub async fn register_index(&self, spec: IndexSpec) -> Result<IndexRow, PlatformError> {
-        self.register_index_state(spec, SystemState::Running).await
-    }
-
-    /// Declares a vector index at an explicit state.
-    pub async fn register_index_state(
-        &self,
-        spec: IndexSpec,
-        state: SystemState,
-    ) -> Result<IndexRow, PlatformError> {
-        let table = self
-            .ensure_table(INDEXES_TABLE, rows::index_schema())
-            .await?;
-        let existing = self.current_index(&table, &spec.name).await?;
-        let now = chrono::Utc::now();
-        let (revision, created_at) = match &existing {
-            Some(r) => (r.revision + 1, r.created_at),
-            None => (1, now),
-        };
-        let row = IndexRow {
-            name: spec.name,
-            target_kind: spec.target_kind,
-            target: spec.target,
-            field: spec.field,
-            metric: spec.metric,
-            params: spec.params,
-            cluster_id: spec.cluster_id,
-            reflected_snapshot: spec.reflected_snapshot,
-            blob_ref: spec.blob_ref,
-            state,
-            created_by: spec.created_by,
-            created_at,
-            updated_at: now,
-            revision,
-        };
-        let batch = rows::encode_indexes(
-            std::slice::from_ref(&row),
-            table.metadata().current_schema(),
-        );
-        self.append_batch(&table, batch).await?;
-        Ok(row)
-    }
-
-    /// The current view of all indexes: the highest-revision row per name.
-    pub async fn list_indexes(&self) -> Result<Vec<IndexRow>, PlatformError> {
-        let table = self
-            .ensure_table(INDEXES_TABLE, rows::index_schema())
-            .await?;
-        let all = self.decode_index_rows(&table).await?;
-        Ok(current_view(all, |r| (r.name.clone(), r.revision)))
-    }
-
-    /// The current view of the `Running` indexes this cluster serves — the rows
-    /// a daemon rehydrates on boot. Rows for other clusters (or non-running
-    /// states) are excluded; they stay in the registry (and in `list_indexes`)
-    /// but are not served locally.
-    pub async fn list_running_indexes_for_cluster(
-        &self,
-        cluster_id: &str,
-    ) -> Result<Vec<IndexRow>, PlatformError> {
-        let mut rows = self.list_indexes().await?;
-        rows.retain(|r| r.cluster_id == cluster_id && r.state == SystemState::Running);
-        Ok(rows)
-    }
-
-    /// The current row for one index, or `None`.
-    pub async fn get_index(&self, name: &str) -> Result<Option<IndexRow>, PlatformError> {
-        let table = self
-            .ensure_table(INDEXES_TABLE, rows::index_schema())
-            .await?;
-        self.current_index(&table, name).await
-    }
-
-    /// Every revision of one index, oldest first — the append-only history of a
-    /// declaration's state and build changes.
-    pub async fn index_revisions(&self, name: &str) -> Result<Vec<IndexRow>, PlatformError> {
-        let table = self
-            .ensure_table(INDEXES_TABLE, rows::index_schema())
-            .await?;
-        let mut rows: Vec<IndexRow> = self
-            .decode_index_rows(&table)
-            .await?
-            .into_iter()
-            .filter(|r| r.name == name)
-            .collect();
-        rows.sort_by_key(|r| r.revision);
-        Ok(rows)
-    }
-
-    /// Flips an index's state by appending a revision (every other field carried
-    /// forward). An unknown index is a [`PlatformError::NotFound`].
-    pub async fn set_index_state(
-        &self,
-        name: &str,
-        state: SystemState,
-    ) -> Result<IndexRow, PlatformError> {
-        let table = self
-            .ensure_table(INDEXES_TABLE, rows::index_schema())
-            .await?;
-        let current =
-            self.current_index(&table, name)
-                .await?
-                .ok_or_else(|| PlatformError::NotFound {
-                    kind: "index",
-                    name: name.to_owned(),
-                })?;
-        let next = IndexRow {
-            state,
-            updated_at: chrono::Utc::now(),
-            revision: current.revision + 1,
-            ..current
-        };
-        let batch = rows::encode_indexes(
-            std::slice::from_ref(&next),
-            table.metadata().current_schema(),
-        );
-        self.append_batch(&table, batch).await?;
-        Ok(next)
-    }
-
-    /// Records the outcome of a build by appending a revision with the new
-    /// reflected snapshot and blob location. This is how a build result becomes
-    /// durable so the next reboot rehydrates the present blob instead of
-    /// rebuilding. An unknown index is a [`PlatformError::NotFound`].
-    pub async fn set_index_build(
-        &self,
-        name: &str,
-        reflected_snapshot: i64,
-        blob_ref: String,
-    ) -> Result<IndexRow, PlatformError> {
-        let table = self
-            .ensure_table(INDEXES_TABLE, rows::index_schema())
-            .await?;
-        let current =
-            self.current_index(&table, name)
-                .await?
-                .ok_or_else(|| PlatformError::NotFound {
-                    kind: "index",
-                    name: name.to_owned(),
-                })?;
-        let next = IndexRow {
-            reflected_snapshot: Some(reflected_snapshot),
-            blob_ref: Some(blob_ref),
-            updated_at: chrono::Utc::now(),
-            revision: current.revision + 1,
-            ..current
-        };
-        let batch = rows::encode_indexes(
-            std::slice::from_ref(&next),
-            table.metadata().current_schema(),
-        );
-        self.append_batch(&table, batch).await?;
-        Ok(next)
-    }
-
-    /// Decodes all index rows.
-    async fn decode_index_rows(&self, table: &Table) -> Result<Vec<IndexRow>, PlatformError> {
-        let mut out = Vec::new();
-        for batch in self.scan_all(table).await? {
-            out.extend(rows::decode_indexes(&batch)?);
-        }
-        Ok(out)
-    }
-
-    /// The highest-revision row for one index name.
-    async fn current_index(
-        &self,
-        table: &Table,
-        name: &str,
-    ) -> Result<Option<IndexRow>, PlatformError> {
-        Ok(self
-            .decode_index_rows(table)
-            .await?
-            .into_iter()
-            .filter(|r| r.name == name)
-            .max_by_key(|r| r.revision))
-    }
-}
-
-/// Composes the `verglas_sys.indexes` primary key from the cluster id, logical
-/// target, and field: `<cluster_id>/<target>/<field>`. The cluster id leads so
-/// the same target+field declared on two clusters are two independent rows —
-/// each daemon rehydrates only the rows under its own cluster id.
-pub fn index_row_name(cluster_id: &str, target: &str, field: &str) -> String {
-    format!("{cluster_id}/{target}/{field}")
 }
 
 /// One deployment as a single record — the canonical shape §7.1 describes,

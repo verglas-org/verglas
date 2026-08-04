@@ -16,7 +16,7 @@
 //!   [`Telemetry::roll_up`] ~1s (drains tapes → folds counters). Readers call
 //!   [`Telemetry::table_report`] / [`Telemetry::render_families`] /
 //!   [`Telemetry::metering_snapshot`] at scrape or heartbeat time.
-//! - This crate provides no timer: the daemon (which owns a runtime) spawns the
+//! - This crate provides no timer: the server (which owns a runtime) spawns the
 //!   periodic `roll_up`, keeping `verglas-core` free of an async dependency.
 
 pub mod rollup;
@@ -203,7 +203,7 @@ impl Telemetry {
 
     /// Drains every shard's inactive buffer and folds the events into the
     /// rollup, mirroring the shards' dropped-event total. Called ~1s by the
-    /// daemon's background task; off any hot path.
+    /// server's background task; off any hot path.
     pub fn roll_up(&self) {
         let mut events = Vec::new();
         for shard in &self.shards {

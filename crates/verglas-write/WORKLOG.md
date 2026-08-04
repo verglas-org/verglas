@@ -76,3 +76,8 @@
   ack-then-crash-then-replay. It kills only its own daemon PID and stops MinIO by
   a unique container name.
 - #3: Renamed the crate from `verglas-writeback` to `verglas-write`; write-back and synchronous write-through are internal durability modes of one logical write subsystem.
+- #263: Removed the commit-barrier documentation's dependency on a loopback
+  catalog proxy. Verglas does not host a catalog; the barrier remains available
+  to explicit customer-invoked commit operations without implying such a route.
+- #91: Updated write-back process documentation for the `verglas-server`
+  rename. Durability barriers and propagation behavior are unchanged.

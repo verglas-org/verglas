@@ -1,4 +1,4 @@
-//! Authenticated, streaming client for the Verglas daemon data plane.
+//! Authenticated, streaming client for the Verglas server data plane.
 //!
 //! The client keeps transport, authentication, Arrow IPC, idempotency, and
 //! table-contract validation in the SDK. Applications and the CLI therefore
@@ -52,7 +52,7 @@ pub struct ConnectOptions {
 }
 
 impl ConnectOptions {
-    /// Creates options for a daemon endpoint.
+    /// Creates options for a server endpoint.
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -68,8 +68,8 @@ impl ConnectOptions {
 
     /// Resolves the standard SDK endpoint and bearer-token environment.
     ///
-    /// `VERGLAS_ENDPOINT` defaults to the local daemon admin endpoint;
-    /// `VERGLAS_TOKEN` is optional because a loopback daemon may not require
+    /// `VERGLAS_ENDPOINT` defaults to the local server admin endpoint;
+    /// `VERGLAS_TOKEN` is optional because a loopback server may not require
     /// bearer authentication.
     pub fn from_env() -> Self {
         let endpoint = std::env::var("VERGLAS_ENDPOINT")
@@ -113,7 +113,7 @@ impl ConnectOptions {
         self
     }
 
-    /// Supplies the catalog bearer token without changing daemon authentication.
+    /// Supplies the catalog bearer token without changing server authentication.
     #[must_use]
     pub fn with_catalog_token(mut self, token: impl Into<String>) -> Self {
         self.catalog_token = Some(token.into());
@@ -173,7 +173,7 @@ pub enum ClientError {
         message: String,
     },
     /// The HTTP transport failed.
-    #[error("daemon transport failed: {0}")]
+    #[error("server transport failed: {0}")]
     Transport(#[from] reqwest::Error),
     /// Arrow IPC encoding or decoding failed.
     #[error("Arrow IPC failed: {0}")]
@@ -185,7 +185,7 @@ pub enum ClientError {
         table: String,
         /// Definition requested by the caller.
         expected: TableDefinition,
-        /// Definition returned by the daemon.
+        /// Definition returned by the server.
         actual: TableDefinition,
     },
     /// The websocket change feed could not connect or exchanged invalid data.
@@ -199,7 +199,7 @@ pub enum ClientError {
     },
 }
 
-/// Reusable authenticated client for a Verglas daemon.
+/// Reusable authenticated client for a Verglas server.
 #[derive(Debug, Clone)]
 pub struct Client {
     endpoint: String,
@@ -207,7 +207,7 @@ pub struct Client {
     warehouse: Option<String>,
     s3_endpoint: String,
     raw_catalog_token: Option<String>,
-    daemon_token: Option<HeaderValue>,
+    server_token: Option<HeaderValue>,
     catalog_token: Option<HeaderValue>,
     catalog_prefix: std::sync::Arc<OnceCell<Option<String>>>,
     request_timeout: Duration,
@@ -220,7 +220,7 @@ impl Client {
         let endpoint = options.endpoint.trim_end_matches('/').to_owned();
         reqwest::Url::parse(&endpoint)
             .map_err(|error| ClientError::Configuration(error.to_string()))?;
-        let daemon_token = options
+        let server_token = options
             .token
             .clone()
             .map(|token| HeaderValue::from_str(&format!("Bearer {token}")))
@@ -236,12 +236,13 @@ impl Client {
             .connect_timeout(options.connect_timeout)
             .build()?;
         let access = if options.catalog_uri.is_none() || options.s3_endpoint.is_none() {
-            let response = tokio::time::timeout(
-                options.request_timeout,
-                http.get(format!("{endpoint}{ACCESS_PATH}")).send(),
-            )
-            .await
-            .map_err(|_| ClientError::RequestTimeout)??;
+            let mut request = http.get(format!("{endpoint}{ACCESS_PATH}"));
+            if let Some(token) = &server_token {
+                request = request.header(AUTHORIZATION, token.clone());
+            }
+            let response = tokio::time::timeout(options.request_timeout, request.send())
+                .await
+                .map_err(|_| ClientError::RequestTimeout)??;
             Some(response.error_for_status()?.json::<LocalAccess>().await?)
         } else {
             None
@@ -250,7 +251,7 @@ impl Client {
             .catalog_uri
             .or_else(|| access.as_ref().and_then(|value| value.catalog_uri.clone()))
             .ok_or_else(|| {
-                ClientError::Configuration("daemon advertises no catalog URI".to_owned())
+                ClientError::Configuration("server advertises no catalog URI".to_owned())
             })?
             .trim_end_matches('/')
             .to_owned();
@@ -258,7 +259,7 @@ impl Client {
             .s3_endpoint
             .or_else(|| access.as_ref().map(|value| value.s3_endpoint.clone()))
             .ok_or_else(|| {
-                ClientError::Configuration("daemon advertises no S3 endpoint".to_owned())
+                ClientError::Configuration("server advertises no S3 endpoint".to_owned())
             })?;
         Ok(Self {
             endpoint,
@@ -268,7 +269,7 @@ impl Client {
                 .or_else(|| access.as_ref().and_then(|value| value.warehouse.clone())),
             s3_endpoint,
             raw_catalog_token,
-            daemon_token,
+            server_token,
             catalog_token,
             catalog_prefix: std::sync::Arc::new(OnceCell::new()),
             request_timeout: options.request_timeout,
@@ -425,7 +426,7 @@ impl Client {
 
     /// Adds authentication to a request when configured.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.daemon_token {
+        match &self.server_token {
             Some(token) => request.header(AUTHORIZATION, token.clone()),
             None => request,
         }

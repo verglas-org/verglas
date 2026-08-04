@@ -26,7 +26,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # MinIO static creds; the daemon and the direct leg both read the origin here.
+  # MinIO static creds; the server and the direct leg both read the origin here.
   AWS_ACCESS_KEY_ID: minioadmin
   AWS_SECRET_ACCESS_KEY: minioadmin
   AWS_REGION: us-east-1
@@ -59,14 +59,14 @@ jobs:
 
       # Only the two binaries the harness drives — keeps the build well under
       # the ~5-minute PR-time budget.
-      - name: Build daemon + CLI
-        run: cargo build -p verglasd -p verglas
+      - name: Build server + CLI
+        run: cargo build -p verglas-server -p verglas
 
       # Compile the plain-Java iceberg-core fixture builder into one runnable jar
       # (no Spark). Runs once; the matrix reuses it for the avro and mixed variants.
       - name: Build Avro/mixed fixture builder (iceberg-core, no Spark)
         working-directory: tests/engine-matrix/fixture-jvm
-        run: ./gradlew --no-daemon shadowJar
+        run: ./gradlew --no-server shadowJar
 
       - name: Start MinIO
         run: |
@@ -81,7 +81,7 @@ jobs:
             "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && \
              mc mb --ignore-existing local/verglas-test"
 
-      - name: Start Verglas daemon against MinIO
+      - name: Start Verglas server against MinIO
         run: |
           mkdir -p "$RUNNER_TEMP/vg-cache"
           cat > "$RUNNER_TEMP/verglas-matrix.toml" <<EOF
@@ -98,13 +98,13 @@ jobs:
           access_key_id = "matrixdev"
           secret_access_key = "matrixdevsecret"
           EOF
-          ./target/debug/verglasd --config "$RUNNER_TEMP/verglas-matrix.toml" \
-            > "$RUNNER_TEMP/verglasd.log" 2>&1 &
+          ./target/debug/verglas-server --config "$RUNNER_TEMP/verglas-matrix.toml" \
+            > "$RUNNER_TEMP/verglas-server.log" 2>&1 &
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:8334/admin/healthz && break
             sleep 1
           done
-          echo "daemon log:"; cat "$RUNNER_TEMP/verglasd.log"
+          echo "server log:"; cat "$RUNNER_TEMP/verglas-server.log"
 
       # Guard the comparator itself: a tripwire that can't trip is worthless.
       - name: Comparator selftest
@@ -117,6 +117,6 @@ jobs:
             --access-key-id matrixdev \
             --secret-key matrixdevsecret
 
-      - name: Daemon log on failure
+      - name: Server log on failure
         if: failure()
-        run: cat "$RUNNER_TEMP/verglasd.log" || true
+        run: cat "$RUNNER_TEMP/verglas-server.log" || true

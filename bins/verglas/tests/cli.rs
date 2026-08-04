@@ -7,25 +7,18 @@
 //! `doctor`), the former `version` subcommand, the remote-targeting `node`
 //! verb, the removed `uninstall` verb, and the `tables` (plural) group that
 //! duplicated `table` must not reappear in `--help`, so nothing creeps back
-//! silently. The `memory` verb was removed too: seeding is
-//! automatic at install and the one-shot spool migration is gone, so there is
-//! no user-facing memory command (the installer's detached seed target `__seed`
-//! is hidden and is not a user verb).
+//! silently. The `memory` and `skills` verbs are gone: durable agent memory is
+//! not part of this product. OS service lifecycle (`init`/`start`/`stop`/
+//! `restart`/`logs`/`dev`) is gone — the server runs in Docker.
 
 use std::process::Command;
 
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// cloud `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 19] = [
-    "dev",
+const SURVIVING_COMMANDS: [&str; 12] = [
     "drain",
-    "init",
-    "start",
-    "stop",
-    "restart",
     "status",
-    "logs",
     "table",
     "graph",
     "query",
@@ -36,20 +29,10 @@ const SURVIVING_COMMANDS: [&str; 19] = [
     "db",
     "volumes",
     "secrets",
-    // `skills` returned with the MCP-endpoint rebuild: `verglas skills install`
-    // wires an agent session to the tenant's memory MCP.
-    "skills",
 ];
 
-/// Commands removed from the CLI: `--help` must not name them. `version` became a
-/// flag; `node` resolved and targeted OTHER nodes, which is not a CLI concern
-/// (`drain` acts on the local daemon only); `uninstall` was replaced by
-/// documented manual steps; the rest were unimplemented stubs. `memory` was
-/// removed once seeding became automatic and the spool migration was deleted.
-/// `deployments` was removed once the platform primitives (`source`/`mv`/`sink`)
-/// became the commands: each primitive's `list` now shows local and cloud
-/// together, so a separate generic verb is redundant.
-const REMOVED_COMMANDS: [&str; 15] = [
+/// Commands removed from the CLI: `--help` must not name them.
+const REMOVED_COMMANDS: [&str; 22] = [
     "version",
     "analyze",
     "deploy",
@@ -59,11 +42,18 @@ const REMOVED_COMMANDS: [&str; 15] = [
     "warm",
     "doctor",
     "memory",
+    "skills",
     "deployments",
     "instrument",
     "source",
     "mv",
     "sink",
+    "init",
+    "start",
+    "stop",
+    "restart",
+    "logs",
+    "dev",
     // `tables` (plural) duplicated `table`; its unique verbs moved under
     // `table` (metrics) and `index`. Only `table` (singular) remains.
     "tables",
@@ -86,7 +76,7 @@ fn long_version_flag_prints_cli_version() {
 #[test]
 fn short_version_flag_prints_cli_version() {
     // `-V` is clap's built-in short version flag (#288): it prints the CLI's own
-    // version without contacting any daemon.
+    // version without contacting any server.
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .arg("-V")
         .output()
@@ -103,7 +93,7 @@ fn short_version_flag_prints_cli_version() {
 fn version_subcommand_is_an_unknown_command() {
     // `version` is no longer a subcommand (#288): it is a flag. Invoking
     // `verglas version` must be a clap unrecognized-subcommand error, exit
-    // non-zero, and never reach out to a daemon.
+    // non-zero, and never reach out to a server.
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .arg("version")
         .output()
@@ -120,15 +110,14 @@ fn version_subcommand_is_an_unknown_command() {
 }
 
 #[test]
-fn memory_subcommand_is_an_unknown_command() {
-    // The `verglas memory` verb was removed: seeding is automatic at install and
-    // the one-shot spool migration is gone. Invoking `verglas memory` (or its old
-    // `seed`/`migrate-spool` children) must be a clap unknown-command error and
-    // must never reach a daemon.
+fn memory_and_skills_subcommands_are_unknown() {
+    // Durable agent memory (`memory`, `skills`) is not part of this product.
     for args in [
         vec!["memory"],
         vec!["memory", "seed"],
         vec!["memory", "migrate-spool"],
+        vec!["skills"],
+        vec!["skills", "install"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
             .args(&args)
@@ -321,66 +310,4 @@ fn index_help_lists_add_search_and_list() {
             "`verglas index --help` must list `{verb}`: {verbs:?}"
         );
     }
-}
-
-#[test]
-fn dev_offers_a_required_bucket_flag() {
-    // `verglas dev` serves exactly one bucket, named by a required `--bucket`
-    // flag. `--help` must list it alongside the other flags.
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["dev", "--help"])
-        .output()
-        .expect("binary runs");
-
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    assert!(
-        stdout.contains("--bucket"),
-        "`verglas dev` must offer a --bucket flag: {stdout}"
-    );
-    // The other flags are still there.
-    assert!(stdout.contains("--cache-dir") && stdout.contains("--port"));
-}
-
-#[test]
-fn dev_help_offers_dram_flag_defaulting_to_one_gib() {
-    // `verglas dev --dram` exposes the DRAM ceiling (issue #141); its default
-    // stays 1GB so the dram-resident profile is the out-of-the-box behavior.
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["dev", "--help"])
-        .output()
-        .expect("binary runs");
-
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    assert!(
-        stdout.contains("--dram"),
-        "expected a --dram flag: {stdout}"
-    );
-    assert!(
-        stdout.contains("1GB"),
-        "expected --dram to default to 1GB: {stdout}"
-    );
-}
-
-#[test]
-fn dev_help_offers_nodes_flag_defaulting_to_one() {
-    // `verglas dev --nodes N` boots a local pseudo-cluster (issue #160); its
-    // default is 1 so the single-node cluster-of-one stays the out-of-the-box
-    // behavior.
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["dev", "--help"])
-        .output()
-        .expect("binary runs");
-
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    assert!(
-        stdout.contains("--nodes"),
-        "expected a --nodes flag: {stdout}"
-    );
-    assert!(
-        stdout.contains("default: 1") || stdout.contains("[default: 1]"),
-        "expected --nodes to default to 1: {stdout}"
-    );
 }

@@ -1,4 +1,4 @@
-//! Shared admin HTTP API types used by the CLI and daemon.
+//! Shared admin HTTP API types used by the CLI and server.
 //!
 //! The admin API is a private control surface on a separate port from the S3
 //! data-plane endpoint. Request and response bodies defined here are the wire
@@ -6,22 +6,22 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Path for the daemon version probe.
+/// Path for the server version probe.
 pub const VERSION_PATH: &str = "/admin/version";
 
-/// Path for the daemon liveness probe.
+/// Path for the server liveness probe.
 pub const HEALTHZ_PATH: &str = "/admin/healthz";
 
 /// Path for the cache purge control operation (`POST`). Drops every key→ETag
 /// mapping and clears both cache tiers so the next reads are cold misses —
-/// an honest repeat-cold benchmark leg (or operator reset) without a daemon
+/// an honest repeat-cold benchmark leg (or operator reset) without a server
 /// restart (issue #138).
 pub const PURGE_PATH: &str = "/cache/purge";
 
-/// Path for the daemon cache-config + read-path counters probe (issue #141).
+/// Path for the server cache-config + read-path counters probe (issue #141).
 ///
 /// The single source of truth for a bench run's tier context: reports read the
-/// daemon's actual `dram_bytes`/`capacity_bytes` from here rather than guessing,
+/// server's actual `dram_bytes`/`capacity_bytes` from here rather than guessing,
 /// and the nvme-resident/constrained profiles read the counters to prove where
 /// warm reads were served from (DRAM vs disk) and whether eviction happened.
 pub const STATS_PATH: &str = "/admin/stats";
@@ -31,7 +31,7 @@ pub const STATS_PATH: &str = "/admin/stats";
 /// Reports this node's live view of the pod — every member's identity,
 /// addresses, capacity/weight, and state — for `verglas status` (#62) and
 /// debugging. Loopback-only like the rest of the admin surface; served only
-/// when the daemon runs with a `[cluster]` config.
+/// when the server runs with a `[cluster]` config.
 pub const MEMBERS_PATH: &str = "/admin/members";
 
 /// Path for the Prometheus metrics scrape (`GET`, issue #46).
@@ -63,18 +63,18 @@ pub const TABLE_METRICS_PATH: &str = "/v1/metering/tables";
 pub const DRAIN_PATH: &str = "/admin/drain";
 
 /// Path for the runtime log-level control (`POST`, issue #61). Hot-reloads the
-/// daemon's `tracing` filter without a restart, so an operator can turn on
+/// server's `tracing` filter without a restart, so an operator can turn on
 /// `DEBUG` span detail for a live investigation and turn it back down after.
 /// Loopback-only like the rest of the admin surface.
 pub const LOG_PATH: &str = "/admin/log";
 
 /// Path for the local-access probe (`GET`, issue #287). Returns the non-secret
-/// connection details SDK clients need with zero configuration: the daemon's S3
-/// cache endpoint and the real upstream Iceberg REST catalog coordinates. The
-/// daemon advertises that catalog but never re-hosts it. The paired secret access key
-/// is deliberately NOT served here: the admin listener is unauthenticated and
+/// connection details clients need: the server's S3 cache endpoint and the real
+/// upstream Iceberg REST catalog coordinates. The server advertises that
+/// catalog but never hosts or proxies it. The paired secret access key is
+/// deliberately NOT served here: the admin listener is unauthenticated and
 /// binds loopback, which is host-scoped, so any local process could otherwise
-/// read a lakehouse read/write key without opening the daemon's 0600 credentials
+/// read a lakehouse read/write key without opening the server's 0600 credentials
 /// file. The CLI reads the secret from that user-scoped credentials file
 /// instead. Loopback-only like the rest of the admin surface.
 pub const ACCESS_PATH: &str = "/admin/access";
@@ -87,15 +87,15 @@ pub const DEFAULT_ADMIN_ADDR: &str = "127.0.0.1:8334";
 pub const ENDPOINT_ENV: &str = "VERGLAS_ENDPOINT";
 
 /// Default admin API base URL used by CLI clients. Must agree with
-/// `DEFAULT_ADMIN_ADDR` so a default CLI reaches a default-config daemon.
+/// `DEFAULT_ADMIN_ADDR` so a default CLI reaches a default-config server.
 pub const DEFAULT_ENDPOINT: &str = "http://127.0.0.1:8334";
 
 /// Version metadata returned by `GET /admin/version`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionInfo {
-    /// Daemon binary name.
+    /// Server binary name.
     pub name: String,
-    /// Daemon release version.
+    /// Server release version.
     pub version: String,
 }
 
@@ -103,7 +103,7 @@ pub struct VersionInfo {
 /// recovery has completed and the node can serve warm reads.
 pub const HEALTH_STATUS_OK: &str = "ok";
 
-/// Readiness marker reported by `/admin/healthz` while the daemon is still
+/// Readiness marker reported by `/admin/healthz` while the server is still
 /// rebuilding its cache index from the on-disk tiers (issue #16). A load
 /// balancer must not route data-plane traffic to a node reporting this — it
 /// would cold-miss everything until recovery finishes.
@@ -152,10 +152,10 @@ pub struct PurgeReport {
 }
 
 impl VersionInfo {
-    /// Builds the version payload served by `verglasd`.
-    pub fn for_daemon(version: &str) -> Self {
+    /// Builds the version payload served by `verglas-server`.
+    pub fn for_server(version: &str) -> Self {
         Self {
-            name: "verglasd".to_owned(),
+            name: "verglas-server".to_owned(),
             version: version.to_owned(),
         }
     }
@@ -180,39 +180,40 @@ impl HealthzInfo {
 
 /// Non-secret connection details returned by `GET /admin/access` (issue #287) so
 /// the agent-facing CLI verbs run with zero configuration against a running
-/// daemon.
+/// server.
 ///
-/// Everything here is resolved from the daemon's own config and is safe to hand
+/// Everything here is resolved from the server's own config and is safe to hand
 /// out over the unauthenticated, host-scoped loopback admin socket: the S3
-/// cache endpoint, the upstream Iceberg REST catalog URI and warehouse, the
-/// signing region and served bucket, and the endpoint access key id.
+/// endpoint, upstream Iceberg REST catalog coordinates, signing region, served
+/// bucket, and endpoint access key id. Verglas advertises the customer catalog
+/// but never hosts or proxies it.
+/// `access_key_id` is present only when the server has an endpoint auth keypair.
 ///
 /// The paired **secret access key is intentionally absent**. Serving it here
 /// would leak a lakehouse read/write credential to any local process that can
-/// open the admin port, bypassing the daemon's 0600 credentials file. The CLI
+/// open the admin port, bypassing the server's 0600 credentials file. The CLI
 /// reads the secret from that user-scoped credentials file instead.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalAccess {
-    /// Base URL of the daemon's S3 data endpoint (e.g. `http://127.0.0.1:8333`).
-    /// Data files are written and queries are read through it so a daemon in the
+    /// Base URL of the server's S3 data endpoint (e.g. `http://127.0.0.1:8333`).
+    /// Data files are written and queries are read through it so a server in the
     /// path gives cache residency and write-back.
     pub s3_endpoint: String,
-    /// Upstream Iceberg REST catalog URI, or `None` when no catalog is configured.
-    /// This is a non-secret coordinate; authentication remains caller supplied.
+    /// Configured upstream Iceberg REST catalog URI, when present.
     pub catalog_uri: Option<String>,
-    /// Optional warehouse identifier supplied to the Iceberg REST catalog.
+    /// Configured upstream Iceberg warehouse identifier, when present.
     pub warehouse: Option<String>,
     /// SigV4 signing region the endpoint expects (e.g. `us-east-1`).
     pub region: String,
-    /// The one bucket the daemon serves, when configured.
+    /// The one bucket the server serves, when configured.
     pub bucket: Option<String>,
-    /// Endpoint access key id, or `None` when the daemon has no auth keypair.
+    /// Endpoint access key id, or `None` when the server has no auth keypair.
     /// The paired secret is never carried here; the CLI reads it from the local
-    /// 0600 credentials file the daemon also reads.
+    /// 0600 credentials file the server also reads.
     pub access_key_id: Option<String>,
 }
 
-/// The daemon's resolved cache budgets, as configured (hard ceilings). Reports
+/// The server's resolved cache budgets, as configured (hard ceilings). Reports
 /// stamp these next to every latency number so no speedup is ever published
 /// without its tier context (issue #141).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -292,7 +293,7 @@ pub struct CountersInfo {
 /// from disk, not DRAM (the nvme-resident proof).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatsInfo {
-    /// The daemon's configured cache budgets.
+    /// The server's configured cache budgets.
     pub cache: CacheConfigInfo,
     /// The live read-path counters.
     pub counters: CountersInfo,
@@ -311,7 +312,7 @@ pub struct StatsInfo {
     pub dram_reclaimable_bytes: u64,
     /// Eager metadata warming progress (#168); `None` when no catalog is
     /// watched (nothing to warm). Absent-field-tolerant so an older client can
-    /// still read a newer daemon's stats.
+    /// still read a newer server's stats.
     #[serde(default)]
     pub warming: Option<WarmingInfo>,
     /// Write-back tier counters (#180); `None` when the tier is disabled. Makes
@@ -418,12 +419,12 @@ pub struct MembersInfo {
 
 /// The `POST /admin/drain` request body (issue #31). Empty JSON (`{}`) is valid
 /// — every field is optional and defaults — so `verglas drain` with no flags
-/// takes the daemon's configured drain timeout.
+/// takes the server's configured drain timeout.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DrainRequest {
     /// Maximum seconds to keep serving as a donor before exiting, regardless of
     /// whether the shed keys have been re-owned warm (`verglas drain
-    /// --timeout`). `None` takes the daemon's configured default.
+    /// --timeout`). `None` takes the server's configured default.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
 }
@@ -463,7 +464,7 @@ mod tests {
     use crate::config::Listen;
 
     /// The compiled-in admin defaults must agree with the documented config
-    /// default (`[listen] admin_port`), or a default-config daemon and a
+    /// default (`[listen] admin_port`), or a default-config server and a
     /// default CLI talk past each other.
     #[test]
     fn admin_defaults_match_listen_default_admin_port() {

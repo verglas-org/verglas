@@ -43,11 +43,11 @@ pub enum AgentError {
         detail: String,
     },
 
-    /// Zero-config resolution could not reach the local daemon and no explicit
+    /// Zero-config resolution could not reach the local server and no explicit
     /// connection flags or environment were provided.
     #[error(
-        "no connection configured and the local daemon at {endpoint} is unreachable: {detail}. \
-         Pass --catalog-uri/--endpoint or start a daemon (`verglas dev`)."
+        "no connection configured and the local server at {endpoint} is unreachable: {detail}. \
+         Pass --catalog-uri/--endpoint or start the Docker server."
     )]
     NoConnection {
         /// The admin endpoint that was probed.

@@ -8,7 +8,7 @@
 //! `~/.verglas/config.toml` under `[control_plane]`.
 //!
 //! Everything else in the CLI works without a login: local `workers` verbs
-//! talk to the daemon endpoint alone. When the user is logged in, `list`/`show`
+//! talk to the server endpoint alone. When the user is logged in, `list`/`show`
 //! can enrich their output with the tenant's cloud deployments through this
 //! module. This module reports a clear "run `verglas login`" error when no key
 //! is stored.
@@ -19,16 +19,18 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Verglas Cloud control plane. `verglas login` uses this when `--url` is omitted
+/// and no prior `[control_plane].url` is stored.
+pub const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.verglas.dev";
+
 /// The me endpoint, relative to the control plane base URL.
 const ME_PATH: &str = "/v1/me";
 /// The lakehouse-config endpoint, relative to the control plane base URL. Returns
-/// the tenant's SCOPED lakehouse config that `verglas login` writes the daemon
+/// the tenant's SCOPED lakehouse config that `verglas login` writes the server
 /// config from.
 const LAKEHOUSE_PATH: &str = "/v1/lakehouse";
 /// The deployments-list endpoint, relative to the control plane base URL.
 const DEPLOYMENTS_PATH: &str = "/v1/deployments";
-/// The nodes-list endpoint, relative to the control plane base URL.
-const NODES_PATH: &str = "/v1/nodes";
 /// The credential file that holds the API key, under `~/.verglas/credentials/`.
 const TOKEN_FILE: &str = "control-plane-token";
 
@@ -56,16 +58,16 @@ pub struct Account {
 }
 
 /// The tenant's SCOPED lakehouse config, from `GET /v1/lakehouse`. Everything a
-/// daemon needs to serve this tenant's bucket: the S3 endpoint/region, the
+/// server needs to serve this tenant's bucket: the S3 endpoint/region, the
 /// Iceberg warehouse and catalog URI, and the tenant's OWN bucket-scoped
 /// credentials (an S3 key pair and a catalog bearer token — never account-wide).
-/// `verglas login` writes the daemon config and its 0600 credential files from
+/// `verglas login` writes the server config and its 0600 credential files from
 /// this. The secret fields are written only to mode-0600 files, never printed.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Lakehouse {
     /// The bucket this tenant's data lives in.
     pub bucket: String,
-    /// S3 endpoint for the bucket (the backend origin the daemon serves).
+    /// S3 endpoint for the bucket (the backend origin the server serves).
     pub s3_endpoint: String,
     /// S3 signing region for the bucket.
     pub s3_region: String,
@@ -118,10 +120,10 @@ pub struct ProvisionResponse {
     pub tenant_id: String,
     /// The email the account is registered under.
     pub account_email: String,
-    /// The long-lived control-plane api key for the daemon and CLI. Secret —
+    /// The long-lived control-plane api key for the server and CLI. Secret —
     /// written only to the 0600 token file, never printed.
     pub api_key: String,
-    /// The tenant's scoped lakehouse config, written to the daemon config and
+    /// The tenant's scoped lakehouse config, written to the server config and
     /// its 0600 credential files.
     pub lakehouse: Lakehouse,
 }
@@ -174,24 +176,6 @@ pub struct Deployment {
     /// is what `verglas source|mv|sink show` fetches to display the code.
     #[serde(default)]
     pub code: Option<String>,
-}
-
-/// One registered daemon instance from `GET /v1/nodes`. `verglas status` reads
-/// this to tell the operator whether the control plane currently lists THIS
-/// machine as active. Absent-field-tolerant so a newer control plane can add
-/// fields without breaking an older CLI.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Node {
-    /// The daemon's cluster id — the stable per-tenant node key.
-    pub node_id: String,
-    /// The hostname the daemon reported.
-    #[serde(default)]
-    pub name: String,
-    /// The daemon version the control plane last saw.
-    #[serde(default)]
-    pub version: String,
-    /// Whether the control plane counts this node active (recent heartbeat).
-    pub active: bool,
 }
 
 /// Failures talking to the control plane, each with a message a user can act on.
@@ -346,7 +330,7 @@ impl ControlPlaneClient {
     }
 
     /// Fetches the tenant's scoped lakehouse config (`GET /v1/lakehouse`). Used
-    /// by `login` to write the daemon config and its credential files after the
+    /// by `login` to write the server config and its credential files after the
     /// key is verified.
     pub async fn lakehouse(&self) -> Result<Lakehouse, ControlPlaneError> {
         self.request(LAKEHOUSE_PATH.to_owned(), LAKEHOUSE_PATH)
@@ -366,18 +350,6 @@ impl ControlPlaneClient {
             .request(DEPLOYMENTS_PATH.to_owned(), DEPLOYMENTS_PATH)
             .await?;
         Ok(wrapper.deployments)
-    }
-
-    /// Lists this tenant's registered daemon instances (`GET /v1/nodes`), each
-    /// with an `active` flag. `verglas status` uses it to report whether THIS
-    /// node is currently active in the control plane.
-    pub async fn nodes(&self) -> Result<Vec<Node>, ControlPlaneError> {
-        #[derive(serde::Deserialize)]
-        struct Wrapper {
-            nodes: Vec<Node>,
-        }
-        let wrapper: Wrapper = self.request(NODES_PATH.to_owned(), NODES_PATH).await?;
-        Ok(wrapper.nodes)
     }
 
     /// Builds a client against `base_url` with no stored token. The OAuth flows
@@ -734,7 +706,7 @@ pub fn config_path() -> Result<PathBuf, ControlPlaneError> {
 
 /// The backend (S3) credentials file `verglas login` writes the tenant's scoped
 /// S3 key pair to, in AWS-INI form (`~/.verglas/credentials/backend.credentials`,
-/// mode 0600). Referenced by `[backend].credentials_file` in the daemon config.
+/// mode 0600). Referenced by `[backend].credentials_file` in the server config.
 pub fn backend_credentials_path() -> Result<PathBuf, ControlPlaneError> {
     Ok(verglas_dir()?
         .join("credentials")
@@ -743,7 +715,7 @@ pub fn backend_credentials_path() -> Result<PathBuf, ControlPlaneError> {
 
 /// The catalog credentials file `verglas login` writes the tenant's scoped
 /// catalog bearer token to (`~/.verglas/credentials/catalog.token`, mode 0600).
-/// Referenced by `[catalog].credentials_file` in the daemon config.
+/// Referenced by `[catalog].credentials_file` in the server config.
 pub fn catalog_credentials_path() -> Result<PathBuf, ControlPlaneError> {
     Ok(verglas_dir()?.join("credentials").join("catalog.token"))
 }
@@ -762,8 +734,8 @@ fn stored_token() -> Result<Option<String>, ControlPlaneError> {
 }
 
 /// Reads the stored control plane URL from `[control_plane]` in the config, or
-/// `None` when the config or the section is absent. Public so `verglas login`
-/// can reuse a prior URL when `--url` is omitted.
+/// `None` when the config or the section is absent. `verglas login` prefers
+/// this over the cloud default when re-logging in.
 pub fn stored_url() -> Result<Option<String>, ControlPlaneError> {
     let path = config_path()?;
     let text = match std::fs::read_to_string(&path) {
@@ -772,7 +744,7 @@ pub fn stored_url() -> Result<Option<String>, ControlPlaneError> {
         Err(_) => return Err(ControlPlaneError::Io(path)),
     };
     // Parse only the `[control_plane]` table, so an otherwise-incomplete config
-    // (say, one written before `verglas init`) still yields the URL.
+    // (say, a hand-edited file) still yields the URL.
     let Ok(table) = text.parse::<toml::Table>() else {
         return Ok(None);
     };

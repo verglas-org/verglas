@@ -2,7 +2,7 @@
 //! resource command groups.
 //!
 //! These are the CLI's control-plane surface: unlike the data-plane verbs (which
-//! talk to a daemon) they target the multi-tenant control plane resolved from a
+//! talk to a server) they target the multi-tenant control plane resolved from a
 //! stored `verglas login`. Every group needs a login; with none stored the verbs
 //! fail with the same "run `verglas login`" pointer the rest of the control-plane
 //! surface uses, never a cryptic transport error.
@@ -277,7 +277,7 @@ async fn resolve_worker_name(
 }
 
 /// Dispatches `verglas workers`. Most verbs target the cloud control plane;
-/// `create --local` and `follow` target the local daemon at `endpoint`, and
+/// `create --local` and `follow` target the local server at `endpoint`, and
 /// `push`/`pull` bridge the two.
 pub async fn run_workers(
     command: WorkersCommand,
@@ -352,7 +352,7 @@ pub async fn run_workers(
 }
 
 /// `workers create`: register a worker from a unified portable spec file. With
-/// `--local` the worker is registered on the local daemon (`POST /v1/workers`);
+/// `--local` the worker is registered on the local server (`POST /v1/workers`);
 /// otherwise on the cloud (`POST /v1/deployments`). The same file drives both.
 async fn run_worker_create(
     endpoint: &str,
@@ -364,8 +364,8 @@ async fn run_worker_create(
     manifest.validate()?;
 
     if args.local {
-        let daemon = crate::backend::daemon(endpoint)?;
-        let row: Value = daemon
+        let server = crate::backend::server(endpoint)?;
+        let row: Value = server
             .post_json("/v1/workers", &manifest.to_local_worker())
             .await?;
         return emit_object(&row, json);
@@ -429,7 +429,7 @@ async fn run_worker_update(
     emit_object(&response, json)
 }
 
-/// `workers follow`: register a throwaway follow worker on the local daemon and
+/// `workers follow`: register a throwaway follow worker on the local server and
 /// stream a local process or file into a table until Ctrl-C (or, for a wrapped
 /// command, until it exits). Torn down on exit unless `--keep` is set.
 async fn run_worker_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(), Box<dyn Error>> {
@@ -468,8 +468,8 @@ async fn run_worker_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(),
     };
     manifest.validate()?;
 
-    let daemon = crate::backend::daemon(endpoint)?;
-    let _row: Value = daemon
+    let server = crate::backend::server(endpoint)?;
+    let _row: Value = server
         .post_json("/v1/workers", &manifest.to_local_worker())
         .await?;
     println!("following -> {table} (worker {name}); press Ctrl-C to stop");
@@ -478,13 +478,13 @@ async fn run_worker_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(),
     // never finishes; only Ctrl-C ends it.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => println!("stopping {name}"),
-        _ = wait_until_finished(&daemon, &name) => println!("worker {name} finished"),
+        _ = wait_until_finished(&server, &name) => println!("worker {name} finished"),
     }
 
     if args.keep {
         println!("worker {name} left registered (--keep)");
     } else {
-        let _: Value = daemon
+        let _: Value = server
             .put_json(
                 &format!("/v1/workers/{name}/state"),
                 &serde_json::json!({ "state": "archived" }),
@@ -496,12 +496,12 @@ async fn run_worker_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(),
 }
 
 /// Polls the local worker until it leaves the `running` state (a wrapped command
-/// that exits is marked `completed` by the daemon). Errors are ignored so a
+/// that exits is marked `completed` by the server). Errors are ignored so a
 /// transient read never ends the follow early.
-async fn wait_until_finished(daemon: &verglas_sdk::daemon::DaemonClient, name: &str) {
+async fn wait_until_finished(server: &verglas_sdk::server::ServerClient, name: &str) {
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        if let Ok(row) = daemon.get::<Value>(&format!("/v1/workers/{name}")).await {
+        if let Ok(row) = server.get::<Value>(&format!("/v1/workers/{name}")).await {
             let state = row
                 .get("state")
                 .and_then(Value::as_str)
@@ -521,12 +521,12 @@ async fn run_worker_push(
     args: WorkerPushArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let daemon = crate::backend::daemon(endpoint)?;
-    let row: Value = daemon
+    let server = crate::backend::server(endpoint)?;
+    let row: Value = server
         .get(&format!("/v1/workers/{}", args.worker))
         .await
         .map_err(|e| match e {
-            verglas_sdk::daemon::DaemonError::Api { status: 404, .. } => {
+            verglas_sdk::server::ServerError::Api { status: 404, .. } => {
                 format!("no local worker named `{}`", args.worker).into()
             }
             other => Box::<dyn Error>::from(other),

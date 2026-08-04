@@ -22,7 +22,7 @@ use std::time::SystemTime;
 /// ever sees a raw exclusive lower bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRequest {
-    /// Bucket to list, exactly as the request named it. The daemon serves one
+    /// Bucket to list, exactly as the request named it. The server serves one
     /// bucket; a request for any other bucket is `NoSuchBucket`.
     pub bucket: String,
     /// Raw S3 key prefix to filter by. Empty lists the whole bucket. This is a
@@ -76,7 +76,7 @@ pub struct ListPage {
 #[derive(Debug, thiserror::Error)]
 pub enum ListError {
     /// The bucket does not exist: either the request named a bucket other than
-    /// the one this daemon serves, or the origin reports `NoSuchBucket` (404).
+    /// the one this server serves, or the origin reports `NoSuchBucket` (404).
     #[error("bucket does not exist")]
     NoSuchBucket,
     /// The origin refused the request's credentials (`AccessDenied`, 403).

@@ -3,16 +3,16 @@
 
 Proves the #168 claim end to end against real infrastructure: a **watched**
 Iceberg table's *cold* planning walk collapses toward a *warm* one because the
-daemon warmed the table's metadata (``metadata.json`` -> manifest list ->
+server warmed the table's metadata (``metadata.json`` -> manifest list ->
 manifests -> Parquet footers) into #50's pinned store **before any client
 asked**. The trigger is the ``[catalog]`` REST watcher (#47) driving the warming
 coordinator (#168) — the exact production path — not a benchmark shortcut.
 
 The plumbing this closes: ``benchmarks/tpch`` seeds through a *local SQLite*
 catalog, which the REST watcher cannot see, so it never exercises warming. Here
-an **Apache Polaris** container is the REST catalog verglasd watches; the table
+an **Apache Polaris** container is the REST catalog verglas-server watches; the table
 is seeded *through Polaris* (pyiceberg as the client) with its data on the same
-origin S3 the daemon fills from, so a commit the watcher observes drives a real
+origin S3 the server fills from, so a commit the watcher observes drives a real
 warming walk.
 
 Subcommands (all configuration arrives as explicit flags from ``run.sh``, which
@@ -23,7 +23,7 @@ loads ``.env`` and never logs secrets):
                  through Polaris, data on the origin. Idempotent per table.
 - ``walk``       the planning walk through the Verglas endpoint
                  (metadata.json -> manifest list -> manifests -> footers),
-                 timed, with the daemon's /admin/stats meta counters recorded as
+                 timed, with the server's /admin/stats meta counters recorded as
                  mechanism evidence. Emits one JSON record appended to a results
                  file.
 - ``report``     render the A/B/C comparison table (+ counters) from the
@@ -82,9 +82,9 @@ def polaris_token(catalog_uri: str) -> str:
     """Fetch a Polaris OAuth2 client-credentials token for the root principal.
 
     pyiceberg's own token exchange asks for a scope Polaris rejects, so the
-    token is minted here and handed to pyiceberg (and to verglasd) as a ready
+    token is minted here and handed to pyiceberg (and to verglas-server) as a ready
     bearer credential. Tokens are short-lived; a demo run finishes well inside
-    the lifetime, and each daemon start re-mints one.
+    the lifetime, and each server start re-mints one.
     """
     resp = requests.post(
         f"{catalog_uri}/v1/oauth/tokens",
@@ -254,7 +254,7 @@ def phase_seed(args: argparse.Namespace) -> dict:
 
     Data files land in ``s3://<bucket>/<prefix>`` on the *origin* (the FileIO
     endpoint is the origin), so the Verglas cache starts genuinely cold and is
-    warmed only by the daemon's watcher-driven walk. A small
+    warmed only by the server's watcher-driven walk. A small
     ``write.target-file-size-bytes`` fans the larger tables out into several
     Parquet files, giving the planning walk a realistic footer count. Idempotent:
     an existing table at the same identifier is dropped and rewritten.
@@ -302,7 +302,7 @@ def phase_seed(args: argparse.Namespace) -> dict:
 
 
 def fetch_counters(admin_endpoint: str) -> Optional[dict]:
-    """Read the daemon's /admin/stats read-path counters, or None if unreachable."""
+    """Read the server's /admin/stats read-path counters, or None if unreachable."""
     try:
         r = requests.get(admin_endpoint.rstrip("/") + "/admin/stats", timeout=5)
         r.raise_for_status()
@@ -339,7 +339,7 @@ def planning_walk(args: argparse.Namespace, pointers: dict) -> tuple[int, int]:
     footer as a suffix range GET (``bytes=-FOOTER_WINDOW``) — byte-identical to
     what the warmer pins. Returns ``(files, footers)`` touched. This is exactly
     the object set a query engine reads to plan a scan, so warm-vs-cold here is
-    the planning cost the daemon's warming targets.
+    the planning cost the server's warming targets.
     """
     import boto3
     from botocore.config import Config as BotoConfig
@@ -390,7 +390,7 @@ def planning_walk(args: argparse.Namespace, pointers: dict) -> tuple[int, int]:
 
 
 def phase_walk(args: argparse.Namespace) -> dict:
-    """Time one planning walk and record the daemon's counter delta.
+    """Time one planning walk and record the server's counter delta.
 
     The counter delta is the mechanism evidence: on a warmed table the walk is
     all ``meta_hits`` with zero ``backend_*`` (served from the pinned store); on
@@ -455,7 +455,7 @@ def phase_walk(args: argparse.Namespace) -> dict:
 
 CONFIG_LABELS = {
     "A": "warming OFF, cold client walk (baseline)",
-    "B": "warming ON, daemon-warmed, cold client walk",
+    "B": "warming ON, server-warmed, cold client walk",
     "C": "warm client walk (floor)",
 }
 
@@ -465,7 +465,7 @@ def phase_report(args: argparse.Namespace) -> dict:
 
     Averages the per-config runs, shows the counter delta of the first run of
     each config as the mechanism evidence, and computes the headline ratios
-    (A/B = the collapse; B/C = how close daemon-warmed cold sits to the warm
+    (A/B = the collapse; B/C = how close server-warmed cold sits to the warm
     floor). Emits Markdown to ``--out`` and stdout.
     """
     records: list[dict] = []
@@ -514,8 +514,8 @@ def phase_report(args: argparse.Namespace) -> dict:
     lines.append("")
     if a and b and c:
         lines.append(
-            f"**Collapse: A/B = {a / b:.1f}x faster cold once the daemon warms "
-            f"it.** Daemon-warmed cold (B) sits at {b / c:.2f}x the warm floor "
+            f"**Collapse: A/B = {a / b:.1f}x faster cold once the server warms "
+            f"it.** Server-warmed cold (B) sits at {b / c:.2f}x the warm floor "
             f"(C) — i.e. within {abs(b - c):.0f} ms of warm."
         )
         lines.append("")
@@ -540,7 +540,7 @@ def phase_report(args: argparse.Namespace) -> dict:
     lines.append("")
     lines.append(
         "B serves the whole planning walk from #50's pinned metadata store "
-        "(`meta_hits` only, **zero backend bytes** — the daemon walked the "
+        "(`meta_hits` only, **zero backend bytes** — the server walked the "
         "metadata before the client asked). A pays a backend round-trip per "
         "planning object plus a footer fetch per Parquet file against the origin "
         "(`backend_bytes` > 0, `meta_hits` = 0)."

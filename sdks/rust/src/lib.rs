@@ -7,25 +7,25 @@
 //! - [`job`]: shared [`Row`] / [`Logger`] / [`JobError`] vocabulary the worker
 //!   context uses.
 //! - [`tables_api`]: the commit/snapshot/rows/delta wire types shared by the
-//!   engine, daemon routes, and SDK callers.
+//!   engine, server routes, and SDK callers.
 //! - [`report`]: the create/append/list/show/history/query report wire types,
-//!   including compaction reports — what daemon routes serve and the CLI
+//!   including compaction reports — what server routes serve and the CLI
 //!   renders without linking the storage engine.
-//! - [`graph`]: the `graph` verb-family wire types the daemon's
+//! - [`graph`]: the `graph` verb-family wire types the server's
 //!   `/v1/graphs/...` routes serve and the CLI and TypeScript SDK speak.
 //! - [`grant`]: the memory grant contract every worker inherits through
 //!   [`worker::WorkerContext`].
-//! - [`client`] / [`daemon`]: the data-plane HTTP client and local daemon
+//! - [`client`] / [`server`]: the data-plane HTTP client and local server
 //!   helpers the CLI and in-process callers use.
 
 pub mod job;
 pub mod worker;
 
 pub mod client;
-pub mod daemon;
 pub mod grant;
 pub mod graph;
 pub mod report;
+pub mod server;
 pub mod vector;
 
 pub use client::{

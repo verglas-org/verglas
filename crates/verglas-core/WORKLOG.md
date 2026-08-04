@@ -403,3 +403,15 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - chore: Remove docs/ cross-references after deleting the docs directory. Crate module docs are the reference now.
 - chore: Remove the unused DashboardInfo / DASHBOARD_PATH admin surface after the daemon probe was deleted.
 - #3: Added explicit query/write role configuration and validation; neither role has an embedded daemon fallback.
+- chore: Drop the `[agent]` config section and `apply_agent_env` — durable agent memory is not part of this product. Keep `user_config_path()` for locating `~/.verglas/config.toml`.
+- chore: Replace stale `verglas dev` references in configuration and cache-medium documentation after removing the CLI launcher. Local human-readable logging remains available as a daemon configuration choice.
+- #263: Removed `catalog_path` from the local-access wire type. Catalog configuration is private daemon state and is no longer presented as a service endpoint.
+- #91: Removed the obsolete vector shadow-store capacity setting. Vamana files
+  are customer-invoked Iceberg statistics attachments and flow through the
+  ordinary object cache.
+- #91: Renamed shared admin metadata and configuration documentation from the
+  daemon identity to `verglas-server`. The version response now reports the new
+  executable name only.
+- #3: Added the configured upstream catalog URI and warehouse to local access
+  discovery. These are non-secret client coordinates and do not create a
+  Verglas-hosted catalog service.

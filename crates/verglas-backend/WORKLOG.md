@@ -150,3 +150,5 @@
   configured single bucket through the same refreshing provider chain the read
   path uses so a backend that cannot be reached or authenticated fails startup;
   a NotFound answer counts as reachable, and a glob-only config is a no-op.
+- #91: Renamed backend process documentation from daemon terminology to
+  `verglas-server`. Backend resolution and startup probing are unchanged.

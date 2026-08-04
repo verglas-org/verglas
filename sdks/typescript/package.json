@@ -9,7 +9,6 @@
   "exports": {
     ".": "./src/index.ts",
     "./logging": "./src/logging.ts",
-    "./trajectory": "./src/trajectory.ts",
     "./examples": "./src/examples/index.ts"
   },
   "scripts": {
@@ -23,7 +22,6 @@
     "vitest": "^2.1.8"
   },
   "dependencies": {
-    "@letta-ai/trajectory": "0.2.0",
     "apache-arrow": "^21.2.0"
   }
 }

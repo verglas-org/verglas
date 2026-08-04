@@ -47,7 +47,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
  * Opens a client against a Verglas endpoint. The endpoint is either the local
- * daemon's base URL or a cloud Verglas endpoint; the interface is identical.
+ * server's base URL or a cloud Verglas endpoint; the interface is identical.
  */
 export function connect(opts: ConnectOptions): VerglasClient {
   if (!opts.endpoint) throw new Error("connect: endpoint is required");
@@ -262,7 +262,7 @@ export class VerglasClient {
    * none has been set yet. A cloud source worker is a fresh isolate on every
    * dispatch, so it reads this at run start to resume where the last dispatch
    * left off. The bearer token identifies the deployment — there is no id in the
-   * path. Not implemented by the local daemon; only the cloud endpoint serves it.
+   * path. Not implemented by the local server; only the cloud endpoint serves it.
    */
   async watermark(): Promise<Watermark | null> {
     const r = await this.transport.request<{ watermark: Watermark | null }>("GET", "/v1/watermark");
@@ -324,8 +324,8 @@ export class Table<T extends Row = Row> {
   /**
    * Declares a real-time-maintained vector (ANN) index on an embedding field and
    * runs the initial build. The index is a streaming Vamana (DiskANN) graph,
-   * maintained incrementally and served from the cluster-local shadow store — it is
-   * never committed to this table's Iceberg snapshot.
+   * maintained incrementally and attached to the exact Iceberg snapshot it
+   * reflects as a Puffin statistics file.
    */
   addIndex(field: string, opts?: AddIndexOptions): Promise<IndexReport> {
     return this.transport.request<IndexReport>("POST", `${this.base()}/indexes`, {
@@ -443,7 +443,7 @@ interface GraphQueryResponse {
 
 /**
  * A handle to a single Verglas property graph — the graph equivalent of
- * `Table`, parallel to the CLI's `graph` verbs and the daemon's `/v1/graphs/...`
+ * `Table`, parallel to the CLI's `graph` verbs and the server's `/v1/graphs/...`
  * routes.
  *
  * A graph is a namespace holding two plain Iceberg tables (`nodes` and `edges`)

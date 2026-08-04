@@ -19,10 +19,10 @@ use tokio::net::TcpListener;
 use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 use verglas_sdk::{Client, ClientError, ConnectOptions};
 
-/// A local client discovers the real catalog while retaining the daemon only
-/// as its S3 cache/data path.
+/// A client authenticates once, discovers the real catalog plus the server's S3
+/// cache endpoint, and keeps the two data-plane destinations separate.
 #[tokio::test]
-async fn connect_separates_catalog_from_daemon_cache() {
+async fn connect_separates_catalog_from_server_cache() {
     let access = LocalAccess {
         s3_endpoint: "http://127.0.0.1:8333".to_owned(),
         catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
@@ -33,23 +33,28 @@ async fn connect_separates_catalog_from_daemon_cache() {
     };
     let app = Router::new().route(
         ACCESS_PATH,
-        get({
-            let access = access.clone();
-            move || async move { Json(access) }
+        get(move |headers: HeaderMap| async move {
+            assert_eq!(
+                headers
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer scoped-access-token")
+            );
+            Json(access)
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
     let endpoint = format!("http://{}", listener.local_addr().expect("mock address"));
     tokio::spawn(async move { axum::serve(listener, app).await.expect("mock server") });
 
-    let client = Client::connect(ConnectOptions::new(endpoint))
+    let client = Client::connect(ConnectOptions::new(endpoint).with_token("scoped-access-token"))
         .await
         .expect("connect client");
     assert_eq!(client.catalog_uri(), "https://tenant.catalog.verglas.dev");
     assert_eq!(client.s3_endpoint(), Some("http://127.0.0.1:8333"));
 }
 
-/// Fully injected container coordinates never require the daemon admin port.
+/// Fully injected container coordinates never require the server admin port.
 #[tokio::test]
 async fn container_environment_shape_connects_without_admin_service() {
     let client = Client::connect(
@@ -70,10 +75,10 @@ struct Captured {
     paths: Arc<Mutex<Vec<String>>>,
 }
 
-/// Query and logical table writes use the daemon execution gateway. They never
+/// Query and logical table writes use the server execution gateway. They never
 /// instantiate an Iceberg query engine or table writer inside the SDK.
 #[tokio::test]
-async fn query_and_append_use_daemon_execution_roles() {
+async fn query_and_append_use_server_execution_roles() {
     let captured = Captured::default();
     let app = Router::new()
         .route("/v1/write/{name}", post(write_arrow))
@@ -126,7 +131,7 @@ struct CatalogState {
 
 /// Table metadata and creation go directly to the Iceberg REST catalog.
 #[tokio::test]
-async fn ensure_table_uses_catalog_rest_without_daemon_table_routes() {
+async fn ensure_table_uses_catalog_rest_without_server_table_routes() {
     let state = CatalogState::default();
     let app = Router::new()
         .route("/v1/config", get(|| async { Json(json!({})) }))

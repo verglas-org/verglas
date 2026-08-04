@@ -2,13 +2,13 @@
 # Ceph s3-tests conformance harness for Verglas (issue #22).
 #
 # One entrypoint. Brings up MinIO (origin) via docker compose, builds and runs
-# verglasd pointed at it, then runs the pinned ceph/s3-tests suite against the
+# verglas-server pointed at it, then runs the pinned ceph/s3-tests suite against the
 # VERGLAS endpoint with the dev credentials. The pass/skip surface is defined by
 # markers-exclude.txt (feature groups) + skip-list.txt (per-test residue) — the
 # documented compatibility contract. See README.md.
 #
 # Nothing here is customer-facing; the dev keypair is a fixed non-secret used
-# only to authenticate the local test client to the local daemon.
+# only to authenticate the local test client to the local server.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,8 +23,8 @@ S3TESTS_COMMIT="5522d1c351f75bc00ae0f64f742f3f095f5939d9"
 
 # ---- defaults (override via flags/env) ------------------------------------ #
 MODE="full"                        # full | smoke | list
-PROFILE="release"                  # release | debug (cargo profile for verglasd)
-KEEP=""                            # --keep leaves MinIO + daemon up for inspection
+PROFILE="release"                  # release | debug (cargo profile for verglas-server)
+KEEP=""                            # --keep leaves MinIO + server up for inspection
 S3_PORT="${VG_S3_PORT:-8433}"
 ADMIN_PORT="${VG_ADMIN_PORT:-8434}"
 MINIO_PORT="${VG_MINIO_PORT:-9100}"
@@ -41,10 +41,10 @@ Usage: run.sh [options] [-- <extra pytest args>]
   --full         run the full suite: test_s3.py + test_headers.py, feature-group
                  markers excluded, per-test skip-list applied (default).
   --smoke        run only the fast PR-path subset (smoke-list.txt).
-  --list         collect-only: print what WOULD run, then exit (no daemon).
-  --debug        build verglasd with the debug profile (faster compile).
-  --keep         leave MinIO + verglasd running after the suite (for debugging).
-  --s3-port N    verglasd S3 port (default 8433).
+  --list         collect-only: print what WOULD run, then exit (no server).
+  --debug        build verglas-server with the debug profile (faster compile).
+  --keep         leave MinIO + verglas-server running after the suite (for debugging).
+  --s3-port N    verglas-server S3 port (default 8433).
   --minio-port N host port MinIO is published on (default 9100).
   -h|--help      this help.
 
@@ -114,7 +114,7 @@ if [[ "$MODE" == "list" ]]; then
   exit 0
 fi
 
-# ---- origin (MinIO) + daemon lifecycle ------------------------------------ #
+# ---- origin (MinIO) + server lifecycle ------------------------------------ #
 COMPOSE=(docker compose -p vg-s3conf -f "$HERE/docker-compose.yml")
 VGD_PID=""
 cleanup() {
@@ -122,7 +122,7 @@ cleanup() {
   if [[ -z "$KEEP" ]]; then
     VG_MINIO_PORT="$MINIO_PORT" "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
   else
-    echo "[keep] MinIO + verglasd left running (S3 http://127.0.0.1:${S3_PORT})" >&2
+    echo "[keep] MinIO + verglas-server left running (S3 http://127.0.0.1:${S3_PORT})" >&2
   fi
 }
 trap cleanup EXIT
@@ -131,14 +131,14 @@ echo "[origin] starting MinIO on :$MINIO_PORT" >&2
 VG_MINIO_PORT="$MINIO_PORT" VG_ORIGIN_ACCESS_KEY="$ORIGIN_AK" VG_ORIGIN_SECRET_KEY="$ORIGIN_SK" \
   "${COMPOSE[@]}" up -d --wait
 
-# Build verglasd from this repo and run it as the system under test.
-echo "[daemon] building verglasd ($PROFILE)" >&2
+# Build verglas-server from this repo and run it as the system under test.
+echo "[server] building verglas-server ($PROFILE)" >&2
 BUILD_FLAGS=(); [[ "$PROFILE" == "release" ]] && BUILD_FLAGS=(--release)
-( cd "$REPO" && cargo build -q -p verglasd ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} )
-VGD="$REPO/target/$PROFILE/verglasd"
+( cd "$REPO" && cargo build -q -p verglas-server ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} )
+VGD="$REPO/target/$PROFILE/verglas-server"
 
 CACHE_DIR="$WORK/cache"; mkdir -p "$CACHE_DIR"
-cat > "$WORK/verglasd.toml" <<TOML
+cat > "$WORK/verglas-server.toml" <<TOML
 [listen]
 s3_port = $S3_PORT
 admin_port = $ADMIN_PORT
@@ -153,18 +153,18 @@ access_key_id = "$DEV_AK"
 secret_access_key = "$DEV_SK"
 TOML
 
-echo "[daemon] starting verglasd → MinIO" >&2
+echo "[server] starting verglas-server → MinIO" >&2
 AWS_ENDPOINT="http://127.0.0.1:${MINIO_PORT}" \
 AWS_ACCESS_KEY_ID="$ORIGIN_AK" AWS_SECRET_ACCESS_KEY="$ORIGIN_SK" \
 AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
 VERGLAS_S3_ADDR="127.0.0.1:${S3_PORT}" VERGLAS_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
-  "$VGD" --config "$WORK/verglasd.toml" &
+  "$VGD" --config "$WORK/verglas-server.toml" &
 VGD_PID=$!
 disown "$VGD_PID" 2>/dev/null || true   # keep job control quiet when we kill it
 
 for _ in $(seq 1 100); do
   curl -sf "http://127.0.0.1:${ADMIN_PORT}/admin/healthz" >/dev/null && break
-  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglasd died on startup" >&2; exit 1; }
+  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglas-server died on startup" >&2; exit 1; }
   sleep 0.1
 done
 

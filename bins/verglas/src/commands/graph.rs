@@ -1,10 +1,10 @@
-//! `verglas graph` — create and traverse property graphs through the daemon.
+//! `verglas graph` — create and traverse property graphs through the server.
 //!
 //! A graph is a namespace holding two plain Iceberg tables (`<ns>.nodes` and
 //! `<ns>.edges`) plus a snapshot-bound adjacency index; the verbs here parallel
-//! `table`. Every verb calls the local daemon's HTTP API (`/v1/graphs/...`) —
-//! the daemon is the only local write authority, so the CLI embeds no engine and
-//! has no daemon-less path. `add-node`/`add-edge` read a JSON array of
+//! `table`. Every verb calls the local server's HTTP API (`/v1/graphs/...`) —
+//! the server is the only local write authority, so the CLI embeds no engine and
+//! has no server-less path. `add-node`/`add-edge` read a JSON array of
 //! node/edge objects from a file or stdin, mirroring how `table append` takes
 //! rows. Results render as `--output json` (the stable shape) or a human
 //! summary; the reader falls back to a table scan when no index is built, so a
@@ -23,15 +23,15 @@ use crate::cli::{
     GraphCommand, GraphInsertArgs, GraphKHopArgs, GraphNameArgs, GraphNeighborsArgs,
     GraphPathsArgs, GraphTraversalOpts,
 };
-use verglas_sdk::daemon::DaemonClient;
+use verglas_sdk::server::ServerClient;
 
 /// Dispatches a `verglas graph` subcommand.
 pub async fn run(
     command: GraphCommand,
-    daemon_endpoint: &str,
+    server_endpoint: &str,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::daemon(daemon_endpoint)?;
+    let client = crate::backend::server(server_endpoint)?;
     match command {
         GraphCommand::Create(args) => create(&client, args, json).await,
         GraphCommand::AddNode(args) => add_node(&client, args, json).await,
@@ -46,7 +46,7 @@ pub async fn run(
 
 /// `graph create <ns>`.
 async fn create(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphNameArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -61,7 +61,7 @@ async fn create(
 
 /// `graph add-node <ns> [FILE]`.
 async fn add_node(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphInsertArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -75,7 +75,7 @@ async fn add_node(
 
 /// `graph add-edge <ns> [FILE]`.
 async fn add_edge(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphInsertArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -89,7 +89,7 @@ async fn add_edge(
 
 /// `graph neighbors <ns> <node>`.
 async fn neighbors(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphNeighborsArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -109,7 +109,7 @@ async fn neighbors(
 
 /// `graph k-hop <ns> <node> --hops N`.
 async fn k_hop(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphKHopArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -129,7 +129,7 @@ async fn k_hop(
 
 /// `graph paths <ns> <src> <dst> --max-hops N`.
 async fn paths(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphPathsArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -149,7 +149,7 @@ async fn paths(
 
 /// `graph index <ns>`.
 async fn index(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphNameArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -162,7 +162,7 @@ async fn index(
 
 /// `graph show <ns>`.
 async fn show(
-    client: &DaemonClient,
+    client: &ServerClient,
     args: GraphNameArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
@@ -174,7 +174,7 @@ async fn show(
 
 /// Posts a traversal request to the graph query route.
 async fn query(
-    client: &DaemonClient,
+    client: &ServerClient,
     namespace: &str,
     request: &GraphQueryRequest,
 ) -> Result<GraphQueryResponse, Box<dyn Error>> {

@@ -33,11 +33,11 @@ impl std::fmt::Display for OriginCredentialError {
 
 impl std::error::Error for OriginCredentialError {}
 
-/// Builds the provider that signs this daemon's requests to its S3 origin.
+/// Builds the provider that signs this server's requests to its S3 origin.
 ///
 /// A named credentials file is read afresh for each signing attempt, so an
 /// operator or credential agent can replace a temporary session without a
-/// daemon restart. Without a file, the AWS SDK default chain owns refresh for
+/// server restart. Without a file, the AWS SDK default chain owns refresh for
 /// environment, SSO, web-identity, ECS, and EC2 instance-role credentials.
 pub(crate) fn s3_credentials(backend: &Backend) -> AwsCredentialProvider {
     match backend
@@ -193,7 +193,7 @@ impl CredentialProvider for FileCredentials {
 #[derive(Default)]
 struct DefaultChain {
     /// The chain is asynchronous to build, so defer it until the first origin
-    /// request rather than blocking daemon startup on IMDS or SSO.
+    /// request rather than blocking server startup on IMDS or SSO.
     chain:
         tokio::sync::OnceCell<aws_config::default_provider::credentials::DefaultCredentialsChain>,
 }

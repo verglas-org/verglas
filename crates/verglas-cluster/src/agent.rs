@@ -43,7 +43,7 @@ pub enum ClusterError {
 
 /// Resolved configuration for one gossip node.
 ///
-/// Built either directly (tests) or from the daemon's `[cluster]` config via
+/// Built either directly (tests) or from the server's `[cluster]` config via
 /// [`AgentConfig::from_config`]. Durations are explicit so tests can tune fast
 /// convergence and production can tune for stability.
 #[derive(Debug, Clone)]
@@ -73,7 +73,7 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
-    /// Derives an agent config from the daemon's `[cluster]` config plus the
+    /// Derives an agent config from the server's `[cluster]` config plus the
     /// cache budget (the default weight) and admin port (advertised for the
     /// CLI). The rendezvous weight is the explicit `weight` if set, else the
     /// configured NVMe budget — capacity *is* the weight. The generation is the
@@ -154,7 +154,7 @@ pub struct ClusterAgent {
 }
 
 impl ClusterAgent {
-    /// Spawns gossip over `transport` (real `UdpTransport` in the daemon, an
+    /// Spawns gossip over `transport` (real `UdpTransport` in the server, an
     /// in-process `ChannelTransport` in tests) and starts the membership-watch
     /// task. The ring begins as a cluster-of-one (self only) and widens as
     /// peers are discovered.
@@ -230,7 +230,7 @@ impl ClusterAgent {
         })
     }
 
-    /// Spawns gossip over the real UDP transport — the daemon's entry point.
+    /// Spawns gossip over the real UDP transport — the server's entry point.
     pub async fn spawn_udp(config: AgentConfig) -> Result<Self, ClusterError> {
         Self::spawn(config, &UdpTransport).await
     }

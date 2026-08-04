@@ -20,7 +20,7 @@
 //!   then silence, never a storm.
 //!
 //! All state is plain files under one guard directory, so the controls hold
-//! across processes without a daemon.
+//! across processes without a server.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

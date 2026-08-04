@@ -439,6 +439,6 @@ async fn non_101_upgrade_falls_back_to_polling() {
     );
     assert!(
         server.connections.load(Ordering::SeqCst) >= 1,
-        "the daemon attempted the upgrade before falling back"
+        "the server attempted the upgrade before falling back"
     );
 }

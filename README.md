@@ -24,197 +24,100 @@ See [WHITEPAPER.md](WHITEPAPER.md) for the full design.
 
 ## Install
 
-Verglas runs on your own machine — self-hosted, no account, no cloud login. The
-installers below fetch prebuilt binaries from the latest GitHub Release, so **no
-Rust toolchain is required**. Each release ships four binaries for macOS
-(arm64/x64), Linux (x64/arm64, glibc), and Windows (x64):
+Install the `verglas` CLI from the Verglas website (macOS, Linux, Windows — no
+Rust toolchain required). The cache server (`verglas-server`) ships as a Docker
+image for self-hosting; most users run against Verglas Cloud instead.
 
-- `verglasd` — the cache daemon. Speaks the S3 protocol, serves hot reads from
-  cache, reads through to the origin on a miss.
-- `verglas` — the operator CLI (`verglas dev`, `verglas init`, `verglas
-  status`, ...).
-- `verglas-mcp` — the stdio MCP server exposing Verglas memory to MCP-capable
-  agents.
-- `verglas-consolidate` — the background memory-consolidation runner.
-
-### One line (all four binaries)
-
-macOS / Linux:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/verglas-org/verglas/main/install.sh | sh
-```
-
-Windows (PowerShell):
-
-```powershell
-irm https://raw.githubusercontent.com/verglas-org/verglas/main/install.ps1 | iex
-```
-
-Both wrappers just run the per-binary installers that
-[cargo-dist](https://opensource.axo.dev/cargo-dist/) generates into every
-release; each installs into `~/.cargo/bin` (or `%USERPROFILE%\.cargo\bin`) and
-verifies a SHA-256 checksum. To install a single tool instead, run its own
-installer directly, e.g. the CLI:
-
-```sh
-curl -fsSL https://github.com/verglas-org/verglas/releases/latest/download/verglas-installer.sh | sh
-```
-
-> **Windows note.** All four binaries run on Windows, but installing `verglasd`
-> as a managed OS service (`verglas init` / `verglas start`) is not supported
-> there yet — those commands print a clear message telling you to run the daemon
-> in the foreground (`verglasd --config <path>`) instead. macOS (launchd) and
-> Linux (systemd) get the managed service.
-
-### Homebrew (coming soon)
-
-A Homebrew formula is generated into each release. The public tap is not
-published yet; once `verglas-org/homebrew-tap` is live, install with:
-
-```sh
-brew install verglas-org/tap/verglas
-```
-
-### Build from source (fallback)
-
-Verglas is a Rust workspace; the toolchain is pinned in
-[`rust-toolchain.toml`](rust-toolchain.toml) (Rust 1.96.1, Edition 2024), and
-`rustup` installs it automatically on first build.
+### Build the CLI from source
 
 ```sh
 git clone https://github.com/verglas-org/verglas.git
 cd verglas
-cargo build --workspace --release
+cargo install --path bins/verglas --locked --force
 ```
 
-To put the binaries on your `PATH` (installs into `~/.cargo/bin`):
+Or `just install` for both the CLI and a local `verglas-server` binary (developers and
+repository test tooling).
+
+## Quickstart
+
+### Verglas Cloud
+
+1. Create an account at [verglas.dev](https://verglas.dev).
+2. Log the CLI into your tenant (browser PKCE by default; or pipe an API key):
 
 ```sh
-cargo install --path bins/verglas  --locked --force
-cargo install --path bins/verglasd --locked --force
+verglas login
+# or: echo "$VERGLAS_API_KEY" | verglas login --api-key
 ```
 
-Or use the [`justfile`](justfile) target that does the same: `just install`.
+Login verifies the key, then writes:
 
-## Quickstart: a local cache in front of an S3 bucket
+- `~/.verglas/credentials/control-plane-token` (mode 0600)
+- `~/.verglas/config.toml` — `[control_plane]` plus lakehouse `[backend]` /
+  `[catalog]` when the tenant has a warehouse
+- scoped backend/catalog credential files under `~/.verglas/credentials/`
 
-`verglas init` installs the daemon as an OS service (per-user by default —
-launchd on macOS, systemd on Linux; `--system` for a root-owned service) and
-scaffolds an annotated `~/.verglas/config.toml` plus credential-file templates
-under `~/.verglas/credentials/`:
+After login, cloud verbs work (`verglas workers`, `containers`, `db`, …) and
+data verbs talk to your cloud endpoint. Re-run `login` any time to refresh.
+
+### Self-host (Docker)
+
+Run the cache server in Docker and point the CLI at its admin port.
+
+1. Copy and edit the sample config (bucket / region / origin credentials):
 
 ```sh
-verglas init --bucket my-bucket --region us-east-1
+cp deploy/docker/verglas.toml deploy/docker/verglas.toml.local
+# edit deploy/docker/verglas.toml.local — set [backend]
+cp deploy/docker/credentials/backend.example deploy/docker/credentials/backend
+# fill aws_access_key_id / aws_secret_access_key (mode 0600)
 ```
 
-The daemon serves the bucket you name. It can serve a whole set: set a single
-`backend.bucket` and/or `backend.bucket_globs` — glob patterns like
-`*--table-s3` that serve a dynamic family of buckets (for example every AWS S3
-Tables underlying bucket) under one credential set. A request for a bucket
-outside the set returns `NoSuchBucket`. Fill your origin keys into the
-scaffolded backend credentials file (standard AWS credentials-file format, mode
-`0600`) — on AWS you can skip this and let the ambient credential chain (SSO,
-instance profile, environment) authenticate instead. Secrets never go in
-`config.toml`; the config only names which file to read. For a non-AWS origin
-(OCI, MinIO), pass `--endpoint` with the origin URL.
-
-Start it and check health:
+Point `docker-compose.yml` at your edited config (or edit the mounted paths),
+then:
 
 ```sh
-verglas start
-verglas status    # service state, daemon health, version, cache warmth
+docker compose up -d --build
 ```
 
-The S3 endpoint listens on `127.0.0.1:8333`; the admin API binds the next port
-(`8334`). Clients authenticate to the endpoint with Verglas-issued keys: `verglas
-init` generates them, prints them in its banner, and writes them to
-`~/.verglas/credentials/endpoint`. Point any S3 client at it. With the `aws` CLI:
+2. Point the CLI at the container’s admin API (S3 is on `8333`, admin on `8334`):
 
 ```sh
-# The keypair from the `verglas init` banner (also in ~/.verglas/credentials/endpoint).
-export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+# optional: persist in the shell profile, or pass --server-endpoint on each command
+verglas status
+```
+
+`VERGLAS_ENDPOINT` / `--server-endpoint` is how every data-plane verb reaches
+the server. There is no OS service install (no launchd / systemd): the container
+is the process manager. Logs: `docker compose logs -f verglas-server`. Stop:
+`docker compose down`.
+
+3. Point an S3 client at the cache:
+
+```sh
 aws s3 cp s3://my-bucket/some/object.parquet /tmp/o.parquet \
   --endpoint-url http://127.0.0.1:8333
 ```
 
-The first read fills from the origin; read the same object again and it comes
-straight from cache. With DuckDB, set the endpoint the same way:
-
 ```sql
+-- DuckDB
 SET s3_endpoint = '127.0.0.1:8333';
 SET s3_use_ssl = false;
 SET s3_url_style = 'path';
 SELECT count(*) FROM 's3://my-bucket/some/table/*.parquet';
 ```
 
-`verglas logs` tails the daemon and `verglas stop` stops the service (removal
-is manual — see [Removing Verglas](#removing-verglas)). For real performance
-point `--cache-dir` at an NVMe path and size the tiers with `--cache-size` /
-`--dram` (init flags, or edit `~/.verglas/config.toml` and `verglas restart`).
-The annotated reference for every config key is
-[`verglas.example.toml`](verglas.example.toml).
-
-When a node runs as part of a pod, `verglas drain` gracefully drains the local
-daemon before decommissioning the machine: it stops taking new cache ownership,
-donates its warmth to peers, then exits.
-
-### Removing Verglas
-
-There is deliberately no `verglas uninstall` — removal is a manual step so it
-cannot be invoked by accident. Stop the service, then remove the service
-definition for your OS. Config, credentials, and cache data are never removed
-by these steps; delete `~/.verglas` (and your `--cache-dir` path, if set)
-yourself if you want them gone.
-
-macOS (per-user LaunchAgent, the default):
-
-```sh
-verglas stop
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/org.verglas.verglas.plist
-rm ~/Library/LaunchAgents/org.verglas.verglas.plist
-```
-
-macOS (system LaunchDaemon, installed with `--system`):
-
-```sh
-verglas stop --system
-sudo launchctl bootout system /Library/LaunchDaemons/org.verglas.verglas.plist
-sudo rm /Library/LaunchDaemons/org.verglas.verglas.plist
-```
-
-Linux (per-user systemd unit, the default):
-
-```sh
-verglas stop
-systemctl --user disable verglasd.service
-rm ~/.config/systemd/user/verglasd.service
-systemctl --user daemon-reload
-```
-
-Linux (system systemd unit, installed with `--system`):
-
-```sh
-verglas stop --system
-sudo systemctl disable verglasd.service
-sudo rm /etc/systemd/system/verglasd.service
-sudo systemctl daemon-reload
-```
+The annotated reference for every server config key is
+[`verglas.example.toml`](verglas.example.toml). For a multi-node pod,
+`verglas drain` drains cache ownership over the admin API before you take a
+container down.
 
 ### Prometheus metrics
 
-`verglasd` exposes `GET /metrics` on the loopback admin listener at port `8334`
-by default (the same private surface as `/admin/stats` and `/admin/healthz`).
-Metric names and labels are defined in `crates/verglas-core/src/metrics.rs`.
-
-### For developers: `verglas dev`
-
-`verglas dev` runs a throwaway single-process cache in the foreground — no
-service install, cache in a temp dir removed on Ctrl-C. It is for hacking on
-Verglas itself: `--nodes` spins up a multi-node pod on one machine, `--writeback`
-enables the erasure-coded write-back tier, `--allow-http` permits a plain-HTTP
-origin (MinIO). `verglas dev --help` lists every flag. If you just want a cache
-in front of a bucket, use `verglas init` above.
+`verglas-server` exposes `GET /metrics` on the admin listener (port `8334` by
+default). Metric names and labels are in `crates/verglas-core/src/metrics.rs`.
 
 ## Iceberg tables: add the catalog watcher
 
@@ -254,18 +157,18 @@ both is a startup error.
 
 The deployment primitive is a **worker**: code plus triggers, registered with
 `verglas workers`. WHITEPAPER.md §7 is the architecture of record — one
-deployment record executed locally by the daemon or as an isolated tenant worker
+deployment record executed locally by the server or as an isolated tenant worker
 in the cloud, with pipeline I/O routed through the cache.
 
-Without a login, workers talk to the local daemon (the same endpoint and
+Without a login, workers talk to the local server (the same endpoint and
 `~/.verglas/config.toml` the other local commands use). `verglas login` adds
 cloud visibility so `workers list` can merge local and cloud deployments.
 
 ```sh
-# Reads the key from stdin, so it never lands in your shell history.
-echo "$VERGLAS_API_KEY" | verglas login --url https://api.verglas.cloud
+# Prefer `verglas login` (browser). Or pipe a key:
+echo "$VERGLAS_API_KEY" | verglas login --api-key
 
-# Register from a portable worker spec (local daemon):
+# Register from a portable worker spec (local server):
 verglas workers create ./worker.json --local
 
 # List and inspect:
@@ -284,7 +187,7 @@ control plane URL in `~/.verglas/config.toml` under `[control_plane]`. Re-runnin
 - [WHITEPAPER.md](WHITEPAPER.md) — the architecture and its reasoning: the cache
   tiers, Iceberg awareness, the ring, and the write-back path.
 - [`verglas.example.toml`](verglas.example.toml) — annotated reference config
-  covering every daemon setting.
+  covering every server setting.
 - `crates/verglas-core/src/metrics.rs` — Prometheus metric names/labels on
   `/metrics` (stability contract).
 - Each crate under `crates/` and `bins/` carries a `WORKLOG.md` recording what

@@ -14,7 +14,7 @@
 //!
 //! This is a separate crate, `verglas-graph`, depending only on
 //! `verglas-iceberg` (plus `iceberg`/`arrow`). It is a pure engine with zero
-//! cache or daemon dependencies, so the cloud committer could embed it, exactly
+//! cache or server dependencies, so the cloud committer could embed it, exactly
 //! like `verglas-iceberg`. It is not folded into `verglas-iceberg` because the
 //! graph model (nodes/edges/CSR/traversal) is a distinct capability with its own
 //! surface; keeping it a sibling crate leaves `verglas-iceberg` the minimal table

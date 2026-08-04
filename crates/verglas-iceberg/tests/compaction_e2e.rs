@@ -1,6 +1,6 @@
 //! End-to-end compaction against the REAL Verglas Cloudflare catalog service
 //! (apps/catalog) in `wrangler dev` mode plus a throwaway MinIO — the same
-//! iceberg-rust client verglasd uses. Proves the executor's REPLACE commit is
+//! iceberg-rust client verglas-server uses. Proves the executor's REPLACE commit is
 //! accepted by the production catalog's commit/CAS path (not just MemoryCatalog),
 //! that file count drops while content is preserved, that time travel to the
 //! pre-compaction snapshot still works, and that an interleaved append conflicts

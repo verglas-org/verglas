@@ -2,7 +2,7 @@
 //!
 //! These values select the origin endpoint, region, and addressing style. AWS
 //! credentials deliberately resolve elsewhere, at request signing time, so an
-//! instance-role or STS session can refresh without restarting the daemon.
+//! instance-role or STS session can refresh without restarting the server.
 //!
 //! [`BackendSettings`] here is the S3-family resolution (AWS/OCI/MinIO): the
 //! byte-exact raw client and the typed S3 client read it. Azure and GCP resolve
@@ -50,7 +50,7 @@ impl BackendSettings {
     /// `us-east-1`, endpoint the regional AWS endpoint). `env` is injected so
     /// endpoint resolution is deterministic and unit-tested without touching
     /// the process environment. Credentials are resolved lazily by the origin
-    /// client, not at daemon startup.
+    /// client, not at server startup.
     pub fn resolve<F>(backend: &Backend, env: &F) -> Result<Self, BackendError>
     where
         F: Fn(&str) -> Option<String>,
@@ -99,7 +99,7 @@ impl BackendSettings {
 /// Parses an AWS-format credentials file (`~/.aws/credentials` style INI) and
 /// returns the access key, secret key, and optional session token for `profile`.
 /// Reads the `(access_key_id, secret_access_key)` for `profile` from the text
-/// of an AWS-format credentials file. Public so the daemon loads the endpoint
+/// of an AWS-format credentials file. Public so the server loads the endpoint
 /// keypair (`[auth]`) exactly the way the backend loads origin credentials —
 /// one parser, one format. Returns `None` if the profile or either key is
 /// missing.

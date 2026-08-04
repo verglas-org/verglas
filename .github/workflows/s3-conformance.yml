@@ -3,7 +3,7 @@ name: s3-conformance
 # Ceph s3-tests conformance harness (issue #22).
 #
 # The FULL suite runs nightly (and on demand) — it is comprehensive and the
-# authoritative signal, but building release verglasd + MinIO + the Python suite
+# authoritative signal, but building release verglas-server + MinIO + the Python suite
 # is too heavy to sit on every PR's critical path.
 #
 # A fast SMOKE subset runs on PRs, but ONLY when the protocol surface or the

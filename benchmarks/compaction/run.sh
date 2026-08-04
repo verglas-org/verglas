@@ -12,7 +12,7 @@
 #   A  prefetch OFF  first post-compaction wave cold-misses (baseline)
 #   B  prefetch ON   first post-compaction wave already warm (recovery)
 # Optionally repeated for an Avro-format fixture (COMPACTION_FORMAT=both). The
-# daemon's /admin/stats counters are the mechanism evidence. Nothing here runs in
+# server's /admin/stats counters are the mechanism evidence. Nothing here runs in
 # PR CI. See README.md for every input; the hermetic CI version of this number is
 # crates/verglas-tables/tests/lifecycle.rs::benchmark_hit_rate_recovery_prefetch_on_vs_off.
 set -euo pipefail
@@ -41,7 +41,7 @@ WAVES="${COMPACTION_WAVES:-3}"
 SETTLE_SECS="${COMPACTION_SETTLE_SECS:-8}"
 FORMAT="${COMPACTION_FORMAT:-parquet}"   # parquet | avro | both
 
-# Verglas daemon (host). Dedicated ports; admin binds S3_PORT+1.
+# Verglas server (host). Dedicated ports; admin binds S3_PORT+1.
 VG_PORT="${COMPACTION_VG_PORT:-8655}"
 VG_ADMIN_PORT="$((VG_PORT + 1))"
 VG_KEY="${COMPACTION_VG_KEY:-demokey}"
@@ -49,9 +49,9 @@ VG_SECRET="${COMPACTION_VG_SECRET:-demosecret}"
 VG_DRAM="${COMPACTION_VG_DRAM:-1GB}"
 VG_DISK="${COMPACTION_VG_DISK:-8GB}"
 POLL_SECS="${COMPACTION_POLL_SECS:-2}"
-VERGLASD_BIN="${VERGLASD_BIN:-$ROOT/target/release/verglasd}"
+VERGLAS_SERVER_BIN="${VERGLAS_SERVER_BIN:-$ROOT/target/release/verglas-server}"
 
-# Polaris on the host (published ports so verglasd + the driver reach it).
+# Polaris on the host (published ports so verglas-server + the driver reach it).
 POLARIS_PORT="${COMPACTION_POLARIS_PORT:-8181}"
 POLARIS_CONTAINER="verglas-compaction-polaris"
 POLARIS_REALM="POLARIS"
@@ -60,7 +60,7 @@ POLARIS_CLIENT_SECRET="s3cr3t"
 CATALOG_URI="http://127.0.0.1:${POLARIS_PORT}/api/catalog"
 
 VG_CACHE_ROOT="${COMPACTION_VG_CACHE_ROOT:-/tmp/vg-compaction-cache}"
-VG_LOG="$HERE/verglasd.log"
+VG_LOG="$HERE/verglas-server.log"
 VG_PID=""
 
 VERGLAS_ENDPOINT="http://127.0.0.1:${VG_PORT}"
@@ -129,9 +129,9 @@ start_polaris() {
 }
 stop_polaris() { docker rm -f "$POLARIS_CONTAINER" >/dev/null 2>&1 || true; }
 
-# ----- verglasd lifecycle --------------------------------------------------- #
-write_verglasd_config() {
-  local prefetch="$1" cache_dir="$2" token="$3" cfg="$HERE/verglasd.toml"
+# ----- verglas-server lifecycle --------------------------------------------------- #
+write_verglas-server_config() {
+  local prefetch="$1" cache_dir="$2" token="$3" cfg="$HERE/verglas-server.toml"
   {
     echo "[listen]"
     echo "s3_port = $VG_PORT"
@@ -154,24 +154,24 @@ write_verglasd_config() {
   echo "$cfg"
 }
 
-start_verglasd() {
+start_verglas-server() {
   local prefetch="$1" cache_dir="$2" token="$3"
-  [[ -x "$VERGLASD_BIN" ]] || { echo "error: build verglasd first (cargo build --release -p verglasd)" >&2; exit 2; }
-  stop_verglasd
+  [[ -x "$VERGLAS_SERVER_BIN" ]] || { echo "error: build verglas-server first (cargo build --release -p verglas-server)" >&2; exit 2; }
+  stop_verglas-server
   rm -rf "$cache_dir"; mkdir -p "$cache_dir"
-  local cfg; cfg="$(write_verglasd_config "$prefetch" "$cache_dir" "$token")"
+  local cfg; cfg="$(write_verglas-server_config "$prefetch" "$cache_dir" "$token")"
   : > "$VG_LOG"
-  "$VERGLASD_BIN" --config "$cfg" >"$VG_LOG" 2>&1 &
+  "$VERGLAS_SERVER_BIN" --config "$cfg" >"$VG_LOG" 2>&1 &
   VG_PID=$!
   for _ in $(seq 1 100); do
-    curl -sf "${ADMIN_ENDPOINT}/admin/healthz" >/dev/null 2>&1 && { echo "[verglasd] ready (prefetch=$prefetch)" >&2; return 0; }
+    curl -sf "${ADMIN_ENDPOINT}/admin/healthz" >/dev/null 2>&1 && { echo "[verglas-server] ready (prefetch=$prefetch)" >&2; return 0; }
     sleep 0.2
   done
-  echo "error: verglasd did not become ready; see $VG_LOG" >&2; exit 1
+  echo "error: verglas-server did not become ready; see $VG_LOG" >&2; exit 1
 }
-stop_verglasd() { [[ -n "$VG_PID" ]] && kill "$VG_PID" 2>/dev/null || true; VG_PID=""; }
+stop_verglas-server() { [[ -n "$VG_PID" ]] && kill "$VG_PID" 2>/dev/null || true; VG_PID=""; }
 
-cleanup() { stop_verglasd; stop_polaris; }
+cleanup() { stop_verglas-server; stop_polaris; }
 trap cleanup EXIT
 
 # ----- run ------------------------------------------------------------------ #
@@ -190,21 +190,21 @@ run_format() {
   start_polaris
   local token; token="$(polaris_token)"
   drive bootstrap --format "$fmt" >/dev/null || true
-  start_verglasd false "$VG_CACHE_ROOT/off-$fmt" "$token"
+  start_verglas-server false "$VG_CACHE_ROOT/off-$fmt" "$token"
   drive seed --format "$fmt"
   drive load --format "$fmt"
   drive compact --format "$fmt"
   drive measure --format "$fmt" --config "A-off"
-  stop_verglasd
+  stop_verglas-server
 
   # Config B: prefetch ON, fresh cache + fresh table (same shape).
   token="$(polaris_token)"
-  start_verglasd true "$VG_CACHE_ROOT/on-$fmt" "$token"
+  start_verglas-server true "$VG_CACHE_ROOT/on-$fmt" "$token"
   drive seed --format "$fmt"
   drive load --format "$fmt"
   drive compact --format "$fmt"
   drive measure --format "$fmt" --config "B-on"
-  stop_verglasd
+  stop_verglas-server
   stop_polaris
 }
 

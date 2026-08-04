@@ -153,7 +153,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
 
     /// Stops background propagation: every in-flight retry loop exits at its
     /// next wake, leaving still-dirty journals for the next run's recovery
-    /// replay (exactly what they are for). For daemon shutdown, and for tests
+    /// replay (exactly what they are for). For server shutdown, and for tests
     /// that simulate process death — a dropped coordinator does not cancel its
     /// spawned tasks (they hold their own `Arc<Self>`), so without this a
     /// "crashed" coordinator's propagation keeps running and races the

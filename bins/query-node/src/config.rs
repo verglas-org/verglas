@@ -3,18 +3,18 @@
 //! Iceberg REST catalog to query against.
 //!
 //! Reuses `verglas_core::config::{Log, Catalog}` verbatim for `[log]` and
-//! `[catalog]` — the same shapes operators already know from `verglasd`, so a
+//! `[catalog]` — the same shapes operators already know from `verglas-server`, so a
 //! fleet image renders one TOML dialect across every role. Everything else in
-//! that daemon-shaped schema (cache sizing, origin backend, cluster gossip)
+//! that server-shaped schema (cache sizing, origin backend, cluster gossip)
 //! does not apply here and is deliberately not reused: this binary has none
 //! of those, and a config knob for a feature that does not exist is worse
 //! than no knob at all.
 //!
-//! `[cache]` here is a different (and much smaller) thing than `verglasd`'s
+//! `[cache]` here is a different (and much smaller) thing than `verglas-server`'s
 //! `[cache]` section: it is not a cache tier, it is the single S3 endpoint
 //! this binary is allowed to read table data through. There is no direct
 //! object-store path anywhere in this binary (the platform rule: cache-or-503
-//! applies to every role, not just verglasd) — `[cache]` is that endpoint and
+//! applies to every role, not just verglas-server) — `[cache]` is that endpoint and
 //! nothing else.
 
 use std::path::Path;
@@ -33,14 +33,14 @@ pub struct QueryConfig {
     #[serde(default)]
     pub listen: Listen,
     /// Structured-logging output format and default verbosity — the same
-    /// `[log]` shape `verglasd` uses.
+    /// `[log]` shape `verglas-server` uses.
     #[serde(default)]
     pub log: Log,
     /// The cache S3 endpoint every table read goes through, and the keypair
     /// to sign those requests with.
     pub cache: CacheEndpoint,
     /// The Iceberg REST catalog to query against — the same `[catalog]` shape
-    /// `verglasd`'s catalog watcher uses (bearer or SigV4 auth, warehouse id).
+    /// `verglas-server`'s catalog watcher uses (bearer or SigV4 auth, warehouse id).
     pub catalog: Catalog,
 }
 
@@ -53,7 +53,7 @@ pub struct Listen {
 }
 
 impl Default for Listen {
-    /// One above `verglasd`/`verglas-cache-node`'s default admin port (8334),
+    /// One above `verglas-server`/`verglas-cache-node`'s default admin port (8334),
     /// so all three can run side by side on one dev host without a port
     /// clash.
     fn default() -> Self {
@@ -66,7 +66,7 @@ impl Default for Listen {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheEndpoint {
-    /// Base URL of the cache node's S3 surface (a `verglasd` or
+    /// Base URL of the cache node's S3 surface (a `verglas-server` or
     /// `verglas-cache-node` instance). Required: without it there is nowhere
     /// to read table data from, and this binary never falls back to a direct
     /// object-store path.

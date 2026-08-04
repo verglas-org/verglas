@@ -1,11 +1,11 @@
 # Local venv and generated artifacts — never committed.
 .venv/
 
-# Generated verglasd config (carries a short-lived Polaris bearer token).
-verglasd.toml
+# Generated verglas-server config (carries a short-lived Polaris bearer token).
+verglas-server.toml
 
-# Daemon log captured during a run.
-verglasd.log
+# Server log captured during a run.
+verglas-server.log
 
 # Per-run walk records and the rendered report. Published numbers go on the
 # issue/PR, not into the tree (benchmarks/ convention).

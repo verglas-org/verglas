@@ -3,7 +3,7 @@
 //! Write-back evaluates "can the pod place `w` fragments on distinct live
 //! nodes?" per write against the current gossip view, not against config. This
 //! trait is that view; [`AgentMembership`] reads it from the cluster agent's
-//! failure detector, and [`SingleNodeMembership`] is the no-cluster daemon
+//! failure detector, and [`SingleNodeMembership`] is the no-cluster server
 //! (always one node, so write-back always degrades to write-through).
 
 use std::sync::Arc;
@@ -25,7 +25,7 @@ pub trait LiveMembership: Send + Sync + 'static {
     fn epoch(&self) -> u64;
 
     /// True only for a deployment that is *architecturally* one node — a
-    /// self-deployed daemon with no pod, never any peers (#286). This is not the
+    /// self-deployed server with no pod, never any peers (#286). This is not the
     /// same as a multi-node pod that has merely degraded to one live member: that
     /// pod keeps the safe write-through fallback so it never silently drops the
     /// redundancy it normally provides, whereas a genuine single-node deployment
@@ -74,14 +74,14 @@ impl LiveMembership for AgentMembership {
     }
 }
 
-/// The single-node daemon's membership: one node, epoch fixed. A one-node
+/// The single-node server's membership: one node, epoch fixed. A one-node
 /// deployment can never reach a fragment quorum of `w > 1`, so instead of the
 /// synchronous write-through fallback it fast-acks from local durability (#286):
 /// write-back degenerates to `k=1, m=0, w=1` — the single object fragment is
 /// fsynced to local NVMe and, with the fsynced journal, is the ack; propagation
 /// to the origin then runs in the background exactly as §6 specifies. The
 /// deployment story puts the buffer directory on a cloud-replicated block
-/// volume, but the daemon does not know or care — durability here is "one local
+/// volume, but the server does not know or care — durability here is "one local
 /// disk until propagation completes," disclosed in the write-back docs.
 pub struct SingleNodeMembership {
     /// The lone node's id.

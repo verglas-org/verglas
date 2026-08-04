@@ -44,7 +44,7 @@ pub(crate) const DEMOTED_GENERATION_BIT: u64 = 1 << 63;
 ///
 /// Guarded by a mutex, not a sharded lock-free map: demotion mutations are a
 /// low-frequency background operation (a compaction commit demotes a batch, a
-/// daemon sweep clears expired ones), never on the request hot path. The hot
+/// server sweep clears expired ones), never on the request hot path. The hot
 /// path only ever reads [`Demotions::any`] (a relaxed atomic) and, when that is
 /// non-zero, takes the lock for a single contains-check on the cold miss path.
 pub(crate) struct Demotions {

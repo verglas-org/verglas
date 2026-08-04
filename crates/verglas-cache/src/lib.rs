@@ -10,10 +10,8 @@
 //! metrics, `admission` the scan-resistant block-admission policy (#15),
 //! [`classify`] the metadata/data store routing (#50), `meta_store` the
 //! dedicated pinned-metadata instance (#50), `demotion` the evict-first
-//! retirement set (#198), [`engine`] the miss ladder and foyer integration
-//! itself, and [`shadow`] the cache-managed store for Verglas-derived Puffin
-//! artifacts (#95) — NVMe-resident under the cache dir, budget-bounded, never a
-//! customer table or bucket.
+//! retirement set (#198), and [`engine`] the miss ladder and foyer integration
+//! itself.
 
 mod admission;
 pub mod block;
@@ -24,7 +22,6 @@ pub mod engine;
 pub mod entry;
 mod foyer_metrics;
 mod meta_store;
-pub mod shadow;
 pub mod writeback_codec;
 
 pub use block::BLOCK_SIZE_BYTES;

@@ -198,3 +198,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `tests/parsing.rs` doc comments that named the offline analyzer (#53) as a
   consumer of `MetadataFetch`/`ObjectStoreFetch`/`walk_snapshot`; the offline
   read path stays, its consumers are now tests and benches.
+- #263: Removed the loopback catalog gateway, its response cache, and mutation-forwarding surface. The REST transport now exists only as the daemon's private, lenient catalog watcher client, including bearer and SigV4 authentication and gzip decoding.
+- #91: Renamed active table lifecycle documentation from daemon terminology to
+  the `verglas-server` process. Catalog watching and cache warming are unchanged.

@@ -57,7 +57,7 @@ The point: tests written after code tend to **confirm what the code does**; test
 ## Standing invariants (violations are release-blocking, in any PR)
 
 - **The turn-off test:** Verglas off = customer's lakehouse still works, just slower. Nothing may make serving depend on Verglas-only state.
-- **Never write to customer tables or buckets autonomously.** Derived artifacts go to the shadow store as Puffin blobs. The only customer-table writes are explicit customer-invoked operations.
+- **Never write to customer tables or buckets autonomously.** Explicit customer-invoked index builds may attach derived Puffin statistics files to the target snapshot; no background operation may publish one without that authorization.
 - **Slow is acceptable; wrong is never.** Degrade to backend fills, never to incorrect bytes. No code path may assume a key is locally owned (everything routes through the ring).
 - **Budgets are hard ceilings** (DRAM, NVMe, CPU) — especially in colocated mode, where Verglas must be a provably polite tenant.
 - **Hot paths do not lock, allocate, or aggregate** — record to tapes/snapshots and do the work in the background.

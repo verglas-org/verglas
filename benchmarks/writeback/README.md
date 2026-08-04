@@ -17,7 +17,7 @@ export AWS_REGION=...
 ```
 
 ```
-cargo build --release -p verglas -p verglasd
+cargo build --release -p verglas -p verglas-server
 set -a; source .env; set +a
 benchmarks/writeback/run.sh
 ```
@@ -26,7 +26,7 @@ It boots a 3-node pod (`verglas dev --nodes 3`) twice — once without
 `--writeback` (write-through) and once with it (k=2/m=1/w=3, which fits a 3-node
 pod) — waits for the gossip view to converge, runs `verglas bench --seed` for the
 seed-phase PUT p50, times single 32/128 MiB PUTs, reads the write-back counters
-from `/admin/stats`, and tears the pod down. It kills only the `verglasd`
+from `/admin/stats`, and tears the pod down. It kills only the `verglas-server`
 children it spawned (matched by its own temp cache dir), so a benchmark running
 in `benchmarks/tpch` is never touched. Results land in `results/<timestamp>.json`
 and a table is printed.

@@ -64,7 +64,7 @@ fn free_bytes_impl(_dir: &Path) -> Option<u64> {
 /// Physical bytes already held by files under `dir`, recursively (#298). The
 /// startup capacity gate adds this to the filesystem's free space: on restart
 /// a warm cache's own files are what consumed the disk, and a budget the
-/// daemon booted with cold must still validate warm. Sums allocated blocks
+/// server booted with cold must still validate warm. Sums allocated blocks
 /// (`st_blocks * 512`), not logical lengths — the foyer device files are
 /// sparse and the budget tracks physical usage. Best-effort: unreadable
 /// entries are skipped (a file vanishing mid-walk must not fail a boot), and
@@ -106,7 +106,7 @@ fn physical_size(meta: &std::fs::Metadata) -> u64 {
 }
 
 /// The tuning that turns the poll's readings into runtime decisions (#96/#223).
-/// Both fields are bytes, derived by the daemon from `cache.capacity_bytes`.
+/// Both fields are bytes, derived by the server from `cache.capacity_bytes`.
 /// The same marks gate the filesystem's free space and the shared budget's
 /// headroom — one reserve, one hysteresis band, no extra knobs.
 #[derive(Debug, Clone, Copy)]

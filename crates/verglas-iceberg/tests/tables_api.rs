@@ -2,8 +2,8 @@
 //!
 //! These exercise the endpoint contract `@verglas/sdk` speaks — commit, current
 //! snapshot, paged row scan, and delta-since — fully in-process against an
-//! Iceberg `MemoryCatalog` over an in-memory warehouse. No daemon, no MinIO, no
-//! network: the daemon's admin routes are thin wrappers over these functions, so
+//! Iceberg `MemoryCatalog` over an in-memory warehouse. No server, no MinIO, no
+//! network: the server's admin routes are thin wrappers over these functions, so
 //! proving the contract here proves the served behaviour.
 
 use std::collections::HashMap;

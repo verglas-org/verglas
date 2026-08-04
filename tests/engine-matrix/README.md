@@ -13,7 +13,7 @@ legs, diffed at the Arrow level:
   scans).
 - **Polars** via a pyiceberg scan handed to Polars (`pyiceberg → Arrow → pl`).
 - Legs: **direct-to-MinIO** (baseline), **Verglas pass 1 (MISS path**, empty
-  daemon cache), **Verglas pass 2 (HIT path**, immediate re-run). Both Verglas
+  server cache), **Verglas pass 2 (HIT path**, immediate re-run). Both Verglas
   legs are compared against the direct baseline.
 
 Every result is **sorted deterministically and compared as Arrow** (schema +
@@ -105,11 +105,11 @@ Run through each engine, on each leg:
   builds the fixture builder jar via `fixture-jvm/gradlew shadowJar` on first use
   (or use the committed Gradle wrapper directly). Not needed for `--variant
   parquet` or `--selftest`.
-- A **built daemon**: `cargo build -p verglasd -p verglas` →
-  `target/debug/{verglasd,verglas}` (release works too).
+- A **built server**: `cargo build -p verglas-server -p verglas` →
+  `target/debug/{verglas-server,verglas}` (release works too).
 - A running **MinIO** (or any S3-compatible origin) with the target bucket
   created, reachable via the standard `AWS_*` environment.
-- A **`verglasd`** started against that origin with static `[auth]` keys (see
+- A **`verglas-server`** started against that origin with static `[auth]` keys (see
   below). Path-style S3 addressing throughout.
 
 ## Inputs
@@ -127,13 +127,13 @@ Run through each engine, on each leg:
 The **direct-to-MinIO** leg reads its credentials + endpoint from the ambient
 `AWS_*` environment (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`); the **Verglas** legs use the endpoint +
-the daemon's static dev keys.
+the server's static dev keys.
 
 ## Copy-paste invocation (local)
 
 ```bash
-# 1. Build the daemon (once).
-cargo build -p verglasd -p verglas
+# 1. Build the server (once).
+cargo build -p verglas-server -p verglas
 
 # 2. Start MinIO and create the bucket.
 docker run -d --name minio -p 9000:9000 \
@@ -143,7 +143,7 @@ docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
   "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && \
    mc mb --ignore-existing local/verglas-test"
 
-# 3. Start the daemon against MinIO with static keys (leave it running).
+# 3. Start the server against MinIO with static keys (leave it running).
 cat > /tmp/vg-matrix.toml <<'EOF'
 [listen]
 s3_port = 8333
@@ -160,7 +160,7 @@ mkdir -p /tmp/vg-matrix-cache
 AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
 AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
 AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
-  ./target/debug/verglasd --config /tmp/vg-matrix.toml &
+  ./target/debug/verglas-server --config /tmp/vg-matrix.toml &
 
 # 4. Run the matrix (fixture then diff). Origin creds come from AWS_*.
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
@@ -180,7 +180,7 @@ tests/engine-matrix/run.sh --selftest       # comparator selftest, no MinIO
 The matrix (and the conformance smoke and tpch bench) are the standing
 cluster-correctness harness: point them at **node 0** of a local pod and every
 leg still diffs byte-for-byte, now with keys routed across three nodes through
-the ring. `verglas dev --nodes 3` boots the pod — three `verglasd` children on
+the ring. `verglas dev --nodes 3` boots the pod — three `verglas-server` children on
 consecutive port blocks, each with its own cache dir and its own
 `--dram`/`--cache-size` budgets, wired into one gossip pod seeded at node 0. The
 **dev keys are shared across the pod**, so a client that talks to node 0 (S3
@@ -237,12 +237,12 @@ equal data), so the comparator can never silently degrade to a no-op.
 ## Runtime
 
 The whole PR job (build the two binaries with a warm cache, start MinIO, start
-the daemon, build the fixtures, run both engines × four queries × three legs ×
+the server, build the fixtures, run both engines × four queries × three legs ×
 three variants, plus the data-file byte check) is designed to stay **under ~5
 minutes** so it remains on the PR path. The fixtures are thousands of Arrow cells
 (500 rows), not millions — the diff, not the scale, is the point.
 
-Measured locally (warm venv + built daemon, docker MinIO), the three variants
+Measured locally (warm venv + built server, docker MinIO), the three variants
 add little over the original Parquet-only run:
 
 | Step                                   | Time |

@@ -3,7 +3,7 @@
 //! This is the MV Job the platform's MV harness drives (§7.2): per run it reads
 //! the source table's Iceberg delta since the index's watermark, applies the
 //! streaming Vamana updates, consolidates past a tombstone threshold, and
-//! persists the updated Puffin blob to the shadow store.
+//! commits the updated Puffin blob as a snapshot-bound Iceberg statistics file.
 //!
 //! ## Contract
 //!
@@ -24,8 +24,9 @@
 //!   on-disk DeleteList) and are filtered at query time.
 //! - **Watermark = the reflected snapshot.** The updated index's
 //!   `reflected_snapshot` is the delta's new tip. Persisting the blob (whose
-//!   body encodes that snapshot) IS the commit; there is no separate ack. On the
-//!   next run the blob's reflected snapshot is read back as `since`. A crash
+//!   body encodes that snapshot) and attaching it through the catalog IS the
+//!   commit; there is no separate registry. On the next run the attachment's
+//!   reflected snapshot is read back as `since`. A crash
 //!   before the persist re-consumes the same delta on restart — inserts are
 //!   upserts and deletes idempotent, so the live result set is unchanged
 //!   (commit-before-ack, kill-and-resume equivalent).
@@ -37,7 +38,6 @@ use serde_json::Value;
 
 use crate::error::{Result, VectorError};
 use crate::metric::Metric;
-use crate::store::{IndexKey, ShadowBlobStore};
 use crate::vamana::{VamanaIndex, VamanaParams};
 
 /// The default tombstone fraction that triggers a consolidation. Not a user
@@ -58,7 +58,7 @@ const BUILD_SEED: u64 = 0x5645_5247_4C41_5331; // "VERGLAS1"
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum IdEncoding {
     /// The id column is an integer (number, or a string that parses to `i64`).
-    /// The default — every table declared through the daemon's generic index
+    /// The default — every table declared through the server's generic index
     /// route.
     #[default]
     Integer,
@@ -138,6 +138,8 @@ impl MaintenanceConfig {
 /// The outcome of one maintenance run.
 #[derive(Debug, Clone)]
 pub struct MaintenanceReport {
+    /// The distance metric encoded in the attached index.
+    pub metric: Metric,
     /// The source snapshot the index now reflects.
     pub reflected_snapshot: i64,
     /// The snapshot the index reflected before this run, if any.
@@ -166,26 +168,26 @@ pub struct MaintenanceReport {
 pub async fn run_maintenance(
     catalog: &dyn Catalog,
     ident: &TableIdent,
-    key: &IndexKey,
-    store: &dyn ShadowBlobStore,
     config: &MaintenanceConfig,
 ) -> Result<Option<MaintenanceReport>> {
-    // Load the prior index (and thus the watermark) from the shadow store.
-    let prior = load_latest_index(store, key).await?;
+    let table = catalog.load_table(ident).await?;
+    let Some(source_snapshot) = table.metadata().current_snapshot_id() else {
+        return Ok(None);
+    };
+    // Load the nearest attached ancestor index and use its snapshot as the
+    // incremental watermark.
+    let prior =
+        crate::attachment::load_latest_ancestor_index(&table, source_snapshot, &config.vec_field)
+            .await?
+            .map(|attached| attached.index);
     let prior_snapshot = prior.as_ref().map(|i| i.reflected_snapshot());
     let since = prior_snapshot.filter(|&s| s >= 0).map(|s| s.to_string());
 
-    // Read the delta. A stale/expired `since` (or any delta error with a prior
-    // index) forces a clean full rebuild from the whole table.
+    // Read exactly the delta after the attached ancestor. An invalid or expired
+    // watermark is an error; this prototype has no implicit rebuild path.
+    let response = verglas_iceberg::tables_api::delta(catalog, ident, since.clone(), None).await?;
     let (rows, watermark_str, full_build, mut index) =
-        match verglas_iceberg::tables_api::delta(catalog, ident, since.clone(), None).await {
-            Ok(resp) => (resp.rows, resp.watermark, since.is_none(), prior),
-            Err(_) if since.is_some() => {
-                let resp = verglas_iceberg::tables_api::delta(catalog, ident, None, None).await?;
-                (resp.rows, resp.watermark, true, None)
-            }
-            Err(e) => return Err(e.into()),
-        };
+        (response.rows, response.watermark, since.is_none(), prior);
 
     // An empty watermark means the table has no snapshot yet.
     if watermark_str.is_empty() {
@@ -242,23 +244,18 @@ pub async fn run_maintenance(
 
     // Persist — this is the commit. The blob body encodes reflected_snapshot, so
     // the persisted blob is the durable watermark.
-    let mut properties = std::collections::HashMap::new();
-    properties.insert("verglas.vector.target".to_owned(), key.target.clone());
-    properties.insert("verglas.vector.field".to_owned(), key.field.clone());
-    properties.insert(
-        "verglas.vector.metric".to_owned(),
-        config.metric.as_str().to_owned(),
-    );
-    properties.insert("verglas.vector.dim".to_owned(), index.dim().to_string());
-    properties.insert(
-        "verglas.vector.reflected-snapshot".to_owned(),
-        reflected_snapshot.to_string(),
-    );
-    let bytes = crate::puffin::to_puffin_bytes(&index, properties).await?;
-    let blob_bytes = bytes.len();
-    let stored = store.put(key, reflected_snapshot, bytes).await?;
+    let blob_location =
+        crate::attachment::attach_index(catalog, &table, reflected_snapshot, config, &index)
+            .await?;
+    let blob_bytes = table
+        .file_io()
+        .new_input(&blob_location)?
+        .read()
+        .await?
+        .len();
 
     Ok(Some(MaintenanceReport {
+        metric: index.metric(),
         reflected_snapshot,
         prior_snapshot,
         full_build,
@@ -267,22 +264,27 @@ pub async fn run_maintenance(
         consolidated,
         live_count: index.len(),
         tombstones: index.tombstone_count(),
-        blob_location: stored.location,
+        blob_location,
         blob_bytes,
     }))
 }
 
-/// Loads the latest index blob for `key` from the shadow store and decodes it.
-/// `None` when no blob exists. A corrupt blob is an error (the caller then falls
-/// back to brute force / rebuild — the turn-off path).
+/// Loads the index attached to the table's current snapshot for `field`.
+/// `None` means the snapshot has no Vamana attachment for that field.
 pub async fn load_latest_index(
-    store: &dyn ShadowBlobStore,
-    key: &IndexKey,
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    field: &str,
 ) -> Result<Option<VamanaIndex>> {
-    match store.latest(key).await? {
-        Some(blob) => Ok(Some(crate::puffin::from_puffin_bytes(&blob.bytes).await?)),
-        None => Ok(None),
-    }
+    let table = catalog.load_table(ident).await?;
+    let Some(snapshot) = table.metadata().current_snapshot_id() else {
+        return Ok(None);
+    };
+    Ok(
+        crate::attachment::load_index_for_snapshot(&table, snapshot, field)
+            .await?
+            .map(|attached| attached.index),
+    )
 }
 
 /// Lazily creates the index once the first vector's dimensionality is known.

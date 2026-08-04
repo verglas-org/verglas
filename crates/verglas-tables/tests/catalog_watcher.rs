@@ -16,13 +16,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use bytes::Bytes;
-use reqwest::Method;
 use serde_json::json;
 use tokio::sync::broadcast;
 use verglas_tables::catalog::{
-    CatalogGateway, CatalogSource, CatalogWatcher, PollingWatcher, RestCatalogSource, TableChanged,
-    TableFilter, TableIdent, WatcherOptions,
+    CatalogWatcher, PollingWatcher, RestCatalogSource, TableChanged, TableFilter, TableIdent,
+    WatcherOptions,
 };
 
 /// Mutable state behind the mock REST catalog: the tables it serves, an
@@ -246,83 +244,6 @@ async fn spawn_mock() -> (SocketAddr, Arc<MockCatalog>) {
         axum::serve(listener, app).await.expect("mock serves");
     });
     (addr, mock)
-}
-
-/// A watcher refresh populates the same response cache the loopback catalog
-/// endpoint serves. Once populated, a client load-table succeeds within a
-/// local deadline even while the upstream catalog is unavailable.
-#[tokio::test(flavor = "multi_thread")]
-async fn watcher_populates_gateway_and_cached_load_survives_outage() {
-    let (addr, mock) = spawn_mock().await;
-    mock.set_table("rlean", "custom_points", "s3://lake/metadata/v1.json", 1);
-    let config: verglas_core::config::Catalog = toml::de::from_str(&format!(
-        "uri = \"http://{addr}\"\npoll_interval_secs = 30\n"
-    ))
-    .expect("catalog config parses");
-    let gateway = CatalogGateway::from_config(&config).expect("gateway builds");
-    let source = gateway.source();
-    let table = TableIdent::new(&["rlean"], "custom_points");
-    source
-        .table_pointer(&table)
-        .await
-        .expect("watcher-style refresh succeeds");
-
-    mock.set_outage(true);
-    let response = tokio::time::timeout(
-        Duration::from_millis(5),
-        gateway.request(
-            Method::GET,
-            "/v1/demo/namespaces/rlean/tables/custom_points",
-            HeaderMap::new(),
-            Bytes::new(),
-        ),
-    )
-    .await
-    .expect("cached catalog read stays local")
-    .expect("cached catalog response");
-    assert_eq!(response.status, StatusCode::OK.as_u16());
-    let body: serde_json::Value = serde_json::from_slice(&response.body).expect("load-table json");
-    assert_eq!(body["metadata"]["current-snapshot-id"], 1);
-}
-
-/// Successful catalog mutations remain write-through and invalidate cached
-/// reads. The first read after the commit observes the new upstream pointer,
-/// preserving read-your-write for sidecar on-demand ingestion.
-#[tokio::test(flavor = "multi_thread")]
-async fn gateway_commit_is_write_through_and_invalidates_cached_load() {
-    let (addr, mock) = spawn_mock().await;
-    mock.set_table("rlean", "custom_points", "s3://lake/metadata/v1.json", 1);
-    let config: verglas_core::config::Catalog = toml::de::from_str(&format!(
-        "uri = \"http://{addr}\"\npoll_interval_secs = 30\n"
-    ))
-    .expect("catalog config parses");
-    let gateway = CatalogGateway::from_config(&config).expect("gateway builds");
-    let path = "/v1/demo/namespaces/rlean/tables/custom_points";
-
-    let first = gateway
-        .request(Method::GET, path, HeaderMap::new(), Bytes::new())
-        .await
-        .expect("initial load");
-    assert_eq!(first.status, StatusCode::OK.as_u16());
-
-    let commit = gateway
-        .request(
-            Method::POST,
-            path,
-            HeaderMap::new(),
-            Bytes::from_static(b"{}"),
-        )
-        .await
-        .expect("commit forwarded");
-    assert_eq!(commit.status, StatusCode::NO_CONTENT.as_u16());
-
-    let refreshed = gateway
-        .request(Method::GET, path, HeaderMap::new(), Bytes::new())
-        .await
-        .expect("post-commit load");
-    let body: serde_json::Value =
-        serde_json::from_slice(&refreshed.body).expect("refreshed load-table json");
-    assert_eq!(body["metadata"]["current-snapshot-id"], 2);
 }
 
 /// Watcher options tuned for tests: fast polls, no jitter, quick backoff cap

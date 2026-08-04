@@ -2,21 +2,21 @@
 //! cache engine over a single-node rendezvous ring, run the disk-full guardrail
 //! poll, and serve the SigV4 S3 endpoint with read-through / write-through.
 //!
-//! This is the CACHE-relevant subset of `bins/verglasd/src/main.rs::serve`,
+//! This is the CACHE-relevant subset of `bins/verglas-server/src/main.rs::serve`,
 //! reproduced without the cluster ring, gossip peers, write-back tier, catalog
 //! watcher, table lifecycle, or any admin surface beyond health/stats/metrics.
 //!
 //! ## Why a cluster-of-one, no peers, no write-back
 //!
 //! - **Ring**: a [`RendezvousRing::single`] node owns every key, so the read
-//!   path never consults a peer. This is byte-identical ownership to a verglasd
-//!   daemon started without `[cluster]`, and it drops the whole `verglas-cluster`
+//!   path never consults a peer. This is byte-identical ownership to a verglas-server
+//!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
 //!   dependency (gossip, peer RPC, fragment store).
 //! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
 //! - **Object write-back**: the fleet cache image's boot script renders no
 //!   `[cache.writeback]`, so the OBJECT tier is off by design; S3 PUTs pass
 //!   straight through to the origin durably (write-through), exactly what a
-//!   disabled write-back tier does in verglasd.
+//!   disabled write-back tier does in verglas-server.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
 //!   reaches the ring. When `VERGLAS_BLOCK_PEERS` names a ring, a device FLUSH is
 //!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
@@ -42,8 +42,8 @@ use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
 use crate::VERSION;
 use crate::admin;
 
-/// The node id the single-node cache uses. Matches verglasd's cluster-of-one id
-/// so ownership is byte-identical to a pre-cluster daemon.
+/// The node id the single-node cache uses. Matches verglas-server's cluster-of-one id
+/// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
 
 /// The default NBD listen port for the block-device tier (#382). The host agent
@@ -60,7 +60,7 @@ type CacheEngine = HybridCacheEngine<PassthroughRead, NoopPeerFetch, RendezvousR
 /// Whether the operator has opted out of the backend startup probe via
 /// `VERGLAS_DEV_ALLOW_MISSING_ORIGIN`. Truthy values are `1`/`true`
 /// (case-insensitive). A dev/test escape hatch — same name and semantics as
-/// verglasd so the two binaries behave identically.
+/// verglas-server so the two binaries behave identically.
 fn dev_allow_missing_origin() -> bool {
     std::env::var("VERGLAS_DEV_ALLOW_MISSING_ORIGIN")
         .map(|value| {
@@ -71,7 +71,7 @@ fn dev_allow_missing_origin() -> bool {
 }
 
 /// Reserves one quarter of configured origin concurrency for repeated aligned
-/// cache tails, leaving the rest for user reads. Copied from verglasd so the
+/// cache tails, leaving the rest for user reads. Copied from verglas-server so the
 /// overfetch behaviour matches.
 fn background_fill_limit(max_concurrent_requests: usize) -> usize {
     max_concurrent_requests / 4
@@ -126,7 +126,7 @@ fn stats_source(config: &Config, engine: CacheEngine) -> admin::StatsSource {
 
 /// Builds the `GET /metrics` source: renders the Prometheus exposition on each
 /// scrape from the shared request registry plus the engine and backend counters
-/// read at scrape time. The CACHE-relevant subset of verglasd's `metrics_source`
+/// read at scrape time. The CACHE-relevant subset of verglas-server's `metrics_source`
 /// (no per-table telemetry, no write-back families).
 fn metrics_source(
     config: &Config,
@@ -193,7 +193,7 @@ fn metrics_source(
 /// publishes one decision the fill path reads as a plain atomic: pause block
 /// admission when the filesystem nears full so a full disk degrades the node to
 /// origin fills rather than crashing it (budgets are hard ceilings). The
-/// fragment-budget sharing verglasd's poll also does is absent — there is no
+/// fragment-budget sharing verglas-server's poll also does is absent — there is no
 /// write-back fragment store to grant budget to. Detached for the process
 /// lifetime.
 fn spawn_disk_monitor(
@@ -207,7 +207,7 @@ fn spawn_disk_monitor(
     let capacity = config.cache.capacity_bytes.0;
     // Keep a headroom reserve so admission stops before the disk is truly spent;
     // the gap to `high_water` is the hysteresis band. Floored at 64 MiB so a tiny
-    // test budget still leaves a sane reserve. Same shape as verglasd's poll.
+    // test budget still leaves a sane reserve. Same shape as verglas-server's poll.
     let low_water = (capacity / 16).max(64 * 1024 * 1024);
     let high_water = low_water.saturating_mul(2);
     let params = DiskParams {
@@ -246,7 +246,7 @@ fn spawn_disk_monitor(
 
 /// Builds the cache engine and runs the admin and S3 listeners together.
 ///
-/// Ordering mirrors verglasd's serve-gating (#16): the admin listener binds
+/// Ordering mirrors verglas-server's serve-gating (#16): the admin listener binds
 /// first reporting `starting`, then the backend is probed and the engine
 /// recovers its on-disk tiers, then the stats/metrics slots are filled and the
 /// health gate flips to `ready`, then the S3 endpoint serves. Either listener
@@ -443,7 +443,7 @@ async fn serve_s3(
         invalidation,
         Some(credentials),
         Some(registry as Arc<dyn verglas_backend::BackendStores>),
-        // The cache-node role does not serve the daemon's `/v1` API.
+        // The cache-node role does not serve the server's `/v1` API.
         None,
         config.listen.domain.as_deref(),
         Some(node_metrics),

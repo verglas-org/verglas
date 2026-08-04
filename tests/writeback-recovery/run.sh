@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Single-node write-back crash-recovery evidence (#286): ack-implies-durable.
 #
-# Proves the load-bearing durability claim end to end against a REAL daemon and
+# Proves the load-bearing durability claim end to end against a REAL server and
 # a REAL S3 origin (MinIO): a PUT fast-acks from local durability while the
-# origin is unreachable, the daemon is kill -9'd between that ack and the S3
-# flush, and after MinIO returns and the daemon restarts, boot recovery replays
+# origin is unreachable, the server is kill -9'd between that ack and the S3
+# flush, and after MinIO returns and the server restarts, boot recovery replays
 # the buffered segment so the object reaches S3 byte-identically. Nothing was
 # ever flushed before the crash (verified: the object is absent from S3 until
 # recovery runs), so this is genuine ack-then-crash-then-replay, not a race.
 #
-# Safety: this NEVER broad-kills. It kills only the exact daemon PID it spawned
+# Safety: this NEVER broad-kills. It kills only the exact server PID it spawned
 # and stops MinIO by its unique container name. High ports, temp dirs.
 set -euo pipefail
 
@@ -68,7 +68,7 @@ aws_access_key_id = $DEV_AK
 aws_secret_access_key = $DEV_SK
 CREDS
   chmod 600 "$WORK/endpoint-creds"
-  cat > "$WORK/verglasd.toml" <<TOML
+  cat > "$WORK/verglas-server.toml" <<TOML
 [listen]
 s3_port = $S3_PORT
 admin_port = $ADMIN_PORT
@@ -90,22 +90,22 @@ credentials_file = "$WORK/endpoint-creds"
 TOML
 }
 
-start_daemon() {
+start_server() {
   AWS_ENDPOINT="http://127.0.0.1:${MINIO_PORT}" \
   AWS_ACCESS_KEY_ID="$ORIGIN_AK" AWS_SECRET_ACCESS_KEY="$ORIGIN_SK" \
   AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
   VERGLAS_S3_ADDR="127.0.0.1:${S3_PORT}" VERGLAS_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
-    "$VGD" --config "$WORK/verglasd.toml" >"$WORK/vgd.log" 2>&1 &
+    "$VGD" --config "$WORK/verglas-server.toml" >"$WORK/vgd.log" 2>&1 &
   VGD_PID=$!
   disown "$VGD_PID" 2>/dev/null || true   # keep job control quiet when we kill it
   wait_for "http://127.0.0.1:${ADMIN_PORT}/admin/healthz" 150 \
-    || { log "verglasd did not become healthy"; cat "$WORK/vgd.log" >&2; exit 1; }
+    || { log "verglas-server did not become healthy"; cat "$WORK/vgd.log" >&2; exit 1; }
 }
 
 # ---- build ---------------------------------------------------------------- #
-log "building verglasd"
-( cd "$REPO" && cargo build -q -p verglasd )
-VGD="$REPO/target/debug/verglasd"
+log "building verglas-server"
+( cd "$REPO" && cargo build -q -p verglas-server )
+VGD="$REPO/target/debug/verglas-server"
 
 # ---- origin up, bucket created -------------------------------------------- #
 log "starting MinIO ($CONTAINER) on :$MINIO_PORT"
@@ -119,11 +119,11 @@ head -c 131072 /dev/urandom > "$OBJ"
 WANT="$(shasum -a 256 "$OBJ" | awk '{print $1}')"
 log "object sha256=$WANT"
 
-# ---- daemon up ------------------------------------------------------------ #
-log "starting verglasd (single-node write-back)"
+# ---- server up ------------------------------------------------------------ #
+log "starting verglas-server (single-node write-back)"
 write_config
-start_daemon
-grep -q "single-node" "$WORK/vgd.log" && log "daemon reports single-node write-back mode"
+start_server
+grep -q "single-node" "$WORK/vgd.log" && log "server reports single-node write-back mode"
 
 # ---- take the origin down: force the ack-before-flush window --------------- #
 log "stopping MinIO — the origin is now unreachable"
@@ -142,8 +142,8 @@ DIRTY="$(grep -rl '"Dirty"' "$CACHE_DIR"/writeback-journals/ 2>/dev/null | head 
 [[ -n "$DIRTY" ]] || { log "FAIL: no dirty journal after ack"; exit 1; }
 log "dirty journal on disk: $(basename "$DIRTY")"
 
-# ---- kill -9 the daemon between the ack and the S3 flush ------------------- #
-log "kill -9 verglasd (PID $VGD_PID) — crash between ack and flush"
+# ---- kill -9 the server between the ack and the S3 flush ------------------- #
+log "kill -9 verglas-server (PID $VGD_PID) — crash between ack and flush"
 kill -9 "$VGD_PID"; wait "$VGD_PID" 2>/dev/null || true; VGD_PID=""
 
 # ---- origin returns; prove the object was NEVER flushed pre-crash ---------- #
@@ -156,9 +156,9 @@ if minio s3api head-object --bucket "$BUCKET" --key "$KEY" >/dev/null 2>&1; then
 fi
 log "confirmed: object is ABSENT from S3 immediately after the crash"
 
-# ---- restart the daemon: boot recovery must replay the segment to S3 ------- #
-log "restarting verglasd — boot recovery replays the unflushed segment"
-start_daemon
+# ---- restart the server: boot recovery must replay the segment to S3 ------- #
+log "restarting verglas-server — boot recovery replays the unflushed segment"
+start_server
 
 log "waiting for the recovered segment to reach S3 (direct MinIO read, no Verglas)"
 GOT=""

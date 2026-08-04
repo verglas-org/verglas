@@ -342,7 +342,7 @@ pub struct ObjectAttributes {
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
     /// The bucket does not exist (`NoSuchBucket`, 404): either the request named
-    /// a bucket other than the one this daemon serves, or the origin reports the
+    /// a bucket other than the one this server serves, or the origin reports the
     /// configured bucket is gone.
     #[error("bucket does not exist")]
     NoSuchBucket,

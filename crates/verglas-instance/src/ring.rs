@@ -148,7 +148,7 @@ impl RingMembership for LocalRing {
 /// Adapts any key-ownership [`Ring`] into a [`RingMembership`] for placement,
 /// with read-from-peer supplied separately (or absent).
 ///
-/// The daemon builds this over the same live gossip ring it already serves from
+/// The server builds this over the same live gossip ring it already serves from
 /// ([`verglas_cluster::LiveRing`]), so instance-level placement is identical to
 /// today's read path — no divergence between "the ring the engine uses" and
 /// "the ring the instance reports." The fleet layers its remote peer transport

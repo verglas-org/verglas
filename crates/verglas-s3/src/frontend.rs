@@ -2,7 +2,7 @@
 //! (`GetObject`/`HeadObject`) on top of the [`ObjectRead`] interface and the write
 //! surface (`PutObject`, `DeleteObject`(s), `CopyObject`, the multipart
 //! lifecycle) on top of the [`ObjectWrite`] interface, exposing the whole thing as
-//! an axum router the daemon can bind to `listen.s3_port`. s3s owns request
+//! an axum router the server can bind to `listen.s3_port`. s3s owns request
 //! parsing, error XML rendering, and status codes; this module owns the
 //! mapping between S3 semantics and the interfaces — including the write path's
 //! ordering invariant: backend durable, then invalidation, then (and only
@@ -71,7 +71,7 @@ pub struct VerglasS3<R, W> {
     invalidation: Arc<dyn Invalidation>,
     /// Node-level Prometheus metrics (#46): each request records its duration
     /// and outcome here. `None` in tests that do not exercise metrics; the
-    /// daemon always wires one.
+    /// server always wires one.
     metrics: Option<Arc<NodeMetrics>>,
     /// Bounds live S3 response bytes while allowing small Parquet ranges much
     /// more concurrency than large response bodies (#254).
@@ -98,7 +98,7 @@ impl<R: ObjectRead, W: ObjectWrite> VerglasS3<R, W> {
     }
 
     /// Like [`VerglasS3::new`] but records request metrics into `metrics` (#46) —
-    /// the daemon path.
+    /// the server path.
     pub fn with_metrics(
         reader: R,
         writer: W,
@@ -1058,9 +1058,9 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         Ok(S3Response::new(output))
     }
 
-    /// ListBuckets: returns an empty bucket list. The daemon serves a configured
+    /// ListBuckets: returns an empty bucket list. The server serves a configured
     /// bucket set (a single bucket and/or glob patterns, #235) addressed
-    /// directly; a glob set cannot be enumerated ahead of time, and the daemon
+    /// directly; a glob set cannot be enumerated ahead of time, and the server
     /// does not enumerate the origin estate. Answering with an empty list (rather
     /// than a not-supported error) keeps clients that probe ListBuckets on
     /// connect working; enumerating the served set is a follow-up.
@@ -1974,7 +1974,7 @@ pub fn router<R: ObjectRead, W: ObjectWrite>(
 ///   operations (HeadBucket, GetBucketLocation) are forwarded to the origin
 ///   resolved through `stores` before s3s's typed dispatch would 501 them.
 ///   `None` keeps s3s's default 501 for unmodeled operations.
-/// - `serving_api`: when `Some`, the daemon's query and logical-write execution
+/// - `serving_api`: when `Some`, the server's query and logical-write execution
 ///   API is served on this SigV4-gated
 ///   surface too, forwarded to the given handler before s3s's typed dispatch.
 ///   Unsigned requests are rejected with `AccessDenied` by the route's default
@@ -2022,7 +2022,7 @@ pub fn router_with_passthrough<R: ObjectRead, W: ObjectWrite>(
             ));
         }
         if let Some(api) = serving_api {
-            // The daemon's `/v1` serving API on the SigV4-gated surface: the
+            // The server's `/v1` serving API on the SigV4-gated surface: the
             // edge re-signs cache-pathed `/v1` forwards with the cache keypair
             // and they land here.
             routes.push(Box::new(crate::serving_api::V1ServingRoute::new(api)));

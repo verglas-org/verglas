@@ -9,7 +9,7 @@ publish.workspace = true
 
 [dependencies]
 verglas-core.workspace = true
-# The data-plane verbs speak the daemon HTTP API (#323); verglas-sdk carries
+# The data-plane verbs speak the server HTTP API (#323); verglas-sdk carries
 # the report and tables_api wire types they deserialize and render.
 verglas-sdk.workspace = true
 clap.workspace = true
@@ -17,23 +17,17 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 chrono = "0.4.44"
-tempfile.workspace = true
 thiserror.workspace = true
 # The control-plane client reads the stored URL out of `~/.verglas/config.toml`
 # and `verglas login` writes the `[control_plane]` section back into it.
 toml.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "process", "time"] }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 # The browser login flow needs secure random bytes (PKCE verifier + OAuth state),
 # a SHA-256 for the PKCE challenge, and base64url-no-pad encoding. Versions pinned
 # to the ones already resolved in Cargo.lock so no other crate's lock entry moves.
 getrandom = "0.2.17"
 sha2 = "0.10.9"
 base64 = "0.22.1"
-
-[target.'cfg(unix)'.dependencies]
-# getuid to address the launchd GUI domain (gui/<uid>) for a per-user
-# LaunchAgent (#216); already in the lock via verglas-core, so no new dep.
-libc.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true

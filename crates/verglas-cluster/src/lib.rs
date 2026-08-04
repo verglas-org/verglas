@@ -20,7 +20,7 @@ pub mod ring;
 
 /// Gossip transports, re-exported so consumers construct them without a direct
 /// `chitchat` dependency: [`UdpTransport`](transport::UdpTransport) in the
-/// daemon, [`ChannelTransport`](transport::ChannelTransport) (in-process) in
+/// server, [`ChannelTransport`](transport::ChannelTransport) (in-process) in
 /// tests. This is the only chitchat surface that leaks past this crate.
 pub mod transport {
     pub use chitchat::transport::{ChannelTransport, Transport, UdpTransport};

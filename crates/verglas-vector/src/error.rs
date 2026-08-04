@@ -6,7 +6,7 @@ use thiserror::Error;
 pub type Result<T> = std::result::Result<T, VectorError>;
 
 /// Everything that can go wrong building, serializing, or querying a Vamana
-/// index, or persisting it to the shadow store.
+/// index, or attaching it to an Iceberg snapshot.
 #[derive(Debug, Error)]
 pub enum VectorError {
     /// A query or insert vector did not match the index dimensionality.
@@ -36,9 +36,20 @@ pub enum VectorError {
     #[error("no id column: {0}")]
     NoIdColumn(String),
 
-    /// The shadow store could not read or write a blob.
-    #[error("shadow store: {0}")]
-    Store(String),
+    /// The requested table snapshot has no attached Vamana index.
+    #[error("no Vamana index for {table}.{field} at snapshot {snapshot:?}")]
+    IndexNotFound {
+        /// The source table.
+        table: String,
+        /// The indexed field.
+        field: String,
+        /// The exact requested snapshot, or `None` when the table is empty.
+        snapshot: Option<i64>,
+    },
+
+    /// The disposable decoded-index cache was poisoned.
+    #[error("vector serving cache: {0}")]
+    Cache(String),
 
     /// A Puffin container read/write failed.
     #[error("puffin: {0}")]
@@ -55,8 +66,4 @@ pub enum VectorError {
     /// Arrow decoding of a vector column failed.
     #[error("arrow: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
-
-    /// Local IO to the shadow store failed.
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
 }

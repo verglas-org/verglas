@@ -344,7 +344,7 @@ impl Admission {
 
     /// Resets the pressure proxy, frequency sketch, and probabilistic-admitter
     /// accumulator to cold — called when the cache is purged (#138) so a
-    /// repeat-cold leg starts admitting freely again, exactly as a fresh daemon
+    /// repeat-cold leg starts admitting freely again, exactly as a fresh server
     /// would.
     pub(crate) fn reset(&self) {
         self.admitted_bytes.store(0, Ordering::Relaxed);

@@ -4,7 +4,7 @@
 //!
 //! # Transport selection (no config knob)
 //!
-//! At startup and after failures the daemon attempts a websocket upgrade at
+//! At startup and after failures the server attempts a websocket upgrade at
 //! `<catalog origin>/v1/catalog/feed` with the same bearer auth it uses for
 //! catalog requests. A `101` means the upstream is the Verglas catalog and the
 //! websocket is the feed; anything else (a `404`, a non-`101` response, a
@@ -18,7 +18,7 @@
 //! [`super::watcher::refresh_table`]). The last-seen event sequence is kept in
 //! this task's memory and replayed on reconnect (in-memory per process is
 //! enough for v1 — a resync recovers a cursor the server has aged out; the
-//! daemon's cache dir would be the natural home for cross-restart persistence).
+//! server's cache dir would be the natural home for cross-restart persistence).
 //! On a socket drop the task reconnects with exponential backoff (cap ~1 min),
 //! re-subscribing from the last-seen sequence; a catch-up polling pass on each
 //! reconnect covers the gap.
@@ -68,7 +68,7 @@ pub struct WsFeedConfig {
 impl WsFeedConfig {
     /// Derives the feed URL from the catalog HTTP `uri`'s origin (scheme +
     /// authority), pairing `http`→`ws` and `https`→`wss`. Returns `None` when
-    /// the uri has no usable `scheme://authority` — the daemon then polls only.
+    /// the uri has no usable `scheme://authority` — the server then polls only.
     pub fn from_catalog_uri(uri: &str, bearer: Option<String>) -> Option<WsFeedConfig> {
         Some(WsFeedConfig {
             url: feed_url(uri)?,
@@ -298,7 +298,7 @@ mod tests {
     }
 
     /// A uri without a usable origin (or an unknown scheme) yields no feed URL,
-    /// so the daemon polls only.
+    /// so the server polls only.
     #[test]
     fn feed_url_rejects_unusable_uris() {
         assert_eq!(feed_url("not-a-url"), None);

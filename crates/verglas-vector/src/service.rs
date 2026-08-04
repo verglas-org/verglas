@@ -1,151 +1,101 @@
-//! The daemon-facing index service: declare, refresh, and search over the
-//! shadow store, with a brute-force fallback.
+//! Server-facing declaration, refresh, discovery, and ANN search over
+//! snapshot-bound Iceberg Vamana attachments.
 //!
-//! This is the thin layer the daemon routes call. It owns:
-//! - a [`ShadowBlobStore`] (injected placement),
-//! - a registry of declared indexes (field → [`MaintenanceConfig`]), and
-//! - an in-memory cache of decoded indexes for serving.
-//!
-//! Declaring an index registers it and runs the initial build (a full
-//! [`run_maintenance`]). Searching loads the index from the cache/shadow store
-//! and runs GreedySearch; when no index blob exists it falls back to brute force
-//! over the column (the turn-off path).
-//!
-//! The in-memory registry is a PROJECTION of the durable `verglas_sys.indexes`
-//! registry, not the source of truth. On daemon boot [`VectorService::rehydrate`]
-//! replays each declared row: it restores the maintenance config into this
-//! in-memory registry and either loads the present shadow-store blob (serve
-//! immediately) or rebuilds a missing one. The durable write of the registry row
-//! lives in the daemon (which owns the `SystemCatalog`); this crate stays free of
-//! the platform control-plane dependency and takes the reconstructed config back
-//! through `rehydrate`.
+//! The table metadata is the only registry. Search loads the attachment for the
+//! table's exact current snapshot and keeps a decoded in-process copy keyed by
+//! `(table, field, snapshot)`. Missing attachments are errors; this prototype
+//! has no brute-force, shadow-store, or rebuild compatibility path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use iceberg::{Catalog, TableIdent};
 
+use crate::attachment::{list_indexes_for_snapshot, load_index_for_snapshot};
 use crate::error::{Result, VectorError};
-use crate::maintenance::{
-    MaintenanceConfig, MaintenanceReport, load_latest_index, run_maintenance,
-};
+use crate::maintenance::{MaintenanceConfig, MaintenanceReport, run_maintenance};
 use crate::metric::Metric;
-use crate::store::{IndexKey, ShadowBlobStore};
 use crate::vamana::{Neighbor, VamanaIndex};
 
-/// Whether a search was served from the ANN index or the brute-force fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchSource {
-    /// Served from the maintained Vamana index.
-    Index,
-    /// Served by brute force over the column (no index for this field).
-    BruteForce,
+/// The logical identity of a vector index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IndexKey {
+    /// Stable logical source id, such as `tbl:default.docs` or `graph:kg`.
+    pub target: String,
+    /// The embedding field stored in the Vamana blob properties.
+    pub field: String,
 }
 
-/// Search parameters. `default_metric`/`default_id_field` are used only on the
-/// brute-force fallback for a field that was never declared (the index path
-/// takes metric/id from the blob and registry).
+impl IndexKey {
+    /// Constructs a key for a table embedding field.
+    pub fn table(ident: &str, field: &str) -> Self {
+        Self {
+            target: format!("tbl:{ident}"),
+            field: field.to_owned(),
+        }
+    }
+
+    /// Constructs a key for a graph node-table embedding field.
+    pub fn graph(namespace: &str, field: &str) -> Self {
+        Self {
+            target: format!("graph:{namespace}"),
+            field: field.to_owned(),
+        }
+    }
+}
+
+/// ANN search parameters.
 #[derive(Debug, Clone)]
 pub struct SearchOptions {
     /// Number of neighbors to return.
     pub k: usize,
-    /// Candidate-list size `L`.
+    /// Candidate-list size used by Vamana GreedySearch.
     pub l: usize,
-    /// Metric for the brute-force fallback when the field is undeclared.
-    pub default_metric: Metric,
-    /// Id column for the brute-force fallback when the field is undeclared.
-    pub default_id_field: String,
 }
 
-/// The result of a search: neighbors and how they were produced.
+/// A successful indexed search.
 #[derive(Debug, Clone)]
 pub struct SearchOutcome {
-    /// Nearest-first neighbors.
+    /// Nearest-first neighbors from Vamana.
     pub neighbors: Vec<Neighbor>,
-    /// Index vs brute-force fallback.
-    pub source: SearchSource,
 }
 
-/// The outcome of rehydrating one declared index from the durable registry on
-/// boot: either the cluster-local blob was present and loaded (served without a
-/// rebuild), or no blob existed and the index was rebuilt from the source table.
-#[derive(Debug, Clone)]
-pub enum RehydrateOutcome {
-    /// The shadow-store blob was present and loaded into the serving cache — the
-    /// index serves immediately, no rebuild.
-    ServedFromBlob {
-        /// The snapshot the loaded blob reflects.
-        reflected_snapshot: i64,
-        /// Live vectors in the loaded blob.
-        live_count: usize,
-    },
-    /// No blob was present, so the index was rebuilt via the maintenance MV.
-    /// `None` when the source table had no rows yet (nothing to build).
-    Rebuilt(Option<MaintenanceReport>),
-}
-
-/// A declared index, for listing.
+/// One index advertised by the current table snapshot.
 #[derive(Debug, Clone)]
 pub struct IndexDescriptor {
-    /// The logical target (`tbl:...` / `graph:...`).
+    /// The logical target supplied by the route.
     pub target: String,
-    /// The embedding field.
+    /// The indexed embedding field.
     pub field: String,
-    /// The distance metric.
+    /// The configured distance metric.
     pub metric: Metric,
-    /// The source snapshot the current blob reflects, if built.
-    pub reflected_snapshot: Option<i64>,
-    /// Live vectors in the current blob, if built.
-    pub live_count: Option<usize>,
+    /// The exact source snapshot carrying the attachment.
+    pub reflected_snapshot: i64,
+    /// Number of live vectors in the attached index.
+    pub live_count: usize,
 }
 
-/// The index service backing the daemon's declare/search routes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    table: String,
+    field: String,
+    snapshot: i64,
+}
+
+/// The vector service. Durable state lives exclusively in Iceberg; this owns
+/// only disposable decoded indexes for the running process.
+#[derive(Default)]
 pub struct VectorService {
-    store: Arc<dyn ShadowBlobStore>,
-    registry: Mutex<HashMap<IndexKey, MaintenanceConfig>>,
-    cache: Mutex<HashMap<IndexKey, Arc<VamanaIndex>>>,
+    cache: Mutex<HashMap<CacheKey, Arc<VamanaIndex>>>,
 }
 
 impl VectorService {
-    /// A service over `store`.
-    pub fn new(store: Arc<dyn ShadowBlobStore>) -> Self {
-        VectorService {
-            store,
-            registry: Mutex::new(HashMap::new()),
-            cache: Mutex::new(HashMap::new()),
-        }
+    /// Creates an empty disposable serving cache.
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    fn lock_registry(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, HashMap<IndexKey, MaintenanceConfig>>> {
-        self.registry
-            .lock()
-            .map_err(|e| VectorError::Store(format!("registry lock: {e}")))
-    }
-
-    fn cache_put(&self, key: &IndexKey, index: VamanaIndex) -> Result<Arc<VamanaIndex>> {
-        let arc = Arc::new(index);
-        self.cache
-            .lock()
-            .map_err(|e| VectorError::Store(format!("cache lock: {e}")))?
-            .insert(key.clone(), arc.clone());
-        Ok(arc)
-    }
-
-    fn cache_get(&self, key: &IndexKey) -> Result<Option<Arc<VamanaIndex>>> {
-        Ok(self
-            .cache
-            .lock()
-            .map_err(|e| VectorError::Store(format!("cache lock: {e}")))?
-            .get(key)
-            .cloned())
-    }
-
-    /// Declares an index on a field and runs the initial build. Registers the
-    /// maintenance config so later [`VectorService::refresh`] runs know how to
-    /// read the source, and warms the serving cache. Returns the build report
-    /// (`None` when the source has no rows yet).
+    /// Builds and attaches an index to the table's current snapshot.
     pub async fn declare(
         &self,
         catalog: &dyn Catalog,
@@ -153,185 +103,176 @@ impl VectorService {
         key: IndexKey,
         config: MaintenanceConfig,
     ) -> Result<Option<MaintenanceReport>> {
-        self.lock_registry()?.insert(key.clone(), config.clone());
-        let report = run_maintenance(catalog, ident, &key, self.store.as_ref(), &config).await?;
-        if report.is_some()
-            && let Some(index) = load_latest_index(self.store.as_ref(), &key).await?
-        {
-            self.cache_put(&key, index)?;
+        if key.field != config.vec_field {
+            return Err(VectorError::Field(format!(
+                "index key field '{}' differs from config field '{}'",
+                key.field, config.vec_field
+            )));
+        }
+        let report = run_maintenance(catalog, ident, &config).await?;
+        if let Some(report) = &report {
+            self.load_and_cache(catalog, ident, &key.field, report.reflected_snapshot)
+                .await?;
         }
         Ok(report)
     }
 
-    /// Registers a maintenance config into the in-memory registry WITHOUT
-    /// building — the config-only half of [`VectorService::declare`]. The daemon
-    /// uses it at boot to register the memory index (whose source table may not
-    /// exist until the first consolidation) so a later [`VectorService::refresh`]
-    /// knows how to read the source; the build lands when the table has rows.
-    pub fn register(&self, key: IndexKey, config: MaintenanceConfig) -> Result<()> {
-        self.lock_registry()?.insert(key, config);
-        Ok(())
-    }
-
-    /// Rehydrates one index from the durable registry on daemon boot: restores
-    /// its maintenance config into the in-memory projection, then either loads
-    /// the present shadow-store blob into the serving cache (serve immediately,
-    /// no rebuild) or, when no blob is present, rebuilds it via the maintenance
-    /// MV. The registry is the source of truth; the in-memory registry/cache is
-    /// the projection this rebuilds after a restart.
-    pub async fn rehydrate(
-        &self,
-        catalog: &dyn Catalog,
-        ident: &TableIdent,
-        key: IndexKey,
-        config: MaintenanceConfig,
-    ) -> Result<RehydrateOutcome> {
-        self.lock_registry()?.insert(key.clone(), config.clone());
-        if let Some(index) = load_latest_index(self.store.as_ref(), &key).await? {
-            let reflected_snapshot = index.reflected_snapshot();
-            let live_count = index.len();
-            self.cache_put(&key, index)?;
-            return Ok(RehydrateOutcome::ServedFromBlob {
-                reflected_snapshot,
-                live_count,
-            });
-        }
-        // No blob in the shadow store — rebuild from the source table.
-        let report = run_maintenance(catalog, ident, &key, self.store.as_ref(), &config).await?;
-        if report.is_some()
-            && let Some(index) = load_latest_index(self.store.as_ref(), &key).await?
-        {
-            self.cache_put(&key, index)?;
-        }
-        Ok(RehydrateOutcome::Rebuilt(report))
-    }
-
-    /// Runs a maintenance pass for a previously declared index (a cron/manual
-    /// trigger). Errors if the field was never declared in this process.
+    /// Refreshes an existing attached index to the table's current snapshot.
+    /// The nearest attached ancestor supplies the build configuration.
     pub async fn refresh(
         &self,
         catalog: &dyn Catalog,
         ident: &TableIdent,
         key: &IndexKey,
     ) -> Result<Option<MaintenanceReport>> {
-        let config = self
-            .lock_registry()?
-            .get(key)
-            .cloned()
-            .ok_or_else(|| VectorError::Field(format!("index '{}' not declared", key.field)))?;
-        let report = run_maintenance(catalog, ident, key, self.store.as_ref(), &config).await?;
-        if report.is_some()
-            && let Some(index) = load_latest_index(self.store.as_ref(), key).await?
-        {
-            self.cache_put(key, index)?;
+        let table = catalog.load_table(ident).await?;
+        let snapshot =
+            table
+                .metadata()
+                .current_snapshot_id()
+                .ok_or_else(|| VectorError::IndexNotFound {
+                    table: ident.to_string(),
+                    field: key.field.clone(),
+                    snapshot: None,
+                })?;
+        let attached = crate::attachment::load_latest_ancestor_index(&table, snapshot, &key.field)
+            .await?
+            .ok_or_else(|| VectorError::IndexNotFound {
+                table: ident.to_string(),
+                field: key.field.clone(),
+                snapshot: Some(snapshot),
+            })?;
+        let report = run_maintenance(catalog, ident, &attached.config).await?;
+        if let Some(report) = &report {
+            self.load_and_cache(catalog, ident, &key.field, report.reflected_snapshot)
+                .await?;
         }
         Ok(report)
     }
 
-    /// Searches `field` for the `k` nearest neighbors of `query`. Serves from the
-    /// maintained index when a blob exists (cache first, then shadow store), else
-    /// falls back to brute force over the column. `default_metric` is used only
-    /// for the brute-force path when the field was never declared.
+    /// Searches the Vamana attachment bound to the exact current snapshot.
+    /// Missing or stale attachments are returned as errors.
     pub async fn search(
         &self,
         catalog: &dyn Catalog,
         ident: &TableIdent,
         key: &IndexKey,
         query: &[f32],
-        opts: &SearchOptions,
+        options: &SearchOptions,
     ) -> Result<SearchOutcome> {
-        // Cache, then shadow store.
-        let cached = self.cache_get(key)?;
-        let index = match cached {
-            Some(idx) => Some(idx),
-            None => match load_latest_index(self.store.as_ref(), key).await? {
-                Some(idx) => Some(self.cache_put(key, idx)?),
-                None => None,
-            },
+        let table = catalog.load_table(ident).await?;
+        let snapshot =
+            table
+                .metadata()
+                .current_snapshot_id()
+                .ok_or_else(|| VectorError::IndexNotFound {
+                    table: ident.to_string(),
+                    field: key.field.clone(),
+                    snapshot: None,
+                })?;
+        let cache_key = CacheKey {
+            table: ident.to_string(),
+            field: key.field.clone(),
+            snapshot,
         };
-        if let Some(index) = index {
-            let neighbors = index.search(query, opts.k, opts.l)?;
-            return Ok(SearchOutcome {
-                neighbors,
-                source: SearchSource::Index,
-            });
-        }
-
-        // Brute-force fallback (turn-off path): metric/id from the registry if
-        // declared, else the caller's defaults.
-        let (metric, id_field, encoding) = {
-            let reg = self.lock_registry()?;
-            match reg.get(key) {
-                Some(cfg) => (cfg.metric, cfg.id_field.clone(), cfg.id_encoding),
-                None => (
-                    opts.default_metric,
-                    opts.default_id_field.clone(),
-                    crate::maintenance::IdEncoding::default(),
-                ),
+        let cached = self
+            .cache
+            .lock()
+            .map_err(|error| VectorError::Cache(error.to_string()))?
+            .get(&cache_key)
+            .cloned();
+        let index = match cached {
+            Some(index) => index,
+            None => {
+                let attached = load_index_for_snapshot(&table, snapshot, &key.field)
+                    .await?
+                    .ok_or_else(|| VectorError::IndexNotFound {
+                        table: ident.to_string(),
+                        field: key.field.clone(),
+                        snapshot: Some(snapshot),
+                    })?;
+                self.cache_index(cache_key, attached.index)?
             }
         };
-        let rows = read_all_vectors(catalog, ident, &id_field, &key.field, encoding).await?;
-        let neighbors = crate::brute_force_search(metric, query.len(), &rows, query, opts.k)?;
         Ok(SearchOutcome {
-            neighbors,
-            source: SearchSource::BruteForce,
+            neighbors: index.search(query, options.k, options.l)?,
         })
     }
 
-    /// Whether a built index blob is available to serve `key` — in the serving
-    /// cache, or loadable from the shadow store. A recall seed source consults
-    /// this before searching so the no-index case takes its own brute-force
-    /// path (the turn-off) rather than paying for the search's whole-table
-    /// fallback scan.
-    pub async fn served(&self, key: &IndexKey) -> Result<bool> {
-        if self.cache_get(key)?.is_some() {
-            return Ok(true);
-        }
-        Ok(self.store.latest(key).await?.is_some())
-    }
-
-    /// Lists declared indexes with their current build state.
-    pub async fn list(&self) -> Result<Vec<IndexDescriptor>> {
-        let entries: Vec<(IndexKey, Metric)> = {
-            let reg = self.lock_registry()?;
-            reg.iter().map(|(k, c)| (k.clone(), c.metric)).collect()
+    /// Returns whether the exact current snapshot advertises `field`.
+    pub async fn served(
+        &self,
+        catalog: &dyn Catalog,
+        ident: &TableIdent,
+        field: &str,
+    ) -> Result<bool> {
+        let table = catalog.load_table(ident).await?;
+        let Some(snapshot) = table.metadata().current_snapshot_id() else {
+            return Ok(false);
         };
-        let mut out = Vec::with_capacity(entries.len());
-        for (key, metric) in entries {
-            let (reflected_snapshot, live_count) =
-                match load_latest_index(self.store.as_ref(), &key).await? {
-                    Some(idx) => (Some(idx.reflected_snapshot()), Some(idx.len())),
-                    None => (None, None),
-                };
-            out.push(IndexDescriptor {
-                target: key.target,
-                field: key.field,
-                metric,
-                reflected_snapshot,
-                live_count,
-            });
-        }
-        Ok(out)
+        Ok(load_index_for_snapshot(&table, snapshot, field)
+            .await?
+            .is_some())
     }
-}
 
-/// Reads every `(id, vector)` pair from the current snapshot for the brute-force
-/// fallback. Skips rows with a null embedding.
-async fn read_all_vectors(
-    catalog: &dyn Catalog,
-    ident: &TableIdent,
-    id_field: &str,
-    vec_field: &str,
-    encoding: crate::maintenance::IdEncoding,
-) -> Result<Vec<(i64, Vec<f32>)>> {
-    let resp = verglas_iceberg::tables_api::rows(catalog, ident, None, None).await?;
-    let mut out = Vec::with_capacity(resp.rows.len());
-    for row in &resp.rows {
-        if let Some((id, Some(vector))) =
-            crate::maintenance::parse_row(row, id_field, vec_field, encoding)?
-        {
-            out.push((id, vector));
-        }
+    /// Lists every Vamana blob attached to the exact current snapshot.
+    pub async fn list(
+        &self,
+        catalog: &dyn Catalog,
+        ident: &TableIdent,
+        target: &str,
+    ) -> Result<Vec<IndexDescriptor>> {
+        let table = catalog.load_table(ident).await?;
+        let Some(snapshot) = table.metadata().current_snapshot_id() else {
+            return Ok(Vec::new());
+        };
+        Ok(list_indexes_for_snapshot(&table, snapshot)
+            .await?
+            .into_iter()
+            .map(|attached| IndexDescriptor {
+                target: target.to_owned(),
+                field: attached.config.vec_field,
+                metric: attached.index.metric(),
+                reflected_snapshot: snapshot,
+                live_count: attached.index.len(),
+            })
+            .collect())
     }
-    Ok(out)
+
+    /// Loads the exact attachment and inserts its decoded index into the
+    /// disposable serving cache.
+    async fn load_and_cache(
+        &self,
+        catalog: &dyn Catalog,
+        ident: &TableIdent,
+        field: &str,
+        snapshot: i64,
+    ) -> Result<Arc<VamanaIndex>> {
+        let table = catalog.load_table(ident).await?;
+        let attached = load_index_for_snapshot(&table, snapshot, field)
+            .await?
+            .ok_or_else(|| VectorError::IndexNotFound {
+                table: ident.to_string(),
+                field: field.to_owned(),
+                snapshot: Some(snapshot),
+            })?;
+        self.cache_index(
+            CacheKey {
+                table: ident.to_string(),
+                field: field.to_owned(),
+                snapshot,
+            },
+            attached.index,
+        )
+    }
+
+    /// Inserts one decoded index into the process-local serving cache.
+    fn cache_index(&self, key: CacheKey, index: VamanaIndex) -> Result<Arc<VamanaIndex>> {
+        let index = Arc::new(index);
+        self.cache
+            .lock()
+            .map_err(|error| VectorError::Cache(error.to_string()))?
+            .insert(key, index.clone());
+        Ok(index)
+    }
 }

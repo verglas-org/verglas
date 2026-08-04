@@ -19,9 +19,9 @@ PREFIX="${TPCH_PREFIX:-}"                 # resolved below once SCALE is known
 NAMESPACE="${TPCH_NAMESPACE:-tpch}"
 CATALOG_DB="${TPCH_CATALOG_DB:-$HERE/catalog.db}"
 READ_MODE="${TPCH_READ_MODE:-auto}"
-CACHE_NOTE="${TPCH_CACHE_NOTE:-daemon --cache-dir (medium unspecified)}"
+CACHE_NOTE="${TPCH_CACHE_NOTE:-server --cache-dir (medium unspecified)}"
 PROFILE="${TPCH_PROFILE:-unspecified}"        # dram-resident | nvme-resident | constrained
-ADMIN_ENDPOINT="${TPCH_ADMIN_ENDPOINT:-}"     # daemon /admin/stats URL; empty derives it
+ADMIN_ENDPOINT="${TPCH_ADMIN_ENDPOINT:-}"     # server /admin/stats URL; empty derives it
 
 # Verglas endpoint + dev keys (from the `verglas dev` banner). The dev command
 # also exports these env names, so they can be sourced instead of flagged.
@@ -53,7 +53,7 @@ Inputs:
   --read-mode MODE   auto | duckdb-iceberg | pyiceberg-arrow (default auto)
   --cache-note TEXT  cache-medium disclosure for the report
   --profile LABEL    tier profile: dram-resident | nvme-resident | constrained
-  --admin-endpoint U daemon /admin/stats URL (cache budgets + counters);
+  --admin-endpoint U server /admin/stats URL (cache budgets + counters);
                      empty derives it from the endpoint's next port
   --json             emit machine-readable JSON
 

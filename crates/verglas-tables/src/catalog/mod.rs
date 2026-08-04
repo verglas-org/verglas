@@ -26,7 +26,7 @@ use std::fmt;
 use async_trait::async_trait;
 use tokio::sync::{broadcast, watch};
 
-pub use rest::{CatalogGateway, CatalogResponse, RestCatalogSource};
+pub use rest::RestCatalogSource;
 pub use watcher::{CatalogFeed, PollingWatcher, WatcherOptions};
 pub use websocket::WsFeedConfig;
 
@@ -200,7 +200,7 @@ pub struct TableFilter {
 }
 
 impl TableFilter {
-    /// Builds a filter from pattern slices (test/daemon convenience).
+    /// Builds a filter from pattern slices (test/server convenience).
     pub fn new(include: &[&str], exclude: &[&str]) -> TableFilter {
         TableFilter {
             include: include.iter().map(|s| (*s).to_owned()).collect(),

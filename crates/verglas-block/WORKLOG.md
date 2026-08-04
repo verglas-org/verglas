@@ -34,3 +34,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   reconstruct-and-drain committing the version exactly once, quorum-short fallback
   to the synchronous barrier, and the device-level single-node read-back.
 - #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.
+- #91: Updated block-tier ownership documentation for the renamed server
+  process. The ring and durability contracts are unchanged.

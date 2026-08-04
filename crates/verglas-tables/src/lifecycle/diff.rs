@@ -117,7 +117,7 @@ pub async fn diff_snapshot(
 }
 
 /// Diffs a specific [`SnapshotRef`] already resolved from a `metadata.json`.
-/// The core the daemon calls when it has parsed the doc once and holds the ref.
+/// The core the server calls when it has parsed the doc once and holds the ref.
 pub async fn diff_from_snapshot_ref(
     fetch: &dyn MetadataFetch,
     bucket: &str,

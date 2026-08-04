@@ -136,7 +136,6 @@ async fn build_engine(
         dir: dir.path().to_path_buf(),
         capacity_bytes: ByteSize(256 * 1024 * 1024),
         dram_bytes: ByteSize(128 * 1024 * 1024),
-        shadow_capacity_bytes: ByteSize(1024 * 1024),
         ..CacheConfig::default()
     };
     let engine = Arc::new(
@@ -669,10 +668,10 @@ async fn wait_until(cond: impl Fn() -> bool) {
 use verglas_tables::catalog::{CatalogError, CatalogSource, PollingWatcher, WatcherOptions};
 
 /// A catalog source whose table set exists BEFORE any watcher polls it — the
-/// "daemon starts against an already-populated catalog" scenario. Each call
+/// "server starts against an already-populated catalog" scenario. Each call
 /// takes a few milliseconds, as any real REST catalog does: the first poll
 /// must still be in flight while the coordinator starts up, which is exactly
-/// the timing window the daemon hits against a real catalog.
+/// the timing window the server hits against a real catalog.
 struct PreExistingSource {
     table: TableIdent,
     state: TableState,
@@ -696,7 +695,7 @@ impl CatalogSource for PreExistingSource {
 }
 
 /// #168 bug reproduction: a table that already exists in the catalog when the
-/// daemon (watcher + coordinator) starts MUST be warmed by the startup pass,
+/// server (watcher + coordinator) starts MUST be warmed by the startup pass,
 /// without waiting for its next commit. Before the fix the coordinator's
 /// initial `warm_all` ran against the watcher's still-empty pre-first-poll
 /// state, and the seeding poll emits no events, so the table was never warmed.
@@ -725,7 +724,7 @@ async fn preexisting_table_is_warmed_on_startup_without_a_commit() {
         jitter: std::time::Duration::ZERO,
         ..WatcherOptions::default()
     };
-    // Daemon startup order: watcher spawns, then the coordinator binds to it.
+    // Server startup order: watcher spawns, then the coordinator binds to it.
     let watcher = Arc::new(PollingWatcher::spawn(source, options));
     let _handle = WarmingCoordinator::new(warmer, watcher).spawn();
 

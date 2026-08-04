@@ -7,7 +7,7 @@ runtime** (no Node APIs) and in **Node** locally.
 A worker is a small code artifact that runs in an isolated sandbox and uses this
 SDK to move data. The SDK is deliberately thin: it never reads Parquet or runs an
 Iceberg commit in JavaScript. It speaks a small HTTP contract to a Verglas
-**endpoint** — the local daemon or a cloud Verglas endpoint — which owns the
+**endpoint** — the local server or a cloud Verglas endpoint — which owns the
 catalog, the snapshots, and the content-addressed write path.
 
 ## The worker model
@@ -117,9 +117,9 @@ triggers: [{ type: "cron", schedule: "0 * * * *", startDate: "2026-01-01T00:00:0
 `connect` takes an endpoint and a token. The interface is identical; only the
 endpoint differs.
 
-- **Local** — point at the daemon's base URL (e.g. `http://127.0.0.1:8334`). The
-  daemon serves the loopback catalog and commits batches through its own write
-  path.
+- **Local** — point at the server's base URL (e.g. `http://127.0.0.1:8334`) for
+  Verglas APIs. Iceberg clients continue to use the customer's catalog endpoint
+  directly; the server never serves or proxies that catalog.
 - **Cloud** — point at the tenant's Verglas endpoint. The cloud commit service
   implements the same contract against the tenant's managed Iceberg REST catalog.
 
@@ -395,16 +395,16 @@ the SDK does no graph work in JS, it POSTs to the endpoint which owns the engine
 `Table` also carries real-time-maintained vector (ANN) search:
 `addIndex(field, opts?)` declares a streaming Vamana (DiskANN) index on an
 embedding field and runs the initial build; `listIndexes()` lists them;
-`searchIndex(field, vector, opts?)` returns the `k` nearest neighbors, serving
-from the maintained index or falling back to brute force over the column when no
-index exists (`result.source` reports which). The index is served from the
-cluster-local shadow store and is never committed to the table's Iceberg snapshot.
+`searchIndex(field, vector, opts?)` returns the `k` nearest neighbors from the
+index attached to the table's exact current snapshot. A missing attachment is
+an error. The durable `verglas-vamana-v1` Puffin file is published through the
+table's Iceberg statistics metadata and cached locally for serving.
 
 ## Automatic run logging + observability
 
 Every worker run — local or remote — emits standardized structured logs with **no
 logging code in the worker**. The runner (`runWorker`) does it. Because the SDK
-runs the same way against the local daemon and a cloud endpoint, this works
+runs the same way against the local server and a cloud endpoint, this works
 everywhere automatically.
 
 ### The `<name>_LOGS` standard table
@@ -466,7 +466,7 @@ await runWorker(worker, ctx, { logging: false });   // opt out entirely
 ### Retention (3-day TTL)
 
 `<name>_LOGS` retains a standard 3-day TTL, but the SDK does not own it. The
-serving runtime enforces retention: the daemon's housekeeping (and the cloud
+serving runtime enforces retention: the server's housekeeping (and the cloud
 committer's daily control-plane tick) drops `day` partitions past the cutoff. The
 SDK only writes the standard `day`-partitioned rows; growth control lives with
 whatever serves the lakehouse.
@@ -557,8 +557,8 @@ The root exports exactly two layers; internals live behind subpaths.
 
 Subpaths (internals the runner uses on the author's behalf — import only when
 building deploy tooling or tests): `@verglas/sdk/logging` (run logging +
-observability: `logsCharting`, `observabilityFor`), `@verglas/sdk/trajectory`
-(session-transcript normalization), `@verglas/sdk/examples` (reference workers).
+observability: `logsCharting`, `observabilityFor`), `@verglas/sdk/examples`
+(reference workers).
 
 ## Development
 

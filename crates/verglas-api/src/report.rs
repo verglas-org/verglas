@@ -1,4 +1,4 @@
-//! Serializable result shapes shared by daemon, SDK, engine, and CLI.
+//! Serializable result shapes shared by server, SDK, engine, and CLI.
 
 use std::collections::BTreeMap;
 

@@ -10,11 +10,6 @@
 //! [`build_adjacency_index`] is the index-builder seam: a callable engine
 //! function the platform's MV/index-builder Job will drive later (§7.7). The Job
 //! wiring is intentionally not here.
-//!
-//! Shadow-store note (extension point): over customer-owned graph tables the
-//! Puffin file belongs in the shadow artifact store, not the table's own
-//! metadata directory; the snapshot-keyed reference stays the binding. At
-//! framework level over Verglas-owned tables we write beside the table metadata.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -93,8 +88,7 @@ pub async fn build_adjacency_index(
         .map(|s| s.sequence_number())
         .unwrap_or(0);
 
-    // A unique path beside the table metadata. The daemon variant would target
-    // the shadow store (see module note).
+    // A unique path beside the table metadata.
     let blob_path = format!(
         "{}/metadata/verglas-graph-{}-{}.puffin",
         table.metadata().location(),

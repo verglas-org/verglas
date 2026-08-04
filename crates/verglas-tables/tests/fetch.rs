@@ -1,5 +1,5 @@
 //! Tests for the `MetadataFetch` trait: the offline `object_store` fetcher and
-//! the daemon through-cache `ObjectRead` adapter must both serve ranges and
+//! the server through-cache `ObjectRead` adapter must both serve ranges and
 //! suffixes identically.
 
 use std::collections::HashMap;

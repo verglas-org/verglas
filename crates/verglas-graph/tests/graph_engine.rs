@@ -1,7 +1,7 @@
 //! Hermetic acceptance tests for the graph-over-Iceberg engine.
 //!
 //! All in-process against an Iceberg `MemoryCatalog` over a temp warehouse (the
-//! same fixture the verglas-iceberg tests use) — no daemon, no MinIO, no
+//! same fixture the verglas-iceberg tests use) — no server, no MinIO, no
 //! network. They prove the load-bearing properties from #258:
 //!
 //! - index-vs-scan equivalence: k-hop / neighbors from the Puffin index match a

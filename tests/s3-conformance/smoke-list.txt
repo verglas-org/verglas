@@ -1,6 +1,6 @@
 # Fast PR-path subset: a handful of core GET/PUT/HEAD/RANGE/LIST/multipart/copy/
 # delete/error tests drawn from the green surface. Runs in seconds once the
-# daemon is up. The nightly job runs the FULL suite; this only catches gross
+# server is up. The nightly job runs the FULL suite; this only catches gross
 # regressions when the harness itself changes. Keep it small.
 s3tests/functional/test_s3.py::test_object_write_check_etag
 s3tests/functional/test_s3.py::test_object_write_read_update_read_delete

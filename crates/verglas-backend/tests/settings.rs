@@ -20,7 +20,7 @@ fn env_reader(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
 #[test]
 fn config_endpoint_and_region_win_over_env() {
     // A configured endpoint/region beats the AWS env vars, so a configured
-    // daemon reaches OCI without exporting anything.
+    // server reaches OCI without exporting anything.
     let backend = Backend {
         endpoint: Some("https://oci.example.com".to_owned()),
         region: Some("us-ashburn-1".to_owned()),
