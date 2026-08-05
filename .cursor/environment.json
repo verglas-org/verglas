@@ -1,0 +1,10 @@
+{
+  "install": "bash scripts/cloud/install.sh",
+  "start": "bash scripts/cloud/start.sh",
+  "terminals": [
+    {
+      "name": "verglas-server",
+      "command": "tail -n +1 -F /tmp/verglas-dev/verglas-server.log"
+    }
+  ]
+}
