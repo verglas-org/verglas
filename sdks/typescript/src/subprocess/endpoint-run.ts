@@ -1,17 +1,14 @@
 // The fleet COMMIT-ENDPOINT run mode: the bun entry a fleet microVM execs to run
-// a tenant WORKER against the live commit service, mirroring exactly what the
-// platform's cron dispatch does.
+// a tenant WORKER against the live commit service for one bounded event.
 //
-// One invocation = one bounded worker run for one scheduled interval, exactly
-// like one cron dispatch. This file maps the process environment onto a
-// `WorkerContext`, builds the cron trigger from the logical-time bindings the
-// control plane injects, runs the worker's handler once through the SDK's
+// One invocation = one bounded worker run. This file maps the process
+// environment onto a `WorkerContext`, validates the complete CloudEvent,
+// runs the worker's handler once through the SDK's
 // `runWorker` (so run logging to `<TARGET>_LOGS` is identical to the platform
 // path), and writes the harness result file.
 //
 // There is no durable watermark here: a worker is a pure function of its trigger
-// (logical time) and the committed data. The control plane owns scheduling,
-// backfill, and replay; this entry just runs the interval it was handed.
+// and the committed data. The control plane owns scheduling, retry, and replay.
 //
 // Usage: `bun endpoint-run.ts <module>` where <module> default-exports a worker
 // (a `WorkerDefinition` from `defineWorker`). Environment:
@@ -21,16 +18,9 @@
 //   DEPLOYMENT        (required) deployment/pipeline name (the `pipeline` log column)
 //   TARGET            (required) output table (its `<TARGET>_LOGS` sibling gets the run log)
 //
-// Trigger delivery — the control plane's fleet dispatch injects the trigger
-// payload as launch env vars (its channel for what the cloud dispatch carries
-// as body/headers):
+// Trigger delivery is one structured CloudEvents 1.0 envelope:
 //
-//   VERGLAS_TRIGGER        (optional) the trigger type. Absent or "cron" runs
-//                          the worker with a cron trigger; anything else is
-//                          refused — this entry only runs cron dispatches.
-//   VERGLAS_LOGICAL_DATE   (optional) the run's nominal scheduled instant (ISO 8601)
-//   VERGLAS_INTERVAL_START (optional) inclusive start of the run's logical interval (ISO 8601)
-//   VERGLAS_INTERVAL_END   (optional) exclusive end of the run's logical interval (ISO 8601)
+//   VERGLAS_CLOUD_EVENT    (required) complete serialized CloudEvent.
 //
 //   RESULT_PATH       (optional) where the result JSON lands; default /run/result.json
 //
@@ -45,7 +35,7 @@ import { dirname } from "node:path";
 import { connect } from "../client";
 import {
   runWorker,
-  type CronTriggerEvent,
+  type CloudEvent,
   type WorkerContext,
   type WorkerDefinition,
   type WorkerResult,
@@ -69,7 +59,13 @@ export interface EndpointRunOptions {
 }
 
 /** The env this mode itself requires; worker secrets are the worker's business. */
-const REQUIRED_ENV = ["VERGLAS_ENDPOINT", "VERGLAS_TOKEN", "DEPLOYMENT", "TARGET"] as const;
+const REQUIRED_ENV = [
+  "VERGLAS_ENDPOINT",
+  "VERGLAS_TOKEN",
+  "VERGLAS_CLOUD_EVENT",
+  "DEPLOYMENT",
+  "TARGET",
+] as const;
 
 const DEFAULT_RESULT_PATH = "/run/result.json";
 
@@ -77,14 +73,23 @@ function failure(message: string): EndpointRunResult {
   return { rows: 0, error: message };
 }
 
-/** Builds the cron trigger from the VERGLAS_* logical-time bindings, if present.
- *  A dispatch that carries none leaves the interval fields undefined. */
-function cronTrigger(env: Record<string, string | undefined>): CronTriggerEvent {
-  const trigger: CronTriggerEvent = { type: "cron" };
-  if (env.VERGLAS_LOGICAL_DATE) trigger.logicalDate = env.VERGLAS_LOGICAL_DATE;
-  if (env.VERGLAS_INTERVAL_START) trigger.intervalStart = env.VERGLAS_INTERVAL_START;
-  if (env.VERGLAS_INTERVAL_END) trigger.intervalEnd = env.VERGLAS_INTERVAL_END;
-  return trigger;
+/** Parses and validates the CloudEvent injected by the scheduler harness. */
+function cloudEvent(env: Record<string, string | undefined>): CloudEvent {
+  const serialized = env.VERGLAS_CLOUD_EVENT;
+  if (!serialized) throw new Error("VERGLAS_CLOUD_EVENT is required");
+  const event = JSON.parse(serialized) as Partial<CloudEvent>;
+  if (event.specversion !== "1.0") {
+    throw new Error(`unsupported CloudEvents specversion ${String(event.specversion)}`);
+  }
+  for (const attribute of ["id", "source", "type"] as const) {
+    if (typeof event[attribute] !== "string" || event[attribute].length === 0) {
+      throw new Error(`CloudEvent ${attribute} is required`);
+    }
+  }
+  if (event.data !== undefined && event.data_base64 !== undefined) {
+    throw new Error("CloudEvent cannot contain both data and data_base64");
+  }
+  return event as CloudEvent;
 }
 
 /**
@@ -103,12 +108,6 @@ export async function endpointRun(
   const missing = REQUIRED_ENV.filter((name) => !env[name]);
   if (missing.length > 0) return failure(`missing required env: ${missing.join(", ")}`);
 
-  // This entry runs cron dispatches only. An absent VERGLAS_TRIGGER is treated
-  // as cron; any other type is refused loudly.
-  if (env.VERGLAS_TRIGGER && env.VERGLAS_TRIGGER !== "cron") {
-    return failure(`unsupported VERGLAS_TRIGGER "${env.VERGLAS_TRIGGER}": this entry runs cron dispatches only`);
-  }
-
   const deployment = env.DEPLOYMENT as string;
   const target = env.TARGET as string;
 
@@ -122,7 +121,7 @@ export async function endpointRun(
     });
     const ctx: WorkerContext = {
       client,
-      trigger: cronTrigger(env),
+      trigger: cloudEvent(env),
       output: target,
       outputs: [target],
       env,

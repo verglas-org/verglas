@@ -21,12 +21,14 @@ members = [
     "sdks/rust",
     "crates/verglas-harness",
     "crates/verglas-vector",
+    "crates/verglas-scheduler",
     "bins/cache-node",
     "crates/verglas-block",
     "crates/verglas-pgcdc",
     "bins/verglas-pgcdc",
     "bins/query-node",
     "bins/write-node",
+    "bins/scheduler",
 ]
 # Language SDKs live under sdks/. The TypeScript package is not a Cargo crate.
 exclude = [
@@ -62,6 +64,7 @@ verglas-api = { path = "crates/verglas-api" }
 verglas-sdk = { path = "sdks/rust" }
 verglas-harness = { path = "crates/verglas-harness" }
 verglas-vector = { path = "crates/verglas-vector" }
+verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 # Client-side Iceberg read/write for the agent-facing CLI verbs (#287). The

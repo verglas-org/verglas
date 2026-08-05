@@ -664,7 +664,7 @@ fn workers_create_sends_the_spec_with_overrides() {
     let spec = home.path().join("worker.json");
     std::fs::write(
         &spec,
-        r#"{"name":"from_spec","exec":["x"],"trigger":{"type":"cron","cron":"0 0 * * *"}}"#,
+        r#"{"name":"from_spec","exec":["x"],"triggers":[{"type":"cron","cron":"0 0 * * *"}]}"#,
     )
     .expect("write spec");
 

@@ -26,6 +26,7 @@ verglas-write.workspace = true
 # verglas-platform owns the system catalog (the workers registry + watermarks).
 verglas-iceberg.workspace = true
 verglas-platform.workspace = true
+object_store.workspace = true
 # The `/v1/graphs/...` admin routes wrap the graph-over-Iceberg engine over the
 # same private catalog handle as the table routes: create the two backing
 # tables, insert nodes/edges, build the Puffin adjacency index, and answer

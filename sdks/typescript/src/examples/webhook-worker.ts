@@ -8,6 +8,13 @@
 
 import { defineWorker, type Row, type WorkerContext } from "../index";
 
+interface HttpCallback {
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: number[];
+}
+
 export interface WebhookEnv {
   /** Optional shared secret the sender must present in `x-webhook-token`. */
   WEBHOOK_TOKEN?: string;
@@ -19,14 +26,17 @@ export const webhookWorker = defineWorker<WebhookEnv>({
   triggers: [{ type: "webhook", path: "/ingest" }],
   secrets: ["WEBHOOK_TOKEN"],
   async handler(ctx: WorkerContext<WebhookEnv>) {
-    if (ctx.trigger.type !== "webhook") throw new Error("webhook-worker: expected a webhook trigger");
-    const request = ctx.trigger.request;
+    if (ctx.trigger.type !== "org.verglas.http.request") {
+      throw new Error("webhook-worker: expected an HTTP CloudEvent");
+    }
+    const request = ctx.trigger.data as HttpCallback | undefined;
+    if (!request) throw new Error("webhook-worker: CloudEvent has no request data");
 
-    if (ctx.env.WEBHOOK_TOKEN && request.headers.get("x-webhook-token") !== ctx.env.WEBHOOK_TOKEN) {
+    if (ctx.env.WEBHOOK_TOKEN && request.headers["x-webhook-token"] !== ctx.env.WEBHOOK_TOKEN) {
       throw new Error("webhook-worker: bad or missing x-webhook-token");
     }
 
-    const body = (await request.json().catch(() => null)) as Row | null;
+    const body = JSON.parse(new TextDecoder().decode(new Uint8Array(request.body))) as Row | null;
     if (!body || typeof body !== "object") throw new Error("webhook-worker: body was not a JSON object");
 
     const row: Row = { ...body, received_at: new Date().toISOString() };

@@ -590,3 +590,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Docker image and enabled both dispatchers in its config. The Docker
   application can now execute SQL and logical writes without embedded paths.
 - #8: Reduced the server crate to process startup and listener assembly, delegating HTTP composition to `verglas-rest`. On-prem startup now advertises and internally uses local S3, query/write, and cached catalog endpoints.
+- #11: Verglas now owns and serves the on-prem scheduler object queue from its existing state directory. The separate scheduler container connects through REST and no longer requires a shared filesystem mount.
+- #11: Connected manual, HTTP callback, and catalog data-update ingress to the standalone scheduler event service. The server requires its scheduler URL when catalog-backed platform routes are enabled and keeps durable queue storage behind `verglas-rest`.
+- #11: Removed scheduler state from the Verglas cache directory and made worker ingress optional. A missing or empty scheduler URL now leaves the storage, query, and catalog server fully operational without mounting worker-trigger routes.
+- #11: Changed the on-prem catalog watcher into an Iceberg snapshot CloudEvent producer. Catalog updates now enter the generic event subscription path instead of a private data-update trigger.

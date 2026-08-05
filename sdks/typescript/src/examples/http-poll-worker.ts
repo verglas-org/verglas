@@ -46,7 +46,9 @@ export const httpPollWorker = defineWorker<HttpPollEnv>({
 
     // Range by the logical interval when the cron trigger carries one.
     const tf = ctx.env.POLL_TIME_FIELD;
-    const cron = ctx.trigger.type === "cron" ? ctx.trigger : undefined;
+    const cron = ctx.trigger.type === "org.verglas.schedule.tick"
+      ? ctx.trigger.data as { intervalStart?: string; intervalEnd?: string } | undefined
+      : undefined;
     const inRange = (r: Row): boolean => {
       if (!tf || !cron) return true;
       const t = String(r[tf] ?? "");

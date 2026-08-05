@@ -50,7 +50,7 @@ export default defineWorker(async (ctx) => {
 The handler receives everything the run needs and nothing it doesn't:
 
 - `ctx.client` — a connected `VerglasClient` for read/write via the table verbs.
-- `ctx.trigger` — the `TriggerEvent` that invoked this run (see below).
+- `ctx.trigger` — the CloudEvent that invoked this run (see below).
 - `ctx.output` / `ctx.outputs` — the **deployment-configured** output table(s).
   Output is deployment config, never hardcoded in worker code — the platform
   passes it in (the fleet harness maps the `TARGET` binding here). `outputs` lists
@@ -79,19 +79,17 @@ the run log and the host's JSON response) or nothing at all.
 
 Triggers are **deployment config, not code**. The SDK *types* them so a definition
 can declare what it expects (`TriggerSpec`), but the platform's deploy path
-registers them; the worker just receives the resulting `TriggerEvent` on
-`ctx.trigger`. There are five shapes:
+registers them; the worker receives one CloudEvents 1.0 envelope on
+`ctx.trigger`. There are three deployment-trigger shapes, plus manual dispatch:
 
 | Trigger | Spec (deploy config) | Event (`ctx.trigger`) |
 |---|---|---|
-| `cron` | `{ type, schedule, startDate?, catchup? }` | `{ type, logicalDate?, intervalStart?, intervalEnd? }` |
-| `webhook` | `{ type, path? }` | `{ type, request }` — the inbound `Request` |
-| `websocket` | `{ type, path? }` | `{ type, message }` — one inbound data frame |
-| `data_change` | `{ type, table }` | `{ type, change }` — a commit notification |
-| `kafka` | `{ type, topic, group? }` | `{ type, topic, partition, offset, key?, value }` |
+| `cron` | `{ type, schedule, startDate?, catchup? }` | `org.verglas.schedule.tick` with interval `data` |
+| `webhook` | `{ type, path? }` | `org.verglas.http.request` with request `data` |
+| `event` | `{ type, eventType, source?, subject? }` | The matching CloudEvent unchanged |
 
-`ctx.trigger.type` narrows the union, so a worker checks it before reading the
-type-specific fields.
+`ctx.trigger.type` identifies the event contract; event-specific fields live in
+`ctx.trigger.data`.
 
 ### Cron and backfill
 
@@ -217,21 +215,20 @@ export default defineWorker({
 });
 ```
 
-### A data_change worker
+### An Iceberg event worker
 
-A `data_change` worker reacts to a commit on a watched table — the streaming
-transform that used to be a materialized view. The trigger carries the commit
-notification; the worker delta-reads the newly committed rows, transforms them,
+An event worker can react to Iceberg snapshot commits. The CloudEvent carries
+the snapshot data; the worker delta-reads the newly committed rows, transforms them,
 and appends the results. Keying the output commit by the input snapshot makes a
 replayed commit a free replay, never a double write:
 
 ```ts
 export default defineWorker({
   name: "change-fanout",
-  triggers: [{ type: "data_change", table: "app.input" }],
+  triggers: [{ type: "event", eventType: "org.apache.iceberg.snapshot.committed", subject: "app.input" }],
   async handler(ctx) {
-    if (ctx.trigger.type !== "data_change") throw new Error("expected a data_change trigger");
-    const changed = ctx.trigger.change;
+    if (ctx.trigger.type !== "org.apache.iceberg.snapshot.committed") throw new Error("expected an Iceberg event");
+    const changed = ctx.trigger.data as { snapshotId: string };
     const rows = (await ctx.client.table("app.input").scan()).rows;
     const out = rows.map((r) => ({ v: Number(r.v) * 2, from_snapshot: changed.snapshotId }));
     if (out.length === 0) return { rowsWritten: 0 };
@@ -524,7 +521,7 @@ trigger shape:
 - `httpPollWorker` — a cron worker: poll a JSON HTTP endpoint and append the rows
   in the trigger's logical interval.
 - `webhookWorker` — a webhook worker: land each inbound request body as a row.
-- `changeFanoutWorker` — a `data_change` worker: transform each committed batch on
+- `changeFanoutWorker` — an Iceberg-event worker: transform each committed batch on
   a watched table and append the results under a snapshot-keyed idempotency key.
 
 ## Public API
@@ -544,11 +541,9 @@ The root exports exactly two layers; internals live behind subpaths.
     `show()`, `neighbors()`, `kHop()`, `paths()`
 - The worker contract: `defineWorker(def)`, `runWorker(worker, ctx, opts?)`; types
   `WorkerContext`, `WorkerHandler`, `WorkerDefinition`, `WorkerResult`,
-  `RunWorkerOptions`; trigger events `TriggerEvent`, `CronTriggerEvent`,
-  `WebhookTriggerEvent`, `WebSocketTriggerEvent`, `DataChangeTriggerEvent`,
-  `KafkaTriggerEvent`; trigger specs `TriggerSpec`, `CronTriggerSpec`,
-  `WebhookTriggerSpec`, `WebSocketTriggerSpec`, `DataChangeTriggerSpec`,
-  `KafkaTriggerSpec`
+  `RunWorkerOptions`; runtime event `CloudEvent`;
+  trigger specs `TriggerSpec`, `CronTriggerSpec`, `WebhookTriggerSpec`,
+  `EventTriggerSpec`
 - Errors: `VerglasHttpError`
 - Types: `Row`, `Watermark`, `ConnectOptions`, `ScanOptions`, `ScanResult`,
   `DeltaResult`, `Snapshot`, `FollowRowsOptions`, `FollowHandler`, `ChangeEvent`,

@@ -24,6 +24,7 @@ struct IngestCall {
     format: String,
     partition_by: Option<String>,
     body_len: usize,
+    idempotency_key: Option<String>,
 }
 
 #[async_trait]
@@ -54,6 +55,7 @@ impl BatchCommitter for FakeCommitter {
         format: &str,
         partition_by: Option<&str>,
         body: axum::body::Bytes,
+        idempotency_key: Option<String>,
     ) -> Result<serde_json::Value, String> {
         self.ingests.lock().expect("ingests").push(IngestCall {
             table: table.to_owned(),
@@ -61,6 +63,7 @@ impl BatchCommitter for FakeCommitter {
             format: format.to_owned(),
             partition_by: partition_by.map(str::to_owned),
             body_len: body.len(),
+            idempotency_key,
         });
         Ok(serde_json::json!({"operation": "append"}))
     }
@@ -74,6 +77,7 @@ async fn source_file_ingest_is_dispatched_to_the_writer() {
     let response = app
         .oneshot(
             Request::post("/v1/ingest/sdk.events?mode=create&format=csv&partition_by=day")
+                .header("idempotency-key", "source-1")
                 .body(Body::from("day,id\n2026-08-04,1\n"))
                 .expect("request"),
         )
@@ -88,6 +92,7 @@ async fn source_file_ingest_is_dispatched_to_the_writer() {
             format: "csv".to_owned(),
             partition_by: Some("day".to_owned()),
             body_len: 20,
+            idempotency_key: Some("source-1".to_owned()),
         }]
     );
 }

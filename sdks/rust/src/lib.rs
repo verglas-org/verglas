@@ -38,6 +38,6 @@ pub use report::{CompactReport, CompactionReport};
 /// Stable table request and response contracts from the dependency-leaf API crate.
 pub use verglas_api::table as tables_api;
 pub use worker::{
-    Catchup, ChangeEvent, CronInterval, RunResult, TableRef, TriggerEvent, TriggerSpec, Worker,
+    Catchup, ChangeEvent, CloudEvent, CronInterval, HttpCallback, RunResult, TriggerSpec, Worker,
     WorkerContext, WorkerResult,
 };
