@@ -72,12 +72,25 @@ The point: tests written after code tend to **confirm what the code does**; test
 
 ## Cursor Cloud specific instructions
 
-Durable, non-obvious notes for agents in the Cloud VM. The startup update script
-already runs `cargo fetch --locked` and (`npm ci` in `sdks/typescript`), so
-dependencies are primed. Standard commands live in the `justfile` and
-`README.md`; use them (`just build`/`just test`/`just lint`, or the underlying
-`cargo` commands). The pinned toolchain (`1.96.1`, from `rust-toolchain.toml`)
-installs automatically on the first `cargo` call.
+Durable, non-obvious notes for agents in the Cloud VM. The environment is defined
+by `.cursor/environment.json` (repo-file managed), which runs two scripts:
+
+- `scripts/cloud/install.sh` (install step): installs dev tooling (`just`, `jq`,
+  MinIO `minio`+`mc`, AWS CLI, Bun 1.3.8), runs `cargo fetch --locked`, pre-builds
+  `verglas-server` + `verglas`, and `npm ci`s the TypeScript SDK. Every step is
+  guarded, so re-runs are no-ops.
+- `scripts/cloud/start.sh` (start step, runs on every boot): brings up a local
+  MinIO origin on `:9000` and `verglas-server` (S3 `:8333`, admin `:8334`) using
+  `deploy/dev/verglas.dev.toml`, creates the `my-bucket` origin bucket, and is
+  idempotent (skips a service already listening on its port). So a fresh VM comes
+  up ready to serve an S3 PUT/GET through the cache with no manual steps. Its
+  output goes to `/tmp/cursor/start-user/start-user.log`; the running stack logs
+  to `/tmp/verglas-dev/{verglas-server,minio}.log`.
+
+Standard commands live in the `justfile` and `README.md`; use them
+(`just build`/`just test`/`just lint`, or the underlying `cargo` commands). The
+pinned toolchain (`1.96.1`, from `rust-toolchain.toml`) installs automatically on
+the first `cargo` call.
 
 Rust workspace facts:
 
