@@ -25,6 +25,12 @@ services:
       - ./deploy/docker/verglas.toml:/etc/verglas/config.toml:ro
       - ./deploy/docker/credentials:/etc/verglas/credentials:ro
       - /Volumes/data_cache/verglas:/var/lib/verglas
+    # Contain a future socket or cache FD leak inside this service. Docker's
+    # million-descriptor default is large enough to exhaust a desktop host.
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
     restart: unless-stopped
 
   verglas-scheduler:
