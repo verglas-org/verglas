@@ -51,6 +51,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Db(command) => commands::cloud::run_db(command, cli.json).await,
         Command::Volumes(command) => commands::cloud::run_volumes(command, cli.json).await,
         Command::Secrets(command) => commands::cloud::run_secrets(command, cli.json).await,
+        Command::Kv(command) => {
+            commands::kv::run(command, &cli.endpoint, cli.token.as_deref()).await
+        }
     }
 }
 

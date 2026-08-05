@@ -38,6 +38,11 @@ fn docker_application_packages_execution_workers() {
         "the quickstart must not require a separate credentials directory"
     );
     assert!(
+        dockerfile.contains("chown -R verglas:verglas /var/lib/verglas")
+            && compose.contains("verglas-cache:/var/lib/verglas"),
+        "the always-on KV log must use the existing writable persistent data volume"
+    );
+    assert!(
         compose.contains("image: postgres:17")
             && compose
                 .contains("postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas"),

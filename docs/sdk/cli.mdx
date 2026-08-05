@@ -20,6 +20,7 @@ cargo install --path bins/verglas --locked --force
 
 ```text
 --server-endpoint <URL>  Local server admin API. Uses VERGLAS_ENDPOINT.
+--token <TOKEN>          Bearer token. Uses VERGLAS_TOKEN.
 --json                   Emit machine-readable JSON.
 -V, --version            Print the CLI version.
 ```
@@ -40,6 +41,17 @@ printf '%s' "$VERGLAS_API_KEY" | verglas login --api-key
 verglas status
 verglas drain --timeout 10m
 ```
+
+## KV
+
+KV is built into the server and needs no feature configuration.
+
+```bash
+verglas kv set workshop.blueprints featured blue --ttl 300
+verglas kv get workshop.blueprints featured
+```
+
+Set `VERGLAS_TOKEN` or pass `--token` when the endpoint requires a bearer token.
 
 ## Workers
 

@@ -21,6 +21,7 @@ members = [
     "sdks/rust",
     "crates/verglas-harness",
     "crates/verglas-vector",
+    "crates/verglas-kv",
     "crates/verglas-scheduler",
     "crates/verglas-microvm-contract",
     "crates/verglas-gadget-runtime",
@@ -66,6 +67,7 @@ verglas-api = { path = "crates/verglas-api" }
 verglas-sdk = { path = "sdks/rust" }
 verglas-harness = { path = "crates/verglas-harness" }
 verglas-vector = { path = "crates/verglas-vector" }
+verglas-kv = { path = "crates/verglas-kv" }
 verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-gadget-runtime = { path = "crates/verglas-gadget-runtime" }
 verglas-block = { path = "crates/verglas-block" }

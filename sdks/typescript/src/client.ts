@@ -17,6 +17,12 @@ import type {
   FollowRowsOptions,
   IndexInfo,
   IndexReport,
+  KvDeleteResult,
+  KvListOptions,
+  KvListPage,
+  KvPutOptions,
+  KvPutResult,
+  KvValue,
   FollowHandler,
   GraphCreateResult,
   GraphEdgeInput,
@@ -73,6 +79,12 @@ export class VerglasClient {
     /** Bearer token, reused to authenticate the change-feed websocket. */
     private readonly token: string,
   ) {}
+
+  /** Returns a thin handle to one tenant-authorized KV namespace. */
+  kv(namespace: string): Kv {
+    if (!namespace) throw new Error("kv: namespace is required");
+    return new Kv(this.transport, namespace);
+  }
 
   /**
    * Follows table-commit notifications over the platform's edge change feed and
@@ -276,6 +288,118 @@ export class VerglasClient {
    */
   async setWatermark(w: Watermark): Promise<void> {
     await this.transport.request<void>("PUT", "/v1/watermark", { body: { watermark: w } });
+  }
+}
+
+/** A thin raw-byte handle to one KV namespace. */
+export class Kv {
+  /** @internal */
+  constructor(
+    private readonly transport: Transport,
+    readonly namespace: string,
+  ) {}
+
+  private base(): string {
+    return `/v1/kv/${encodeURIComponent(this.namespace)}`;
+  }
+
+  private path(key: string): string {
+    if (!key) throw new Error("KV key is required");
+    return `${this.base()}/${encodeURIComponent(key)}`;
+  }
+
+  /** Durably sets raw bytes and returns the server-owned version. */
+  async put(key: string, bytes: Uint8Array, opts?: KvPutOptions): Promise<KvPutResult> {
+    if (opts?.ttlSeconds !== undefined && opts.expiresAtMs !== undefined) {
+      throw new Error("KV put accepts ttlSeconds or expiresAtMs, not both");
+    }
+    const headers: Record<string, string> = {};
+    if (opts?.ttlSeconds !== undefined) headers["x-verglas-ttl-seconds"] = String(opts.ttlSeconds);
+    if (opts?.expiresAtMs !== undefined) headers["x-verglas-expires-at-ms"] = String(opts.expiresAtMs);
+    if (opts?.contentType) headers["content-type"] = opts.contentType;
+    if (opts?.ifMatch) headers["if-match"] = opts.ifMatch;
+    if (opts?.ifNoneMatch) headers["if-none-match"] = "*";
+    if (opts?.idempotencyKey) headers["idempotency-key"] = opts.idempotencyKey;
+    for (const [name, value] of Object.entries(opts?.metadata ?? {})) {
+      headers[`x-verglas-meta-${name}`] = value;
+    }
+    const response = await this.transport.requestRaw("PUT", this.path(key), {
+      body: Uint8Array.from(bytes).buffer,
+      headers,
+    });
+    const version = response.headers.get("etag");
+    if (!version) throw new Error("KV put response has no ETag");
+    return {
+      version,
+      idempotent: response.headers.get("x-verglas-idempotent") === "true",
+    };
+  }
+
+  /** Gets raw bytes, or null when the key is absent or expired. */
+  async get(key: string): Promise<KvValue | null> {
+    let response: Response;
+    try {
+      response = await this.transport.requestRaw("GET", this.path(key));
+    } catch (error) {
+      if (error instanceof VerglasHttpError && error.status === 404) return null;
+      throw error;
+    }
+    const version = response.headers.get("etag");
+    const modified = response.headers.get("x-verglas-modified-at-ms");
+    if (!version || !modified) throw new Error("KV get response is missing metadata headers");
+    const metadata: Record<string, string> = {};
+    response.headers.forEach((value, name) => {
+      if (name.startsWith("x-verglas-meta-")) metadata[name.slice("x-verglas-meta-".length)] = value;
+    });
+    const expires = response.headers.get("x-verglas-expires-at-ms");
+    return {
+      bytes: new Uint8Array(await response.arrayBuffer()),
+      version,
+      contentType: response.headers.get("content-type") ?? undefined,
+      modifiedAtMs: Number(modified),
+      expiresAtMs: expires === null ? undefined : Number(expires),
+      metadata,
+      tier: (() => {
+        const tier = response.headers.get("x-verglas-kv-tier");
+        return tier === "ram" || tier === "nvme" ? tier : "unspecified";
+      })(),
+    };
+  }
+
+  /** Deletes one key idempotently with an optional expected version. */
+  async delete(key: string, opts?: { ifMatch?: string }): Promise<KvDeleteResult> {
+    const response = await this.transport.requestRaw("DELETE", this.path(key), {
+      headers: opts?.ifMatch ? { "if-match": opts.ifMatch } : undefined,
+    });
+    return (await response.json()) as KvDeleteResult;
+  }
+
+  /** Lists one bounded metadata-only prefix page without interpreting its cursor. */
+  async list(opts?: KvListOptions): Promise<KvListPage> {
+    const page = await this.transport.request<{
+      entries: Array<{
+        key: string;
+        version: string;
+        modified_at_ms: number;
+        expires_at_ms?: number;
+        content_type?: string;
+        metadata: Record<string, string>;
+      }>;
+      next_cursor?: string;
+    }>("GET", this.base(), {
+      query: { prefix: opts?.prefix, limit: opts?.limit, cursor: opts?.cursor },
+    });
+    return {
+      entries: page.entries.map((entry) => ({
+        key: entry.key,
+        version: entry.version,
+        modifiedAtMs: entry.modified_at_ms,
+        expiresAtMs: entry.expires_at_ms,
+        contentType: entry.content_type,
+        metadata: entry.metadata,
+      })),
+      nextCursor: page.next_cursor,
+    };
   }
 }
 

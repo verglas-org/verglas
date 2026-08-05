@@ -4,7 +4,7 @@
 //! table-contract validation in the SDK. Applications and the CLI therefore
 //! call the same implementation instead of rebuilding HTTP behavior.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -14,7 +14,9 @@ use arrow_ipc::reader::StreamDecoder;
 use arrow_ipc::writer::StreamWriter;
 use bytes::Bytes;
 use futures::{SinkExt, Stream, StreamExt, TryStream, stream};
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use reqwest::header::{
+    ACCEPT, AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH, IF_NONE_MATCH,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -165,6 +167,97 @@ pub struct AppendResult {
     pub commits: u64,
 }
 
+/// Optional metadata and conditions for one durable KV put.
+#[derive(Debug, Clone, Default)]
+pub struct KvPutOptions {
+    /// Relative logical lifetime in seconds.
+    pub ttl_seconds: Option<u64>,
+    /// Absolute logical expiration in Unix milliseconds.
+    pub expires_at_ms: Option<u64>,
+    /// MIME type returned with the raw value.
+    pub content_type: Option<String>,
+    /// Bounded application metadata.
+    pub metadata: BTreeMap<String, String>,
+    /// Required current version.
+    pub if_match: Option<String>,
+    /// Requires the key to have no live value.
+    pub create_only: bool,
+    /// Identity for one logical write. The SDK never retries it itself.
+    pub idempotency_key: Option<String>,
+}
+
+/// Result of one committed KV put.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvPutResult {
+    /// Opaque committed version/ETag.
+    pub version: String,
+    /// Whether the server replayed an existing idempotent result.
+    pub idempotent: bool,
+}
+
+/// The serving tier reported by the endpoint when available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvReadTier {
+    /// The endpoint did not expose its local serving tier.
+    Unspecified,
+    /// The value came from process RAM.
+    Ram,
+    /// The value came from local NVMe.
+    Nvme,
+}
+
+/// One raw KV value and its bounded metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KvValue {
+    /// Raw value bytes.
+    pub bytes: Bytes,
+    /// Opaque committed version/ETag.
+    pub version: String,
+    /// MIME type supplied on write.
+    pub content_type: Option<String>,
+    /// Commit time in Unix milliseconds.
+    pub modified_at_ms: u64,
+    /// Logical expiration time in Unix milliseconds.
+    pub expires_at_ms: Option<u64>,
+    /// Bounded application metadata.
+    pub metadata: BTreeMap<String, String>,
+    /// Local serving tier when the endpoint reports it.
+    pub tier: KvReadTier,
+}
+
+/// Result of one idempotent KV delete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct KvDeleteResult {
+    /// Whether a live value was removed.
+    pub removed: bool,
+}
+
+/// One metadata-only KV list entry.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct KvListEntry {
+    /// Key in bytewise list order.
+    pub key: String,
+    /// Opaque committed version.
+    pub version: String,
+    /// Commit time in Unix milliseconds.
+    pub modified_at_ms: u64,
+    /// Logical expiration time.
+    pub expires_at_ms: Option<u64>,
+    /// MIME type supplied on write.
+    pub content_type: Option<String>,
+    /// Bounded application metadata.
+    pub metadata: BTreeMap<String, String>,
+}
+
+/// One bounded metadata-only KV list page.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct KvListPage {
+    /// Entries in deterministic bytewise order.
+    pub entries: Vec<KvListEntry>,
+    /// Opaque continuation cursor when more entries remain.
+    pub next_cursor: Option<String>,
+}
+
 /// Errors returned by the Verglas data-plane client.
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -309,6 +402,19 @@ impl Client {
     /// Returns the S3-compatible Verglas object-cache endpoint.
     pub fn s3_endpoint(&self) -> Option<&str> {
         Some(&self.s3_endpoint)
+    }
+
+    /// Returns a thin raw-byte handle to one tenant-authorized KV namespace.
+    pub fn kv(&self, namespace: &str) -> Result<Kv, ClientError> {
+        if namespace.is_empty() || namespace.contains('/') {
+            return Err(ClientError::Configuration(
+                "KV namespace must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Kv {
+            client: self.clone(),
+            namespace: namespace.to_owned(),
+        })
     }
 
     /// Creates a missing table or verifies the exact existing definition.
@@ -568,6 +674,214 @@ impl Client {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.query_uri)
     }
+}
+
+/// A thin raw-byte client for one KV namespace.
+#[derive(Debug, Clone)]
+pub struct Kv {
+    client: Client,
+    namespace: String,
+}
+
+impl Kv {
+    /// Durably sets raw bytes and returns the server-owned version.
+    pub async fn put(
+        &self,
+        key: &str,
+        bytes: Bytes,
+        options: KvPutOptions,
+    ) -> Result<KvPutResult, ClientError> {
+        if options.ttl_seconds.is_some() && options.expires_at_ms.is_some() {
+            return Err(ClientError::Configuration(
+                "KV put accepts ttl_seconds or expires_at_ms, not both".to_owned(),
+            ));
+        }
+        let mut request = self
+            .client
+            .authorize(self.client.http.put(self.url(Some(key))?))
+            .body(bytes);
+        if let Some(ttl) = options.ttl_seconds {
+            request = request.header("x-verglas-ttl-seconds", ttl);
+        }
+        if let Some(expires) = options.expires_at_ms {
+            request = request.header("x-verglas-expires-at-ms", expires);
+        }
+        if let Some(content_type) = options.content_type {
+            request = request.header(CONTENT_TYPE, content_type);
+        }
+        if let Some(expected) = options.if_match {
+            request = request.header(IF_MATCH, expected);
+        }
+        if options.create_only {
+            request = request.header(IF_NONE_MATCH, "*");
+        }
+        if let Some(idempotency_key) = options.idempotency_key {
+            request = request.header("idempotency-key", idempotency_key);
+        }
+        for (name, value) in options.metadata {
+            let name = HeaderName::from_bytes(format!("x-verglas-meta-{name}").as_bytes())
+                .map_err(|error| ClientError::Configuration(error.to_string()))?;
+            request = request.header(name, value);
+        }
+        let response = Client::require_success(self.client.send(request).await?).await?;
+        let version = required_header(response.headers(), ETAG.as_str())?;
+        let idempotent = response
+            .headers()
+            .get("x-verglas-idempotent")
+            .and_then(|value| value.to_str().ok())
+            == Some("true");
+        Ok(KvPutResult {
+            version,
+            idempotent,
+        })
+    }
+
+    /// Gets raw bytes, returning `None` for an absent or expired key.
+    pub async fn get(&self, key: &str) -> Result<Option<KvValue>, ClientError> {
+        let response = self
+            .client
+            .send(
+                self.client
+                    .authorize(self.client.http.get(self.url(Some(key))?)),
+            )
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = Client::require_success(response).await?;
+        let version = required_header(response.headers(), ETAG.as_str())?;
+        let modified_at_ms = required_header(response.headers(), "x-verglas-modified-at-ms")?
+            .parse::<u64>()
+            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+        let expires_at_ms = optional_u64_header(response.headers(), "x-verglas-expires-at-ms")?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let tier = match response
+            .headers()
+            .get("x-verglas-kv-tier")
+            .and_then(|value| value.to_str().ok())
+        {
+            Some("ram") => KvReadTier::Ram,
+            Some("nvme") => KvReadTier::Nvme,
+            _ => KvReadTier::Unspecified,
+        };
+        let mut metadata = BTreeMap::new();
+        for (name, value) in response.headers() {
+            let Some(name) = name.as_str().strip_prefix("x-verglas-meta-") else {
+                continue;
+            };
+            let value = value
+                .to_str()
+                .map_err(|error| ClientError::Configuration(error.to_string()))?;
+            metadata.insert(name.to_owned(), value.to_owned());
+        }
+        let bytes = response.bytes().await?;
+        Ok(Some(KvValue {
+            bytes,
+            version,
+            content_type,
+            modified_at_ms,
+            expires_at_ms,
+            metadata,
+            tier,
+        }))
+    }
+
+    /// Deletes one key idempotently with an optional expected version.
+    pub async fn delete(
+        &self,
+        key: &str,
+        if_match: Option<&str>,
+    ) -> Result<KvDeleteResult, ClientError> {
+        let mut request = self
+            .client
+            .authorize(self.client.http.delete(self.url(Some(key))?));
+        if let Some(expected) = if_match {
+            request = request.header(IF_MATCH, expected);
+        }
+        let response = Client::require_success(self.client.send(request).await?).await?;
+        Ok(response.json().await?)
+    }
+
+    /// Lists one bounded metadata-only page without interpreting its cursor.
+    pub async fn list(
+        &self,
+        prefix: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<KvListPage, ClientError> {
+        let mut url = self.url(None)?;
+        url.query_pairs_mut()
+            .append_pair("prefix", prefix)
+            .append_pair("limit", &limit.to_string());
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("cursor", cursor);
+        }
+        let response = Client::require_success(
+            self.client
+                .send(self.client.authorize(self.client.http.get(url)))
+                .await?,
+        )
+        .await?;
+        Ok(response.json().await?)
+    }
+
+    /// Builds one URL using path-segment encoding owned by the HTTP client.
+    fn url(&self, key: Option<&str>) -> Result<reqwest::Url, ClientError> {
+        let mut url = reqwest::Url::parse(&self.client.query_uri)
+            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                ClientError::Configuration("KV endpoint cannot carry path segments".to_owned())
+            })?;
+            segments
+                .pop_if_empty()
+                .push("v1")
+                .push("kv")
+                .push(&self.namespace);
+            if let Some(key) = key {
+                if key.is_empty() {
+                    return Err(ClientError::Configuration("KV key is required".to_owned()));
+                }
+                segments.push(key);
+            }
+        }
+        Ok(url)
+    }
+}
+
+/// Reads one required text response header.
+fn required_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &str,
+) -> Result<String, ClientError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            ClientError::Configuration(format!("KV response is missing the `{name}` header"))
+        })
+}
+
+/// Parses one optional decimal response header.
+fn optional_u64_header(
+    headers: &reqwest::header::HeaderMap,
+    name: &str,
+) -> Result<Option<u64>, ClientError> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|error| ClientError::Configuration(error.to_string()))?
+                .parse::<u64>()
+                .map_err(|error| ClientError::Configuration(error.to_string()))
+        })
+        .transpose()
 }
 
 #[derive(Debug, Serialize)]
