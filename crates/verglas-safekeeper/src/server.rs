@@ -1,0 +1,739 @@
+//! PostgreSQL wire listener for Neon walproposer and pageserver clients. One
+//! listener lives inside each cache-node process and maps timeline connections
+//! onto [`crate::EcAppendLog`] instances backed by the shared EC ring.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use verglas_core::read::ObjectRead;
+use verglas_core::write::ObjectWrite;
+
+use crate::protocol::{
+    AcceptorGreeting, AcceptorMessage, AppendResponse, Membership, ProposerMessage, ProtocolError,
+    SafekeeperCommand, TermSwitch, VoteResponse, parse_command, parse_proposer, serialize_acceptor,
+};
+use crate::{
+    AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, FragmentTransport, LiveMembership,
+    Lsn,
+};
+
+/// PostgreSQL protocol version 3.0.
+const PG_PROTOCOL_V3: u32 = 196_608;
+/// PostgreSQL SSLRequest code. The VXLAN listener answers `N` and continues
+/// with the startup packet; tenant network isolation is the transport boundary.
+const PG_SSL_REQUEST: u32 = 80_877_103;
+/// Maximum bytes returned in one physical replication `XLogData` frame.
+const REPLICATION_CHUNK: u64 = 128 * 1024;
+/// Delay between attempts to drain committed EC WAL into object storage.
+const WAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// One Neon tenant/timeline identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TimelineKey {
+    /// Neon tenant id.
+    tenant_id: String,
+    /// Neon timeline id.
+    timeline_id: String,
+}
+
+impl TimelineKey {
+    /// Builds a validated key from two Neon hexadecimal ids.
+    fn new(tenant_id: String, timeline_id: String) -> Result<Self, ServerError> {
+        validate_id("tenant", &tenant_id)?;
+        validate_id("timeline", &timeline_id)?;
+        Ok(Self {
+            tenant_id,
+            timeline_id,
+        })
+    }
+}
+
+/// Failure serving a Neon safekeeper connection.
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    /// Socket or PostgreSQL framing I/O failed.
+    #[error("safekeeper I/O: {0}")]
+    Io(#[from] std::io::Error),
+    /// The Neon proposer/acceptor payload was invalid.
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+    /// The EC WAL store rejected an operation.
+    #[error(transparent)]
+    Storage(#[from] AppendError),
+    /// Startup/query state was incomplete or inconsistent.
+    #[error("safekeeper connection: {0}")]
+    Connection(String),
+}
+
+/// One cache-node safekeeper service, shared by every accepted connection.
+pub struct SafekeeperServer<S> {
+    /// Numeric identity returned in acceptor greetings.
+    node_id: u64,
+    /// Origin store used after WAL segments drain from EC fragments.
+    origin: Arc<S>,
+    /// Origin bucket containing WAL objects.
+    bucket: String,
+    /// Tenant-scoped prefix before tenant/timeline ids.
+    prefix: String,
+    /// Shared cache-node fragment transport.
+    transport: Arc<dyn FragmentTransport>,
+    /// Shared cache-node live ring membership.
+    membership: Arc<dyn LiveMembership>,
+    /// Local fast-restart state root.
+    state_dir: PathBuf,
+    /// WAL erasure geometry.
+    geometry: AppendGeometry,
+    /// Open timelines, created lazily on first connection.
+    timelines: Mutex<HashMap<TimelineKey, Arc<EcAppendLog<S>>>>,
+}
+
+impl<S> SafekeeperServer<S>
+where
+    S: ObjectRead + ObjectWrite + 'static,
+{
+    /// Builds a safekeeper over the cache node's existing origin and ring plane.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        node_id: u64,
+        origin: Arc<S>,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        transport: Arc<dyn FragmentTransport>,
+        membership: Arc<dyn LiveMembership>,
+        state_dir: impl AsRef<Path>,
+        geometry: AppendGeometry,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            node_id,
+            origin,
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+            transport,
+            membership,
+            state_dir: state_dir.as_ref().to_path_buf(),
+            geometry,
+            timelines: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Accepts connections until the listener fails. Each connection is
+    /// independent; a malformed client is logged and closed without stopping
+    /// the cache-node process.
+    pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<(), ServerError> {
+        loop {
+            let (stream, peer) = listener.accept().await?;
+            let server = Arc::clone(&self);
+            tokio::spawn(async move {
+                if let Err(error) = server.serve_connection(stream).await {
+                    tracing::warn!(%peer, %error, "safekeeper connection closed");
+                }
+            });
+        }
+    }
+
+    /// Opens a timeline and recovers a newer coordinator state from the ring.
+    async fn timeline(&self, key: &TimelineKey) -> Result<Arc<EcAppendLog<S>>, ServerError> {
+        if let Some(existing) = self.timelines.lock().await.get(key).cloned() {
+            return Ok(existing);
+        }
+        let dir = self.state_dir.join(&key.tenant_id).join(&key.timeline_id);
+        let prefix = format!(
+            "{}/{}/{}",
+            self.prefix.trim_matches('/'),
+            key.tenant_id,
+            key.timeline_id
+        );
+        let log = Arc::new(EcAppendLog::open(
+            Arc::clone(&self.origin),
+            self.bucket.clone(),
+            prefix,
+            Arc::clone(&self.transport),
+            Arc::clone(&self.membership),
+            dir,
+            self.geometry,
+        )?);
+        log.recover_from_ring().await?;
+        let mut timelines = self.timelines.lock().await;
+        let (timeline, inserted) = match timelines.entry(key.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => (entry.get().clone(), false),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Arc::clone(&log));
+                (log, true)
+            }
+        };
+        drop(timelines);
+        if inserted {
+            spawn_wal_drain(key.clone(), Arc::clone(&timeline));
+        }
+        Ok(timeline)
+    }
+
+    /// Handles one PostgreSQL connection from startup through termination.
+    async fn serve_connection(&self, mut stream: TcpStream) -> Result<(), ServerError> {
+        let startup = read_startup(&mut stream).await?;
+        write_startup_ok(&mut stream).await?;
+        let startup_key = timeline_from_startup(&startup)?;
+
+        loop {
+            let Some((tag, payload)) = read_frontend(&mut stream).await? else {
+                return Ok(());
+            };
+            match tag {
+                b'Q' => {
+                    let query = payload_cstr(&payload, "query")?;
+                    let command = parse_command(query)?;
+                    match command {
+                        SafekeeperCommand::StartWalPush {
+                            protocol_version,
+                            allow_timeline_creation: _,
+                        } => {
+                            write_copy_both(&mut stream).await?;
+                            return self
+                                .receive_wal(&mut stream, startup_key, protocol_version)
+                                .await;
+                        }
+                        SafekeeperCommand::StartReplication { start_lsn, term } => {
+                            let key = startup_key.clone().ok_or_else(|| {
+                                ServerError::Connection(
+                                    "START_REPLICATION needs tenant_id and timeline_id startup options"
+                                        .to_owned(),
+                                )
+                            })?;
+                            let timeline = self.timeline(&key).await?;
+                            if let Some(term) = term
+                                && term < timeline.epoch().0
+                            {
+                                return Err(ServerError::Connection(format!(
+                                    "requested stale term {term}; current is {}",
+                                    timeline.epoch().0
+                                )));
+                            }
+                            write_copy_both(&mut stream).await?;
+                            return send_wal(&mut stream, timeline, start_lsn).await;
+                        }
+                        SafekeeperCommand::IdentifySystem => {
+                            let key = startup_key.clone().ok_or_else(|| {
+                                ServerError::Connection(
+                                    "IDENTIFY_SYSTEM needs timeline startup options".to_owned(),
+                                )
+                            })?;
+                            let timeline = self.timeline(&key).await?;
+                            write_identify_system(&mut stream, &timeline).await?;
+                        }
+                        SafekeeperCommand::TimelineStatus => {
+                            let key = startup_key.clone().ok_or_else(|| {
+                                ServerError::Connection(
+                                    "TIMELINE_STATUS needs timeline startup options".to_owned(),
+                                )
+                            })?;
+                            let timeline = self.timeline(&key).await?;
+                            write_timeline_status(&mut stream, &timeline).await?;
+                        }
+                    }
+                }
+                b'X' => return Ok(()),
+                _ => {
+                    return Err(ServerError::Connection(format!(
+                        "unexpected PostgreSQL frontend tag {tag:#x}"
+                    )));
+                }
+            }
+        }
+    }
+
+    /// Runs Neon's proposer/acceptor exchange inside PostgreSQL `COPY BOTH`.
+    async fn receive_wal(
+        &self,
+        stream: &mut TcpStream,
+        startup_key: Option<TimelineKey>,
+        protocol_version: u32,
+    ) -> Result<(), ServerError> {
+        let mut timeline: Option<Arc<EcAppendLog<S>>> = None;
+        let mut membership: Option<Membership> = None;
+        loop {
+            let Some((tag, payload)) = read_frontend(stream).await? else {
+                return Ok(());
+            };
+            match tag {
+                b'd' => match parse_proposer(payload, protocol_version)? {
+                    ProposerMessage::Greeting(greeting) => {
+                        let key = TimelineKey::new(
+                            greeting.tenant_id.clone(),
+                            greeting.timeline_id.clone(),
+                        )?;
+                        if let Some(startup_key) = &startup_key
+                            && startup_key != &key
+                        {
+                            return Err(ServerError::Connection(
+                                "startup and greeting name different timelines".to_owned(),
+                            ));
+                        }
+                        let opened = self.timeline(&key).await?;
+                        opened
+                            .configure_timeline(
+                                greeting.membership.generation,
+                                greeting.system_id,
+                                greeting.pg_version,
+                                greeting.wal_segment_size,
+                            )
+                            .await?;
+                        let state = opened.safekeeper_state().await;
+                        write_copy_data(
+                            stream,
+                            serialize_acceptor(
+                                &AcceptorMessage::Greeting(AcceptorGreeting {
+                                    node_id: self.node_id,
+                                    membership: greeting.membership.clone(),
+                                    term: state.term,
+                                }),
+                                protocol_version,
+                            )?,
+                        )
+                        .await?;
+                        membership = Some(greeting.membership);
+                        timeline = Some(opened);
+                    }
+                    ProposerMessage::Vote(vote) => {
+                        let timeline = required_timeline(&timeline)?;
+                        let vote_given = timeline.accept_vote(vote.generation, vote.term).await?;
+                        let state = timeline.safekeeper_state().await;
+                        write_copy_data(
+                            stream,
+                            serialize_acceptor(
+                                &AcceptorMessage::Vote(VoteResponse {
+                                    generation: state.generation,
+                                    term: state.term,
+                                    vote_given,
+                                    flush_lsn: state.flush_lsn,
+                                    truncate_lsn: state.truncate_lsn,
+                                    term_history: state
+                                        .term_history
+                                        .into_iter()
+                                        .map(|(term, lsn)| TermSwitch { term, lsn })
+                                        .collect(),
+                                }),
+                                protocol_version,
+                            )?,
+                        )
+                        .await?;
+                    }
+                    ProposerMessage::Elected(elected) => {
+                        let timeline = required_timeline(&timeline)?;
+                        timeline
+                            .announce_elected(
+                                elected.generation,
+                                elected.term,
+                                elected.start_streaming_at,
+                                elected
+                                    .term_history
+                                    .into_iter()
+                                    .map(|entry| (entry.term, entry.lsn))
+                                    .collect(),
+                            )
+                            .await?;
+                    }
+                    ProposerMessage::Append(append) => {
+                        let timeline = required_timeline(&timeline)?;
+                        if membership.as_ref().map(|set| set.generation) != Some(append.generation)
+                        {
+                            return Err(ServerError::Connection(format!(
+                                "append generation {} differs from greeting",
+                                append.generation
+                            )));
+                        }
+                        timeline
+                            .append(Epoch(append.term), append.begin_lsn, append.wal)
+                            .await?;
+                        let state = timeline
+                            .record_watermarks(append.commit_lsn, append.truncate_lsn)
+                            .await?;
+                        write_copy_data(
+                            stream,
+                            serialize_acceptor(
+                                &AcceptorMessage::Append(AppendResponse {
+                                    generation: state.generation,
+                                    term: state.term,
+                                    flush_lsn: state.flush_lsn,
+                                    commit_lsn: state.commit_lsn,
+                                }),
+                                protocol_version,
+                            )?,
+                        )
+                        .await?;
+                    }
+                },
+                b'c' | b'X' => return Ok(()),
+                other => {
+                    return Err(ServerError::Connection(format!(
+                        "unexpected COPY frontend tag {other:#x}"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+/// Runs the asynchronous EC-to-object-storage drain for one open timeline.
+/// Failed origin writes retain the EC fragments and are retried; they never
+/// alter the already-issued durability acknowledgement.
+fn spawn_wal_drain<S>(key: TimelineKey, timeline: Arc<EcAppendLog<S>>)
+where
+    S: ObjectRead + ObjectWrite + 'static,
+{
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(WAL_DRAIN_INTERVAL);
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            match timeline.flush().await {
+                Ok(flushed) => {
+                    let state = timeline.safekeeper_state().await;
+                    if state.truncate_lsn.0 > 0
+                        && state.truncate_lsn.0 <= flushed.0
+                        && let Err(error) = timeline.truncate(state.truncate_lsn).await
+                    {
+                        tracing::warn!(
+                            tenant_id = %key.tenant_id,
+                            timeline_id = %key.timeline_id,
+                            %error,
+                            "failed to truncate drained safekeeper WAL"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(
+                    tenant_id = %key.tenant_id,
+                    timeline_id = %key.timeline_id,
+                    %error,
+                    "failed to drain safekeeper WAL to object storage"
+                ),
+            }
+        }
+    });
+}
+
+/// Returns the active timeline or an ordering error.
+fn required_timeline<S>(
+    timeline: &Option<Arc<EcAppendLog<S>>>,
+) -> Result<&Arc<EcAppendLog<S>>, ServerError> {
+    timeline
+        .as_ref()
+        .ok_or_else(|| ServerError::Connection("message arrived before greeting".to_owned()))
+}
+
+/// Validates Neon's fixed-width hexadecimal identity.
+fn validate_id(kind: &str, value: &str) -> Result<(), ServerError> {
+    if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(ServerError::Connection(format!(
+            "{kind} id must be 32 hexadecimal characters"
+        )))
+    }
+}
+
+/// Reads startup packets, declining SSL when libpq probes for it.
+async fn read_startup(stream: &mut TcpStream) -> Result<HashMap<String, String>, ServerError> {
+    loop {
+        let len = stream.read_u32().await? as usize;
+        if !(8..=1024 * 1024).contains(&len) {
+            return Err(ServerError::Connection(format!(
+                "invalid startup length {len}"
+            )));
+        }
+        let mut payload = vec![0_u8; len - 4];
+        stream.read_exact(&mut payload).await?;
+        let mut payload = Bytes::from(payload);
+        let code = payload.get_u32();
+        if code == PG_SSL_REQUEST {
+            stream.write_all(b"N").await?;
+            continue;
+        }
+        if code != PG_PROTOCOL_V3 {
+            return Err(ServerError::Connection(format!(
+                "unsupported PostgreSQL protocol {code}"
+            )));
+        }
+        let mut params = HashMap::new();
+        while !payload.is_empty() && payload[0] != 0 {
+            let key = take_cstr(&mut payload, "startup key")?;
+            let value = take_cstr(&mut payload, "startup value")?;
+            params.insert(key, value);
+        }
+        return Ok(params);
+    }
+}
+
+/// Extracts timeline ids from libpq startup options when present.
+fn timeline_from_startup(
+    params: &HashMap<String, String>,
+) -> Result<Option<TimelineKey>, ServerError> {
+    let mut tenant = params
+        .get("tenant_id")
+        .or_else(|| params.get("ztenantid"))
+        .cloned();
+    let mut timeline = params
+        .get("timeline_id")
+        .or_else(|| params.get("ztimelineid"))
+        .cloned();
+    if let Some(options) = params.get("options") {
+        let fields: Vec<&str> = options.split_whitespace().collect();
+        for field in fields {
+            let field = field.trim_start_matches("-c");
+            let Some((key, value)) = field.split_once('=').or_else(|| field.split_once(':')) else {
+                continue;
+            };
+            match key {
+                "tenant_id" | "ztenantid" => tenant = Some(value.to_owned()),
+                "timeline_id" | "ztimelineid" => timeline = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+    }
+    match (tenant, timeline) {
+        (None, None) => Ok(None),
+        (Some(tenant), Some(timeline)) => TimelineKey::new(tenant, timeline).map(Some),
+        _ => Err(ServerError::Connection(
+            "startup supplied only one of tenant_id/timeline_id".to_owned(),
+        )),
+    }
+}
+
+/// Sends trust authentication success and the minimum PostgreSQL startup state.
+async fn write_startup_ok(stream: &mut TcpStream) -> Result<(), ServerError> {
+    write_backend(stream, b'R', &0_u32.to_be_bytes()).await?;
+    write_parameter(stream, "server_version", "16.0").await?;
+    write_parameter(stream, "client_encoding", "UTF8").await?;
+    let mut backend_key = BytesMut::new();
+    backend_key.put_u32(std::process::id());
+    backend_key.put_u32(0);
+    write_backend(stream, b'K', &backend_key).await?;
+    write_backend(stream, b'Z', b"I").await
+}
+
+/// Sends one PostgreSQL ParameterStatus message.
+async fn write_parameter(
+    stream: &mut TcpStream,
+    key: &str,
+    value: &str,
+) -> Result<(), ServerError> {
+    let mut payload = BytesMut::new();
+    payload.put_slice(key.as_bytes());
+    payload.put_u8(0);
+    payload.put_slice(value.as_bytes());
+    payload.put_u8(0);
+    write_backend(stream, b'S', &payload).await
+}
+
+/// Reads one tagged frontend message, or `None` at a clean EOF.
+async fn read_frontend(stream: &mut TcpStream) -> Result<Option<(u8, Bytes)>, ServerError> {
+    let tag = match stream.read_u8().await {
+        Ok(tag) => tag,
+        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let len = stream.read_u32().await? as usize;
+    if !(4..=16 * 1024 * 1024).contains(&len) {
+        return Err(ServerError::Connection(format!(
+            "invalid frontend message length {len}"
+        )));
+    }
+    let mut payload = vec![0_u8; len - 4];
+    stream.read_exact(&mut payload).await?;
+    Ok(Some((tag, Bytes::from(payload))))
+}
+
+/// Sends one tagged PostgreSQL backend message.
+async fn write_backend(stream: &mut TcpStream, tag: u8, payload: &[u8]) -> Result<(), ServerError> {
+    stream.write_u8(tag).await?;
+    stream.write_u32((payload.len() + 4) as u32).await?;
+    stream.write_all(payload).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+/// Enters PostgreSQL copy-both mode with no column descriptors.
+async fn write_copy_both(stream: &mut TcpStream) -> Result<(), ServerError> {
+    write_backend(stream, b'W', &[0, 0, 0]).await
+}
+
+/// Sends one proposer/acceptor or replication CopyData payload.
+async fn write_copy_data(stream: &mut TcpStream, payload: Bytes) -> Result<(), ServerError> {
+    write_backend(stream, b'd', &payload).await
+}
+
+/// Streams WAL from the EC/origin log using PostgreSQL physical replication
+/// `XLogData` frames, then stays attached for future appends and feedback.
+async fn send_wal<S>(
+    stream: &mut TcpStream,
+    timeline: Arc<EcAppendLog<S>>,
+    mut position: Lsn,
+) -> Result<(), ServerError>
+where
+    S: ObjectRead + ObjectWrite + 'static,
+{
+    loop {
+        let tail = timeline.tail();
+        if position.0 < tail.0 {
+            let end = Lsn((position.0 + REPLICATION_CHUNK).min(tail.0));
+            let wal = timeline.read(position, end).await?;
+            let mut payload = BytesMut::with_capacity(25 + wal.len());
+            payload.put_u8(b'w');
+            payload.put_u64(position.0);
+            payload.put_u64(tail.0);
+            payload.put_i64(0);
+            payload.put_slice(&wal);
+            write_copy_data(stream, payload.freeze()).await?;
+            position = end;
+            continue;
+        }
+
+        match tokio::time::timeout(Duration::from_secs(1), read_frontend(stream)).await {
+            Ok(Ok(Some((b'X' | b'c', _)))) | Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some((_tag, _feedback)))) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                let mut keepalive = BytesMut::with_capacity(18);
+                keepalive.put_u8(b'k');
+                keepalive.put_u64(timeline.tail().0);
+                keepalive.put_i64(0);
+                keepalive.put_u8(0);
+                write_copy_data(stream, keepalive.freeze()).await?;
+            }
+        }
+    }
+}
+
+/// Sends Neon's `IDENTIFY_SYSTEM` row followed by ReadyForQuery.
+async fn write_identify_system<S>(
+    stream: &mut TcpStream,
+    timeline: &EcAppendLog<S>,
+) -> Result<(), ServerError>
+where
+    S: ObjectRead + ObjectWrite,
+{
+    let state = timeline.safekeeper_state().await;
+    write_row_description(
+        stream,
+        &[
+            ("systemid", 25, -1),
+            ("timeline", 23, 4),
+            ("xlogpos", 25, -1),
+            ("dbname", 25, -1),
+        ],
+    )
+    .await?;
+    write_data_row(
+        stream,
+        &[
+            Some(state.system_id.to_string()),
+            Some("1".to_owned()),
+            Some(format_lsn(state.commit_lsn)),
+            None,
+        ],
+    )
+    .await?;
+    write_command_complete(stream, "IDENTIFY_SYSTEM").await?;
+    write_backend(stream, b'Z', b"I").await
+}
+
+/// Sends Neon's `TIMELINE_STATUS` row followed by ReadyForQuery.
+async fn write_timeline_status<S>(
+    stream: &mut TcpStream,
+    timeline: &EcAppendLog<S>,
+) -> Result<(), ServerError>
+where
+    S: ObjectRead + ObjectWrite,
+{
+    let state = timeline.safekeeper_state().await;
+    write_row_description(stream, &[("flush_lsn", 25, -1), ("commit_lsn", 25, -1)]).await?;
+    write_data_row(
+        stream,
+        &[
+            Some(format_lsn(state.flush_lsn)),
+            Some(format_lsn(state.commit_lsn)),
+        ],
+    )
+    .await?;
+    write_command_complete(stream, "TIMELINE_STATUS").await?;
+    write_backend(stream, b'Z', b"I").await
+}
+
+/// Sends a PostgreSQL RowDescription for text/int fields.
+async fn write_row_description(
+    stream: &mut TcpStream,
+    fields: &[(&str, u32, i16)],
+) -> Result<(), ServerError> {
+    let mut payload = BytesMut::new();
+    payload.put_u16(fields.len() as u16);
+    for (name, oid, len) in fields {
+        payload.put_slice(name.as_bytes());
+        payload.put_u8(0);
+        payload.put_u32(0);
+        payload.put_i16(0);
+        payload.put_u32(*oid);
+        payload.put_i16(*len);
+        payload.put_i32(-1);
+        payload.put_i16(0);
+    }
+    write_backend(stream, b'T', &payload).await
+}
+
+/// Sends one PostgreSQL DataRow.
+async fn write_data_row(
+    stream: &mut TcpStream,
+    fields: &[Option<String>],
+) -> Result<(), ServerError> {
+    let mut payload = BytesMut::new();
+    payload.put_u16(fields.len() as u16);
+    for field in fields {
+        match field {
+            Some(value) => {
+                payload.put_i32(value.len() as i32);
+                payload.put_slice(value.as_bytes());
+            }
+            None => payload.put_i32(-1),
+        }
+    }
+    write_backend(stream, b'D', &payload).await
+}
+
+/// Sends PostgreSQL CommandComplete.
+async fn write_command_complete(stream: &mut TcpStream, command: &str) -> Result<(), ServerError> {
+    let mut payload = BytesMut::new();
+    payload.put_slice(command.as_bytes());
+    payload.put_u8(0);
+    write_backend(stream, b'C', &payload).await
+}
+
+/// Reads a NUL-terminated UTF-8 string from a protocol payload.
+fn take_cstr(payload: &mut Bytes, field: &str) -> Result<String, ServerError> {
+    let end = payload
+        .iter()
+        .position(|byte| *byte == 0)
+        .ok_or_else(|| ServerError::Connection(format!("{field} lacks NUL terminator")))?;
+    let bytes = payload.split_to(end);
+    payload.advance(1);
+    std::str::from_utf8(&bytes)
+        .map(str::to_owned)
+        .map_err(|error| ServerError::Connection(format!("{field} is not UTF-8: {error}")))
+}
+
+/// Borrows one NUL-terminated query without its terminator.
+fn payload_cstr<'a>(payload: &'a Bytes, field: &str) -> Result<&'a str, ServerError> {
+    let bytes = payload
+        .strip_suffix(&[0])
+        .ok_or_else(|| ServerError::Connection(format!("{field} lacks NUL terminator")))?;
+    std::str::from_utf8(bytes)
+        .map_err(|error| ServerError::Connection(format!("{field} is not UTF-8: {error}")))
+}
+
+/// Renders an LSN using PostgreSQL's `HIGH/LOW` hexadecimal convention.
+fn format_lsn(lsn: Lsn) -> String {
+    format!("{:X}/{:08X}", lsn.0 >> 32, lsn.0 & 0xffff_ffff)
+}

@@ -7136,6 +7136,7 @@ dependencies = [
  "verglas-cluster",
  "verglas-core",
  "verglas-s3",
+ "verglas-safekeeper",
 ]
 
 [[package]]
@@ -7437,9 +7438,11 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "verglas-cache",
  "verglas-cluster",
  "verglas-core",

@@ -1,10 +1,9 @@
-//! Ring wiring for the block-flush write-back plane (#382).
+//! Shared fragment-ring wiring for block FLUSH and Neon WAL (#13/#382).
 //!
 //! The cache node's object serving path is a deliberate cluster-of-one (see
-//! [`crate::serve`]), but the block-device tier's FLUSH is write-back over the
-//! fleet ring: a device flush is erasure-coded across the ring's boxes and acked
-//! on a quorum, draining to R2 in the background. This module is the only place
-//! the cache node reaches the ring, and only for the block tier. It:
+//! [`crate::serve`]), but block FLUSH and the embedded safekeeper both write over
+//! the fleet ring. This module constructs their one shared transport,
+//! membership view, fragment store, and listener. It:
 //!
 //! - learns the ring from the environment (the same env-driven shape the block
 //!   NBD/S3 addresses use — no new config-file schema);
@@ -19,7 +18,7 @@
 //! - runs the takeover pass that completes a drain a crashed originator left
 //!   behind.
 //!
-//! With no ring configured (`VERGLAS_BLOCK_PEERS` unset or naming fewer than two
+//! With no ring configured (`VERGLAS_RING_PEERS` unset or naming fewer than three
 //! nodes) this module does nothing and the block tier stays single-node: FLUSH is
 //! the synchronous R2 barrier, byte-identical to before the write-back plane
 //! existed. That is topology-driven, not a config knob.
@@ -43,7 +42,7 @@ use crate::blockdev::DeviceRegistry;
 
 /// The default fragment-plane listen address. The ring's boxes place block-flush
 /// shards on this node here; bound like the S3/NBD planes, overridable with
-/// `VERGLAS_BLOCK_RING_ADDR`. Not a config knob — one fixed port, one listener.
+/// `VERGLAS_RING_ADDR`. Not a config knob — one fixed port, one listener.
 const DEFAULT_RING_ADDR: &str = "0.0.0.0:8336";
 
 /// How often each node scans its held drain descriptors for one past its lease
@@ -54,10 +53,43 @@ const TAKEOVER_INTERVAL: Duration = Duration::from_secs(5);
 /// The handles that keep the ring plane alive for the process lifetime: the
 /// fragment peer server and the takeover loop. Dropping them stops the plane.
 pub struct RingPlane {
+    /// Stable identity of this cache node in the ring.
+    self_id: NodeId,
+    /// Shared local/peer fragment transport.
+    transport: Arc<dyn FragmentTransport>,
+    /// Shared view of live fragment holders.
+    membership: Arc<dyn LiveMembership>,
     /// The fragment RPC listener peers place shards through.
     _peer_server: PeerServer,
     /// The background takeover loop.
     _takeover: tokio::task::JoinHandle<()>,
+}
+
+impl RingPlane {
+    /// Returns the fragment transport shared by block FLUSH and WAL.
+    pub fn transport(&self) -> Arc<dyn FragmentTransport> {
+        Arc::clone(&self.transport)
+    }
+
+    /// Returns the live ring view shared by block FLUSH and WAL.
+    pub fn membership(&self) -> Arc<dyn LiveMembership> {
+        Arc::clone(&self.membership)
+    }
+
+    /// Returns a deterministic Neon numeric id derived from the fleet node id.
+    pub fn safekeeper_id(&self) -> u64 {
+        self.self_id
+            .as_str()
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+    }
+
+    /// Returns the current number of configured live fragment holders.
+    pub fn node_count(&self) -> usize {
+        self.membership.live_nodes().len()
+    }
 }
 
 /// Wires the block-flush write-back plane onto `registry` from the environment,
@@ -70,28 +102,28 @@ pub async fn setup(
     cache_dir: &std::path::Path,
     registry: &DeviceRegistry,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
-    let peers = match env_var("VERGLAS_BLOCK_PEERS") {
+    let peers = match env_var("VERGLAS_RING_PEERS") {
         Some(raw) => parse_peers(&raw),
         None => Vec::new(),
     };
-    // A ring needs at least two boxes to erasure-code across; fewer is a
+    // A production cache ring needs at least three boxes; fewer is a
     // single-node deployment and the block tier stays on the synchronous barrier.
-    if peers.len() < 2 {
+    if peers.len() < 3 {
         eprintln!(
-            "verglas-cache-node {VERSION} block-device tier single-node: FLUSH is the synchronous R2 barrier (set VERGLAS_BLOCK_PEERS to erasure-code flushes across the ring)"
+            "verglas-cache-node {VERSION} fragment ring disabled: at least three VERGLAS_RING_PEERS are required"
         );
         return Ok(None);
     }
 
     let Some(self_id) = env_var("VERGLAS_NODE_ID").map(|s| NodeId::new(s.as_str())) else {
         eprintln!(
-            "verglas-cache-node {VERSION} block ring disabled: VERGLAS_BLOCK_PEERS is set but VERGLAS_NODE_ID is not — cannot tell which ring member this node is"
+            "verglas-cache-node {VERSION} fragment ring disabled: VERGLAS_RING_PEERS is set but VERGLAS_NODE_ID is not — cannot tell which ring member this node is"
         );
         return Ok(None);
     };
     if !peers.iter().any(|(id, _)| *id == self_id) {
         eprintln!(
-            "verglas-cache-node {VERSION} block ring disabled: VERGLAS_NODE_ID `{}` is not among VERGLAS_BLOCK_PEERS",
+            "verglas-cache-node {VERSION} fragment ring disabled: VERGLAS_NODE_ID `{}` is not among VERGLAS_RING_PEERS",
             self_id.as_str()
         );
         return Ok(None);
@@ -99,9 +131,9 @@ pub async fn setup(
 
     let secret = env_var("VERGLAS_CLUSTER_SECRET");
 
-    // The fragment store this node holds ring shards in — kept under a
-    // block-specific subdir so it never collides with anything else in cache.dir.
-    let local = LocalFragmentStore::new(cache_dir.join("block-ring"));
+    // The fragment store this node holds block and WAL ring shards in — kept
+    // under its own subdir so it never collides with the read cache.
+    let local = LocalFragmentStore::new(cache_dir.join("fragment-ring"));
 
     // The peer RPC client + transport: self-directed placements go to the local
     // store, everything else over the fragment RPC to the resolved peer address.
@@ -119,17 +151,22 @@ pub async fn setup(
     ));
 
     let membership: Arc<dyn LiveMembership> = Arc::new(StaticMembership {
-        self_id,
+        self_id: self_id.clone(),
         live: peers.iter().map(|(id, _)| id.clone()).collect(),
     });
 
     // The plane MUST code over the same chunk store the registry stages into.
-    let ring = RingWriteback::new(transport, membership, local.clone(), registry.chunk_store());
+    let ring = RingWriteback::new(
+        Arc::clone(&transport),
+        Arc::clone(&membership),
+        local.clone(),
+        registry.chunk_store(),
+    );
     registry.attach_ring(Arc::clone(&ring));
 
     // Serve the fragment endpoints peers place shards through. The block-fetch
     // source is a no-op — the ring plane serves only fragments.
-    let ring_addr: SocketAddr = env_var("VERGLAS_BLOCK_RING_ADDR")
+    let ring_addr: SocketAddr = env_var("VERGLAS_RING_ADDR")
         .unwrap_or_else(|| DEFAULT_RING_ADDR.to_owned())
         .parse()?;
     let peer_server = PeerServer::bind_with_fragments(
@@ -155,12 +192,15 @@ pub async fn setup(
     });
 
     Ok(Some(RingPlane {
+        self_id,
+        transport,
+        membership,
         _peer_server: peer_server,
         _takeover: takeover,
     }))
 }
 
-/// Parses `VERGLAS_BLOCK_PEERS` — `id=host:port` entries, comma-separated —
+/// Parses `VERGLAS_RING_PEERS` — `id=host:port` entries, comma-separated —
 /// skipping any malformed entry with a warning rather than failing startup.
 fn parse_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
     let mut peers = Vec::new();

@@ -47,8 +47,13 @@ impl MemoryTransport {
             frags: Mutex::new(HashMap::new()),
         })
     }
-    fn fragment_count(&self) -> usize {
-        self.frags.lock().expect("lock").len()
+    fn wal_fragment_count(&self) -> usize {
+        self.frags
+            .lock()
+            .expect("lock")
+            .keys()
+            .filter(|(_, index)| *index < 1024)
+            .count()
     }
 }
 
@@ -284,7 +289,7 @@ async fn single_node_fast_acks_with_the_origin_absent() {
     assert_eq!(r.end, Lsn(4096));
 
     // One fragment (k=1, m=0), nothing in S3.
-    assert_eq!(transport.fragment_count(), 1, "one local fragment");
+    assert_eq!(transport.wal_fragment_count(), 1, "one local fragment");
     assert_eq!(
         store.object_count(),
         0,
@@ -336,7 +341,7 @@ async fn single_node_flush_then_recover_from_s3() {
         let watermark = log.flush().await.expect("flush");
         assert_eq!(watermark, Lsn(6000));
         assert_eq!(
-            transport.fragment_count(),
+            transport.wal_fragment_count(),
             0,
             "fragment dropped after flush"
         );

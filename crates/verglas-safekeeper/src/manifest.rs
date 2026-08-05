@@ -34,6 +34,8 @@ pub struct Placement {
 /// One acked append: the bytes it occupies and how to rebuild them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendEntry {
+    /// Globally unique fragment object id for this timeline append.
+    pub object_id: String,
     /// Per-append sequence within its segment, part of the fragment object id.
     pub seq: u64,
     /// First LSN of this append.
@@ -55,8 +57,8 @@ pub struct AppendEntry {
 impl AppendEntry {
     /// The fragment object id for this append within `segment_id`: stable, and
     /// unique across the log so fragments never collide.
-    pub fn object_id(&self, segment_id: u64) -> String {
-        format!("seg{segment_id:020}/app{:020}", self.seq)
+    pub fn object_id(&self) -> &str {
+        &self.object_id
     }
 }
 
@@ -89,8 +91,24 @@ pub struct SegmentEntry {
 /// The whole durable state of one append log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Monotonic state revision replicated through the fragment ring.
+    pub revision: u64,
+    /// Neon membership generation accepted by this timeline.
+    pub generation: u32,
+    /// PostgreSQL system identifier learned from the proposer greeting.
+    pub system_id: u64,
+    /// PostgreSQL server version in `PG_VERSION_NUM` form.
+    pub pg_version: u32,
+    /// PostgreSQL WAL segment size.
+    pub wal_segment_size: u32,
     /// Current writer fencing token.
     pub epoch: Epoch,
+    /// Quorum commit watermark learned from walproposer.
+    pub commit_lsn: Lsn,
+    /// Oldest WAL retained for proposer/pageserver recovery.
+    pub truncate_lsn: Lsn,
+    /// Ordered `(term, first_lsn)` boundaries selected during elections.
+    pub term_history: Vec<(u64, Lsn)>,
     /// The stream's base LSN (appends below this were truncated away).
     pub base: Lsn,
     /// One past the last acked byte across the whole log.
@@ -107,7 +125,15 @@ impl Manifest {
     /// A fresh, empty log at LSN 0, epoch 0.
     fn empty() -> Self {
         Self {
+            revision: 0,
+            generation: 0,
+            system_id: 0,
+            pg_version: 0,
+            wal_segment_size: 0,
             epoch: Epoch(0),
+            commit_lsn: Lsn(0),
+            truncate_lsn: Lsn(0),
+            term_history: Vec::new(),
             base: Lsn(0),
             tail: Lsn(0),
             flushed_through: Lsn(0),

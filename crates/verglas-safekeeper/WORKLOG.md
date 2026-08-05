@@ -21,3 +21,13 @@
   cache-node safekeeper. WAL appends now preserve caller-supplied PostgreSQL
   LSNs, validate reconnect overlap byte-for-byte, append only a new suffix, and
   reject gaps or divergent WAL without moving the durable tail.
+- #13: Completed the embedded safekeeper. Added the PostgreSQL v3 listener and
+  Neon's protocol-v3 `START_WAL_PUSH`, greeting/vote/elected/append exchange,
+  quorum-backed append acknowledgements, `START_REPLICATION` WAL readback,
+  `IDENTIFY_SYSTEM`, and `TIMELINE_STATUS`. Timeline terms, watermarks, term
+  history, append descriptors, and the latest-state head are replicated across
+  the EC ring, so a scheduler replacement with an empty local state directory
+  recovers from surviving caches. A background loop drains committed WAL to
+  object storage and only then deletes EC fragments. Tests cover pinned Neon
+  wire vectors, real PostgreSQL sockets, node loss, coordinator replacement,
+  asynchronous drain, and byte-identical physical replication.

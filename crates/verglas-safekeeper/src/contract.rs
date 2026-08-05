@@ -91,6 +91,29 @@ pub struct Appended {
     pub end: Lsn,
 }
 
+/// Persisted Neon acceptor state returned during greeting and election.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafekeeperState {
+    /// PostgreSQL system identifier learned from the proposer greeting.
+    pub system_id: u64,
+    /// PostgreSQL server version in `PG_VERSION_NUM` form.
+    pub pg_version: u32,
+    /// PostgreSQL WAL segment size.
+    pub wal_segment_size: u32,
+    /// Membership generation accepted by this timeline.
+    pub generation: u32,
+    /// Highest term voted for and accepted.
+    pub term: u64,
+    /// End of byte-identical EC-durable WAL.
+    pub flush_lsn: Lsn,
+    /// Quorum commit watermark learned from walproposer.
+    pub commit_lsn: Lsn,
+    /// Oldest retained WAL needed for recovery.
+    pub truncate_lsn: Lsn,
+    /// Ordered `(term, first_lsn)` boundaries.
+    pub term_history: Vec<(u64, Lsn)>,
+}
+
 /// Why an append-log operation could not complete. Every variant is a clean
 /// failure that leaves the log consistent — never a partial or sub-quorum ack.
 #[derive(Debug, thiserror::Error)]

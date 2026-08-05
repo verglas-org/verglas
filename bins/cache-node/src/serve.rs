@@ -18,12 +18,12 @@
 //!   straight through to the origin durably (write-through), exactly what a
 //!   disabled write-back tier does in verglas-server.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
-//!   reaches the ring. When `VERGLAS_BLOCK_PEERS` names a ring, a device FLUSH is
+//!   reaches the ring. When `VERGLAS_RING_PEERS` names a ring, a device FLUSH is
 //!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
-//!   background); see [`crate::ring`]. This pulls in `verglas-cluster`'s fragment
-//!   store and peer RPC for the block plane only — the object read/serve path
-//!   above is still a peerless cluster-of-one. With no ring configured the block
-//!   FLUSH stays the synchronous R2 barrier.
+//!   background); see [`crate::ring`]. The embedded safekeeper shares that same
+//!   fragment store and peer RPC; the object read/serve path above is still a
+//!   peerless cluster-of-one. With no ring configured block FLUSH stays the
+//!   synchronous R2 barrier and no safekeeper listener starts.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -302,7 +302,7 @@ pub async fn run(
     // chunks in, so the block tier is off there.
     // The ring flush plane, held for the process lifetime when the node is on a
     // ring (fragment peer server + takeover loop). `None` on a single-node node.
-    let mut _ring_plane = None;
+    let mut ring_plane = None;
     let block_registry = match config.backend.bucket.as_deref() {
         Some(bucket) => {
             let store = registry.store_for(bucket)?;
@@ -312,7 +312,9 @@ pub async fn run(
             // Learn the ring and attach the flush write-back plane to the registry
             // before any device is ensured. With no ring configured this is a
             // no-op and FLUSH stays the synchronous R2 barrier (#382).
-            _ring_plane = crate::ring::setup(&config.cache.dir, &device_registry).await?;
+            ring_plane = crate::ring::setup(&config.cache.dir, &device_registry)
+                .await?
+                .map(Arc::new);
             let block_addr = std::env::var("VERGLAS_BLOCK_ADDR")
                 .unwrap_or_else(|_| format!("0.0.0.0:{BLOCK_PORT}"));
             let block_listener = tokio::net::TcpListener::bind(&block_addr).await?;
@@ -325,6 +327,24 @@ pub async fn run(
         None => {
             eprintln!(
                 "verglas-cache-node {VERSION} block-device tier disabled: no single backend.bucket to root chunks in"
+            );
+            None
+        }
+    };
+
+    // The Neon listener is another data plane of this same process. It is
+    // present whenever this node belongs to the fragment ring and shares that
+    // ring's transport/listener/store with block FLUSH.
+    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane) {
+        (Some(bucket), Some(ring)) => Some((
+            Arc::clone(&registry),
+            bucket,
+            config.cache.dir.clone(),
+            ring,
+        )),
+        _ => {
+            eprintln!(
+                "verglas-cache-node {VERSION} embedded safekeeper disabled: this node is not a configured fragment-ring member"
             );
             None
         }
@@ -411,7 +431,22 @@ pub async fn run(
         }
     };
 
-    tokio::try_join!(admin_fut, data_plane, nbd_fut).map(|_| ())
+    // The embedded PostgreSQL/Neon WAL plane. As with an absent NBD listener,
+    // a node outside the fragment ring waits forever instead of inventing a
+    // separate durability mode.
+    let safekeeper_fut = async move {
+        match safekeeper_args {
+            Some((stores, bucket, cache_dir, ring)) => {
+                crate::safekeeper::serve(stores, bucket, cache_dir, ring).await
+            }
+            None => {
+                std::future::pending::<()>().await;
+                Ok(())
+            }
+        }
+    };
+
+    tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut).map(|_| ())
 }
 
 /// Serves the SigV4 S3 endpoint until the process is interrupted. Reads are

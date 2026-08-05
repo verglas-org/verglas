@@ -17,7 +17,9 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "time"] }
+tracing = "0.1.44"
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

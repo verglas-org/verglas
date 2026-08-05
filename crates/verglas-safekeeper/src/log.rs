@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use verglas_cache::writeback_codec::{Encoded, Fragment, Geometry, encode, reassemble};
 use verglas_cluster::fragments::{FragmentKey, FragmentRecord};
@@ -26,7 +27,9 @@ use verglas_core::read::{ObjectRead, ReadRange};
 use verglas_core::ring::rendezvous_hash;
 use verglas_core::write::{ObjectWrite, WriteBodyStream, WriteMetadata};
 
-use crate::contract::{AppendError, AppendGeometry, AppendLog, Appended, Epoch, Lsn};
+use crate::contract::{
+    AppendError, AppendGeometry, AppendLog, Appended, Epoch, Lsn, SafekeeperState,
+};
 use crate::manifest::{
     AppendEntry, Manifest, ManifestStore, Placement, SegmentEntry, SegmentState,
 };
@@ -35,6 +38,14 @@ use crate::manifest::{
 /// A fixed flush-granularity constant, not a tuning knob: the whole tuning
 /// surface is the erasure geometry (see the crate contract, §7).
 const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
+
+/// Fragment index reserved for full-copy state descriptors. EC data fragments
+/// occupy the small `0..k+m` range, so this cannot collide with WAL data.
+const STATE_DESCRIPTOR_INDEX: usize = usize::MAX - 1;
+
+/// Fragment index reserved for the replicated pointer to the latest committed
+/// state descriptor.
+const STATE_HEAD_INDEX: usize = usize::MAX;
 
 /// The erasure-coded quorum append log. `S` is the S3 origin, used for the flush
 /// write and for reading already-flushed ranges back; it is never on the append
@@ -114,6 +125,285 @@ where
         }
     }
 
+    /// Stable object-id prefix for this timeline's replicated state records.
+    fn state_prefix(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(self.bucket.as_bytes());
+        digest.update([0]);
+        digest.update(self.prefix.trim_matches('/').as_bytes());
+        format!("sk/{:x}", digest.finalize())
+    }
+
+    /// Object id holding a full immutable copy of one manifest revision.
+    fn state_object_id(&self, revision: u64) -> String {
+        format!("{}/state/{revision:020}", self.state_prefix())
+    }
+
+    /// Stable object id whose payload is the latest committed revision number.
+    fn head_object_id(&self) -> String {
+        format!("{}/head", self.state_prefix())
+    }
+
+    /// Replicates an immutable manifest revision and then publishes its head.
+    /// A revision is published only after its full descriptor reaches `w`
+    /// distinct nodes.
+    async fn replicate_state(&self, manifest: &Manifest) -> Result<(), AppendError> {
+        let live = self.membership.live_nodes();
+        let geometry = self.effective_geometry();
+        let descriptor = serde_json::to_vec(manifest)
+            .map(Bytes::from)
+            .map_err(|error| AppendError::Manifest(format!("encode ring state: {error}")))?;
+        let descriptor_key = FragmentKey {
+            object_id: self.state_object_id(manifest.revision),
+            index: STATE_DESCRIPTOR_INDEX,
+        };
+        let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
+        let mut descriptor_nodes = Vec::new();
+        for node in &live {
+            match self.transport.place(node, descriptor_record.clone()).await {
+                Ok(()) => descriptor_nodes.push(node.clone()),
+                Err(error) => tracing::warn!(
+                    node = node.as_str(),
+                    revision = manifest.revision,
+                    %error,
+                    "failed to replicate safekeeper descriptor"
+                ),
+            }
+        }
+        if descriptor_nodes.len() < geometry.w {
+            return Err(AppendError::QuorumUnavailable {
+                needed: geometry.w,
+                placed: descriptor_nodes.len(),
+            });
+        }
+
+        let head_record = FragmentRecord::new(
+            FragmentKey {
+                object_id: self.head_object_id(),
+                index: STATE_HEAD_INDEX,
+            },
+            Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
+        );
+        let mut heads = 0;
+        for node in &descriptor_nodes {
+            match self.transport.place(node, head_record.clone()).await {
+                Ok(()) => heads += 1,
+                Err(error) => tracing::warn!(
+                    node = node.as_str(),
+                    revision = manifest.revision,
+                    %error,
+                    "failed to publish safekeeper state head"
+                ),
+            }
+        }
+        if heads < geometry.w {
+            return Err(AppendError::QuorumUnavailable {
+                needed: geometry.w,
+                placed: heads,
+            });
+        }
+        Ok(())
+    }
+
+    /// Recovers the newest ring-committed state visible through live peers. A
+    /// head is only a discovery pointer; one checksum-valid survivor of the
+    /// descriptor is sufficient because publishing that head required the full
+    /// descriptor to have reached the configured quorum first.
+    pub async fn recover_from_ring(&self) -> Result<bool, AppendError> {
+        let live = self.membership.live_nodes();
+        let head_key = FragmentKey {
+            object_id: self.head_object_id(),
+            index: STATE_HEAD_INDEX,
+        };
+        let mut latest = None;
+        for node in &live {
+            if let Ok(Some(head)) = self.transport.load(node, &head_key).await
+                && head.is_healthy()
+                && head.bytes.len() == 8
+            {
+                let mut raw = [0_u8; 8];
+                raw.copy_from_slice(&head.bytes);
+                let revision = u64::from_be_bytes(raw);
+                latest = Some(latest.map_or(revision, |seen: u64| seen.max(revision)));
+            }
+        }
+        let Some(revision) = latest else {
+            return Ok(false);
+        };
+        let descriptor_key = FragmentKey {
+            object_id: self.state_object_id(revision),
+            index: STATE_DESCRIPTOR_INDEX,
+        };
+        let mut candidates: std::collections::HashMap<Vec<u8>, usize> =
+            std::collections::HashMap::new();
+        for node in &live {
+            if let Ok(Some(descriptor)) = self.transport.load(node, &descriptor_key).await
+                && descriptor.is_healthy()
+            {
+                *candidates.entry(descriptor.bytes.to_vec()).or_default() += 1;
+            }
+        }
+        let bytes = candidates
+            .into_iter()
+            .filter(|(_, count)| *count >= 1)
+            .map(|(bytes, _)| bytes)
+            .next()
+            .ok_or_else(|| {
+                AppendError::Manifest(format!(
+                    "state revision {revision} is unavailable on every live peer"
+                ))
+            })?;
+        let recovered: Manifest = serde_json::from_slice(&bytes)
+            .map_err(|error| AppendError::Manifest(format!("decode ring state: {error}")))?;
+        if recovered.revision != revision {
+            return Err(AppendError::Manifest(format!(
+                "state head {revision} points at revision {}",
+                recovered.revision
+            )));
+        }
+        let mut manifest = self.state.lock().await;
+        if recovered.revision <= manifest.revision {
+            return Ok(false);
+        }
+        self.manifest_store.persist(&recovered)?;
+        self.tail.store(recovered.tail.0, Ordering::Relaxed);
+        self.flushed
+            .store(recovered.flushed_through.0, Ordering::Relaxed);
+        self.epoch.store(recovered.epoch.0, Ordering::Relaxed);
+        *manifest = recovered;
+        Ok(true)
+    }
+
+    /// Returns the persisted Neon acceptor state for greeting, voting, and WAL
+    /// responses.
+    pub async fn safekeeper_state(&self) -> SafekeeperState {
+        let manifest = self.state.lock().await;
+        SafekeeperState {
+            system_id: manifest.system_id,
+            pg_version: manifest.pg_version,
+            wal_segment_size: manifest.wal_segment_size,
+            generation: manifest.generation,
+            term: manifest.epoch.0,
+            flush_lsn: manifest.tail,
+            commit_lsn: manifest.commit_lsn,
+            truncate_lsn: manifest.truncate_lsn,
+            term_history: manifest.term_history.clone(),
+        }
+    }
+
+    /// Persists the timeline identity and PostgreSQL server properties carried
+    /// by the walproposer greeting. Repeated identical greetings are free.
+    pub async fn configure_timeline(
+        &self,
+        generation: u32,
+        system_id: u64,
+        pg_version: u32,
+        wal_segment_size: u32,
+    ) -> Result<(), AppendError> {
+        let mut manifest = self.state.lock().await;
+        if manifest.system_id != 0 && manifest.system_id != system_id {
+            return Err(AppendError::Manifest(format!(
+                "timeline system id changed from {} to {system_id}",
+                manifest.system_id
+            )));
+        }
+        if generation < manifest.generation {
+            return Err(AppendError::Manifest(format!(
+                "stale membership generation {generation}; current is {}",
+                manifest.generation
+            )));
+        }
+        if manifest.generation == generation
+            && manifest.system_id == system_id
+            && manifest.pg_version == pg_version
+            && manifest.wal_segment_size == wal_segment_size
+        {
+            return Ok(());
+        }
+        manifest.generation = generation;
+        manifest.system_id = system_id;
+        manifest.pg_version = pg_version;
+        manifest.wal_segment_size = wal_segment_size;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)
+    }
+
+    /// Persists an election vote. A stale term or generation is refused without
+    /// changing state; an equal vote is idempotent.
+    pub async fn accept_vote(&self, generation: u32, term: u64) -> Result<bool, AppendError> {
+        let mut manifest = self.state.lock().await;
+        if generation < manifest.generation || term < manifest.epoch.0 {
+            return Ok(false);
+        }
+        if generation == manifest.generation && term == manifest.epoch.0 {
+            return Ok(true);
+        }
+        manifest.generation = generation;
+        manifest.epoch = Epoch(term);
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)?;
+        self.epoch.store(term, Ordering::Relaxed);
+        Ok(true)
+    }
+
+    /// Installs the elected proposer's term history and streaming boundary.
+    pub async fn announce_elected(
+        &self,
+        generation: u32,
+        term: u64,
+        start_streaming_at: Lsn,
+        term_history: Vec<(u64, Lsn)>,
+    ) -> Result<(), AppendError> {
+        let mut manifest = self.state.lock().await;
+        if generation != manifest.generation || term != manifest.epoch.0 {
+            return Err(AppendError::Fenced {
+                current: manifest.epoch,
+                presented: Epoch(term),
+            });
+        }
+        if start_streaming_at.0 > manifest.tail.0 && manifest.tail != Lsn(0) {
+            return Err(AppendError::WalGap {
+                expected: manifest.tail,
+                presented: start_streaming_at,
+            });
+        }
+        manifest.term_history = term_history;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)
+    }
+
+    /// Advances Neon's commit and truncation watermarks after a durable append.
+    pub async fn record_watermarks(
+        &self,
+        commit_lsn: Lsn,
+        truncate_lsn: Lsn,
+    ) -> Result<SafekeeperState, AppendError> {
+        let mut manifest = self.state.lock().await;
+        let commit_lsn = Lsn(commit_lsn.0.min(manifest.tail.0));
+        let truncate_lsn = Lsn(truncate_lsn.0.min(manifest.tail.0));
+        if commit_lsn.0 > manifest.commit_lsn.0 || truncate_lsn.0 > manifest.truncate_lsn.0 {
+            manifest.commit_lsn = Lsn(manifest.commit_lsn.0.max(commit_lsn.0));
+            manifest.truncate_lsn = Lsn(manifest.truncate_lsn.0.max(truncate_lsn.0));
+            manifest.revision = manifest.revision.saturating_add(1);
+            self.replicate_state(&manifest).await?;
+            self.manifest_store.persist(&manifest)?;
+        }
+        Ok(SafekeeperState {
+            system_id: manifest.system_id,
+            pg_version: manifest.pg_version,
+            wal_segment_size: manifest.wal_segment_size,
+            generation: manifest.generation,
+            term: manifest.epoch.0,
+            flush_lsn: manifest.tail,
+            commit_lsn: manifest.commit_lsn,
+            truncate_lsn: manifest.truncate_lsn,
+            term_history: manifest.term_history.clone(),
+        })
+    }
+
     /// Encodes `records` and places its fragments on distinct live nodes,
     /// returning the placements once at least `w` are durable. Fewer than `w`
     /// is not a durable ack: the partial placements are cleaned up and the
@@ -134,6 +424,13 @@ where
         for node in ordered {
             if self.transport.has_headroom(&node, probe).await {
                 nodes.push(node);
+            } else {
+                tracing::warn!(
+                    node = node.as_str(),
+                    bytes = probe,
+                    %object_id,
+                    "safekeeper fragment holder has no reachable headroom"
+                );
             }
         }
 
@@ -147,11 +444,18 @@ where
                 },
                 fragment.bytes.clone(),
             );
-            if self.transport.place(node, record).await.is_ok() {
-                placements.push(Placement {
+            match self.transport.place(node, record).await {
+                Ok(()) => placements.push(Placement {
                     index,
                     node: node.as_str().to_owned(),
-                });
+                }),
+                Err(error) => tracing::warn!(
+                    node = node.as_str(),
+                    index,
+                    %object_id,
+                    %error,
+                    "failed to place safekeeper WAL fragment"
+                ),
             }
         }
 
@@ -186,12 +490,8 @@ where
     /// Reassembles one append's bytes from any `k` surviving, verified
     /// fragments. Tolerates the loss or corruption of up to the codec's erasure
     /// budget; fails loudly below `k`.
-    async fn reassemble_append(
-        &self,
-        segment_id: u64,
-        entry: &AppendEntry,
-    ) -> Result<Bytes, AppendError> {
-        let object_id = entry.object_id(segment_id);
+    async fn reassemble_append(&self, entry: &AppendEntry) -> Result<Bytes, AppendError> {
+        let object_id = entry.object_id().to_owned();
         let geometry = Geometry {
             k: entry.k,
             m: entry.m,
@@ -227,7 +527,7 @@ where
     async fn reassemble_segment(&self, segment: &SegmentEntry) -> Result<Bytes, AppendError> {
         let mut out = Vec::new();
         for entry in &segment.appends {
-            let bytes = self.reassemble_append(segment.id, entry).await?;
+            let bytes = self.reassemble_append(entry).await?;
             out.extend_from_slice(&bytes);
         }
         Ok(Bytes::from(out))
@@ -423,7 +723,7 @@ where
             let seg = &manifest.segments[idx];
             (seg.id, seg.appends.len() as u64)
         };
-        let object_id = format!("seg{segment_id:020}/app{seq:020}");
+        let object_id = format!("{}/w/{segment_id:016x}/{seq:016x}", self.state_prefix());
 
         let geometry = self.effective_geometry();
         let live = self.membership.live_nodes();
@@ -443,6 +743,7 @@ where
         };
 
         let entry = AppendEntry {
+            object_id: object_id.clone(),
             seq,
             start,
             end,
@@ -462,8 +763,16 @@ where
             manifest.flushed_through = begin_lsn;
         }
         manifest.tail = end;
+        manifest.revision = manifest.revision.saturating_add(1);
 
-        // Fsync the manifest before acking: the ack must not outrun durability.
+        if let Err(error) = self.replicate_state(&manifest).await {
+            *manifest = previous;
+            self.drop_fragments(&object_id, &placements).await;
+            return Err(error);
+        }
+
+        // The ring descriptor is the coordinator-replacement authority. Keep a
+        // local fsynced copy as the fast same-node restart path.
         if let Err(error) = self.manifest_store.persist(&manifest) {
             // The fragments are placed but the record is not durable — roll the
             // append back so the tail never reflects an un-fsynced ack, and drop
@@ -516,13 +825,15 @@ where
             // Segments flush in LSN order with no gaps, so the whole prefix up to
             // this segment's end is now in S3.
             manifest.flushed_through = segment.end;
+            manifest.revision = manifest.revision.saturating_add(1);
+            self.replicate_state(&manifest).await?;
             self.manifest_store.persist(&manifest)?;
             self.flushed.store(segment.end.0, Ordering::Relaxed);
 
             // The flushed record is durable; free the fragments.
             for entry in &segment.appends {
-                let object_id = entry.object_id(segment.id);
-                self.drop_fragments(&object_id, &entry.placements).await;
+                self.drop_fragments(entry.object_id(), &entry.placements)
+                    .await;
             }
             i += 1;
         }
@@ -559,6 +870,8 @@ where
         }
         manifest.segments = kept;
         manifest.base = up_to;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
         self.manifest_store.persist(&manifest)?;
         for key in deletes {
             let _ = self.store.delete(&key).await;
@@ -575,6 +888,8 @@ where
             });
         }
         manifest.epoch = new_epoch;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
         self.manifest_store.persist(&manifest)?;
         self.epoch.store(new_epoch.0, Ordering::Relaxed);
         Ok(())

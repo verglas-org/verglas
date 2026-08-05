@@ -26,9 +26,13 @@ verglas-block.workspace = true
 # The block FLUSH write-back plane erasure-codes a device flush across the fleet
 # ring and acks on a quorum. It reuses the object tier's fragment store and peer
 # RPC (verglas-cluster) — this binary wires the block ring peers to them and
-# serves the fragment endpoints peers place shards through. The object serving
-# path stays a deliberate cluster-of-one; only the block tier reaches the ring.
+# serves the fragment endpoints peers place shards through. The embedded
+# safekeeper shares this transport; the object serving path stays a deliberate
+# cluster-of-one.
 verglas-cluster.workspace = true
+# The Neon-compatible WAL listener is embedded in this process and places WAL
+# fragments through the same ring transport as block FLUSH.
+verglas-safekeeper.workspace = true
 axum.workspace = true
 futures.workspace = true
 # The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.

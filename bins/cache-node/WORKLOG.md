@@ -29,10 +29,10 @@
   single configured backend bucket, binds the NBD listener, and joins it with the
   admin and S3 planes. `vhost-user-blk` is noted as the extension point.
 
-- #382: Wired the block-flush write-back ring (`ring.rs`). When VERGLAS_BLOCK_PEERS
+- #382: Wired the block-flush write-back ring (`ring.rs`). When VERGLAS_RING_PEERS
   names a ring (id=host:port entries) and VERGLAS_NODE_ID is this box, the node
   builds the flush plane over the device registry's chunk store, serves the
-  fragment RPC endpoints peers place shards through on VERGLAS_BLOCK_RING_ADDR
+  fragment RPC endpoints peers place shards through on VERGLAS_RING_ADDR
   (default :8336, no new authz — VXLAN isolation like the NBD plane), and runs the
   drain-takeover loop. With no ring configured the block tier stays single-node and
   FLUSH is the synchronous R2 barrier, unchanged. The object serve path is still a
@@ -43,3 +43,11 @@
 - #91: Renamed the full local process from `verglasd` to `verglas-server` in
   cache-node parity documentation. The comparison now names the foreground
   server binary used by self-hosted deployments.
+- #13: Embedded `verglas-safekeeper` in the cache-node process. The Neon
+  PostgreSQL listener shares the existing fragment transport, membership,
+  local NVMe fragment store, and peer RPC listener with block FLUSH; it is not
+  another daemon or deployment. Three-node rings use `k=2,m=1,w=3`; four and
+  larger nodes retain two parity fragments and acknowledge after `n-1`
+  placements. Added a process-level test that launches three real cache-node
+  binaries, pushes WAL through one ingress, observes the EC quorum ack, and
+  reads the exact bytes back with physical replication.
