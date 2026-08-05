@@ -1,10 +1,10 @@
-// Reference worker: a data_change worker that reacts to commits on an input table
+// Reference worker that reacts to Iceberg snapshot CloudEvents on an input table
 // and writes derived rows to the deployment-configured output table. Stands in
 // for any "on new data, transform it" pipeline — the streaming transform that
 // used to be a materialized view, now a worker whose trigger is a table commit.
 //
-// The trigger is `data_change`: a commit to the watched table invokes the worker
-// with the commit notification. The worker delta-reads the newly committed rows
+// An Iceberg snapshot event invokes the worker with the commit data. The worker
+// delta-reads the newly committed rows
 // (a short request that wakes the sleeping backend), transforms them, and appends
 // the results. Dedupe across a replayed commit is the idempotency key: the same
 // commit produces the same output under the same key, so a re-delivery is a free
@@ -19,13 +19,20 @@ export interface FanoutEnv {
   SINCE_WATERMARK?: string;
 }
 
-/** A data_change worker that doubles a `v` column and appends the result. */
+/** An Iceberg-event worker that doubles a `v` column and appends the result. */
 export const changeFanoutWorker = defineWorker<FanoutEnv>({
   name: "change-fanout",
-  triggers: [{ type: "data_change", table: "app.input" }],
+  triggers: [{
+    type: "event",
+    eventType: "org.apache.iceberg.snapshot.committed",
+    subject: "app.input",
+  }],
   async handler(ctx: WorkerContext<FanoutEnv>) {
-    if (ctx.trigger.type !== "data_change") throw new Error("change-fanout: expected a data_change trigger");
-    const changed = ctx.trigger.change;
+    if (ctx.trigger.type !== "org.apache.iceberg.snapshot.committed") {
+      throw new Error("change-fanout: expected an Iceberg snapshot CloudEvent");
+    }
+    const changed = ctx.trigger.data as { snapshotId?: string } | undefined;
+    if (!changed?.snapshotId) throw new Error("change-fanout: snapshotId is required");
 
     // Read the rows this commit added. `SINCE_WATERMARK` (deployment config) marks
     // the last processed position; absent, we read the whole current snapshot.
@@ -38,7 +45,7 @@ export const changeFanoutWorker = defineWorker<FanoutEnv>({
       .map((r) => ({ v: Number(r.v) * 2, from_snapshot: changed.snapshotId }));
     if (out.length === 0) return { rowsWritten: 0 };
 
-    // Key the commit by the input snapshot: a replayed data_change re-commits the
+    // Key the commit by the input snapshot: a replayed CloudEvent re-commits the
     // same derived rows under the same key, so the output is never doubled.
     const result = await ctx.client
       .table(ctx.output)

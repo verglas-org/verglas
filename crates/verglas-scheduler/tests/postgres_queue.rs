@@ -1,10 +1,8 @@
 //! Postgres integration coverage for durable queue fencing and idempotency.
 
 use chrono::{Duration, Utc};
-use verglas_scheduler::{
-    ClaimRequest, CompleteRequest, Completion, Invocation, PgQueue, RunQueue, TriggerSource,
-};
-use verglas_sdk::worker::TriggerEvent;
+use verglas_scheduler::{ClaimRequest, CompleteRequest, Completion, Invocation, PgQueue, RunQueue};
+use verglas_sdk::worker::CloudEvent;
 
 /// Exercises the real SQL schema and transactional claim path.
 #[tokio::test]
@@ -22,10 +20,7 @@ async fn postgres_queue_lifecycle() {
     let now = Utc::now();
     let invocation = Invocation::new(
         "worker-a",
-        TriggerSource::Manual {
-            request_id: "request-1".to_owned(),
-        },
-        TriggerEvent::Manual,
+        CloudEvent::new("request-1", "urn:test", "org.verglas.worker.manual"),
         now,
     );
 

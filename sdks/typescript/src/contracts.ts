@@ -8,10 +8,10 @@
 // programming model. The platform owns scheduling, backfill, and replay; a worker
 // only computes the run it was handed.
 //
-// Triggers themselves (cron | webhook | data_change) are
+// Triggers themselves (cron | webhook | event) are
 // DEPLOYMENT config, not code. The SDK types them (`TriggerSpec`) so a definition
 // can declare what it expects, but the platform's deploy path registers them; the
-// worker just receives the resulting `TriggerEvent` on `ctx.trigger`.
+// worker just receives the resulting CloudEvent on `ctx.trigger`.
 //
 // The runner (`runWorker`) does standardized, automatic run logging: without the
 // author writing any logging code, each run emits structured rows (`run_start`,
@@ -20,7 +20,7 @@
 // the automatic charting spec.
 
 import type { VerglasClient } from "./client";
-import type { ChangeEvent, Row } from "./types";
+import type { Row } from "./types";
 import {
   RunLogger,
   errorMessage,
@@ -31,50 +31,34 @@ import {
 } from "./logging";
 
 // ---------------------------------------------------------------------------
-// Trigger events — the runtime payload a worker receives on `ctx.trigger`.
+// CloudEvents — the only runtime payload a worker receives on `ctx.trigger`.
 // ---------------------------------------------------------------------------
 
-/**
- * A cron-dispatched run. Carries the run's LOGICAL time (the Airflow model): the
- * nominal instant the platform scheduled this run for and the half-open interval
- * `[intervalStart, intervalEnd)` it is responsible for. A worker doing an
- * incremental pull ranges its query over this interval — it is the only progress
- * signal a worker sees.
- */
-export interface CronTriggerEvent {
-  type: "cron";
-  /** The nominal scheduled instant for this run (ISO 8601). */
-  logicalDate: string;
-  /** Inclusive start of the logical interval this run covers (ISO 8601). */
-  intervalStart: string;
-  /** Exclusive end of the logical interval this run covers (ISO 8601). */
-  intervalEnd: string;
+/** One structured CloudEvents 1.0 envelope. */
+export interface CloudEvent<T = unknown> {
+  /** CloudEvents version. Verglas accepts exactly 1.0. */
+  specversion: "1.0";
+  /** Producer-scoped stable event identity. */
+  id: string;
+  /** Stable URI-reference identifying the producer. */
+  source: string;
+  /** Event kind used by worker subscription filters. */
+  type: string;
+  /** Optional resource within the source that the event concerns. */
+  subject?: string;
+  /** Optional RFC 3339 event timestamp. */
+  time?: string;
+  /** Optional media type of `data`. */
+  datacontenttype?: string;
+  /** Optional schema URI for `data`. */
+  dataschema?: string;
+  /** Event-specific structured payload. */
+  data?: T;
+  /** Event-specific binary payload encoded as base64. */
+  data_base64?: string;
+  /** CloudEvents extension attributes. */
+  [extension: string]: unknown;
 }
-
-/** A caller-requested immediate run. */
-export interface ManualTriggerEvent {
-  type: "manual";
-}
-
-/** An inbound HTTP callback routed to the worker as one bounded event. */
-export interface WebhookTriggerEvent {
-  type: "webhook";
-  request: Request;
-}
-
-/** A table-commit that the worker is subscribed to (a `data_change` trigger).
- *  `change` is the same commit notification the catalog change feed carries. */
-export interface DataChangeTriggerEvent {
-  type: "data_change";
-  change: ChangeEvent;
-}
-
-/** The event that invoked a worker run. */
-export type TriggerEvent =
-  | ManualTriggerEvent
-  | CronTriggerEvent
-  | WebhookTriggerEvent
-  | DataChangeTriggerEvent;
 
 // ---------------------------------------------------------------------------
 // Trigger specs — deployment config the SDK types (registration is deploy-time).
@@ -108,11 +92,15 @@ export interface WebhookTriggerSpec {
   path?: string;
 }
 
-/** A data-change trigger: a commit to any declared table invokes the worker. */
-export interface DataChangeTriggerSpec {
-  type: "data_change";
-  /** The table(s) whose commits invoke the worker. */
-  table: string | string[];
+/** A CloudEvent subscription with exact attribute matching. */
+export interface EventTriggerSpec {
+  type: "event";
+  /** Exact CloudEvent type to accept. */
+  eventType: string;
+  /** Optional exact CloudEvent source filter. */
+  source?: string;
+  /** Optional exact CloudEvent subject filter. */
+  subject?: string;
 }
 
 /** Any trigger a deployment can declare. Registration happens at deploy time;
@@ -120,7 +108,7 @@ export interface DataChangeTriggerSpec {
 export type TriggerSpec =
   | CronTriggerSpec
   | WebhookTriggerSpec
-  | DataChangeTriggerSpec;
+  | EventTriggerSpec;
 
 // ---------------------------------------------------------------------------
 // The worker contract.
@@ -137,7 +125,7 @@ export interface WorkerContext<Env = Record<string, unknown>> {
   /** A connected client for the target endpoint (read/write via table verbs). */
   client: VerglasClient;
   /** The event that invoked this run. */
-  trigger: TriggerEvent;
+  trigger: CloudEvent;
   /**
    * The deployment-configured output table. Output is deployment config, never
    * hardcoded in worker code — the platform passes it in (the fleet harness maps

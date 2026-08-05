@@ -26,8 +26,8 @@ use std::process::ExitCode;
 use verglas_pgcdc::iceberg_sink::SinkConfig;
 use verglas_pgcdc::runner::{IcebergSink, PgConn, RunnerConfig, drain_tick};
 use verglas_sdk::worker::{
-    DEFAULT_RESULT_PATH, ENV_DEPLOYMENT, ENV_RESULT_PATH, ENV_TARGET, ENV_TOKEN, RunResult,
-    TriggerEvent,
+    CloudEvent, DEFAULT_RESULT_PATH, ENV_DEPLOYMENT, ENV_RESULT_PATH, ENV_TARGET, ENV_TOKEN,
+    RunResult,
 };
 
 /// The environment the control plane injects for a CDC worker (the launch env
@@ -207,8 +207,8 @@ fn main() -> ExitCode {
     };
 
     // Informational: the trigger this run was invoked under (CDC is cron-driven).
-    let trigger = match TriggerEvent::from_env(|k| std::env::var(k).ok()) {
-        Ok(trigger) => trigger,
+    let event = match CloudEvent::from_env(|k| std::env::var(k).ok()) {
+        Ok(event) => event,
         Err(error) => {
             let result = RunResult::failed(error);
             let _ = write_result(&cdc.result_path, &result);
@@ -216,9 +216,8 @@ fn main() -> ExitCode {
         }
     };
     eprintln!(
-        "verglas-pgcdc: deployment={} trigger={}",
-        cdc.deployment,
-        trigger.kind()
+        "verglas-pgcdc: deployment={} event_type={}",
+        cdc.deployment, event.event_type
     );
 
     let runtime = match tokio::runtime::Runtime::new() {

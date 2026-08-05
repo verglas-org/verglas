@@ -3,7 +3,7 @@ import {
   connect,
   defineWorker,
   runWorker,
-  type TriggerEvent,
+  type CloudEvent,
   type WorkerContext,
   type VerglasClient,
 } from "../src/index";
@@ -24,11 +24,16 @@ beforeEach(async () => {
 });
 afterEach(() => endpoint.close());
 
-const CRON: TriggerEvent = {
-  type: "cron",
-  logicalDate: "2026-08-01T00:05:00Z",
-  intervalStart: "2026-08-01T00:00:00Z",
-  intervalEnd: "2026-08-01T00:05:00Z",
+const CRON: CloudEvent = {
+  specversion: "1.0",
+  id: "tick-1",
+  source: "urn:verglas:scheduler:test",
+  type: "org.verglas.schedule.tick",
+  data: {
+    logicalDate: "2026-08-01T00:05:00Z",
+    intervalStart: "2026-08-01T00:00:00Z",
+    intervalEnd: "2026-08-01T00:05:00Z",
+  },
 };
 
 /** A minimal WorkerContext; log is a no-op (the runner installs its own logger). */

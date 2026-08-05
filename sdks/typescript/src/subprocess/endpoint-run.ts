@@ -2,7 +2,7 @@
 // a tenant WORKER against the live commit service for one bounded event.
 //
 // One invocation = one bounded worker run. This file maps the process
-// environment onto a `WorkerContext`, reconstructs the complete trigger event,
+// environment onto a `WorkerContext`, validates the complete CloudEvent,
 // runs the worker's handler once through the SDK's
 // `runWorker` (so run logging to `<TARGET>_LOGS` is identical to the platform
 // path), and writes the harness result file.
@@ -18,16 +18,9 @@
 //   DEPLOYMENT        (required) deployment/pipeline name (the `pipeline` log column)
 //   TARGET            (required) output table (its `<TARGET>_LOGS` sibling gets the run log)
 //
-// Trigger delivery — the control plane's fleet dispatch injects the trigger
-// payload as launch env vars (its channel for what the cloud dispatch carries
-// as body/headers):
+// Trigger delivery is one structured CloudEvents 1.0 envelope:
 //
-//   VERGLAS_TRIGGER        (required) manual, cron, webhook, or data_change.
-//   VERGLAS_EVENT_JSON     (required for webhook and data_change) the complete
-//                          serialized trigger event.
-//   VERGLAS_LOGICAL_DATE   (required for cron) nominal scheduled instant (ISO 8601)
-//   VERGLAS_INTERVAL_START (required for cron) inclusive interval start (ISO 8601)
-//   VERGLAS_INTERVAL_END   (required for cron) exclusive interval end (ISO 8601)
+//   VERGLAS_CLOUD_EVENT    (required) complete serialized CloudEvent.
 //
 //   RESULT_PATH       (optional) where the result JSON lands; default /run/result.json
 //
@@ -42,8 +35,7 @@ import { dirname } from "node:path";
 import { connect } from "../client";
 import {
   runWorker,
-  type CronTriggerEvent,
-  type TriggerEvent,
+  type CloudEvent,
   type WorkerContext,
   type WorkerDefinition,
   type WorkerResult,
@@ -70,7 +62,7 @@ export interface EndpointRunOptions {
 const REQUIRED_ENV = [
   "VERGLAS_ENDPOINT",
   "VERGLAS_TOKEN",
-  "VERGLAS_TRIGGER",
+  "VERGLAS_CLOUD_EVENT",
   "DEPLOYMENT",
   "TARGET",
 ] as const;
@@ -81,56 +73,23 @@ function failure(message: string): EndpointRunResult {
   return { rows: 0, error: message };
 }
 
-/** Builds the cron trigger from the VERGLAS_* logical-time bindings, if present.
- *  A dispatch that carries none leaves the interval fields undefined. */
-function cronTrigger(env: Record<string, string | undefined>): CronTriggerEvent {
-  if (!env.VERGLAS_LOGICAL_DATE) throw new Error("VERGLAS_LOGICAL_DATE is required for cron runs");
-  if (!env.VERGLAS_INTERVAL_START) throw new Error("VERGLAS_INTERVAL_START is required for cron runs");
-  if (!env.VERGLAS_INTERVAL_END) throw new Error("VERGLAS_INTERVAL_END is required for cron runs");
-  return {
-    type: "cron",
-    logicalDate: env.VERGLAS_LOGICAL_DATE,
-    intervalStart: env.VERGLAS_INTERVAL_START,
-    intervalEnd: env.VERGLAS_INTERVAL_END,
-  };
-}
-
-interface HttpCallbackWire {
-  method: string;
-  path: string;
-  headers: Record<string, string>;
-  body: number[];
-}
-
-/** Reconstructs the complete worker event injected by the scheduler harness. */
-function triggerEvent(env: Record<string, string | undefined>): TriggerEvent {
-  const kind = env.VERGLAS_TRIGGER;
-  if (!kind) throw new Error("VERGLAS_TRIGGER is required");
-  if (kind === "cron") return cronTrigger(env);
-  if (kind === "manual") return { type: "manual" };
-  const serialized = env.VERGLAS_EVENT_JSON;
-  if (!serialized) throw new Error(`VERGLAS_EVENT_JSON is required for ${kind} runs`);
-  const wire = JSON.parse(serialized) as Record<string, unknown>;
-  if (wire.type !== kind) {
-    throw new Error(`VERGLAS_EVENT_JSON contains ${String(wire.type)} for ${kind} run`);
+/** Parses and validates the CloudEvent injected by the scheduler harness. */
+function cloudEvent(env: Record<string, string | undefined>): CloudEvent {
+  const serialized = env.VERGLAS_CLOUD_EVENT;
+  if (!serialized) throw new Error("VERGLAS_CLOUD_EVENT is required");
+  const event = JSON.parse(serialized) as Partial<CloudEvent>;
+  if (event.specversion !== "1.0") {
+    throw new Error(`unsupported CloudEvents specversion ${String(event.specversion)}`);
   }
-  if (kind === "webhook") {
-    const request = wire.request as HttpCallbackWire | undefined;
-    if (!request || typeof request.method !== "string" || typeof request.path !== "string") {
-      throw new Error("VERGLAS_EVENT_JSON contains an invalid HTTP callback");
+  for (const attribute of ["id", "source", "type"] as const) {
+    if (typeof event[attribute] !== "string" || event[attribute].length === 0) {
+      throw new Error(`CloudEvent ${attribute} is required`);
     }
-    const method = request.method.toUpperCase();
-    return {
-      type: "webhook",
-      request: new Request(`http://worker.verglas${request.path}`, {
-        method,
-        headers: request.headers,
-        body: method === "GET" || method === "HEAD" ? undefined : new Uint8Array(request.body),
-      }),
-    };
   }
-  if (kind === "data_change") return wire as unknown as TriggerEvent;
-  throw new Error(`unsupported VERGLAS_TRIGGER "${kind}"`);
+  if (event.data !== undefined && event.data_base64 !== undefined) {
+    throw new Error("CloudEvent cannot contain both data and data_base64");
+  }
+  return event as CloudEvent;
 }
 
 /**
@@ -162,7 +121,7 @@ export async function endpointRun(
     });
     const ctx: WorkerContext = {
       client,
-      trigger: triggerEvent(env),
+      trigger: cloudEvent(env),
       output: target,
       outputs: [target],
       env,

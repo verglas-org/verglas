@@ -20,9 +20,12 @@ use serde::{Deserialize, Serialize};
 use verglas_harness::worker::{WorkerExec, WorkerRun, run_worker};
 use verglas_scheduler::{
     ClaimRequest, ClaimedJob, CompleteRequest, Completion, EnqueueOutcome, Invocation, Lease,
-    NextWakeRequest, PgQueue, RenewRequest, RunQueue, TriggerSource, plan_cron,
+    NextWakeRequest, PgQueue, RenewRequest, RunQueue, plan_cron,
 };
-use verglas_sdk::worker::{Catchup, TriggerEvent, TriggerSpec};
+use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
+
+/// CloudEvent type emitted for a planned cron interval.
+const CRON_EVENT_TYPE: &str = "org.verglas.schedule.tick";
 
 /// Standalone scheduler process configuration.
 #[derive(Debug, Parser)]
@@ -195,17 +198,19 @@ async fn reconcile_cron(
                 continue;
             };
             let trigger_id = format!("cron-{index}");
+            let cron_source = format!("urn:verglas:scheduler:{}:{trigger_id}", worker.name);
             let cursor = jobs
                 .iter()
-                .filter_map(|job| match &job.source {
-                    TriggerSource::Cron {
-                        trigger_id: job_trigger,
-                        logical_time,
-                    } if job.worker == worker.name && job_trigger == &trigger_id => {
-                        Some(*logical_time)
-                    }
-                    _ => None,
+                .filter(|job| {
+                    job.worker == worker.name
+                        && job.event.source == cron_source
+                        && job.event.event_type == CRON_EVENT_TYPE
                 })
+                .filter_map(|job| job.event.data.as_ref())
+                .filter_map(|data| data.get("logicalDate"))
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(|value| DateTime::parse_from_rfc3339(value).ok())
+                .map(|value| value.with_timezone(&Utc))
                 .max();
             let start_date = start_date
                 .as_deref()
@@ -228,16 +233,19 @@ async fn reconcile_cron(
                 let logical_time = DateTime::parse_from_rfc3339(&interval.logical_date)
                     .map(|time| time.with_timezone(&Utc))
                     .map_err(|error| format!("worker {} logical date: {error}", worker.name))?;
+                let mut event = CloudEvent::new(
+                    format!("{trigger_id}:{}", interval.logical_date),
+                    cron_source.clone(),
+                    CRON_EVENT_TYPE,
+                );
+                event.time = Some(interval.logical_date.clone());
+                event.datacontenttype = Some("application/json".to_owned());
+                event.data = Some(
+                    serde_json::to_value(&interval)
+                        .map_err(|error| format!("serialize cron interval: {error}"))?,
+                );
                 queue
-                    .enqueue(&Invocation::new(
-                        &worker.name,
-                        TriggerSource::Cron {
-                            trigger_id: trigger_id.clone(),
-                            logical_time,
-                        },
-                        TriggerEvent::Cron(interval),
-                        logical_time,
-                    ))
+                    .enqueue(&Invocation::new(&worker.name, event, logical_time))
                     .await
                     .map_err(|error| error.to_string())?;
             }
@@ -500,18 +508,7 @@ mod tests {
         };
         let invocation = Invocation::new(
             "http-worker",
-            TriggerSource::Http {
-                request_id: "request-1".to_owned(),
-                path: "/callback".to_owned(),
-            },
-            TriggerEvent::Webhook {
-                request: verglas_sdk::worker::HttpCallback {
-                    method: "POST".to_owned(),
-                    path: "/callback".to_owned(),
-                    headers: std::collections::BTreeMap::new(),
-                    body: b"payload".to_vec(),
-                },
-            },
+            CloudEvent::new("request-1", "urn:verglas:http", "org.verglas.http.request"),
             Utc::now(),
         );
 
@@ -524,7 +521,7 @@ mod tests {
             .clone()
             .expect("stored event");
         assert_eq!(stored.worker, "http-worker");
-        assert!(matches!(stored.event, TriggerEvent::Webhook { .. }));
+        assert_eq!(stored.event.event_type, "org.verglas.http.request");
     }
 
     /// A claimed worker executes through the harness and becomes a completion.
@@ -556,10 +553,11 @@ mod tests {
                 id: "job-1".to_owned(),
                 queue: "local".to_owned(),
                 worker: "worker-a".to_owned(),
-                source: TriggerSource::Manual {
-                    request_id: "request-1".to_owned(),
-                },
-                event: TriggerEvent::Manual,
+                event: CloudEvent::new(
+                    "request-1",
+                    "urn:verglas:rest",
+                    "org.verglas.worker.manual",
+                ),
                 ready_at: now,
             },
             lease: Lease {

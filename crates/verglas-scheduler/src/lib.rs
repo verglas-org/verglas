@@ -11,5 +11,4 @@ pub use cron::{CronPlan, plan_cron};
 pub use queue::{
     Attempt, ClaimRequest, ClaimedJob, CompleteRequest, Completion, EnqueueOutcome, Invocation,
     Job, Lease, LeaseError, NextWakeRequest, PgQueue, RenewRequest, RunQueue, SchedulerError,
-    TriggerSource,
 };

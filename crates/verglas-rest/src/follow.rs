@@ -1,7 +1,7 @@
 //! The follow-worker manager: keeps a long-lived follow runner alive for every
 //! active worker whose trigger is `follow`.
 //!
-//! Cron/data_change/webhook workers run as one-shot subprocesses per fire (see
+//! Cron, event, and webhook workers run as one-shot subprocesses per fire (see
 //! [`crate::platform`]). A `follow` worker is different: it runs continuously,
 //! tailing a file or wrapping a command, and streams captured lines into its
 //! target table as rows. This manager reconciles the set of running follow

@@ -338,7 +338,7 @@ fn spawn_lifecycle(
 }
 
 /// Bridges on-prem catalog polling events into durable scheduler invocations.
-fn spawn_scheduler_data_updates(
+fn spawn_scheduler_catalog_events(
     watcher: Arc<verglas_tables::catalog::CatalogFeed>,
     ingress: Arc<platform::SchedulerIngress>,
 ) -> tokio::task::JoinHandle<()> {
@@ -351,21 +351,21 @@ fn spawn_scheduler_data_updates(
                     let Some(snapshot_id) = change.new_snapshot else {
                         continue;
                     };
-                    let Ok(sequence) = u64::try_from(snapshot_id) else {
-                        tracing::warn!(
-                            "scheduler catalog update ignored negative snapshot id {snapshot_id}"
-                        );
-                        continue;
-                    };
-                    if let Err(error) = ingress
-                        .data_update(
-                            &change.table.dotted(),
-                            snapshot_id.to_string(),
-                            sequence,
-                            chrono::Utc::now(),
-                        )
-                        .await
-                    {
+                    let table = change.table.dotted();
+                    let committed_at = chrono::Utc::now();
+                    let mut event = verglas_sdk::worker::CloudEvent::new(
+                        format!("{table}:{snapshot_id}"),
+                        "urn:verglas:catalog:on-prem",
+                        "org.apache.iceberg.snapshot.committed",
+                    );
+                    event.subject = Some(table.clone());
+                    event.time = Some(committed_at.to_rfc3339());
+                    event.datacontenttype = Some("application/json".to_owned());
+                    event.data = Some(serde_json::json!({
+                        "table": table,
+                        "snapshotId": snapshot_id.to_string()
+                    }));
+                    if let Err(error) = ingress.event(event, committed_at).await {
                         tracing::warn!("scheduler catalog update enqueue failed: {error}");
                     }
                 }
@@ -1768,7 +1768,7 @@ async fn serve(
                         ));
                         let _ = platform.set(ingress.clone());
                         if let Some(watcher) = hooks.watcher.clone() {
-                            spawn_scheduler_data_updates(watcher, ingress);
+                            spawn_scheduler_catalog_events(watcher, ingress);
                         }
                         // Follow workers run continuously, not per-tick, so a
                         // dedicated manager keeps one runner alive per active

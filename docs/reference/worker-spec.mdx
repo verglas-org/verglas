@@ -41,7 +41,7 @@ mem_mib = 256
 | `cwd` | No | Working directory for the command and bundled files. |
 | `files` | No | Map from relative path to bundled text content. |
 | `env` | No | Environment map. Use `@secret:NAME` for a secret reference. |
-| `trigger` | No | One of `manual`, `cron`, `webhook`, `data_change`, or local-only `follow`. Defaults to `manual`. |
+| `trigger` | No | One of `manual`, `cron`, `webhook`, `event`, or local-only `follow`. Defaults to `manual`. |
 | `target_tables` | No | Iceberg tables the worker writes. The first table becomes the primary local output. |
 | `resources.vcpus` | No | Fractional vCPU hint for cloud placement. |
 | `resources.mem_mib` | No | Memory hint in MiB for cloud placement. |
@@ -69,11 +69,12 @@ mem_mib = 256
     path = "/callbacks/orders"
     ```
   </Tab>
-  <Tab title="Data change">
+  <Tab title="CloudEvent">
     ```toml
     [trigger]
-    type = "data_change"
-    table = "app.events"
+    type = "event"
+    event_type = "org.apache.iceberg.snapshot.committed"
+    subject = "app.events"
     ```
   </Tab>
   <Tab title="Follow a command">

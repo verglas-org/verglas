@@ -48,10 +48,16 @@ pub enum Trigger {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
-    /// Run when the catalog reports a commit to one table.
-    DataChange {
-        /// Dotted Iceberg table name such as `app.events`.
-        table: String,
+    /// Run when a CloudEvent matches exact subscription attributes.
+    Event {
+        /// Exact CloudEvent type to accept.
+        event_type: String,
+        /// Optional exact CloudEvent source filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Optional exact CloudEvent subject filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
     },
     /// Follow a local target continuously, appending each captured line to the
     /// target table. Local only — a follow worker cannot be pushed to the cloud.
@@ -158,14 +164,10 @@ impl WorkerManifest {
         {
             return Err("a webhook path must start with `/` and contain no query string".into());
         }
-        if let Trigger::DataChange { table } = &self.trigger {
-            let mut parts = table.split('.');
-            if parts.next().is_none_or(str::is_empty)
-                || parts.next().is_none_or(str::is_empty)
-                || parts.next().is_some()
-            {
-                return Err("a data_change table must have the form `namespace.table`".into());
-            }
+        if let Trigger::Event { event_type, .. } = &self.trigger
+            && event_type.trim().is_empty()
+        {
+            return Err("an event trigger needs an event_type".into());
         }
         Ok(())
     }
@@ -213,9 +215,16 @@ impl WorkerManifest {
                 Some(path) => json!([{ "type": "webhook", "path": path }]),
                 None => json!([{ "type": "webhook" }]),
             },
-            Trigger::DataChange { table } => {
-                json!([{ "type": "data_change", "table": table }])
-            }
+            Trigger::Event {
+                event_type,
+                source,
+                subject,
+            } => json!([{
+                "type": "event",
+                "eventType": event_type,
+                "source": source,
+                "subject": subject
+            }]),
             Trigger::Follow { file: Some(file) } => json!([{ "type": "follow", "file": file }]),
             Trigger::Follow { file: None } => json!([{ "type": "follow" }]),
         };
@@ -271,10 +280,18 @@ impl WorkerManifest {
                     json!([{ "type": "webhook", "config": config }]),
                 )
             }
-            Trigger::DataChange { table } => (
-                "manual",
+            Trigger::Event {
+                event_type,
+                source,
+                subject,
+            } => (
+                "event",
                 None,
-                json!([{ "type": "data_change", "config": { "table": table } }]),
+                json!([{ "type": "event", "config": {
+                    "eventType": event_type,
+                    "source": source,
+                    "subject": subject
+                } }]),
             ),
             // A follow worker is local-only; callers reject it before here.
             Trigger::Manual | Trigger::Follow { .. } => ("manual", None, json!([])),
@@ -478,10 +495,12 @@ fn trigger_from_local(triggers: &Value) -> Trigger {
                     path: t.get("path").and_then(Value::as_str).map(str::to_owned),
                 };
             }
-            Some("data_change") => {
-                if let Some(table) = t.get("table").and_then(Value::as_str) {
-                    return Trigger::DataChange {
-                        table: table.to_owned(),
+            Some("event") => {
+                if let Some(event_type) = t.get("eventType").and_then(Value::as_str) {
+                    return Trigger::Event {
+                        event_type: event_type.to_owned(),
+                        source: t.get("source").and_then(Value::as_str).map(str::to_owned),
+                        subject: t.get("subject").and_then(Value::as_str).map(str::to_owned),
                     };
                 }
             }
@@ -518,13 +537,21 @@ fn trigger_from_cloud(triggers: Option<&Value>) -> Trigger {
                         .map(str::to_owned),
                 };
             }
-            Some("data_change") => {
-                if let Some(table) = config
-                    .and_then(|value| value.get("table"))
+            Some("event") => {
+                if let Some(event_type) = config
+                    .and_then(|value| value.get("eventType"))
                     .and_then(Value::as_str)
                 {
-                    return Trigger::DataChange {
-                        table: table.to_owned(),
+                    return Trigger::Event {
+                        event_type: event_type.to_owned(),
+                        source: config
+                            .and_then(|value| value.get("source"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        subject: config
+                            .and_then(|value| value.get("subject"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
                     };
                 }
             }
@@ -560,7 +587,7 @@ mod tests {
         }
     }
 
-    /// Webhook and data-change manifests project to the local trigger registry
+    /// Webhook and CloudEvent manifests project to the local trigger registry
     /// without requiring callers to hand-write embedded JSON strings.
     #[test]
     fn translates_event_triggers_to_local_workers() {
@@ -580,19 +607,23 @@ mod tests {
             }])
         );
 
-        let mut data_change = cron_manifest();
-        data_change.trigger = Trigger::DataChange {
-            table: "app.events".to_owned(),
+        let mut event = cron_manifest();
+        event.trigger = Trigger::Event {
+            event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
+            source: None,
+            subject: Some("app.events".to_owned()),
         };
-        let data_body = data_change.to_local_worker();
+        let data_body = event.to_local_worker();
         let data_triggers: Value =
             serde_json::from_str(data_body["triggers"].as_str().expect("triggers string"))
                 .expect("data triggers");
         assert_eq!(
             data_triggers,
             json!([{
-                "type": "data_change",
-                "table": "app.events"
+                "type": "event",
+                "eventType": "org.apache.iceberg.snapshot.committed",
+                "source": null,
+                "subject": "app.events"
             }])
         );
     }
@@ -610,19 +641,25 @@ mod tests {
             json!([{"type":"webhook","config":{}}])
         );
 
-        let mut data_change = cron_manifest();
-        data_change.trigger = Trigger::DataChange {
-            table: "app.events".to_owned(),
+        let mut event = cron_manifest();
+        event.trigger = Trigger::Event {
+            event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
+            source: None,
+            subject: Some("app.events".to_owned()),
         };
-        let data_body = data_change.to_cloud_deployment("cloud");
-        assert_eq!(data_body["trigger"], "manual");
+        let data_body = event.to_cloud_deployment("cloud");
+        assert_eq!(data_body["trigger"], "event");
         assert_eq!(
             data_body["config"]["triggers"],
-            json!([{"type":"data_change","config":{"table":"app.events"}}])
+            json!([{"type":"event","config":{
+                "eventType":"org.apache.iceberg.snapshot.committed",
+                "source":null,
+                "subject":"app.events"
+            }}])
         );
     }
 
-    /// JSON and TOML manifests accept the public webhook and data-change forms.
+    /// JSON and TOML manifests accept the public webhook and CloudEvent forms.
     #[test]
     fn parses_event_trigger_manifests() {
         let webhook: WorkerManifest = toml::from_str(
@@ -640,15 +677,20 @@ path = "/callbacks/orders"
             Trigger::Webhook { path: Some(path) } if path == "/callbacks/orders"
         ));
 
-        let data_change: WorkerManifest = serde_json::from_value(json!({
+        let event: WorkerManifest = serde_json::from_value(json!({
             "name": "changed",
             "exec": ["sh", "worker.sh"],
-            "trigger": {"type": "data_change", "table": "app.events"}
+            "trigger": {
+                "type": "event",
+                "event_type": "org.apache.iceberg.snapshot.committed",
+                "subject": "app.events"
+            }
         }))
-        .expect("data-change manifest");
+        .expect("event manifest");
         assert!(matches!(
-            data_change.trigger,
-            Trigger::DataChange { table } if table == "app.events"
+            event.trigger,
+            Trigger::Event { event_type, subject: Some(subject), .. }
+                if event_type == "org.apache.iceberg.snapshot.committed" && subject == "app.events"
         ));
     }
 
@@ -659,8 +701,10 @@ path = "/callbacks/orders"
             Trigger::Webhook {
                 path: Some("/callbacks/orders".to_owned()),
             },
-            Trigger::DataChange {
-                table: "app.events".to_owned(),
+            Trigger::Event {
+                event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
+                source: None,
+                subject: Some("app.events".to_owned()),
             },
         ] {
             let mut manifest = cron_manifest();

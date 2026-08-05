@@ -52,3 +52,4 @@
 - #91: Updated platform runtime terminology for the `verglas-server` process.
   Worker registration, triggers, and watermarks retain their existing behavior.
 - #11: Aligned worker registry documentation with the executable trigger contract: cron, HTTP callback, and data update. Manual dispatch remains an ingress event rather than deployment configuration.
+- #11: Updated the worker registry row contract to describe generic CloudEvent subscriptions. Registry persistence remains unchanged.

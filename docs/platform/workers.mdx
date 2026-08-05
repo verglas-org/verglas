@@ -48,15 +48,15 @@ sequenceDiagram
 
 ## Current trigger surfaces
 
-The SDK contract defines the following trigger events:
+The SDK contract defines these trigger producers and subscriptions. Every run receives one CloudEvents 1.0 envelope:
 
 | Trigger | Dispatch payload | Typical use |
 | --- | --- | --- |
-| `cron` | Logical date and interval bounds | Scheduled ingestion and backfill |
-| `webhook` | An inbound `Request` | HTTP ingestion |
-| `data_change` | A table commit notification | Incremental transformations |
+| `cron` | `org.verglas.schedule.tick` with logical interval data | Scheduled ingestion and backfill |
+| `webhook` | `org.verglas.http.request` with the complete request in `data` | HTTP ingestion |
+| `event` | Any matching CloudEvent type, source, and subject | Event-driven transformations |
 
-The portable CLI manifest registers `manual`, `cron`, `webhook`, and `data_change` workers. It also registers local-only `follow` workers. HTTP and data-update events use the same bounded worker-run contract.
+The portable CLI manifest registers `manual`, `cron`, `webhook`, and `event` workers. It also registers local-only `follow` workers. Iceberg snapshot commits use the CloudEvent type `org.apache.iceberg.snapshot.committed` and the dotted table name as `subject`.
 
 ## Create a portable worker
 
@@ -132,11 +132,11 @@ Each replayed run receives its own logical interval. Range the upstream request 
 
 ## Use idempotency keys
 
-Use a stable input identifier as the commit idempotency key. A `data_change` worker can use the input snapshot ID:
+Use a stable input identifier as the commit idempotency key. An Iceberg-event worker can use the input snapshot ID:
 
 ```ts
 const result = await ctx.client.table(ctx.output).append(rows, {
-  idempotencyKey: `analytics.orders@${ctx.trigger.change.snapshotId}`,
+  idempotencyKey: `analytics.orders@${(ctx.trigger.data as { snapshotId: string }).snapshotId}`,
 });
 ```
 

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::{Row, Transaction};
-use verglas_sdk::worker::TriggerEvent;
+use verglas_sdk::worker::CloudEvent;
 
 /// A scheduler storage, encoding, or input error.
 #[derive(Debug, thiserror::Error)]
@@ -55,32 +55,11 @@ impl From<serde_json::Error> for LeaseError {
     }
 }
 
-/// The durable identity supplied by the trigger source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TriggerSource {
-    /// A caller-requested run, idempotent by request id.
-    Manual { request_id: String },
-    /// A dynamically routed HTTP request.
-    Http { request_id: String, path: String },
-    /// One logical time from a cron trigger.
-    Cron {
-        trigger_id: String,
-        logical_time: DateTime<Utc>,
-    },
-    /// One catalog change-feed event.
-    DataUpdate {
-        subscription_id: String,
-        sequence: u64,
-    },
-}
-
 /// One trigger delivery before it is materialized as a durable job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invocation {
     pub worker: String,
-    pub source: TriggerSource,
-    pub event: TriggerEvent,
+    pub event: CloudEvent,
     pub ready_at: DateTime<Utc>,
 }
 
@@ -88,13 +67,11 @@ impl Invocation {
     /// Builds an invocation from ingress-owned identity and payload.
     pub fn new(
         worker: impl Into<String>,
-        source: TriggerSource,
-        event: TriggerEvent,
+        event: CloudEvent,
         ready_at: DateTime<Utc>,
     ) -> Invocation {
         Invocation {
             worker: worker.into(),
-            source,
             event,
             ready_at,
         }
@@ -105,11 +82,13 @@ impl Invocation {
         #[derive(Serialize)]
         struct Identity<'a> {
             worker: &'a str,
-            source: &'a TriggerSource,
+            source: &'a str,
+            event_id: &'a str,
         }
         let bytes = serde_json::to_vec(&Identity {
             worker: &self.worker,
-            source: &self.source,
+            source: &self.event.source,
+            event_id: &self.event.id,
         })?;
         Ok(format!("{:x}", Sha256::digest(bytes)))
     }
@@ -121,8 +100,7 @@ pub struct Job {
     pub id: String,
     pub queue: String,
     pub worker: String,
-    pub source: TriggerSource,
-    pub event: TriggerEvent,
+    pub event: CloudEvent,
     pub ready_at: DateTime<Utc>,
 }
 
@@ -252,7 +230,7 @@ impl PgQueue {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS verglas_scheduler_jobs (\
              id TEXT NOT NULL, queue TEXT NOT NULL, worker TEXT NOT NULL, \
-             source JSONB NOT NULL, event JSONB NOT NULL, ready_at TIMESTAMPTZ NOT NULL, \
+             event JSONB NOT NULL, ready_at TIMESTAMPTZ NOT NULL, \
              state TEXT NOT NULL DEFAULT 'pending', lease_owner TEXT, \
              lease_generation BIGINT NOT NULL DEFAULT 0, lease_expires_at TIMESTAMPTZ, \
              created_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (queue, id))",
@@ -288,13 +266,12 @@ impl RunQueue for PgQueue {
         let id = invocation.id()?;
         let result = sqlx::query(
             "INSERT INTO verglas_scheduler_jobs \
-             (id, queue, worker, source, event, ready_at) VALUES ($1,$2,$3,$4,$5,$6) \
+             (id, queue, worker, event, ready_at) VALUES ($1,$2,$3,$4,$5) \
              ON CONFLICT (queue, id) DO NOTHING",
         )
         .bind(&id)
         .bind(&self.queue)
         .bind(&invocation.worker)
-        .bind(serde_json::to_value(&invocation.source)?)
         .bind(serde_json::to_value(&invocation.event)?)
         .bind(invocation.ready_at)
         .execute(&self.pool)
@@ -309,7 +286,7 @@ impl RunQueue for PgQueue {
     /// Lists jobs in deterministic creation order for cron reconciliation.
     async fn jobs(&self) -> Result<Vec<Job>, SchedulerError> {
         let rows = sqlx::query(
-            "SELECT id, queue, worker, source, event, ready_at FROM verglas_scheduler_jobs \
+            "SELECT id, queue, worker, event, ready_at FROM verglas_scheduler_jobs \
              WHERE queue=$1 ORDER BY created_at, id",
         )
         .bind(&self.queue)
@@ -332,7 +309,7 @@ impl RunQueue for PgQueue {
              UPDATE verglas_scheduler_jobs j SET state='running', lease_owner=$3, \
              lease_generation=j.lease_generation+1, lease_expires_at=$4 \
              FROM candidate WHERE j.queue=$1 AND j.id=candidate.id \
-             RETURNING j.id,j.queue,j.worker,j.source,j.event,j.ready_at,j.lease_generation",
+             RETURNING j.id,j.queue,j.worker,j.event,j.ready_at,j.lease_generation",
         )
         .bind(&self.queue)
         .bind(request.now)
@@ -499,7 +476,6 @@ fn row_job(row: &PgRow) -> Result<Job, SchedulerError> {
         id: row.try_get("id")?,
         queue: row.try_get("queue")?,
         worker: row.try_get("worker")?,
-        source: serde_json::from_value(row.try_get("source")?)?,
         event: serde_json::from_value(row.try_get("event")?)?,
         ready_at: row.try_get("ready_at")?,
     })
@@ -539,16 +515,9 @@ mod tests {
     #[test]
     fn invocation_identity_excludes_ready_time() {
         let now = Utc::now();
-        let source = TriggerSource::Manual {
-            request_id: "request-1".to_owned(),
-        };
-        let first = Invocation::new("worker", source.clone(), TriggerEvent::Manual, now);
-        let retry = Invocation::new(
-            "worker",
-            source,
-            TriggerEvent::Manual,
-            now + chrono::Duration::minutes(1),
-        );
+        let event = CloudEvent::new("request-1", "urn:test", "org.verglas.worker.manual");
+        let first = Invocation::new("worker", event.clone(), now);
+        let retry = Invocation::new("worker", event, now + chrono::Duration::minutes(1));
         assert_eq!(first.id().expect("first id"), retry.id().expect("retry id"));
     }
 

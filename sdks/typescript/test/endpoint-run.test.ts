@@ -63,7 +63,12 @@ function baseEnv(extra: Record<string, string> = {}): Record<string, string> {
   return {
     VERGLAS_ENDPOINT: "https://commit.example",
     VERGLAS_TOKEN: TOKEN,
-    VERGLAS_TRIGGER: "manual",
+    VERGLAS_CLOUD_EVENT: JSON.stringify({
+      specversion: "1.0",
+      id: "request-1",
+      source: "urn:verglas:rest",
+      type: "org.verglas.worker.manual",
+    }),
     DEPLOYMENT: "demo-worker",
     TARGET: "app.t",
     ...extra,
@@ -77,7 +82,7 @@ const targetCommits = (requests: RecordedRequest[]) =>
   requests.filter((r) => r.method === "POST" && r.path === "/v1/tables/app.t/commit");
 
 describe("endpointRun worker semantics", () => {
-  it("passes the configured output and the cron trigger interval into ctx", async () => {
+  it("passes the configured output and complete CloudEvent into ctx", async () => {
     const fake = fakeEndpoint();
     let seenOutput: string | undefined;
     let seenTrigger: unknown;
@@ -88,142 +93,49 @@ describe("endpointRun worker semantics", () => {
       return { rowsWritten: r.rowsCommitted };
     });
 
-    const env = baseEnv({
-      VERGLAS_TRIGGER: "cron",
-      VERGLAS_LOGICAL_DATE: "2026-08-02T00:00:00Z",
-      VERGLAS_INTERVAL_START: "2026-08-01T00:00:00Z",
-      VERGLAS_INTERVAL_END: "2026-08-02T00:00:00Z",
-    });
+    const event = {
+      specversion: "1.0",
+      id: "tick-1",
+      source: "urn:verglas:scheduler:demo",
+      type: "org.verglas.schedule.tick",
+      data: {
+        logicalDate: "2026-08-02T00:00:00Z",
+        intervalStart: "2026-08-01T00:00:00Z",
+        intervalEnd: "2026-08-02T00:00:00Z",
+      },
+    };
+    const env = baseEnv({ VERGLAS_CLOUD_EVENT: JSON.stringify(event) });
     const result = await endpointRun(worker, env, { fetch: fake.fetch, ...quiet });
     expect(result.error).toBeNull();
     expect(seenOutput).toBe("app.t");
-    expect(seenTrigger).toEqual({
-      type: "cron",
-      logicalDate: "2026-08-02T00:00:00Z",
-      intervalStart: "2026-08-01T00:00:00Z",
-      intervalEnd: "2026-08-02T00:00:00Z",
-    });
+    expect(seenTrigger).toEqual(event);
   });
 
-  it("maps the control plane's VERGLAS_* payload vars onto the cron trigger event", async () => {
-    const fake = fakeEndpoint();
-    let seenTrigger: unknown;
-    const worker = defineWorker((ctx: WorkerContext) => {
-      seenTrigger = ctx.trigger;
-      return { rowsWritten: 0 };
-    });
-
-    const env = baseEnv({
-      VERGLAS_TRIGGER: "cron",
-      VERGLAS_LOGICAL_DATE: "2026-08-01T13:05:00.000Z",
-      VERGLAS_INTERVAL_START: "2026-08-01T13:05:00.000Z",
-      VERGLAS_INTERVAL_END: "2026-08-01T13:10:00.000Z",
-    });
-    const result = await endpointRun(worker, env, { fetch: fake.fetch, ...quiet });
-    expect(result.error).toBeNull();
-    expect(seenTrigger).toEqual({
-      type: "cron",
-      logicalDate: "2026-08-01T13:05:00.000Z",
-      intervalStart: "2026-08-01T13:05:00.000Z",
-      intervalEnd: "2026-08-01T13:10:00.000Z",
-    });
-  });
-
-  it("ignores unprefixed INTERVAL_* env vars", async () => {
-    const fake = fakeEndpoint();
-    let seenTrigger: unknown;
-    const worker = defineWorker((ctx: WorkerContext) => {
-      seenTrigger = ctx.trigger;
-    });
-
-    const env = baseEnv({
-      VERGLAS_TRIGGER: "cron",
-      VERGLAS_LOGICAL_DATE: "2026-08-01T13:10:00.000Z",
-      VERGLAS_INTERVAL_START: "2026-08-01T13:05:00.000Z",
-      VERGLAS_INTERVAL_END: "2026-08-01T13:10:00.000Z",
-      INTERVAL_START: "1999-01-01T00:00:00.000Z",
-      INTERVAL_END: "2026-08-01T13:10:00.000Z",
-    });
-    const result = await endpointRun(worker, env, { fetch: fake.fetch, ...quiet });
-    expect(result.error).toBeNull();
-    expect(seenTrigger).toEqual({
-      type: "cron",
-      logicalDate: "2026-08-01T13:10:00.000Z",
-      intervalStart: "2026-08-01T13:05:00.000Z",
-      intervalEnd: "2026-08-01T13:10:00.000Z",
-    });
-  });
-
-  it("refuses a run with no trigger identity", async () => {
+  it("refuses a run with no CloudEvent", async () => {
     const fake = fakeEndpoint();
     let ran = false;
     const worker = defineWorker(() => { ran = true; });
     const env = baseEnv();
-    delete env.VERGLAS_TRIGGER;
+    delete env.VERGLAS_CLOUD_EVENT;
     const result = await endpointRun(worker, env, { fetch: fake.fetch, ...quiet });
-    expect(result.error).toContain("missing required env: VERGLAS_TRIGGER");
+    expect(result.error).toContain("missing required env: VERGLAS_CLOUD_EVENT");
     expect(ran).toBe(false);
   });
 
-  it("refuses an incomplete cron interval", async () => {
+  it("refuses a non-1.0 CloudEvent", async () => {
     const fake = fakeEndpoint();
     let ran = false;
     const worker = defineWorker(() => { ran = true; });
-    const result = await endpointRun(worker, baseEnv({ VERGLAS_TRIGGER: "cron" }), {
-      fetch: fake.fetch,
-      ...quiet,
-    });
-    expect(result.error).toContain("VERGLAS_LOGICAL_DATE is required");
-    expect(ran).toBe(false);
-  });
-
-  it("delivers a complete HTTP callback event to the worker", async () => {
-    const fake = fakeEndpoint();
-    let observed: unknown;
-    const worker = defineWorker(async (ctx: WorkerContext) => {
-      if (ctx.trigger.type !== "webhook") throw new Error("expected webhook");
-      observed = {
-        method: ctx.trigger.request.method,
-        path: new URL(ctx.trigger.request.url).pathname,
-        contentType: ctx.trigger.request.headers.get("content-type"),
-        body: await ctx.trigger.request.text(),
-      };
-    });
-
     const result = await endpointRun(
       worker,
       baseEnv({
-        VERGLAS_TRIGGER: "webhook",
-        VERGLAS_EVENT_JSON: JSON.stringify({
-          type: "webhook",
-          request: {
-            method: "POST",
-            path: "/callbacks/build",
-            headers: { "content-type": "application/json" },
-            body: Array.from(new TextEncoder().encode('{"ok":true}')),
-          },
+        VERGLAS_CLOUD_EVENT: JSON.stringify({
+          specversion: "0.3", id: "bad", source: "urn:test", type: "test",
         }),
       }),
       { fetch: fake.fetch, ...quiet },
     );
-    expect(result.error).toBeNull();
-    expect(observed).toEqual({
-      method: "POST",
-      path: "/callbacks/build",
-      contentType: "application/json",
-      body: '{"ok":true}',
-    });
-  });
-
-  it("rejects a webhook run without its complete event payload", async () => {
-    const fake = fakeEndpoint();
-    let ran = false;
-    const worker = defineWorker(() => { ran = true; });
-    const result = await endpointRun(worker, baseEnv({ VERGLAS_TRIGGER: "webhook" }), {
-      fetch: fake.fetch,
-      ...quiet,
-    });
-    expect(result.error).toContain("VERGLAS_EVENT_JSON is required");
+    expect(result.error).toContain("unsupported CloudEvents specversion 0.3");
     expect(ran).toBe(false);
   });
 

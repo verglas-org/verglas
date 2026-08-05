@@ -10,8 +10,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use verglas_platform::{SystemCatalog, SystemState, WorkerRow};
-use verglas_scheduler::{EnqueueOutcome, Invocation, TriggerSource};
-use verglas_sdk::worker::{ChangeEvent, HttpCallback, TriggerEvent, TriggerSpec};
+use verglas_scheduler::{EnqueueOutcome, Invocation};
+use verglas_sdk::worker::{CloudEvent, HttpCallback, TriggerSpec};
+
+/// CloudEvent type used for caller-requested immediate runs.
+const MANUAL_EVENT_TYPE: &str = "org.verglas.worker.manual";
+/// CloudEvent type used for complete accepted HTTP callbacks.
+const HTTP_EVENT_TYPE: &str = "org.verglas.http.request";
 
 /// An ingress request could not resolve or enqueue a runnable deployment.
 #[derive(Debug, thiserror::Error)]
@@ -68,13 +73,9 @@ impl SchedulerIngress {
         request_id: String,
     ) -> Result<EnqueueOutcome, IngressError> {
         self.running_worker(name).await?;
-        self.enqueue(&Invocation::new(
-            name,
-            TriggerSource::Manual { request_id },
-            TriggerEvent::Manual,
-            Utc::now(),
-        ))
-        .await
+        let event = CloudEvent::new(request_id, "urn:verglas:rest", MANUAL_EVENT_TYPE);
+        self.enqueue(&Invocation::new(name, event, Utc::now()))
+            .await
     }
 
     /// Enqueues a request routed to one named webhook deployment.
@@ -93,16 +94,14 @@ impl SchedulerIngress {
                 "worker {name} has no webhook trigger"
             )));
         }
-        self.enqueue(&Invocation::new(
-            name,
-            TriggerSource::Http {
-                request_id,
-                path: request.path.clone(),
-            },
-            TriggerEvent::Webhook { request },
-            Utc::now(),
-        ))
-        .await
+        let mut event = CloudEvent::new(request_id, "urn:verglas:http", HTTP_EVENT_TYPE);
+        event.subject = Some(request.path.clone());
+        event.datacontenttype = Some("application/json".to_owned());
+        event.data = Some(serde_json::to_value(request).map_err(|error| {
+            IngressError::Invalid(format!("HTTP callback is not serializable: {error}"))
+        })?);
+        self.enqueue(&Invocation::new(name, event, Utc::now()))
+            .await
     }
 
     /// Resolves a dynamically configured HTTP path and enqueues its worker.
@@ -129,42 +128,28 @@ impl SchedulerIngress {
         )))
     }
 
-    /// Fans one durable catalog update into matching data-change job objects.
-    pub async fn data_update(
+    /// Fans one CloudEvent into every running worker whose event filter matches.
+    pub async fn event(
         &self,
-        table: &str,
-        snapshot_id: String,
-        sequence: u64,
-        committed_at: DateTime<Utc>,
+        event: CloudEvent,
+        ready_at: DateTime<Utc>,
     ) -> Result<Vec<EnqueueOutcome>, IngressError> {
+        event
+            .validate()
+            .map_err(|error| IngressError::Invalid(format!("invalid CloudEvent: {error}")))?;
         let workers = self.sys.list_active_workers().await?;
         let mut outcomes = Vec::new();
         for worker in workers {
             if worker.state != SystemState::Running
-                || !data_change_tables(&worker)?
+                || !parse_triggers(&worker)?
                     .iter()
-                    .any(|name| name == table)
+                    .any(|trigger| trigger.matches(&event))
             {
                 continue;
             }
             outcomes.push(
-                self.enqueue(&Invocation::new(
-                    &worker.name,
-                    TriggerSource::DataUpdate {
-                        subscription_id: format!("{}:{table}", worker.name),
-                        sequence,
-                    },
-                    TriggerEvent::DataChange {
-                        change: ChangeEvent {
-                            seq: sequence,
-                            table: table.to_owned(),
-                            snapshot_id: snapshot_id.clone(),
-                            committed_at: committed_at.to_rfc3339(),
-                        },
-                    },
-                    committed_at,
-                ))
-                .await?,
+                self.enqueue(&Invocation::new(&worker.name, event.clone(), ready_at))
+                    .await?,
             );
         }
         Ok(outcomes)
@@ -211,16 +196,4 @@ pub(crate) fn parse_triggers(worker: &WorkerRow) -> Result<Vec<TriggerSpec>, Ing
         worker: worker.name.clone(),
         source,
     })
-}
-
-/// Returns every table subscribed by `data_change` triggers.
-fn data_change_tables(worker: &WorkerRow) -> Result<Vec<String>, IngressError> {
-    Ok(parse_triggers(worker)?
-        .into_iter()
-        .filter_map(|trigger| match trigger {
-            TriggerSpec::DataChange { table } => Some(table.tables()),
-            _ => None,
-        })
-        .flatten()
-        .collect())
 }

@@ -20,8 +20,8 @@
 //! | `WorkerDefinition`                          | [`Worker`] trait + [`TriggerSpec`]    |
 //! | `TriggerSpec` (`type` discriminant)         | [`TriggerSpec`] (`#[serde(tag="type")]`) |
 //! | `CronTriggerSpec.catchup`                   | [`Catchup`]                           |
-//! | `TriggerEvent`                              | [`TriggerEvent`]                      |
-//! | `CronTriggerEvent.{logicalDate,interval*}`  | [`CronInterval`]                      |
+//! | `CloudEvent`                                | [`CloudEvent`]                        |
+//! | cron CloudEvent `data`                     | [`CronInterval`]                      |
 //! | `ChangeEvent`                               | [`ChangeEvent`]                       |
 //! | `WorkerContext`                             | [`WorkerContext`]                     |
 //! | `WorkerResult.rowsWritten`                  | [`WorkerResult::rows_written`]        |
@@ -31,8 +31,7 @@
 //!
 //! A worker in another language runs as a subprocess exactly the way the TS
 //! `endpoint-run` harness runs one: the parent sets the run's environment
-//! ([`ENV_TRIGGER`], [`ENV_LOGICAL_DATE`], [`ENV_INTERVAL_START`],
-//! [`ENV_INTERVAL_END`], [`ENV_DEPLOYMENT`], [`ENV_TARGET`], plus the endpoint
+//! ([`ENV_CLOUD_EVENT`], [`ENV_DEPLOYMENT`], [`ENV_TARGET`], plus the endpoint
 //! and token), spawns the child, and reads a small result JSON ([`RunResult`])
 //! back from [`ENV_RESULT_PATH`]. There is no framed stdio protocol on the
 //! worker side — progress is the trigger's logical time, not a durable cursor
@@ -48,18 +47,8 @@ use serde::{Deserialize, Serialize};
 use crate::grant::{LocalGrantHost, MemoryGrantHost, MemoryGrantRequest};
 use crate::job::{JobError, Logger, Row};
 
-/// The environment variable naming the trigger kind for a subprocess worker
-/// (`manual`, `cron`, `webhook`, `data_change`).
-pub const ENV_TRIGGER: &str = "VERGLAS_TRIGGER";
-/// The complete serialized [`TriggerEvent`] delivered to a subprocess worker.
-/// Cron keeps its individual logical-time variables too for shell consumers.
-pub const ENV_EVENT_JSON: &str = "VERGLAS_EVENT_JSON";
-/// The nominal scheduled instant of a cron run (ISO 8601).
-pub const ENV_LOGICAL_DATE: &str = "VERGLAS_LOGICAL_DATE";
-/// The inclusive start of a cron run's logical interval (ISO 8601).
-pub const ENV_INTERVAL_START: &str = "VERGLAS_INTERVAL_START";
-/// The exclusive end of a cron run's logical interval (ISO 8601).
-pub const ENV_INTERVAL_END: &str = "VERGLAS_INTERVAL_END";
+/// The complete serialized CloudEvents 1.0 envelope delivered to a subprocess.
+pub const ENV_CLOUD_EVENT: &str = "VERGLAS_CLOUD_EVENT";
 /// The deployment name bound into the worker subprocess environment.
 pub const ENV_DEPLOYMENT: &str = "DEPLOYMENT";
 /// The deployment-configured output table (the first, when there are several).
@@ -95,28 +84,6 @@ impl Default for Catchup {
     }
 }
 
-/// The table(s) a `data_change` trigger follows: the TS `string | string[]`.
-/// Deserializes from either a bare string or an array; always presents as a
-/// list.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum TableRef {
-    /// A single dotted `namespace.table`.
-    One(String),
-    /// Several dotted tables.
-    Many(Vec<String>),
-}
-
-impl TableRef {
-    /// The tables as a flat list, whether declared as one or many.
-    pub fn tables(&self) -> Vec<String> {
-        match self {
-            TableRef::One(t) => vec![t.clone()],
-            TableRef::Many(ts) => ts.clone(),
-        }
-    }
-}
-
 /// A trigger declaration — deployment config saying when a worker runs. The
 /// `type` field is the discriminant, matching the TS `TriggerSpec` union.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -139,10 +106,17 @@ pub enum TriggerSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
-    /// Fire when a commit lands on any of the named tables.
-    DataChange {
-        /// The table(s) whose commits invoke the worker.
-        table: TableRef,
+    /// Fire when an accepted CloudEvent matches the declared attributes.
+    Event {
+        /// Exact CloudEvent `type` to accept.
+        #[serde(rename = "eventType")]
+        event_type: String,
+        /// Optional exact CloudEvent `source` filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        /// Optional exact CloudEvent `subject` filter.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
     },
     /// Follow a local process or file continuously, appending each captured
     /// output line to the worker's target table as a row.
@@ -163,20 +137,128 @@ pub enum TriggerSpec {
 }
 
 impl TriggerSpec {
-    /// The wire discriminant (`cron`, `webhook`, `data_change`, `follow`),
-    /// for logging and the [`ENV_TRIGGER`] binding.
+    /// The wire discriminant (`cron`, `webhook`, `event`, `follow`).
     pub fn kind(&self) -> &'static str {
         match self {
             TriggerSpec::Cron { .. } => "cron",
             TriggerSpec::Webhook { .. } => "webhook",
-            TriggerSpec::DataChange { .. } => "data_change",
+            TriggerSpec::Event { .. } => "event",
             TriggerSpec::Follow { .. } => "follow",
+        }
+    }
+
+    /// Returns whether this event subscription accepts a CloudEvent.
+    pub fn matches(&self, event: &CloudEvent) -> bool {
+        match self {
+            TriggerSpec::Event {
+                event_type,
+                source,
+                subject,
+            } => {
+                event.event_type == *event_type
+                    && source.as_ref().is_none_or(|value| event.source == *value)
+                    && subject
+                        .as_ref()
+                        .is_none_or(|value| event.subject.as_ref() == Some(value))
+            }
+            _ => false,
         }
     }
 }
 
+/// One CloudEvents 1.0 structured event delivered throughout the worker system.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloudEvent {
+    /// CloudEvents specification version. Only `1.0` is accepted.
+    pub specversion: String,
+    /// Producer-scoped stable event identity.
+    pub id: String,
+    /// Stable URI-reference identifying the producer.
+    pub source: String,
+    /// Event kind used by worker subscription filters.
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// Optional resource within the source that the event concerns.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Optional event timestamp in RFC 3339 form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    /// Optional media type of `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub datacontenttype: Option<String>,
+    /// Optional schema URI for `data`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataschema: Option<String>,
+    /// Event-specific structured payload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+    /// Event-specific binary payload encoded as base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_base64: Option<String>,
+    /// CloudEvents extension attributes not known to this SDK.
+    #[serde(flatten)]
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+
+impl CloudEvent {
+    /// Creates a CloudEvents 1.0 envelope with no optional attributes.
+    pub fn new(
+        id: impl Into<String>,
+        source: impl Into<String>,
+        event_type: impl Into<String>,
+    ) -> CloudEvent {
+        CloudEvent {
+            specversion: "1.0".to_owned(),
+            id: id.into(),
+            source: source.into(),
+            event_type: event_type.into(),
+            subject: None,
+            time: None,
+            datacontenttype: None,
+            dataschema: None,
+            data: None,
+            data_base64: None,
+            extensions: BTreeMap::new(),
+        }
+    }
+
+    /// Validates the required attributes and the supported CloudEvents version.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.specversion != "1.0" {
+            return Err(format!(
+                "unsupported CloudEvents specversion `{}`",
+                self.specversion
+            ));
+        }
+        for (name, value) in [
+            ("id", self.id.as_str()),
+            ("source", self.source.as_str()),
+            ("type", self.event_type.as_str()),
+        ] {
+            if value.is_empty() {
+                return Err(format!("CloudEvent `{name}` is required"));
+            }
+        }
+        if self.data.is_some() && self.data_base64.is_some() {
+            return Err("CloudEvent cannot contain both `data` and `data_base64`".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Reads and validates the single structured CloudEvent subprocess binding.
+    pub fn from_env<F: Fn(&str) -> Option<String>>(getenv: F) -> Result<CloudEvent, String> {
+        let body =
+            getenv(ENV_CLOUD_EVENT).ok_or_else(|| format!("{ENV_CLOUD_EVENT} is required"))?;
+        let event: CloudEvent = serde_json::from_str(&body)
+            .map_err(|error| format!("invalid {ENV_CLOUD_EVENT}: {error}"))?;
+        event.validate()?;
+        Ok(event)
+    }
+}
+
 /// The logical interval a cron run covers, half-open `[start, end)`. Mirrors the
-/// TS `CronTriggerEvent`'s `logicalDate` / `intervalStart` / `intervalEnd`. All
+/// Cron CloudEvent `data` fields `logicalDate` / `intervalStart` / `intervalEnd`. All
 /// ISO 8601 strings; the worker reads them, it never parses a durable cursor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronInterval {
@@ -191,8 +273,7 @@ pub struct CronInterval {
     pub interval_end: String,
 }
 
-/// A committed-table change, the payload of a `data_change` run. Mirrors the TS
-/// `ChangeEvent`; the field spellings match the catalog feed's wire JSON.
+/// A committed-table change from the catalog follow feed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChangeEvent {
     /// The feed's monotonic sequence number for this change.
@@ -221,75 +302,6 @@ pub struct HttpCallback {
     pub headers: BTreeMap<String, String>,
     /// Complete request body bytes.
     pub body: Vec<u8>,
-}
-
-/// The event that invoked one worker run. Mirrors the TS `TriggerEvent`; the
-/// `type` field is the discriminant.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum TriggerEvent {
-    /// A caller-requested immediate run.
-    Manual,
-    /// A scheduled run over a logical interval.
-    Cron(CronInterval),
-    /// A routed HTTP callback run.
-    Webhook {
-        /// Complete callback request accepted by the HTTP ingress.
-        request: HttpCallback,
-    },
-    /// A run fired by a table commit.
-    DataChange {
-        /// The change that fired the run.
-        change: ChangeEvent,
-    },
-}
-
-impl TriggerEvent {
-    /// The wire discriminant, for logging and the [`ENV_TRIGGER`] binding.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            TriggerEvent::Manual => "manual",
-            TriggerEvent::Cron(_) => "cron",
-            TriggerEvent::Webhook { .. } => "webhook",
-            TriggerEvent::DataChange { .. } => "data_change",
-        }
-    }
-
-    /// Builds the trigger event for a subprocess run from its environment,
-    /// mirroring the TS `endpoint-run` harness. Non-cron events require the
-    /// complete [`ENV_EVENT_JSON`] payload; missing or malformed worker events
-    /// are rejected instead of silently fabricating an empty event.
-    pub fn from_env<F: Fn(&str) -> Option<String>>(getenv: F) -> Result<TriggerEvent, String> {
-        match getenv(ENV_TRIGGER).as_deref() {
-            Some("manual") => Ok(TriggerEvent::Manual),
-            Some(kind @ ("webhook" | "data_change")) => getenv(ENV_EVENT_JSON)
-                .ok_or_else(|| format!("{ENV_EVENT_JSON} is required for {kind} runs"))
-                .and_then(|body| {
-                    serde_json::from_str::<TriggerEvent>(&body)
-                        .map_err(|error| format!("invalid {ENV_EVENT_JSON}: {error}"))
-                })
-                .and_then(|event| {
-                    if event.kind() == kind {
-                        Ok(event)
-                    } else {
-                        Err(format!(
-                            "{ENV_EVENT_JSON} contains {} for {kind} run",
-                            event.kind()
-                        ))
-                    }
-                }),
-            Some("cron") => Ok(TriggerEvent::Cron(CronInterval {
-                logical_date: getenv(ENV_LOGICAL_DATE)
-                    .ok_or_else(|| format!("{ENV_LOGICAL_DATE} is required for cron runs"))?,
-                interval_start: getenv(ENV_INTERVAL_START)
-                    .ok_or_else(|| format!("{ENV_INTERVAL_START} is required for cron runs"))?,
-                interval_end: getenv(ENV_INTERVAL_END)
-                    .ok_or_else(|| format!("{ENV_INTERVAL_END} is required for cron runs"))?,
-            })),
-            Some(kind) => Err(format!("unsupported {ENV_TRIGGER} `{kind}`")),
-            None => Err(format!("{ENV_TRIGGER} is required")),
-        }
-    }
 }
 
 /// What a [`Worker::run`] reports back. Mirrors the TS `WorkerResult`.
@@ -340,7 +352,7 @@ pub struct WorkerContext<C> {
     /// A connected client for the target endpoint (read/write via table verbs).
     pub client: C,
     /// The event that invoked this run.
-    pub trigger: TriggerEvent,
+    pub trigger: CloudEvent,
     /// The deployment-configured output table (the first configured output).
     pub output: String,
     /// Every deployment-configured output table (>= 1). `output` is
@@ -437,105 +449,63 @@ mod tests {
         );
     }
 
-    /// A `data_change` trigger accepts both a single table and a list, matching
-    /// the TS `string | string[]`.
+    /// Event subscriptions match CloudEvents by type and optional source and subject.
     #[test]
-    fn data_change_accepts_one_or_many_tables() {
-        let one: TriggerSpec =
-            serde_json::from_str(r#"{"type":"data_change","table":"agent_memory.memories"}"#)
-                .expect("one");
+    fn event_trigger_matches_cloud_event() {
+        let spec: TriggerSpec = serde_json::from_str(
+            r#"{"type":"event","eventType":"org.apache.iceberg.snapshot.committed","source":"urn:verglas:catalog:local","subject":"agent_memory.memories"}"#,
+        )
+        .expect("event trigger");
         assert_eq!(
-            one,
-            TriggerSpec::DataChange {
-                table: TableRef::One("agent_memory.memories".to_owned())
+            spec,
+            TriggerSpec::Event {
+                event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
+                source: Some("urn:verglas:catalog:local".to_owned()),
+                subject: Some("agent_memory.memories".to_owned()),
             }
         );
-        let many: TriggerSpec =
-            serde_json::from_str(r#"{"type":"data_change","table":["a.b","c.d"]}"#).expect("many");
-        match many {
-            TriggerSpec::DataChange { table } => {
-                assert_eq!(table.tables(), vec!["a.b".to_owned(), "c.d".to_owned()])
-            }
-            other => panic!("expected data_change, got {other:?}"),
-        }
+        let event: CloudEvent = serde_json::from_str(
+            r#"{"specversion":"1.0","id":"42","source":"urn:verglas:catalog:local","type":"org.apache.iceberg.snapshot.committed","subject":"agent_memory.memories","data":{"snapshotId":"99"}}"#,
+        )
+        .expect("CloudEvent");
+        assert!(spec.matches(&event));
     }
 
-    /// The env → cron event mapping mirrors the TS `endpoint-run` harness: the
-    /// interval env vars land on the cron trigger event.
+    /// Worker events accept exactly CloudEvents 1.0, not the former trigger union.
     #[test]
-    fn cron_event_from_env() {
-        let vars = |k: &str| -> Option<String> {
-            match k {
-                ENV_TRIGGER => Some("cron".to_owned()),
-                ENV_LOGICAL_DATE => Some("2026-08-01T00:00:00Z".to_owned()),
-                ENV_INTERVAL_START => Some("2026-07-31T00:00:00Z".to_owned()),
-                ENV_INTERVAL_END => Some("2026-08-01T00:00:00Z".to_owned()),
-                _ => None,
-            }
-        };
-        let event = TriggerEvent::from_env(vars).expect("cron event");
+    fn cloud_event_rejects_other_spec_versions() {
+        let event: CloudEvent = serde_json::from_str(
+            r#"{"specversion":"0.3","id":"42","source":"urn:test","type":"test"}"#,
+        )
+        .expect("wire shape");
         assert_eq!(
-            event,
-            TriggerEvent::Cron(CronInterval {
-                logical_date: "2026-08-01T00:00:00Z".to_owned(),
-                interval_start: "2026-07-31T00:00:00Z".to_owned(),
-                interval_end: "2026-08-01T00:00:00Z".to_owned(),
-            })
+            event.validate().expect_err("unsupported spec version"),
+            "unsupported CloudEvents specversion `0.3`"
         );
-        assert_eq!(event.kind(), "cron");
     }
 
-    /// A webhook `VERGLAS_TRIGGER` maps to the webhook event, not cron.
+    /// The subprocess contract reads one complete CloudEvent envelope.
     #[test]
-    fn webhook_event_from_env() {
-        let expected = TriggerEvent::Webhook {
-            request: HttpCallback {
-                method: "POST".to_owned(),
-                path: "/callbacks/build".to_owned(),
-                headers: std::collections::BTreeMap::from([(
-                    "content-type".to_owned(),
-                    "application/json".to_owned(),
-                )]),
-                body: b"{\"ok\":true}".to_vec(),
-            },
-        };
-        let body = serde_json::to_string(&expected).expect("event JSON");
-        let vars = |k: &str| -> Option<String> {
-            match k {
-                ENV_TRIGGER => Some("webhook".to_owned()),
-                ENV_EVENT_JSON => Some(body.clone()),
-                _ => None,
-            }
-        };
+    fn cloud_event_from_env() {
+        let mut expected = CloudEvent::new("run-1", "urn:verglas:scheduler", "org.verglas.cron");
+        expected.data = Some(serde_json::json!({
+            "logicalDate": "2026-08-01T00:00:00Z",
+            "intervalStart": "2026-07-31T00:00:00Z",
+            "intervalEnd": "2026-08-01T00:00:00Z"
+        }));
+        let body = serde_json::to_string(&expected).expect("CloudEvent JSON");
         assert_eq!(
-            TriggerEvent::from_env(vars).expect("webhook event"),
+            CloudEvent::from_env(|key| (key == ENV_CLOUD_EVENT).then(|| body.clone()))
+                .expect("CloudEvent"),
             expected
         );
     }
 
-    /// Manual dispatch is its own event and never impersonates an empty cron run.
+    /// The harness must receive a CloudEvent for every worker run.
     #[test]
-    fn manual_event_from_env() {
-        let vars = |key: &str| (key == ENV_TRIGGER).then(|| "manual".to_owned());
-        assert_eq!(
-            TriggerEvent::from_env(vars).expect("manual event"),
-            TriggerEvent::Manual
-        );
-    }
-
-    /// The harness must identify every run; an absent trigger is not cron.
-    #[test]
-    fn missing_trigger_is_rejected() {
-        let error = TriggerEvent::from_env(|_| None).expect_err("missing trigger");
-        assert_eq!(error, "VERGLAS_TRIGGER is required");
-    }
-
-    /// Cron never runs with a fabricated logical interval.
-    #[test]
-    fn incomplete_cron_interval_is_rejected() {
-        let error = TriggerEvent::from_env(|key| (key == ENV_TRIGGER).then(|| "cron".to_owned()))
-            .expect_err("incomplete cron");
-        assert_eq!(error, "VERGLAS_LOGICAL_DATE is required for cron runs");
+    fn missing_cloud_event_is_rejected() {
+        let error = CloudEvent::from_env(|_| None).expect_err("missing event");
+        assert_eq!(error, "VERGLAS_CLOUD_EVENT is required");
     }
 
     /// Websocket is not a worker scheduling trigger.

@@ -14,8 +14,8 @@
 use uuid::Uuid;
 
 use verglas_sdk::worker::{
-    ENV_DEPLOYMENT, ENV_ENDPOINT, ENV_EVENT_JSON, ENV_INTERVAL_END, ENV_INTERVAL_START,
-    ENV_LOGICAL_DATE, ENV_RESULT_PATH, ENV_TARGET, ENV_TOKEN, ENV_TRIGGER, RunResult, TriggerEvent,
+    CloudEvent, ENV_CLOUD_EVENT, ENV_DEPLOYMENT, ENV_ENDPOINT, ENV_RESULT_PATH, ENV_TARGET,
+    ENV_TOKEN, RunResult,
 };
 
 use crate::commit::HarnessError;
@@ -93,7 +93,7 @@ pub struct WorkerOutcome {
 pub async fn run_worker(
     run: &WorkerRun<'_>,
     exec: &WorkerExec,
-    event: &TriggerEvent,
+    event: &CloudEvent,
 ) -> Result<WorkerOutcome, HarnessError> {
     drive(run, exec, event).await
 }
@@ -103,7 +103,7 @@ pub async fn run_worker(
 async fn drive(
     run: &WorkerRun<'_>,
     exec: &WorkerExec,
-    event: &TriggerEvent,
+    event: &CloudEvent,
 ) -> Result<WorkerOutcome, HarnessError> {
     let result_path = std::env::temp_dir().join(format!("verglas-worker-{}.json", Uuid::new_v4()));
 
@@ -130,13 +130,15 @@ async fn drive(
 /// endpoint, token, and result path. Mirrors the TS `endpoint-run` env contract.
 fn run_env(
     run: &WorkerRun<'_>,
-    event: &TriggerEvent,
+    event: &CloudEvent,
     result_path: &std::path::Path,
 ) -> Result<Vec<(String, String)>, HarnessError> {
     let event_json = serde_json::to_string(event)
         .map_err(|error| HarnessError::Job(format!("serialize worker event: {error}")))?;
-    let mut env = vec![
-        (ENV_TRIGGER.to_owned(), event.kind().to_owned()),
+    event
+        .validate()
+        .map_err(|error| HarnessError::Job(format!("invalid worker CloudEvent: {error}")))?;
+    let env = vec![
         (ENV_DEPLOYMENT.to_owned(), run.deployment.to_owned()),
         (ENV_TARGET.to_owned(), run.output.to_owned()),
         (ENV_ENDPOINT.to_owned(), run.endpoint.to_owned()),
@@ -145,16 +147,8 @@ fn run_env(
             ENV_RESULT_PATH.to_owned(),
             result_path.to_string_lossy().into_owned(),
         ),
-        (ENV_EVENT_JSON.to_owned(), event_json),
+        (ENV_CLOUD_EVENT.to_owned(), event_json),
     ];
-    if let TriggerEvent::Cron(interval) = event {
-        env.push((ENV_LOGICAL_DATE.to_owned(), interval.logical_date.clone()));
-        env.push((
-            ENV_INTERVAL_START.to_owned(),
-            interval.interval_start.clone(),
-        ));
-        env.push((ENV_INTERVAL_END.to_owned(), interval.interval_end.clone()));
-    }
     Ok(env)
 }
 
@@ -190,8 +184,7 @@ fn read_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, HashMap};
-    use verglas_sdk::worker::{CronInterval, ENV_EVENT_JSON, HttpCallback};
+    use std::collections::HashMap;
 
     /// A worker with no `exec` is rejected — the server only runs subprocess
     /// workers.
@@ -227,69 +220,30 @@ mod tests {
         assert!(WorkerExec::from_config("w", r#"{"exec":[]}"#).is_err());
     }
 
-    /// Every cron interval field and the trigger kind are bound for the worker.
+    /// Every run crosses the subprocess boundary as one structured CloudEvent.
     #[test]
-    fn cron_env_carries_the_interval() {
+    fn env_carries_one_cloud_event() {
         let run = WorkerRun {
             deployment: "d",
             output: "a.b",
             endpoint: "http://127.0.0.1:8334",
             token: "",
         };
-        let event = TriggerEvent::Cron(CronInterval {
-            logical_date: "2026-08-01T00:00:00Z".to_owned(),
-            interval_start: "2026-07-31T00:00:00Z".to_owned(),
-            interval_end: "2026-08-01T00:00:00Z".to_owned(),
-        });
+        let mut event = CloudEvent::new("tick-1", "urn:verglas:scheduler", "org.verglas.cron");
+        event.data = Some(serde_json::json!({
+            "logicalDate": "2026-08-01T00:00:00Z",
+            "intervalStart": "2026-07-31T00:00:00Z",
+            "intervalEnd": "2026-08-01T00:00:00Z"
+        }));
         let env: HashMap<String, String> =
             run_env(&run, &event, std::path::Path::new("/tmp/r.json"))
                 .expect("run env")
                 .into_iter()
                 .collect();
-        assert_eq!(env.get(ENV_TRIGGER).map(String::as_str), Some("cron"));
         assert_eq!(env.get(ENV_TARGET).map(String::as_str), Some("a.b"));
+        let serialized = env.get(ENV_CLOUD_EVENT).expect("serialized event");
         assert_eq!(
-            env.get(ENV_LOGICAL_DATE).map(String::as_str),
-            Some("2026-08-01T00:00:00Z")
-        );
-        assert_eq!(
-            env.get(ENV_INTERVAL_START).map(String::as_str),
-            Some("2026-07-31T00:00:00Z")
-        );
-        assert_eq!(
-            env.get(ENV_INTERVAL_END).map(String::as_str),
-            Some("2026-08-01T00:00:00Z")
-        );
-    }
-
-    /// HTTP callbacks cross the subprocess boundary as one complete serialized
-    /// worker event; the scheduler never acts as an HTTP connection broker.
-    #[test]
-    fn webhook_env_carries_the_callback_event() {
-        let run = WorkerRun {
-            deployment: "callback-worker",
-            output: "app.events",
-            endpoint: "http://127.0.0.1:8334",
-            token: "",
-        };
-        let event = TriggerEvent::Webhook {
-            request: HttpCallback {
-                method: "POST".to_owned(),
-                path: "/callbacks/build".to_owned(),
-                headers: BTreeMap::from([(
-                    "content-type".to_owned(),
-                    "application/json".to_owned(),
-                )]),
-                body: b"{\"build\":7}".to_vec(),
-            },
-        };
-        let env: HashMap<_, _> = run_env(&run, &event, std::path::Path::new("/tmp/result"))
-            .expect("run env")
-            .into_iter()
-            .collect();
-        let serialized = env.get(ENV_EVENT_JSON).expect("serialized callback");
-        assert_eq!(
-            serde_json::from_str::<TriggerEvent>(serialized).expect("event"),
+            serde_json::from_str::<CloudEvent>(serialized).expect("event"),
             event
         );
     }
