@@ -243,6 +243,8 @@ fn warming_info(
 /// sender + organic-yield gate (for wrapping the serving engine).
 #[derive(Default)]
 struct LifecycleHooks {
+    /// Shared catalog watcher used by cache lifecycle and scheduler subscriptions.
+    watcher: Option<Arc<verglas_tables::catalog::CatalogFeed>>,
     /// Live warming progress, when warming is on.
     warming: Option<Arc<verglas_tables::warming::WarmProgress>>,
     /// The request-path heat sample sender, when prefetch is on.
@@ -305,7 +307,10 @@ fn spawn_lifecycle(
         TokenBucket::new(w.byte_budget_bytes_per_sec.0, w.byte_budget_bytes_per_sec.0)
     });
 
-    let mut hooks = LifecycleHooks::default();
+    let mut hooks = LifecycleHooks {
+        watcher: Some(watcher.clone()),
+        ..LifecycleHooks::default()
+    };
     if config.cache.warming.enabled {
         hooks.warming = Some(spawn_warming(
             config,
@@ -330,6 +335,49 @@ fn spawn_lifecycle(
         );
     }
     Ok(hooks)
+}
+
+/// Bridges on-prem catalog polling events into durable scheduler invocations.
+fn spawn_scheduler_data_updates(
+    watcher: Arc<verglas_tables::catalog::CatalogFeed>,
+    ingress: Arc<platform::SchedulerIngress>,
+) -> tokio::task::JoinHandle<()> {
+    use verglas_tables::catalog::CatalogWatcher;
+    let mut events = watcher.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(change) => {
+                    let Some(snapshot_id) = change.new_snapshot else {
+                        continue;
+                    };
+                    let Ok(sequence) = u64::try_from(snapshot_id) else {
+                        tracing::warn!(
+                            "scheduler catalog update ignored negative snapshot id {snapshot_id}"
+                        );
+                        continue;
+                    };
+                    if let Err(error) = ingress
+                        .data_update(
+                            &change.table.dotted(),
+                            snapshot_id.to_string(),
+                            sequence,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                    {
+                        tracing::warn!("scheduler catalog update enqueue failed: {error}");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        "scheduler catalog subscription lagged by {skipped} event(s); object idempotency keeps replay safe"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
 }
 
 /// Spawns the eager warming coordinator (#168) over the shared watcher + budget.
@@ -1390,11 +1438,13 @@ async fn serve(
             queue_dir.display()
         );
     }
-    // The worker runtime runs workers over the private catalog, so — like the
-    // table routes — it exists only when a catalog is configured and is filled
-    // after recovery.
+    // Worker ingress exists only when an external scheduler is configured.
+    // With no URL, Verglas boots normally and mounts no worker-trigger routes.
+    let scheduler_url = std::env::var("VERGLAS_SCHEDULER_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
     let platform_slot: Option<admin::PlatformSlot> =
-        config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
+        (config.catalog.is_some() && scheduler_url.is_some()).then(|| Arc::new(OnceLock::new()));
 
     // Bind the admin and S3 listeners now, before serving, so their
     // kernel-assigned ports are known (issue #194): `verglas dev` passes
@@ -1706,22 +1756,20 @@ async fn serve(
                     if let Some(sys) = &sys_slot {
                         let _ = sys.set(sys_catalog.clone());
                     }
-                    // The worker runtime runs workers over this same loopback
-                    // catalog — cache-pathed by construction (§7.4). Spawned
-                    // detached AFTER the catalog is open and BEFORE mark_ready, so
-                    // it never blocks recovery; its first tick fires a minute
-                    // later, reading the registry fresh so pause/resume take
-                    // effect at each boundary. The guard dir sits beside the queue
-                    // dir under the cache dir.
-                    if let Some(platform) = &platform_slot {
-                        let supervisor = Arc::new(platform::WorkerSupervisor {
-                            catalog: catalog.clone(),
-                            sys: sys_catalog.clone(),
-                            guard_dir: config.cache.dir.join("platform/guard"),
-                            endpoint: format!("http://127.0.0.1:{resolved_admin_port}"),
-                        });
-                        platform::spawn_supervisor(supervisor.clone());
-                        let _ = platform.set(supervisor);
+                    // REST ingress resolves deployments through this registry
+                    // and pushes complete worker events to the scheduler. Cron
+                    // reconciliation and execution live only in that separate
+                    // container.
+                    if let (Some(platform), Some(scheduler_url)) = (&platform_slot, &scheduler_url)
+                    {
+                        let ingress = Arc::new(platform::SchedulerIngress::new(
+                            sys_catalog.clone(),
+                            scheduler_url.clone(),
+                        ));
+                        let _ = platform.set(ingress.clone());
+                        if let Some(watcher) = hooks.watcher.clone() {
+                            spawn_scheduler_data_updates(watcher, ingress);
+                        }
                         // Follow workers run continuously, not per-tick, so a
                         // dedicated manager keeps one runner alive per active
                         // follow worker — tailing a file or wrapping a command and

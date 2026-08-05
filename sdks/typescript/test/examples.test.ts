@@ -63,6 +63,7 @@ describe("httpPollWorker", () => {
     };
     const trigger: TriggerEvent = {
       type: "cron",
+      logicalDate: "2026-08-02T00:00:00Z",
       intervalStart: "2026-08-01T00:00:00Z",
       intervalEnd: "2026-08-02T00:00:00Z", // exclusive: excludes the second row
     };

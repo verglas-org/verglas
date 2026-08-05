@@ -207,7 +207,14 @@ fn main() -> ExitCode {
     };
 
     // Informational: the trigger this run was invoked under (CDC is cron-driven).
-    let trigger = TriggerEvent::from_env(|k| std::env::var(k).ok());
+    let trigger = match TriggerEvent::from_env(|k| std::env::var(k).ok()) {
+        Ok(trigger) => trigger,
+        Err(error) => {
+            let result = RunResult::failed(error);
+            let _ = write_result(&cdc.result_path, &result);
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!(
         "verglas-pgcdc: deployment={} trigger={}",
         cdc.deployment,

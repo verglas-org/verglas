@@ -19,3 +19,4 @@
   alternates per the no-fallbacks rule.
 - #91: Updated the CDC runner's local endpoint documentation for the renamed
   `verglas-server` process. No legacy executable or endpoint spelling remains.
+- #11: Made the CDC worker reject malformed scheduler event payloads instead of silently running with a fabricated trigger. The binary now shares the strict SDK subprocess contract used by the scheduler harness.

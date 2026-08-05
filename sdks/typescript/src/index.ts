@@ -22,18 +22,15 @@ export type {
   RunWorkerOptions,
   // Trigger events (runtime payload on ctx.trigger)
   TriggerEvent,
+  ManualTriggerEvent,
   CronTriggerEvent,
   WebhookTriggerEvent,
-  WebSocketTriggerEvent,
   DataChangeTriggerEvent,
-  KafkaTriggerEvent,
   // Trigger specs (deployment config the SDK types)
   TriggerSpec,
   CronTriggerSpec,
   WebhookTriggerSpec,
-  WebSocketTriggerSpec,
   DataChangeTriggerSpec,
-  KafkaTriggerSpec,
 } from "./contracts";
 
 export type {

@@ -14,8 +14,8 @@
 use uuid::Uuid;
 
 use verglas_sdk::worker::{
-    ENV_DEPLOYMENT, ENV_ENDPOINT, ENV_INTERVAL_END, ENV_INTERVAL_START, ENV_LOGICAL_DATE,
-    ENV_RESULT_PATH, ENV_TARGET, ENV_TOKEN, ENV_TRIGGER, RunResult, TriggerEvent,
+    ENV_DEPLOYMENT, ENV_ENDPOINT, ENV_EVENT_JSON, ENV_INTERVAL_END, ENV_INTERVAL_START,
+    ENV_LOGICAL_DATE, ENV_RESULT_PATH, ENV_TARGET, ENV_TOKEN, ENV_TRIGGER, RunResult, TriggerEvent,
 };
 
 use crate::commit::HarnessError;
@@ -112,7 +112,7 @@ async fn drive(
     if let Some(cwd) = &exec.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in run_env(run, event, &result_path) {
+    for (key, value) in run_env(run, event, &result_path)? {
         cmd.env(key, value);
     }
 
@@ -132,7 +132,9 @@ fn run_env(
     run: &WorkerRun<'_>,
     event: &TriggerEvent,
     result_path: &std::path::Path,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, HarnessError> {
+    let event_json = serde_json::to_string(event)
+        .map_err(|error| HarnessError::Job(format!("serialize worker event: {error}")))?;
     let mut env = vec![
         (ENV_TRIGGER.to_owned(), event.kind().to_owned()),
         (ENV_DEPLOYMENT.to_owned(), run.deployment.to_owned()),
@@ -143,19 +145,17 @@ fn run_env(
             ENV_RESULT_PATH.to_owned(),
             result_path.to_string_lossy().into_owned(),
         ),
+        (ENV_EVENT_JSON.to_owned(), event_json),
     ];
     if let TriggerEvent::Cron(interval) = event {
-        if let Some(v) = &interval.logical_date {
-            env.push((ENV_LOGICAL_DATE.to_owned(), v.clone()));
-        }
-        if let Some(v) = &interval.interval_start {
-            env.push((ENV_INTERVAL_START.to_owned(), v.clone()));
-        }
-        if let Some(v) = &interval.interval_end {
-            env.push((ENV_INTERVAL_END.to_owned(), v.clone()));
-        }
+        env.push((ENV_LOGICAL_DATE.to_owned(), interval.logical_date.clone()));
+        env.push((
+            ENV_INTERVAL_START.to_owned(),
+            interval.interval_start.clone(),
+        ));
+        env.push((ENV_INTERVAL_END.to_owned(), interval.interval_end.clone()));
     }
-    env
+    Ok(env)
 }
 
 /// Interprets the child's result file and exit status. A result-file error, a
@@ -190,8 +190,8 @@ fn read_result(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use verglas_sdk::worker::CronInterval;
+    use std::collections::{BTreeMap, HashMap};
+    use verglas_sdk::worker::{CronInterval, ENV_EVENT_JSON, HttpCallback};
 
     /// A worker with no `exec` is rejected — the server only runs subprocess
     /// workers.
@@ -227,8 +227,7 @@ mod tests {
         assert!(WorkerExec::from_config("w", r#"{"exec":[]}"#).is_err());
     }
 
-    /// The cron interval env vars are bound only when present, and the trigger
-    /// kind is always set.
+    /// Every cron interval field and the trigger kind are bound for the worker.
     #[test]
     fn cron_env_carries_the_interval() {
         let run = WorkerRun {
@@ -238,12 +237,13 @@ mod tests {
             token: "",
         };
         let event = TriggerEvent::Cron(CronInterval {
-            logical_date: Some("2026-08-01T00:00:00Z".to_owned()),
-            interval_start: Some("2026-07-31T00:00:00Z".to_owned()),
-            interval_end: None,
+            logical_date: "2026-08-01T00:00:00Z".to_owned(),
+            interval_start: "2026-07-31T00:00:00Z".to_owned(),
+            interval_end: "2026-08-01T00:00:00Z".to_owned(),
         });
         let env: HashMap<String, String> =
             run_env(&run, &event, std::path::Path::new("/tmp/r.json"))
+                .expect("run env")
                 .into_iter()
                 .collect();
         assert_eq!(env.get(ENV_TRIGGER).map(String::as_str), Some("cron"));
@@ -256,6 +256,41 @@ mod tests {
             env.get(ENV_INTERVAL_START).map(String::as_str),
             Some("2026-07-31T00:00:00Z")
         );
-        assert!(!env.contains_key(ENV_INTERVAL_END), "absent end not bound");
+        assert_eq!(
+            env.get(ENV_INTERVAL_END).map(String::as_str),
+            Some("2026-08-01T00:00:00Z")
+        );
+    }
+
+    /// HTTP callbacks cross the subprocess boundary as one complete serialized
+    /// worker event; the scheduler never acts as an HTTP connection broker.
+    #[test]
+    fn webhook_env_carries_the_callback_event() {
+        let run = WorkerRun {
+            deployment: "callback-worker",
+            output: "app.events",
+            endpoint: "http://127.0.0.1:8334",
+            token: "",
+        };
+        let event = TriggerEvent::Webhook {
+            request: HttpCallback {
+                method: "POST".to_owned(),
+                path: "/callbacks/build".to_owned(),
+                headers: BTreeMap::from([(
+                    "content-type".to_owned(),
+                    "application/json".to_owned(),
+                )]),
+                body: b"{\"build\":7}".to_vec(),
+            },
+        };
+        let env: HashMap<_, _> = run_env(&run, &event, std::path::Path::new("/tmp/result"))
+            .expect("run env")
+            .into_iter()
+            .collect();
+        let serialized = env.get(ENV_EVENT_JSON).expect("serialized callback");
+        assert_eq!(
+            serde_json::from_str::<TriggerEvent>(serialized).expect("event"),
+            event
+        );
     }
 }

@@ -14,6 +14,7 @@ verglas-iceberg.workspace = true
 verglas-platform.workspace = true
 verglas-graph.workspace = true
 verglas-vector.workspace = true
+verglas-scheduler.workspace = true
 verglas-harness.workspace = true
 verglas-sdk.workspace = true
 verglas-s3.workspace = true

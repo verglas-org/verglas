@@ -6,6 +6,17 @@ icon: "workflow"
 
 A worker combines code, a trigger, output tables, configuration, secrets, and resource hints. One dispatch invokes one bounded run. The same portable specification can register on a local server or in Verglas Cloud.
 
+Scheduling runs in the standalone `verglas-scheduler` service. On-prem, an operator enables the optional `workers` Docker Compose profile and supplies Postgres and scheduler URLs. Postgres owns the durable queue; Verglas REST supplies the deployment registry and forwards bounded trigger events. With that profile disabled, Verglas runs normally without worker scheduling. In cloud, the fleet scheduler consumes tenant queues from Lakebase and chooses a microVM host after claiming a run. Cloud placement is outside the open-source queue contract.
+
+Enable it explicitly:
+
+```bash
+COMPOSE_PROFILES=workers \
+VERGLAS_SCHEDULER_URL=http://verglas-scheduler:8340 \
+VERGLAS_SCHEDULER_DATABASE_URL=postgres://user:password@postgres:5432/verglas \
+docker compose up -d
+```
+
 ## Worker invariants
 
 Design every worker around the following rules:
@@ -43,11 +54,9 @@ The SDK contract defines the following trigger events:
 | --- | --- | --- |
 | `cron` | Logical date and interval bounds | Scheduled ingestion and backfill |
 | `webhook` | An inbound `Request` | HTTP ingestion |
-| `websocket` | One data frame | Event-driven socket workloads |
 | `data_change` | A table commit notification | Incremental transformations |
-| `kafka` | Topic, partition, offset, key, and value | Stream ingestion |
 
-The portable CLI manifest currently registers `cron` and `manual` cloud workers. It also registers local-only `follow` workers. The SDK types the broader trigger contract used by the platform runtime.
+The portable CLI manifest currently registers `cron` and `manual` cloud workers. It also registers local-only `follow` workers. HTTP and data-update events use the same bounded worker-run contract.
 
 ## Create a portable worker
 

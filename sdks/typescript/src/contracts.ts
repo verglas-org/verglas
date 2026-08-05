@@ -8,7 +8,7 @@
 // programming model. The platform owns scheduling, backfill, and replay; a worker
 // only computes the run it was handed.
 //
-// Triggers themselves (cron | webhook | websocket | data_change | kafka) are
+// Triggers themselves (cron | webhook | data_change) are
 // DEPLOYMENT config, not code. The SDK types them (`TriggerSpec`) so a definition
 // can declare what it expects, but the platform's deploy path registers them; the
 // worker just receives the resulting `TriggerEvent` on `ctx.trigger`.
@@ -39,31 +39,27 @@ import {
  * nominal instant the platform scheduled this run for and the half-open interval
  * `[intervalStart, intervalEnd)` it is responsible for. A worker doing an
  * incremental pull ranges its query over this interval — it is the only progress
- * signal a worker sees. The fields are optional: a legacy or manual dispatch may
- * carry none, in which case the worker falls back to its own notion of "now".
+ * signal a worker sees.
  */
 export interface CronTriggerEvent {
   type: "cron";
   /** The nominal scheduled instant for this run (ISO 8601). */
-  logicalDate?: string;
+  logicalDate: string;
   /** Inclusive start of the logical interval this run covers (ISO 8601). */
-  intervalStart?: string;
+  intervalStart: string;
   /** Exclusive end of the logical interval this run covers (ISO 8601). */
-  intervalEnd?: string;
+  intervalEnd: string;
 }
 
-/** An inbound HTTP request routed to the worker. The worker reads the request
- *  and may write tables; the platform returns the worker's response. */
+/** A caller-requested immediate run. */
+export interface ManualTriggerEvent {
+  type: "manual";
+}
+
+/** An inbound HTTP callback routed to the worker as one bounded event. */
 export interface WebhookTriggerEvent {
   type: "webhook";
   request: Request;
-}
-
-/** One inbound websocket message that woke the worker. The long-lived socket is
- *  held by a hibernating edge object; only a data frame invokes the worker. */
-export interface WebSocketTriggerEvent {
-  type: "websocket";
-  message: string | ArrayBuffer;
 }
 
 /** A table-commit that the worker is subscribed to (a `data_change` trigger).
@@ -73,23 +69,12 @@ export interface DataChangeTriggerEvent {
   change: ChangeEvent;
 }
 
-/** One Kafka record delivered to the worker. */
-export interface KafkaTriggerEvent {
-  type: "kafka";
-  topic: string;
-  partition: number;
-  offset: number;
-  key?: string;
-  value: string | Uint8Array;
-}
-
 /** The event that invoked a worker run. */
 export type TriggerEvent =
+  | ManualTriggerEvent
   | CronTriggerEvent
   | WebhookTriggerEvent
-  | WebSocketTriggerEvent
-  | DataChangeTriggerEvent
-  | KafkaTriggerEvent;
+  | DataChangeTriggerEvent;
 
 // ---------------------------------------------------------------------------
 // Trigger specs — deployment config the SDK types (registration is deploy-time).
@@ -123,13 +108,6 @@ export interface WebhookTriggerSpec {
   path?: string;
 }
 
-/** A websocket trigger: inbound messages invoke the worker; the socket lives on
- *  a hibernating edge object, so an idle connection pins no compute. */
-export interface WebSocketTriggerSpec {
-  type: "websocket";
-  path?: string;
-}
-
 /** A data-change trigger: a commit to any declared table invokes the worker. */
 export interface DataChangeTriggerSpec {
   type: "data_change";
@@ -137,22 +115,12 @@ export interface DataChangeTriggerSpec {
   table: string | string[];
 }
 
-/** A Kafka trigger: records on a topic invoke the worker. */
-export interface KafkaTriggerSpec {
-  type: "kafka";
-  topic: string;
-  /** Consumer group; defaults to the deployment name. */
-  group?: string;
-}
-
 /** Any trigger a deployment can declare. Registration happens at deploy time;
  *  this type exists so a `WorkerDefinition` can name what it expects. */
 export type TriggerSpec =
   | CronTriggerSpec
   | WebhookTriggerSpec
-  | WebSocketTriggerSpec
-  | DataChangeTriggerSpec
-  | KafkaTriggerSpec;
+  | DataChangeTriggerSpec;
 
 // ---------------------------------------------------------------------------
 // The worker contract.

@@ -63,3 +63,4 @@
 - #393: Removed platform `_LOGS` run logging and day-partition retention from Verglas. Catalog-side lakekeeping owns telemetry write/TTL; harness no longer writes `verglas_logs.<name>_LOGS`.
 - #91: Renamed harness process documentation and error guidance from daemon to
   server. Worker execution contracts otherwise remain unchanged.
+- #11: Passed the complete serialized trigger event into every worker subprocess. HTTP callbacks and data updates now cross the harness boundary without losing their payload, while malformed events fail the run.

@@ -7,10 +7,8 @@
 //!
 //! - [`admin`]: the admin HTTP router and its route handlers, including the
 //!   `verglas_sys` registry, watermark, and platform queue routes.
-//! - [`platform`]: the server-hosted harness executors (#328) — the
-//!   [`platform::SysWatermarkStore`] over `verglas_sys.watermarks` and the
-//!   registry-driven supervisor that runs each active local deployment's
-//!   executor.
+//! - [`platform`]: optional REST and catalog trigger ingress into the external
+//!   scheduler service.
 //! - [`logging`]: the process-global tracing subscriber and its reloadable
 //!   level filter.
 //! - [`query_worker`]: dispatches `POST /v1/query` to a standalone

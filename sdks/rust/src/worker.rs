@@ -38,6 +38,7 @@
 //! worker side — progress is the trigger's logical time, not a durable cursor
 //! the child owns.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
@@ -48,8 +49,11 @@ use crate::grant::{LocalGrantHost, MemoryGrantHost, MemoryGrantRequest};
 use crate::job::{JobError, Logger, Row};
 
 /// The environment variable naming the trigger kind for a subprocess worker
-/// (`cron`, `webhook`, `websocket`, `data_change`).
+/// (`manual`, `cron`, `webhook`, `data_change`).
 pub const ENV_TRIGGER: &str = "VERGLAS_TRIGGER";
+/// The complete serialized [`TriggerEvent`] delivered to a subprocess worker.
+/// Cron keeps its individual logical-time variables too for shell consumers.
+pub const ENV_EVENT_JSON: &str = "VERGLAS_EVENT_JSON";
 /// The nominal scheduled instant of a cron run (ISO 8601).
 pub const ENV_LOGICAL_DATE: &str = "VERGLAS_LOGICAL_DATE";
 /// The inclusive start of a cron run's logical interval (ISO 8601).
@@ -135,12 +139,6 @@ pub enum TriggerSpec {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
     },
-    /// Fire on each message of a websocket the worker follows.
-    Websocket {
-        /// The path the websocket is mounted at (platform-scoped).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        path: Option<String>,
-    },
     /// Fire when a commit lands on any of the named tables.
     DataChange {
         /// The table(s) whose commits invoke the worker.
@@ -165,13 +163,12 @@ pub enum TriggerSpec {
 }
 
 impl TriggerSpec {
-    /// The wire discriminant (`cron`, `webhook`, `websocket`, `data_change`),
+    /// The wire discriminant (`cron`, `webhook`, `data_change`, `follow`),
     /// for logging and the [`ENV_TRIGGER`] binding.
     pub fn kind(&self) -> &'static str {
         match self {
             TriggerSpec::Cron { .. } => "cron",
             TriggerSpec::Webhook { .. } => "webhook",
-            TriggerSpec::Websocket { .. } => "websocket",
             TriggerSpec::DataChange { .. } => "data_change",
             TriggerSpec::Follow { .. } => "follow",
         }
@@ -181,29 +178,17 @@ impl TriggerSpec {
 /// The logical interval a cron run covers, half-open `[start, end)`. Mirrors the
 /// TS `CronTriggerEvent`'s `logicalDate` / `intervalStart` / `intervalEnd`. All
 /// ISO 8601 strings; the worker reads them, it never parses a durable cursor.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CronInterval {
     /// The nominal scheduled instant for this run.
-    #[serde(
-        default,
-        rename = "logicalDate",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub logical_date: Option<String>,
+    #[serde(rename = "logicalDate")]
+    pub logical_date: String,
     /// Inclusive start of the logical interval this run covers.
-    #[serde(
-        default,
-        rename = "intervalStart",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub interval_start: Option<String>,
+    #[serde(rename = "intervalStart")]
+    pub interval_start: String,
     /// Exclusive end of the logical interval this run covers.
-    #[serde(
-        default,
-        rename = "intervalEnd",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub interval_end: Option<String>,
+    #[serde(rename = "intervalEnd")]
+    pub interval_end: String,
 }
 
 /// A committed-table change, the payload of a `data_change` run. Mirrors the TS
@@ -222,21 +207,35 @@ pub struct ChangeEvent {
     pub committed_at: String,
 }
 
+/// One complete HTTP callback delivered as a worker event.
+///
+/// The scheduler owns no client connection. It stores these request bytes with
+/// the run and hands them to the worker when the run is claimed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HttpCallback {
+    /// Original HTTP method.
+    pub method: String,
+    /// Routed callback path, including its leading slash.
+    pub path: String,
+    /// Request headers after hop-by-hop headers have been removed.
+    pub headers: BTreeMap<String, String>,
+    /// Complete request body bytes.
+    pub body: Vec<u8>,
+}
+
 /// The event that invoked one worker run. Mirrors the TS `TriggerEvent`; the
-/// `type` field is the discriminant. Webhook/websocket bodies reach a
-/// subprocess worker through its own client, so the Rust event carries only what
-/// the server knows.
+/// `type` field is the discriminant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TriggerEvent {
+    /// A caller-requested immediate run.
+    Manual,
     /// A scheduled run over a logical interval.
     Cron(CronInterval),
-    /// A routed webhook run.
-    Webhook,
-    /// One websocket message.
-    Websocket {
-        /// The message body, as text.
-        message: String,
+    /// A routed HTTP callback run.
+    Webhook {
+        /// Complete callback request accepted by the HTTP ingress.
+        request: HttpCallback,
     },
     /// A run fired by a table commit.
     DataChange {
@@ -249,36 +248,46 @@ impl TriggerEvent {
     /// The wire discriminant, for logging and the [`ENV_TRIGGER`] binding.
     pub fn kind(&self) -> &'static str {
         match self {
+            TriggerEvent::Manual => "manual",
             TriggerEvent::Cron(_) => "cron",
-            TriggerEvent::Webhook => "webhook",
-            TriggerEvent::Websocket { .. } => "websocket",
+            TriggerEvent::Webhook { .. } => "webhook",
             TriggerEvent::DataChange { .. } => "data_change",
         }
     }
 
     /// Builds the trigger event for a subprocess run from its environment,
-    /// mirroring the TS `endpoint-run` harness's `cronTrigger`. An unset or
-    /// `cron` [`ENV_TRIGGER`] yields a [`TriggerEvent::Cron`] reading the
-    /// interval env vars; any other value maps to that kind with an empty body.
-    pub fn from_env<F: Fn(&str) -> Option<String>>(getenv: F) -> TriggerEvent {
+    /// mirroring the TS `endpoint-run` harness. Non-cron events require the
+    /// complete [`ENV_EVENT_JSON`] payload; missing or malformed worker events
+    /// are rejected instead of silently fabricating an empty event.
+    pub fn from_env<F: Fn(&str) -> Option<String>>(getenv: F) -> Result<TriggerEvent, String> {
         match getenv(ENV_TRIGGER).as_deref() {
-            Some("webhook") => TriggerEvent::Webhook,
-            Some("websocket") => TriggerEvent::Websocket {
-                message: String::new(),
-            },
-            Some("data_change") => TriggerEvent::DataChange {
-                change: ChangeEvent {
-                    seq: 0,
-                    table: getenv(ENV_TARGET).unwrap_or_default(),
-                    snapshot_id: String::new(),
-                    committed_at: String::new(),
-                },
-            },
-            _ => TriggerEvent::Cron(CronInterval {
-                logical_date: getenv(ENV_LOGICAL_DATE),
-                interval_start: getenv(ENV_INTERVAL_START),
-                interval_end: getenv(ENV_INTERVAL_END),
-            }),
+            Some("manual") => Ok(TriggerEvent::Manual),
+            Some(kind @ ("webhook" | "data_change")) => getenv(ENV_EVENT_JSON)
+                .ok_or_else(|| format!("{ENV_EVENT_JSON} is required for {kind} runs"))
+                .and_then(|body| {
+                    serde_json::from_str::<TriggerEvent>(&body)
+                        .map_err(|error| format!("invalid {ENV_EVENT_JSON}: {error}"))
+                })
+                .and_then(|event| {
+                    if event.kind() == kind {
+                        Ok(event)
+                    } else {
+                        Err(format!(
+                            "{ENV_EVENT_JSON} contains {} for {kind} run",
+                            event.kind()
+                        ))
+                    }
+                }),
+            Some("cron") => Ok(TriggerEvent::Cron(CronInterval {
+                logical_date: getenv(ENV_LOGICAL_DATE)
+                    .ok_or_else(|| format!("{ENV_LOGICAL_DATE} is required for cron runs"))?,
+                interval_start: getenv(ENV_INTERVAL_START)
+                    .ok_or_else(|| format!("{ENV_INTERVAL_START} is required for cron runs"))?,
+                interval_end: getenv(ENV_INTERVAL_END)
+                    .ok_or_else(|| format!("{ENV_INTERVAL_END} is required for cron runs"))?,
+            })),
+            Some(kind) => Err(format!("unsupported {ENV_TRIGGER} `{kind}`")),
+            None => Err(format!("{ENV_TRIGGER} is required")),
         }
     }
 }
@@ -464,13 +473,13 @@ mod tests {
                 _ => None,
             }
         };
-        let event = TriggerEvent::from_env(vars);
+        let event = TriggerEvent::from_env(vars).expect("cron event");
         assert_eq!(
             event,
             TriggerEvent::Cron(CronInterval {
-                logical_date: Some("2026-08-01T00:00:00Z".to_owned()),
-                interval_start: Some("2026-07-31T00:00:00Z".to_owned()),
-                interval_end: Some("2026-08-01T00:00:00Z".to_owned()),
+                logical_date: "2026-08-01T00:00:00Z".to_owned(),
+                interval_start: "2026-07-31T00:00:00Z".to_owned(),
+                interval_end: "2026-08-01T00:00:00Z".to_owned(),
             })
         );
         assert_eq!(event.kind(), "cron");
@@ -479,8 +488,62 @@ mod tests {
     /// A webhook `VERGLAS_TRIGGER` maps to the webhook event, not cron.
     #[test]
     fn webhook_event_from_env() {
-        let vars = |k: &str| -> Option<String> { (k == ENV_TRIGGER).then(|| "webhook".to_owned()) };
-        assert_eq!(TriggerEvent::from_env(vars), TriggerEvent::Webhook);
+        let expected = TriggerEvent::Webhook {
+            request: HttpCallback {
+                method: "POST".to_owned(),
+                path: "/callbacks/build".to_owned(),
+                headers: std::collections::BTreeMap::from([(
+                    "content-type".to_owned(),
+                    "application/json".to_owned(),
+                )]),
+                body: b"{\"ok\":true}".to_vec(),
+            },
+        };
+        let body = serde_json::to_string(&expected).expect("event JSON");
+        let vars = |k: &str| -> Option<String> {
+            match k {
+                ENV_TRIGGER => Some("webhook".to_owned()),
+                ENV_EVENT_JSON => Some(body.clone()),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            TriggerEvent::from_env(vars).expect("webhook event"),
+            expected
+        );
+    }
+
+    /// Manual dispatch is its own event and never impersonates an empty cron run.
+    #[test]
+    fn manual_event_from_env() {
+        let vars = |key: &str| (key == ENV_TRIGGER).then(|| "manual".to_owned());
+        assert_eq!(
+            TriggerEvent::from_env(vars).expect("manual event"),
+            TriggerEvent::Manual
+        );
+    }
+
+    /// The harness must identify every run; an absent trigger is not cron.
+    #[test]
+    fn missing_trigger_is_rejected() {
+        let error = TriggerEvent::from_env(|_| None).expect_err("missing trigger");
+        assert_eq!(error, "VERGLAS_TRIGGER is required");
+    }
+
+    /// Cron never runs with a fabricated logical interval.
+    #[test]
+    fn incomplete_cron_interval_is_rejected() {
+        let error = TriggerEvent::from_env(|key| (key == ENV_TRIGGER).then(|| "cron".to_owned()))
+            .expect_err("incomplete cron");
+        assert_eq!(error, "VERGLAS_LOGICAL_DATE is required for cron runs");
+    }
+
+    /// Websocket is not a worker scheduling trigger.
+    #[test]
+    fn websocket_trigger_spec_is_rejected() {
+        assert!(
+            serde_json::from_str::<TriggerSpec>(r#"{"type":"websocket","path":"/ws"}"#).is_err()
+        );
     }
 
     /// The subprocess result file round-trips the success and failure shapes the

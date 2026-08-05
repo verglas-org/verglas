@@ -19,12 +19,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use axum::body::Bytes;
-use axum::extract::{Path, Query, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::extract::{OriginalUri, Path, Query, RawQuery, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
-    routing::{get, post, put},
+    routing::{any, get, post, put},
 };
 use std::future::Future;
 use std::pin::Pin;
@@ -182,10 +182,9 @@ pub type SysSlot = Arc<OnceLock<Arc<verglas_platform::SystemCatalog>>>;
 /// dir. The TS SDK queue verb targets these routes directly.
 pub type QueueDir = Arc<std::path::PathBuf>;
 
-/// The worker runtime handle the manual-run and webhook routes invoke, wired
-/// lazily after recovery like [`TablesSlot`] — it runs workers over the loopback
-/// catalog, so it exists only once recovery has opened it.
-pub type PlatformSlot = Arc<OnceLock<Arc<crate::platform::WorkerSupervisor>>>;
+/// The scheduler ingress handle the manual and HTTP routes enqueue through,
+/// wired after recovery opens the deployment registry.
+pub type PlatformSlot = Arc<OnceLock<Arc<crate::platform::SchedulerIngress>>>;
 
 /// The engine-backed surfaces the admin router serves, each optional (absent =
 /// the route is not mounted) and most deferred behind a [`OnceLock`] slot
@@ -223,8 +222,7 @@ pub struct Slots {
     /// The platform queue routes (`/v1/queues/<name>/{enqueue,poll,ack}`),
     /// backed by [`verglas_harness::queue`] under this queue root.
     pub queues: Option<QueueDir>,
-    /// The worker manual-run (`POST /v1/workers/<name>/run`) and webhook
-    /// (`POST /v1/hooks/<name>`) routes, invoking the worker runtime.
+    /// Manual and dynamically routed HTTP ingress into the scheduler queue.
     pub platform: Option<PlatformSlot>,
     /// The standalone query worker dispatcher (`[query_worker]` configured).
     /// When present it is the sole engine for `/v1/query`; dispatch failure is
@@ -1516,58 +1514,156 @@ async fn queue_ack(
     }
 }
 
-/// The worker execution sub-router: run a worker now regardless of trigger
-/// (`POST /v1/workers/<name>/run`, the manual trigger), or route an inbound
-/// webhook to a webhook-triggered worker (`POST /v1/hooks/<name>`). Both invoke
-/// the worker runtime over the private catalog; each answers 503 until recovery
-/// wires the runtime.
+/// Worker ingress routes: manual dispatch, named webhook compatibility, and
+/// deployment-configured dynamic HTTP paths. Each creates a durable job object.
 fn platform_router(platform: PlatformSlot) -> Router {
     Router::new()
         .route("/v1/workers/{name}/run", post(worker_run_now))
         .route("/v1/hooks/{name}", post(worker_webhook))
+        .route("/v1/http/{*path}", any(worker_dynamic_http))
         .with_state(platform)
 }
 
-/// Runs one worker now through the runtime, returning the rows it produced. The
-/// manual trigger: it runs any `Running` worker regardless of its declared
-/// triggers, as a cron run over no interval. 503 until the runtime is wired; 500
-/// with the plain message on a run failure (an unknown or paused worker is a run
-/// failure).
+/// Enqueues one manual invocation for a running worker.
 async fn worker_run_now(
     State(platform): State<PlatformSlot>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
-    run_worker_route(
-        &platform,
-        &name,
-        verglas_sdk::worker::TriggerEvent::Cron(Default::default()),
-    )
-    .await
+    let request_id = match idempotency_key(&headers) {
+        Ok(request_id) => request_id,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    enqueue_response(ingress.manual(&name, request_id).await)
 }
 
-/// Routes an inbound webhook to its worker: runs the named worker now with a
-/// webhook trigger event. The server does not interpret the webhook body — a
-/// webhook worker reads whatever it needs through its own client.
+/// Enqueues an inbound request for one named webhook worker.
 async fn worker_webhook(
     State(platform): State<PlatformSlot>,
     Path(name): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> Response {
-    run_worker_route(&platform, &name, verglas_sdk::worker::TriggerEvent::Webhook).await
-}
-
-/// Shared body for the manual-run and webhook routes: run the named worker for
-/// `event` through the runtime.
-async fn run_worker_route(
-    platform: &PlatformSlot,
-    name: &str,
-    event: verglas_sdk::worker::TriggerEvent,
-) -> Response {
-    let Some(runtime) = platform.get() else {
+    let request_id = match idempotency_key(&headers) {
+        Ok(request_id) => request_id,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(ingress) = platform.get() else {
         return recovering();
     };
-    match runtime.run_worker_now(name, event).await {
-        Ok(rows) => Json(json!({ "worker": name, "rows_produced": rows })).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    enqueue_response(
+        ingress
+            .webhook(
+                &name,
+                request_id,
+                verglas_sdk::worker::HttpCallback {
+                    method: method.to_string(),
+                    path: uri
+                        .path_and_query()
+                        .map_or_else(|| uri.path().to_owned(), ToString::to_string),
+                    headers: callback_headers(&headers),
+                    body: body.to_vec(),
+                },
+            )
+            .await,
+    )
+}
+
+/// Routes a dynamically configured HTTP path to its owning deployment.
+async fn worker_dynamic_http(
+    State(platform): State<PlatformSlot>,
+    Path(path): Path<String>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request_id = match idempotency_key(&headers) {
+        Ok(request_id) => request_id,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    enqueue_response(
+        ingress
+            .dynamic_http(
+                &format!("/{path}"),
+                request_id,
+                verglas_sdk::worker::HttpCallback {
+                    method: method.to_string(),
+                    path: uri
+                        .query()
+                        .map_or_else(|| format!("/{path}"), |query| format!("/{path}?{query}")),
+                    headers: callback_headers(&headers),
+                    body: body.to_vec(),
+                },
+            )
+            .await,
+    )
+}
+
+/// Copies end-to-end request headers into the durable callback event.
+fn callback_headers(headers: &HeaderMap) -> std::collections::BTreeMap<String, String> {
+    const HOP_BY_HOP: &[&str] = &[
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    ];
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name = name.as_str();
+            if HOP_BY_HOP.contains(&name) || name == "idempotency-key" {
+                return None;
+            }
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.to_owned(), value.to_owned()))
+        })
+        .collect()
+}
+
+/// Reads the caller-owned idempotency identity required by all HTTP ingress.
+fn idempotency_key(headers: &axum::http::HeaderMap) -> Result<String, &'static str> {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .ok_or("Idempotency-Key header is required")
+}
+
+/// Maps a create-only enqueue result onto accepted or idempotent-join JSON.
+fn enqueue_response(
+    result: Result<verglas_scheduler::EnqueueOutcome, crate::platform::IngressError>,
+) -> Response {
+    match result {
+        Ok(verglas_scheduler::EnqueueOutcome::Created(job_id)) => (
+            StatusCode::ACCEPTED,
+            Json(json!({ "job_id": job_id, "created": true })),
+        )
+            .into_response(),
+        Ok(verglas_scheduler::EnqueueOutcome::Existing(job_id)) => {
+            Json(json!({ "job_id": job_id, "created": false })).into_response()
+        }
+        Err(crate::platform::IngressError::Invalid(message)) => {
+            (StatusCode::NOT_FOUND, message).into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -1856,6 +1952,23 @@ mod tests {
         let slot: PurgerSlot = Arc::new(OnceLock::new());
         let _ = slot.set(purger(dir).await);
         slot
+    }
+
+    /// Durable HTTP events keep application headers but not transport framing
+    /// or the scheduler's idempotency key.
+    #[test]
+    fn callback_headers_keep_only_end_to_end_values() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().expect("header"));
+        headers.insert("connection", "keep-alive".parse().expect("header"));
+        headers.insert("idempotency-key", "request-1".parse().expect("header"));
+        assert_eq!(
+            callback_headers(&headers),
+            std::collections::BTreeMap::from([(
+                "content-type".to_owned(),
+                "application/json".to_owned(),
+            )])
+        );
     }
 
     /// Sends a request to the router and returns the response.

@@ -7411,6 +7411,7 @@ dependencies = [
  "verglas-iceberg",
  "verglas-platform",
  "verglas-s3",
+ "verglas-scheduler",
  "verglas-sdk",
  "verglas-vector",
 ]
@@ -7444,6 +7445,39 @@ dependencies = [
  "urlencoding",
  "verglas-backend",
  "verglas-core",
+]
+
+[[package]]
+name = "verglas-scheduler"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "verglas-harness",
+ "verglas-sdk",
+]
+
+[[package]]
+name = "verglas-scheduler-bin"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "verglas-harness",
+ "verglas-scheduler",
+ "verglas-sdk",
 ]
 
 [[package]]

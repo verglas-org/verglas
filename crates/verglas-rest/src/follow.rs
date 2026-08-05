@@ -209,10 +209,13 @@ impl FollowManager {
 /// A follow worker's target: `Some(Some(path))` tails a file, `Some(None)` wraps
 /// the worker's command, `None` means the worker has no follow trigger.
 fn follow_target(worker: &WorkerRow) -> Option<Option<String>> {
-    parse_triggers(worker).into_iter().find_map(|t| match t {
-        TriggerSpec::Follow { file } => Some(file),
-        _ => None,
-    })
+    parse_triggers(worker)
+        .ok()?
+        .into_iter()
+        .find_map(|t| match t {
+            TriggerSpec::Follow { file } => Some(file),
+            _ => None,
+        })
 }
 
 /// Spawns the manager's reconcile loop, detached for the process lifetime. Like

@@ -115,8 +115,8 @@ pub struct WorkerSpec {
     /// subprocess worker; empty for a built-in the server runs directly.
     #[serde(default)]
     pub code: String,
-    /// The triggers as a JSON array of `TriggerSpec` (cron/webhook/websocket/
-    /// data_change). Defaults to `[]` (on-demand).
+    /// The triggers as a JSON array of `TriggerSpec` (cron/webhook/data_change).
+    /// Defaults to `[]` (on-demand).
     #[serde(default = "default_triggers")]
     pub triggers: String,
     /// The output table the worker writes, or `None` for an ephemeral worker

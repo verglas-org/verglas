@@ -24,7 +24,12 @@ beforeEach(async () => {
 });
 afterEach(() => endpoint.close());
 
-const CRON: TriggerEvent = { type: "cron" };
+const CRON: TriggerEvent = {
+  type: "cron",
+  logicalDate: "2026-08-01T00:05:00Z",
+  intervalStart: "2026-08-01T00:00:00Z",
+  intervalEnd: "2026-08-01T00:05:00Z",
+};
 
 /** A minimal WorkerContext; log is a no-op (the runner installs its own logger). */
 function ctx(output = "app.points", c: VerglasClient = client): WorkerContext {

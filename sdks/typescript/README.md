@@ -80,15 +80,13 @@ the run log and the host's JSON response) or nothing at all.
 Triggers are **deployment config, not code**. The SDK *types* them so a definition
 can declare what it expects (`TriggerSpec`), but the platform's deploy path
 registers them; the worker just receives the resulting `TriggerEvent` on
-`ctx.trigger`. There are five shapes:
+`ctx.trigger`. There are three deployment-trigger shapes, plus manual dispatch:
 
 | Trigger | Spec (deploy config) | Event (`ctx.trigger`) |
 |---|---|---|
-| `cron` | `{ type, schedule, startDate?, catchup? }` | `{ type, logicalDate?, intervalStart?, intervalEnd? }` |
+| `cron` | `{ type, schedule, startDate?, catchup? }` | `{ type, logicalDate, intervalStart, intervalEnd }` |
 | `webhook` | `{ type, path? }` | `{ type, request }` — the inbound `Request` |
-| `websocket` | `{ type, path? }` | `{ type, message }` — one inbound data frame |
 | `data_change` | `{ type, table }` | `{ type, change }` — a commit notification |
-| `kafka` | `{ type, topic, group? }` | `{ type, topic, partition, offset, key?, value }` |
 
 `ctx.trigger.type` narrows the union, so a worker checks it before reading the
 type-specific fields.
@@ -544,11 +542,10 @@ The root exports exactly two layers; internals live behind subpaths.
     `show()`, `neighbors()`, `kHop()`, `paths()`
 - The worker contract: `defineWorker(def)`, `runWorker(worker, ctx, opts?)`; types
   `WorkerContext`, `WorkerHandler`, `WorkerDefinition`, `WorkerResult`,
-  `RunWorkerOptions`; trigger events `TriggerEvent`, `CronTriggerEvent`,
-  `WebhookTriggerEvent`, `WebSocketTriggerEvent`, `DataChangeTriggerEvent`,
-  `KafkaTriggerEvent`; trigger specs `TriggerSpec`, `CronTriggerSpec`,
-  `WebhookTriggerSpec`, `WebSocketTriggerSpec`, `DataChangeTriggerSpec`,
-  `KafkaTriggerSpec`
+  `RunWorkerOptions`; trigger events `TriggerEvent`, `ManualTriggerEvent`,
+  `CronTriggerEvent`, `WebhookTriggerEvent`, `DataChangeTriggerEvent`;
+  trigger specs `TriggerSpec`, `CronTriggerSpec`, `WebhookTriggerSpec`,
+  `DataChangeTriggerSpec`
 - Errors: `VerglasHttpError`
 - Types: `Row`, `Watermark`, `ConnectOptions`, `ScanOptions`, `ScanResult`,
   `DeltaResult`, `Snapshot`, `FollowRowsOptions`, `FollowHandler`, `ChangeEvent`,

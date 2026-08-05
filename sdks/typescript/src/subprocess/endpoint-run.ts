@@ -1,17 +1,14 @@
 // The fleet COMMIT-ENDPOINT run mode: the bun entry a fleet microVM execs to run
-// a tenant WORKER against the live commit service, mirroring exactly what the
-// platform's cron dispatch does.
+// a tenant WORKER against the live commit service for one bounded event.
 //
-// One invocation = one bounded worker run for one scheduled interval, exactly
-// like one cron dispatch. This file maps the process environment onto a
-// `WorkerContext`, builds the cron trigger from the logical-time bindings the
-// control plane injects, runs the worker's handler once through the SDK's
+// One invocation = one bounded worker run. This file maps the process
+// environment onto a `WorkerContext`, reconstructs the complete trigger event,
+// runs the worker's handler once through the SDK's
 // `runWorker` (so run logging to `<TARGET>_LOGS` is identical to the platform
 // path), and writes the harness result file.
 //
 // There is no durable watermark here: a worker is a pure function of its trigger
-// (logical time) and the committed data. The control plane owns scheduling,
-// backfill, and replay; this entry just runs the interval it was handed.
+// and the committed data. The control plane owns scheduling, retry, and replay.
 //
 // Usage: `bun endpoint-run.ts <module>` where <module> default-exports a worker
 // (a `WorkerDefinition` from `defineWorker`). Environment:
@@ -25,12 +22,12 @@
 // payload as launch env vars (its channel for what the cloud dispatch carries
 // as body/headers):
 //
-//   VERGLAS_TRIGGER        (optional) the trigger type. Absent or "cron" runs
-//                          the worker with a cron trigger; anything else is
-//                          refused — this entry only runs cron dispatches.
-//   VERGLAS_LOGICAL_DATE   (optional) the run's nominal scheduled instant (ISO 8601)
-//   VERGLAS_INTERVAL_START (optional) inclusive start of the run's logical interval (ISO 8601)
-//   VERGLAS_INTERVAL_END   (optional) exclusive end of the run's logical interval (ISO 8601)
+//   VERGLAS_TRIGGER        (required) manual, cron, webhook, or data_change.
+//   VERGLAS_EVENT_JSON     (required for webhook and data_change) the complete
+//                          serialized trigger event.
+//   VERGLAS_LOGICAL_DATE   (required for cron) nominal scheduled instant (ISO 8601)
+//   VERGLAS_INTERVAL_START (required for cron) inclusive interval start (ISO 8601)
+//   VERGLAS_INTERVAL_END   (required for cron) exclusive interval end (ISO 8601)
 //
 //   RESULT_PATH       (optional) where the result JSON lands; default /run/result.json
 //
@@ -46,6 +43,7 @@ import { connect } from "../client";
 import {
   runWorker,
   type CronTriggerEvent,
+  type TriggerEvent,
   type WorkerContext,
   type WorkerDefinition,
   type WorkerResult,
@@ -69,7 +67,13 @@ export interface EndpointRunOptions {
 }
 
 /** The env this mode itself requires; worker secrets are the worker's business. */
-const REQUIRED_ENV = ["VERGLAS_ENDPOINT", "VERGLAS_TOKEN", "DEPLOYMENT", "TARGET"] as const;
+const REQUIRED_ENV = [
+  "VERGLAS_ENDPOINT",
+  "VERGLAS_TOKEN",
+  "VERGLAS_TRIGGER",
+  "DEPLOYMENT",
+  "TARGET",
+] as const;
 
 const DEFAULT_RESULT_PATH = "/run/result.json";
 
@@ -80,11 +84,53 @@ function failure(message: string): EndpointRunResult {
 /** Builds the cron trigger from the VERGLAS_* logical-time bindings, if present.
  *  A dispatch that carries none leaves the interval fields undefined. */
 function cronTrigger(env: Record<string, string | undefined>): CronTriggerEvent {
-  const trigger: CronTriggerEvent = { type: "cron" };
-  if (env.VERGLAS_LOGICAL_DATE) trigger.logicalDate = env.VERGLAS_LOGICAL_DATE;
-  if (env.VERGLAS_INTERVAL_START) trigger.intervalStart = env.VERGLAS_INTERVAL_START;
-  if (env.VERGLAS_INTERVAL_END) trigger.intervalEnd = env.VERGLAS_INTERVAL_END;
-  return trigger;
+  if (!env.VERGLAS_LOGICAL_DATE) throw new Error("VERGLAS_LOGICAL_DATE is required for cron runs");
+  if (!env.VERGLAS_INTERVAL_START) throw new Error("VERGLAS_INTERVAL_START is required for cron runs");
+  if (!env.VERGLAS_INTERVAL_END) throw new Error("VERGLAS_INTERVAL_END is required for cron runs");
+  return {
+    type: "cron",
+    logicalDate: env.VERGLAS_LOGICAL_DATE,
+    intervalStart: env.VERGLAS_INTERVAL_START,
+    intervalEnd: env.VERGLAS_INTERVAL_END,
+  };
+}
+
+interface HttpCallbackWire {
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body: number[];
+}
+
+/** Reconstructs the complete worker event injected by the scheduler harness. */
+function triggerEvent(env: Record<string, string | undefined>): TriggerEvent {
+  const kind = env.VERGLAS_TRIGGER;
+  if (!kind) throw new Error("VERGLAS_TRIGGER is required");
+  if (kind === "cron") return cronTrigger(env);
+  if (kind === "manual") return { type: "manual" };
+  const serialized = env.VERGLAS_EVENT_JSON;
+  if (!serialized) throw new Error(`VERGLAS_EVENT_JSON is required for ${kind} runs`);
+  const wire = JSON.parse(serialized) as Record<string, unknown>;
+  if (wire.type !== kind) {
+    throw new Error(`VERGLAS_EVENT_JSON contains ${String(wire.type)} for ${kind} run`);
+  }
+  if (kind === "webhook") {
+    const request = wire.request as HttpCallbackWire | undefined;
+    if (!request || typeof request.method !== "string" || typeof request.path !== "string") {
+      throw new Error("VERGLAS_EVENT_JSON contains an invalid HTTP callback");
+    }
+    const method = request.method.toUpperCase();
+    return {
+      type: "webhook",
+      request: new Request(`http://worker.verglas${request.path}`, {
+        method,
+        headers: request.headers,
+        body: method === "GET" || method === "HEAD" ? undefined : new Uint8Array(request.body),
+      }),
+    };
+  }
+  if (kind === "data_change") return wire as unknown as TriggerEvent;
+  throw new Error(`unsupported VERGLAS_TRIGGER "${kind}"`);
 }
 
 /**
@@ -103,12 +149,6 @@ export async function endpointRun(
   const missing = REQUIRED_ENV.filter((name) => !env[name]);
   if (missing.length > 0) return failure(`missing required env: ${missing.join(", ")}`);
 
-  // This entry runs cron dispatches only. An absent VERGLAS_TRIGGER is treated
-  // as cron; any other type is refused loudly.
-  if (env.VERGLAS_TRIGGER && env.VERGLAS_TRIGGER !== "cron") {
-    return failure(`unsupported VERGLAS_TRIGGER "${env.VERGLAS_TRIGGER}": this entry runs cron dispatches only`);
-  }
-
   const deployment = env.DEPLOYMENT as string;
   const target = env.TARGET as string;
 
@@ -122,7 +162,7 @@ export async function endpointRun(
     });
     const ctx: WorkerContext = {
       client,
-      trigger: cronTrigger(env),
+      trigger: triggerEvent(env),
       output: target,
       outputs: [target],
       env,
