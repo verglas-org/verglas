@@ -22,6 +22,7 @@ members = [
     "crates/verglas-harness",
     "crates/verglas-vector",
     "crates/verglas-scheduler",
+    "crates/verglas-microvm-contract",
     "bins/cache-node",
     "crates/verglas-block",
     "crates/verglas-pgcdc",
@@ -117,6 +118,7 @@ aws-sigv4 = "1"
 aws-smithy-runtime-api = "1"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
+serde_yaml = "0.9.34"
 # SHA-256 content addressing for the block-device chunk store (verglas-block,
 # #382): identical 2 MiB chunks hash to one key so they dedup across devices and
 # versions. `hex` renders the digest as the backend object key.
@@ -130,6 +132,7 @@ typetag = "0.2.22"
 schemars = "1.0.4"
 tempfile = "3.20.0"
 thiserror = "2.0.18"
+ts-rs = { version = "11.1.0", features = ["serde-compat"] }
 chrono = "0.4.44"
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
 toml = "1.1.2"
