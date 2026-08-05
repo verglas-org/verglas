@@ -69,3 +69,51 @@ The point: tests written after code tend to **confirm what the code does**; test
 - PR descriptions state what changed and how it was verified against the acceptance criteria — reviewers check the criteria, the worklog entries, and the standing invariants above.
 - PR-review checklist: no code path may assume a key is locally owned — every read/fill/dedup/invalidation path resolves ownership through the ring (#17).
 - Do not merge your own PRs without review unless explicitly told to.
+
+## Cursor Cloud specific instructions
+
+Durable, non-obvious notes for agents in the Cloud VM. The startup update script
+already runs `cargo fetch --locked` and (`npm ci` in `sdks/typescript`), so
+dependencies are primed. Standard commands live in the `justfile` and
+`README.md`; use them (`just build`/`just test`/`just lint`, or the underlying
+`cargo` commands). The pinned toolchain (`1.96.1`, from `rust-toolchain.toml`)
+installs automatically on the first `cargo` call.
+
+Rust workspace facts:
+
+- `cargo build --workspace`, `cargo clippy --workspace --all-targets`, and
+  `cargo test --workspace` each take roughly ~3 min from cold because clippy and
+  test recompile with their own drivers. `cargo fmt --all --check` is fast.
+- CI gates per changed crate (`cargo clippy -p <pkg>` + `cargo test -p <pkg>`);
+  running a single crate is much faster than the whole workspace when iterating.
+- The default `cargo test` path uses in-process mocks and needs no external
+  services (see the standing test policy at the top of `.github/workflows/ci.yml`).
+  Anything needing a real service is behind `#[ignore]`.
+
+Running `verglas-server` locally (non-obvious gotchas):
+
+- There is **no in-memory/filesystem origin exposed by the binary**. `[backend]`
+  requires a bucket set and a reachable S3-compatible origin, so a live server
+  needs one. MinIO is preinstalled (`minio`, `mc`) — run it as a single binary
+  (no Docker): `minio server /tmp/verglas-origin --address 127.0.0.1:9000`. The
+  fully dependency-free exercise of the read/write/list path is instead
+  `cargo test -p verglas-server --test s3_smoke` (in-process mock origin).
+- A **config-less** `cargo run --bin verglas-server` (a.k.a. `just run-dev`)
+  brings up **only the admin API** — no S3 endpoint, no cache. Pass
+  `--config <file>` to serve S3.
+- **Two distinct credential sets:** `[auth].credentials_file` is what engines
+  present to Verglas on the S3 port; the origin credentials come from the AWS
+  env chain or `[backend].credentials_file`. Don't conflate them. With no
+  `[auth]`, the server prints an ephemeral keypair at startup.
+- An `http://` origin needs `backend.allow_http = true` (or `AWS_ALLOW_HTTP=true`).
+- `cache.dir` must exist, be writable, and be exclusive to one server.
+- **Cache acceleration is Iceberg/Parquet-aware.** Without a `[catalog]` and real
+  Parquet data files, reads are served `tier="passthrough"` (correct read-through:
+  right bytes, just not locally accelerated), so `verglas_cache_hits_total` stays
+  0. Non-zero hits require standing up an Iceberg REST catalog + Parquet objects.
+  The `verglas` CLI has no raw object put/get — use an S3 client (`aws`, DuckDB)
+  for object I/O on port 8333; the CLI drives the admin/table/catalog verbs on 8334.
+
+TypeScript SDK (`sdks/typescript`): `npm run typecheck` + `npm test` (vitest,
+mock endpoint, no server needed). Bun 1.3.8 is preinstalled for the parity/
+trajectory checks (`node scripts/check-sdk-parity.mjs`, `bash scripts/check-cli-thin.sh`).
