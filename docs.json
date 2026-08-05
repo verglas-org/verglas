@@ -29,6 +29,13 @@
         ]
       },
       {
+        "group": "Architecture",
+        "icon": "compass-drafting",
+        "pages": [
+          "docs/architecture/whitepaper"
+        ]
+      },
+      {
         "group": "SDKs",
         "icon": "code-2",
         "pages": [

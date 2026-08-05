@@ -20,7 +20,8 @@ statistics for planning, and transfers cache heat across compaction by snapshot
 rather than by path — so a rewrite does not crater the hit rate the way a
 path-keyed cache does.
 
-See [WHITEPAPER.md](WHITEPAPER.md) for the full design.
+See the [architecture whitepaper](docs/architecture/whitepaper.mdx) for the
+full design.
 
 ## Install
 
@@ -156,9 +157,9 @@ both is a startup error.
 ## Platform workers (local and cloud)
 
 The deployment primitive is a **worker**: code plus triggers, registered with
-`verglas workers`. WHITEPAPER.md §7 is the architecture of record — one
-deployment record executed locally by the server or as an isolated tenant worker
-in the cloud, with pipeline I/O routed through the cache.
+`verglas workers`. The architecture whitepaper §7 is the architecture of
+record — one deployment record executed locally by the server or as an isolated
+tenant worker in the cloud, with pipeline I/O routed through the cache.
 
 Without a login, workers talk to the local server (the same endpoint and
 `~/.verglas/config.toml` the other local commands use). `verglas login` adds
@@ -184,7 +185,8 @@ control plane URL in `~/.verglas/config.toml` under `[control_plane]`. Re-runnin
 
 ## Documentation
 
-- [WHITEPAPER.md](WHITEPAPER.md) — the architecture and its reasoning: the cache
+- [Architecture whitepaper](docs/architecture/whitepaper.mdx) — the architecture
+  and its reasoning: the cache
   tiers, Iceberg awareness, the ring, and the write-back path.
 - [`verglas.example.toml`](verglas.example.toml) — annotated reference config
   covering every server setting.
