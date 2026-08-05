@@ -91,6 +91,29 @@ pub struct Appended {
     pub end: Lsn,
 }
 
+/// Persisted Neon acceptor state returned during greeting and election.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SafekeeperState {
+    /// PostgreSQL system identifier learned from the proposer greeting.
+    pub system_id: u64,
+    /// PostgreSQL server version in `PG_VERSION_NUM` form.
+    pub pg_version: u32,
+    /// PostgreSQL WAL segment size.
+    pub wal_segment_size: u32,
+    /// Membership generation accepted by this timeline.
+    pub generation: u32,
+    /// Highest term voted for and accepted.
+    pub term: u64,
+    /// End of byte-identical EC-durable WAL.
+    pub flush_lsn: Lsn,
+    /// Quorum commit watermark learned from walproposer.
+    pub commit_lsn: Lsn,
+    /// Oldest retained WAL needed for recovery.
+    pub truncate_lsn: Lsn,
+    /// Ordered `(term, first_lsn)` boundaries.
+    pub term_history: Vec<(u64, Lsn)>,
+}
+
 /// Why an append-log operation could not complete. Every variant is a clean
 /// failure that leaves the log consistent — never a partial or sub-quorum ack.
 #[derive(Debug, thiserror::Error)]
@@ -114,6 +137,30 @@ pub enum AppendError {
         needed: usize,
         /// Fragments that actually reached distinct nodes.
         placed: usize,
+    },
+    /// The proposer attempted to start after the durable tail. Accepting it
+    /// would create a hole in PostgreSQL WAL, so the tail is left unchanged.
+    #[error("WAL gap: expected the next byte at {expected}, got {presented}")]
+    WalGap {
+        /// The current durable tail.
+        expected: Lsn,
+        /// The first LSN supplied by the proposer.
+        presented: Lsn,
+    },
+    /// A reconnect replayed bytes that differ from the WAL already stored at
+    /// the same LSN. This is a divergent timeline, never an idempotent retry.
+    #[error("conflicting WAL at {at}")]
+    ConflictingWal {
+        /// The first LSN whose byte differs.
+        at: Lsn,
+    },
+    /// The supplied range cannot be represented by a PostgreSQL `u64` LSN.
+    #[error("WAL range starting at {begin} with {bytes} bytes overflows the LSN space")]
+    LsnOverflow {
+        /// First LSN supplied by the proposer.
+        begin: Lsn,
+        /// Number of WAL bytes in the request.
+        bytes: usize,
     },
     /// A read or truncate named a range the log cannot serve: past the tail,
     /// or (for read) partly below the truncation point.
@@ -180,11 +227,17 @@ pub enum AppendError {
 /// `Arc<dyn AppendLog>`.
 #[async_trait]
 pub trait AppendLog: Send + Sync {
-    /// Synchronously append `records` under `epoch`, returning the assigned
-    /// range once the bytes are quorum-durable (§1). Rejects a mismatched epoch
-    /// ([`AppendError::Fenced`]) and a shortfall below `w`
-    /// ([`AppendError::QuorumUnavailable`]) without moving the tail.
-    async fn append(&self, epoch: Epoch, records: Bytes) -> Result<Appended, AppendError>;
+    /// Synchronously append `records` at PostgreSQL `begin_lsn` under `epoch`,
+    /// returning that request's range once every new byte is quorum-durable.
+    /// Exact and overlapping retries are byte-validated and idempotent. A gap,
+    /// conflicting overlap, mismatched epoch, or shortfall below `w` leaves the
+    /// tail unchanged.
+    async fn append(
+        &self,
+        epoch: Epoch,
+        begin_lsn: Lsn,
+        records: Bytes,
+    ) -> Result<Appended, AppendError>;
 
     /// Read the exact bytes of `[from, to)` (§3), served from the EC tail or
     /// from S3 for already-flushed ranges. Fails on an out-of-range or

@@ -1,6 +1,6 @@
 [package]
-name = "verglas-appendlog"
-description = "EC quorum-append WAL buffer: the durable append-log substrate for the pg-engine pageserver fork (#372)"
+name = "verglas-safekeeper"
+description = "Neon-compatible WAL ingress backed by Verglas EC quorum storage"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -17,7 +17,9 @@ futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["io-util", "time"] }
+tracing = "0.1.44"
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

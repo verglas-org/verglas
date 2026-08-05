@@ -20,6 +20,7 @@ mod blockdev;
 mod logging;
 mod nbd;
 mod ring;
+mod safekeeper;
 mod serve;
 
 /// The server version, from the package manifest. Reported by `/admin/version`

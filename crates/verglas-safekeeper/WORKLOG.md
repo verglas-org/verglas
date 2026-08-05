@@ -1,4 +1,4 @@
-# verglas-appendlog worklog
+# verglas-safekeeper worklog
 
 - #372: New crate. Pinned the append-log contract (the substrate<->pageserver
   boundary for pg-engine) as the crate-root doc plus the `AppendLog` trait, and
@@ -16,3 +16,18 @@
   a library. Tests: 9 multi-node contract/recovery tests + 3 single-node tests.
 - chore: Remove docs/ cross-references after deleting the docs directory. Crate module docs are the reference now.
 - #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.
+- #13: Renamed the crate to `verglas-safekeeper` and replaced the obsolete
+  direct-pageserver seam with the Neon protocol-v3 boundary used by an embedded
+  cache-node safekeeper. WAL appends now preserve caller-supplied PostgreSQL
+  LSNs, validate reconnect overlap byte-for-byte, append only a new suffix, and
+  reject gaps or divergent WAL without moving the durable tail.
+- #13: Completed the embedded safekeeper. Added the PostgreSQL v3 listener and
+  Neon's protocol-v3 `START_WAL_PUSH`, greeting/vote/elected/append exchange,
+  quorum-backed append acknowledgements, `START_REPLICATION` WAL readback,
+  `IDENTIFY_SYSTEM`, and `TIMELINE_STATUS`. Timeline terms, watermarks, term
+  history, append descriptors, and the latest-state head are replicated across
+  the EC ring, so a scheduler replacement with an empty local state directory
+  recovers from surviving caches. A background loop drains committed WAL to
+  object storage and only then deletes EC fragments. Tests cover pinned Neon
+  wire vectors, real PostgreSQL sockets, node loss, coordinator replacement,
+  asynchronous drain, and byte-identical physical replication.

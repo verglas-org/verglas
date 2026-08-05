@@ -13,7 +13,7 @@ members = [
     "crates/verglas-rest",
     "crates/verglas-tables",
     "crates/verglas-write",
-    "crates/verglas-appendlog",
+    "crates/verglas-safekeeper",
     "crates/verglas-iceberg",
     "crates/verglas-graph",
     "crates/verglas-platform",
@@ -56,7 +56,7 @@ verglas-catalog = { path = "crates/verglas-catalog" }
 verglas-rest = { path = "crates/verglas-rest" }
 verglas-tables = { path = "crates/verglas-tables" }
 verglas-write = { path = "crates/verglas-write" }
-verglas-appendlog = { path = "crates/verglas-appendlog" }
+verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }
 verglas-platform = { path = "crates/verglas-platform" }
