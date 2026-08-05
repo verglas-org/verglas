@@ -23,8 +23,10 @@ use verglas_sdk::{Client, ClientError, ConnectOptions};
 /// cache endpoint, and keeps the two data-plane destinations separate.
 #[tokio::test]
 async fn connect_separates_catalog_from_server_cache() {
+    let query_uri = "http://127.0.0.1:8334";
     let access = LocalAccess {
         s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+        query_uri: query_uri.to_owned(),
         catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
         warehouse: Some("s3://warehouse/tenant".to_owned()),
         region: "auto".to_owned(),
@@ -51,6 +53,7 @@ async fn connect_separates_catalog_from_server_cache() {
         .await
         .expect("connect client");
     assert_eq!(client.catalog_uri(), "https://tenant.catalog.verglas.dev");
+    assert_eq!(client.query_uri(), query_uri);
     assert_eq!(client.s3_endpoint(), Some("http://127.0.0.1:8333"));
 }
 
@@ -59,6 +62,7 @@ async fn connect_separates_catalog_from_server_cache() {
 async fn container_environment_shape_connects_without_admin_service() {
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://verglas:8334")
             .with_catalog_uri("https://tenant.catalog.verglas.dev")
             .with_warehouse("s3://warehouse/tenant")
             .with_s3_endpoint("http://verglas:8333")
@@ -91,7 +95,8 @@ async fn query_and_append_use_server_execution_roles() {
     tokio::spawn(async move { axum::serve(listener, app).await.expect("gateway server") });
 
     let client = Client::connect(
-        ConnectOptions::new(endpoint)
+        ConnectOptions::new(endpoint.clone())
+            .with_query_uri(endpoint)
             .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("sdk-token"),
@@ -149,6 +154,7 @@ async fn ensure_table_uses_catalog_rest_without_server_table_routes() {
     tokio::spawn(async move { axum::serve(listener, app).await.expect("catalog server") });
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://127.0.0.1:1")
             .with_catalog_uri(catalog_uri)
             .with_s3_endpoint("http://127.0.0.1:8333"),
     )

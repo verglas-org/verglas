@@ -53,6 +53,7 @@ async fn follow_reconnects_and_resumes_exactly_once() {
 
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://127.0.0.1:1")
             .with_catalog_uri(&endpoint)
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("feed-token"),
@@ -85,6 +86,7 @@ async fn follow_reports_cursor_expiry_distinctly() {
     });
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://127.0.0.1:1")
             .with_catalog_uri(&endpoint)
             .with_s3_endpoint("http://127.0.0.1:8333"),
     )

@@ -9,7 +9,7 @@
 
 Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
 
-We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible storage endpoint with compute and serves frequently accessed bytes from DRAM and NVMe. Data integration requires only a change to `s3.endpoint`; clients continue using their catalog service directly. Verglas is itself a private catalog client: it observes commits to warm metadata and data files before queries request them, but never hosts or proxies an Iceberg REST catalog. Verglas keys cached blocks by object version, yielding correctness properties that format-blind systems cannot achieve at any configuration. An erasure-coded, quorum-acknowledged write-back path stages writes durably in front of object storage, which remains the system of record. Above the cache, Verglas runs a pipeline platform (§7). A deployment is a single record — kind, trigger, placement — carrying user code written against one SDK; the same record executes on the local server or as an isolated tenant worker in the cloud, and local pipeline I/O is routed through the cache, so the working set of an operator's pipelines is exactly the set the cache keeps resident.
+We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible storage endpoint with compute and serves frequently accessed bytes from DRAM and NVMe. In cloud deployments, independently scalable roles connect to the tenant catalog directly and catalog events drive cache maintenance. In an on-prem deployment, one REST composition exposes the cache S3 endpoint, query/write API, and a shallow Iceberg REST proxy; the proxy caches successful metadata reads, polls for changes, and writes mutations through to the configured customer catalog. Verglas never becomes the catalog system of record. Verglas keys cached blocks by object version, yielding correctness properties that format-blind systems cannot achieve at any configuration. An erasure-coded, quorum-acknowledged write-back path stages writes durably in front of object storage, which remains the system of record. Above the cache, Verglas runs a pipeline platform (§7). A deployment is a single record — kind, trigger, placement — carrying user code written against one SDK; the same record executes on the local server or as an isolated tenant worker in the cloud, and local pipeline I/O is routed through the cache, so the working set of an operator's pipelines is exactly the set the cache keeps resident.
 
 ---
 
@@ -18,9 +18,11 @@ We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible 
 This open-source repository is **solely the cache server**: caching of Iceberg,
 WAL, and block devices, and the **query primitives** that are part of the cache
 product — `/v1/query`, graph traversal, vector search, and table scans. The
-server is a catalog **client**: it connects out to an Iceberg REST catalog (its
-`[catalog]` config carries a URL and token) and never runs an embedded catalog
-server, so an edge deployment carries no catalog server.
+The server is a catalog **client**, not a catalog implementation: it connects
+to the configured Iceberg REST catalog and never stores authoritative catalog
+state. The on-prem `verglas-rest` composition may expose a shallow cached proxy
+at `/catalog`; cloud roles use `verglas-catalog`, query, write, and cache crates
+independently and do not run that composition service.
 
 The **cloud services** live in the separate `verglas-cloud` repository, not
 here: the Iceberg REST catalog **service** (`verglas-catalogd` and its
@@ -246,7 +248,7 @@ sequenceDiagram
 
 ### 4.1 Cache node
 
-A cache node is one `verglas-server` process. Its S3 front end validates SigV4 requests and maps supported operations onto separate read and write interfaces. The backend layer applies concurrency limits, retry policy, and circuit breaking before issuing origin requests. The cache engine and Iceberg layer sit between these interfaces.
+A cache node is one `verglas-server` process. Process startup and listener ownership remain in that binary; `verglas-rest` owns the on-prem HTTP composition. Its S3 front end validates SigV4 requests and maps supported operations onto separate read and write interfaces, while its execution listener exposes query/write and the shallow catalog proxy. The backend layer applies concurrency limits, retry policy, and circuit breaking before issuing origin requests. The cache engine and Iceberg layer sit between these interfaces.
 
 The data cache divides objects into configurable 1–8 MiB blocks (2 MiB by default) and stores them in a hybrid DRAM and NVMe cache. The default follows a local Iceberg TPC-DS SF1000 measurement: DuckDB's 1–2 MiB Parquet ranges made 8 MiB fills fetch 70.67 GB from S3 to serve 12.61 GB, while 2 MiB blocks fetched 33.29 GB and cut cold wall time from 658.142 s to 329.440 s. Block geometry is part of the block identity, so a divergent peer configuration is a miss rather than a wrong-offset serve. Changing the configured geometry is a pre-release flag day and requires an empty cache directory; Verglas deliberately has no on-disk compatibility layer. A separate hybrid store holds metadata files and bounded Parquet footer suffixes. Separating the stores prevents a data scan from consuming the capacity reserved for planning metadata. Both stores recover their NVMe indexes after restart; a recovery test reopened a 256 MiB cache containing 32 blocks in approximately 11 ms.
 
@@ -531,7 +533,7 @@ A long-lived inbound socket must not pin a backend that is supposed to scale to 
 
 ### 7.11 Layering
 
-A hosted catalog service may provide the push feed of §7.9, but it remains a separate customer-facing service. A local Verglas server connects to that service as a private client and becomes an edge tier beneath it; it does not re-host the catalog. Three interfaces are kept transport-agnostic so push replaces polling without rework: the engine's catalog client (Iceberg REST against any backend), the metadata-warming trigger (§5), and the change feed (§7.9, now a live edge websocket rather than the snapshot/delta poll it began as). The transport-agnostic interfaces are the extension point that keeps the local and cloud planes one design without conflating their service boundaries.
+A hosted catalog service may provide the push feed of §7.9 and remains the authoritative customer-facing service. A local Verglas server connects to it as a client and may expose a shallow cached `/catalog` proxy as part of the on-prem REST composition; that proxy implements no catalog semantics of its own. Three interfaces are kept transport-agnostic so push replaces polling without rework: the engine's catalog client (Iceberg REST against any backend), the metadata-warming trigger (§5), and the change feed (§7.9, now a live edge websocket rather than the snapshot/delta poll it began as). The transport-agnostic interfaces are the extension point that keeps the local and cloud planes one design without conflating their service boundaries.
 
 ---
 
