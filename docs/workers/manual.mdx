@@ -1,0 +1,33 @@
+---
+title: "Manual runs"
+description: "Run the market-data worker immediately with an idempotent REST call."
+icon: "play"
+---
+
+Manual dispatch is available for every registered worker. The example worker
+uses the most recent seven days when the event has no explicit interval.
+
+Complete [Worker overview](/docs/workers/overview), then send the run request:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Idempotency-Key: market-data-manual-2026-08-05' \
+  http://127.0.0.1:8334/v1/workers/market-data-ingest/run
+```
+
+Verglas returns HTTP `202` and a durable job ID. Repeating the request with the
+same idempotency key returns the existing job instead of scheduling another
+write.
+
+After the run finishes, query the rows:
+
+```bash
+verglas query \
+  'SELECT symbol, min(timestamp), max(timestamp), count(*)
+   FROM market.ohlcv
+   GROUP BY symbol'
+```
+
+Manual dispatch produces an `org.verglas.worker.manual` CloudEvent. The event's
+`source` and `id` become the worker's Iceberg commit key.

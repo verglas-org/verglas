@@ -1,0 +1,49 @@
+---
+title: "Benchmarks"
+description: "Review the current measured query-wave and compaction-recovery results."
+icon: "stopwatch"
+---
+
+These measurements establish behavior on specific hardware and datasets. They
+are not a claim that every workload sees the same speedup.
+
+## TPC-DS SF1,000 query wave
+
+The representative wave contains three fixed queries over approximately 279 GB
+of Iceberg Parquet data: a fact-table count, monthly sales aggregation, and
+item-revenue aggregation. It is not the complete 99-query TPC-DS suite.
+
+| Engine | Storage path | Cold | Warm | Warm versus direct S3 |
+| --- | --- | ---: | ---: | ---: |
+| DuckDB 1.4.5 | S3 direct | 618.098 s | — | 1.00× |
+| DuckDB 1.4.5 | Verglas | 636.725 s | **42.128 s** | **14.67×** |
+| Trino 446 | S3 direct | 296.762 s | — | 1.00× |
+| Trino 446 | Own filesystem cache | 348.948 s | 69.892 s | 4.25× |
+| Trino 446 | Verglas | 398.269 s | **67.060 s** | **4.43×** |
+| ClickHouse 26.6.1 | S3 direct | 227.043 s | — | 1.00× |
+| ClickHouse 26.6.1 | Own filesystem cache | 447.397 s | 25.776 s | 8.81× |
+| ClickHouse 26.6.1 | Verglas | 461.587 s | **22.390 s** | **10.14×** |
+
+Hardware was a Mac Studio with an Apple M3 Ultra, 28 CPU cores, and 256 GB of
+unified memory. Each engine received 24 CPUs and 48 GB while running alone.
+Verglas used 48 GiB of DRAM and 2 MiB data blocks.
+
+## Recovery after Iceberg compaction
+
+Compaction replaces data files with new object names. A path-keyed cache must
+load those new objects on demand. Verglas observes the snapshot commit and
+prefetches hot replacement ranges.
+
+| Query path | Before compaction | After recovery |
+| --- | ---: | ---: |
+| DuckDB through Verglas | 2.770 s | **2.587 s** |
+| Trino with its filesystem cache | 26.967 s | 25.981 s |
+
+This run used TPC-DS SF100 on one `i4i.2xlarge` in `us-west-2a`: 8 vCPUs,
+64 GB DRAM, 1.75 TB NVMe, and 28.4 GB across 806 objects and 24 tables.
+
+<Note>
+The repository benchmark harness is the source for reproducing and extending
+these measurements. Compare results only when the dataset, query wave, engine
+limits, cache budget, and network path match.
+</Note>

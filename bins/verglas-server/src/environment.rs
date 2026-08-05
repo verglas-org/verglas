@@ -48,18 +48,22 @@ impl EnvironmentConfig {
                 .ok_or_else(|| format!("{name} is required in --environment mode"))
         };
 
-        let mut cache = Cache::default();
-        cache.dir = required("VERGLAS_CACHE_DIR")?.into();
-        cache.capacity_bytes = parse_bytes(
-            "VERGLAS_CACHE_CAPACITY",
-            &required("VERGLAS_CACHE_CAPACITY")?,
-        )?;
-        cache.dram_bytes = parse_bytes("VERGLAS_CACHE_DRAM", &required("VERGLAS_CACHE_DRAM")?)?;
+        let cache = Cache {
+            dir: required("VERGLAS_CACHE_DIR")?.into(),
+            capacity_bytes: parse_bytes(
+                "VERGLAS_CACHE_CAPACITY",
+                &required("VERGLAS_CACHE_CAPACITY")?,
+            )?,
+            dram_bytes: parse_bytes("VERGLAS_CACHE_DRAM", &required("VERGLAS_CACHE_DRAM")?)?,
+            ..Cache::default()
+        };
 
-        let mut backend = Backend::default();
-        backend.bucket = Some(required("VERGLAS_BACKEND_BUCKET")?);
-        backend.endpoint = Some(required("VERGLAS_BACKEND_ENDPOINT")?);
-        backend.region = Some(required("VERGLAS_BACKEND_REGION")?);
+        let backend = Backend {
+            bucket: Some(required("VERGLAS_BACKEND_BUCKET")?),
+            endpoint: Some(required("VERGLAS_BACKEND_ENDPOINT")?),
+            region: Some(required("VERGLAS_BACKEND_REGION")?),
+            ..Backend::default()
+        };
 
         let catalog = Catalog {
             uri: required("VERGLAS_CATALOG_URI")?,

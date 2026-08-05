@@ -133,4 +133,7 @@ The stream reconnects after a socket drop and resumes from the last observed seq
 
 Implement `Worker<C>` for native in-process workers. The runtime passes a `WorkerContext<C>` with the trigger, outputs, environment, logger, abort flag, and memory-grant host.
 
-The Rust trigger and result shapes match the TypeScript wire contract. Use `CronInterval` for logical time, `ChangeEvent` for data-change dispatches, and `WorkerResult` for the optional rows-written summary.
+The Rust trigger and result shapes match the TypeScript wire contract. Use
+`CloudEvent` for every dispatch, `CronInterval` to decode cron event data, and
+`WorkerResult` for the optional rows-written summary. `ChangeEvent` belongs to
+the separate table-follow stream; it is not a worker trigger.

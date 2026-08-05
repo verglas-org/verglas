@@ -37,6 +37,12 @@ fn docker_application_packages_execution_workers() {
         !compose.contains("deploy/docker/credentials"),
         "the quickstart must not require a separate credentials directory"
     );
+    assert!(
+        compose.contains("image: postgres:17")
+            && compose
+                .contains("postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas"),
+        "the workers profile must include its Postgres queue store"
+    );
     for variable in [
         "VERGLAS_BACKEND_BUCKET",
         "VERGLAS_BACKEND_ENDPOINT",

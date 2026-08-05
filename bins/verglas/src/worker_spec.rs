@@ -688,13 +688,13 @@ mod tests {
     fn parses_one_worker_with_every_bounded_trigger() {
         let manifest: WorkerManifest = toml::from_str(
             r#"
-name = "spy-ohlcv"
-exec = ["python3", "spy_ohlcv.py"]
+name = "market-data-ingest"
+exec = ["python3", "ingest.py"]
 cwd = "."
 
 [[triggers]]
 type = "webhook"
-path = "/market-data/spy"
+path = "/market-data/daily-bars"
 
 [[triggers]]
 type = "cron"

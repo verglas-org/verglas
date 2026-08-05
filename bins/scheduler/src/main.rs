@@ -592,14 +592,14 @@ mod tests {
     #[test]
     fn prepares_a_portable_worker_bundle() {
         let worker = WorkerRecord {
-            name: "spy-ohlcv".to_owned(),
-            code: r#"{"exec":["python3","spy_ohlcv.py"],"cwd":"."}"#.to_owned(),
-            output: Some("market.spy_ohlcv".to_owned()),
+            name: "market-data-ingest".to_owned(),
+            code: r#"{"exec":["python3","ingest.py"],"cwd":"."}"#.to_owned(),
+            output: Some("market.ohlcv".to_owned()),
             triggers: "[]".to_owned(),
             state: "running".to_owned(),
             config: r#"{
                 "env":{"SYMBOL":"SPY"},
-                "files":{"spy_ohlcv.py":"print('ready')\n"}
+                "files":{"ingest.py":"print('ready')\n"}
             }"#
             .to_owned(),
         };
@@ -610,8 +610,7 @@ mod tests {
             Some("SPY")
         );
         assert_eq!(
-            std::fs::read_to_string(prepared._root.path().join("spy_ohlcv.py"))
-                .expect("bundled file"),
+            std::fs::read_to_string(prepared._root.path().join("ingest.py")).expect("bundled file"),
             "print('ready')\n"
         );
         assert_eq!(

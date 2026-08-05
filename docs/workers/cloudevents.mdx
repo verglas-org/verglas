@@ -1,0 +1,173 @@
+---
+title: "CloudEvents"
+description: "Publish a quote to RabbitMQ and bridge the structured CloudEvent into Verglas."
+icon: "message-queue"
+---
+
+Verglas accepts structured [CloudEvents 1.0](https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md)
+at `POST /v1/events`. Kafka, RabbitMQ, and other brokers remain transport
+owners; a small bridge forwards the CloudEvent after broker delivery.
+
+The worker from [Worker overview](/docs/workers/overview) matches this exact
+`type`, `source`, and `subject`:
+
+```toml
+[[triggers]]
+type = "event"
+event_type = "com.yahoo.finance.quote"
+source = "urn:rabbitmq:market-data"
+subject = "SPY"
+```
+
+## Create the CloudEvent
+
+Create `examples/workers/market-data-ingest/quote.json`. The outer fields are
+the CloudEvent envelope; `data` is the market quote consumed by `ingest.py`.
+
+```json quote.json
+{
+  "specversion": "1.0",
+  "id": "SPY-2026-08-03",
+  "source": "urn:rabbitmq:market-data",
+  "type": "com.yahoo.finance.quote",
+  "subject": "SPY",
+  "time": "2026-08-03T20:00:00Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "symbol": "SPY",
+    "timestamp": "2026-08-03T20:00:00Z",
+    "open": 631.20,
+    "high": 633.91,
+    "low": 629.88,
+    "close": 632.08,
+    "volume": 71345000
+  }
+}
+```
+
+## Create the RabbitMQ bridge
+
+Create `examples/workers/market-data-ingest/requirements.txt`. It pins the
+AMQP client used by the bridge:
+
+```text requirements.txt
+pika==1.3.2
+```
+
+Create `examples/workers/market-data-ingest/rabbitmq_bridge.py`. It accepts
+only structured CloudEvents and acknowledges a RabbitMQ delivery only after
+Verglas returns HTTP `202`, meaning matching jobs are durable in Postgres.
+
+```python rabbitmq_bridge.py
+import os
+import urllib.request
+
+import pika
+
+
+connection = pika.BlockingConnection(
+    pika.URLParameters(os.environ["RABBITMQ_URL"])
+)
+channel = connection.channel()
+queue = os.environ.get("RABBITMQ_QUEUE", "market-quotes")
+channel.queue_declare(queue=queue, durable=True)
+channel.basic_qos(prefetch_count=1)
+
+
+def forward(ch, method, properties, body):
+    if properties.content_type != "application/cloudevents+json":
+        raise ValueError("message must contain a structured CloudEvent")
+    request = urllib.request.Request(
+        os.environ["VERGLAS_EVENTS_URL"],
+        data=body,
+        method="POST",
+        headers={"content-type": "application/cloudevents+json"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        if response.status != 202:
+            raise RuntimeError(f"Verglas returned HTTP {response.status}")
+    ch.basic_ack(delivery_tag=method.delivery_tag)
+
+
+channel.basic_consume(queue=queue, on_message_callback=forward)
+channel.start_consuming()
+```
+
+Create `examples/workers/market-data-ingest/Dockerfile.rabbitmq-bridge`. It
+packages only the two bridge files described above:
+
+```dockerfile Dockerfile.rabbitmq-bridge
+FROM python:3.13-slim
+WORKDIR /app
+COPY requirements.txt rabbitmq_bridge.py ./
+RUN pip install --no-cache-dir -r requirements.txt
+USER 65532:65532
+ENTRYPOINT ["python3", "rabbitmq_bridge.py"]
+```
+
+## Start RabbitMQ and the bridge
+
+Start open-source RabbitMQ on the Compose network:
+
+```bash
+docker run --detach \
+  --name rabbitmq \
+  --network verglas_default \
+  --publish 5672:5672 \
+  --publish 15672:15672 \
+  rabbitmq:4-management
+```
+
+Build and start the bridge only after its three files exist:
+
+```bash
+docker build \
+  --tag verglas/rabbitmq-cloudevents:local \
+  --file examples/workers/market-data-ingest/Dockerfile.rabbitmq-bridge \
+  examples/workers/market-data-ingest
+
+docker run --detach \
+  --name verglas-rabbitmq-bridge \
+  --network verglas_default \
+  --env RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/%2F \
+  --env RABBITMQ_QUEUE=market-quotes \
+  --env VERGLAS_EVENTS_URL=http://verglas-server:8334/v1/events \
+  verglas/rabbitmq-cloudevents:local
+```
+
+## Publish the quote
+
+Create the durable queue:
+
+```bash
+curl --fail-with-body --user guest:guest \
+  --request PUT \
+  --header 'Content-Type: application/json' \
+  --data '{"durable":true}' \
+  http://127.0.0.1:15672/api/queues/%2F/market-quotes
+```
+
+Publish `quote.json` as one persistent structured CloudEvent:
+
+```bash
+jq --raw-input --slurp \
+  '{properties:{content_type:"application/cloudevents+json",delivery_mode:2},
+    routing_key:"market-quotes",payload:.,payload_encoding:"string"}' \
+  examples/workers/market-data-ingest/quote.json |
+curl --fail-with-body --user guest:guest \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data-binary @- \
+  http://127.0.0.1:15672/api/exchanges/%2F/amq.default/publish
+```
+
+Verify the row:
+
+```bash
+verglas query \
+  "SELECT * FROM market.ohlcv
+   WHERE timestamp = '2026-08-03T20:00:00Z'"
+```
+
+Re-publishing the same CloudEvent keeps the same `source` and `id`, so the
+Iceberg commit is idempotent.

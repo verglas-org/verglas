@@ -56,12 +56,32 @@ services:
       target: verglas-scheduler
     image: verglas/verglas-scheduler:local
     environment:
-      VERGLAS_SCHEDULER_DATABASE_URL: ${VERGLAS_SCHEDULER_DATABASE_URL:-}
+      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas
       VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
       VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
       VERGLAS_SCHEDULER_QUEUE: local
     depends_on:
-      - verglas-server
+      verglas-server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    profiles:
+      - workers
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: verglas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
+      POSTGRES_DB: verglas
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verglas -d verglas"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     profiles:
       - workers
     restart: unless-stopped
@@ -102,3 +122,4 @@ services:
 volumes:
   verglas-cache:
   rill-data:
+  postgres-data:

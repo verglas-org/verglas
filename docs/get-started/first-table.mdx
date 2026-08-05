@@ -1,0 +1,83 @@
+---
+title: "Create your first table"
+description: "Create an Iceberg table, append rows, and query it through Verglas."
+icon: "table"
+---
+
+This guide continues from [Self-host Verglas](/docs/get-started/self-host). It
+creates an Iceberg table of daily market bars. The example uses SPY as data;
+the table and commands are reusable for any symbol.
+
+## Before you begin
+
+Confirm that the server is ready and that this terminal points at it:
+
+```bash
+export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+verglas status
+```
+
+## Create the seed file
+
+Create `market-bars.jsonl`. Each line is one JSON object. The first write gives
+Iceberg the table schema.
+
+```json market-bars.jsonl
+{"symbol":"SPY","timestamp":"2026-08-03T20:00:00Z","open":631.20,"high":633.91,"low":629.88,"close":632.08,"volume":71345000}
+```
+
+## Create the table
+
+Create `market.ohlcv` from the seed file:
+
+```bash
+verglas table create market.ohlcv ./market-bars.jsonl
+```
+
+Expected output includes the table name and one committed row. Verglas writes
+ordinary Iceberg metadata and Parquet files to the R2 bucket, then commits the
+new metadata location to R2 Data Catalog.
+
+## Append another row
+
+Create `more-market-bars.jsonl`:
+
+```json more-market-bars.jsonl
+{"symbol":"SPY","timestamp":"2026-08-04T20:00:00Z","open":632.44,"high":635.12,"low":630.77,"close":634.89,"volume":68112000}
+```
+
+Append it:
+
+```bash
+verglas table append market.ohlcv ./more-market-bars.jsonl
+```
+
+## Query the table
+
+The query runs in the isolated query role and reads metadata and Parquet bytes
+through the Verglas cache endpoint:
+
+```bash
+verglas query \
+  'SELECT symbol, timestamp, close, volume
+   FROM market.ohlcv
+   ORDER BY timestamp'
+```
+
+You should see both rows. Run the same query again, then inspect cache activity:
+
+```bash
+verglas table metrics
+```
+
+## Continue building
+
+<CardGroup cols={2}>
+  <Card title="Run the ingestion as a worker" icon="workflow" href="/docs/workers/overview">
+    Package the same market-data write once, then invoke it manually, by HTTP,
+    on cron, or from a CloudEvent.
+  </Card>
+  <Card title="Create a dashboard" icon="chart-line" href="/docs/analytics/rill">
+    Start Rill and create an Explore dashboard from `market.ohlcv`.
+  </Card>
+</CardGroup>

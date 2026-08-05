@@ -1,6 +1,6 @@
 ---
-title: "Build a Rill dashboard"
-description: "Create an Explore dashboard from an Iceberg table through the optional on-prem Rill service."
+title: "Rill dashboards"
+description: "Start Rill and create an Explore dashboard from an Iceberg table."
 ---
 
 Use the Rill integration when you want an interactive dashboard over a table
@@ -14,14 +14,14 @@ and Rill does not become an Iceberg catalog.
 
 ## Start the analytics service
 
-The provided Docker configuration includes `[analytics.rill]`. Start the Rill
-profile with Verglas:
+The Compose application already connects Verglas to Rill over the private
+Docker network. Start the Analytics profile:
 
 ```bash
-docker compose --profile analytics up -d
+docker compose --profile analytics up --detach
 ```
 
-The configuration defines three distinct addresses:
+Compose defines three distinct addresses:
 
 - `uri` is the private address Verglas uses to manage the Rill project.
 - `s3_uri` is the private address Rill uses to read through Verglas.
@@ -30,21 +30,21 @@ The configuration defines three distinct addresses:
 Rill stores its project in the `rill-data` Docker volume. Verglas does not mount
 or edit that volume. It uses Rill's runtime API over the Compose network.
 
-## Example: explore SPY bars
+## Create the market-data dashboard
 
-Assume a worker has written daily SPY bars to `market.spy_ohlcv`. Create a
-dashboard from that table:
+Complete [Create your first table](/docs/get-started/first-table), which writes
+SPY example rows to `market.ohlcv`. Create a dashboard from that table:
 
 ```bash
-verglas dashboard create market.spy_ohlcv
+verglas dashboard create market.ohlcv
 ```
 
 The command prints the generated resource name, source table, and Rill URL:
 
 ```text
-dashboard: market_spy_ohlcv
-table:     market.spy_ohlcv
-url:       http://127.0.0.1:9009/explore/market_spy_ohlcv
+dashboard: market_ohlcv
+table:     market.ohlcv
+url:       http://127.0.0.1:9009/explore/market_ohlcv
 ```
 
 Open the URL. The initial Explore dashboard includes every primitive column as
@@ -66,13 +66,13 @@ verglas dashboard list
 Show one dashboard:
 
 ```bash
-verglas dashboard show market_spy_ohlcv
+verglas dashboard show market_ohlcv
 ```
 
 Delete its model, metrics view, and Explore resource:
 
 ```bash
-verglas dashboard delete market_spy_ohlcv
+verglas dashboard delete market_ohlcv
 ```
 
 Deleting a dashboard does not modify the Iceberg table or delete the shared
@@ -80,13 +80,13 @@ Rill S3 connector.
 
 ## What Verglas creates
 
-For `market.spy_ohlcv`, Verglas writes these resources through Rill's API:
+For `market.ohlcv`, Verglas writes these resources through Rill's API:
 
 ```text
 connectors/verglas.yaml
-models/market_spy_ohlcv.yaml
-metrics/market_spy_ohlcv.yaml
-dashboards/market_spy_ohlcv.yaml
+models/market_ohlcv.yaml
+metrics/market_ohlcv.yaml
+dashboards/market_ohlcv.yaml
 ```
 
 The model calls DuckDB's `iceberg_scan` with the exact current metadata file

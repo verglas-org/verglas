@@ -16,24 +16,45 @@
         "pages": [
           "docs/index",
           "docs/get-started/cloud-quickstart",
-          "docs/get-started/self-host"
+          "docs/get-started/self-host",
+          "docs/get-started/first-table"
         ]
       },
       {
-        "group": "Build",
-        "icon": "blocks",
+        "group": "Workers",
+        "icon": "workflow",
         "pages": [
-          "docs/platform/workers",
-          "docs/platform/containers",
-          "docs/platform/follow",
-          "docs/platform/analytics"
+          "docs/workers/overview",
+          "docs/workers/manual",
+          "docs/workers/http",
+          "docs/workers/cron",
+          "docs/workers/cloudevents"
+        ]
+      },
+      {
+        "group": "Analytics",
+        "icon": "chart-line",
+        "pages": [
+          "docs/analytics/rill"
+        ]
+      },
+      {
+        "group": "Containers",
+        "icon": "container",
+        "pages": [
+          "docs/platform/containers"
         ]
       },
       {
         "group": "Architecture",
         "icon": "compass-drafting",
         "pages": [
-          "docs/architecture/whitepaper"
+          "docs/architecture/overview",
+          "docs/architecture/cache",
+          "docs/architecture/iceberg",
+          "docs/architecture/writes",
+          "docs/architecture/execution",
+          "docs/architecture/benchmarks"
         ]
       },
       {
@@ -41,16 +62,9 @@
         "icon": "code-2",
         "pages": [
           "docs/sdk/overview",
+          "docs/sdk/cli",
           "docs/sdk/typescript",
           "docs/sdk/rust"
-        ]
-      },
-      {
-        "group": "Reference",
-        "icon": "book-open",
-        "pages": [
-          "docs/reference/cli",
-          "docs/reference/worker-spec"
         ]
       }
     ]

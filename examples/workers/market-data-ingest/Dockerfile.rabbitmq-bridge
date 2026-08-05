@@ -1,8 +1,6 @@
 FROM python:3.13-slim
-
 WORKDIR /app
 COPY requirements.txt rabbitmq_bridge.py ./
 RUN pip install --no-cache-dir -r requirements.txt
-
 USER 65532:65532
 ENTRYPOINT ["python3", "rabbitmq_bridge.py"]

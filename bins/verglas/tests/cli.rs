@@ -91,6 +91,24 @@ fn short_version_flag_prints_cli_version() {
 }
 
 #[test]
+fn dashboard_help_uses_the_compose_configuration_surface() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["dashboard", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(
+        stdout.contains("Compose analytics profile"),
+        "dashboard help must point self-hosted users at Compose: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[analytics.rill]"),
+        "dashboard help must not advertise removed server TOML: {stdout}"
+    );
+}
+
+#[test]
 fn version_subcommand_is_an_unknown_command() {
     // `version` is no longer a subcommand (#288): it is a flag. Invoking
     // `verglas version` must be a clap unrecognized-subcommand error, exit

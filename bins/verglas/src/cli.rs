@@ -63,7 +63,7 @@ pub enum Command {
     #[command(subcommand)]
     Index(IndexCommand),
     /// Create and manage Rill dashboards over catalog-resolved Iceberg tables.
-    /// Available when the on-prem server has `[analytics.rill]` configured.
+    /// Available when the self-hosted Compose analytics profile is running.
     #[command(subcommand)]
     Dashboard(DashboardCommand),
     /// Cloud workers — scheduled or event-driven container executions on the

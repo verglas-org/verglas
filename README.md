@@ -20,8 +20,8 @@ statistics for planning, and transfers cache heat across compaction by snapshot
 rather than by path — so a rewrite does not crater the hit rate the way a
 path-keyed cache does.
 
-See the [architecture whitepaper](docs/architecture/whitepaper.mdx) for the
-full design.
+See the [architecture overview](docs/architecture/overview.mdx) for the full
+design.
 
 ## Install
 
@@ -64,56 +64,24 @@ data verbs talk to your cloud endpoint. Re-run `login` any time to refresh.
 
 ### Self-host (Docker)
 
-Run the cache server in Docker and point the CLI at its admin port.
-
-1. Copy and edit the sample config (bucket / region / origin credentials):
-
-```sh
-cp deploy/docker/verglas.toml deploy/docker/verglas.toml.local
-# edit deploy/docker/verglas.toml.local — set [backend]
-cp deploy/docker/credentials/backend.example deploy/docker/credentials/backend
-# fill aws_access_key_id / aws_secret_access_key (mode 0600)
-```
-
-Point `docker-compose.yml` at your edited config (or edit the mounted paths),
-then:
+The Docker application is configured entirely by Compose environment values.
+Export your R2 bucket, S3 credentials, catalog URI, warehouse, catalog token,
+and a client-facing S3 secret, then start it:
 
 ```sh
 docker compose up -d --build
 ```
 
-2. Point the CLI at the container’s admin API (S3 is on `8333`, admin on `8334`):
+Point the CLI at the container's API:
 
 ```sh
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
-# optional: persist in the shell profile, or pass --server-endpoint on each command
 verglas status
 ```
 
-`VERGLAS_ENDPOINT` / `--server-endpoint` is how every data-plane verb reaches
-the server. There is no OS service install (no launchd / systemd): the container
-is the process manager. Logs: `docker compose logs -f verglas-server`. Stop:
-`docker compose down`.
-
-3. Point an S3 client at the cache:
-
-```sh
-aws s3 cp s3://my-bucket/some/object.parquet /tmp/o.parquet \
-  --endpoint-url http://127.0.0.1:8333
-```
-
-```sql
--- DuckDB
-SET s3_endpoint = '127.0.0.1:8333';
-SET s3_use_ssl = false;
-SET s3_url_style = 'path';
-SELECT count(*) FROM 's3://my-bucket/some/table/*.parquet';
-```
-
-The annotated reference for every server config key is
-[`verglas.example.toml`](verglas.example.toml). For a multi-node pod,
-`verglas drain` drains cache ownership over the admin API before you take a
-container down.
+The [self-hosted guide](docs/get-started/self-host.mdx) covers R2 and Data
+Catalog setup, every required environment variable, the complete Compose file,
+and creating the first table.
 
 ### Prometheus metrics
 
@@ -128,68 +96,34 @@ and hot data and carry cache heat across compaction automatically — planning
 reads hit warm statistics, and a rewrite does not force queries to re-earn the
 cache from the origin.
 
-Add a `[catalog]` table to `~/.verglas/config.toml`:
+The Docker application takes the catalog URI, warehouse, and bearer token from
+`VERGLAS_CATALOG_URI`, `VERGLAS_CATALOG_WAREHOUSE`, and
+`VERGLAS_CATALOG_BEARER_TOKEN` in `docker-compose.yml`. It watches the catalog
+and warms changed metadata through the cache path.
 
-```toml
-[catalog]
-# Base URI of the Iceberg REST catalog, before /v1/... . Required to turn
-# Iceberg awareness on.
-uri = "http://localhost:8181"
+## Workers
 
-# Tables to watch, as namespace.table globs. Empty watches everything.
-include = ["analytics.*"]
-# Tables to skip. A match here always wins over include.
-exclude = ["analytics.tmp_*"]
-
-# Optional: path to a file (mode 0600) holding the catalog bearer token.
-# The token is never stored in this config.
-# credentials_file = "~/.verglas/credentials/catalog-token"
-
-# Optional: warehouse identifier, for multi-warehouse catalogs.
-# warehouse = "lake"
-```
-
-With the `[catalog]` table absent, the Iceberg-awareness layer stays off and
-Verglas behaves as a byte cache. `poll_interval_secs` (default `30`) tunes the
-poll cadence. Prefer `credentials_file` over an inline `bearer_token` — setting
-both is a startup error.
-
-## Platform workers (local and cloud)
-
-The deployment primitive is a **worker**: code plus triggers, registered with
-`verglas workers`. The architecture whitepaper §7 is the architecture of
-record — one deployment record executed locally by the server or as an isolated
-tenant worker in the cloud, with pipeline I/O routed through the cache.
-
-Without a login, workers talk to the local server (the same endpoint and
-`~/.verglas/config.toml` the other local commands use). `verglas login` adds
-cloud visibility so `workers list` can merge local and cloud deployments.
+The optional Workers Compose profile starts Postgres and
+`verglas-scheduler`. A portable worker contains its bounded command, bundled
+files, target table, and cron, HTTP, or CloudEvent triggers. Register one on the
+self-hosted server explicitly:
 
 ```sh
-# Prefer `verglas login` (browser). Or pipe a key:
-echo "$VERGLAS_API_KEY" | verglas login --api-key
-
-# Register from a portable worker spec (local server):
-verglas workers create ./worker.json --local
-
-# List and inspect:
-verglas workers list
-verglas workers show orders_ingest
+export VERGLAS_SCHEDULER_URL=http://verglas-scheduler:8340
+docker compose --profile workers up -d --build
+verglas workers create \
+  --local \
+  --file examples/workers/market-data-ingest/worker.toml
 ```
 
-`login` verifies the key against the control plane before saving anything, then
-prints the account it logged in as. The key is stored at
-`~/.verglas/credentials/control-plane-token` (mode 0600, never printed) and the
-control plane URL in `~/.verglas/config.toml` under `[control_plane]`. Re-running
-`login` overwrites both.
+The [Workers guide](docs/workers/overview.mdx) shows the complete program and
+manifest before running it manually, through an HTTP callback, on cron, and
+from a RabbitMQ CloudEvent.
 
 ## Documentation
 
-- [Architecture whitepaper](docs/architecture/whitepaper.mdx) — the architecture
-  and its reasoning: the cache
-  tiers, Iceberg awareness, the ring, and the write-back path.
-- [`verglas.example.toml`](verglas.example.toml) — annotated reference config
-  covering every server setting.
+- [Architecture](docs/architecture/overview.mdx) — cache tiers, Iceberg
+  awareness, the ring, write-back, and execution roles.
 - `crates/verglas-core/src/metrics.rs` — Prometheus metric names/labels on
   `/metrics` (stability contract).
 - Each crate under `crates/` and `bins/` carries a `WORKLOG.md` recording what
