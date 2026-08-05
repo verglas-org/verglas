@@ -22,6 +22,7 @@ pub mod job;
 pub mod worker;
 
 pub mod client;
+pub mod dashboard;
 pub mod grant;
 pub mod graph;
 pub mod report;
@@ -33,6 +34,7 @@ pub use client::{
     EnsureTable, FollowStream, Kv, KvDeleteResult, KvListEntry, KvListPage, KvPutOptions,
     KvPutResult, KvReadTier, KvValue, PartitionSpec, QueryStream, TableDefinition,
 };
+pub use dashboard::{DashboardDeleted, DashboardInfo, DashboardList};
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};
 pub use report::{CompactReport, CompactionReport};

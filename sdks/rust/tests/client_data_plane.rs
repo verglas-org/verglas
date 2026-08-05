@@ -103,6 +103,93 @@ async fn kv_handle_is_a_thin_raw_byte_client() {
     assert_eq!(page.next_cursor.as_deref(), Some("opaque"));
 }
 
+/// Typed dashboard verbs share the optional on-prem REST contract.
+#[tokio::test]
+async fn dashboard_operations_use_typed_server_routes() {
+    let app = Router::new()
+        .route(
+            "/v1/dashboards",
+            post(|Json(body): Json<serde_json::Value>| async move {
+                assert_eq!(body, json!({"table": "sdk.events", "name": "events"}));
+                Json(dashboard_info())
+            })
+            .get(|| async { Json(json!({"dashboards": [dashboard_info()]})) }),
+        )
+        .route(
+            "/v1/dashboards/{name}",
+            get(|Path(name): Path<String>| async move {
+                assert_eq!(name, "events");
+                Json(dashboard_info())
+            })
+            .delete(|Path(name): Path<String>| async move {
+                assert_eq!(name, "events");
+                Json(json!({"deleted": name}))
+            }),
+        )
+        .route(
+            "/v1/dashboards/{name}/refresh",
+            post(|Path(name): Path<String>| async move {
+                assert_eq!(name, "events");
+                Json(dashboard_info())
+            }),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
+    let endpoint = format!("http://{}", listener.local_addr().expect("mock address"));
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("mock server") });
+    let client = Client::connect(
+        ConnectOptions::new(endpoint.clone())
+            .with_query_uri(endpoint)
+            .with_catalog_uri("http://127.0.0.1:1")
+            .with_s3_endpoint("http://127.0.0.1:8333"),
+    )
+    .await
+    .expect("client");
+
+    let created = client
+        .create_dashboard("sdk.events", Some("events"))
+        .await
+        .expect("create dashboard");
+    assert_eq!(created.name, "events");
+    assert_eq!(
+        client
+            .list_dashboards()
+            .await
+            .expect("list")
+            .dashboards
+            .len(),
+        1
+    );
+    assert_eq!(
+        client.show_dashboard("events").await.expect("show").table,
+        "sdk.events"
+    );
+    assert_eq!(
+        client
+            .refresh_dashboard("events")
+            .await
+            .expect("refresh")
+            .url,
+        "http://rill/explore/events"
+    );
+    assert_eq!(
+        client
+            .delete_dashboard("events")
+            .await
+            .expect("delete")
+            .deleted,
+        "events"
+    );
+}
+
+/// Returns the common dashboard response fixture.
+fn dashboard_info() -> serde_json::Value {
+    json!({
+        "name": "events",
+        "table": "sdk.events",
+        "url": "http://rill/explore/events"
+    })
+}
+
 /// A client authenticates once, discovers the real catalog plus the server's S3
 /// cache endpoint, and keeps the two data-plane destinations separate.
 #[tokio::test]

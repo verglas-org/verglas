@@ -51,9 +51,9 @@ Open the URL. The initial Explore dashboard includes every primitive column as
 a dimension, a row-count measure, sum measures for numeric columns, and the
 first date or timestamp column as its time series.
 
-Creating the same dashboard again refreshes the generated resources. Verglas
-checks its ownership marker before every update and refuses to overwrite a Rill
-resource that you created yourself.
+Creating the same dashboard again is idempotent. Verglas checks its ownership
+marker before every update and refuses to overwrite a Rill resource that you
+created yourself.
 
 ## Manage dashboards
 
@@ -67,6 +67,14 @@ Show one dashboard:
 
 ```bash
 verglas dashboard show market_ohlcv
+```
+
+Rill materializes the model against the Iceberg metadata file that was current
+when the model was created. After the table commits a new snapshot, explicitly
+reload the table through the catalog and rematerialize the model:
+
+```bash
+verglas dashboard refresh market_ohlcv
 ```
 
 Delete its model, metrics view, and Explore resource:
@@ -90,9 +98,10 @@ dashboards/market_ohlcv.yaml
 ```
 
 The model calls DuckDB's `iceberg_scan` with the exact current metadata file
-returned by the Iceberg catalog. This avoids unsafe object-list guessing;
-running `dashboard create` again refreshes the model to the catalog's current
-metadata file. Rill materializes the model while its scoped S3 credentials are
-active, so the dashboard remains queryable without keeping credentials in a
-DuckDB view. Its `verglas` S3 connector points at `s3_uri`, so each refresh's
-metadata, manifest, Parquet, and Puffin reads stay on the Verglas cache path.
+returned by the Iceberg catalog. This avoids unsafe object-list guessing.
+`dashboard refresh` resolves the table again and rewrites only the owned model
+with the catalog's latest metadata location. Rill materializes the model while
+its scoped S3 credentials are active, so the dashboard remains queryable without
+keeping credentials in a DuckDB view. Its `verglas` S3 connector points at
+`s3_uri`, so each refresh's metadata, manifest, Parquet, and Puffin reads stay on
+the Verglas cache path.

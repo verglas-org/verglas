@@ -220,6 +220,42 @@ impl DashboardRuntime {
         Ok(self.info(name, table))
     }
 
+    /// Reloads the source table and rematerializes the owned model at its latest metadata file.
+    pub async fn refresh(&self, name: &str) -> Result<DashboardInfo, DashboardError> {
+        let info = self.show(name).await?;
+        let model_path = model_path(&info.name);
+        let model = self
+            .rill
+            .get_optional_file(&model_path)
+            .await?
+            .ok_or_else(|| DashboardError::NotFound(info.name.clone()))?;
+        if owned_table(&model).as_deref() != Some(info.table.as_str()) {
+            return Err(DashboardError::Ownership(model_path));
+        }
+        let ident = parse_table_ident(&info.table)
+            .map_err(|error| DashboardError::Invalid(error.to_string()))?;
+        let catalog = self.tables.get().ok_or_else(|| {
+            DashboardError::Catalog("cache engine is still recovering".to_owned())
+        })?;
+        let table = catalog
+            .load_table(&ident)
+            .await
+            .map_err(|error| DashboardError::Catalog(error.to_string()))?;
+        let metadata_location = table.metadata_location().ok_or_else(|| {
+            DashboardError::Catalog(format!(
+                "table `{}` has no catalog metadata location",
+                info.table
+            ))
+        })?;
+        self.put_owned(
+            &model_path,
+            &model_yaml(&info.table, metadata_location),
+            &info.table,
+        )
+        .await?;
+        Ok(info)
+    }
+
     /// Deletes the three table-specific resources for a Verglas-owned dashboard.
     pub async fn delete(&self, name: &str) -> Result<DashboardDeleted, DashboardError> {
         let info = self.show(name).await?;

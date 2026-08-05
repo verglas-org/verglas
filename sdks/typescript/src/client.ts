@@ -12,6 +12,10 @@ import type {
   CreateTableResult,
   EnsureTableResult,
   DeltaResult,
+  DashboardCreateOptions,
+  DashboardDeleted,
+  DashboardInfo,
+  DashboardList,
   FeedSubscription,
   FollowFeedOptions,
   FollowRowsOptions,
@@ -267,6 +271,46 @@ export class VerglasClient {
   query(sql: string): Promise<QueryResult> {
     if (!sql) throw new Error("query: sql is required");
     return this.transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
+  }
+
+  /** Creates a Rill dashboard for a catalog-resolved Iceberg table. */
+  createDashboard(table: string, opts?: DashboardCreateOptions): Promise<DashboardInfo> {
+    if (!table) throw new Error("createDashboard: table is required");
+    return this.transport.request<DashboardInfo>("POST", "/v1/dashboards", {
+      body: { table, ...(opts?.name !== undefined ? { name: opts.name } : {}) },
+    });
+  }
+
+  /** Lists dashboards managed by Verglas in the configured Rill project. */
+  listDashboards(): Promise<DashboardList> {
+    return this.transport.request<DashboardList>("GET", "/v1/dashboards");
+  }
+
+  /** Shows one Verglas-owned dashboard and its Explore URL. */
+  showDashboard(name: string): Promise<DashboardInfo> {
+    if (!name) throw new Error("showDashboard: name is required");
+    return this.transport.request<DashboardInfo>(
+      "GET",
+      `/v1/dashboards/${encodeURIComponent(name)}`,
+    );
+  }
+
+  /** Reloads the source table and rematerializes the model at its latest snapshot. */
+  refreshDashboard(name: string): Promise<DashboardInfo> {
+    if (!name) throw new Error("refreshDashboard: name is required");
+    return this.transport.request<DashboardInfo>(
+      "POST",
+      `/v1/dashboards/${encodeURIComponent(name)}/refresh`,
+    );
+  }
+
+  /** Deletes the Rill resources owned by one Verglas dashboard. */
+  deleteDashboard(name: string): Promise<DashboardDeleted> {
+    if (!name) throw new Error("deleteDashboard: name is required");
+    return this.transport.request<DashboardDeleted>(
+      "DELETE",
+      `/v1/dashboards/${encodeURIComponent(name)}`,
+    );
   }
 
   /**

@@ -142,12 +142,14 @@ pub struct KvKeyArgs {
 /// `verglas dashboard` subcommands for the optional on-prem Rill integration.
 #[derive(Debug, Subcommand)]
 pub enum DashboardCommand {
-    /// Create or refresh an Explore dashboard for an Iceberg table.
+    /// Create an Explore dashboard for an Iceberg table.
     Create(DashboardCreateArgs),
     /// List dashboards managed by Verglas in the configured Rill project.
     List,
     /// Show one dashboard and its browser URL.
     Show(DashboardNameArgs),
+    /// Refresh one dashboard from its table's latest Iceberg snapshot.
+    Refresh(DashboardNameArgs),
     /// Delete the Rill resources owned by one Verglas dashboard.
     Delete(DashboardNameArgs),
 }

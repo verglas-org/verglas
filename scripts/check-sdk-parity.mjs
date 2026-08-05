@@ -53,4 +53,6 @@ for (const { specification, manifest } of loaded.slice(1)) {
   }
 }
 
-console.log("SDK parity: connect, ensure_table, query, append, and follow match");
+console.log(
+  "SDK parity: core data operations and typed dashboard create/list/show/delete/refresh match",
+);

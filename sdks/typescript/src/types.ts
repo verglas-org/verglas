@@ -327,6 +327,34 @@ export interface QueryResult {
   row_count: number;
 }
 
+/** Options for creating a dashboard from an Iceberg table. */
+export interface DashboardCreateOptions {
+  /** Stable Rill resource name. Defaults to a name derived from the table. */
+  name?: string;
+}
+
+/** One Verglas-owned Rill dashboard. */
+export interface DashboardInfo {
+  /** Stable Rill resource name. */
+  name: string;
+  /** Dotted Iceberg table identifier backing the dashboard. */
+  table: string;
+  /** Browser-facing Rill Explore URL. */
+  url: string;
+}
+
+/** Dashboards managed by Verglas in the configured Rill project. */
+export interface DashboardList {
+  /** Verglas-owned dashboards, ordered by name. */
+  dashboards: DashboardInfo[];
+}
+
+/** Acknowledgement after deleting one dashboard's owned resources. */
+export interface DashboardDeleted {
+  /** Dashboard resource name that was deleted. */
+  deleted: string;
+}
+
 // ----- Graph verb family -----
 //
 // A graph is a namespace holding two plain Iceberg tables (nodes and edges) plus

@@ -2,6 +2,7 @@
 
 use std::net::TcpListener;
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::Path;
 use axum::routing::{get, post};
@@ -10,7 +11,26 @@ use serde_json::{Value, json};
 
 /// Serves the dashboard API shape expected from `verglas-rest`.
 fn spawn_mock() -> String {
+    let query_uri = Arc::new(Mutex::new(String::new()));
+    let access_query_uri = query_uri.clone();
     let app = Router::new()
+        .route(
+            "/admin/access",
+            get(move || {
+                let query_uri = access_query_uri.lock().expect("query URI").clone();
+                async move {
+                    Json(json!({
+                        "s3_endpoint": "http://127.0.0.1:8333",
+                        "query_uri": query_uri,
+                        "catalog_uri": "http://127.0.0.1:8181",
+                        "warehouse": "warehouse",
+                        "region": "us-east-1",
+                        "bucket": "warehouse",
+                        "access_key_id": "test"
+                    }))
+                }
+            }),
+        )
         .route(
             "/v1/dashboards",
             post(|Json(body): Json<Value>| async move {
@@ -43,9 +63,21 @@ fn spawn_mock() -> String {
                 assert_eq!(name, "sales_orders");
                 Json(json!({"deleted": name}))
             }),
+        )
+        .route(
+            "/v1/dashboards/{name}/refresh",
+            post(|Path(name): Path<String>| async move {
+                assert_eq!(name, "sales_orders");
+                Json(json!({
+                    "name": name,
+                    "table": "sales.orders",
+                    "url": "http://127.0.0.1:9009/explore/sales_orders",
+                }))
+            }),
         );
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let addr = listener.local_addr().expect("mock address");
+    *query_uri.lock().expect("query URI") = format!("http://{addr}");
     listener
         .set_nonblocking(true)
         .expect("nonblocking listener");
@@ -77,7 +109,7 @@ fn run(endpoint: &str, args: &[&str]) -> (bool, String, String) {
     )
 }
 
-/// Create, list, show, and delete use only the composed on-prem REST API.
+/// Create, list, show, refresh, and delete use the Rust SDK's typed dashboard API.
 #[test]
 fn dashboard_verbs_speak_the_server_api() {
     let endpoint = spawn_mock();
@@ -99,6 +131,14 @@ fn dashboard_verbs_speak_the_server_api() {
     assert!(ok, "dashboard show failed: {stderr}");
     let shown: Value = serde_json::from_str(&stdout).expect("show JSON");
     assert_eq!(shown["url"], "http://127.0.0.1:9009/explore/sales_orders");
+
+    let (ok, stdout, stderr) = run(
+        &endpoint,
+        &["--json", "dashboard", "refresh", "sales_orders"],
+    );
+    assert!(ok, "dashboard refresh failed: {stderr}");
+    let refreshed: Value = serde_json::from_str(&stdout).expect("refresh JSON");
+    assert_eq!(refreshed["table"], "sales.orders");
 
     let (ok, stdout, stderr) = run(
         &endpoint,

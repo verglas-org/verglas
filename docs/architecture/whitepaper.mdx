@@ -147,7 +147,10 @@ direct metadata location rather than an Iceberg REST catalog, so Verglas supplie
 the catalog-resolved current metadata file and an S3 connector pointed back at the Verglas
 S3 endpoint. Rill remains the owner of its project and query engine; Verglas
 remains the catalog-aware cache path. No Rill project filesystem is mounted by
-Verglas, and no dashboard registry is stored in customer tables.
+Verglas, and no dashboard registry is stored in customer tables. Because the
+Rill model is materialized against one immutable Iceberg metadata file, refresh
+is explicit: Verglas reloads the table through the catalog and rewrites the
+owned model with the latest metadata location after a new snapshot commits.
 
 **Online serving and feature stores.** Applications and ML inference require low-latency retrieval by entity key. Feature-store architectures address this by retaining historical features in an offline store and materializing their latest values into a separate online store. Scheduled or streaming materialization keeps the two stores eventually consistent; failed or partial updates can produce training-serving skew [6].
 

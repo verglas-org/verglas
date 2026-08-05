@@ -29,6 +29,7 @@ use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
 
+use crate::dashboard::{CreateDashboardRequest, DashboardDeleted, DashboardInfo, DashboardList};
 use crate::worker::ChangeEvent;
 
 /// MIME type used by Verglas for Arrow IPC streaming requests and responses.
@@ -39,6 +40,20 @@ pub type QueryStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, ClientError
 
 /// A resumable stream of catalog commit notifications.
 pub type FollowStream = Pin<Box<dyn Stream<Item = Result<ChangeEvent, ClientError>> + Send>>;
+
+/// Validates one dashboard name before placing it in an API path.
+fn dashboard_path(name: &str, suffix: &str) -> Result<String, ClientError> {
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(ClientError::Configuration(
+            "dashboard name must contain only ASCII letters, digits, or `_`".to_owned(),
+        ));
+    }
+    Ok(format!("/v1/dashboards/{name}{suffix}"))
+}
 
 /// Configuration used to construct a [`Client`].
 #[derive(Debug, Clone)]
@@ -415,6 +430,65 @@ impl Client {
             client: self.clone(),
             namespace: namespace.to_owned(),
         })
+    }
+
+    /// Creates a Rill dashboard for a catalog-resolved Iceberg table.
+    pub async fn create_dashboard(
+        &self,
+        table: &str,
+        name: Option<&str>,
+    ) -> Result<DashboardInfo, ClientError> {
+        let request = self
+            .authorize(self.http.post(self.url("/v1/dashboards")))
+            .json(&CreateDashboardRequest { table, name });
+        Self::require_success(self.send(request).await?)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Lists dashboards managed by Verglas in the configured Rill project.
+    pub async fn list_dashboards(&self) -> Result<DashboardList, ClientError> {
+        let request = self.authorize(self.http.get(self.url("/v1/dashboards")));
+        Self::require_success(self.send(request).await?)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Shows one Verglas-owned dashboard and its Explore URL.
+    pub async fn show_dashboard(&self, name: &str) -> Result<DashboardInfo, ClientError> {
+        let path = dashboard_path(name, "")?;
+        let request = self.authorize(self.http.get(self.url(&path)));
+        Self::require_success(self.send(request).await?)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Reloads the dashboard's table and rematerializes its model at the latest snapshot.
+    pub async fn refresh_dashboard(&self, name: &str) -> Result<DashboardInfo, ClientError> {
+        let path = dashboard_path(name, "/refresh")?;
+        let request = self.authorize(self.http.post(self.url(&path)));
+        Self::require_success(self.send(request).await?)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::from)
+    }
+
+    /// Deletes the Rill resources owned by one Verglas dashboard.
+    pub async fn delete_dashboard(&self, name: &str) -> Result<DashboardDeleted, ClientError> {
+        let path = dashboard_path(name, "")?;
+        let request = self.authorize(self.http.delete(self.url(&path)));
+        Self::require_success(self.send(request).await?)
+            .await?
+            .json()
+            .await
+            .map_err(ClientError::from)
     }
 
     /// Creates a missing table or verifies the exact existing definition.

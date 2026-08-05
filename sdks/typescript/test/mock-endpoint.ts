@@ -331,6 +331,11 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
   const definitions = new Map<string, { schema: unknown[]; partitions: unknown[] }>();
   const queues = new Map<string, MockQueue>();
   const graphs = new Map<string, MockGraph>();
+  const dashboard = {
+    name: "events",
+    table: "sdk.events",
+    url: "http://rill/explore/events",
+  };
   const queueState = (name: string): MockQueue => {
     let q = queues.get(name);
     if (!q) queues.set(name, (q = new MockQueue()));
@@ -360,6 +365,42 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     if (req.headers.authorization !== `Bearer ${token}`) return send(401, { error: "bad token" });
 
     const url = new URL(req.url ?? "/", "http://localhost");
+
+    if (url.pathname === "/v1/dashboards") {
+      if (req.method === "GET") {
+        requests.push({ method: "GET", path: url.pathname });
+        return send(200, { dashboards: [dashboard] });
+      }
+      if (req.method === "POST") {
+        let raw = "";
+        req.on("data", (chunk) => (raw += chunk));
+        req.on("end", () => {
+          const body = raw ? JSON.parse(raw) : {};
+          requests.push({ method: "POST", path: url.pathname, body });
+          send(200, dashboard);
+        });
+        return;
+      }
+      return send(405, { error: "method not allowed" });
+    }
+
+    const dashboardRefresh = url.pathname.match(/^\/v1\/dashboards\/([^/]+)\/refresh$/);
+    if (dashboardRefresh && req.method === "POST") {
+      requests.push({ method: "POST", path: url.pathname });
+      return send(200, dashboard);
+    }
+    const dashboardItem = url.pathname.match(/^\/v1\/dashboards\/([^/]+)$/);
+    if (dashboardItem) {
+      if (req.method === "GET") {
+        requests.push({ method: "GET", path: url.pathname });
+        return send(200, dashboard);
+      }
+      if (req.method === "DELETE") {
+        requests.push({ method: "DELETE", path: url.pathname });
+        return send(200, { deleted: decodeURIComponent(dashboardItem[1]) });
+      }
+      return send(405, { error: "method not allowed" });
+    }
 
     if (url.pathname === "/v1/query" && req.method === "POST") {
       let raw = "";

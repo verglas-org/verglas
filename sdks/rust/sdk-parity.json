@@ -30,6 +30,36 @@
       "routes": ["WS /v1/catalog/feed"],
       "guarantees": ["cursor-expiry-distinct", "exactly-once-sequence", "resume-after-drop"],
       "symbol": "pub fn follow"
+    },
+    {
+      "operation": "dashboard_create",
+      "routes": ["POST /v1/dashboards"],
+      "guarantees": ["typed-response", "catalog-resolved-table"],
+      "symbol": "pub async fn create_dashboard"
+    },
+    {
+      "operation": "dashboard_list",
+      "routes": ["GET /v1/dashboards"],
+      "guarantees": ["typed-response", "owned-resources-only"],
+      "symbol": "pub async fn list_dashboards"
+    },
+    {
+      "operation": "dashboard_show",
+      "routes": ["GET /v1/dashboards/{name}"],
+      "guarantees": ["typed-response", "owned-resource"],
+      "symbol": "pub async fn show_dashboard"
+    },
+    {
+      "operation": "dashboard_delete",
+      "routes": ["DELETE /v1/dashboards/{name}"],
+      "guarantees": ["typed-response", "owned-resources-only"],
+      "symbol": "pub async fn delete_dashboard"
+    },
+    {
+      "operation": "dashboard_refresh",
+      "routes": ["POST /v1/dashboards/{name}/refresh"],
+      "guarantees": ["typed-response", "latest-catalog-metadata", "owned-resource"],
+      "symbol": "pub async fn refresh_dashboard"
     }
   ]
 }

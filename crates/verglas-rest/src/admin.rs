@@ -416,6 +416,7 @@ fn dashboard_router(dashboards: DashboardSlot) -> Router {
             "/v1/dashboards/{name}",
             get(dashboard_show).delete(dashboard_delete),
         )
+        .route("/v1/dashboards/{name}/refresh", post(dashboard_refresh))
         .with_state(dashboards)
 }
 
@@ -434,6 +435,17 @@ async fn dashboard_create(
 async fn dashboard_list(State(dashboards): State<DashboardSlot>) -> Response {
     match dashboards.list().await {
         Ok(list) => Json(list).into_response(),
+        Err(error) => dashboard_error(error),
+    }
+}
+
+/// Refreshes a dashboard model from the table's latest catalog metadata pointer.
+async fn dashboard_refresh(
+    State(dashboards): State<DashboardSlot>,
+    Path(name): Path<String>,
+) -> Response {
+    match dashboards.refresh(&name).await {
+        Ok(info) => Json(info).into_response(),
         Err(error) => dashboard_error(error),
     }
 }
@@ -2419,6 +2431,11 @@ mod tests {
     /// Builds a filled tables slot: a memory catalog with `sdk.events` created
     /// from a one-row CSV seed, wrapped as the server wires it post-recovery.
     async fn tables_slot_with_table() -> TablesSlot {
+        tables_slot_and_catalog_with_table().await.0
+    }
+
+    /// Builds a filled tables slot and retains the catalog for commit-driven tests.
+    async fn tables_slot_and_catalog_with_table() -> (TablesSlot, Arc<dyn Catalog>) {
         use iceberg::CatalogBuilder;
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 
@@ -2446,8 +2463,8 @@ mod tests {
         std::mem::forget(dir);
 
         let slot: TablesSlot = Arc::new(OnceLock::new());
-        let _ = slot.set(catalog);
-        slot
+        let _ = slot.set(catalog.clone());
+        (slot, catalog)
     }
 
     /// Dashboard routes are absent unless the optional Rill runtime is wired.
@@ -2525,6 +2542,85 @@ mod tests {
         assert!(!files.contains_key("models/sdk_events.yaml"));
         assert!(!files.contains_key("metrics/sdk_events.yaml"));
         assert!(!files.contains_key("dashboards/sdk_events.yaml"));
+    }
+
+    /// Refresh reloads the table and rewrites only the model at its latest metadata location.
+    #[tokio::test]
+    async fn dashboard_refresh_resolves_the_latest_catalog_metadata() {
+        let (tables, catalog) = tables_slot_and_catalog_with_table().await;
+        let rill = crate::dashboard::test_runtime(tables).await;
+        let recorder = rill.test_recorder();
+        let app = router(
+            VERSION,
+            Health::ready(),
+            Slots {
+                dashboards: Some(Arc::new(rill)),
+                ..Slots::default()
+            },
+        );
+        let response = call_json(
+            app.clone(),
+            "POST",
+            "/v1/dashboards",
+            json!({"table": "sdk.events"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let before = recorder.files();
+
+        let dir = tempfile::tempdir().expect("append dir");
+        let path = dir.path().join("append.csv");
+        std::fs::write(&path, "id,name\n2,new\n").expect("write append csv");
+        let ident = parse_table_ident("sdk.events").expect("ident");
+        verglas_iceberg::write::append(catalog.as_ref(), &ident, &path)
+            .await
+            .expect("append table");
+
+        let response = call_json(app, "POST", "/v1/dashboards/sdk_events/refresh", json!({})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let after = recorder.files();
+        assert_ne!(
+            before["models/sdk_events.yaml"],
+            after["models/sdk_events.yaml"]
+        );
+        assert_eq!(
+            before["metrics/sdk_events.yaml"],
+            after["metrics/sdk_events.yaml"]
+        );
+        assert_eq!(
+            before["dashboards/sdk_events.yaml"],
+            after["dashboards/sdk_events.yaml"]
+        );
+    }
+
+    /// Refresh refuses a model whose ownership marker no longer matches the dashboard.
+    #[tokio::test]
+    async fn dashboard_refresh_refuses_an_inconsistent_owned_model() {
+        let rill = crate::dashboard::test_runtime(tables_slot_with_table().await).await;
+        let recorder = rill.test_recorder();
+        let app = router(
+            VERSION,
+            Health::ready(),
+            Slots {
+                dashboards: Some(Arc::new(rill)),
+                ..Slots::default()
+            },
+        );
+        let response = call_json(
+            app.clone(),
+            "POST",
+            "/v1/dashboards",
+            json!({"table": "sdk.events"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        recorder.insert(
+            "models/sdk_events.yaml",
+            "# managed-by: verglas\n# verglas-table: other.events\ntype: model\n",
+        );
+
+        let response = call_json(app, "POST", "/v1/dashboards/sdk_events/refresh", json!({})).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     /// A generated name collision never overwrites a user-owned Rill file.

@@ -80,6 +80,29 @@ describe("shared SDK parity contract", () => {
   });
 });
 
+describe("dashboard operations", () => {
+  it("uses typed create, list, show, refresh, and delete routes", async () => {
+    const created = await client.createDashboard("sdk.events", { name: "events" });
+    expect(created).toEqual({
+      name: "events",
+      table: "sdk.events",
+      url: "http://rill/explore/events",
+    });
+    expect((await client.listDashboards()).dashboards).toEqual([created]);
+    expect(await client.showDashboard("events")).toEqual(created);
+    expect(await client.refreshDashboard("events")).toEqual(created);
+    expect(await client.deleteDashboard("events")).toEqual({ deleted: "events" });
+
+    expect(endpoint.requests.filter((request) => request.path.startsWith("/v1/dashboards"))).toEqual([
+      { method: "POST", path: "/v1/dashboards", body: { table: "sdk.events", name: "events" } },
+      { method: "GET", path: "/v1/dashboards", body: undefined },
+      { method: "GET", path: "/v1/dashboards/events", body: undefined },
+      { method: "POST", path: "/v1/dashboards/events/refresh", body: undefined },
+      { method: "DELETE", path: "/v1/dashboards/events", body: undefined },
+    ]);
+  });
+});
+
 describe("append -> commit contract", () => {
   it("POSTs rows to /v1/tables/{name}/commit and surfaces the response", async () => {
     const res = await client.table("cloud.job_runs").append([{ a: 1 }, { a: 2 }]);

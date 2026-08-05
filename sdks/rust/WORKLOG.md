@@ -84,3 +84,4 @@
 - #11: Replaced runtime trigger variants with a validated CloudEvents 1.0 envelope and exact event subscription filters. Subprocess workers now read one `VERGLAS_CLOUD_EVENT` value with no legacy environment fallback.
 - #16: Added generic JSON DELETE support to the Rust server transport so pure clients can remove REST resources while preserving server status and response errors.
 - #29: Added a namespace-scoped raw-byte KV client with TTL, metadata, conditional writes, idempotency, delete, and bounded prefix listing. The client preserves opaque versions and cursors and reports whether reads came from RAM or NVMe.
+- #39: Added typed dashboard create, list, show, delete, and refresh operations to the Rust client. The refresh contract points at the explicit server route and preserves typed success and HTTP error responses.
