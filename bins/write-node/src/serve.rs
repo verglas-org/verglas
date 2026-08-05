@@ -43,6 +43,7 @@ impl BatchCommitter for IcebergCommitter {
         format: &str,
         partition_by: Option<&str>,
         body: Bytes,
+        idempotency_key: Option<String>,
     ) -> Result<serde_json::Value, String> {
         let ident = verglas_iceberg::parse_table_ident(table).map_err(|error| error.to_string())?;
         let extension = match format {
@@ -69,10 +70,29 @@ impl BatchCommitter for IcebergCommitter {
             .await
             .map_err(|error| error.to_string())
             .and_then(|report| serde_json::to_value(report).map_err(|error| error.to_string())),
-            "append" => verglas_iceberg::write::append(self.catalog.as_ref(), &ident, &path)
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|report| serde_json::to_value(report).map_err(|error| error.to_string())),
+            "append" => match idempotency_key {
+                Some(key) => {
+                    let ingested =
+                        verglas_iceberg::ingest::read(&path).map_err(|error| error.to_string())?;
+                    verglas_iceberg::tables_api::commit_batches(
+                        self.catalog.as_ref(),
+                        &ident,
+                        ingested.batches,
+                        Some(key),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|report| {
+                        serde_json::to_value(report).map_err(|error| error.to_string())
+                    })
+                }
+                None => verglas_iceberg::write::append(self.catalog.as_ref(), &ident, &path)
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|report| {
+                        serde_json::to_value(report).map_err(|error| error.to_string())
+                    }),
+            },
             other => Err(format!("unknown mode `{other}`: expected create or append")),
         }
     }

@@ -396,7 +396,19 @@ fn apply_create_overrides(
         manifest.name = name;
     }
     if let Some(schedule) = schedule {
-        manifest.trigger = crate::worker_spec::Trigger::Cron { cron: schedule };
+        if let Some(crate::worker_spec::Trigger::Cron { cron, .. }) = manifest
+            .triggers
+            .iter_mut()
+            .find(|trigger| matches!(trigger, crate::worker_spec::Trigger::Cron { .. }))
+        {
+            *cron = schedule;
+        } else {
+            manifest.triggers.push(crate::worker_spec::Trigger::Cron {
+                cron: schedule,
+                start_date: None,
+                catchup: None,
+            });
+        }
     }
 }
 
@@ -462,7 +474,7 @@ async fn run_worker_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(),
         cwd,
         files: Default::default(),
         env: Default::default(),
-        trigger,
+        triggers: vec![trigger],
         target_tables: vec![table.clone()],
         resources: Default::default(),
     };

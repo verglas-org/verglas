@@ -65,3 +65,4 @@
   server. Worker execution contracts otherwise remain unchanged.
 - #11: Passed the complete serialized trigger event into every worker subprocess. HTTP callbacks and data updates now cross the harness boundary without losing their payload, while malformed events fail the run.
 - #11: Reduced the subprocess event contract to one validated `VERGLAS_CLOUD_EVENT` binding. Removed the trigger discriminator and cron-specific environment variables so workers cannot consume two competing event formats.
+- #11: Added declared environment variables to the subprocess execution contract. The scheduler can now run a self-contained worker bundle with its configured endpoints and arguments instead of relying on host-global state.

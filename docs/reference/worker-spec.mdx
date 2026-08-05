@@ -22,7 +22,7 @@ target_tables = ["analytics.orders_raw"]
 ORDERS_URL = "https://api.example.com/v1/orders"
 ORDERS_KEY = "@secret:ORDERS_KEY"
 
-[trigger]
+[[triggers]]
 type = "cron"
 cron = "*/5 * * * *"
 
@@ -39,9 +39,9 @@ mem_mib = 256
 | `name` | Yes | Worker name. Must not be empty. |
 | `exec` | Usually | Program and arguments. A file-follow worker may omit it. |
 | `cwd` | No | Working directory for the command and bundled files. |
-| `files` | No | Map from relative path to bundled text content. |
+| `files` | No | Map from bundle paths to text or relative `@file:` references. |
 | `env` | No | Environment map. Use `@secret:NAME` for a secret reference. |
-| `trigger` | No | One of `manual`, `cron`, `webhook`, `event`, or local-only `follow`. Defaults to `manual`. |
+| `triggers` | No | Array of `cron`, `webhook`, `event`, or local-only `follow` declarations. Manual dispatch is always available. |
 | `target_tables` | No | Iceberg tables the worker writes. The first table becomes the primary local output. |
 | `resources.vcpus` | No | Fractional vCPU hint for cloud placement. |
 | `resources.mem_mib` | No | Memory hint in MiB for cloud placement. |
@@ -51,27 +51,28 @@ mem_mib = 256
 <Tabs>
   <Tab title="Manual">
     ```toml
-    [trigger]
-    type = "manual"
+    # No trigger declaration is required for manual dispatch.
     ```
   </Tab>
   <Tab title="Cron">
     ```toml
-    [trigger]
+    [[triggers]]
     type = "cron"
     cron = "0 * * * *"
+    start_date = "2025-08-04T00:00:00Z"
+    catchup = "sequential"
     ```
   </Tab>
   <Tab title="Webhook">
     ```toml
-    [trigger]
+    [[triggers]]
     type = "webhook"
     path = "/callbacks/orders"
     ```
   </Tab>
   <Tab title="CloudEvent">
     ```toml
-    [trigger]
+    [[triggers]]
     type = "event"
     event_type = "org.apache.iceberg.snapshot.committed"
     subject = "app.events"
@@ -81,13 +82,13 @@ mem_mib = 256
     ```toml
     exec = ["./server", "--port", "8080"]
 
-    [trigger]
+    [[triggers]]
     type = "follow"
     ```
   </Tab>
   <Tab title="Follow a file">
     ```toml
-    [trigger]
+    [[triggers]]
     type = "follow"
     file = "/var/log/acme/app.jsonl"
     ```

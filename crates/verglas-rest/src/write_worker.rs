@@ -53,12 +53,13 @@ impl WriteWorkerDispatcher {
         table: &str,
         query: &str,
         body: Bytes,
+        idempotency_key: Option<String>,
     ) -> Result<Response, String> {
         self.dispatch_request(
             &format!("/v1/ingest/{table}?{query}"),
             body,
             "application/octet-stream",
-            None,
+            idempotency_key,
         )
         .await
     }

@@ -41,6 +41,7 @@ pub trait BatchCommitter: Send + Sync {
         format: &str,
         partition_by: Option<&str>,
         body: Bytes,
+        idempotency_key: Option<String>,
     ) -> Result<Value, String>;
 }
 
@@ -80,8 +81,13 @@ async fn ingest_file(
     State(state): State<AppState>,
     Path(name): Path<String>,
     Query(query): Query<IngestQuery>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     match state
         .committer
         .ingest(
@@ -90,6 +96,7 @@ async fn ingest_file(
             &query.format,
             query.partition_by.as_deref(),
             body,
+            idempotency_key,
         )
         .await
     {

@@ -11,6 +11,7 @@
 //! pipeline telemetry; this executor only runs the subprocess and returns its
 //! outcome.
 
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use verglas_sdk::worker::{
@@ -30,6 +31,9 @@ pub struct WorkerExec {
     pub args: Vec<String>,
     /// The working directory, if the worker needs one.
     pub cwd: Option<String>,
+    /// Plain deployment environment bindings injected before reserved runtime
+    /// bindings such as the endpoint and CloudEvent.
+    pub env: BTreeMap<String, String>,
 }
 
 impl WorkerExec {
@@ -61,6 +65,7 @@ impl WorkerExec {
             command,
             args: parts.collect(),
             cwd,
+            env: BTreeMap::new(),
         })
     }
 }
@@ -112,6 +117,7 @@ async fn drive(
     if let Some(cwd) = &exec.cwd {
         cmd.current_dir(cwd);
     }
+    cmd.envs(&exec.env);
     for (key, value) in run_env(run, event, &result_path)? {
         cmd.env(key, value);
     }

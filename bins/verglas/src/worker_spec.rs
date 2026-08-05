@@ -20,6 +20,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use verglas_sdk::worker::Catchup;
 
 /// The spec version this CLI writes and understands.
 pub const SPEC_VERSION: u32 = 1;
@@ -30,18 +31,24 @@ pub const FOLLOW_NAMESPACE: &str = "follow";
 /// The prefix marking an env value as a reference to a named secret.
 const SECRET_PREFIX: &str = "@secret:";
 
-/// A worker trigger: exactly one bounded scheduler event or a local follow.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+/// The prefix that bundles a text file relative to the manifest.
+const FILE_PREFIX: &str = "@file:";
+
+/// One bounded scheduler trigger or a local continuous follow declaration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Trigger {
     /// Run on a cron schedule.
     Cron {
         /// A five-field cron expression.
         cron: String,
+        /// Backfill anchor for scheduled intervals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_date: Option<String>,
+        /// How the scheduler drains intervals between the anchor and now.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        catchup: Option<Catchup>,
     },
-    /// Run only when dispatched by hand.
-    #[default]
-    Manual,
     /// Run when an HTTP request reaches the worker's registered callback.
     Webhook {
         /// Optional dynamic path such as `/ingest/orders`.
@@ -69,6 +76,77 @@ pub enum Trigger {
     },
 }
 
+impl Trigger {
+    /// Returns the deployment trigger discriminant used by the cloud envelope.
+    fn kind(&self) -> &'static str {
+        match self {
+            Trigger::Cron { .. } => "cron",
+            Trigger::Webhook { .. } => "webhook",
+            Trigger::Event { .. } => "event",
+            Trigger::Follow { .. } => "follow",
+        }
+    }
+}
+
+/// Projects one portable trigger into the local worker registry contract.
+fn local_trigger(trigger: &Trigger) -> Value {
+    match trigger {
+        Trigger::Cron {
+            cron,
+            start_date,
+            catchup,
+        } => json!({
+            "type": "cron",
+            "schedule": cron,
+            "startDate": start_date,
+            "catchup": catchup,
+        }),
+        Trigger::Webhook { path } => json!({ "type": "webhook", "path": path }),
+        Trigger::Event {
+            event_type,
+            source,
+            subject,
+        } => json!({
+            "type": "event",
+            "eventType": event_type,
+            "source": source,
+            "subject": subject,
+        }),
+        Trigger::Follow { file } => json!({ "type": "follow", "file": file }),
+    }
+}
+
+/// Projects one portable trigger into the cloud deployment config contract.
+fn cloud_trigger(trigger: &Trigger) -> Value {
+    match trigger {
+        Trigger::Cron {
+            cron,
+            start_date,
+            catchup,
+        } => json!({ "type": "cron", "config": {
+            "schedule": cron,
+            "startDate": start_date,
+            "catchup": catchup,
+        }}),
+        Trigger::Webhook { path } => json!({
+            "type": "webhook",
+            "config": path
+                .as_ref()
+                .map_or_else(|| json!({}), |path| json!({ "path": path })),
+        }),
+        Trigger::Event {
+            event_type,
+            source,
+            subject,
+        } => json!({ "type": "event", "config": {
+            "eventType": event_type,
+            "source": source,
+            "subject": subject,
+        }}),
+        Trigger::Follow { file } => json!({ "type": "follow", "config": { "file": file } }),
+    }
+}
+
 /// Resource hints for cloud placement. Advisory locally.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Resources {
@@ -82,6 +160,7 @@ pub struct Resources {
 
 /// The portable worker spec, version 1.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerManifest {
     /// The spec format version. Only `1` is understood.
     #[serde(default = "default_spec_version")]
@@ -103,9 +182,10 @@ pub struct WorkerManifest {
     /// plane from that plane's secret store; the value is never in this file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
-    /// When the worker runs.
+    /// Events that run the worker. Manual dispatch is available to every worker
+    /// and therefore is not a trigger declaration.
     #[serde(default)]
-    pub trigger: Trigger,
+    pub triggers: Vec<Trigger>,
     /// The Iceberg tables the worker writes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_tables: Vec<String>,
@@ -127,14 +207,41 @@ impl WorkerManifest {
     pub fn from_file(path: &Path) -> Result<WorkerManifest, Box<dyn Error>> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("could not read spec file {}: {e}", path.display()))?;
-        let manifest: WorkerManifest = if path.extension().and_then(|e| e.to_str()) == Some("toml")
-        {
-            toml::from_str(&text)
-                .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?
-        } else {
-            serde_json::from_str(&text)
-                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?
-        };
+        let mut manifest: WorkerManifest =
+            if path.extension().and_then(|e| e.to_str()) == Some("toml") {
+                toml::from_str(&text)
+                    .map_err(|e| format!("{} is not valid TOML: {e}", path.display()))?
+            } else {
+                serde_json::from_str(&text)
+                    .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))?
+            };
+        let base = path.parent().unwrap_or_else(|| Path::new("."));
+        for content in manifest.files.values_mut() {
+            let Some(reference) = content.strip_prefix(FILE_PREFIX) else {
+                continue;
+            };
+            let reference = Path::new(reference);
+            if reference.as_os_str().is_empty()
+                || reference.is_absolute()
+                || reference
+                    .components()
+                    .any(|part| !matches!(part, std::path::Component::Normal(_)))
+            {
+                return Err(format!(
+                    "{} has invalid file reference `{}`",
+                    path.display(),
+                    reference.display()
+                )
+                .into());
+            }
+            *content = std::fs::read_to_string(base.join(reference)).map_err(|error| {
+                format!(
+                    "could not bundle {} referenced by {}: {error}",
+                    reference.display(),
+                    path.display()
+                )
+            })?;
+        }
         manifest.validate()?;
         Ok(manifest)
     }
@@ -151,7 +258,15 @@ impl WorkerManifest {
         if self.name.trim().is_empty() {
             return Err("the worker spec needs a name".into());
         }
-        let follow_file = matches!(&self.trigger, Trigger::Follow { file: Some(_) });
+        let follows: Vec<&Trigger> = self
+            .triggers
+            .iter()
+            .filter(|trigger| matches!(trigger, Trigger::Follow { .. }))
+            .collect();
+        if !follows.is_empty() && self.triggers.len() != 1 {
+            return Err("a follow worker cannot declare bounded triggers".into());
+        }
+        let follow_file = matches!(follows.first(), Some(Trigger::Follow { file: Some(_) }));
         if self.exec.is_empty() && !follow_file {
             return Err(
                 "the worker spec needs an `exec` command (only a follow worker that tails a \
@@ -159,22 +274,28 @@ impl WorkerManifest {
                     .into(),
             );
         }
-        if let Trigger::Webhook { path: Some(path) } = &self.trigger
-            && (!path.starts_with('/') || path.contains('?'))
-        {
-            return Err("a webhook path must start with `/` and contain no query string".into());
-        }
-        if let Trigger::Event { event_type, .. } = &self.trigger
-            && event_type.trim().is_empty()
-        {
-            return Err("an event trigger needs an event_type".into());
+        for trigger in &self.triggers {
+            if let Trigger::Webhook { path: Some(path) } = trigger
+                && (!path.starts_with('/') || path.contains('?'))
+            {
+                return Err(
+                    "a webhook path must start with `/` and contain no query string".into(),
+                );
+            }
+            if let Trigger::Event { event_type, .. } = trigger
+                && event_type.trim().is_empty()
+            {
+                return Err("an event trigger needs an event_type".into());
+            }
         }
         Ok(())
     }
 
     /// Whether this worker's trigger is follow — local only.
     pub fn is_follow(&self) -> bool {
-        matches!(self.trigger, Trigger::Follow { .. })
+        self.triggers
+            .iter()
+            .any(|trigger| matches!(trigger, Trigger::Follow { .. }))
     }
 
     /// The names of the secrets this worker references through `@secret:` env
@@ -208,27 +329,8 @@ impl WorkerManifest {
 
     /// The `triggers` JSON array a local worker row carries.
     fn local_triggers(&self) -> Value {
-        let specs = match &self.trigger {
-            Trigger::Cron { cron } => json!([{ "type": "cron", "schedule": cron }]),
-            Trigger::Manual => json!([]),
-            Trigger::Webhook { path } => match path {
-                Some(path) => json!([{ "type": "webhook", "path": path }]),
-                None => json!([{ "type": "webhook" }]),
-            },
-            Trigger::Event {
-                event_type,
-                source,
-                subject,
-            } => json!([{
-                "type": "event",
-                "eventType": event_type,
-                "source": source,
-                "subject": subject
-            }]),
-            Trigger::Follow { file: Some(file) } => json!([{ "type": "follow", "file": file }]),
-            Trigger::Follow { file: None } => json!([{ "type": "follow" }]),
-        };
-        Value::String(specs.to_string())
+        let specs: Vec<Value> = self.triggers.iter().map(local_trigger).collect();
+        Value::String(Value::Array(specs).to_string())
     }
 
     /// The worker `config` JSON string a local worker row carries: env and any
@@ -264,42 +366,17 @@ impl WorkerManifest {
     /// env, resources) exactly as the fleet launch expects; `code` carries a
     /// self-describing job spec so the required non-empty field is meaningful.
     pub fn to_cloud_deployment(&self, placement: &str) -> Value {
-        let (trigger, schedule, trigger_specs) = match &self.trigger {
-            Trigger::Cron { cron } => (
-                "cron",
-                Some(cron.clone()),
-                json!([{ "type": "cron", "config": { "schedule": cron } }]),
-            ),
-            Trigger::Webhook { path } => {
-                let config = path
-                    .as_ref()
-                    .map_or_else(|| json!({}), |path| json!({ "path": path }));
-                (
-                    "webhook",
-                    None,
-                    json!([{ "type": "webhook", "config": config }]),
-                )
-            }
-            Trigger::Event {
-                event_type,
-                source,
-                subject,
-            } => (
-                "event",
-                None,
-                json!([{ "type": "event", "config": {
-                    "eventType": event_type,
-                    "source": source,
-                    "subject": subject
-                } }]),
-            ),
-            // A follow worker is local-only; callers reject it before here.
-            Trigger::Manual | Trigger::Follow { .. } => ("manual", None, json!([])),
+        let trigger_specs: Vec<Value> = self.triggers.iter().map(cloud_trigger).collect();
+        let primary = self.triggers.first();
+        let trigger = primary.map_or("manual", Trigger::kind);
+        let schedule = match primary {
+            Some(Trigger::Cron { cron, .. }) => Some(cron.clone()),
+            _ => None,
         };
         let mut config = serde_json::Map::new();
         config.insert("spec_version".to_owned(), json!(self.spec_version));
         config.insert("exec".to_owned(), json!(self.exec));
-        config.insert("triggers".to_owned(), trigger_specs);
+        config.insert("triggers".to_owned(), Value::Array(trigger_specs));
         if let Some(cwd) = &self.cwd {
             config.insert("cwd".to_owned(), json!(cwd));
         }
@@ -372,7 +449,7 @@ impl WorkerManifest {
             })
             .unwrap_or_default();
         let triggers: Value = parse_embedded(row.get("triggers"));
-        let trigger = trigger_from_local(&triggers);
+        let triggers = triggers_from_local(&triggers);
         let target_tables = row
             .get("output")
             .and_then(Value::as_str)
@@ -386,7 +463,7 @@ impl WorkerManifest {
             cwd,
             files,
             env,
-            trigger,
+            triggers,
             target_tables,
             resources: Resources::default(),
         })
@@ -418,7 +495,7 @@ impl WorkerManifest {
             vcpus: config.get("vcpus").and_then(Value::as_f64),
             mem_mib: config.get("mem_mib").and_then(Value::as_u64),
         };
-        let trigger = trigger_from_cloud(config.get("triggers"));
+        let triggers = triggers_from_cloud(config.get("triggers"));
         let target_tables = dep
             .get("target_tables")
             .and_then(Value::as_array)
@@ -435,7 +512,7 @@ impl WorkerManifest {
             cwd,
             files,
             env,
-            trigger,
+            triggers,
             target_tables,
             resources,
         })
@@ -470,52 +547,60 @@ fn parse_embedded(field: Option<&Value>) -> Value {
     }
 }
 
-/// Maps a local `triggers` JSON array back to a spec trigger (the first
-/// recognized one wins; none means manual).
-fn trigger_from_local(triggers: &Value) -> Trigger {
+/// Maps a local `triggers` JSON array back to every portable trigger.
+fn triggers_from_local(triggers: &Value) -> Vec<Trigger> {
     let Some(list) = triggers.as_array() else {
-        return Trigger::Manual;
+        return Vec::new();
     };
+    let mut parsed = Vec::new();
     for t in list {
         match t.get("type").and_then(Value::as_str) {
             Some("cron") => {
                 if let Some(cron) = t.get("schedule").and_then(Value::as_str) {
-                    return Trigger::Cron {
+                    parsed.push(Trigger::Cron {
                         cron: cron.to_owned(),
-                    };
+                        start_date: t
+                            .get("startDate")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        catchup: t
+                            .get("catchup")
+                            .cloned()
+                            .and_then(|value| serde_json::from_value(value).ok()),
+                    });
                 }
             }
             Some("follow") => {
-                return Trigger::Follow {
+                parsed.push(Trigger::Follow {
                     file: t.get("file").and_then(Value::as_str).map(str::to_owned),
-                };
+                });
             }
             Some("webhook") => {
-                return Trigger::Webhook {
+                parsed.push(Trigger::Webhook {
                     path: t.get("path").and_then(Value::as_str).map(str::to_owned),
-                };
+                });
             }
             Some("event") => {
                 if let Some(event_type) = t.get("eventType").and_then(Value::as_str) {
-                    return Trigger::Event {
+                    parsed.push(Trigger::Event {
                         event_type: event_type.to_owned(),
                         source: t.get("source").and_then(Value::as_str).map(str::to_owned),
                         subject: t.get("subject").and_then(Value::as_str).map(str::to_owned),
-                    };
+                    });
                 }
             }
             _ => {}
         }
     }
-    Trigger::Manual
+    parsed
 }
 
-/// Maps the cloud control plane's `config.triggers` array back to one portable
-/// trigger. The manifest intentionally carries one trigger today.
-fn trigger_from_cloud(triggers: Option<&Value>) -> Trigger {
+/// Maps the cloud control plane's trigger config back to portable triggers.
+fn triggers_from_cloud(triggers: Option<&Value>) -> Vec<Trigger> {
     let Some(list) = triggers.and_then(Value::as_array) else {
-        return Trigger::Manual;
+        return Vec::new();
     };
+    let mut parsed = Vec::new();
     for trigger in list {
         let config = trigger.get("config").and_then(Value::as_object);
         match trigger.get("type").and_then(Value::as_str) {
@@ -524,25 +609,33 @@ fn trigger_from_cloud(triggers: Option<&Value>) -> Trigger {
                     .and_then(|value| value.get("schedule"))
                     .and_then(Value::as_str)
                 {
-                    return Trigger::Cron {
+                    parsed.push(Trigger::Cron {
                         cron: schedule.to_owned(),
-                    };
+                        start_date: config
+                            .and_then(|value| value.get("startDate"))
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        catchup: config
+                            .and_then(|value| value.get("catchup"))
+                            .cloned()
+                            .and_then(|value| serde_json::from_value(value).ok()),
+                    });
                 }
             }
             Some("webhook") => {
-                return Trigger::Webhook {
+                parsed.push(Trigger::Webhook {
                     path: config
                         .and_then(|value| value.get("path"))
                         .and_then(Value::as_str)
                         .map(str::to_owned),
-                };
+                });
             }
             Some("event") => {
                 if let Some(event_type) = config
                     .and_then(|value| value.get("eventType"))
                     .and_then(Value::as_str)
                 {
-                    return Trigger::Event {
+                    parsed.push(Trigger::Event {
                         event_type: event_type.to_owned(),
                         source: config
                             .and_then(|value| value.get("source"))
@@ -552,13 +645,13 @@ fn trigger_from_cloud(triggers: Option<&Value>) -> Trigger {
                             .and_then(|value| value.get("subject"))
                             .and_then(Value::as_str)
                             .map(str::to_owned),
-                    };
+                    });
                 }
             }
             _ => {}
         }
     }
-    Trigger::Manual
+    parsed
 }
 
 #[cfg(test)]
@@ -576,9 +669,11 @@ mod tests {
                 ("LOG_LEVEL".to_owned(), "info".to_owned()),
                 ("API_KEY".to_owned(), "@secret:MY_KEY".to_owned()),
             ]),
-            trigger: Trigger::Cron {
+            triggers: vec![Trigger::Cron {
                 cron: "*/5 * * * *".to_owned(),
-            },
+                start_date: None,
+                catchup: None,
+            }],
             target_tables: vec!["metrics.samples".to_owned()],
             resources: Resources {
                 vcpus: Some(0.25),
@@ -587,14 +682,81 @@ mod tests {
         }
     }
 
+    /// One portable declaration can expose manual dispatch, an HTTP callback,
+    /// scheduled backfill, and a broker-fed CloudEvent subscription together.
+    #[test]
+    fn parses_one_worker_with_every_bounded_trigger() {
+        let manifest: WorkerManifest = toml::from_str(
+            r#"
+name = "spy-ohlcv"
+exec = ["python3", "spy_ohlcv.py"]
+cwd = "."
+
+[[triggers]]
+type = "webhook"
+path = "/market-data/spy"
+
+[[triggers]]
+type = "cron"
+cron = "0 22 * * 1-5"
+start_date = "2025-08-04T00:00:00Z"
+catchup = "sequential"
+
+[[triggers]]
+type = "event"
+event_type = "com.yahoo.finance.quote"
+source = "urn:rabbitmq:market-data"
+subject = "SPY"
+"#,
+        )
+        .expect("multi-trigger manifest");
+
+        assert_eq!(manifest.triggers.len(), 3);
+        assert!(manifest.validate().is_ok());
+        let local: Value = serde_json::from_str(
+            manifest.to_local_worker()["triggers"]
+                .as_str()
+                .expect("trigger JSON"),
+        )
+        .expect("local triggers");
+        assert_eq!(local.as_array().expect("trigger array").len(), 3);
+        assert_eq!(local[1]["startDate"], "2025-08-04T00:00:00Z");
+        assert_eq!(local[1]["catchup"], "sequential");
+    }
+
+    /// A manifest can bundle readable source files by path instead of copying
+    /// their complete contents into TOML.
+    #[test]
+    fn resolves_relative_file_references() {
+        let dir = tempfile::tempdir().expect("temp worker");
+        std::fs::write(dir.path().join("worker.py"), "print('SPY')\n").expect("worker source");
+        std::fs::write(
+            dir.path().join("worker.toml"),
+            r#"
+name = "spy"
+exec = ["python3", "worker.py"]
+[files]
+"worker.py" = "@file:worker.py"
+"#,
+        )
+        .expect("manifest");
+
+        let manifest =
+            WorkerManifest::from_file(&dir.path().join("worker.toml")).expect("resolved manifest");
+        assert_eq!(
+            manifest.files.get("worker.py").map(String::as_str),
+            Some("print('SPY')\n")
+        );
+    }
+
     /// Webhook and CloudEvent manifests project to the local trigger registry
     /// without requiring callers to hand-write embedded JSON strings.
     #[test]
     fn translates_event_triggers_to_local_workers() {
         let mut webhook = cron_manifest();
-        webhook.trigger = Trigger::Webhook {
+        webhook.triggers = vec![Trigger::Webhook {
             path: Some("/ingest/orders".to_owned()),
-        };
+        }];
         let webhook_body = webhook.to_local_worker();
         let webhook_triggers: Value =
             serde_json::from_str(webhook_body["triggers"].as_str().expect("triggers string"))
@@ -608,11 +770,11 @@ mod tests {
         );
 
         let mut event = cron_manifest();
-        event.trigger = Trigger::Event {
+        event.triggers = vec![Trigger::Event {
             event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
             source: None,
             subject: Some("app.events".to_owned()),
-        };
+        }];
         let data_body = event.to_local_worker();
         let data_triggers: Value =
             serde_json::from_str(data_body["triggers"].as_str().expect("triggers string"))
@@ -633,7 +795,7 @@ mod tests {
     #[test]
     fn translates_event_triggers_to_cloud_deployments() {
         let mut webhook = cron_manifest();
-        webhook.trigger = Trigger::Webhook { path: None };
+        webhook.triggers = vec![Trigger::Webhook { path: None }];
         let webhook_body = webhook.to_cloud_deployment("cloud");
         assert_eq!(webhook_body["trigger"], "webhook");
         assert_eq!(
@@ -642,11 +804,11 @@ mod tests {
         );
 
         let mut event = cron_manifest();
-        event.trigger = Trigger::Event {
+        event.triggers = vec![Trigger::Event {
             event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
             source: None,
             subject: Some("app.events".to_owned()),
-        };
+        }];
         let data_body = event.to_cloud_deployment("cloud");
         assert_eq!(data_body["trigger"], "event");
         assert_eq!(
@@ -666,30 +828,30 @@ mod tests {
             r#"
 name = "hook"
 exec = ["sh", "worker.sh"]
-[trigger]
+[[triggers]]
 type = "webhook"
 path = "/callbacks/orders"
 "#,
         )
         .expect("webhook manifest");
         assert!(matches!(
-            webhook.trigger,
-            Trigger::Webhook { path: Some(path) } if path == "/callbacks/orders"
+            webhook.triggers.as_slice(),
+            [Trigger::Webhook { path: Some(path) }] if path == "/callbacks/orders"
         ));
 
         let event: WorkerManifest = serde_json::from_value(json!({
             "name": "changed",
             "exec": ["sh", "worker.sh"],
-            "trigger": {
+            "triggers": [{
                 "type": "event",
                 "event_type": "org.apache.iceberg.snapshot.committed",
                 "subject": "app.events"
-            }
+            }]
         }))
         .expect("event manifest");
         assert!(matches!(
-            event.trigger,
-            Trigger::Event { event_type, subject: Some(subject), .. }
+            event.triggers.as_slice(),
+            [Trigger::Event { event_type, subject: Some(subject), .. }]
                 if event_type == "org.apache.iceberg.snapshot.committed" && subject == "app.events"
         ));
     }
@@ -708,7 +870,7 @@ path = "/callbacks/orders"
             },
         ] {
             let mut manifest = cron_manifest();
-            manifest.trigger = trigger;
+            manifest.triggers = vec![trigger];
             let local = WorkerManifest::from_local_worker(&manifest.to_local_worker())
                 .expect("local round trip");
             assert_eq!(local.local_triggers(), manifest.local_triggers());
@@ -778,7 +940,7 @@ path = "/callbacks/orders"
         assert_eq!(back.exec, manifest.exec);
         assert_eq!(back.cwd, manifest.cwd);
         assert_eq!(back.env, manifest.env);
-        assert!(matches!(back.trigger, Trigger::Cron { .. }));
+        assert!(matches!(back.triggers.as_slice(), [Trigger::Cron { .. }]));
         assert_eq!(back.target_tables, manifest.target_tables);
     }
 
@@ -792,9 +954,9 @@ path = "/callbacks/orders"
             cwd: None,
             files: BTreeMap::new(),
             env: BTreeMap::new(),
-            trigger: Trigger::Follow {
+            triggers: vec![Trigger::Follow {
                 file: Some("/var/log/app.log".to_owned()),
-            },
+            }],
             target_tables: vec!["follow.app".to_owned()],
             resources: Resources::default(),
         };

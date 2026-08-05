@@ -547,6 +547,7 @@ async fn ingest_dispatch(
     State(state): State<WriteState>,
     Path(name): Path<String>,
     RawQuery(query): RawQuery,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     let Some(dispatcher) = &state.write_worker else {
@@ -563,7 +564,14 @@ async fn ingest_dispatch(
         )
             .into_response();
     };
-    match dispatcher.dispatch_ingest(&name, &query, body).await {
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match dispatcher
+        .dispatch_ingest(&name, &query, body, idempotency_key)
+        .await
+    {
         Ok(response) => response,
         Err(error) => (StatusCode::BAD_GATEWAY, error).into_response(),
     }
@@ -1518,10 +1526,47 @@ async fn queue_ack(
 /// deployment-configured dynamic HTTP paths. Each creates a durable job object.
 fn platform_router(platform: PlatformSlot) -> Router {
     Router::new()
+        .route("/v1/events", post(worker_event))
         .route("/v1/workers/{name}/run", post(worker_run_now))
         .route("/v1/hooks/{name}", post(worker_webhook))
         .route("/v1/http/{*path}", any(worker_dynamic_http))
         .with_state(platform)
+}
+
+/// Accepts one structured CloudEvent and fans it out to exact worker
+/// subscriptions. The CloudEvent's source and id remain the durable
+/// idempotency identity after broker delivery.
+async fn worker_event(
+    State(platform): State<PlatformSlot>,
+    Json(event): Json<verglas_sdk::worker::CloudEvent>,
+) -> Response {
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    match ingress.event(event, chrono::Utc::now()).await {
+        Ok(outcomes) => {
+            let jobs: Vec<serde_json::Value> = outcomes
+                .into_iter()
+                .map(|outcome| match outcome {
+                    verglas_scheduler::EnqueueOutcome::Created(job_id) => {
+                        json!({ "job_id": job_id, "created": true })
+                    }
+                    verglas_scheduler::EnqueueOutcome::Existing(job_id) => {
+                        json!({ "job_id": job_id, "created": false })
+                    }
+                })
+                .collect();
+            (
+                StatusCode::ACCEPTED,
+                Json(json!({ "matched": jobs.len(), "jobs": jobs })),
+            )
+                .into_response()
+        }
+        Err(crate::platform::IngressError::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
 }
 
 /// Enqueues one manual invocation for a running worker.
@@ -2342,6 +2387,37 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    /// A configured platform exposes standard structured CloudEvent ingress.
+    /// The empty deferred slot returns 503, proving the route exists without
+    /// requiring a live catalog and scheduler in this router test.
+    #[tokio::test]
+    async fn platform_mounts_structured_cloudevent_ingress() {
+        let platform: PlatformSlot = Arc::new(OnceLock::new());
+        let event = serde_json::json!({
+            "specversion": "1.0",
+            "id": "quote-1",
+            "source": "urn:rabbitmq:market-data",
+            "type": "com.yahoo.finance.quote",
+            "subject": "SPY",
+            "data": {"close": 632.08}
+        });
+        let response = call_json(
+            router(
+                VERSION,
+                Health::ready(),
+                Slots {
+                    platform: Some(platform),
+                    ..Slots::default()
+                },
+            ),
+            "POST",
+            "/v1/events",
+            event,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A tables route on a router whose slot is not yet filled answers 503, like

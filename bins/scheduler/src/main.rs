@@ -5,7 +5,9 @@
 //! local worker harness. It mounts no state and contains no cloud placement or
 //! connection-broker behavior.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,6 +69,94 @@ struct WorkerRecord {
     triggers: String,
     /// Lifecycle state; only `running` declarations are reconciled.
     state: String,
+    /// Portable environment and bundled text files.
+    config: String,
+}
+
+/// The portable portion of a worker registry config.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerConfig {
+    /// Plain subprocess environment bindings.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    /// Text files materialized into one isolated run directory.
+    #[serde(default)]
+    files: BTreeMap<String, String>,
+}
+
+/// One prepared subprocess and the temporary bundle that keeps its files live.
+struct PreparedWorker {
+    /// Executable subprocess contract.
+    exec: WorkerExec,
+    /// Isolated directory removed after the run finishes.
+    _root: tempfile::TempDir,
+}
+
+/// Validates that a bundled file path stays below the isolated run directory.
+fn safe_bundle_path(path: &Path) -> Result<&Path, String> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err(format!(
+            "worker bundle path `{}` is not a relative file path",
+            path.display()
+        ));
+    }
+    Ok(path)
+}
+
+/// Materializes one portable worker config into an isolated run directory.
+fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
+    let config: WorkerConfig = serde_json::from_str(&worker.config)
+        .map_err(|error| format!("worker {} config: {error}", worker.name))?;
+    if let Some((name, _)) = config
+        .env
+        .iter()
+        .find(|(_, value)| value.starts_with("@secret:"))
+    {
+        return Err(format!(
+            "worker {} secret binding {name} is unresolved",
+            worker.name
+        ));
+    }
+    let root = tempfile::tempdir()
+        .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
+    for (name, contents) in &config.files {
+        let relative = safe_bundle_path(Path::new(name))?;
+        let target = root.path().join(relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
+        }
+        std::fs::write(&target, contents)
+            .map_err(|error| format!("worker {} bundle file {name}: {error}", worker.name))?;
+    }
+    let mut exec =
+        WorkerExec::from_config(&worker.name, &worker.code).map_err(|error| error.to_string())?;
+    if let Some(cwd) = exec.cwd.as_deref() {
+        let cwd = Path::new(cwd);
+        if !cwd.is_absolute() {
+            let relative = if cwd == Path::new(".") {
+                Path::new("")
+            } else {
+                safe_bundle_path(cwd)?
+            };
+            exec.cwd = Some(root.path().join(relative).to_string_lossy().into_owned());
+        } else if !config.files.is_empty() {
+            return Err(format!(
+                "worker {} has bundled files and an absolute cwd",
+                worker.name
+            ));
+        }
+    } else if !config.files.is_empty() {
+        exec.cwd = Some(root.path().to_string_lossy().into_owned());
+    }
+    exec.env = config.env;
+    Ok(PreparedWorker { exec, _root: root })
 }
 
 /// Queue enqueue response returned by `verglas-rest` and this service.
@@ -262,8 +352,7 @@ async fn execute_claimed(
     claimed: ClaimedJob,
 ) -> Result<(Lease, Completion), String> {
     let worker = client.worker(&claimed.job.worker).await?;
-    let exec =
-        WorkerExec::from_config(&worker.name, &worker.code).map_err(|error| error.to_string())?;
+    let prepared = prepare_worker(&worker)?;
     let output = worker.output.unwrap_or_default();
     let run = WorkerRun {
         deployment: &worker.name,
@@ -274,7 +363,7 @@ async fn execute_claimed(
     let mut lease = claimed.lease;
     let renew_every = Duration::from_secs((args.lease_seconds / 2).max(1));
     let mut renewal_error = None;
-    let mut execution = Box::pin(run_worker(&run, &exec, &claimed.job.event));
+    let mut execution = Box::pin(run_worker(&run, &prepared.exec, &claimed.job.event));
     let outcome = loop {
         tokio::select! {
             result = &mut execution => break result,
@@ -498,6 +587,39 @@ mod tests {
         format!("http://{address}")
     }
 
+    /// Bundled files and plain environment bindings are materialized for one
+    /// run, and a relative cwd resolves inside that isolated bundle.
+    #[test]
+    fn prepares_a_portable_worker_bundle() {
+        let worker = WorkerRecord {
+            name: "spy-ohlcv".to_owned(),
+            code: r#"{"exec":["python3","spy_ohlcv.py"],"cwd":"."}"#.to_owned(),
+            output: Some("market.spy_ohlcv".to_owned()),
+            triggers: "[]".to_owned(),
+            state: "running".to_owned(),
+            config: r#"{
+                "env":{"SYMBOL":"SPY"},
+                "files":{"spy_ohlcv.py":"print('ready')\n"}
+            }"#
+            .to_owned(),
+        };
+
+        let prepared = prepare_worker(&worker).expect("prepare bundle");
+        assert_eq!(
+            prepared.exec.env.get("SYMBOL").map(String::as_str),
+            Some("SPY")
+        );
+        assert_eq!(
+            std::fs::read_to_string(prepared._root.path().join("spy_ohlcv.py"))
+                .expect("bundled file"),
+            "print('ready')\n"
+        );
+        assert_eq!(
+            prepared.exec.cwd.as_deref(),
+            Some(prepared._root.path().join("").to_string_lossy().as_ref())
+        );
+    }
+
     /// The pushed-event API acknowledges only after the queue persists the event.
     #[tokio::test]
     async fn pushed_event_is_persisted_before_acceptance() {
@@ -541,7 +663,8 @@ mod tests {
                         "code": code,
                         "output": "app.output",
                         "triggers": "[]",
-                        "state": "running"
+                        "state": "running",
+                        "config": "{}"
                     }))
                 }
             }),

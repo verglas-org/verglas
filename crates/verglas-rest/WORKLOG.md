@@ -5,3 +5,4 @@
 - #11: Added the on-prem scheduler queue transport and pushed-event ingress wiring. HTTP worker routes now preserve method, path, end-to-end headers, and body while lease renewal, completion, attempt inspection, and exact deadline APIs remain storage-only REST operations.
 - #11: Removed the scheduler persistence facade after moving the queue to Postgres in the standalone service. REST now only validates deployments and forwards bounded manual, HTTP callback, and catalog-update events when scheduling is configured.
 - #11: Unified manual, HTTP, and catalog ingress around CloudEvents. Generic event fan-out now matches exact subscription attributes and forwards the unchanged envelope to the scheduler.
+- #11: Exposed structured CloudEvents through the on-prem REST service and preserved their envelopes during exact worker-subscription fan-out. The write ingress also forwards idempotency keys, allowing broker redelivery to remain safe at the Iceberg commit boundary.

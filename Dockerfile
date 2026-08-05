@@ -25,6 +25,9 @@ RUN apt-get update \
     && chown -R verglas:verglas /var/lib/verglas
 
 FROM runtime AS verglas-scheduler
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler
 USER verglas
 EXPOSE 8340
