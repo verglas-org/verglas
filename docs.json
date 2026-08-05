@@ -50,6 +50,7 @@
   "navbar": {
     "links": [
       {
+        "type": "github",
         "label": "GitHub",
         "href": "https://github.com/verglas-org/verglas"
       }
