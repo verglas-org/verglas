@@ -1,7 +1,7 @@
 //! The follow-worker manager: keeps a long-lived follow runner alive for every
 //! active worker whose trigger is `follow`.
 //!
-//! Cron/data_change/webhook workers run as one-shot subprocesses per fire (see
+//! Cron, event, and webhook workers run as one-shot subprocesses per fire (see
 //! [`crate::platform`]). A `follow` worker is different: it runs continuously,
 //! tailing a file or wrapping a command, and streams captured lines into its
 //! target table as rows. This manager reconciles the set of running follow
@@ -209,10 +209,13 @@ impl FollowManager {
 /// A follow worker's target: `Some(Some(path))` tails a file, `Some(None)` wraps
 /// the worker's command, `None` means the worker has no follow trigger.
 fn follow_target(worker: &WorkerRow) -> Option<Option<String>> {
-    parse_triggers(worker).into_iter().find_map(|t| match t {
-        TriggerSpec::Follow { file } => Some(file),
-        _ => None,
-    })
+    parse_triggers(worker)
+        .ok()?
+        .into_iter()
+        .find_map(|t| match t {
+            TriggerSpec::Follow { file } => Some(file),
+            _ => None,
+        })
 }
 
 /// Spawns the manager's reconcile loop, detached for the process lifetime. Like

@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 verglas-pgcdc.workspace = true
 # The env-in / result-file-out worker contract (env const names, RunResult,
-# TriggerEvent) shared with the harness and the TS SDK's endpoint-run.
+# CloudEvent) shared with the harness and the TS SDK's endpoint-run.
 verglas-sdk.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

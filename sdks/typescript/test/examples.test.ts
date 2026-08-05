@@ -1,7 +1,7 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { connect, runWorker, type TriggerEvent, type WorkerContext, type VerglasClient } from "../src/index";
+import { connect, runWorker, type CloudEvent, type WorkerContext, type VerglasClient } from "../src/index";
 import { httpPollWorker, webhookWorker, changeFanoutWorker } from "../src/examples/index";
 import { startMockEndpoint, type MockEndpoint } from "./mock-endpoint";
 
@@ -15,7 +15,7 @@ beforeEach(async () => {
 afterEach(() => endpoint.close());
 
 /** A test WorkerContext with a captured log, the given output, trigger, and env. */
-function ctx<Env>(output: string, env: Env, trigger: TriggerEvent): WorkerContext<Env> & { logs: { message: string }[] } {
+function ctx<Env>(output: string, env: Env, trigger: CloudEvent): WorkerContext<Env> & { logs: { message: string }[] } {
   const logs: { message: string }[] = [];
   return {
     client,
@@ -61,10 +61,14 @@ describe("httpPollWorker", () => {
       POLL_ITEMS_KEY: "items",
       POLL_TIME_FIELD: "t",
     };
-    const trigger: TriggerEvent = {
-      type: "cron",
-      intervalStart: "2026-08-01T00:00:00Z",
-      intervalEnd: "2026-08-02T00:00:00Z", // exclusive: excludes the second row
+    const trigger: CloudEvent = {
+      specversion: "1.0", id: "tick-1", source: "urn:test",
+      type: "org.verglas.schedule.tick",
+      data: {
+        logicalDate: "2026-08-02T00:00:00Z",
+        intervalStart: "2026-08-01T00:00:00Z",
+        intervalEnd: "2026-08-02T00:00:00Z", // exclusive: excludes the second row
+      },
     };
     const result = await runWorker(httpPollWorker, ctx("ext.points", env, trigger));
     await upstream.close();
@@ -76,13 +80,14 @@ describe("httpPollWorker", () => {
 
 describe("webhookWorker", () => {
   it("records the request body as a row", async () => {
-    const trigger: TriggerEvent = {
-      type: "webhook",
-      request: new Request("https://app/ingest", {
-        method: "POST",
+    const trigger: CloudEvent = {
+      specversion: "1.0", id: "http-1", source: "urn:test",
+      type: "org.verglas.http.request",
+      data: {
+        method: "POST", path: "/ingest",
         headers: { "content-type": "application/json", "x-webhook-token": "s3cr3t" },
-        body: JSON.stringify({ event: "signup", user: "u1" }),
-      }),
+        body: Array.from(new TextEncoder().encode(JSON.stringify({ event: "signup", user: "u1" }))),
+      },
     };
     const result = await runWorker(webhookWorker, ctx("app.events", { WEBHOOK_TOKEN: "s3cr3t" }, trigger));
     expect(result?.rowsWritten).toBe(1);
@@ -92,9 +97,10 @@ describe("webhookWorker", () => {
   });
 
   it("rejects a bad webhook token", async () => {
-    const trigger: TriggerEvent = {
-      type: "webhook",
-      request: new Request("https://app/ingest", { method: "POST", body: "{}" }),
+    const trigger: CloudEvent = {
+      specversion: "1.0", id: "http-2", source: "urn:test",
+      type: "org.verglas.http.request",
+      data: { method: "POST", path: "/ingest", headers: {}, body: [123, 125] },
     };
     await expect(
       runWorker(webhookWorker, ctx("app.events", { WEBHOOK_TOKEN: "s3cr3t" }, trigger), { logging: false }),
@@ -107,9 +113,10 @@ describe("changeFanoutWorker", () => {
     const input = client.table<{ v: number }>("app.input");
     await input.append([{ v: 2 }, { v: 3 }]);
 
-    const trigger: TriggerEvent = {
-      type: "data_change",
-      change: { seq: 1, table: "app.input", snapshotId: "snap-2", committedAt: "2026-08-01T00:00:00Z" },
+    const trigger: CloudEvent = {
+      specversion: "1.0", id: "snap-2", source: "urn:test",
+      type: "org.apache.iceberg.snapshot.committed", subject: "app.input",
+      data: { snapshotId: "snap-2", table: "app.input" },
     };
     const result = await runWorker(
       changeFanoutWorker,

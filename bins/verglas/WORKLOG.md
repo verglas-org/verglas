@@ -726,3 +726,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #3: Corrected the execution-boundary tests after rebasing the isolated roles:
   table metadata reads now exercise the customer Iceberg REST catalog directly,
   while create, append, query, graph, and maintenance requests exercise Verglas.
+- #11: Added `webhook` and `data_change` to the portable worker manifest and projected them into both the local registry and cloud trigger configuration. Operators can now create every bounded scheduler trigger through `verglas workers create --file` instead of hand-writing REST payloads.
+- #11: Replaced the portable data-change manifest with a generic CloudEvent subscription over exact type and optional source and subject. Local and cloud projections now carry the same event filter contract.
+- #11: Let one portable worker declaration contain cron, HTTP, and CloudEvent triggers while keeping manual dispatch implicit. Worker files can now be bundled with relative `@file:` references, and the CLI rejects the removed singular-trigger manifest instead of preserving a compatibility path.

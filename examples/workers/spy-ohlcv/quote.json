@@ -1,0 +1,18 @@
+{
+  "specversion": "1.0",
+  "id": "SPY-2026-08-03",
+  "source": "urn:rabbitmq:market-data",
+  "type": "com.yahoo.finance.quote",
+  "subject": "SPY",
+  "time": "2026-08-03T20:00:00Z",
+  "datacontenttype": "application/json",
+  "data": {
+    "symbol": "SPY",
+    "timestamp": "2026-08-03T20:00:00Z",
+    "open": 631.20,
+    "high": 633.91,
+    "low": 629.88,
+    "close": 632.08,
+    "volume": 71345000
+  }
+}

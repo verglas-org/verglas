@@ -80,3 +80,5 @@
   default response-header deadline to cover cold worker startup and remote
   catalog planning.
 - #8: Separated the bootstrap endpoint from the discovered query/write endpoint. The SDK now uses the three server-advertised on-prem destinations instead of assuming execution shares the bootstrap URL.
+- #11: Added complete HTTP callback and manual worker events plus strict subprocess event decoding. Removed WebSocket from the worker scheduling trigger contract; catalog change-feed WebSockets remain a separate client transport.
+- #11: Replaced runtime trigger variants with a validated CloudEvents 1.0 envelope and exact event subscription filters. Subprocess workers now read one `VERGLAS_CLOUD_EVENT` value with no legacy environment fallback.

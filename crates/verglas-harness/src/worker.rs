@@ -11,11 +11,12 @@
 //! pipeline telemetry; this executor only runs the subprocess and returns its
 //! outcome.
 
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use verglas_sdk::worker::{
-    ENV_DEPLOYMENT, ENV_ENDPOINT, ENV_INTERVAL_END, ENV_INTERVAL_START, ENV_LOGICAL_DATE,
-    ENV_RESULT_PATH, ENV_TARGET, ENV_TOKEN, ENV_TRIGGER, RunResult, TriggerEvent,
+    CloudEvent, ENV_CLOUD_EVENT, ENV_DEPLOYMENT, ENV_ENDPOINT, ENV_RESULT_PATH, ENV_TARGET,
+    ENV_TOKEN, RunResult,
 };
 
 use crate::commit::HarnessError;
@@ -30,6 +31,9 @@ pub struct WorkerExec {
     pub args: Vec<String>,
     /// The working directory, if the worker needs one.
     pub cwd: Option<String>,
+    /// Plain deployment environment bindings injected before reserved runtime
+    /// bindings such as the endpoint and CloudEvent.
+    pub env: BTreeMap<String, String>,
 }
 
 impl WorkerExec {
@@ -61,6 +65,7 @@ impl WorkerExec {
             command,
             args: parts.collect(),
             cwd,
+            env: BTreeMap::new(),
         })
     }
 }
@@ -93,7 +98,7 @@ pub struct WorkerOutcome {
 pub async fn run_worker(
     run: &WorkerRun<'_>,
     exec: &WorkerExec,
-    event: &TriggerEvent,
+    event: &CloudEvent,
 ) -> Result<WorkerOutcome, HarnessError> {
     drive(run, exec, event).await
 }
@@ -103,7 +108,7 @@ pub async fn run_worker(
 async fn drive(
     run: &WorkerRun<'_>,
     exec: &WorkerExec,
-    event: &TriggerEvent,
+    event: &CloudEvent,
 ) -> Result<WorkerOutcome, HarnessError> {
     let result_path = std::env::temp_dir().join(format!("verglas-worker-{}.json", Uuid::new_v4()));
 
@@ -112,7 +117,8 @@ async fn drive(
     if let Some(cwd) = &exec.cwd {
         cmd.current_dir(cwd);
     }
-    for (key, value) in run_env(run, event, &result_path) {
+    cmd.envs(&exec.env);
+    for (key, value) in run_env(run, event, &result_path)? {
         cmd.env(key, value);
     }
 
@@ -130,11 +136,15 @@ async fn drive(
 /// endpoint, token, and result path. Mirrors the TS `endpoint-run` env contract.
 fn run_env(
     run: &WorkerRun<'_>,
-    event: &TriggerEvent,
+    event: &CloudEvent,
     result_path: &std::path::Path,
-) -> Vec<(String, String)> {
-    let mut env = vec![
-        (ENV_TRIGGER.to_owned(), event.kind().to_owned()),
+) -> Result<Vec<(String, String)>, HarnessError> {
+    let event_json = serde_json::to_string(event)
+        .map_err(|error| HarnessError::Job(format!("serialize worker event: {error}")))?;
+    event
+        .validate()
+        .map_err(|error| HarnessError::Job(format!("invalid worker CloudEvent: {error}")))?;
+    let env = vec![
         (ENV_DEPLOYMENT.to_owned(), run.deployment.to_owned()),
         (ENV_TARGET.to_owned(), run.output.to_owned()),
         (ENV_ENDPOINT.to_owned(), run.endpoint.to_owned()),
@@ -143,19 +153,9 @@ fn run_env(
             ENV_RESULT_PATH.to_owned(),
             result_path.to_string_lossy().into_owned(),
         ),
+        (ENV_CLOUD_EVENT.to_owned(), event_json),
     ];
-    if let TriggerEvent::Cron(interval) = event {
-        if let Some(v) = &interval.logical_date {
-            env.push((ENV_LOGICAL_DATE.to_owned(), v.clone()));
-        }
-        if let Some(v) = &interval.interval_start {
-            env.push((ENV_INTERVAL_START.to_owned(), v.clone()));
-        }
-        if let Some(v) = &interval.interval_end {
-            env.push((ENV_INTERVAL_END.to_owned(), v.clone()));
-        }
-    }
-    env
+    Ok(env)
 }
 
 /// Interprets the child's result file and exit status. A result-file error, a
@@ -191,7 +191,6 @@ fn read_result(
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use verglas_sdk::worker::CronInterval;
 
     /// A worker with no `exec` is rejected — the server only runs subprocess
     /// workers.
@@ -227,35 +226,31 @@ mod tests {
         assert!(WorkerExec::from_config("w", r#"{"exec":[]}"#).is_err());
     }
 
-    /// The cron interval env vars are bound only when present, and the trigger
-    /// kind is always set.
+    /// Every run crosses the subprocess boundary as one structured CloudEvent.
     #[test]
-    fn cron_env_carries_the_interval() {
+    fn env_carries_one_cloud_event() {
         let run = WorkerRun {
             deployment: "d",
             output: "a.b",
             endpoint: "http://127.0.0.1:8334",
             token: "",
         };
-        let event = TriggerEvent::Cron(CronInterval {
-            logical_date: Some("2026-08-01T00:00:00Z".to_owned()),
-            interval_start: Some("2026-07-31T00:00:00Z".to_owned()),
-            interval_end: None,
-        });
+        let mut event = CloudEvent::new("tick-1", "urn:verglas:scheduler", "org.verglas.cron");
+        event.data = Some(serde_json::json!({
+            "logicalDate": "2026-08-01T00:00:00Z",
+            "intervalStart": "2026-07-31T00:00:00Z",
+            "intervalEnd": "2026-08-01T00:00:00Z"
+        }));
         let env: HashMap<String, String> =
             run_env(&run, &event, std::path::Path::new("/tmp/r.json"))
+                .expect("run env")
                 .into_iter()
                 .collect();
-        assert_eq!(env.get(ENV_TRIGGER).map(String::as_str), Some("cron"));
         assert_eq!(env.get(ENV_TARGET).map(String::as_str), Some("a.b"));
+        let serialized = env.get(ENV_CLOUD_EVENT).expect("serialized event");
         assert_eq!(
-            env.get(ENV_LOGICAL_DATE).map(String::as_str),
-            Some("2026-08-01T00:00:00Z")
+            serde_json::from_str::<CloudEvent>(serialized).expect("event"),
+            event
         );
-        assert_eq!(
-            env.get(ENV_INTERVAL_START).map(String::as_str),
-            Some("2026-07-31T00:00:00Z")
-        );
-        assert!(!env.contains_key(ENV_INTERVAL_END), "absent end not bound");
     }
 }

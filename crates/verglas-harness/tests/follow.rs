@@ -66,6 +66,7 @@ async fn command_follow_captures_stdout_and_stderr() {
             "echo hello-out; echo hello-err 1>&2".to_owned(),
         ],
         cwd: None,
+        env: Default::default(),
     };
     // The command exits on its own, so shutdown is never signalled.
     let (_tx, rx) = watch::channel(false);
@@ -121,6 +122,7 @@ async fn shutdown_ends_a_running_follow() {
         command: "sh".to_owned(),
         args: vec!["-c".to_owned(), "echo up; sleep 30".to_owned()],
         cwd: None,
+        env: Default::default(),
     };
     let (tx, rx) = watch::channel(false);
     let handle = tokio::spawn(run_follow(

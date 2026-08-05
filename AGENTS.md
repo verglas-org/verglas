@@ -12,7 +12,7 @@ This project is pre-release. The rules that follow from that are strict:
 
 ## Sources of truth
 
-1. **WHITEPAPER.md** — the architecture and its reasoning. Read the relevant section before implementing; if an implementation decision contradicts the whitepaper, stop and raise it rather than silently diverging.
+1. **docs/architecture/whitepaper.mdx** — the architecture and its reasoning. Read the relevant section before implementing; if an implementation decision contradicts the whitepaper, stop and raise it rather than silently diverging.
 2. **GitHub issues** — every unit of work has an issue with Context / Work / Acceptance criteria. The acceptance criteria are the definition of done. Read the whole issue (including addenda after `---` separators) before writing code; cross-issue dependencies are tracked in the project board's "Blocked by" field.
 
 ## Worklog discipline (required for all transactions)

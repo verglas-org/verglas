@@ -1,134 +1,287 @@
 ---
-title: "Workers"
-description: "Build bounded, event-driven workloads that run locally or in Verglas Cloud."
+title: "Ingest SPY market data with a worker"
+description: "Run one worker manually, by HTTP, on cron, or from RabbitMQ CloudEvents."
 icon: "workflow"
 ---
 
-A worker combines code, a trigger, output tables, configuration, secrets, and resource hints. One dispatch invokes one bounded run. The same portable specification can register on a local server or in Verglas Cloud.
+This tutorial creates one worker that writes SPY daily open, high, low, close,
+and volume (OHLCV) rows to an Iceberg table. You use the same worker for a
+manual pull, an HTTP-requested range, a one-year cron backfill, and a quote
+delivered through RabbitMQ.
 
-## Worker invariants
+The complete example is in
+[`examples/workers/spy-ohlcv`](https://github.com/verglas-org/verglas/tree/main/examples/workers/spy-ohlcv).
 
-Design every worker around the following rules:
+## Worker event flow
 
-- Treat the trigger and committed table data as the complete input to a run.
-- Keep no durable process state between runs.
-- Use the cron event's half-open interval `[intervalStart, intervalEnd)` for incremental pulls.
-- Read output table names from deployment configuration instead of hard-coding them.
-- Make every commit idempotent so a replay does not duplicate data.
-- Read secrets from the runtime environment and never write them to logs.
-
-## Worker lifecycle
+Every bounded run receives one CloudEvents 1.0 envelope. The scheduler stores
+the envelope in Postgres before it acknowledges the event. The worker uses the
+CloudEvent `source` and `id` as its Iceberg commit idempotency key.
 
 ```mermaid
-sequenceDiagram
-    participant T as Trigger
-    participant P as Verglas platform
-    participant W as Worker
-    participant I as Iceberg table
-
-    T->>P: Dispatch event
-    P->>W: Context, endpoint, token, outputs, secrets
-    W->>I: Read committed input
-    W->>I: Append with idempotency key
-    I-->>W: Snapshot and watermark
-    W-->>P: rowsWritten summary
-    P->>P: Record structured run logs
+flowchart LR
+    M["Manual run"] --> R["Verglas REST"]
+    H["HTTP callback"] --> R
+    C["Cron interval"] --> S["Verglas scheduler"]
+    Q["RabbitMQ quote"] --> B["CloudEvent bridge"] --> R
+    R --> S --> W["SPY OHLCV worker"] --> I["Iceberg table"]
 ```
 
-## Current trigger surfaces
+The broker integration follows the same separation that RisingWave uses for
+stream sources: transport configuration is separate from message encoding.
+RabbitMQ owns delivery, CloudEvents defines the message envelope, and Verglas
+matches the event to a worker. The scheduler has no RabbitMQ-specific payload.
 
-The SDK contract defines the following trigger events:
+## Before you begin
 
-| Trigger | Dispatch payload | Typical use |
-| --- | --- | --- |
-| `cron` | Logical date and interval bounds | Scheduled ingestion and backfill |
-| `webhook` | An inbound `Request` | HTTP ingestion |
-| `websocket` | One data frame | Event-driven socket workloads |
-| `data_change` | A table commit notification | Incremental transformations |
-| `kafka` | Topic, partition, offset, key, and value | Stream ingestion |
+You need the following software and configuration:
 
-The portable CLI manifest currently registers `cron` and `manual` cloud workers. It also registers local-only `follow` workers. The SDK types the broader trigger contract used by the platform runtime.
+- Docker with Docker Compose.
+- The `verglas` CLI built from this repository.
+- A working `deploy/docker/verglas.toml` file and object-store credentials.
+- A Postgres database for the optional scheduler service.
 
-## Create a portable worker
+From the repository root, start Verglas without the optional worker profile:
 
-The current manifest supports JSON and TOML. This filled TOML example packages a Python entrypoint and a referenced secret:
+```bash
+docker compose up --detach --build
+```
 
-```toml metrics-worker.toml
+Worker registration and the rest of the lakehouse remain available when the
+scheduler is off.
+
+## Create the target table
+
+The example appends JSON Lines data through the isolated Verglas write role.
+Create the table from one seed row so Iceberg has the expected schema:
+
+```bash
+export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+verglas table create \
+  market.spy_ohlcv \
+  examples/workers/spy-ohlcv/seed.jsonl
+```
+
+## Review the worker definition
+
+The manifest bundles `spy_ohlcv.py` from a path relative to the manifest. The
+three declarations cover HTTP, cron, and CloudEvent subscriptions. Manual
+dispatch is available to every worker and does not need a trigger declaration.
+
+```toml
 spec_version = 1
-name = "metrics-collector"
-exec = ["python3", "collector.py"]
-cwd = "/app"
-target_tables = ["observability.host_metrics"]
+name = "spy-ohlcv"
+exec = ["python3", "spy_ohlcv.py"]
+cwd = "."
+target_tables = ["market.spy_ohlcv"]
 
 [files]
-"collector.py" = "# packaged worker entrypoint\n"
+"spy_ohlcv.py" = "@file:spy_ohlcv.py"
 
 [env]
-METRICS_URL = "https://metrics.example.com/v1/samples"
-METRICS_TOKEN = "@secret:METRICS_TOKEN"
+SYMBOL = "SPY"
 
-[trigger]
+[[triggers]]
+type = "webhook"
+path = "/market-data/spy"
+
+[[triggers]]
 type = "cron"
-cron = "*/10 * * * *"
+cron = "0 22 * * 1-5"
+start_date = "2025-08-04T00:00:00Z"
+catchup = "sequential"
 
-[resources]
-vcpus = 0.5
-mem_mib = 512
+[[triggers]]
+type = "event"
+event_type = "com.yahoo.finance.quote"
+source = "urn:rabbitmq:market-data"
+subject = "SPY"
 ```
 
-Create the secret and worker in the cloud:
+The cron schedule runs at 22:00 UTC on weekdays. The `start_date` and
+`sequential` catch-up policy create one ordered logical interval for every
+missed weekday in the preceding year. Each run asks Yahoo Finance for only its
+half-open interval, `[intervalStart, intervalEnd)`.
+
+Register the worker on the local server:
 
 ```bash
-printf '%s' "$METRICS_TOKEN" | verglas secrets set METRICS_TOKEN
-verglas workers create --file ./metrics-worker.toml
+verglas workers create \
+  --local \
+  --file examples/workers/spy-ohlcv/worker.toml
 ```
 
-Register the same file locally:
+## Start the scheduler and cron backfill
+
+Start the Postgres database that stores durable worker jobs:
 
 ```bash
-verglas workers create --file ./metrics-worker.toml --local
-verglas workers push metrics-collector
+docker run --detach \
+  --name verglas-workers-postgres \
+  --publish 5432:5432 \
+  --env POSTGRES_USER=verglas \
+  --env POSTGRES_PASSWORD=verglas \
+  --env POSTGRES_DB=verglas \
+  postgres:17
 ```
 
-## Inspect and operate workers
+Enable the worker profile and recreate Verglas with its scheduler route:
 
 ```bash
-verglas workers list
-verglas workers get metrics-collector
-verglas workers run metrics-collector
-verglas workers logs metrics-collector
-verglas workers update metrics-collector --schedule '0 * * * *'
-verglas workers update metrics-collector --status paused
-verglas workers delete metrics-collector
+export COMPOSE_PROFILES=workers
+export VERGLAS_SCHEDULER_URL=http://verglas-scheduler:8340
+export VERGLAS_SCHEDULER_DATABASE_URL=\
+postgres://verglas:verglas@host.docker.internal:5432/verglas
+docker compose up --detach --build
 ```
 
-Pass `--json` before `workers` when a script needs a stable machine-readable response.
+The scheduler reads the registered worker at startup and immediately creates
+the year of missed cron intervals. It then waits for the exact next deadline or
+an incoming worker event; it does not poll. If you omit the scheduler URL and
+Postgres database, Docker Compose runs Verglas without worker scheduling.
 
-## Backfill with logical time
+## Run the worker manually
 
-The TypeScript worker contract supports `startDate` and `catchup` on cron trigger definitions:
+A manual run fetches the most recent seven days when the event does not specify
+a range. Provide a unique idempotency key for the request:
 
-```ts
-triggers: [
-  {
-    type: "cron",
-    schedule: "0 * * * *",
-    startDate: "2026-08-01T00:00:00Z",
-    catchup: "sequential",
-  },
-]
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Idempotency-Key: spy-manual-2026-08-04' \
+  http://127.0.0.1:8334/v1/workers/spy-ohlcv/run
 ```
 
-Each replayed run receives its own logical interval. Range the upstream request over that interval. Do not store a cross-run watermark in the worker.
+The response contains the durable scheduler job ID. Repeating the request with
+the same header returns the existing job instead of creating another run.
 
-## Use idempotency keys
+## Request a range by HTTP
 
-Use a stable input identifier as the commit idempotency key. A `data_change` worker can use the input snapshot ID:
+The registered webhook path is available below `/v1/http`. Send a start and end
+time in the request body:
 
-```ts
-const result = await ctx.client.table(ctx.output).append(rows, {
-  idempotencyKey: `analytics.orders@${ctx.trigger.change.snapshotId}`,
-});
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --header 'Idempotency-Key: spy-http-2026-07' \
+  --data '{"start":"2026-07-01T00:00:00Z","end":"2026-08-01T00:00:00Z"}' \
+  http://127.0.0.1:8334/v1/http/market-data/spy
 ```
 
-If the platform replays the trigger, the duplicate commit becomes a no-op instead of appending the same rows twice.
+Verglas preserves the method, path, headers, and body in an
+`org.verglas.http.request` CloudEvent. The worker decodes the body and fetches
+that range from Yahoo Finance.
+
+## Send a quote through RabbitMQ
+
+This procedure starts open-source RabbitMQ and a small transport bridge. The
+bridge acknowledges a RabbitMQ delivery only after Verglas returns HTTP 202,
+which means the matching jobs are durable in Postgres.
+
+Start RabbitMQ on the same Docker network as Verglas:
+
+```bash
+docker run --detach \
+  --name rabbitmq \
+  --network verglas_default \
+  --publish 5672:5672 \
+  --publish 15672:15672 \
+  rabbitmq:4-management
+```
+
+Build the bridge image:
+
+```bash
+docker build \
+  --tag verglas/rabbitmq-cloudevents:local \
+  --file examples/workers/spy-ohlcv/Dockerfile.rabbitmq-bridge \
+  examples/workers/spy-ohlcv
+```
+
+Create the durable queue:
+
+```bash
+curl --fail-with-body \
+  --user guest:guest \
+  --request PUT \
+  --header 'Content-Type: application/json' \
+  --data '{"durable":true}' \
+  http://127.0.0.1:15672/api/queues/%2F/yahoo-quotes
+```
+
+Publish the example quote as a structured CloudEvent:
+
+```bash
+jq --raw-input --slurp \
+  '{properties:{content_type:"application/cloudevents+json",delivery_mode:2},
+    routing_key:"yahoo-quotes",payload:.,payload_encoding:"string"}' \
+  examples/workers/spy-ohlcv/quote.json |
+curl --fail-with-body \
+  --user guest:guest \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data-binary @- \
+  http://127.0.0.1:15672/api/exchanges/%2F/amq.default/publish
+```
+
+Read and requeue the CloudEvent to verify the broker payload before starting
+the bridge:
+
+```bash
+curl --fail-with-body \
+  --user guest:guest \
+  --request POST \
+  --header 'Content-Type: application/json' \
+  --data '{"count":1,"ackmode":"ack_requeue_true","encoding":"auto"}' \
+  http://127.0.0.1:15672/api/queues/%2F/yahoo-quotes/get |
+jq --raw-output '.[0].payload | fromjson'
+```
+
+Start the bridge:
+
+```bash
+docker run --detach \
+  --name verglas-rabbitmq-bridge \
+  --network verglas_default \
+  --env RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/%2F \
+  --env RABBITMQ_QUEUE=yahoo-quotes \
+  --env VERGLAS_EVENTS_URL=http://verglas-server:8334/v1/events \
+  verglas/rabbitmq-cloudevents:local
+```
+
+The worker subscription requires the exact type, source, and subject from
+`quote.json`. A message that differs on any configured attribute remains a valid
+CloudEvent but does not start this worker.
+
+## Verify the result
+
+Inspect the target table after the jobs finish:
+
+```bash
+verglas table show market.spy_ohlcv
+verglas query \
+  'SELECT timestamp, open, high, low, close, volume
+   FROM market.spy_ohlcv
+   ORDER BY timestamp DESC
+   LIMIT 10'
+```
+
+The table contains the seed, Yahoo Finance ranges, and the RabbitMQ quote. If an
+HTTP request or broker message is delivered again with the same CloudEvent
+identity, the keyed Iceberg commit is a no-op.
+
+## Trigger reference
+
+The following table summarizes the runtime event for each surface:
+
+| Surface | CloudEvent type | Data |
+| --- | --- | --- |
+| Manual | `org.verglas.worker.manual` | Empty; this example fetches seven days. |
+| Cron | `org.verglas.schedule.tick` | Logical date, interval start, and interval end. |
+| HTTP | `org.verglas.http.request` | Method, path, headers, and body bytes. |
+| Broker | Producer-defined | The structured CloudEvent forwarded unchanged. |
+
+An event subscription uses exact matching for `type` and optional exact
+matching for `source` and `subject`. The scheduler identity is the worker name,
+CloudEvent source, and CloudEvent ID.

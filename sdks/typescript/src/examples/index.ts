@@ -1,5 +1,5 @@
 // Reference workers. Domain-neutral templates an agent can generate against, one
-// per trigger shape: a cron poller, a webhook ingress, and a data_change fan-out.
+// per trigger shape: a cron poller, a webhook ingress, and an Iceberg-event fan-out.
 
 export { httpPollWorker } from "./http-poll-worker";
 export type { HttpPollEnv } from "./http-poll-worker";

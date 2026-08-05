@@ -20,20 +20,13 @@ export type {
   WorkerDefinition,
   WorkerResult,
   RunWorkerOptions,
-  // Trigger events (runtime payload on ctx.trigger)
-  TriggerEvent,
-  CronTriggerEvent,
-  WebhookTriggerEvent,
-  WebSocketTriggerEvent,
-  DataChangeTriggerEvent,
-  KafkaTriggerEvent,
+  // CloudEvents runtime payload on ctx.trigger
+  CloudEvent,
   // Trigger specs (deployment config the SDK types)
   TriggerSpec,
   CronTriggerSpec,
   WebhookTriggerSpec,
-  WebSocketTriggerSpec,
-  DataChangeTriggerSpec,
-  KafkaTriggerSpec,
+  EventTriggerSpec,
 } from "./contracts";
 
 export type {
