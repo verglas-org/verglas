@@ -597,3 +597,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #19: Capped the self-hosted server container at 8,192 open file descriptors.
   Docker previously granted it 1,048,576, so a future socket or cache leak could
   exhaust the host file table instead of failing inside the container.
+- #18: Added an explicit environment-configured startup mode for the Docker image. The Compose application now supplies cache, R2, catalog, endpoint-auth, and execution-role settings directly and no longer copies or mounts a server TOML or credentials directory.

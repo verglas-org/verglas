@@ -37,7 +37,6 @@ FROM runtime AS verglas-server
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server
 COPY --from=build /src/target/release/verglas-query /usr/local/bin/verglas-query
 COPY --from=build /src/target/release/verglas-write /usr/local/bin/verglas-write
-COPY deploy/docker/verglas.toml /etc/verglas/config.toml
 USER verglas
 EXPOSE 8333 8334
-ENTRYPOINT ["verglas-server", "--config", "/etc/verglas/config.toml"]
+ENTRYPOINT ["verglas-server", "--environment"]
