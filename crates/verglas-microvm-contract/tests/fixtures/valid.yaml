@@ -1,0 +1,61 @@
+apiVersion: verglas.io/v1alpha1
+kind: MicroVMStack
+
+tenant:
+  name: tenant-runtime
+  network: vxlan
+
+ingress:
+  component: scheduler
+  port: api
+
+components:
+  - name: cache
+    runtime:
+      image: ghcr.io/verglas/cache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    exec: ["/usr/local/bin/cache-boot.sh"]
+    cluster:
+      members: 3
+    resources:
+      vcpus: 1
+      memoryMiB: 512
+    network:
+      ports:
+        - name: cache
+          port: 8333
+          protocol: tcp
+    health:
+      port: cache
+
+  - name: postgres
+    runtime:
+      image: ghcr.io/verglas/neon-postgres@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+    exec: ["/usr/local/bin/postgres-boot.sh"]
+    dependsOn: [cache]
+    resources:
+      vcpus: 2
+      memoryMiB: 2048
+    network:
+      ports:
+        - name: postgres
+          port: 55433
+          protocol: tcp
+    health:
+      port: postgres
+
+  - name: scheduler
+    runtime:
+      image: ghcr.io/verglas/scheduler@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    exec: ["/usr/local/bin/verglas-scheduler"]
+    dependsOn: [postgres]
+    resources:
+      vcpus: 1
+      memoryMiB: 512
+    network:
+      ports:
+        - name: api
+          port: 8443
+          protocol: http
+    health:
+      port: api
+      path: /ready

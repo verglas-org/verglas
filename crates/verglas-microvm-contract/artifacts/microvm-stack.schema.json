@@ -1,0 +1,299 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MicroVmStack",
+  "description": "A complete portable microVM dependency graph.",
+  "type": "object",
+  "properties": {
+    "apiVersion": {
+      "description": "Contract API version. Must be `verglas.io/v1alpha1`.",
+      "type": "string"
+    },
+    "components": {
+      "description": "Desired microVM components and their dependency graph.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Component"
+      }
+    },
+    "ingress": {
+      "description": "The sole platform-callable entry point for a dormant stack.",
+      "$ref": "#/$defs/Ingress"
+    },
+    "kind": {
+      "description": "Manifest kind. Must be `MicroVMStack`.",
+      "type": "string"
+    },
+    "tenant": {
+      "description": "Tenant identity and isolation network.",
+      "$ref": "#/$defs/Tenant"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "apiVersion",
+    "kind",
+    "tenant",
+    "ingress",
+    "components"
+  ],
+  "$defs": {
+    "Cluster": {
+      "description": "Fixed-size quorum cluster configuration.",
+      "type": "object",
+      "properties": {
+        "members": {
+          "description": "Number of stable ordinal members in the cluster.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "members"
+      ]
+    },
+    "Component": {
+      "description": "One microVM component in the desired dependency graph.",
+      "type": "object",
+      "properties": {
+        "cluster": {
+          "description": "Optional fixed-size quorum cluster.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Cluster"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "dependsOn": {
+          "description": "Components that must be healthy before this component starts.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string"
+          }
+        },
+        "exec": {
+          "description": "Process and arguments started inside the microVM.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "health": {
+          "description": "Optional readiness condition.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Health"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "name": {
+          "description": "Unique name used for dependency and network resolution.",
+          "type": "string"
+        },
+        "network": {
+          "description": "Optional named ports provided inside the tenant network.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ComponentNetwork"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "resources": {
+          "description": "Requested microVM compute resources.",
+          "$ref": "#/$defs/Resources"
+        },
+        "runtime": {
+          "description": "Bootable runtime image.",
+          "$ref": "#/$defs/Runtime"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "runtime",
+        "exec",
+        "resources"
+      ]
+    },
+    "ComponentNetwork": {
+      "description": "Named ports provided by one component.",
+      "type": "object",
+      "properties": {
+        "ports": {
+          "description": "Ports addressable by dependencies or stack ingress.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/NetworkPort"
+          }
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "ports"
+      ]
+    },
+    "Health": {
+      "description": "Component readiness declaration.",
+      "type": "object",
+      "properties": {
+        "path": {
+          "description": "Optional HTTP readiness path.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "port": {
+          "description": "Named port that must accept traffic.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "port"
+      ]
+    },
+    "Ingress": {
+      "description": "The single authenticated platform ingress into a dormant stack.",
+      "type": "object",
+      "properties": {
+        "component": {
+          "description": "Component receiving platform traffic.",
+          "type": "string"
+        },
+        "port": {
+          "description": "Named port on the ingress component.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "component",
+        "port"
+      ]
+    },
+    "NetworkPort": {
+      "description": "One named component port.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Stable port name used by health and ingress references.",
+          "type": "string"
+        },
+        "port": {
+          "description": "TCP port number.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "protocol": {
+          "description": "Protocol served on this port.",
+          "$ref": "#/$defs/NetworkProtocol"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "port",
+        "protocol"
+      ]
+    },
+    "NetworkProtocol": {
+      "description": "Supported component network protocols.",
+      "oneOf": [
+        {
+          "description": "Raw TCP traffic.",
+          "type": "string",
+          "const": "tcp"
+        },
+        {
+          "description": "HTTP traffic over TCP.",
+          "type": "string",
+          "const": "http"
+        }
+      ]
+    },
+    "Resources": {
+      "description": "Requested microVM compute resources.",
+      "type": "object",
+      "properties": {
+        "memoryMiB": {
+          "description": "Memory allocation in mebibytes.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "vcpus": {
+          "description": "Number of virtual CPUs.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "vcpus",
+        "memoryMiB"
+      ]
+    },
+    "Runtime": {
+      "description": "OCI runtime image selection.",
+      "type": "object",
+      "properties": {
+        "image": {
+          "description": "Digest-pinned OCI image reference.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "image"
+      ]
+    },
+    "Tenant": {
+      "description": "Tenant-scoped runtime identity and network isolation.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "description": "Stable tenant runtime name.",
+          "type": "string"
+        },
+        "network": {
+          "description": "Tenant network implementation.",
+          "$ref": "#/$defs/TenantNetwork"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "network"
+      ]
+    },
+    "TenantNetwork": {
+      "description": "Supported tenant network implementations.",
+      "oneOf": [
+        {
+          "description": "A tenant-specific VXLAN shared by every component instance.",
+          "type": "string",
+          "const": "vxlan"
+        }
+      ]
+    }
+  }
+}
