@@ -417,3 +417,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Verglas-hosted catalog service.
 - #8: Extended local access discovery with an explicit query API URI. On-prem clients now receive separate S3, query/write, and catalog proxy coordinates.
 - #16: Replaced the obsolete worklog-only dashboard sink concept with validated `[analytics.rill]` network configuration. The configuration names Rill's private runtime, browser address, and return S3 path, and requires an Iceberg catalog for table resolution.
+- #34: Removed the Rill-specific analytics schema and validation from core configuration. Legacy `[analytics.rill]` input is rejected as an unknown field instead of preserving a compatibility path.

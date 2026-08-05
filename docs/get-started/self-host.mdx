@@ -16,7 +16,6 @@ The running application exposes:
 | `8333` | S3-compatible cache | Query engines and SDKs |
 | `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
 | `8350` | Gadget runtime API and Cap'n Web RPC | Verglas OS |
-| `9009` | Rill | Optional analytics profile |
 
 ## Before you begin
 
@@ -92,7 +91,7 @@ with R2 enabled.
   <Step title="Review the complete Compose application">
     The repository's `docker-compose.yml` is the complete self-hosted
     configuration. It builds Verglas, persists the cache in a named volume,
-    and defines optional Workers and Analytics profiles.
+    and defines an optional Workers profile.
 
     ```yaml docker-compose.yml
     services:
@@ -122,10 +121,6 @@ with R2 enabled.
           VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
           VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
           VERGLAS_WRITE_WORKER_BINARY: /usr/local/bin/verglas-write
-          VERGLAS_RILL_URI: http://rill:9009
-          VERGLAS_RILL_INSTANCE_ID: default
-          VERGLAS_RILL_BROWSER_URI: http://127.0.0.1:9009
-          VERGLAS_RILL_S3_URI: http://verglas-server:8333
           VERGLAS_SCHEDULER_URL: ${VERGLAS_SCHEDULER_URL:-}
         volumes:
           - verglas-cache:/var/lib/verglas
@@ -185,32 +180,9 @@ with R2 enabled.
         profiles: [workers]
         restart: unless-stopped
 
-      rill-volume-init:
-        image: alpine:3.22
-        command: [chown, -R, "1001:1001", /var/lib/rill]
-        volumes:
-          - rill-data:/var/lib/rill
-        profiles: [analytics]
-        restart: "no"
-
-      rill:
-        image: rilldata/rill:v0.88.6
-        platform: linux/amd64
-        command: [start, /var/lib/rill, --no-open, --port, "9009"]
-        ports:
-          - "9009:9009"
-        volumes:
-          - rill-data:/var/lib/rill
-        depends_on:
-          rill-volume-init:
-            condition: service_completed_successfully
-        profiles: [analytics]
-        restart: unless-stopped
-
     volumes:
       verglas-cache:
       postgres-data:
-      rill-data:
     ```
   </Step>
 
@@ -265,4 +237,4 @@ docker compose down
 ```
 
 The named volumes remain. Add `--volumes` only when you intentionally want to
-delete the local cache, scheduler database, and Rill project.
+delete the local cache and scheduler database.

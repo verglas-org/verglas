@@ -56,13 +56,16 @@ fn docker_application_packages_execution_workers() {
         "VERGLAS_S3_SECRET_ACCESS_KEY",
         "VERGLAS_QUERY_WORKER_BINARY",
         "VERGLAS_WRITE_WORKER_BINARY",
-        "VERGLAS_RILL_URI",
-        "VERGLAS_RILL_BROWSER_URI",
-        "VERGLAS_RILL_S3_URI",
     ] {
         assert!(
             compose.contains(variable),
             "Compose must declare {variable}"
+        );
+    }
+    for removed in ["VERGLAS_RILL_", "rill:", "rill-data", "analytics"] {
+        assert!(
+            !compose.contains(removed),
+            "Compose still contains removed Rill surface {removed}"
         );
     }
 }

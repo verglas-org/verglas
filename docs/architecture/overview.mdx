@@ -30,7 +30,6 @@ one self-hosted service:
 | Query | Run bounded SQL in the isolated query role. |
 | Write | Commit logical table writes in the isolated write role. |
 | Scheduler | Persist and execute worker events when the optional Workers profile is running. |
-| Analytics | Manage Rill resources when the optional Analytics profile is running. |
 
 Cloud deployments use the same crates as separate roles. They do not run the
 self-hosted REST composition as one container. Cache, query, write, catalog,

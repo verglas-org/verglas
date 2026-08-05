@@ -1531,29 +1531,6 @@ async fn serve(
         build_query_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
     let write_worker_dispatcher =
         build_write_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
-    let dashboard_runtime = match (&config.analytics, &tables_slot) {
-        (Some(analytics), Some(tables)) => {
-            Some(Arc::new(verglas_rest::dashboard::DashboardRuntime::new(
-                tables.clone(),
-                &analytics.rill,
-                verglas_rest::dashboard::RillStorage {
-                    endpoint: analytics.rill.s3_uri.clone(),
-                    region: config
-                        .backend
-                        .region
-                        .clone()
-                        .unwrap_or_else(|| "us-east-1".to_owned()),
-                    access_key_id: credentials.0.clone(),
-                    secret_access_key: credentials.1.clone(),
-                },
-            )?))
-        }
-        (None, _) => None,
-        (Some(_), None) => {
-            return Err("analytics.rill requires a configured catalog".into());
-        }
-    };
-
     let admin_fut = serve_admin(
         admin_listener,
         health.clone(),
@@ -1567,7 +1544,6 @@ async fn serve(
             catalog: catalog_gateway,
             access,
             tables: tables_slot.clone(),
-            dashboards: dashboard_runtime,
             graphs: graphs_slot.clone(),
             vector: vector_slot.clone(),
             sys: sys_slot.clone(),

@@ -1328,7 +1328,7 @@ fn catalog_sigv4_and_bearer_token_are_mutually_exclusive() {
 }
 
 #[test]
-fn rill_analytics_parses_only_with_a_catalog() {
+fn legacy_rill_analytics_configuration_is_rejected() {
     let toml = format!(
         "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n\
          [backend]\nbucket = \"b\"\n\
@@ -1338,16 +1338,9 @@ fn rill_analytics_parses_only_with_a_catalog() {
          s3_uri = \"http://verglas-server:8333\"\n",
         scratch_dir("rill-analytics").display()
     );
-    let config = Config::from_toml_str(&toml).expect("Rill config parses");
-    config.validate().expect("Rill config validates");
-    let rill = &config.analytics.expect("analytics").rill;
-    assert_eq!(rill.instance_id, "default");
-    assert_eq!(rill.uri, "http://rill:9009");
-
-    let without_catalog = toml.replace("[catalog]\nuri = \"https://catalog.example.com\"\n", "");
-    let config = Config::from_toml_str(&without_catalog).expect("schema parses");
-    let error = config
-        .validate()
-        .expect_err("analytics without a catalog is rejected");
-    assert!(error.to_string().contains("analytics.rill"));
+    let error = Config::from_toml_str(&toml).expect_err("removed Rill config must be rejected");
+    assert!(
+        error.to_string().contains("analytics"),
+        "parse error must identify the removed analytics section: {error}"
+    );
 }

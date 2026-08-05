@@ -58,8 +58,6 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "verglas-server:",
         "postgres:",
         "verglas-scheduler:",
-        "rill-volume-init:",
-        "rill:",
         "VERGLAS_BACKEND_BUCKET:",
         "VERGLAS_BACKEND_ENDPOINT:",
         "VERGLAS_CATALOG_URI:",
@@ -73,10 +71,8 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "soft: 8192",
         "hard: 8192",
         "profiles: [workers]",
-        "profiles: [analytics]",
         "verglas-cache:",
         "postgres-data:",
-        "rill-data:",
     ] {
         assert!(
             compose.contains(required),
@@ -87,6 +83,17 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("config.toml"),
         "the server must be configured entirely by Compose"
     );
+    for removed in [
+        "rill:",
+        "rill-data",
+        "profiles: [analytics]",
+        "VERGLAS_RILL_",
+    ] {
+        assert!(
+            !compose.contains(removed),
+            "documented Compose file still contains removed Rill surface {removed}"
+        );
+    }
 }
 
 #[test]
