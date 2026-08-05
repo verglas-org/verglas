@@ -5,7 +5,8 @@
 use std::collections::HashMap;
 
 use verglas_core::config::{
-    Backend, ByteSize, Cache, Catalog, Config, Listen, Log, QueryWorker, WriteWorker,
+    Analytics, Backend, ByteSize, Cache, Catalog, Config, Listen, Log, QueryWorker, Rill,
+    WriteWorker,
 };
 
 /// A validated server configuration plus the S3 credentials accepted from
@@ -82,6 +83,14 @@ impl EnvironmentConfig {
             required("VERGLAS_S3_ACCESS_KEY_ID")?,
             required("VERGLAS_S3_SECRET_ACCESS_KEY")?,
         );
+        let analytics = Analytics {
+            rill: Rill {
+                uri: required("VERGLAS_RILL_URI")?,
+                instance_id: required("VERGLAS_RILL_INSTANCE_ID")?,
+                browser_uri: required("VERGLAS_RILL_BROWSER_URI")?,
+                s3_uri: required("VERGLAS_RILL_S3_URI")?,
+            },
+        };
         let config = Config {
             listen: Listen::default(),
             log: Log::default(),
@@ -91,6 +100,7 @@ impl EnvironmentConfig {
             catalog: Some(catalog),
             query_worker: Some(query_worker),
             write_worker: Some(write_worker),
+            analytics: Some(analytics),
             cluster: None,
             control_plane: None,
         };
@@ -156,6 +166,10 @@ mod tests {
             ("VERGLAS_S3_SECRET_ACCESS_KEY", "endpoint-secret"),
             ("VERGLAS_QUERY_WORKER_BINARY", "/usr/bin/true"),
             ("VERGLAS_WRITE_WORKER_BINARY", "/usr/bin/true"),
+            ("VERGLAS_RILL_URI", "http://rill:9009"),
+            ("VERGLAS_RILL_INSTANCE_ID", "default"),
+            ("VERGLAS_RILL_BROWSER_URI", "http://127.0.0.1:9009"),
+            ("VERGLAS_RILL_S3_URI", "http://verglas-server:8333"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -172,6 +186,8 @@ mod tests {
         let catalog = loaded.config.catalog.expect("catalog");
         assert_eq!(catalog.warehouse.as_deref(), Some("account_lake"));
         assert_eq!(catalog.bearer_token.as_deref(), Some("catalog-token"));
+        let analytics = loaded.config.analytics.expect("analytics");
+        assert_eq!(analytics.rill.uri, "http://rill:9009");
     }
 
     #[test]

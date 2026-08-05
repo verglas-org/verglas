@@ -598,3 +598,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Docker previously granted it 1,048,576, so a future socket or cache leak could
   exhaust the host file table instead of failing inside the container.
 - #18: Added an explicit environment-configured startup mode for the Docker image. The Compose application now supplies cache, R2, catalog, endpoint-auth, and execution-role settings directly and no longer copies or mounts a server TOML or credentials directory.
+- #16: Wired the optional Rill analytics runtime into the on-prem REST composition from validated server configuration. Rill receives the resolved Verglas S3 credentials only over the private deployment network, while deployments without analytics keep the dashboard routes absent. The admin integration-test startup window now covers a cold instrumented cache boot instead of failing at five seconds.

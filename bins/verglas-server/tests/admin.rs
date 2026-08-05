@@ -8,7 +8,7 @@ use verglas_core::admin::{HealthzInfo, LogLevelInfo, PurgeReport, StatsInfo, Ver
 
 /// Waits until the server admin API responds on `/admin/healthz`.
 fn wait_for_admin(endpoint: &str) {
-    for _ in 0..50 {
+    for _ in 0..100 {
         if let Ok(response) = reqwest::blocking::get(format!("{endpoint}/admin/healthz"))
             && response.status().is_success()
         {

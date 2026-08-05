@@ -25,7 +25,8 @@
         "pages": [
           "docs/platform/workers",
           "docs/platform/containers",
-          "docs/platform/follow"
+          "docs/platform/follow",
+          "docs/platform/analytics"
         ]
       },
       {

@@ -2,6 +2,7 @@
 
 pub mod catalog;
 pub mod cloud;
+pub mod dashboard;
 pub mod drain;
 pub mod graph;
 pub mod login;

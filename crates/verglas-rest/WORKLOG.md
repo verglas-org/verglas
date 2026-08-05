@@ -6,3 +6,4 @@
 - #11: Removed the scheduler persistence facade after moving the queue to Postgres in the standalone service. REST now only validates deployments and forwards bounded manual, HTTP callback, and catalog-update events when scheduling is configured.
 - #11: Unified manual, HTTP, and catalog ingress around CloudEvents. Generic event fan-out now matches exact subscription attributes and forwards the unchanged envelope to the scheduler.
 - #11: Exposed structured CloudEvents through the on-prem REST service and preserved their envelopes during exact worker-subscription fan-out. The write ingress also forwards idempotency keys, allowing broker redelivery to remain safe at the Iceberg commit boundary.
+- #16: Added the optional on-prem Rill dashboard API. It resolves Iceberg table locations through the configured catalog, manages owned Rill connector/model/metrics/Explore files over Rill's runtime API, and refuses to overwrite unowned resources without a filesystem fallback.
