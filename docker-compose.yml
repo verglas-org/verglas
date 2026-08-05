@@ -1,8 +1,7 @@
 # Self-hosted Verglas cache server.
 #
-# 1. Copy deploy/docker/verglas.toml and fill [backend] (bucket/region/endpoint)
-#    plus credentials under deploy/docker/credentials/ (see that directory).
-# 2. docker compose up -d
+# 1. Export the R2, catalog, and client-facing S3 values required below.
+# 2. docker compose up -d --build
 # 3. Point the CLI at the admin port:
 #      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 #    Engines point S3 at http://127.0.0.1:8333.
@@ -18,13 +17,31 @@ services:
       - "8334:8334" # admin API (CLI)
     environment:
       VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
+      VERGLAS_S3_ADDR: 0.0.0.0:8333
+      VERGLAS_CACHE_DIR: /var/lib/verglas
+      VERGLAS_CACHE_CAPACITY: ${VERGLAS_CACHE_CAPACITY:-20GB}
+      VERGLAS_CACHE_DRAM: ${VERGLAS_CACHE_DRAM:-1GB}
+      VERGLAS_BACKEND_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+      VERGLAS_BACKEND_ENDPOINT: ${R2_ENDPOINT:?Set R2_ENDPOINT}
+      VERGLAS_BACKEND_REGION: auto
+      AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}
+      VERGLAS_CATALOG_URI: ${R2_CATALOG_URI:?Set R2_CATALOG_URI}
+      VERGLAS_CATALOG_WAREHOUSE: ${R2_CATALOG_WAREHOUSE:?Set R2_CATALOG_WAREHOUSE}
+      VERGLAS_CATALOG_BEARER_TOKEN: ${R2_CATALOG_TOKEN:?Set R2_CATALOG_TOKEN}
+      VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+      VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+      VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
+      VERGLAS_WRITE_WORKER_BINARY: /usr/local/bin/verglas-write
+      VERGLAS_RILL_URI: http://rill:9009
+      VERGLAS_RILL_INSTANCE_ID: default
+      VERGLAS_RILL_BROWSER_URI: http://127.0.0.1:9009
+      VERGLAS_RILL_S3_URI: http://verglas-server:8333
       # Leave empty to run Verglas without worker scheduling. To enable the
       # optional workers profile, set this to http://verglas-scheduler:8340.
       VERGLAS_SCHEDULER_URL: ${VERGLAS_SCHEDULER_URL:-}
     volumes:
-      - ./deploy/docker/verglas.toml:/etc/verglas/config.toml:ro
-      - ./deploy/docker/credentials:/etc/verglas/credentials:ro
-      - /Volumes/data_cache/verglas:/var/lib/verglas
+      - verglas-cache:/var/lib/verglas
     # Contain a future socket or cache FD leak inside this service. Docker's
     # million-descriptor default is large enough to exhaust a desktop host.
     ulimits:
@@ -39,12 +56,70 @@ services:
       target: verglas-scheduler
     image: verglas/verglas-scheduler:local
     environment:
-      VERGLAS_SCHEDULER_DATABASE_URL: ${VERGLAS_SCHEDULER_DATABASE_URL:-}
+      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas
       VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
       VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
       VERGLAS_SCHEDULER_QUEUE: local
     depends_on:
-      - verglas-server
+      verglas-server:
+        condition: service_started
+      postgres:
+        condition: service_healthy
     profiles:
       - workers
     restart: unless-stopped
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: verglas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
+      POSTGRES_DB: verglas
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verglas -d verglas"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    profiles:
+      - workers
+    restart: unless-stopped
+
+  rill-volume-init:
+    image: alpine:3.22
+    command:
+      - chown
+      - -R
+      - "1001:1001"
+      - /var/lib/rill
+    volumes:
+      - rill-data:/var/lib/rill
+    profiles:
+      - analytics
+    restart: "no"
+
+  rill:
+    image: rilldata/rill:v0.88.6
+    platform: linux/amd64
+    command:
+      - start
+      - /var/lib/rill
+      - --no-open
+      - --port
+      - "9009"
+    ports:
+      - "9009:9009"
+    volumes:
+      - rill-data:/var/lib/rill
+    depends_on:
+      rill-volume-init:
+        condition: service_completed_successfully
+    profiles:
+      - analytics
+    restart: unless-stopped
+
+volumes:
+  verglas-cache:
+  rill-data:
+  postgres-data:

@@ -32,24 +32,30 @@ Both primitives use ordinary Iceberg tables. Removing Verglas leaves those table
 
 ## What the cache changes
 
-Query engines continue to use their Iceberg catalog directly. You change only the engine's S3 endpoint. Verglas serves hot object ranges from DRAM or NVMe and reads through to the origin on a miss.
+Query engines change their S3 endpoint to Verglas. In cloud they continue to
+use the tenant catalog directly. The self-hosted REST service also exposes a
+shallow cached catalog path for engines that want one address for both
+interfaces. The configured upstream catalog remains authoritative in either
+deployment.
 
 ```mermaid
 flowchart LR
     A["Query engine or worker"] -->|"S3 reads and writes"| B["Verglas cache endpoint"]
     B -->|"cache miss or write-back"| C["Customer object store"]
-    A -->|"catalog requests"| D["Customer Iceberg catalog"]
+    A -->|"catalog requests"| D["Authoritative Iceberg catalog"]
     B -->|"private commit observation"| D
 ```
 
 <Note>
-Verglas does not replace or proxy the customer's Iceberg REST catalog. The server connects to the catalog as a private client for table operations and warming.
+The self-hosted catalog path caches successful reads and writes mutations
+through. It does not implement catalog semantics or become the catalog system
+of record.
 </Note>
 
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Learn the worker model" icon="workflow" href="/docs/platform/workers">
+  <Card title="Learn the worker model" icon="workflow" href="/docs/workers/overview">
     Understand triggers, logical intervals, outputs, secrets, and idempotent commits.
   </Card>
   <Card title="Explore the SDKs" icon="braces" href="/docs/sdk/overview">

@@ -8,8 +8,8 @@ fn docker_application_packages_execution_workers() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let dockerfile =
         std::fs::read_to_string(workspace.join("Dockerfile")).expect("read workspace Dockerfile");
-    let config = std::fs::read_to_string(workspace.join("deploy/docker/verglas.toml"))
-        .expect("read Docker config");
+    let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
+        .expect("read Docker Compose application");
 
     for package in ["verglas-server", "verglas-query", "verglas-write-node"] {
         assert!(
@@ -26,13 +26,45 @@ fn docker_application_packages_execution_workers() {
         );
     }
     assert!(
-        config.contains("[query_worker]\nbinary = \"/usr/local/bin/verglas-query\""),
-        "Docker config must enable the query worker"
+        dockerfile.contains("ENTRYPOINT [\"verglas-server\", \"--environment\"]"),
+        "the container must load its server configuration from Compose"
     );
     assert!(
-        config.contains("[write_worker]\nbinary = \"/usr/local/bin/verglas-write\""),
-        "Docker config must enable the write worker"
+        !dockerfile.contains("config.toml") && !compose.contains("config.toml"),
+        "the Docker application must not copy or mount a server config.toml"
     );
+    assert!(
+        !compose.contains("deploy/docker/credentials"),
+        "the quickstart must not require a separate credentials directory"
+    );
+    assert!(
+        compose.contains("image: postgres:17")
+            && compose
+                .contains("postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas"),
+        "the workers profile must include its Postgres queue store"
+    );
+    for variable in [
+        "VERGLAS_BACKEND_BUCKET",
+        "VERGLAS_BACKEND_ENDPOINT",
+        "VERGLAS_BACKEND_REGION",
+        "VERGLAS_CACHE_CAPACITY",
+        "VERGLAS_CACHE_DRAM",
+        "VERGLAS_CATALOG_URI",
+        "VERGLAS_CATALOG_WAREHOUSE",
+        "VERGLAS_CATALOG_BEARER_TOKEN",
+        "VERGLAS_S3_ACCESS_KEY_ID",
+        "VERGLAS_S3_SECRET_ACCESS_KEY",
+        "VERGLAS_QUERY_WORKER_BINARY",
+        "VERGLAS_WRITE_WORKER_BINARY",
+        "VERGLAS_RILL_URI",
+        "VERGLAS_RILL_BROWSER_URI",
+        "VERGLAS_RILL_S3_URI",
+    ] {
+        assert!(
+            compose.contains(variable),
+            "Compose must declare {variable}"
+        );
+    }
 }
 
 /// #19: the self-hosted container must fail inside its own resource boundary

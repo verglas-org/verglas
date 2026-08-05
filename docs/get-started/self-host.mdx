@@ -1,168 +1,237 @@
 ---
 title: "Self-host Verglas"
-description: "Run a single-node Verglas cache server with Docker Compose."
+description: "Start Verglas against Cloudflare R2 and R2 Data Catalog with one Docker Compose file."
 icon: "server"
 ---
 
-Self-hosting runs the Verglas cache and admin API on your infrastructure. Your object store remains the system of record, and your query engine continues to use its existing Iceberg catalog.
+This guide starts one Verglas server backed by Cloudflare R2. You provide the
+object-store and catalog credentials as environment variables; Docker Compose
+contains the complete server configuration. You do not create or mount a
+server `config.toml`.
 
-## Ports and data
+The running application exposes:
 
-The Docker example exposes the following endpoints:
-
-| Port | Endpoint | Used by |
+| Port | Service | Used by |
 | --- | --- | --- |
-| `8333` | S3-compatible data endpoint | Query engines and S3 clients |
-| `8334` | Admin and data API | The `verglas` CLI and SDK |
+| `8333` | S3-compatible cache | Query engines and SDKs |
+| `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
+| `9009` | Rill | Optional analytics profile |
 
-The container stores cache data under `/var/lib/verglas`. Mount that path on local NVMe or another fast, persistent volume.
+## Before you begin
 
-## Start a single server
+Install [Docker Desktop](https://docs.docker.com/desktop/) or Docker Engine
+with Compose, Git, and the Rust toolchain. You also need a Cloudflare account
+with R2 enabled.
 
 <Steps>
-  <Step title="Create local configuration files">
-    From the Verglas repository, create an ignored working directory:
+  <Step title="Create an R2 bucket and catalog">
+    Follow Cloudflare's [R2 S3 setup](https://developers.cloudflare.com/r2/get-started/s3/)
+    to create a bucket. This guide calls it `verglas-demo`.
 
-    ```bash
-    mkdir -p .verglas-selfhost/credentials .verglas-selfhost/cache
-    cp deploy/docker/verglas.toml .verglas-selfhost/verglas.toml
+    Open **Storage & databases → R2 Data Catalog**, create a catalog for that
+    bucket, and record the catalog URI and warehouse name. Cloudflare documents
+    this flow in [Manage catalogs](https://developers.cloudflare.com/r2/data-catalog/manage-catalogs/).
+
+    The values have this shape:
+
+    ```text
+    S3 endpoint: https://ACCOUNT_ID.r2.cloudflarestorage.com
+    Catalog URI: https://catalog.cloudflarestorage.com/ACCOUNT_ID/verglas-demo
+    Warehouse:   ACCOUNT_ID_verglas-demo
     ```
-
-    Edit `.verglas-selfhost/verglas.toml` with your origin bucket and region. The following filled example uses an AWS S3 bucket named `acme-lakehouse-prod`:
-
-    ```toml .verglas-selfhost/verglas.toml
-    [listen]
-    s3_port = 8333
-    admin_port = 8334
-
-    [log]
-    format = "json"
-    level = "info"
-
-    [cache]
-    dir = "/var/lib/verglas"
-    capacity_bytes = "200GB"
-    dram_bytes = "4GB"
-
-    [backend]
-    provider = "s3"
-    bucket = "acme-lakehouse-prod"
-    region = "us-west-2"
-    credentials_file = "/etc/verglas/credentials/backend"
-
-    [auth]
-    credentials_file = "/etc/verglas/credentials/endpoint"
-
-    [catalog]
-    uri = "https://catalog.example.com"
-    warehouse = "acme-production"
-    include = ["analytics.*"]
-    exclude = ["analytics.scratch_*"]
-    credentials_file = "/etc/verglas/credentials/catalog.token"
-    ```
-
-    Remove the `[catalog]` section when you only need a byte cache. Verglas then skips table watching and metadata warming.
   </Step>
 
-  <Step title="Write credentials">
-    Write the origin credentials that Verglas uses on cache misses:
+  <Step title="Create a read-write R2 token">
+    In **R2 → Overview → Manage API Tokens**, create an **Admin Read & Write**
+    token scoped to the bucket. That permission covers both R2 objects and R2
+    Data Catalog writes. See Cloudflare's [R2 authentication guide](https://developers.cloudflare.com/r2/api/tokens/).
 
-    ```ini .verglas-selfhost/credentials/backend
-    [default]
-    aws_access_key_id = AKIA_REPLACE_ME
-    aws_secret_access_key = REPLACE_ME
-    ```
+    Record all three values shown once at creation:
 
-    Write a separate keypair for clients that connect to the Verglas S3 endpoint:
-
-    ```ini .verglas-selfhost/credentials/endpoint
-    [default]
-    aws_access_key_id = verglas-local
-    aws_secret_access_key = replace-with-a-long-random-secret
-    ```
-
-    If the catalog uses a bearer token, write only that token to `.verglas-selfhost/credentials/catalog.token`.
-
-    ```bash
-    chmod 600 .verglas-selfhost/credentials/*
-    ```
+    - Token value, used as the Iceberg REST bearer token.
+    - Access Key ID, used for S3 requests.
+    - Secret Access Key, used for S3 requests.
 
     <Warning>
-    Never reuse the origin keypair as the client-facing endpoint keypair. Never commit either credential file.
+    Cloudflare does not show the secret access key again. Do not commit any of
+    these values.
     </Warning>
   </Step>
 
-  <Step title="Override the Compose mounts">
-    Save the following file as `docker-compose.override.yml`:
-
-    ```yaml docker-compose.override.yml
-    services:
-      verglas-server:
-        volumes:
-          - ./.verglas-selfhost/verglas.toml:/etc/verglas/config.toml:ro
-          - ./.verglas-selfhost/credentials:/etc/verglas/credentials:ro
-          - ./.verglas-selfhost/cache:/var/lib/verglas
+  <Step title="Clone Verglas and install the CLI">
+    ```bash
+    git clone https://github.com/verglas-org/verglas.git
+    cd verglas
+    cargo install --path bins/verglas --locked --force
+    verglas --version
     ```
   </Step>
 
-  <Step title="Start and verify the server">
-    Build the image and start the server:
+  <Step title="Export the deployment values">
+    Replace the placeholders with the values from Cloudflare. The last command
+    creates a separate credential for clients of your Verglas S3 endpoint.
 
     ```bash
-    docker compose up -d --build
-    docker compose logs -f verglas-server
+    export R2_BUCKET=verglas-demo
+    export R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+    export R2_ACCESS_KEY_ID=YOUR_R2_ACCESS_KEY_ID
+    export R2_SECRET_ACCESS_KEY=YOUR_R2_SECRET_ACCESS_KEY
+    export R2_CATALOG_URI=https://catalog.cloudflarestorage.com/ACCOUNT_ID/verglas-demo
+    export R2_CATALOG_WAREHOUSE=ACCOUNT_ID_verglas-demo
+    export R2_CATALOG_TOKEN=YOUR_R2_TOKEN_VALUE
+
+    export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
+    export VERGLAS_S3_SECRET_ACCESS_KEY=$(openssl rand -hex 32)
     ```
 
-    In a second terminal, point the CLI at the admin API:
+    Keep this terminal open. Compose substitutes these values when it creates
+    the containers.
+  </Step>
+
+  <Step title="Review the complete Compose application">
+    The repository's `docker-compose.yml` is the complete self-hosted
+    configuration. It builds Verglas, persists the cache in a named volume,
+    and defines optional Workers and Analytics profiles.
+
+    ```yaml docker-compose.yml
+    services:
+      verglas-server:
+        build:
+          context: .
+          target: verglas-server
+        image: verglas/verglas-server:local
+        ports:
+          - "8333:8333"
+          - "8334:8334"
+        environment:
+          VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
+          VERGLAS_S3_ADDR: 0.0.0.0:8333
+          VERGLAS_CACHE_DIR: /var/lib/verglas
+          VERGLAS_CACHE_CAPACITY: ${VERGLAS_CACHE_CAPACITY:-20GB}
+          VERGLAS_CACHE_DRAM: ${VERGLAS_CACHE_DRAM:-1GB}
+          VERGLAS_BACKEND_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+          VERGLAS_BACKEND_ENDPOINT: ${R2_ENDPOINT:?Set R2_ENDPOINT}
+          VERGLAS_BACKEND_REGION: auto
+          AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}
+          AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}
+          VERGLAS_CATALOG_URI: ${R2_CATALOG_URI:?Set R2_CATALOG_URI}
+          VERGLAS_CATALOG_WAREHOUSE: ${R2_CATALOG_WAREHOUSE:?Set R2_CATALOG_WAREHOUSE}
+          VERGLAS_CATALOG_BEARER_TOKEN: ${R2_CATALOG_TOKEN:?Set R2_CATALOG_TOKEN}
+          VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+          VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+          VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
+          VERGLAS_WRITE_WORKER_BINARY: /usr/local/bin/verglas-write
+          VERGLAS_RILL_URI: http://rill:9009
+          VERGLAS_RILL_INSTANCE_ID: default
+          VERGLAS_RILL_BROWSER_URI: http://127.0.0.1:9009
+          VERGLAS_RILL_S3_URI: http://verglas-server:8333
+          VERGLAS_SCHEDULER_URL: ${VERGLAS_SCHEDULER_URL:-}
+        volumes:
+          - verglas-cache:/var/lib/verglas
+        ulimits:
+          nofile:
+            soft: 8192
+            hard: 8192
+        restart: unless-stopped
+
+      postgres:
+        image: postgres:17
+        environment:
+          POSTGRES_USER: verglas
+          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
+          POSTGRES_DB: verglas
+        healthcheck:
+          test: ["CMD-SHELL", "pg_isready -U verglas -d verglas"]
+          interval: 2s
+          timeout: 5s
+          retries: 15
+        volumes:
+          - postgres-data:/var/lib/postgresql/data
+        profiles: [workers]
+        restart: unless-stopped
+
+      verglas-scheduler:
+        build:
+          context: .
+          target: verglas-scheduler
+        image: verglas/verglas-scheduler:local
+        environment:
+          VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas
+          VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
+          VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
+          VERGLAS_SCHEDULER_QUEUE: local
+        depends_on:
+          verglas-server:
+            condition: service_started
+          postgres:
+            condition: service_healthy
+        profiles: [workers]
+        restart: unless-stopped
+
+      rill-volume-init:
+        image: alpine:3.22
+        command: [chown, -R, "1001:1001", /var/lib/rill]
+        volumes:
+          - rill-data:/var/lib/rill
+        profiles: [analytics]
+        restart: "no"
+
+      rill:
+        image: rilldata/rill:v0.88.6
+        platform: linux/amd64
+        command: [start, /var/lib/rill, --no-open, --port, "9009"]
+        ports:
+          - "9009:9009"
+        volumes:
+          - rill-data:/var/lib/rill
+        depends_on:
+          rill-volume-init:
+            condition: service_completed_successfully
+        profiles: [analytics]
+        restart: unless-stopped
+
+    volumes:
+      verglas-cache:
+      postgres-data:
+      rill-data:
+    ```
+  </Step>
+
+  <Step title="Start Verglas">
+    Build and start the base server:
 
     ```bash
+    docker compose up --detach --build
+    ```
+
+    Wait until the health endpoint reports `ready`, then connect the CLI:
+
+    ```bash
+    until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 2; done
     export VERGLAS_ENDPOINT=http://127.0.0.1:8334
     verglas status
     ```
 
-    A healthy response includes the server version and cache state.
-  </Step>
-
-  <Step title="Point a client at the cache">
-    Configure an S3 client with the endpoint keypair and fetch an object:
+    If startup fails, read the server log:
 
     ```bash
-    export AWS_ACCESS_KEY_ID=verglas-local
-    export AWS_SECRET_ACCESS_KEY=replace-with-a-long-random-secret
-
-    aws s3 cp s3://acme-lakehouse-prod/analytics/orders/data.parquet /tmp/orders.parquet \
-      --endpoint-url http://127.0.0.1:8333
-    ```
-
-    Configure DuckDB with path-style addressing:
-
-    ```sql
-    SET s3_endpoint = '127.0.0.1:8333';
-    SET s3_use_ssl = false;
-    SET s3_url_style = 'path';
-    SET s3_access_key_id = 'verglas-local';
-    SET s3_secret_access_key = 'replace-with-a-long-random-secret';
-
-    SELECT count(*)
-    FROM 's3://acme-lakehouse-prod/analytics/orders/*.parquet';
+    docker compose logs verglas-server
     ```
   </Step>
 </Steps>
 
-## Operate the server
+## Next: create your first table
 
-Use the following commands during normal operation:
+The server is connected to R2 and its Iceberg catalog. Continue with
+[Create your first table](/docs/get-started/first-table) to write rows, run a
+query, and confirm that the resulting Iceberg table is visible through the
+catalog.
+
+## Stop the cluster
 
 ```bash
-docker compose logs -f verglas-server
-verglas status
-curl -fsS http://127.0.0.1:8334/metrics
-verglas drain --timeout 10m
 docker compose down
 ```
 
-`verglas drain` stops new cache ownership, donates warm blocks to peers, and then exits. Use it before removing a node from a multi-node pod.
-
-## Configure production deployments
-
-The Docker quickstart uses plaintext loopback endpoints. Production deployments must add TLS, restrict the admin listener, mount a persistent cache directory, and give the server only the origin and catalog permissions it needs. See the annotated `verglas.example.toml` in the repository for every supported key.
+The named volumes remain. Add `--volumes` only when you intentionally want to
+delete the local cache, scheduler database, and Rill project.

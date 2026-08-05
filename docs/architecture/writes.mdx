@@ -1,0 +1,52 @@
+---
+title: "Write path"
+description: "Understand durable staging, quorum acknowledgement, and propagation to object storage."
+icon: "pen-to-square"
+---
+
+Verglas can acknowledge a write before the origin object store completes only
+after the write is durably staged across the configured fault boundary. Object
+storage remains the final system of record.
+
+## Commit sequence
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Coordinator
+    participant CacheNodes as Cache nodes
+    participant Origin as Object storage
+    participant Catalog
+
+    Client->>Coordinator: Write immutable objects
+    Coordinator->>CacheNodes: Stage erasure-coded fragments
+    CacheNodes-->>Coordinator: Quorum durable
+    Coordinator-->>Client: Object write acknowledged
+    Coordinator->>Origin: Propagate complete object
+    Client->>Catalog: Commit new metadata location
+```
+
+The catalog commit happens only after every object referenced by the new
+metadata is readable. A failed catalog compare-and-swap leaves unreferenced
+objects that normal Iceberg cleanup can remove; it does not publish a partial
+table state.
+
+## Quorum staging
+
+Reed–Solomon fragments spread a staged object across independent cache nodes.
+The configured quorum must contain enough fragments to reconstruct the object.
+A coordinator generation fences a recovered or superseded writer from
+completing stale work.
+
+## Degraded operation
+
+If the cluster cannot meet its staging quorum, Verglas writes through to the
+origin before acknowledging. This increases latency but preserves correctness.
+It never acknowledges an object that exists only in volatile memory.
+
+## Repair and scrubbing
+
+Background propagation reconstructs complete objects and uploads them to the
+origin. Scrubbing verifies fragment checksums and repairs damaged fragments
+while enough independent fragments remain. Both operate under hard bandwidth
+and concurrency limits so cache recovery cannot consume the host.

@@ -16,7 +16,7 @@ use std::process::Command;
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// cloud `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 12] = [
+const SURVIVING_COMMANDS: [&str; 13] = [
     "drain",
     "status",
     "table",
@@ -24,6 +24,7 @@ const SURVIVING_COMMANDS: [&str; 12] = [
     "query",
     "login",
     "index",
+    "dashboard",
     "workers",
     "containers",
     "db",
@@ -86,6 +87,24 @@ fn short_version_flag_prints_cli_version() {
     assert!(
         stdout.starts_with("verglas "),
         "-V must print the CLI version: {stdout}"
+    );
+}
+
+#[test]
+fn dashboard_help_uses_the_compose_configuration_surface() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["dashboard", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(
+        stdout.contains("Compose analytics profile"),
+        "dashboard help must point self-hosted users at Compose: {stdout}"
+    );
+    assert!(
+        !stdout.contains("[analytics.rill]"),
+        "dashboard help must not advertise removed server TOML: {stdout}"
     );
 }
 

@@ -4,6 +4,8 @@
 //! local cache and reading through to the origin bucket on miss. The admin HTTP
 //! API is the private control surface the `verglas` CLI talks to.
 
+mod environment;
+
 use verglas_server::{VERSION, admin, follow, logging, node_report, platform};
 
 use std::sync::{Arc, OnceLock};
@@ -527,7 +529,25 @@ fn spawn_prefetch(
 /// Parses `--config <path>` from the command line, loading and validating the
 /// file when present. Exits non-zero with the loader's actionable message on
 /// any failure — nothing may bind before the config is known good.
-fn load_config_from_args() -> Option<verglas_core::config::Config> {
+fn load_config_from_args() -> Option<LoadedServerConfig> {
+    let environment_mode = std::env::args().any(|arg| arg == "--environment");
+    let file_mode = std::env::args().any(|arg| arg == "--config");
+    if environment_mode && file_mode {
+        eprintln!("verglas-server: choose either --environment or --config, not both");
+        std::process::exit(1);
+    }
+    if environment_mode {
+        return match environment::EnvironmentConfig::load() {
+            Ok(loaded) => Some(LoadedServerConfig {
+                config: loaded.config,
+                endpoint_credentials: Some(loaded.endpoint_credentials),
+            }),
+            Err(error) => {
+                eprintln!("verglas-server: {error}");
+                std::process::exit(1);
+            }
+        };
+    }
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg != "--config" {
@@ -538,7 +558,12 @@ fn load_config_from_args() -> Option<verglas_core::config::Config> {
             std::process::exit(1);
         };
         match verglas_core::config::Config::load(std::path::Path::new(&path)) {
-            Ok(config) => return Some(config),
+            Ok(config) => {
+                return Some(LoadedServerConfig {
+                    config,
+                    endpoint_credentials: None,
+                });
+            }
             Err(error) => {
                 eprintln!("verglas-server: {error}");
                 std::process::exit(1);
@@ -546,6 +571,15 @@ fn load_config_from_args() -> Option<verglas_core::config::Config> {
         }
     }
     None
+}
+
+/// A startup configuration and, for Compose environment mode, endpoint
+/// credentials supplied outside the serializable TOML schema.
+struct LoadedServerConfig {
+    /// The validated server settings.
+    config: verglas_core::config::Config,
+    /// Static endpoint credentials supplied by Compose.
+    endpoint_credentials: Option<(String, String)>,
 }
 
 /// Reports each listener's kernel-assigned address to the file named by
@@ -1497,6 +1531,28 @@ async fn serve(
         build_query_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
     let write_worker_dispatcher =
         build_write_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
+    let dashboard_runtime = match (&config.analytics, &tables_slot) {
+        (Some(analytics), Some(tables)) => {
+            Some(Arc::new(verglas_rest::dashboard::DashboardRuntime::new(
+                tables.clone(),
+                &analytics.rill,
+                verglas_rest::dashboard::RillStorage {
+                    endpoint: analytics.rill.s3_uri.clone(),
+                    region: config
+                        .backend
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| "us-east-1".to_owned()),
+                    access_key_id: credentials.0.clone(),
+                    secret_access_key: credentials.1.clone(),
+                },
+            )?))
+        }
+        (None, _) => None,
+        (Some(_), None) => {
+            return Err("analytics.rill requires a configured catalog".into());
+        }
+    };
 
     let admin_fut = serve_admin(
         admin_listener,
@@ -1511,6 +1567,7 @@ async fn serve(
             catalog: catalog_gateway,
             access,
             tables: tables_slot.clone(),
+            dashboards: dashboard_runtime,
             graphs: graphs_slot.clone(),
             vector: vector_slot.clone(),
             sys: sys_slot.clone(),
@@ -2266,14 +2323,19 @@ async fn main() {
     // are visible from the first line (#61/#241). `RUST_LOG` still overrides the
     // level; `verglas dev` sets `VERGLAS_LOG_FORMAT=pretty` for human output.
     let (log_format, log_level) = match &config {
-        Some(config) => (config.log.format, config.log.level.clone()),
+        Some(loaded) => (loaded.config.log.format, loaded.config.log.level.clone()),
         None => (verglas_core::config::LogFormat::Json, "info".to_owned()),
     };
     logging::install(log_format, &log_level);
     let result = match &config {
-        Some(config) => {
+        Some(loaded) => {
+            let config = &loaded.config;
             println!("verglas-server {VERSION} config ok: {}", config.summary());
-            match resolve_auth(config) {
+            match loaded
+                .endpoint_credentials
+                .clone()
+                .map_or_else(|| resolve_auth(config), Ok)
+            {
                 Ok(credentials) => serve(config, credentials).await,
                 Err(e) => {
                     eprintln!("verglas-server: {e}");

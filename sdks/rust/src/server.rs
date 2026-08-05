@@ -103,6 +103,17 @@ impl ServerClient {
         Self::decode(response).await
     }
 
+    /// Sends DELETE and decodes the JSON response.
+    pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ServerError> {
+        let response = self
+            .http
+            .delete(self.url(path))
+            .send()
+            .await
+            .map_err(|error| self.unreachable(error))?;
+        Self::decode(response).await
+    }
+
     /// Streams a CSV, JSONL, or Parquet file to the server ingest route.
     pub async fn ingest<T: DeserializeOwned>(
         &self,

@@ -10,6 +10,7 @@ use bytes::Bytes;
 use verglas_catalog::CatalogGateway;
 
 pub mod admin;
+pub mod dashboard;
 pub mod follow;
 pub mod logging;
 pub mod platform;

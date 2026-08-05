@@ -1,18 +1,18 @@
 spec_version = 1
-name = "spy-ohlcv"
-exec = ["python3", "spy_ohlcv.py"]
+name = "market-data-ingest"
+exec = ["python3", "ingest.py"]
 cwd = "."
-target_tables = ["market.spy_ohlcv"]
+target_tables = ["market.ohlcv"]
 
 [files]
-"spy_ohlcv.py" = "@file:spy_ohlcv.py"
+"ingest.py" = "@file:ingest.py"
 
 [env]
 SYMBOL = "SPY"
 
 [[triggers]]
 type = "webhook"
-path = "/market-data/spy"
+path = "/market-data/daily-bars"
 
 [[triggers]]
 type = "cron"
