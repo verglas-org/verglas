@@ -594,3 +594,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #11: Connected manual, HTTP callback, and catalog data-update ingress to the standalone scheduler event service. The server requires its scheduler URL when catalog-backed platform routes are enabled and keeps durable queue storage behind `verglas-rest`.
 - #11: Removed scheduler state from the Verglas cache directory and made worker ingress optional. A missing or empty scheduler URL now leaves the storage, query, and catalog server fully operational without mounting worker-trigger routes.
 - #11: Changed the on-prem catalog watcher into an Iceberg snapshot CloudEvent producer. Catalog updates now enter the generic event subscription path instead of a private data-update trigger.
+- #19: Capped the self-hosted server container at 8,192 open file descriptors.
+  Docker previously granted it 1,048,576, so a future socket or cache leak could
+  exhaust the host file table instead of failing inside the container.

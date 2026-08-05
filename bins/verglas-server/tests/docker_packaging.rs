@@ -34,3 +34,21 @@ fn docker_application_packages_execution_workers() {
         "Docker config must enable the write worker"
     );
 }
+
+/// #19: the self-hosted container must fail inside its own resource boundary
+/// before an FD leak can exhaust the host-wide file table.
+#[test]
+fn docker_application_caps_server_file_descriptors() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
+        .expect("read Docker Compose application");
+
+    let server = compose
+        .split("  verglas-scheduler:")
+        .next()
+        .expect("verglas-server service");
+    assert!(
+        server.contains("ulimits:\n      nofile:\n        soft: 8192\n        hard: 8192"),
+        "verglas-server must cap soft and hard nofile at 8192"
+    );
+}
