@@ -40,6 +40,7 @@ verglas-vector.workspace = true
 # logging, the queue segment log, the cron matcher, the guard policy, and the
 # worker subprocess executor. verglas-sdk carries the worker/trigger contract.
 verglas-harness.workspace = true
+verglas-kv.workspace = true
 verglas-sdk.workspace = true
 async-trait.workspace = true
 chrono = "0.4.44"

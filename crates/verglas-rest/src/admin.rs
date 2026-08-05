@@ -196,6 +196,8 @@ pub type PlatformSlot = Arc<OnceLock<Arc<crate::platform::SchedulerIngress>>>;
 /// positional list so call sites name what they wire.
 #[derive(Default)]
 pub struct Slots {
+    /// Always-on native KV routes, authenticated at the route boundary.
+    pub kv: Option<crate::kv::KvRuntime>,
     /// Cache purge (`POST /cache/purge`).
     pub purger: Option<PurgerSlot>,
     /// Cache stats probe (`GET /cache/stats`).
@@ -251,6 +253,7 @@ pub struct Slots {
 /// filled (#16).
 pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Router {
     let Slots {
+        kv,
         purger,
         stats,
         metrics,
@@ -281,6 +284,9 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         // process-global, so this answers whether or not the engine is ready.
         .route(LOG_PATH, post(set_log_level))
         .merge(health_router(health));
+    if let Some(kv) = kv {
+        app = app.merge(crate::kv::router(kv));
+    }
     if let Some(access) = access {
         // Local-access probe (#287): a fixed snapshot of this server's
         // connection details, resolved once at startup. Not engine-dependent, so

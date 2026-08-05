@@ -27,6 +27,7 @@ use verglas_s3::{
 /// One request the stub saw, captured for assertions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SeenRequest {
+    tenant: String,
     method: String,
     path: String,
     body: Vec<u8>,
@@ -43,6 +44,7 @@ struct StubApi {
 impl ServingApi for StubApi {
     async fn handle(&self, req: ApiRequest) -> ApiResponse {
         self.seen.lock().expect("stub lock").push(SeenRequest {
+            tenant: req.tenant.clone(),
             method: req.method.to_string(),
             path: req.uri.path().to_owned(),
             body: req.body.to_vec(),
@@ -142,11 +144,43 @@ async fn signed_v1_query_reaches_the_stub() {
     assert_eq!(
         captured.as_slice(),
         &[SeenRequest {
+            tenant: ACCESS_KEY.to_owned(),
             method: "POST".to_owned(),
             path: "/v1/query".to_owned(),
             body: body.as_bytes().to_vec(),
         }]
     );
+}
+
+/// A signed KV request reaches the extension with the access key as its tenant.
+#[tokio::test]
+async fn signed_v1_kv_reaches_the_stub_with_authenticated_tenant() {
+    let (base, seen) = serve_with_stub().await;
+    let path = "/v1/kv/workshop.blueprints/featured";
+    let url = format!("{base}{path}");
+    let headers = sign_headers(
+        "PUT",
+        &url,
+        ACCESS_KEY,
+        SECRET_KEY,
+        REGION,
+        Utc::now(),
+        &[("x-amz-content-sha256", UNSIGNED_PAYLOAD)],
+    );
+    let response = reqwest::Client::new()
+        .put(&url)
+        .headers(headers)
+        .body("blue")
+        .send()
+        .await
+        .expect("PUT");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let captured = seen.lock().expect("stub lock");
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].tenant, ACCESS_KEY);
+    assert_eq!(captured[0].path, path);
+    assert_eq!(captured[0].body, b"blue");
 }
 
 #[tokio::test]

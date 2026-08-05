@@ -10,7 +10,7 @@
 // examples) are NOT re-exported here; reach them explicitly via the
 // `@verglas/sdk/logging` and `@verglas/sdk/examples` subpaths.
 
-export { connect, VerglasClient, Table, Queue, Graph } from "./client";
+export { connect, VerglasClient, Table, Queue, Graph, Kv } from "./client";
 export { VerglasHttpError } from "./http";
 
 export { defineWorker, runWorker } from "./contracts";
@@ -75,4 +75,11 @@ export type {
   SearchIndexOptions,
   SearchResult,
   IndexInfo,
+  KvDeleteResult,
+  KvListEntry,
+  KvListOptions,
+  KvListPage,
+  KvPutOptions,
+  KvPutResult,
+  KvValue,
 } from "./types";

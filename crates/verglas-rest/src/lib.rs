@@ -12,6 +12,7 @@ use verglas_catalog::CatalogGateway;
 pub mod admin;
 pub mod dashboard;
 pub mod follow;
+pub mod kv;
 pub mod logging;
 pub mod platform;
 pub mod query_worker;

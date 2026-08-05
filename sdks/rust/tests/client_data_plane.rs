@@ -7,7 +7,7 @@ use arrow_array::{Int64Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, State};
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::{
     Json, Router,
@@ -18,6 +18,90 @@ use serde_json::json;
 use tokio::net::TcpListener;
 use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 use verglas_sdk::{Client, ClientError, ConnectOptions};
+use verglas_sdk::{KvPutOptions, KvReadTier};
+
+/// The Rust KV handle sends raw bytes and preserves server-owned versions and cursors.
+#[tokio::test]
+async fn kv_handle_is_a_thin_raw_byte_client() {
+    async fn put(headers: HeaderMap, body: Bytes) -> impl IntoResponse {
+        assert_eq!(headers["x-verglas-ttl-seconds"], "300");
+        assert_eq!(headers["if-none-match"], "*");
+        assert_eq!(body, Bytes::from_static(b"blue"));
+        (
+            StatusCode::CREATED,
+            [("etag", "\"4\""), ("x-verglas-idempotent", "false")],
+        )
+    }
+    async fn get_kv() -> impl IntoResponse {
+        (
+            [
+                ("etag", "\"4\""),
+                ("content-type", "application/octet-stream"),
+                ("x-verglas-modified-at-ms", "11"),
+                ("x-verglas-meta-kind", "demo"),
+            ],
+            Bytes::from_static(b"blue"),
+        )
+    }
+    async fn delete_kv(headers: HeaderMap) -> impl IntoResponse {
+        assert_eq!(headers["if-match"], "\"4\"");
+        Json(json!({"removed": true}))
+    }
+    async fn list_kv() -> impl IntoResponse {
+        Json(json!({
+            "entries": [{"key":"user/a", "version":"\"4\"", "modified_at_ms":11, "metadata":{}}],
+            "next_cursor":"opaque"
+        }))
+    }
+    let app = Router::new()
+        .route("/v1/kv/workshop.blueprints", get(list_kv))
+        .route(
+            "/v1/kv/workshop.blueprints/{key}",
+            get(get_kv).put(put).delete(delete_kv),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    let client = Client::connect(
+        ConnectOptions::new(endpoint.clone())
+            .with_query_uri(endpoint)
+            .with_catalog_uri("http://127.0.0.1:1")
+            .with_s3_endpoint("http://127.0.0.1:8333")
+            .with_token("scoped"),
+    )
+    .await
+    .expect("client");
+    let cache = client.kv("workshop.blueprints").expect("namespace");
+    let put = cache
+        .put(
+            "featured",
+            Bytes::from_static(b"blue"),
+            KvPutOptions {
+                ttl_seconds: Some(300),
+                create_only: true,
+                ..KvPutOptions::default()
+            },
+        )
+        .await
+        .expect("put");
+    assert_eq!(put.version, "\"4\"");
+    let value = cache.get("featured").await.expect("get").expect("live");
+    assert_eq!(value.bytes, Bytes::from_static(b"blue"));
+    assert_eq!(value.tier, KvReadTier::Unspecified);
+    assert!(
+        cache
+            .delete("featured", Some(&value.version))
+            .await
+            .expect("delete")
+            .removed
+    );
+    let page = cache
+        .list("user/", 25, Some("opaque-in"))
+        .await
+        .expect("list");
+    assert_eq!(page.entries[0].key, "user/a");
+    assert_eq!(page.next_cursor.as_deref(), Some("opaque"));
+}
 
 /// A client authenticates once, discovers the real catalog plus the server's S3
 /// cache endpoint, and keeps the two data-plane destinations separate.

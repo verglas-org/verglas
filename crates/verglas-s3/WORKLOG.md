@@ -253,3 +253,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #91: Updated S3 serving and authentication documentation for the renamed
   `verglas-server` process. The protocol surface is unchanged by the process
   rename.
+- #29: Routed the KV data-plane path through the existing SigV4 serving boundary and carried its authenticated tenant identity into the REST extension. All other serving routes retain their existing role restrictions.

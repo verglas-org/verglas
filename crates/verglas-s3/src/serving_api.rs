@@ -49,6 +49,8 @@ pub const SERVING_PREFIX: &str = "v1";
 /// An owned HTTP request handed to a [`ServingApi`]. The body is fully buffered
 /// so the implementation never touches the s3s stream types.
 pub struct ApiRequest {
+    /// Tenant identity resolved from the authenticated access key.
+    pub tenant: String,
     /// The request method.
     pub method: Method,
     /// The full request URI (path and query).
@@ -94,7 +96,10 @@ impl V1ServingRoute {
     /// Whether `uri` names a served execution path.
     fn path_matches(uri: &Uri) -> bool {
         let path = uri.path();
-        path == "/v1/query" || path.starts_with("/v1/write/") || path.starts_with("/v1/ingest/")
+        path == "/v1/query"
+            || path.starts_with("/v1/write/")
+            || path.starts_with("/v1/ingest/")
+            || path.starts_with("/v1/kv/")
     }
 }
 
@@ -116,6 +121,16 @@ impl S3Route for V1ServingRoute {
     /// [`check_access`](S3Route::check_access) requires credentials), which is
     /// the SigV4 gate the edge relies on.
     async fn call(&self, req: S3Request<Body>) -> S3Result<S3Response<Body>> {
+        let tenant = req
+            .credentials
+            .as_ref()
+            .map(|credentials| credentials.access_key.clone())
+            .ok_or_else(|| {
+                S3Error::with_message(
+                    S3ErrorCode::AccessDenied,
+                    "KV and execution requests require authentication",
+                )
+            })?;
         let body = req
             .input
             .collect()
@@ -130,6 +145,7 @@ impl S3Route for V1ServingRoute {
         let response = self
             .api
             .handle(ApiRequest {
+                tenant,
                 method: req.method,
                 uri: req.uri,
                 headers: req.headers,
@@ -236,6 +252,9 @@ mod tests {
             "/v1/ingest/analytics.events?mode=append&format=parquet"
         )));
         assert!(V1ServingRoute::path_matches(&uri("/v1/query?ignored=1")));
+        assert!(V1ServingRoute::path_matches(&uri(
+            "/v1/kv/workshop.blueprints/featured"
+        )));
     }
 
     /// Object reads and unrelated paths are never claimed by the serving route.

@@ -46,6 +46,13 @@
         ]
       },
       {
+        "group": "Platform",
+        "icon": "database",
+        "pages": [
+          "docs/platform/kv"
+        ]
+      },
+      {
         "group": "Architecture",
         "icon": "compass-drafting",
         "pages": [

@@ -19,6 +19,10 @@ pub struct Cli {
     )]
     pub endpoint: String,
 
+    /// Bearer token for authenticated server APIs (`VERGLAS_TOKEN`).
+    #[arg(long, env = "VERGLAS_TOKEN", global = true)]
+    pub token: Option<String>,
+
     /// Emit machine-readable JSON instead of human-readable tables.
     #[arg(long, global = true)]
     pub json: bool,
@@ -98,6 +102,41 @@ pub enum Command {
     /// `verglas login`.
     #[command(subcommand)]
     Secrets(SecretsCommand),
+    /// Set and get small raw values in the built-in persistent KV engine.
+    #[command(subcommand)]
+    Kv(KvCommand),
+}
+
+/// `verglas kv` operations.
+#[derive(Debug, Subcommand)]
+pub enum KvCommand {
+    /// Set a raw UTF-8 value, optionally with a TTL in seconds.
+    Set(KvSetArgs),
+    /// Get a raw value.
+    Get(KvKeyArgs),
+}
+
+/// Arguments for `verglas kv set`.
+#[derive(Debug, Args)]
+pub struct KvSetArgs {
+    /// Tenant-scoped application namespace.
+    pub namespace: String,
+    /// Key within the namespace.
+    pub key: String,
+    /// Raw UTF-8 value.
+    pub value: String,
+    /// Lifetime in seconds.
+    #[arg(long)]
+    pub ttl: Option<u64>,
+}
+
+/// Arguments for `verglas kv get`.
+#[derive(Debug, Args)]
+pub struct KvKeyArgs {
+    /// Tenant-scoped application namespace.
+    pub namespace: String,
+    /// Key within the namespace.
+    pub key: String,
 }
 
 /// `verglas dashboard` subcommands for the optional on-prem Rill integration.

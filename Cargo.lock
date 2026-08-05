@@ -7406,6 +7406,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-kv"
+version = "0.1.1"
+dependencies = [
+ "arc-swap",
+ "bytes",
+ "crc32c",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "verglas-microvm-contract"
 version = "0.1.1"
 dependencies = [
@@ -7528,6 +7543,7 @@ dependencies = [
  "verglas-graph",
  "verglas-harness",
  "verglas-iceberg",
+ "verglas-kv",
  "verglas-platform",
  "verglas-s3",
  "verglas-scheduler",
@@ -7687,6 +7703,7 @@ dependencies = [
  "verglas-harness",
  "verglas-iceberg",
  "verglas-instance",
+ "verglas-kv",
  "verglas-platform",
  "verglas-rest",
  "verglas-s3",

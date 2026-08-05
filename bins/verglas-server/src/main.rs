@@ -116,7 +116,7 @@ fn stats_source(
 fn metrics_source(
     config: &verglas_core::config::Config,
     metrics: Arc<verglas_core::metrics::NodeMetrics>,
-    engine: ServerEngine,
+    storage: (ServerEngine, verglas_kv::Store),
     backend: Arc<verglas_backend::BackendStore>,
     writeback: Option<Arc<WritebackMetrics>>,
     telemetry: Option<Arc<verglas_core::telemetry::Telemetry>>,
@@ -127,6 +127,7 @@ fn metrics_source(
 
     let dram_capacity = config.cache.dram_bytes.0;
     let nvme_capacity = config.cache.capacity_bytes.0;
+    let (engine, kv) = storage;
     Arc::new(move || {
         let c = engine.counters().snapshot();
         // Hits are every lookup a cache tier answered; misses are lookups that
@@ -198,6 +199,7 @@ fn metrics_source(
         if let Some(telemetry) = &telemetry {
             telemetry.render_families(table_name_resolver(mapper.as_ref()), &mut text);
         }
+        text.push_str(&kv.render_metrics());
         text
     })
 }
@@ -959,6 +961,7 @@ struct V1ServingApi {
 impl verglas_s3::ServingApi for V1ServingApi {
     async fn handle(&self, req: verglas_s3::ApiRequest) -> verglas_s3::ApiResponse {
         let verglas_s3::ApiRequest {
+            tenant,
             method,
             uri,
             headers,
@@ -968,12 +971,15 @@ impl verglas_s3::ServingApi for V1ServingApi {
         if let Some(destination) = builder.headers_mut() {
             *destination = headers;
         }
-        let request = match builder.body(axum::body::Body::from(body)) {
+        let mut request = match builder.body(axum::body::Body::from(body)) {
             Ok(request) => request,
             Err(error) => {
                 return v1_error_response(format!("building the /v1 request failed: {error}"));
             }
         };
+        request
+            .extensions_mut()
+            .insert(verglas_rest::kv::AuthenticatedKvPrincipal { tenant });
         // The axum router is infallible (its Service error is `Infallible`), so
         // `oneshot` cannot return a transport error here.
         let response = match self.router.clone().oneshot(request).await {
@@ -1405,6 +1411,44 @@ async fn serve(
     // render closure (which encodes it alongside the scrape-time snapshots).
     let node_metrics = Arc::new(verglas_core::metrics::NodeMetrics::new()?);
 
+    // KV is part of every engine, not an optional service. Its non-evictable
+    // log participates in shared disk accounting by actual bytes; the
+    // heat-managed object cache receives no fixed carve or partition.
+    let kv_capacity = config.cache.capacity_bytes.0;
+    let kv_ram = (1024 * 1024)
+        .min(kv_capacity)
+        .min(config.cache.dram_bytes.0);
+    let kv_store = verglas_kv::Store::open(
+        &config.cache.dir.join("kv"),
+        verglas_kv::StoreConfig {
+            capacity_bytes: kv_capacity,
+            ram_bytes: kv_ram,
+        },
+    )?;
+    // Recovery-gated cache accounting takes over once the engine is open. Until
+    // then, constrain KV against the bytes the shared directory already holds
+    // so an early admin request cannot spend space occupied by a warm cache.
+    let held_total = verglas_core::disk::allocated_bytes(&config.cache.dir);
+    let kv_allocated = verglas_core::disk::allocated_bytes(&config.cache.dir.join("kv"));
+    let non_kv_held = held_total.saturating_sub(kv_allocated);
+    kv_store.set_capacity_ceiling(config.cache.capacity_bytes.0.saturating_sub(non_kv_held));
+    let kv_admin_runtime = verglas_rest::kv::KvRuntime {
+        store: kv_store.clone(),
+        authorizer: verglas_rest::kv::KvAuthorizer::new(std::collections::HashMap::from([(
+            credentials.1.clone(),
+            verglas_rest::kv::KvGrant {
+                tenant: credentials.0.clone(),
+                namespace: "*".to_owned(),
+                read: true,
+                write: true,
+            },
+        )])),
+    };
+    eprintln!(
+        "verglas-server {VERSION} KV recovery complete — always on under {}",
+        config.cache.dir.join("kv").display(),
+    );
+
     let health = admin::Health::starting();
     let purger_slot: admin::PurgerSlot = Arc::new(OnceLock::new());
     let stats_slot: admin::StatsSlot = Arc::new(OnceLock::new());
@@ -1558,6 +1602,7 @@ async fn serve(
         admin_listener,
         health.clone(),
         admin::Slots {
+            kv: Some(kv_admin_runtime),
             purger: Some(purger_slot.clone()),
             stats: Some(stats_slot.clone()),
             metrics: Some(metrics_slot.clone()),
@@ -1615,8 +1660,8 @@ async fn serve(
         let writeback_on = config.cache.writeback.enabled;
         let node_id_for_writeback = node_id.clone();
         // The fragment store's byte ceiling is dynamic (#223): a shared atomic
-        // the background disk poll updates each tick to what the block cache is
-        // not using of the one NVMe budget — first come, first served, no carve.
+        // the background disk poll updates each tick to what neither the block
+        // cache nor KV is using — first come, first served, no carve.
         // It starts at 0 (nothing granted before the accounting has run); the
         // poll's first tick fires immediately after the engine is built, before
         // the S3 listener serves a byte.
@@ -1653,9 +1698,9 @@ async fn serve(
         // watches free NVMe and the engine's physical growth, and publishes two
         // decisions the hot paths read as plain atomics — pause block admission
         // when the filesystem nears full or the block cache would grow into
-        // fragment-held budget (serve from origin, never crash), and grant the
-        // fragment store exactly the budget the block cache is not using. Owned
-        // by the data plane for the process lifetime.
+        // bytes held by KV or fragments (serve from origin, never crash), and
+        // grant new fragments exactly the budget neither cache nor KV is using.
+        // Owned by the data plane for the process lifetime.
         let growth_room = {
             let engine = reader.clone();
             move || engine.disk_growth_room_bytes()
@@ -1666,6 +1711,7 @@ async fn serve(
             growth_room,
             Arc::clone(&fragment_ceiling),
             fragment_store.clone(),
+            kv_store.clone(),
         );
         // Peer-fetch server (#29): serves this node's owned, cached blocks to
         // peers from the local tiers only. Held for the process lifetime;
@@ -1721,17 +1767,20 @@ async fn serve(
         let s3_agent = agent.clone();
         let s3_writeback_metrics = writeback_metrics.clone();
         let s3_node_metrics = node_metrics.clone();
-        // The SigV4-gated S3 port can also dispatch configured execution roles.
-        // Catalog metadata never passes through this surface.
+        // The SigV4-gated data port always serves KV and can also dispatch the
+        // configured execution roles. The authenticated access key becomes the
+        // tenant before the KV router resolves a namespace or key.
         let s3_serving_api: Option<Arc<dyn verglas_s3::ServingApi>> =
-            (query_worker_dispatcher.is_some() || write_worker_dispatcher.is_some()).then(|| {
-                Arc::new(V1ServingApi {
-                    router: admin::v1_serving_router(
-                        query_worker_dispatcher.clone(),
-                        write_worker_dispatcher.clone(),
-                    ),
-                }) as Arc<dyn verglas_s3::ServingApi>
-            });
+            Some(Arc::new(V1ServingApi {
+                router: admin::v1_serving_router(
+                    query_worker_dispatcher.clone(),
+                    write_worker_dispatcher.clone(),
+                )
+                .merge(verglas_rest::kv::router(verglas_rest::kv::KvRuntime {
+                    store: kv_store.clone(),
+                    authorizer: verglas_rest::kv::KvAuthorizer::default(),
+                })),
+            }));
         let s3_task = tokio::spawn(async move {
             serve_s3(
                 &s3_config,
@@ -1764,7 +1813,7 @@ async fn serve(
         let _ = metrics_slot.set(metrics_source(
             config,
             node_metrics.clone(),
-            reader.clone(),
+            (reader.clone(), kv_store.clone()),
             registry.clone(),
             writeback_metrics.clone(),
             hooks.telemetry.clone(),
@@ -1880,12 +1929,13 @@ async fn serve(
 /// foyer files have not consumed), and publishes two decisions the hot paths
 /// consume as plain atomics. `caching_paused`: block admission stops when the
 /// filesystem nears full (#96) or when the block cache would otherwise grow
-/// into budget bytes the write-back fragments already hold (#223) — either way
+/// into budget bytes KV or write-back fragments already hold (#223) — either way
 /// the node degrades to origin fills, never crashes. `fragment_ceiling`: the
 /// fragment store may hold what it holds plus exactly the budget the block
-/// cache is not using — one `cache.capacity_bytes` budget, shared first come,
-/// first served, no carve. The poll keeps every `statfs`/`stat` off the serve
-/// and fill paths — they only read the atomics. The first tick fires
+/// cache and durable KV log are not using — one `cache.capacity_bytes` budget,
+/// shared first come, first served, no carve. The poll keeps every
+/// `statfs`/`stat` off the serve and fill paths — they only read the atomics.
+/// The first tick fires
 /// immediately, so the granted ceiling is live before serving starts. The
 /// returned task handle is held by the data plane for the process lifetime;
 /// dropping it on exit stops the poll.
@@ -1895,9 +1945,10 @@ fn spawn_disk_monitor(
     growth_room: impl Fn() -> u64 + Send + 'static,
     fragment_ceiling: Arc<std::sync::atomic::AtomicU64>,
     fragment_store: Option<LocalFragmentStore>,
+    kv_store: verglas_kv::Store,
 ) -> tokio::task::JoinHandle<()> {
     use std::sync::atomic::Ordering;
-    use verglas_core::disk::{DiskParams, disk_decision, free_bytes};
+    use verglas_core::disk::{DiskParams, free_bytes};
 
     let dir = config.cache.dir.clone();
     let capacity = config.cache.capacity_bytes.0;
@@ -1917,10 +1968,13 @@ fn spawn_disk_monitor(
         loop {
             ticker.tick().await;
             let frag_used = fragment_store.as_ref().map_or(0, |s| s.used_bytes());
+            let kv_used = kv_store.used_bytes();
             let was_paused = caching_paused.load(Ordering::Relaxed);
             let free = free_bytes(&dir);
             let room = growth_room();
-            let state = disk_decision(free, room, frag_used, was_paused, &params);
+            let state = shared_disk_decision(free, room, frag_used, kv_used, was_paused, &params);
+            let shared_available = state.fragment_max.saturating_sub(frag_used);
+            kv_store.set_capacity_ceiling(kv_used.saturating_add(shared_available));
             caching_paused.store(state.caching_paused, Ordering::Relaxed);
             // Pause transitions must be loud (#300): a paused cache serves
             // correctly but admits nothing, and hit counters were the only way
@@ -1931,6 +1985,7 @@ fn spawn_disk_monitor(
                         fs_free_bytes = free,
                         foyer_growth_room = room,
                         frag_used,
+                        kv_used,
                         "cache admission paused: disk headroom below low water"
                     );
                 } else {
@@ -1938,6 +1993,7 @@ fn spawn_disk_monitor(
                         fs_free_bytes = free,
                         foyer_growth_room = room,
                         frag_used,
+                        kv_used,
                         "cache admission resumed"
                     );
                 }
@@ -1949,6 +2005,28 @@ fn spawn_disk_monitor(
             }
         }
     })
+}
+
+/// Accounts KV and write-back bytes as one non-evictable total while returning
+/// a ceiling expressed only in fragment-store bytes.
+fn shared_disk_decision(
+    free: Option<u64>,
+    foyer_growth_room: u64,
+    frag_used: u64,
+    kv_used: u64,
+    was_paused: bool,
+    params: &verglas_core::disk::DiskParams,
+) -> verglas_core::disk::DiskState {
+    let protected_used = frag_used.saturating_add(kv_used);
+    let mut state = verglas_core::disk::disk_decision(
+        free,
+        foyer_growth_room,
+        protected_used,
+        was_paused,
+        params,
+    );
+    state.fragment_max = state.fragment_max.saturating_sub(kv_used).max(frag_used);
+    state
 }
 
 /// Builds the peer-fetch client (#29). When `[cluster]` is configured, it
@@ -2377,6 +2455,25 @@ mod tests {
         assert_eq!(background_fill_limit(3), 0);
         assert_eq!(background_fill_limit(4), 1);
         assert_eq!(background_fill_limit(64), 16);
+    }
+
+    /// KV consumes shared headroom by actual durable bytes and never receives a carve.
+    #[test]
+    fn kv_and_fragments_share_non_evictable_disk_accounting() {
+        let params = verglas_core::disk::DiskParams {
+            low_water: 100,
+            high_water: 200,
+        };
+        let open = shared_disk_decision(None, 10_000, 500, 1_000, false, &params);
+        assert!(!open.caching_paused);
+        assert_eq!(open.fragment_max, 9_000);
+
+        let full = shared_disk_decision(None, 10_000, 500, 9_500, false, &params);
+        assert!(full.caching_paused);
+        assert_eq!(
+            full.fragment_max, 500,
+            "acked fragments remain but cannot grow"
+        );
     }
 
     /// Builds the engine in-process, mounts the admin router with its stats

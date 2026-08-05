@@ -18,10 +18,15 @@ export class VerglasHttpError extends Error {
 /** Everything the transport needs, resolved once at `connect` time. */
 export interface Transport {
   request<T>(
-    method: "GET" | "POST" | "PUT",
+    method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     opts?: { query?: Record<string, string | number | undefined>; body?: unknown; headers?: Record<string, string> },
   ): Promise<T>;
+  requestRaw(
+    method: "GET" | "PUT" | "DELETE",
+    path: string,
+    opts?: { query?: Record<string, string | number | undefined>; body?: BodyInit; headers?: Record<string, string> },
+  ): Promise<Response>;
 }
 
 /** Joins the endpoint base and a path, tolerating a trailing slash on either. */
@@ -40,7 +45,7 @@ export function makeTransport(
 ): Transport {
   return {
     async request<T>(
-      method: "GET" | "POST" | "PUT",
+      method: "GET" | "POST" | "PUT" | "DELETE",
       path: string,
       opts?: { query?: Record<string, string | number | undefined>; body?: unknown; headers?: Record<string, string> },
     ): Promise<T> {
@@ -70,6 +75,33 @@ export function makeTransport(
         // 204 or empty body: return undefined cast to T.
         const text = await resp.text();
         return (text ? JSON.parse(text) : undefined) as T;
+      } finally {
+        clearTimeout(timer);
+      }
+    },
+    async requestRaw(
+      method: "GET" | "PUT" | "DELETE",
+      path: string,
+      opts?: { query?: Record<string, string | number | undefined>; body?: BodyInit; headers?: Record<string, string> },
+    ): Promise<Response> {
+      const url = new URL(joinUrl(endpoint, path));
+      for (const [k, v] of Object.entries(opts?.query ?? {})) {
+        if (v !== undefined) url.searchParams.set(k, String(v));
+      }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const resp = await fetchImpl(url.toString(), {
+          method,
+          headers: { authorization: `Bearer ${token}`, ...opts?.headers },
+          body: opts?.body,
+          signal: controller.signal,
+        });
+        if (!resp.ok) {
+          const text = await resp.text().catch(() => "");
+          throw new VerglasHttpError(resp.status, method, url.pathname, text);
+        }
+        return resp;
       } finally {
         clearTimeout(timer);
       }

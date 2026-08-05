@@ -6,13 +6,17 @@
 //! pauses cache admission when the filesystem itself nears full. Budget sharing
 //! (#223): there is **one** NVMe budget — `cache.capacity_bytes` — shared first
 //! come, first served by the block cache, the metadata store, and the
-//! write-back fragment store. There is no carve and no fraction; enforcement is
-//! accounting. The foyer stores get the full budget as their *logical* capacity
+//! write-back fragment store and durable KV log. There is no carve and no
+//! fraction; enforcement is accounting. KV and acknowledged write-back bytes
+//! are non-evictable; every other cached byte remains heat-managed. The foyer
+//! stores get the full budget as their *logical* capacity
 //! but their device files are sparse, so their *physical* usage grows only with
 //! admitted data; [`disk_decision`] lets fragments take exactly the bytes the
 //! block cache has not physically grown into, and pauses block admission before
-//! it would grow into bytes fragments already hold. The poll runs off every hot
-//! path; the serve path only reads the resulting atomics.
+//! it would grow into bytes protected durable state already holds. The server
+//! aggregates KV and fragment usage for this decision, then translates the
+//! returned grant back into a fragment-only ceiling. The poll runs off every
+//! hot path; the serve path only reads the resulting atomics.
 
 use std::path::Path;
 
