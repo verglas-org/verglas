@@ -10,7 +10,10 @@ WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN rustup show
 COPY . .
-RUN cargo build --release -p verglas-server
+RUN cargo build --release \
+    -p verglas-server \
+    -p verglas-query \
+    -p verglas-write-node
 
 FROM debian:bookworm-slim
 RUN apt-get update \
@@ -20,6 +23,8 @@ RUN apt-get update \
     && mkdir -p /var/lib/verglas /etc/verglas \
     && chown -R verglas:verglas /var/lib/verglas
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server
+COPY --from=build /src/target/release/verglas-query /usr/local/bin/verglas-query
+COPY --from=build /src/target/release/verglas-write /usr/local/bin/verglas-write
 COPY deploy/docker/verglas.toml /etc/verglas/config.toml
 USER verglas
 EXPOSE 8333 8334

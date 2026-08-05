@@ -74,3 +74,8 @@
   and warehouse alongside the Verglas S3 endpoint. Clients communicate with
   the catalog directly; the server advertises coordinates but never hosts or
   proxies it.
+- #3: Made generated partition field names Avro-safe by separating the source
+  and transform with an underscore. Cloudflare can now emit manifests that the
+  Iceberg reader accepts for SDK-created partitioned tables. Extended the
+  default response-header deadline to cover cold worker startup and remote
+  catalog planning.

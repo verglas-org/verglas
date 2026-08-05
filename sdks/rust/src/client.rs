@@ -62,7 +62,7 @@ impl ConnectOptions {
             warehouse: None,
             s3_endpoint: None,
             connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(30),
+            request_timeout: Duration::from_secs(120),
         }
     }
 
@@ -600,7 +600,7 @@ fn catalog_create_request(name: &str, definition: &TableDefinition) -> Result<Va
         partition_fields.push(json!({
             "source-id": source_id,
             "field-id": field_id,
-            "name": format!("{}-{}", partition.source, partition.transform),
+            "name": format!("{}_{}", partition.source, partition.transform),
             "transform": partition.transform,
         }));
     }
@@ -978,4 +978,19 @@ fn encode_batch(batch: &RecordBatch) -> Result<Vec<u8>, ClientError> {
 /// Reads a non-empty environment value.
 fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default header deadline covers a cold isolated worker launch plus
+    /// catalog planning against a remote warehouse.
+    #[test]
+    fn default_request_timeout_covers_cold_worker_startup() {
+        assert_eq!(
+            ConnectOptions::new("http://127.0.0.1:8334").request_timeout,
+            Duration::from_secs(120)
+        );
+    }
 }
