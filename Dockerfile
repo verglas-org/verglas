@@ -13,8 +13,16 @@ COPY . .
 RUN cargo build --release \
     -p verglas-server \
     -p verglas-scheduler-bin \
+    -p verglas-gadget-runtime \
     -p verglas-query \
     -p verglas-write-node
+
+FROM oven/bun:1.3.8 AS gadget-host
+WORKDIR /opt/verglas-gadget-runtime
+COPY crates/verglas-gadget-runtime/runtime/package.json \
+    crates/verglas-gadget-runtime/runtime/bun.lock ./
+RUN bun install --frozen-lockfile --production
+COPY crates/verglas-gadget-runtime/runtime/host.mjs ./host.mjs
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -32,6 +40,14 @@ COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-s
 USER verglas
 EXPOSE 8340
 ENTRYPOINT ["verglas-scheduler"]
+
+FROM runtime AS verglas-gadget-runtime
+COPY --from=build /src/target/release/verglas-gadget-runtime /usr/local/bin/verglas-gadget-runtime
+COPY --from=gadget-host /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=gadget-host /opt/verglas-gadget-runtime /opt/verglas-gadget-runtime
+USER verglas
+EXPOSE 8350
+ENTRYPOINT ["verglas-gadget-runtime"]
 
 FROM runtime AS verglas-server
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server

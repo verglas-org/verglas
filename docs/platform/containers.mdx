@@ -10,6 +10,19 @@ Containers run service images in Verglas Cloud. Use a container when the workloa
 The current CLI manages containers through the cloud control plane. Local container execution is outside the current CLI contract.
 </Note>
 
+## Run Verglas OS Gadgets locally
+
+The repository Compose stack includes `verglas-gadget-runtime`. This is a
+specialized OS execution service, not the generic `verglas containers` control
+plane described below. One local runtime container can register multiple
+Gadgets and supervises one Bun child process for each selected revision.
+
+Cloud scheduling uses the same runtime image with `VERGLAS_GADGET_ID` set. That
+setting rejects every other Gadget identity and fixes runtime capacity at one,
+so the cloud scheduler can place each Gadget in its own sandbox.
+
+See the crate README for its authenticated registration and Cap'n Web routes.
+
 ## Deploy a catalog app
 
 List the curated applications available to your tenant:

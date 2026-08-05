@@ -50,6 +50,22 @@ services:
         hard: 8192
     restart: unless-stopped
 
+  verglas-gadget-runtime:
+    build:
+      context: .
+      target: verglas-gadget-runtime
+    image: verglas/verglas-gadget-runtime:local
+    ports:
+      - "8350:8350"
+    environment:
+      VERGLAS_GADGET_RUNTIME_LISTEN: 0.0.0.0:8350
+      VERGLAS_GADGET_RUNTIME_TOKEN: ${VERGLAS_GADGET_RUNTIME_TOKEN:-verglas-local-gadget-runtime}
+      VERGLAS_GADGET_MAX_GADGETS: ${VERGLAS_GADGET_MAX_GADGETS:-64}
+    depends_on:
+      verglas-server:
+        condition: service_started
+    restart: unless-stopped
+
   verglas-scheduler:
     build:
       context: .
