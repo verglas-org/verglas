@@ -35,3 +35,11 @@ binary = "/usr/local/bin/verglas-query"
 
 [write_worker]
 binary = "/usr/local/bin/verglas-write"
+
+# Optional Rill Developer integration. Start it with:
+#   docker compose --profile analytics up -d
+[analytics.rill]
+uri = "http://rill:9009"
+instance_id = "default"
+browser_uri = "http://127.0.0.1:9009"
+s3_uri = "http://verglas-server:8333"

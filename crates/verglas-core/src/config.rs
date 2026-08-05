@@ -71,6 +71,10 @@ pub struct Config {
     pub query_worker: Option<QueryWorker>,
     /// Isolated logical table writer launched by the server for Arrow commits.
     pub write_worker: Option<WriteWorker>,
+    /// Optional on-prem analytics services. Cloud composes analytics roles
+    /// independently and does not use this deployment-specific integration.
+    #[serde(default)]
+    pub analytics: Option<Analytics>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
     /// The control plane the CLI authenticates against for cross-node and cloud
@@ -1146,6 +1150,64 @@ pub struct WriteWorker {
     pub binary: String,
 }
 
+/// Optional analytics services composed by the on-prem REST process.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Analytics {
+    /// Rill Developer runtime reachable over the private deployment network.
+    pub rill: Rill,
+}
+
+/// Network contract for an on-prem Rill Developer runtime.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Rill {
+    /// Internal base URI used by `verglas-rest` to manage Rill project files.
+    pub uri: String,
+    /// Rill runtime instance receiving project-file requests.
+    #[serde(default = "default_rill_instance_id")]
+    pub instance_id: String,
+    /// Browser-facing URI returned by dashboard commands.
+    pub browser_uri: String,
+    /// S3 URI Rill uses from inside the deployment network to reach Verglas.
+    pub s3_uri: String,
+}
+
+/// Rill Developer's local runtime instance name.
+fn default_rill_instance_id() -> String {
+    "default".to_owned()
+}
+
+impl Rill {
+    /// Rejects malformed network addresses and instance identifiers at startup.
+    fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("analytics.rill.uri", self.uri.as_str()),
+            ("analytics.rill.browser_uri", self.browser_uri.as_str()),
+            ("analytics.rill.s3_uri", self.s3_uri.as_str()),
+        ] {
+            if !(value.starts_with("http://") || value.starts_with("https://")) {
+                return Err(ConfigError::Invalid(
+                    field,
+                    "must be an http:// or https:// URI".to_owned(),
+                ));
+            }
+        }
+        if self.instance_id.is_empty()
+            || !self
+                .instance_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        {
+            return Err(ConfigError::Invalid(
+                "analytics.rill.instance_id",
+                "must contain only ASCII letters, digits, `_`, or `-`".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl WriteWorker {
     /// Validates the configured role binary before the first write request.
     fn validate(&self) -> Result<(), ConfigError> {
@@ -1538,6 +1600,15 @@ impl Config {
         if let Some(write_worker) = &self.write_worker {
             write_worker.validate()?;
         }
+        if let Some(analytics) = &self.analytics {
+            if self.catalog.is_none() {
+                return Err(ConfigError::Invalid(
+                    "analytics.rill",
+                    "requires a configured [catalog] so tables can be resolved".to_owned(),
+                ));
+            }
+            analytics.rill.validate()?;
+        }
         if let Some(cluster) = &self.cluster {
             cluster.validate()?;
         }
@@ -1572,7 +1643,7 @@ impl Config {
     /// One-line startup summary so operators can eyeball what loaded.
     pub fn summary(&self) -> String {
         format!(
-            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} cluster={} query_worker={} write_worker={}",
+            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} cluster={} query_worker={} write_worker={} analytics={}",
             self.listen.s3_port,
             self.listen.admin_port,
             if self.listen.tls.is_some() {
@@ -1603,6 +1674,9 @@ impl Config {
             self.write_worker
                 .as_ref()
                 .map_or("off", |w| w.binary.as_str()),
+            self.analytics
+                .as_ref()
+                .map_or("off", |a| a.rill.uri.as_str()),
         )
     }
 }

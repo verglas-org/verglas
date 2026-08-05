@@ -146,6 +146,10 @@ pub type DrainHandler =
 /// filled.
 pub type TablesSlot = Arc<OnceLock<Arc<dyn Catalog>>>;
 
+/// Optional on-prem Rill integration. The runtime carries the deferred table
+/// catalog slot and reaches Rill only over its private network API.
+pub type DashboardSlot = Arc<crate::dashboard::DashboardRuntime>;
+
 /// The catalog handle the `graph` verb-family routes (`/v1/graphs/...`) drive
 /// the graph-over-Iceberg engine through. A graph is not a new storage
 /// primitive — it is a namespace holding two plain Iceberg tables plus the
@@ -210,6 +214,8 @@ pub struct Slots {
     pub access: Option<LocalAccess>,
     /// The internal catalog handle used by compaction and engine subsystems.
     pub tables: Option<TablesSlot>,
+    /// Rill-backed dashboard routes, absent when `[analytics.rill]` is unset.
+    pub dashboards: Option<DashboardSlot>,
     /// The `graph` verb-family routes (`/v1/graphs/...`), backed by
     /// `verglas-graph` over the same private catalog as the table routes.
     pub graphs: Option<GraphsSlot>,
@@ -254,6 +260,7 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         catalog,
         access,
         tables,
+        dashboards,
         graphs,
         vector,
         sys,
@@ -370,6 +377,9 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
     if let Some(tables) = tables {
         app = app.merge(compact_router(tables));
     }
+    if let Some(dashboards) = dashboards {
+        app = app.merge(dashboard_router(dashboards));
+    }
     app = app.merge(v1_serving_router(query_worker, write_worker));
     if let Some(graphs) = graphs {
         app = app.merge(graphs_router(graphs));
@@ -390,6 +400,75 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         app = crate::compose_query_and_catalog(app, catalog);
     }
     app
+}
+
+/// Mounts the optional Rill dashboard resource API.
+fn dashboard_router(dashboards: DashboardSlot) -> Router {
+    Router::new()
+        .route("/v1/dashboards", post(dashboard_create).get(dashboard_list))
+        .route(
+            "/v1/dashboards/{name}",
+            get(dashboard_show).delete(dashboard_delete),
+        )
+        .with_state(dashboards)
+}
+
+/// Creates or refreshes a Rill dashboard for one catalog-resolved table.
+async fn dashboard_create(
+    State(dashboards): State<DashboardSlot>,
+    Json(request): Json<crate::dashboard::CreateDashboardRequest>,
+) -> Response {
+    match dashboards.create(request).await {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => dashboard_error(error),
+    }
+}
+
+/// Lists Verglas-owned Rill dashboards.
+async fn dashboard_list(State(dashboards): State<DashboardSlot>) -> Response {
+    match dashboards.list().await {
+        Ok(list) => Json(list).into_response(),
+        Err(error) => dashboard_error(error),
+    }
+}
+
+/// Shows one Verglas-owned Rill dashboard.
+async fn dashboard_show(
+    State(dashboards): State<DashboardSlot>,
+    Path(name): Path<String>,
+) -> Response {
+    match dashboards.show(&name).await {
+        Ok(info) => Json(info).into_response(),
+        Err(error) => dashboard_error(error),
+    }
+}
+
+/// Deletes only the Rill files owned by the named Verglas dashboard.
+async fn dashboard_delete(
+    State(dashboards): State<DashboardSlot>,
+    Path(name): Path<String>,
+) -> Response {
+    match dashboards.delete(&name).await {
+        Ok(deleted) => Json(deleted).into_response(),
+        Err(error) => dashboard_error(error),
+    }
+}
+
+/// Maps the dashboard contract to stable HTTP statuses.
+fn dashboard_error(error: crate::dashboard::DashboardError) -> Response {
+    let status = match &error {
+        crate::dashboard::DashboardError::Invalid(_) => StatusCode::BAD_REQUEST,
+        crate::dashboard::DashboardError::NotFound(_) => StatusCode::NOT_FOUND,
+        crate::dashboard::DashboardError::Ownership(_) => StatusCode::CONFLICT,
+        crate::dashboard::DashboardError::Catalog(message)
+            if message == "cache engine is still recovering" =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        crate::dashboard::DashboardError::Catalog(_)
+        | crate::dashboard::DashboardError::Rill(_) => StatusCode::BAD_GATEWAY,
+    };
+    (status, error.to_string()).into_response()
 }
 
 /// The health sub-router, isolated so its [`Health`] state does not leak into
@@ -2363,6 +2442,107 @@ mod tests {
         let slot: TablesSlot = Arc::new(OnceLock::new());
         let _ = slot.set(catalog);
         slot
+    }
+
+    /// Dashboard routes are absent unless the optional Rill runtime is wired.
+    #[tokio::test]
+    async fn dashboard_routes_are_absent_without_rill_configuration() {
+        let app = router(VERSION, Health::ready(), Slots::default());
+        let response = call(app, "GET", "/v1/dashboards").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Creating a dashboard resolves the table and writes Rill project resources.
+    #[tokio::test]
+    async fn dashboard_create_writes_rill_resources_for_the_catalog_table() {
+        let rill = crate::dashboard::test_runtime(tables_slot_with_table().await).await;
+        let recorder = rill.test_recorder();
+        let app = router(
+            VERSION,
+            Health::ready(),
+            Slots {
+                dashboards: Some(Arc::new(rill)),
+                ..Slots::default()
+            },
+        );
+        let response = call_json(
+            app.clone(),
+            "POST",
+            "/v1/dashboards",
+            json!({"table": "sdk.events"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["name"], "sdk_events");
+        assert_eq!(body["table"], "sdk.events");
+        assert_eq!(body["url"], "http://127.0.0.1:9009/explore/sdk_events");
+
+        let files = recorder.files();
+        assert!(files.contains_key("rill.yaml"));
+        assert!(files.contains_key("connectors/verglas.yaml"));
+        assert!(files.contains_key("models/sdk_events.yaml"));
+        assert!(files.contains_key("metrics/sdk_events.yaml"));
+        assert!(files.contains_key("dashboards/sdk_events.yaml"));
+        assert!(files["models/sdk_events.yaml"].contains("iceberg_scan"));
+        assert!(
+            files["models/sdk_events.yaml"].contains("create_secrets_from_connectors: verglas")
+        );
+        assert!(files["models/sdk_events.yaml"].contains("materialize: true"));
+        assert!(files["dashboards/sdk_events.yaml"].contains("metrics_view: sdk_events"));
+
+        // Repeating create refreshes the same owned files instead of creating
+        // duplicates or failing on its own resources.
+        let response = call_json(
+            app.clone(),
+            "POST",
+            "/v1/dashboards",
+            json!({"table": "sdk.events"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = call(app.clone(), "GET", "/v1/dashboards").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["dashboards"].as_array().expect("dashboards").len(), 1);
+
+        let response = call(app.clone(), "GET", "/v1/dashboards/sdk_events").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = json_body(response).await;
+        assert_eq!(body["table"], "sdk.events");
+
+        let response = call(app, "DELETE", "/v1/dashboards/sdk_events").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let files = recorder.files();
+        assert!(files.contains_key("connectors/verglas.yaml"));
+        assert!(!files.contains_key("models/sdk_events.yaml"));
+        assert!(!files.contains_key("metrics/sdk_events.yaml"));
+        assert!(!files.contains_key("dashboards/sdk_events.yaml"));
+    }
+
+    /// A generated name collision never overwrites a user-owned Rill file.
+    #[tokio::test]
+    async fn dashboard_create_refuses_an_unowned_rill_resource() {
+        let rill = crate::dashboard::test_runtime(tables_slot_with_table().await).await;
+        rill.test_recorder()
+            .insert("models/clash.yaml", "type: model\nsql: SELECT 1\n");
+        let app = router(
+            VERSION,
+            Health::ready(),
+            Slots {
+                dashboards: Some(Arc::new(rill)),
+                ..Slots::default()
+            },
+        );
+        let response = call_json(
+            app,
+            "POST",
+            "/v1/dashboards",
+            json!({"table": "sdk.events", "name": "clash"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     /// Sends a request with a JSON body and returns the response.

@@ -42,3 +42,39 @@ services:
     profiles:
       - workers
     restart: unless-stopped
+
+  rill-volume-init:
+    image: alpine:3.22
+    command:
+      - chown
+      - -R
+      - "1001:1001"
+      - /var/lib/rill
+    volumes:
+      - rill-data:/var/lib/rill
+    profiles:
+      - analytics
+    restart: "no"
+
+  rill:
+    image: rilldata/rill:v0.88.6
+    platform: linux/amd64
+    command:
+      - start
+      - /var/lib/rill
+      - --no-open
+      - --port
+      - "9009"
+    ports:
+      - "9009:9009"
+    volumes:
+      - rill-data:/var/lib/rill
+    depends_on:
+      rill-volume-init:
+        condition: service_completed_successfully
+    profiles:
+      - analytics
+    restart: unless-stopped
+
+volumes:
+  rill-data:
