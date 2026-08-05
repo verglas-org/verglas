@@ -45,6 +45,7 @@ pub struct ConnectOptions {
     token: Option<String>,
     catalog_token: Option<String>,
     catalog_uri: Option<String>,
+    query_uri: Option<String>,
     warehouse: Option<String>,
     s3_endpoint: Option<String>,
     connect_timeout: Duration,
@@ -59,6 +60,7 @@ impl ConnectOptions {
             token: None,
             catalog_token: None,
             catalog_uri: None,
+            query_uri: None,
             warehouse: None,
             s3_endpoint: None,
             connect_timeout: Duration::from_secs(5),
@@ -78,6 +80,7 @@ impl ConnectOptions {
         options.token = nonempty_env("VERGLAS_TOKEN");
         options.catalog_token = nonempty_env("VERGLAS_CATALOG_TOKEN");
         options.catalog_uri = nonempty_env("VERGLAS_CATALOG_URI");
+        options.query_uri = nonempty_env("VERGLAS_QUERY_URI");
         options.warehouse = nonempty_env("VERGLAS_WAREHOUSE");
         options.s3_endpoint = nonempty_env("VERGLAS_S3_ENDPOINT");
         options
@@ -92,10 +95,17 @@ impl ConnectOptions {
         self
     }
 
-    /// Supplies the upstream Iceberg REST catalog explicitly.
+    /// Supplies the Iceberg REST endpoint clients should use explicitly.
     #[must_use]
     pub fn with_catalog_uri(mut self, catalog_uri: impl Into<String>) -> Self {
         self.catalog_uri = Some(catalog_uri.into());
+        self
+    }
+
+    /// Supplies the query and write API base URL explicitly.
+    #[must_use]
+    pub fn with_query_uri(mut self, query_uri: impl Into<String>) -> Self {
+        self.query_uri = Some(query_uri.into());
         self
     }
 
@@ -202,7 +212,7 @@ pub enum ClientError {
 /// Reusable authenticated client for a Verglas server.
 #[derive(Debug, Clone)]
 pub struct Client {
-    endpoint: String,
+    query_uri: String,
     catalog_uri: String,
     warehouse: Option<String>,
     s3_endpoint: String,
@@ -235,7 +245,10 @@ impl Client {
         let http = reqwest::Client::builder()
             .connect_timeout(options.connect_timeout)
             .build()?;
-        let access = if options.catalog_uri.is_none() || options.s3_endpoint.is_none() {
+        let access = if options.catalog_uri.is_none()
+            || options.query_uri.is_none()
+            || options.s3_endpoint.is_none()
+        {
             let mut request = http.get(format!("{endpoint}{ACCESS_PATH}"));
             if let Some(token) = &server_token {
                 request = request.header(AUTHORIZATION, token.clone());
@@ -261,8 +274,14 @@ impl Client {
             .ok_or_else(|| {
                 ClientError::Configuration("server advertises no S3 endpoint".to_owned())
             })?;
+        let query_uri = options
+            .query_uri
+            .or_else(|| access.as_ref().map(|value| value.query_uri.clone()))
+            .ok_or_else(|| ClientError::Configuration("server advertises no query URI".to_owned()))?
+            .trim_end_matches('/')
+            .to_owned();
         Ok(Self {
-            endpoint,
+            query_uri,
             catalog_uri,
             warehouse: options
                 .warehouse
@@ -277,9 +296,14 @@ impl Client {
         })
     }
 
-    /// Returns the discovered upstream Iceberg REST catalog URI.
+    /// Returns the discovered Iceberg REST catalog URI.
     pub fn catalog_uri(&self) -> &str {
         &self.catalog_uri
+    }
+
+    /// Returns the query and write API base URL.
+    pub fn query_uri(&self) -> &str {
+        &self.query_uri
     }
 
     /// Returns the S3-compatible Verglas object-cache endpoint.
@@ -542,7 +566,7 @@ impl Client {
 
     /// Joins an API path to the configured endpoint.
     fn url(&self, path: &str) -> String {
-        format!("{}{path}", self.endpoint)
+        format!("{}{path}", self.query_uri)
     }
 }
 

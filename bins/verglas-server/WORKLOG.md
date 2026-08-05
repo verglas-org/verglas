@@ -589,3 +589,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #3: Packaged the isolated query and write role binaries in the self-hosted
   Docker image and enabled both dispatchers in its config. The Docker
   application can now execute SQL and logical writes without embedded paths.
+- #8: Reduced the server crate to process startup and listener assembly, delegating HTTP composition to `verglas-rest`. On-prem startup now advertises and internally uses local S3, query/write, and cached catalog endpoints.

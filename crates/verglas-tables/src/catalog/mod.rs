@@ -17,16 +17,15 @@
 //! event exactly once.
 
 mod feed;
-mod rest;
 mod watcher;
 mod websocket;
 
-use std::fmt;
-
-use async_trait::async_trait;
 use tokio::sync::{broadcast, watch};
 
-pub use rest::RestCatalogSource;
+pub use verglas_catalog::{
+    CatalogError, CatalogGateway, CatalogResponse, CatalogSource, RestCatalogSource, TableIdent,
+    TableState,
+};
 pub use watcher::{CatalogFeed, PollingWatcher, WatcherOptions};
 pub use websocket::WsFeedConfig;
 
@@ -34,54 +33,6 @@ pub use websocket::WsFeedConfig;
 /// table; a consumer that falls 1024 events behind is resynchronizing from
 /// state anyway (see the module docs).
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
-
-/// A table's identity in the catalog: a (possibly nested) namespace plus a
-/// table name.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct TableIdent {
-    /// Namespace levels, outermost first (e.g. `["db"]` or `["db", "sub"]`).
-    pub namespace: Vec<String>,
-    /// Table name within the namespace.
-    pub name: String,
-}
-
-impl TableIdent {
-    /// Builds an identity from namespace levels and a name.
-    pub fn new(namespace: &[&str], name: &str) -> TableIdent {
-        TableIdent {
-            namespace: namespace.iter().map(|s| (*s).to_owned()).collect(),
-            name: name.to_owned(),
-        }
-    }
-
-    /// The dotted full name (`db.sub.table`) filters match against.
-    pub fn dotted(&self) -> String {
-        let mut out = self.namespace.join(".");
-        if !out.is_empty() {
-            out.push('.');
-        }
-        out.push_str(&self.name);
-        out
-    }
-}
-
-impl fmt::Display for TableIdent {
-    /// Renders the dotted full name.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.dotted())
-    }
-}
-
-/// A table's current catalog pointer: where the metadata.json lives and
-/// which snapshot it names. This pair is everything a cheap poll compares.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TableState {
-    /// Object-store location of the current `metadata.json`.
-    pub metadata_location: String,
-    /// The metadata's current snapshot id; `None` for a table with no
-    /// snapshots yet (freshly created, never written).
-    pub current_snapshot_id: Option<i64>,
-}
 
 /// One observed step in a table's snapshot lineage.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,51 +62,6 @@ pub struct TableChanged {
     pub old_snapshot: Option<i64>,
     /// Snapshot id after the change (`None`: table was dropped).
     pub new_snapshot: Option<i64>,
-}
-
-/// Error talking to or decoding a catalog.
-#[derive(Debug, thiserror::Error)]
-pub enum CatalogError {
-    /// The HTTP request itself failed (connect, timeout, TLS).
-    #[error("catalog request failed: {0}")]
-    Http(#[from] reqwest::Error),
-    /// The catalog answered with a non-success status.
-    #[error("catalog returned HTTP {status} for {url}")]
-    Status {
-        /// The HTTP status code returned.
-        status: u16,
-        /// The URL that produced it.
-        url: String,
-    },
-    /// The catalog answered 200 but the body was not the expected shape.
-    #[error("malformed catalog response from {url}: {detail}")]
-    Malformed {
-        /// The URL that produced the body.
-        url: String,
-        /// What was wrong with it.
-        detail: String,
-    },
-    /// SigV4 signing could not resolve credentials or build the signature (#236).
-    #[error("catalog request signing failed: {detail}")]
-    Auth {
-        /// What went wrong (credential resolution or signing).
-        detail: String,
-    },
-}
-
-/// A catalog protocol the polling loop can drive: enumerate tables and read
-/// one table's current pointer. This is the trait the Glue watcher (#48)
-/// implements; everything above it (filtering, diffing, lineage, backoff,
-/// events) is shared via [`PollingWatcher`].
-#[async_trait]
-pub trait CatalogSource: Send + Sync + 'static {
-    /// Enumerates every table visible in the catalog (unfiltered — the
-    /// polling loop applies [`TableFilter`] before touching any table).
-    async fn list_tables(&self) -> Result<Vec<TableIdent>, CatalogError>;
-
-    /// Reads one table's current pointer. Must be cheap: pointer fields
-    /// only, no manifest reads.
-    async fn table_pointer(&self, table: &TableIdent) -> Result<TableState, CatalogError>;
 }
 
 /// The interface downstream consumers hold: last-known catalog state plus a

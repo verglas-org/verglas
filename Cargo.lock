@@ -7157,6 +7157,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-catalog"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "aws-config",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-sigv4",
+ "aws-smithy-runtime-api",
+ "axum",
+ "bytes",
+ "flate2",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "verglas-core",
+]
+
+[[package]]
 name = "verglas-cluster"
 version = "0.1.1"
 dependencies = [
@@ -7355,6 +7376,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-rest"
+version = "0.1.1"
+dependencies = [
+ "arrow-array 57.3.1",
+ "arrow-ipc 57.3.1",
+ "arrow-schema 57.3.1",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "futures",
+ "iceberg",
+ "iceberg-catalog-sql",
+ "object_store 0.14.0",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "verglas-backend",
+ "verglas-cache",
+ "verglas-catalog",
+ "verglas-core",
+ "verglas-graph",
+ "verglas-harness",
+ "verglas-iceberg",
+ "verglas-platform",
+ "verglas-s3",
+ "verglas-sdk",
+ "verglas-vector",
+]
+
+[[package]]
 name = "verglas-s3"
 version = "0.1.1"
 dependencies = [
@@ -7445,6 +7506,7 @@ dependencies = [
  "urlencoding",
  "verglas-backend",
  "verglas-cache",
+ "verglas-catalog",
  "verglas-cluster",
  "verglas-core",
  "verglas-graph",
@@ -7452,6 +7514,7 @@ dependencies = [
  "verglas-iceberg",
  "verglas-instance",
  "verglas-platform",
+ "verglas-rest",
  "verglas-s3",
  "verglas-sdk",
  "verglas-tables",
@@ -7491,6 +7554,7 @@ dependencies = [
  "toml",
  "tracing",
  "verglas-cache",
+ "verglas-catalog",
  "verglas-core",
  "verglas-s3",
  "xxhash-rust",

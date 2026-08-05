@@ -9,6 +9,8 @@ members = [
     "crates/verglas-cache",
     "crates/verglas-instance",
     "crates/verglas-s3",
+    "crates/verglas-catalog",
+    "crates/verglas-rest",
     "crates/verglas-tables",
     "crates/verglas-write",
     "crates/verglas-appendlog",
@@ -48,6 +50,8 @@ verglas-cluster = { path = "crates/verglas-cluster" }
 verglas-cache = { path = "crates/verglas-cache" }
 verglas-instance = { path = "crates/verglas-instance" }
 verglas-s3 = { path = "crates/verglas-s3" }
+verglas-catalog = { path = "crates/verglas-catalog" }
+verglas-rest = { path = "crates/verglas-rest" }
 verglas-tables = { path = "crates/verglas-tables" }
 verglas-write = { path = "crates/verglas-write" }
 verglas-appendlog = { path = "crates/verglas-appendlog" }

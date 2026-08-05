@@ -18,6 +18,8 @@ verglas-cluster.workspace = true
 # log and clustered ring plug in behind these traits.
 verglas-instance.workspace = true
 verglas-s3.workspace = true
+verglas-catalog.workspace = true
+verglas-rest.workspace = true
 verglas-tables.workspace = true
 verglas-write.workspace = true
 # verglas-iceberg is the engine (catalog open, the SDK table API, retention);

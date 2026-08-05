@@ -1,6 +1,7 @@
-//! Private Iceberg REST catalog transport used by the watcher. It reads only
-//! the catalog state Verglas needs for table awareness and is never mounted as
-//! a customer-facing or loopback catalog service.
+//! Iceberg REST catalog transport shared by the watcher and the loopback
+//! read-through gateway. Watcher refreshes retain complete successful GET
+//! responses while parsing only pointer fields; local clients reuse those
+//! responses, and catalog mutations remain authenticated write-through calls.
 //!
 //! # Why not iceberg-rust's catalog client
 //!
@@ -21,7 +22,7 @@
 //! (which has no signing hook). SigV4 signs the `/v1/config` call too, so the
 //! warehouse-prefix bootstrap works signed end-to-end.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,6 +40,7 @@ use reqwest::header::{
 use reqwest::{Method, header::HeaderMap};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
+use tokio::sync::RwLock;
 use verglas_core::config;
 
 use super::{CatalogError, CatalogSource, TableIdent, TableState};
@@ -64,6 +66,66 @@ const MAX_NAMESPACE_DEPTH: usize = 8;
 /// Per-request ceiling so a hung catalog cannot stall a poll cycle.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Hard memory ceiling for buffered REST catalog responses. This cache holds
+/// control-plane JSON only; immutable Iceberg objects use the metadata store.
+const CATALOG_RESPONSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Byte-bounded response map shared by watcher refreshes and local clients.
+#[derive(Debug)]
+struct CachedResponses {
+    /// Maximum sum of cached response body bytes.
+    budget: usize,
+    /// Current sum of cached response body bytes.
+    bytes: usize,
+    /// Path-and-query keyed successful GET responses.
+    entries: HashMap<String, CatalogResponse>,
+}
+
+impl CachedResponses {
+    /// Creates an empty response cache with a hard byte ceiling.
+    fn new(budget: usize) -> Self {
+        Self {
+            budget,
+            bytes: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Returns a cloned cached response for `key`.
+    fn get(&self, key: &str) -> Option<CatalogResponse> {
+        self.entries.get(key).cloned()
+    }
+
+    /// Inserts one response, evicting existing entries until the hard byte
+    /// ceiling can accommodate it. Responses larger than the whole budget are
+    /// served but not retained.
+    fn insert(&mut self, key: String, response: CatalogResponse) {
+        if let Some(previous) = self.entries.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.body.len());
+        }
+        let size = response.body.len();
+        if size > self.budget {
+            return;
+        }
+        while self.bytes.saturating_add(size) > self.budget {
+            let Some(victim) = self.entries.keys().next().cloned() else {
+                break;
+            };
+            if let Some(removed) = self.entries.remove(&victim) {
+                self.bytes = self.bytes.saturating_sub(removed.body.len());
+            }
+        }
+        self.bytes = self.bytes.saturating_add(size);
+        self.entries.insert(key, response);
+    }
+
+    /// Drops every cached GET after a successful catalog mutation.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+}
+
 /// An Iceberg REST catalog as a [`CatalogSource`].
 #[derive(Clone, Debug)]
 pub struct RestCatalogSource {
@@ -83,15 +145,59 @@ pub struct RestCatalogSource {
     http: reqwest::Client,
     /// Route prefix advertised by `/v1/config`, fetched lazily once.
     prefix: Arc<tokio::sync::OnceCell<String>>,
+    /// Successful GET responses shared with the loopback catalog gateway.
+    responses: Arc<RwLock<CachedResponses>>,
 }
 
-/// One buffered response from the private upstream catalog client.
+/// One buffered Iceberg REST response returned through the loopback gateway.
+/// Bodies are small catalog JSON documents or empty commit acknowledgements;
+/// object data never passes through this type.
 #[derive(Clone, Debug)]
-struct CatalogResponse {
+pub struct CatalogResponse {
     /// Upstream HTTP status code.
     pub status: u16,
+    /// End-to-end response headers with transfer framing removed.
+    pub headers: HeaderMap,
     /// Complete response body.
-    body: Bytes,
+    pub body: Bytes,
+}
+
+/// A loopback Iceberg REST gateway sharing successful GETs with the daemon's
+/// catalog watcher. Reads are served from the watcher's last-known response;
+/// mutations remain write-through and invalidate cached reads on success.
+#[derive(Clone, Debug)]
+pub struct CatalogGateway {
+    /// Shared authenticated upstream client and response cache.
+    source: RestCatalogSource,
+}
+
+impl CatalogGateway {
+    /// Builds a gateway from the daemon's catalog configuration.
+    pub fn from_config(config: &config::Catalog) -> Result<Self, config::ConfigError> {
+        Ok(Self {
+            source: RestCatalogSource::from_config(config)?,
+        })
+    }
+
+    /// Returns a watcher source backed by the same client and response cache.
+    pub fn source(&self) -> RestCatalogSource {
+        self.source.clone()
+    }
+
+    /// Serves one local catalog request. Successful watcher or gateway GETs are
+    /// reusable without upstream I/O; successful mutations clear cached GETs so
+    /// the next load observes the commit before being cached again.
+    pub async fn request(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<CatalogResponse, CatalogError> {
+        self.source
+            .gateway_request(method, path_and_query, headers, body)
+            .await
+    }
 }
 
 /// `GET /v1/config` response: we only care about a `prefix` override.
@@ -274,7 +380,7 @@ impl RestCatalogSource {
         RestCatalogSource::build(uri.into(), None, None, None)
     }
 
-    /// Creates a source from the server's `[catalog]` config section. In SigV4
+    /// Creates a source from the daemon's `[catalog]` config section. In SigV4
     /// mode, resolves the AWS credentials provider (a named AWS-INI file with an
     /// optional profile, or the ambient chain) and no bearer token. Otherwise
     /// resolves the bearer token from `credentials_file` (or the inline token),
@@ -320,7 +426,16 @@ impl RestCatalogSource {
             nested_namespaces,
             http,
             prefix: Arc::new(tokio::sync::OnceCell::new()),
+            responses: Arc::new(RwLock::new(CachedResponses::new(
+                CATALOG_RESPONSE_CACHE_BYTES,
+            ))),
         }
+    }
+
+    /// Converts a full upstream URL into the stable path-and-query cache key
+    /// local clients send to the gateway.
+    fn cache_key(&self, url: &str) -> String {
+        url.strip_prefix(&self.base).unwrap_or(url).to_owned()
     }
 
     /// Sends one request to the configured upstream catalog, applying bearer or
@@ -353,17 +468,19 @@ impl RestCatalogSource {
                 .sign(sigv4, &method, url, &headers, &body, request)
                 .await?;
         }
-        // The server negotiates compression with the upstream itself and always
+        // The daemon negotiates compression with the upstream itself and always
         // hands clients decoded JSON, so the client's own Accept-Encoding never
         // reaches the origin (stripped above) and cannot decide the wire framing.
         request = request.header(ACCEPT_ENCODING, "gzip");
         let response = request.body(body).send().await?;
         let status = response.status().as_u16();
-        let content_encoding = response
-            .headers()
+        let mut response_headers = response.headers().clone();
+        let content_encoding = response_headers
             .get(CONTENT_ENCODING)
             .and_then(|value| value.to_str().ok())
             .map(str::to_ascii_lowercase);
+        response_headers.remove(TRANSFER_ENCODING);
+        response_headers.remove(CONTENT_LENGTH);
         let raw = response.bytes().await?;
         // Decode compressed upstream bodies here so every local client — the
         // CLI, the sidecar's iceberg-rust client, curl — receives plain JSON
@@ -371,11 +488,59 @@ impl RestCatalogSource {
         // untouched. The decoder is built per call, so concurrent proxied
         // requests never share decode state.
         let body = match content_encoding.as_deref() {
-            Some("gzip") | Some("x-gzip") if !raw.is_empty() => gunzip(&raw, url)?,
-            Some("gzip") | Some("x-gzip") => raw,
+            Some("gzip") | Some("x-gzip") if !raw.is_empty() => {
+                response_headers.remove(CONTENT_ENCODING);
+                gunzip(&raw, url)?
+            }
+            Some("gzip") | Some("x-gzip") => {
+                response_headers.remove(CONTENT_ENCODING);
+                raw
+            }
             _ => raw,
         };
-        Ok(CatalogResponse { status, body })
+        Ok(CatalogResponse {
+            status,
+            headers: response_headers,
+            body,
+        })
+    }
+
+    /// Executes a loopback gateway request against the shared response cache or
+    /// the authenticated upstream catalog on a miss.
+    async fn gateway_request(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> Result<CatalogResponse, CatalogError> {
+        if !path_and_query.starts_with('/') {
+            return Err(CatalogError::Malformed {
+                url: path_and_query.to_owned(),
+                detail: "catalog gateway path must start with '/'".to_owned(),
+            });
+        }
+        if method == Method::GET
+            && let Some(response) = self.responses.read().await.get(path_and_query)
+        {
+            return Ok(response);
+        }
+
+        let url = format!("{}{}", self.base, path_and_query);
+        let response = self
+            .send_upstream(method.clone(), &url, headers, body)
+            .await?;
+        if (200..300).contains(&response.status) {
+            if method == Method::GET {
+                self.responses
+                    .write()
+                    .await
+                    .insert(path_and_query.to_owned(), response.clone());
+            } else {
+                self.responses.write().await.clear();
+            }
+        }
+        Ok(response)
     }
 
     /// One authenticated GET decoded as JSON; non-2xx becomes
@@ -392,6 +557,8 @@ impl RestCatalogSource {
                 url: url.to_owned(),
             });
         }
+        let key = self.cache_key(url);
+        self.responses.write().await.insert(key, response.clone());
         serde_json::from_slice::<T>(&response.body).map_err(|e| CatalogError::Malformed {
             url: url.to_owned(),
             detail: e.to_string(),
@@ -441,7 +608,7 @@ impl RestCatalogSource {
                 || name == CONNECTION
                 || name == TRANSFER_ENCODING
                 || name == AUTHORIZATION
-                // The server sets its own Accept-Encoding after signing, so it
+                // The daemon sets its own Accept-Encoding after signing, so it
                 // must stay out of the signed header set to match the wire.
                 || name == ACCEPT_ENCODING
             {
@@ -574,5 +741,27 @@ impl CatalogSource for RestCatalogSource {
             // Spec quirk: v1 metadata uses -1 for "no current snapshot".
             current_snapshot_id: response.metadata.current_snapshot_id.filter(|id| *id >= 0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catalog response caching obeys its hard byte ceiling by evicting older
+    /// responses before admitting a new one.
+    #[test]
+    fn cached_responses_never_exceed_their_byte_budget() {
+        let mut cache = CachedResponses::new(10);
+        let response = |size| CatalogResponse {
+            status: 200,
+            headers: HeaderMap::new(),
+            body: Bytes::from(vec![0; size]),
+        };
+        cache.insert("/one".to_owned(), response(6));
+        cache.insert("/two".to_owned(), response(6));
+        assert!(cache.bytes <= 10);
+        assert!(cache.entries.contains_key("/two"));
+        assert!(!cache.entries.contains_key("/one"));
     }
 }

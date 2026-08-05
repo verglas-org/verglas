@@ -415,3 +415,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #3: Added the configured upstream catalog URI and warehouse to local access
   discovery. These are non-secret client coordinates and do not create a
   Verglas-hosted catalog service.
+- #8: Extended local access discovery with an explicit query API URI. On-prem clients now receive separate S3, query/write, and catalog proxy coordinates.

@@ -205,10 +205,11 @@ pub struct Slots {
     pub members: Option<MembersSlot>,
     /// Drain control (`POST /admin/drain`).
     pub drain: Option<DrainSlot>,
+    /// Shallow on-prem Iceberg REST proxy sharing cache state with polling.
+    pub catalog: Option<verglas_catalog::CatalogGateway>,
     /// The local-access snapshot (`GET /admin/access`).
     pub access: Option<LocalAccess>,
     /// The internal catalog handle used by compaction and engine subsystems.
-    /// Catalog metadata is never proxied through the server.
     pub tables: Option<TablesSlot>,
     /// The `graph` verb-family routes (`/v1/graphs/...`), backed by
     /// `verglas-graph` over the same private catalog as the table routes.
@@ -252,6 +253,7 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         table_metrics,
         members,
         drain,
+        catalog,
         access,
         tables,
         graphs,
@@ -385,6 +387,9 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
     }
     if let Some(platform) = platform {
         app = app.merge(platform_router(platform));
+    }
+    if let Some(catalog) = catalog {
+        app = crate::compose_query_and_catalog(app, catalog);
     }
     app
 }
@@ -1866,21 +1871,9 @@ mod tests {
         .expect("router responds")
     }
 
-    /// The server never hosts or proxies an Iceberg REST catalog, even when it
-    /// has a private upstream catalog client for its own table-aware work.
+    /// Without an on-prem catalog gateway, the catalog route is absent.
     #[tokio::test]
-    async fn catalog_route_is_never_hosted() {
-        let private_catalog_client_present = router(
-            VERSION,
-            Health::ready(),
-            Slots {
-                tables: Some(Arc::new(OnceLock::new())),
-                ..Slots::default()
-            },
-        );
-        let response = call(private_catalog_client_present, "GET", "/catalog/v1/config").await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-
+    async fn catalog_route_is_absent_without_a_gateway() {
         let absent = router(VERSION, Health::ready(), Slots::default());
         let response = call(absent, "GET", "/catalog/v1/config").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -1896,6 +1889,7 @@ mod tests {
     async fn access_route_serves_the_snapshot_without_the_secret() {
         let access = LocalAccess {
             s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+            query_uri: "http://127.0.0.1:8334".to_owned(),
             catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
             warehouse: Some("s3://warehouse/tenant".to_owned()),
             region: "us-east-1".to_owned(),
@@ -1922,6 +1916,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("access json value");
         for key in [
             "s3_endpoint",
+            "query_uri",
             "catalog_uri",
             "warehouse",
             "region",

@@ -18,13 +18,8 @@
 //!   configured it is the sole query engine (no embedded fallback on
 //!   dispatch failure). When unset, `/v1/query` stays on the embedded engine.
 
-pub mod admin;
-pub mod follow;
-pub mod logging;
 pub mod node_report;
-pub mod platform;
-pub mod query_worker;
-pub mod write_worker;
+pub use verglas_rest::{admin, follow, logging, platform, query_worker, write_worker};
 
 /// The server version, from the package manifest. Reported by `/admin/version`
 /// and stamped on operator log lines.

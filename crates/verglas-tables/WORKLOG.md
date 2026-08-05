@@ -201,3 +201,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #263: Removed the loopback catalog gateway, its response cache, and mutation-forwarding surface. The REST transport now exists only as the daemon's private, lenient catalog watcher client, including bearer and SigV4 authentication and gzip decoding.
 - #91: Renamed active table lifecycle documentation from daemon terminology to
   the `verglas-server` process. Catalog watching and cache warming are unchanged.
+- #8: Moved shallow Iceberg REST transport ownership into `verglas-catalog` and re-exported its polling contracts. Catalog polling now shares the same bounded response cache as the on-prem proxy.

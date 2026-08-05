@@ -69,9 +69,8 @@ pub const DRAIN_PATH: &str = "/admin/drain";
 pub const LOG_PATH: &str = "/admin/log";
 
 /// Path for the local-access probe (`GET`, issue #287). Returns the non-secret
-/// connection details clients need: the server's S3 cache endpoint and the real
-/// upstream Iceberg REST catalog coordinates. The server advertises that
-/// catalog but never hosts or proxies it. The paired secret access key is
+/// connection details clients need: the server's S3 cache endpoint, query API,
+/// and shallow on-prem Iceberg REST proxy. The paired secret access key is
 /// deliberately NOT served here: the admin listener is unauthenticated and
 /// binds loopback, which is host-scoped, so any local process could otherwise
 /// read a lakehouse read/write key without opening the server's 0600 credentials
@@ -184,9 +183,8 @@ impl HealthzInfo {
 ///
 /// Everything here is resolved from the server's own config and is safe to hand
 /// out over the unauthenticated, host-scoped loopback admin socket: the S3
-/// endpoint, upstream Iceberg REST catalog coordinates, signing region, served
-/// bucket, and endpoint access key id. Verglas advertises the customer catalog
-/// but never hosts or proxies it.
+/// endpoint, query API, Iceberg REST catalog coordinates, signing region, served
+/// bucket, and endpoint access key id.
 /// `access_key_id` is present only when the server has an endpoint auth keypair.
 ///
 /// The paired **secret access key is intentionally absent**. Serving it here
@@ -199,9 +197,11 @@ pub struct LocalAccess {
     /// Data files are written and queries are read through it so a server in the
     /// path gives cache residency and write-back.
     pub s3_endpoint: String,
-    /// Configured upstream Iceberg REST catalog URI, when present.
+    /// Base URL of the query and write API served by this deployment.
+    pub query_uri: String,
+    /// Iceberg REST catalog URI clients should use, when present.
     pub catalog_uri: Option<String>,
-    /// Configured upstream Iceberg warehouse identifier, when present.
+    /// Configured Iceberg warehouse identifier, when present.
     pub warehouse: Option<String>,
     /// SigV4 signing region the endpoint expects (e.g. `us-east-1`).
     pub region: String,
