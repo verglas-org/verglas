@@ -586,3 +586,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #3: Advertise the configured upstream catalog URI and warehouse through the
   access-discovery response alongside the Verglas S3 endpoint. SDK clients use
   those coordinates directly; the server does not host or proxy the catalog.
+- #3: Packaged the isolated query and write role binaries in the self-hosted
+  Docker image and enabled both dispatchers in its config. The Docker
+  application can now execute SQL and logical writes without embedded paths.

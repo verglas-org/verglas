@@ -29,3 +29,9 @@ credentials_file = "/etc/verglas/credentials/endpoint"
 uri = "https://catalog.cloudflarestorage.com/856387ff129d6ed69bf6fc5abe57ab22/cascadelabs"
 credentials_file = "/etc/verglas/credentials/catalog.token"
 warehouse = "856387ff129d6ed69bf6fc5abe57ab22_cascadelabs"
+
+[query_worker]
+binary = "/usr/local/bin/verglas-query"
+
+[write_worker]
+binary = "/usr/local/bin/verglas-write"

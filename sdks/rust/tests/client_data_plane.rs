@@ -215,6 +215,7 @@ async fn create_catalog_table(
     assert_eq!(body["name"], "events");
     assert_eq!(body["schema"]["fields"][0]["type"], "long");
     assert_eq!(body["partition-spec"]["fields"][0]["source-id"], 1);
+    assert_eq!(body["partition-spec"]["fields"][0]["name"], "id_identity");
     state.created.store(true, Ordering::SeqCst);
     (axum::http::StatusCode::OK, Json(json!({})))
 }
