@@ -2538,8 +2538,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// Catalog metadata is not a server surface; SDKs and the CLI use Iceberg
-    /// REST directly.
+    /// Proprietary table metadata routes stay absent; clients use the mounted
+    /// standard Iceberg REST catalog instead.
     #[tokio::test]
     async fn catalog_table_proxy_is_not_mounted() {
         let app = slots_router(Slots {
