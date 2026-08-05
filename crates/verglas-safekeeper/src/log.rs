@@ -256,6 +256,40 @@ where
         Ok(Bytes::from(buf))
     }
 
+    /// Reads a live range using one already-locked manifest snapshot. Keeping
+    /// this separate lets append validate reconnect overlap while it owns the
+    /// serialization lock, so no concurrent append can move the tail between
+    /// validation and suffix placement.
+    async fn read_manifest(
+        &self,
+        manifest: &Manifest,
+        from: Lsn,
+        to: Lsn,
+    ) -> Result<Bytes, AppendError> {
+        if to.0 < from.0 || from.0 < manifest.base.0 || to.0 > manifest.tail.0 {
+            return Err(AppendError::OutOfRange { from, to });
+        }
+        if from == to {
+            return Ok(Bytes::new());
+        }
+        let mut out = Vec::with_capacity((to.0 - from.0) as usize);
+        for segment in &manifest.segments {
+            if segment.end.0 <= from.0 || segment.start.0 >= to.0 {
+                continue;
+            }
+            let bytes = match segment.state {
+                SegmentState::Flushed => self.read_flushed_segment(segment).await?,
+                SegmentState::Open => self.reassemble_segment(segment).await?,
+            };
+            let lo = from.0.max(segment.start.0);
+            let hi = to.0.min(segment.end.0);
+            let start = (lo - segment.start.0) as usize;
+            let end = (hi - segment.start.0) as usize;
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        Ok(Bytes::from(out))
+    }
+
     /// The deterministic S3 key a segment flushes to. Deterministic so a re-flush
     /// after a crash between the S3 put and the manifest persist overwrites the
     /// same object rather than orphaning one.
@@ -275,7 +309,7 @@ where
 /// rendezvous machinery the cache ring and the write-back placement use.
 fn placement_order(seed: &str, live: &[NodeId]) -> Vec<NodeId> {
     let key = CacheKey {
-        bucket: "appendlog".to_owned(),
+        bucket: "safekeeper".to_owned(),
         key: seed.to_owned(),
     };
     let mut scored: Vec<(u64, NodeId)> = live
@@ -316,7 +350,12 @@ impl<S> AppendLog for EcAppendLog<S>
 where
     S: ObjectRead + ObjectWrite,
 {
-    async fn append(&self, epoch: Epoch, records: Bytes) -> Result<Appended, AppendError> {
+    async fn append(
+        &self,
+        epoch: Epoch,
+        begin_lsn: Lsn,
+        records: Bytes,
+    ) -> Result<Appended, AppendError> {
         let mut manifest = self.state.lock().await;
         if epoch != manifest.epoch {
             return Err(AppendError::Fenced {
@@ -324,16 +363,61 @@ where
                 presented: epoch,
             });
         }
-        let start = manifest.tail;
-        if records.is_empty() {
-            // An empty append is a no-op: the tail does not move.
-            return Ok(Appended { start, end: start });
+        let end_lsn =
+            Lsn(begin_lsn
+                .0
+                .checked_add(records.len() as u64)
+                .ok_or(AppendError::LsnOverflow {
+                    begin: begin_lsn,
+                    bytes: records.len(),
+                })?);
+        let fresh = manifest.segments.is_empty()
+            && manifest.base == Lsn(0)
+            && manifest.tail == Lsn(0)
+            && manifest.flushed_through == Lsn(0);
+        let durable_tail = if fresh { begin_lsn } else { manifest.tail };
+        if begin_lsn.0 > durable_tail.0 {
+            return Err(AppendError::WalGap {
+                expected: durable_tail,
+                presented: begin_lsn,
+            });
         }
-        let end = start.advance(records.len() as u64);
+        if begin_lsn.0 < manifest.base.0 {
+            return Err(AppendError::OutOfRange {
+                from: begin_lsn,
+                to: end_lsn,
+            });
+        }
 
-        let geometry = self.effective_geometry();
-        let live = self.membership.live_nodes();
+        let overlap_end = Lsn(end_lsn.0.min(durable_tail.0));
+        if overlap_end.0 > begin_lsn.0 {
+            let existing = self
+                .read_manifest(&manifest, begin_lsn, overlap_end)
+                .await?;
+            let overlap_len = existing.len();
+            if let Some(offset) = existing
+                .iter()
+                .zip(records[..overlap_len].iter())
+                .position(|(stored, proposed)| stored != proposed)
+            {
+                return Err(AppendError::ConflictingWal {
+                    at: begin_lsn.advance(offset as u64),
+                });
+            }
+        }
+        if end_lsn.0 <= durable_tail.0 {
+            return Ok(Appended {
+                start: begin_lsn,
+                end: end_lsn,
+            });
+        }
 
+        let suffix_offset = (durable_tail.0 - begin_lsn.0) as usize;
+        let suffix = records.slice(suffix_offset..);
+        let start = durable_tail;
+        let end = end_lsn;
+
+        let previous = manifest.clone();
         let idx = ensure_tail_segment(&mut manifest, start);
         let (segment_id, seq) = {
             let seg = &manifest.segments[idx];
@@ -341,12 +425,22 @@ where
         };
         let object_id = format!("seg{segment_id:020}/app{seq:020}");
 
-        let encoded = encode(geometry.k, geometry.m, &records).map_err(|e| {
-            // A partial (padding-only) failure leaves nothing placed; the tail is
-            // untouched, so this is a clean failure.
-            AppendError::Codec(e.to_string())
-        })?;
-        let placements = self.place(&object_id, &encoded, geometry.w, &live).await?;
+        let geometry = self.effective_geometry();
+        let live = self.membership.live_nodes();
+        let encoded = match encode(geometry.k, geometry.m, &suffix) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                *manifest = previous.clone();
+                return Err(AppendError::Codec(error.to_string()));
+            }
+        };
+        let placements = match self.place(&object_id, &encoded, geometry.w, &live).await {
+            Ok(placements) => placements,
+            Err(error) => {
+                *manifest = previous.clone();
+                return Err(error);
+            }
+        };
 
         let entry = AppendEntry {
             seq,
@@ -363,6 +457,10 @@ where
             seg.appends.push(entry);
             seg.end = end;
         }
+        if fresh {
+            manifest.base = begin_lsn;
+            manifest.flushed_through = begin_lsn;
+        }
         manifest.tail = end;
 
         // Fsync the manifest before acking: the ack must not outrun durability.
@@ -370,46 +468,23 @@ where
             // The fragments are placed but the record is not durable — roll the
             // append back so the tail never reflects an un-fsynced ack, and drop
             // the orphaned fragments.
-            let seg = &mut manifest.segments[idx];
-            seg.appends.pop();
-            seg.end = start;
-            manifest.tail = start;
+            *manifest = previous;
             self.drop_fragments(&object_id, &placements).await;
             return Err(error);
         }
         self.tail.store(end.0, Ordering::Relaxed);
+        self.flushed
+            .store(manifest.flushed_through.0, Ordering::Relaxed);
 
-        Ok(Appended { start, end })
+        Ok(Appended {
+            start: begin_lsn,
+            end,
+        })
     }
 
     async fn read(&self, from: Lsn, to: Lsn) -> Result<Bytes, AppendError> {
-        if to.0 < from.0 {
-            return Err(AppendError::OutOfRange { from, to });
-        }
         let manifest = self.state.lock().await;
-        if from.0 < manifest.base.0 || to.0 > manifest.tail.0 {
-            return Err(AppendError::OutOfRange { from, to });
-        }
-        if from == to {
-            return Ok(Bytes::new());
-        }
-        let mut out = Vec::with_capacity((to.0 - from.0) as usize);
-        for segment in &manifest.segments {
-            // Skip segments that do not overlap [from, to).
-            if segment.end.0 <= from.0 || segment.start.0 >= to.0 {
-                continue;
-            }
-            let bytes = match segment.state {
-                SegmentState::Flushed => self.read_flushed_segment(segment).await?,
-                SegmentState::Open => self.reassemble_segment(segment).await?,
-            };
-            let lo = from.0.max(segment.start.0);
-            let hi = to.0.min(segment.end.0);
-            let s = (lo - segment.start.0) as usize;
-            let e = (hi - segment.start.0) as usize;
-            out.extend_from_slice(&bytes[s..e]);
-        }
-        Ok(Bytes::from(out))
+        self.read_manifest(&manifest, from, to).await
     }
 
     async fn flush(&self) -> Result<Lsn, AppendError> {

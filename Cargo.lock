@@ -7045,24 +7045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "verglas-appendlog"
-version = "0.1.1"
-dependencies = [
- "async-trait",
- "bytes",
- "futures",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "verglas-cache",
- "verglas-cluster",
- "verglas-core",
- "verglas-write",
-]
-
-[[package]]
 name = "verglas-backend"
 version = "0.1.1"
 dependencies = [
@@ -7444,6 +7426,24 @@ dependencies = [
  "urlencoding",
  "verglas-backend",
  "verglas-core",
+]
+
+[[package]]
+name = "verglas-safekeeper"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "verglas-cache",
+ "verglas-cluster",
+ "verglas-core",
+ "verglas-write",
 ]
 
 [[package]]

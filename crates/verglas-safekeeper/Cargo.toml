@@ -1,6 +1,6 @@
 [package]
-name = "verglas-appendlog"
-description = "EC quorum-append WAL buffer: the durable append-log substrate for the pg-engine pageserver fork (#372)"
+name = "verglas-safekeeper"
+description = "Neon-compatible WAL ingress backed by Verglas EC quorum storage"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

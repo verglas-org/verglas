@@ -130,7 +130,7 @@ impl ManifestStore {
     /// loading any existing state so a restart recovers the log; a fresh log
     /// starts empty.
     pub fn open(dir: impl AsRef<Path>) -> Result<(Self, Manifest), AppendError> {
-        let dir = dir.as_ref().join("appendlog");
+        let dir = dir.as_ref().join("safekeeper");
         fs::create_dir_all(&dir)
             .map_err(|e| AppendError::Manifest(format!("create {}: {e}", dir.display())))?;
         let path = dir.join("manifest.json");

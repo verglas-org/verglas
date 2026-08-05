@@ -18,10 +18,6 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use verglas_appendlog::{
-    AppendGeometry, AppendLog, EcAppendLog, Epoch, FragmentTransport, Lsn, SingleNodeMembership,
-    TransportError,
-};
 use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
@@ -31,6 +27,10 @@ use verglas_core::read::{
 use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
+};
+use verglas_safekeeper::{
+    AppendGeometry, AppendLog, EcAppendLog, Epoch, FragmentTransport, Lsn, SingleNodeMembership,
+    TransportError,
 };
 
 const SELF: &str = "solo";
@@ -277,7 +277,7 @@ async fn single_node_fast_acks_with_the_origin_absent() {
 
     let payload = bytes(4096);
     let r = log
-        .append(Epoch(0), payload.clone())
+        .append(Epoch(0), Lsn(0), payload.clone())
         .await
         .expect("single-node append acks from local durability, origin untouched");
     assert_eq!(r.start, Lsn(0));
@@ -305,7 +305,9 @@ async fn single_node_recovers_the_tail_across_a_restart() {
     let payload = bytes(5000);
     {
         let log = build(store.clone(), transport.clone(), dir.path());
-        log.append(Epoch(0), payload.clone()).await.expect("append");
+        log.append(Epoch(0), Lsn(0), payload.clone())
+            .await
+            .expect("append");
         // crash: drop the log before any flush
     }
 
@@ -328,7 +330,9 @@ async fn single_node_flush_then_recover_from_s3() {
     let payload = bytes(6000);
     {
         let log = build(store.clone(), transport.clone(), dir.path());
-        log.append(Epoch(0), payload.clone()).await.expect("append");
+        log.append(Epoch(0), Lsn(0), payload.clone())
+            .await
+            .expect("append");
         let watermark = log.flush().await.expect("flush");
         assert_eq!(watermark, Lsn(6000));
         assert_eq!(

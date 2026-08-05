@@ -32,8 +32,6 @@ use std::sync::Mutex;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use verglas_appendlog::{AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn};
-use verglas_appendlog::{FragmentTransport, LiveMembership, TransportError};
 use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
@@ -44,6 +42,8 @@ use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
+use verglas_safekeeper::{AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn};
+use verglas_safekeeper::{FragmentTransport, LiveMembership, TransportError};
 
 // ---- in-memory fragment transport (fragments persist across a simulated crash
 // because the store Arc is reused, standing in for durable NVMe) ---------------
@@ -374,8 +374,14 @@ async fn append_acks_over_quorum_and_reads_back_the_tail() {
 
     let a = bytes(4096);
     let b = bytes(2048);
-    let r1 = log.append(Epoch(0), a.clone()).await.expect("append a");
-    let r2 = log.append(Epoch(0), b.clone()).await.expect("append b");
+    let r1 = log
+        .append(Epoch(0), Lsn(0), a.clone())
+        .await
+        .expect("append a");
+    let r2 = log
+        .append(Epoch(0), r1.end, b.clone())
+        .await
+        .expect("append b");
 
     // Ranges are contiguous and monotonic.
     assert_eq!(r1.start, Lsn(0));
@@ -406,6 +412,122 @@ async fn append_acks_over_quorum_and_reads_back_the_tail() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_append_preserves_the_postgres_start_lsn() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport, membership, dir.path(), geom());
+
+    let start = Lsn(0x16B6_0A10);
+    let payload = bytes(4096);
+    let appended = log
+        .append(Epoch(0), start, payload.clone())
+        .await
+        .expect("append at the timeline's PostgreSQL LSN");
+
+    assert_eq!(appended.start, start);
+    assert_eq!(appended.end, start.advance(payload.len() as u64));
+    assert_eq!(log.read(start, appended.end).await.expect("read"), payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn exact_replay_is_idempotent_and_places_no_new_fragments() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport.clone(), membership, dir.path(), geom());
+    let payload = bytes(4096);
+
+    let first = log
+        .append(Epoch(0), Lsn(0), payload.clone())
+        .await
+        .expect("first append");
+    let fragments = transport.fragment_count();
+    let replay = log
+        .append(Epoch(0), Lsn(0), payload)
+        .await
+        .expect("idempotent replay");
+
+    assert_eq!(replay, first);
+    assert_eq!(log.tail(), first.end);
+    assert_eq!(transport.fragment_count(), fragments);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn partial_overlap_is_validated_and_only_the_suffix_is_appended() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport.clone(), membership, dir.path(), geom());
+    let payload = bytes(4096);
+    log.append(Epoch(0), Lsn(0), payload.clone())
+        .await
+        .expect("first append");
+
+    let mut replay_and_suffix = payload[2048..].to_vec();
+    replay_and_suffix.extend_from_slice(&bytes(1024));
+    let appended = log
+        .append(Epoch(0), Lsn(2048), Bytes::from(replay_and_suffix))
+        .await
+        .expect("validated overlap and new suffix");
+
+    assert_eq!(appended.start, Lsn(2048));
+    assert_eq!(appended.end, Lsn(5120));
+    assert_eq!(log.tail(), Lsn(5120));
+    assert_eq!(transport.fragment_count(), 6, "one new EC append");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_overlap_is_rejected_without_moving_the_tail() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport, membership, dir.path(), geom());
+    let payload = bytes(4096);
+    log.append(Epoch(0), Lsn(0), payload)
+        .await
+        .expect("first append");
+
+    let err = log
+        .append(Epoch(0), Lsn(2048), Bytes::from_static(b"different WAL"))
+        .await
+        .expect_err("conflicting WAL must fail");
+
+    assert!(matches!(err, AppendError::ConflictingWal { at: Lsn(2048) }));
+    assert_eq!(log.tail(), Lsn(4096));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gap_is_rejected_without_moving_the_tail() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport, membership, dir.path(), geom());
+    log.append(Epoch(0), Lsn(0), bytes(4096))
+        .await
+        .expect("first append");
+
+    let err = log
+        .append(Epoch(0), Lsn(5000), bytes(32))
+        .await
+        .expect_err("gap must fail");
+
+    assert!(matches!(
+        err,
+        AppendError::WalGap {
+            expected: Lsn(4096),
+            presented: Lsn(5000)
+        }
+    ));
+    assert_eq!(log.tail(), Lsn(4096));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn below_quorum_append_fails_and_leaves_the_tail_unmoved() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
@@ -418,7 +540,7 @@ async fn below_quorum_append_fails_and_leaves_the_tail_unmoved() {
     let log = build(store, transport.clone(), membership, dir.path(), geom());
 
     let err = log
-        .append(Epoch(0), bytes(4096))
+        .append(Epoch(0), Lsn(0), bytes(4096))
         .await
         .expect_err("below-quorum append fails");
     assert!(
@@ -448,7 +570,9 @@ async fn flush_drains_to_s3_then_drops_local_fragments() {
     );
 
     let payload = bytes(9000);
-    log.append(Epoch(0), payload.clone()).await.expect("append");
+    log.append(Epoch(0), Lsn(0), payload.clone())
+        .await
+        .expect("append");
     assert_eq!(transport.fragment_count(), 3);
 
     let watermark = log.flush().await.expect("flush");
@@ -475,10 +599,14 @@ async fn read_spans_a_flushed_segment_and_the_ec_tail() {
     let log = build(store, transport.clone(), membership, dir.path(), geom());
 
     let a = bytes(5000);
-    log.append(Epoch(0), a.clone()).await.expect("append a");
+    log.append(Epoch(0), Lsn(0), a.clone())
+        .await
+        .expect("append a");
     log.flush().await.expect("flush a"); // a is now in S3
     let b = bytes(3000);
-    log.append(Epoch(0), b.clone()).await.expect("append b"); // b is the EC tail
+    log.append(Epoch(0), Lsn(5000), b.clone())
+        .await
+        .expect("append b"); // b is the EC tail
 
     let whole = log.read(Lsn(0), log.tail()).await.expect("read across");
     let mut expect = a.to_vec();
@@ -506,7 +634,9 @@ async fn recovers_the_tail_from_fragments_after_a_node_loss() {
             dir.path(),
             geom(),
         );
-        log.append(Epoch(0), payload.clone()).await.expect("append");
+        log.append(Epoch(0), Lsn(0), payload.clone())
+            .await
+            .expect("append");
         // drop the log: simulated process death before any flush
     }
 
@@ -547,7 +677,9 @@ async fn recovers_from_s3_after_a_full_flush() {
             dir.path(),
             geom(),
         );
-        log.append(Epoch(0), payload.clone()).await.expect("append");
+        log.append(Epoch(0), Lsn(0), payload.clone())
+            .await
+            .expect("append");
         log.flush().await.expect("flush");
     }
     // Lose every fragment node: the buffer is gone entirely. The log must still
@@ -583,11 +715,13 @@ async fn truncate_below_the_flush_watermark_drops_segments() {
 
     // Two segments: append, flush (seals segment 0), append, flush (segment 1).
     let a = bytes(4000);
-    log.append(Epoch(0), a).await.expect("append a");
+    log.append(Epoch(0), Lsn(0), a).await.expect("append a");
     log.flush().await.expect("flush a");
     let split = log.tail();
     let b = bytes(3000);
-    log.append(Epoch(0), b.clone()).await.expect("append b");
+    log.append(Epoch(0), split, b.clone())
+        .await
+        .expect("append b");
     log.flush().await.expect("flush b");
     assert_eq!(store.object_count(), 2, "two segment objects in S3");
 
@@ -620,7 +754,9 @@ async fn truncate_beyond_the_flush_watermark_is_refused() {
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
     let log = build(store, transport, membership, dir.path(), geom());
 
-    log.append(Epoch(0), bytes(4000)).await.expect("append");
+    log.append(Epoch(0), Lsn(0), bytes(4000))
+        .await
+        .expect("append");
     // Nothing flushed, so any positive truncate is beyond the watermark.
     let err = log
         .truncate(log.tail())
@@ -640,7 +776,7 @@ async fn fencing_rejects_a_stale_writer() {
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
     let log = build(store, transport, membership, dir.path(), geom());
 
-    log.append(Epoch(0), bytes(1000))
+    log.append(Epoch(0), Lsn(0), bytes(1000))
         .await
         .expect("epoch 0 append");
 
@@ -650,13 +786,13 @@ async fn fencing_rejects_a_stale_writer() {
 
     // The stale writer (epoch 0) is now fenced out.
     let err = log
-        .append(Epoch(0), bytes(1000))
+        .append(Epoch(0), Lsn(1000), bytes(1000))
         .await
         .expect_err("stale writer is fenced");
     assert!(matches!(err, AppendError::Fenced { .. }), "{err}");
 
     // The new writer (epoch 1) appends fine.
-    log.append(Epoch(1), bytes(1000))
+    log.append(Epoch(1), Lsn(1000), bytes(1000))
         .await
         .expect("new writer appends under the current epoch");
 

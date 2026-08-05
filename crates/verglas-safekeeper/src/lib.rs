@@ -1,14 +1,14 @@
-//! The Verglas append-log substrate for pg-engine (#372).
+//! Neon-compatible safekeeper storage on the Verglas EC ring (#13).
 //!
 //! # The append-log contract
 //!
-//! This crate is the pinned boundary between the Verglas substrate and the
-//! forked Neon pageserver. The pageserver's safekeeper is deleted; a durable
-//! Verglas append log takes its place, and the compute's WAL proposer commits
-//! against it. The contract lives here as this doc-comment plus the
-//! [`AppendLog`] trait. Both sides — the substrate implementation
-//! ([`EcAppendLog`]) and the pageserver fork that consumes it — build to
-//! exactly what this section pins.
+//! This crate is the safekeeper component embedded in `verglas-cache-node`.
+//! Neon compute connects to one selected cache node using the ordinary
+//! safekeeper PostgreSQL protocol. The protocol adapter translates WAL pushes
+//! into the [`AppendLog`] contract, and [`EcAppendLog`] commits the new bytes to
+//! the same fragment ring and NVMe substrate the cache node already operates.
+//! There is no second safekeeper deployment or Neon durability quorum: the
+//! selected Verglas ingress coordinates one EC quorum append.
 //!
 //! The one primitive Postgres needs that a read cache does not provide is a
 //! *durable commit*: a WAL record must be safe before it reaches S3. Everything
@@ -25,7 +25,8 @@
 //!
 //! ## 1. Append semantics — sync, quorum-acked, durable
 //!
-//! [`AppendLog::append`] takes an opaque run of WAL bytes and returns only once
+//! [`AppendLog::append`] takes the PostgreSQL start LSN plus an opaque run of WAL
+//! bytes and returns only once
 //! those bytes are durable. "Durable" means: the bytes were erasure-coded into
 //! `k + m` fragments (any `k` reconstruct) and at least `w` of those fragments
 //! are fsynced on `w` distinct live nodes, and the append's manifest record is
@@ -47,12 +48,11 @@
 //!
 //! ## 2. Ordering and sequencing
 //!
-//! Appends are totally ordered and their assigned ranges are contiguous and
-//! monotonic: the `end` of one append is the `start` of the next, with no gaps
-//! and no overlap. The log is single-writer by construction (one WAL proposer
-//! per timeline), and appends are serialized so the assigned order is the commit
-//! order. [`AppendLog::tail`] is the LSN one past the last acked byte — the
-//! start the next append will receive.
+//! Appends are totally ordered and their ranges are contiguous and monotonic.
+//! Neon reconnects may resend an exact or partially overlapping range; overlap
+//! is byte-validated and only a new suffix is placed. A conflicting byte or a
+//! gap is rejected without moving the tail. The log is single-writer by term,
+//! and appends are serialized so durable order is commit order.
 //!
 //! ## 3. Read-back of the un-flushed tail
 //!
@@ -120,23 +120,20 @@
 //!   surface. There are no other knobs: segment size is a fixed flush-
 //!   granularity constant, not a parameter.
 //!
-//! ## Where the pageserver fork consumes this
+//! ## Where Neon consumes this
 //!
-//! - `safekeeper -> AppendLog`: the WAL proposer's `AppendRequest` becomes
-//!   [`AppendLog::append`] under the compute's epoch; commit returns on its ack.
-//! - `WAL replay on start -> AppendLog::read`: from the pageserver's last
-//!   durable LSN to [`AppendLog::tail`].
-//! - `remote_storage WAL offload -> AppendLog::flush` + [`AppendLog::truncate`]:
-//!   the pageserver flushes and, once WAL is folded into layer files, truncates.
-//! - `compute failover -> AppendLog::fence`: the new compute fences the old.
-//!
-//! The pageserver holds this as `Arc<dyn AppendLog>` (the trait is object-safe
-//! via `async_trait`), so the substrate stays a library dependency and no
-//! network service wrapper is needed at the seam.
+//! - Walproposer `START_WAL_PUSH` messages are decoded by [`protocol`] and their
+//!   explicit LSN ranges become [`AppendLog::append`] calls under the elected
+//!   term. `flush_lsn` advances only after the EC durability barrier.
+//! - Pageserver `START_REPLICATION` reads byte-identical WAL through
+//!   [`AppendLog::read`] from its requested LSN to [`AppendLog::tail`].
+//! - The storage lifecycle flushes sealed WAL segments to object storage and
+//!   truncates only after pageserver no longer needs the prefix.
 
 mod contract;
 mod log;
 mod manifest;
+pub mod protocol;
 
 pub use contract::{AppendError, AppendGeometry, AppendLog, Appended, Epoch, Lsn};
 pub use log::EcAppendLog;
