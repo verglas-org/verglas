@@ -12,10 +12,14 @@ cd "$REPO"
 
 echo "== verglas cloud install: system tooling =="
 
+# unzip — required to unpack the AWS CLI and Bun release zips below.
 # jq — used by scripts/changed-cargo-packages.sh and release tooling.
-if ! command -v jq >/dev/null 2>&1; then
+need_apt=0
+command -v unzip >/dev/null 2>&1 || need_apt=1
+command -v jq >/dev/null 2>&1 || need_apt=1
+if [ "$need_apt" -eq 1 ]; then
   sudo apt-get update -qq
-  sudo apt-get install -y -qq jq
+  sudo apt-get install -y -qq unzip jq
 fi
 
 # just — the documented task runner (just build/test/lint).

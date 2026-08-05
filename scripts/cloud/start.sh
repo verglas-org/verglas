@@ -53,6 +53,21 @@ wait_for_port() {
   return 1
 }
 
+# Block until the admin health gate answers ready, or fail after ~30s.
+# Port bind alone is not enough — recovery can still be in progress.
+wait_for_healthz() {
+  local i
+  for i in $(seq 1 60); do
+    if curl -fsS "http://127.0.0.1:8334/admin/healthz" >/dev/null 2>&1; then
+      echo "  verglas-server healthz ready"
+      return 0
+    fi
+    sleep 0.5
+  done
+  echo "  ERROR: verglas-server /admin/healthz did not become ready in time" >&2
+  return 1
+}
+
 echo "== verglas cloud start: MinIO origin (:9000) =="
 if port_open 9000; then
   echo "  MinIO already running, leaving it alone"
@@ -81,6 +96,7 @@ else
   # is set in the config. AWS_ALLOW_HTTP is a belt-and-braces echo of that.
   AWS_ALLOW_HTTP=true nohup "$SERVER_BIN" --config "$CONFIG" > "$SERVER_LOG" 2>&1 &
   wait_for_port 8334 verglas-server
+  wait_for_healthz
 fi
 
 echo "== verglas cloud start: ready =="

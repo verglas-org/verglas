@@ -82,10 +82,11 @@ by `.cursor/environment.json` (repo-file managed), which runs two scripts:
 - `scripts/cloud/start.sh` (start step, runs on every boot): brings up a local
   MinIO origin on `:9000` and `verglas-server` (S3 `:8333`, admin `:8334`) using
   `deploy/dev/verglas.dev.toml`, creates the `my-bucket` origin bucket, and is
-  idempotent (skips a service already listening on its port). So a fresh VM comes
-  up ready to serve an S3 PUT/GET through the cache with no manual steps. Its
-  output goes to `/tmp/cursor/start-user/start-user.log`; the running stack logs
-  to `/tmp/verglas-dev/{verglas-server,minio}.log`.
+  idempotent (skips a service already listening on its port). After binding the
+  admin port it waits for `/admin/healthz` before declaring ready. So a fresh VM
+  comes up ready to serve an S3 PUT/GET through the cache with no manual steps.
+  Its output goes to `/tmp/cursor/start-user/start-user.log`; the running stack
+  logs to `/tmp/verglas-dev/{verglas-server,minio}.log`.
 
 Standard commands live in the `justfile` and `README.md`; use them
 (`just build`/`just test`/`just lint`, or the underlying `cargo` commands). The
