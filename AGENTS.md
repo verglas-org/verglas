@@ -86,6 +86,13 @@ Rust workspace facts:
   test recompile with their own drivers. `cargo fmt --all --check` is fast.
 - CI gates per changed crate (`cargo clippy -p <pkg>` + `cargo test -p <pkg>`);
   running a single crate is much faster than the whole workspace when iterating.
+- Prefer per-crate `cargo test -p <pkg>` over `cargo test --workspace` on this VM.
+  The workspace run serializes crates but runs each crate's tests multi-threaded;
+  on 4 cores that oversubscribes CPU and can starve tokio + foyer's background
+  reclaimer, which makes the timing/background-fill tests in `verglas-cache`
+  (`tests/engine.rs`, e.g. `scan_resistant_admission_protects_the_working_set`,
+  `first_unmapped_partial_read_does_not_wait_for_aligned_tail`) flake or stall.
+  Those same tests pass reliably when the crate is run on its own.
 - The default `cargo test` path uses in-process mocks and needs no external
   services (see the standing test policy at the top of `.github/workflows/ci.yml`).
   Anything needing a real service is behind `#[ignore]`.
