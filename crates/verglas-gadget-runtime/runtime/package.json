@@ -1,0 +1,8 @@
+{
+  "name": "@verglas/gadget-host",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "capnweb": "0.8.0"
+  }
+}

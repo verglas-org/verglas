@@ -15,6 +15,7 @@ The running application exposes:
 | --- | --- | --- |
 | `8333` | S3-compatible cache | Query engines and SDKs |
 | `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
+| `8350` | Gadget runtime API and Cap'n Web RPC | Verglas OS |
 | `9009` | Rill | Optional analytics profile |
 
 ## Before you begin
@@ -134,6 +135,22 @@ with R2 enabled.
             hard: 8192
         restart: unless-stopped
 
+      verglas-gadget-runtime:
+        build:
+          context: .
+          target: verglas-gadget-runtime
+        image: verglas/verglas-gadget-runtime:local
+        ports:
+          - "8350:8350"
+        environment:
+          VERGLAS_GADGET_RUNTIME_LISTEN: 0.0.0.0:8350
+          VERGLAS_GADGET_RUNTIME_TOKEN: ${VERGLAS_GADGET_RUNTIME_TOKEN:-verglas-local-gadget-runtime}
+          VERGLAS_GADGET_MAX_GADGETS: ${VERGLAS_GADGET_MAX_GADGETS:-64}
+        depends_on:
+          verglas-server:
+            condition: service_started
+        restart: unless-stopped
+
       postgres:
         image: postgres:17
         environment:
@@ -198,9 +215,11 @@ with R2 enabled.
   </Step>
 
   <Step title="Start Verglas">
-    Build and start the base server:
+    Set a local control-plane token used by Verglas OS to register and call
+    Gadgets, then build and start the base stack:
 
     ```bash
+    export VERGLAS_GADGET_RUNTIME_TOKEN="$(openssl rand -hex 32)"
     docker compose up --detach --build
     ```
 
@@ -211,6 +230,18 @@ with R2 enabled.
     export VERGLAS_ENDPOINT=http://127.0.0.1:8334
     verglas status
     ```
+
+    The same Compose stack starts `verglas-gadget-runtime` on port `8350`. It
+    can supervise multiple local Gadgets and starts one separate Bun child per
+    selected revision:
+
+    ```bash
+    curl -fsS http://127.0.0.1:8350/healthz
+    docker compose logs -f verglas-gadget-runtime
+    ```
+
+    Pass the same `VERGLAS_GADGET_RUNTIME_TOKEN` to Verglas OS. Do not use the
+    Compose file's development default on a shared machine.
 
     If startup fails, read the server log:
 
