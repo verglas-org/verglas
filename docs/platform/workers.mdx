@@ -56,7 +56,7 @@ The SDK contract defines the following trigger events:
 | `webhook` | An inbound `Request` | HTTP ingestion |
 | `data_change` | A table commit notification | Incremental transformations |
 
-The portable CLI manifest currently registers `cron` and `manual` cloud workers. It also registers local-only `follow` workers. HTTP and data-update events use the same bounded worker-run contract.
+The portable CLI manifest registers `manual`, `cron`, `webhook`, and `data_change` workers. It also registers local-only `follow` workers. HTTP and data-update events use the same bounded worker-run contract.
 
 ## Create a portable worker
 

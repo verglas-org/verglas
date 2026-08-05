@@ -41,7 +41,7 @@ mem_mib = 256
 | `cwd` | No | Working directory for the command and bundled files. |
 | `files` | No | Map from relative path to bundled text content. |
 | `env` | No | Environment map. Use `@secret:NAME` for a secret reference. |
-| `trigger` | No | One of `manual`, `cron`, or local-only `follow`. Defaults to `manual`. |
+| `trigger` | No | One of `manual`, `cron`, `webhook`, `data_change`, or local-only `follow`. Defaults to `manual`. |
 | `target_tables` | No | Iceberg tables the worker writes. The first table becomes the primary local output. |
 | `resources.vcpus` | No | Fractional vCPU hint for cloud placement. |
 | `resources.mem_mib` | No | Memory hint in MiB for cloud placement. |
@@ -60,6 +60,20 @@ mem_mib = 256
     [trigger]
     type = "cron"
     cron = "0 * * * *"
+    ```
+  </Tab>
+  <Tab title="Webhook">
+    ```toml
+    [trigger]
+    type = "webhook"
+    path = "/callbacks/orders"
+    ```
+  </Tab>
+  <Tab title="Data change">
+    ```toml
+    [trigger]
+    type = "data_change"
+    table = "app.events"
     ```
   </Tab>
   <Tab title="Follow a command">

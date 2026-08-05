@@ -4,3 +4,4 @@
 - #11: Documented the scheduler crate as a durable queue rather than an execution or placement service. On-prem supplies a local executor while cloud claims the same run contract and selects a fleet microVM container in its private execution layer.
 - #11: Defined the backend-neutral `RunQueue` contract and completed lease renewal, expiry fencing, retry timing, and immutable attempt reconstruction. Worker events are limited to manual, cron, complete HTTP callbacks, and data updates; the queue contains no connection or fleet-placement logic.
 - #11: Replaced the prototype object queue with transactional Postgres storage. Jobs are idempotent per tenant queue, claims use `SKIP LOCKED`, and generation-fenced renewals, retries, completions, and attempt history survive scheduler restarts.
+- #11: Materialized the first future run when a live cron worker has no prior job. This prevents each wake from advancing past the deadline without ever creating runnable work.

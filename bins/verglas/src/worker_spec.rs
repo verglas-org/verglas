@@ -30,7 +30,7 @@ pub const FOLLOW_NAMESPACE: &str = "follow";
 /// The prefix marking an env value as a reference to a named secret.
 const SECRET_PREFIX: &str = "@secret:";
 
-/// A worker trigger: exactly one of cron, manual, or follow.
+/// A worker trigger: exactly one bounded scheduler event or a local follow.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Trigger {
@@ -39,9 +39,20 @@ pub enum Trigger {
         /// A five-field cron expression.
         cron: String,
     },
-    /// Run only when dispatched by hand (or a webhook, in the cloud).
+    /// Run only when dispatched by hand.
     #[default]
     Manual,
+    /// Run when an HTTP request reaches the worker's registered callback.
+    Webhook {
+        /// Optional dynamic path such as `/ingest/orders`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+    },
+    /// Run when the catalog reports a commit to one table.
+    DataChange {
+        /// Dotted Iceberg table name such as `app.events`.
+        table: String,
+    },
     /// Follow a local target continuously, appending each captured line to the
     /// target table. Local only — a follow worker cannot be pushed to the cloud.
     Follow {
@@ -142,6 +153,20 @@ impl WorkerManifest {
                     .into(),
             );
         }
+        if let Trigger::Webhook { path: Some(path) } = &self.trigger
+            && (!path.starts_with('/') || path.contains('?'))
+        {
+            return Err("a webhook path must start with `/` and contain no query string".into());
+        }
+        if let Trigger::DataChange { table } = &self.trigger {
+            let mut parts = table.split('.');
+            if parts.next().is_none_or(str::is_empty)
+                || parts.next().is_none_or(str::is_empty)
+                || parts.next().is_some()
+            {
+                return Err("a data_change table must have the form `namespace.table`".into());
+            }
+        }
         Ok(())
     }
 
@@ -184,6 +209,13 @@ impl WorkerManifest {
         let specs = match &self.trigger {
             Trigger::Cron { cron } => json!([{ "type": "cron", "schedule": cron }]),
             Trigger::Manual => json!([]),
+            Trigger::Webhook { path } => match path {
+                Some(path) => json!([{ "type": "webhook", "path": path }]),
+                None => json!([{ "type": "webhook" }]),
+            },
+            Trigger::DataChange { table } => {
+                json!([{ "type": "data_change", "table": table }])
+            }
             Trigger::Follow { file: Some(file) } => json!([{ "type": "follow", "file": file }]),
             Trigger::Follow { file: None } => json!([{ "type": "follow" }]),
         };
@@ -223,15 +255,34 @@ impl WorkerManifest {
     /// env, resources) exactly as the fleet launch expects; `code` carries a
     /// self-describing job spec so the required non-empty field is meaningful.
     pub fn to_cloud_deployment(&self, placement: &str) -> Value {
-        let (trigger, schedule) = match &self.trigger {
-            Trigger::Cron { cron } => ("cron", Some(cron.clone())),
-            // A follow worker is local-only; callers reject it before here. Map to
-            // manual so a stray push carries a valid trigger for the CP to reject.
-            Trigger::Manual | Trigger::Follow { .. } => ("manual", None),
+        let (trigger, schedule, trigger_specs) = match &self.trigger {
+            Trigger::Cron { cron } => (
+                "cron",
+                Some(cron.clone()),
+                json!([{ "type": "cron", "config": { "schedule": cron } }]),
+            ),
+            Trigger::Webhook { path } => {
+                let config = path
+                    .as_ref()
+                    .map_or_else(|| json!({}), |path| json!({ "path": path }));
+                (
+                    "webhook",
+                    None,
+                    json!([{ "type": "webhook", "config": config }]),
+                )
+            }
+            Trigger::DataChange { table } => (
+                "manual",
+                None,
+                json!([{ "type": "data_change", "config": { "table": table } }]),
+            ),
+            // A follow worker is local-only; callers reject it before here.
+            Trigger::Manual | Trigger::Follow { .. } => ("manual", None, json!([])),
         };
         let mut config = serde_json::Map::new();
         config.insert("spec_version".to_owned(), json!(self.spec_version));
         config.insert("exec".to_owned(), json!(self.exec));
+        config.insert("triggers".to_owned(), trigger_specs);
         if let Some(cwd) = &self.cwd {
             config.insert("cwd".to_owned(), json!(cwd));
         }
@@ -350,16 +401,7 @@ impl WorkerManifest {
             vcpus: config.get("vcpus").and_then(Value::as_f64),
             mem_mib: config.get("mem_mib").and_then(Value::as_u64),
         };
-        let trigger = match dep.get("trigger").and_then(Value::as_str) {
-            Some("cron") => Trigger::Cron {
-                cron: dep
-                    .get("schedule")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-            },
-            _ => Trigger::Manual,
-        };
+        let trigger = trigger_from_cloud(config.get("triggers"));
         let target_tables = dep
             .get("target_tables")
             .and_then(Value::as_array)
@@ -431,6 +473,61 @@ fn trigger_from_local(triggers: &Value) -> Trigger {
                     file: t.get("file").and_then(Value::as_str).map(str::to_owned),
                 };
             }
+            Some("webhook") => {
+                return Trigger::Webhook {
+                    path: t.get("path").and_then(Value::as_str).map(str::to_owned),
+                };
+            }
+            Some("data_change") => {
+                if let Some(table) = t.get("table").and_then(Value::as_str) {
+                    return Trigger::DataChange {
+                        table: table.to_owned(),
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    Trigger::Manual
+}
+
+/// Maps the cloud control plane's `config.triggers` array back to one portable
+/// trigger. The manifest intentionally carries one trigger today.
+fn trigger_from_cloud(triggers: Option<&Value>) -> Trigger {
+    let Some(list) = triggers.and_then(Value::as_array) else {
+        return Trigger::Manual;
+    };
+    for trigger in list {
+        let config = trigger.get("config").and_then(Value::as_object);
+        match trigger.get("type").and_then(Value::as_str) {
+            Some("cron") => {
+                if let Some(schedule) = config
+                    .and_then(|value| value.get("schedule"))
+                    .and_then(Value::as_str)
+                {
+                    return Trigger::Cron {
+                        cron: schedule.to_owned(),
+                    };
+                }
+            }
+            Some("webhook") => {
+                return Trigger::Webhook {
+                    path: config
+                        .and_then(|value| value.get("path"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                };
+            }
+            Some("data_change") => {
+                if let Some(table) = config
+                    .and_then(|value| value.get("table"))
+                    .and_then(Value::as_str)
+                {
+                    return Trigger::DataChange {
+                        table: table.to_owned(),
+                    };
+                }
+            }
             _ => {}
         }
     }
@@ -460,6 +557,122 @@ mod tests {
                 vcpus: Some(0.25),
                 mem_mib: Some(256),
             },
+        }
+    }
+
+    /// Webhook and data-change manifests project to the local trigger registry
+    /// without requiring callers to hand-write embedded JSON strings.
+    #[test]
+    fn translates_event_triggers_to_local_workers() {
+        let mut webhook = cron_manifest();
+        webhook.trigger = Trigger::Webhook {
+            path: Some("/ingest/orders".to_owned()),
+        };
+        let webhook_body = webhook.to_local_worker();
+        let webhook_triggers: Value =
+            serde_json::from_str(webhook_body["triggers"].as_str().expect("triggers string"))
+                .expect("webhook triggers");
+        assert_eq!(
+            webhook_triggers,
+            json!([{
+                "type": "webhook",
+                "path": "/ingest/orders"
+            }])
+        );
+
+        let mut data_change = cron_manifest();
+        data_change.trigger = Trigger::DataChange {
+            table: "app.events".to_owned(),
+        };
+        let data_body = data_change.to_local_worker();
+        let data_triggers: Value =
+            serde_json::from_str(data_body["triggers"].as_str().expect("triggers string"))
+                .expect("data triggers");
+        assert_eq!(
+            data_triggers,
+            json!([{
+                "type": "data_change",
+                "table": "app.events"
+            }])
+        );
+    }
+
+    /// The portable trigger shape populates the cloud trigger registry while
+    /// the deployment envelope carries the control plane's execution class.
+    #[test]
+    fn translates_event_triggers_to_cloud_deployments() {
+        let mut webhook = cron_manifest();
+        webhook.trigger = Trigger::Webhook { path: None };
+        let webhook_body = webhook.to_cloud_deployment("cloud");
+        assert_eq!(webhook_body["trigger"], "webhook");
+        assert_eq!(
+            webhook_body["config"]["triggers"],
+            json!([{"type":"webhook","config":{}}])
+        );
+
+        let mut data_change = cron_manifest();
+        data_change.trigger = Trigger::DataChange {
+            table: "app.events".to_owned(),
+        };
+        let data_body = data_change.to_cloud_deployment("cloud");
+        assert_eq!(data_body["trigger"], "manual");
+        assert_eq!(
+            data_body["config"]["triggers"],
+            json!([{"type":"data_change","config":{"table":"app.events"}}])
+        );
+    }
+
+    /// JSON and TOML manifests accept the public webhook and data-change forms.
+    #[test]
+    fn parses_event_trigger_manifests() {
+        let webhook: WorkerManifest = toml::from_str(
+            r#"
+name = "hook"
+exec = ["sh", "worker.sh"]
+[trigger]
+type = "webhook"
+path = "/callbacks/orders"
+"#,
+        )
+        .expect("webhook manifest");
+        assert!(matches!(
+            webhook.trigger,
+            Trigger::Webhook { path: Some(path) } if path == "/callbacks/orders"
+        ));
+
+        let data_change: WorkerManifest = serde_json::from_value(json!({
+            "name": "changed",
+            "exec": ["sh", "worker.sh"],
+            "trigger": {"type": "data_change", "table": "app.events"}
+        }))
+        .expect("data-change manifest");
+        assert!(matches!(
+            data_change.trigger,
+            Trigger::DataChange { table } if table == "app.events"
+        ));
+    }
+
+    /// Event triggers survive both local registry and cloud detail round trips.
+    #[test]
+    fn event_triggers_round_trip() {
+        for trigger in [
+            Trigger::Webhook {
+                path: Some("/callbacks/orders".to_owned()),
+            },
+            Trigger::DataChange {
+                table: "app.events".to_owned(),
+            },
+        ] {
+            let mut manifest = cron_manifest();
+            manifest.trigger = trigger;
+            let local = WorkerManifest::from_local_worker(&manifest.to_local_worker())
+                .expect("local round trip");
+            assert_eq!(local.local_triggers(), manifest.local_triggers());
+
+            let cloud =
+                WorkerManifest::from_cloud_deployment(&manifest.to_cloud_deployment("cloud"))
+                    .expect("cloud round trip");
+            assert_eq!(cloud.local_triggers(), manifest.local_triggers());
         }
     }
 

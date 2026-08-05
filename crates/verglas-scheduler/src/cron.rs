@@ -6,16 +6,16 @@ use verglas_sdk::worker::{Catchup, CronInterval};
 
 use crate::SchedulerError;
 
-/// The due logical intervals and earliest future scheduler deadline.
+/// The logical intervals to materialize and earliest future scheduler deadline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CronPlan {
-    /// Logical intervals due at the reconciliation time.
+    /// Logical intervals that must exist as durable jobs.
     pub intervals: Vec<CronInterval>,
     /// First scheduled instant strictly after the reconciliation time.
     pub next_wake_at: DateTime<Utc>,
 }
 
-/// Plans due cron intervals and the next wake without a continuous polling loop.
+/// Plans cron jobs to materialize and the next wake without a polling loop.
 pub fn plan_cron(
     cursor: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
@@ -25,6 +25,21 @@ pub fn plan_cron(
 ) -> Result<CronPlan, SchedulerError> {
     let schedule =
         CronSchedule::parse(expression).map_err(|error| SchedulerError::Cron(error.to_string()))?;
+    if cursor.is_none() && catchup == Catchup::None {
+        let next_wake_at = schedule.next_after(&now).ok_or_else(|| {
+            SchedulerError::Cron(format!(
+                "`{expression}` has no occurrence in the next four years"
+            ))
+        })?;
+        return Ok(CronPlan {
+            intervals: vec![CronInterval {
+                logical_date: next_wake_at.to_rfc3339(),
+                interval_start: now.to_rfc3339(),
+                interval_end: next_wake_at.to_rfc3339(),
+            }],
+            next_wake_at,
+        });
+    }
     let from = cursor
         .or(if catchup == Catchup::None {
             None
