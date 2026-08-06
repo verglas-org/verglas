@@ -1,0 +1,24 @@
+[package]
+name = "verglas-container-runtime"
+description = "Docker Engine placement adapter for open-source Verglas deployments"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bollard.workspace = true
+futures.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
