@@ -30,7 +30,7 @@ const storage = new VerglasKvStorage(
   nativeFetch,
   kvEndpoint,
   kvToken,
-  `gadget/${gadgetId}`,
+  `gadget.${gadgetId}`,
 );
 const context = Object.freeze({
   storage,

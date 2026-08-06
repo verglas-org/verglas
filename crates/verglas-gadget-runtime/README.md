@@ -68,7 +68,7 @@ requests. `GET /v1/gadgets` lists selected revisions, and
 
 The KV endpoint and token must be set together. They are captured by the host
 before ambient network globals are disabled and are exposed to Gadget code only
-through `ctx.storage`.
+through `ctx.storage`. Each Gadget uses the exact KV namespace `gadget.<id>`.
 
 ## Security boundary
 
