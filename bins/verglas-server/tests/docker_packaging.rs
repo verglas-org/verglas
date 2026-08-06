@@ -42,12 +42,9 @@ fn docker_application_packages_execution_workers() {
             && compose.contains("verglas-cache:/var/lib/verglas"),
         "the always-on KV log must use the existing writable persistent data volume"
     );
-    assert!(
-        compose.contains("image: postgres:17")
-            && compose
-                .contains("postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas"),
-        "the workers profile must include its Postgres queue store"
-    );
+    assert!(!compose.contains("\n  postgres:"));
+    assert!(!compose.contains("\n  verglas-scheduler:"));
+    assert!(!compose.contains("\n  rill:"));
     for variable in [
         "VERGLAS_BACKEND_BUCKET",
         "VERGLAS_BACKEND_ENDPOINT",
@@ -61,9 +58,6 @@ fn docker_application_packages_execution_workers() {
         "VERGLAS_S3_SECRET_ACCESS_KEY",
         "VERGLAS_QUERY_WORKER_BINARY",
         "VERGLAS_WRITE_WORKER_BINARY",
-        "VERGLAS_RILL_URI",
-        "VERGLAS_RILL_BROWSER_URI",
-        "VERGLAS_RILL_S3_URI",
     ] {
         assert!(
             compose.contains(variable),
@@ -81,7 +75,7 @@ fn docker_application_caps_server_file_descriptors() {
         .expect("read Docker Compose application");
 
     let server = compose
-        .split("  verglas-scheduler:")
+        .split("  verglas-container-runtime:")
         .next()
         .expect("verglas-server service");
     assert!(

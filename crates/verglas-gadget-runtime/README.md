@@ -3,8 +3,8 @@
 `verglas-gadget-runtime` executes Verglas OS Gadget server modules outside
 Cloudflare Workers. The same image supports two deployment shapes:
 
-- The local Compose service registers and supervises multiple Gadgets, with one
-  Bun child process per Gadget revision.
+- A local managed container sets `VERGLAS_GADGET_ID` and runs one Gadget
+  revision. The container runtime manager owns its Docker lifecycle.
 - A cloud microVM sets `VERGLAS_GADGET_ID`. The runtime then accepts only that
   Gadget identity and enforces a capacity of one.
 
@@ -13,19 +13,32 @@ in memory: after a runtime restart, the OS registers each desired immutable
 revision again. Re-registering the same ID, version, and bytes is idempotent;
 reusing a version with different bytes is rejected.
 
-## Run with Docker Compose
+## Use the managed runtime image
 
-The repository's default Compose stack exposes the runtime at
-`http://127.0.0.1:8350`:
+The default Compose stack does not start a shared Gadget supervisor. Its runtime
+manager image already carries the Gadget executable and Bun host. Submit one
+single-target declaration per Gadget with:
 
-```bash
-export VERGLAS_GADGET_RUNTIME_TOKEN="$(openssl rand -hex 32)"
-docker compose up -d --build
-curl -fsS http://127.0.0.1:8350/healthz
+```json
+{
+  "deployment_id": "gadget-example",
+  "image": "verglas/verglas-container-runtime:local",
+  "entrypoint": ["verglas-gadget-runtime"],
+  "environment": {
+    "VERGLAS_GADGET_ID": "example",
+    "VERGLAS_GADGET_RUNTIME_LISTEN": "0.0.0.0:8350",
+    "VERGLAS_GADGET_RUNTIME_TOKEN": "scoped-secret"
+  },
+  "published_ports": [
+    {"container_port": 8350, "host_port": 18350}
+  ]
+}
 ```
 
-The token protects code registration, client-module reads, and RPC upgrades.
-The health endpoint is intentionally unauthenticated.
+The declaration sets `VERGLAS_GADGET_ID`, its scoped runtime and KV
+credentials, and a unique published host port. The token protects code
+registration, client-module reads, and RPC upgrades. The health endpoint is
+intentionally unauthenticated.
 
 ## Register and call Gadgets
 
@@ -33,7 +46,7 @@ Register an immutable source bundle:
 
 ```bash
 curl --fail-with-body \
-  -X PUT http://127.0.0.1:8350/v1/gadgets/hello \
+  -X PUT http://127.0.0.1:18350/v1/gadgets/hello \
   -H "Authorization: Bearer $VERGLAS_GADGET_RUNTIME_TOKEN" \
   -H 'Content-Type: application/json' \
   --data @- <<'JSON'
@@ -48,7 +61,7 @@ JSON
 
 The OS loads the browser module from
 `GET /v1/gadgets/hello/client.js` and opens Cap'n Web at
-`ws://127.0.0.1:8350/v1/gadgets/hello/rpc`, using the same bearer token on both
+`ws://127.0.0.1:18350/v1/gadgets/hello/rpc`, using the same bearer token on both
 requests. `GET /v1/gadgets` lists selected revisions, and
 `DELETE /v1/gadgets/{id}` removes a revision and stops its child process.
 

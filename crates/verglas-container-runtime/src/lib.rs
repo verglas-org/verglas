@@ -9,7 +9,9 @@ use std::collections::{BTreeMap, HashMap};
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
-use bollard::models::{ContainerCreateBody, HostConfig};
+use bollard::models::{
+    ContainerCreateBody, HostConfig, NetworkCreateRequest, PortBinding as DockerPortBinding,
+};
 use bollard::query_parameters::{
     CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
 };
@@ -17,6 +19,10 @@ use futures::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+mod service;
+
+pub use service::{RuntimeService, ServiceError};
 
 /// Label marking a container as owned by the Verglas runtime.
 pub const LABEL_MANAGED: &str = "io.verglas.managed";
@@ -28,12 +34,6 @@ pub const LABEL_DEPLOYMENT: &str = "io.verglas.deployment";
 pub const LABEL_SPEC_DIGEST: &str = "io.verglas.spec-sha256";
 
 const CONTAINER_NAME_PREFIX: &str = "verglas-";
-const DOCKER_AUTHORITY_ENVIRONMENT: [&str; 4] = [
-    "DOCKER_HOST",
-    "DOCKER_CERT_PATH",
-    "DOCKER_TLS_VERIFY",
-    "DOCKER_CONTEXT",
-];
 
 /// One host path exposed inside a managed workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +43,16 @@ pub struct BindMount {
     pub source: String,
     /// Absolute path visible inside the workload.
     pub target: String,
+}
+
+/// One TCP port published from a managed container to the local host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishedPort {
+    /// TCP port listened to inside the container.
+    pub container_port: u16,
+    /// TCP port published on the Docker Engine host.
+    pub host_port: u16,
 }
 
 /// Immutable declaration for one locally placed container.
@@ -56,12 +66,21 @@ pub struct ContainerSpec {
     /// Optional command overriding the image command.
     #[serde(default)]
     pub command: Vec<String>,
+    /// Optional executable overriding the image entrypoint.
+    #[serde(default)]
+    pub entrypoint: Vec<String>,
     /// Workload environment sorted for deterministic hashing.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
     /// Explicit host bind mounts sorted in declaration order.
     #[serde(default)]
     pub bind_mounts: Vec<BindMount>,
+    /// Docker network shared with declared local dependencies.
+    #[serde(default)]
+    pub network: Option<String>,
+    /// TCP ports explicitly published to the Docker Engine host.
+    #[serde(default)]
+    pub published_ports: Vec<PublishedPort>,
 }
 
 impl ContainerSpec {
@@ -71,8 +90,11 @@ impl ContainerSpec {
             deployment_id: deployment_id.into(),
             image: image.into(),
             command: Vec::new(),
+            entrypoint: Vec::new(),
             environment: BTreeMap::new(),
             bind_mounts: Vec::new(),
+            network: None,
+            published_ports: Vec::new(),
         }
     }
 
@@ -83,6 +105,16 @@ impl ContainerSpec {
         S: Into<String>,
     {
         self.command = command.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Replaces the image entrypoint with the supplied executable sequence.
+    pub fn with_entrypoint<I, S>(mut self, entrypoint: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.entrypoint = entrypoint.into_iter().map(Into::into).collect();
         self
     }
 
@@ -97,6 +129,21 @@ impl ContainerSpec {
         self.bind_mounts.push(BindMount {
             source: source.into(),
             target: target.into(),
+        });
+        self
+    }
+
+    /// Attaches the workload to one existing Docker network.
+    pub fn with_network(mut self, network: impl Into<String>) -> Self {
+        self.network = Some(network.into());
+        self
+    }
+
+    /// Publishes one container TCP port on a fixed local host port.
+    pub fn with_published_port(mut self, container_port: u16, host_port: u16) -> Self {
+        self.published_ports.push(PublishedPort {
+            container_port,
+            host_port,
         });
         self
     }
@@ -117,7 +164,7 @@ impl ContainerSpec {
             return Err(RuntimeError::MissingImage);
         }
         for key in self.environment.keys() {
-            if DOCKER_AUTHORITY_ENVIRONMENT.contains(&key.as_str()) {
+            if key.starts_with("DOCKER_") {
                 return Err(RuntimeError::DockerAuthority {
                     detail: format!("environment key {key}"),
                 });
@@ -129,6 +176,20 @@ impl ContainerSpec {
                     detail: format!("bind mount {}:{}", mount.source, mount.target),
                 });
             }
+        }
+        if self
+            .network
+            .as_ref()
+            .is_some_and(|network| network.is_empty())
+        {
+            return Err(RuntimeError::InvalidNetwork);
+        }
+        if self
+            .published_ports
+            .iter()
+            .any(|port| port.container_port == 0 || port.host_port == 0)
+        {
+            return Err(RuntimeError::InvalidPort);
         }
         Ok(())
     }
@@ -162,15 +223,19 @@ impl ContainerSpec {
             name: self.container_name(),
             image: self.image.clone(),
             command: self.command.clone(),
+            entrypoint: self.entrypoint.clone(),
             environment: self.environment.clone(),
             bind_mounts: self.bind_mounts.clone(),
+            network: self.network.clone(),
+            published_ports: self.published_ports.clone(),
             labels: self.labels()?,
         })
     }
 }
 
 /// Normalized lifecycle state independent of Docker response spelling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObservedState {
     /// The workload process is running.
     Running,
@@ -179,7 +244,8 @@ pub enum ObservedState {
 }
 
 /// Public observation of one Verglas-managed deployment.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ManagedContainer {
     /// Docker Engine container identifier.
     pub id: String,
@@ -190,7 +256,8 @@ pub struct ManagedContainer {
 }
 
 /// Result of reconciling one desired container declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReconcileOutcome {
     /// A missing container was created and started.
     Created,
@@ -214,6 +281,12 @@ pub enum RuntimeError {
     /// An OCI image reference was not supplied.
     #[error("container image must not be empty")]
     MissingImage,
+    /// An explicitly selected Docker network was empty.
+    #[error("container network must not be empty")]
+    InvalidNetwork,
+    /// A published TCP port used the reserved zero value.
+    #[error("published container and host ports must be non-zero")]
+    InvalidPort,
     /// A workload attempted to receive Docker daemon authority.
     #[error("workload cannot receive Docker authority through {detail}")]
     DockerAuthority {
@@ -285,6 +358,11 @@ impl DockerRuntime {
     pub async fn list(&self) -> Result<Vec<ManagedContainer>, RuntimeError> {
         self.core.list().await
     }
+
+    /// Ensures one labelled shared Docker network exists.
+    pub async fn ensure_network(&self, name: &str) -> Result<bool, RuntimeError> {
+        self.core.ensure_network(name).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -300,8 +378,11 @@ struct EngineCreateRequest {
     name: String,
     image: String,
     command: Vec<String>,
+    entrypoint: Vec<String>,
     environment: BTreeMap<String, String>,
     bind_mounts: Vec<BindMount>,
+    network: Option<String>,
+    published_ports: Vec<PublishedPort>,
     labels: BTreeMap<String, String>,
 }
 
@@ -324,6 +405,19 @@ trait DockerApi: Send + Sync {
 
     /// Lists all containers visible to the engine client.
     async fn list(&self) -> Result<Vec<EngineContainer>, RuntimeError>;
+
+    /// Finds a Docker network and returns its labels.
+    async fn inspect_network(
+        &self,
+        name: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, RuntimeError>;
+
+    /// Creates one labelled bridge network.
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), RuntimeError>;
 }
 
 struct DockerRuntimeCore<A> {
@@ -419,6 +513,28 @@ where
             .map(|container| normalize_managed(&container))
             .collect()
     }
+
+    /// Creates a missing shared network and fails closed on a foreign collision.
+    async fn ensure_network(&self, name: &str) -> Result<bool, RuntimeError> {
+        if name.is_empty() {
+            return Err(RuntimeError::InvalidNetwork);
+        }
+        if let Some(labels) = self.api.inspect_network(name).await? {
+            if labels.get(LABEL_MANAGED).map(String::as_str) == Some("true") {
+                return Ok(false);
+            }
+            return Err(RuntimeError::UnmanagedCollision {
+                name: name.to_owned(),
+            });
+        }
+        self.api
+            .create_network(
+                name,
+                BTreeMap::from([(LABEL_MANAGED.to_owned(), "true".to_owned())]),
+            )
+            .await?;
+        Ok(true)
+    }
 }
 
 #[derive(Clone)]
@@ -464,19 +580,24 @@ impl DockerApi for BollardDockerApi {
 
     /// Pulls the declared image and creates one stopped Docker container.
     async fn create(&self, request: EngineCreateRequest) -> Result<(), RuntimeError> {
-        self.docker
-            .create_image(
-                Some(
-                    CreateImageOptionsBuilder::new()
-                        .from_image(&request.image)
-                        .build(),
-                ),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(engine_error)?;
+        if let Err(error) = self.docker.inspect_image(&request.image).await {
+            if !is_not_found(&error) {
+                return Err(engine_error(error));
+            }
+            self.docker
+                .create_image(
+                    Some(
+                        CreateImageOptionsBuilder::new()
+                            .from_image(&request.image)
+                            .build(),
+                    ),
+                    None,
+                    None,
+                )
+                .try_collect::<Vec<_>>()
+                .await
+                .map_err(engine_error)?;
+        }
         let environment = request
             .environment
             .into_iter()
@@ -487,15 +608,43 @@ impl DockerApi for BollardDockerApi {
             .into_iter()
             .map(|mount| format!("{}:{}", mount.source, mount.target))
             .collect::<Vec<_>>();
+        let exposed_ports = request
+            .published_ports
+            .iter()
+            .map(|port| format!("{}/tcp", port.container_port))
+            .collect::<Vec<_>>();
+        let port_bindings = request
+            .published_ports
+            .into_iter()
+            .map(|port| {
+                (
+                    format!("{}/tcp", port.container_port),
+                    Some(vec![DockerPortBinding {
+                        host_ip: Some("127.0.0.1".to_owned()),
+                        host_port: Some(port.host_port.to_string()),
+                    }]),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let host_config =
+            if binds.is_empty() && request.network.is_none() && port_bindings.is_empty() {
+                None
+            } else {
+                Some(HostConfig {
+                    binds: (!binds.is_empty()).then_some(binds),
+                    network_mode: request.network,
+                    port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
+                    ..Default::default()
+                })
+            };
         let body = ContainerCreateBody {
             image: Some(request.image),
             cmd: (!request.command.is_empty()).then_some(request.command),
+            entrypoint: (!request.entrypoint.is_empty()).then_some(request.entrypoint),
             env: (!environment.is_empty()).then_some(environment),
             labels: Some(request.labels.into_iter().collect::<HashMap<_, _>>()),
-            host_config: (!binds.is_empty()).then_some(HostConfig {
-                binds: Some(binds),
-                ..Default::default()
-            }),
+            exposed_ports: (!exposed_ports.is_empty()).then_some(exposed_ports),
+            host_config,
             ..Default::default()
         };
         self.docker
@@ -562,6 +711,37 @@ impl DockerApi for BollardDockerApi {
                 },
             })
             .collect())
+    }
+
+    /// Inspects one Docker network and maps a missing name to None.
+    async fn inspect_network(
+        &self,
+        name: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, RuntimeError> {
+        match self.docker.inspect_network(name, None).await {
+            Ok(network) => Ok(Some(
+                network.labels.unwrap_or_default().into_iter().collect(),
+            )),
+            Err(error) if is_not_found(&error) => Ok(None),
+            Err(error) => Err(engine_error(error)),
+        }
+    }
+
+    /// Creates one labelled Docker bridge network.
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), RuntimeError> {
+        self.docker
+            .create_network(NetworkCreateRequest {
+                name: name.to_owned(),
+                labels: Some(labels.into_iter().collect()),
+                ..Default::default()
+            })
+            .await
+            .map_err(engine_error)?;
+        Ok(())
     }
 }
 

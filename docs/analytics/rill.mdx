@@ -14,12 +14,9 @@ and Rill does not become an Iceberg catalog.
 
 ## Start the analytics service
 
-The Compose application already connects Verglas to Rill over the private
-Docker network. Start the Analytics profile:
-
-```bash
-docker compose --profile analytics up --detach
-```
+Rill is an optional container declaration, not a Compose profile. Submit its
+image, port `9009`, and Verglas S3 settings to the local container runtime only
+when this deployment needs Rill.
 
 Compose defines three distinct addresses:
 
@@ -27,8 +24,8 @@ Compose defines three distinct addresses:
 - `s3_uri` is the private address Rill uses to read through Verglas.
 - `browser_uri` is the address printed for you to open.
 
-Rill stores its project in the `rill-data` Docker volume. Verglas does not mount
-or edit that volume. It uses Rill's runtime API over the Compose network.
+Rill stores its project in its declared storage. Verglas does not mount or edit
+that storage. It uses Rill's runtime API over the shared runtime network.
 
 ## Create the market-data dashboard
 

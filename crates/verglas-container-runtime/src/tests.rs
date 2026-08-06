@@ -18,6 +18,7 @@ struct FakeDocker {
 #[derive(Default)]
 struct FakeState {
     containers: BTreeMap<String, EngineContainer>,
+    networks: BTreeMap<String, BTreeMap<String, String>>,
     events: VecDeque<String>,
 }
 
@@ -110,6 +111,32 @@ impl DockerApi for FakeDocker {
             .values()
             .cloned()
             .collect())
+    }
+
+    /// Finds a network and returns its engine labels.
+    async fn inspect_network(
+        &self,
+        name: &str,
+    ) -> Result<Option<BTreeMap<String, String>>, RuntimeError> {
+        Ok(self
+            .state
+            .lock()
+            .expect("fake state lock")
+            .networks
+            .get(name)
+            .cloned())
+    }
+
+    /// Creates one labelled bridge network.
+    async fn create_network(
+        &self,
+        name: &str,
+        labels: BTreeMap<String, String>,
+    ) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().expect("fake state lock");
+        state.events.push_back(format!("network:{name}"));
+        state.networks.insert(name.to_owned(), labels);
+        Ok(())
     }
 }
 
@@ -251,6 +278,8 @@ fn workload_cannot_receive_docker_authority() {
         .with_bind_mount("/var/run/docker.sock", "/var/run/docker.sock");
     let host = ContainerSpec::new("unsafe", "alpine:3.22")
         .with_environment("DOCKER_HOST", "unix:///var/run/docker.sock");
+    let credentials = ContainerSpec::new("unsafe", "alpine:3.22")
+        .with_environment("DOCKER_AUTH_CONFIG", "secret");
 
     assert!(matches!(
         socket.validate(),
@@ -258,6 +287,10 @@ fn workload_cannot_receive_docker_authority() {
     ));
     assert!(matches!(
         host.validate(),
+        Err(RuntimeError::DockerAuthority { .. })
+    ));
+    assert!(matches!(
+        credentials.validate(),
         Err(RuntimeError::DockerAuthority { .. })
     ));
 }
@@ -283,4 +316,56 @@ fn managed_labels_include_ownership_and_spec_digest() {
 
     assert_eq!(labels.get(LABEL_MANAGED).map(String::as_str), Some("true"));
     assert!(labels.contains_key(LABEL_SPEC_DIGEST));
+}
+
+#[tokio::test]
+async fn ensure_network_creates_once_and_rejects_foreign_collision() {
+    let api = FakeDocker::default();
+    let runtime = DockerRuntimeCore::new(api.clone());
+
+    assert!(
+        runtime
+            .ensure_network("verglas-runtime")
+            .await
+            .expect("create network")
+    );
+    assert!(
+        !runtime
+            .ensure_network("verglas-runtime")
+            .await
+            .expect("reuse network")
+    );
+
+    api.state
+        .lock()
+        .expect("fake state lock")
+        .networks
+        .insert("foreign".into(), BTreeMap::new());
+    let error = runtime
+        .ensure_network("foreign")
+        .await
+        .expect_err("foreign collision");
+    assert!(matches!(error, RuntimeError::UnmanagedCollision { .. }));
+}
+
+#[test]
+fn published_ports_are_part_of_the_immutable_digest() {
+    let private = ContainerSpec::new("service", "alpine:3.22");
+    let published = private.clone().with_published_port(8350, 8350);
+
+    assert_ne!(
+        private.digest().expect("private digest"),
+        published.digest().expect("published digest")
+    );
+}
+
+#[test]
+fn entrypoint_override_is_part_of_the_immutable_digest() {
+    let manager = ContainerSpec::new("scheduler", "verglas/verglas-container-runtime:local");
+    let scheduler = manager.clone().with_entrypoint(["verglas-scheduler"]);
+
+    assert_ne!(
+        manager.digest().expect("manager digest"),
+        scheduler.digest().expect("scheduler digest")
+    );
 }

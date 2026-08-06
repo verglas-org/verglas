@@ -14,6 +14,7 @@ RUN cargo build --release \
     -p verglas-server \
     -p verglas-scheduler-bin \
     -p verglas-gadget-runtime \
+    -p verglas-container-runtime \
     -p verglas-query \
     -p verglas-write-node
 
@@ -48,6 +49,17 @@ COPY --from=gadget-host /opt/verglas-gadget-runtime /opt/verglas-gadget-runtime
 USER verglas
 EXPOSE 8350
 ENTRYPOINT ["verglas-gadget-runtime"]
+
+FROM verglas-gadget-runtime AS verglas-container-runtime
+USER root
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/lib/verglas-container-runtime
+COPY --from=build /src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime
+COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler
+EXPOSE 8360
+ENTRYPOINT ["verglas-container-runtime"]
 
 FROM runtime AS verglas-server
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server

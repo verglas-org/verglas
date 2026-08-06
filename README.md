@@ -101,16 +101,17 @@ The Docker application takes the catalog URI, warehouse, and bearer token from
 `VERGLAS_CATALOG_BEARER_TOKEN` in `docker-compose.yml`. It watches the catalog
 and warms changed metadata through the cache path.
 
-## Workers
+## Workers and containers
 
-The optional Workers Compose profile starts Postgres and
-`verglas-scheduler`. A portable worker contains its bounded command, bundled
-files, target table, and cron, HTTP, or CloudEvent triggers. Register one on the
-self-hosted server explicitly:
+Compose bootstraps only `verglas-server` and `verglas-container-runtime`. The
+runtime manager owns every optional local service through Docker: scheduler,
+Neon database components, one single-target runtime per Gadget, external brokers, and
+optional applications. A portable worker contains its bounded command, bundled
+files, target table, and cron, HTTP, or CloudEvent triggers.
 
 ```sh
-export VERGLAS_SCHEDULER_URL=http://verglas-scheduler:8340
-docker compose --profile workers up -d --build
+export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
+docker compose up -d --build
 verglas workers create \
   --local \
   --file examples/workers/market-data-ingest/worker.toml

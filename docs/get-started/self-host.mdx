@@ -89,12 +89,26 @@ with R2 enabled.
     the containers.
   </Step>
 
-  <Step title="Review the complete Compose application">
-    The repository's `docker-compose.yml` is the complete self-hosted
-    configuration. It builds Verglas, persists the cache in a named volume,
-    and defines optional Workers and Analytics profiles.
+  <Step title="Review the Compose bootstrap">
+    The repository's `docker-compose.yml` directly starts only two services:
+    `verglas-server` and the trusted `verglas-container-runtime` manager. The
+    server keeps the data plane and deployment records. The manager alone
+    receives the host Docker socket and owns optional or generated containers.
+
+    Scheduler, Neon, queues, single-target Gadget runtimes, and optional
+    applications are submitted through the manager's authenticated API. They
+    join the fixed `verglas-runtime` network and are restored from the manager's
+    persistent desired-state volume after restart.
 
     ```yaml docker-compose.yml
+    # Self-hosted Verglas cache server.
+    #
+    # 1. Export the R2, catalog, and client-facing S3 values required below.
+    # 2. docker compose up -d --build
+    # 3. Point the CLI at the admin port:
+    #      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+    #    Engines point S3 at http://127.0.0.1:8333.
+
     services:
       verglas-server:
         build:
@@ -102,8 +116,8 @@ with R2 enabled.
           target: verglas-server
         image: verglas/verglas-server:local
         ports:
-          - "8333:8333"
-          - "8334:8334"
+          - "8333:8333" # S3 endpoint
+          - "8334:8334" # admin API (CLI)
         environment:
           VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
           VERGLAS_S3_ADDR: 0.0.0.0:8333
@@ -122,104 +136,58 @@ with R2 enabled.
           VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
           VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
           VERGLAS_WRITE_WORKER_BINARY: /usr/local/bin/verglas-write
-          VERGLAS_RILL_URI: http://rill:9009
-          VERGLAS_RILL_INSTANCE_ID: default
-          VERGLAS_RILL_BROWSER_URI: http://127.0.0.1:9009
-          VERGLAS_RILL_S3_URI: http://verglas-server:8333
+          # Leave empty to run Verglas without worker scheduling. To enable the
+          # scheduler, create it through the local container runtime and set this
+          # to its stable network address.
           VERGLAS_SCHEDULER_URL: ${VERGLAS_SCHEDULER_URL:-}
         volumes:
           - verglas-cache:/var/lib/verglas
+        # Contain a future socket or cache FD leak inside this service. Docker's
+        # million-descriptor default is large enough to exhaust a desktop host.
         ulimits:
           nofile:
             soft: 8192
             hard: 8192
         restart: unless-stopped
 
-      verglas-gadget-runtime:
+      verglas-container-runtime:
         build:
           context: .
-          target: verglas-gadget-runtime
-        image: verglas/verglas-gadget-runtime:local
+          target: verglas-container-runtime
+        image: verglas/verglas-container-runtime:local
         ports:
-          - "8350:8350"
+          - "127.0.0.1:8360:8360"
         environment:
-          VERGLAS_GADGET_RUNTIME_LISTEN: 0.0.0.0:8350
-          VERGLAS_GADGET_RUNTIME_TOKEN: ${VERGLAS_GADGET_RUNTIME_TOKEN:-verglas-local-gadget-runtime}
-          VERGLAS_GADGET_MAX_GADGETS: ${VERGLAS_GADGET_MAX_GADGETS:-64}
+          VERGLAS_CONTAINER_RUNTIME_LISTEN: 0.0.0.0:8360
+          VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
+          VERGLAS_CONTAINER_RUNTIME_NETWORK: verglas-runtime
+          VERGLAS_CONTAINER_RUNTIME_STATE: /var/lib/verglas-container-runtime/deployments.json
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+          - verglas-runtime-state:/var/lib/verglas-container-runtime
         depends_on:
           verglas-server:
             condition: service_started
-        restart: unless-stopped
-
-      postgres:
-        image: postgres:17
-        environment:
-          POSTGRES_USER: verglas
-          POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
-          POSTGRES_DB: verglas
-        healthcheck:
-          test: ["CMD-SHELL", "pg_isready -U verglas -d verglas"]
-          interval: 2s
-          timeout: 5s
-          retries: 15
-        volumes:
-          - postgres-data:/var/lib/postgresql/data
-        profiles: [workers]
-        restart: unless-stopped
-
-      verglas-scheduler:
-        build:
-          context: .
-          target: verglas-scheduler
-        image: verglas/verglas-scheduler:local
-        environment:
-          VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas
-          VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
-          VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
-          VERGLAS_SCHEDULER_QUEUE: local
-        depends_on:
-          verglas-server:
-            condition: service_started
-          postgres:
-            condition: service_healthy
-        profiles: [workers]
-        restart: unless-stopped
-
-      rill-volume-init:
-        image: alpine:3.22
-        command: [chown, -R, "1001:1001", /var/lib/rill]
-        volumes:
-          - rill-data:/var/lib/rill
-        profiles: [analytics]
-        restart: "no"
-
-      rill:
-        image: rilldata/rill:v0.88.6
-        platform: linux/amd64
-        command: [start, /var/lib/rill, --no-open, --port, "9009"]
-        ports:
-          - "9009:9009"
-        volumes:
-          - rill-data:/var/lib/rill
-        depends_on:
-          rill-volume-init:
-            condition: service_completed_successfully
-        profiles: [analytics]
         restart: unless-stopped
 
     volumes:
       verglas-cache:
-      postgres-data:
-      rill-data:
+      verglas-runtime-state:
+
+    networks:
+      default:
+        name: verglas-runtime
+        labels:
+          io.verglas.managed: "true"
     ```
   </Step>
 
   <Step title="Start Verglas">
-    Set a local control-plane token used by Verglas OS to register and call
-    Gadgets, then build and start the base stack:
+    Set the local Docker control-plane token, then build and start the two
+    bootstrap services:
 
     ```bash
-    export VERGLAS_GADGET_RUNTIME_TOKEN="$(openssl rand -hex 32)"
+    export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
     docker compose up --detach --build
     ```
 
@@ -231,17 +199,15 @@ with R2 enabled.
     verglas status
     ```
 
-    The same Compose stack starts `verglas-gadget-runtime` on port `8350`. It
-    can supervise multiple local Gadgets and starts one separate Bun child per
-    selected revision:
+    Confirm that the runtime manager can reach Docker:
 
     ```bash
-    curl -fsS http://127.0.0.1:8350/healthz
-    docker compose logs -f verglas-gadget-runtime
+    curl -i http://127.0.0.1:8360/health
+    docker compose logs -f verglas-container-runtime
     ```
 
-    Pass the same `VERGLAS_GADGET_RUNTIME_TOKEN` to Verglas OS. Do not use the
-    Compose file's development default on a shared machine.
+    Pass the same `VERGLAS_CONTAINER_RUNTIME_TOKEN` to the local Verglas control
+    plane. Do not use the Compose file's development default on a shared machine.
 
     If startup fails, read the server log:
 
@@ -264,5 +230,7 @@ catalog.
 docker compose down
 ```
 
-The named volumes remain. Add `--volumes` only when you intentionally want to
-delete the local cache, scheduler database, and Rill project.
+This stops the two bootstrap services. Dynamically managed containers retain
+their declared state and are reconciled when the manager starts again. The
+named volumes retain the local cache and runtime desired-state document. Add
+`--volumes` only when you intentionally want to delete both.

@@ -56,10 +56,7 @@ fn self_hosted_compose_is_complete_and_runnable() {
     let compose = named_fence(&page, "docker-compose.yml");
     for required in [
         "verglas-server:",
-        "postgres:",
-        "verglas-scheduler:",
-        "rill-volume-init:",
-        "rill:",
+        "verglas-container-runtime:",
         "VERGLAS_BACKEND_BUCKET:",
         "VERGLAS_BACKEND_ENDPOINT:",
         "VERGLAS_CATALOG_URI:",
@@ -72,11 +69,12 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "nofile:",
         "soft: 8192",
         "hard: 8192",
-        "profiles: [workers]",
-        "profiles: [analytics]",
+        "/var/run/docker.sock:/var/run/docker.sock",
+        "verglas-runtime-state:/var/lib/verglas-container-runtime",
+        "name: verglas-runtime",
+        "io.verglas.managed: \"true\"",
         "verglas-cache:",
-        "postgres-data:",
-        "rill-data:",
+        "verglas-runtime-state:",
     ] {
         assert!(
             compose.contains(required),
@@ -87,6 +85,12 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("config.toml"),
         "the server must be configured entirely by Compose"
     );
+    for unmanaged_service in ["postgres:", "verglas-scheduler:", "rill:"] {
+        assert!(
+            !compose.contains(unmanaged_service),
+            "bootstrap Compose must not directly own {unmanaged_service}"
+        );
+    }
 }
 
 #[test]
