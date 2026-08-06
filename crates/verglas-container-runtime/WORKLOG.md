@@ -1,5 +1,8 @@
 # Worklog
 
+- #63: Added an authenticated, read-only Vessel manifest validation endpoint backed by the shared
+  compositional contract; invalid compositions cannot partially mutate local desired state.
+
 - #61: Added bounded, content-addressed TypeScript Vessel project builds with declared npm
   dependencies, a platform-owned Bun Dockerfile, authenticated project deployment API, and
   reconciliation into standalone Application or Integration images.

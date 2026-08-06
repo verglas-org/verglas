@@ -17,6 +17,7 @@ use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
+use verglas_vessel_contract::{ManifestError, VesselManifest, parse_manifest};
 
 use crate::{
     ContainerSpec, DockerRuntime, ManagedContainer, ObservedState, ReconcileOutcome, RuntimeError,
@@ -76,6 +77,9 @@ pub enum ServiceError {
         /// Bounded validation failure.
         detail: String,
     },
+    /// A submitted Vessel manifest was not valid YAML or violated the contract.
+    #[error(transparent)]
+    InvalidVesselManifest(#[from] ManifestError),
 }
 
 impl IntoResponse for ServiceError {
@@ -85,6 +89,7 @@ impl IntoResponse for ServiceError {
             ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServiceError::IdentityMismatch { .. }
             | ServiceError::BootstrapTarget { .. }
+            | ServiceError::InvalidVesselManifest(_)
             | ServiceError::Runtime(
                 RuntimeError::InvalidDeploymentId { .. }
                 | RuntimeError::MissingImage
@@ -155,6 +160,10 @@ impl RuntimeService {
             .route("/apps/{name}/{*path}", get(application_proxy))
             .route("/v1/containers", get(list_containers))
             .route("/v1/vessels", get(list_vessels))
+            .route(
+                "/v1/vessel-manifests/validate",
+                post(validate_vessel_manifest),
+            )
             .route("/v1/namespaces", get(list_namespaces))
             .route("/v1/namespaces/{namespace}", get(get_namespace))
             .route(
@@ -196,6 +205,16 @@ impl RuntimeService {
             .await
             .map_err(ServiceError::Storage)
     }
+}
+
+/// Parses a complete Vessel YAML document without mutating desired runtime state.
+async fn validate_vessel_manifest(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+    yaml: String,
+) -> Result<Json<VesselManifest>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    Ok(Json(parse_manifest(&yaml)?))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

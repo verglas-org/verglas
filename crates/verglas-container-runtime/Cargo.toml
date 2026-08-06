@@ -21,6 +21,7 @@ sha2.workspace = true
 tar = "0.4.44"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "time"] }
+verglas-vessel-contract.workspace = true
 
 [[bin]]
 name = "verglas-container-runtime"
