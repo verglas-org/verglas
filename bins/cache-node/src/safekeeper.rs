@@ -164,7 +164,7 @@ pub async fn serve(
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let layout = geometry(ring.node_count());
-    let server = SafekeeperServer::new(
+    let mut server = SafekeeperServer::new(
         ring.safekeeper_id(),
         Arc::new(Origin::new(stores)),
         bucket,
@@ -174,6 +174,11 @@ pub async fn serve(
         cache_dir.join("safekeeper"),
         layout,
     );
+    if let Ok(endpoint) = std::env::var("VERGLAS_SAFEKEEPER_BROKER_ENDPOINT") {
+        let advertise = std::env::var("VERGLAS_SAFEKEEPER_ADVERTISE_ADDR")
+            .map_err(|_| "VERGLAS_SAFEKEEPER_ADVERTISE_ADDR is required with broker endpoint")?;
+        server = server.with_broker(endpoint, advertise);
+    }
     eprintln!(
         "verglas-cache-node {VERSION} embedded safekeeper listening on {} (EC k={}, m={}, ack quorum={})",
         listener.local_addr()?,

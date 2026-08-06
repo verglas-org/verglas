@@ -20,6 +20,13 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "time"] }
 tracing = "0.1.44"
 sha2.workspace = true
+tonic.workspace = true
+prost.workspace = true
+async-stream = "0.3.5"
+
+[build-dependencies]
+tonic-build = "0.13.1"
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tempfile.workspace = true

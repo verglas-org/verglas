@@ -14,6 +14,9 @@ use tokio::sync::Mutex;
 use verglas_core::read::ObjectRead;
 use verglas_core::write::ObjectWrite;
 
+use crate::broker::proto::{
+    SafekeeperTimelineInfo, TenantTimelineId, broker_service_client::BrokerServiceClient,
+};
 use crate::protocol::{
     AcceptorGreeting, AcceptorMessage, AppendResponse, Membership, ProposerMessage, ProtocolError,
     SafekeeperCommand, TermSwitch, VoteResponse, parse_command, parse_proposer, serialize_acceptor,
@@ -32,6 +35,14 @@ const PG_SSL_REQUEST: u32 = 80_877_103;
 const REPLICATION_CHUNK: u64 = 128 * 1024;
 /// Delay between attempts to drain committed EC WAL into object storage.
 const WAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct BrokerConfig {
+    endpoint: String,
+    advertise_pg_addr: String,
+}
 
 /// One Neon tenant/timeline identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,6 +102,10 @@ pub struct SafekeeperServer<S> {
     geometry: AppendGeometry,
     /// Open timelines, created lazily on first connection.
     timelines: Mutex<HashMap<TimelineKey, Arc<EcAppendLog<S>>>>,
+    /// Optional Neon storage-broker publication required for pageserver WAL
+    /// receiver discovery. Connections retry forever because the broker lives
+    /// in the dependent Postgres VM and may start after the cache.
+    broker: Option<BrokerConfig>,
 }
 
 impl<S> SafekeeperServer<S>
@@ -119,13 +134,35 @@ where
             state_dir: state_dir.as_ref().to_path_buf(),
             geometry,
             timelines: Mutex::new(HashMap::new()),
+            broker: None,
         })
+    }
+
+    /// Publishes every opened timeline to Neon's storage broker. The advertised
+    /// address must be reachable from the Postgres microVM over the tenant VXLAN.
+    #[must_use]
+    pub fn with_broker(
+        mut self: Arc<Self>,
+        endpoint: impl Into<String>,
+        advertise_pg_addr: impl Into<String>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_broker must be called before cloning the server")
+            .broker = Some(BrokerConfig {
+            endpoint: endpoint.into(),
+            advertise_pg_addr: advertise_pg_addr.into(),
+        });
+        self
     }
 
     /// Accepts connections until the listener fails. Each connection is
     /// independent; a malformed client is logged and closed without stopping
     /// the cache-node process.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<(), ServerError> {
+        if let Some(config) = self.broker.clone() {
+            let server = Arc::clone(&self);
+            tokio::spawn(async move { server.publish_broker(config).await });
+        }
         loop {
             let (stream, peer) = listener.accept().await?;
             let server = Arc::clone(&self);
@@ -134,6 +171,57 @@ where
                     tracing::warn!(%peer, %error, "safekeeper connection closed");
                 }
             });
+        }
+    }
+
+    async fn publish_broker(self: Arc<Self>, config: BrokerConfig) {
+        loop {
+            let server = Arc::clone(&self);
+            let advertise_pg_addr = config.advertise_pg_addr.clone();
+            let outbound = async_stream::stream! {
+                loop {
+                    let timelines = server.timelines.lock().await.clone();
+                    for (key, timeline) in timelines {
+                        let state = timeline.safekeeper_state().await;
+                        yield SafekeeperTimelineInfo {
+                            safekeeper_id: server.node_id,
+                            tenant_timeline_id: Some(TenantTimelineId {
+                                tenant_id: decode_hex_id(&key.tenant_id),
+                                timeline_id: decode_hex_id(&key.timeline_id),
+                            }),
+                            term: state.term,
+                            last_log_term: state.term_history.last().map_or(0, |entry| entry.0),
+                            flush_lsn: state.flush_lsn.0,
+                            commit_lsn: state.commit_lsn.0,
+                            backup_lsn: state.truncate_lsn.0,
+                            remote_consistent_lsn: 0,
+                            peer_horizon_lsn: state.truncate_lsn.0,
+                            local_start_lsn: state.truncate_lsn.0,
+                            standby_horizon: 0,
+                            safekeeper_connstr: advertise_pg_addr.clone(),
+                            http_connstr: String::new(),
+                            https_connstr: None,
+                            availability_zone: Some("verglas".to_owned()),
+                        };
+                    }
+                    tokio::time::sleep(BROKER_PUBLISH_INTERVAL).await;
+                }
+            };
+            match BrokerServiceClient::connect(config.endpoint.clone()).await {
+                Ok(mut client) => {
+                    tracing::info!(endpoint = %config.endpoint, "publishing safekeeper timelines to storage broker");
+                    if let Err(error) = client
+                        .publish_safekeeper_info(tonic::Request::new(outbound))
+                        .await
+                    {
+                        tracing::warn!(endpoint = %config.endpoint, %error, "storage broker publisher disconnected");
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(endpoint = %config.endpoint, %error, "storage broker unavailable; retrying");
+                }
+            }
+            tokio::time::sleep(BROKER_RETRY_INTERVAL).await;
         }
     }
 
@@ -437,6 +525,23 @@ fn validate_id(kind: &str, value: &str) -> Result<(), ServerError> {
         Err(ServerError::Connection(format!(
             "{kind} id must be 32 hexadecimal characters"
         )))
+    }
+}
+
+fn decode_hex_id(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("timeline ids are validated before broker publication"),
     }
 }
 

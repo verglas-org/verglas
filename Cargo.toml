@@ -73,6 +73,8 @@ verglas-gadget-runtime = { path = "crates/verglas-gadget-runtime" }
 verglas-container-runtime = { path = "crates/verglas-container-runtime" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
+tonic = "0.13.1"
+prost = "0.13.5"
 # Client-side Iceberg read/write for the agent-facing CLI verbs (#287). The
 # write path (create/append/commit) and the embedded query engine are new; they
 # speak to any Iceberg REST catalog, including the server's loopback gateway.
