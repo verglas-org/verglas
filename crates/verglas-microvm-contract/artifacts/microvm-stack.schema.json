@@ -253,17 +253,22 @@
       ]
     },
     "Runtime": {
-      "description": "OCI runtime image selection.",
+      "description": "Immutable runtime root filesystem stored in the platform R2 bucket.",
       "type": "object",
       "properties": {
-        "image": {
-          "description": "Digest-pinned OCI image reference.",
+        "object": {
+          "description": "Exact R2 object key for the root filesystem image.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Lowercase hexadecimal SHA-256 digest of the object contents.",
           "type": "string"
         }
       },
       "additionalProperties": false,
       "required": [
-        "image"
+        "object",
+        "sha256"
       ]
     },
     "Tenant": {

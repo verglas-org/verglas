@@ -11,7 +11,7 @@ ajv.addFormat("uint16", true);
 ajv.addFormat("uint32", true);
 const validateSchema = ajv.compile(schema);
 const namePattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-const imagePattern = /^[^\s/@]+(?:\/[^\s/@]+)+@sha256:[a-f0-9]{64}$/;
+const sha256Pattern = /^[a-f0-9]{64}$/;
 
 /**
  * Parse and validate a MicroVMStack YAML document.
@@ -90,10 +90,20 @@ function validateSemantics(stack) {
 /** Validate fields scoped to one component. */
 function validateComponent(component) {
   validateName("component.name", component.name);
-  if (!imagePattern.test(component.runtime.image)) {
+  const object = component.runtime.object;
+  const segments = object.split("/");
+  if (
+    object.startsWith("/") ||
+    !object.endsWith("/rootfs.ext4") ||
+    /[\s\\?#]/.test(object) ||
+    segments.some((segment) => segment === "" || segment === "." || segment === "..")
+  ) {
     invalid(
-      `runtime.image \`${component.runtime.image}\` must use registry/repository@sha256:digest`,
+      `runtime.object \`${object}\` must be a relative R2 key ending in /rootfs.ext4`,
     );
+  }
+  if (!sha256Pattern.test(component.runtime.sha256)) {
+    invalid(`runtime.sha256 must be 64 lowercase hexadecimal characters`);
   }
   if (component.exec.length === 0 || component.exec.some((argument) => argument.length === 0)) {
     invalid(`component \`${component.name}\` exec must not be empty`);

@@ -12,7 +12,8 @@ ingress:
 components:
   - name: cache
     runtime:
-      image: ghcr.io/verglas/cache@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+      object: cache-v1/rootfs.ext4
+      sha256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
     exec: ["/usr/local/bin/cache-boot.sh"]
     cluster:
       members: 3
@@ -29,7 +30,8 @@ components:
 
   - name: postgres
     runtime:
-      image: ghcr.io/verglas/neon-postgres@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+      object: postgres-v1/rootfs.ext4
+      sha256: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
     exec: ["/usr/local/bin/postgres-boot.sh"]
     dependsOn: [cache]
     resources:
@@ -45,7 +47,8 @@ components:
 
   - name: scheduler
     runtime:
-      image: ghcr.io/verglas/scheduler@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+      object: scheduler-v1/rootfs.ext4
+      sha256: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     exec: ["/usr/local/bin/verglas-scheduler"]
     dependsOn: [postgres]
     resources:

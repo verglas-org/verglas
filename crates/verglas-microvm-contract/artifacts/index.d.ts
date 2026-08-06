@@ -26,9 +26,13 @@ port: string, };
 
 export type Runtime = { 
 /**
- * Digest-pinned OCI image reference.
+ * Exact R2 object key for the root filesystem image.
  */
-image: string, };
+object: string, 
+/**
+ * Lowercase hexadecimal SHA-256 digest of the object contents.
+ */
+sha256: string, };
 
 export type Cluster = { 
 /**

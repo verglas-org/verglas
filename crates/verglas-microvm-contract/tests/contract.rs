@@ -19,15 +19,28 @@ fn parses_the_minimal_stack_contract() {
 }
 
 #[test]
-fn rejects_mutable_image_tags() {
+fn rejects_unsafe_r2_object_keys() {
     let yaml = VALID.replace(
-        "ghcr.io/verglas/scheduler@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        "ghcr.io/verglas/scheduler:latest",
+        "scheduler-v1/rootfs.ext4",
+        "../scheduler-v1/rootfs.ext4",
     );
 
-    let error = parse_manifest(&yaml).expect_err("mutable tag must be rejected");
+    let error = parse_manifest(&yaml).expect_err("unsafe object key must be rejected");
     assert!(matches!(error, ManifestError::Validation(_)));
-    assert!(error.to_string().contains("runtime.image"));
+    assert!(error.to_string().contains("runtime.object"));
+}
+
+#[test]
+fn rejects_invalid_runtime_sha256() {
+    let yaml = VALID.replacen(
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "not-a-sha",
+        1,
+    );
+
+    let error = parse_manifest(&yaml).expect_err("invalid SHA-256 must be rejected");
+    assert!(matches!(error, ManifestError::Validation(_)));
+    assert!(error.to_string().contains("runtime.sha256"));
 }
 
 #[test]

@@ -98,14 +98,16 @@ pub struct Component {
     pub depends_on: Option<Vec<String>>,
 }
 
-/// OCI runtime image selection.
+/// Immutable runtime root filesystem stored in the platform R2 bucket.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 #[serde(rename_all = "camelCase")]
 #[ts(rename_all = "camelCase")]
 pub struct Runtime {
-    /// Digest-pinned OCI image reference.
-    pub image: String,
+    /// Exact R2 object key for the root filesystem image.
+    pub object: String,
+    /// Lowercase hexadecimal SHA-256 digest of the object contents.
+    pub sha256: String,
 }
 
 /// Fixed-size quorum cluster configuration.
@@ -305,7 +307,8 @@ impl Component {
     /// Validate component-local fields and references.
     fn validate(&self) -> Result<(), ManifestError> {
         validate_name("component.name", &self.name)?;
-        validate_oci_image(&self.runtime.image)?;
+        validate_r2_object(&self.runtime.object)?;
+        validate_sha256(&self.runtime.sha256)?;
         if self.exec.is_empty() || self.exec.iter().any(String::is_empty) {
             return validation(format!("component `{}` exec must not be empty", self.name));
         }
@@ -406,26 +409,36 @@ fn validate_name(field: &str, name: &str) -> Result<(), ManifestError> {
     }
 }
 
-/// Validate a canonical digest-pinned OCI image reference.
-fn validate_oci_image(image: &str) -> Result<(), ManifestError> {
-    let Some((repository, digest)) = image.rsplit_once("@sha256:") else {
-        return validation(format!(
-            "runtime.image `{image}` must use registry/repository@sha256:digest"
-        ));
-    };
-    let repository_valid = repository.contains('/')
-        && !repository.contains(char::is_whitespace)
-        && !repository.ends_with('/')
-        && !repository.contains('@');
-    let digest_valid = digest.len() == 64
-        && digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
-    if repository_valid && digest_valid {
+/// Validate a safe, exact R2 object key for a Firecracker root filesystem.
+fn validate_r2_object(object: &str) -> Result<(), ManifestError> {
+    let valid = !object.is_empty()
+        && !object.starts_with('/')
+        && object.ends_with("/rootfs.ext4")
+        && !object.contains(char::is_whitespace)
+        && !object.contains(['\\', '?', '#'])
+        && object
+            .split('/')
+            .all(|segment| !segment.is_empty() && segment != "." && segment != "..");
+    if valid {
         Ok(())
     } else {
         validation(format!(
-            "runtime.image `{image}` must use registry/repository@sha256:digest"
+            "runtime.object `{object}` must be a relative R2 key ending in /rootfs.ext4"
+        ))
+    }
+}
+
+/// Validate a canonical SHA-256 digest.
+fn validate_sha256(digest: &str) -> Result<(), ManifestError> {
+    let valid = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase());
+    if valid {
+        Ok(())
+    } else {
+        validation(format!(
+            "runtime.sha256 `{digest}` must be 64 lowercase hexadecimal characters"
         ))
     }
 }
