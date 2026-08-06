@@ -392,20 +392,11 @@ where
         loop {
             interval.tick().await;
             match timeline.flush().await {
-                Ok(flushed) => {
-                    let state = timeline.safekeeper_state().await;
-                    if state.truncate_lsn.0 > 0
-                        && state.truncate_lsn.0 <= flushed.0
-                        && let Err(error) = timeline.truncate(state.truncate_lsn).await
-                    {
-                        tracing::warn!(
-                            tenant_id = %key.tenant_id,
-                            timeline_id = %key.timeline_id,
-                            %error,
-                            "failed to truncate drained safekeeper WAL"
-                        );
-                    }
-                }
+                // The walproposer truncate watermark does not prove that a
+                // pageserver has ingested this WAL. Keep drained segments
+                // readable until the pageserver protocol carries an
+                // authoritative retention boundary.
+                Ok(_) => {}
                 Err(error) => tracing::warn!(
                     tenant_id = %key.tenant_id,
                     timeline_id = %key.timeline_id,

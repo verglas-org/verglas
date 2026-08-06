@@ -994,7 +994,7 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
     append.put_u64(start);
     append.put_u64(end);
     append.put_u64(end);
-    append.put_u64(start);
+    append.put_u64(end);
     append.put_slice(&wal);
     send_pg_message(&mut proposer, b'd', &append).await;
     let (_, append_response) = read_pg_message(&mut proposer).await;
@@ -1017,6 +1017,10 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
         0,
         "EC fragments drop only after the object-store write"
     );
+
+    // The proposer may advance its truncate watermark before a cold pageserver
+    // has consumed the retained WAL. Object-store drain must not make that WAL
+    // unavailable to physical replication.
 
     let mut replica = tokio::net::TcpStream::connect(address)
         .await
