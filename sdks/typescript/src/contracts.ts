@@ -122,7 +122,9 @@ export type TriggerSpec =
  * accessor — progress is the trigger's logical time, not durable job state.
  */
 export interface WorkerContext<Env = Record<string, unknown>> {
-  /** A connected client for the target endpoint (read/write via table verbs). */
+  /** The connected SDK instance, including reflected Integration namespaces. */
+  verglas: VerglasClient;
+  /** @deprecated Use `verglas`; this is the same instance for older Workers. */
   client: VerglasClient;
   /** The event that invoked this run. */
   trigger: CloudEvent;
@@ -159,6 +161,7 @@ export interface WorkerResult {
 
 /** A worker handler: one invocation is one bounded run against one trigger. */
 export type WorkerHandler<Env = Record<string, unknown>> = (
+  this: { verglas: VerglasClient },
   ctx: WorkerContext<Env>,
 ) => Promise<WorkerResult | void> | WorkerResult | void;
 
@@ -231,7 +234,7 @@ export async function runWorker<Env>(
   const pipeline = opts?.name ?? worker.name ?? ctx.output;
 
   if (opts?.logging === false) {
-    return worker.handler(ctx);
+    return worker.handler.call({ verglas: ctx.verglas }, ctx);
   }
 
   // pipeline label = the deployment name; logs table = <ctx.output>_LOGS.
@@ -244,11 +247,16 @@ export async function runWorker<Env>(
     now: opts?.now,
   });
   const client = instrumentClient(ctx.client, logger);
-  const runCtx: WorkerContext<Env> = { ...ctx, client, log: logger.contextLog() };
+  const runCtx: WorkerContext<Env> = {
+    ...ctx,
+    verglas: client,
+    client,
+    log: logger.contextLog(),
+  };
   const start = logger.now();
   logger.log("run_start", { message: `worker ${logger.pipeline} (${ctx.trigger.type})` });
   try {
-    const result = await worker.handler(runCtx);
+    const result = await worker.handler.call({ verglas: client }, runCtx);
     logger.log("run_end", {
       rows: typeof result?.rowsWritten === "number" ? result.rowsWritten : 0,
       duration_ms: logger.now() - start,

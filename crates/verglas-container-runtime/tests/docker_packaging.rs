@@ -24,6 +24,9 @@ fn dockerfile_builds_the_runtime_manager() {
     );
     assert!(!dockerfile.contains("FROM verglas-gadget-runtime AS verglas-container-runtime"));
     assert!(dockerfile.contains("ENTRYPOINT [\"verglas-container-runtime\"]"));
+    assert!(dockerfile.contains("AS verglas-integration-runtime"));
+    assert!(dockerfile.contains("AS verglas-application-runtime"));
+    assert!(dockerfile.contains("COPY sdks/typescript/src ./sdk"));
 }
 
 #[test]
@@ -49,4 +52,7 @@ fn compose_bootstraps_only_server_and_runtime_manager() {
     assert_eq!(compose.matches("/var/run/docker.sock").count(), 2);
     assert!(compose.contains("verglas-runtime-state:/var/lib/verglas-container-runtime"));
     assert!(compose.contains("name: verglas-runtime"));
+    assert!(
+        compose.contains("VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360")
+    );
 }

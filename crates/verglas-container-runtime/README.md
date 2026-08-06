@@ -45,3 +45,13 @@ Docker socket nor Docker environment. Database declarations consume the separate
 `ghcr.io/verglas-org/verglas-neon-storage:latest` and
 `ghcr.io/verglas-org/verglas-neon-compute-v16:latest` images. Neon remains multiple declared
 services (broker, pageserver, and compute), not a hidden single Postgres container.
+
+## Reflected Integration namespaces
+
+Every Integration Vessel publishes `GET /v1/namespace` on its private HTTP
+service. The manager discovers those manifests and exposes authenticated
+`GET /v1/namespaces`, `GET /v1/namespaces/{name}`, and
+`POST /v1/namespaces/{name}/invoke/{method}` routes. A manifest's namespace must
+equal its Vessel name; an Application Vessel cannot register an Integration
+namespace. Invocation responses stream through the manager without result-wide
+buffering.

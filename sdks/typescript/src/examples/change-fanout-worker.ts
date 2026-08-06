@@ -36,7 +36,7 @@ export const changeFanoutWorker = defineWorker<FanoutEnv>({
 
     // Read the rows this commit added. `SINCE_WATERMARK` (deployment config) marks
     // the last processed position; absent, we read the whole current snapshot.
-    const input = ctx.client.table(ctx.env.INPUT_TABLE);
+    const input = ctx.verglas.table(ctx.env.INPUT_TABLE);
     const since = ctx.env.SINCE_WATERMARK;
     const rows = since ? (await input.delta(since)).rows : (await input.scan()).rows;
 
@@ -47,7 +47,7 @@ export const changeFanoutWorker = defineWorker<FanoutEnv>({
 
     // Key the commit by the input snapshot: a replayed CloudEvent re-commits the
     // same derived rows under the same key, so the output is never doubled.
-    const result = await ctx.client
+    const result = await ctx.verglas
       .table(ctx.output)
       .append(out, { idempotencyKey: `${ctx.env.INPUT_TABLE}@${changed.snapshotId}` });
     ctx.log("change-fanout: appended", { rows: result.rowsCommitted, idempotent: result.idempotent });

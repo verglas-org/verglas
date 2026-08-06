@@ -31,7 +31,8 @@ pub mod vector;
 pub use client::{
     ARROW_STREAM_CONTENT_TYPE, AppendResult, Client, ClientError, ColumnSpec, ConnectOptions,
     EnsureTable, FollowStream, Kv, KvDeleteResult, KvListEntry, KvListPage, KvPutOptions,
-    KvPutResult, KvReadTier, KvValue, PartitionSpec, QueryStream, TableDefinition,
+    KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest, NamespaceMethodManifest,
+    NamespaceMethodMode, NamespaceStream, PartitionSpec, QueryStream, TableDefinition,
 };
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};

@@ -3,6 +3,7 @@
 import { makeTransport, type Transport } from "./http";
 import { VerglasHttpError } from "./http";
 import { CatalogFeed, feedUrl, globalWebSocket } from "./feed";
+import { NamespaceRuntime } from "./namespace";
 import type {
   AddIndexOptions,
   ChangeHandler,
@@ -17,6 +18,10 @@ import type {
   FollowRowsOptions,
   IndexInfo,
   IndexReport,
+  DynamicNamespaceRegistry,
+  NamespaceBindings,
+  NamespaceManifest,
+  NamespaceRegistry,
   KvDeleteResult,
   KvListOptions,
   KvListPage,
@@ -55,7 +60,9 @@ const DEFAULT_TIMEOUT_MS = 30_000;
  * Opens a client against a Verglas endpoint. The endpoint is either the local
  * server's base URL or a cloud Verglas endpoint; the interface is identical.
  */
-export function connect(opts: ConnectOptions): VerglasClient {
+export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceRegistry>(
+  opts: ConnectOptions,
+): VerglasClient<Namespaces> {
   if (!opts.endpoint) throw new Error("connect: endpoint is required");
   if (!opts.token) throw new Error("connect: token is required");
   const fetchImpl = opts.fetch ?? globalThis.fetch;
@@ -63,13 +70,17 @@ export function connect(opts: ConnectOptions): VerglasClient {
     throw new Error("connect: no global fetch; pass one via ConnectOptions.fetch");
   }
   const transport = makeTransport(opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  return new VerglasClient(transport, opts.endpoint, opts.token);
+  return new VerglasClient<Namespaces>(transport, opts.endpoint, opts.token);
 }
 
 /** A connected Verglas client. Cheap to hold; makes no requests until used. */
-export class VerglasClient {
+export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespaceRegistry> {
   /** The shared change-feed socket, opened lazily on the first `follow`. */
   private feed?: CatalogFeed;
+  readonly #namespaces: NamespaceRuntime<Namespaces>;
+
+  /** Integration APIs composed into this client through reflection. */
+  readonly namespace: NamespaceBindings<Namespaces>;
 
   /** @internal */
   constructor(
@@ -78,7 +89,18 @@ export class VerglasClient {
     readonly endpoint: string,
     /** Bearer token, reused to authenticate the change-feed websocket. */
     private readonly token: string,
-  ) {}
+  ) {
+    this.#namespaces = new NamespaceRuntime<Namespaces>(transport);
+    this.namespace = this.#namespaces.namespace;
+  }
+
+  /** Lists all Integration namespace manifests visible to this principal. */
+  reflect(): Promise<NamespaceManifest[]>;
+  /** Reads one Integration namespace manifest and caches it for later invocations. */
+  reflect(namespace: string): Promise<NamespaceManifest>;
+  reflect(namespace?: string): Promise<NamespaceManifest | NamespaceManifest[]> {
+    return namespace === undefined ? this.#namespaces.reflect() : this.#namespaces.manifest(namespace);
+  }
 
   /** Returns a thin handle to one tenant-authorized KV namespace. */
   kv(namespace: string): Kv {

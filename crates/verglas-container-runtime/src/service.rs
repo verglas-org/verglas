@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
@@ -13,6 +13,7 @@ use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
@@ -64,6 +65,17 @@ pub enum ServiceError {
     /// A local application preview path named a non-Application Vessel.
     #[error("Vessel {0} is not an Application")]
     NotApplication(String),
+    /// A reflected namespace did not identify an Integration Vessel.
+    #[error("namespace {0} is not a registered Integration")]
+    NotIntegration(String),
+    /// An Integration returned a malformed or mismatched reflection manifest.
+    #[error("Integration {name} returned an invalid namespace manifest: {detail}")]
+    InvalidNamespaceManifest {
+        /// Stable Integration Vessel name.
+        name: String,
+        /// Bounded validation failure.
+        detail: String,
+    },
 }
 
 impl IntoResponse for ServiceError {
@@ -85,7 +97,10 @@ impl IntoResponse for ServiceError {
             ServiceError::VesselRequest(_) | ServiceError::VesselResponseTooLarge => {
                 StatusCode::BAD_GATEWAY
             }
-            ServiceError::NotApplication(_) => StatusCode::NOT_FOUND,
+            ServiceError::NotApplication(_) | ServiceError::NotIntegration(_) => {
+                StatusCode::NOT_FOUND
+            }
+            ServiceError::InvalidNamespaceManifest { .. } => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()
@@ -135,6 +150,12 @@ impl RuntimeService {
             .route("/apps/{name}/{*path}", get(application_proxy))
             .route("/v1/containers", get(list_containers))
             .route("/v1/vessels", get(list_vessels))
+            .route("/v1/namespaces", get(list_namespaces))
+            .route("/v1/namespaces/{namespace}", get(get_namespace))
+            .route(
+                "/v1/namespaces/{namespace}/invoke/{method}",
+                post(invoke_namespace),
+            )
             .route(
                 "/v1/vessels/{name}",
                 get(get_vessel).put(put_vessel).delete(delete_vessel),
@@ -454,6 +475,123 @@ async fn proxy_vessel(
     forward_vessel(&state, &name, &path, method, &headers, body).await
 }
 
+/// Discovers the reflected manifests published by every Integration Vessel.
+async fn list_namespaces(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Value>>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let names = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .values()
+        .filter(|vessel| vessel.role == VesselRole::Integration)
+        .map(|vessel| vessel.name.clone())
+        .collect::<Vec<_>>();
+    let mut manifests = Vec::with_capacity(names.len());
+    for name in names {
+        manifests.push(load_namespace_manifest(&state, &name).await?);
+    }
+    Ok(Json(manifests))
+}
+
+/// Returns one Integration Vessel's self-published reflection manifest.
+async fn get_namespace(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(namespace): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    require_integration(&state, &namespace).await?;
+    Ok(Json(load_namespace_manifest(&state, &namespace).await?))
+}
+
+/// Streams one reflected Integration invocation through its private container.
+async fn invoke_namespace(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath((namespace, method)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ServiceError> {
+    authorize(&headers, &state.token)?;
+    require_integration(&state, &namespace).await?;
+    forward_vessel_streaming(
+        &state,
+        &namespace,
+        &format!("v1/namespace/invoke/{method}"),
+        Method::POST,
+        &headers,
+        body,
+    )
+    .await
+}
+
+/// Ensures a public namespace resolves only to an Integration Vessel.
+async fn require_integration(state: &ServiceState, name: &str) -> Result<(), ServiceError> {
+    let role = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .get(name)
+        .map(|vessel| vessel.role);
+    if role == Some(VesselRole::Integration) {
+        Ok(())
+    } else {
+        Err(ServiceError::NotIntegration(name.to_owned()))
+    }
+}
+
+/// Reads and validates one bounded manifest from an Integration container.
+async fn load_namespace_manifest(state: &ServiceState, name: &str) -> Result<Value, ServiceError> {
+    let response = forward_vessel(
+        state,
+        name,
+        "v1/namespace",
+        Method::GET,
+        &HeaderMap::new(),
+        Bytes::new(),
+    )
+    .await?;
+    if !response.status().is_success() {
+        return Err(ServiceError::InvalidNamespaceManifest {
+            name: name.to_owned(),
+            detail: format!("HTTP {}", response.status()),
+        });
+    }
+    let body = axum::body::to_bytes(response.into_body(), MAX_PROXY_RESPONSE_BYTES)
+        .await
+        .map_err(|error| ServiceError::InvalidNamespaceManifest {
+            name: name.to_owned(),
+            detail: error.to_string(),
+        })?;
+    let manifest: Value =
+        serde_json::from_slice(&body).map_err(|error| ServiceError::InvalidNamespaceManifest {
+            name: name.to_owned(),
+            detail: error.to_string(),
+        })?;
+    validate_namespace_manifest(name, manifest)
+}
+
+/// Enforces the stable one-Vessel/one-namespace identity mapping.
+fn validate_namespace_manifest(name: &str, manifest: Value) -> Result<Value, ServiceError> {
+    if manifest.get("namespace").and_then(Value::as_str) != Some(name) {
+        return Err(ServiceError::InvalidNamespaceManifest {
+            name: name.to_owned(),
+            detail: "namespace must match the Vessel name".to_owned(),
+        });
+    }
+    if !manifest.get("methods").is_some_and(Value::is_object) {
+        return Err(ServiceError::InvalidNamespaceManifest {
+            name: name.to_owned(),
+            detail: "methods must be an object".to_owned(),
+        });
+    }
+    Ok(manifest)
+}
+
 /// Redirects a local Application URL to its slash-terminated asset base.
 async fn application_redirect(AxumPath(name): AxumPath<String>) -> Redirect {
     Redirect::temporary(&format!("/apps/{name}/"))
@@ -505,31 +643,7 @@ async fn forward_vessel(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, ServiceError> {
-    let vessel = state
-        .desired
-        .read()
-        .await
-        .vessels
-        .get(name)
-        .cloned()
-        .ok_or_else(|| RuntimeError::InvalidDeploymentId {
-            deployment_id: name.to_owned(),
-        })?;
-    let url = format!("http://verglas-vessel-{name}:{}/{path}", vessel.http.port);
-    let response = reqwest::Client::new()
-        .request(method, url)
-        .header(
-            header::CONTENT_TYPE,
-            headers
-                .get(header::CONTENT_TYPE)
-                .cloned()
-                .unwrap_or_else(|| "application/json".parse().expect("static content type")),
-        )
-        .body(body)
-        .timeout(Duration::from_secs(30))
-        .send()
-        .await
-        .map_err(|error| ServiceError::VesselRequest(error.to_string()))?;
+    let response = send_vessel(state, name, path, method, headers, body).await?;
     let status = response.status();
     let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
     let mut stream = response.bytes_stream();
@@ -548,6 +662,63 @@ async fn forward_vessel(
             .insert(header::CONTENT_TYPE, content_type);
     }
     Ok(result)
+}
+
+/// Relays an Integration stream without buffering it in the manager.
+async fn forward_vessel_streaming(
+    state: &ServiceState,
+    name: &str,
+    path: &str,
+    method: Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, ServiceError> {
+    let response = send_vessel(state, name, path, method, headers, body).await?;
+    let status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let mut result = Response::new(Body::from_stream(response.bytes_stream()));
+    *result.status_mut() = status;
+    if let Some(content_type) = content_type {
+        result
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
+    }
+    Ok(result)
+}
+
+/// Sends one request to a declared Vessel on the private runtime network.
+async fn send_vessel(
+    state: &ServiceState,
+    name: &str,
+    path: &str,
+    method: Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<reqwest::Response, ServiceError> {
+    let vessel = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .get(name)
+        .cloned()
+        .ok_or_else(|| RuntimeError::InvalidDeploymentId {
+            deployment_id: name.to_owned(),
+        })?;
+    let url = format!("http://verglas-vessel-{name}:{}/{path}", vessel.http.port);
+    let mut request = reqwest::Client::new()
+        .request(method, url)
+        .body(body)
+        .timeout(Duration::from_secs(30));
+    for name in [header::CONTENT_TYPE, header::ACCEPT] {
+        if let Some(value) = headers.get(&name) {
+            request = request.header(name, value);
+        }
+    }
+    request
+        .send()
+        .await
+        .map_err(|error| ServiceError::VesselRequest(error.to_string()))
 }
 
 /// Joins a desired Vessel with its normalized Docker observation.
@@ -633,7 +804,9 @@ async fn load_desired(path: &Path) -> Result<DesiredState, ServiceError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_bootstrap_target, load_desired};
+    use serde_json::json;
+
+    use super::{is_bootstrap_target, load_desired, validate_namespace_manifest};
 
     /// The manager and the data-plane server cannot recursively manage themselves.
     #[test]
@@ -653,5 +826,17 @@ mod tests {
         let desired = load_desired(&path).await.expect("load missing state");
         assert!(desired.containers.is_empty());
         assert!(desired.vessels.is_empty());
+    }
+
+    /// Integration containers cannot claim another Vessel's public namespace.
+    #[test]
+    fn namespace_manifest_must_match_vessel_identity() {
+        let valid = json!({"namespace":"crm","methods":{}});
+        assert!(validate_namespace_manifest("crm", valid).is_ok());
+
+        let mismatch = json!({"namespace":"billing","methods":{}});
+        let error = validate_namespace_manifest("crm", mismatch)
+            .expect_err("mismatched namespace must fail closed");
+        assert!(error.to_string().contains("namespace must match"));
     }
 }

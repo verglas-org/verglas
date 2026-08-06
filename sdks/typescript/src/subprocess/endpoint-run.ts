@@ -120,6 +120,7 @@ export async function endpointRun(
       fetch: opts?.fetch,
     });
     const ctx: WorkerContext = {
+      verglas: client,
       client,
       trigger: cloudEvent(env),
       output: target,

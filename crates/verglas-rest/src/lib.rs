@@ -14,6 +14,7 @@ pub mod dashboard;
 pub mod follow;
 pub mod kv;
 pub mod logging;
+pub mod namespace;
 pub mod platform;
 pub mod query_worker;
 pub mod write_worker;

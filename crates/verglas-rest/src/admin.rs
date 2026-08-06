@@ -196,6 +196,8 @@ pub type PlatformSlot = Arc<OnceLock<Arc<crate::platform::SchedulerIngress>>>;
 /// positional list so call sites name what they wire.
 #[derive(Default)]
 pub struct Slots {
+    /// Reflected Integration namespace gateway backed by the local runtime manager.
+    pub namespaces: Option<crate::namespace::NamespaceGateway>,
     /// Always-on native KV routes, authenticated at the route boundary.
     pub kv: Option<crate::kv::KvRuntime>,
     /// Cache purge (`POST /cache/purge`).
@@ -253,6 +255,7 @@ pub struct Slots {
 /// filled (#16).
 pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Router {
     let Slots {
+        namespaces,
         kv,
         purger,
         stats,
@@ -284,6 +287,9 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         // process-global, so this answers whether or not the engine is ready.
         .route(LOG_PATH, post(set_log_level))
         .merge(health_router(health));
+    if let Some(namespaces) = namespaces {
+        app = app.merge(crate::namespace::router(namespaces));
+    }
     if let Some(kv) = kv {
         app = app.merge(crate::kv::router(kv));
     }

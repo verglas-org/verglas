@@ -1567,6 +1567,26 @@ async fn serve(
         build_query_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
     let write_worker_dispatcher =
         build_write_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
+    let namespace_gateway = match (
+        std::env::var("VERGLAS_CONTAINER_RUNTIME_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty()),
+        std::env::var("VERGLAS_CONTAINER_RUNTIME_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty()),
+    ) {
+        (Some(endpoint), Some(token)) => Some(
+            verglas_rest::namespace::NamespaceGateway::new(endpoint, token)
+                .map_err(|error| format!("configure Integration namespace gateway: {error}"))?,
+        ),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "VERGLAS_CONTAINER_RUNTIME_URL and VERGLAS_CONTAINER_RUNTIME_TOKEN must be set together"
+                    .into(),
+            );
+        }
+    };
     let dashboard_runtime = match (&config.analytics, &tables_slot) {
         (Some(analytics), Some(tables)) => {
             Some(Arc::new(verglas_rest::dashboard::DashboardRuntime::new(
@@ -1594,6 +1614,7 @@ async fn serve(
         admin_listener,
         health.clone(),
         admin::Slots {
+            namespaces: namespace_gateway,
             kv: Some(kv_admin_runtime),
             purger: Some(purger_slot.clone()),
             stats: Some(stats_slot.clone()),

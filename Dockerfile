@@ -25,6 +25,24 @@ COPY crates/verglas-gadget-runtime/runtime/package.json \
 RUN bun install --frozen-lockfile --production
 COPY crates/verglas-gadget-runtime/runtime/host.mjs ./host.mjs
 
+FROM oven/bun:1.3.8 AS verglas-integration-runtime
+WORKDIR /opt/verglas-integration-runtime
+COPY crates/verglas-integration-runtime/runtime.mjs ./runtime.mjs
+COPY crates/verglas-integration-runtime/contract.mjs ./contract.mjs
+COPY sdks/typescript/src ./sdk
+USER bun
+EXPOSE 8370
+ENTRYPOINT ["bun", "/opt/verglas-integration-runtime/runtime.mjs"]
+
+FROM oven/bun:1.3.8 AS verglas-application-runtime
+WORKDIR /opt/verglas-application-runtime
+COPY crates/verglas-application-runtime/runtime.mjs ./runtime.mjs
+COPY crates/verglas-application-runtime/contract.mjs ./contract.mjs
+COPY sdks/typescript/src ./sdk
+USER bun
+EXPOSE 8380
+ENTRYPOINT ["bun", "/opt/verglas-application-runtime/runtime.mjs"]
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
@@ -57,6 +75,10 @@ RUN apt-get update \
     && mkdir -p /var/lib/verglas-container-runtime
 COPY --from=build /src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime
 COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler
+COPY --from=gadget-host /usr/local/bin/bun /usr/local/bin/bun
+COPY crates/verglas-integration-runtime/runtime.mjs /opt/verglas-integration-runtime/runtime.mjs
+COPY crates/verglas-integration-runtime/contract.mjs /opt/verglas-integration-runtime/contract.mjs
+COPY sdks/typescript/src /opt/verglas-integration-runtime/sdk
 EXPOSE 8360
 ENTRYPOINT ["verglas-container-runtime"]
 

@@ -30,6 +30,12 @@
       "routes": ["WS /v1/catalog/feed"],
       "guarantees": ["cursor-expiry-distinct", "exactly-once-sequence", "resume-after-drop"],
       "symbol": "pub fn follow"
+    },
+    {
+      "operation": "namespace",
+      "routes": ["GET /v1/namespaces", "GET /v1/namespaces/{namespace}", "POST /v1/namespaces/{namespace}/invoke/{method}"],
+      "guarantees": ["reflected-contract", "scoped-bearer-auth", "bounded-or-ndjson-stream"],
+      "symbol": "pub fn namespace"
     }
   ]
 }

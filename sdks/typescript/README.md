@@ -31,7 +31,7 @@ export default defineWorker({
   secrets: ["FEED_KEY"],
   async handler(ctx: WorkerContext) {
     const rows = await fetchUpstream(ctx.env.FEED_KEY, ctx.signal);
-    const result = await ctx.client.table(ctx.output).append(rows);
+    const result = await ctx.verglas.table(ctx.output).append(rows);
     return { rowsWritten: result.rowsCommitted };
   },
 });
@@ -41,7 +41,7 @@ export default defineWorker({
 
 ```ts
 export default defineWorker(async (ctx) => {
-  await ctx.client.table(ctx.output).append([{ ok: true }]);
+  await ctx.verglas.table(ctx.output).append([{ ok: true }]);
 });
 ```
 
@@ -49,7 +49,7 @@ export default defineWorker(async (ctx) => {
 
 The handler receives everything the run needs and nothing it doesn't:
 
-- `ctx.client` — a connected `VerglasClient` for read/write via the table verbs.
+- `ctx.verglas` — the connected `VerglasClient` for lakehouse verbs and reflected Integration APIs. The same instance is also bound to `this.verglas`.
 - `ctx.trigger` — the CloudEvent that invoked this run (see below).
 - `ctx.output` / `ctx.outputs` — the **deployment-configured** output table(s).
   Output is deployment config, never hardcoded in worker code — the platform
@@ -131,8 +131,45 @@ const client = connect({
 ```
 
 Inside a worker you never call `connect` yourself — the runner hands you a
-connected `ctx.client`. You call `connect` only when driving the SDK directly
+connected `ctx.verglas`. You call `connect` only when driving the SDK directly
 (tests, a script, the fleet entry).
+
+## Reflected Integration namespaces
+
+An Integration publishes a reflection manifest instead of requiring a
+product-specific SDK change. The manifest declares its stable namespace,
+dot-separated methods, JSON Schema inputs and outputs, and whether each method
+is a bounded read, bounded write, or stream. The same authenticated client
+therefore composes external APIs with tables, queues, vectors, and graphs:
+
+```ts
+const manifest = await client.reflect("crm");
+const contact = await client.namespace.crm.contacts.get({id: "c-1"});
+
+for await (const update of client.namespace.crm.contacts.watch({team: "platform"})) {
+  await client.table("crm.contact_updates").append([update]);
+}
+```
+
+The SDK loads a namespace manifest once before its first call and rejects an
+undeclared method without invoking it. Bounded calls are awaitable. Stream calls
+are async-iterable NDJSON responses. A caller token authorizes both reflection
+and invocation; Integration credentials remain owned by the Integration.
+
+SDK implementors may supply optional generated types without changing runtime
+reflection:
+
+```ts
+type APIs = {
+  crm: {
+    contacts: {
+      get: NamespaceMethod<{id: string}, {id: string; name: string}>;
+    };
+  };
+};
+
+const typed = connect<APIs>({endpoint, token});
+```
 
 ## Reading and writing
 
@@ -190,7 +227,7 @@ export default defineWorker({
     });
     if (fresh.length === 0) return { rowsWritten: 0 };
 
-    const result = await ctx.client.table(ctx.output).append(fresh);
+    const result = await ctx.verglas.table(ctx.output).append(fresh);
     ctx.log("appended", { rows: result.rowsCommitted });
     return { rowsWritten: result.rowsCommitted };
   },
@@ -209,7 +246,7 @@ export default defineWorker({
   async handler(ctx) {
     if (ctx.trigger.type !== "webhook") throw new Error("expected a webhook trigger");
     const body = (await ctx.trigger.request.json()) as Row;
-    const result = await ctx.client.table(ctx.output).append([{ ...body, received_at: new Date().toISOString() }]);
+    const result = await ctx.verglas.table(ctx.output).append([{ ...body, received_at: new Date().toISOString() }]);
     return { rowsWritten: result.rowsCommitted };
   },
 });
@@ -229,10 +266,10 @@ export default defineWorker({
   async handler(ctx) {
     if (ctx.trigger.type !== "org.apache.iceberg.snapshot.committed") throw new Error("expected an Iceberg event");
     const changed = ctx.trigger.data as { snapshotId: string };
-    const rows = (await ctx.client.table("app.input").scan()).rows;
+    const rows = (await ctx.verglas.table("app.input").scan()).rows;
     const out = rows.map((r) => ({ v: Number(r.v) * 2, from_snapshot: changed.snapshotId }));
     if (out.length === 0) return { rowsWritten: 0 };
-    const result = await ctx.client
+    const result = await ctx.verglas
       .table(ctx.output)
       .append(out, { idempotencyKey: `app.input@${changed.snapshotId}` });
     return { rowsWritten: result.rowsCommitted };
@@ -531,6 +568,7 @@ The root exports exactly two layers; internals live behind subpaths.
 - Data-plane verbs:
   - `connect(opts)` → `VerglasClient`; `client.table<T>(name)`,
     `client.queue<T>(name)`, `client.graph(namespace)`, `client.createTable()`,
+    `client.reflect(namespace?)`, `client.namespace.<integration>.<method>()`,
     `client.follow(table, handler, opts?)`,
     `client.followRows(table, handler, opts?)`
   - `Table`: `snapshot()`, `scan(opts?)`, `delta(since, opts?)`,
@@ -549,6 +587,7 @@ The root exports exactly two layers; internals live behind subpaths.
   `DeltaResult`, `Snapshot`, `FollowRowsOptions`, `FollowHandler`, `ChangeEvent`,
   `ChangeHandler`, `FollowFeedOptions`, `FeedSubscription`, `CommitOptions`,
   `CommitResult`, plus the table/queue/graph/index result types
+  and reflected namespace manifest, method, call, and static typing helpers
 
 Subpaths (internals the runner uses on the author's behalf — import only when
 building deploy tooling or tests): `@verglas/sdk/logging` (run logging +

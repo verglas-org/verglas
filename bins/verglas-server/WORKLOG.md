@@ -1,5 +1,6 @@
 # verglasd worklog
 
+- #43: Wired the optional local container-runtime namespace gateway into the primary admin endpoint through paired URL and bearer-token configuration.
 - #385: Added content-negotiated Arrow IPC query streaming, Arrow IPC table
   commits, and exact table-definition inspection to the daemon data plane. A
   real in-memory Iceberg route test covers definition, append, and query end to

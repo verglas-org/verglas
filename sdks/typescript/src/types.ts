@@ -8,6 +8,76 @@
 /** One row. Shapes are table-specific; callers narrow with a generic. */
 export type Row = Record<string, unknown>;
 
+/** JSON Schema fragment published by a reflected Integration method. */
+export type NamespaceJsonSchema = boolean | Record<string, unknown>;
+
+/** Whether a reflected method is bounded, mutating, or streaming. */
+export type NamespaceMethodMode = "read" | "write" | "stream";
+
+/** One callable operation published by an Integration namespace. */
+export interface NamespaceMethodManifest {
+  /** Human-readable operation purpose available to agents and management UIs. */
+  description: string;
+  /** Execution and authorization behavior. */
+  mode: NamespaceMethodMode;
+  /** JSON Schema for the single method argument. */
+  input: NamespaceJsonSchema;
+  /** JSON Schema for a bounded result or each streamed item. */
+  output: NamespaceJsonSchema;
+}
+
+/** Reflection document through which one Integration composes into the SDK. */
+export interface NamespaceManifest {
+  /** Stable, unique SDK property below `client.namespace`. */
+  namespace: string;
+  /** User-facing Integration title. */
+  title: string;
+  /** User-facing Integration purpose. */
+  description: string;
+  /** Dot-separated method paths and their machine-readable contracts. */
+  methods: Record<string, NamespaceMethodManifest>;
+}
+
+declare const namespaceMethodType: unique symbol;
+
+/** Static type marker for an optionally generated Integration SDK method. */
+export interface NamespaceMethod<Input = unknown, Output = unknown, Mode extends NamespaceMethodMode = "read"> {
+  readonly [namespaceMethodType]: {input: Input; output: Output; mode: Mode};
+}
+
+/** An invocation is awaitable for bounded methods and async-iterable for streams. */
+export interface NamespaceCall<Output> extends PromiseLike<Output>, AsyncIterable<Output> {}
+
+/** Recursive static description accepted by `connect<Namespaces>()`. */
+export type NamespaceRegistry = object;
+
+declare const dynamicNamespaceRegistryType: unique symbol;
+
+/** Default registry marker which keeps reflected namespaces dynamically callable. */
+export interface DynamicNamespaceRegistry {
+  readonly [dynamicNamespaceRegistryType]: true;
+}
+
+/** Untyped reflected node used when no generated namespace types are supplied. */
+export interface DynamicNamespaceNode {
+  (input?: unknown): NamespaceCall<unknown>;
+  [segment: string]: DynamicNamespaceNode;
+}
+
+/** Maps reflected type markers into the callable SDK shape used by generated code. */
+export type NamespaceBinding<Node> =
+  Node extends NamespaceMethod<infer Input, infer Output, NamespaceMethodMode>
+    ? (input: Input) => NamespaceCall<Output>
+    : Node extends Record<string, unknown>
+      ? {[Key in keyof Node]: NamespaceBinding<Node[Key]>}
+      : never;
+
+/** The composed namespace tree on a connected client. */
+export type NamespaceBindings<Namespaces extends NamespaceRegistry> =
+  Namespaces extends DynamicNamespaceRegistry
+    ? Record<string, DynamicNamespaceNode>
+    : {[Key in keyof Namespaces]: NamespaceBinding<Namespaces[Key]>};
+
 /**
  * An opaque high-watermark token that marks a position in a table's history.
  * The SDK never parses it; it hands the value straight back to the endpoint on

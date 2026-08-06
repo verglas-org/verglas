@@ -40,7 +40,7 @@ export const webhookWorker = defineWorker<WebhookEnv>({
     if (!body || typeof body !== "object") throw new Error("webhook-worker: body was not a JSON object");
 
     const row: Row = { ...body, received_at: new Date().toISOString() };
-    const result = await ctx.client.table(ctx.output).append([row]);
+    const result = await ctx.verglas.table(ctx.output).append([row]);
     ctx.log("webhook-worker: recorded", { rows: result.rowsCommitted });
     return { rowsWritten: result.rowsCommitted };
   },
