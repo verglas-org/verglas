@@ -193,10 +193,10 @@ where
                             last_log_term: state.term_history.last().map_or(0, |entry| entry.0),
                             flush_lsn: state.flush_lsn.0,
                             commit_lsn: state.commit_lsn.0,
-                            backup_lsn: state.truncate_lsn.0,
-                            remote_consistent_lsn: 0,
+                            backup_lsn: state.backup_lsn.0,
+                            remote_consistent_lsn: state.remote_consistent_lsn.0,
                             peer_horizon_lsn: state.truncate_lsn.0,
-                            local_start_lsn: state.truncate_lsn.0,
+                            local_start_lsn: state.local_start_lsn.0,
                             standby_horizon: 0,
                             safekeeper_connstr: advertise_pg_addr.clone(),
                             http_connstr: String::new(),
@@ -492,11 +492,26 @@ where
         loop {
             interval.tick().await;
             match timeline.flush().await {
-                // The walproposer truncate watermark does not prove that a
-                // pageserver has ingested this WAL. Keep drained segments
-                // readable until the pageserver protocol carries an
-                // authoritative retention boundary.
-                Ok(_) => {}
+                Ok(flushed) => {
+                    let state = timeline.safekeeper_state().await;
+                    // A proposer peer horizon only says other safekeepers no
+                    // longer need this WAL. Retain it until the pageserver also
+                    // reports the prefix durable remotely and the local backup
+                    // has completed. Truncating on peer_horizon alone races the
+                    // pageserver's first replication stream and loses WAL.
+                    // (#47 stopped that race; this uses pageserver feedback.)
+                    let retention_lsn = retention_lsn(&state, flushed);
+                    if retention_lsn.0 > state.local_start_lsn.0
+                        && let Err(error) = timeline.truncate(retention_lsn).await
+                    {
+                        tracing::warn!(
+                            tenant_id = %key.tenant_id,
+                            timeline_id = %key.timeline_id,
+                            %error,
+                            "failed to truncate drained safekeeper WAL"
+                        );
+                    }
+                }
                 Err(error) => tracing::warn!(
                     tenant_id = %key.tenant_id,
                     timeline_id = %key.timeline_id,
@@ -506,6 +521,15 @@ where
             }
         }
     });
+}
+
+fn retention_lsn(state: &crate::SafekeeperState, flushed: Lsn) -> Lsn {
+    Lsn(state
+        .truncate_lsn
+        .0
+        .min(state.remote_consistent_lsn.0)
+        .min(state.commit_lsn.0)
+        .min(flushed.0))
 }
 
 /// Returns the active timeline or an ordering error.
@@ -703,6 +727,13 @@ where
 
         match tokio::time::timeout(Duration::from_secs(1), read_frontend(stream)).await {
             Ok(Ok(Some((b'X' | b'c', _)))) | Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some((b'd', feedback)))) => {
+                if let Some(remote_consistent_lsn) = parse_pageserver_feedback(&feedback)? {
+                    timeline
+                        .record_remote_consistent_lsn(remote_consistent_lsn)
+                        .await?;
+                }
+            }
             Ok(Ok(Some((_tag, _feedback)))) => {}
             Ok(Err(error)) => return Err(error),
             Err(_) => {
@@ -715,6 +746,51 @@ where
             }
         }
     }
+}
+
+/// Parses the pageserver's extensible `z` feedback frame and returns its
+/// remotely durable apply LSN. Unknown fields remain forward-compatible.
+fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError> {
+    if payload.first() != Some(&b'z') {
+        return Ok(None);
+    }
+    if payload.len() < 10 {
+        return Err(ServerError::Connection(
+            "truncated pageserver feedback".to_owned(),
+        ));
+    }
+    let mut fields = payload.slice(9..);
+    if !fields.has_remaining() {
+        return Err(ServerError::Connection(
+            "pageserver feedback has no fields".to_owned(),
+        ));
+    }
+    let count = fields.get_u8();
+    let mut remote_consistent_lsn = None;
+    for _ in 0..count {
+        let key = take_cstr(&mut fields, "pageserver feedback key")?;
+        if fields.remaining() < 4 {
+            return Err(ServerError::Connection(
+                "truncated pageserver feedback length".to_owned(),
+            ));
+        }
+        let len = fields.get_u32() as usize;
+        if fields.remaining() < len {
+            return Err(ServerError::Connection(
+                "truncated pageserver feedback value".to_owned(),
+            ));
+        }
+        let mut value = fields.split_to(len);
+        if key == "ps_applylsn" {
+            if len != 8 {
+                return Err(ServerError::Connection(
+                    "invalid ps_applylsn length".to_owned(),
+                ));
+            }
+            remote_consistent_lsn = Some(Lsn(value.get_u64()));
+        }
+    }
+    Ok(remote_consistent_lsn.filter(|lsn| *lsn != Lsn(0)))
 }
 
 /// Sends Neon's `IDENTIFY_SYSTEM` row followed by ReadyForQuery.
@@ -844,4 +920,64 @@ fn payload_cstr<'a>(payload: &'a Bytes, field: &str) -> Result<&'a str, ServerEr
 /// Renders an LSN using PostgreSQL's `HIGH/LOW` hexadecimal convention.
 fn format_lsn(lsn: Lsn) -> String {
     format!("{:X}/{:08X}", lsn.0 >> 32, lsn.0 & 0xffff_ffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SafekeeperState;
+
+    fn state(peer: u64, remote: u64, commit: u64, backup: u64) -> SafekeeperState {
+        SafekeeperState {
+            system_id: 1,
+            pg_version: 17,
+            wal_segment_size: 16 * 1024 * 1024,
+            generation: 0,
+            term: 1,
+            flush_lsn: Lsn(0x9000),
+            commit_lsn: Lsn(commit),
+            truncate_lsn: Lsn(peer),
+            backup_lsn: Lsn(backup),
+            remote_consistent_lsn: Lsn(remote),
+            local_start_lsn: Lsn(0x1000),
+            term_history: vec![(1, Lsn(0x1000))],
+        }
+    }
+
+    #[test]
+    fn proposer_horizon_cannot_truncate_before_pageserver_feedback() {
+        assert_eq!(
+            retention_lsn(&state(0x8000, 0, 0x8000, 0x8000), Lsn(0x8000)),
+            Lsn(0)
+        );
+    }
+
+    #[test]
+    fn retention_uses_the_slowest_durability_watermark() {
+        assert_eq!(
+            retention_lsn(&state(0x8000, 0x5000, 0x7000, 0x6000), Lsn(0x6000)),
+            Lsn(0x5000),
+        );
+    }
+
+    #[test]
+    fn parses_remote_consistent_lsn_from_neon_feedback() {
+        let mut fields = BytesMut::new();
+        fields.put_u8(2);
+        fields.put_slice(b"ps_writelsn\0");
+        fields.put_u32(8);
+        fields.put_u64(0x7000);
+        fields.put_slice(b"ps_applylsn\0");
+        fields.put_u32(8);
+        fields.put_u64(0x5000);
+
+        let mut frame = BytesMut::new();
+        frame.put_u8(b'z');
+        frame.put_u64(fields.len() as u64);
+        frame.extend_from_slice(&fields);
+        assert_eq!(
+            parse_pageserver_feedback(&frame.freeze()).expect("valid pageserver feedback"),
+            Some(Lsn(0x5000))
+        );
+    }
 }

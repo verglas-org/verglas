@@ -107,6 +107,10 @@ pub struct Manifest {
     pub commit_lsn: Lsn,
     /// Oldest WAL retained for proposer/pageserver recovery.
     pub truncate_lsn: Lsn,
+    /// Oldest checkpoint that the pageserver reports durable in remote storage.
+    /// Zero means no pageserver durability feedback has been received yet.
+    #[serde(default)]
+    pub remote_consistent_lsn: Lsn,
     /// Ordered `(term, first_lsn)` boundaries selected during elections.
     pub term_history: Vec<(u64, Lsn)>,
     /// The stream's base LSN (appends below this were truncated away).
@@ -133,6 +137,7 @@ impl Manifest {
             epoch: Epoch(0),
             commit_lsn: Lsn(0),
             truncate_lsn: Lsn(0),
+            remote_consistent_lsn: Lsn(0),
             term_history: Vec::new(),
             base: Lsn(0),
             tail: Lsn(0),

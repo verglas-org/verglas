@@ -323,6 +323,9 @@ where
             flush_lsn: manifest.tail,
             commit_lsn: manifest.commit_lsn,
             truncate_lsn: manifest.truncate_lsn,
+            backup_lsn: manifest.flushed_through,
+            remote_consistent_lsn: manifest.remote_consistent_lsn,
+            local_start_lsn: manifest.base,
             term_history: manifest.term_history.clone(),
         }
     }
@@ -436,8 +439,29 @@ where
             flush_lsn: manifest.tail,
             commit_lsn: manifest.commit_lsn,
             truncate_lsn: manifest.truncate_lsn,
+            backup_lsn: manifest.flushed_through,
+            remote_consistent_lsn: manifest.remote_consistent_lsn,
+            local_start_lsn: manifest.base,
             term_history: manifest.term_history.clone(),
         })
+    }
+
+    /// Records pageserver durability feedback. WAL deletion is never driven by
+    /// walproposer's peer horizon alone: the pageserver must first confirm that
+    /// the same prefix is durable in its remote storage.
+    pub async fn record_remote_consistent_lsn(&self, lsn: Lsn) -> Result<(), AppendError> {
+        if lsn == Lsn(0) {
+            return Ok(());
+        }
+        let mut manifest = self.state.lock().await;
+        let lsn = Lsn(lsn.0.min(manifest.tail.0));
+        if lsn.0 <= manifest.remote_consistent_lsn.0 {
+            return Ok(());
+        }
+        manifest.remote_consistent_lsn = lsn;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)
     }
 
     /// Encodes `records` and places its fragments on distinct live nodes,
