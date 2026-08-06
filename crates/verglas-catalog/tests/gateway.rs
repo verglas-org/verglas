@@ -48,14 +48,14 @@ async fn reads_cache_and_mutations_invalidate() {
         .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
         .await
         .expect("first read");
-    assert_eq!(gateway.generation(), 1);
+    assert_eq!(gateway.generation(), 0);
     gateway
         .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
         .await
         .expect("cached read");
     assert_eq!(
         gateway.generation(),
-        1,
+        0,
         "cache hits do not invalidate sessions"
     );
     assert_eq!(reads.load(Ordering::SeqCst), 1);
@@ -69,7 +69,7 @@ async fn reads_cache_and_mutations_invalidate() {
         )
         .await
         .expect("write through mutation");
-    assert_eq!(gateway.generation(), 2);
+    assert_eq!(gateway.generation(), 1);
     gateway
         .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
         .await

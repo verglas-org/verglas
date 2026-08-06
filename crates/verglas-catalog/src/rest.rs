@@ -101,7 +101,11 @@ impl CachedResponses {
     /// ceiling can accommodate it. Responses larger than the whole budget are
     /// served but not retained.
     fn insert(&mut self, key: String, response: CatalogResponse) -> bool {
-        let changed = self.entries.get(&key).is_none_or(|previous| {
+        // First population establishes generation zero; it is not a catalog
+        // change. Only replacing a prepared response with different content
+        // invalidates an already-built query session. Successful mutations bump
+        // the generation separately before their cleared entries repopulate.
+        let changed = self.entries.get(&key).is_some_and(|previous| {
             previous.status != response.status || previous.body != response.body
         });
         if let Some(previous) = self.entries.remove(&key) {
