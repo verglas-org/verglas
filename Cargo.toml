@@ -23,7 +23,6 @@ members = [
     "crates/verglas-vector",
     "crates/verglas-kv",
     "crates/verglas-scheduler",
-    "crates/verglas-microvm-contract",
     "crates/verglas-gadget-runtime",
     "crates/verglas-container-runtime",
     "bins/cache-node",
