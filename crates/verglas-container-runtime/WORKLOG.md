@@ -10,5 +10,5 @@
   It no longer layers on the Gadget runtime image or documents Gadgets as managed products.
 - #55: Added persisted Vessel declarations, one-container mapping, and authenticated private-network
   HTTP proxying without publishing workload ports to the host.
-- #55: Exposed GET-only localhost routes for Application Vessels while keeping Integration HTTP
-  surfaces behind runtime authentication.
+- #55: Exposed GET-only localhost preview routes for Application Vessels while keeping Integration
+  HTTP surfaces behind runtime authentication.

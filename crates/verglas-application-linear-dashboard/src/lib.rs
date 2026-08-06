@@ -91,7 +91,7 @@ h1{font-size:38px;margin:7px 0 5px}.muted{color:#969daa}.status{padding:8px 12px
 .team{padding:12px;border-radius:10px;background:#181c27;margin:8px 0}.team b{display:block}.team span{color:#969daa;font-size:13px}
 .issue{display:grid;grid-template-columns:85px 1fr 90px;gap:12px;padding:13px 5px;border-top:1px solid #252a38;align-items:start}.issue a{color:#edf0ff;text-decoration:none}.issue a:hover{text-decoration:underline}
 .id{font:12px monospace;color:#8c93ff}.priority{font-size:12px;color:#adb3c0;text-align:right}.empty{padding:30px;color:#969daa;text-align:center}@media(max-width:760px){.grid{grid-template-columns:1fr}.metrics{grid-template-columns:1fr}.issue{grid-template-columns:72px 1fr}.priority{display:none}}
-</style></head><body><main><header><div><div class="eyebrow">Verglas Application Vessel</div><h1>Linear Workspace</h1><div id="subtitle" class="muted">Loading connected workspace…</div></div><div id="status" class="status">Connecting</div></header>
+</style></head><body><main><header><div><div class="eyebrow">Connected workspace</div><h1>Linear Workspace</h1><div id="subtitle" class="muted">Loading connected workspace…</div></div><div id="status" class="status">Connecting</div></header>
 <section class="metrics"><div class="card"><div class="muted">Teams</div><div id="teamCount" class="metric">—</div></div><div class="card"><div class="muted">Recent issues</div><div id="issueCount" class="metric">—</div></div><div class="card"><div class="muted">High priority</div><div id="priorityCount" class="metric">—</div></div></section>
 <section class="grid"><div class="panel"><h2>Teams</h2><div id="teams"></div></div><div class="panel"><h2>Recent issues</h2><div id="issues"></div></div></section></main>
 <script>

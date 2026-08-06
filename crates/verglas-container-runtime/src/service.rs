@@ -61,7 +61,7 @@ pub enum ServiceError {
     /// A private Vessel response exceeded the manager's bounded relay contract.
     #[error("Vessel HTTP response exceeds {MAX_PROXY_RESPONSE_BYTES} bytes")]
     VesselResponseTooLarge,
-    /// A public local application path named a non-Application Vessel.
+    /// A local application preview path named a non-Application Vessel.
     #[error("Vessel {0} is not an Application")]
     NotApplication(String),
 }
@@ -468,7 +468,7 @@ async fn application_root(
     application_proxy(State(state), AxumPath((name, String::new())), headers).await
 }
 
-/// Serves a local Application Vessel without exposing Integration HTTP surfaces.
+/// Serves a local Application preview without exposing Integration HTTP surfaces.
 async fn application_proxy(
     State(state): State<Arc<ServiceState>>,
     AxumPath((name, path)): AxumPath<(String, String)>,
