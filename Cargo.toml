@@ -26,6 +26,7 @@ members = [
     "crates/verglas-gadget-runtime",
     "crates/verglas-container-runtime",
     "crates/verglas-integration-linear",
+    "crates/verglas-application-linear-dashboard",
     "bins/cache-node",
     "crates/verglas-block",
     "crates/verglas-pgcdc",
@@ -73,6 +74,7 @@ verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-gadget-runtime = { path = "crates/verglas-gadget-runtime" }
 verglas-container-runtime = { path = "crates/verglas-container-runtime" }
 verglas-integration-linear = { path = "crates/verglas-integration-linear" }
+verglas-application-linear-dashboard = { path = "crates/verglas-application-linear-dashboard" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 tonic = "0.13.1"

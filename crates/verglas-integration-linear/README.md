@@ -1,6 +1,7 @@
 # Linear integration Vessel
 
-This standalone HTTP service connects Verglas to one Linear workspace. It does not use a
+This standalone HTTP service connects Verglas to one Linear workspace using either a personal API
+key or an OAuth access token. It does not use a
 Cloudflare Worker, Durable Object, Gatekeeper capability, or Cap'n Web.
 
 ## Configure

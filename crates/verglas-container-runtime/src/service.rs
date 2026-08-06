@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
 use axum::http::{HeaderMap, Method, StatusCode, header};
-use axum::response::{IntoResponse, Response};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
 use futures::StreamExt;
@@ -61,6 +61,9 @@ pub enum ServiceError {
     /// A private Vessel response exceeded the manager's bounded relay contract.
     #[error("Vessel HTTP response exceeds {MAX_PROXY_RESPONSE_BYTES} bytes")]
     VesselResponseTooLarge,
+    /// A public local application path named a non-Application Vessel.
+    #[error("Vessel {0} is not an Application")]
+    NotApplication(String),
 }
 
 impl IntoResponse for ServiceError {
@@ -82,6 +85,7 @@ impl IntoResponse for ServiceError {
             ServiceError::VesselRequest(_) | ServiceError::VesselResponseTooLarge => {
                 StatusCode::BAD_GATEWAY
             }
+            ServiceError::NotApplication(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()
@@ -126,6 +130,9 @@ impl RuntimeService {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(health))
+            .route("/apps/{name}", get(application_redirect))
+            .route("/apps/{name}/", get(application_root))
+            .route("/apps/{name}/{*path}", get(application_proxy))
             .route("/v1/containers", get(list_containers))
             .route("/v1/vessels", get(list_vessels))
             .route(
@@ -444,6 +451,29 @@ async fn proxy_vessel(
     body: Bytes,
 ) -> Result<Response, ServiceError> {
     authorize(&headers, &state.token)?;
+    forward_vessel(&state, &name, &path, method, &headers, body).await
+}
+
+/// Redirects a local Application URL to its slash-terminated asset base.
+async fn application_redirect(AxumPath(name): AxumPath<String>) -> Redirect {
+    Redirect::temporary(&format!("/apps/{name}/"))
+}
+
+/// Serves the root document of one local Application Vessel.
+async fn application_root(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, ServiceError> {
+    application_proxy(State(state), AxumPath((name, String::new())), headers).await
+}
+
+/// Serves a local Application Vessel without exposing Integration HTTP surfaces.
+async fn application_proxy(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath((name, path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ServiceError> {
     let vessel = state
         .desired
         .read()
@@ -451,8 +481,39 @@ async fn proxy_vessel(
         .vessels
         .get(&name)
         .cloned()
+        .ok_or_else(|| ServiceError::NotApplication(name.clone()))?;
+    if vessel.role != VesselRole::Application {
+        return Err(ServiceError::NotApplication(name));
+    }
+    forward_vessel(
+        &state,
+        &vessel.name,
+        &path,
+        Method::GET,
+        &headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+/// Relays one bounded request to a declared Vessel's private HTTP endpoint.
+async fn forward_vessel(
+    state: &ServiceState,
+    name: &str,
+    path: &str,
+    method: Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, ServiceError> {
+    let vessel = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .get(name)
+        .cloned()
         .ok_or_else(|| RuntimeError::InvalidDeploymentId {
-            deployment_id: name.clone(),
+            deployment_id: name.to_owned(),
         })?;
     let url = format!("http://verglas-vessel-{name}:{}/{path}", vessel.http.port);
     let response = reqwest::Client::new()

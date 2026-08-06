@@ -207,7 +207,7 @@ struct GraphqlError {
 async fn load_viewer(state: &AppState) -> Result<ViewerResult, ApiError> {
     let data = graphql(
         state,
-        "query { viewer { id name displayName email } organization { id name urlKey } }",
+        "query { user: viewer { id name displayName email } organization { id name urlKey } }",
         json!({}),
     )
     .await?;
@@ -222,10 +222,13 @@ async fn graphql(state: &AppState, query: &str, variables: Value) -> Result<Valu
         .await
         .clone()
         .ok_or(ApiError::NotConfigured)?;
-    let response = state
-        .client
-        .post(&state.graphql_endpoint)
-        .bearer_auth(token)
+    let request = state.client.post(&state.graphql_endpoint);
+    let request = if token.starts_with("lin_api_") {
+        request.header(reqwest::header::AUTHORIZATION, token)
+    } else {
+        request.bearer_auth(token)
+    };
+    let response = request
         .json(&json!({
             "query": query,
             "variables": variables,
@@ -334,7 +337,7 @@ mod tests {
         let upstream = Router::new().route(
             "/graphql",
             post(|headers: HeaderMap| async move {
-                assert_eq!(headers["authorization"], "Bearer test-linear-token");
+                assert_eq!(headers["authorization"], "lin_api_test-token");
                 Json(serde_json::json!({
                     "data": {
                         "user": {"id":"user-1","name":"Test","displayName":"Test","email":"test@example.com"},
@@ -355,7 +358,7 @@ mod tests {
             .oneshot(
                 Request::put("/v1/config")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"apiToken":"test-linear-token"}"#))
+                    .body(Body::from(r#"{"apiToken":"lin_api_test-token"}"#))
                     .expect("request"),
             )
             .await

@@ -24,7 +24,8 @@ RUN rustup show
 COPY . .
 RUN cargo build --release \
     -p verglas-container-runtime \
-    -p verglas-integration-linear
+    -p verglas-integration-linear \
+    -p verglas-application-linear-dashboard
 
 FROM oven/bun:1.3.8 AS gadget-host
 WORKDIR /opt/verglas-gadget-runtime
@@ -73,6 +74,12 @@ COPY --from=runtime-control-build /src/target/release/verglas-integration-linear
 USER verglas
 EXPOSE 8371
 ENTRYPOINT ["verglas-integration-linear"]
+
+FROM runtime AS verglas-application-linear-dashboard
+COPY --from=runtime-control-build /src/target/release/verglas-application-linear-dashboard /usr/local/bin/verglas-application-linear-dashboard
+USER verglas
+EXPOSE 8372
+ENTRYPOINT ["verglas-application-linear-dashboard"]
 
 FROM runtime AS verglas-server
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server

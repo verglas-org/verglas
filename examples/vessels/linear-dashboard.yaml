@@ -1,0 +1,6 @@
+name: linear-dashboard
+role: application
+image: verglas/application-linear-dashboard:local
+http:
+  port: 8372
+  healthPath: /health
