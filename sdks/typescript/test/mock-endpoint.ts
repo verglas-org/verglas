@@ -9,8 +9,20 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import type { AddressInfo, Socket } from "node:net";
 import { createHash } from "node:crypto";
+import { tableFromIPC } from "apache-arrow";
 
 const WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+function plainArrowValue(value: any): any {
+  if (value && typeof value.toArray === "function") {
+    return Array.from(value.toArray(), plainArrowValue);
+  }
+  if (Array.isArray(value)) return value.map(plainArrowValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, plainArrowValue(item)]));
+  }
+  return value;
+}
 
 /** Encodes a text payload as a single unmasked server websocket frame. */
 function encodeWsText(payload: string): Buffer {
@@ -329,6 +341,7 @@ export interface MockEndpoint {
 export async function startMockEndpoint(token = "test-token"): Promise<MockEndpoint> {
   const tables = new Map<string, MockTable>();
   const definitions = new Map<string, { schema: unknown[]; partitions: unknown[] }>();
+  const namespaces = new Set<string>();
   const queues = new Map<string, MockQueue>();
   const graphs = new Map<string, MockGraph>();
   const queueState = (name: string): MockQueue => {
@@ -361,6 +374,91 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
 
     const url = new URL(req.url ?? "/", "http://localhost");
 
+    if (url.pathname === "/admin/access" && req.method === "GET") {
+      return send(200, {
+        catalog_uri: `http://${req.headers.host}/catalog`,
+        warehouse: "test",
+      });
+    }
+    if (url.pathname === "/catalog/v1/config" && req.method === "GET") {
+      return send(200, {overrides: {prefix: "test-prefix"}});
+    }
+    const catalogTable = url.pathname.match(
+      /^\/catalog\/v1\/test-prefix\/namespaces\/([^/]+)\/tables\/([^/]+)$/,
+    );
+    if (catalogTable && req.method === "GET") {
+      const namespace = decodeURIComponent(catalogTable[1]).replaceAll("\u001f", ".");
+      const name = `${namespace}.${decodeURIComponent(catalogTable[2])}`;
+      const definition = definitions.get(name);
+      if (!definition) return send(404, {error: "missing table"});
+      const fields = (definition.schema as Array<{name: string; type: string; nullable?: boolean}>)
+        .map((field, index) => ({
+          id: index + 1,
+          name: field.name,
+          required: !field.nullable,
+          type: field.type === "int64" ? "long" : field.type === "date32" ? "date"
+            : field.type === "utf8" ? "string" : field.type.replace(/^decimal128/, "decimal"),
+        }));
+      const ids = new Map(fields.map(field => [field.name, field.id]));
+      return send(200, {metadata: {
+        "current-schema-id": 0,
+        schemas: [{"schema-id": 0, fields}],
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, fields:
+          (definition.partitions as Array<{source: string; transform: string}>).map(
+            (partition, index) => ({
+              "source-id": ids.get(partition.source),
+              "field-id": 1000 + index,
+              name: `${partition.source}_${partition.transform}`,
+              transform: partition.transform,
+            }),
+          )}],
+      }});
+    }
+    const catalogNamespaces = url.pathname === "/catalog/v1/test-prefix/namespaces";
+    if (catalogNamespaces && req.method === "POST") {
+      let raw = "";
+      req.on("data", chunk => raw += chunk);
+      req.on("end", () => {
+        const body = JSON.parse(raw);
+        const namespace = body.namespace.join(".");
+        requests.push({method: "POST", path: url.pathname, body});
+        if (namespaces.has(namespace)) return send(409, {error: "exists"});
+        namespaces.add(namespace);
+        send(200, {});
+      });
+      return;
+    }
+    const catalogCreate = url.pathname.match(
+      /^\/catalog\/v1\/test-prefix\/namespaces\/([^/]+)\/tables$/,
+    );
+    if (catalogCreate && req.method === "POST") {
+      let raw = "";
+      req.on("data", chunk => raw += chunk);
+      req.on("end", () => {
+        const body = JSON.parse(raw);
+        const namespace = decodeURIComponent(catalogCreate[1]).replaceAll("\u001f", ".");
+        const name = `${namespace}.${body.name}`;
+        requests.push({method: "POST", path: url.pathname, body});
+        if (definitions.has(name)) return send(409, {error: "exists"});
+        const fields = body.schema.fields.map((field: any) => ({
+          name: field.name,
+          type: field.type === "long" ? "int64" : field.type === "date" ? "date32"
+            : field.type === "string" ? "utf8" : String(field.type).replace(/^decimal/, "decimal128"),
+          nullable: !field.required,
+        }));
+        const names = new Map(body.schema.fields.map((field: any) => [field.id, field.name]));
+        const partitions = body["partition-spec"].fields.map((field: any) => ({
+          source: names.get(field["source-id"]),
+          transform: field.transform,
+        }));
+        definitions.set(name, {schema: fields, partitions});
+        tableState(name);
+        send(200, {});
+      });
+      return;
+    }
+
     if (url.pathname === "/v1/query" && req.method === "POST") {
       let raw = "";
       req.on("data", (c) => (raw += c));
@@ -368,6 +466,27 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
         const body = raw ? JSON.parse(raw) : {};
         requests.push({ method: "POST", path: url.pathname, body });
         send(200, { columns: ["id"], rows: [{ id: 1 }], row_count: 1 });
+      });
+      return;
+    }
+
+    const write = url.pathname.match(/^\/v1\/write\/([^/]+)$/);
+    if (write && req.method === "POST") {
+      const name = decodeURIComponent(write[1]);
+      const chunks: Buffer[] = [];
+      req.on("data", chunk => chunks.push(Buffer.from(chunk)));
+      req.on("end", () => {
+        const arrow = tableFromIPC(Buffer.concat(chunks));
+        const rows = arrow.toArray().map(row =>
+          plainArrowValue(row.toJSON()) as Record<string, unknown>,
+        );
+        requests.push({method: "POST", path: url.pathname, body: {rows}});
+        send(200, tableState(name).commit(
+          rows,
+          typeof req.headers["idempotency-key"] === "string"
+            ? req.headers["idempotency-key"]
+            : undefined,
+        ));
       });
       return;
     }

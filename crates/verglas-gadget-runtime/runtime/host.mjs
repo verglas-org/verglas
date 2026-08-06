@@ -7,13 +7,18 @@ import {
 import { pathToFileURL } from "node:url";
 import { resolve } from "node:path";
 
+import { makeVerglasEnvironment } from "./verglas-env.mjs";
+
 const bundleRoot = process.argv.at(-1);
 if (!bundleRoot) throw new Error("missing Gadget bundle directory");
 
 const gadgetId = requireEnvironment("VERGLAS_GADGET_ID");
 const gadgetVersion = requireEnvironment("VERGLAS_GADGET_VERSION");
-const kvEndpoint = process.env.VERGLAS_GADGET_KV_ENDPOINT?.replace(/\/$/, "");
-const kvToken = process.env.VERGLAS_GADGET_KV_TOKEN;
+const capabilityEndpoint = requireEnvironment("VERGLAS_GADGET_CAPABILITY_ENDPOINT")
+  .replace(/\/$/, "");
+const capabilityToken = requireEnvironment("VERGLAS_GADGET_CAPABILITY_TOKEN");
+delete process.env.VERGLAS_GADGET_CAPABILITY_ENDPOINT;
+delete process.env.VERGLAS_GADGET_CAPABILITY_TOKEN;
 const nativeFetch = globalThis.fetch.bind(globalThis);
 
 globalThis.__verglasCapnWeb = Object.freeze({ RpcStub, RpcTarget });
@@ -28,8 +33,8 @@ if (typeof gadgetModule.Gadget !== "function") {
 
 const storage = new VerglasKvStorage(
   nativeFetch,
-  kvEndpoint,
-  kvToken,
+  capabilityEndpoint,
+  capabilityToken,
   `gadget.${gadgetId}`,
 );
 const context = Object.freeze({
@@ -43,7 +48,12 @@ const context = Object.freeze({
     });
   },
 });
-const gadget = new gadgetModule.Gadget(context, Object.freeze({}));
+const environment = makeVerglasEnvironment({
+  endpoint: capabilityEndpoint,
+  token: capabilityToken,
+  fetchImpl: nativeFetch,
+});
+const gadget = new gadgetModule.Gadget(context, environment);
 const rpcHandler = newBunWebSocketRpcHandler(() => gadget, {
   maxMessageSize: 4 * 1024 * 1024,
 });

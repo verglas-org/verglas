@@ -5,3 +5,7 @@
 - #11: Taught the endpoint runner to reconstruct manual, HTTP callback, cron, and data-update events from the scheduler harness environment. Removed WebSocket worker trigger types while leaving the catalog change-feed transport unchanged.
 - #11: Replaced the TypeScript runtime trigger union with a CloudEvents 1.0 contract and generic event subscriptions. The endpoint runner validates one structured CloudEvent, and the reference workers consume event-specific data from its payload.
 - #29: Added a namespace-scoped raw-byte KV client with TTL, metadata, conditional writes, idempotency, delete, and bounded prefix listing. The transport leaves opaque versions and continuation cursors under server control.
+- #43: Changed SDK clients and resource handles to use JavaScript private fields
+  for bearer credentials and raw transports. A runtime can now inject a
+  connected client into generated Gadget code without exposing either value as
+  object data.

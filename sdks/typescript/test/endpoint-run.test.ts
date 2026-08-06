@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { defineWorker, type WorkerContext } from "../src/index";
 import { endpointRun, main, type EndpointRunResult } from "../src/subprocess/endpoint-run";
+import { tableFromIPC } from "apache-arrow";
 
 /** One request the fake transport saw. */
 interface RecordedRequest {
@@ -34,10 +35,12 @@ function fakeEndpoint() {
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input as RequestInfo, init);
     const url = new URL(request.url);
-    const body =
-      request.method === "GET"
-        ? undefined
-        : ((await request.json().catch(() => undefined)) as Record<string, unknown> | undefined);
+    let body: Record<string, unknown> | undefined;
+    if (request.method !== "GET" && url.pathname.startsWith("/v1/write/")) {
+      body = {rows: tableFromIPC(await request.arrayBuffer()).toArray().map(row => row.toJSON())};
+    } else if (request.method !== "GET") {
+      body = (await request.json().catch(() => undefined)) as Record<string, unknown> | undefined;
+    }
     requests.push({
       method: request.method,
       path: url.pathname,
@@ -45,7 +48,7 @@ function fakeEndpoint() {
       body,
     });
 
-    if (/^\/v1\/tables\/[^/]+\/commit$/.test(url.pathname)) {
+    if (/^\/v1\/write\/[^/]+$/.test(url.pathname)) {
       const rows = (body?.rows as unknown[] | undefined) ?? [];
       seq += rows.length;
       return json({ snapshotId: `snap-${seq}`, rowsCommitted: rows.length, watermark: String(seq) });
@@ -79,7 +82,7 @@ const quiet = { log: () => {} };
 
 /** Commit requests against the target table (log commits go to app.t_LOGS). */
 const targetCommits = (requests: RecordedRequest[]) =>
-  requests.filter((r) => r.method === "POST" && r.path === "/v1/tables/app.t/commit");
+  requests.filter((r) => r.method === "POST" && r.path === "/v1/write/app.t");
 
 describe("endpointRun worker semantics", () => {
   it("passes the configured output and complete CloudEvent into ctx", async () => {

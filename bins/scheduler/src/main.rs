@@ -11,10 +11,10 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{FromRef, Path as AxumPath, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
 use clap::Parser;
@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use verglas_harness::worker::{WorkerExec, WorkerRun, run_worker};
 use verglas_scheduler::{
     ClaimRequest, ClaimedJob, CompleteRequest, Completion, EnqueueOutcome, Invocation, Lease,
-    NextWakeRequest, PgQueue, RenewRequest, RunQueue, plan_cron,
+    NextWakeRequest, PgQueue, PgSecretStore, RenewRequest, RunQueue, plan_cron,
 };
 use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
 
@@ -42,6 +42,9 @@ struct Args {
     /// Data-plane endpoint injected into worker subprocesses.
     #[arg(long, env = "VERGLAS_WORKER_ENDPOINT")]
     worker_endpoint: String,
+    /// Bearer token injected into worker SDK clients; local REST accepts the non-secret default.
+    #[arg(long, env = "VERGLAS_WORKER_TOKEN", default_value = "verglas-local")]
+    worker_token: String,
     /// Queue identity served by the configured Verglas instance.
     #[arg(long, env = "VERGLAS_SCHEDULER_QUEUE")]
     queue: String,
@@ -54,6 +57,9 @@ struct Args {
     /// Address receiving pushed worker events from Verglas.
     #[arg(long, env = "VERGLAS_SCHEDULER_LISTEN", default_value = "0.0.0.0:8340")]
     listen: SocketAddr,
+    /// Bearer token protecting local secret-management endpoints.
+    #[arg(long, env = "VERGLAS_SCHEDULER_CONTROL_TOKEN")]
+    control_token: String,
 }
 
 /// The worker fields returned by Verglas's registry endpoint.
@@ -110,18 +116,32 @@ fn safe_bundle_path(path: &Path) -> Result<&Path, String> {
 }
 
 /// Materializes one portable worker config into an isolated run directory.
-fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
-    let config: WorkerConfig = serde_json::from_str(&worker.config)
+async fn prepare_worker(
+    worker: &WorkerRecord,
+    secrets: Option<&PgSecretStore>,
+) -> Result<PreparedWorker, String> {
+    let mut config: WorkerConfig = serde_json::from_str(&worker.config)
         .map_err(|error| format!("worker {} config: {error}", worker.name))?;
-    if let Some((name, _)) = config
-        .env
-        .iter()
-        .find(|(_, value)| value.starts_with("@secret:"))
-    {
-        return Err(format!(
-            "worker {} secret binding {name} is unresolved",
-            worker.name
-        ));
+    for (binding, value) in &mut config.env {
+        let Some(name) = value.strip_prefix("@secret:") else {
+            continue;
+        };
+        let Some(store) = secrets else {
+            return Err(format!(
+                "worker {} secret binding {binding} cannot be resolved",
+                worker.name
+            ));
+        };
+        *value = store
+            .get(name)
+            .await
+            .map_err(|error| format!("worker {} secret binding {binding}: {error}", worker.name))?
+            .ok_or_else(|| {
+                format!(
+                    "worker {} secret binding {binding} references missing secret {name}",
+                    worker.name
+                )
+            })?;
     }
     let root = tempfile::tempdir()
         .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
@@ -220,6 +240,84 @@ struct EventIngress {
     ready: Arc<tokio::sync::Notify>,
 }
 
+/// State for scheduler-owned local control endpoints.
+#[derive(Clone)]
+struct SchedulerApi {
+    ingress: EventIngress,
+    secrets: PgSecretStore,
+    control_token: Arc<str>,
+}
+
+impl FromRef<SchedulerApi> for EventIngress {
+    fn from_ref(api: &SchedulerApi) -> Self {
+        api.ingress.clone()
+    }
+}
+
+#[derive(Deserialize)]
+struct PutSecretRequest {
+    value: String,
+}
+
+#[derive(Serialize)]
+struct SecretNamesResponse {
+    secrets: Vec<String>,
+}
+
+fn authorized(headers: &HeaderMap, expected: &str) -> bool {
+    let supplied = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    supplied == Some(expected)
+}
+
+async fn list_secrets(State(api): State<SchedulerApi>, headers: HeaderMap) -> Response {
+    if !authorized(&headers, &api.control_token) {
+        return (StatusCode::UNAUTHORIZED, "invalid scheduler control token").into_response();
+    }
+    match api.secrets.names().await {
+        Ok(secrets) => Json(SecretNamesResponse { secrets }).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+async fn put_secret(
+    State(api): State<SchedulerApi>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<PutSecretRequest>,
+) -> Response {
+    if !authorized(&headers, &api.control_token) {
+        return (StatusCode::UNAUTHORIZED, "invalid scheduler control token").into_response();
+    }
+    match api.secrets.put(&name, &request.value).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(verglas_scheduler::SchedulerError::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+async fn delete_secret(
+    State(api): State<SchedulerApi>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if !authorized(&headers, &api.control_token) {
+        return (StatusCode::UNAUTHORIZED, "invalid scheduler control token").into_response();
+    }
+    match api.secrets.delete(&name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(verglas_scheduler::SchedulerError::Invalid(message)) => {
+            (StatusCode::BAD_REQUEST, message).into_response()
+        }
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
 /// Accepts one complete worker event, persists it, and wakes execution now.
 async fn submit_event(
     State(ingress): State<EventIngress>,
@@ -256,11 +354,13 @@ async fn healthz() -> &'static str {
 }
 
 /// Builds the scheduler's pushed-event API.
-fn event_router(ingress: EventIngress) -> Router {
+fn event_router(api: SchedulerApi) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/v1/events", post(submit_event))
-        .with_state(ingress)
+        .route("/v1/secrets", get(list_secrets))
+        .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
+        .with_state(api)
 }
 
 /// Reconstructs cron progress from run objects and materializes every due run.
@@ -349,16 +449,17 @@ async fn execute_claimed(
     args: &Args,
     client: &VerglasClient,
     queue: &dyn RunQueue,
+    secrets: Option<&PgSecretStore>,
     claimed: ClaimedJob,
 ) -> Result<(Lease, Completion), String> {
     let worker = client.worker(&claimed.job.worker).await?;
-    let prepared = prepare_worker(&worker)?;
+    let prepared = prepare_worker(&worker, secrets).await?;
     let output = worker.output.unwrap_or_default();
     let run = WorkerRun {
         deployment: &worker.name,
         output: &output,
         endpoint: &args.worker_endpoint,
-        token: "",
+        token: &args.worker_token,
     };
     let mut lease = claimed.lease;
     let renew_every = Duration::from_secs((args.lease_seconds / 2).max(1));
@@ -399,6 +500,7 @@ async fn run_one(
     args: &Args,
     client: &VerglasClient,
     queue: &dyn RunQueue,
+    secrets: &PgSecretStore,
 ) -> Result<bool, String> {
     let claim = ClaimRequest {
         owner: format!("{}:{}", args.queue, args.consumer),
@@ -412,10 +514,11 @@ async fn run_one(
     else {
         return Ok(false);
     };
-    let (lease, completion) = match execute_claimed(args, client, queue, claimed).await {
-        Ok(result) => result,
-        Err(error) => return Err(format!("execute claimed run: {error}")),
-    };
+    let (lease, completion) =
+        match execute_claimed(args, client, queue, Some(secrets), claimed).await {
+            Ok(result) => result,
+            Err(error) => return Err(format!("execute claimed run: {error}")),
+        };
     queue
         .complete(&CompleteRequest {
             lease,
@@ -441,12 +544,13 @@ async fn scheduler_loop(
     args: &Args,
     client: &VerglasClient,
     queue: &dyn RunQueue,
+    secrets: &PgSecretStore,
     ready: &tokio::sync::Notify,
 ) -> Result<(), String> {
     loop {
         let now = Utc::now();
         let cron_deadline = reconcile_cron(client, queue, now).await?;
-        while run_one(args, client, queue).await? {}
+        while run_one(args, client, queue, secrets).await? {}
         let queue_deadline = queue
             .next_wake_at(&NextWakeRequest { now: Utc::now() })
             .await
@@ -480,10 +584,21 @@ async fn main() {
         }
     };
     let client = VerglasClient::new(&args.verglas_url);
+    let secrets = match PgSecretStore::connect(&args.database_url).await {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("verglas-scheduler: connect secret store: {error}");
+            std::process::exit(1);
+        }
+    };
     let ready = Arc::new(tokio::sync::Notify::new());
-    let app = event_router(EventIngress {
-        queue: queue.clone(),
-        ready: ready.clone(),
+    let app = event_router(SchedulerApi {
+        ingress: EventIngress {
+            queue: queue.clone(),
+            ready: ready.clone(),
+        },
+        secrets: secrets.clone(),
+        control_token: Arc::from(args.control_token.as_str()),
     });
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(listener) => listener,
@@ -506,7 +621,7 @@ async fn main() {
                 .err()
                 .map_or_else(|| "stopped".to_owned(), |error| error.to_string()));
         }
-        result = scheduler_loop(&args, &client, queue.as_ref(), &ready) => {
+        result = scheduler_loop(&args, &client, queue.as_ref(), &secrets, &ready) => {
             eprintln!("verglas-scheduler: {}", result
                 .err()
                 .unwrap_or_else(|| "scheduler loop stopped".to_owned()));
@@ -589,8 +704,8 @@ mod tests {
 
     /// Bundled files and plain environment bindings are materialized for one
     /// run, and a relative cwd resolves inside that isolated bundle.
-    #[test]
-    fn prepares_a_portable_worker_bundle() {
+    #[tokio::test]
+    async fn prepares_a_portable_worker_bundle() {
         let worker = WorkerRecord {
             name: "market-data-ingest".to_owned(),
             code: r#"{"exec":["python3","ingest.py"],"cwd":"."}"#.to_owned(),
@@ -604,7 +719,7 @@ mod tests {
             .to_owned(),
         };
 
-        let prepared = prepare_worker(&worker).expect("prepare bundle");
+        let prepared = prepare_worker(&worker, None).await.expect("prepare bundle");
         assert_eq!(
             prepared.exec.env.get("SYMBOL").map(String::as_str),
             Some("SPY")
@@ -693,14 +808,16 @@ mod tests {
             database_url: "postgres://unused".to_owned(),
             verglas_url: "unused".to_owned(),
             worker_endpoint: "http://127.0.0.1:8334".to_owned(),
+            worker_token: "verglas-local".to_owned(),
             queue: "local".to_owned(),
             consumer: "consumer-1".to_owned(),
             lease_seconds: 300,
             listen: "127.0.0.1:0".parse().expect("listen"),
+            control_token: "test-control-token".to_owned(),
         };
 
         let queue = TestQueue::default();
-        let (_, completion) = execute_claimed(&args, &client, &queue, claimed)
+        let (_, completion) = execute_claimed(&args, &client, &queue, None, claimed)
             .await
             .expect("execute");
         assert_eq!(completion, Completion::Succeeded { rows_produced: 3 });

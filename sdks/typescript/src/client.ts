@@ -3,6 +3,7 @@
 import { makeTransport, type Transport } from "./http";
 import { VerglasHttpError } from "./http";
 import { CatalogFeed, feedUrl, globalWebSocket } from "./feed";
+import { tableFromJSON, tableToIPC } from "apache-arrow";
 import type {
   AddIndexOptions,
   ChangeHandler,
@@ -51,6 +52,110 @@ import type {
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
+function normalizeType(type: string): string {
+  const value = type.trim().toLowerCase();
+  if (value === "long") return "int64";
+  if (value === "int") return "int32";
+  if (value === "double") return "float64";
+  if (value === "float") return "float32";
+  if (value === "string") return "utf8";
+  if (value === "bool") return "boolean";
+  if (value === "date") return "date32";
+  if (value.startsWith("decimal(") && value.endsWith(")")) {
+    return `decimal128(${value.slice(8)}`;
+  }
+  return value;
+}
+
+function catalogType(type: string): string {
+  const value = normalizeType(type);
+  const primitive: Record<string, string> = {
+    int64: "long", int32: "int", float64: "double", float32: "float",
+    utf8: "string", boolean: "boolean", date32: "date",
+  };
+  if (primitive[value]) return primitive[value];
+  if (value.startsWith("decimal128(") && value.endsWith(")")) {
+    return `decimal(${value.slice(11)}`;
+  }
+  throw new Error(`unsupported table column type ${type}`);
+}
+
+function normalizeDefinition(definition: TableDefinition): Required<TableDefinition> {
+  return {
+    schema: definition.schema.map(column => ({
+      name: column.name,
+      type: normalizeType(column.type),
+      nullable: Boolean(column.nullable),
+    })),
+    partitions: (definition.partitions ?? []).map(partition => ({...partition})),
+  };
+}
+
+function catalogCreateRequest(name: string, definition: TableDefinition): unknown {
+  const normalized = normalizeDefinition(definition);
+  const ids = new Map(normalized.schema.map((column, index) => [column.name, index + 1]));
+  return {
+    name,
+    schema: {
+      type: "struct",
+      "schema-id": 0,
+      "identifier-field-ids": [],
+      fields: normalized.schema.map((column, index) => ({
+        id: index + 1,
+        name: column.name,
+        required: !column.nullable,
+        type: catalogType(column.type),
+      })),
+    },
+    "partition-spec": {
+      "spec-id": 0,
+      fields: normalized.partitions.map((partition, index) => {
+        const sourceId = ids.get(partition.source);
+        if (!sourceId) throw new Error(`partition source ${partition.source} is not a table column`);
+        return {
+          "source-id": sourceId,
+          "field-id": 1000 + index,
+          name: `${partition.source}_${partition.transform}`,
+          transform: partition.transform,
+        };
+      }),
+    },
+    "write-order": {"order-id": 0, fields: []},
+    properties: {},
+  };
+}
+
+function definitionFromCatalogResponse(value: any): Required<TableDefinition> {
+  const metadata = value.metadata ?? value;
+  const currentSchemaId = metadata["current-schema-id"];
+  const schema = metadata.schemas?.find((candidate: any) =>
+    candidate["schema-id"] === currentSchemaId,
+  ) ?? metadata.schema;
+  if (!schema?.fields) throw new Error("Iceberg catalog response omitted its current schema");
+  const namesById = new Map<number, string>();
+  const columns = schema.fields.map((field: any) => {
+    namesById.set(field.id, field.name);
+    return {
+      name: field.name,
+      type: normalizeType(String(field.type)),
+      nullable: !Boolean(field.required),
+    };
+  });
+  const defaultSpecId = metadata["default-spec-id"];
+  const spec = metadata["partition-specs"]?.find((candidate: any) =>
+    candidate["spec-id"] === defaultSpecId,
+  ) ?? metadata["partition-spec"];
+  const partitions = (spec?.fields ?? []).map((field: any) => {
+    const source = namesById.get(field["source-id"]);
+    if (!source) throw new Error("Iceberg partition references an unknown source field");
+    if (field.transform !== "identity" && field.transform !== "month") {
+      throw new Error(`unsupported Iceberg partition transform ${field.transform}`);
+    }
+    return {source, transform: field.transform};
+  });
+  return {schema: columns, partitions};
+}
+
 /**
  * Opens a client against a Verglas endpoint. The endpoint is either the local
  * server's base URL or a cloud Verglas endpoint; the interface is identical.
@@ -69,21 +174,27 @@ export function connect(opts: ConnectOptions): VerglasClient {
 /** A connected Verglas client. Cheap to hold; makes no requests until used. */
 export class VerglasClient {
   /** The shared change-feed socket, opened lazily on the first `follow`. */
-  private feed?: CatalogFeed;
+  #feed?: CatalogFeed;
+  readonly #transport: Transport;
+  readonly #token: string;
+  #catalogContext?: Promise<{base: string; prefix: string}>;
 
   /** @internal */
   constructor(
-    private readonly transport: Transport,
+    transport: Transport,
     /** The endpoint this client is bound to (for logging/diagnostics). */
     readonly endpoint: string,
     /** Bearer token, reused to authenticate the change-feed websocket. */
-    private readonly token: string,
-  ) {}
+    token: string,
+  ) {
+    this.#transport = transport;
+    this.#token = token;
+  }
 
   /** Returns a thin handle to one tenant-authorized KV namespace. */
   kv(namespace: string): Kv {
     if (!namespace) throw new Error("kv: namespace is required");
-    return new Kv(this.transport, namespace);
+    return new Kv(this.#transport, namespace);
   }
 
   /**
@@ -107,10 +218,10 @@ export class VerglasClient {
     if (tables.length === 0 || tables.some((t) => !t)) {
       throw new Error("follow: at least one non-empty table name is required");
     }
-    if (!this.feed) {
-      this.feed = new CatalogFeed(feedUrl(this.endpoint), this.token, globalWebSocket());
+    if (!this.#feed) {
+      this.#feed = new CatalogFeed(feedUrl(this.endpoint), this.#token, globalWebSocket());
     }
-    return this.feed.follow(tables, handler, opts);
+    return this.#feed.follow(tables, handler, opts);
   }
 
   /**
@@ -198,7 +309,7 @@ export class VerglasClient {
   /** A handle to one table by fully-qualified name (e.g. `cloud.job_runs`). */
   table<T extends Row = Row>(name: string): Table<T> {
     if (!name) throw new Error("table: name is required");
-    return new Table<T>(this.transport, name);
+    return new Table<T>(this.#transport, name);
   }
 
   /**
@@ -209,7 +320,7 @@ export class VerglasClient {
    */
   queue<T extends Row = Row>(name: string): Queue<T> {
     if (!name) throw new Error("queue: name is required");
-    return new Queue<T>(this.transport, name);
+    return new Queue<T>(this.#transport, name);
   }
 
   /**
@@ -220,7 +331,7 @@ export class VerglasClient {
    */
   graph(namespace: string): Graph {
     if (!namespace) throw new Error("graph: namespace is required");
-    return new Graph(this.transport, namespace);
+    return new Graph(this.#transport, namespace);
   }
 
   /**
@@ -234,39 +345,94 @@ export class VerglasClient {
   createTable(name: string, def: TableDefinition): Promise<CreateTableResult> {
     if (!name) throw new Error("createTable: name is required");
     if (!def?.schema?.length) throw new Error("createTable: schema is required");
-    const body = { schema: def.schema, partitions: def.partitions ?? [] };
-    return this.transport.request<CreateTableResult>(
-      "POST",
-      `/v1/tables/${encodeURIComponent(name)}`,
-      { body },
-    );
+    return this.#ensureTable(name, def).then(({columns}) => ({table: name, columns}));
   }
 
   /** Creates a missing table or verifies its exact existing definition. */
   async ensureTable(name: string, def: TableDefinition): Promise<EnsureTableResult> {
     if (!name) throw new Error("ensureTable: name is required");
-    const expected = { schema: def.schema, partitions: def.partitions ?? [] };
-    try {
-      const actual = await this.transport.request<TableDefinition>(
-        "GET",
-        `/v1/tables/${encodeURIComponent(name)}/definition`,
-      );
-      const normalized = { schema: actual.schema, partitions: actual.partitions ?? [] };
-      if (JSON.stringify(normalized) !== JSON.stringify(expected)) {
-        throw new Error(`ensureTable: ${name} definition mismatch`);
-      }
-      return "existing";
-    } catch (error) {
-      if (!(error instanceof VerglasHttpError) || error.status !== 404) throw error;
-      await this.createTable(name, expected);
-      return "created";
+    return (await this.#ensureTable(name, def)).status;
+  }
+
+  async #ensureTable(
+    table: string,
+    definition: TableDefinition,
+  ): Promise<{status: EnsureTableResult; columns: string[]}> {
+    const split = table.lastIndexOf(".");
+    if (split <= 0 || split === table.length - 1) {
+      throw new Error(`table ${table} must include a namespace and table name`);
     }
+    const namespace = table.slice(0, split).split(".");
+    const name = table.slice(split + 1);
+    if (namespace.some(part => !part)) throw new Error(`table ${table} has an empty namespace`);
+    const {base, prefix} = await this.#getCatalogContext();
+    const namespacePath = encodeURIComponent(namespace.join("\u001f"));
+    const tablePath = `${base}/v1/${encodeURIComponent(prefix)}/namespaces/${namespacePath}/tables/${encodeURIComponent(name)}`;
+    const existing = await this.#transport.requestRaw("GET", tablePath).catch(error => {
+      if (error instanceof VerglasHttpError && error.status === 404) return null;
+      throw error;
+    });
+    if (existing) {
+      const actual = definitionFromCatalogResponse(await existing.json());
+      const expected = normalizeDefinition(definition);
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw new Error(`ensureTable: ${table} definition mismatch`);
+      }
+      return {status: "existing", columns: expected.schema.map(column => column.name)};
+    }
+
+    const namespacesPath = `${base}/v1/${encodeURIComponent(prefix)}/namespaces`;
+    try {
+      await this.#transport.request("POST", namespacesPath, {
+        body: {namespace, properties: {}},
+      });
+    } catch (error) {
+      if (!(error instanceof VerglasHttpError) || error.status !== 409) throw error;
+    }
+    try {
+      await this.#transport.request("POST", `${namespacesPath}/${namespacePath}/tables`, {
+        body: catalogCreateRequest(name, definition),
+      });
+      return {status: "created", columns: definition.schema.map(column => column.name)};
+    } catch (error) {
+      if (!(error instanceof VerglasHttpError) || error.status !== 409) throw error;
+      const response = await this.#transport.requestRaw("GET", tablePath);
+      const actual = definitionFromCatalogResponse(await response.json());
+      const expected = normalizeDefinition(definition);
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+        throw new Error(`ensureTable: ${table} definition mismatch`);
+      }
+      return {status: "existing", columns: expected.schema.map(column => column.name)};
+    }
+  }
+
+  async #getCatalogContext(): Promise<{base: string; prefix: string}> {
+    this.#catalogContext ??= (async () => {
+      const access = await this.#transport.request<{catalog_uri?: string; warehouse?: string}>(
+        "GET", "/admin/access",
+      );
+      if (!access.catalog_uri || !access.warehouse) {
+        throw new Error("Verglas server advertises no writable Iceberg catalog");
+      }
+      const catalogUrl = new URL(access.catalog_uri, this.endpoint);
+      // Self-hosted servers advertise their host-loopback URI. Workers reach
+      // the same proxy through the service name in `endpoint`, so retain only
+      // the server-owned catalog path instead of following that host literally.
+      const base = catalogUrl.pathname.replace(/\/+$/, "");
+      const config = await this.#transport.request<{overrides?: {prefix?: string}}>(
+        "GET", `${base}/v1/config`, {query: {warehouse: access.warehouse}},
+      );
+      const prefix = config.overrides?.prefix;
+      if (!prefix) throw new Error("Iceberg catalog config omitted its route prefix");
+      return {base, prefix};
+    })();
+    return this.#catalogContext;
   }
 
   /** Executes SQL through the endpoint's language-neutral JSON representation. */
   query(sql: string): Promise<QueryResult> {
     if (!sql) throw new Error("query: sql is required");
-    return this.transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
+    return this.#transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
   }
 
   /**
@@ -277,7 +443,7 @@ export class VerglasClient {
    * path. Not implemented by the local server; only the cloud endpoint serves it.
    */
   async watermark(): Promise<Watermark | null> {
-    const r = await this.transport.request<{ watermark: Watermark | null }>("GET", "/v1/watermark");
+    const r = await this.#transport.request<{ watermark: Watermark | null }>("GET", "/v1/watermark");
     return r?.watermark ?? null;
   }
 
@@ -287,17 +453,21 @@ export class VerglasClient {
    * next dispatch resumes strictly after it. The token identifies the deployment.
    */
   async setWatermark(w: Watermark): Promise<void> {
-    await this.transport.request<void>("PUT", "/v1/watermark", { body: { watermark: w } });
+    await this.#transport.request<void>("PUT", "/v1/watermark", { body: { watermark: w } });
   }
 }
 
 /** A thin raw-byte handle to one KV namespace. */
 export class Kv {
+  readonly #transport: Transport;
+
   /** @internal */
   constructor(
-    private readonly transport: Transport,
+    transport: Transport,
     readonly namespace: string,
-  ) {}
+  ) {
+    this.#transport = transport;
+  }
 
   private base(): string {
     return `/v1/kv/${encodeURIComponent(this.namespace)}`;
@@ -323,7 +493,7 @@ export class Kv {
     for (const [name, value] of Object.entries(opts?.metadata ?? {})) {
       headers[`x-verglas-meta-${name}`] = value;
     }
-    const response = await this.transport.requestRaw("PUT", this.path(key), {
+    const response = await this.#transport.requestRaw("PUT", this.path(key), {
       body: Uint8Array.from(bytes).buffer,
       headers,
     });
@@ -339,7 +509,7 @@ export class Kv {
   async get(key: string): Promise<KvValue | null> {
     let response: Response;
     try {
-      response = await this.transport.requestRaw("GET", this.path(key));
+      response = await this.#transport.requestRaw("GET", this.path(key));
     } catch (error) {
       if (error instanceof VerglasHttpError && error.status === 404) return null;
       throw error;
@@ -368,7 +538,7 @@ export class Kv {
 
   /** Deletes one key idempotently with an optional expected version. */
   async delete(key: string, opts?: { ifMatch?: string }): Promise<KvDeleteResult> {
-    const response = await this.transport.requestRaw("DELETE", this.path(key), {
+    const response = await this.#transport.requestRaw("DELETE", this.path(key), {
       headers: opts?.ifMatch ? { "if-match": opts.ifMatch } : undefined,
     });
     return (await response.json()) as KvDeleteResult;
@@ -376,7 +546,7 @@ export class Kv {
 
   /** Lists one bounded metadata-only prefix page without interpreting its cursor. */
   async list(opts?: KvListOptions): Promise<KvListPage> {
-    const page = await this.transport.request<{
+    const page = await this.#transport.request<{
       entries: Array<{
         key: string;
         version: string;
@@ -405,11 +575,15 @@ export class Kv {
 
 /** A read/write handle to a single Verglas table. */
 export class Table<T extends Row = Row> {
+  readonly #transport: Transport;
+
   /** @internal */
   constructor(
-    private readonly transport: Transport,
+    transport: Transport,
     readonly name: string,
-  ) {}
+  ) {
+    this.#transport = transport;
+  }
 
   private base(): string {
     return `/v1/tables/${encodeURIComponent(this.name)}`;
@@ -417,12 +591,12 @@ export class Table<T extends Row = Row> {
 
   /** The current snapshot's metadata — a cheap poll, reads no rows. */
   snapshot(): Promise<Snapshot> {
-    return this.transport.request<Snapshot>("GET", `${this.base()}/snapshot`);
+    return this.#transport.request<Snapshot>("GET", `${this.base()}/snapshot`);
   }
 
   /** Reads a page of rows from the current snapshot. */
   scan(opts?: ScanOptions): Promise<ScanResult<T>> {
-    return this.transport.request<ScanResult<T>>("GET", `${this.base()}/rows`, {
+    return this.#transport.request<ScanResult<T>>("GET", `${this.base()}/rows`, {
       query: { limit: opts?.limit, cursor: opts?.cursor },
     });
   }
@@ -433,7 +607,7 @@ export class Table<T extends Row = Row> {
    * nothing new has committed, `rows` is empty and the watermark is unchanged.
    */
   delta(sinceWatermark: Watermark, opts?: { limit?: number }): Promise<DeltaResult<T>> {
-    return this.transport.request<DeltaResult<T>>("GET", `${this.base()}/delta`, {
+    return this.#transport.request<DeltaResult<T>>("GET", `${this.base()}/delta`, {
       query: { since: sinceWatermark, limit: opts?.limit },
     });
   }
@@ -452,7 +626,7 @@ export class Table<T extends Row = Row> {
    * reflects as a Puffin statistics file.
    */
   addIndex(field: string, opts?: AddIndexOptions): Promise<IndexReport> {
-    return this.transport.request<IndexReport>("POST", `${this.base()}/indexes`, {
+    return this.#transport.request<IndexReport>("POST", `${this.base()}/indexes`, {
       body: {
         field,
         metric: opts?.metric ?? "cosine",
@@ -464,7 +638,7 @@ export class Table<T extends Row = Row> {
 
   /** Lists the vector indexes declared on this table. */
   async listIndexes(): Promise<IndexInfo[]> {
-    const res = await this.transport.request<{ indexes: IndexInfo[] }>(
+    const res = await this.#transport.request<{ indexes: IndexInfo[] }>(
       "GET",
       `${this.base()}/indexes`,
     );
@@ -477,7 +651,7 @@ export class Table<T extends Row = Row> {
    * column when no index exists (`result.source` reports which).
    */
   searchIndex(field: string, vector: number[], opts?: SearchIndexOptions): Promise<SearchResult> {
-    return this.transport.request<SearchResult>(
+    return this.#transport.request<SearchResult>(
       "POST",
       `${this.base()}/indexes/${encodeURIComponent(field)}/search`,
       { body: { vector, k: opts?.k ?? 10, l: opts?.l } },
@@ -485,12 +659,22 @@ export class Table<T extends Row = Row> {
   }
 
   async append(rows: T[], opts?: CommitOptions): Promise<CommitResult> {
-    const body: { rows: T[]; idempotencyKey?: string } = { rows };
-    if (opts?.idempotencyKey) body.idempotencyKey = opts.idempotencyKey;
-    return this.transport.request<CommitResult>("POST", `${this.base()}/commit`, {
-      body,
-      headers: opts?.idempotencyKey ? { "idempotency-key": opts.idempotencyKey } : undefined,
-    });
+    if (rows.length === 0) {
+      throw new Error("append: at least one row is required");
+    }
+    const bytes = tableToIPC(tableFromJSON(rows), "stream");
+    const response = await this.#transport.requestRaw(
+      "POST",
+      `/v1/write/${encodeURIComponent(this.name)}`,
+      {
+        body: Uint8Array.from(bytes).buffer,
+        headers: {
+          "content-type": "application/vnd.apache.arrow.stream",
+          ...(opts?.idempotencyKey ? {"idempotency-key": opts.idempotencyKey} : {}),
+        },
+      },
+    );
+    return await response.json() as CommitResult;
   }
 }
 
@@ -512,11 +696,15 @@ export class Table<T extends Row = Row> {
  * regressing position is ignored.
  */
 export class Queue<T extends Row = Row> {
+  readonly #transport: Transport;
+
   /** @internal */
   constructor(
-    private readonly transport: Transport,
+    transport: Transport,
     readonly name: string,
-  ) {}
+  ) {
+    this.#transport = transport;
+  }
 
   private base(): string {
     return `/v1/queues/${encodeURIComponent(this.name)}`;
@@ -524,7 +712,7 @@ export class Queue<T extends Row = Row> {
 
   /** Appends rows to the queue. */
   enqueue(rows: T[]): Promise<QueueEnqueueResult> {
-    return this.transport.request<QueueEnqueueResult>("POST", `${this.base()}/enqueue`, {
+    return this.#transport.request<QueueEnqueueResult>("POST", `${this.base()}/enqueue`, {
       body: { rows },
     });
   }
@@ -536,7 +724,7 @@ export class Queue<T extends Row = Row> {
    */
   poll(group: string, opts?: { max?: number }): Promise<QueuePollResult<T>> {
     if (!group) throw new Error("poll: group is required");
-    return this.transport.request<QueuePollResult<T>>("GET", `${this.base()}/poll`, {
+    return this.#transport.request<QueuePollResult<T>>("GET", `${this.base()}/poll`, {
       query: { group, max: opts?.max },
     });
   }
@@ -548,7 +736,7 @@ export class Queue<T extends Row = Row> {
    */
   ack(group: string, position: number): Promise<{ watermark: number }> {
     if (!group) throw new Error("ack: group is required");
-    return this.transport.request<{ watermark: number }>("POST", `${this.base()}/ack`, {
+    return this.#transport.request<{ watermark: number }>("POST", `${this.base()}/ack`, {
       body: { group, position },
     });
   }
@@ -576,11 +764,15 @@ interface GraphQueryResponse {
  * SDK does no graph work in JS, it POSTs to the endpoint which owns the engine.
  */
 export class Graph {
+  readonly #transport: Transport;
+
   /** @internal */
   constructor(
-    private readonly transport: Transport,
+    transport: Transport,
     readonly namespace: string,
-  ) {}
+  ) {
+    this.#transport = transport;
+  }
 
   private base(): string {
     return `/v1/graphs/${encodeURIComponent(this.namespace)}`;
@@ -588,31 +780,31 @@ export class Graph {
 
   /** Creates the graph: ensures its nodes and edges tables exist. Idempotent. */
   create(): Promise<GraphCreateResult> {
-    return this.transport.request<GraphCreateResult>("POST", this.base(), { body: {} });
+    return this.#transport.request<GraphCreateResult>("POST", this.base(), { body: {} });
   }
 
   /** Appends a batch of nodes; returns the new nodes-table snapshot and count. */
   insertNodes(nodes: GraphNodeInput[]): Promise<GraphInsertResult> {
-    return this.transport.request<GraphInsertResult>("POST", `${this.base()}/nodes`, {
+    return this.#transport.request<GraphInsertResult>("POST", `${this.base()}/nodes`, {
       body: { nodes },
     });
   }
 
   /** Appends a batch of edges; returns the new edges-table snapshot and count. */
   insertEdges(edges: GraphEdgeInput[]): Promise<GraphInsertResult> {
-    return this.transport.request<GraphInsertResult>("POST", `${this.base()}/edges`, {
+    return this.#transport.request<GraphInsertResult>("POST", `${this.base()}/edges`, {
       body: { edges },
     });
   }
 
   /** Builds or refreshes the adjacency index for the current edge snapshot. */
   buildIndex(): Promise<GraphIndexResult> {
-    return this.transport.request<GraphIndexResult>("POST", `${this.base()}/index`, { body: {} });
+    return this.#transport.request<GraphIndexResult>("POST", `${this.base()}/index`, { body: {} });
   }
 
   /** Shows the backing tables, live counts, and whether an index is bound. */
   show(): Promise<GraphShowResult> {
-    return this.transport.request<GraphShowResult>("GET", this.base());
+    return this.#transport.request<GraphShowResult>("GET", this.base());
   }
 
   /** The direct neighbors of `node`. */
@@ -653,6 +845,6 @@ export class Graph {
 
   /** POSTs one traversal request to the graph query route. */
   private query(body: Record<string, unknown>): Promise<GraphQueryResponse> {
-    return this.transport.request<GraphQueryResponse>("POST", `${this.base()}/query`, { body });
+    return this.#transport.request<GraphQueryResponse>("POST", `${this.base()}/query`, { body });
   }
 }

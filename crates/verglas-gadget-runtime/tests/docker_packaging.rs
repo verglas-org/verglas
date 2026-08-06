@@ -14,7 +14,9 @@ fn dockerfile_builds_the_runtime_binary_and_bun_host() {
     assert!(dockerfile.contains("-p verglas-gadget-runtime"));
     assert!(dockerfile.contains("AS verglas-gadget-runtime"));
     assert!(dockerfile.contains("WORKDIR /opt/verglas-gadget-runtime"));
-    assert!(dockerfile.contains("runtime/host.mjs ./host.mjs"));
+    assert!(dockerfile.contains("sdks/typescript"));
+    assert!(dockerfile.contains("runtime/host.mjs"));
+    assert!(dockerfile.contains("runtime/verglas-env.mjs"));
     assert!(dockerfile.contains("ENTRYPOINT [\"verglas-gadget-runtime\"]"));
 }
 
@@ -34,8 +36,10 @@ fn compose_starts_one_multi_gadget_runtime_by_default() {
     assert!(service.contains("target: verglas-gadget-runtime"));
     assert!(service.contains("8350:8350"));
     assert!(service.contains("VERGLAS_GADGET_MAX_GADGETS"));
-    assert!(service.contains("VERGLAS_GADGET_KV_ENDPOINT: http://verglas-server:8334"));
-    assert!(service.contains("VERGLAS_GADGET_KV_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY"));
+    assert!(service.contains("VERGLAS_GADGET_DATA_ENDPOINT: http://verglas-server:8334"));
+    assert!(service.contains("VERGLAS_GADGET_DATA_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY"));
+    assert!(!service.contains("VERGLAS_GADGET_KV_ENDPOINT"));
+    assert!(!service.contains("VERGLAS_GADGET_KV_TOKEN"));
     assert!(!service.lines().any(|line| line.trim() == "profiles:"));
 }
 
@@ -48,4 +52,15 @@ fn host_uses_a_valid_exact_kv_namespace_for_each_gadget() {
 
     assert!(host.contains("`gadget.${gadgetId}`"));
     assert!(!host.contains("`gadget/${gadgetId}`"));
+    assert!(host.contains("delete process.env.VERGLAS_GADGET_CAPABILITY_TOKEN"));
+    assert!(!host.contains("VERGLAS_GADGET_DATA_TOKEN"));
+}
+
+#[test]
+fn supervisor_does_not_inherit_control_process_credentials() {
+    let supervisor = std::fs::read_to_string(repository_file(
+        "crates/verglas-gadget-runtime/src/supervisor.rs",
+    ))
+    .expect("read Gadget supervisor");
+    assert!(supervisor.contains(".env_clear()"));
 }

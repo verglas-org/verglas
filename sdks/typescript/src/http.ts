@@ -23,7 +23,7 @@ export interface Transport {
     opts?: { query?: Record<string, string | number | undefined>; body?: unknown; headers?: Record<string, string> },
   ): Promise<T>;
   requestRaw(
-    method: "GET" | "PUT" | "DELETE",
+    method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     opts?: { query?: Record<string, string | number | undefined>; body?: BodyInit; headers?: Record<string, string> },
   ): Promise<Response>;
@@ -80,7 +80,7 @@ export function makeTransport(
       }
     },
     async requestRaw(
-      method: "GET" | "PUT" | "DELETE",
+      method: "GET" | "POST" | "PUT" | "DELETE",
       path: string,
       opts?: { query?: Record<string, string | number | undefined>; body?: BodyInit; headers?: Record<string, string> },
     ): Promise<Response> {

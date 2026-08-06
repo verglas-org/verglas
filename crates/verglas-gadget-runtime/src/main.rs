@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::Parser;
-use verglas_gadget_runtime::{HostConfig, RuntimeConfig, RuntimeService};
+use verglas_gadget_runtime::{DataPlaneConfig, HostConfig, RuntimeConfig, RuntimeService};
 
 /// Standalone Gadget runtime configuration.
 #[derive(Debug, Parser)]
@@ -29,7 +29,11 @@ struct Args {
     #[arg(long, env = "VERGLAS_GADGET_ID")]
     target_gadget: Option<String>,
     /// JavaScript runtime used to start the private Gadget host.
-    #[arg(long, env = "VERGLAS_GADGET_HOST_COMMAND", default_value = "bun")]
+    #[arg(
+        long,
+        env = "VERGLAS_GADGET_HOST_COMMAND",
+        default_value = "/usr/local/bin/bun"
+    )]
     host_command: PathBuf,
     /// Cap'n Web host module executed once per selected Gadget.
     #[arg(
@@ -41,12 +45,12 @@ struct Args {
     /// Maximum seconds for a child host to bind its private listener.
     #[arg(long, env = "VERGLAS_GADGET_STARTUP_SECS", default_value_t = 15)]
     startup_seconds: u64,
-    /// Verglas REST base used by deployment-scoped Gadget KV storage.
-    #[arg(long, env = "VERGLAS_GADGET_KV_ENDPOINT")]
-    kv_endpoint: Option<String>,
-    /// Scoped token used only by the child host's captured KV transport.
-    #[arg(long, env = "VERGLAS_GADGET_KV_TOKEN")]
-    kv_token: Option<String>,
+    /// Verglas REST base used by the trusted data capability proxy.
+    #[arg(long, env = "VERGLAS_GADGET_DATA_ENDPOINT")]
+    data_endpoint: String,
+    /// Upstream bearer token held only by the runtime control process.
+    #[arg(long, env = "VERGLAS_GADGET_DATA_TOKEN")]
+    data_token: String,
 }
 
 /// Parses configuration, binds the service, and runs until process shutdown.
@@ -63,27 +67,19 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Some(target) => RuntimeConfig::single(target),
         None => RuntimeConfig::local(args.max_gadgets),
     };
-    let mut environment = BTreeMap::new();
-    match (args.kv_endpoint, args.kv_token) {
-        (Some(endpoint), Some(token)) => {
-            environment.insert("VERGLAS_GADGET_KV_ENDPOINT".to_owned(), endpoint);
-            environment.insert("VERGLAS_GADGET_KV_TOKEN".to_owned(), token);
-        }
-        (None, None) => {}
-        _ => {
-            return Err(
-                "VERGLAS_GADGET_KV_ENDPOINT and VERGLAS_GADGET_KV_TOKEN must be set together"
-                    .into(),
-            );
-        }
-    }
     let host = HostConfig {
         command: args.host_command,
         arguments: vec![args.host_script.to_string_lossy().into_owned()],
         startup_timeout: Duration::from_secs(args.startup_seconds),
-        environment,
+        environment: BTreeMap::new(),
     };
-    let app = RuntimeService::with_host(config, args.runtime_token, host)?.router();
+    let capability_base_url = format!("http://127.0.0.1:{}", args.listen.port());
+    let data_plane = DataPlaneConfig {
+        endpoint: args.data_endpoint,
+        token: args.data_token,
+        capability_base_url,
+    };
+    let app = RuntimeService::with_host(config, args.runtime_token, host, data_plane)?.router();
     let listener = tokio::net::TcpListener::bind(args.listen).await?;
     tracing::info!(address = %args.listen, "Verglas Gadget runtime listening");
     axum::serve(listener, app)

@@ -12,6 +12,17 @@ beforeEach(async () => {
 afterEach(() => endpoint.close());
 
 describe("connect", () => {
+  it("does not expose its bearer token or raw transport", () => {
+    const isolated = connect({ endpoint: endpoint.url, token: "not-object-data" });
+    expect("token" in isolated).toBe(false);
+    expect("transport" in isolated).toBe(false);
+    expect(JSON.stringify(isolated)).not.toContain("not-object-data");
+    expect("transport" in isolated.table("private.rows")).toBe(false);
+    expect("transport" in isolated.kv("private-state")).toBe(false);
+    expect("transport" in isolated.queue("private-events")).toBe(false);
+    expect("transport" in isolated.graph("private-graph")).toBe(false);
+  });
+
   it("requires endpoint and token", () => {
     expect(() => connect({ endpoint: "", token: "t" })).toThrow(/endpoint is required/);
     expect(() => connect({ endpoint: "http://x", token: "" })).toThrow(/token is required/);
@@ -24,7 +35,7 @@ describe("connect", () => {
 });
 
 describe("createTable contract", () => {
-  it("POSTs an explicit schema + partition spec to /v1/tables/{name}", async () => {
+  it("creates an explicit schema + partition spec through the Iceberg catalog", async () => {
     const res = await client.createTable("rlean.custom_points", {
       schema: [
         { name: "value", type: "decimal128(38,18)", nullable: false },
@@ -40,20 +51,12 @@ describe("createTable contract", () => {
     expect(res.columns).toEqual(["value", "day", "symbol_sid"]);
 
     const post = endpoint.requests.find(
-      (r) => r.method === "POST" && r.path === "/v1/tables/rlean.custom_points",
+      (r) => r.method === "POST" && r.path.endsWith("/namespaces/rlean/tables"),
     );
     expect(post).toBeTruthy();
-    expect(post!.body).toEqual({
-      schema: [
-        { name: "value", type: "decimal128(38,18)", nullable: false },
-        { name: "day", type: "date32", nullable: false },
-        { name: "symbol_sid", type: "int64", nullable: true },
-      ],
-      partitions: [
-        { source: "value", transform: "identity" },
-        { source: "day", transform: "month" },
-      ],
-    });
+    expect((post!.body as any).name).toBe("custom_points");
+    expect((post!.body as any).schema.fields).toHaveLength(3);
+    expect((post!.body as any)["partition-spec"].fields).toHaveLength(2);
   });
 
   it("requires a name and a non-empty schema", () => {
@@ -81,14 +84,14 @@ describe("shared SDK parity contract", () => {
 });
 
 describe("append -> commit contract", () => {
-  it("POSTs rows to /v1/tables/{name}/commit and surfaces the response", async () => {
+  it("POSTs Arrow rows to /v1/write/{name} and surfaces the response", async () => {
     const res = await client.table("cloud.job_runs").append([{ a: 1 }, { a: 2 }]);
     expect(res.rowsCommitted).toBe(2);
     expect(res.snapshotId).toMatch(/^snap-/);
     expect(res.idempotent).toBe(false);
 
-    const commit = endpoint.requests.find((r) => r.method === "POST");
-    expect(commit?.path).toBe("/v1/tables/cloud.job_runs/commit");
+    const commit = endpoint.requests.find((r) => r.path === "/v1/write/cloud.job_runs");
+    expect(commit?.path).toBe("/v1/write/cloud.job_runs");
     expect(commit?.body).toEqual({ rows: [{ a: 1 }, { a: 2 }] });
   });
 

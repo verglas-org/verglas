@@ -19,10 +19,12 @@ RUN cargo build --release \
 
 FROM oven/bun:1.3.8 AS gadget-host
 WORKDIR /opt/verglas-gadget-runtime
+COPY sdks/typescript /sdks/typescript
 COPY crates/verglas-gadget-runtime/runtime/package.json \
     crates/verglas-gadget-runtime/runtime/bun.lock ./
 RUN bun install --frozen-lockfile --production
-COPY crates/verglas-gadget-runtime/runtime/host.mjs ./host.mjs
+COPY crates/verglas-gadget-runtime/runtime/host.mjs \
+    crates/verglas-gadget-runtime/runtime/verglas-env.mjs ./
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -37,6 +39,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler
+COPY --from=gadget-host /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=gadget-host /sdks/typescript /sdks/typescript
 USER verglas
 EXPOSE 8340
 ENTRYPOINT ["verglas-scheduler"]
@@ -45,6 +49,7 @@ FROM runtime AS verglas-gadget-runtime
 COPY --from=build /src/target/release/verglas-gadget-runtime /usr/local/bin/verglas-gadget-runtime
 COPY --from=gadget-host /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=gadget-host /opt/verglas-gadget-runtime /opt/verglas-gadget-runtime
+COPY --from=gadget-host /sdks/typescript /sdks/typescript
 USER verglas
 EXPOSE 8350
 ENTRYPOINT ["verglas-gadget-runtime"]

@@ -44,7 +44,11 @@ async fn supervisor_reuses_replaces_and_stops_per_gadget_children() {
         startup_timeout: Duration::from_secs(2),
         environment: BTreeMap::from([("START_LOG".to_owned(), log.to_string_lossy().into_owned())]),
     };
-    let supervisor = ProcessSupervisor::new(config);
+    let supervisor = ProcessSupervisor::new(
+        config,
+        "http://127.0.0.1:8350".to_owned(),
+        "runtime-control-secret".to_owned(),
+    );
 
     let first = supervisor
         .ensure("alpha", "digest-a", &bundle("1"))

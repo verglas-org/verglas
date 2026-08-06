@@ -234,7 +234,7 @@ export function errorMessage(err: unknown): string {
  */
 export function instrumentClient(client: VerglasClient, logger: RunLogger): VerglasClient {
   return new Proxy(client, {
-    get(target, prop, receiver) {
+    get(target, prop) {
       if (prop === "table") {
         return <T extends Row>(name: string): Table<T> => {
           const table = target.table<T>(name);
@@ -243,14 +243,15 @@ export function instrumentClient(client: VerglasClient, logger: RunLogger): Verg
           return instrumentTable(table, logger, name);
         };
       }
-      return Reflect.get(target, prop, receiver);
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
     },
   });
 }
 
 function instrumentTable<T extends Row>(table: Table<T>, logger: RunLogger, name: string): Table<T> {
   return new Proxy(table, {
-    get(target, prop, receiver) {
+    get(target, prop) {
       if (prop === "append") {
         return async (rows: T[], opts?: CommitOptions) => {
           const t0 = logger.now();
@@ -275,7 +276,8 @@ function instrumentTable<T extends Row>(table: Table<T>, logger: RunLogger, name
           }
         };
       }
-      return Reflect.get(target, prop, receiver);
+      const value = Reflect.get(target, prop, target);
+      return typeof value === "function" ? value.bind(target) : value;
     },
   });
 }

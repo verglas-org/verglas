@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
+use sha2::Digest;
 use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
@@ -105,14 +106,18 @@ struct RunningHost {
 /// Multiplexes independently replaceable Gadget child hosts in one container.
 pub struct ProcessSupervisor {
     config: HostConfig,
+    capability_base_url: String,
+    capability_seed: String,
     hosts: Mutex<HashMap<String, RunningHost>>,
 }
 
 impl ProcessSupervisor {
     /// Creates an empty child supervisor.
-    pub fn new(config: HostConfig) -> Self {
+    pub fn new(config: HostConfig, capability_base_url: String, capability_seed: String) -> Self {
         Self {
             config,
+            capability_base_url,
+            capability_seed,
             hosts: Mutex::new(HashMap::new()),
         }
     }
@@ -176,12 +181,21 @@ impl ProcessSupervisor {
 
         let mut command = Command::new(&self.config.command);
         command
+            .env_clear()
             .args(&self.config.arguments)
             .arg(root.path())
             .envs(&self.config.environment)
             .env("VERGLAS_GADGET_ID", id)
             .env("VERGLAS_GADGET_VERSION", &bundle.version)
             .env("VERGLAS_GADGET_DIGEST", digest)
+            .env(
+                "VERGLAS_GADGET_CAPABILITY_ENDPOINT",
+                format!("{}/v1/gadgets/{id}/data", self.capability_base_url),
+            )
+            .env(
+                "VERGLAS_GADGET_CAPABILITY_TOKEN",
+                gadget_capability_token(&self.capability_seed, id),
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -232,6 +246,16 @@ impl ProcessSupervisor {
             _bundle_root: root,
         })
     }
+}
+
+/// Derives one non-transferable data capability without exposing the runtime or upstream token.
+pub(crate) fn gadget_capability_token(seed: &str, gadget_id: &str) -> String {
+    let mut digest = sha2::Sha256::new();
+    digest.update(b"verglas-gadget-data-capability\0");
+    digest.update(gadget_id.as_bytes());
+    digest.update(b"\0");
+    digest.update(seed.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 /// Writes one immutable revision into a private temporary directory.

@@ -2,12 +2,13 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use axum::body::{Body, to_bytes};
 use axum::extract::ws::{Message as AxumMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, put};
+use axum::routing::{any, get, put};
 use axum::{Json, Router};
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
@@ -15,14 +16,29 @@ use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
 
 use crate::{
     GadgetBundle, HostConfig, ProcessSupervisor, RegisterOutcome, RuntimeCatalog, RuntimeConfig,
-    RuntimeError,
+    RuntimeError, supervisor::gadget_capability_token,
 };
+
+const MAX_CAPABILITY_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+
+/// Trusted upstream configuration held only by the Gadget runtime control process.
+#[derive(Debug, Clone)]
+pub struct DataPlaneConfig {
+    /// Base URL of the local or cloud Verglas data API.
+    pub endpoint: String,
+    /// Upstream bearer credential; never copied into a Gadget child process.
+    pub token: String,
+    /// Loopback base URL through which child capabilities reach this runtime.
+    pub capability_base_url: String,
+}
 
 /// Shared state for the runtime's bounded HTTP handlers.
 struct ServiceState {
     catalog: Mutex<RuntimeCatalog>,
     token: String,
     supervisor: Option<Arc<ProcessSupervisor>>,
+    data_plane: Option<DataPlaneConfig>,
+    http: reqwest::Client,
 }
 
 /// An authenticated HTTP service around one runtime catalog.
@@ -41,6 +57,8 @@ impl RuntimeService {
                 catalog: Mutex::new(RuntimeCatalog::new(config)?),
                 token,
                 supervisor: None,
+                data_plane: None,
+                http: reqwest::Client::new(),
             }),
         })
     }
@@ -50,15 +68,32 @@ impl RuntimeService {
         config: RuntimeConfig,
         token: String,
         host: HostConfig,
+        data_plane: DataPlaneConfig,
     ) -> Result<Self, RuntimeError> {
         if token.is_empty() {
             return Err(RuntimeError::EmptyRuntimeToken);
         }
+        if data_plane.endpoint.is_empty()
+            || data_plane.token.is_empty()
+            || data_plane.capability_base_url.is_empty()
+        {
+            return Err(RuntimeError::EmptyDataPlaneConfig);
+        }
+        let supervisor = ProcessSupervisor::new(
+            host,
+            data_plane
+                .capability_base_url
+                .trim_end_matches('/')
+                .to_owned(),
+            token.clone(),
+        );
         Ok(Self {
             state: Arc::new(ServiceState {
                 catalog: Mutex::new(RuntimeCatalog::new(config)?),
                 token,
-                supervisor: Some(Arc::new(ProcessSupervisor::new(host))),
+                supervisor: Some(Arc::new(supervisor)),
+                data_plane: Some(data_plane),
+                http: reqwest::Client::new(),
             }),
         })
     }
@@ -74,7 +109,126 @@ impl RuntimeService {
             )
             .route("/v1/gadgets/{id}/client.js", get(client_module))
             .route("/v1/gadgets/{id}/rpc", get(gadget_rpc))
+            .route("/v1/gadgets/{id}/data/{*path}", any(proxy_data))
             .with_state(self.state)
+    }
+}
+
+/// Proxies one Gadget-scoped SDK call while retaining the upstream credential here.
+async fn proxy_data(
+    State(state): State<Arc<ServiceState>>,
+    Path((id, path)): Path<(String, String)>,
+    request: Request<Body>,
+) -> Response {
+    let expected = gadget_capability_token(&state.token, &id);
+    if !authorized(request.headers(), &expected) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let registered = match lock_catalog(&state) {
+        Ok(catalog) => catalog.get(&id).is_some(),
+        Err(status) => return status.into_response(),
+    };
+    if !registered {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if !allowed_data_path(&path) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(data_plane) = &state.data_plane else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_CAPABILITY_REQUEST_BYTES).await {
+        Ok(body) => body,
+        Err(_) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    let mut upstream_url = format!(
+        "{}/{}",
+        data_plane.endpoint.trim_end_matches('/'),
+        path.trim_start_matches('/'),
+    );
+    if let Some(query) = parts.uri.query() {
+        upstream_url.push('?');
+        upstream_url.push_str(query);
+    }
+    let mut upstream = state
+        .http
+        .request(parts.method, upstream_url)
+        .bearer_auth(&data_plane.token)
+        .body(body);
+    for name in [axum::http::header::ACCEPT, CONTENT_TYPE] {
+        if let Some(value) = parts.headers.get(&name) {
+            upstream = upstream.header(name, value);
+        }
+    }
+    let response = match upstream.send().await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(gadget_id = %id, %error, "Verglas data capability request failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(gadget_id = %id, %error, "Verglas data capability response failed");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let mut result = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        result = result.header(CONTENT_TYPE, content_type);
+    }
+    result
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn allowed_data_path(path: &str) -> bool {
+    [
+        "admin/access",
+        "catalog/v1/",
+        "v1/query",
+        "v1/write/",
+        "v1/tables/",
+        "v1/queues/",
+        "v1/graphs/",
+        "v1/kv/",
+    ]
+    .iter()
+    .any(|prefix| path == *prefix || path.starts_with(prefix))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allowed_data_path;
+
+    #[test]
+    fn data_capability_covers_sdk_routes_but_not_control_routes() {
+        for path in [
+            "admin/access",
+            "catalog/v1/config",
+            "catalog/v1/warehouse/namespaces",
+            "v1/query",
+            "v1/write/company.events",
+            "v1/tables/company.events/rows",
+            "v1/queues/jobs/enqueue",
+            "v1/graphs/company/query",
+            "v1/kv/gadget.workspace/key",
+        ] {
+            assert!(
+                allowed_data_path(path),
+                "SDK path should be allowed: {path}"
+            );
+        }
+        for path in ["admin/workers", "v1/workers/source/run", "v1/secrets"] {
+            assert!(
+                !allowed_data_path(path),
+                "control path should be denied: {path}"
+            );
+        }
     }
 }
 
@@ -350,9 +504,9 @@ fn runtime_error_response(error: RuntimeError) -> Response {
         | RuntimeError::MissingServerModule
         | RuntimeError::InvalidVersion { .. }
         | RuntimeError::BundleTooLarge { .. } => StatusCode::BAD_REQUEST,
-        RuntimeError::BundleEncoding(_) | RuntimeError::EmptyRuntimeToken => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        RuntimeError::BundleEncoding(_)
+        | RuntimeError::EmptyRuntimeToken
+        | RuntimeError::EmptyDataPlaneConfig => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, error.to_string()).into_response()
 }

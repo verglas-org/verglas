@@ -61,8 +61,8 @@ services:
       VERGLAS_GADGET_RUNTIME_LISTEN: 0.0.0.0:8350
       VERGLAS_GADGET_RUNTIME_TOKEN: ${VERGLAS_GADGET_RUNTIME_TOKEN:-verglas-local-gadget-runtime}
       VERGLAS_GADGET_MAX_GADGETS: ${VERGLAS_GADGET_MAX_GADGETS:-64}
-      VERGLAS_GADGET_KV_ENDPOINT: http://verglas-server:8334
-      VERGLAS_GADGET_KV_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+      VERGLAS_GADGET_DATA_ENDPOINT: http://verglas-server:8334
+      VERGLAS_GADGET_DATA_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
     depends_on:
       verglas-server:
         condition: service_started
@@ -73,11 +73,15 @@ services:
       context: .
       target: verglas-scheduler
     image: verglas/verglas-scheduler:local
+    ports:
+      - "8340:8340"
     environment:
       VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@postgres:5432/verglas
       VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
       VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
+      VERGLAS_WORKER_TOKEN: ${VERGLAS_WORKER_TOKEN:-verglas-local}
       VERGLAS_SCHEDULER_QUEUE: local
+      VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
     depends_on:
       verglas-server:
         condition: service_started

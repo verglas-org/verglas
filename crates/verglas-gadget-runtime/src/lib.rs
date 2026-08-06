@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 mod server;
 mod supervisor;
 
-pub use server::RuntimeService;
+pub use server::{DataPlaneConfig, RuntimeService};
 pub use supervisor::{HostConfig, ProcessSupervisor, SupervisorError};
 
 /// Maximum accepted bytes across one Gadget's source bundle.
@@ -155,6 +155,9 @@ pub enum RuntimeError {
     /// The HTTP service was configured without an authentication secret.
     #[error("runtime token must not be empty")]
     EmptyRuntimeToken,
+    /// The trusted data-plane proxy was configured without an endpoint or credential.
+    #[error("data-plane endpoint, token, and capability base URL must not be empty")]
+    EmptyDataPlaneConfig,
     /// A Gadget identity cannot be used safely in a route or directory.
     #[error("invalid Gadget id `{id}`")]
     InvalidGadgetId {
