@@ -36,12 +36,35 @@ pub struct QueryConfig {
     /// `[log]` shape `verglas-server` uses.
     #[serde(default)]
     pub log: Log,
+    /// Memory-grant behavior. Fixed-memory microVMs can skip the redundant
+    /// estimate pass before each query; dynamically granted workers retain it.
+    #[serde(default)]
+    pub memory: Memory,
     /// The cache S3 endpoint every table read goes through, and the keypair
     /// to sign those requests with.
     pub cache: CacheEndpoint,
     /// The Iceberg REST catalog to query against — the same `[catalog]` shape
     /// `verglas-server`'s catalog watcher uses (bearer or SigV4 auth, warehouse id).
     pub catalog: Catalog,
+}
+
+/// Query memory behavior. Estimation remains the safe default for workers
+/// whose launcher can grow their allocation at runtime.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Memory {
+    /// Estimate and grow the grant before every query. A Firecracker VM with a
+    /// fixed allocation should set this false because its local grant host is
+    /// bookkeeping-only and the estimate otherwise repeats catalog I/O.
+    pub estimate_on_request: bool,
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            estimate_on_request: true,
+        }
+    }
 }
 
 /// Ports this binary listens on.
@@ -185,6 +208,23 @@ mod tests {
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         assert_eq!(config.listen.admin_port, 8335);
+        assert!(config.memory.estimate_on_request);
+    }
+
+    #[test]
+    fn fixed_memory_runtime_can_disable_per_request_estimation() {
+        let toml = r#"
+            [memory]
+            estimate_on_request = false
+
+            [cache]
+            s3_endpoint = "http://127.0.0.1:8333"
+
+            [catalog]
+            uri = "http://127.0.0.1:8334/catalog"
+        "#;
+        let config = QueryConfig::from_toml_str(toml).expect("parses");
+        assert!(!config.memory.estimate_on_request);
     }
 
     /// A non-http(s) cache endpoint is rejected at validation, naming the

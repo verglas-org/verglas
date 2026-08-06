@@ -113,6 +113,7 @@ pub async fn run(
         grant_host: grant_host.clone(),
         grant: Arc::new(Mutex::new(initial_grant)),
         last_activity: last_activity.clone(),
+        estimate_on_request: config.memory.estimate_on_request,
     };
 
     let app = admin::router(state.clone());

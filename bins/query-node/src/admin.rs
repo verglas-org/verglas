@@ -61,6 +61,10 @@ pub struct AppState {
     /// Unix seconds of the last request served — the idle-shutdown loop reads
     /// this, every handler that touches the query surface updates it.
     pub last_activity: Arc<AtomicU64>,
+    /// Whether this runtime can use an estimate to grow its memory grant.
+    /// Fixed-memory microVMs disable it to avoid repeating catalog I/O that
+    /// cannot change their already-assigned memory.
+    pub estimate_on_request: bool,
 }
 
 impl AppState {
@@ -142,8 +146,9 @@ async fn query_sql(
     state.touch();
     let at = request.time_travel();
 
-    if let Ok(estimate) =
-        verglas_iceberg::estimate(state.catalog.clone(), &request.sql, at.clone()).await
+    if state.estimate_on_request
+        && let Ok(estimate) =
+            verglas_iceberg::estimate(state.catalog.clone(), &request.sql, at.clone()).await
     {
         let mut current = state.grant.lock().await;
         *current = sizing::ensure_covers(

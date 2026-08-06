@@ -104,6 +104,7 @@ async fn serve(catalog: Arc<dyn Catalog>, initial_grant_bytes: u64) -> (String, 
             bytes: initial_grant_bytes,
         })),
         last_activity: Arc::new(AtomicU64::new(0)),
+        estimate_on_request: true,
     };
     let app = admin::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
