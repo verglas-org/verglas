@@ -464,6 +464,19 @@ async fn timeline_initialization_publishes_the_pageserver_start_lsn() {
         .expect("append after initialization");
     assert_eq!(appended.start, start);
     assert_eq!(log.read(start, appended.end).await.expect("read"), payload);
+    assert!(
+        !log.initialize_timeline(start.advance(2048))
+            .await
+            .expect("wake at a durable LSN already retained by the safekeeper")
+    );
+    assert!(
+        log.initialize_timeline(start.advance(8192)).await.is_err(),
+        "a wake beyond the safekeeper tail must not skip missing WAL"
+    );
+    assert!(
+        log.initialize_timeline(Lsn(start.0 - 8)).await.is_err(),
+        "a wake below the retained range must not resurrect discarded WAL"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -137,12 +137,17 @@ where
         }
         let mut manifest = self.state.lock().await;
         if manifest.tail != Lsn(0) {
-            if manifest.base == start_lsn {
+            // A compute wake restores the pageserver at its durable LSN and
+            // repeats TIMELINE_CREATE before reconnecting walproposer. Treat
+            // that as idempotent when the requested point is already covered
+            // by this safekeeper. Never jump across WAL we do not have, and
+            // never resurrect WAL below the retained range.
+            if start_lsn.0 >= manifest.base.0 && start_lsn.0 <= manifest.tail.0 {
                 return Ok(false);
             }
             return Err(AppendError::Manifest(format!(
-                "timeline already starts at {}, cannot initialize at {start_lsn}",
-                manifest.base,
+                "timeline retains {}..{}, cannot initialize at {start_lsn}",
+                manifest.base, manifest.tail,
             )));
         }
         manifest.base = start_lsn;
