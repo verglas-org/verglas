@@ -56,6 +56,31 @@ pub struct QueryExecution {
     pub batches: SendableRecordBatchStream,
 }
 
+/// A whole-catalog DataFusion session prepared once and reused across queries.
+///
+/// Building an [`IcebergCatalogProvider`] walks the REST catalog and constructs
+/// every table provider. Query workers must not repeat that work for every HTTP
+/// request; their cache-owned catalog generation tells them when to replace this
+/// value instead.
+#[derive(Clone)]
+pub struct PreparedCatalog {
+    context: Arc<SessionContext>,
+}
+
+impl PreparedCatalog {
+    /// Builds one complete query session from the current catalog generation.
+    pub async fn open(catalog: Arc<dyn Catalog>) -> Result<Self> {
+        Ok(Self {
+            context: Arc::new(catalog_context(catalog).await?),
+        })
+    }
+
+    /// Plans and executes SQL using the already-registered catalog providers.
+    pub async fn query_stream(&self, sql: &str) -> Result<QueryExecution> {
+        query_stream_in_context(self.context.as_ref(), sql).await
+    }
+}
+
 /// Plans `sql` against `catalog` and returns its incremental execution stream
 /// without collecting the result in memory: `execute_stream` builds the
 /// physical plan and hands back a pull-based [`SendableRecordBatchStream`] —
@@ -81,6 +106,11 @@ pub async fn query_stream(
         None => catalog_context(catalog).await?,
     };
 
+    query_stream_in_context(&ctx, sql).await
+}
+
+/// Plans and starts one query in an existing DataFusion session.
+async fn query_stream_in_context(ctx: &SessionContext, sql: &str) -> Result<QueryExecution> {
     let dataframe = ctx
         .sql(sql)
         .await

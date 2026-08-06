@@ -156,8 +156,16 @@ pub fn router(
 /// credentials or an independent catalog cache.
 pub fn catalog_router(catalog: CatalogGateway) -> Router {
     Router::new()
+        .route("/catalog/_verglas/generation", get(catalog_generation))
         .route("/catalog/{*path}", any(catalog_request))
         .with_state(catalog)
+}
+
+/// Returns the cache-owned catalog generation. Query workers keep their
+/// DataFusion catalog session while this value is unchanged and rebuild it
+/// exactly once after the watcher observes a changed catalog response.
+async fn catalog_generation(State(catalog): State<CatalogGateway>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "generation": catalog.generation() }))
 }
 
 /// Forwards one local metadata request through the cache node's shared catalog

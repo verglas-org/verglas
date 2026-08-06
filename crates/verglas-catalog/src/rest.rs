@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -99,13 +100,16 @@ impl CachedResponses {
     /// Inserts one response, evicting existing entries until the hard byte
     /// ceiling can accommodate it. Responses larger than the whole budget are
     /// served but not retained.
-    fn insert(&mut self, key: String, response: CatalogResponse) {
+    fn insert(&mut self, key: String, response: CatalogResponse) -> bool {
+        let changed = self.entries.get(&key).is_none_or(|previous| {
+            previous.status != response.status || previous.body != response.body
+        });
         if let Some(previous) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(previous.body.len());
         }
         let size = response.body.len();
         if size > self.budget {
-            return;
+            return changed;
         }
         while self.bytes.saturating_add(size) > self.budget {
             let Some(victim) = self.entries.keys().next().cloned() else {
@@ -117,6 +121,7 @@ impl CachedResponses {
         }
         self.bytes = self.bytes.saturating_add(size);
         self.entries.insert(key, response);
+        changed
     }
 
     /// Drops every cached GET after a successful catalog mutation.
@@ -147,6 +152,9 @@ pub struct RestCatalogSource {
     prefix: Arc<tokio::sync::OnceCell<String>>,
     /// Successful GET responses shared with the loopback catalog gateway.
     responses: Arc<RwLock<CachedResponses>>,
+    /// Monotonic catalog generation advanced only when a prepared REST response
+    /// changes or a successful mutation invalidates the prepared response set.
+    generation: Arc<AtomicU64>,
 }
 
 /// One buffered Iceberg REST response returned through the loopback gateway.
@@ -182,6 +190,11 @@ impl CatalogGateway {
     /// Returns a watcher source backed by the same client and response cache.
     pub fn source(&self) -> RestCatalogSource {
         self.source.clone()
+    }
+
+    /// Current prepared-catalog generation for query-session invalidation.
+    pub fn generation(&self) -> u64 {
+        self.source.generation.load(Ordering::Acquire)
     }
 
     /// Serves one local catalog request. Successful watcher or gateway GETs are
@@ -429,6 +442,7 @@ impl RestCatalogSource {
             responses: Arc::new(RwLock::new(CachedResponses::new(
                 CATALOG_RESPONSE_CACHE_BYTES,
             ))),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -545,12 +559,17 @@ impl RestCatalogSource {
             .await?;
         if (200..300).contains(&response.status) {
             if method == Method::GET {
-                self.responses
+                let changed = self
+                    .responses
                     .write()
                     .await
                     .insert(resolved_path, response.clone());
+                if changed {
+                    self.generation.fetch_add(1, Ordering::AcqRel);
+                }
             } else {
                 self.responses.write().await.clear();
+                self.generation.fetch_add(1, Ordering::AcqRel);
             }
         }
         Ok(response)
@@ -571,7 +590,10 @@ impl RestCatalogSource {
             });
         }
         let key = self.cache_key(url);
-        self.responses.write().await.insert(key, response.clone());
+        let changed = self.responses.write().await.insert(key, response.clone());
+        if changed {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
         serde_json::from_slice::<T>(&response.body).map_err(|e| CatalogError::Malformed {
             url: url.to_owned(),
             detail: e.to_string(),

@@ -42,13 +42,22 @@ async fn reads_cache_and_mutations_invalidate() {
     .expect("valid config");
     let gateway =
         CatalogGateway::from_config(config.catalog.as_ref().expect("catalog")).expect("gateway");
+    assert_eq!(gateway.generation(), 0);
 
-    for _ in 0..2 {
-        gateway
-            .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
-            .await
-            .expect("cached read");
-    }
+    gateway
+        .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
+        .await
+        .expect("first read");
+    assert_eq!(gateway.generation(), 1);
+    gateway
+        .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
+        .await
+        .expect("cached read");
+    assert_eq!(
+        gateway.generation(),
+        1,
+        "cache hits do not invalidate sessions"
+    );
     assert_eq!(reads.load(Ordering::SeqCst), 1);
 
     gateway
@@ -60,6 +69,7 @@ async fn reads_cache_and_mutations_invalidate() {
         )
         .await
         .expect("write through mutation");
+    assert_eq!(gateway.generation(), 2);
     gateway
         .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
         .await

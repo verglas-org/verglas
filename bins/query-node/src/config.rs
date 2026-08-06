@@ -218,7 +218,7 @@ mod tests {
             [cache]
             s3_endpoint = "http://127.0.0.1:8333"
 
-            [catalog]
+            [metadata]
             uri = "http://127.0.0.1:8334/catalog"
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
