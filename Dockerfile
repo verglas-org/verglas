@@ -14,9 +14,17 @@ RUN cargo build --release \
     -p verglas-server \
     -p verglas-scheduler-bin \
     -p verglas-gadget-runtime \
-    -p verglas-container-runtime \
     -p verglas-query \
     -p verglas-write-node
+
+FROM rust:bookworm AS runtime-control-build
+WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup show
+COPY . .
+RUN cargo build --release \
+    -p verglas-container-runtime \
+    -p verglas-integration-linear
 
 FROM oven/bun:1.3.8 AS gadget-host
 WORKDIR /opt/verglas-gadget-runtime
@@ -55,10 +63,16 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/lib/verglas-container-runtime
-COPY --from=build /src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime
+COPY --from=runtime-control-build /src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime
 COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler
 EXPOSE 8360
 ENTRYPOINT ["verglas-container-runtime"]
+
+FROM runtime AS verglas-integration-linear
+COPY --from=runtime-control-build /src/target/release/verglas-integration-linear /usr/local/bin/verglas-integration-linear
+USER verglas
+EXPOSE 8371
+ENTRYPOINT ["verglas-integration-linear"]
 
 FROM runtime AS verglas-server
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server

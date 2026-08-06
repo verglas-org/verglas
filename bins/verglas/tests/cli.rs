@@ -16,7 +16,7 @@ use std::process::Command;
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// cloud `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 14] = [
+const SURVIVING_COMMANDS: [&str; 15] = [
     "drain",
     "status",
     "table",
@@ -31,6 +31,7 @@ const SURVIVING_COMMANDS: [&str; 14] = [
     "volumes",
     "secrets",
     "kv",
+    "vessel",
 ];
 
 /// Commands removed from the CLI: `--help` must not name them.
@@ -234,6 +235,24 @@ fn help_lists_exactly_the_surviving_commands() {
         assert!(
             SURVIVING_COMMANDS.contains(&name.as_str()) || name == "help",
             "unexpected command `{name}` in --help: {listed:?}"
+        );
+    }
+}
+
+#[test]
+fn vessel_help_lists_the_local_http_service_contract() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["vessel", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    for command in ["add", "list", "get", "remove", "curl", "query"] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "vessel help must list {command}: {stdout}"
         );
     }
 }

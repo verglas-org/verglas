@@ -7353,6 +7353,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -7518,6 +7519,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -7645,6 +7647,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "verglas-core",
+]
+
+[[package]]
+name = "verglas-integration-linear"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "clap",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

@@ -7,6 +7,9 @@
 Append-only log of changes to this crate, by issue. Every PR touching this
 crate adds an entry (see /AGENTS.md, "Worklog discipline").
 
+- #55: Added `vessel add/list/get/remove/curl/query` against the authenticated local Docker runtime
+  manager, with YAML/JSON manifests and a dedicated runtime endpoint.
+
 - #1: Scaffolded as part of the initial cargo workspace: stub with module-level
   docs, placeholder types wiring real dependency edges, and an integration
   test directory. Toolchain pinned (1.96.1), workspace clippy lints applied.

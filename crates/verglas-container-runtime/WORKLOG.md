@@ -8,3 +8,5 @@
   bootstrap after rebasing onto the merged runtime crate.
 - #50: Built the runtime-manager image from the shared runtime base with scheduler only.
   It no longer layers on the Gadget runtime image or documents Gadgets as managed products.
+- #55: Added persisted Vessel declarations, one-container mapping, and authenticated private-network
+  HTTP proxying without publishing workload ports to the host.

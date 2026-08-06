@@ -7,7 +7,8 @@ use async_trait::async_trait;
 
 use super::{
     ContainerSpec, DockerApi, DockerRuntimeCore, EngineContainer, EngineCreateRequest,
-    LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError,
+    LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError, VesselHttp,
+    VesselRole, VesselSpec,
 };
 
 #[derive(Clone, Default)]
@@ -144,6 +145,28 @@ fn fixture() -> ContainerSpec {
     ContainerSpec::new("scheduler", "verglas/verglas-scheduler:local")
         .with_command(["verglas-scheduler"])
         .with_environment("VERGLAS_SCHEDULER_QUEUE", "local")
+}
+
+#[test]
+fn vessel_maps_to_one_unpublished_managed_container() {
+    let vessel = VesselSpec {
+        name: "linear".to_owned(),
+        role: VesselRole::Integration,
+        image: "verglas/integration-linear:local".to_owned(),
+        command: Vec::new(),
+        entrypoint: Vec::new(),
+        environment: BTreeMap::new(),
+        http: VesselHttp {
+            port: 8371,
+            health_path: Some("/health".to_owned()),
+        },
+    };
+
+    let container = vessel.container_spec().expect("container specification");
+
+    assert_eq!(container.deployment_id, "vessel-linear");
+    assert!(container.published_ports.is_empty());
+    assert_eq!(container.image, vessel.image);
 }
 
 #[tokio::test]
