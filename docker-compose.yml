@@ -61,6 +61,8 @@ services:
       VERGLAS_GADGET_RUNTIME_LISTEN: 0.0.0.0:8350
       VERGLAS_GADGET_RUNTIME_TOKEN: ${VERGLAS_GADGET_RUNTIME_TOKEN:-verglas-local-gadget-runtime}
       VERGLAS_GADGET_MAX_GADGETS: ${VERGLAS_GADGET_MAX_GADGETS:-64}
+      VERGLAS_GADGET_KV_ENDPOINT: http://verglas-server:8334
+      VERGLAS_GADGET_KV_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
     depends_on:
       verglas-server:
         condition: service_started

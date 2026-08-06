@@ -34,5 +34,18 @@ fn compose_starts_one_multi_gadget_runtime_by_default() {
     assert!(service.contains("target: verglas-gadget-runtime"));
     assert!(service.contains("8350:8350"));
     assert!(service.contains("VERGLAS_GADGET_MAX_GADGETS"));
+    assert!(service.contains("VERGLAS_GADGET_KV_ENDPOINT: http://verglas-server:8334"));
+    assert!(service.contains("VERGLAS_GADGET_KV_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY"));
     assert!(!service.lines().any(|line| line.trim() == "profiles:"));
+}
+
+#[test]
+fn host_uses_a_valid_exact_kv_namespace_for_each_gadget() {
+    let host = std::fs::read_to_string(repository_file(
+        "crates/verglas-gadget-runtime/runtime/host.mjs",
+    ))
+    .expect("read Gadget host");
+
+    assert!(host.contains("`gadget.${gadgetId}`"));
+    assert!(!host.contains("`gadget/${gadgetId}`"));
 }
