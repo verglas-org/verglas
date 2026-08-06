@@ -8,14 +8,16 @@ use std::collections::{BTreeMap, HashMap};
 
 use async_trait::async_trait;
 use bollard::Docker;
+use bollard::body_full;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, HostConfig, NetworkCreateRequest, PortBinding as DockerPortBinding,
 };
 use bollard::query_parameters::{
-    CreateContainerOptionsBuilder, CreateImageOptionsBuilder, ListContainersOptionsBuilder,
+    BuildImageOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
+    ListContainersOptionsBuilder,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -34,6 +36,11 @@ pub const LABEL_DEPLOYMENT: &str = "io.verglas.deployment";
 pub const LABEL_SPEC_DIGEST: &str = "io.verglas.spec-sha256";
 
 const CONTAINER_NAME_PREFIX: &str = "verglas-";
+const TYPESCRIPT_BASE_IMAGE: &str = "oven/bun:1.2.20";
+const MAX_PROJECT_FILES: usize = 128;
+const MAX_PROJECT_FILE_BYTES: usize = 512 * 1024;
+const MAX_PROJECT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_BUILD_ERROR_BYTES: usize = 8 * 1024;
 
 /// Product role assigned to one long-lived local Vessel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +84,272 @@ pub struct VesselSpec {
     pub environment: BTreeMap<String, String>,
     /// Private HTTP service contract.
     pub http: VesselHttp,
+}
+
+/// A bounded multi-file TypeScript project compiled into one Vessel image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TypescriptProject {
+    /// UTF-8 project files keyed by relative POSIX path.
+    pub files: BTreeMap<String, String>,
+}
+
+/// Desired standalone Vessel project and its runtime configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VesselProjectSpec {
+    /// Stable local name used by the CLI, image tag, and runtime proxy.
+    pub name: String,
+    /// Product behavior exposed by the built Vessel.
+    pub role: VesselRole,
+    /// TypeScript source and dependency declaration.
+    pub project: TypescriptProject,
+    /// Non-secret configuration injected only when the built image starts.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    /// Private HTTP service contract.
+    pub http: VesselHttp,
+}
+
+/// Normalized content-addressed Docker build for a TypeScript Vessel project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VesselBuildContext {
+    /// Immutable local OCI image tag derived from the normalized project.
+    pub image: String,
+    /// Platform-owned Dockerfile included in the build context.
+    pub dockerfile: String,
+    /// Deterministic uncompressed tar archive sent to the Docker Engine.
+    pub context: Vec<u8>,
+}
+
+impl VesselProjectSpec {
+    /// Validates and archives this project into a platform-owned Docker build.
+    pub fn build_context(&self) -> Result<VesselBuildContext, RuntimeError> {
+        ContainerSpec::new(format!("vessel-{}", self.name), "validation").validate()?;
+        if self.http.port == 0 {
+            return Err(RuntimeError::InvalidPort);
+        }
+        if self
+            .http
+            .health_path
+            .as_ref()
+            .is_some_and(|path| !path.starts_with('/'))
+        {
+            return Err(RuntimeError::InvalidHealthPath);
+        }
+        validate_project_files(&self.project.files)?;
+        validate_package_json(self.project.files.get("package.json").ok_or_else(|| {
+            RuntimeError::MissingProjectFile {
+                path: "package.json".to_owned(),
+            }
+        })?)?;
+
+        let dockerfile = typescript_dockerfile();
+        let files = materialize_project(&self.project.files)?;
+        let context = archive_project(&files, &dockerfile)?;
+        let digest = hex::encode(Sha256::digest(&context));
+        let image = format!("verglas/vessel-{}:sha256-{digest}", self.name);
+        Ok(VesselBuildContext {
+            image,
+            dockerfile,
+            context,
+        })
+    }
+
+    /// Maps a completed project build to the existing Vessel runtime record.
+    pub fn vessel_spec(&self, image: impl Into<String>) -> VesselSpec {
+        VesselSpec {
+            name: self.name.clone(),
+            role: self.role,
+            image: image.into(),
+            command: Vec::new(),
+            entrypoint: Vec::new(),
+            environment: self.environment.clone(),
+            http: self.http.clone(),
+        }
+    }
+}
+
+/// Adds the platform SDK as an ordinary local package inside the standalone image.
+fn materialize_project(
+    submitted: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, RuntimeError> {
+    let mut files = submitted.clone();
+    let source = files
+        .get("package.json")
+        .ok_or_else(|| RuntimeError::MissingProjectFile {
+            path: "package.json".to_owned(),
+        })?;
+    let mut package: serde_json::Value = serde_json::from_str(source)
+        .map_err(|error| RuntimeError::InvalidPackageJson(error.to_string()))?;
+    let dependencies = package
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidPackageJson("root must be an object".to_owned()))?
+        .entry("dependencies")
+        .or_insert_with(|| serde_json::json!({}));
+    let dependencies = dependencies.as_object_mut().ok_or_else(|| {
+        RuntimeError::InvalidPackageJson("dependencies must be an object".to_owned())
+    })?;
+    dependencies.insert(
+        "@verglas/sdk".to_owned(),
+        serde_json::Value::String("file:vendor/verglas-sdk".to_owned()),
+    );
+    files.insert(
+        "package.json".to_owned(),
+        serde_json::to_string_pretty(&package)
+            .map_err(|error| RuntimeError::SpecificationEncoding(error.to_string()))?,
+    );
+    files.insert(
+        "vendor/verglas-sdk/package.json".to_owned(),
+        r#"{"name":"@verglas/sdk","version":"0.0.0","type":"module","main":"./src/index.ts","exports":{".":"./src/index.ts","./logging":"./src/logging.ts","./examples":"./src/examples/index.ts"},"dependencies":{"apache-arrow":"21.2.0"}}"#.to_owned(),
+    );
+    for (path, source) in TYPESCRIPT_SDK_FILES {
+        files.insert(
+            format!("vendor/verglas-sdk/src/{path}"),
+            (*source).to_owned(),
+        );
+    }
+    Ok(files)
+}
+
+const TYPESCRIPT_SDK_FILES: &[(&str, &str)] = &[
+    (
+        "client.ts",
+        include_str!("../../../sdks/typescript/src/client.ts"),
+    ),
+    (
+        "contracts.ts",
+        include_str!("../../../sdks/typescript/src/contracts.ts"),
+    ),
+    (
+        "feed.ts",
+        include_str!("../../../sdks/typescript/src/feed.ts"),
+    ),
+    (
+        "http.ts",
+        include_str!("../../../sdks/typescript/src/http.ts"),
+    ),
+    (
+        "index.ts",
+        include_str!("../../../sdks/typescript/src/index.ts"),
+    ),
+    (
+        "logging.ts",
+        include_str!("../../../sdks/typescript/src/logging.ts"),
+    ),
+    (
+        "namespace.ts",
+        include_str!("../../../sdks/typescript/src/namespace.ts"),
+    ),
+    (
+        "types.ts",
+        include_str!("../../../sdks/typescript/src/types.ts"),
+    ),
+    (
+        "examples/change-fanout-worker.ts",
+        include_str!("../../../sdks/typescript/src/examples/change-fanout-worker.ts"),
+    ),
+    (
+        "examples/http-poll-worker.ts",
+        include_str!("../../../sdks/typescript/src/examples/http-poll-worker.ts"),
+    ),
+    (
+        "examples/index.ts",
+        include_str!("../../../sdks/typescript/src/examples/index.ts"),
+    ),
+    (
+        "examples/webhook-worker.ts",
+        include_str!("../../../sdks/typescript/src/examples/webhook-worker.ts"),
+    ),
+];
+
+/// Validates bounded safe paths before creating an engine build context.
+fn validate_project_files(files: &BTreeMap<String, String>) -> Result<(), RuntimeError> {
+    if files.len() > MAX_PROJECT_FILES {
+        return Err(RuntimeError::ProjectTooLarge);
+    }
+    let mut total = 0usize;
+    for (path, source) in files {
+        let valid_path = !path.is_empty()
+            && !path.starts_with('/')
+            && !path.ends_with('/')
+            && path.split('/').all(|part| {
+                !part.is_empty() && part != "." && part != ".." && !part.contains('\\')
+            })
+            && path != "Dockerfile"
+            && path != ".dockerignore";
+        if !valid_path {
+            return Err(RuntimeError::InvalidProjectPath { path: path.clone() });
+        }
+        if source.len() > MAX_PROJECT_FILE_BYTES {
+            return Err(RuntimeError::ProjectTooLarge);
+        }
+        total = total
+            .saturating_add(path.len())
+            .saturating_add(source.len());
+        if total > MAX_PROJECT_BYTES {
+            return Err(RuntimeError::ProjectTooLarge);
+        }
+    }
+    Ok(())
+}
+
+/// Requires the standard start contract used by the generated runtime image.
+fn validate_package_json(source: &str) -> Result<(), RuntimeError> {
+    let package: serde_json::Value = serde_json::from_str(source)
+        .map_err(|error| RuntimeError::InvalidPackageJson(error.to_string()))?;
+    if package
+        .pointer("/scripts/start")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Err(RuntimeError::MissingStartScript);
+    }
+    Ok(())
+}
+
+/// Returns the fixed TypeScript build policy owned by the local runtime.
+fn typescript_dockerfile() -> String {
+    format!(
+        "FROM {TYPESCRIPT_BASE_IMAGE}\nWORKDIR /app\nCOPY package.json ./\nCOPY . .\nRUN bun install\nRUN bun run --if-present build\nRUN bun install --production\nENV NODE_ENV=production\nCMD [\"bun\", \"run\", \"start\"]\n"
+    )
+}
+
+/// Creates a deterministic tar archive without accepting filesystem objects.
+fn archive_project(
+    files: &BTreeMap<String, String>,
+    dockerfile: &str,
+) -> Result<Vec<u8>, RuntimeError> {
+    let mut context = Vec::new();
+    {
+        let mut archive = tar::Builder::new(&mut context);
+        append_archive_file(&mut archive, "Dockerfile", dockerfile.as_bytes())?;
+        for (path, source) in files {
+            append_archive_file(&mut archive, path, source.as_bytes())?;
+        }
+        archive
+            .finish()
+            .map_err(|error| RuntimeError::BuildContext(error.to_string()))?;
+    }
+    Ok(context)
+}
+
+/// Appends one regular file with stable metadata to a Docker build archive.
+fn append_archive_file<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    path: &str,
+    contents: &[u8],
+) -> Result<(), RuntimeError> {
+    let mut header = tar::Header::new_gnu();
+    header.set_size(contents.len() as u64);
+    header.set_mode(0o644);
+    header.set_uid(0);
+    header.set_gid(0);
+    header.set_mtime(0);
+    header.set_cksum();
+    archive
+        .append_data(&mut header, path, contents)
+        .map_err(|error| RuntimeError::BuildContext(error.to_string()))
 }
 
 impl VesselSpec {
@@ -357,6 +630,33 @@ pub enum RuntimeError {
     /// A Vessel health path was not origin-relative.
     #[error("vessel health path must begin with '/'")]
     InvalidHealthPath,
+    /// A submitted source path cannot be represented safely in a build context.
+    #[error("invalid Vessel project path: {path}")]
+    InvalidProjectPath {
+        /// Rejected relative path.
+        path: String,
+    },
+    /// A required TypeScript project file was not supplied.
+    #[error("Vessel project is missing required file {path}")]
+    MissingProjectFile {
+        /// Required relative path.
+        path: String,
+    },
+    /// The submitted package declaration was not valid JSON.
+    #[error("invalid Vessel package.json: {0}")]
+    InvalidPackageJson(String),
+    /// The submitted package does not define the standalone runtime command.
+    #[error("Vessel package.json must define scripts.start")]
+    MissingStartScript,
+    /// The submitted project exceeded a bounded source limit.
+    #[error("Vessel project exceeds the source size or file count limit")]
+    ProjectTooLarge,
+    /// Encoding the in-memory Docker build context failed.
+    #[error("failed to encode Vessel build context: {0}")]
+    BuildContext(String),
+    /// The Docker Engine failed the standalone Vessel image build.
+    #[error("Vessel image build failed: {0}")]
+    ImageBuild(String),
     /// A workload attempted to receive Docker daemon authority.
     #[error("workload cannot receive Docker authority through {detail}")]
     DockerAuthority {
@@ -433,6 +733,19 @@ impl DockerRuntime {
     pub async fn ensure_network(&self, name: &str) -> Result<bool, RuntimeError> {
         self.core.ensure_network(name).await
     }
+
+    /// Builds one normalized TypeScript Vessel project into its immutable image.
+    pub async fn build_project(
+        &self,
+        project: &VesselProjectSpec,
+    ) -> Result<VesselBuildContext, RuntimeError> {
+        let build = project.build_context()?;
+        self.core
+            .api
+            .build(&build.image, build.context.clone())
+            .await?;
+        Ok(build)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -458,6 +771,9 @@ struct EngineCreateRequest {
 
 #[async_trait]
 trait DockerApi: Send + Sync {
+    /// Builds one immutable image from an in-memory Docker build archive.
+    async fn build(&self, image: &str, context: Vec<u8>) -> Result<(), RuntimeError>;
+
     /// Finds a container by its exact engine name.
     async fn inspect(&self, name: &str) -> Result<Option<EngineContainer>, RuntimeError>;
 
@@ -614,6 +930,27 @@ struct BollardDockerApi {
 
 #[async_trait]
 impl DockerApi for BollardDockerApi {
+    /// Builds one content-addressed Vessel image and returns bounded failures.
+    async fn build(&self, image: &str, context: Vec<u8>) -> Result<(), RuntimeError> {
+        let options = BuildImageOptionsBuilder::default()
+            .dockerfile("Dockerfile")
+            .t(image)
+            .rm(true)
+            .build();
+        let mut stream = self
+            .docker
+            .build_image(options, None, Some(body_full(context.into())));
+        while let Some(message) = stream.next().await {
+            let message = message.map_err(engine_error)?;
+            if let Some(error) = message.error_detail.and_then(|detail| detail.message) {
+                return Err(RuntimeError::ImageBuild(
+                    error.chars().take(MAX_BUILD_ERROR_BYTES).collect(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Inspects one Docker container and maps a missing name to None.
     async fn inspect(&self, name: &str) -> Result<Option<EngineContainer>, RuntimeError> {
         match self.docker.inspect_container(name, None).await {

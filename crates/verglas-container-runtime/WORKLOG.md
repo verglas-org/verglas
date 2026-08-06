@@ -1,5 +1,9 @@
 # Worklog
 
+- #61: Added bounded, content-addressed TypeScript Vessel project builds with declared npm
+  dependencies, a platform-owned Bun Dockerfile, authenticated project deployment API, and
+  reconciliation into standalone Application or Integration images.
+
 - #43: Added manifest discovery and streaming namespace invocation for private Integration Vessels, with stable Vessel-name identity validation and no public workload ports.
 - #49: Added the open-source Docker Engine placement crate with label-owned, idempotent container
   lifecycle reconciliation and fake-engine contract tests.

@@ -55,3 +55,34 @@ service. The manager discovers those manifests and exposes authenticated
 equal its Vessel name; an Application Vessel cannot register an Integration
 namespace. Invocation responses stream through the manager without result-wide
 buffering.
+
+## Standalone TypeScript projects
+
+`PUT /v1/vessels/{name}/project` builds an Application or Integration as its own OCI image. The
+request contains a bounded map of UTF-8 project files, including `package.json`; the package must
+define `scripts.start`. Verglas supplies the Dockerfile, installs the project's declared packages
+with Bun, tags the image from the complete normalized project digest, and then reconciles the
+ordinary Vessel record to that immutable image.
+
+```bash
+curl --fail-with-body \
+  -X PUT http://127.0.0.1:8360/v1/vessels/example/project \
+  -H "Authorization: Bearer $VERGLAS_CONTAINER_RUNTIME_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data '{
+    "name": "example",
+    "role": "application",
+    "project": {"files": {
+      "package.json": "{\"scripts\":{\"start\":\"bun src/server.ts\"},\"dependencies\":{\"hono\":\"4.8.3\"}}",
+      "src/server.ts": "import { Hono } from '\''hono'\''; const app = new Hono().get('\''/'\'', c => c.text('\''hello'\'')); Bun.serve({port: 8380, fetch: app.fetch});"
+    }},
+    "environment": {},
+    "http": {"port": 8380, "healthPath": "/"}
+  }'
+```
+
+The first contract is intentionally TypeScript-only and rejects caller-supplied Dockerfiles,
+absolute paths, traversal, and oversized source trees. Secrets remain runtime environment values;
+they are never copied into the build context or image layers. Applications are then previewed at
+`/apps/{name}/`, while Integrations publish reflected namespace APIs through the existing private
+Vessel routes.

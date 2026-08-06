@@ -20,11 +20,11 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::{
     ContainerSpec, DockerRuntime, ManagedContainer, ObservedState, ReconcileOutcome, RuntimeError,
-    VesselRole, VesselSpec,
+    VesselProjectSpec, VesselRole, VesselSpec,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_PROXY_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_PROXY_REQUEST_BYTES: usize = 3 * 1024 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Failures from the local runtime manager service.
@@ -91,6 +91,11 @@ impl IntoResponse for ServiceError {
                 | RuntimeError::InvalidNetwork
                 | RuntimeError::InvalidPort
                 | RuntimeError::InvalidHealthPath
+                | RuntimeError::InvalidProjectPath { .. }
+                | RuntimeError::MissingProjectFile { .. }
+                | RuntimeError::InvalidPackageJson(_)
+                | RuntimeError::MissingStartScript
+                | RuntimeError::ProjectTooLarge
                 | RuntimeError::DockerAuthority { .. },
             ) => StatusCode::BAD_REQUEST,
             ServiceError::Runtime(RuntimeError::UnmanagedCollision { .. }) => StatusCode::CONFLICT,
@@ -160,6 +165,7 @@ impl RuntimeService {
                 "/v1/vessels/{name}",
                 get(get_vessel).put(put_vessel).delete(delete_vessel),
             )
+            .route("/v1/vessels/{name}/project", put(put_vessel_project))
             .route("/v1/vessels/{name}/http/{*path}", any(proxy_vessel))
             .route(
                 "/v1/containers/{deployment_id}",
@@ -447,6 +453,48 @@ async fn put_vessel(
         .insert(vessel.name.clone(), vessel);
     state.persist().await?;
     Ok(Json(outcome))
+}
+
+/// Result of building and reconciling one standalone Vessel project.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VesselProjectView {
+    name: String,
+    image: String,
+    outcome: ReconcileOutcome,
+}
+
+/// Builds a standalone TypeScript project and starts its immutable Vessel image.
+async fn put_vessel_project(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(project): Json<VesselProjectSpec>,
+) -> Result<Json<VesselProjectView>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    if name != project.name {
+        return Err(ServiceError::IdentityMismatch {
+            path: name,
+            body: project.name,
+        });
+    }
+    let _operation = state.operation.lock().await;
+    let build = state.runtime.build_project(&project).await?;
+    let vessel = project.vessel_spec(build.image.clone());
+    let specification = state.normalize(vessel.container_spec()?);
+    let outcome = state.runtime.reconcile(&specification).await?;
+    state
+        .desired
+        .write()
+        .await
+        .vessels
+        .insert(vessel.name.clone(), vessel);
+    state.persist().await?;
+    Ok(Json(VesselProjectView {
+        name: project.name,
+        image: build.image,
+        outcome,
+    }))
 }
 
 /// Removes one desired Vessel and its owned container.
