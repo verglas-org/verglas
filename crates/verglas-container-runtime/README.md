@@ -86,3 +86,30 @@ absolute paths, traversal, and oversized source trees. Secrets remain runtime en
 they are never copied into the build context or image layers. Applications are then previewed at
 `/apps/{name}/`, while Integrations publish reflected namespace APIs through the existing private
 Vessel routes.
+
+## Compositional Vessel releases
+
+`PUT /v1/vessels/{name}/composition` applies a complete Vessel release from its YAML manifest and
+a project-file map keyed by component source path. A Vessel may contain any number of independently
+versioned Integrations and Workers and at most one graphical Interface. Integrations and the
+Interface are built as standalone OCI images; Workers are appended to the Verglas Worker registry
+with ownership that records both the Vessel and component versions.
+
+The request is validated and every long-lived image is built before runtime state changes. Service
+and Worker reconciliation is rolled back on failure, and desired state is persisted only after the
+whole release succeeds. Integration configuration schemas are returned to the caller for setup,
+but credential values are never part of the manifest or response. `GET /v1/vessel-compositions`
+returns the active release inventory and local Interface preview paths.
+
+```bash
+curl --fail-with-body \
+  -X PUT http://127.0.0.1:8360/v1/vessels/example/composition \
+  -H "Authorization: Bearer $VERGLAS_CONTAINER_RUNTIME_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @release.json
+```
+
+`release.json` contains `manifest` (the YAML contract), `projects` (one bounded project per
+Integration or Interface source), and the scoped `dataEndpoint` and `dataToken` injected into the
+component runtimes. Runtime credentials affect reconciliation without changing the content release
+digest, so rotating a token replaces the affected containers while preserving the release identity.

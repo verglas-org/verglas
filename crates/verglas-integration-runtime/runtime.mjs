@@ -3,17 +3,28 @@ import {describeIntegration, invokeIntegration} from "./contract.mjs";
 
 const listenPort = Number.parseInt(process.env.VERGLAS_INTEGRATION_PORT || "8370", 10);
 const name = requiredEnv("VERGLAS_INTEGRATION_NAME");
-const definition = JSON.parse(decode("VERGLAS_INTEGRATION_DEFINITION"));
-const moduleSource = decode("VERGLAS_INTEGRATION_MODULE");
+const definition = process.env.VERGLAS_INTEGRATION_DEFINITION_JSON
+  ? JSON.parse(process.env.VERGLAS_INTEGRATION_DEFINITION_JSON)
+  : JSON.parse(decode("VERGLAS_INTEGRATION_DEFINITION"));
 const dataEndpoint = requiredEnv("VERGLAS_DATA_ENDPOINT").replace(/\/+$/, "");
 const dataToken = requiredEnv("VERGLAS_DATA_TOKEN");
 const verglas = connect({endpoint: dataEndpoint, token: dataToken});
 const namespace = `integration.${name}`;
 const configKey = "configuration";
-for (const key of ["VERGLAS_DATA_TOKEN", "VERGLAS_INTEGRATION_MODULE", "VERGLAS_INTEGRATION_DEFINITION"]) {
+const entrypoint = process.env.VERGLAS_INTEGRATION_ENTRYPOINT?.trim();
+const moduleSource = entrypoint ? null : decode("VERGLAS_INTEGRATION_MODULE");
+for (const key of [
+  "VERGLAS_DATA_TOKEN",
+  "VERGLAS_INTEGRATION_MODULE",
+  "VERGLAS_INTEGRATION_DEFINITION",
+  "VERGLAS_INTEGRATION_DEFINITION_JSON",
+]) {
   delete process.env[key];
 }
-const generated = await import(`data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}`);
+const generated = entrypoint
+  ? await import(entrypoint)
+  : await import(`data:text/javascript;base64,${Buffer.from(moduleSource).toString("base64")}`);
+delete process.env.VERGLAS_INTEGRATION_ENTRYPOINT;
 const integration = generated.default;
 
 if (!integration || typeof integration !== "object" || typeof integration.verify !== "function") {

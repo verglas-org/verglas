@@ -20,12 +20,14 @@ use tokio::sync::{Mutex, RwLock};
 use verglas_vessel_contract::{ManifestError, VesselManifest, parse_manifest};
 
 use crate::{
-    ContainerSpec, DockerRuntime, ManagedContainer, ObservedState, ReconcileOutcome, RuntimeError,
-    VesselProjectSpec, VesselRole, VesselSpec,
+    AppliedComponent, AppliedIntegration, AppliedVessel, CompositionError, ContainerSpec,
+    DockerRuntime, ManagedContainer, ObservedState, ReconcileOutcome, RuntimeError,
+    VesselApplyPlan, VesselApplyRequest, VesselProjectSpec, VesselRole, VesselSpec,
+    WorkerRegistration,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
-const MAX_PROXY_REQUEST_BYTES: usize = 3 * 1024 * 1024;
+const MAX_PROXY_REQUEST_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PROXY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Failures from the local runtime manager service.
@@ -80,6 +82,12 @@ pub enum ServiceError {
     /// A submitted Vessel manifest was not valid YAML or violated the contract.
     #[error(transparent)]
     InvalidVesselManifest(#[from] ManifestError),
+    /// A complete compositional release could not be planned.
+    #[error(transparent)]
+    InvalidComposition(#[from] CompositionError),
+    /// The Verglas Worker registry rejected a compositional update.
+    #[error("Verglas Worker registry request failed: {0}")]
+    WorkerRegistry(String),
 }
 
 impl IntoResponse for ServiceError {
@@ -90,6 +98,7 @@ impl IntoResponse for ServiceError {
             ServiceError::IdentityMismatch { .. }
             | ServiceError::BootstrapTarget { .. }
             | ServiceError::InvalidVesselManifest(_)
+            | ServiceError::InvalidComposition(_)
             | ServiceError::Runtime(
                 RuntimeError::InvalidDeploymentId { .. }
                 | RuntimeError::MissingImage
@@ -107,6 +116,7 @@ impl IntoResponse for ServiceError {
             ServiceError::VesselRequest(_) | ServiceError::VesselResponseTooLarge => {
                 StatusCode::BAD_GATEWAY
             }
+            ServiceError::WorkerRegistry(_) => StatusCode::BAD_GATEWAY,
             ServiceError::NotApplication(_) | ServiceError::NotIntegration(_) => {
                 StatusCode::NOT_FOUND
             }
@@ -174,6 +184,11 @@ impl RuntimeService {
                 "/v1/vessels/{name}",
                 get(get_vessel).put(put_vessel).delete(delete_vessel),
             )
+            .route(
+                "/v1/vessels/{name}/composition",
+                put(put_vessel_composition),
+            )
+            .route("/v1/vessel-compositions", get(list_vessel_compositions))
             .route("/v1/vessels/{name}/project", put(put_vessel_project))
             .route("/v1/vessels/{name}/http/{*path}", any(proxy_vessel))
             .route(
@@ -230,6 +245,8 @@ struct DesiredState {
     containers: BTreeMap<String, DesiredDeployment>,
     #[serde(default)]
     vessels: BTreeMap<String, VesselSpec>,
+    #[serde(default)]
+    compositions: BTreeMap<String, AppliedVessel>,
 }
 
 struct ServiceState {
@@ -514,6 +531,318 @@ async fn put_vessel_project(
         image: build.image,
         outcome,
     }))
+}
+
+/// Public result of atomically applying one compositional Vessel release.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VesselCompositionView {
+    name: String,
+    version: String,
+    digest: String,
+    components: Vec<AppliedComponent>,
+    integrations: Vec<AppliedIntegration>,
+    interface_runtime: String,
+    preview_url: String,
+    outcome: CompositionOutcome,
+}
+
+/// Whether a compositional apply changed local desired state.
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CompositionOutcome {
+    Created,
+    Upgraded,
+    Unchanged,
+}
+
+/// Lists resolved compositional Vessel releases without configuration or credentials.
+async fn list_vessel_compositions(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VesselCompositionView>>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let vessels = state
+        .desired
+        .read()
+        .await
+        .compositions
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Json(
+        vessels
+            .into_iter()
+            .map(|vessel| composition_view(vessel, CompositionOutcome::Unchanged))
+            .collect(),
+    ))
+}
+
+/// Builds and atomically reconciles every component of one Vessel release.
+async fn put_vessel_composition(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<VesselApplyRequest>,
+) -> Result<Json<VesselCompositionView>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let plan = VesselApplyPlan::new(request)?;
+    if name != plan.manifest.name {
+        return Err(ServiceError::IdentityMismatch {
+            path: name,
+            body: plan.manifest.name,
+        });
+    }
+
+    let _operation = state.operation.lock().await;
+    let prior_state = state.desired.read().await.clone();
+    let previous = prior_state.compositions.get(&name).cloned();
+    if let Some(existing) = &previous
+        && existing.digest == plan.digest
+        && existing.runtime_digest == plan.runtime_digest()
+    {
+        return Ok(Json(composition_view(
+            existing.clone(),
+            CompositionOutcome::Unchanged,
+        )));
+    }
+
+    let endpoint = plan.data_endpoint.clone();
+    let token = plan.data_token.clone();
+    let workers_changed = previous
+        .as_ref()
+        .is_none_or(|existing| existing.workers != plan.workers);
+    let mut resolved_services = Vec::with_capacity(plan.services.len());
+    for project in &plan.services {
+        let build = state.runtime.build_project(project).await?;
+        resolved_services.push(project.vessel_spec(build.image));
+    }
+
+    if let Err(error) = reconcile_services(&state, &resolved_services).await {
+        rollback_services(&state, previous.as_ref(), &resolved_services).await;
+        return Err(error);
+    }
+    if workers_changed
+        && let Err(error) = register_workers(&endpoint, &token, &plan.workers).await
+    {
+        rollback_workers(&endpoint, &token, previous.as_ref(), &plan.workers).await;
+        rollback_services(&state, previous.as_ref(), &resolved_services).await;
+        return Err(error);
+    }
+
+    let applied = plan.applied(resolved_services.clone());
+    if let Some(old) = &previous {
+        let current_services = resolved_services
+            .iter()
+            .map(|service| service.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for service in &old.services {
+            if !current_services.contains(service.name.as_str())
+                && let Err(error) = state
+                    .runtime
+                    .remove(&format!("vessel-{}", service.name))
+                    .await
+            {
+                if workers_changed {
+                    rollback_workers(&endpoint, &token, previous.as_ref(), &applied.workers).await;
+                }
+                rollback_services(&state, previous.as_ref(), &resolved_services).await;
+                return Err(error.into());
+            }
+        }
+        let current_workers = applied
+            .workers
+            .iter()
+            .map(|worker| worker.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        for worker in &old.workers {
+            if !current_workers.contains(worker.name.as_str())
+                && let Err(error) =
+                    set_worker_state(&endpoint, &token, &worker.name, "archived").await
+            {
+                rollback_workers(&endpoint, &token, previous.as_ref(), &applied.workers).await;
+                rollback_services(&state, previous.as_ref(), &resolved_services).await;
+                return Err(error);
+            }
+        }
+    }
+
+    {
+        let mut desired = state.desired.write().await;
+        if let Some(old) = &previous {
+            for service in &old.services {
+                desired.vessels.remove(&service.name);
+            }
+        }
+        for service in &applied.services {
+            desired
+                .vessels
+                .insert(service.name.clone(), service.clone());
+        }
+        desired.compositions.insert(name, applied.clone());
+    }
+    if let Err(error) = state.persist().await {
+        *state.desired.write().await = prior_state;
+        if workers_changed {
+            rollback_workers(&endpoint, &token, previous.as_ref(), &applied.workers).await;
+        }
+        rollback_services(&state, previous.as_ref(), &resolved_services).await;
+        return Err(error);
+    }
+
+    let outcome = if previous.is_some() {
+        CompositionOutcome::Upgraded
+    } else {
+        CompositionOutcome::Created
+    };
+    Ok(Json(composition_view(applied, outcome)))
+}
+
+/// Reconciles all already-built long-lived components.
+async fn reconcile_services(
+    state: &ServiceState,
+    services: &[VesselSpec],
+) -> Result<(), ServiceError> {
+    for service in services {
+        state
+            .runtime
+            .reconcile(&state.normalize(service.container_spec()?))
+            .await?;
+    }
+    Ok(())
+}
+
+/// Restores the prior service set after a failed apply.
+async fn rollback_services(
+    state: &ServiceState,
+    previous: Option<&AppliedVessel>,
+    attempted: &[VesselSpec],
+) {
+    let old = previous
+        .map(|vessel| {
+            vessel
+                .services
+                .iter()
+                .map(|service| (service.name.as_str(), service))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for service in attempted {
+        if !old.contains_key(service.name.as_str()) {
+            let _ = state
+                .runtime
+                .remove(&format!("vessel-{}", service.name))
+                .await;
+        }
+    }
+    for service in old.values() {
+        if let Ok(specification) = service.container_spec() {
+            let _ = state
+                .runtime
+                .reconcile(&state.normalize(specification))
+                .await;
+        }
+    }
+}
+
+/// Appends all Worker revisions belonging to the new Vessel release.
+async fn register_workers(
+    endpoint: &str,
+    token: &str,
+    workers: &[WorkerRegistration],
+) -> Result<(), ServiceError> {
+    for worker in workers {
+        platform_request(endpoint, token, Method::POST, "/v1/workers", Some(worker)).await?;
+    }
+    Ok(())
+}
+
+/// Restores the prior Worker definitions or archives newly introduced names.
+async fn rollback_workers(
+    endpoint: &str,
+    token: &str,
+    previous: Option<&AppliedVessel>,
+    attempted: &[WorkerRegistration],
+) {
+    let old = previous
+        .map(|vessel| {
+            vessel
+                .workers
+                .iter()
+                .map(|worker| (worker.name.as_str(), worker))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for worker in attempted {
+        if !old.contains_key(worker.name.as_str()) {
+            let _ = set_worker_state(endpoint, token, &worker.name, "archived").await;
+        }
+    }
+    for worker in old.values() {
+        let _ = platform_request(endpoint, token, Method::POST, "/v1/workers", Some(*worker)).await;
+    }
+}
+
+/// Changes one Worker lifecycle state through the append-only registry.
+async fn set_worker_state(
+    endpoint: &str,
+    token: &str,
+    worker: &str,
+    state: &str,
+) -> Result<(), ServiceError> {
+    let path = format!("/v1/workers/{worker}/state");
+    platform_request(
+        endpoint,
+        token,
+        Method::PUT,
+        &path,
+        Some(&serde_json::json!({"state": state})),
+    )
+    .await
+}
+
+/// Sends one bounded JSON mutation to the local Verglas platform API.
+async fn platform_request<T: Serialize + ?Sized>(
+    endpoint: &str,
+    token: &str,
+    method: Method,
+    path: &str,
+    body: Option<&T>,
+) -> Result<(), ServiceError> {
+    let mut request = reqwest::Client::new()
+        .request(method, format!("{endpoint}{path}"))
+        .bearer_auth(token)
+        .timeout(Duration::from_secs(30));
+    if let Some(body) = body {
+        request = request.json(body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| ServiceError::WorkerRegistry(error.to_string()))?;
+    if response.status().is_success() {
+        return Ok(());
+    }
+    let status = response.status();
+    let detail = response.text().await.unwrap_or_default();
+    Err(ServiceError::WorkerRegistry(format!(
+        "HTTP {status} — {}",
+        detail.chars().take(1000).collect::<String>()
+    )))
+}
+
+/// Removes secret-bearing desired state from the public composition response.
+fn composition_view(vessel: AppliedVessel, outcome: CompositionOutcome) -> VesselCompositionView {
+    VesselCompositionView {
+        preview_url: format!("/apps/{}/", vessel.interface_runtime),
+        name: vessel.name,
+        version: vessel.version,
+        digest: vessel.digest,
+        components: vessel.components,
+        integrations: vessel.integrations,
+        interface_runtime: vessel.interface_runtime,
+        outcome,
+    }
 }
 
 /// Removes one desired Vessel and its owned container.

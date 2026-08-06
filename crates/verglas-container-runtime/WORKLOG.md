@@ -2,6 +2,10 @@
 
 - #63: Added an authenticated, read-only Vessel manifest validation endpoint backed by the shared
   compositional contract; invalid compositions cannot partially mutate local desired state.
+- #63: Added atomic compositional Vessel apply. The runtime builds independently versioned
+  Integration and Interface projects, registers version-owned Workers, carries Integration setup
+  schemas without credential values, rolls back failed reconciliation, and publishes one release
+  view with its local Application preview.
 
 - #61: Added bounded, content-addressed TypeScript Vessel project builds with declared npm
   dependencies, a platform-owned Bun Dockerfile, authenticated project deployment API, and

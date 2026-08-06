@@ -22,8 +22,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod composition;
 mod service;
 
+pub use composition::{
+    AppliedComponent, AppliedComponentKind, AppliedIntegration, AppliedVessel, CompositionError,
+    VesselApplyPlan, VesselApplyRequest, WorkerRegistration,
+};
 pub use service::{RuntimeService, ServiceError};
 
 /// Label marking a container as owned by the Verglas runtime.
@@ -145,7 +150,7 @@ impl VesselProjectSpec {
         })?)?;
 
         let dockerfile = typescript_dockerfile();
-        let files = materialize_project(&self.project.files)?;
+        let files = materialize_project(&self.project.files, self.role)?;
         let context = archive_project(&files, &dockerfile)?;
         let digest = hex::encode(Sha256::digest(&context));
         let image = format!("verglas/vessel-{}:sha256-{digest}", self.name);
@@ -173,6 +178,7 @@ impl VesselProjectSpec {
 /// Adds the platform SDK as an ordinary local package inside the standalone image.
 fn materialize_project(
     submitted: &BTreeMap<String, String>,
+    role: VesselRole,
 ) -> Result<BTreeMap<String, String>, RuntimeError> {
     let mut files = submitted.clone();
     let source = files
@@ -208,6 +214,22 @@ fn materialize_project(
             format!("vendor/verglas-sdk/src/{path}"),
             (*source).to_owned(),
         );
+    }
+    if role == VesselRole::Integration {
+        files.insert(
+            "vendor/verglas-integration-runtime/runtime.mjs".to_owned(),
+            include_str!("../../verglas-integration-runtime/runtime.mjs").to_owned(),
+        );
+        files.insert(
+            "vendor/verglas-integration-runtime/contract.mjs".to_owned(),
+            include_str!("../../verglas-integration-runtime/contract.mjs").to_owned(),
+        );
+        for (path, source) in TYPESCRIPT_SDK_FILES {
+            files.insert(
+                format!("vendor/verglas-integration-runtime/sdk/{path}"),
+                (*source).to_owned(),
+            );
+        }
     }
     Ok(files)
 }
