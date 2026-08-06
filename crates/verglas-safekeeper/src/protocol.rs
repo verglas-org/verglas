@@ -174,6 +174,12 @@ pub enum AcceptorMessage {
 /// A PostgreSQL simple-query command understood by the safekeeper listener.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SafekeeperCommand {
+    /// Initialize a newly-created timeline at the pageserver's base LSN before
+    /// the first compute connects. Mirrors Neon's timeline-create API.
+    TimelineCreate {
+        /// First valid WAL position for the timeline.
+        start_lsn: Lsn,
+    },
     /// Enter proposer/acceptor `COPY BOTH` mode.
     StartWalPush {
         /// Proposer/acceptor protocol revision.
@@ -302,6 +308,11 @@ pub fn serialize_acceptor(
 /// Parses the simple-query commands used by Neon compute and pageserver.
 pub fn parse_command(command: &str) -> Result<SafekeeperCommand, ProtocolError> {
     let command = command.trim();
+    if let Some(value) = command.strip_prefix("TIMELINE_CREATE ") {
+        return Ok(SafekeeperCommand::TimelineCreate {
+            start_lsn: parse_lsn(value.trim())?,
+        });
+    }
     if let Some(rest) = command.strip_prefix("START_WAL_PUSH") {
         return parse_start_wal_push(command, rest);
     }

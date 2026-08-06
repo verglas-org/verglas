@@ -189,6 +189,18 @@ where
                     let query = payload_cstr(&payload, "query")?;
                     let command = parse_command(query)?;
                     match command {
+                        SafekeeperCommand::TimelineCreate { start_lsn } => {
+                            let key = startup_key.clone().ok_or_else(|| {
+                                ServerError::Connection(
+                                    "TIMELINE_CREATE needs tenant_id and timeline_id startup options"
+                                        .to_owned(),
+                                )
+                            })?;
+                            let timeline = self.timeline(&key).await?;
+                            timeline.initialize_timeline(start_lsn).await?;
+                            write_command_complete(&mut stream, "TIMELINE_CREATE").await?;
+                            write_backend(&mut stream, b'Z', b"I").await?;
+                        }
                         SafekeeperCommand::StartWalPush {
                             protocol_version,
                             allow_timeline_creation: _,

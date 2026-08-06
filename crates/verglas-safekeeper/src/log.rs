@@ -125,6 +125,42 @@ where
         }
     }
 
+    /// Initializes an empty timeline at the base LSN created by the pageserver.
+    /// Neon normally supplies this through its safekeeper management API before
+    /// compute starts. Without it, walproposer sees `0/0`, attempts to fetch the
+    /// initdb WAL prefix from an empty donor, and can never finish bootstrap.
+    pub async fn initialize_timeline(&self, start_lsn: Lsn) -> Result<bool, AppendError> {
+        if start_lsn == Lsn(0) {
+            return Err(AppendError::Manifest(
+                "timeline start LSN must not be 0/0".to_owned(),
+            ));
+        }
+        let mut manifest = self.state.lock().await;
+        if manifest.tail != Lsn(0) {
+            if manifest.base == start_lsn {
+                return Ok(false);
+            }
+            return Err(AppendError::Manifest(format!(
+                "timeline already starts at {}, cannot initialize at {start_lsn}",
+                manifest.base,
+            )));
+        }
+        manifest.base = start_lsn;
+        manifest.tail = start_lsn;
+        manifest.flushed_through = start_lsn;
+        manifest.commit_lsn = start_lsn;
+        manifest.truncate_lsn = start_lsn;
+        manifest.epoch = Epoch(1);
+        manifest.term_history = vec![(1, start_lsn)];
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)?;
+        self.tail.store(start_lsn.0, Ordering::Relaxed);
+        self.flushed.store(start_lsn.0, Ordering::Relaxed);
+        self.epoch.store(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Stable object-id prefix for this timeline's replicated state records.
     fn state_prefix(&self) -> String {
         let mut digest = Sha256::new();

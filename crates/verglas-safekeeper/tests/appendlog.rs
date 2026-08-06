@@ -440,6 +440,33 @@ async fn first_append_preserves_the_postgres_start_lsn() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_initialization_publishes_the_pageserver_start_lsn() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport, membership, dir.path(), geom());
+    let start = Lsn(0x14F_13F0);
+
+    assert!(log.initialize_timeline(start).await.expect("initialize"));
+    assert!(!log.initialize_timeline(start).await.expect("idempotent"));
+    let state = log.safekeeper_state().await;
+    assert_eq!(state.flush_lsn, start);
+    assert_eq!(state.commit_lsn, start);
+    assert_eq!(state.truncate_lsn, start);
+    assert_eq!(state.term, 1);
+    assert_eq!(state.term_history, vec![(1, start)]);
+
+    let payload = bytes(4096);
+    let appended = log
+        .append(Epoch(1), start, payload.clone())
+        .await
+        .expect("append after initialization");
+    assert_eq!(appended.start, start);
+    assert_eq!(log.read(start, appended.end).await.expect("read"), payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exact_replay_is_idempotent_and_places_no_new_fragments() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
