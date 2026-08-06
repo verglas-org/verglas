@@ -25,6 +25,7 @@ members = [
     "crates/verglas-scheduler",
     "crates/verglas-microvm-contract",
     "crates/verglas-gadget-runtime",
+    "crates/verglas-container-runtime",
     "bins/cache-node",
     "crates/verglas-block",
     "crates/verglas-pgcdc",
@@ -70,6 +71,7 @@ verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-gadget-runtime = { path = "crates/verglas-gadget-runtime" }
+verglas-container-runtime = { path = "crates/verglas-container-runtime" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 # Client-side Iceberg read/write for the agent-facing CLI verbs (#287). The
@@ -154,6 +156,7 @@ reed-solomon-erasure = "6.0.0"
 # The `process` feature is off — node-level process stats come from node-exporter,
 # not this in-process registry (see verglas-core::metrics).
 prometheus = { version = "0.14.0", default-features = false }
+bollard = "0.21.0"
 
 [workspace.lints.clippy]
 # CI will run clippy with `-D warnings` (see `just lint`), turning these into errors.
