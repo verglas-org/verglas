@@ -1,10 +1,8 @@
 //! The query role's configuration: an admin listen port, log settings, the
 //! cache S3 endpoint this binary reads every table's data through, and the
-//! Iceberg REST catalog to query against.
+//! cache-owned Iceberg metadata endpoint to query against.
 //!
-//! Reuses `verglas_core::config::{Log, Catalog}` verbatim for `[log]` and
-//! `[catalog]` — the same shapes operators already know from `verglas-server`, so a
-//! fleet image renders one TOML dialect across every role. Everything else in
+//! Reuses `verglas_core::config::Log` for `[log]`. Everything else in
 //! that server-shaped schema (cache sizing, origin backend, cluster gossip)
 //! does not apply here and is deliberately not reused: this binary has none
 //! of those, and a config knob for a feature that does not exist is worse
@@ -20,7 +18,6 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use verglas_core::config::Catalog;
 pub use verglas_core::config::Log;
 
 /// Root of the query role's configuration. Unknown fields are rejected at
@@ -39,9 +36,9 @@ pub struct QueryConfig {
     /// The cache S3 endpoint every table read goes through, and the keypair
     /// to sign those requests with.
     pub cache: CacheEndpoint,
-    /// The Iceberg REST catalog to query against — the same `[catalog]` shape
-    /// `verglas-server`'s catalog watcher uses (bearer or SigV4 auth, warehouse id).
-    pub catalog: Catalog,
+    /// Cache-node catalog gateway. The cache owns upstream credentials, change
+    /// tracking, and response state; this worker receives none of them.
+    pub metadata: MetadataEndpoint,
 }
 
 /// Ports this binary listens on.
@@ -82,6 +79,14 @@ pub struct CacheEndpoint {
     pub credentials_profile: Option<String>,
 }
 
+/// The cache-node's local, prepared Iceberg REST metadata surface.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataEndpoint {
+    /// Base URI of the selected cache node's `/catalog` gateway.
+    pub uri: String,
+}
+
 impl QueryConfig {
     /// Reads, parses, and validates a config file — the one call `main` makes.
     pub fn load(path: &Path) -> Result<QueryConfig, String> {
@@ -101,12 +106,12 @@ impl QueryConfig {
     /// reads and queries against. Never includes credentials.
     pub fn summary(&self) -> String {
         format!(
-            "admin_port={} cache={} catalog={}",
-            self.listen.admin_port, self.cache.s3_endpoint, self.catalog.uri
+            "admin_port={} cache={} metadata={}",
+            self.listen.admin_port, self.cache.s3_endpoint, self.metadata.uri
         )
     }
 
-    /// Semantic checks: the cache endpoint and catalog URI are http(s) URLs, and
+    /// Semantic checks: the cache data and metadata endpoints are http(s) URLs, and
     /// a named credentials file exists as a readable regular file. Iceberg's own
     /// catalog-open call would surface most of the same problems, but failing
     /// here first turns a typo'd path or scheme into an actionable startup
@@ -123,10 +128,10 @@ impl QueryConfig {
                 self.cache.s3_endpoint
             ));
         }
-        if !self.catalog.uri.starts_with("http://") && !self.catalog.uri.starts_with("https://") {
+        if !self.metadata.uri.starts_with("http://") && !self.metadata.uri.starts_with("https://") {
             return Err(format!(
-                "catalog.uri `{}` must start with http:// or https://",
-                self.catalog.uri
+                "metadata.uri `{}` must start with http:// or https://",
+                self.metadata.uri
             ));
         }
         if let Some(file) = &self.cache.credentials_file
@@ -134,13 +139,6 @@ impl QueryConfig {
         {
             return Err(format!(
                 "cache.credentials_file `{file}` does not exist or is not a readable file"
-            ));
-        }
-        if let Some(file) = &self.catalog.credentials_file
-            && !Path::new(file).is_file()
-        {
-            return Err(format!(
-                "catalog.credentials_file `{file}` does not exist or is not a readable file"
             ));
         }
         Ok(())
@@ -162,14 +160,14 @@ mod tests {
             [cache]
             s3_endpoint = "http://127.0.0.1:8333"
 
-            [catalog]
+            [metadata]
             uri = "http://127.0.0.1:8334/catalog"
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         config.validate().expect("valid");
         assert_eq!(config.listen.admin_port, 9000);
         assert_eq!(config.cache.s3_endpoint, "http://127.0.0.1:8333");
-        assert_eq!(config.catalog.uri, "http://127.0.0.1:8334/catalog");
+        assert_eq!(config.metadata.uri, "http://127.0.0.1:8334/catalog");
     }
 
     /// With no `[listen]` at all, the port defaults to 8335 — one above the
@@ -180,7 +178,7 @@ mod tests {
             [cache]
             s3_endpoint = "http://127.0.0.1:8333"
 
-            [catalog]
+            [metadata]
             uri = "http://127.0.0.1:8334/catalog"
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
@@ -195,7 +193,7 @@ mod tests {
             [cache]
             s3_endpoint = "127.0.0.1:8333"
 
-            [catalog]
+            [metadata]
             uri = "http://127.0.0.1:8334/catalog"
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
@@ -212,7 +210,7 @@ mod tests {
             s3_endpoint = "http://127.0.0.1:8333"
             credentials_file = "/nonexistent/creds"
 
-            [catalog]
+            [metadata]
             uri = "http://127.0.0.1:8334/catalog"
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
@@ -230,6 +228,24 @@ mod tests {
 
             [catalog]
             uri = "http://127.0.0.1:8334/catalog"
+        "#;
+        assert!(QueryConfig::from_toml_str(toml).is_err());
+    }
+
+    /// Query workers receive no upstream Lakekeeper credentials or warehouse.
+    /// Their only metadata authority is the local cache-node gateway.
+    #[test]
+    fn rejects_direct_catalog_configuration() {
+        let toml = r#"
+            [cache]
+            s3_endpoint = "http://127.0.0.1:8333"
+
+            [metadata]
+            uri = "http://127.0.0.1:8334/catalog"
+
+            [catalog]
+            uri = "http://lakekeeper:8181/catalog"
+            bearer_token = "must-not-reach-query"
         "#;
         assert!(QueryConfig::from_toml_str(toml).is_err());
     }

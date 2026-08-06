@@ -280,6 +280,33 @@ pub async fn run(
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
 
+    // The cache node is the sole owner of upstream catalog credentials and
+    // change tracking. The gateway and watcher share one response cache: every
+    // successful poll/feed refresh prepares the exact Iceberg REST documents a
+    // local query worker subsequently consumes from `/catalog`.
+    let catalog_runtime = config
+        .catalog
+        .as_ref()
+        .map(|catalog| -> Result<_, Box<dyn std::error::Error>> {
+            use verglas_tables::catalog::{CatalogFeed, WatcherOptions, WsFeedConfig};
+
+            let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
+            let feed_uri =
+                std::env::var("VERGLAS_CATALOG_FEED_URI").unwrap_or_else(|_| catalog.uri.clone());
+            let feed_token = std::env::var("VERGLAS_CATALOG_FEED_TOKEN")
+                .ok()
+                .or(catalog.resolve_bearer_token()?);
+            let ws = if catalog.sigv4_enabled() {
+                None
+            } else {
+                WsFeedConfig::from_catalog_uri(&feed_uri, feed_token)
+            };
+            let watcher =
+                CatalogFeed::spawn(gateway.source(), WatcherOptions::from_config(catalog), ws);
+            Ok((gateway, watcher))
+        })
+        .transpose()?;
+
     // Bind the admin listener first so its port is owned before serving; it
     // answers `/admin/healthz` = starting/503 while the engine recovers below.
     let admin_addr = std::env::var("VERGLAS_ADMIN_ADDR")
@@ -358,6 +385,9 @@ pub async fn run(
     );
     if let Some((device_registry, _)) = &block_registry {
         admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
+    }
+    if let Some((gateway, _watcher)) = &catalog_runtime {
+        admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
     }
     let admin_fut = async move {
         axum::serve(admin_listener, admin_app)
@@ -502,6 +532,9 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
+    use axum::routing::get;
+    use std::sync::atomic::AtomicUsize;
     use verglas_core::admin::{HEALTHZ_PATH, METRICS_PATH, STATS_PATH};
 
     /// Background fills consume only their configured quarter-share and are
@@ -602,6 +635,45 @@ mod tests {
         health.mark_ready();
         let resp = reqwest::get(&health_url).await.expect("request");
         assert_eq!(resp.status().as_u16(), 200);
+    }
+
+    /// The cache node owns the upstream catalog response cache. Repeated query
+    /// workers loading the same snapshot use its local gateway without another
+    /// Lakekeeper request.
+    #[tokio::test]
+    async fn catalog_gateway_serves_repeated_metadata_from_cache() {
+        let upstream_hits = Arc::new(AtomicUsize::new(0));
+        let hits = upstream_hits.clone();
+        let upstream = serve_router(Router::new().route(
+            "/v1/config",
+            get(move || {
+                hits.fetch_add(1, Ordering::Relaxed);
+                async { axum::Json(serde_json::json!({})) }
+            }),
+        ))
+        .await;
+        let catalog = verglas_core::config::Catalog {
+            uri: format!("http://{upstream}"),
+            poll_interval_secs: 30,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            credentials_file: None,
+            credentials_profile: None,
+            bearer_token: None,
+            sigv4_region: None,
+            sigv4_signing_name: None,
+            warehouse: None,
+        };
+        let gateway = verglas_catalog::CatalogGateway::from_config(&catalog).expect("gateway");
+        let addr = serve_router(admin::catalog_router(gateway)).await;
+
+        for _ in 0..2 {
+            let response = reqwest::get(format!("http://{addr}/catalog/v1/config"))
+                .await
+                .expect("metadata request");
+            assert_eq!(response.status().as_u16(), 200);
+        }
+        assert_eq!(upstream_hits.load(Ordering::Relaxed), 1);
     }
 
     /// `/metrics` serves the Prometheus exposition with the

@@ -12,16 +12,25 @@
 //! - `GET /metrics` — the Prometheus exposition the metrics VM self-scrapes.
 //!
 //! Everything else verglas-server's admin router carries (purge, members, drain, the
-//! catalog/table/graph/vector/platform/recall verb families) is deliberately
-//! absent: the cache node runs no catalog, no cluster, and no jobs, so those
+//! table/graph/vector/platform/recall verb families) is deliberately absent:
+//! the cache node proxies prepared catalog reads but owns no catalog semantics,
 //! surfaces have nothing to answer. The `Health` gate and the deferred stats/
 //! metrics slots mirror verglas-server's serve-gating shape (origin: `bins/verglas-server/src/admin.rs`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use axum::extract::OriginalUri;
+use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::StatusCode,
+    routing::{any, get},
+};
+use bytes::Bytes;
+use verglas_catalog::CatalogGateway;
 
 use verglas_core::admin::{
     HEALTHZ_PATH, HealthzInfo, METRICS_PATH, STATS_PATH, StatsInfo, VERSION_PATH, VersionInfo,
@@ -139,4 +148,49 @@ pub fn router(
                 }
             }),
         )
+}
+
+/// Mounts the cache-owned Iceberg REST metadata gateway at `/catalog`.
+/// Successful GET responses are shared with the cache node's watcher; query
+/// workers therefore consume already-observed metadata without Lakekeeper
+/// credentials or an independent catalog cache.
+pub fn catalog_router(catalog: CatalogGateway) -> Router {
+    Router::new()
+        .route("/catalog/{*path}", any(catalog_request))
+        .with_state(catalog)
+}
+
+/// Forwards one local metadata request through the cache node's shared catalog
+/// gateway while preserving the upstream status, headers, and body.
+async fn catalog_request(
+    State(catalog): State<CatalogGateway>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(path_and_query) = uri.path_and_query().map(|value| value.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "catalog request has no path").into_response();
+    };
+    let Some(upstream_path) = path_and_query.strip_prefix("/catalog") else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "catalog request is outside its mount",
+        )
+            .into_response();
+    };
+    match catalog.request(method, upstream_path, headers, body).await {
+        Ok(result) => {
+            let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = Response::new(axum::body::Body::from(result.body));
+            *response.status_mut() = status;
+            *response.headers_mut() = result.headers;
+            response
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("catalog gateway error: {error}"),
+        )
+            .into_response(),
+    }
 }

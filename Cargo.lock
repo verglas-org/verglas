@@ -7259,10 +7259,12 @@ dependencies = [
  "verglas-backend",
  "verglas-block",
  "verglas-cache",
+ "verglas-catalog",
  "verglas-cluster",
  "verglas-core",
  "verglas-s3",
  "verglas-safekeeper",
+ "verglas-tables",
 ]
 
 [[package]]

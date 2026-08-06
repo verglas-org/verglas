@@ -1,11 +1,11 @@
 //! `verglas-cache-node` — the standalone Verglas cache serving server.
 //!
 //! One job: run the cache. It loads the same TOML subset the fleet cache image
-//! renders (`[listen] [log] [cache] [backend] [auth]`), verifies SigV4 against
+//! renders (`[listen] [log] [cache] [backend] [auth] [catalog]`), verifies SigV4 against
 //! the `[auth]` credentials file, serves the S3 endpoint from the local foyer
 //! cache tiers, and reads through / writes through to the origin bucket. There
-//! is no catalog, no cluster, no jobs framework, no query engine, and no
-//! platform executor — those live in `verglas-server`. This binary is the cloud
+//! owns a cached catalog gateway and watcher for local query workers, but no
+//! query engine, jobs framework, or platform executor. This binary is the cloud
 //! fleet's cache image (`fleet/images/Dockerfile.cache`), built small enough for
 //! a 256 MB VM.
 //!

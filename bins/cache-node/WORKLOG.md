@@ -51,3 +51,4 @@
   placements. Added a process-level test that launches three real cache-node
   binaries, pushes WAL through one ingress, observes the EC quorum ack, and
   reads the exact bytes back with physical replication.
+- #58: Added the cache-owned Iceberg REST gateway and catalog watcher used by local query workers. Watcher refreshes and query reads share the same bounded response cache, so ephemeral query processes never own upstream credentials or catalog state.

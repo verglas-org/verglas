@@ -42,7 +42,7 @@ fn resolve_keypair(
 
 /// Builds the [`Connection`] this instance queries through: the configured
 /// cache S3 endpoint (never a direct object-store path) and the configured
-/// Iceberg REST catalog. Public so the `estimate` CLI mode (`bin/main.rs`,
+/// cache-owned Iceberg metadata endpoint. Public so the `estimate` CLI mode (`bin/main.rs`,
 /// a separate crate from this library) can open the same connection without
 /// starting a server.
 pub fn connection_for(config: &QueryConfig) -> Result<Connection, String> {
@@ -53,14 +53,10 @@ pub fn connection_for(config: &QueryConfig) -> Result<Connection, String> {
         Some((id, secret)) => (Some(id), Some(secret)),
         None => (None, None),
     };
-    let token = config
-        .catalog
-        .resolve_bearer_token()
-        .map_err(|e| e.to_string())?;
     Ok(Connection {
-        catalog_uri: config.catalog.uri.clone(),
-        token,
-        warehouse: config.catalog.warehouse.clone(),
+        catalog_uri: config.metadata.uri.clone(),
+        token: None,
+        warehouse: None,
         s3_endpoint: Some(config.cache.s3_endpoint.clone()),
         region: config
             .cache

@@ -50,7 +50,7 @@ use crate::sizing;
 #[derive(Clone)]
 pub struct AppState {
     /// The Iceberg catalog, opened once at startup against the configured
-    /// `[catalog]` and reading data only through the configured
+    /// cache-owned `[metadata]` endpoint and reading data only through the configured
     /// `[cache].s3_endpoint`.
     pub catalog: Arc<dyn Catalog>,
     /// The grant host: local/no-op standalone, or a real enforcing host when

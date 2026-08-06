@@ -365,7 +365,7 @@ async fn binary_exits_cleanly_on_an_unreachable_catalog() {
     std::fs::write(
         &config_path,
         "[cache]\ns3_endpoint = \"http://127.0.0.1:1\"\n\n\
-         [catalog]\nuri = \"http://127.0.0.1:1\"\n",
+         [metadata]\nuri = \"http://127.0.0.1:1\"\n",
     )
     .expect("write config");
 

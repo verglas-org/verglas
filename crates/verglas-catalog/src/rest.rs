@@ -438,6 +438,18 @@ impl RestCatalogSource {
         url.strip_prefix(&self.base).unwrap_or(url).to_owned()
     }
 
+    /// Resolves a local gateway path into the upstream path owned by this cache.
+    /// Query workers deliberately omit warehouse configuration; the cache adds
+    /// it to config discovery so the request shares the watcher's prepared entry.
+    fn gateway_path(&self, path_and_query: &str) -> String {
+        if path_and_query == "/v1/config"
+            && let Some(warehouse) = &self.warehouse
+        {
+            return format!("/v1/config?warehouse={}", encode(warehouse));
+        }
+        path_and_query.to_owned()
+    }
+
     /// Sends one request to the configured upstream catalog, applying bearer or
     /// SigV4 authentication and buffering the small REST response body.
     async fn send_upstream(
@@ -520,13 +532,14 @@ impl RestCatalogSource {
                 detail: "catalog gateway path must start with '/'".to_owned(),
             });
         }
+        let resolved_path = self.gateway_path(path_and_query);
         if method == Method::GET
-            && let Some(response) = self.responses.read().await.get(path_and_query)
+            && let Some(response) = self.responses.read().await.get(&resolved_path)
         {
             return Ok(response);
         }
 
-        let url = format!("{}{}", self.base, path_and_query);
+        let url = format!("{}{}", self.base, resolved_path);
         let response = self
             .send_upstream(method.clone(), &url, headers, body)
             .await?;
@@ -535,7 +548,7 @@ impl RestCatalogSource {
                 self.responses
                     .write()
                     .await
-                    .insert(path_and_query.to_owned(), response.clone());
+                    .insert(resolved_path, response.clone());
             } else {
                 self.responses.write().await.clear();
             }
@@ -763,5 +776,22 @@ mod tests {
         assert!(cache.bytes <= 10);
         assert!(cache.entries.contains_key("/two"));
         assert!(!cache.entries.contains_key("/one"));
+    }
+
+    /// A local query worker does not know the upstream warehouse. The cache
+    /// gateway adds its owned warehouse to `/v1/config`, matching the response
+    /// the watcher already prepared.
+    #[test]
+    fn gateway_config_uses_the_cache_owned_warehouse() {
+        let source = RestCatalogSource::build(
+            "http://catalog".to_owned(),
+            None,
+            None,
+            Some("tenant-001".to_owned()),
+        );
+        assert_eq!(
+            source.gateway_path("/v1/config"),
+            "/v1/config?warehouse=tenant-001"
+        );
     }
 }
