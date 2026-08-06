@@ -66,10 +66,6 @@ pub enum Command {
     /// from the current snapshot; `add` builds one and `search` queries it.
     #[command(subcommand)]
     Index(IndexCommand),
-    /// Create and manage Rill dashboards over catalog-resolved Iceberg tables.
-    /// Available when the self-hosted Compose analytics profile is running.
-    #[command(subcommand)]
-    Dashboard(DashboardCommand),
     /// Cloud workers — scheduled or event-driven container executions on the
     /// Verglas cloud or a registered node. `list`/`get` read them;
     /// `create`/`update`/`delete` manage them from a spec file; `run` dispatches
@@ -137,37 +133,6 @@ pub struct KvKeyArgs {
     pub namespace: String,
     /// Key within the namespace.
     pub key: String,
-}
-
-/// `verglas dashboard` subcommands for the optional on-prem Rill integration.
-#[derive(Debug, Subcommand)]
-pub enum DashboardCommand {
-    /// Create or refresh an Explore dashboard for an Iceberg table.
-    Create(DashboardCreateArgs),
-    /// List dashboards managed by Verglas in the configured Rill project.
-    List,
-    /// Show one dashboard and its browser URL.
-    Show(DashboardNameArgs),
-    /// Delete the Rill resources owned by one Verglas dashboard.
-    Delete(DashboardNameArgs),
-}
-
-/// Arguments for `verglas dashboard create`.
-#[derive(Debug, Args)]
-pub struct DashboardCreateArgs {
-    /// Dotted Iceberg table identifier, such as `sales.orders`.
-    pub table: String,
-    /// Stable Rill resource name. Defaults to the table identifier with dots
-    /// replaced by underscores.
-    #[arg(long)]
-    pub name: Option<String>,
-}
-
-/// A dashboard referenced by its Rill resource name.
-#[derive(Debug, Args)]
-pub struct DashboardNameArgs {
-    /// Dashboard resource name returned by create or list.
-    pub name: String,
 }
 
 /// `verglas secrets` subcommands. Secrets are control-plane resources; every verb

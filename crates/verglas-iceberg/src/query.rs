@@ -19,6 +19,7 @@ use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion::scalar::ScalarValue;
 use futures::{StreamExt, TryStreamExt};
 use iceberg::{Catalog, TableIdent};
 use iceberg_datafusion::{IcebergCatalogProvider, IcebergStaticTableProvider};
@@ -26,6 +27,7 @@ use iceberg_datafusion::{IcebergCatalogProvider, IcebergStaticTableProvider};
 use crate::error::{AgentError, Result};
 use crate::ident::parse_table_ident;
 use crate::report::QueryReport;
+use verglas_api::query::QueryParameter;
 
 /// A time-travel request: pin `table` to the snapshot named by `reference` (a
 /// snapshot id or a timestamp) for the query.
@@ -76,14 +78,33 @@ pub async fn query_stream(
     sql: &str,
     at: Option<TimeTravel>,
 ) -> Result<QueryExecution> {
+    query_stream_with_params(catalog, sql, at, Vec::new()).await
+}
+
+/// Plans and streams a query after binding typed positional parameters.
+pub async fn query_stream_with_params(
+    catalog: Arc<dyn Catalog>,
+    sql: &str,
+    at: Option<TimeTravel>,
+    params: Vec<QueryParameter>,
+) -> Result<QueryExecution> {
     let ctx = match at {
         Some(travel) => time_travel_context(catalog, travel).await?,
         None => catalog_context(catalog).await?,
     };
 
+    let sql = number_positional_placeholders(sql, params.len())?;
     let dataframe = ctx
-        .sql(sql)
+        .sql(&sql)
         .await
+        .map_err(|error| AgentError::Query(error.to_string()))?;
+    let dataframe = dataframe
+        .with_param_values(
+            params
+                .into_iter()
+                .map(parameter_scalar)
+                .collect::<Result<Vec<_>>>()?,
+        )
         .map_err(|error| AgentError::Query(error.to_string()))?;
     let columns = dataframe
         .schema()
@@ -111,7 +132,17 @@ pub async fn query(
     sql: &str,
     at: Option<TimeTravel>,
 ) -> Result<QueryReport> {
-    let execution = query_stream(catalog, sql, at).await?;
+    query_with_params(catalog, sql, at, Vec::new()).await
+}
+
+/// Runs a query with typed positional parameters and buffers its JSON report.
+pub async fn query_with_params(
+    catalog: Arc<dyn Catalog>,
+    sql: &str,
+    at: Option<TimeTravel>,
+    params: Vec<QueryParameter>,
+) -> Result<QueryReport> {
+    let execution = query_stream_with_params(catalog, sql, at, params).await?;
     let columns = execution.columns;
     let batches = execution
         .batches
@@ -141,10 +172,137 @@ pub(crate) async fn catalog_context(catalog: Arc<dyn Catalog>) -> Result<Session
         .await
         .map_err(AgentError::Iceberg)?;
     let provider = CaseInsensitiveCatalogProvider::new(Arc::new(provider));
-    let config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
+    let config = SessionConfig::new()
+        .with_default_catalog_and_schema(CATALOG_NAME, "default")
+        .with_information_schema(true);
     let ctx = SessionContext::new_with_config(config);
     ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
     Ok(ctx)
+}
+
+/// Converts one wire parameter into the scalar DataFusion binds to `$N`.
+fn parameter_scalar(param: QueryParameter) -> Result<ScalarValue> {
+    match param {
+        QueryParameter::Null => Ok(ScalarValue::Null),
+        QueryParameter::Boolean(value) => Ok(ScalarValue::Boolean(Some(value))),
+        QueryParameter::Int64(value) => Ok(ScalarValue::Int64(Some(value))),
+        QueryParameter::Uint64(value) => Ok(ScalarValue::UInt64(Some(value))),
+        QueryParameter::Float64(value) => Ok(ScalarValue::Float64(Some(value))),
+        QueryParameter::String(value) => Ok(ScalarValue::Utf8(Some(value))),
+        QueryParameter::Timestamp(value) => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(&value).map_err(|error| {
+                AgentError::Query(format!(
+                    "invalid timestamp query parameter `{value}`: {error}"
+                ))
+            })?;
+            Ok(ScalarValue::TimestampMicrosecond(
+                Some(parsed.timestamp_micros()),
+                Some("UTC".into()),
+            ))
+        }
+        QueryParameter::Date(value) => {
+            let parsed =
+                chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d").map_err(|error| {
+                    AgentError::Query(format!("invalid date query parameter `{value}`: {error}"))
+                })?;
+            let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1)
+                .ok_or_else(|| AgentError::Query("could not construct Unix epoch".to_owned()))?;
+            let days = parsed.signed_duration_since(epoch).num_days();
+            let days = i32::try_from(days).map_err(|_| {
+                AgentError::Query(format!("date query parameter is out of range: {value}"))
+            })?;
+            Ok(ScalarValue::Date32(Some(days)))
+        }
+    }
+}
+
+/// Rewrites Rill's `?` placeholders to DataFusion's `$N` form without touching
+/// quoted strings, quoted identifiers, or SQL comments.
+fn number_positional_placeholders(sql: &str, expected: usize) -> Result<String> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum State {
+        Plain,
+        SingleQuote,
+        DoubleQuote,
+        LineComment,
+        BlockComment,
+    }
+
+    let bytes = sql.as_bytes();
+    let mut output = String::with_capacity(sql.len() + expected * 2);
+    let mut state = State::Plain;
+    let mut index = 0;
+    let mut count = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        let next = bytes.get(index + 1).copied();
+        match state {
+            State::Plain if byte == b'\'' => state = State::SingleQuote,
+            State::Plain if byte == b'"' => state = State::DoubleQuote,
+            State::Plain if byte == b'-' && next == Some(b'-') => state = State::LineComment,
+            State::Plain if byte == b'/' && next == Some(b'*') => state = State::BlockComment,
+            State::Plain if byte == b'?' => {
+                count += 1;
+                output.push('$');
+                output.push_str(&count.to_string());
+                index += 1;
+                continue;
+            }
+            State::SingleQuote if byte == b'\'' && next == Some(b'\'') => {
+                output.push_str("''");
+                index += 2;
+                continue;
+            }
+            State::SingleQuote if byte == b'\'' => state = State::Plain,
+            State::DoubleQuote if byte == b'"' && next == Some(b'"') => {
+                output.push_str("\"\"");
+                index += 2;
+                continue;
+            }
+            State::DoubleQuote if byte == b'"' => state = State::Plain,
+            State::LineComment if byte == b'\n' => state = State::Plain,
+            State::BlockComment if byte == b'*' && next == Some(b'/') => {
+                output.push_str("*/");
+                index += 2;
+                state = State::Plain;
+                continue;
+            }
+            _ => {}
+        }
+        if byte.is_ascii() {
+            output.push(char::from(byte));
+            index += 1;
+        } else {
+            let character = sql[index..].chars().next().ok_or_else(|| {
+                AgentError::Query("query ended inside a UTF-8 character".to_owned())
+            })?;
+            output.push(character);
+            index += character.len_utf8();
+        }
+    }
+    if count != expected {
+        return Err(AgentError::Query(format!(
+            "query has {count} positional placeholders but received {expected} parameters"
+        )));
+    }
+    Ok(output)
+}
+
+#[cfg(test)]
+mod parameter_tests {
+    use super::number_positional_placeholders;
+
+    /// Placeholder numbering ignores question marks inside quoted SQL and
+    /// comments instead of treating them as values to bind.
+    #[test]
+    fn numbers_only_plain_sql_placeholders() {
+        let sql = "SELECT 'café?', \"?\" FROM t WHERE a = ? -- ?\nAND b = ? /* ? */";
+        let numbered = number_positional_placeholders(sql, 2).expect("number placeholders");
+        assert_eq!(
+            numbered,
+            "SELECT 'café?', \"?\" FROM t WHERE a = $1 -- ?\nAND b = $2 /* ? */"
+        );
+    }
 }
 
 /// A [`CatalogProvider`] that resolves schema and table names case-insensitively

@@ -37,8 +37,8 @@ use axum::{Json, Router};
 use bytes::Bytes;
 use futures::StreamExt;
 use iceberg::Catalog;
-use serde::Deserialize;
 use tokio::sync::Mutex;
+use verglas_api::query::QueryRequest;
 use verglas_iceberg::AgentError;
 use verglas_sdk::grant::{MemoryGrant, MemoryGrantHost};
 
@@ -89,33 +89,12 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// The body of `POST /v1/query` and `POST /v1/query/estimate`: identical to
-/// `verglas-server`'s embedded `/v1/query` request shape.
-#[derive(Debug, Deserialize)]
-struct QueryRequest {
-    /// The SQL to run (or, for `/estimate`, to plan without running).
-    sql: String,
-    /// Optional time travel: pins `table` to snapshot-id-or-timestamp
-    /// `reference`.
-    at: Option<QueryAt>,
-}
-
-/// The time-travel pin of a [`QueryRequest`].
-#[derive(Debug, Deserialize)]
-struct QueryAt {
-    /// A snapshot id or an RFC 3339 timestamp.
-    reference: String,
-    /// The table to pin.
-    table: String,
-}
-
-impl QueryRequest {
-    fn time_travel(&self) -> Option<verglas_iceberg::TimeTravel> {
-        self.at.as_ref().map(|at| verglas_iceberg::TimeTravel {
-            reference: at.reference.clone(),
-            table: at.table.clone(),
-        })
-    }
+/// Converts the wire time-travel selection to the engine request.
+fn time_travel(request: &QueryRequest) -> Option<verglas_iceberg::TimeTravel> {
+    request.at.as_ref().map(|at| verglas_iceberg::TimeTravel {
+        reference: at.reference.clone(),
+        table: at.table.clone(),
+    })
 }
 
 /// `POST /v1/query`: streams SQL results as `{columns, rows, row_count}`, one
@@ -140,7 +119,7 @@ async fn query_sql(
     Json(request): Json<QueryRequest>,
 ) -> Response {
     state.touch();
-    let at = request.time_travel();
+    let at = time_travel(&request);
 
     if let Ok(estimate) =
         verglas_iceberg::estimate(state.catalog.clone(), &request.sql, at.clone()).await
@@ -154,11 +133,17 @@ async fn query_sql(
         .await;
     }
 
-    let execution =
-        match verglas_iceberg::query_stream(state.catalog.clone(), &request.sql, at).await {
-            Ok(v) => v,
-            Err(error) => return query_error(error),
-        };
+    let execution = match verglas_iceberg::query_stream_with_params(
+        state.catalog.clone(),
+        &request.sql,
+        at,
+        request.args,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(error) => return query_error(error),
+    };
 
     if accepts_arrow(&headers) {
         return arrow_query_response(execution);
@@ -309,7 +294,7 @@ async fn query_estimate(
     Json(request): Json<QueryRequest>,
 ) -> Response {
     state.touch();
-    let at = request.time_travel();
+    let at = time_travel(&request);
     match verglas_iceberg::estimate(state.catalog.clone(), &request.sql, at).await {
         Ok(estimate) => Json(estimate).into_response(),
         Err(error) => query_error(error),

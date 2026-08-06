@@ -9,3 +9,4 @@
   Iceberg implementation.
 - #91: Updated API ownership documentation to call the foreground process the
   server. Wire behavior is unchanged by the executable rename.
+- #42: Added one typed SQL request contract for positional values and optional time travel. Rill and other live query clients can bind values without interpolating SQL text.

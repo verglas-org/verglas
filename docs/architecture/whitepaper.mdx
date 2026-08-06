@@ -140,14 +140,13 @@ Lakehouse deployments serve heterogeneous consumers, and for many of them the la
 **Interactive analytics.** Dashboards and user-facing analytics require low query latency over recent data. Real-time OLAP systems meet this requirement by continuously ingesting source data into indexed, column-oriented storage designed for high query concurrency. Pinot, for example, combines near-real-time stream ingestion with tens of thousands of analytical queries per second [5]. Freshness therefore depends on the progress and correctness of a separate ingestion path.
 
 The on-prem composition may attach Rill Developer as an optional analytics
-service. `verglas-rest` resolves a selected table through the configured Iceberg
-catalog, then manages the corresponding Rill model, metrics view, and Explore
-resource through Rill's runtime API. Rill currently discovers Iceberg through a
-direct metadata location rather than an Iceberg REST catalog, so Verglas supplies
-the catalog-resolved current metadata file and an S3 connector pointed back at the Verglas
-S3 endpoint. Rill remains the owner of its project and query engine; Verglas
-remains the catalog-aware cache path. No Rill project filesystem is mounted by
-Verglas, and no dashboard registry is stored in customer tables.
+service. Rill owns its project, metrics views, and dashboards, but uses Verglas
+as a live OLAP query integration. Each interactive request sends parameterized
+SQL to the Verglas query role and receives an Arrow stream. Verglas resolves
+the catalog's current Iceberg state for that execution, so no copied model,
+pinned metadata snapshot, refresh lifecycle, or dashboard registry exists.
+This preserves the boundary: Rill presents and defines analytics resources;
+Verglas is the catalog-aware cache and execution engine.
 
 **Online serving and feature stores.** Applications and ML inference require low-latency retrieval by entity key. Feature-store architectures address this by retaining historical features in an offline store and materializing their latest values into a separate online store. Scheduled or streaming materialization keeps the two stores eventually consistent; failed or partial updates can produce training-serving skew [6].
 

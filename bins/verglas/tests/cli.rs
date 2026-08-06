@@ -16,7 +16,7 @@ use std::process::Command;
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// cloud `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 14] = [
+const SURVIVING_COMMANDS: [&str; 13] = [
     "drain",
     "status",
     "table",
@@ -24,7 +24,6 @@ const SURVIVING_COMMANDS: [&str; 14] = [
     "query",
     "login",
     "index",
-    "dashboard",
     "workers",
     "containers",
     "db",
@@ -34,7 +33,7 @@ const SURVIVING_COMMANDS: [&str; 14] = [
 ];
 
 /// Commands removed from the CLI: `--help` must not name them.
-const REMOVED_COMMANDS: [&str; 22] = [
+const REMOVED_COMMANDS: [&str; 23] = [
     "version",
     "analyze",
     "deploy",
@@ -56,6 +55,7 @@ const REMOVED_COMMANDS: [&str; 22] = [
     "restart",
     "logs",
     "dev",
+    "dashboard",
     // `tables` (plural) duplicated `table`; its unique verbs moved under
     // `table` (metrics) and `index`. Only `table` (singular) remains.
     "tables",
@@ -92,20 +92,16 @@ fn short_version_flag_prints_cli_version() {
 }
 
 #[test]
-fn dashboard_help_uses_the_compose_configuration_surface() {
+fn dashboard_is_an_unknown_command() {
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .args(["dashboard", "--help"])
         .output()
         .expect("binary runs");
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8(out.stderr).expect("utf8");
     assert!(
-        stdout.contains("Compose analytics profile"),
-        "dashboard help must point self-hosted users at Compose: {stdout}"
-    );
-    assert!(
-        !stdout.contains("[analytics.rill]"),
-        "dashboard help must not advertise removed server TOML: {stdout}"
+        stderr.contains("unrecognized subcommand 'dashboard'"),
+        "{stderr}"
     );
 }
 

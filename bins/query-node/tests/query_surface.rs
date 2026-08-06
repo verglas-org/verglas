@@ -156,6 +156,91 @@ async fn query_runs_sql_over_http() {
     assert_eq!(report.rows[0].get("n").and_then(|v| v.as_i64()), Some(25));
 }
 
+/// Rill's live connector can bind values and discover tables through the same
+/// HTTP execution surface; neither operation uses dashboard state.
+#[tokio::test]
+async fn rill_query_contract_binds_values_and_exposes_information_schema() {
+    let ident = parse_table_ident("sales.orders").expect("ident");
+    let catalog = catalog_with_table(&ident, 25).await;
+    let (base, state) = serve(catalog, 1).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base}/v1/query"))
+        .json(&serde_json::json!({
+            "sql": "SELECT table_name FROM information_schema.tables WHERE table_schema = ? AND table_name = ?",
+            "args": [
+                {"type": "string", "value": "sales"},
+                {"type": "string", "value": "orders"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("request");
+    assert!(
+        response.status().is_success(),
+        "status: {}",
+        response.status()
+    );
+    let report: QueryReport = response.json().await.expect("report json");
+    assert_eq!(report.row_count, 1, "rows: {:?}", report.rows);
+    assert_eq!(
+        report.rows[0]
+            .get("table_name")
+            .and_then(|value| value.as_str()),
+        Some("orders")
+    );
+    assert!(
+        state.grant.lock().await.bytes > 1,
+        "a parameterized query must be planned before it executes so its grant can grow"
+    );
+}
+
+/// A Rill process can stay running while later Iceberg commits become visible
+/// to its next Verglas query; no dashboard or model refresh participates.
+#[tokio::test]
+async fn live_query_resolves_a_commit_made_after_rill_started() {
+    let ident = parse_table_ident("sales.orders").expect("ident");
+    let catalog = catalog_with_table(&ident, 25).await;
+    let (base, _state) = serve(catalog.clone(), 64 * 1024 * 1024).await;
+    let client = reqwest::Client::new();
+
+    let first: QueryReport = client
+        .post(format!("{base}/v1/query"))
+        .json(&serde_json::json!({"sql": "SELECT COUNT(*) AS n FROM sales.orders"}))
+        .send()
+        .await
+        .expect("first query")
+        .json()
+        .await
+        .expect("first report");
+    assert_eq!(
+        first.rows[0].get("n").and_then(|value| value.as_i64()),
+        Some(25)
+    );
+
+    let source = tempfile::tempdir().expect("append source");
+    let path = source.path().join("new.csv");
+    std::fs::write(&path, "id,amount,customer,note\n25,25.00,customer-25,new\n")
+        .expect("write append source");
+    write::append(catalog.as_ref(), &ident, &path)
+        .await
+        .expect("append commit");
+
+    let second: QueryReport = client
+        .post(format!("{base}/v1/query"))
+        .json(&serde_json::json!({"sql": "SELECT COUNT(*) AS n FROM sales.orders"}))
+        .send()
+        .await
+        .expect("second query")
+        .json()
+        .await
+        .expect("second report");
+    assert_eq!(
+        second.rows[0].get("n").and_then(|value| value.as_i64()),
+        Some(26)
+    );
+}
+
 /// Arrow clients receive a bounded IPC stream directly from the query role.
 #[tokio::test]
 async fn query_streams_arrow_ipc_when_requested() {

@@ -61,15 +61,16 @@ fn docker_application_packages_execution_workers() {
         "VERGLAS_S3_SECRET_ACCESS_KEY",
         "VERGLAS_QUERY_WORKER_BINARY",
         "VERGLAS_WRITE_WORKER_BINARY",
-        "VERGLAS_RILL_URI",
-        "VERGLAS_RILL_BROWSER_URI",
-        "VERGLAS_RILL_S3_URI",
     ] {
         assert!(
             compose.contains(variable),
             "Compose must declare {variable}"
         );
     }
+    assert!(
+        !compose.contains("VERGLAS_RILL_"),
+        "Rill must connect to Verglas; the server must not manage Rill"
+    );
 }
 
 /// #19: the self-hosted container must fail inside its own resource boundary

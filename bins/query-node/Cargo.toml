@@ -23,6 +23,7 @@ path = "src/main.rs"
 # for its `[log]`/`[catalog]` config shapes, the same ones verglas-server's schema
 # uses, so a fleet image renders one familiar TOML dialect for every role.
 verglas-core.workspace = true
+verglas-api.workspace = true
 verglas-iceberg.workspace = true
 verglas-sdk.workspace = true
 # `iceberg::Catalog` is the trait object type this binary's app state and

@@ -41,9 +41,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Index(command) => {
             commands::table::run_index_registry(command, &cli.endpoint, cli.json).await
         }
-        Command::Dashboard(command) => {
-            commands::dashboard::run(command, &cli.endpoint, cli.json).await
-        }
         Command::Workers(command) => {
             commands::cloud::run_workers(command, &cli.endpoint, cli.json).await
         }

@@ -126,3 +126,4 @@
 - #91: Updated engine integration and test documentation for the renamed
   `verglas-server` process. The engine continues to connect directly to the
   customer's catalog and use the server only as its S3 endpoint.
+- #42: Enabled DataFusion information-schema discovery and typed positional parameter binding for live OLAP clients. Each execution still constructs its table providers from the catalog's current Iceberg state.

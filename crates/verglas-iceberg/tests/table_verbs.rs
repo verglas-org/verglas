@@ -16,8 +16,10 @@ use std::sync::Arc;
 use futures::StreamExt;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::{Catalog, CatalogBuilder};
+use verglas_api::query::QueryParameter;
 use verglas_iceberg::{
-    TimeTravel, batch_to_json_rows_fragment, inspect, parse_table_ident, query, query_stream, write,
+    TimeTravel, batch_to_json_rows_fragment, inspect, parse_table_ident, query, query_stream,
+    query_with_params, write,
 };
 
 /// Builds an in-process memory catalog over a fresh temp warehouse path.
@@ -164,6 +166,77 @@ async fn parquet_create_and_query() {
         .expect("query");
     assert_eq!(report.row_count, 1);
     assert_eq!(report.rows[0]["n"], serde_json::json!(3));
+}
+
+/// Acceptance for #42: Rill's live OLAP connector can discover namespaces,
+/// tables, and columns through the same query engine it uses for dashboard SQL.
+#[tokio::test]
+async fn information_schema_exposes_current_catalog_tables() {
+    let catalog = memory_catalog().await;
+    let ident = parse_table_ident("analytics.events").expect("ident");
+    write::create_table(
+        catalog.as_ref(),
+        &ident,
+        &source_file("events.csv", "id,name\n1,alpha\n"),
+        None,
+    )
+    .await
+    .expect("create");
+
+    let tables = query::query(
+        catalog.clone(),
+        "SELECT table_schema, table_name FROM information_schema.tables \
+         WHERE table_schema = 'analytics' AND table_name = 'events'",
+        None,
+    )
+    .await
+    .expect("information schema table query");
+    assert_eq!(tables.row_count, 1);
+    assert_eq!(tables.rows[0]["table_schema"], "analytics");
+    assert_eq!(tables.rows[0]["table_name"], "events");
+
+    let columns = query::query(
+        catalog,
+        "SELECT column_name FROM information_schema.columns \
+         WHERE table_schema = 'analytics' AND table_name = 'events' \
+         ORDER BY ordinal_position",
+        None,
+    )
+    .await
+    .expect("information schema column query");
+    assert_eq!(columns.row_count, 2);
+    assert_eq!(columns.rows[0]["column_name"], "id");
+    assert_eq!(columns.rows[1]["column_name"], "name");
+}
+
+/// Acceptance for #42: Rill's positional `?` arguments are bound by the
+/// query engine rather than interpolated into SQL by the connector.
+#[tokio::test]
+async fn query_binds_typed_positional_parameters() {
+    let catalog = memory_catalog().await;
+    let ident = parse_table_ident("analytics.values").expect("ident");
+    write::create_table(
+        catalog.as_ref(),
+        &ident,
+        &source_file("values.csv", "id,name\n1,alpha\n2,beta\n"),
+        None,
+    )
+    .await
+    .expect("create");
+
+    let report = query_with_params(
+        catalog,
+        "SELECT name FROM analytics.values WHERE id > ? AND name <> ? ORDER BY id",
+        None,
+        vec![
+            QueryParameter::Int64(1),
+            QueryParameter::String("other".to_owned()),
+        ],
+    )
+    .await
+    .expect("parameterized query");
+    assert_eq!(report.row_count, 1);
+    assert_eq!(report.rows[0]["name"], "beta");
 }
 
 /// Acceptance: an unquoted table reference resolves case-insensitively, so a

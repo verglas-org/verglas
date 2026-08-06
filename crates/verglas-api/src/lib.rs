@@ -5,6 +5,7 @@
 //! `verglas-sdk` and `verglas-iceberg` can depend on the same contract without
 //! either architectural layer depending on the other.
 
+pub mod query;
 pub mod report;
 pub mod table;
 

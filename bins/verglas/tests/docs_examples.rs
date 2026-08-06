@@ -58,8 +58,9 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "verglas-server:",
         "postgres:",
         "verglas-scheduler:",
-        "rill-volume-init:",
         "rill:",
+        "dockerfile: integrations/rill/Dockerfile",
+        "./deploy/rill:/var/lib/rill",
         "VERGLAS_BACKEND_BUCKET:",
         "VERGLAS_BACKEND_ENDPOINT:",
         "VERGLAS_CATALOG_URI:",
@@ -76,7 +77,6 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "profiles: [analytics]",
         "verglas-cache:",
         "postgres-data:",
-        "rill-data:",
     ] {
         assert!(
             compose.contains(required),
@@ -86,6 +86,10 @@ fn self_hosted_compose_is_complete_and_runnable() {
     assert!(
         !compose.contains("config.toml"),
         "the server must be configured entirely by Compose"
+    );
+    assert!(
+        !compose.contains("VERGLAS_RILL_") && !compose.contains("rill-volume-init:"),
+        "Rill must own its project and connect to Verglas as an OLAP store"
     );
 }
 

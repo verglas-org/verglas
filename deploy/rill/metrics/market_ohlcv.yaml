@@ -1,0 +1,19 @@
+version: 1
+type: metrics_view
+display_name: Market OHLCV
+table: ohlcv
+database_schema: market
+timeseries: timestamp
+
+dimensions:
+  - name: symbol
+    display_name: Symbol
+    column: symbol
+
+measures:
+  - name: record_count
+    display_name: Record count
+    expression: COUNT(*)
+  - name: total_volume
+    display_name: Total volume
+    expression: SUM(volume)

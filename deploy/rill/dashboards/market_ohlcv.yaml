@@ -1,0 +1,5 @@
+type: explore
+title: Market OHLCV
+metrics_view: market_ohlcv
+dimensions: "*"
+measures: "*"

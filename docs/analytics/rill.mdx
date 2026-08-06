@@ -1,98 +1,50 @@
 ---
 title: "Rill dashboards"
-description: "Start Rill and create an Explore dashboard from an Iceberg table."
+description: "Run a Rill Explore dashboard against the live Verglas query engine."
 ---
 
-Use the Rill integration when you want an interactive dashboard over a table
-that already lives in your Iceberg catalog. Verglas discovers the table through
-the catalog and configures Rill to read its metadata and data files through the
-Verglas S3 endpoint. Those reads use the same DRAM and NVMe cache as every other
-Iceberg client.
-
-This feature is on-prem only. It does not turn Verglas into an analytics engine,
-and Rill does not become an Iceberg catalog.
+The Analytics profile runs Rill with the Verglas OLAP connector. Rill owns the
+project, metrics views, and dashboards. Each dashboard request sends SQL to
+`POST /v1/query`; Verglas resolves the current Iceberg table state and returns
+an Arrow stream. There is no copied model, pinned metadata snapshot, or refresh
+command.
 
 ## Start the analytics service
 
-The Compose application already connects Verglas to Rill over the private
-Docker network. Start the Analytics profile:
+The repository includes a Rill project under `deploy/rill`. Start it with the
+rest of the self-hosted application:
 
 ```bash
-docker compose --profile analytics up --detach
+docker compose --profile analytics up --detach --build
 ```
 
-Compose defines three distinct addresses:
+Open [http://127.0.0.1:9009](http://127.0.0.1:9009). The supplied
+`market_ohlcv` Explore uses the live `market.ohlcv` table.
 
-- `uri` is the private address Verglas uses to manage the Rill project.
-- `s3_uri` is the private address Rill uses to read through Verglas.
-- `browser_uri` is the address printed for you to open.
+## Define dashboards in Rill
 
-Rill stores its project in the `rill-data` Docker volume. Verglas does not mount
-or edit that volume. It uses Rill's runtime API over the Compose network.
+Rill resources are ordinary project files. The connector is
+`deploy/rill/connectors/verglas.yaml`:
 
-## Create the market-data dashboard
-
-Complete [Create your first table](/docs/get-started/first-table), which writes
-SPY example rows to `market.ohlcv`. Create a dashboard from that table:
-
-```bash
-verglas dashboard create market.ohlcv
+```yaml
+type: connector
+driver: verglas
+endpoint: http://verglas-server:8334
 ```
 
-The command prints the generated resource name, source table, and Rill URL:
+Metrics views and Explore dashboards live under `deploy/rill/metrics` and
+`deploy/rill/dashboards`. Add or edit them with Rill's normal project workflow;
+Verglas does not create, list, show, delete, or persist dashboard resources.
 
-```text
-dashboard: market_ohlcv
-table:     market.ohlcv
-url:       http://127.0.0.1:9009/explore/market_ohlcv
-```
+## Query behavior
 
-Open the URL. The initial Explore dashboard includes every primitive column as
-a dimension, a row-count measure, sum measures for numeric columns, and the
-first date or timestamp column as its time series.
+The connector implements Rill's live `OLAPStore` interface. It discovers
+tables and columns through Verglas `information_schema`, sends parameterized
+DuckDB-dialect SQL to the query API, and decodes Arrow IPC results directly.
+Every query creates a new Verglas execution against the catalog's current
+Iceberg snapshot, so a committed backtest is visible without rebuilding a Rill
+model.
 
-Creating the same dashboard again refreshes the generated resources. Verglas
-checks its ownership marker before every update and refuses to overwrite a Rill
-resource that you created yourself.
-
-## Manage dashboards
-
-List all dashboards managed by Verglas:
-
-```bash
-verglas dashboard list
-```
-
-Show one dashboard:
-
-```bash
-verglas dashboard show market_ohlcv
-```
-
-Delete its model, metrics view, and Explore resource:
-
-```bash
-verglas dashboard delete market_ohlcv
-```
-
-Deleting a dashboard does not modify the Iceberg table or delete the shared
-Rill S3 connector.
-
-## What Verglas creates
-
-For `market.ohlcv`, Verglas writes these resources through Rill's API:
-
-```text
-connectors/verglas.yaml
-models/market_ohlcv.yaml
-metrics/market_ohlcv.yaml
-dashboards/market_ohlcv.yaml
-```
-
-The model calls DuckDB's `iceberg_scan` with the exact current metadata file
-returned by the Iceberg catalog. This avoids unsafe object-list guessing;
-running `dashboard create` again refreshes the model to the catalog's current
-metadata file. Rill materializes the model while its scoped S3 credentials are
-active, so the dashboard remains queryable without keeping credentials in a
-DuckDB view. Its `verglas` S3 connector points at `s3_uri`, so each refresh's
-metadata, manifest, Parquet, and Puffin reads stay on the Verglas cache path.
+Verglas remains the cache and execution layer. The catalog and customer bucket
+remain authoritative, and stopping Verglas only requires pointing another
+query engine at those same tables.

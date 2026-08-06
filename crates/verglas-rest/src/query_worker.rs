@@ -50,6 +50,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use futures::StreamExt;
 use tokio::sync::Mutex;
+use verglas_api::query::{QueryAt, QueryParameter, QueryRequest};
 use verglas_iceberg::TimeTravel;
 
 /// Dispatch counter for unique per-launch ports-file names — this process's
@@ -97,6 +98,7 @@ impl QueryWorkerDispatcher {
     pub async fn dispatch(
         &self,
         sql: &str,
+        args: Vec<QueryParameter>,
         at: Option<TimeTravel>,
         accept_arrow: bool,
     ) -> Result<Response, String> {
@@ -133,7 +135,7 @@ impl QueryWorkerDispatcher {
             }
         };
 
-        let response = post_query_streaming(port, sql, at, accept_arrow).await;
+        let response = post_query_streaming(port, sql, args, at, accept_arrow).await;
         let response = match response {
             Ok(response) => response,
             Err(e) => {
@@ -225,20 +227,6 @@ pub(crate) async fn wait_for_port(
     }
 }
 
-/// The wire request `POST /v1/query` (and this worker's own admin route)
-/// accepts — the same shape on both sides of the dispatch.
-#[derive(serde::Serialize)]
-struct QueryRequest {
-    sql: String,
-    at: Option<QueryAt>,
-}
-
-#[derive(serde::Serialize)]
-struct QueryAt {
-    reference: String,
-    table: String,
-}
-
 /// Posts `sql` to the worker's `/v1/query` and returns the raw, not-yet-read
 /// `reqwest::Response` — the caller streams its body through rather than
 /// buffering it here. Only a request-level failure (connection refused,
@@ -246,11 +234,13 @@ struct QueryAt {
 async fn post_query_streaming(
     port: u16,
     sql: &str,
+    args: Vec<QueryParameter>,
     at: Option<TimeTravel>,
     accept_arrow: bool,
 ) -> Result<reqwest::Response, String> {
     let body = QueryRequest {
         sql: sql.to_owned(),
+        args,
         at: at.map(|t| QueryAt {
             reference: t.reference,
             table: t.table,
