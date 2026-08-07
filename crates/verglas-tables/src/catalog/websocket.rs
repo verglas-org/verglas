@@ -19,9 +19,11 @@
 //! this task's memory and replayed on reconnect (in-memory per process is
 //! enough for v1 — a resync recovers a cursor the server has aged out; the
 //! server's cache dir would be the natural home for cross-restart persistence).
-//! On a socket drop the task reconnects with exponential backoff (cap ~1 min),
-//! re-subscribing from the last-seen sequence; a catch-up polling pass on each
-//! reconnect covers the gap.
+//! A periodic reconciliation poll remains active while connected. That is the
+//! correctness backstop when a catalog change lands outside the websocket
+//! publisher (for example a vanilla Lakekeeper commit); websocket events remain
+//! the low-latency path. On a socket drop the task reconnects with exponential
+//! backoff (cap ~1 min), re-subscribing from the last-seen sequence.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -223,8 +225,23 @@ async fn run_session<S: CatalogSource>(
     cursor: &mut Option<i64>,
 ) {
     let mut state = FeedState::new(*cursor);
+    let mut reconcile = tokio::time::interval(options.interval);
+    reconcile.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The successful seed pass immediately before this session is current.
+    // Consume interval's immediate first tick so reconciliation waits one full
+    // configured interval instead of duplicating that work.
+    reconcile.tick().await;
     loop {
-        let text = match stream.next().await {
+        let frame = tokio::select! {
+            frame = stream.next() => frame,
+            _ = reconcile.tick() => {
+                if let Err(error) = poll_once(source, options, shared, true).await {
+                    tracing::warn!(%error, "catalog feed reconciliation poll failed");
+                }
+                continue;
+            }
+        };
+        let text = match frame {
             Some(Ok(Message::Text(text))) => text,
             // Control frames and binary are ignored; the library answers pings.
             Some(Ok(_)) => continue,
