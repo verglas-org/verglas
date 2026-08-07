@@ -367,7 +367,17 @@ where
         wal_segment_size: u32,
     ) -> Result<(), AppendError> {
         let mut manifest = self.state.lock().await;
-        if manifest.system_id != 0 && manifest.system_id != system_id {
+        // Neon uses zero while a compute is synchronizing from a safekeeper and
+        // has not recovered PostgreSQL's control file yet. Treat that value as
+        // unspecified once this timeline has a durable identity; overwriting or
+        // rejecting the recovered identity makes every scale-to-zero wake fail.
+        // A conflicting nonzero identity remains a hard fencing error.
+        let effective_system_id = if system_id == 0 {
+            manifest.system_id
+        } else {
+            system_id
+        };
+        if manifest.system_id != 0 && manifest.system_id != effective_system_id {
             return Err(AppendError::Manifest(format!(
                 "timeline system id changed from {} to {system_id}",
                 manifest.system_id
@@ -380,14 +390,14 @@ where
             )));
         }
         if manifest.generation == generation
-            && manifest.system_id == system_id
+            && manifest.system_id == effective_system_id
             && manifest.pg_version == pg_version
             && manifest.wal_segment_size == wal_segment_size
         {
             return Ok(());
         }
         manifest.generation = generation;
-        manifest.system_id = system_id;
+        manifest.system_id = effective_system_id;
         manifest.pg_version = pg_version;
         manifest.wal_segment_size = wal_segment_size;
         manifest.revision = manifest.revision.saturating_add(1);

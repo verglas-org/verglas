@@ -373,6 +373,55 @@ fn geom() -> AppendGeometry {
 // ---- tests -----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_greeting_with_zero_system_id_preserves_timeline_identity() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let log = build(
+        MemStore::new(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    log.configure_timeline(0, 7_671_068_361_459_482_993, 17, 16 * 1024 * 1024)
+        .await
+        .expect("establish timeline identity");
+    log.configure_timeline(0, 0, 17, 16 * 1024 * 1024)
+        .await
+        .expect("zero is unspecified during compute recovery");
+
+    assert_eq!(
+        log.safekeeper_state().await.system_id,
+        7_671_068_361_459_482_993,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_nonzero_system_id_is_still_rejected() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let log = build(
+        MemStore::new(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    log.configure_timeline(0, 41, 17, 16 * 1024 * 1024)
+        .await
+        .expect("establish timeline identity");
+    let error = log
+        .configure_timeline(0, 42, 17, 16 * 1024 * 1024)
+        .await
+        .expect_err("conflicting identity must remain fenced");
+    assert!(
+        error
+            .to_string()
+            .contains("system id changed from 41 to 42")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_acks_over_quorum_and_reads_back_the_tail() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
