@@ -100,7 +100,21 @@ where
         dir: impl AsRef<Path>,
         geometry: AppendGeometry,
     ) -> Result<Self, AppendError> {
-        let (manifest_store, manifest) = ManifestStore::open(dir)?;
+        let (manifest_store, mut manifest) = ManifestStore::open(dir)?;
+        // Older builds retained per-append fragment placements even after the
+        // complete segment was durable in origin and those fragments had been
+        // deleted. Compact that legacy state before serving so the first new
+        // descriptor does not republish an unbounded historical payload.
+        let mut compacted = false;
+        for segment in &mut manifest.segments {
+            if segment.state == SegmentState::Flushed && !segment.appends.is_empty() {
+                segment.appends.clear();
+                compacted = true;
+            }
+        }
+        if compacted {
+            manifest_store.persist(&manifest)?;
+        }
         let tail = AtomicU64::new(manifest.tail.0);
         let flushed = AtomicU64::new(manifest.flushed_through.0);
         let epoch = AtomicU64::new(manifest.epoch.0);

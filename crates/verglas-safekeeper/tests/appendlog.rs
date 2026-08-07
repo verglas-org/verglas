@@ -942,6 +942,47 @@ async fn flush_compacts_fragment_placements_out_of_recovery_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_compacts_legacy_flushed_placements_before_serving() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    {
+        let log = build(
+            store.clone(),
+            transport.clone(),
+            membership.clone(),
+            dir.path(),
+            geom(),
+        );
+        log.append(Epoch(0), Lsn(0), bytes(4000))
+            .await
+            .expect("append");
+    }
+
+    let path = dir.path().join("safekeeper/manifest.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read manifest"))
+            .expect("manifest json");
+    legacy["segments"][0]["state"] = serde_json::json!("Flushed");
+    legacy["segments"][0]["s3_key"] = serde_json::json!("wal/legacy.wal");
+    assert!(
+        !legacy["segments"][0]["appends"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap())
+        .expect("write legacy manifest");
+
+    let _reopened = build(store, transport, membership, dir.path(), geom());
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("read migrated manifest"))
+            .expect("migrated json");
+    assert_eq!(migrated["segments"][0]["appends"], serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fencing_rejects_a_stale_writer() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
