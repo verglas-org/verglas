@@ -54,12 +54,17 @@ pub struct Memory {
     /// fixed allocation should set this false because its local grant host is
     /// bookkeeping-only and the estimate otherwise repeats catalog I/O.
     pub estimate_on_request: bool,
+    /// Hard DataFusion operator-memory ceiling. Spillable operators write
+    /// temporary state to disk above this boundary rather than OOM-killing the
+    /// query microVM. The cloud launcher sets this from the assigned guest RAM.
+    pub limit_bytes: usize,
 }
 
 impl Default for Memory {
     fn default() -> Self {
         Self {
             estimate_on_request: true,
+            limit_bytes: 512 * 1024 * 1024,
         }
     }
 }
@@ -140,6 +145,9 @@ impl QueryConfig {
     /// here first turns a typo'd path or scheme into an actionable startup
     /// error instead of an opaque connection failure.
     fn validate(&self) -> Result<(), String> {
+        if self.memory.limit_bytes == 0 {
+            return Err("memory.limit_bytes must be greater than zero".to_owned());
+        }
         if self.cache.s3_endpoint.is_empty() {
             return Err("cache.s3_endpoint is required".to_owned());
         }
@@ -207,6 +215,7 @@ mod tests {
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         assert_eq!(config.listen.admin_port, 8335);
         assert!(config.memory.estimate_on_request);
+        assert_eq!(config.memory.limit_bytes, 512 * 1024 * 1024);
     }
 
     #[test]
@@ -214,6 +223,7 @@ mod tests {
         let toml = r#"
             [memory]
             estimate_on_request = false
+            limit_bytes = 1610612736
 
             [cache]
             s3_endpoint = "http://127.0.0.1:8333"
@@ -223,6 +233,7 @@ mod tests {
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         assert!(!config.memory.estimate_on_request);
+        assert_eq!(config.memory.limit_bytes, 1_610_612_736);
     }
 
     /// A non-http(s) cache endpoint is rejected at validation, naming the

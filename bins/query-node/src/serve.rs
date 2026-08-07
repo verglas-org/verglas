@@ -104,10 +104,13 @@ pub async fn run(
     tracing::info!(bytes = initial_grant.bytes, "initial memory grant");
 
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
-    let prepared_catalog =
-        admin::PreparedQueryCatalog::open(catalog.clone(), Some(&config.metadata.uri))
-            .await
-            .map_err(|e| format!("cannot prepare catalog session: {e}"))?;
+    let prepared_catalog = admin::PreparedQueryCatalog::open(
+        catalog.clone(),
+        Some(&config.metadata.uri),
+        config.memory.limit_bytes,
+    )
+    .await
+    .map_err(|e| format!("cannot prepare catalog session: {e}"))?;
     let state = AppState {
         catalog,
         prepared_catalog,

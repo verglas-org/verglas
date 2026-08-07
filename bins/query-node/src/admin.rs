@@ -76,6 +76,7 @@ pub struct PreparedQueryCatalog {
     catalog: Arc<dyn Catalog>,
     generation_url: Option<String>,
     http: reqwest::Client,
+    memory_limit_bytes: usize,
     current: Arc<RwLock<PreparedGeneration>>,
 }
 
@@ -95,6 +96,7 @@ impl PreparedQueryCatalog {
     pub async fn open(
         catalog: Arc<dyn Catalog>,
         metadata_uri: Option<&str>,
+        memory_limit_bytes: usize,
     ) -> Result<Self, AgentError> {
         let http = reqwest::Client::new();
         let generation_url =
@@ -102,7 +104,11 @@ impl PreparedQueryCatalog {
         let (generation, prepared) = match &generation_url {
             Some(url) => loop {
                 let before = fetch_generation(&http, url).await?;
-                let prepared = verglas_iceberg::PreparedCatalog::open(catalog.clone()).await?;
+                let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
+                    catalog.clone(),
+                    memory_limit_bytes,
+                )
+                .await?;
                 let after = fetch_generation(&http, url).await?;
                 if before == after {
                     break (after, prepared);
@@ -110,13 +116,18 @@ impl PreparedQueryCatalog {
             },
             None => (
                 0,
-                verglas_iceberg::PreparedCatalog::open(catalog.clone()).await?,
+                verglas_iceberg::PreparedCatalog::open_with_memory_limit(
+                    catalog.clone(),
+                    memory_limit_bytes,
+                )
+                .await?,
             ),
         };
         Ok(Self {
             catalog,
             generation_url,
             http,
+            memory_limit_bytes,
             current: Arc::new(RwLock::new(PreparedGeneration {
                 generation,
                 catalog: prepared,
@@ -157,7 +168,11 @@ impl PreparedQueryCatalog {
         if current.generation == observed {
             return Ok(());
         }
-        let prepared = verglas_iceberg::PreparedCatalog::open(self.catalog.clone()).await?;
+        let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
+            self.catalog.clone(),
+            self.memory_limit_bytes,
+        )
+        .await?;
         let completed_generation = fetch_generation(&self.http, url).await?;
         if completed_generation != observed {
             return Err(AgentError::Query(

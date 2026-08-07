@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::{StreamExt, TryStreamExt};
@@ -72,6 +74,21 @@ impl PreparedCatalog {
     pub async fn open(catalog: Arc<dyn Catalog>) -> Result<Self> {
         Ok(Self {
             context: Arc::new(catalog_context(catalog).await?),
+        })
+    }
+
+    /// Builds a reusable catalog session whose spillable DataFusion operators
+    /// are bounded by `memory_limit_bytes`. The runtime's disk manager remains
+    /// enabled, so joins, aggregates, and sorts spill instead of exhausting a
+    /// fixed-memory microVM.
+    pub async fn open_with_memory_limit(
+        catalog: Arc<dyn Catalog>,
+        memory_limit_bytes: usize,
+    ) -> Result<Self> {
+        Ok(Self {
+            context: Arc::new(
+                catalog_context_with_memory_limit(catalog, memory_limit_bytes).await?,
+            ),
         })
     }
 
@@ -167,12 +184,37 @@ pub async fn query(
 /// fail to plan. A table identifier is an identifier, not a case-sensitive
 /// string.
 pub(crate) async fn catalog_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
+    catalog_context_with_runtime(catalog, None).await
+}
+
+/// The catalog context used by fixed-memory query workers. A fair spill pool
+/// is essential here: DataFusion's default pool is unbounded and can otherwise
+/// let one hash-heavy TPC-H query consume the entire guest before Linux can
+/// reclaim anything.
+pub(crate) async fn catalog_context_with_memory_limit(
+    catalog: Arc<dyn Catalog>,
+    memory_limit_bytes: usize,
+) -> Result<SessionContext> {
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(memory_limit_bytes)))
+        .build()
+        .map_err(|error| AgentError::Query(error.to_string()))?;
+    catalog_context_with_runtime(catalog, Some(Arc::new(runtime))).await
+}
+
+async fn catalog_context_with_runtime(
+    catalog: Arc<dyn Catalog>,
+    runtime: Option<Arc<RuntimeEnv>>,
+) -> Result<SessionContext> {
     let provider = IcebergCatalogProvider::try_new(catalog)
         .await
         .map_err(AgentError::Iceberg)?;
     let provider = CaseInsensitiveCatalogProvider::new(Arc::new(provider));
     let config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
-    let ctx = SessionContext::new_with_config(config);
+    let ctx = match runtime {
+        Some(runtime) => SessionContext::new_with_config_rt(config, runtime),
+        None => SessionContext::new_with_config(config),
+    };
     ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
     Ok(ctx)
 }
