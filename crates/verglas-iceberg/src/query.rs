@@ -84,10 +84,11 @@ impl PreparedCatalog {
     pub async fn open_with_memory_limit(
         catalog: Arc<dyn Catalog>,
         memory_limit_bytes: usize,
+        spill_path: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
             context: Arc::new(
-                catalog_context_with_memory_limit(catalog, memory_limit_bytes).await?,
+                catalog_context_with_memory_limit(catalog, memory_limit_bytes, spill_path).await?,
             ),
         })
     }
@@ -194,9 +195,14 @@ pub(crate) async fn catalog_context(catalog: Arc<dyn Catalog>) -> Result<Session
 pub(crate) async fn catalog_context_with_memory_limit(
     catalog: Arc<dyn Catalog>,
     memory_limit_bytes: usize,
+    spill_path: Option<std::path::PathBuf>,
 ) -> Result<SessionContext> {
-    let runtime = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::new(FairSpillPool::new(memory_limit_bytes)))
+    let mut runtime =
+        RuntimeEnvBuilder::new().with_memory_pool(Arc::new(FairSpillPool::new(memory_limit_bytes)));
+    if let Some(path) = spill_path {
+        runtime = runtime.with_temp_file_path(path);
+    }
+    let runtime = runtime
         .build()
         .map_err(|error| AgentError::Query(error.to_string()))?;
     catalog_context_with_runtime(catalog, Some(Arc::new(runtime))).await

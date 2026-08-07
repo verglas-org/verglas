@@ -58,6 +58,10 @@ pub struct Memory {
     /// temporary state to disk above this boundary rather than OOM-killing the
     /// query microVM. The cloud launcher sets this from the assigned guest RAM.
     pub limit_bytes: usize,
+    /// Writable directory reserved for DataFusion spill files. Cloud query
+    /// microVMs mount their host-local ephemeral block device here; leaving it
+    /// unset retains DataFusion's normal OS temporary directory for local use.
+    pub spill_path: Option<std::path::PathBuf>,
 }
 
 impl Default for Memory {
@@ -65,6 +69,7 @@ impl Default for Memory {
         Self {
             estimate_on_request: true,
             limit_bytes: 512 * 1024 * 1024,
+            spill_path: None,
         }
     }
 }
@@ -148,6 +153,14 @@ impl QueryConfig {
         if self.memory.limit_bytes == 0 {
             return Err("memory.limit_bytes must be greater than zero".to_owned());
         }
+        if let Some(path) = &self.memory.spill_path
+            && !path.is_dir()
+        {
+            return Err(format!(
+                "memory.spill_path `{}` does not exist or is not a directory",
+                path.display()
+            ));
+        }
         if self.cache.s3_endpoint.is_empty() {
             return Err("cache.s3_endpoint is required".to_owned());
         }
@@ -216,6 +229,7 @@ mod tests {
         assert_eq!(config.listen.admin_port, 8335);
         assert!(config.memory.estimate_on_request);
         assert_eq!(config.memory.limit_bytes, 512 * 1024 * 1024);
+        assert!(config.memory.spill_path.is_none());
     }
 
     #[test]
@@ -224,6 +238,7 @@ mod tests {
             [memory]
             estimate_on_request = false
             limit_bytes = 1610612736
+            spill_path = "/tmp"
 
             [cache]
             s3_endpoint = "http://127.0.0.1:8333"
@@ -234,6 +249,7 @@ mod tests {
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         assert!(!config.memory.estimate_on_request);
         assert_eq!(config.memory.limit_bytes, 1_610_612_736);
+        assert_eq!(config.memory.spill_path.as_deref(), Some(Path::new("/tmp")));
     }
 
     /// A non-http(s) cache endpoint is rejected at validation, naming the

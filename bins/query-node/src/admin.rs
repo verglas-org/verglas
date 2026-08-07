@@ -77,6 +77,7 @@ pub struct PreparedQueryCatalog {
     generation_url: Option<String>,
     http: reqwest::Client,
     memory_limit_bytes: usize,
+    spill_path: Option<std::path::PathBuf>,
     current: Arc<RwLock<PreparedGeneration>>,
 }
 
@@ -97,6 +98,7 @@ impl PreparedQueryCatalog {
         catalog: Arc<dyn Catalog>,
         metadata_uri: Option<&str>,
         memory_limit_bytes: usize,
+        spill_path: Option<std::path::PathBuf>,
     ) -> Result<Self, AgentError> {
         let http = reqwest::Client::new();
         let generation_url =
@@ -107,6 +109,7 @@ impl PreparedQueryCatalog {
                 let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
                     catalog.clone(),
                     memory_limit_bytes,
+                    spill_path.clone(),
                 )
                 .await?;
                 let after = fetch_generation(&http, url).await?;
@@ -119,6 +122,7 @@ impl PreparedQueryCatalog {
                 verglas_iceberg::PreparedCatalog::open_with_memory_limit(
                     catalog.clone(),
                     memory_limit_bytes,
+                    spill_path.clone(),
                 )
                 .await?,
             ),
@@ -128,6 +132,7 @@ impl PreparedQueryCatalog {
             generation_url,
             http,
             memory_limit_bytes,
+            spill_path,
             current: Arc::new(RwLock::new(PreparedGeneration {
                 generation,
                 catalog: prepared,
@@ -171,6 +176,7 @@ impl PreparedQueryCatalog {
         let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
             self.catalog.clone(),
             self.memory_limit_bytes,
+            self.spill_path.clone(),
         )
         .await?;
         let completed_generation = fetch_generation(&self.http, url).await?;

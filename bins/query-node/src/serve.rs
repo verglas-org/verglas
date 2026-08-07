@@ -108,6 +108,7 @@ pub async fn run(
         catalog.clone(),
         Some(&config.metadata.uri),
         config.memory.limit_bytes,
+        config.memory.spill_path.clone(),
     )
     .await
     .map_err(|e| format!("cannot prepare catalog session: {e}"))?;

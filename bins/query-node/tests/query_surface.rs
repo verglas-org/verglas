@@ -97,10 +97,14 @@ async fn catalog_with_table(ident: &iceberg::TableIdent, rows: u64) -> Arc<dyn C
 /// `catalog` and starting from `initial_grant` bytes. Returns the base URL and
 /// the state handle (so tests can inspect the grant after requests).
 async fn serve(catalog: Arc<dyn Catalog>, initial_grant_bytes: u64) -> (String, AppState) {
-    let prepared_catalog =
-        verglas_query::admin::PreparedQueryCatalog::open(catalog.clone(), None, 64 * 1024 * 1024)
-            .await
-            .expect("prepare catalog");
+    let prepared_catalog = verglas_query::admin::PreparedQueryCatalog::open(
+        catalog.clone(),
+        None,
+        64 * 1024 * 1024,
+        None,
+    )
+    .await
+    .expect("prepare catalog");
     let state = AppState {
         catalog,
         prepared_catalog,
