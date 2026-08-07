@@ -238,6 +238,7 @@ where
             key.timeline_id
         );
         let log = Arc::new(EcAppendLog::open(
+            self.node_id,
             Arc::clone(&self.origin),
             self.bucket.clone(),
             prefix,

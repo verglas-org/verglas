@@ -51,6 +51,10 @@ const STATE_HEAD_INDEX: usize = usize::MAX;
 /// write and for reading already-flushed ranges back; it is never on the append
 /// (commit) path.
 pub struct EcAppendLog<S> {
+    /// Stable identity of the safekeeper whose state this log represents.
+    /// Safekeepers advance and flush independently, so their replicated state
+    /// keys must not collide even though they receive the same WAL stream.
+    node_id: u64,
     /// The S3 origin: flush target and flushed-range read source.
     store: Arc<S>,
     /// The bucket flushed segment objects live in.
@@ -87,6 +91,7 @@ where
     /// log. `geometry` is the multi-node erasure geometry; a single-node
     /// deployment ignores it and runs `(1, 0, 1)`.
     pub fn open(
+        node_id: u64,
         store: Arc<S>,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -100,6 +105,7 @@ where
         let flushed = AtomicU64::new(manifest.flushed_through.0);
         let epoch = AtomicU64::new(manifest.epoch.0);
         Ok(Self {
+            node_id,
             store,
             bucket: bucket.into(),
             prefix: prefix.into(),
@@ -172,6 +178,8 @@ where
         digest.update(self.bucket.as_bytes());
         digest.update([0]);
         digest.update(self.prefix.trim_matches('/').as_bytes());
+        digest.update([0]);
+        digest.update(self.node_id.to_be_bytes());
         format!("sk/{:x}", digest.finalize())
     }
 
@@ -887,6 +895,11 @@ where
 
             manifest.segments[i].state = SegmentState::Flushed;
             manifest.segments[i].s3_key = Some(s3_key);
+            // Origin now owns the complete segment. Recovery and reads need
+            // only its LSN range and object key; retaining every append's
+            // fragment placements made the replicated descriptor grow without
+            // bound even though those fragments are deleted below.
+            manifest.segments[i].appends.clear();
             // Segments flush in LSN order with no gaps, so the whole prefix up to
             // this segment's end is now in S3.
             manifest.flushed_through = segment.end;

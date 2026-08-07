@@ -266,7 +266,7 @@ fn build(
     let membership = Arc::new(SingleNodeMembership::new(NodeId::new(SELF)));
     let geometry = AppendGeometry::new(4, 2, 5).expect("pod geometry");
     EcAppendLog::open(
-        store, "wal-bkt", "wal", transport, membership, dir, geometry,
+        0, store, "wal-bkt", "wal", transport, membership, dir, geometry,
     )
     .expect("open")
 }

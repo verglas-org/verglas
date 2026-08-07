@@ -361,7 +361,7 @@ fn build(
     geometry: AppendGeometry,
 ) -> EcAppendLog<MemStore> {
     EcAppendLog::open(
-        store, "wal-bkt", "wal", transport, membership, dir, geometry,
+        0, store, "wal-bkt", "wal", transport, membership, dir, geometry,
     )
     .expect("open append log")
 }
@@ -856,6 +856,89 @@ async fn truncate_beyond_the_flush_watermark_is_refused() {
         matches!(err, AppendError::TruncateBeyondFlush { .. }),
         "refused: {err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_safekeepers_publish_disjoint_recovery_state() {
+    let first_dir = tempfile::tempdir().expect("first tmp");
+    let second_dir = tempfile::tempdir().expect("second tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let first = EcAppendLog::open(
+        1,
+        store.clone(),
+        "wal-bkt",
+        "wal",
+        transport.clone(),
+        membership.clone(),
+        first_dir.path(),
+        geom(),
+    )
+    .expect("open first safekeeper");
+    let second = EcAppendLog::open(
+        2,
+        store,
+        "wal-bkt",
+        "wal",
+        transport.clone(),
+        membership,
+        second_dir.path(),
+        geom(),
+    )
+    .expect("open second safekeeper");
+
+    first
+        .initialize_timeline(Lsn(0x1000))
+        .await
+        .expect("initialize first");
+    second
+        .initialize_timeline(Lsn(0x1000))
+        .await
+        .expect("initialize second");
+
+    let object_ids: HashSet<String> = transport
+        .inner
+        .lock()
+        .expect("lock")
+        .frags
+        .keys()
+        .filter(|(_, _, index)| *index >= usize::MAX - 1)
+        .map(|(_, object_id, _)| object_id.clone())
+        .collect();
+    assert_eq!(
+        object_ids.len(),
+        4,
+        "each safekeeper owns a distinct descriptor and head key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_compacts_fragment_placements_out_of_recovery_state() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport.clone(), membership, dir.path(), geom());
+    log.append(Epoch(0), Lsn(0), bytes(4000))
+        .await
+        .expect("append");
+    log.flush().await.expect("flush");
+
+    let descriptor = transport
+        .inner
+        .lock()
+        .expect("lock")
+        .frags
+        .iter()
+        .filter(|((_, object_id, index), _)| {
+            *index == usize::MAX - 1 && object_id.ends_with("/state/00000000000000000002")
+        })
+        .map(|(_, (bytes, _))| bytes.clone())
+        .next()
+        .expect("flushed descriptor");
+    let manifest: serde_json::Value = serde_json::from_slice(&descriptor).expect("manifest json");
+    assert_eq!(manifest["segments"][0]["appends"], serde_json::json!([]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

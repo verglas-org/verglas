@@ -819,9 +819,15 @@ impl FragmentClient {
         if response.status().is_success() {
             Ok(())
         } else {
+            let status = response.status();
+            let detail = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("unreadable response body: {error}"));
+            let detail: String = detail.chars().take(512).collect();
             Err(FragmentRpcError::Unavailable {
                 node: node.clone(),
-                reason: format!("peer returned HTTP {}", response.status().as_u16()),
+                reason: format!("peer returned HTTP {}: {detail}", status.as_u16()),
             })
         }
     }
@@ -853,9 +859,15 @@ impl FragmentClient {
         if response.status().is_success() {
             Ok(())
         } else {
+            let status = response.status();
+            let detail = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("unreadable response body: {error}"));
+            let detail: String = detail.chars().take(512).collect();
             Err(FragmentRpcError::Unavailable {
                 node: node.clone(),
-                reason: format!("peer returned HTTP {}", response.status().as_u16()),
+                reason: format!("peer returned HTTP {}: {detail}", status.as_u16()),
             })
         }
     }

@@ -9,7 +9,8 @@
 //! S3 for everything below the flush watermark.
 //!
 //! Rewriting the whole file per append is O(segments-in-flight); appends are
-//! serialized and flush drops flushed segments, so the file stays small. The
+//! serialized and flush drops the flushed segments' per-append placements, so
+//! the file stays small. The
 //! extension point for a higher append rate is a per-append journal file plus a
 //! small watermark manifest (the object write-back tier's shape) — noted, not
 //! built, per the prototype rules.
