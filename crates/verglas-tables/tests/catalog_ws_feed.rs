@@ -6,6 +6,8 @@
 //!
 //! - upgrade → hello → subscribe → change drives the downstream handling (a
 //!   `TableChanged` event, produced by a targeted pointer refresh),
+//! - a healthy but quiet socket still reconciles commits made outside its
+//!   publisher (the vanilla Lakekeeper path),
 //! - a socket drop reconnects and re-subscribes from the last-seen cursor,
 //! - a non-101 upgrade falls back to polling, which still detects commits.
 
@@ -349,6 +351,41 @@ async fn change_frame_drives_downstream_refresh() {
         server.cursors().first(),
         Some(&None),
         "first subscribe live-only"
+    );
+}
+
+/// A connected feed is only a latency optimization. A commit made by a catalog
+/// that does not publish into this websocket must still converge through the
+/// periodic reconciliation pass.
+#[tokio::test(flavor = "multi_thread")]
+async fn connected_feed_reconciles_unpublished_catalog_changes() {
+    let (rest_addr, mock) = spawn_rest_mock().await;
+    mock.set_table("db", "events", "s3://lake/db/events/v1.json", 100);
+
+    let server = WsServer::new(WsMode::Normal, "db.events");
+    let ws_addr = spawn_ws_server(Arc::clone(&server)).await;
+    let source = RestCatalogSource::new(format!("http://{rest_addr}"));
+    let ws = WsFeedConfig::from_catalog_uri(&format!("http://{ws_addr}"), None).expect("feed url");
+    let feed = CatalogFeed::spawn(source, test_options(), Some(ws));
+    let mut rx = feed.subscribe();
+    let ident = TableIdent::new(&["db"], "events");
+
+    wait_until(
+        || feed.table_state(&ident).is_some(),
+        EVENT_TIMEOUT,
+        "feed seeded via attach poll",
+    )
+    .await;
+    mock.set_table("db", "events", "s3://lake/db/events/v2.json", 200);
+
+    let event = next_event(&mut rx, EVENT_TIMEOUT).await;
+    assert_eq!(event.table, ident);
+    assert_eq!(event.old_snapshot, Some(100));
+    assert_eq!(event.new_snapshot, Some(200));
+    assert_eq!(
+        server.seq.load(Ordering::SeqCst),
+        0,
+        "no websocket change was published"
     );
 }
 
