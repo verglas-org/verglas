@@ -216,13 +216,26 @@ async fn catalog_context_with_runtime(
         .await
         .map_err(AgentError::Iceberg)?;
     let provider = CaseInsensitiveCatalogProvider::new(Arc::new(provider));
-    let config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
+    let config = query_session_config(runtime.is_some());
     let ctx = match runtime {
         Some(runtime) => SessionContext::new_with_config_rt(config, runtime),
         None => SessionContext::new_with_config(config),
     };
     ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
     Ok(ctx)
+}
+
+fn query_session_config(bounded: bool) -> SessionConfig {
+    let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
+    if bounded {
+        // HashJoin materializes its build side and can exhaust a fixed-memory
+        // microVM before the spill pool can reclaim enough memory (TPC-H Q18
+        // is the concrete regression). SortMergeJoin participates in
+        // DataFusion's disk-spill path, so bounded workers prefer it while the
+        // unbounded embedded/CLI path retains DataFusion's faster default.
+        config.options_mut().optimizer.prefer_hash_join = false;
+    }
+    config
 }
 
 /// A [`CatalogProvider`] that resolves schema and table names case-insensitively
@@ -449,4 +462,25 @@ pub fn batch_to_json_rows_fragment(batch: &arrow_array::RecordBatch) -> Result<(
         bytes.pop();
     }
     Ok((bytes, row_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_memory_sessions_prefer_spillable_merge_joins() {
+        assert!(
+            !query_session_config(true)
+                .options()
+                .optimizer
+                .prefer_hash_join
+        );
+        assert!(
+            query_session_config(false)
+                .options()
+                .optimizer
+                .prefer_hash_join
+        );
+    }
 }
