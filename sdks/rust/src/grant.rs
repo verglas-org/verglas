@@ -10,12 +10,11 @@
 //!
 //! The seam is deliberately neutral about *how* a grant is enforced. A grant
 //! is just a byte count the host agrees to. On a bare-metal or dev host there
-//! may be nothing enforcing it at all ([`LocalGrantHost`]); on the fleet the
-//! host agent maps a grant onto whatever primitive it manages memory with —
-//! a cgroup limit, a Firecracker virtio-balloon target, or something else
-//! later. None of that is this crate's concern or knowledge: OSS ships the
-//! contract and the no-op local host; the enforcing host lives outside this
-//! repo.
+//! may be nothing enforcing it at all ([`LocalGrantHost`]); a supervising host
+//! may map a grant onto whatever primitive it manages memory with — a cgroup
+//! limit, or something else later. None of that is this crate's concern or
+//! knowledge: OSS ships the contract and the no-op local host; an enforcing
+//! host implements the same trait outside the SDK.
 
 use async_trait::async_trait;
 use thiserror::Error;
@@ -104,9 +103,8 @@ pub trait MemoryGrantHost: Send + Sync {
 /// A host that grants exactly what is asked, unconditionally, and enforces
 /// nothing. This is what a worker gets when it runs standalone or in dev with
 /// no host agent attached — the request/grow/release calls still work, they
-/// just have no effect beyond bookkeeping. The real enforcing host (cgroups
-/// today, Firecracker's virtio-balloon on the fleet) lives outside this repo
-/// and implements the same trait.
+/// just have no effect beyond bookkeeping. An enforcing host (for example
+/// cgroups) lives outside this crate and implements the same trait.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalGrantHost;
 

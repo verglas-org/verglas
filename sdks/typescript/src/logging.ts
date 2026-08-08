@@ -92,7 +92,7 @@ export function newRunId(): string {
   return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Loopback endpoints are local; anything else is a remote (cloud) endpoint. */
+/** Loopback endpoints are local; anything else is remote. */
 export function inferPlacement(endpoint: string): LogPlacement {
   return /\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(endpoint) ? "local" : "remote";
 }
@@ -370,8 +370,8 @@ export interface WorkerObservability {
  * observability with no per-worker wiring.
  *
  * Log retention is not the SDK's concern: every `<name>_LOGS` table is pruned to
- * the platform's standard TTL by the serving runtime (the server's housekeeping,
- * and the cloud committer's daily tick), not by anything computed here.
+ * the platform's standard TTL by the server's housekeeping, not by anything
+ * computed here.
  */
 export function observabilityFor(name: string): WorkerObservability {
   return {

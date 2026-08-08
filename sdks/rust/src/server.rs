@@ -15,7 +15,7 @@ use thiserror::Error;
 pub enum ServerError {
     /// No server accepted the connection.
     #[error(
-        "no Verglas server reachable at {endpoint}: {detail}. The CLI is a pure client — point it at a running server with `--server-endpoint <url>` (or the VERGLAS_ENDPOINT env var), which may be a remote server, a cloud node, or a local Docker instance. A local server is for edge/read latency, never required to use the platform."
+        "no Verglas server reachable at {endpoint}: {detail}. The CLI is a pure client — point it at a running self-hosted server with `--server-endpoint <url>` (or the VERGLAS_ENDPOINT env var), for example a local Docker instance."
     )]
     Unreachable {
         /// Endpoint that was tried.

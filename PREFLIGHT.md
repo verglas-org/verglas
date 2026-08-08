@@ -11,6 +11,3 @@ docker compose up -d --build
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 verglas status
 ```
-
-For cloud: create an account at https://verglas.dev, then
-`verglas login`.

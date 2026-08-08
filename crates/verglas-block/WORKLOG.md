@@ -36,3 +36,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.
 - #91: Updated block-tier ownership documentation for the renamed server
   process. The ring and durability contracts are unchanged.
+
+- #66: Neutralized crate and module docs so virtual block devices describe attached NBD clients rather than microVMs or proprietary cloud placement.

@@ -2,8 +2,8 @@
 //!
 //! Verglas pushes complete worker events to this service. The service persists
 //! them through `verglas-rest`, immediately claims ready work, and executes the
-//! local worker harness. It mounts no state and contains no cloud placement or
-//! connection-broker behavior.
+//! local worker harness. It mounts no state and contains no connection-broker
+//! behavior.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;

@@ -68,7 +68,7 @@ wait_for_healthz() {
   return 1
 }
 
-echo "== verglas cloud start: MinIO origin (:9000) =="
+echo "== verglas dev env start: MinIO origin (:9000) =="
 if port_open 9000; then
   echo "  MinIO already running, leaving it alone"
 else
@@ -78,12 +78,12 @@ else
   wait_for_port 9000 MinIO
 fi
 
-echo "== verglas cloud start: origin bucket =="
+echo "== verglas dev env start: origin bucket =="
 mc alias set localminio http://127.0.0.1:9000 minioadmin minioadmin >/dev/null 2>&1 || true
 mc mb -p "localminio/$BUCKET" >/dev/null 2>&1 || true
 echo "  bucket ready: $BUCKET"
 
-echo "== verglas cloud start: verglas-server (S3 :8333, admin :8334) =="
+echo "== verglas dev env start: verglas-server (S3 :8333, admin :8334) =="
 if port_open 8334; then
   echo "  verglas-server already running, leaving it alone"
 else
@@ -99,7 +99,7 @@ else
   wait_for_healthz
 fi
 
-echo "== verglas cloud start: ready =="
+echo "== verglas dev env start: ready =="
 echo "  S3 endpoint:   http://127.0.0.1:8333  (engine keypair: engine-ak / engine-secret)"
 echo "  admin API:     http://127.0.0.1:8334  (VERGLAS_ENDPOINT)"
 echo "  MinIO origin:  http://127.0.0.1:9000  (minioadmin / minioadmin)"

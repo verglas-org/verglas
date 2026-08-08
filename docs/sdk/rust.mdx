@@ -39,11 +39,11 @@ Supply every destination explicitly inside an injected container environment:
 
 ```rust
 let client = Client::connect(
-    ConnectOptions::new("https://tenant.query.verglas.dev")
+    ConnectOptions::new("http://127.0.0.1:8334")
         .with_token(std::env::var("VERGLAS_TOKEN")?)
-        .with_catalog_uri("https://catalog.example.com")
+        .with_catalog_uri("http://127.0.0.1:8181")
         .with_warehouse("acme-production")
-        .with_s3_endpoint("https://tenant.s3.verglas.dev"),
+        .with_s3_endpoint("http://127.0.0.1:8333"),
 )
 .await?;
 ```

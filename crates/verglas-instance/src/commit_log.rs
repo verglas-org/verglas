@@ -3,18 +3,18 @@
 //!
 //! A cache instance (a ring member) is the local S3 surface a pipeline writes
 //! through. When a write it owns becomes durable at the origin, the instance
-//! appends a [`CommitRecord`] to a [`CommitLog`]. In a fleet, three cache
-//! instances per tenant funnel these records through a PostgreSQL quorum so the
+//! appends a [`CommitRecord`] to a [`CommitLog`]. In a multi-node ring, cache
+//! instances can funnel these records through a PostgreSQL quorum so the
 //! commit order is agreed across the ring before any reader observes it; on a
 //! single self-hosted node there is no quorum to reach, so the default
 //! [`LocalCommitLog`] assigns a monotonic local sequence and never blocks.
 //!
-//! This module owns only the **trait and the local default**. The quorum
-//! implementation is provided from the cloud side (the PG-WAL work) behind this
-//! same trait — see [`CommitLog`] for the exact contract an implementation must
-//! satisfy. Keeping the seam here, independent of the write-back tier, lets the
-//! single-node lakehouse run for free and lets the fleet plug its quorum in
-//! without a source change to the cache or the server.
+//! This module owns only the **trait and the local default**. A quorum
+//! implementation (for example PG-WAL) can plug in behind the same trait —
+//! see [`CommitLog`] for the exact contract. Keeping the seam here, independent
+//! of the write-back tier, lets the single-node lakehouse run without a quorum
+//! and lets a multi-node deployment add one without a source change to the
+//! cache or the server.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -32,7 +32,7 @@ use verglas_core::node::NodeId;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRecord {
     /// The tenant (pod) scope the commit belongs to. On a single node this is
-    /// the local deployment id; in the fleet it is the tenant whose three cache
+    /// the local deployment id; in a multi-node ring it is the tenant whose cache
     /// instances share one transaction layer.
     pub tenant: String,
     /// The logical table (or write-back prefix) the committed object belongs
@@ -133,7 +133,7 @@ pub trait CommitLog: Send + Sync + 'static {
 ///
 /// This is what lets a self-hosted single node run a full lakehouse for free —
 /// read-your-writes is local and immediate because there is no other reader in
-/// the ring to agree with. A fleet swaps this for the PG-backed quorum log
+/// the ring to agree with. A multi-node deployment swaps this for a PG-backed quorum log
 /// behind the same [`CommitLog`] trait; nothing else changes.
 #[derive(Debug, Default)]
 pub struct LocalCommitLog {

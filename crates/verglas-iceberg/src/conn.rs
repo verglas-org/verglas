@@ -5,8 +5,9 @@
 //! endpoint. It carries no resolution logic — callers resolve their own
 //! config, environment, or server probe into one of these and hand it to the
 //! engine. The engine reads and writes wherever the endpoint points
-//! (WHITEPAPER §7.4): the server points it at its own S3 surface for cache
-//! residency; the cloud committer points it straight at object storage.
+//! (WHITEPAPER §7.4): the self-hosted server typically points it at its own S3
+//! surface for cache residency; a direct object-storage endpoint is equally
+//! valid.
 
 /// A fully resolved connection: everything an operation needs to reach the
 /// catalog and write or read data files.

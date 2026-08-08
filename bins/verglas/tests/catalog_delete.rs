@@ -96,7 +96,7 @@ fn spawn_catalog(prefix: &str) -> (String, Deletes) {
 fn write_catalog_config(home: &Path, url: &str) {
     let creds = home.join(".verglas/credentials");
     std::fs::create_dir_all(&creds).expect("mkdir creds");
-    let token_path = creds.join("cloud-catalog.token");
+    let token_path = creds.join("catalog.token");
     std::fs::write(&token_path, CATALOG_TOKEN).expect("write token");
     std::fs::write(
         home.join(".verglas/config.toml"),

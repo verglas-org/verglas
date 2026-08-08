@@ -204,7 +204,7 @@ mod tests {
     }
 
     /// The unified `exec` array parses element 0 as the command and the rest as
-    /// its args, so one portable spec round-trips with the cloud launch contract.
+    /// its args, so one portable spec round-trips with the worker launch contract.
     #[test]
     fn exec_parses_the_unified_exec_array() {
         let exec = WorkerExec::from_config(

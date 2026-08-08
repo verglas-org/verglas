@@ -152,3 +152,4 @@
   a NotFound answer counts as reachable, and a glob-only config is a no-op.
 - #91: Renamed backend process documentation from daemon terminology to
   `verglas-server`. Backend resolution and startup probing are unchanged.
+- #66: Replaced “which cloud” / “real cloud” wording with object-store language in backend docs.

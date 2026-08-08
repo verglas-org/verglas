@@ -1,6 +1,6 @@
 //! The CDC worker binary: env-in / result-file-out, one drain tick per run.
 //!
-//! This is the subprocess worker the fleet spawns for a zero-ETL deployment. It
+//! This is the subprocess worker spawned for a zero-ETL / CDC deployment. It
 //! follows the same contract `verglas_harness::worker::run_worker` and the TS
 //! SDK's `endpoint-run.ts` share: the parent sets the run's environment, the
 //! child runs once and writes a [`RunResult`] JSON to `RESULT_PATH`, and exits 0
@@ -8,7 +8,7 @@
 //!
 //! One run: resolve the environment into a [`CdcEnv`], connect the Postgres pool
 //! and open the Iceberg catalog (all data-file IO routed through the injected
-//! cache endpoint — never direct R2), run exactly one
+//! cache endpoint — never bypassing the cache), run exactly one
 //! [`verglas_pgcdc::runner::drain_tick`], and report the rows appended.
 //!
 //! ## Cursor
@@ -27,14 +27,12 @@ use verglas_sdk::worker::{
     RunResult,
 };
 
-/// The environment the control plane injects for a CDC worker (the launch env
-/// built in verglas-cloud's `pg_cdc.ts`), beyond the shared `VERGLAS_*` /
+/// The environment a CDC worker launch injects, beyond the shared `VERGLAS_*` /
 /// `DEPLOYMENT` / `TARGET` worker bindings. One contract, no alternates: these
-/// exact names are what the fleet launch carries (the PG password arrives
-/// sealed to the box and is unsealed into `VERGLAS_CDC_PG_PASSWORD` by the
-/// host agent before the guest starts).
+/// exact names are what the launcher carries (the PG password is supplied as
+/// `VERGLAS_CDC_PG_PASSWORD` before the process starts).
 mod env {
-    /// Source-database host (the tenant PG VM's guest IP, resolved on the box).
+    /// Source-database host.
     pub const PG_HOST: &str = "VERGLAS_CDC_PG_HOST";
     /// Source-database port (defaults to 5432).
     pub const PG_PORT: &str = "VERGLAS_CDC_PG_PORT";
@@ -42,16 +40,16 @@ mod env {
     pub const PG_DATABASE: &str = "VERGLAS_CDC_PG_DATABASE";
     /// Source-database user (the dedicated CDC replication role).
     pub const PG_USER: &str = "VERGLAS_CDC_PG_USER";
-    /// Source-database password (unsealed on the box; never logged).
+    /// Source-database password (never logged).
     pub const PG_PASSWORD: &str = "VERGLAS_CDC_PG_PASSWORD";
     /// The replication slot name (defaults to `verglas_cdc`).
     pub const SLOT: &str = "VERGLAS_CDC_SLOT";
     /// The publication name (defaults to `verglas_cdc`).
     pub const PUBLICATION: &str = "VERGLAS_CDC_PUBLICATION";
-    /// The tenant's Iceberg REST catalog (catalogd in the PG stack VM, :8181).
+    /// Iceberg REST catalog endpoint for the CDC sink.
     pub const CATALOG_ENDPOINT: &str = "VERGLAS_CDC_CATALOG_ENDPOINT";
-    /// The tenant cache S3 endpoint ALL Iceberg data-file IO routes through
-    /// (:8333). Required: there is no direct-R2 branch.
+    /// S3 endpoint ALL Iceberg data-file IO routes through (typically the
+    /// Verglas cache at :8333). Required.
     pub const CACHE_S3_ENDPOINT: &str = "VERGLAS_CDC_CACHE_S3_ENDPOINT";
     /// The catalog warehouse identifier (optional; catalogd defaults it).
     pub const WAREHOUSE: &str = "VERGLAS_CDC_WAREHOUSE";
@@ -126,7 +124,7 @@ impl CdcEnv {
             // The shared worker token authenticates against the tenant catalogd.
             token: getenv(ENV_TOKEN),
             warehouse: getenv(env::WAREHOUSE),
-            // The cache endpoint: all Iceberg IO routes through it, never R2.
+            // The cache endpoint: all Iceberg IO routes through it.
             // Required — a CDC run without a cache endpoint must not start.
             s3_endpoint: Some(
                 getenv(env::CACHE_S3_ENDPOINT)

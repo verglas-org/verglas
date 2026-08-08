@@ -106,7 +106,6 @@ impl EnvironmentConfig {
             write_worker: Some(write_worker),
             analytics: Some(analytics),
             cluster: None,
-            control_plane: None,
         };
         config
             .validate()

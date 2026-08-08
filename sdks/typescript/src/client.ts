@@ -57,8 +57,7 @@ import type {
 const DEFAULT_TIMEOUT_MS = 30_000;
 
 /**
- * Opens a client against a Verglas endpoint. The endpoint is either the local
- * server's base URL or a cloud Verglas endpoint; the interface is identical.
+ * Opens a client against a Verglas endpoint (the self-hosted server's base URL).
  */
 export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceRegistry>(
   opts: ConnectOptions,
@@ -224,7 +223,7 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     };
   }
 
-  /** A handle to one table by fully-qualified name (e.g. `cloud.job_runs`). */
+  /** A handle to one table by fully-qualified name (e.g. `demo.job_runs`). */
   table<T extends Row = Row>(name: string): Table<T> {
     if (!name) throw new Error("table: name is required");
     return new Table<T>(this.transport, name);
@@ -232,9 +231,7 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
 
   /**
    * A handle to one queue by name — the queue a worker can target instead of a
-   * Table. Locally the queue is a durable segment log; in
-   * the cloud it is a managed queue. The verb is identical for both placements;
-   * the endpoint owns the substrate.
+   * Table. The self-hosted endpoint backs it with a durable segment log.
    */
   queue<T extends Row = Row>(name: string): Queue<T> {
     if (!name) throw new Error("queue: name is required");

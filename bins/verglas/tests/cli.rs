@@ -9,33 +9,30 @@
 //! duplicated `table` must not reappear in `--help`, so nothing creeps back
 //! silently. The `memory` and `skills` verbs are gone: durable agent memory is
 //! not part of this product. OS service lifecycle (`init`/`start`/`stop`/
-//! `restart`/`logs`/`dev`) is gone — the server runs in Docker.
+//! `restart`/`logs`/`dev`) is gone — the server runs in Docker. Removed
+//! control-plane verbs (`login`, `containers`, `db`, `volumes`, `secrets`) are
+//! gone (#66); workers target the local server registry only.
 
 use std::process::Command;
 
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
-/// cloud `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 15] = [
+/// local `workers` command is the surviving deployment surface.
+const SURVIVING_COMMANDS: [&str; 10] = [
     "drain",
     "status",
     "table",
     "graph",
     "query",
-    "login",
     "index",
     "dashboard",
     "workers",
-    "containers",
-    "db",
-    "volumes",
-    "secrets",
     "kv",
     "vessel",
 ];
 
 /// Commands removed from the CLI: `--help` must not name them.
-const REMOVED_COMMANDS: [&str; 22] = [
+const REMOVED_COMMANDS: [&str; 27] = [
     "version",
     "analyze",
     "deploy",
@@ -60,6 +57,12 @@ const REMOVED_COMMANDS: [&str; 22] = [
     // `tables` (plural) duplicated `table`; its unique verbs moved under
     // `table` (metrics) and `index`. Only `table` (singular) remains.
     "tables",
+    // Removed control-plane surface (#66).
+    "login",
+    "containers",
+    "db",
+    "volumes",
+    "secrets",
 ];
 
 #[test]
@@ -253,6 +256,26 @@ fn vessel_help_lists_the_local_http_service_contract() {
                 .lines()
                 .any(|line| line.trim_start().starts_with(command)),
             "vessel help must list {command}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn removed_control_plane_commands_are_unknown() {
+    // #66 removed login and the hosted resource groups; they must not reappear.
+    for command in ["login", "containers", "db", "volumes", "secrets"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+            .arg(command)
+            .output()
+            .expect("binary runs");
+        assert!(
+            !out.status.success(),
+            "`verglas {command}` must fail as an unknown command"
+        );
+        let stderr = String::from_utf8(out.stderr).expect("utf8");
+        assert!(
+            stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
+            "`verglas {command}` must be a clap unknown-command error: {stderr}"
         );
     }
 }

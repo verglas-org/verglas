@@ -19,16 +19,9 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 chrono = "0.4.44"
 thiserror.workspace = true
-# The control-plane client reads the stored URL out of `~/.verglas/config.toml`
-# and `verglas login` writes the `[control_plane]` section back into it.
+# Worker specs and catalog config are TOML on disk.
 toml.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-# The browser login flow needs secure random bytes (PKCE verifier + OAuth state),
-# a SHA-256 for the PKCE challenge, and base64url-no-pad encoding. Versions pinned
-# to the ones already resolved in Cargo.lock so no other crate's lock entry moves.
-getrandom = "0.2.17"
-sha2 = "0.10.9"
-base64 = "0.22.1"
 
 [dev-dependencies]
 reqwest.workspace = true
@@ -41,9 +34,7 @@ verglas-backend.workspace = true
 # Reflects over the serialized default Config to assert the init scaffold covers
 # every config field (#221).
 toml.workspace = true
-# The control-plane tests stand up a local mock of the control plane API so
-# `verglas login` and `verglas deployments` are exercised end to end without
-# ever contacting a real cloud endpoint.
+# Local workers integration tests stand up a mock `/v1/workers` server.
 axum.workspace = true
 
 [lints]

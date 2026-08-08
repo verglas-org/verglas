@@ -36,3 +36,5 @@
   drained segments until a future pageserver-confirmed retention boundary is
   added, with a socket-level regression test covering that launch race.
 - #58: Allowed the eight-argument `EcAppendLog::open` (node identity plus ring plane) and replaced test `unwrap`s with `expect` so clippy stays clean after the cache-metadata fleet fixes.
+
+- #66: Documented Neon broker advertise reachability as Postgres compute over the tenant network rather than a microVM.

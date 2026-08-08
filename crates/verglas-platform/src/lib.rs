@@ -21,7 +21,7 @@
 //!   output). What the worker runtime reads each tick.
 //!
 //! [`Deployment`] is the canonical projection of a worker row into the unified
-//! record shape shared with the cloud control plane.
+//! deployment record.
 
 mod rows;
 
@@ -326,11 +326,9 @@ impl SystemCatalog {
 
 }
 
-/// One deployment as a single record — the canonical shape §7.1 describes,
-/// shared by the local `verglas_sys` rows and the cloud control plane's
-/// `deployments` table. A deployment is `kind × trigger × placement` plus its
-/// code, config, and target tables; the local rows and a cloud row are two
-/// projections of this one shape, not two systems.
+/// One deployment as a single record — the canonical shape §7.1 describes for
+/// a `verglas_sys` worker row. A deployment is `kind × trigger × placement`
+/// plus its code, config, and target tables.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Deployment {
     /// Always `"worker"` for local registry rows.
@@ -339,7 +337,7 @@ pub struct Deployment {
     pub name: String,
     /// How it is invoked: derived from triggers (`cron`, `webhook`, or `manual`).
     pub trigger: String,
-    /// `local` or `cloud`.
+    /// Always `"local"` for v0 (single-node only).
     pub placement: String,
     /// The Job code or an artifact reference.
     pub code: String,
