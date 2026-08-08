@@ -1,6 +1,6 @@
 [package]
 name = "verglas-harness"
-description = "Shared harness runtime for the worker executor: idempotent commits + watermark store, the cron matcher, guard policy, and the local queue (#324-#327)"
+description = "Shared harness runtime for the worker executor: idempotent commits, the cron matcher, guard policy, and the local queue (#324-#327)"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -11,12 +11,8 @@ verglas-iceberg.workspace = true
 verglas-sdk.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
-async-trait.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 iceberg = "0.9.1"
-# The durable watermark store writes each deployment's cursor as a small object
-# in the warehouse bucket over the S3/R2 keypair the harness already holds.
-opendal.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

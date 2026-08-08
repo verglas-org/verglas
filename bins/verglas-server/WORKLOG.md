@@ -612,3 +612,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #74: Wired the prefix-filtered fragment identity callback into the shared peer
   server. This keeps the full server's fragment RPC surface aligned with the
   cache-node implementation.
+- chore: Removed deployment-watermark comments from the sys registry wiring. Server no longer exposes /v1/watermark.
