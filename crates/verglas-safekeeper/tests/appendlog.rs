@@ -1018,11 +1018,14 @@ async fn open_compacts_legacy_flushed_placements_before_serving() {
     assert!(
         !legacy["segments"][0]["appends"]
             .as_array()
-            .unwrap()
+            .expect("appends array")
             .is_empty()
     );
-    std::fs::write(&path, serde_json::to_vec_pretty(&legacy).unwrap())
-        .expect("write legacy manifest");
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&legacy).expect("serialize legacy manifest"),
+    )
+    .expect("write legacy manifest");
 
     let _reopened = build(store, transport, membership, dir.path(), geom());
     let migrated: serde_json::Value =

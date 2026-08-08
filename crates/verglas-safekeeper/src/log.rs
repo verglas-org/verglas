@@ -90,6 +90,9 @@ where
     /// restart rebuilds the tail and the flush watermark) or starting an empty
     /// log. `geometry` is the multi-node erasure geometry; a single-node
     /// deployment ignores it and runs `(1, 0, 1)`.
+    // Open takes the full append-plane identity (node, store, ring, geometry).
+    // Bundling would only rename the same eight inputs.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         node_id: u64,
         store: Arc<S>,

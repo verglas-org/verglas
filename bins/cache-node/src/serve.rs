@@ -282,27 +282,18 @@ pub async fn run(
 
     // The cache node is the sole owner of upstream catalog credentials and
     // change tracking. The gateway and watcher share one response cache: every
-    // successful poll/feed refresh prepares the exact Iceberg REST documents a
-    // local query worker subsequently consumes from `/catalog`.
+    // successful poll refresh prepares the exact Iceberg REST documents a local
+    // query worker subsequently consumes from `/catalog`. Catalog push notify
+    // (Lakekeeper/cloud) is out of band; this binary polls Iceberg REST only.
     let catalog_runtime = config
         .catalog
         .as_ref()
         .map(|catalog| -> Result<_, Box<dyn std::error::Error>> {
-            use verglas_tables::catalog::{CatalogFeed, WatcherOptions, WsFeedConfig};
+            use verglas_tables::catalog::{PollingWatcher, WatcherOptions};
 
             let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
-            let feed_uri =
-                std::env::var("VERGLAS_CATALOG_FEED_URI").unwrap_or_else(|_| catalog.uri.clone());
-            let feed_token = std::env::var("VERGLAS_CATALOG_FEED_TOKEN")
-                .ok()
-                .or(catalog.resolve_bearer_token()?);
-            let ws = if catalog.sigv4_enabled() {
-                None
-            } else {
-                WsFeedConfig::from_catalog_uri(&feed_uri, feed_token)
-            };
             let watcher =
-                CatalogFeed::spawn(gateway.source(), WatcherOptions::from_config(catalog), ws);
+                PollingWatcher::spawn(gateway.source(), WatcherOptions::from_config(catalog));
             Ok((gateway, watcher))
         })
         .transpose()?;

@@ -3,6 +3,10 @@
 //! `TableChanged` events for downstream consumers (the mapper #49, the
 //! prefetcher #51).
 //!
+//! Change discovery is Iceberg REST polling only. Push notification from a
+//! hosted catalog (for example Lakekeeper) is a separate cloud integration; this
+//! crate does not open a Verglas-owned websocket to the catalog origin.
+//!
 //! # Event-channel semantics
 //!
 //! Events fan out over a [`tokio::sync::broadcast`] channel so several
@@ -16,9 +20,7 @@
 //! continues consuming events. Nothing downstream may rely on seeing every
 //! event exactly once.
 
-mod feed;
 mod watcher;
-mod websocket;
 
 use tokio::sync::{broadcast, watch};
 
@@ -26,8 +28,7 @@ pub use verglas_catalog::{
     CatalogError, CatalogGateway, CatalogResponse, CatalogSource, RestCatalogSource, TableIdent,
     TableState,
 };
-pub use watcher::{CatalogFeed, PollingWatcher, WatcherOptions};
-pub use websocket::WsFeedConfig;
+pub use watcher::{PollingWatcher, WatcherOptions};
 
 /// Capacity of the broadcast ring. Commits are seconds-to-minutes apart per
 /// table; a consumer that falls 1024 events behind is resynchronizing from
