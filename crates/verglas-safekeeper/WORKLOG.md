@@ -31,3 +31,7 @@
   object storage and only then deletes EC fragments. Tests cover pinned Neon
   wire vectors, real PostgreSQL sockets, node loss, coordinator replacement,
   asynchronous drain, and byte-identical physical replication.
+- #46: Stopped the background drain from deleting WAL based only on the
+  walproposer truncate watermark. A lagging or cold pageserver can now read
+  drained segments until a future pageserver-confirmed retention boundary is
+  added, with a socket-level regression test covering that launch race.
