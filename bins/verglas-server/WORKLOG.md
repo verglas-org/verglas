@@ -605,3 +605,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #58: Server catalog lifecycle uses `PollingWatcher` only. Removed the `/v1/catalog/feed` websocket upgrade path from process startup.
 
 - #58: Updated `unavailable_catalog_is_reported_to_stderr` to match the poll-only watcher warn text after removing the catalog websocket feed.
+- #50: Reduced the local Compose bootstrap to the server and trusted Docker
+  runtime manager; optional scheduler, database, and analytics services
+  are now dynamic managed containers.
