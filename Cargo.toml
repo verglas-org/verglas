@@ -178,8 +178,8 @@ unwrap_used = "warn"
 # floating branch tip. Patch inventory:
 # https://github.com/verglas-org/iceberg-rust/blob/verglas/v0.9.1/VERGLAS.md
 [patch.crates-io]
-iceberg = { git = "https://github.com/verglas-org/iceberg-rust", rev = "1421e3de8541ea6254700980555d343089386bf7" }
-iceberg-datafusion = { git = "https://github.com/verglas-org/iceberg-rust", rev = "1421e3de8541ea6254700980555d343089386bf7" }
+iceberg = { git = "https://github.com/verglas-org/iceberg-rust", rev = "9a73a6c2b77be257c4e139a2ca8c27a1d7444a02" }
+iceberg-datafusion = { git = "https://github.com/verglas-org/iceberg-rust", rev = "9a73a6c2b77be257c4e139a2ca8c27a1d7444a02" }
 
 # The profile that 'dist' will build with
 [profile.dist]
