@@ -17,6 +17,7 @@ use verglas_core::write::ObjectWrite;
 use crate::broker::proto::{
     SafekeeperTimelineInfo, TenantTimelineId, broker_service_client::BrokerServiceClient,
 };
+use crate::log::SEGMENT_TARGET;
 use crate::protocol::{
     AcceptorGreeting, AcceptorMessage, AppendResponse, Membership, ProposerMessage, ProtocolError,
     SafekeeperCommand, TermSwitch, VoteResponse, parse_command, parse_proposer, serialize_acceptor,
@@ -32,7 +33,10 @@ const PG_PROTOCOL_V3: u32 = 196_608;
 /// with the startup packet; tenant network isolation is the transport boundary.
 const PG_SSL_REQUEST: u32 = 80_877_103;
 /// Maximum bytes returned in one physical replication `XLogData` frame.
-const REPLICATION_CHUNK: u64 = 128 * 1024;
+// Match the append-log's immutable segment size. Flushed WAL reads fetch one
+// complete origin object, so a smaller replication frame would redownload the
+// same object for every slice during pageserver catch-up.
+const REPLICATION_CHUNK: u64 = SEGMENT_TARGET;
 /// Delay between attempts to drain committed EC WAL into object storage.
 const WAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
@@ -448,11 +452,14 @@ where
                                 append.generation
                             )));
                         }
-                        timeline
-                            .append(Epoch(append.term), append.begin_lsn, append.wal)
-                            .await?;
                         let state = timeline
-                            .record_watermarks(append.commit_lsn, append.truncate_lsn)
+                            .append_with_watermarks(
+                                Epoch(append.term),
+                                append.begin_lsn,
+                                append.wal,
+                                append.commit_lsn,
+                                append.truncate_lsn,
+                            )
                             .await?;
                         write_copy_data(
                             stream,

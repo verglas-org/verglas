@@ -19,8 +19,8 @@ use axum::routing::get;
 use serde_json::json;
 use tokio::sync::broadcast;
 use verglas_tables::catalog::{
-    CatalogWatcher, PollingWatcher, RestCatalogSource, TableChanged, TableFilter, TableIdent,
-    WatcherOptions,
+    CatalogWatcher, PollingWatcher, PushWatcher, RestCatalogSource, TableChanged, TableFilter,
+    TableIdent, WatcherOptions,
 };
 
 /// Mutable state behind the mock REST catalog: the tables it serves, an
@@ -326,6 +326,55 @@ async fn commit_detected_within_one_poll_with_correct_snapshot_ids() {
     // The watcher is usable through the trait object the mapper (#49) holds.
     let as_trait: &dyn CatalogWatcher = &watcher;
     assert_eq!(as_trait.watched_tables(), vec![ident]);
+}
+
+/// Hosted cache nodes seed once, remain quiet without a Lakekeeper signal, and
+/// reconcile immediately when the direct mutation endpoint triggers them.
+#[tokio::test(flavor = "multi_thread")]
+async fn push_watcher_reconciles_only_after_an_explicit_signal() {
+    let (addr, mock) = spawn_mock().await;
+    mock.set_table("db", "events", "s3://lake/db/events/metadata/v1.json", 100);
+
+    let watcher = PushWatcher::spawn(
+        RestCatalogSource::new(format!("http://{addr}")),
+        test_options(),
+    );
+    let ident = TableIdent::new(&["db"], "events");
+    wait_until(
+        || watcher.table_state(&ident).is_some(),
+        EVENT_TIMEOUT,
+        "push watcher seeded",
+    )
+    .await;
+    let mut events = watcher.subscribe();
+
+    mock.set_table("db", "events", "s3://lake/db/events/metadata/v2.json", 200);
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        watcher
+            .table_state(&ident)
+            .expect("last-known state")
+            .current_snapshot_id,
+        Some(100),
+        "push watcher must not poll in steady state"
+    );
+    assert!(watcher.request_refresh());
+
+    assert_eq!(
+        next_event(&mut events, EVENT_TIMEOUT).await,
+        TableChanged {
+            table: ident.clone(),
+            old_snapshot: Some(100),
+            new_snapshot: Some(200),
+        }
+    );
+    assert_eq!(
+        watcher
+            .table_state(&ident)
+            .expect("refreshed state")
+            .current_snapshot_id,
+        Some(200)
+    );
 }
 
 /// `seeded()` starts `false` and flips to `true` once the first successful

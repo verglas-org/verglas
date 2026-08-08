@@ -938,6 +938,10 @@ struct Inner<B, P, R> {
     /// capacity they have physically consumed. Read only by the background disk
     /// poll, never on a request path.
     device_paths: [PathBuf; 2],
+    /// Total logical NVMe budget shared by the two sparse device files. Kept
+    /// with the paths so observability can report actual allocated usage as
+    /// `capacity - growth_room` instead of a hard-coded placeholder.
+    disk_capacity_bytes: u64,
 }
 
 impl<B> HybridCacheEngine<B, NoopPeerFetch, RendezvousRing>
@@ -1100,6 +1104,7 @@ where
                     config.dir.join(BLOCKS_DEVICE_FILE),
                     config.dir.join(META_DEVICE_FILE),
                 ],
+                disk_capacity_bytes: config.capacity_bytes.0,
             }),
         })
     }
@@ -1136,6 +1141,13 @@ where
             .iter()
             .map(|path| verglas_core::disk::file_growth_room(path))
             .sum()
+    }
+
+    /// Bytes physically allocated by the sparse data and metadata device files.
+    pub fn disk_usage_bytes(&self) -> u64 {
+        self.inner
+            .disk_capacity_bytes
+            .saturating_sub(self.disk_growth_room_bytes())
     }
 
     /// Opens the warm-from-peers window (#30) for `window` from now: while it is

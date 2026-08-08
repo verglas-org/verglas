@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use verglas_cache::writeback_codec::{Encoded, Fragment, Geometry, encode, reassemble};
@@ -37,7 +38,7 @@ use crate::manifest::{
 /// Seal a segment and start a new one once the open one reaches this many bytes.
 /// A fixed flush-granularity constant, not a tuning knob: the whole tuning
 /// surface is the erasure geometry (see the crate contract, §7).
-const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
+pub(crate) const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
 
 /// Fragment index reserved for full-copy state descriptors. EC data fragments
 /// occupy the small `0..k+m` range, so this cannot collide with WAL data.
@@ -80,6 +81,12 @@ pub struct EcAppendLog<S> {
     flushed: AtomicU64,
     /// Mirror of the writer epoch.
     epoch: AtomicU64,
+    /// Highest commit watermark supplied with an append but not yet folded
+    /// into that append's durable manifest revision.
+    pending_commit: AtomicU64,
+    /// Highest truncate watermark supplied with an append but not yet folded
+    /// into that append's durable manifest revision.
+    pending_truncate: AtomicU64,
 }
 
 impl<S> EcAppendLog<S>
@@ -134,7 +141,29 @@ where
             tail,
             flushed,
             epoch,
+            pending_commit: AtomicU64::new(0),
+            pending_truncate: AtomicU64::new(0),
         })
+    }
+
+    /// Appends WAL and records the watermarks carried by the same proposer
+    /// frame in one replicated manifest revision. Persisting them in two
+    /// revisions doubles the quorum network and fsync round trips on the hot
+    /// path, while providing no additional durability boundary.
+    pub async fn append_with_watermarks(
+        &self,
+        epoch: Epoch,
+        begin_lsn: Lsn,
+        records: Bytes,
+        commit_lsn: Lsn,
+        truncate_lsn: Lsn,
+    ) -> Result<SafekeeperState, AppendError> {
+        self.pending_commit
+            .fetch_max(commit_lsn.0, Ordering::Relaxed);
+        self.pending_truncate
+            .fetch_max(truncate_lsn.0, Ordering::Relaxed);
+        <Self as AppendLog>::append(self, epoch, begin_lsn, records).await?;
+        Ok(self.safekeeper_state().await)
     }
 
     /// The geometry this append uses: the degenerate single-node code for a
@@ -224,10 +253,21 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
+        let mut descriptor_writes = live
+            .iter()
+            .cloned()
+            .map(|node| {
+                let record = descriptor_record.clone();
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (node, result)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut descriptor_nodes = Vec::new();
-        for node in &live {
-            match self.transport.place(node, descriptor_record.clone()).await {
-                Ok(()) => descriptor_nodes.push(node.clone()),
+        while let Some((node, result)) = descriptor_writes.next().await {
+            match result {
+                Ok(()) => descriptor_nodes.push(node),
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
                     revision = manifest.revision,
@@ -250,9 +290,20 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
+        let mut head_writes = descriptor_nodes
+            .iter()
+            .cloned()
+            .map(|node| {
+                let record = head_record.clone();
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (node, result)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut heads = 0;
-        for node in &descriptor_nodes {
-            match self.transport.place(node, head_record.clone()).await {
+        while let Some((node, result)) = head_writes.next().await {
+            match result {
                 Ok(()) => heads += 1,
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
@@ -534,17 +585,28 @@ where
             }
         }
 
+        let mut fragment_writes = encoded
+            .fragments
+            .iter()
+            .enumerate()
+            .zip(nodes)
+            .map(|((index, fragment), node)| {
+                let record = FragmentRecord::new(
+                    FragmentKey {
+                        object_id: object_id.to_owned(),
+                        index,
+                    },
+                    fragment.bytes.clone(),
+                );
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (index, node, result)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut placements = Vec::new();
-        for (index, fragment) in encoded.fragments.iter().enumerate() {
-            let Some(node) = nodes.get(index) else { break };
-            let record = FragmentRecord::new(
-                FragmentKey {
-                    object_id: object_id.to_owned(),
-                    index,
-                },
-                fragment.bytes.clone(),
-            );
-            match self.transport.place(node, record).await {
+        while let Some((index, node, result)) = fragment_writes.next().await {
+            match result {
                 Ok(()) => placements.push(Placement {
                     index,
                     node: node.as_str().to_owned(),
@@ -558,6 +620,7 @@ where
                 ),
             }
         }
+        placements.sort_unstable_by_key(|placement| placement.index);
 
         if placements.len() < w {
             self.drop_fragments(object_id, &placements).await;
@@ -771,6 +834,8 @@ where
                     begin: begin_lsn,
                     bytes: records.len(),
                 })?);
+        let pending_commit = self.pending_commit.load(Ordering::Relaxed);
+        let pending_truncate = self.pending_truncate.load(Ordering::Relaxed);
         let fresh = manifest.segments.is_empty()
             && manifest.base == Lsn(0)
             && manifest.tail == Lsn(0)
@@ -806,6 +871,25 @@ where
             }
         }
         if end_lsn.0 <= durable_tail.0 {
+            let commit_lsn = pending_commit.min(manifest.tail.0);
+            let truncate_lsn = pending_truncate.min(manifest.tail.0);
+            if commit_lsn > manifest.commit_lsn.0 || truncate_lsn > manifest.truncate_lsn.0 {
+                manifest.commit_lsn = Lsn(manifest.commit_lsn.0.max(commit_lsn));
+                manifest.truncate_lsn = Lsn(manifest.truncate_lsn.0.max(truncate_lsn));
+                manifest.revision = manifest.revision.saturating_add(1);
+                self.replicate_state(&manifest).await?;
+                self.manifest_store.persist(&manifest)?;
+            }
+            let _ =
+                self.pending_commit
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        (current <= pending_commit).then_some(0)
+                    });
+            let _ = self.pending_truncate.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| (current <= pending_truncate).then_some(0),
+            );
             return Ok(Appended {
                 start: begin_lsn,
                 end: end_lsn,
@@ -863,6 +947,14 @@ where
             manifest.flushed_through = begin_lsn;
         }
         manifest.tail = end;
+        manifest.commit_lsn = Lsn(manifest
+            .commit_lsn
+            .0
+            .max(pending_commit.min(manifest.tail.0)));
+        manifest.truncate_lsn = Lsn(manifest
+            .truncate_lsn
+            .0
+            .max(pending_truncate.min(manifest.tail.0)));
         manifest.revision = manifest.revision.saturating_add(1);
 
         if let Err(error) = self.replicate_state(&manifest).await {
@@ -884,6 +976,16 @@ where
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
+        let _ = self
+            .pending_commit
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current <= pending_commit).then_some(0)
+            });
+        let _ =
+            self.pending_truncate
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (current <= pending_truncate).then_some(0)
+                });
 
         Ok(Appended {
             start: begin_lsn,
@@ -892,57 +994,77 @@ where
     }
 
     async fn read(&self, from: Lsn, to: Lsn) -> Result<Bytes, AppendError> {
-        let manifest = self.state.lock().await;
+        // Replication reads can block on an origin GET while recovering a
+        // flushed segment. Keep that I/O outside the timeline serialization
+        // lock so a compute proposer can still complete its greeting and append
+        // new WAL while a pageserver is catching up from older WAL.
+        let manifest = self.state.lock().await.clone();
         self.read_manifest(&manifest, from, to).await
     }
 
     async fn flush(&self) -> Result<Lsn, AppendError> {
+        // Snapshot one segment under the serialization lock, then release the
+        // lock before reconstructing it and performing the potentially slow R2
+        // PUT. Holding this lock across object storage used to stop every WAL
+        // append for the duration of each upload, limiting synchronous commit
+        // throughput to roughly one segment per R2 round trip.
+        let segment = {
+            let manifest = self.state.lock().await;
+            manifest
+                .segments
+                .iter()
+                .find(|segment| segment.state == SegmentState::Open)
+                .cloned()
+        };
+        let Some(segment) = segment else {
+            return Ok(self.flushed_through());
+        };
+
+        let bytes = self.reassemble_segment(&segment).await?;
+        let s3_key = self.segment_key(&segment);
+        let key = CacheKey {
+            bucket: self.bucket.clone(),
+            key: s3_key.clone(),
+        };
+        self.store
+            .put(&key, WriteMetadata::default(), once_body(bytes))
+            .await
+            .map_err(|e| AppendError::Origin(e.to_string()))?;
+
         let mut manifest = self.state.lock().await;
-        let mut i = 0;
-        while i < manifest.segments.len() {
-            if manifest.segments[i].state != SegmentState::Open {
-                i += 1;
-                continue;
-            }
-            let segment = manifest.segments[i].clone();
-            // Reassemble the segment and write it to S3. Only after S3 confirms
-            // it durable do we mark it flushed and drop the local fragments —
-            // S3 first, then drop, so the buffer is never the sole copy of bytes
-            // it has forgotten.
-            let bytes = self.reassemble_segment(&segment).await?;
-            let s3_key = self.segment_key(&segment);
-            let key = CacheKey {
-                bucket: self.bucket.clone(),
-                key: s3_key.clone(),
-            };
-            self.store
-                .put(&key, WriteMetadata::default(), once_body(bytes))
-                .await
-                .map_err(|e| AppendError::Origin(e.to_string()))?;
-
-            manifest.segments[i].state = SegmentState::Flushed;
-            manifest.segments[i].s3_key = Some(s3_key);
-            // Origin now owns the complete segment. Recovery and reads need
-            // only its LSN range and object key; retaining every append's
-            // fragment placements made the replicated descriptor grow without
-            // bound even though those fragments are deleted below.
-            manifest.segments[i].appends.clear();
-            // Segments flush in LSN order with no gaps, so the whole prefix up to
-            // this segment's end is now in S3.
-            manifest.flushed_through = segment.end;
-            manifest.revision = manifest.revision.saturating_add(1);
-            self.replicate_state(&manifest).await?;
-            self.manifest_store.persist(&manifest)?;
-            self.flushed.store(segment.end.0, Ordering::Relaxed);
-
-            // The flushed record is durable; free the fragments.
-            for entry in &segment.appends {
-                self.drop_fragments(entry.object_id(), &entry.placements)
-                    .await;
-            }
-            i += 1;
+        let Some(i) = manifest
+            .segments
+            .iter()
+            .position(|current| current.id == segment.id)
+        else {
+            return Ok(manifest.flushed_through);
+        };
+        // The open tail may have grown while its snapshot uploaded. That upload
+        // is not a complete segment and therefore cannot advance durability;
+        // leave the fragment-backed tail intact and retry a fresh snapshot on a
+        // later drain tick. Most importantly, appends never waited for the PUT.
+        if manifest.segments[i] != segment {
+            return Ok(manifest.flushed_through);
         }
-        Ok(manifest.flushed_through)
+
+        manifest.segments[i].state = SegmentState::Flushed;
+        manifest.segments[i].s3_key = Some(s3_key);
+        // Origin now owns the complete segment. Recovery and reads need only its
+        // LSN range and object key; retain the snapshot below only long enough to
+        // delete its fragment placements after the manifest commit.
+        manifest.segments[i].appends.clear();
+        manifest.flushed_through = segment.end;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)?;
+        self.flushed.store(segment.end.0, Ordering::Relaxed);
+        drop(manifest);
+
+        for entry in &segment.appends {
+            self.drop_fragments(entry.object_id(), &entry.placements)
+                .await;
+        }
+        Ok(segment.end)
     }
 
     async fn truncate(&self, up_to: Lsn) -> Result<(), AppendError> {

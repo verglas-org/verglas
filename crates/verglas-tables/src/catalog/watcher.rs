@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{broadcast, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use verglas_core::config;
 
 use super::{
@@ -213,6 +213,71 @@ impl CatalogWatcher for PollingWatcher {
     }
 }
 
+/// A catalog watcher seeded once from the source and refreshed only by explicit
+/// mutation notifications. This is the hosted-catalog path: Lakekeeper pushes
+/// every successful table mutation directly to the cache node, so steady-state
+/// catalog polling is unnecessary. A failed seed or refresh retries with the
+/// same bounded backoff as [`PollingWatcher`].
+pub struct PushWatcher {
+    shared: Arc<Shared>,
+    task: tokio::task::JoinHandle<()>,
+    refresh: mpsc::Sender<()>,
+}
+
+impl PushWatcher {
+    /// Starts the initial seed and returns a handle whose
+    /// [`request_refresh`](Self::request_refresh) method coalesces mutation
+    /// notifications into full catalog-pointer reconciliation passes.
+    pub fn spawn<S: CatalogSource>(source: S, options: WatcherOptions) -> PushWatcher {
+        let shared = Arc::new(Shared::new());
+        let (refresh, refresh_rx) = mpsc::channel(1);
+        let task = tokio::spawn(run_push(source, options, Arc::clone(&shared), refresh_rx));
+        PushWatcher {
+            shared,
+            task,
+            refresh,
+        }
+    }
+
+    /// Schedules a refresh. A full channel means one is already pending and is
+    /// treated as success; catalog state is level-triggered, so duplicate event
+    /// delivery never requires duplicate catalog reads.
+    pub fn request_refresh(&self) -> bool {
+        match self.refresh.try_send(()) {
+            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => true,
+            Err(mpsc::error::TrySendError::Closed(())) => false,
+        }
+    }
+}
+
+impl Drop for PushWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl CatalogWatcher for PushWatcher {
+    fn watched_tables(&self) -> Vec<TableIdent> {
+        self.shared.watched_tables()
+    }
+
+    fn table_state(&self, table: &TableIdent) -> Option<TableState> {
+        self.shared.table_state(table)
+    }
+
+    fn lineage(&self, table: &TableIdent) -> Vec<SnapshotEntry> {
+        self.shared.lineage(table)
+    }
+
+    fn subscribe(&self) -> broadcast::Receiver<TableChanged> {
+        self.shared.subscribe()
+    }
+
+    fn seeded(&self) -> watch::Receiver<bool> {
+        self.shared.seeded_rx()
+    }
+}
+
 /// The poll-forever task: sleep-with-jitter between successful cycles,
 /// exponential backoff (state intact) while the catalog is unreachable.
 /// Never panics, never exits — resilience is this loop's whole job.
@@ -243,6 +308,40 @@ async fn run<S: CatalogSource>(source: S, options: WatcherOptions, shared: Arc<S
                     ?delay,
                     "catalog poll failed; backing off with last-known state intact"
                 );
+                tokio::time::sleep(delay + jitter(options.jitter)).await;
+            }
+        }
+    }
+}
+
+/// Seed once, then reconcile only after a direct catalog mutation signal. A
+/// failed read retries automatically because waiting for another mutation
+/// would otherwise strand the watcher after a transient catalog outage.
+async fn run_push<S: CatalogSource>(
+    source: S,
+    options: WatcherOptions,
+    shared: Arc<Shared>,
+    mut refresh: mpsc::Receiver<()>,
+) {
+    let mut seeded = false;
+    let mut failures: u32 = 0;
+    loop {
+        match poll_once(&source, &options, &shared, seeded).await {
+            Ok(()) => {
+                if failures > 0 {
+                    tracing::info!(failures, "catalog refresh recovered");
+                }
+                seeded = true;
+                shared.mark_seeded();
+                failures = 0;
+                if refresh.recv().await.is_none() {
+                    return;
+                }
+            }
+            Err(error) => {
+                failures = failures.saturating_add(1);
+                let delay = backoff_delay(options.interval, options.max_backoff, failures);
+                tracing::warn!(%error, failures, ?delay, "catalog refresh failed; retrying with last-known state intact");
                 tokio::time::sleep(delay + jitter(options.jitter)).await;
             }
         }

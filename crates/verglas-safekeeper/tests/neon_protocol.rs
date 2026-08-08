@@ -136,6 +136,26 @@ fn parses_vote_elected_and_append_vectors() {
 }
 
 #[test]
+fn accepts_the_verglas_eight_mib_wal_frame_boundary() {
+    const FRAME_BYTES: usize = 8 * 1024 * 1024;
+    let mut append = BytesMut::with_capacity(1 + 44 + FRAME_BYTES);
+    append.put_u8(b'a');
+    append.put_u32(7);
+    append.put_u64(12);
+    append.put_u64(0x20);
+    append.put_u64(0x20 + FRAME_BYTES as u64);
+    append.put_u64(0x18);
+    append.put_u64(0x10);
+    append.resize(append.len() + FRAME_BYTES, 0x5a);
+
+    let parsed = parse_proposer(append.freeze(), PROTOCOL_VERSION).expect("8 MiB append");
+    assert!(matches!(
+        parsed,
+        ProposerMessage::Append(request) if request.wal.len() == FRAME_BYTES
+    ));
+}
+
+#[test]
 fn serializes_neon_v3_acceptor_vectors() {
     let greeting = serialize_acceptor(
         &AcceptorMessage::Greeting(AcceptorGreeting {

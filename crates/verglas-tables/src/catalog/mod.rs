@@ -28,7 +28,7 @@ pub use verglas_catalog::{
     CatalogError, CatalogGateway, CatalogResponse, CatalogSource, RestCatalogSource, TableIdent,
     TableState,
 };
-pub use watcher::{PollingWatcher, WatcherOptions};
+pub use watcher::{PollingWatcher, PushWatcher, WatcherOptions};
 
 /// Capacity of the broadcast ring. Commits are seconds-to-minutes apart per
 /// table; a consumer that falls 1024 events behind is resynchronizing from

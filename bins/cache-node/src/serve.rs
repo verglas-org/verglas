@@ -167,7 +167,7 @@ fn metrics_source(
                 (
                     ServedTier::Nvme,
                     TierSize {
-                        used: 0,
+                        used: engine.disk_usage_bytes(),
                         capacity: nvme_capacity,
                     },
                 ),
@@ -281,19 +281,33 @@ pub async fn run(
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
 
     // The cache node is the sole owner of upstream catalog credentials and
-    // change tracking. The gateway and watcher share one response cache: every
-    // successful poll refresh prepares the exact Iceberg REST documents a local
-    // query worker subsequently consumes from `/catalog`. Catalog push notify
-    // (Lakekeeper/cloud) is out of band; this binary polls Iceberg REST only.
+    // change tracking. The gateway and watcher share one response cache. In the
+    // hosted path Lakekeeper signals this node directly after a mutation; the
+    // watcher seeds once and performs no periodic steady-state polling. A
+    // self-hosted node without an event token retains the polling fallback.
+    enum CatalogWatcherRuntime {
+        Polling {
+            _watcher: verglas_tables::catalog::PollingWatcher,
+        },
+        Push(Arc<verglas_tables::catalog::PushWatcher>),
+    }
+
     let catalog_runtime = config
         .catalog
         .as_ref()
         .map(|catalog| -> Result<_, Box<dyn std::error::Error>> {
-            use verglas_tables::catalog::{PollingWatcher, WatcherOptions};
+            use verglas_tables::catalog::{PollingWatcher, PushWatcher, WatcherOptions};
 
             let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
-            let watcher =
-                PollingWatcher::spawn(gateway.source(), WatcherOptions::from_config(catalog));
+            let options = WatcherOptions::from_config(catalog);
+            let watcher = match std::env::var("VERGLAS_CATALOG_EVENT_TOKEN") {
+                Ok(token) if !token.is_empty() => CatalogWatcherRuntime::Push(Arc::new(
+                    PushWatcher::spawn(gateway.source(), options),
+                )),
+                _ => CatalogWatcherRuntime::Polling {
+                    _watcher: PollingWatcher::spawn(gateway.source(), options),
+                },
+            };
             Ok((gateway, watcher))
         })
         .transpose()?;
@@ -377,8 +391,14 @@ pub async fn run(
     if let Some((device_registry, _)) = &block_registry {
         admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
     }
-    if let Some((gateway, _watcher)) = &catalog_runtime {
+    if let Some((gateway, watcher)) = &catalog_runtime {
         admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
+        if let CatalogWatcherRuntime::Push(watcher) = watcher {
+            let token = std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
+                .expect("push watcher requires VERGLAS_CATALOG_EVENT_TOKEN");
+            admin_app = admin_app.merge(admin::catalog_event_router(Arc::clone(watcher), token));
+            eprintln!("verglas-cache-node {VERSION} catalog changes are push-driven by Lakekeeper");
+        }
     }
     let admin_fut = async move {
         axum::serve(admin_listener, admin_app)
