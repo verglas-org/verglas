@@ -228,12 +228,12 @@ async fn catalog_context_with_runtime(
 fn query_session_config(bounded: bool) -> SessionConfig {
     let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
     if bounded {
-        // HashJoin materializes its build side and can exhaust a fixed-memory
-        // microVM before the spill pool can reclaim enough memory (TPC-H Q18
-        // is the concrete regression). SortMergeJoin participates in
-        // DataFusion's disk-spill path, so bounded workers prefer it while the
-        // unbounded embedded/CLI path retains DataFusion's faster default.
-        config.options_mut().optimizer.prefer_hash_join = false;
+        // Keep DataFusion's hash-join preference in bounded workers. The query
+        // service sizes the fair memory pool explicitly; forcing merge joins
+        // made join-heavy SF10 queries sort and spill the complete 60M-row
+        // lineitem input even when every build side fit comfortably in the
+        // configured pool.
+        config.options_mut().optimizer.prefer_hash_join = true;
     }
     config
 }
@@ -469,9 +469,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_memory_sessions_prefer_spillable_merge_joins() {
+    fn fixed_memory_sessions_prefer_hash_joins() {
         assert!(
-            !query_session_config(true)
+            query_session_config(true)
                 .options()
                 .optimizer
                 .prefer_hash_join
