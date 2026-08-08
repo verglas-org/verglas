@@ -6,7 +6,7 @@
 //! layers so they can be tested without spawning a process:
 //!
 //! - [`admin`]: the admin HTTP router and its route handlers, including the
-//!   `verglas_sys` registry, watermark, and platform queue routes.
+//!   `verglas_sys` registry and platform queue routes.
 //! - [`platform`]: optional REST and catalog trigger ingress into the external
 //!   scheduler service.
 //! - [`logging`]: the process-global tracing subscriber and its reloadable

@@ -11,15 +11,12 @@
 //! cache endpoint — never direct R2), run exactly one
 //! [`verglas_pgcdc::runner::drain_tick`], and report the rows appended.
 //!
-//! ## Watermark
+//! ## Cursor
 //!
 //! The confirmed LSN is durable in the replication slot itself — the drain
 //! advances the slot only after the Iceberg append commits, so the slot is the
 //! authoritative cursor and a crash before the result write simply redelivers on
-//! the next tick. Mirroring the confirmed LSN to the server's durable watermark
-//! endpoint (`GET/PUT /v1/watermark`, keyed by `DEPLOYMENT`) is a
-//! TODO(watermark-http-mirror): it is an observability convenience, not a
-//! correctness requirement, and is out of scope for green v1.
+//! the next tick.
 
 use std::process::ExitCode;
 
@@ -189,9 +186,6 @@ async fn run(cdc: &CdcEnv) -> Result<u64, String> {
         .await
         .map_err(|e| format!("drain tick: {e}"))?;
 
-    // TODO(watermark-http-mirror): PUT status.confirmed_lsn to the server's
-    // /v1/watermark keyed by cdc.deployment. The slot is the durable cursor;
-    // this mirror is observability only.
     Ok(status.tables.iter().map(|t| t.rows_appended).sum())
 }
 

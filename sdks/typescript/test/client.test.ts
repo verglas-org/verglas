@@ -102,26 +102,6 @@ describe("append -> commit contract", () => {
   });
 });
 
-describe("watermark", () => {
-  it("returns null before any watermark has been set", async () => {
-    expect(await client.watermark()).toBeNull();
-    const get = endpoint.requests.find((r) => r.method === "GET" && r.path === "/v1/watermark");
-    expect(get).toBeTruthy();
-  });
-
-  it("setWatermark PUTs the value and watermark reads it back", async () => {
-    await client.setWatermark("2026-07-20T13:05:07Z");
-    const put = endpoint.requests.find((r) => r.method === "PUT" && r.path === "/v1/watermark");
-    expect(put?.body).toEqual({ watermark: "2026-07-20T13:05:07Z" });
-    expect(endpoint.watermark()).toBe("2026-07-20T13:05:07Z");
-    expect(await client.watermark()).toBe("2026-07-20T13:05:07Z");
-  });
-
-  it("a bad token is rejected at request time", async () => {
-    const bad = connect({ endpoint: endpoint.url, token: "wrong" });
-    await expect(bad.watermark()).rejects.toBeInstanceOf(VerglasHttpError);
-  });
-});
 
 describe("scan", () => {
   it("reads the current snapshot and pages via cursor", async () => {

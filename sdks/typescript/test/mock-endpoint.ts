@@ -314,8 +314,6 @@ export interface MockEndpoint {
   tableState(name: string): MockTable;
   /** Access (or create) a graph's in-memory state, e.g. to assert on it. */
   graphState(namespace: string): MockGraph;
-  /** The single durable watermark cell (mirrors the control plane's per-deployment row). */
-  watermark(): string | null;
   /** Requests seen, for assertions. */
   requests: { method: string; path: string; body?: unknown }[];
   /** Pushes a `change` frame to every attached change-feed socket. */
@@ -342,9 +340,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     return g;
   };
   const requests: MockEndpoint["requests"] = [];
-  // A single durable watermark cell, as the control plane keeps one row per
-  // deployment (the presented token identifies the deployment).
-  let storedWatermark: string | null = null;
   const tableState = (name: string): MockTable => {
     let t = tables.get(name);
     if (!t) tables.set(name, (t = new MockTable()));
@@ -372,25 +367,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
       return;
     }
 
-    // GET/PUT /v1/watermark — the deployment's durable cross-run watermark cell.
-    if (url.pathname === "/v1/watermark") {
-      if (req.method === "GET") {
-        requests.push({ method: "GET", path: url.pathname });
-        return send(200, { watermark: storedWatermark });
-      }
-      if (req.method === "PUT") {
-        let raw = "";
-        req.on("data", (c) => (raw += c));
-        req.on("end", () => {
-          const body = raw ? JSON.parse(raw) : {};
-          requests.push({ method: "PUT", path: url.pathname, body });
-          storedWatermark = typeof body.watermark === "string" ? body.watermark : storedWatermark;
-          send(200, { watermark: storedWatermark });
-        });
-        return;
-      }
-      return send(405, { error: "method not allowed" });
-    }
 
     // POST /v1/tables/:name — create a table from an explicit schema + partition
     // spec. Records the definition and echoes the column names.
@@ -612,7 +588,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     token,
     tableState,
     graphState,
-    watermark: () => storedWatermark,
     requests,
     pushChange: (change) => {
       const frame = encodeWsText(

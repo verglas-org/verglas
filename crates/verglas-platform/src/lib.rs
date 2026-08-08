@@ -19,7 +19,6 @@
 //! The tables:
 //! - `verglas_sys.workers` — the single deployment registry (code + triggers +
 //!   output). What the worker runtime reads each tick.
-//! - `verglas_sys.watermarks` — each deployment's durable cross-run watermark.
 //!
 //! [`Deployment`] is the canonical projection of a worker row into the unified
 //! record shape shared with the cloud control plane.
@@ -47,9 +46,7 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use parquet::file::properties::WriterProperties;
 use serde::{Serialize, Serializer};
 
-pub use rows::{
-    PLACEMENT_LOCAL, WATERMARKS_TABLE, WORKERS_TABLE, WatermarkRow, WorkerRow, WorkerSpec,
-};
+pub use rows::{PLACEMENT_LOCAL, WORKERS_TABLE, WorkerRow, WorkerSpec};
 
 pub const SYSTEM_NAMESPACE: &str = "verglas_sys";
 
@@ -130,7 +127,7 @@ pub enum PlatformError {
     },
 }
 
-/// The control plane over one catalog's worker registry and durable watermarks.
+/// The control plane over one catalog's worker registry.
 pub struct SystemCatalog {
     catalog: Arc<dyn Catalog>,
 }
@@ -327,65 +324,6 @@ impl SystemCatalog {
             .max_by_key(|r| r.revision))
     }
 
-    // --- deployment watermarks ---------------------------------------------
-
-    /// The current durable watermark for one deployment: the highest-revision
-    /// row of `verglas_sys.watermarks`, or `None` before the first set. This
-    /// backs the server's `GET /v1/watermark` (#322).
-    pub async fn get_watermark(
-        &self,
-        deployment: &str,
-    ) -> Result<Option<WatermarkRow>, PlatformError> {
-        let table = self
-            .ensure_table(WATERMARKS_TABLE, rows::watermark_schema())
-            .await?;
-        self.current_watermark(&table, deployment).await
-    }
-
-    /// Stores a deployment's durable watermark by appending the next revision —
-    /// never a mutation, so the snapshot log records every advance. This backs
-    /// the server's `PUT /v1/watermark` (#322).
-    pub async fn set_watermark(
-        &self,
-        deployment: &str,
-        watermark: String,
-    ) -> Result<WatermarkRow, PlatformError> {
-        let table = self
-            .ensure_table(WATERMARKS_TABLE, rows::watermark_schema())
-            .await?;
-        let revision = match self.current_watermark(&table, deployment).await? {
-            Some(row) => row.revision + 1,
-            None => 1,
-        };
-        let row = WatermarkRow {
-            deployment: deployment.to_owned(),
-            watermark,
-            updated_at: chrono::Utc::now(),
-            revision,
-        };
-        let batch = rows::encode_watermarks(
-            std::slice::from_ref(&row),
-            table.metadata().current_schema(),
-        );
-        self.append_batch(&table, batch).await?;
-        Ok(row)
-    }
-
-    /// The highest-revision watermark row for one deployment.
-    async fn current_watermark(
-        &self,
-        table: &Table,
-        deployment: &str,
-    ) -> Result<Option<WatermarkRow>, PlatformError> {
-        let mut all = Vec::new();
-        for batch in self.scan_all(table).await? {
-            all.extend(rows::decode_watermarks(&batch)?);
-        }
-        Ok(all
-            .into_iter()
-            .filter(|r| r.deployment == deployment)
-            .max_by_key(|r| r.revision))
-    }
 }
 
 /// One deployment as a single record — the canonical shape §7.1 describes,

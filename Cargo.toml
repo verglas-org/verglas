@@ -87,11 +87,6 @@ iceberg-datafusion = "0.9.1"
 # explicit StorageFactory; the S3 one routes data-file writes and reads through
 # the configured (server) S3 endpoint.
 iceberg-storage-opendal = "0.9.1"
-# Direct OpenDAL S3 client for the harness's durable watermark store: small
-# per-deployment cursor objects in the warehouse bucket, written with the same
-# R2/S3 keypair the catalog FileIO uses. Version matches the opendal that
-# iceberg-storage-opendal pulls in, so the lock is unchanged.
-opendal = { version = "0.55", default-features = false, features = ["services-s3", "services-memory"] }
 datafusion = "52.2"
 # Arrow at the major version iceberg 0.9 / datafusion 52 build against; the CSV
 # and JSON readers drive schema inference for `verglas table create`.

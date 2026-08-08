@@ -609,3 +609,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #50: Reduced the local Compose bootstrap to the server and trusted Docker
   runtime manager; optional scheduler, database, and analytics services
   are now dynamic managed containers.
+- chore: Removed deployment-watermark comments from the sys registry wiring. Server no longer exposes /v1/watermark.
