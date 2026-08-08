@@ -286,7 +286,9 @@ pub async fn run(
     // watcher seeds once and performs no periodic steady-state polling. A
     // self-hosted node without an event token retains the polling fallback.
     enum CatalogWatcherRuntime {
-        Polling(verglas_tables::catalog::PollingWatcher),
+        Polling {
+            _watcher: verglas_tables::catalog::PollingWatcher,
+        },
         Push(Arc<verglas_tables::catalog::PushWatcher>),
     }
 
@@ -302,9 +304,9 @@ pub async fn run(
                 Ok(token) if !token.is_empty() => CatalogWatcherRuntime::Push(Arc::new(
                     PushWatcher::spawn(gateway.source(), options),
                 )),
-                _ => {
-                    CatalogWatcherRuntime::Polling(PollingWatcher::spawn(gateway.source(), options))
-                }
+                _ => CatalogWatcherRuntime::Polling {
+                    _watcher: PollingWatcher::spawn(gateway.source(), options),
+                },
             };
             Ok((gateway, watcher))
         })
