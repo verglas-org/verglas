@@ -15,8 +15,8 @@ The running application exposes:
 | --- | --- | --- |
 | `8333` | S3-compatible cache | Query engines and SDKs |
 | `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
-| `8350` | Gadget runtime API and Cap'n Web RPC | Verglas OS |
-| `9009` | Rill | Optional analytics profile |
+| `8360` | Local container runtime manager | Optional managed services |
+| `9009` | Rill | Optional analytics container |
 
 ## Before you begin
 
@@ -95,10 +95,10 @@ with R2 enabled.
     server keeps the data plane and deployment records. The manager alone
     receives the host Docker socket and owns optional or generated containers.
 
-    Scheduler, Neon, queues, single-target Gadget runtimes, and optional
-    applications are submitted through the manager's authenticated API. They
-    join the fixed `verglas-runtime` network and are restored from the manager's
-    persistent desired-state volume after restart.
+    Scheduler, Neon, queues, and optional applications are submitted through the
+    manager's authenticated API. They join the fixed `verglas-runtime` network
+    and are restored from the manager's persistent desired-state volume after
+    restart.
 
     ```yaml docker-compose.yml
     # Self-hosted Verglas cache server.

@@ -343,7 +343,7 @@ mod tests {
     fn bootstrap_targets_are_reserved() {
         assert!(is_bootstrap_target("verglas-server"));
         assert!(is_bootstrap_target("verglas-container-runtime"));
-        assert!(!is_bootstrap_target("gadget-workspace-1"));
+        assert!(!is_bootstrap_target("optional-workspace-1"));
     }
 
     /// A missing desired-state file initializes an empty registry.

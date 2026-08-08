@@ -105,9 +105,9 @@ and warms changed metadata through the cache path.
 
 Compose bootstraps only `verglas-server` and `verglas-container-runtime`. The
 runtime manager owns every optional local service through Docker: scheduler,
-Neon database components, one single-target runtime per Gadget, external brokers, and
-optional applications. A portable worker contains its bounded command, bundled
-files, target table, and cron, HTTP, or CloudEvent triggers.
+Neon database components, external brokers, and optional applications. A portable
+worker contains its bounded command, bundled files, target table, and cron, HTTP,
+or CloudEvent triggers.
 
 ```sh
 export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"

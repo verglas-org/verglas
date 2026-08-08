@@ -17,11 +17,12 @@ fn dockerfile_builds_the_runtime_manager() {
     assert!(dockerfile.contains(
         "/src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime"
     ));
-    assert!(dockerfile.contains("FROM verglas-gadget-runtime AS verglas-container-runtime"));
+    assert!(dockerfile.contains("FROM runtime AS verglas-container-runtime"));
     assert!(
         dockerfile
             .contains("/src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler")
     );
+    assert!(!dockerfile.contains("FROM verglas-gadget-runtime AS verglas-container-runtime"));
     assert!(dockerfile.contains("ENTRYPOINT [\"verglas-container-runtime\"]"));
 }
 

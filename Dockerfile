@@ -50,8 +50,7 @@ USER verglas
 EXPOSE 8350
 ENTRYPOINT ["verglas-gadget-runtime"]
 
-FROM verglas-gadget-runtime AS verglas-container-runtime
-USER root
+FROM runtime AS verglas-container-runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 \
     && rm -rf /var/lib/apt/lists/* \
