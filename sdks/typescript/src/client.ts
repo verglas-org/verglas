@@ -291,26 +291,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     return this.transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
   }
 
-  /**
-   * The durable cross-run watermark for the calling deployment, or null when
-   * none has been set yet. A cloud source worker is a fresh isolate on every
-   * dispatch, so it reads this at run start to resume where the last dispatch
-   * left off. The bearer token identifies the deployment — there is no id in the
-   * path. Not implemented by the local server; only the cloud endpoint serves it.
-   */
-  async watermark(): Promise<Watermark | null> {
-    const r = await this.transport.request<{ watermark: Watermark | null }>("GET", "/v1/watermark");
-    return r?.watermark ?? null;
-  }
-
-  /**
-   * Stores the calling deployment's durable cross-run watermark, overwriting any
-   * prior value. A cloud source worker calls this after a successful run so the
-   * next dispatch resumes strictly after it. The token identifies the deployment.
-   */
-  async setWatermark(w: Watermark): Promise<void> {
-    await this.transport.request<void>("PUT", "/v1/watermark", { body: { watermark: w } });
-  }
 }
 
 /** A thin raw-byte handle to one KV namespace. */

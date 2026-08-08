@@ -1,10 +1,10 @@
 //! The row types, Iceberg schemas, and Arrow codecs for the `verglas_sys`
-//! system tables (workers and deployment watermarks).
+//! system tables (workers).
 //!
-//! Every table is flat: strings, timestamps, longs. Config, watermark, and
-//! index params travel as opaque JSON strings — the platform stores them
-//! verbatim and never inspects a secret. Each row carries a `revision`, and
-//! state changes append a new revision rather than mutating a row.
+//! Every table is flat: strings, timestamps, longs. Config and index params
+//! travel as opaque JSON strings — the platform stores them verbatim and never
+//! inspects a secret. Each row carries a `revision`, and state changes append a
+//! new revision rather than mutating a row.
 
 use std::sync::Arc;
 
@@ -252,78 +252,3 @@ pub fn decode_workers(batch: &RecordBatch) -> Result<Vec<WorkerRow>, PlatformErr
     Ok(out)
 }
 
-// --- deployment watermarks -------------------------------------------------
-
-/// The `verglas_sys.watermarks` table name.
-pub const WATERMARKS_TABLE: &str = "watermarks";
-
-/// One row of `verglas_sys.watermarks`: a deployment's durable cross-run
-/// watermark at a given revision. The server's `/v1/watermark` routes (#322)
-/// serve the highest-revision row per deployment; a set appends the next
-/// revision, never mutating, so the snapshot log records every advance.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct WatermarkRow {
-    /// The deployment the watermark belongs to (primary key).
-    pub deployment: String,
-    /// The opaque watermark value. The store never parses it.
-    pub watermark: String,
-    /// When this revision was written.
-    pub updated_at: DateTime<Utc>,
-    /// Monotone revision; each set appends the next one.
-    pub revision: i64,
-}
-
-/// The Iceberg schema for `verglas_sys.watermarks`.
-pub fn watermark_schema() -> Schema {
-    Schema::builder()
-        .with_schema_id(0)
-        .with_identifier_field_ids(vec![1])
-        .with_fields(vec![
-            req_str(1, "deployment").into(),
-            req_str(2, "watermark").into(),
-            NestedField::required(3, "updated_at", Type::Primitive(PrimitiveType::Timestamptz))
-                .into(),
-            NestedField::required(4, "revision", Type::Primitive(PrimitiveType::Long)).into(),
-        ])
-        .build()
-        .expect("watermark schema is well-formed")
-}
-
-/// Encodes watermark rows into a record batch bound to `live_schema`.
-pub fn encode_watermarks(rows: &[WatermarkRow], live_schema: &Schema) -> RecordBatch {
-    let schema = Arc::new(schema_to_arrow_schema(live_schema).expect("watermarks schema to arrow"));
-    let columns: Vec<arrow_array::ArrayRef> = vec![
-        Arc::new(
-            rows.iter()
-                .map(|r| Some(r.deployment.clone()))
-                .collect::<StringArray>(),
-        ),
-        Arc::new(
-            rows.iter()
-                .map(|r| Some(r.watermark.clone()))
-                .collect::<StringArray>(),
-        ),
-        ts_col(
-            rows.iter()
-                .map(|r| r.updated_at.timestamp_micros())
-                .collect(),
-        ),
-        Arc::new(rows.iter().map(|r| r.revision).collect::<Int64Array>()),
-    ];
-    RecordBatch::try_new(schema, columns).expect("watermark columns match the schema")
-}
-
-/// Decodes a record batch back into watermark rows, the inverse of
-/// [`encode_watermarks`].
-pub fn decode_watermarks(batch: &RecordBatch) -> Result<Vec<WatermarkRow>, PlatformError> {
-    let mut out = Vec::with_capacity(batch.num_rows());
-    for i in 0..batch.num_rows() {
-        out.push(WatermarkRow {
-            deployment: str_at(batch, 0, i)?,
-            watermark: str_at(batch, 1, i)?,
-            updated_at: ts_at(batch, 2, i)?,
-            revision: i64_at(batch, 3, i)?,
-        });
-    }
-    Ok(out)
-}

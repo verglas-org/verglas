@@ -7653,13 +7653,11 @@ version = "0.1.1"
 dependencies = [
  "arrow-array 57.3.1",
  "arrow-schema 57.3.1",
- "async-trait",
  "chrono",
  "filetime",
  "iceberg",
  "iceberg-catalog-sql",
  "libc",
- "opendal",
  "serde",
  "serde_json",
  "sqlx",

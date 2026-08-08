@@ -1492,8 +1492,8 @@ async fn serve(
     // Puffin statistics attachment on the exact source snapshot it reflects.
     let vector_slot: Option<admin::VectorSlot> =
         config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
-    // The `verglas_sys` registry and watermark routes (#322) write and read
-    // through a `SystemCatalog` over the same private catalog — the server is
+    // The `verglas_sys` registry routes write and read through a
+    // `SystemCatalog` over the same private catalog — the server is
     // the only local writer of `verglas_sys`. Filled after recovery.
     let sys_slot: Option<admin::SysSlot> =
         config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
@@ -1868,8 +1868,8 @@ async fn serve(
                 .await
             {
                 Ok(catalog) => {
-                    // The registry/watermark routes (#322) share the handle:
-                    // one private catalog client, one write authority.
+                    // The registry routes share the handle: one private
+                    // catalog client, one write authority.
                     let sys_catalog =
                         Arc::new(verglas_platform::SystemCatalog::new(catalog.clone()));
                     if let Some(sys) = &sys_slot {

@@ -513,7 +513,7 @@ Scheduling is a separate stateless service. Each tenant has one logical worker q
 
 The scheduler is a running queue consumer. Pushed worker events are persisted before the event API acknowledges them and are eligible to run immediately. Cron, retry, and lease deadlines use exact timers derived from durable queue state; there is no periodic queue poll and no separate wake endpoint. On-prem, the catalog change feed pushes matching data-update events to the scheduler. In cloud, event producers write the same tenant queue contract and the fleet scheduler claims work and chooses a microVM host.
 
-The durable per-deployment watermark cell remains available behind the client as a general-purpose key-value primitive for workloads that genuinely need cross-run state, but it is deliberately *not* the cron progress model and no longer appears in the worker context. Scheduling progress is the platform's responsibility, expressed as logical time; the watermark KV is a tool a worker may reach for, not a contract the harness maintains on its behalf.
+There is no per-deployment watermark cell. Cross-run state a worker genuinely needs belongs in a table or KV the worker writes through the connected client; scheduling progress remains the platform's responsibility, expressed as logical time.
 
 ### 7.4 Containers and scale-to-zero
 
