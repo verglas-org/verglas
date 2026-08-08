@@ -302,7 +302,9 @@ pub async fn run(
                 Ok(token) if !token.is_empty() => CatalogWatcherRuntime::Push(Arc::new(
                     PushWatcher::spawn(gateway.source(), options),
                 )),
-                _ => CatalogWatcherRuntime::Polling(PollingWatcher::spawn(gateway.source(), options)),
+                _ => {
+                    CatalogWatcherRuntime::Polling(PollingWatcher::spawn(gateway.source(), options))
+                }
             };
             Ok((gateway, watcher))
         })
