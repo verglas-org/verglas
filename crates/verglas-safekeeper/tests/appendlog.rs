@@ -201,16 +201,23 @@ impl LiveMembership for FakeMembership {
 
 struct MemStore {
     objects: Mutex<HashMap<(String, String), Bytes>>,
+    put_gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
 }
 
 impl MemStore {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             objects: Mutex::new(HashMap::new()),
+            put_gate: Mutex::new(None),
         })
     }
     fn object_count(&self) -> usize {
         self.objects.lock().expect("lock").len()
+    }
+    fn block_next_put(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let gate = (Arc::new(tokio::sync::Notify::new()), Arc::new(tokio::sync::Notify::new()));
+        *self.put_gate.lock().expect("lock") = Some(gate.clone());
+        gate
     }
 }
 
@@ -263,6 +270,11 @@ impl ObjectWrite for MemStore {
         _metadata: WriteMetadata,
         mut body: WriteBodyStream,
     ) -> Result<PutOutcome, WriteError> {
+        let gate = self.put_gate.lock().expect("lock").take();
+        if let Some((started, release)) = gate {
+            started.notify_one();
+            release.notified().await;
+        }
         let mut buf = Vec::new();
         while let Some(chunk) = body.next().await {
             buf.extend_from_slice(&chunk?);
@@ -658,13 +670,13 @@ async fn flush_drains_to_s3_then_drops_local_fragments() {
     let store = MemStore::new();
     let transport = MemoryTransport::new();
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
-    let log = build(
+    let log = Arc::new(build(
         store.clone(),
         transport.clone(),
         membership,
         dir.path(),
         geom(),
-    );
+    ));
 
     let payload = bytes(9000);
     log.append(Epoch(0), Lsn(0), payload.clone())
@@ -685,6 +697,43 @@ async fn flush_drains_to_s3_then_drops_local_fragments() {
     // The range still reads back, now served from S3.
     let got = log.read(Lsn(0), log.tail()).await.expect("read from s3");
     assert_eq!(got, payload, "flushed range reads back byte-identically");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slow_origin_flush_does_not_block_quorum_appends() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = Arc::new(build(
+        store.clone(),
+        transport.clone(),
+        membership,
+        dir.path(),
+        geom(),
+    ));
+    log.append(Epoch(0), Lsn(0), bytes(9000)).await.expect("first append");
+    let (put_started, release_put) = store.block_next_put();
+    let flushing = {
+        let log = log.clone();
+        tokio::spawn(async move { log.flush().await })
+    };
+    put_started.notified().await;
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        log.append(Epoch(0), Lsn(9000), bytes(1000)),
+    )
+    .await
+    .expect("append must not wait for object storage")
+    .expect("concurrent append");
+    release_put.notify_one();
+    assert_eq!(flushing.await.expect("flush task").expect("stale flush"), Lsn(0));
+    assert_eq!(log.tail(), Lsn(10_000));
+    assert_eq!(transport.wal_fragment_count(), 6, "stale flush keeps both appends durable");
+
+    assert_eq!(log.flush().await.expect("fresh flush"), Lsn(10_000));
+    assert_eq!(transport.wal_fragment_count(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

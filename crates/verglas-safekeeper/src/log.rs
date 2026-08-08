@@ -999,52 +999,64 @@ where
     }
 
     async fn flush(&self) -> Result<Lsn, AppendError> {
+        // Snapshot one segment under the serialization lock, then release the
+        // lock before reconstructing it and performing the potentially slow R2
+        // PUT. Holding this lock across object storage used to stop every WAL
+        // append for the duration of each upload, limiting synchronous commit
+        // throughput to roughly one segment per R2 round trip.
+        let segment = {
+            let manifest = self.state.lock().await;
+            manifest
+                .segments
+                .iter()
+                .find(|segment| segment.state == SegmentState::Open)
+                .cloned()
+        };
+        let Some(segment) = segment else {
+            return Ok(self.flushed_through());
+        };
+
+        let bytes = self.reassemble_segment(&segment).await?;
+        let s3_key = self.segment_key(&segment);
+        let key = CacheKey {
+            bucket: self.bucket.clone(),
+            key: s3_key.clone(),
+        };
+        self.store
+            .put(&key, WriteMetadata::default(), once_body(bytes))
+            .await
+            .map_err(|e| AppendError::Origin(e.to_string()))?;
+
         let mut manifest = self.state.lock().await;
-        let mut i = 0;
-        while i < manifest.segments.len() {
-            if manifest.segments[i].state != SegmentState::Open {
-                i += 1;
-                continue;
-            }
-            let segment = manifest.segments[i].clone();
-            // Reassemble the segment and write it to S3. Only after S3 confirms
-            // it durable do we mark it flushed and drop the local fragments —
-            // S3 first, then drop, so the buffer is never the sole copy of bytes
-            // it has forgotten.
-            let bytes = self.reassemble_segment(&segment).await?;
-            let s3_key = self.segment_key(&segment);
-            let key = CacheKey {
-                bucket: self.bucket.clone(),
-                key: s3_key.clone(),
-            };
-            self.store
-                .put(&key, WriteMetadata::default(), once_body(bytes))
-                .await
-                .map_err(|e| AppendError::Origin(e.to_string()))?;
-
-            manifest.segments[i].state = SegmentState::Flushed;
-            manifest.segments[i].s3_key = Some(s3_key);
-            // Origin now owns the complete segment. Recovery and reads need
-            // only its LSN range and object key; retaining every append's
-            // fragment placements made the replicated descriptor grow without
-            // bound even though those fragments are deleted below.
-            manifest.segments[i].appends.clear();
-            // Segments flush in LSN order with no gaps, so the whole prefix up to
-            // this segment's end is now in S3.
-            manifest.flushed_through = segment.end;
-            manifest.revision = manifest.revision.saturating_add(1);
-            self.replicate_state(&manifest).await?;
-            self.manifest_store.persist(&manifest)?;
-            self.flushed.store(segment.end.0, Ordering::Relaxed);
-
-            // The flushed record is durable; free the fragments.
-            for entry in &segment.appends {
-                self.drop_fragments(entry.object_id(), &entry.placements)
-                    .await;
-            }
-            i += 1;
+        let Some(i) = manifest.segments.iter().position(|current| current.id == segment.id) else {
+            return Ok(manifest.flushed_through);
+        };
+        // The open tail may have grown while its snapshot uploaded. That upload
+        // is not a complete segment and therefore cannot advance durability;
+        // leave the fragment-backed tail intact and retry a fresh snapshot on a
+        // later drain tick. Most importantly, appends never waited for the PUT.
+        if manifest.segments[i] != segment {
+            return Ok(manifest.flushed_through);
         }
-        Ok(manifest.flushed_through)
+
+        manifest.segments[i].state = SegmentState::Flushed;
+        manifest.segments[i].s3_key = Some(s3_key);
+        // Origin now owns the complete segment. Recovery and reads need only its
+        // LSN range and object key; retain the snapshot below only long enough to
+        // delete its fragment placements after the manifest commit.
+        manifest.segments[i].appends.clear();
+        manifest.flushed_through = segment.end;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)?;
+        self.flushed.store(segment.end.0, Ordering::Relaxed);
+        drop(manifest);
+
+        for entry in &segment.appends {
+            self.drop_fragments(entry.object_id(), &entry.placements)
+                .await;
+        }
+        Ok(segment.end)
     }
 
     async fn truncate(&self, up_to: Lsn) -> Result<(), AppendError> {
