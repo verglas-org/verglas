@@ -11,3 +11,4 @@ pub mod query;
 pub mod status;
 pub mod table;
 pub mod table_metrics;
+pub mod vessel;

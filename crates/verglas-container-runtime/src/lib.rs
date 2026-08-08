@@ -35,6 +35,73 @@ pub const LABEL_SPEC_DIGEST: &str = "io.verglas.spec-sha256";
 
 const CONTAINER_NAME_PREFIX: &str = "verglas-";
 
+/// Product role assigned to one long-lived local Vessel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VesselRole {
+    /// An API connection to an external application.
+    Integration,
+    /// A full-stack application over Verglas data or integrations.
+    Application,
+}
+
+/// Internal HTTP endpoint exposed by a Vessel on the shared runtime network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VesselHttp {
+    /// TCP port listened to inside the Vessel container.
+    pub port: u16,
+    /// Optional readiness endpoint relative to the Vessel origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_path: Option<String>,
+}
+
+/// Desired declaration for one isolated long-lived HTTP service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VesselSpec {
+    /// Stable local name used by the CLI and runtime proxy.
+    pub name: String,
+    /// Product behavior exposed by this Vessel.
+    pub role: VesselRole,
+    /// OCI image containing the service.
+    pub image: String,
+    /// Optional command overriding the image command.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Optional executable overriding the image entrypoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entrypoint: Vec<String>,
+    /// Non-secret service configuration.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    /// Private HTTP service contract.
+    pub http: VesselHttp,
+}
+
+impl VesselSpec {
+    /// Validates the Vessel boundary and maps it to one unpublished container.
+    pub fn container_spec(&self) -> Result<ContainerSpec, RuntimeError> {
+        if self.http.port == 0 {
+            return Err(RuntimeError::InvalidPort);
+        }
+        if self
+            .http
+            .health_path
+            .as_ref()
+            .is_some_and(|path| !path.starts_with('/'))
+        {
+            return Err(RuntimeError::InvalidHealthPath);
+        }
+        let mut container = ContainerSpec::new(format!("vessel-{}", self.name), &self.image)
+            .with_command(self.command.clone())
+            .with_entrypoint(self.entrypoint.clone());
+        container.environment = self.environment.clone();
+        container.validate()?;
+        Ok(container)
+    }
+}
+
 /// One host path exposed inside a managed workload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -287,6 +354,9 @@ pub enum RuntimeError {
     /// A published TCP port used the reserved zero value.
     #[error("published container and host ports must be non-zero")]
     InvalidPort,
+    /// A Vessel health path was not origin-relative.
+    #[error("vessel health path must begin with '/'")]
+    InvalidHealthPath,
     /// A workload attempted to receive Docker daemon authority.
     #[error("workload cannot receive Docker authority through {detail}")]
     DockerAuthority {

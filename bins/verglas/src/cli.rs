@@ -105,6 +105,68 @@ pub enum Command {
     /// Set and get small raw values in the built-in persistent KV engine.
     #[command(subcommand)]
     Kv(KvCommand),
+    /// Manage and call long-lived local HTTP services in the Docker runtime.
+    #[command(subcommand)]
+    Vessel(VesselCommand),
+}
+
+/// `verglas vessel` operations against the local Docker runtime manager.
+#[derive(Debug, Subcommand)]
+pub enum VesselCommand {
+    /// Create or replace a Vessel from a YAML or JSON declaration.
+    Add(VesselAddArgs),
+    /// List desired Vessels and their observed state.
+    List,
+    /// Show one Vessel by name.
+    Get(VesselNameArgs),
+    /// Remove one Vessel and its owned container.
+    Remove(VesselNameArgs),
+    /// Send an HTTP GET to a path exposed by a Vessel.
+    Curl(VesselCurlArgs),
+    /// POST a JSON operation to the Vessel's `/v1/query` endpoint.
+    Query(VesselQueryArgs),
+}
+
+/// Arguments for creating or replacing a Vessel.
+#[derive(Debug, Args)]
+pub struct VesselAddArgs {
+    /// YAML or JSON Vessel declaration.
+    #[arg(long)]
+    pub file: PathBuf,
+}
+
+/// A Vessel referenced by its stable local name.
+#[derive(Debug, Args)]
+pub struct VesselNameArgs {
+    /// Stable Vessel name.
+    pub name: String,
+}
+
+/// Arguments for a direct Vessel HTTP call.
+#[derive(Debug, Args)]
+pub struct VesselCurlArgs {
+    /// Stable Vessel name.
+    pub name: String,
+    /// Origin-relative HTTP path exposed by the Vessel.
+    pub path: String,
+    /// HTTP method sent through the runtime proxy.
+    #[arg(long, default_value = "GET")]
+    pub method: String,
+    /// JSON request body. Prefer `--data-stdin` for credentials.
+    #[arg(long, conflicts_with = "data_stdin")]
+    pub data: Option<String>,
+    /// Read a JSON request body from stdin so secrets avoid shell history.
+    #[arg(long, conflicts_with = "data")]
+    pub data_stdin: bool,
+}
+
+/// Arguments for a semantic Vessel query.
+#[derive(Debug, Args)]
+pub struct VesselQueryArgs {
+    /// Stable Vessel name.
+    pub name: String,
+    /// JSON request body sent to `/v1/query`.
+    pub request: String,
 }
 
 /// `verglas kv` operations.

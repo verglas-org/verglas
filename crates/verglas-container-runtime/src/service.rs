@@ -5,19 +5,26 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path as AxumPath, State};
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, State};
+use axum::http::{HeaderMap, Method, StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum::routing::{any, get, post, put};
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::{ContainerSpec, DockerRuntime, ManagedContainer, ReconcileOutcome, RuntimeError};
+use crate::{
+    ContainerSpec, DockerRuntime, ManagedContainer, ObservedState, ReconcileOutcome, RuntimeError,
+    VesselRole, VesselSpec,
+};
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_PROXY_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_PROXY_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Failures from the local runtime manager service.
 #[derive(Debug, Error)]
@@ -48,6 +55,15 @@ pub enum ServiceError {
     /// Docker placement failed.
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
+    /// A private Vessel HTTP call failed before returning a response.
+    #[error("Vessel HTTP request failed: {0}")]
+    VesselRequest(String),
+    /// A private Vessel response exceeded the manager's bounded relay contract.
+    #[error("Vessel HTTP response exceeds {MAX_PROXY_RESPONSE_BYTES} bytes")]
+    VesselResponseTooLarge,
+    /// A local application preview path named a non-Application Vessel.
+    #[error("Vessel {0} is not an Application")]
+    NotApplication(String),
 }
 
 impl IntoResponse for ServiceError {
@@ -62,9 +78,14 @@ impl IntoResponse for ServiceError {
                 | RuntimeError::MissingImage
                 | RuntimeError::InvalidNetwork
                 | RuntimeError::InvalidPort
+                | RuntimeError::InvalidHealthPath
                 | RuntimeError::DockerAuthority { .. },
             ) => StatusCode::BAD_REQUEST,
             ServiceError::Runtime(RuntimeError::UnmanagedCollision { .. }) => StatusCode::CONFLICT,
+            ServiceError::VesselRequest(_) | ServiceError::VesselResponseTooLarge => {
+                StatusCode::BAD_GATEWAY
+            }
+            ServiceError::NotApplication(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (status, self.to_string()).into_response()
@@ -109,7 +130,16 @@ impl RuntimeService {
     pub fn router(&self) -> Router {
         Router::new()
             .route("/health", get(health))
+            .route("/apps/{name}", get(application_redirect))
+            .route("/apps/{name}/", get(application_root))
+            .route("/apps/{name}/{*path}", get(application_proxy))
             .route("/v1/containers", get(list_containers))
+            .route("/v1/vessels", get(list_vessels))
+            .route(
+                "/v1/vessels/{name}",
+                get(get_vessel).put(put_vessel).delete(delete_vessel),
+            )
+            .route("/v1/vessels/{name}/http/{*path}", any(proxy_vessel))
             .route(
                 "/v1/containers/{deployment_id}",
                 put(put_container).delete(delete_container),
@@ -119,6 +149,7 @@ impl RuntimeService {
                 "/v1/containers/{deployment_id}/resume",
                 post(resume_container),
             )
+            .layer(DefaultBodyLimit::max(MAX_PROXY_REQUEST_BYTES))
             .with_state(Arc::clone(&self.state))
     }
 
@@ -146,7 +177,14 @@ struct DesiredDeployment {
     running: bool,
 }
 
-type DesiredState = BTreeMap<String, DesiredDeployment>;
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DesiredState {
+    #[serde(default)]
+    containers: BTreeMap<String, DesiredDeployment>,
+    #[serde(default)]
+    vessels: BTreeMap<String, VesselSpec>,
+}
 
 struct ServiceState {
     runtime: DockerRuntime,
@@ -162,7 +200,7 @@ impl ServiceState {
     async fn reconcile_all(&self) -> Result<(), ServiceError> {
         let _operation = self.operation.lock().await;
         let desired = self.desired.read().await.clone();
-        for deployment in desired.values() {
+        for deployment in desired.containers.values() {
             if deployment.running {
                 self.runtime.reconcile(&deployment.specification).await?;
             } else {
@@ -170,6 +208,11 @@ impl ServiceState {
                     .stop(&deployment.specification.deployment_id)
                     .await?;
             }
+        }
+        for vessel in desired.vessels.values() {
+            self.runtime
+                .reconcile(&self.normalize(vessel.container_spec()?))
+                .await?;
         }
         Ok(())
     }
@@ -222,7 +265,7 @@ async fn put_container(
     let specification = state.normalize(specification);
     let _operation = state.operation.lock().await;
     let outcome = state.runtime.reconcile(&specification).await?;
-    state.desired.write().await.insert(
+    state.desired.write().await.containers.insert(
         deployment_id,
         DesiredDeployment {
             specification,
@@ -242,7 +285,12 @@ async fn delete_container(
     authorize(&headers, &state.token)?;
     let _operation = state.operation.lock().await;
     state.runtime.remove(&deployment_id).await?;
-    state.desired.write().await.remove(&deployment_id);
+    state
+        .desired
+        .write()
+        .await
+        .containers
+        .remove(&deployment_id);
     state.persist().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -255,7 +303,13 @@ async fn stop_container(
 ) -> Result<StatusCode, ServiceError> {
     authorize(&headers, &state.token)?;
     let _operation = state.operation.lock().await;
-    if let Some(deployment) = state.desired.write().await.get_mut(&deployment_id) {
+    if let Some(deployment) = state
+        .desired
+        .write()
+        .await
+        .containers
+        .get_mut(&deployment_id)
+    {
         deployment.running = false;
     }
     state.persist().await?;
@@ -273,18 +327,261 @@ async fn resume_container(
     let _operation = state.operation.lock().await;
     let specification = {
         let mut desired = state.desired.write().await;
-        let deployment =
-            desired
-                .get_mut(&deployment_id)
-                .ok_or_else(|| RuntimeError::InvalidDeploymentId {
-                    deployment_id: deployment_id.clone(),
-                })?;
+        let deployment = desired.containers.get_mut(&deployment_id).ok_or_else(|| {
+            RuntimeError::InvalidDeploymentId {
+                deployment_id: deployment_id.clone(),
+            }
+        })?;
         deployment.running = true;
         deployment.specification.clone()
     };
     let outcome = state.runtime.reconcile(&specification).await?;
     state.persist().await?;
     Ok(Json(outcome))
+}
+
+/// Public runtime observation for a Vessel without secret-bearing configuration.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VesselView {
+    name: String,
+    role: VesselRole,
+    image: String,
+    state: Option<ObservedState>,
+    health: VesselHealth,
+}
+
+/// Result of the optional private-network Vessel health probe.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum VesselHealth {
+    Ready,
+    Unhealthy,
+    Unknown,
+}
+
+/// Lists desired Vessels and their current Docker state.
+async fn list_vessels(
+    State(state): State<Arc<ServiceState>>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<VesselView>>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let vessels = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut views = Vec::with_capacity(vessels.len());
+    for vessel in vessels {
+        views.push(vessel_view(&state, vessel).await?);
+    }
+    Ok(Json(views))
+}
+
+/// Returns one desired Vessel and its current Docker state.
+async fn get_vessel(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<VesselView>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let vessel = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .get(&name)
+        .cloned()
+        .ok_or(RuntimeError::InvalidDeploymentId {
+            deployment_id: name,
+        })?;
+    Ok(Json(vessel_view(&state, vessel).await?))
+}
+
+/// Creates or replaces one desired Vessel and its single container.
+async fn put_vessel(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(vessel): Json<VesselSpec>,
+) -> Result<Json<ReconcileOutcome>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    if name != vessel.name {
+        return Err(ServiceError::IdentityMismatch {
+            path: name,
+            body: vessel.name,
+        });
+    }
+    let specification = state.normalize(vessel.container_spec()?);
+    let _operation = state.operation.lock().await;
+    let outcome = state.runtime.reconcile(&specification).await?;
+    state
+        .desired
+        .write()
+        .await
+        .vessels
+        .insert(vessel.name.clone(), vessel);
+    state.persist().await?;
+    Ok(Json(outcome))
+}
+
+/// Removes one desired Vessel and its owned container.
+async fn delete_vessel(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let _operation = state.operation.lock().await;
+    state.runtime.remove(&format!("vessel-{name}")).await?;
+    state.desired.write().await.vessels.remove(&name);
+    state.persist().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Proxies one authenticated request to a Vessel over the private Docker network.
+async fn proxy_vessel(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath((name, path)): AxumPath<(String, String)>,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ServiceError> {
+    authorize(&headers, &state.token)?;
+    forward_vessel(&state, &name, &path, method, &headers, body).await
+}
+
+/// Redirects a local Application URL to its slash-terminated asset base.
+async fn application_redirect(AxumPath(name): AxumPath<String>) -> Redirect {
+    Redirect::temporary(&format!("/apps/{name}/"))
+}
+
+/// Serves the root document of one local Application Vessel.
+async fn application_root(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Response, ServiceError> {
+    application_proxy(State(state), AxumPath((name, String::new())), headers).await
+}
+
+/// Serves a local Application preview without exposing Integration HTTP surfaces.
+async fn application_proxy(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath((name, path)): AxumPath<(String, String)>,
+    headers: HeaderMap,
+) -> Result<Response, ServiceError> {
+    let vessel = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .get(&name)
+        .cloned()
+        .ok_or_else(|| ServiceError::NotApplication(name.clone()))?;
+    if vessel.role != VesselRole::Application {
+        return Err(ServiceError::NotApplication(name));
+    }
+    forward_vessel(
+        &state,
+        &vessel.name,
+        &path,
+        Method::GET,
+        &headers,
+        Bytes::new(),
+    )
+    .await
+}
+
+/// Relays one bounded request to a declared Vessel's private HTTP endpoint.
+async fn forward_vessel(
+    state: &ServiceState,
+    name: &str,
+    path: &str,
+    method: Method,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, ServiceError> {
+    let vessel = state
+        .desired
+        .read()
+        .await
+        .vessels
+        .get(name)
+        .cloned()
+        .ok_or_else(|| RuntimeError::InvalidDeploymentId {
+            deployment_id: name.to_owned(),
+        })?;
+    let url = format!("http://verglas-vessel-{name}:{}/{path}", vessel.http.port);
+    let response = reqwest::Client::new()
+        .request(method, url)
+        .header(
+            header::CONTENT_TYPE,
+            headers
+                .get(header::CONTENT_TYPE)
+                .cloned()
+                .unwrap_or_else(|| "application/json".parse().expect("static content type")),
+        )
+        .body(body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|error| ServiceError::VesselRequest(error.to_string()))?;
+    let status = response.status();
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| ServiceError::VesselRequest(error.to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_PROXY_RESPONSE_BYTES {
+            return Err(ServiceError::VesselResponseTooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let mut result = (status, bytes).into_response();
+    if let Some(content_type) = content_type {
+        result
+            .headers_mut()
+            .insert(header::CONTENT_TYPE, content_type);
+    }
+    Ok(result)
+}
+
+/// Joins a desired Vessel with its normalized Docker observation.
+async fn vessel_view(state: &ServiceState, vessel: VesselSpec) -> Result<VesselView, ServiceError> {
+    let observed = state
+        .runtime
+        .inspect(&format!("vessel-{}", vessel.name))
+        .await?;
+    let health = match (&observed, &vessel.http.health_path) {
+        (Some(container), Some(path)) if container.state == ObservedState::Running => {
+            let url = format!(
+                "http://verglas-vessel-{}:{}{}",
+                vessel.name, vessel.http.port, path
+            );
+            match reqwest::Client::new()
+                .get(url)
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => VesselHealth::Ready,
+                _ => VesselHealth::Unhealthy,
+            }
+        }
+        (Some(_), Some(_)) => VesselHealth::Unhealthy,
+        _ => VesselHealth::Unknown,
+    };
+    Ok(VesselView {
+        name: vessel.name,
+        role: vessel.role,
+        image: vessel.image,
+        state: observed.map(|container| container.state),
+        health,
+    })
 }
 
 /// Compares the bearer credential without accepting alternate authority forms.
@@ -329,7 +626,7 @@ fn is_bootstrap_target(deployment_id: &str) -> bool {
 async fn load_desired(path: &Path) -> Result<DesiredState, ServiceError> {
     match tokio::fs::read(path).await {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(DesiredState::default()),
         Err(error) => Err(ServiceError::Storage(error)),
     }
 }
@@ -354,6 +651,7 @@ mod tests {
             std::process::id()
         ));
         let desired = load_desired(&path).await.expect("load missing state");
-        assert!(desired.is_empty());
+        assert!(desired.containers.is_empty());
+        assert!(desired.vessels.is_empty());
     }
 }

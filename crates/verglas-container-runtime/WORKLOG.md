@@ -8,3 +8,9 @@
   bootstrap after rebasing onto the merged runtime crate.
 - #50: Built the runtime-manager image from the shared runtime base with scheduler only.
   It no longer layers on the Gadget runtime image or documents Gadgets as managed products.
+- #55: Added persisted Vessel declarations, one-container mapping, and authenticated private-network
+  HTTP proxying without publishing workload ports to the host.
+- #55: Exposed GET-only localhost preview routes for Application Vessels while keeping Integration
+  HTTP surfaces behind runtime authentication.
+- #55: Removed the in-tree Linear integration and dashboard Application crates. Vessel persistence,
+  proxying, and Application previews stay; product examples are no longer bundled.
