@@ -81,6 +81,12 @@ pub struct EcAppendLog<S> {
     flushed: AtomicU64,
     /// Mirror of the writer epoch.
     epoch: AtomicU64,
+    /// Highest commit watermark supplied with an append but not yet folded
+    /// into that append's durable manifest revision.
+    pending_commit: AtomicU64,
+    /// Highest truncate watermark supplied with an append but not yet folded
+    /// into that append's durable manifest revision.
+    pending_truncate: AtomicU64,
 }
 
 impl<S> EcAppendLog<S>
@@ -135,7 +141,29 @@ where
             tail,
             flushed,
             epoch,
+            pending_commit: AtomicU64::new(0),
+            pending_truncate: AtomicU64::new(0),
         })
+    }
+
+    /// Appends WAL and records the watermarks carried by the same proposer
+    /// frame in one replicated manifest revision. Persisting them in two
+    /// revisions doubles the quorum network and fsync round trips on the hot
+    /// path, while providing no additional durability boundary.
+    pub async fn append_with_watermarks(
+        &self,
+        epoch: Epoch,
+        begin_lsn: Lsn,
+        records: Bytes,
+        commit_lsn: Lsn,
+        truncate_lsn: Lsn,
+    ) -> Result<SafekeeperState, AppendError> {
+        self.pending_commit
+            .fetch_max(commit_lsn.0, Ordering::Relaxed);
+        self.pending_truncate
+            .fetch_max(truncate_lsn.0, Ordering::Relaxed);
+        <Self as AppendLog>::append(self, epoch, begin_lsn, records).await?;
+        Ok(self.safekeeper_state().await)
     }
 
     /// The geometry this append uses: the degenerate single-node code for a
@@ -806,6 +834,8 @@ where
                     begin: begin_lsn,
                     bytes: records.len(),
                 })?);
+        let pending_commit = self.pending_commit.load(Ordering::Relaxed);
+        let pending_truncate = self.pending_truncate.load(Ordering::Relaxed);
         let fresh = manifest.segments.is_empty()
             && manifest.base == Lsn(0)
             && manifest.tail == Lsn(0)
@@ -841,6 +871,25 @@ where
             }
         }
         if end_lsn.0 <= durable_tail.0 {
+            let commit_lsn = pending_commit.min(manifest.tail.0);
+            let truncate_lsn = pending_truncate.min(manifest.tail.0);
+            if commit_lsn > manifest.commit_lsn.0 || truncate_lsn > manifest.truncate_lsn.0 {
+                manifest.commit_lsn = Lsn(manifest.commit_lsn.0.max(commit_lsn));
+                manifest.truncate_lsn = Lsn(manifest.truncate_lsn.0.max(truncate_lsn));
+                manifest.revision = manifest.revision.saturating_add(1);
+                self.replicate_state(&manifest).await?;
+                self.manifest_store.persist(&manifest)?;
+            }
+            let _ =
+                self.pending_commit
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                        (current <= pending_commit).then_some(0)
+                    });
+            let _ = self.pending_truncate.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| (current <= pending_truncate).then_some(0),
+            );
             return Ok(Appended {
                 start: begin_lsn,
                 end: end_lsn,
@@ -898,6 +947,14 @@ where
             manifest.flushed_through = begin_lsn;
         }
         manifest.tail = end;
+        manifest.commit_lsn = Lsn(manifest
+            .commit_lsn
+            .0
+            .max(pending_commit.min(manifest.tail.0)));
+        manifest.truncate_lsn = Lsn(manifest
+            .truncate_lsn
+            .0
+            .max(pending_truncate.min(manifest.tail.0)));
         manifest.revision = manifest.revision.saturating_add(1);
 
         if let Err(error) = self.replicate_state(&manifest).await {
@@ -919,6 +976,16 @@ where
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
+        let _ = self
+            .pending_commit
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current <= pending_commit).then_some(0)
+            });
+        let _ =
+            self.pending_truncate
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    (current <= pending_truncate).then_some(0)
+                });
 
         Ok(Appended {
             start: begin_lsn,

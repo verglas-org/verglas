@@ -452,11 +452,14 @@ where
                                 append.generation
                             )));
                         }
-                        timeline
-                            .append(Epoch(append.term), append.begin_lsn, append.wal)
-                            .await?;
                         let state = timeline
-                            .record_watermarks(append.commit_lsn, append.truncate_lsn)
+                            .append_with_watermarks(
+                                Epoch(append.term),
+                                append.begin_lsn,
+                                append.wal,
+                                append.commit_lsn,
+                                append.truncate_lsn,
+                            )
                             .await?;
                         write_copy_data(
                             stream,
