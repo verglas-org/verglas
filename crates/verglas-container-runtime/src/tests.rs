@@ -150,9 +150,9 @@ fn fixture() -> ContainerSpec {
 #[test]
 fn vessel_maps_to_one_unpublished_managed_container() {
     let vessel = VesselSpec {
-        name: "linear".to_owned(),
+        name: "demo".to_owned(),
         role: VesselRole::Integration,
-        image: "verglas/integration-linear:local".to_owned(),
+        image: "verglas/integration-demo:local".to_owned(),
         command: Vec::new(),
         entrypoint: Vec::new(),
         environment: BTreeMap::new(),
@@ -164,7 +164,7 @@ fn vessel_maps_to_one_unpublished_managed_container() {
 
     let container = vessel.container_spec().expect("container specification");
 
-    assert_eq!(container.deployment_id, "vessel-linear");
+    assert_eq!(container.deployment_id, "vessel-demo");
     assert!(container.published_ports.is_empty());
     assert_eq!(container.image, vessel.image);
 }

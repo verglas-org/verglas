@@ -12,3 +12,5 @@
   HTTP proxying without publishing workload ports to the host.
 - #55: Exposed GET-only localhost preview routes for Application Vessels while keeping Integration
   HTTP surfaces behind runtime authentication.
+- #55: Removed the in-tree Linear integration and dashboard Application crates. Vessel persistence,
+  proxying, and Application previews stay; product examples are no longer bundled.

@@ -736,3 +736,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #18: Reorganized the worker example around a reusable `market-data-ingest` definition and kept SPY only as an input symbol. The manifest tests now use the same neutral worker and callback names shown throughout the rewritten trigger guides.
 - #18: Added documentation regression tests that keep the complete Compose contract and every displayed worker file synchronized with the runnable repository examples. CLI help now points dashboard users to the Compose analytics profile instead of the removed server TOML configuration.
 - #29: Added direct `verglas kv set` and `verglas kv get` commands against the server's built-in KV engine. Set accepts an optional TTL and both commands use the existing endpoint and bearer-token environment without KV configuration.
+- #55: Dropped the bundled Linear Vessel example from CLI tests; the vessel commands keep a generic demo fixture.

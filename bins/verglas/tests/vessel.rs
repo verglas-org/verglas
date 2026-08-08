@@ -12,11 +12,11 @@ use axum::routing::{delete, get, post, put};
 fn spawn_mock() -> String {
     let app = Router::new()
         .route(
-            "/v1/vessels/linear",
+            "/v1/vessels/demo",
             put(|headers: HeaderMap, body: Bytes| async move {
                 assert_eq!(headers[header::AUTHORIZATION], "Bearer runtime-secret");
                 let body: serde_json::Value = serde_json::from_slice(&body).expect("vessel json");
-                assert_eq!(body["name"], "linear");
+                assert_eq!(body["name"], "demo");
                 assert_eq!(body["role"], "integration");
                 assert_eq!(body["http"]["port"], 8371);
                 assert!(body.get("token").is_none());
@@ -25,9 +25,9 @@ fn spawn_mock() -> String {
             .get(|headers: HeaderMap| async move {
                 assert_eq!(headers[header::AUTHORIZATION], "Bearer runtime-secret");
                 axum::Json(serde_json::json!({
-                    "name":"linear",
+                    "name":"demo",
                     "role":"integration",
-                    "image":"verglas/integration-linear:local",
+                    "image":"verglas/integration-demo:local",
                     "state":"running",
                     "health":"ready"
                 }))
@@ -42,16 +42,16 @@ fn spawn_mock() -> String {
             get(|headers: HeaderMap| async move {
                 assert_eq!(headers[header::AUTHORIZATION], "Bearer runtime-secret");
                 axum::Json(serde_json::json!([{
-                    "name":"linear",
+                    "name":"demo",
                     "role":"integration",
-                    "image":"verglas/integration-linear:local",
+                    "image":"verglas/integration-demo:local",
                     "state":"running",
                     "health":"ready"
                 }]))
             }),
         )
         .route(
-            "/v1/vessels/linear/http/v1/query",
+            "/v1/vessels/demo/http/v1/query",
             post(|headers: HeaderMap, body: Bytes| async move {
                 assert_eq!(headers[header::AUTHORIZATION], "Bearer runtime-secret");
                 let body: serde_json::Value = serde_json::from_slice(&body).expect("query json");
@@ -60,7 +60,7 @@ fn spawn_mock() -> String {
             }),
         )
         .route(
-            "/v1/vessels/linear/http/v1/viewer",
+            "/v1/vessels/demo/http/v1/viewer",
             get(|headers: HeaderMap| async move {
                 assert_eq!(headers[header::AUTHORIZATION], "Bearer runtime-secret");
                 axum::Json(serde_json::json!({"id":"viewer-1","name":"Test User"}))
@@ -97,12 +97,12 @@ fn run(endpoint: &str, args: &[&str]) -> std::process::Output {
 fn add_list_get_remove_and_call_a_local_vessel() {
     let endpoint = spawn_mock();
     let directory = tempfile::tempdir().expect("tempdir");
-    let manifest = directory.path().join("linear.yaml");
+    let manifest = directory.path().join("demo.yaml");
     std::fs::write(
         &manifest,
-        r#"name: linear
+        r#"name: demo
 role: integration
-image: verglas/integration-linear:local
+image: verglas/integration-demo:local
 http:
   port: 8371
   healthPath: /health
@@ -130,9 +130,9 @@ http:
         serde_json::json!({
             "outcome":"created",
             "vessel":{
-                "name":"linear",
+                "name":"demo",
                 "role":"integration",
-                "image":"verglas/integration-linear:local",
+                "image":"verglas/integration-demo:local",
                 "http":{"port":8371,"healthPath":"/health"}
             }
         })
@@ -140,7 +140,7 @@ http:
 
     for args in [
         vec!["--json", "vessel", "list"],
-        vec!["--json", "vessel", "get", "linear"],
+        vec!["--json", "vessel", "get", "demo"],
     ] {
         let output = run(&endpoint, &args);
         assert!(
@@ -148,12 +148,12 @@ http:
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stdout).contains("linear"));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("demo"));
     }
 
     let query = run(
         &endpoint,
-        &["vessel", "query", "linear", r#"{"operation":"viewer"}"#],
+        &["vessel", "query", "demo", r#"{"operation":"viewer"}"#],
     );
     assert!(
         query.status.success(),
@@ -162,7 +162,7 @@ http:
     );
     assert!(String::from_utf8_lossy(&query.stdout).contains("Test User"));
 
-    let curl = run(&endpoint, &["vessel", "curl", "linear", "/v1/viewer"]);
+    let curl = run(&endpoint, &["vessel", "curl", "demo", "/v1/viewer"]);
     assert!(
         curl.status.success(),
         "{}",
@@ -170,7 +170,7 @@ http:
     );
     assert!(String::from_utf8_lossy(&curl.stdout).contains("Test User"));
 
-    let remove = run(&endpoint, &["vessel", "remove", "linear"]);
+    let remove = run(&endpoint, &["vessel", "remove", "demo"]);
     assert!(
         remove.status.success(),
         "{}",

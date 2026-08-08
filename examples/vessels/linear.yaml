@@ -1,6 +1,0 @@
-name: linear
-role: integration
-image: verglas/integration-linear:local
-http:
-  port: 8371
-  healthPath: /health
