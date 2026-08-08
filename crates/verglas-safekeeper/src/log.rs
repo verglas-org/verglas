@@ -38,7 +38,7 @@ use crate::manifest::{
 /// Seal a segment and start a new one once the open one reaches this many bytes.
 /// A fixed flush-granularity constant, not a tuning knob: the whole tuning
 /// surface is the erasure geometry (see the crate contract, §7).
-const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
+pub(crate) const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
 
 /// Fragment index reserved for full-copy state descriptors. EC data fragments
 /// occupy the small `0..k+m` range, so this cannot collide with WAL data.
