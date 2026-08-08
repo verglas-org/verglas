@@ -874,11 +874,26 @@ async fn first_unmapped_partial_read_does_not_wait_for_aligned_tail() {
     assert_eq!(first, expected.slice(start as usize..=end as usize));
     assert!(body.try_next().await.expect("response end").is_none());
 
-    // Release the aligned tail and quiesce the background fill (#274 barrier);
-    // the completed aligned block must then be a backend-free warm hit.
+    // While the aligned tail is still gated, flush must not report quiescence —
+    // the background block flight is registered before the partial path returns
+    // so the #273 barrier observes it.
+    let flushing = engine.clone();
+    let mut flush = tokio::spawn(async move { flushing.flush().await });
+    let pending = tokio::time::timeout(std::time::Duration::from_millis(500), &mut flush).await;
+    assert!(
+        pending.is_err(),
+        "flush() returned while the aligned background fill was still gated"
+    );
+
+    // Release the aligned tail; the fill admits and flush completes. The
+    // completed aligned block must then be a backend-free warm hit.
     release.add_permits(1);
-    engine.flush().await;
+    flush.await.expect("flush task");
     let gets_after_fill = calls.snapshot().0;
+    assert!(
+        gets_after_fill >= 2,
+        "exact partial GET plus aligned block fill must both have run, got {gets_after_fill}"
+    );
     let (_, _, warm) = read_all(&engine, &key, ReadRange::Full)
         .await
         .expect("warm full-block read");
