@@ -994,7 +994,11 @@ where
     }
 
     async fn read(&self, from: Lsn, to: Lsn) -> Result<Bytes, AppendError> {
-        let manifest = self.state.lock().await;
+        // Replication reads can block on an origin GET while recovering a
+        // flushed segment. Keep that I/O outside the timeline serialization
+        // lock so a compute proposer can still complete its greeting and append
+        // new WAL while a pageserver is catching up from older WAL.
+        let manifest = self.state.lock().await.clone();
         self.read_manifest(&manifest, from, to).await
     }
 
@@ -1028,7 +1032,11 @@ where
             .map_err(|e| AppendError::Origin(e.to_string()))?;
 
         let mut manifest = self.state.lock().await;
-        let Some(i) = manifest.segments.iter().position(|current| current.id == segment.id) else {
+        let Some(i) = manifest
+            .segments
+            .iter()
+            .position(|current| current.id == segment.id)
+        else {
             return Ok(manifest.flushed_through);
         };
         // The open tail may have grown while its snapshot uploaded. That upload
