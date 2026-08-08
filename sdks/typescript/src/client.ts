@@ -70,7 +70,7 @@ export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceR
     throw new Error("connect: no global fetch; pass one via ConnectOptions.fetch");
   }
   const transport = makeTransport(opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  return new VerglasClient<Namespaces>(transport, opts.endpoint, opts.token);
+  return new VerglasClient<Namespaces>(transport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 }
 
 /** A connected Verglas client. Cheap to hold; makes no requests until used. */
@@ -78,6 +78,9 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
   /** The shared change-feed socket, opened lazily on the first `follow`. */
   private feed?: CatalogFeed;
   readonly #namespaces: NamespaceRuntime<Namespaces>;
+  /** Resolved Iceberg REST catalog base, discovered lazily when unset. */
+  #catalogUri?: string;
+  #catalogTransport?: Transport;
 
   /** Integration APIs composed into this client through reflection. */
   readonly namespace: NamespaceBindings<Namespaces>;
@@ -89,9 +92,13 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     readonly endpoint: string,
     /** Bearer token, reused to authenticate the change-feed websocket. */
     private readonly token: string,
+    catalogUri: string | undefined,
+    private readonly fetchImpl: typeof fetch,
+    private readonly timeoutMs: number,
   ) {
     this.#namespaces = new NamespaceRuntime<Namespaces>(transport);
     this.namespace = this.#namespaces.namespace;
+    this.#catalogUri = catalogUri;
   }
 
   /** Lists all Integration namespace manifests visible to this principal. */
@@ -253,36 +260,76 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
    * it POSTs the definition to the endpoint, which owns the catalog. Returns the
    * table name and its final column list.
    */
-  createTable(name: string, def: TableDefinition): Promise<CreateTableResult> {
+  /**
+   * Creates a table in the Iceberg REST catalog from an explicit schema and
+   * partition spec. Prefer `ensureTable` when the table may already exist.
+   */
+  async createTable(name: string, def: TableDefinition): Promise<CreateTableResult> {
     if (!name) throw new Error("createTable: name is required");
     if (!def?.schema?.length) throw new Error("createTable: schema is required");
-    const body = { schema: def.schema, partitions: def.partitions ?? [] };
-    return this.transport.request<CreateTableResult>(
-      "POST",
-      `/v1/tables/${encodeURIComponent(name)}`,
-      { body },
-    );
+    const expected = { schema: def.schema, partitions: def.partitions ?? [] };
+    await this.#createCatalogTable(name, expected);
+    return { table: name, columns: expected.schema.map((column) => column.name) };
   }
 
-  /** Creates a missing table or verifies its exact existing definition. */
+  /** Creates a missing table or verifies its exact existing definition via Iceberg REST. */
   async ensureTable(name: string, def: TableDefinition): Promise<EnsureTableResult> {
     if (!name) throw new Error("ensureTable: name is required");
     const expected = { schema: def.schema, partitions: def.partitions ?? [] };
+    const catalog = await this.#catalog();
+    const { namespacePath, tableName } = splitTableName(name);
     try {
-      const actual = await this.transport.request<TableDefinition>(
+      const loaded = await catalog.request<unknown>(
         "GET",
-        `/v1/tables/${encodeURIComponent(name)}/definition`,
+        `/v1/namespaces/${namespacePath}/tables/${encodeURIComponent(tableName)}`,
       );
-      const normalized = { schema: actual.schema, partitions: actual.partitions ?? [] };
-      if (JSON.stringify(normalized) !== JSON.stringify(expected)) {
+      const actual = definitionFromLoadResponse(loaded);
+      if (JSON.stringify(actual) !== JSON.stringify(expected)) {
         throw new Error(`ensureTable: ${name} definition mismatch`);
       }
       return "existing";
     } catch (error) {
       if (!(error instanceof VerglasHttpError) || error.status !== 404) throw error;
-      await this.createTable(name, expected);
+      await this.#createCatalogTable(name, expected);
       return "created";
     }
+  }
+
+  /** Resolves the Iceberg REST transport, discovering the catalog URI when needed. */
+  async #catalog(): Promise<Transport> {
+    if (this.#catalogTransport) return this.#catalogTransport;
+    if (!this.#catalogUri) {
+      const access = await this.transport.request<{ catalog_uri?: string }>("GET", "/admin/access");
+      if (!access?.catalog_uri) {
+        throw new Error("connect: catalog URI is required; pass ConnectOptions.catalogUri or configure /admin/access");
+      }
+      this.#catalogUri = access.catalog_uri;
+    }
+    this.#catalogTransport = makeTransport(
+      this.#catalogUri,
+      this.token,
+      this.fetchImpl,
+      this.timeoutMs,
+    );
+    return this.#catalogTransport;
+  }
+
+  /** Creates the Iceberg namespace (if needed) and table for `name`. */
+  async #createCatalogTable(name: string, def: TableDefinition): Promise<void> {
+    const catalog = await this.#catalog();
+    const { namespace, namespacePath, tableName } = splitTableName(name);
+    try {
+      await catalog.request("POST", "/v1/namespaces", {
+        body: { namespace, properties: {} },
+      });
+    } catch (error) {
+      if (!(error instanceof VerglasHttpError) || (error.status !== 409 && error.status !== 400)) {
+        throw error;
+      }
+    }
+    await catalog.request("POST", `/v1/namespaces/${namespacePath}/tables`, {
+      body: catalogCreateRequest(tableName, def),
+    });
   }
 
   /** Executes SQL through the endpoint's language-neutral JSON representation. */
@@ -290,7 +337,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     if (!sql) throw new Error("query: sql is required");
     return this.transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
   }
-
 }
 
 /** A thin raw-byte handle to one KV namespace. */
@@ -441,13 +487,6 @@ export class Table<T extends Row = Row> {
   }
 
   /**
-   * Appends a batch of rows. The SDK does NOT build Parquet or run an Iceberg
-   * commit in JS — it POSTs the batch to the endpoint's commit service, which
-   * owns the content-addressed write path. Each `append` commits its own batch
-   * synchronously (this is what replaces the old global "drain"). Returns the
-   * snapshot id, rows committed, and the new watermark.
-   */
-  /**
    * Declares a real-time-maintained vector (ANN) index on an embedding field and
    * runs the initial build. The index is a streaming Vamana (DiskANN) graph,
    * maintained incrementally and attached to the exact Iceberg snapshot it
@@ -486,13 +525,153 @@ export class Table<T extends Row = Row> {
     );
   }
 
+  /**
+   * Appends a batch of rows as JSONL through `POST /v1/ingest/{name}`. The SDK
+   * does not build Parquet or commit Iceberg metadata in JS — the write worker
+   * owns that path. Rust `append_stream` uses Arrow IPC on `/v1/write` instead.
+   */
   async append(rows: T[], opts?: CommitOptions): Promise<CommitResult> {
-    const body: { rows: T[]; idempotencyKey?: string } = { rows };
-    if (opts?.idempotencyKey) body.idempotencyKey = opts.idempotencyKey;
-    return this.transport.request<CommitResult>("POST", `${this.base()}/commit`, {
-      body,
-      headers: opts?.idempotencyKey ? { "idempotency-key": opts.idempotencyKey } : undefined,
-    });
+    const jsonl = rows.map((row) => JSON.stringify(row)).join("\n");
+    const response = await this.transport.requestRaw(
+      "POST",
+      `/v1/ingest/${encodeURIComponent(this.name)}`,
+      {
+        query: { mode: "append", format: "jsonl" },
+        body: jsonl,
+        headers: {
+          "content-type": "application/x-ndjson",
+          ...(opts?.idempotencyKey ? { "idempotency-key": opts.idempotencyKey } : {}),
+        },
+      },
+    );
+    const text = await response.text();
+    return (text ? JSON.parse(text) : undefined) as CommitResult;
+  }
+}
+
+/** Splits `ns.table` into Iceberg REST namespace segments and the table name. */
+function splitTableName(table: string): { namespace: string[]; namespacePath: string; tableName: string } {
+  const dot = table.lastIndexOf(".");
+  if (dot <= 0 || dot === table.length - 1) {
+    throw new Error(`table '${table}' must include a namespace and table name`);
+  }
+  const namespace = table.slice(0, dot).split(".");
+  const tableName = table.slice(dot + 1);
+  if (namespace.some((part) => !part) || !tableName) {
+    throw new Error(`table '${table}' contains an empty identifier`);
+  }
+  return { namespace, namespacePath: namespace.map(encodeURIComponent).join("%1F"), tableName };
+}
+
+/** Builds the Iceberg REST create-table body from a Verglas table definition. */
+function catalogCreateRequest(name: string, definition: TableDefinition): unknown {
+  const ids = new Map<string, number>();
+  const fields = definition.schema.map((column, index) => {
+    const id = index + 1;
+    ids.set(column.name, id);
+    return {
+      id,
+      name: column.name,
+      required: column.nullable === false,
+      type: catalogType(column.type),
+    };
+  });
+  const partitionFields = (definition.partitions ?? []).map((partition, index) => {
+    const sourceId = ids.get(partition.source);
+    if (sourceId === undefined) {
+      throw new Error(`partition source '${partition.source}' is not a table column`);
+    }
+    return {
+      "source-id": sourceId,
+      "field-id": 1000 + index,
+      name: `${partition.source}_${partition.transform}`,
+      transform: partition.transform,
+    };
+  });
+  return {
+    name,
+    schema: { type: "struct", "schema-id": 0, fields },
+    "partition-spec": { "spec-id": 0, fields: partitionFields },
+  };
+}
+
+/** Maps a Verglas/Arrow type name onto an Iceberg REST primitive type string. */
+function catalogType(typeName: string): string {
+  switch (typeName) {
+    case "int64":
+      return "long";
+    case "int32":
+      return "int";
+    case "float64":
+    case "double":
+      return "double";
+    case "float32":
+    case "float":
+      return "float";
+    case "utf8":
+    case "string":
+      return "string";
+    case "bool":
+    case "boolean":
+      return "boolean";
+    case "date32":
+      return "date";
+    default:
+      if (typeName.startsWith("decimal")) return typeName.replace("decimal128", "decimal");
+      return typeName;
+  }
+}
+
+/** Extracts a Verglas table definition from an Iceberg REST load-table response. */
+function definitionFromLoadResponse(loaded: unknown): TableDefinition {
+  const root = loaded as {
+    metadata?: { schemas?: Array<{ fields?: CatalogField[] }>; "partition-specs"?: Array<{ fields?: CatalogPartition[] }> };
+    schema?: { fields?: CatalogField[] };
+    "partition-spec"?: { fields?: CatalogPartition[] };
+  };
+  const fields = root.metadata?.schemas?.[0]?.fields ?? root.schema?.fields ?? [];
+  const partitions = root.metadata?.["partition-specs"]?.[0]?.fields ?? root["partition-spec"]?.fields ?? [];
+  const idToName = new Map<number, string>();
+  for (const [index, field] of fields.entries()) {
+    idToName.set(field.id ?? index + 1, field.name);
+  }
+  return {
+    schema: fields.map((field) => ({
+      name: field.name,
+      type: reverseCatalogType(String(field.type)),
+      nullable: field.required !== true,
+    })),
+    partitions: partitions.map((field) => ({
+      source: idToName.get(field["source-id"]) ?? String(field["source-id"]),
+      transform: field.transform === "month" ? ("month" as const) : ("identity" as const),
+    })),
+  };
+}
+
+/** One Iceberg REST schema field. */
+type CatalogField = { id?: number; name: string; required?: boolean; type: string };
+/** One Iceberg REST partition-spec field. */
+type CatalogPartition = { "source-id": number; transform: string };
+
+/** Maps an Iceberg primitive type name back to the Verglas/Arrow name used in definitions. */
+function reverseCatalogType(typeName: string): string {
+  switch (typeName) {
+    case "long":
+      return "int64";
+    case "int":
+      return "int32";
+    case "double":
+      return "float64";
+    case "float":
+      return "float32";
+    case "string":
+      return "utf8";
+    case "boolean":
+      return "bool";
+    case "date":
+      return "date32";
+    default:
+      return typeName;
   }
 }
 

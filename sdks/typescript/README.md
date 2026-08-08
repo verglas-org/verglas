@@ -341,24 +341,22 @@ attach; the client replies `{"type":"subscribe","cursor":<int|null>}`; the serve
 pushes `{"type":"change","seq":<int>,"table":"ns.t","snapshot_id":"…","committed_at":"…"}`
 and `{"type":"resync","reason":"cursor-too-old"}`.
 
-## The `append` → commit-endpoint contract
+## The `append` → ingest-endpoint contract
 
-`append` does **not** build Parquet or run an Iceberg commit in JS. It POSTs the
-batch to the endpoint's commit service. Each `append` commits its own batch
-synchronously.
+`append` does **not** build Parquet or run an Iceberg commit in JS. It POSTs
+JSONL rows to the write worker ingest route. Rust `append_stream` uses Arrow IPC
+on `/v1/write` instead. Each `append` commits its own batch synchronously.
 
 **Request**
 
 ```
-POST {endpoint}/v1/tables/{name}/commit
+POST {endpoint}/v1/ingest/{name}?mode=append&format=jsonl
 Authorization: Bearer {token}
-Content-Type: application/json
-Idempotency-Key: {optional}          # mirrors the body field
+Content-Type: application/x-ndjson
+Idempotency-Key: {optional}
 
-{
-  "rows": [ { ... }, ... ],
-  "idempotencyKey": "optional-string"
-}
+{ ...row... }
+{ ...row... }
 ```
 
 **Response** `200`

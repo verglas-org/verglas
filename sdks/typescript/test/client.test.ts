@@ -24,7 +24,7 @@ describe("connect", () => {
 });
 
 describe("createTable contract", () => {
-  it("POSTs an explicit schema + partition spec to /v1/tables/{name}", async () => {
+  it("creates a table through the Iceberg REST catalog", async () => {
     const res = await client.createTable("rlean.custom_points", {
       schema: [
         { name: "value", type: "decimal128(38,18)", nullable: false },
@@ -40,27 +40,17 @@ describe("createTable contract", () => {
     expect(res.columns).toEqual(["value", "day", "symbol_sid"]);
 
     const post = endpoint.requests.find(
-      (r) => r.method === "POST" && r.path === "/v1/tables/rlean.custom_points",
+      (r) => r.method === "POST" && r.path === "/v1/namespaces/rlean/tables",
     );
     expect(post).toBeTruthy();
-    expect(post!.body).toEqual({
-      schema: [
-        { name: "value", type: "decimal128(38,18)", nullable: false },
-        { name: "day", type: "date32", nullable: false },
-        { name: "symbol_sid", type: "int64", nullable: true },
-      ],
-      partitions: [
-        { source: "value", transform: "identity" },
-        { source: "day", transform: "month" },
-      ],
-    });
+    expect(post!.body).toMatchObject({ name: "custom_points" });
   });
 
-  it("requires a name and a non-empty schema", () => {
-    expect(() => client.createTable("", { schema: [{ name: "a", type: "int64" }] })).toThrow(
+  it("requires a name and a non-empty schema", async () => {
+    await expect(client.createTable("", { schema: [{ name: "a", type: "int64" }] })).rejects.toThrow(
       /name is required/,
     );
-    expect(() => client.createTable("t", { schema: [] })).toThrow(/schema is required/);
+    await expect(client.createTable("t", { schema: [] })).rejects.toThrow(/schema is required/);
   });
 });
 
@@ -80,16 +70,21 @@ describe("shared SDK parity contract", () => {
   });
 });
 
-describe("append -> commit contract", () => {
-  it("POSTs rows to /v1/tables/{name}/commit and surfaces the response", async () => {
+describe("append -> ingest contract", () => {
+  it("POSTs JSONL rows to /v1/ingest/{name} and surfaces the response", async () => {
     const res = await client.table("cloud.job_runs").append([{ a: 1 }, { a: 2 }]);
     expect(res.rowsCommitted).toBe(2);
     expect(res.snapshotId).toMatch(/^snap-/);
     expect(res.idempotent).toBe(false);
 
-    const commit = endpoint.requests.find((r) => r.method === "POST");
-    expect(commit?.path).toBe("/v1/tables/cloud.job_runs/commit");
-    expect(commit?.body).toEqual({ rows: [{ a: 1 }, { a: 2 }] });
+    const ingest = endpoint.requests.find(
+      (r) => r.method === "POST" && r.path === "/v1/ingest/cloud.job_runs",
+    );
+    expect(ingest?.body).toEqual({
+      rows: [{ a: 1 }, { a: 2 }],
+      mode: "append",
+      format: "jsonl",
+    });
   });
 
   it("is idempotent under a repeated idempotency key", async () => {

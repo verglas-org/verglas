@@ -97,6 +97,11 @@ export interface ConnectOptions {
   /** Bearer token for the endpoint. Never logged. */
   token: string;
   /**
+   * Iceberg REST catalog base URL. When omitted, the client discovers it from
+   * `GET /admin/access` on first catalog operation (`ensureTable` / `createTable`).
+   */
+  catalogUri?: string;
+  /**
    * Override the `fetch` used for requests. Defaults to the global `fetch`
    * (present in edge/serverless runtimes and Node 18+). Handy for tests and for
    * runtimes that expose fetch under a different name.

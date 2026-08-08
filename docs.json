@@ -69,6 +69,7 @@
         "icon": "code-2",
         "pages": [
           "docs/sdk/overview",
+          "docs/sdk/http",
           "docs/sdk/cli",
           "docs/sdk/typescript",
           "docs/sdk/rust"
@@ -97,5 +98,8 @@
   },
   "styling": {
     "eyebrows": "breadcrumbs"
+  },
+  "api": {
+    "openapi": "contracts/openapi.json"
   }
 }
