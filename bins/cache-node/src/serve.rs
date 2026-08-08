@@ -167,7 +167,7 @@ fn metrics_source(
                 (
                     ServedTier::Nvme,
                     TierSize {
-                        used: 0,
+                        used: engine.disk_usage_bytes(),
                         capacity: nvme_capacity,
                     },
                 ),
