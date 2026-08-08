@@ -8,3 +8,4 @@
 - #29: Added a namespace-scoped raw-byte KV client with TTL, metadata, conditional writes, idempotency, delete, and bounded prefix listing. The transport leaves opaque versions and continuation cursors under server control.
 - #43: Added reflected Integration namespaces to the TypeScript SDK. Generated Applications and Workers can compose arbitrary Integration methods through `client.namespace`, using awaitable bounded calls or incremental NDJSON streams, while optional generated types preserve compile-time input and output checks.
 - chore: Dropped client.watermark()/setWatermark() and the mock /v1/watermark cell. Table/queue read cursors named watermark are unchanged.
+- #67: Realigned ensure/create to Iceberg REST (catalog discovery via `/admin/access` or `catalogUri`) and `table.append` to `POST /v1/ingest/{name}` JSONL. Shared surface inventory now lives in `contracts/api-surface.json`; follow/feed is documented as not live on-prem.

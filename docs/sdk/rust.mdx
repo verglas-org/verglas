@@ -4,7 +4,7 @@ description: "Use the native streaming client and worker contract from Rust."
 icon: "boxes"
 ---
 
-The Rust SDK provides an authenticated client, Arrow IPC streaming, exact table-definition checks, resumable commit following, and the native worker contract.
+The Rust SDK provides an authenticated client, Arrow IPC streaming, exact table-definition checks, queues, graphs, vector indexes, and the native worker contract.
 
 ## Install from the repository
 
@@ -115,19 +115,22 @@ while let Some(batch) = batches.next().await {
 
 The SDK decodes the Arrow IPC response incrementally instead of buffering the full result.
 
-## Follow table commits
+## Queues, graphs, and vector indexes
 
 ```rust
-use futures::StreamExt;
+let queue = client.queue("orders")?;
+queue.enqueue(vec![serde_json::json!({"id": 1})]).await?;
 
-let mut changes = client.follow(["analytics.orders"], None)?;
-while let Some(change) = changes.next().await {
-    let change = change?;
-    println!("{} committed snapshot {}", change.table, change.snapshot_id);
-}
+let graph = client.graph("knowledge")?;
+graph.create().await?;
+
+let table = client.table("docs.embeddings")?;
+table.list_indexes().await?;
 ```
 
-The stream reconnects after a socket drop and resumes from the last observed sequence. An expired replay cursor returns a distinct `ClientError::CursorExpired` error.
+These handles speak the same `/v1/queues`, `/v1/graphs`, and `/v1/tables/.../indexes` routes as the TypeScript SDK. See [HTTP surface](/docs/sdk/http).
+
+Catalog commit following (`Client::follow`) is not mounted on the live on-prem router; do not rely on it until a feed returns to the shared surface.
 
 ## Implement the worker contract
 

@@ -20,9 +20,9 @@ interface RecordedRequest {
 }
 
 /**
- * A fake commit service injected through ConnectOptions' fetch seam. Records
- * every request; implements the commit route with monotonically increasing
- * sequence watermarks. No watermark route — the worker model does not use one.
+ * A fake write service injected through ConnectOptions' fetch seam. Records
+ * every request; implements the JSONL ingest route with monotonically increasing
+ * sequence watermarks. No deployment watermark route — the worker model does not use one.
  */
 function fakeEndpoint() {
   const requests: RecordedRequest[] = [];
@@ -34,10 +34,15 @@ function fakeEndpoint() {
   const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const request = new Request(input as RequestInfo, init);
     const url = new URL(request.url);
-    const body =
-      request.method === "GET"
-        ? undefined
-        : ((await request.json().catch(() => undefined)) as Record<string, unknown> | undefined);
+    const text = request.method === "GET" ? "" : await request.text().catch(() => "");
+    const rows = text
+      ? text
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => JSON.parse(line) as unknown)
+      : [];
+    const body = rows.length > 0 ? { rows } : undefined;
     requests.push({
       method: request.method,
       path: url.pathname,
@@ -45,10 +50,14 @@ function fakeEndpoint() {
       body,
     });
 
-    if (/^\/v1\/tables\/[^/]+\/commit$/.test(url.pathname)) {
-      const rows = (body?.rows as unknown[] | undefined) ?? [];
+    if (/^\/v1\/ingest\/[^/]+$/.test(url.pathname) && request.method === "POST") {
       seq += rows.length;
-      return json({ snapshotId: `snap-${seq}`, rowsCommitted: rows.length, watermark: String(seq) });
+      return json({
+        snapshotId: `snap-${seq}`,
+        rowsCommitted: rows.length,
+        watermark: String(seq),
+        idempotent: false,
+      });
     }
     return json({ error: `no route for ${url.pathname}` }, 404);
   }) as typeof fetch;
@@ -77,9 +86,9 @@ function baseEnv(extra: Record<string, string> = {}): Record<string, string> {
 
 const quiet = { log: () => {} };
 
-/** Commit requests against the target table (log commits go to app.t_LOGS). */
+/** Ingest requests against the target table. */
 const targetCommits = (requests: RecordedRequest[]) =>
-  requests.filter((r) => r.method === "POST" && r.path === "/v1/tables/app.t/commit");
+  requests.filter((r) => r.method === "POST" && r.path === "/v1/ingest/app.t");
 
 describe("endpointRun worker semantics", () => {
   it("passes the configured output and complete CloudEvent into ctx", async () => {
@@ -157,7 +166,7 @@ describe("endpointRun worker semantics", () => {
     expect(ran).toBe(false);
   });
 
-  it("idempotency-keyed appends survive to the commit route and report the row count", async () => {
+  it("idempotency-keyed appends survive to the ingest route and report the row count", async () => {
     const fake = fakeEndpoint();
     const worker = defineWorker(async (ctx: WorkerContext) => {
       const r = await ctx.client.table(ctx.output).append([{ n: 1 }, { n: 2 }], { idempotencyKey: "k1" });

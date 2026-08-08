@@ -13,6 +13,10 @@
 //!   renders without linking the storage engine.
 //! - [`graph`]: the `graph` verb-family wire types the server's
 //!   `/v1/graphs/...` routes serve and the CLI and TypeScript SDK speak.
+//! - [`queue`]: the queue enqueue/poll/ack wire types the `/v1/queues/...`
+//!   routes serve and both language SDKs speak.
+//! - [`vector`]: the table/graph vector-index wire types the `/indexes`
+//!   routes serve and both language SDKs speak.
 //! - [`grant`]: the memory grant contract every worker inherits through
 //!   [`worker::WorkerContext`].
 //! - [`client`] / [`server`]: the data-plane HTTP client and local server
@@ -24,18 +28,21 @@ pub mod worker;
 pub mod client;
 pub mod grant;
 pub mod graph;
+pub mod queue;
 pub mod report;
 pub mod server;
 pub mod vector;
 
 pub use client::{
     ARROW_STREAM_CONTENT_TYPE, AppendResult, Client, ClientError, ColumnSpec, ConnectOptions,
-    EnsureTable, FollowStream, Kv, KvDeleteResult, KvListEntry, KvListPage, KvPutOptions,
-    KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest, NamespaceMethodManifest,
-    NamespaceMethodMode, NamespaceStream, PartitionSpec, QueryStream, TableDefinition,
+    EnsureTable, FollowStream, Graph, GraphReadOptions, Kv, KvDeleteResult, KvListEntry,
+    KvListPage, KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest,
+    NamespaceMethodManifest, NamespaceMethodMode, NamespaceStream, PartitionSpec, QueryStream,
+    Queue, Table, TableDefinition,
 };
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};
+pub use queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult, QueueRecord};
 pub use report::{CompactReport, CompactionReport};
 /// Stable table request and response contracts from the dependency-leaf API crate.
 pub use verglas_api::table as tables_api;

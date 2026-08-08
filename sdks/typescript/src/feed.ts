@@ -1,4 +1,7 @@
 // The catalog change feed: one websocket per client, carrying table-commit
+// notifications. The on-prem server currently uses PollingWatcher only and does
+// not mount `/v1/catalog/feed`; these helpers remain for cloud/tests until a
+// live feed returns to the shared surface.
 // notifications from the platform's edge. The tenant backend scales to zero, so
 // the long-lived socket is held by the edge Durable Object — the SDK never opens
 // a long-lived connection to a backend. `VerglasClient.follow` registers a
