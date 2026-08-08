@@ -110,6 +110,12 @@ pub struct SafekeeperState {
     pub commit_lsn: Lsn,
     /// Oldest retained WAL needed for recovery.
     pub truncate_lsn: Lsn,
+    /// LSN through which WAL has been copied to object storage.
+    pub backup_lsn: Lsn,
+    /// Oldest checkpoint the pageserver reports durable in remote storage.
+    pub remote_consistent_lsn: Lsn,
+    /// Actual first byte still retained by this safekeeper.
+    pub local_start_lsn: Lsn,
     /// Ordered `(term, first_lsn)` boundaries.
     pub term_history: Vec<(u64, Lsn)>,
 }

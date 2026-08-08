@@ -38,7 +38,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use iceberg::Catalog;
 use serde::Deserialize;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use verglas_iceberg::AgentError;
 use verglas_sdk::grant::{MemoryGrant, MemoryGrantHost};
 
@@ -50,9 +50,12 @@ use crate::sizing;
 #[derive(Clone)]
 pub struct AppState {
     /// The Iceberg catalog, opened once at startup against the configured
-    /// `[catalog]` and reading data only through the configured
+    /// cache-owned `[metadata]` endpoint and reading data only through the configured
     /// `[cache].s3_endpoint`.
     pub catalog: Arc<dyn Catalog>,
+    /// Long-lived DataFusion catalog session, replaced only when the cache
+    /// watcher exposes a new prepared-catalog generation.
+    pub prepared_catalog: PreparedQueryCatalog,
     /// The grant host: local/no-op standalone, or a real enforcing host when
     /// one is wired in.
     pub grant_host: Arc<dyn MemoryGrantHost>,
@@ -61,6 +64,148 @@ pub struct AppState {
     /// Unix seconds of the last request served — the idle-shutdown loop reads
     /// this, every handler that touches the query surface updates it.
     pub last_activity: Arc<AtomicU64>,
+    /// Whether this runtime can use an estimate to grow its memory grant.
+    /// Fixed-memory microVMs disable it to avoid repeating catalog I/O that
+    /// cannot change their already-assigned memory.
+    pub estimate_on_request: bool,
+}
+
+/// A generation-fenced, reusable DataFusion catalog session.
+#[derive(Clone)]
+pub struct PreparedQueryCatalog {
+    catalog: Arc<dyn Catalog>,
+    generation_url: Option<String>,
+    http: reqwest::Client,
+    memory_limit_bytes: usize,
+    spill_path: Option<std::path::PathBuf>,
+    current: Arc<RwLock<PreparedGeneration>>,
+}
+
+struct PreparedGeneration {
+    generation: u64,
+    catalog: verglas_iceberg::PreparedCatalog,
+}
+
+#[derive(Deserialize)]
+struct CatalogGeneration {
+    generation: u64,
+}
+
+impl PreparedQueryCatalog {
+    /// Prepares the initial catalog once. Tests and embedded callers can omit a
+    /// generation URL; fleet query workers point it at the cache metadata mount.
+    pub async fn open(
+        catalog: Arc<dyn Catalog>,
+        metadata_uri: Option<&str>,
+        memory_limit_bytes: usize,
+        spill_path: Option<std::path::PathBuf>,
+    ) -> Result<Self, AgentError> {
+        let http = reqwest::Client::new();
+        let generation_url =
+            metadata_uri.map(|uri| format!("{}/_verglas/generation", uri.trim_end_matches('/')));
+        let (generation, prepared) = match &generation_url {
+            Some(url) => loop {
+                let before = fetch_generation(&http, url).await?;
+                let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
+                    catalog.clone(),
+                    memory_limit_bytes,
+                    spill_path.clone(),
+                )
+                .await?;
+                let after = fetch_generation(&http, url).await?;
+                if before == after {
+                    break (after, prepared);
+                }
+            },
+            None => (
+                0,
+                verglas_iceberg::PreparedCatalog::open_with_memory_limit(
+                    catalog.clone(),
+                    memory_limit_bytes,
+                    spill_path.clone(),
+                )
+                .await?,
+            ),
+        };
+        Ok(Self {
+            catalog,
+            generation_url,
+            http,
+            memory_limit_bytes,
+            spill_path,
+            current: Arc::new(RwLock::new(PreparedGeneration {
+                generation,
+                catalog: prepared,
+            })),
+        })
+    }
+
+    /// Uses the current prepared session, rebuilding only after a catalog-feed
+    /// change. Time-travel remains request-specific because it deliberately pins
+    /// a historical snapshot rather than the current catalog generation.
+    async fn query_stream(
+        &self,
+        sql: &str,
+        at: Option<verglas_iceberg::TimeTravel>,
+    ) -> Result<verglas_iceberg::QueryExecution, AgentError> {
+        if at.is_some() {
+            return verglas_iceberg::query_stream(self.catalog.clone(), sql, at).await;
+        }
+        self.refresh_if_changed().await?;
+        let prepared = self.current.read().await.catalog.clone();
+        prepared.query_stream(sql).await
+    }
+
+    async fn refresh_if_changed(&self) -> Result<(), AgentError> {
+        let Some(url) = &self.generation_url else {
+            return Ok(());
+        };
+        let observed = fetch_generation(&self.http, url).await?;
+        if self.current.read().await.generation == observed {
+            return Ok(());
+        }
+
+        // Hold the write lock through reconstruction so concurrent requests do
+        // not all rebuild the same generation. Re-check after taking it because
+        // another request may have completed the refresh while this one waited.
+        let mut current = self.current.write().await;
+        let observed = fetch_generation(&self.http, url).await?;
+        if current.generation == observed {
+            return Ok(());
+        }
+        let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
+            self.catalog.clone(),
+            self.memory_limit_bytes,
+            self.spill_path.clone(),
+        )
+        .await?;
+        let completed_generation = fetch_generation(&self.http, url).await?;
+        if completed_generation != observed {
+            return Err(AgentError::Query(
+                "catalog changed while rebuilding the query session; retry the query".to_owned(),
+            ));
+        }
+        *current = PreparedGeneration {
+            generation: completed_generation,
+            catalog: prepared,
+        };
+        Ok(())
+    }
+}
+
+async fn fetch_generation(http: &reqwest::Client, url: &str) -> Result<u64, AgentError> {
+    let response = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|error| AgentError::Query(format!("read catalog generation: {error}")))?
+        .error_for_status()
+        .map_err(|error| AgentError::Query(format!("read catalog generation: {error}")))?;
+    response
+        .json::<CatalogGeneration>()
+        .await
+        .map(|value| value.generation)
+        .map_err(|error| AgentError::Query(format!("decode catalog generation: {error}")))
 }
 
 impl AppState {
@@ -142,8 +287,9 @@ async fn query_sql(
     state.touch();
     let at = request.time_travel();
 
-    if let Ok(estimate) =
-        verglas_iceberg::estimate(state.catalog.clone(), &request.sql, at.clone()).await
+    if state.estimate_on_request
+        && let Ok(estimate) =
+            verglas_iceberg::estimate(state.catalog.clone(), &request.sql, at.clone()).await
     {
         let mut current = state.grant.lock().await;
         *current = sizing::ensure_covers(
@@ -154,11 +300,10 @@ async fn query_sql(
         .await;
     }
 
-    let execution =
-        match verglas_iceberg::query_stream(state.catalog.clone(), &request.sql, at).await {
-            Ok(v) => v,
-            Err(error) => return query_error(error),
-        };
+    let execution = match state.prepared_catalog.query_stream(&request.sql, at).await {
+        Ok(v) => v,
+        Err(error) => return query_error(error),
+    };
 
     if accepts_arrow(&headers) {
         return arrow_query_response(execution);

@@ -361,7 +361,7 @@ fn build(
     geometry: AppendGeometry,
 ) -> EcAppendLog<MemStore> {
     EcAppendLog::open(
-        store, "wal-bkt", "wal", transport, membership, dir, geometry,
+        0, store, "wal-bkt", "wal", transport, membership, dir, geometry,
     )
     .expect("open append log")
 }
@@ -371,6 +371,55 @@ fn geom() -> AppendGeometry {
 }
 
 // ---- tests -----------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_greeting_with_zero_system_id_preserves_timeline_identity() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let log = build(
+        MemStore::new(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    log.configure_timeline(0, 7_671_068_361_459_482_993, 17, 16 * 1024 * 1024)
+        .await
+        .expect("establish timeline identity");
+    log.configure_timeline(0, 0, 17, 16 * 1024 * 1024)
+        .await
+        .expect("zero is unspecified during compute recovery");
+
+    assert_eq!(
+        log.safekeeper_state().await.system_id,
+        7_671_068_361_459_482_993,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn conflicting_nonzero_system_id_is_still_rejected() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let log = build(
+        MemStore::new(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    log.configure_timeline(0, 41, 17, 16 * 1024 * 1024)
+        .await
+        .expect("establish timeline identity");
+    let error = log
+        .configure_timeline(0, 42, 17, 16 * 1024 * 1024)
+        .await
+        .expect_err("conflicting identity must remain fenced");
+    assert!(
+        error
+            .to_string()
+            .contains("system id changed from 41 to 42")
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn append_acks_over_quorum_and_reads_back_the_tail() {
@@ -437,6 +486,46 @@ async fn first_append_preserves_the_postgres_start_lsn() {
     assert_eq!(appended.start, start);
     assert_eq!(appended.end, start.advance(payload.len() as u64));
     assert_eq!(log.read(start, appended.end).await.expect("read"), payload);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn timeline_initialization_publishes_the_pageserver_start_lsn() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport, membership, dir.path(), geom());
+    let start = Lsn(0x14F_13F0);
+
+    assert!(log.initialize_timeline(start).await.expect("initialize"));
+    assert!(!log.initialize_timeline(start).await.expect("idempotent"));
+    let state = log.safekeeper_state().await;
+    assert_eq!(state.flush_lsn, start);
+    assert_eq!(state.commit_lsn, start);
+    assert_eq!(state.truncate_lsn, start);
+    assert_eq!(state.term, 1);
+    assert_eq!(state.term_history, vec![(1, start)]);
+
+    let payload = bytes(4096);
+    let appended = log
+        .append(Epoch(1), start, payload.clone())
+        .await
+        .expect("append after initialization");
+    assert_eq!(appended.start, start);
+    assert_eq!(log.read(start, appended.end).await.expect("read"), payload);
+    assert!(
+        !log.initialize_timeline(start.advance(2048))
+            .await
+            .expect("wake at a durable LSN already retained by the safekeeper")
+    );
+    assert!(
+        log.initialize_timeline(start.advance(8192)).await.is_err(),
+        "a wake beyond the safekeeper tail must not skip missing WAL"
+    );
+    assert!(
+        log.initialize_timeline(Lsn(start.0 - 8)).await.is_err(),
+        "a wake below the retained range must not resurrect discarded WAL"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -816,6 +905,133 @@ async fn truncate_beyond_the_flush_watermark_is_refused() {
         matches!(err, AppendError::TruncateBeyondFlush { .. }),
         "refused: {err}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn independent_safekeepers_publish_disjoint_recovery_state() {
+    let first_dir = tempfile::tempdir().expect("first tmp");
+    let second_dir = tempfile::tempdir().expect("second tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let first = EcAppendLog::open(
+        1,
+        store.clone(),
+        "wal-bkt",
+        "wal",
+        transport.clone(),
+        membership.clone(),
+        first_dir.path(),
+        geom(),
+    )
+    .expect("open first safekeeper");
+    let second = EcAppendLog::open(
+        2,
+        store,
+        "wal-bkt",
+        "wal",
+        transport.clone(),
+        membership,
+        second_dir.path(),
+        geom(),
+    )
+    .expect("open second safekeeper");
+
+    first
+        .initialize_timeline(Lsn(0x1000))
+        .await
+        .expect("initialize first");
+    second
+        .initialize_timeline(Lsn(0x1000))
+        .await
+        .expect("initialize second");
+
+    let object_ids: HashSet<String> = transport
+        .inner
+        .lock()
+        .expect("lock")
+        .frags
+        .keys()
+        .filter(|(_, _, index)| *index >= usize::MAX - 1)
+        .map(|(_, object_id, _)| object_id.clone())
+        .collect();
+    assert_eq!(
+        object_ids.len(),
+        4,
+        "each safekeeper owns a distinct descriptor and head key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flush_compacts_fragment_placements_out_of_recovery_state() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store, transport.clone(), membership, dir.path(), geom());
+    log.append(Epoch(0), Lsn(0), bytes(4000))
+        .await
+        .expect("append");
+    log.flush().await.expect("flush");
+
+    let descriptor = transport
+        .inner
+        .lock()
+        .expect("lock")
+        .frags
+        .iter()
+        .filter(|((_, object_id, index), _)| {
+            *index == usize::MAX - 1 && object_id.ends_with("/state/00000000000000000002")
+        })
+        .map(|(_, (bytes, _))| bytes.clone())
+        .next()
+        .expect("flushed descriptor");
+    let manifest: serde_json::Value = serde_json::from_slice(&descriptor).expect("manifest json");
+    assert_eq!(manifest["segments"][0]["appends"], serde_json::json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn open_compacts_legacy_flushed_placements_before_serving() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    {
+        let log = build(
+            store.clone(),
+            transport.clone(),
+            membership.clone(),
+            dir.path(),
+            geom(),
+        );
+        log.append(Epoch(0), Lsn(0), bytes(4000))
+            .await
+            .expect("append");
+    }
+
+    let path = dir.path().join("safekeeper/manifest.json");
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("read manifest"))
+            .expect("manifest json");
+    legacy["segments"][0]["state"] = serde_json::json!("Flushed");
+    legacy["segments"][0]["s3_key"] = serde_json::json!("wal/legacy.wal");
+    assert!(
+        !legacy["segments"][0]["appends"]
+            .as_array()
+            .expect("appends array")
+            .is_empty()
+    );
+    std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&legacy).expect("serialize legacy manifest"),
+    )
+    .expect("write legacy manifest");
+
+    let _reopened = build(store, transport, membership, dir.path(), geom());
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).expect("read migrated manifest"))
+            .expect("migrated json");
+    assert_eq!(migrated["segments"][0]["appends"], serde_json::json!([]));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

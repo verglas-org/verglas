@@ -483,3 +483,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #91: Updated cache-engine integration documentation to name the foreground
   `verglas-server` process. No cache behavior or on-disk compatibility path was
   added.
+
+- #58: Fixed a flush-barrier race on unmapped partial reads: the aligned background fill is registered with `start_flight` before the foreground partial flight drops its in-flight count, so `flush()` cannot return in the gap and leave a warm re-read to refill from origin. The partial-read engine test now asserts flush blocks while the aligned tail is gated.

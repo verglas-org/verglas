@@ -14,6 +14,9 @@ use tokio::sync::Mutex;
 use verglas_core::read::ObjectRead;
 use verglas_core::write::ObjectWrite;
 
+use crate::broker::proto::{
+    SafekeeperTimelineInfo, TenantTimelineId, broker_service_client::BrokerServiceClient,
+};
 use crate::protocol::{
     AcceptorGreeting, AcceptorMessage, AppendResponse, Membership, ProposerMessage, ProtocolError,
     SafekeeperCommand, TermSwitch, VoteResponse, parse_command, parse_proposer, serialize_acceptor,
@@ -32,6 +35,14 @@ const PG_SSL_REQUEST: u32 = 80_877_103;
 const REPLICATION_CHUNK: u64 = 128 * 1024;
 /// Delay between attempts to drain committed EC WAL into object storage.
 const WAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
+const BROKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct BrokerConfig {
+    endpoint: String,
+    advertise_pg_addr: String,
+}
 
 /// One Neon tenant/timeline identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -91,6 +102,10 @@ pub struct SafekeeperServer<S> {
     geometry: AppendGeometry,
     /// Open timelines, created lazily on first connection.
     timelines: Mutex<HashMap<TimelineKey, Arc<EcAppendLog<S>>>>,
+    /// Optional Neon storage-broker publication required for pageserver WAL
+    /// receiver discovery. Connections retry forever because the broker lives
+    /// in the dependent Postgres VM and may start after the cache.
+    broker: Option<BrokerConfig>,
 }
 
 impl<S> SafekeeperServer<S>
@@ -119,13 +134,35 @@ where
             state_dir: state_dir.as_ref().to_path_buf(),
             geometry,
             timelines: Mutex::new(HashMap::new()),
+            broker: None,
         })
+    }
+
+    /// Publishes every opened timeline to Neon's storage broker. The advertised
+    /// address must be reachable from the Postgres microVM over the tenant VXLAN.
+    #[must_use]
+    pub fn with_broker(
+        mut self: Arc<Self>,
+        endpoint: impl Into<String>,
+        advertise_pg_addr: impl Into<String>,
+    ) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_broker must be called before cloning the server")
+            .broker = Some(BrokerConfig {
+            endpoint: endpoint.into(),
+            advertise_pg_addr: advertise_pg_addr.into(),
+        });
+        self
     }
 
     /// Accepts connections until the listener fails. Each connection is
     /// independent; a malformed client is logged and closed without stopping
     /// the cache-node process.
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> Result<(), ServerError> {
+        if let Some(config) = self.broker.clone() {
+            let server = Arc::clone(&self);
+            tokio::spawn(async move { server.publish_broker(config).await });
+        }
         loop {
             let (stream, peer) = listener.accept().await?;
             let server = Arc::clone(&self);
@@ -134,6 +171,57 @@ where
                     tracing::warn!(%peer, %error, "safekeeper connection closed");
                 }
             });
+        }
+    }
+
+    async fn publish_broker(self: Arc<Self>, config: BrokerConfig) {
+        loop {
+            let server = Arc::clone(&self);
+            let advertise_pg_addr = config.advertise_pg_addr.clone();
+            let outbound = async_stream::stream! {
+                loop {
+                    let timelines = server.timelines.lock().await.clone();
+                    for (key, timeline) in timelines {
+                        let state = timeline.safekeeper_state().await;
+                        yield SafekeeperTimelineInfo {
+                            safekeeper_id: server.node_id,
+                            tenant_timeline_id: Some(TenantTimelineId {
+                                tenant_id: decode_hex_id(&key.tenant_id),
+                                timeline_id: decode_hex_id(&key.timeline_id),
+                            }),
+                            term: state.term,
+                            last_log_term: state.term_history.last().map_or(0, |entry| entry.0),
+                            flush_lsn: state.flush_lsn.0,
+                            commit_lsn: state.commit_lsn.0,
+                            backup_lsn: state.backup_lsn.0,
+                            remote_consistent_lsn: state.remote_consistent_lsn.0,
+                            peer_horizon_lsn: state.truncate_lsn.0,
+                            local_start_lsn: state.local_start_lsn.0,
+                            standby_horizon: 0,
+                            safekeeper_connstr: advertise_pg_addr.clone(),
+                            http_connstr: String::new(),
+                            https_connstr: None,
+                            availability_zone: Some("verglas".to_owned()),
+                        };
+                    }
+                    tokio::time::sleep(BROKER_PUBLISH_INTERVAL).await;
+                }
+            };
+            match BrokerServiceClient::connect(config.endpoint.clone()).await {
+                Ok(mut client) => {
+                    tracing::info!(endpoint = %config.endpoint, "publishing safekeeper timelines to storage broker");
+                    if let Err(error) = client
+                        .publish_safekeeper_info(tonic::Request::new(outbound))
+                        .await
+                    {
+                        tracing::warn!(endpoint = %config.endpoint, %error, "storage broker publisher disconnected");
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(endpoint = %config.endpoint, %error, "storage broker unavailable; retrying");
+                }
+            }
+            tokio::time::sleep(BROKER_RETRY_INTERVAL).await;
         }
     }
 
@@ -150,6 +238,7 @@ where
             key.timeline_id
         );
         let log = Arc::new(EcAppendLog::open(
+            self.node_id,
             Arc::clone(&self.origin),
             self.bucket.clone(),
             prefix,
@@ -189,6 +278,18 @@ where
                     let query = payload_cstr(&payload, "query")?;
                     let command = parse_command(query)?;
                     match command {
+                        SafekeeperCommand::TimelineCreate { start_lsn } => {
+                            let key = startup_key.clone().ok_or_else(|| {
+                                ServerError::Connection(
+                                    "TIMELINE_CREATE needs tenant_id and timeline_id startup options"
+                                        .to_owned(),
+                                )
+                            })?;
+                            let timeline = self.timeline(&key).await?;
+                            timeline.initialize_timeline(start_lsn).await?;
+                            write_command_complete(&mut stream, "TIMELINE_CREATE").await?;
+                            write_backend(&mut stream, b'Z', b"I").await?;
+                        }
                         SafekeeperCommand::StartWalPush {
                             protocol_version,
                             allow_timeline_creation: _,
@@ -392,11 +493,26 @@ where
         loop {
             interval.tick().await;
             match timeline.flush().await {
-                // The walproposer truncate watermark does not prove that a
-                // pageserver has ingested this WAL. Keep drained segments
-                // readable until the pageserver protocol carries an
-                // authoritative retention boundary.
-                Ok(_) => {}
+                Ok(flushed) => {
+                    let state = timeline.safekeeper_state().await;
+                    // A proposer peer horizon only says other safekeepers no
+                    // longer need this WAL. Retain it until the pageserver also
+                    // reports the prefix durable remotely and the local backup
+                    // has completed. Truncating on peer_horizon alone races the
+                    // pageserver's first replication stream and loses WAL.
+                    // (#47 stopped that race; this uses pageserver feedback.)
+                    let retention_lsn = retention_lsn(&state, flushed);
+                    if retention_lsn.0 > state.local_start_lsn.0
+                        && let Err(error) = timeline.truncate(retention_lsn).await
+                    {
+                        tracing::warn!(
+                            tenant_id = %key.tenant_id,
+                            timeline_id = %key.timeline_id,
+                            %error,
+                            "failed to truncate drained safekeeper WAL"
+                        );
+                    }
+                }
                 Err(error) => tracing::warn!(
                     tenant_id = %key.tenant_id,
                     timeline_id = %key.timeline_id,
@@ -406,6 +522,15 @@ where
             }
         }
     });
+}
+
+fn retention_lsn(state: &crate::SafekeeperState, flushed: Lsn) -> Lsn {
+    Lsn(state
+        .truncate_lsn
+        .0
+        .min(state.remote_consistent_lsn.0)
+        .min(state.commit_lsn.0)
+        .min(flushed.0))
 }
 
 /// Returns the active timeline or an ordering error.
@@ -425,6 +550,23 @@ fn validate_id(kind: &str, value: &str) -> Result<(), ServerError> {
         Err(ServerError::Connection(format!(
             "{kind} id must be 32 hexadecimal characters"
         )))
+    }
+}
+
+fn decode_hex_id(value: &str) -> Vec<u8> {
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| (hex_nibble(pair[0]) << 4) | hex_nibble(pair[1]))
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => unreachable!("timeline ids are validated before broker publication"),
     }
 }
 
@@ -586,6 +728,13 @@ where
 
         match tokio::time::timeout(Duration::from_secs(1), read_frontend(stream)).await {
             Ok(Ok(Some((b'X' | b'c', _)))) | Ok(Ok(None)) => return Ok(()),
+            Ok(Ok(Some((b'd', feedback)))) => {
+                if let Some(remote_consistent_lsn) = parse_pageserver_feedback(&feedback)? {
+                    timeline
+                        .record_remote_consistent_lsn(remote_consistent_lsn)
+                        .await?;
+                }
+            }
             Ok(Ok(Some((_tag, _feedback)))) => {}
             Ok(Err(error)) => return Err(error),
             Err(_) => {
@@ -598,6 +747,51 @@ where
             }
         }
     }
+}
+
+/// Parses the pageserver's extensible `z` feedback frame and returns its
+/// remotely durable apply LSN. Unknown fields remain forward-compatible.
+fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError> {
+    if payload.first() != Some(&b'z') {
+        return Ok(None);
+    }
+    if payload.len() < 10 {
+        return Err(ServerError::Connection(
+            "truncated pageserver feedback".to_owned(),
+        ));
+    }
+    let mut fields = payload.slice(9..);
+    if !fields.has_remaining() {
+        return Err(ServerError::Connection(
+            "pageserver feedback has no fields".to_owned(),
+        ));
+    }
+    let count = fields.get_u8();
+    let mut remote_consistent_lsn = None;
+    for _ in 0..count {
+        let key = take_cstr(&mut fields, "pageserver feedback key")?;
+        if fields.remaining() < 4 {
+            return Err(ServerError::Connection(
+                "truncated pageserver feedback length".to_owned(),
+            ));
+        }
+        let len = fields.get_u32() as usize;
+        if fields.remaining() < len {
+            return Err(ServerError::Connection(
+                "truncated pageserver feedback value".to_owned(),
+            ));
+        }
+        let mut value = fields.split_to(len);
+        if key == "ps_applylsn" {
+            if len != 8 {
+                return Err(ServerError::Connection(
+                    "invalid ps_applylsn length".to_owned(),
+                ));
+            }
+            remote_consistent_lsn = Some(Lsn(value.get_u64()));
+        }
+    }
+    Ok(remote_consistent_lsn.filter(|lsn| *lsn != Lsn(0)))
 }
 
 /// Sends Neon's `IDENTIFY_SYSTEM` row followed by ReadyForQuery.
@@ -727,4 +921,64 @@ fn payload_cstr<'a>(payload: &'a Bytes, field: &str) -> Result<&'a str, ServerEr
 /// Renders an LSN using PostgreSQL's `HIGH/LOW` hexadecimal convention.
 fn format_lsn(lsn: Lsn) -> String {
     format!("{:X}/{:08X}", lsn.0 >> 32, lsn.0 & 0xffff_ffff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::SafekeeperState;
+
+    fn state(peer: u64, remote: u64, commit: u64, backup: u64) -> SafekeeperState {
+        SafekeeperState {
+            system_id: 1,
+            pg_version: 17,
+            wal_segment_size: 16 * 1024 * 1024,
+            generation: 0,
+            term: 1,
+            flush_lsn: Lsn(0x9000),
+            commit_lsn: Lsn(commit),
+            truncate_lsn: Lsn(peer),
+            backup_lsn: Lsn(backup),
+            remote_consistent_lsn: Lsn(remote),
+            local_start_lsn: Lsn(0x1000),
+            term_history: vec![(1, Lsn(0x1000))],
+        }
+    }
+
+    #[test]
+    fn proposer_horizon_cannot_truncate_before_pageserver_feedback() {
+        assert_eq!(
+            retention_lsn(&state(0x8000, 0, 0x8000, 0x8000), Lsn(0x8000)),
+            Lsn(0)
+        );
+    }
+
+    #[test]
+    fn retention_uses_the_slowest_durability_watermark() {
+        assert_eq!(
+            retention_lsn(&state(0x8000, 0x5000, 0x7000, 0x6000), Lsn(0x6000)),
+            Lsn(0x5000),
+        );
+    }
+
+    #[test]
+    fn parses_remote_consistent_lsn_from_neon_feedback() {
+        let mut fields = BytesMut::new();
+        fields.put_u8(2);
+        fields.put_slice(b"ps_writelsn\0");
+        fields.put_u32(8);
+        fields.put_u64(0x7000);
+        fields.put_slice(b"ps_applylsn\0");
+        fields.put_u32(8);
+        fields.put_u64(0x5000);
+
+        let mut frame = BytesMut::new();
+        frame.put_u8(b'z');
+        frame.put_u64(fields.len() as u64);
+        frame.extend_from_slice(&fields);
+        assert_eq!(
+            parse_pageserver_feedback(&frame.freeze()).expect("valid pageserver feedback"),
+            Some(Lsn(0x5000))
+        );
+    }
 }

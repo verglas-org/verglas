@@ -65,6 +65,16 @@ fn parses_neon_v3_greeting_vector() {
 }
 
 #[test]
+fn parses_timeline_create_command() {
+    assert_eq!(
+        parse_command("TIMELINE_CREATE 0/14F13F0").expect("timeline create"),
+        SafekeeperCommand::TimelineCreate {
+            start_lsn: Lsn(0x14F13F0),
+        },
+    );
+}
+
+#[test]
 fn parses_vote_elected_and_append_vectors() {
     let mut vote = BytesMut::new();
     vote.put_u8(b'v');

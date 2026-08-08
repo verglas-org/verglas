@@ -710,6 +710,15 @@ enum SuffixOutcome {
 /// [`Shared`] requires a `Clone` output.
 type SharedFill<V> = Shared<BoxFuture<'static, Result<V, Arc<ReadError>>>>;
 
+/// Result of [`Inner::start_flight`]: either a registered shared fill or an
+/// inline bypass future when the in-flight map is at capacity.
+enum FlightStart<V> {
+    /// Deduplicated fill already counted against [`InFlight::size`].
+    Shared(SharedFill<V>),
+    /// Cap bypass: run this future without map registration.
+    Bypass(BoxFuture<'static, Result<V, ReadError>>),
+}
+
 /// One singleflight in-flight map: keys of `K` to shared fills yielding `V`.
 type FlightMap<K, V> = Mutex<HashMap<K, SharedFill<V>>>;
 
@@ -2461,82 +2470,96 @@ where
         K: Eq + Hash + Clone + Send + 'static,
         V: Clone + Send + 'static,
     {
+        match self.start_flight(select, dedup_counter, key, make) {
+            // Awaited outside the lock. Every waiter reconstructs its own error
+            // from the one shared error (ReadError is not Clone).
+            FlightStart::Shared(shared) => shared.await.map_err(|err| clone_read_error(&err)),
+            // Over the bound: fill inline, undeduplicated.
+            FlightStart::Bypass(fill) => fill.await,
+        }
+    }
+
+    /// Registers a singleflight fill without awaiting it. Used by
+    /// [`Inner::run_flight`] and by the unmapped-partial path, which must put
+    /// the aligned background fill on the flush barrier *before* the foreground
+    /// partial flight drops its own in-flight count — otherwise `flush()` can
+    /// return between those two moments and a warm re-read refills from origin.
+    fn start_flight<K, V>(
+        self: &Arc<Self>,
+        select: fn(&Inner<B, P, R>) -> &FlightMap<K, V>,
+        dedup_counter: fn(&Inner<B, P, R>) -> &AtomicU64,
+        key: K,
+        make: impl FnOnce(Arc<Inner<B, P, R>>) -> BoxFuture<'static, Result<V, ReadError>>,
+    ) -> FlightStart<V>
+    where
+        K: Eq + Hash + Clone + Send + 'static,
+        V: Clone + Send + 'static,
+    {
         // `make` is consumed by exactly one of the winner / bypass branches
         // (never by a join); an `Option` makes that conditional move explicit.
         let mut make = Some(make);
         // Decide under the lock, then act outside it — no await is ever
         // reached while the (non-`Send`) map guard is alive.
-        let shared = {
-            let map = select(self);
-            let mut guard = map.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(existing) = guard.get(&key) {
-                // Join the in-flight fill: no backend request of our own. The
-                // per-site counter selector lets the suffix path (#149) break
-                // its footer-stampede collapses out from block/mapping fills.
-                CacheCounters::bump(dedup_counter(self));
-                Some(existing.clone())
-            } else if self.inflight.size.load(Ordering::Relaxed) >= MAX_INFLIGHT {
-                // Bounded map: over the cap, fill inline without registering
-                // (still correct, just not collapsed) — signalled by `None`.
-                None
-            } else {
-                let make = make.take().expect("winner runs the fill factory once");
-                let inner = Arc::clone(self);
-                let entry_key = key.clone();
-                let fill = make(Arc::clone(self));
-                // `tokio::spawn` inherits neither the task-local request id nor
-                // the active span, so a fill running in this detached task would
-                // log its failure with no request id (#61). Capture both here, in
-                // the requesting task, and re-establish them inside the fill.
-                let request_id = verglas_core::trace::current();
-                let span = tracing::Span::current();
-                let task = tokio::spawn(async move {
-                    let scoped = fill.instrument(span);
-                    let result = match request_id {
-                        Some(id) => verglas_core::trace::scope(id, scoped).await,
-                        None => scoped.await,
-                    };
-                    // Remove the entry *after* the fill admitted its result, so
-                    // the next request retries (on error) or hits the freshly
-                    // admitted cache state (on success) — never a fresh fill of
-                    // something already in flight.
-                    select(&inner)
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .remove(&entry_key);
-                    // Release so the flush barrier's Acquire load, once it sees
-                    // this decrement, also sees the admission this task just did.
-                    inner.inflight.size.fetch_sub(1, Ordering::Release);
-                    inner.inflight.quiesced.notify_waiters();
-                    result
-                });
-                let shared = task
-                    .map(|joined| match joined {
-                        Ok(result) => result.map_err(Arc::new),
-                        // A panicked/aborted fill task: surface it to every
-                        // waiter as a backend error (never a wrong or missing
-                        // byte). The detached task is only aborted on runtime
-                        // shutdown, not by any waiter.
-                        Err(join) => Err(Arc::new(ReadError::Backend(format!(
-                            "fill task failed: {join}"
-                        )))),
-                    })
-                    .boxed()
-                    .shared();
-                guard.insert(key, shared.clone());
-                self.inflight.size.fetch_add(1, Ordering::Relaxed);
-                Some(shared)
-            }
-        };
-        match shared {
-            // Awaited outside the lock. Every waiter reconstructs its own error
-            // from the one shared error (ReadError is not Clone).
-            Some(shared) => shared.await.map_err(|err| clone_read_error(&err)),
-            // Over the bound: fill inline, undeduplicated.
-            None => {
-                let make = make.take().expect("bypass runs the fill factory once");
-                make(Arc::clone(self)).await
-            }
+        let map = select(self);
+        let mut guard = map.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(existing) = guard.get(&key) {
+            // Join the in-flight fill: no backend request of our own. The
+            // per-site counter selector lets the suffix path (#149) break
+            // its footer-stampede collapses out from block/mapping fills.
+            CacheCounters::bump(dedup_counter(self));
+            FlightStart::Shared(existing.clone())
+        } else if self.inflight.size.load(Ordering::Relaxed) >= MAX_INFLIGHT {
+            // Bounded map: over the cap, fill inline without registering
+            // (still correct, just not collapsed).
+            let make = make.take().expect("bypass runs the fill factory once");
+            FlightStart::Bypass(make(Arc::clone(self)))
+        } else {
+            let make = make.take().expect("winner runs the fill factory once");
+            let inner = Arc::clone(self);
+            let entry_key = key.clone();
+            let fill = make(Arc::clone(self));
+            // `tokio::spawn` inherits neither the task-local request id nor
+            // the active span, so a fill running in this detached task would
+            // log its failure with no request id (#61). Capture both here, in
+            // the requesting task, and re-establish them inside the fill.
+            let request_id = verglas_core::trace::current();
+            let span = tracing::Span::current();
+            let task = tokio::spawn(async move {
+                let scoped = fill.instrument(span);
+                let result = match request_id {
+                    Some(id) => verglas_core::trace::scope(id, scoped).await,
+                    None => scoped.await,
+                };
+                // Remove the entry *after* the fill admitted its result, so
+                // the next request retries (on error) or hits the freshly
+                // admitted cache state (on success) — never a fresh fill of
+                // something already in flight.
+                select(&inner)
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&entry_key);
+                // Release so the flush barrier's Acquire load, once it sees
+                // this decrement, also sees the admission this task just did.
+                inner.inflight.size.fetch_sub(1, Ordering::Release);
+                inner.inflight.quiesced.notify_waiters();
+                result
+            });
+            let shared = task
+                .map(|joined| match joined {
+                    Ok(result) => result.map_err(Arc::new),
+                    // A panicked/aborted fill task: surface it to every
+                    // waiter as a backend error (never a wrong or missing
+                    // byte). The detached task is only aborted on runtime
+                    // shutdown, not by any waiter.
+                    Err(join) => Err(Arc::new(ReadError::Backend(format!(
+                        "fill task failed: {join}"
+                    )))),
+                })
+                .boxed()
+                .shared();
+            guard.insert(key, shared.clone());
+            self.inflight.size.fetch_add(1, Ordering::Relaxed);
+            FlightStart::Shared(shared)
         }
     }
 
@@ -2765,24 +2788,41 @@ where
                 block_index: index,
             };
             let block_key = self.block_entry_key(logical);
-            tokio::spawn(async move {
-                let _permit = permit;
-                let flight_key = block_key.block.clone();
-                let _ = inner
-                    .run_flight(
-                        |inner| &inner.inflight.blocks,
-                        |inner| &inner.counters.deduped_fills,
-                        flight_key,
-                        move |inner| {
-                            Box::pin(async move {
-                                inner
-                                    .fill_block(&object, &version, index, expected_len, block_key)
-                                    .await
-                            })
-                        },
-                    )
-                    .await;
-            });
+            let flight_key = block_key.block.clone();
+            // Register the aligned fill against the flush barrier *before* this
+            // partial flight returns and drops its own in-flight count. Spawning
+            // `run_flight` after return left a window where `flush()` saw size==0
+            // and a warm re-read refilled from origin under CPU starvation.
+            match inner.start_flight(
+                |inner| &inner.inflight.blocks,
+                |inner| &inner.counters.deduped_fills,
+                flight_key,
+                move |inner| {
+                    Box::pin(async move {
+                        let _permit = permit;
+                        inner
+                            .fill_block(&object, &version, index, expected_len, block_key)
+                            .await
+                    })
+                },
+            ) {
+                FlightStart::Shared(shared) => {
+                    tokio::spawn(async move {
+                        let _ = shared.await;
+                    });
+                }
+                FlightStart::Bypass(fill) => {
+                    // Cap bypass still has to be visible to flush: hold a manual
+                    // in-flight slot around the detached work.
+                    inner.inflight.size.fetch_add(1, Ordering::Relaxed);
+                    let tracked = Arc::clone(&inner);
+                    tokio::spawn(async move {
+                        let _ = fill.await;
+                        tracked.inflight.size.fetch_sub(1, Ordering::Release);
+                        tracked.inflight.quiesced.notify_waiters();
+                    });
+                }
+            }
         }
         Ok(PartialOutcome::Cacheable {
             meta,

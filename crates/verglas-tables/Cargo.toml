@@ -31,14 +31,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
-# Websocket transport for the catalog change feed (the second change-feed
-# implementation after polling). rustls only, matching the workspace's reqwest
-# rustls-tls choice — no native-tls / OpenSSL.
-tokio-tungstenite = { version = "0.24", default-features = false, features = [
-    "connect",
-    "handshake",
-    "rustls-tls-webpki-roots",
-] }
 tracing = "0.1.44"
 # Lock-free read path (arc-swap) and the fast hash for the hot-path maps.
 arc-swap = "1.9"

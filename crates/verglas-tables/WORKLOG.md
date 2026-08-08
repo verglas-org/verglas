@@ -202,3 +202,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #91: Renamed active table lifecycle documentation from daemon terminology to
   the `verglas-server` process. Catalog watching and cache warming are unchanged.
 - #8: Moved shallow Iceberg REST transport ownership into `verglas-catalog` and re-exported its polling contracts. Catalog polling now shares the same bounded response cache as the on-prem proxy.
+
+- #58: Removed the Verglas-owned catalog websocket change feed (`/v1/catalog/feed` client, `CatalogFeed` transport selection, and `catalog_ws_feed` tests). Catalog watching is Iceberg REST polling only; hosted-catalog push notify stays a cloud concern.

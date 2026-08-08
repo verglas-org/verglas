@@ -22,14 +22,18 @@
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
 /// Bytes of the CRC32C integrity trailer appended to every stored fragment file
 /// (#220). Little-endian `u32` over the fragment payload.
 const CHECKSUM_TRAILER_LEN: usize = 4;
+
+/// Makes in-flight paths unique when independent coordinators concurrently
+/// place the same logical fragment on this node.
+static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
 /// The per-fragment integrity checksum (CRC32C, Castagnoli) over a fragment's
 /// payload. Chosen for bit-flip detection on the storage path: hardware
@@ -164,6 +168,10 @@ pub struct LocalFragmentStore {
     ceiling: Arc<AtomicU64>,
     /// Live fragment bytes on disk, charged on store and released on delete.
     used: Arc<AtomicU64>,
+    /// Serializes only the final replacement/accounting step. Uploads and
+    /// fsyncs remain concurrent, while two placements of one key cannot both
+    /// charge or release the previous live file.
+    commit_lock: Arc<Mutex<()>>,
 }
 
 impl LocalFragmentStore {
@@ -190,6 +198,7 @@ impl LocalFragmentStore {
             root: Arc::new(root),
             ceiling,
             used: Arc::new(AtomicU64::new(used)),
+            commit_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -253,12 +262,6 @@ impl LocalFragmentStore {
     /// commit, so the hard ceiling holds even mid-stream.
     pub fn open_fragment(&self, key: &FragmentKey) -> Result<FragmentWriter, FragmentIoError> {
         let path = self.fragment_path(key);
-        // A re-place of an existing fragment frees its old charge first so a
-        // rewrite is budget-neutral.
-        let existing = self.fragment_len(key);
-        if existing > 0 {
-            self.used.fetch_sub(existing, Ordering::AcqRel);
-        }
         let parent = path
             .parent()
             .ok_or_else(|| FragmentIoError::io(format!("{} has no parent", path.display())))?
@@ -266,7 +269,8 @@ impl LocalFragmentStore {
         fs::create_dir_all(&parent).map_err(|error| {
             FragmentIoError::io(format!("create fragment dir {}: {error}", parent.display()))
         })?;
-        let tmp = path.with_extension("tmp");
+        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tmp.{}.{temp_id}", std::process::id()));
         let file = File::create(&tmp)
             .map_err(|error| FragmentIoError::io(format!("create {}: {error}", tmp.display())))?;
         Ok(FragmentWriter {
@@ -396,7 +400,12 @@ impl LocalFragmentStore {
     /// checksum trailer), or 0 if absent. The budget tracks payload bytes, so
     /// the fixed trailer overhead never counts against the sub-budget (#220).
     fn fragment_len(&self, key: &FragmentKey) -> u64 {
-        fs::metadata(self.fragment_path(key))
+        self.fragment_len_by_path(&self.fragment_path(key))
+    }
+
+    /// Payload length for an already-resolved fragment path.
+    fn fragment_len_by_path(&self, path: &Path) -> u64 {
+        fs::metadata(path)
             .map(|m| payload_len(m.len()))
             .unwrap_or(0)
     }
@@ -488,6 +497,12 @@ impl FragmentWriter {
             FragmentIoError::io(format!("fsync {}: {error}", self.tmp.display()))
         })?;
         drop(file);
+        let _commit = self
+            .store
+            .commit_lock
+            .lock()
+            .map_err(|_| FragmentIoError::io("fragment replacement lock poisoned"))?;
+        let replaced = self.store.fragment_len_by_path(&self.path);
         fs::rename(&self.tmp, &self.path).map_err(|error| {
             FragmentIoError::io(format!(
                 "rename {} to {}: {error}",
@@ -496,6 +511,7 @@ impl FragmentWriter {
             ))
         })?;
         sync_dir(&self.parent)?;
+        self.store.used.fetch_sub(replaced, Ordering::AcqRel);
         self.committed = true;
         Ok(())
     }
@@ -827,6 +843,31 @@ mod tests {
             store.verify_fragment(&key).expect("verify"),
             FragmentHealth::Healthy
         );
+    }
+
+    /// Overlapping idempotent placements use separate temporary files and the
+    /// final winner is charged exactly once.
+    #[test]
+    fn overlapping_streamed_replacements_do_not_collide_or_leak_budget() {
+        let store = LocalFragmentStore::with_budget(scratch("stream-overlap"), 1000);
+        let key = FragmentKey {
+            object_id: "same".to_owned(),
+            index: 1,
+        };
+        let mut first = store.open_fragment(&key).expect("open first");
+        let mut second = store.open_fragment(&key).expect("open second");
+        first.append(b"aaa").expect("append first");
+        second.append(b"bbbb").expect("append second");
+        first.commit().expect("commit first");
+        second.commit().expect("commit second");
+
+        assert_eq!(
+            store.used_bytes(),
+            4,
+            "only the live replacement is charged"
+        );
+        let loaded = store.load_fragment(&key).expect("load").expect("present");
+        assert_eq!(loaded.bytes.as_ref(), b"bbbb");
     }
 
     /// A missing fragment loads as `None`, and delete is idempotent.

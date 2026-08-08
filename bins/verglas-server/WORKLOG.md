@@ -601,3 +601,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #16: Wired the optional Rill analytics runtime into the on-prem REST composition from validated server configuration. Rill receives the resolved Verglas S3 credentials only over the private deployment network, while deployments without analytics keep the dashboard routes absent. The admin integration-test startup window now covers a cold instrumented cache boot instead of failing at five seconds.
 - #18: Added Postgres and its health gate to the optional Workers Compose profile so the documented scheduler starts as a complete application. The base storage, catalog, query, and analytics paths remain independent of that profile.
 - #29: Opened the persistent KV engine automatically beneath every server's existing cache directory and exposed it through both authenticated serving boundaries. The engine requires no KV configuration, survives process termination, and remains independent from object-cache purge and eviction.
+
+- #58: Server catalog lifecycle uses `PollingWatcher` only. Removed the `/v1/catalog/feed` websocket upgrade path from process startup.
+
+- #58: Updated `unavailable_catalog_is_reported_to_stderr` to match the poll-only watcher warn text after removing the catalog websocket feed.

@@ -20,6 +20,10 @@ verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-s3.workspace = true
 verglas-backend.workspace = true
+# Cache nodes own the tenant catalog response cache and watcher. Query workers
+# consume the local gateway and never receive upstream Lakekeeper credentials.
+verglas-catalog.workspace = true
+verglas-tables.workspace = true
 # The block-device tier (#382): the NBD server in this binary serves cache-served
 # virtual disks to microVMs; verglas-block owns the durable chunk store + manifest.
 verglas-block.workspace = true

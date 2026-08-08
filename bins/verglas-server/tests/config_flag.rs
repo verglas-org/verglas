@@ -227,9 +227,12 @@ fn unavailable_catalog_is_reported_to_stderr() {
         }
     });
 
+    // PollingWatcher logs connectivity failures with tracing::warn!. With
+    // RUST_LOG=info those events must still reach stderr so an operator sees
+    // an unreachable catalog instead of a silent empty warm set (#241).
     let lines = wait_for_stderr_line(
         &receiver,
-        "catalog feed seeding poll failed; keeping last-known state",
+        "catalog poll failed; backing off with last-known state intact",
         Duration::from_secs(10),
     );
     let _ = server.kill();
@@ -237,9 +240,9 @@ fn unavailable_catalog_is_reported_to_stderr() {
     reader.join().expect("stderr reader exits");
 
     assert!(
-        lines
-            .iter()
-            .any(|line| line.contains("catalog feed seeding poll failed; keeping last-known state")),
+        lines.iter().any(|line| {
+            line.contains("catalog poll failed; backing off with last-known state intact")
+        }),
         "catalog connectivity failure must be visible on stderr, got:\n{}",
         lines.join("\n")
     );

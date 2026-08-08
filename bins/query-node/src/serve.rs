@@ -42,7 +42,7 @@ fn resolve_keypair(
 
 /// Builds the [`Connection`] this instance queries through: the configured
 /// cache S3 endpoint (never a direct object-store path) and the configured
-/// Iceberg REST catalog. Public so the `estimate` CLI mode (`bin/main.rs`,
+/// cache-owned Iceberg metadata endpoint. Public so the `estimate` CLI mode (`bin/main.rs`,
 /// a separate crate from this library) can open the same connection without
 /// starting a server.
 pub fn connection_for(config: &QueryConfig) -> Result<Connection, String> {
@@ -53,14 +53,10 @@ pub fn connection_for(config: &QueryConfig) -> Result<Connection, String> {
         Some((id, secret)) => (Some(id), Some(secret)),
         None => (None, None),
     };
-    let token = config
-        .catalog
-        .resolve_bearer_token()
-        .map_err(|e| e.to_string())?;
     Ok(Connection {
-        catalog_uri: config.catalog.uri.clone(),
-        token,
-        warehouse: config.catalog.warehouse.clone(),
+        catalog_uri: config.metadata.uri.clone(),
+        token: None,
+        warehouse: None,
         s3_endpoint: Some(config.cache.s3_endpoint.clone()),
         region: config
             .cache
@@ -108,11 +104,21 @@ pub async fn run(
     tracing::info!(bytes = initial_grant.bytes, "initial memory grant");
 
     let last_activity = Arc::new(AtomicU64::new(now_secs()));
+    let prepared_catalog = admin::PreparedQueryCatalog::open(
+        catalog.clone(),
+        Some(&config.metadata.uri),
+        config.memory.limit_bytes,
+        config.memory.spill_path.clone(),
+    )
+    .await
+    .map_err(|e| format!("cannot prepare catalog session: {e}"))?;
     let state = AppState {
         catalog,
+        prepared_catalog,
         grant_host: grant_host.clone(),
         grant: Arc::new(Mutex::new(initial_grant)),
         last_activity: last_activity.clone(),
+        estimate_on_request: config.memory.estimate_on_request,
     };
 
     let app = admin::router(state.clone());

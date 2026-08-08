@@ -10,7 +10,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, watch};
 use verglas_core::config;
 
-use super::websocket::WsFeedConfig;
 use super::{
     CatalogSource, CatalogWatcher, EVENT_CHANNEL_CAPACITY, SnapshotEntry, TableChanged,
     TableFilter, TableIdent, TableState,
@@ -93,11 +92,8 @@ impl TableRecord {
     }
 }
 
-/// State shared between a feed task (polling or websocket) and the
-/// [`CatalogWatcher`] surface. Both transports write last-known state here and
-/// fan out [`TableChanged`] events; consumers read the same memory regardless
-/// of which transport produced it.
-pub(crate) struct Shared {
+/// State shared between the polling task and the [`CatalogWatcher`] surface.
+struct Shared {
     /// Last-known state per watched table.
     tables: Mutex<HashMap<TableIdent, TableRecord>>,
     /// Event fan-out (see the module docs in `catalog` for lag semantics).
@@ -111,7 +107,7 @@ pub(crate) struct Shared {
 impl Shared {
     /// Creates empty shared state with a fresh event ring and an un-seeded
     /// signal.
-    pub(crate) fn new() -> Shared {
+    fn new() -> Shared {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (seeded, _) = watch::channel(false);
         Shared {
@@ -130,7 +126,7 @@ impl Shared {
     }
 
     /// Marks state seeded, waking startup consumers. Idempotent.
-    pub(crate) fn mark_seeded(&self) {
+    fn mark_seeded(&self) {
         self.seeded.send_replace(true);
     }
 
@@ -217,79 +213,6 @@ impl CatalogWatcher for PollingWatcher {
     }
 }
 
-/// The catalog change feed the server runs (#47 transport selection): the same
-/// [`CatalogWatcher`] surface, driven by either the websocket transport or
-/// polling.
-///
-/// With a [`WsFeedConfig`] the feed attempts a websocket upgrade at the catalog
-/// origin; on success the websocket drives changes and polling only covers
-/// reconnect gaps, and on a non-upgradeable endpoint (a third-party catalog) it
-/// falls back to polling and retries the upgrade periodically. Without a config
-/// (SigV4 / AWS catalogs, which never speak the feed) polling is the only mode.
-pub struct CatalogFeed {
-    /// State shared with the background feed task.
-    shared: Arc<Shared>,
-    /// The background feed task; aborted on drop.
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl CatalogFeed {
-    /// Spawns the feed. `ws` selects the transport: `Some` attempts websocket
-    /// with polling fallback; `None` polls only.
-    pub fn spawn<S: CatalogSource>(
-        source: S,
-        options: WatcherOptions,
-        ws: Option<WsFeedConfig>,
-    ) -> CatalogFeed {
-        let shared = Arc::new(Shared::new());
-        let task = match ws {
-            Some(config) => tokio::spawn(super::websocket::run(
-                source,
-                options,
-                Arc::clone(&shared),
-                config,
-            )),
-            None => tokio::spawn(run(source, options, Arc::clone(&shared))),
-        };
-        CatalogFeed { shared, task }
-    }
-}
-
-impl Drop for CatalogFeed {
-    /// Stops the background task when the handle goes away.
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl CatalogWatcher for CatalogFeed {
-    /// Watched tables from last-known state, sorted by identity.
-    fn watched_tables(&self) -> Vec<TableIdent> {
-        self.shared.watched_tables()
-    }
-
-    /// Last-known pointer for one table.
-    fn table_state(&self, table: &TableIdent) -> Option<TableState> {
-        self.shared.table_state(table)
-    }
-
-    /// Recent lineage for one table (empty if unknown).
-    fn lineage(&self, table: &TableIdent) -> Vec<SnapshotEntry> {
-        self.shared.lineage(table)
-    }
-
-    /// A fresh event subscription.
-    fn subscribe(&self) -> broadcast::Receiver<TableChanged> {
-        self.shared.subscribe()
-    }
-
-    /// `true` once the first successful poll/attach has populated the watched
-    /// set.
-    fn seeded(&self) -> watch::Receiver<bool> {
-        self.shared.seeded_rx()
-    }
-}
-
 /// The poll-forever task: sleep-with-jitter between successful cycles,
 /// exponential backoff (state intact) while the catalog is unreachable.
 /// Never panics, never exits — resilience is this loop's whole job.
@@ -306,9 +229,8 @@ async fn run<S: CatalogSource>(source: S, options: WatcherOptions, shared: Arc<S
                 }
                 seeded = true;
                 // Wake startup consumers: the watched set now reflects a real
-                // read of the catalog (send_replace never fails, receivers or
-                // not). Idempotent on every later successful cycle.
-                shared.seeded.send_replace(true);
+                // read of the catalog. Idempotent on every later successful cycle.
+                shared.mark_seeded();
                 failures = 0;
                 tokio::time::sleep(options.interval + jitter(options.jitter)).await;
             }
@@ -330,8 +252,7 @@ async fn run<S: CatalogSource>(source: S, options: WatcherOptions, shared: Arc<S
 /// Diffs one table's freshly-read `state` against last-known state, updating
 /// the record and returning the [`TableChanged`] to emit (or `None` when the
 /// pointer is unchanged). A brand-new table emits only when `seeded` — the
-/// initial seeding pass stays silent. Shared by the polling loop and the
-/// websocket single-table refresh so both diff identically.
+/// initial seeding pass stays silent.
 fn apply_one(
     tables: &mut HashMap<TableIdent, TableRecord>,
     ident: TableIdent,
@@ -372,11 +293,7 @@ fn apply_one(
 /// pointer, diff against last-known state, emit events. No manifest reads
 /// ever happen here. Errors on a single table are logged and skipped (its
 /// state is kept); an error listing tables fails the cycle for backoff.
-///
-/// Shared by the polling watcher and the websocket transport: the websocket
-/// runs one pass to seed the watched set on attach, to catch up on reconnect,
-/// and to service a `resync`.
-pub(crate) async fn poll_once<S: CatalogSource>(
+async fn poll_once<S: CatalogSource>(
     source: &S,
     options: &WatcherOptions,
     shared: &Shared,
@@ -431,44 +348,6 @@ pub(crate) async fn poll_once<S: CatalogSource>(
         let _ = shared.events.send(event);
     }
     Ok(())
-}
-
-/// Refreshes one table after a websocket `change` frame: read its current
-/// pointer, diff against last-known state, and emit downstream — the same
-/// handling the poller drives, but for a single named table instead of a full
-/// scan. Tables outside the filter set are ignored; a pointer-read error keeps
-/// last-known state (the reconnect catch-up poll will retry).
-pub(crate) async fn refresh_table<S: CatalogSource>(
-    source: &S,
-    options: &WatcherOptions,
-    shared: &Shared,
-    table: &TableIdent,
-) {
-    if !options.filter.matches(table) {
-        return;
-    }
-    let state = match source.table_pointer(table).await {
-        Ok(state) => state,
-        Err(error) => {
-            tracing::warn!(table = %table, %error, "feed change: table pointer read failed; keeping last-known state");
-            return;
-        }
-    };
-    let event = {
-        let mut tables = shared.tables();
-        // A change frame names a table the server knows has committed, so the
-        // refresh always treats the table as seeded (a new appearance emits).
-        apply_one(
-            &mut tables,
-            table.clone(),
-            state,
-            options.history_depth,
-            true,
-        )
-    };
-    if let Some(event) = event {
-        let _ = shared.events.send(event);
-    }
 }
 
 /// Exponential backoff for consecutive failures: `interval * 2^(n-1)`,

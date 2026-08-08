@@ -97,13 +97,23 @@ async fn catalog_with_table(ident: &iceberg::TableIdent, rows: u64) -> Arc<dyn C
 /// `catalog` and starting from `initial_grant` bytes. Returns the base URL and
 /// the state handle (so tests can inspect the grant after requests).
 async fn serve(catalog: Arc<dyn Catalog>, initial_grant_bytes: u64) -> (String, AppState) {
+    let prepared_catalog = verglas_query::admin::PreparedQueryCatalog::open(
+        catalog.clone(),
+        None,
+        64 * 1024 * 1024,
+        None,
+    )
+    .await
+    .expect("prepare catalog");
     let state = AppState {
         catalog,
+        prepared_catalog,
         grant_host: Arc::new(LocalGrantHost),
         grant: Arc::new(Mutex::new(MemoryGrant {
             bytes: initial_grant_bytes,
         })),
         last_activity: Arc::new(AtomicU64::new(0)),
+        estimate_on_request: true,
     };
     let app = admin::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -365,7 +375,7 @@ async fn binary_exits_cleanly_on_an_unreachable_catalog() {
     std::fs::write(
         &config_path,
         "[cache]\ns3_endpoint = \"http://127.0.0.1:1\"\n\n\
-         [catalog]\nuri = \"http://127.0.0.1:1\"\n",
+         [metadata]\nuri = \"http://127.0.0.1:1\"\n",
     )
     .expect("write config");
 

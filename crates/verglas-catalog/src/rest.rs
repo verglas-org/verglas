@@ -25,6 +25,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
@@ -99,13 +100,20 @@ impl CachedResponses {
     /// Inserts one response, evicting existing entries until the hard byte
     /// ceiling can accommodate it. Responses larger than the whole budget are
     /// served but not retained.
-    fn insert(&mut self, key: String, response: CatalogResponse) {
+    fn insert(&mut self, key: String, response: CatalogResponse) -> bool {
+        // First population establishes generation zero; it is not a catalog
+        // change. Only replacing a prepared response with different content
+        // invalidates an already-built query session. Successful mutations bump
+        // the generation separately before their cleared entries repopulate.
+        let changed = self.entries.get(&key).is_some_and(|previous| {
+            previous.status != response.status || previous.body != response.body
+        });
         if let Some(previous) = self.entries.remove(&key) {
             self.bytes = self.bytes.saturating_sub(previous.body.len());
         }
         let size = response.body.len();
         if size > self.budget {
-            return;
+            return changed;
         }
         while self.bytes.saturating_add(size) > self.budget {
             let Some(victim) = self.entries.keys().next().cloned() else {
@@ -117,6 +125,7 @@ impl CachedResponses {
         }
         self.bytes = self.bytes.saturating_add(size);
         self.entries.insert(key, response);
+        changed
     }
 
     /// Drops every cached GET after a successful catalog mutation.
@@ -147,6 +156,9 @@ pub struct RestCatalogSource {
     prefix: Arc<tokio::sync::OnceCell<String>>,
     /// Successful GET responses shared with the loopback catalog gateway.
     responses: Arc<RwLock<CachedResponses>>,
+    /// Monotonic catalog generation advanced only when a prepared REST response
+    /// changes or a successful mutation invalidates the prepared response set.
+    generation: Arc<AtomicU64>,
 }
 
 /// One buffered Iceberg REST response returned through the loopback gateway.
@@ -182,6 +194,11 @@ impl CatalogGateway {
     /// Returns a watcher source backed by the same client and response cache.
     pub fn source(&self) -> RestCatalogSource {
         self.source.clone()
+    }
+
+    /// Current prepared-catalog generation for query-session invalidation.
+    pub fn generation(&self) -> u64 {
+        self.source.generation.load(Ordering::Acquire)
     }
 
     /// Serves one local catalog request. Successful watcher or gateway GETs are
@@ -429,6 +446,7 @@ impl RestCatalogSource {
             responses: Arc::new(RwLock::new(CachedResponses::new(
                 CATALOG_RESPONSE_CACHE_BYTES,
             ))),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -436,6 +454,18 @@ impl RestCatalogSource {
     /// local clients send to the gateway.
     fn cache_key(&self, url: &str) -> String {
         url.strip_prefix(&self.base).unwrap_or(url).to_owned()
+    }
+
+    /// Resolves a local gateway path into the upstream path owned by this cache.
+    /// Query workers deliberately omit warehouse configuration; the cache adds
+    /// it to config discovery so the request shares the watcher's prepared entry.
+    fn gateway_path(&self, path_and_query: &str) -> String {
+        if path_and_query == "/v1/config"
+            && let Some(warehouse) = &self.warehouse
+        {
+            return format!("/v1/config?warehouse={}", encode(warehouse));
+        }
+        path_and_query.to_owned()
     }
 
     /// Sends one request to the configured upstream catalog, applying bearer or
@@ -520,24 +550,30 @@ impl RestCatalogSource {
                 detail: "catalog gateway path must start with '/'".to_owned(),
             });
         }
+        let resolved_path = self.gateway_path(path_and_query);
         if method == Method::GET
-            && let Some(response) = self.responses.read().await.get(path_and_query)
+            && let Some(response) = self.responses.read().await.get(&resolved_path)
         {
             return Ok(response);
         }
 
-        let url = format!("{}{}", self.base, path_and_query);
+        let url = format!("{}{}", self.base, resolved_path);
         let response = self
             .send_upstream(method.clone(), &url, headers, body)
             .await?;
         if (200..300).contains(&response.status) {
             if method == Method::GET {
-                self.responses
+                let changed = self
+                    .responses
                     .write()
                     .await
-                    .insert(path_and_query.to_owned(), response.clone());
+                    .insert(resolved_path, response.clone());
+                if changed {
+                    self.generation.fetch_add(1, Ordering::AcqRel);
+                }
             } else {
                 self.responses.write().await.clear();
+                self.generation.fetch_add(1, Ordering::AcqRel);
             }
         }
         Ok(response)
@@ -558,7 +594,10 @@ impl RestCatalogSource {
             });
         }
         let key = self.cache_key(url);
-        self.responses.write().await.insert(key, response.clone());
+        let changed = self.responses.write().await.insert(key, response.clone());
+        if changed {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
         serde_json::from_slice::<T>(&response.body).map_err(|e| CatalogError::Malformed {
             url: url.to_owned(),
             detail: e.to_string(),
@@ -763,5 +802,22 @@ mod tests {
         assert!(cache.bytes <= 10);
         assert!(cache.entries.contains_key("/two"));
         assert!(!cache.entries.contains_key("/one"));
+    }
+
+    /// A local query worker does not know the upstream warehouse. The cache
+    /// gateway adds its owned warehouse to `/v1/config`, matching the response
+    /// the watcher already prepared.
+    #[test]
+    fn gateway_config_uses_the_cache_owned_warehouse() {
+        let source = RestCatalogSource::build(
+            "http://catalog".to_owned(),
+            None,
+            None,
+            Some("tenant-001".to_owned()),
+        );
+        assert_eq!(
+            source.gateway_path("/v1/config"),
+            "/v1/config?warehouse=tenant-001"
+        );
     }
 }

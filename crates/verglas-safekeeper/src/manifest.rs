@@ -9,7 +9,8 @@
 //! S3 for everything below the flush watermark.
 //!
 //! Rewriting the whole file per append is O(segments-in-flight); appends are
-//! serialized and flush drops flushed segments, so the file stays small. The
+//! serialized and flush drops the flushed segments' per-append placements, so
+//! the file stays small. The
 //! extension point for a higher append rate is a per-append journal file plus a
 //! small watermark manifest (the object write-back tier's shape) — noted, not
 //! built, per the prototype rules.
@@ -107,6 +108,10 @@ pub struct Manifest {
     pub commit_lsn: Lsn,
     /// Oldest WAL retained for proposer/pageserver recovery.
     pub truncate_lsn: Lsn,
+    /// Oldest checkpoint that the pageserver reports durable in remote storage.
+    /// Zero means no pageserver durability feedback has been received yet.
+    #[serde(default)]
+    pub remote_consistent_lsn: Lsn,
     /// Ordered `(term, first_lsn)` boundaries selected during elections.
     pub term_history: Vec<(u64, Lsn)>,
     /// The stream's base LSN (appends below this were truncated away).
@@ -133,6 +138,7 @@ impl Manifest {
             epoch: Epoch(0),
             commit_lsn: Lsn(0),
             truncate_lsn: Lsn(0),
+            remote_consistent_lsn: Lsn(0),
             term_history: Vec::new(),
             base: Lsn(0),
             tail: Lsn(0),

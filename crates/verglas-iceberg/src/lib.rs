@@ -56,7 +56,9 @@ pub use conn::Connection;
 pub use error::{AgentError, Result};
 pub use estimate::estimate;
 pub use ident::parse_table_ident;
-pub use query::{QueryExecution, TimeTravel, batch_to_json_rows_fragment, query_stream};
+pub use query::{
+    PreparedCatalog, QueryExecution, TimeTravel, batch_to_json_rows_fragment, query_stream,
+};
 pub use report::{
     AppendReport, CreateReport, FieldInfo, HistoryReport, ListReport, QueryMemoryEstimate,
     QueryReport, ShowReport, SnapshotInfo, TableRef,

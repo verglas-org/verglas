@@ -35,3 +35,4 @@
   walproposer truncate watermark. A lagging or cold pageserver can now read
   drained segments until a future pageserver-confirmed retention boundary is
   added, with a socket-level regression test covering that launch race.
+- #58: Allowed the eight-argument `EcAppendLog::open` (node identity plus ring plane) and replaced test `unwrap`s with `expect` so clippy stays clean after the cache-metadata fleet fixes.

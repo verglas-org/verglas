@@ -130,6 +130,7 @@
 //! - The storage lifecycle flushes sealed WAL segments to object storage and
 //!   truncates only after pageserver no longer needs the prefix.
 
+mod broker;
 mod contract;
 mod log;
 mod manifest;

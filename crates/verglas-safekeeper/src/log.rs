@@ -51,6 +51,10 @@ const STATE_HEAD_INDEX: usize = usize::MAX;
 /// write and for reading already-flushed ranges back; it is never on the append
 /// (commit) path.
 pub struct EcAppendLog<S> {
+    /// Stable identity of the safekeeper whose state this log represents.
+    /// Safekeepers advance and flush independently, so their replicated state
+    /// keys must not collide even though they receive the same WAL stream.
+    node_id: u64,
     /// The S3 origin: flush target and flushed-range read source.
     store: Arc<S>,
     /// The bucket flushed segment objects live in.
@@ -86,7 +90,11 @@ where
     /// restart rebuilds the tail and the flush watermark) or starting an empty
     /// log. `geometry` is the multi-node erasure geometry; a single-node
     /// deployment ignores it and runs `(1, 0, 1)`.
+    // Open takes the full append-plane identity (node, store, ring, geometry).
+    // Bundling would only rename the same eight inputs.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
+        node_id: u64,
         store: Arc<S>,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -95,11 +103,26 @@ where
         dir: impl AsRef<Path>,
         geometry: AppendGeometry,
     ) -> Result<Self, AppendError> {
-        let (manifest_store, manifest) = ManifestStore::open(dir)?;
+        let (manifest_store, mut manifest) = ManifestStore::open(dir)?;
+        // Older builds retained per-append fragment placements even after the
+        // complete segment was durable in origin and those fragments had been
+        // deleted. Compact that legacy state before serving so the first new
+        // descriptor does not republish an unbounded historical payload.
+        let mut compacted = false;
+        for segment in &mut manifest.segments {
+            if segment.state == SegmentState::Flushed && !segment.appends.is_empty() {
+                segment.appends.clear();
+                compacted = true;
+            }
+        }
+        if compacted {
+            manifest_store.persist(&manifest)?;
+        }
         let tail = AtomicU64::new(manifest.tail.0);
         let flushed = AtomicU64::new(manifest.flushed_through.0);
         let epoch = AtomicU64::new(manifest.epoch.0);
         Ok(Self {
+            node_id,
             store,
             bucket: bucket.into(),
             prefix: prefix.into(),
@@ -125,12 +148,55 @@ where
         }
     }
 
+    /// Initializes an empty timeline at the base LSN created by the pageserver.
+    /// Neon normally supplies this through its safekeeper management API before
+    /// compute starts. Without it, walproposer sees `0/0`, attempts to fetch the
+    /// initdb WAL prefix from an empty donor, and can never finish bootstrap.
+    pub async fn initialize_timeline(&self, start_lsn: Lsn) -> Result<bool, AppendError> {
+        if start_lsn == Lsn(0) {
+            return Err(AppendError::Manifest(
+                "timeline start LSN must not be 0/0".to_owned(),
+            ));
+        }
+        let mut manifest = self.state.lock().await;
+        if manifest.tail != Lsn(0) {
+            // A compute wake restores the pageserver at its durable LSN and
+            // repeats TIMELINE_CREATE before reconnecting walproposer. Treat
+            // that as idempotent when the requested point is already covered
+            // by this safekeeper. Never jump across WAL we do not have, and
+            // never resurrect WAL below the retained range.
+            if start_lsn.0 >= manifest.base.0 && start_lsn.0 <= manifest.tail.0 {
+                return Ok(false);
+            }
+            return Err(AppendError::Manifest(format!(
+                "timeline retains {}..{}, cannot initialize at {start_lsn}",
+                manifest.base, manifest.tail,
+            )));
+        }
+        manifest.base = start_lsn;
+        manifest.tail = start_lsn;
+        manifest.flushed_through = start_lsn;
+        manifest.commit_lsn = start_lsn;
+        manifest.truncate_lsn = start_lsn;
+        manifest.epoch = Epoch(1);
+        manifest.term_history = vec![(1, start_lsn)];
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)?;
+        self.tail.store(start_lsn.0, Ordering::Relaxed);
+        self.flushed.store(start_lsn.0, Ordering::Relaxed);
+        self.epoch.store(1, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Stable object-id prefix for this timeline's replicated state records.
     fn state_prefix(&self) -> String {
         let mut digest = Sha256::new();
         digest.update(self.bucket.as_bytes());
         digest.update([0]);
         digest.update(self.prefix.trim_matches('/').as_bytes());
+        digest.update([0]);
+        digest.update(self.node_id.to_be_bytes());
         format!("sk/{:x}", digest.finalize())
     }
 
@@ -287,6 +353,9 @@ where
             flush_lsn: manifest.tail,
             commit_lsn: manifest.commit_lsn,
             truncate_lsn: manifest.truncate_lsn,
+            backup_lsn: manifest.flushed_through,
+            remote_consistent_lsn: manifest.remote_consistent_lsn,
+            local_start_lsn: manifest.base,
             term_history: manifest.term_history.clone(),
         }
     }
@@ -301,7 +370,17 @@ where
         wal_segment_size: u32,
     ) -> Result<(), AppendError> {
         let mut manifest = self.state.lock().await;
-        if manifest.system_id != 0 && manifest.system_id != system_id {
+        // Neon uses zero while a compute is synchronizing from a safekeeper and
+        // has not recovered PostgreSQL's control file yet. Treat that value as
+        // unspecified once this timeline has a durable identity; overwriting or
+        // rejecting the recovered identity makes every scale-to-zero wake fail.
+        // A conflicting nonzero identity remains a hard fencing error.
+        let effective_system_id = if system_id == 0 {
+            manifest.system_id
+        } else {
+            system_id
+        };
+        if manifest.system_id != 0 && manifest.system_id != effective_system_id {
             return Err(AppendError::Manifest(format!(
                 "timeline system id changed from {} to {system_id}",
                 manifest.system_id
@@ -314,14 +393,14 @@ where
             )));
         }
         if manifest.generation == generation
-            && manifest.system_id == system_id
+            && manifest.system_id == effective_system_id
             && manifest.pg_version == pg_version
             && manifest.wal_segment_size == wal_segment_size
         {
             return Ok(());
         }
         manifest.generation = generation;
-        manifest.system_id = system_id;
+        manifest.system_id = effective_system_id;
         manifest.pg_version = pg_version;
         manifest.wal_segment_size = wal_segment_size;
         manifest.revision = manifest.revision.saturating_add(1);
@@ -400,8 +479,29 @@ where
             flush_lsn: manifest.tail,
             commit_lsn: manifest.commit_lsn,
             truncate_lsn: manifest.truncate_lsn,
+            backup_lsn: manifest.flushed_through,
+            remote_consistent_lsn: manifest.remote_consistent_lsn,
+            local_start_lsn: manifest.base,
             term_history: manifest.term_history.clone(),
         })
+    }
+
+    /// Records pageserver durability feedback. WAL deletion is never driven by
+    /// walproposer's peer horizon alone: the pageserver must first confirm that
+    /// the same prefix is durable in its remote storage.
+    pub async fn record_remote_consistent_lsn(&self, lsn: Lsn) -> Result<(), AppendError> {
+        if lsn == Lsn(0) {
+            return Ok(());
+        }
+        let mut manifest = self.state.lock().await;
+        let lsn = Lsn(lsn.0.min(manifest.tail.0));
+        if lsn.0 <= manifest.remote_consistent_lsn.0 {
+            return Ok(());
+        }
+        manifest.remote_consistent_lsn = lsn;
+        manifest.revision = manifest.revision.saturating_add(1);
+        self.replicate_state(&manifest).await?;
+        self.manifest_store.persist(&manifest)
     }
 
     /// Encodes `records` and places its fragments on distinct live nodes,
@@ -822,6 +922,11 @@ where
 
             manifest.segments[i].state = SegmentState::Flushed;
             manifest.segments[i].s3_key = Some(s3_key);
+            // Origin now owns the complete segment. Recovery and reads need
+            // only its LSN range and object key; retaining every append's
+            // fragment placements made the replicated descriptor grow without
+            // bound even though those fragments are deleted below.
+            manifest.segments[i].appends.clear();
             // Segments flush in LSN order with no gaps, so the whole prefix up to
             // this segment's end is now in S3.
             manifest.flushed_through = segment.end;

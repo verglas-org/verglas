@@ -4,3 +4,4 @@
 - #91: Updated query-node compatibility documentation for the renamed
   `verglas-server` process. Query-node continues to share wire contracts and
   configuration shapes with the foreground server.
+- #58: Query workers now receive only a cache-local metadata gateway URI. Upstream Lakekeeper credentials, warehouse configuration, and catalog change state remain in the cache node.

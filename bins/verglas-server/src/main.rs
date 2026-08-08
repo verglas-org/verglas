@@ -248,7 +248,7 @@ fn warming_info(
 #[derive(Default)]
 struct LifecycleHooks {
     /// Shared catalog watcher used by cache lifecycle and scheduler subscriptions.
-    watcher: Option<Arc<verglas_tables::catalog::CatalogFeed>>,
+    watcher: Option<Arc<verglas_tables::catalog::PollingWatcher>>,
     /// Live warming progress, when warming is on.
     warming: Option<Arc<verglas_tables::warming::WarmProgress>>,
     /// The request-path heat sample sender, when prefetch is on.
@@ -280,7 +280,7 @@ fn spawn_lifecycle(
     let Some(catalog) = config.catalog.as_ref() else {
         return Ok(LifecycleHooks::default());
     };
-    use verglas_tables::catalog::{CatalogFeed, WatcherOptions, WsFeedConfig};
+    use verglas_tables::catalog::{PollingWatcher, WatcherOptions};
     use verglas_tables::warming::budget::TokenBucket;
 
     // One watcher, one byte budget shared by warming and prefetch. Resolving the
@@ -293,17 +293,9 @@ fn spawn_lifecycle(
         )
     })?;
     let options = WatcherOptions::from_config(catalog);
-    // Transport selection carries no config knob: attempt a websocket upgrade at
-    // the catalog origin (the default when the upstream is the Verglas catalog
-    // service) and fall back to polling automatically for third-party catalogs.
-    // SigV4 (AWS S3 Tables / Glue) catalogs never speak the feed, so they poll
-    // directly with no upgrade attempt.
-    let ws = if catalog.sigv4_enabled() {
-        None
-    } else {
-        WsFeedConfig::from_catalog_uri(&catalog.uri, catalog.resolve_bearer_token()?)
-    };
-    let watcher = Arc::new(CatalogFeed::spawn(source, options, ws));
+    // Iceberg REST polling only. Hosted-catalog push notify is a cloud concern;
+    // this process does not open a Verglas websocket to the catalog origin.
+    let watcher = Arc::new(PollingWatcher::spawn(source, options));
     let w = &config.cache.warming;
     let budget = Arc::new(if w.byte_budget_bytes_per_sec.0 == 0 {
         TokenBucket::unlimited()
@@ -343,7 +335,7 @@ fn spawn_lifecycle(
 
 /// Bridges on-prem catalog polling events into durable scheduler invocations.
 fn spawn_scheduler_catalog_events(
-    watcher: Arc<verglas_tables::catalog::CatalogFeed>,
+    watcher: Arc<verglas_tables::catalog::PollingWatcher>,
     ingress: Arc<platform::SchedulerIngress>,
 ) -> tokio::task::JoinHandle<()> {
     use verglas_tables::catalog::CatalogWatcher;
@@ -388,7 +380,7 @@ fn spawn_scheduler_catalog_events(
 fn spawn_warming(
     config: &verglas_core::config::Config,
     engine: ServerEngine,
-    watcher: Arc<verglas_tables::catalog::CatalogFeed>,
+    watcher: Arc<verglas_tables::catalog::PollingWatcher>,
     budget: Arc<verglas_tables::warming::budget::TokenBucket>,
 ) -> Arc<verglas_tables::warming::WarmProgress> {
     use verglas_tables::warming::{WarmConfig, WarmSource, Warmer, WarmingCoordinator};
@@ -425,7 +417,7 @@ struct PrefetchHandles {
 fn spawn_prefetch(
     config: &verglas_core::config::Config,
     engine: ServerEngine,
-    watcher: Arc<verglas_tables::catalog::CatalogFeed>,
+    watcher: Arc<verglas_tables::catalog::PollingWatcher>,
     budget: Arc<verglas_tables::warming::budget::TokenBucket>,
 ) -> PrefetchHandles {
     use verglas_tables::fetch::ObjectReadFetch;
@@ -2379,10 +2371,10 @@ async fn main() {
         return;
     }
 
-    // Pin the process-level rustls CryptoProvider. The catalog feed websocket
-    // (tokio-tungstenite, rustls-only) resolves TLS through the process default,
-    // and with more than one provider feature in the dependency graph rustls
-    // panics at first use unless one is installed explicitly.
+    // Pin the process-level rustls CryptoProvider. Catalog HTTPS and other
+    // rustls clients resolve TLS through the process default, and with more
+    // than one provider feature in the dependency graph rustls panics at first
+    // use unless one is installed explicitly.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Arm the parent-death watch before binding anything: if `verglas dev`

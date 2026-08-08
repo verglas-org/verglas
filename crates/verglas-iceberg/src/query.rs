@@ -17,6 +17,8 @@ use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::execution::memory_pool::FairSpillPool;
+use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::prelude::{SessionConfig, SessionContext};
 use futures::{StreamExt, TryStreamExt};
@@ -56,6 +58,47 @@ pub struct QueryExecution {
     pub batches: SendableRecordBatchStream,
 }
 
+/// A whole-catalog DataFusion session prepared once and reused across queries.
+///
+/// Building an [`IcebergCatalogProvider`] walks the REST catalog and constructs
+/// every table provider. Query workers must not repeat that work for every HTTP
+/// request; their cache-owned catalog generation tells them when to replace this
+/// value instead.
+#[derive(Clone)]
+pub struct PreparedCatalog {
+    context: Arc<SessionContext>,
+}
+
+impl PreparedCatalog {
+    /// Builds one complete query session from the current catalog generation.
+    pub async fn open(catalog: Arc<dyn Catalog>) -> Result<Self> {
+        Ok(Self {
+            context: Arc::new(catalog_context(catalog).await?),
+        })
+    }
+
+    /// Builds a reusable catalog session whose spillable DataFusion operators
+    /// are bounded by `memory_limit_bytes`. The runtime's disk manager remains
+    /// enabled, so joins, aggregates, and sorts spill instead of exhausting a
+    /// fixed-memory microVM.
+    pub async fn open_with_memory_limit(
+        catalog: Arc<dyn Catalog>,
+        memory_limit_bytes: usize,
+        spill_path: Option<std::path::PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            context: Arc::new(
+                catalog_context_with_memory_limit(catalog, memory_limit_bytes, spill_path).await?,
+            ),
+        })
+    }
+
+    /// Plans and executes SQL using the already-registered catalog providers.
+    pub async fn query_stream(&self, sql: &str) -> Result<QueryExecution> {
+        query_stream_in_context(self.context.as_ref(), sql).await
+    }
+}
+
 /// Plans `sql` against `catalog` and returns its incremental execution stream
 /// without collecting the result in memory: `execute_stream` builds the
 /// physical plan and hands back a pull-based [`SendableRecordBatchStream`] —
@@ -81,6 +124,11 @@ pub async fn query_stream(
         None => catalog_context(catalog).await?,
     };
 
+    query_stream_in_context(&ctx, sql).await
+}
+
+/// Plans and starts one query in an existing DataFusion session.
+async fn query_stream_in_context(ctx: &SessionContext, sql: &str) -> Result<QueryExecution> {
     let dataframe = ctx
         .sql(sql)
         .await
@@ -137,14 +185,57 @@ pub async fn query(
 /// fail to plan. A table identifier is an identifier, not a case-sensitive
 /// string.
 pub(crate) async fn catalog_context(catalog: Arc<dyn Catalog>) -> Result<SessionContext> {
+    catalog_context_with_runtime(catalog, None).await
+}
+
+/// The catalog context used by fixed-memory query workers. A fair spill pool
+/// is essential here: DataFusion's default pool is unbounded and can otherwise
+/// let one hash-heavy TPC-H query consume the entire guest before Linux can
+/// reclaim anything.
+pub(crate) async fn catalog_context_with_memory_limit(
+    catalog: Arc<dyn Catalog>,
+    memory_limit_bytes: usize,
+    spill_path: Option<std::path::PathBuf>,
+) -> Result<SessionContext> {
+    let mut runtime =
+        RuntimeEnvBuilder::new().with_memory_pool(Arc::new(FairSpillPool::new(memory_limit_bytes)));
+    if let Some(path) = spill_path {
+        runtime = runtime.with_temp_file_path(path);
+    }
+    let runtime = runtime
+        .build()
+        .map_err(|error| AgentError::Query(error.to_string()))?;
+    catalog_context_with_runtime(catalog, Some(Arc::new(runtime))).await
+}
+
+async fn catalog_context_with_runtime(
+    catalog: Arc<dyn Catalog>,
+    runtime: Option<Arc<RuntimeEnv>>,
+) -> Result<SessionContext> {
     let provider = IcebergCatalogProvider::try_new(catalog)
         .await
         .map_err(AgentError::Iceberg)?;
     let provider = CaseInsensitiveCatalogProvider::new(Arc::new(provider));
-    let config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
-    let ctx = SessionContext::new_with_config(config);
+    let config = query_session_config(runtime.is_some());
+    let ctx = match runtime {
+        Some(runtime) => SessionContext::new_with_config_rt(config, runtime),
+        None => SessionContext::new_with_config(config),
+    };
     ctx.register_catalog(CATALOG_NAME, Arc::new(provider));
     Ok(ctx)
+}
+
+fn query_session_config(bounded: bool) -> SessionConfig {
+    let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
+    if bounded {
+        // HashJoin materializes its build side and can exhaust a fixed-memory
+        // microVM before the spill pool can reclaim enough memory (TPC-H Q18
+        // is the concrete regression). SortMergeJoin participates in
+        // DataFusion's disk-spill path, so bounded workers prefer it while the
+        // unbounded embedded/CLI path retains DataFusion's faster default.
+        config.options_mut().optimizer.prefer_hash_join = false;
+    }
+    config
 }
 
 /// A [`CatalogProvider`] that resolves schema and table names case-insensitively
@@ -371,4 +462,25 @@ pub fn batch_to_json_rows_fragment(batch: &arrow_array::RecordBatch) -> Result<(
         bytes.pop();
     }
     Ok((bytes, row_count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_memory_sessions_prefer_spillable_merge_joins() {
+        assert!(
+            !query_session_config(true)
+                .options()
+                .optimizer
+                .prefer_hash_join
+        );
+        assert!(
+            query_session_config(false)
+                .options()
+                .optimizer
+                .prefer_hash_join
+        );
+    }
 }
