@@ -603,3 +603,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #29: Opened the persistent KV engine automatically beneath every server's existing cache directory and exposed it through both authenticated serving boundaries. The engine requires no KV configuration, survives process termination, and remains independent from object-cache purge and eviction.
 
 - #58: Server catalog lifecycle uses `PollingWatcher` only. Removed the `/v1/catalog/feed` websocket upgrade path from process startup.
+
+- #58: Updated `unavailable_catalog_is_reported_to_stderr` to match the poll-only watcher warn text after removing the catalog websocket feed.
