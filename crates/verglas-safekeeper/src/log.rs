@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use verglas_cache::writeback_codec::{Encoded, Fragment, Geometry, encode, reassemble};
@@ -224,10 +225,21 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
+        let mut descriptor_writes = live
+            .iter()
+            .cloned()
+            .map(|node| {
+                let record = descriptor_record.clone();
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (node, result)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut descriptor_nodes = Vec::new();
-        for node in &live {
-            match self.transport.place(node, descriptor_record.clone()).await {
-                Ok(()) => descriptor_nodes.push(node.clone()),
+        while let Some((node, result)) = descriptor_writes.next().await {
+            match result {
+                Ok(()) => descriptor_nodes.push(node),
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
                     revision = manifest.revision,
@@ -250,9 +262,20 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
+        let mut head_writes = descriptor_nodes
+            .iter()
+            .cloned()
+            .map(|node| {
+                let record = head_record.clone();
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (node, result)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut heads = 0;
-        for node in &descriptor_nodes {
-            match self.transport.place(node, head_record.clone()).await {
+        while let Some((node, result)) = head_writes.next().await {
+            match result {
                 Ok(()) => heads += 1,
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
@@ -534,17 +557,28 @@ where
             }
         }
 
+        let mut fragment_writes = encoded
+            .fragments
+            .iter()
+            .enumerate()
+            .zip(nodes)
+            .map(|((index, fragment), node)| {
+                let record = FragmentRecord::new(
+                    FragmentKey {
+                        object_id: object_id.to_owned(),
+                        index,
+                    },
+                    fragment.bytes.clone(),
+                );
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (index, node, result)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
         let mut placements = Vec::new();
-        for (index, fragment) in encoded.fragments.iter().enumerate() {
-            let Some(node) = nodes.get(index) else { break };
-            let record = FragmentRecord::new(
-                FragmentKey {
-                    object_id: object_id.to_owned(),
-                    index,
-                },
-                fragment.bytes.clone(),
-            );
-            match self.transport.place(node, record).await {
+        while let Some((index, node, result)) = fragment_writes.next().await {
+            match result {
                 Ok(()) => placements.push(Placement {
                     index,
                     node: node.as_str().to_owned(),
@@ -558,6 +592,7 @@ where
                 ),
             }
         }
+        placements.sort_unstable_by_key(|placement| placement.index);
 
         if placements.len() < w {
             self.drop_fragments(object_id, &placements).await;
