@@ -20,17 +20,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use axum::extract::OriginalUri;
-use axum::http::{HeaderMap, Method};
+use axum::extract::{DefaultBodyLimit, OriginalUri};
+use axum::http::{HeaderMap, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
     extract::State,
     http::StatusCode,
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use bytes::Bytes;
 use verglas_catalog::CatalogGateway;
+use verglas_tables::catalog::PushWatcher;
 
 use verglas_core::admin::{
     HEALTHZ_PATH, HealthzInfo, METRICS_PATH, STATS_PATH, StatsInfo, VERSION_PATH, VersionInfo,
@@ -74,6 +75,56 @@ pub type StatsSlot = Arc<OnceLock<StatsSource>>;
 
 /// A metrics source wired lazily once recovery completes; see [`StatsSlot`].
 pub type MetricsSlot = Arc<OnceLock<MetricsSource>>;
+
+/// Direct Lakekeeper mutation endpoint on the tenant network. The payload is a
+/// CloudEvent for observability, but catalog state remains authoritative: one
+/// authenticated signal schedules a coalesced pointer reconciliation.
+pub const CATALOG_EVENTS_PATH: &str = "/admin/catalog/events";
+
+#[derive(Clone)]
+struct CatalogEventState {
+    watcher: Arc<PushWatcher>,
+    token: Arc<str>,
+}
+
+/// Mounts the authenticated, push-driven catalog refresh endpoint.
+pub fn catalog_event_router(watcher: Arc<PushWatcher>, token: String) -> Router {
+    Router::new()
+        .route(CATALOG_EVENTS_PATH, post(catalog_event))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .with_state(CatalogEventState {
+            watcher,
+            token: Arc::from(token),
+        })
+}
+
+async fn catalog_event(
+    State(state): State<CatalogEventState>,
+    headers: HeaderMap,
+    _body: Bytes,
+) -> Response {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !constant_time_equal(presented.as_bytes(), state.token.as_bytes()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if !state.watcher.request_refresh() {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    StatusCode::ACCEPTED.into_response()
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    let length = left.len().max(right.len());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..length {
+        difference |= usize::from(*left.get(index).unwrap_or(&0) ^ *right.get(index).unwrap_or(&0));
+    }
+    difference == 0
+}
 
 /// The 503 body the engine-dependent routes return until recovery completes.
 fn recovering() -> Response {
