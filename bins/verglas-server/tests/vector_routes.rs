@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use arrow_array::builder::{Float32Builder, ListBuilder};
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
@@ -251,6 +251,107 @@ fn serve(runtime: Arc<VectorRuntime>) -> (String, tokio::task::JoinHandle<()>) {
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://{addr}"), handle)
+}
+
+/// Declaring an index on a table whose string ids cannot be read under the
+/// default integer encoding must return a non-2xx error (not 200 / inserts: 0).
+#[tokio::test]
+async fn declare_full_build_rejects_unreadable_string_ids() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let catalog: Arc<dyn Catalog> = Arc::new(
+        MemoryCatalogBuilder::default()
+            .load(
+                "memory",
+                HashMap::from([(
+                    MEMORY_CATALOG_WAREHOUSE.to_string(),
+                    format!("file://{}", dir.path().display()),
+                )]),
+            )
+            .await
+            .expect("catalog"),
+    );
+    catalog
+        .create_namespace(&NamespaceIdent::new("default".into()), HashMap::new())
+        .await
+        .expect("ns");
+    let ident = TableIdent::from_strs(["default", "docs"]).expect("ident");
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        ),
+    ]));
+    verglas_iceberg::write::create_table_from_schema(catalog.as_ref(), &ident, &schema, None)
+        .await
+        .expect("create");
+    let mut lb = ListBuilder::new(Float32Builder::new());
+    for v in [[0.0f32, 1.0], [1.0, 0.0]] {
+        for x in v {
+            lb.values().append_value(x);
+        }
+        lb.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec!["doc-1", "doc-2"])),
+            Arc::new(lb.finish()),
+        ],
+    )
+    .expect("batch");
+    verglas_iceberg::write::append_batches(catalog.as_ref(), &ident, vec![batch], HashMap::new())
+        .await
+        .expect("append");
+
+    let runtime = Arc::new(VectorRuntime {
+        catalog: catalog.clone(),
+        service: Arc::new(verglas_vector::service::VectorService::new()),
+    });
+    let (base, server) = serve(runtime);
+    let http = reqwest::Client::new();
+    let resp = http
+        .post(format!("{base}/v1/tables/default.docs/indexes"))
+        .json(&serde_json::json!({ "field": "embedding", "metric": "l2" }))
+        .send()
+        .await
+        .expect("declare send");
+    assert!(
+        !resp.status().is_success(),
+        "expected non-2xx, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("integer") && body.contains("uuidHash"),
+        "error body must mention integer / uuidHash, got: {body}"
+    );
+
+    // List stays empty; search stays 404 — no silent empty index.
+    let list: serde_json::Value = http
+        .get(format!("{base}/v1/tables/default.docs/indexes"))
+        .send()
+        .await
+        .expect("list send")
+        .json()
+        .await
+        .expect("list json");
+    assert!(
+        list["indexes"].as_array().expect("indexes").is_empty(),
+        "failed declare must not list an index"
+    );
+    let search = http
+        .post(format!(
+            "{base}/v1/tables/default.docs/indexes/embedding/search"
+        ))
+        .json(&serde_json::json!({ "vector": [0.1, 0.9], "k": 1 }))
+        .send()
+        .await
+        .expect("search send");
+    assert_eq!(search.status(), reqwest::StatusCode::NOT_FOUND);
+
+    server.abort();
 }
 
 /// The full durable round-trip: a fresh service discovers the table's attached
