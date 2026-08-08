@@ -243,9 +243,9 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         b"START_WAL_PUSH (proto_version '3', allow_timeline_creation 'true')\0",
     )
     .await;
-    let copy_both = receive(&mut proposer)
-        .await
-        .unwrap_or_else(|error| panic!("START_WAL_PUSH reply: {error}\n{}", fleet.stderr_snapshot()));
+    let copy_both = receive(&mut proposer).await.unwrap_or_else(|error| {
+        panic!("START_WAL_PUSH reply: {error}\n{}", fleet.stderr_snapshot())
+    });
     assert_eq!(copy_both.0, b'W');
 
     let mut greeting = BytesMut::new();
@@ -263,10 +263,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     greeting.put_u32(16 * 1024 * 1024);
     send(&mut proposer, b'd', &greeting).await;
     assert_eq!(
-        receive(&mut proposer)
-            .await
-            .expect("greeting reply")
-            .1[0],
+        receive(&mut proposer).await.expect("greeting reply").1[0],
         b'g'
     );
 
@@ -310,11 +307,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     );
 
     let options = format!("-c tenant_id={TENANT} -c timeline_id={TIMELINE}");
-    let mut replica = connect_and_ready(
-        address,
-        &[("user", "cloud_admin"), ("options", &options)],
-    )
-    .await;
+    let mut replica =
+        connect_and_ready(address, &[("user", "cloud_admin"), ("options", &options)]).await;
     send(
         &mut replica,
         b'Q',
