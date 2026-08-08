@@ -202,10 +202,13 @@ pub async fn run_maintenance(
 
     let mut inserts = 0usize;
     let mut deletes = 0usize;
+    let mut skipped_unreadable_ids = 0usize;
     for row in &rows {
         let Some((id, vector)) =
             parse_row(row, &config.id_field, &config.vec_field, config.id_encoding)?
         else {
+            // Id missing or not decodable under the active encoding.
+            skipped_unreadable_ids += 1;
             continue;
         };
         match vector {
@@ -222,6 +225,18 @@ pub async fn run_maintenance(
                 }
             }
         }
+    }
+
+    // Full build that scanned rows but indexed none because every id was
+    // unreadable under the active encoding is a configuration error — not a
+    // successful empty index (HTTP 200 / inserts: 0). A truly empty table
+    // (no rows) still returns `None` below.
+    if full_build && inserts == 0 && skipped_unreadable_ids > 0 {
+        return Err(VectorError::Field(
+            "full build indexed zero rows: no source row yielded a usable id under the active encoding; \
+             id must be an integer, or a UUID with uuidHash"
+                .to_owned(),
+        ));
     }
 
     // Nothing was ever indexed (no non-null embeddings across the whole table).

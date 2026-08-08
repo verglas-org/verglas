@@ -7,13 +7,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::builder::{Float32Builder, ListBuilder};
-use arrow_array::{Int64Array, RecordBatch};
+use arrow_array::{Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 
-use verglas_vector::maintenance::{MaintenanceConfig, load_latest_index, run_maintenance};
-use verglas_vector::{Metric, brute_force_search};
+use verglas_vector::maintenance::{
+    IdEncoding, MaintenanceConfig, load_latest_index, run_maintenance, uuid_hash_id,
+};
+use verglas_vector::{Metric, VectorError, brute_force_search};
 
 async fn memory_catalog() -> Arc<dyn Catalog> {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -312,6 +314,139 @@ async fn empty_table_yields_no_index() {
     assert!(report.is_none(), "empty table should build no index");
     let table = catalog.load_table(&ident).await.expect("load");
     assert!(table.metadata().statistics_iter().next().is_none());
+}
+
+/// Schema with a Utf8 identity column (arbitrary strings like `doc-1`).
+fn string_id_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new(
+            "embedding",
+            DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+            true,
+        ),
+    ]))
+}
+
+/// Appends `(string id, embedding)` rows to a Utf8-keyed table.
+async fn append_string_ids(catalog: &dyn Catalog, ident: &TableIdent, rows: &[(&str, Vec<f32>)]) {
+    let ids: Vec<&str> = rows.iter().map(|(id, _)| *id).collect();
+    let mut lb = ListBuilder::new(Float32Builder::new());
+    for (_, v) in rows {
+        for x in v {
+            lb.values().append_value(*x);
+        }
+        lb.append(true);
+    }
+    let batch = RecordBatch::try_new(
+        string_id_schema(),
+        vec![Arc::new(StringArray::from(ids)), Arc::new(lb.finish())],
+    )
+    .expect("string-id batch");
+    verglas_iceberg::write::append_batches(catalog, ident, vec![batch], HashMap::new())
+        .await
+        .expect("append string ids");
+}
+
+/// Full build must hard-error when every source row is skipped because the id
+/// column is not readable under the active (integer) encoding — not succeed
+/// with inserts: 0 / no blob.
+#[tokio::test]
+async fn full_build_errors_when_all_row_ids_unreadable_under_integer_encoding() {
+    let catalog = memory_catalog().await;
+    catalog
+        .create_namespace(&NamespaceIdent::new("default".into()), HashMap::new())
+        .await
+        .expect("ns");
+    let ident = TableIdent::from_strs(["default", "docs"]).expect("ident");
+    verglas_iceberg::write::create_table_from_schema(
+        catalog.as_ref(),
+        &ident,
+        &string_id_schema(),
+        None,
+    )
+    .await
+    .expect("create");
+
+    // Table has real rows; ids are arbitrary strings (not integers, not UUIDs).
+    append_string_ids(
+        catalog.as_ref(),
+        &ident,
+        &[
+            ("doc-1", vec![0.0, 1.0]),
+            ("doc-2", vec![1.0, 0.0]),
+            ("doc-3", vec![0.5, 0.5]),
+        ],
+    )
+    .await;
+
+    let config = MaintenanceConfig::new("id", "embedding", Metric::L2);
+    let err = run_maintenance(catalog.as_ref(), &ident, &config)
+        .await
+        .expect_err("full build with unreadable ids must fail");
+    let msg = err.to_string();
+    assert!(
+        matches!(err, VectorError::Field(_)),
+        "expected Field error, got {err:?}"
+    );
+    assert!(
+        msg.contains("integer") && msg.to_lowercase().contains("uuid"),
+        "error must mention integer / UUID uuidHash, got: {msg}"
+    );
+    assert!(
+        msg.contains("uuidHash") || msg.contains("uuid hash") || msg.contains("UUID"),
+        "error must mention uuidHash, got: {msg}"
+    );
+
+    // No silent empty attachment.
+    let table = catalog.load_table(&ident).await.expect("load");
+    assert!(
+        table.metadata().statistics_iter().next().is_none(),
+        "failed full build must not attach a blob"
+    );
+}
+
+/// UUID string ids under `uuidHash` still full-build and serve neighbors.
+#[tokio::test]
+async fn full_build_with_uuid_hash_encoding_indexes_rows() {
+    let catalog = memory_catalog().await;
+    catalog
+        .create_namespace(&NamespaceIdent::new("default".into()), HashMap::new())
+        .await
+        .expect("ns");
+    let ident = TableIdent::from_strs(["default", "docs"]).expect("ident");
+    verglas_iceberg::write::create_table_from_schema(
+        catalog.as_ref(),
+        &ident,
+        &string_id_schema(),
+        None,
+    )
+    .await
+    .expect("create");
+
+    let u1 = "00000000-0000-0000-0000-000000000001";
+    let u2 = "00000000-0000-0000-0000-000000000002";
+    let v1 = vec![0.0f32, 1.0];
+    let v2 = vec![1.0f32, 0.0];
+    append_string_ids(catalog.as_ref(), &ident, &[(u1, v1.clone()), (u2, v2)]).await;
+
+    let config = MaintenanceConfig::new("id", "embedding", Metric::L2)
+        .with_id_encoding(IdEncoding::UuidHash);
+    let report = run_maintenance(catalog.as_ref(), &ident, &config)
+        .await
+        .expect("maintain")
+        .expect("built");
+    assert!(report.full_build);
+    assert_eq!(report.inserts, 2);
+    assert_eq!(report.live_count, 2);
+
+    let index = load_latest_index(catalog.as_ref(), &ident, "embedding")
+        .await
+        .expect("load")
+        .expect("present");
+    let expected = uuid_hash_id(u1).expect("uuid folds");
+    let hits = index.search(&v1, 1, 64).expect("search");
+    assert_eq!(hits[0].id, expected);
 }
 
 #[tokio::test]
