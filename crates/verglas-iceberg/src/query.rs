@@ -248,12 +248,6 @@ fn query_session_config(bounded: bool) -> SessionConfig {
             .options_mut()
             .optimizer
             .hash_join_single_partition_threshold_rows = 1024 * 1024;
-        // Iceberg scans currently expose unknown planning statistics. Leaving
-        // repartitioned joins enabled therefore makes DataFusion conservatively
-        // hash-shuffle both inputs, including full fact tables. A bounded
-        // single-node worker can instead build the SQL left side once and
-        // stream the probe side without that shuffle.
-        config.options_mut().optimizer.repartition_joins = false;
         // Amortize Arrow scheduling and channel overhead for analytical scans.
         config.options_mut().execution.batch_size = 64 * 1024;
     }
@@ -508,7 +502,7 @@ mod tests {
                 .hash_join_single_partition_threshold_rows,
             1024 * 1024
         );
-        assert!(!config.options().optimizer.repartition_joins);
+        assert!(config.options().optimizer.repartition_joins);
         assert_eq!(config.options().execution.batch_size, 64 * 1024);
         assert!(
             query_session_config(false)
