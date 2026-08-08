@@ -234,6 +234,20 @@ fn query_session_config(bounded: bool) -> SessionConfig {
         // lineitem input even when every build side fit comfortably in the
         // configured pool.
         config.options_mut().optimizer.prefer_hash_join = true;
+        // DataFusion's 1 MiB broadcast threshold is too conservative for an
+        // analytical worker with an explicitly bounded multi-GiB pool. At
+        // SF10 it forces a 60M-row fact table through a hash repartition even
+        // when the filtered dimension side is only a few MiB. Broadcast such
+        // dimension inputs and reserve partitioned joins for genuinely large
+        // build sides.
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold = 64 * 1024 * 1024;
+        config
+            .options_mut()
+            .optimizer
+            .hash_join_single_partition_threshold_rows = 1024 * 1024;
     }
     config
 }
@@ -470,11 +484,21 @@ mod tests {
 
     #[test]
     fn fixed_memory_sessions_prefer_hash_joins() {
-        assert!(
-            query_session_config(true)
+        let config = query_session_config(true);
+        assert!(config.options().optimizer.prefer_hash_join);
+        assert_eq!(
+            config
                 .options()
                 .optimizer
-                .prefer_hash_join
+                .hash_join_single_partition_threshold,
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold_rows,
+            1024 * 1024
         );
         assert!(
             query_session_config(false)
