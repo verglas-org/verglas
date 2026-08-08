@@ -139,7 +139,7 @@ where
     }
 
     /// Publishes every opened timeline to Neon's storage broker. The advertised
-    /// address must be reachable from the Postgres microVM over the tenant VXLAN.
+    /// address must be reachable from the Postgres compute over the tenant network.
     #[must_use]
     pub fn with_broker(
         mut self: Arc<Self>,

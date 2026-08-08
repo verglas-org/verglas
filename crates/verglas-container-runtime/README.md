@@ -1,8 +1,7 @@
 # Verglas Docker container runtime
 
 This crate places open-source Verglas workloads on the operator's Docker Engine. It is the local
-placement adapter for Verglas container deployments; Verglas Cloud continues to use its
-Firecracker adapter.
+placement adapter for Verglas container and vessel deployments.
 
 The runtime connects to the host engine through Docker's API and defaults to the local Docker
 socket. Only this trusted runtime process receives Docker authority. Managed workloads never

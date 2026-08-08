@@ -22,13 +22,6 @@
 //! own acks and never blocks another. A group that lags past the segment TTL
 //! loses the expired records — the TTL is the retention window, enforced by
 //! [`SegmentLog::cleanup`].
-//!
-//! # Cloud queue backing
-//!
-//! A cloud placement backs the same SDK queue verb with whatever managed queue
-//! service the deployment target provides; that is Phase 5 (#319) and
-//! deliberately not built here — this is the local
-//! substrate only.
 
 use std::io::{BufRead, BufReader, Write};
 use std::marker::PhantomData;

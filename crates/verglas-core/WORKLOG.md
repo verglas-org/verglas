@@ -418,3 +418,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #8: Extended local access discovery with an explicit query API URI. On-prem clients now receive separate S3, query/write, and catalog proxy coordinates.
 - #16: Replaced the obsolete worklog-only dashboard sink concept with validated `[analytics.rill]` network configuration. The configuration names Rill's private runtime, browser address, and return S3 path, and requires an Iceberg catalog for table resolution.
 - #29: Extended the shared NVMe accounting contract to include the durable KV log alongside acknowledged write-back fragments. Both are protected from eviction while the remaining object cache stays heat-managed with no fixed partition.
+
+- #66: Replaced control-plane config examples and comments that referenced api.verglas.dev / verglas login with self-host-neutral wording, and switched admin test fixtures to example.test hostnames.
+- #66: Documented optional analytics config as self-hosted only (removed cloud-composes-independently contrast).
+- #66: Removed optional external control-plane node reporting and the [control_plane] config field from the OSS server.

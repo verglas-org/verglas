@@ -9,3 +9,5 @@
 - #43: Added reflected Integration namespaces to the TypeScript SDK. Generated Applications and Workers can compose arbitrary Integration methods through `client.namespace`, using awaitable bounded calls or incremental NDJSON streams, while optional generated types preserve compile-time input and output checks.
 - chore: Dropped client.watermark()/setWatermark() and the mock /v1/watermark cell. Table/queue read cursors named watermark are unchanged.
 - #67: Realigned ensure/create to Iceberg REST (catalog discovery via `/admin/access` or `catalogUri`) and `table.append` to `POST /v1/ingest/{name}` JSONL. Shared surface inventory now lives in `contracts/api-surface.json`; follow/feed is documented as not live on-prem.
+- #66: Rewrote endpoint-run and README host-entry docs for the local worker harness against http://127.0.0.1:8334; kept VERGLAS_CLOUD_EVENT as the CloudEvents env binding.
+- #66: Removed local-vs-cloud endpoint product wording from README and SDK comments; renamed test fixtures `t.verglas.cloud` → `t.example.test` and `cloud.job_runs` → `demo.job_runs`.

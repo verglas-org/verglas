@@ -1,11 +1,14 @@
-//! On-prem HTTP composition for independently reusable Verglas services.
-//! Cloud roles use the underlying crates directly and do not depend on this
-//! deployment-specific router.
+//! Self-hosted HTTP composition for independently reusable Verglas services.
+//! This router is the deployment-specific surface that mounts cache, admin,
+//! catalog proxy, and worker APIs in one process.
 
 use axum::extract::{OriginalUri, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::{Router, routing::any};
+use axum::{
+    Json, Router,
+    routing::{any, get},
+};
 use bytes::Bytes;
 use verglas_catalog::CatalogGateway;
 
@@ -29,9 +32,15 @@ pub use verglas_s3::router_with_passthrough as compose_s3;
 pub fn compose_query_and_catalog(query: Router, catalog: CatalogGateway) -> Router {
     query.merge(
         Router::new()
+            .route("/catalog/_verglas/generation", get(catalog_generation))
             .route("/catalog/{*path}", any(catalog_request))
             .with_state(catalog),
     )
+}
+
+/// Cache-owned catalog generation for query-worker session fencing.
+async fn catalog_generation(State(catalog): State<CatalogGateway>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "generation": catalog.generation() }))
 }
 
 /// Forwards one mounted catalog request while preserving status and headers.

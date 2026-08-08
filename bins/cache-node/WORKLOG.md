@@ -56,3 +56,6 @@
 - #58: Cache-node catalog watching uses `PollingWatcher` only. Dropped `VERGLAS_CATALOG_FEED_*` and the websocket upgrade attempt against the catalog origin.
 
 - #58: Hardened the embedded safekeeper process test: wait for all three children to log listen readiness, capture stderr, and retry the Postgres startup handshake so CI does not flake on early connect.
+
+- #66: Rewrote block-device and NBD docs for attached NBD clients instead of microVMs, and dropped cloud-fleet wording from the package description.
+- #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.

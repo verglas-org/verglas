@@ -13,17 +13,18 @@
 //!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
 //!   dependency (gossip, peer RPC, fragment store).
 //! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
-//! - **Object write-back**: the fleet cache image's boot script renders no
-//!   `[cache.writeback]`, so the OBJECT tier is off by design; S3 PUTs pass
-//!   straight through to the origin durably (write-through), exactly what a
-//!   disabled write-back tier does in verglas-server.
+//! - **Object write-back**: without `[cache.writeback]`, the OBJECT tier is off
+//!   by design; S3 PUTs pass straight through to the origin durably
+//!   (write-through), exactly what a disabled write-back tier does in
+//!   verglas-server.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
 //!   reaches the ring. When `VERGLAS_RING_PEERS` names a ring, a device FLUSH is
-//!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
-//!   background); see [`crate::ring`]. The embedded safekeeper shares that same
-//!   fragment store and peer RPC; the object read/serve path above is still a
-//!   peerless cluster-of-one. With no ring configured block FLUSH stays the
-//!   synchronous R2 barrier and no safekeeper listener starts.
+//!   erasure-coded across the peers and acked on a quorum (draining to the
+//!   origin in the background); see [`crate::ring`]. The embedded safekeeper
+//!   shares that same fragment store and peer RPC; the object read/serve path
+//!   above is still a peerless cluster-of-one. With no ring configured block
+//!   FLUSH stays the synchronous origin barrier and no safekeeper listener
+//!   starts.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -46,8 +47,8 @@ use crate::admin;
 /// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
 
-/// The default NBD listen port for the block-device tier (#382). The host agent
-/// connects a microVM's kernel NBD client here; the export name selects the
+/// The default NBD listen port for the block-device tier (#382). An attach
+/// client connects a kernel NBD client here; the export name selects the
 /// device. Overridable with `VERGLAS_BLOCK_ADDR` (same shape as
 /// `VERGLAS_S3_ADDR`). Not a config knob — one fixed port, one listener.
 const BLOCK_PORT: u16 = 8335;
@@ -284,7 +285,7 @@ pub async fn run(
     // change tracking. The gateway and watcher share one response cache: every
     // successful poll refresh prepares the exact Iceberg REST documents a local
     // query worker subsequently consumes from `/catalog`. Catalog push notify
-    // (Lakekeeper/cloud) is out of band; this binary polls Iceberg REST only.
+    // (for example Lakekeeper) is out of band; this binary polls Iceberg REST only.
     let catalog_runtime = config
         .catalog
         .as_ref()
@@ -329,7 +330,7 @@ pub async fn run(
                 crate::blockdev::DeviceRegistry::open(&config.cache.dir, backend).await?;
             // Learn the ring and attach the flush write-back plane to the registry
             // before any device is ensured. With no ring configured this is a
-            // no-op and FLUSH stays the synchronous R2 barrier (#382).
+            // no-op and FLUSH stays the synchronous origin barrier (#382).
             ring_plane = crate::ring::setup(&config.cache.dir, &device_registry)
                 .await?
                 .map(Arc::new);
@@ -585,7 +586,7 @@ mod tests {
 
     /// `/admin/healthz` reports `starting`/503 until the slot-filling recovery
     /// step calls `mark_ready`, then `ok`/200 — the serve-gating (#16) contract
-    /// the fleet's health check depends on. While starting, the engine-dependent
+    /// operators and load balancers depend on. While starting, the engine-dependent
     /// `/admin/stats` and `/metrics` routes answer 503 (not 404), so a load
     /// balancer sees a clear not-ready signal rather than connection-refused.
     #[tokio::test]

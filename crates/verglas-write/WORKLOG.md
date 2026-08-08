@@ -81,3 +81,4 @@
   to explicit customer-invoked commit operations without implying such a route.
 - #91: Updated write-back process documentation for the `verglas-server`
   rename. Durability barriers and propagation behavior are unchanged.
+- #66: Softened single-node write-back durability comment (replicated block volume, not cloud-replicated product language).

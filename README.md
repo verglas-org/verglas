@@ -25,9 +25,8 @@ design.
 
 ## Install
 
-Install the `verglas` CLI from the Verglas website (macOS, Linux, Windows — no
-Rust toolchain required). The cache server (`verglas-server`) ships as a Docker
-image for self-hosting; most users run against Verglas Cloud instead.
+Install the `verglas` CLI from source (macOS, Linux, Windows). The cache server
+(`verglas-server`) ships as a Docker image for self-hosting.
 
 ### Build the CLI from source
 
@@ -41,26 +40,6 @@ Or `just install` for both the CLI and a local `verglas-server` binary (develope
 repository test tooling).
 
 ## Quickstart
-
-### Verglas Cloud
-
-1. Create an account at [verglas.dev](https://verglas.dev).
-2. Log the CLI into your tenant (browser PKCE by default; or pipe an API key):
-
-```sh
-verglas login
-# or: echo "$VERGLAS_API_KEY" | verglas login --api-key
-```
-
-Login verifies the key, then writes:
-
-- `~/.verglas/credentials/control-plane-token` (mode 0600)
-- `~/.verglas/config.toml` — `[control_plane]` plus lakehouse `[backend]` /
-  `[catalog]` when the tenant has a warehouse
-- scoped backend/catalog credential files under `~/.verglas/credentials/`
-
-After login, cloud verbs work (`verglas workers`, `containers`, `db`, …) and
-data verbs talk to your cloud endpoint. Re-run `login` any time to refresh.
 
 ### Self-host (Docker)
 
@@ -113,7 +92,6 @@ or CloudEvent triggers.
 export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d --build
 verglas workers create \
-  --local \
   --file examples/workers/market-data-ingest/worker.toml
 ```
 

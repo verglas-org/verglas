@@ -63,11 +63,6 @@ futures.workspace = true
 # `bins/query-node`'s own streaming response.
 async-stream = "0.3"
 arrow-ipc = "57"
-# Control-plane node reporting (server-instance tracking): the detached
-# register/heartbeat task POSTs small JSON bodies to the tenant's control plane
-# when the machine is logged in. json + rustls-tls come from the workspace pin.
-reqwest.workspace = true
-thiserror.workspace = true
 tracing = "0.1.44"
 # `json` for the one-object-per-line output (#61); `env-filter` for RUST_LOG and
 # the hot-reloadable filter; `fmt` for the human-pretty `verglas dev` format.

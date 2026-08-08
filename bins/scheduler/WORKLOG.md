@@ -6,3 +6,4 @@
 - #11: Replaced scheduler-specific trigger-source identities and payload variants with CloudEvents 1.0. Cron reconciliation now emits and reconstructs progress from stable CloudEvent source and id attributes.
 - #11: Materialized worker bundles into a fresh temporary directory for each execution and passed declared environment variables to the subprocess. Relative bundled entrypoints now run without a shared filesystem, while unresolved secrets and unsafe paths fail before execution.
 - #18: Renamed the scheduler's portable-bundle fixture to the neutral market-data ingestion example used by the worker guides. SPY remains test input data instead of becoming a worker, file, or table name.
+- #66: Dropped cloud-placement wording from the standalone scheduler binary docs.

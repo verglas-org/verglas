@@ -80,7 +80,7 @@ impl PreparedCatalog {
     /// Builds a reusable catalog session whose spillable DataFusion operators
     /// are bounded by `memory_limit_bytes`. The runtime's disk manager remains
     /// enabled, so joins, aggregates, and sorts spill instead of exhausting a
-    /// fixed-memory microVM.
+    /// fixed memory ceiling.
     pub async fn open_with_memory_limit(
         catalog: Arc<dyn Catalog>,
         memory_limit_bytes: usize,
@@ -228,8 +228,8 @@ async fn catalog_context_with_runtime(
 fn query_session_config(bounded: bool) -> SessionConfig {
     let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
     if bounded {
-        // HashJoin materializes its build side and can exhaust a fixed-memory
-        // microVM before the spill pool can reclaim enough memory (TPC-H Q18
+        // HashJoin materializes its build side and can exhaust a fixed memory
+        // ceiling before the spill pool can reclaim enough memory (TPC-H Q18
         // is the concrete regression). SortMergeJoin participates in
         // DataFusion's disk-spill path, so bounded workers prefer it while the
         // unbounded embedded/CLI path retains DataFusion's faster default.

@@ -124,10 +124,9 @@ pub enum TriggerSpec {
     /// This trigger runs the worker as a long-lived local process rather than a
     /// one-shot subprocess. When `file` is set the server tails that file; when
     /// it is absent the server runs the worker's own `exec` command and captures
-    /// its stdout and stderr. It is LOCAL ONLY: a follow worker tails something
-    /// on the machine the server runs on, so the cloud rejects it for fleet
-    /// placement. When the server is logged in, the rows still stream into the
-    /// tenant's cloud lakehouse, because the server's catalog points there.
+    /// its stdout and stderr. Follow is local-only: it tails something on the
+    /// machine the server runs on. Captured rows append through the server's
+    /// catalog into the configured lakehouse.
     Follow {
         /// A file to tail. When absent, the server wraps the worker's `exec`
         /// command and captures its stdout and stderr instead.

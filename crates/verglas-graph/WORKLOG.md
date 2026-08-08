@@ -15,3 +15,4 @@
   table-FileIO plus snapshot StatisticsFile model.
 - #91: Updated graph route documentation to identify `verglas-server` as the
   serving process. Graph storage and traversal behavior are unchanged.
+- #66: Removed cloud-committer embedding language from crate placement docs.

@@ -1,17 +1,15 @@
 //! `verglas-cache-node` — the standalone Verglas cache serving server.
 //!
-//! One job: run the cache. It loads the same TOML subset the fleet cache image
-//! renders (`[listen] [log] [cache] [backend] [auth] [catalog]`), verifies SigV4 against
+//! One job: run the cache. It loads the TOML subset
+//! (`[listen] [log] [cache] [backend] [auth] [catalog]`), verifies SigV4 against
 //! the `[auth]` credentials file, serves the S3 endpoint from the local foyer
-//! cache tiers, and reads through / writes through to the origin bucket. There
+//! cache tiers, and reads through / writes through to the origin bucket. It
 //! owns a cached catalog gateway and watcher for local query workers, but no
-//! query engine, jobs framework, or platform executor. This binary is the cloud
-//! fleet's cache image (`fleet/images/Dockerfile.cache`), built small enough for
-//! a 256 MB VM.
+//! query engine, jobs framework, or platform executor.
 //!
 //! The config schema and its validation are `verglas-core`'s, reused verbatim,
-//! so this binary accepts exactly the config `verglas-server` does and the fleet image
-//! swaps binaries without a boot-script change (`--config <path>`, same flag).
+//! so this binary accepts exactly the config `verglas-server` does
+//! (`--config <path>`, same flag).
 
 use verglas_core::config::Config;
 
@@ -163,8 +161,7 @@ mod tests {
         }
     }
 
-    /// Renders the exact config the fleet cache image's boot script writes
-    /// (`fleet/images/boot/cache-boot.sh`) — every section, in the same shape,
+    /// Renders a representative cache-node config — every section, in the same shape,
     /// with a backend credentials file and an `[auth]` credentials file — and
     /// asserts `verglas-core`'s loader accepts it and resolves each field. This
     /// is the binary-swap contract: the image renders one config and both
@@ -204,7 +201,7 @@ mod tests {
              capacity_bytes = \"64MB\"\n\
              dram_bytes = \"80MB\"\n\n\
              [backend]\n\
-             bucket = \"verglas-fleet-cache\"\n\
+             bucket = \"verglas-cache-test\"\n\
              endpoint = \"https://accountid.r2.cloudflarestorage.com\"\n\
              region = \"us-east-1\"\n\
              credentials_file = \"{backend_creds}\"\n\n\
@@ -223,7 +220,7 @@ mod tests {
         assert_eq!(config.cache.dram_bytes.0, 80 * 1024 * 1024);
         assert_eq!(
             config.backend.bucket.as_deref(),
-            Some("verglas-fleet-cache")
+            Some("verglas-cache-test")
         );
         assert_eq!(
             config.backend.endpoint.as_deref(),

@@ -71,29 +71,11 @@ pub struct Config {
     pub query_worker: Option<QueryWorker>,
     /// Isolated logical table writer launched by the server for Arrow commits.
     pub write_worker: Option<WriteWorker>,
-    /// Optional on-prem analytics services. Cloud composes analytics roles
-    /// independently and does not use this deployment-specific integration.
+    /// Optional self-hosted analytics services (Rill and related roles).
     #[serde(default)]
     pub analytics: Option<Analytics>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
-    /// The control plane the CLI authenticates against for cross-node and cloud
-    /// deployment visibility. Written by `verglas login`; unset otherwise. The
-    /// server does not use it, and the CLI's local commands never require it —
-    /// only cloud verbs do.
-    #[serde(default)]
-    pub control_plane: Option<ControlPlane>,
-}
-
-/// The control plane the CLI talks to for the cross-node and cloud deployment
-/// view. Its URL is recorded here by `verglas login`; the matching API key
-/// lives in a mode-0600 credentials file, never in this config.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct ControlPlane {
-    /// Base URL of the control plane API (for example
-    /// `https://api.verglas.dev`).
-    pub url: String,
 }
 
 /// Ports the server binds: the S3 endpoint and the private admin API, plus the

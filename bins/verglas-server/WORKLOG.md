@@ -610,3 +610,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   runtime manager; optional scheduler, database, and analytics services
   are now dynamic managed containers.
 - chore: Removed deployment-watermark comments from the sys registry wiring. Server no longer exposes /v1/watermark.
+- #66: Removed verglas login product wording from optional control-plane node-report comments and tests; self-host privacy invariant unchanged.
+- #66: Removed cloud lakehouse / fleet product wording from catalog watcher and cache-instance commit-seam comments.
+- #66: Removed optional external control-plane node reporting and the [control_plane] config field from the OSS server.

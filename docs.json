@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "maple",
   "name": "Verglas documentation",
-  "description": "Run cache-pathed lakehouse workloads with Verglas Cloud or a self-hosted Verglas server.",
+  "description": "Run cache-pathed lakehouse workloads on a self-hosted Verglas server.",
   "colors": {
     "primary": "#2563EB",
     "light": "#60A5FA",
@@ -15,7 +15,6 @@
         "icon": "rocket",
         "pages": [
           "docs/index",
-          "docs/get-started/cloud-quickstart",
           "docs/get-started/self-host",
           "docs/get-started/first-table"
         ]
@@ -36,13 +35,6 @@
         "icon": "chart-line",
         "pages": [
           "docs/analytics/rill"
-        ]
-      },
-      {
-        "group": "Containers",
-        "icon": "container",
-        "pages": [
-          "docs/platform/containers"
         ]
       },
       {
@@ -87,8 +79,8 @@
     ],
     "primary": {
       "type": "button",
-      "label": "Open Verglas Cloud",
-      "href": "https://verglas.dev"
+      "label": "Self-host",
+      "href": "/docs/get-started/self-host"
     }
   },
   "footer": {

@@ -8,9 +8,8 @@
 //! runners against the registry on a short interval, so a newly declared follow
 //! worker starts promptly and a paused/removed one is torn down.
 //!
-//! A follow runner writes through the server's own catalog, so the destination
-//! follows the server's login state with no branch here: logged in, the lines
-//! stream into the tenant's cloud lakehouse; logged out, into the local one.
+//! A follow runner writes through the server's own catalog into the configured
+//! lakehouse.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -52,7 +51,7 @@ struct Desired {
 
 /// Reconciles follow runners against the worker registry.
 pub struct FollowManager {
-    /// The catalog runners write their rows through (cloud when logged in).
+    /// The catalog runners write their rows through.
     catalog: Arc<dyn Catalog>,
     /// The registry the active follow workers are read from.
     sys: Arc<SystemCatalog>,

@@ -5,3 +5,5 @@
   `verglas-server` process. Query-node continues to share wire contracts and
   configuration shapes with the foreground server.
 - #58: Query workers now receive only a cache-local metadata gateway URI. Upstream Lakekeeper credentials, warehouse configuration, and catalog change state remain in the cache node.
+
+- #66: Neutralized memory-grant and spill-path docs so fixed-memory query roles no longer reference Firecracker or microVMs.

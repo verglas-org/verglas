@@ -3,16 +3,15 @@
 //! A single versioned file (TOML or JSON) describes a worker completely: its
 //! name, the command to run, the files it bundles, its environment (with
 //! `@secret:` references), its trigger, its target tables, and its resource
-//! hints. The SAME file drives `verglas workers create` against the local server
-//! AND `verglas workers push` to the cloud — the CLI translates it into each
-//! plane's request body, so the spec round-trips with no edits.
+//! hints. The CLI translates it into the local server's `POST /v1/workers`
+//! body so the same file registers and round-trips without edits.
 //!
 //! A JS-module worker is not a special kind: it is just a spec whose `exec`
 //! starts with `bun`. Nothing here assumes a runtime.
 //!
 //! Secrets never travel in the spec beyond a NAME. An env value of the form
-//! `@secret:NAME` is a reference the server or the cloud resolves from its own
-//! secret store at run time; the value is never in the file and never printed.
+//! `@secret:NAME` is a reference the server resolves from its own secret store
+//! at run time; the value is never in the file and never printed.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -67,7 +66,7 @@ pub enum Trigger {
         subject: Option<String>,
     },
     /// Follow a local target continuously, appending each captured line to the
-    /// target table. Local only — a follow worker cannot be pushed to the cloud.
+    /// target table. Local only.
     Follow {
         /// A file to tail. When absent, the worker's `exec` command is wrapped
         /// and its stdout and stderr are captured.
@@ -76,17 +75,6 @@ pub enum Trigger {
     },
 }
 
-impl Trigger {
-    /// Returns the deployment trigger discriminant used by the cloud envelope.
-    fn kind(&self) -> &'static str {
-        match self {
-            Trigger::Cron { .. } => "cron",
-            Trigger::Webhook { .. } => "webhook",
-            Trigger::Event { .. } => "event",
-            Trigger::Follow { .. } => "follow",
-        }
-    }
-}
 
 /// Projects one portable trigger into the local worker registry contract.
 fn local_trigger(trigger: &Trigger) -> Value {
@@ -116,38 +104,8 @@ fn local_trigger(trigger: &Trigger) -> Value {
     }
 }
 
-/// Projects one portable trigger into the cloud deployment config contract.
-fn cloud_trigger(trigger: &Trigger) -> Value {
-    match trigger {
-        Trigger::Cron {
-            cron,
-            start_date,
-            catchup,
-        } => json!({ "type": "cron", "config": {
-            "schedule": cron,
-            "startDate": start_date,
-            "catchup": catchup,
-        }}),
-        Trigger::Webhook { path } => json!({
-            "type": "webhook",
-            "config": path
-                .as_ref()
-                .map_or_else(|| json!({}), |path| json!({ "path": path })),
-        }),
-        Trigger::Event {
-            event_type,
-            source,
-            subject,
-        } => json!({ "type": "event", "config": {
-            "eventType": event_type,
-            "source": source,
-            "subject": subject,
-        }}),
-        Trigger::Follow { file } => json!({ "type": "follow", "config": { "file": file } }),
-    }
-}
 
-/// Resource hints for cloud placement. Advisory locally.
+/// Advisory resource hints for the worker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Resources {
     /// Fractional vCPUs the worker is sized for.
@@ -174,12 +132,12 @@ pub struct WorkerManifest {
     /// The working directory the command and bundled files resolve against.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
-    /// Files bundled with the worker, path to text content. On the cloud they
-    /// ride the deployment; locally they are written under the worker's directory.
+    /// Files bundled with the worker, path to text content. Written under the
+    /// worker's directory on the local server.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub files: BTreeMap<String, String>,
-    /// Environment for the worker. A value of `@secret:NAME` is resolved per
-    /// plane from that plane's secret store; the value is never in this file.
+    /// Environment for the worker. A value of `@secret:NAME` is resolved from
+    /// the server's secret store; the value is never in this file.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Events that run the worker. Manual dispatch is available to every worker
@@ -291,7 +249,8 @@ impl WorkerManifest {
         Ok(())
     }
 
-    /// Whether this worker's trigger is follow — local only.
+    /// Whether this worker's trigger is follow.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_follow(&self) -> bool {
         self.triggers
             .iter()
@@ -300,6 +259,7 @@ impl WorkerManifest {
 
     /// The names of the secrets this worker references through `@secret:` env
     /// values, in sorted order and de-duplicated.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn secret_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .env
@@ -317,8 +277,7 @@ impl WorkerManifest {
         self.target_tables.first().map(String::as_str)
     }
 
-    /// The `code` JSON a local worker row carries: the exec array and cwd, the
-    /// same shape the harness runs and the cloud launch contract uses.
+    /// The `code` JSON a local worker row carries: the exec array and cwd.
     fn code_json(&self) -> Value {
         let mut code = json!({ "exec": self.exec });
         if let Some(cwd) = &self.cwd {
@@ -361,57 +320,11 @@ impl WorkerManifest {
         body
     }
 
-    /// Translates this spec into the cloud `POST /v1/deployments` body at
-    /// `placement`. The launch shape lives in `config` (spec_version, exec, files,
-    /// env, resources) exactly as the fleet launch expects; `code` carries a
-    /// self-describing job spec so the required non-empty field is meaningful.
-    pub fn to_cloud_deployment(&self, placement: &str) -> Value {
-        let trigger_specs: Vec<Value> = self.triggers.iter().map(cloud_trigger).collect();
-        let primary = self.triggers.first();
-        let trigger = primary.map_or("manual", Trigger::kind);
-        let schedule = match primary {
-            Some(Trigger::Cron { cron, .. }) => Some(cron.clone()),
-            _ => None,
-        };
-        let mut config = serde_json::Map::new();
-        config.insert("spec_version".to_owned(), json!(self.spec_version));
-        config.insert("exec".to_owned(), json!(self.exec));
-        config.insert("triggers".to_owned(), Value::Array(trigger_specs));
-        if let Some(cwd) = &self.cwd {
-            config.insert("cwd".to_owned(), json!(cwd));
-        }
-        if !self.files.is_empty() {
-            config.insert("files".to_owned(), json!(self.files));
-        }
-        if !self.env.is_empty() {
-            config.insert("env".to_owned(), json!(self.env));
-        }
-        if let Some(v) = self.resources.vcpus {
-            config.insert("vcpus".to_owned(), json!(v));
-        }
-        if let Some(m) = self.resources.mem_mib {
-            config.insert("mem_mib".to_owned(), json!(m));
-        }
-        let code = json!({ "name": self.name, "exec": self.exec }).to_string();
-        let mut body = json!({
-            "kind": "worker",
-            "name": self.name,
-            "code": code,
-            "trigger": trigger,
-            "placement": placement,
-            "target_tables": self.target_tables,
-            "config": Value::Object(config),
-            "created_by": "cli",
-        });
-        if let Some(schedule) = schedule {
-            body["schedule"] = Value::String(schedule);
-        }
-        body
-    }
 
-    /// Rebuilds a spec from a worker row read back from the local server (the
-    /// `pull` and round-trip path). `code`, `triggers`, and `config` are JSON
+    /// Rebuilds a spec from a worker row read back from the local server.
+    /// `code`, `triggers`, and `config` are JSON
     /// strings on the row.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn from_local_worker(row: &Value) -> Result<WorkerManifest, Box<dyn Error>> {
         let name = row
             .get("name")
@@ -469,76 +382,14 @@ impl WorkerManifest {
         })
     }
 
-    /// Rebuilds a spec from a cloud deployment detail (the `pull` path). The
-    /// deployment's `config` object carries the launch shape (exec, cwd, files,
-    /// env, resources); `trigger`/`schedule`/`target_tables` are top-level.
-    pub fn from_cloud_deployment(dep: &Value) -> Result<WorkerManifest, Box<dyn Error>> {
-        let name = dep
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or("deployment has no name")?
-            .to_owned();
-        let config = dep.get("config").cloned().unwrap_or(Value::Null);
-        let exec: Vec<String> = config
-            .get("exec")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let cwd = config.get("cwd").and_then(Value::as_str).map(str::to_owned);
-        let files = string_map(config.get("files"));
-        let env = string_map(config.get("env"));
-        let resources = Resources {
-            vcpus: config.get("vcpus").and_then(Value::as_f64),
-            mem_mib: config.get("mem_mib").and_then(Value::as_u64),
-        };
-        let triggers = triggers_from_cloud(config.get("triggers"));
-        let target_tables = dep
-            .get("target_tables")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        Ok(WorkerManifest {
-            spec_version: SPEC_VERSION,
-            name,
-            exec,
-            cwd,
-            files,
-            env,
-            triggers,
-            target_tables,
-            resources,
-        })
-    }
 
-    /// Renders the spec as pretty TOML for `pull` to write to a file.
-    pub fn to_toml(&self) -> Result<String, Box<dyn Error>> {
-        Ok(toml::to_string_pretty(self)?)
-    }
 }
 
-/// Reads a JSON object of string values into a sorted string map, or empty.
-fn string_map(field: Option<&Value>) -> BTreeMap<String, String> {
-    field
-        .and_then(Value::as_object)
-        .map(|o| {
-            o.iter()
-                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_owned())))
-                .collect()
-        })
-        .unwrap_or_default()
-}
 
 /// Parses a possibly-embedded JSON string column into a `Value` (a row's `code`
 /// / `config` / `triggers` are stored as JSON strings). A plain object passes
 /// through; anything unparseable becomes null.
+#[cfg_attr(not(test), allow(dead_code))]
 fn parse_embedded(field: Option<&Value>) -> Value {
     match field {
         Some(Value::String(s)) => serde_json::from_str(s).unwrap_or(Value::Null),
@@ -548,6 +399,7 @@ fn parse_embedded(field: Option<&Value>) -> Value {
 }
 
 /// Maps a local `triggers` JSON array back to every portable trigger.
+#[cfg_attr(not(test), allow(dead_code))]
 fn triggers_from_local(triggers: &Value) -> Vec<Trigger> {
     let Some(list) = triggers.as_array() else {
         return Vec::new();
@@ -595,64 +447,6 @@ fn triggers_from_local(triggers: &Value) -> Vec<Trigger> {
     parsed
 }
 
-/// Maps the cloud control plane's trigger config back to portable triggers.
-fn triggers_from_cloud(triggers: Option<&Value>) -> Vec<Trigger> {
-    let Some(list) = triggers.and_then(Value::as_array) else {
-        return Vec::new();
-    };
-    let mut parsed = Vec::new();
-    for trigger in list {
-        let config = trigger.get("config").and_then(Value::as_object);
-        match trigger.get("type").and_then(Value::as_str) {
-            Some("cron") => {
-                if let Some(schedule) = config
-                    .and_then(|value| value.get("schedule"))
-                    .and_then(Value::as_str)
-                {
-                    parsed.push(Trigger::Cron {
-                        cron: schedule.to_owned(),
-                        start_date: config
-                            .and_then(|value| value.get("startDate"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        catchup: config
-                            .and_then(|value| value.get("catchup"))
-                            .cloned()
-                            .and_then(|value| serde_json::from_value(value).ok()),
-                    });
-                }
-            }
-            Some("webhook") => {
-                parsed.push(Trigger::Webhook {
-                    path: config
-                        .and_then(|value| value.get("path"))
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                });
-            }
-            Some("event") => {
-                if let Some(event_type) = config
-                    .and_then(|value| value.get("eventType"))
-                    .and_then(Value::as_str)
-                {
-                    parsed.push(Trigger::Event {
-                        event_type: event_type.to_owned(),
-                        source: config
-                            .and_then(|value| value.get("source"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        subject: config
-                            .and_then(|value| value.get("subject"))
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-    parsed
-}
 
 #[cfg(test)]
 mod tests {
@@ -790,36 +584,6 @@ exec = ["python3", "worker.py"]
         );
     }
 
-    /// The portable trigger shape populates the cloud trigger registry while
-    /// the deployment envelope carries the control plane's execution class.
-    #[test]
-    fn translates_event_triggers_to_cloud_deployments() {
-        let mut webhook = cron_manifest();
-        webhook.triggers = vec![Trigger::Webhook { path: None }];
-        let webhook_body = webhook.to_cloud_deployment("cloud");
-        assert_eq!(webhook_body["trigger"], "webhook");
-        assert_eq!(
-            webhook_body["config"]["triggers"],
-            json!([{"type":"webhook","config":{}}])
-        );
-
-        let mut event = cron_manifest();
-        event.triggers = vec![Trigger::Event {
-            event_type: "org.apache.iceberg.snapshot.committed".to_owned(),
-            source: None,
-            subject: Some("app.events".to_owned()),
-        }];
-        let data_body = event.to_cloud_deployment("cloud");
-        assert_eq!(data_body["trigger"], "event");
-        assert_eq!(
-            data_body["config"]["triggers"],
-            json!([{"type":"event","config":{
-                "eventType":"org.apache.iceberg.snapshot.committed",
-                "source":null,
-                "subject":"app.events"
-            }}])
-        );
-    }
 
     /// JSON and TOML manifests accept the public webhook and CloudEvent forms.
     #[test]
@@ -856,7 +620,7 @@ path = "/callbacks/orders"
         ));
     }
 
-    /// Event triggers survive both local registry and cloud detail round trips.
+    /// Event triggers survive a local registry round trip.
     #[test]
     fn event_triggers_round_trip() {
         for trigger in [
@@ -874,11 +638,6 @@ path = "/callbacks/orders"
             let local = WorkerManifest::from_local_worker(&manifest.to_local_worker())
                 .expect("local round trip");
             assert_eq!(local.local_triggers(), manifest.local_triggers());
-
-            let cloud =
-                WorkerManifest::from_cloud_deployment(&manifest.to_cloud_deployment("cloud"))
-                    .expect("cloud round trip");
-            assert_eq!(cloud.local_triggers(), manifest.local_triggers());
         }
     }
 
@@ -910,25 +669,6 @@ path = "/callbacks/orders"
         assert_eq!(config["env"]["API_KEY"], "@secret:MY_KEY");
     }
 
-    /// The cloud deployment body is a worker kind with the exec array in config,
-    /// the cron schedule projected, and the resource hints carried.
-    #[test]
-    fn translates_to_a_cloud_deployment() {
-        let body = cron_manifest().to_cloud_deployment("cloud");
-        assert_eq!(body["kind"], "worker");
-        assert_eq!(body["trigger"], "cron");
-        assert_eq!(body["schedule"], "*/5 * * * *");
-        assert_eq!(body["placement"], "cloud");
-        assert_eq!(body["config"]["spec_version"], 1);
-        assert_eq!(body["config"]["exec"][1], "collect.py");
-        assert_eq!(body["config"]["vcpus"], 0.25);
-        assert!(
-            body["code"]
-                .as_str()
-                .expect("code string")
-                .contains("collector")
-        );
-    }
 
     /// A spec round-trips through the local worker body and back with no edits.
     #[test]
@@ -944,7 +684,7 @@ path = "/callbacks/orders"
         assert_eq!(back.target_tables, manifest.target_tables);
     }
 
-    /// A follow worker is recognized as local-only; a file-follow may omit exec.
+    /// A follow worker is recognized; a file-follow may omit exec.
     #[test]
     fn follow_worker_validates_without_exec_when_tailing_a_file() {
         let manifest = WorkerManifest {

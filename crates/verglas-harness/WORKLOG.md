@@ -69,3 +69,4 @@
 - chore: Deleted WatermarkStore (memory + S3), its tests, and the OpenDAL
   dependency. The harness commit path is keyed idempotent appends only; workers
   have no cross-run watermark cell.
+- #66: Removed cloud queue-backing and cloud-lakehouse dual-plane docs from queue, follow, and worker harness comments.

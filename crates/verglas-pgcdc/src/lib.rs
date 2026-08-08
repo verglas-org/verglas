@@ -1,5 +1,5 @@
 //! Turn PostgreSQL logical replication (pgoutput) into Iceberg change-log
-//! tables — the CDC runner behind Verglas Cloud's zero-ETL feature.
+//! tables — the CDC runner for zero-ETL Postgres-to-Iceberg pipelines.
 //!
 //! The pipeline is a small set of composable layers:
 //!

@@ -87,3 +87,5 @@
 - #16: Added generic JSON DELETE support to the Rust server transport so pure clients can remove REST resources while preserving server status and response errors.
 - #29: Added a namespace-scoped raw-byte KV client with TTL, metadata, conditional writes, idempotency, delete, and bounded prefix listing. The client preserves opaque versions and cursors and reports whether reads came from RAM or NVMe.
 - #67: Added first-class `Client::queue`, `Client::graph`, and `Client::table` handles matching the TypeScript SDK surface for queue enqueue/poll/ack, graph lifecycle and traversal, and table vector-index declare/list/search. Queue wire types live in `queue.rs`; graph and vector routes reuse the existing wire modules.
+- #66: Neutralized MemoryGrantHost docs (no Firecracker) and replaced *.verglas.dev catalog fixtures in client_data_plane tests with example.test hostnames.
+- #66: Rewrote unreachable-server and follow-trigger docs for self-hosted servers only (no cloud node / cloud lakehouse contrast).

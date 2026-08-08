@@ -43,8 +43,8 @@ successful metadata reads, polls the configured upstream catalog for changes,
 and writes mutations through. It does not implement an independent catalog or
 become the system of record.
 
-Cloud deployments do not need that cache. Their Lakebase catalog emits commit
-events directly to the cache and execution roles.
+Operators who already receive commit events from their catalog can skip the
+shallow REST cache and drive warming from those events instead.
 
 ## Warming and snapshot changes
 

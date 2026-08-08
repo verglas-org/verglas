@@ -10,7 +10,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 
-echo "== verglas cloud install: system tooling =="
+echo "== verglas dev env install: system tooling =="
 
 # unzip — required to unpack the AWS CLI and Bun release zips below.
 # jq — used by scripts/changed-cargo-packages.sh and release tooling.
@@ -51,15 +51,15 @@ if ! command -v bun >/dev/null 2>&1; then
   ( cd /tmp && unzip -oq bun.zip && sudo mv bun-linux-x64/bun /usr/local/bin/bun && sudo chmod +x /usr/local/bin/bun )
 fi
 
-echo "== verglas cloud install: rust deps + build =="
+echo "== verglas dev env install: rust deps + build =="
 # rustup installs the pinned toolchain (rust-toolchain.toml) on first use.
 cargo fetch --locked
 # Pre-build the two binaries the start step runs, so boot is fast.
 cargo build -p verglas-server -p verglas
 
-echo "== verglas cloud install: typescript sdk =="
+echo "== verglas dev env install: typescript sdk =="
 if [ -f sdks/typescript/package-lock.json ]; then
   npm --prefix sdks/typescript ci
 fi
 
-echo "== verglas cloud install: done =="
+echo "== verglas dev env install: done =="

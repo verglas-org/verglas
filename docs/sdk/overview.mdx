@@ -4,7 +4,7 @@ description: "Choose the TypeScript or Rust SDK and understand the shared data-p
 icon: "braces"
 ---
 
-The Verglas SDKs expose the same endpoint contract against a local server and Verglas Cloud. A worker receives a connected client. A standalone application connects with an endpoint and bearer token.
+The Verglas SDKs expose the same endpoint contract against a local self-hosted server. A worker receives a connected client. A standalone application connects with an endpoint and bearer token.
 
 <Warning>
 The SDK packages are private workspace packages in the current prototype. Install them from this repository until published packages become available.
@@ -14,7 +14,7 @@ The SDK packages are private workspace packages in the current prototype. Instal
 
 <CardGroup cols={3}>
   <Card title="CLI" icon="terminal" href="/docs/sdk/cli">
-    Automate local and cloud operations from shell scripts and CI.
+    Automate local server operations from shell scripts and CI.
   </Card>
   <Card title="TypeScript" icon="code" href="/docs/sdk/typescript">
     Use the fetch-only client and `defineWorker` contract in Bun, Node.js, and edge runtimes.
@@ -47,7 +47,7 @@ The SDK packages are private workspace packages in the current prototype. Instal
 
 | Capability | TypeScript | Rust |
 | --- | --- | --- |
-| Connect to local or cloud endpoints | `connect` | `Client::connect` |
+| Connect to a local endpoint | `connect` | `Client::connect` |
 | Create or verify a table definition | `ensureTable` (Iceberg REST) | `ensure_table` (Iceberg REST) |
 | Append idempotently | `table.append` → `/v1/ingest` JSONL | `append_stream` → `/v1/write` Arrow |
 | Run SQL | `client.query` | `query_stream` |
@@ -70,15 +70,15 @@ The SDK separates three destinations:
 - The **Iceberg REST catalog** handles table metadata and table creation.
 - The **S3-compatible cache endpoint** handles object bytes.
 
-Local clients can discover the catalog and S3 endpoint from the server. Cloud runtimes receive all connection values from the platform.
+Local clients can discover the catalog and S3 endpoint from the server admin API.
 
 ## Authentication
 
 Do not hard-code a token. Workers receive a connected client and secret bindings through their context. Standalone applications read `VERGLAS_ENDPOINT` and `VERGLAS_TOKEN` from their environment.
 
 ```bash
-export VERGLAS_ENDPOINT=https://tenant.query.verglas.dev
+export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 export VERGLAS_TOKEN=replace-with-a-scoped-token
 ```
 
-The control-plane token written by `verglas login` manages tenant resources. A worker runtime receives a separate, scoped data-plane token for its table grants.
+A worker runtime receives a scoped data-plane token for its table grants.

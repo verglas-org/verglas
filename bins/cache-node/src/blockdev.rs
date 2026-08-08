@@ -1,12 +1,13 @@
 //! The block-device subsystem: the durable chunk store, the attached-device
-//! registry, and the block-control HTTP route the host agent calls.
+//! registry, and the block-control HTTP route an attach client calls.
 //!
-//! Workload microVMs are stateless; this cache node is the stateful layer for
-//! their block storage (#382). The host agent, before it connects a microVM's
-//! kernel NBD client to this node's [`crate::nbd`] listener, POSTs
-//! `/blocks/ensure` here so the device exists at a known size and is registered
-//! for the NBD export name = device id. Durability is the cache's backing
-//! bucket, reached through [`verglas_block`]'s object backend.
+//! Workloads that attach virtual block devices are otherwise stateless; this
+//! cache node is the stateful layer for their block storage (#382). Before an
+//! attach client connects a kernel NBD client to this node's [`crate::nbd`]
+//! listener, it POSTs `/blocks/ensure` here so the device exists at a known
+//! size and is registered for the NBD export name = device id. Durability is
+//! the cache's backing bucket, reached through [`verglas_block`]'s object
+//! backend.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
