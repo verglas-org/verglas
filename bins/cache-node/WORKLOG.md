@@ -54,3 +54,5 @@
 - #58: Added the cache-owned Iceberg REST gateway and catalog watcher used by local query workers. Watcher refreshes and query reads share the same bounded response cache, so ephemeral query processes never own upstream credentials or catalog state.
 
 - #58: Cache-node catalog watching uses `PollingWatcher` only. Dropped `VERGLAS_CATALOG_FEED_*` and the websocket upgrade attempt against the catalog origin.
+
+- #58: Hardened the embedded safekeeper process test: wait for all three children to log listen readiness, capture stderr, and retry the Postgres startup handshake so CI does not flake on early connect.
