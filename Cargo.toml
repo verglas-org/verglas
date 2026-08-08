@@ -23,6 +23,7 @@ members = [
     "crates/verglas-vector",
     "crates/verglas-kv",
     "crates/verglas-scheduler",
+    "crates/verglas-vessel-contract",
     "crates/verglas-gadget-runtime",
     "crates/verglas-container-runtime",
     "bins/cache-node",
@@ -69,6 +70,7 @@ verglas-harness = { path = "crates/verglas-harness" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-scheduler = { path = "crates/verglas-scheduler" }
+verglas-vessel-contract = { path = "crates/verglas-vessel-contract" }
 verglas-gadget-runtime = { path = "crates/verglas-gadget-runtime" }
 verglas-container-runtime = { path = "crates/verglas-container-runtime" }
 verglas-block = { path = "crates/verglas-block" }

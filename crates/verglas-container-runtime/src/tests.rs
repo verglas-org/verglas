@@ -7,8 +7,8 @@ use async_trait::async_trait;
 
 use super::{
     ContainerSpec, DockerApi, DockerRuntimeCore, EngineContainer, EngineCreateRequest,
-    LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError, VesselHttp,
-    VesselRole, VesselSpec,
+    LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError,
+    TypescriptProject, VesselHttp, VesselProjectSpec, VesselRole, VesselSpec,
 };
 
 #[derive(Clone, Default)]
@@ -21,6 +21,7 @@ struct FakeState {
     containers: BTreeMap<String, EngineContainer>,
     networks: BTreeMap<String, BTreeMap<String, String>>,
     events: VecDeque<String>,
+    builds: BTreeMap<String, Vec<u8>>,
 }
 
 impl FakeDocker {
@@ -47,6 +48,14 @@ impl FakeDocker {
 
 #[async_trait]
 impl DockerApi for FakeDocker {
+    /// Builds one immutable image from a normalized tar context.
+    async fn build(&self, image: &str, context: Vec<u8>) -> Result<(), RuntimeError> {
+        let mut state = self.state.lock().expect("fake state lock");
+        state.events.push_back(format!("build:{image}"));
+        state.builds.insert(image.to_owned(), context);
+        Ok(())
+    }
+
     /// Finds a container by its exact engine name.
     async fn inspect(&self, name: &str) -> Result<Option<EngineContainer>, RuntimeError> {
         Ok(self
@@ -139,6 +148,98 @@ impl DockerApi for FakeDocker {
         state.networks.insert(name.to_owned(), labels);
         Ok(())
     }
+}
+
+fn typescript_project() -> VesselProjectSpec {
+    VesselProjectSpec {
+        name: "shipping-map".to_owned(),
+        role: VesselRole::Application,
+        project: TypescriptProject {
+            files: BTreeMap::from([
+                (
+                    "package.json".to_owned(),
+                    r#"{"scripts":{"start":"bun src/server.ts"},"dependencies":{"hono":"4.8.3"}}"#
+                        .to_owned(),
+                ),
+                (
+                    "src/server.ts".to_owned(),
+                    "import { Hono } from 'hono';\nBun.serve({fetch: new Hono().get('/', c => c.text('ok')).fetch, port: 8380});\n"
+                        .to_owned(),
+                ),
+            ]),
+        },
+        environment: BTreeMap::new(),
+        http: VesselHttp {
+            port: 8380,
+            health_path: Some("/health".to_owned()),
+        },
+    }
+}
+
+#[test]
+fn typescript_project_is_content_addressed_and_generates_a_owned_build() {
+    let project = typescript_project();
+
+    let build = project.build_context().expect("build context");
+
+    assert!(
+        build
+            .image
+            .starts_with("verglas/vessel-shipping-map:sha256-")
+    );
+    assert!(build.dockerfile.contains("FROM oven/bun:"));
+    assert!(build.dockerfile.contains("RUN bun install"));
+    assert!(build.dockerfile.contains("RUN bun run --if-present build"));
+    assert!(
+        build
+            .dockerfile
+            .contains("CMD [\"bun\", \"run\", \"start\"]")
+    );
+    assert!(!build.context.is_empty());
+}
+
+#[test]
+fn typescript_project_digest_changes_with_a_dependency() {
+    let original = typescript_project().build_context().expect("original");
+    let mut changed = typescript_project();
+    changed.project.files.insert(
+        "package.json".to_owned(),
+        r#"{"scripts":{"start":"bun src/server.ts"},"dependencies":{"hono":"4.8.4"}}"#.to_owned(),
+    );
+
+    let changed = changed.build_context().expect("changed");
+
+    assert_ne!(original.image, changed.image);
+}
+
+#[test]
+fn typescript_project_rejects_unsafe_or_incomplete_projects() {
+    let mut traversal = typescript_project();
+    traversal
+        .project
+        .files
+        .insert("../secret".to_owned(), "no".to_owned());
+    assert!(matches!(
+        traversal.build_context(),
+        Err(RuntimeError::InvalidProjectPath { .. })
+    ));
+
+    let mut dockerfile = typescript_project();
+    dockerfile
+        .project
+        .files
+        .insert("Dockerfile".to_owned(), "FROM scratch".to_owned());
+    assert!(matches!(
+        dockerfile.build_context(),
+        Err(RuntimeError::InvalidProjectPath { .. })
+    ));
+
+    let mut missing_package = typescript_project();
+    missing_package.project.files.remove("package.json");
+    assert!(matches!(
+        missing_package.build_context(),
+        Err(RuntimeError::MissingProjectFile { .. })
+    ));
 }
 
 fn fixture() -> ContainerSpec {
