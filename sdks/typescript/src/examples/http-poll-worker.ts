@@ -62,7 +62,7 @@ export const httpPollWorker = defineWorker<HttpPollEnv>({
       return { rowsWritten: 0 };
     }
 
-    const result = await ctx.client.table(ctx.output).append(fresh);
+    const result = await ctx.verglas.table(ctx.output).append(fresh);
     ctx.log("http-poll-worker: appended", { rows: result.rowsCommitted, snapshot: result.snapshotId });
     return { rowsWritten: result.rowsCommitted };
   },

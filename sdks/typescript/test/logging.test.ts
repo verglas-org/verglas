@@ -38,7 +38,7 @@ const CRON: CloudEvent = {
 
 /** A minimal WorkerContext; log is a no-op (the runner installs its own logger). */
 function ctx(output = "app.points", c: VerglasClient = client): WorkerContext {
-  return { client: c, trigger: CRON, output, outputs: [output], env: {}, log: () => {} };
+  return { verglas: c, client: c, trigger: CRON, output, outputs: [output], env: {}, log: () => {} };
 }
 
 /** The log rows written to `<name>_LOGS`, typed. */

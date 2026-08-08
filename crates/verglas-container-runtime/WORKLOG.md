@@ -1,5 +1,6 @@
 # Worklog
 
+- #43: Added manifest discovery and streaming namespace invocation for private Integration Vessels, with stable Vessel-name identity validation and no public workload ports.
 - #49: Added the open-source Docker Engine placement crate with label-owned, idempotent container
   lifecycle reconciliation and fake-engine contract tests.
 - #50: Added the authenticated persistent desired-state manager, shared-network and host-port

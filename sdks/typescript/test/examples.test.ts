@@ -18,6 +18,7 @@ afterEach(() => endpoint.close());
 function ctx<Env>(output: string, env: Env, trigger: CloudEvent): WorkerContext<Env> & { logs: { message: string }[] } {
   const logs: { message: string }[] = [];
   return {
+    verglas: client,
     client,
     trigger,
     output,

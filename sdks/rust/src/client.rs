@@ -4,7 +4,7 @@
 //! table-contract validation in the SDK. Applications and the CLI therefore
 //! call the same implementation instead of rebuilding HTTP behavior.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use futures::{SinkExt, Stream, StreamExt, TryStream, stream};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH, IF_NONE_MATCH,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -39,6 +40,47 @@ pub type QueryStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, ClientError
 
 /// A resumable stream of catalog commit notifications.
 pub type FollowStream = Pin<Box<dyn Stream<Item = Result<ChangeEvent, ClientError>> + Send>>;
+
+/// A stream of reflected Integration method results decoded from NDJSON.
+pub type NamespaceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ClientError>> + Send>>;
+
+/// Whether a reflected Integration method is bounded, mutating, or streaming.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NamespaceMethodMode {
+    /// Bounded observation with no declared external mutation.
+    Read,
+    /// Bounded operation that may mutate the external system.
+    Write,
+    /// Long-lived sequence of output values.
+    Stream,
+}
+
+/// One callable operation published by an Integration namespace.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NamespaceMethodManifest {
+    /// Human-readable operation purpose available to agents and management UIs.
+    pub description: String,
+    /// Execution and authorization behavior.
+    pub mode: NamespaceMethodMode,
+    /// JSON Schema for the single method argument.
+    pub input: Value,
+    /// JSON Schema for a bounded result or each streamed item.
+    pub output: Value,
+}
+
+/// Reflection document through which one Integration composes into every SDK.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct NamespaceManifest {
+    /// Stable SDK namespace owned by the Integration.
+    pub namespace: String,
+    /// User-facing Integration title.
+    pub title: String,
+    /// User-facing Integration purpose.
+    pub description: String,
+    /// Dot-separated method paths and their machine-readable contracts.
+    pub methods: BTreeMap<String, NamespaceMethodManifest>,
+}
 
 /// Configuration used to construct a [`Client`].
 #[derive(Debug, Clone)]
@@ -281,6 +323,9 @@ pub enum ClientError {
     /// Arrow IPC encoding or decoding failed.
     #[error("Arrow IPC failed: {0}")]
     Arrow(#[from] arrow_schema::ArrowError),
+    /// A reflected namespace response was not valid JSON.
+    #[error("namespace JSON failed: {0}")]
+    NamespaceJson(#[from] serde_json::Error),
     /// The existing table differs from the requested contract.
     #[error("table {table} definition mismatch: expected {expected:?}, actual {actual:?}")]
     DefinitionMismatch {
@@ -414,6 +459,30 @@ impl Client {
         Ok(Kv {
             client: self.clone(),
             namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Lists every reflected Integration namespace visible to this principal.
+    pub async fn namespaces(&self) -> Result<Vec<NamespaceManifest>, ClientError> {
+        let response = Self::require_success(
+            self.send(self.authorize(self.http.get(self.url("/v1/namespaces"))))
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Creates a lazy handle to one reflected Integration namespace.
+    pub fn namespace(&self, namespace: &str) -> Result<Namespace, ClientError> {
+        if namespace.is_empty() || namespace.contains('/') {
+            return Err(ClientError::Configuration(
+                "Integration namespace must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Namespace {
+            client: self.clone(),
+            name: namespace.to_owned(),
+            manifest: std::sync::Arc::new(OnceCell::new()),
         })
     }
 
@@ -673,6 +742,181 @@ impl Client {
     /// Joins an API path to the configured endpoint.
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.query_uri)
+    }
+}
+
+/// A reflected Integration namespace bound to one authenticated client identity.
+#[derive(Debug, Clone)]
+pub struct Namespace {
+    client: Client,
+    name: String,
+    manifest: std::sync::Arc<OnceCell<NamespaceManifest>>,
+}
+
+impl Namespace {
+    /// Loads and caches the namespace's reflection manifest.
+    pub async fn manifest(&self) -> Result<&NamespaceManifest, ClientError> {
+        self.manifest
+            .get_or_try_init(|| async {
+                let response = Client::require_success(
+                    self.client
+                        .send(
+                            self.client
+                                .authorize(self.client.http.get(self.method_url(None)?)),
+                        )
+                        .await?,
+                )
+                .await?;
+                response.json().await.map_err(ClientError::Transport)
+            })
+            .await
+    }
+
+    /// Invokes one reflected bounded read or write method.
+    pub async fn invoke<Input, Output>(
+        &self,
+        method: &str,
+        input: &Input,
+    ) -> Result<Output, ClientError>
+    where
+        Input: Serialize + ?Sized,
+        Output: DeserializeOwned,
+    {
+        let definition = self.method(method).await?;
+        if definition.mode == NamespaceMethodMode::Stream {
+            return Err(ClientError::Configuration(format!(
+                "namespace method {}.{method} is a stream",
+                self.name
+            )));
+        }
+        let request = self
+            .client
+            .authorize(self.client.http.post(self.method_url(Some(method))?))
+            .json(input);
+        let response = Client::require_success(self.client.send(request).await?).await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Opens one reflected stream method and incrementally decodes its NDJSON items.
+    pub async fn stream<Input, Output>(
+        &self,
+        method: &str,
+        input: &Input,
+    ) -> Result<NamespaceStream<Output>, ClientError>
+    where
+        Input: Serialize + ?Sized,
+        Output: DeserializeOwned + Send + 'static,
+    {
+        let definition = self.method(method).await?;
+        if definition.mode != NamespaceMethodMode::Stream {
+            return Err(ClientError::Configuration(format!(
+                "namespace method {}.{method} is not a stream",
+                self.name
+            )));
+        }
+        let request = self
+            .client
+            .authorize(self.client.http.post(self.method_url(Some(method))?))
+            .header(ACCEPT, "application/x-ndjson")
+            .json(input);
+        let response = Client::require_success(self.client.send(request).await?).await?;
+        let state = NamespaceDecodeState {
+            chunks: Box::pin(response.bytes_stream()),
+            buffered: Vec::new(),
+            ready: VecDeque::new(),
+            finished: false,
+        };
+        Ok(Box::pin(stream::try_unfold(state, namespace_decode_next)))
+    }
+
+    /// Resolves one declared method before allowing the invocation to leave the SDK.
+    async fn method(&self, method: &str) -> Result<NamespaceMethodManifest, ClientError> {
+        if method.is_empty() || method.contains('/') {
+            return Err(ClientError::Configuration(
+                "Integration method must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        self.manifest()
+            .await?
+            .methods
+            .get(method)
+            .cloned()
+            .ok_or_else(|| {
+                ClientError::Configuration(format!(
+                    "namespace {} does not declare method {method}",
+                    self.name
+                ))
+            })
+    }
+
+    /// Builds the reflected manifest or invocation URL without interpolating path input.
+    fn method_url(&self, method: Option<&str>) -> Result<reqwest::Url, ClientError> {
+        let mut url = reqwest::Url::parse(&self.client.query_uri)
+            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            ClientError::Configuration("query URI cannot carry path segments".to_owned())
+        })?;
+        segments
+            .pop_if_empty()
+            .push("v1")
+            .push("namespaces")
+            .push(&self.name);
+        if let Some(method) = method {
+            segments.push("invoke").push(method);
+        }
+        drop(segments);
+        Ok(url)
+    }
+}
+
+/// Incremental state for one NDJSON Integration response.
+struct NamespaceDecodeState<T> {
+    chunks: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    buffered: Vec<u8>,
+    ready: VecDeque<T>,
+    finished: bool,
+}
+
+/// Produces one decoded namespace stream item without buffering the complete response.
+async fn namespace_decode_next<T>(
+    mut state: NamespaceDecodeState<T>,
+) -> Result<Option<(T, NamespaceDecodeState<T>)>, ClientError>
+where
+    T: DeserializeOwned,
+{
+    loop {
+        if let Some(value) = state.ready.pop_front() {
+            return Ok(Some((value, state)));
+        }
+        if state.finished {
+            return Ok(None);
+        }
+        match state.chunks.next().await {
+            Some(Ok(chunk)) => {
+                state.buffered.extend_from_slice(&chunk);
+                while let Some(newline) = state.buffered.iter().position(|byte| *byte == b'\n') {
+                    let mut line: Vec<u8> = state.buffered.drain(..=newline).collect();
+                    line.pop();
+                    if line.iter().any(|byte| !byte.is_ascii_whitespace()) {
+                        state.ready.push_back(serde_json::from_slice(&line)?);
+                    }
+                }
+            }
+            Some(Err(error)) => return Err(ClientError::Transport(error)),
+            None => {
+                state.finished = true;
+                if state
+                    .buffered
+                    .iter()
+                    .any(|byte| !byte.is_ascii_whitespace())
+                {
+                    state
+                        .ready
+                        .push_back(serde_json::from_slice(&state.buffered)?);
+                    state.buffered.clear();
+                }
+            }
+        }
     }
 }
 

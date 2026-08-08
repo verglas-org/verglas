@@ -111,6 +111,24 @@ describe("endpointRun worker semantics", () => {
     expect(seenTrigger).toEqual(event);
   });
 
+  it("injects one SDK instance as ctx.verglas and this.verglas", async () => {
+    const fake = fakeEndpoint();
+    let contextClient: WorkerContext["verglas"] | undefined;
+    let receiverClient: WorkerContext["verglas"] | undefined;
+    const worker = defineWorker(async function (this: { verglas: WorkerContext["verglas"] }, ctx) {
+      contextClient = ctx.verglas;
+      receiverClient = this.verglas;
+      expect(ctx.client).toBe(ctx.verglas);
+      return { rowsWritten: 0 };
+    });
+
+    const result = await endpointRun(worker, baseEnv(), { fetch: fake.fetch, ...quiet });
+
+    expect(result.error).toBeNull();
+    expect(contextClient).toBeDefined();
+    expect(receiverClient).toBe(contextClient);
+  });
+
   it("refuses a run with no CloudEvent", async () => {
     const fake = fakeEndpoint();
     let ran = false;

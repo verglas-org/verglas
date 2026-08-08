@@ -37,6 +37,8 @@ services:
       # scheduler, create it through the local container runtime and set this
       # to its stable network address.
       VERGLAS_SCHEDULER_URL: ${VERGLAS_SCHEDULER_URL:-}
+      VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
+      VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
     volumes:
       - verglas-cache:/var/lib/verglas
     # Contain a future socket or cache FD leak inside this service. Docker's

@@ -82,4 +82,13 @@ export type {
   KvPutOptions,
   KvPutResult,
   KvValue,
+  DynamicNamespaceRegistry,
+  NamespaceBindings,
+  NamespaceCall,
+  NamespaceJsonSchema,
+  NamespaceManifest,
+  NamespaceMethod,
+  NamespaceMethodManifest,
+  NamespaceMethodMode,
+  NamespaceRegistry,
 } from "./types";

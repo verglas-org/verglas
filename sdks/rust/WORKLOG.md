@@ -1,5 +1,7 @@
 # verglas-sdk worklog
 
+- #43: Added the Rust half of the reflected Integration namespace contract. Clients can discover manifests, create a namespace handle, invoke bounded methods, and incrementally decode streaming methods through the same authenticated routes as the TypeScript SDK.
+
 - #376: Moved the generic daemon HTTP/file-ingest transport and all table/query
   report wire shapes into the pure SDK. The SDK no longer depends on the
   Iceberg engine, so CLI consumers link only client/runtime dependencies.

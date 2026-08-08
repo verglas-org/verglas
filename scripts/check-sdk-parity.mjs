@@ -53,4 +53,4 @@ for (const { specification, manifest } of loaded.slice(1)) {
   }
 }
 
-console.log("SDK parity: connect, ensure_table, query, append, and follow match");
+console.log("SDK parity: connect, ensure_table, query, append, follow, and namespace match");
