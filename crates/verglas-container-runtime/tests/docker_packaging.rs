@@ -23,6 +23,11 @@ fn dockerfile_builds_the_runtime_manager() {
             .contains("/src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler")
     );
     assert!(!dockerfile.contains("FROM verglas-gadget-runtime AS verglas-container-runtime"));
+    assert!(!dockerfile.contains("verglas-gadget-runtime"));
+    assert!(!dockerfile.contains("gadget-host"));
+    assert!(dockerfile.contains("COPY --from=oven/bun:1.3.8 /usr/local/bin/bun"));
+    assert!(dockerfile.contains("FROM oven/bun:1.3.8 AS verglas-integration-runtime"));
+    assert!(dockerfile.contains("FROM oven/bun:1.3.8 AS verglas-application-runtime"));
     assert!(dockerfile.contains("ENTRYPOINT [\"verglas-container-runtime\"]"));
     assert!(dockerfile.contains("AS verglas-integration-runtime"));
     assert!(dockerfile.contains("AS verglas-application-runtime"));

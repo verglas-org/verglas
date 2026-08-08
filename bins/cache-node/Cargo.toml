@@ -1,6 +1,6 @@
 [package]
 name = "verglas-cache-node"
-description = "The standalone Verglas cache server: SigV4 S3, shared cache tiers, and ring-durable write-back for the cloud fleet."
+description = "The standalone Verglas cache server: SigV4 S3, shared cache tiers, and ring-durable write-back."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -23,9 +23,10 @@ verglas-backend.workspace = true
 verglas-catalog.workspace = true
 verglas-tables.workspace = true
 # The block-device tier (#382): the NBD server in this binary serves cache-served
-# virtual disks to microVMs; verglas-block owns the durable chunk store + manifest.
+# virtual disks to attached NBD clients; verglas-block owns the durable chunk
+# store + manifest.
 verglas-block.workspace = true
-# The block FLUSH write-back plane erasure-codes a device flush across the fleet
+# The block FLUSH write-back plane erasure-codes a device flush across the
 # ring and acks on a quorum. It reuses the object tier's fragment store and peer
 # RPC (verglas-cluster) — this binary wires the block ring peers to them and
 # serves the fragment endpoints peers place shards through. The embedded

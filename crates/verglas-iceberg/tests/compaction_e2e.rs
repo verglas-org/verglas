@@ -1,4 +1,4 @@
-//! End-to-end compaction against the REAL Verglas Cloudflare catalog service
+//! End-to-end compaction against the REAL Cloudflare catalog service
 //! (apps/catalog) in `wrangler dev` mode plus a throwaway MinIO — the same
 //! iceberg-rust client verglas-server uses. Proves the executor's REPLACE commit is
 //! accepted by the production catalog's commit/CAS path (not just MemoryCatalog),

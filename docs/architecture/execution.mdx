@@ -15,9 +15,6 @@ service starts one bounded role process per request and passes it the current
 catalog and Verglas S3 coordinates. A broken or missing role is an error; the
 server does not fall back to an embedded implementation.
 
-Cloud runs those roles as independently scalable microVMs using the same
-request contracts.
-
 ## Worker lifecycle
 
 ```mermaid
@@ -55,6 +52,6 @@ asynchronously.
 
 Containers are for service processes rather than bounded events. A stateless
 container can scale horizontally to zero. A stateful container has one active
-instance and requires snapshot-and-restore to idle. Container routing and cold
-connection brokering are cloud control-plane responsibilities, not scheduler
-features.
+instance and requires snapshot-and-restore to idle. On a self-hosted host the
+Docker container runtime reconciles desired state; routing and cold connection
+brokering stay outside the scheduler.

@@ -11,7 +11,7 @@
 //! non-durable chunk. A chunk that writes back to all zeros is dropped to
 //! unwritten, keeping zero regions sparse.
 //!
-//! Concurrency: one device serves one attached microVM, so operations serialize
+//! Concurrency: one device serves one attached NBD client, so operations serialize
 //! behind a single async lock. Correctness over throughput — the block path is
 //! not the object cache's hot path.
 

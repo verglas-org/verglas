@@ -186,7 +186,7 @@ pub struct Attempt {
     pub completion: Option<Completion>,
 }
 
-/// Durable queue contract shared by local and cloud scheduler processes.
+/// Durable queue contract for scheduler processes.
 #[async_trait]
 pub trait RunQueue: Send + Sync {
     async fn enqueue(&self, invocation: &Invocation) -> Result<EnqueueOutcome, SchedulerError>;

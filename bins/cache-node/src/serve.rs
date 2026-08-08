@@ -47,8 +47,8 @@ use crate::admin;
 /// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
 
-/// The default NBD listen port for the block-device tier (#382). The host agent
-/// connects a microVM's kernel NBD client here; the export name selects the
+/// The default NBD listen port for the block-device tier (#382). An attach
+/// client connects a kernel NBD client here; the export name selects the
 /// device. Overridable with `VERGLAS_BLOCK_ADDR` (same shape as
 /// `VERGLAS_S3_ADDR`). Not a config knob — one fixed port, one listener.
 const BLOCK_PORT: u16 = 8335;
@@ -389,7 +389,7 @@ pub async fn run(
                 crate::blockdev::DeviceRegistry::open(&config.cache.dir, backend).await?;
             // Learn the ring and attach the flush write-back plane to the registry
             // before any device is ensured. With no ring configured this is a
-            // no-op and FLUSH stays the synchronous R2 barrier (#382).
+            // no-op and FLUSH stays the synchronous origin barrier (#382).
             ring_plane = crate::ring::setup(
                 &config.cache.dir,
                 config.cache.capacity_bytes.0,
@@ -756,7 +756,7 @@ mod tests {
 
     /// `/admin/healthz` reports `starting`/503 until the slot-filling recovery
     /// step calls `mark_ready`, then `ok`/200 — the serve-gating (#16) contract
-    /// the fleet's health check depends on. While starting, the engine-dependent
+    /// operators and load balancers depend on. While starting, the engine-dependent
     /// `/admin/stats` and `/metrics` routes answer 503 (not 404), so a load
     /// balancer sees a clear not-ready signal rather than connection-refused.
     #[tokio::test]

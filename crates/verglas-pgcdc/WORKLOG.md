@@ -18,3 +18,5 @@
   vendored iceberg 0.9.1).
 
 - #393: Switched from in-tree `vendor/iceberg` to the pinned `verglas-org/iceberg-rust` fork (`verglas/v0.9.1` @ a40f9268) for `TableCommit::from_parts`. Same patch, maintained out of tree; drop when upstream exposes overwrite/replace commits.
+
+- #66: Rewrote the crate description and module docs to describe zero-ETL Postgres-to-Iceberg CDC without naming Verglas Cloud.

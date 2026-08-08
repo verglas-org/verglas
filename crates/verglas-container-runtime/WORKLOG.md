@@ -26,3 +26,5 @@
   HTTP surfaces behind runtime authentication.
 - #55: Removed the in-tree Linear integration and dashboard Application crates. Vessel persistence,
   proxying, and Application previews stay; product examples are no longer bundled.
+
+- #65/#66: Strengthened Docker packaging assertions against gadget-runtime/gadget-host leftovers and required Bun from oven/bun; README now describes Docker-only local placement without Firecracker or Verglas Cloud.

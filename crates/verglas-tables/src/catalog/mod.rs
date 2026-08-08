@@ -4,8 +4,8 @@
 //! prefetcher #51).
 //!
 //! Change discovery is Iceberg REST polling only. Push notification from a
-//! hosted catalog (for example Lakekeeper) is a separate cloud integration; this
-//! crate does not open a Verglas-owned websocket to the catalog origin.
+//! hosted catalog (for example Lakekeeper) is out of band; this crate does not
+//! open a Verglas-owned websocket to the catalog origin.
 //!
 //! # Event-channel semantics
 //!

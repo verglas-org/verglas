@@ -32,9 +32,9 @@ one self-hosted service:
 | Scheduler | Persist and execute worker events when the optional Workers profile is running. |
 | Analytics | Manage Rill resources when the optional Analytics profile is running. |
 
-Cloud deployments use the same crates as separate roles. They do not run the
-self-hosted REST composition as one container. Cache, query, write, catalog,
-and scheduling can scale independently.
+Self-hosted installs typically run the REST composition in one container.
+Operators may also run the same crates as separate roles so cache, query,
+write, catalog, and scheduling scale independently.
 
 ## Design requirements
 

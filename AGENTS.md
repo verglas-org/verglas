@@ -70,10 +70,11 @@ The point: tests written after code tend to **confirm what the code does**; test
 - PR-review checklist: no code path may assume a key is locally owned — every read/fill/dedup/invalidation path resolves ownership through the ring (#17).
 - Do not merge your own PRs without review unless explicitly told to.
 
-## Cursor Cloud specific instructions
+## Cursor remote VM specific instructions
 
-Durable, non-obvious notes for agents in the Cloud VM. The environment is defined
-by `.cursor/environment.json` (repo-file managed), which runs two scripts:
+Durable, non-obvious notes for agents in the Cursor remote / dev VM. The
+environment is defined by `.cursor/environment.json` (repo-file managed), which
+runs two scripts:
 
 - `scripts/cloud/install.sh` (install step): installs dev tooling (`just`, `jq`,
   MinIO `minio`+`mc`, AWS CLI, Bun 1.3.8), runs `cargo fetch --locked`, pre-builds

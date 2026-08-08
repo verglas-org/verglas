@@ -10,3 +10,4 @@
 - #16: Added the optional on-prem Rill dashboard API. It resolves Iceberg table locations through the configured catalog, manages owned Rill connector/model/metrics/Explore files over Rill's runtime API, and refuses to overwrite unowned resources without a filesystem fallback.
 - #29: Added authenticated raw-byte KV get, put, delete, and deterministic prefix-list routes. The routes enforce tenant, namespace, and verb scopes before storage and keep keys, values, tokens, and metadata out of logs.
 - chore: Removed GET/PUT /v1/watermark and its wire-shape tests. Sys routes are worker registry only.
+- #66: Switched LocalAccess admin test fixtures from *.verglas.dev catalog hostnames to catalog.example.test.

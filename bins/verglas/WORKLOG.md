@@ -737,3 +737,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #18: Added documentation regression tests that keep the complete Compose contract and every displayed worker file synchronized with the runnable repository examples. CLI help now points dashboard users to the Compose analytics profile instead of the removed server TOML configuration.
 - #29: Added direct `verglas kv set` and `verglas kv get` commands against the server's built-in KV engine. Set accepts an optional TTL and both commands use the existing endpoint and bearer-token environment without KV configuration.
 - #55: Dropped the bundled Linear Vessel example from CLI tests; the vessel commands keep a generic demo fixture.
+- #66: Removed Verglas Cloud login/control-plane CLI (containers/db/volumes/secrets/login) and retargeted workers to the local server registry.
+- #66: Neutralized CLI tests that asserted removed control-plane verbs (#66); renamed catalog_delete token fixture away from cloud-catalog.token.

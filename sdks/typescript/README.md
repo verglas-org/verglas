@@ -7,8 +7,8 @@ runtime** (no Node APIs) and in **Node** locally.
 A worker is a small code artifact that runs in an isolated sandbox and uses this
 SDK to move data. The SDK is deliberately thin: it never reads Parquet or runs an
 Iceberg commit in JavaScript. It speaks a small HTTP contract to a Verglas
-**endpoint** — the local server or a cloud Verglas endpoint — which owns the
-catalog, the snapshots, and the content-addressed write path.
+**endpoint** (the self-hosted server's base URL), which owns the catalog, the
+snapshots, and the content-addressed write path.
 
 ## The worker model
 
@@ -53,7 +53,7 @@ The handler receives everything the run needs and nothing it doesn't:
 - `ctx.trigger` — the CloudEvent that invoked this run (see below).
 - `ctx.output` / `ctx.outputs` — the **deployment-configured** output table(s).
   Output is deployment config, never hardcoded in worker code — the platform
-  passes it in (the fleet harness maps the `TARGET` binding here). `outputs` lists
+  passes it in (the runner maps the `TARGET` binding here). `outputs` lists
   every configured output when a deployment declares more than one; `output` is
   `outputs[0]`.
 - `ctx.env` — the deployment environment: declared secret bindings and config
@@ -110,29 +110,25 @@ runs:
 triggers: [{ type: "cron", schedule: "0 * * * *", startDate: "2026-01-01T00:00:00Z", catchup: "sequential" }]
 ```
 
-## The endpoint model: local vs cloud
+## The endpoint model
 
-`connect` takes an endpoint and a token. The interface is identical; only the
-endpoint differs.
-
-- **Local** — point at the server's base URL (e.g. `http://127.0.0.1:8334`) for
-  Verglas APIs. Iceberg clients continue to use the customer's catalog endpoint
-  directly; the server never serves or proxies that catalog.
-- **Cloud** — point at the tenant's Verglas endpoint. The cloud commit service
-  implements the same contract against the tenant's managed Iceberg REST catalog.
+`connect` takes the self-hosted server's base URL and a token. Point at the
+admin API (e.g. `http://127.0.0.1:8334`). Iceberg clients continue to use the
+customer's catalog endpoint directly; the server never becomes the catalog
+system of record.
 
 ```ts
 import { connect } from "@verglas/sdk";
 
 const client = connect({
-  endpoint: "http://127.0.0.1:8334", // or the cloud endpoint
+  endpoint: "http://127.0.0.1:8334",
   token: process.env.VERGLAS_TOKEN!, // never hard-code
 });
 ```
 
 Inside a worker you never call `connect` yourself — the runner hands you a
 connected `ctx.verglas`. You call `connect` only when driving the SDK directly
-(tests, a script, the fleet entry).
+(tests, a script, a harness entry).
 
 ## Reflected Integration namespaces
 
@@ -409,8 +405,7 @@ before any consumer sees it, and a group's watermark advances only on an explici
 `ack` after the consumer's downstream commit. A crash between `poll` and `ack`
 re-serves the same records, so a consumer that must not act twice dedupes on
 `QueueRecord.position`. `ack` is monotone — a regressing position is ignored.
-Locally the queue is a durable segment log; the cloud backs the same verb with a
-managed queue.
+The self-hosted server backs the queue with a durable segment log.
 
 ### Graphs
 
@@ -434,10 +429,9 @@ table's Iceberg statistics metadata and cached locally for serving.
 
 ## Automatic run logging + observability
 
-Every worker run — local or remote — emits standardized structured logs with **no
-logging code in the worker**. The runner (`runWorker`) does it. Because the SDK
-runs the same way against the local server and a cloud endpoint, this works
-everywhere automatically.
+Every worker run emits standardized structured logs with **no logging code in
+the worker**. The runner (`runWorker`) does it automatically against the
+connected endpoint.
 
 ### The `<name>_LOGS` standard table
 
@@ -498,10 +492,9 @@ await runWorker(worker, ctx, { logging: false });   // opt out entirely
 ### Retention (3-day TTL)
 
 `<name>_LOGS` retains a standard 3-day TTL, but the SDK does not own it. The
-serving runtime enforces retention: the server's housekeeping (and the cloud
-committer's daily control-plane tick) drops `day` partitions past the cutoff. The
-SDK only writes the standard `day`-partitioned rows; growth control lives with
-whatever serves the lakehouse.
+server's housekeeping drops `day` partitions past the cutoff. The SDK only
+writes the standard `day`-partitioned rows; growth control lives with the
+serving runtime.
 
 ### Charting
 
@@ -525,11 +518,11 @@ const obs = observabilityFor("app.points");
 *renderer*. The renderer is the missing consumer that reads `<name>_LOGS` per the
 `chart` spec and draws run rates, error counts, rows, and latency percentiles.
 
-## The fleet / edge host entry
+## The local host entry
 
-`src/subprocess/endpoint-run.ts` is the bun entry a fleet microVM execs to run a
-tenant worker against the live commit service, mirroring exactly what the
-platform's cron dispatch does. **One invocation = one bounded worker run for one
+`src/subprocess/endpoint-run.ts` is the bun entry the worker harness execs to run
+a tenant worker against the live commit service, mirroring exactly what the
+scheduler's cron dispatch does. **One invocation = one bounded worker run for one
 scheduled interval.**
 
 It maps the process environment onto a `WorkerContext`: it builds the cron trigger
@@ -538,7 +531,7 @@ from the logical-time bindings `VERGLAS_LOGICAL_DATE` / `VERGLAS_INTERVAL_START`
 undefined), maps the
 `TARGET` binding to `ctx.output`, and runs the worker's handler once through
 `runWorker` (so run logging to `<TARGET>_LOGS` is identical to the platform path).
-There is **no durable watermark** here — the control plane owns scheduling,
+There is **no durable watermark** here — the scheduler owns scheduling,
 backfill, and replay; this entry just runs the interval it was handed.
 
 Required env: `VERGLAS_ENDPOINT`, `VERGLAS_TOKEN`, `DEPLOYMENT`, `TARGET`. Worker

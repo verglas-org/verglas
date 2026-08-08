@@ -6,7 +6,7 @@
 
 mod environment;
 
-use verglas_server::{VERSION, admin, follow, logging, node_report, platform};
+use verglas_server::{VERSION, admin, follow, logging, platform};
 
 use std::sync::{Arc, OnceLock};
 
@@ -293,7 +293,7 @@ fn spawn_lifecycle(
         )
     })?;
     let options = WatcherOptions::from_config(catalog);
-    // Iceberg REST polling only. Hosted-catalog push notify is a cloud concern;
+    // Iceberg REST polling only. Hosted-catalog push notify is out of band;
     // this process does not open a Verglas websocket to the catalog origin.
     let watcher = Arc::new(PollingWatcher::spawn(source, options));
     let w = &config.cache.warming;
@@ -803,12 +803,11 @@ fn build_query_worker_dispatcher(
     resolved_admin_port: u16,
 ) -> Option<Arc<verglas_server::query_worker::QueryWorkerDispatcher>> {
     let query_worker = config.query_worker.as_ref()?;
-    let config_path = match render_execution_worker_config(
+    let config_path = match render_query_worker_config(
         config,
         credentials,
         resolved_s3_port,
         resolved_admin_port,
-        "query-worker",
     ) {
         Ok(path) => path,
         Err(error) => {
@@ -832,12 +831,11 @@ fn build_write_worker_dispatcher(
     resolved_admin_port: u16,
 ) -> Option<Arc<verglas_server::write_worker::WriteWorkerDispatcher>> {
     let write_worker = config.write_worker.as_ref()?;
-    let config_path = match render_execution_worker_config(
+    let config_path = match render_write_worker_config(
         config,
         credentials,
         resolved_s3_port,
         resolved_admin_port,
-        "write-worker",
     ) {
         Ok(path) => path,
         Err(error) => {
@@ -853,16 +851,12 @@ fn build_write_worker_dispatcher(
     ))
 }
 
-/// Renders the common cache and catalog connection used by execution roles.
-fn render_execution_worker_config(
-    config: &verglas_core::config::Config,
+/// Writes endpoint credentials shared by query and write role configs.
+fn write_role_credentials(
+    dir: &std::path::Path,
     credentials: &(String, String),
-    resolved_s3_port: u16,
-    resolved_admin_port: u16,
-    directory: &str,
 ) -> Result<std::path::PathBuf, String> {
-    let dir = config.cache.dir.join(directory);
-    std::fs::create_dir_all(&dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
+    std::fs::create_dir_all(dir).map_err(|error| format!("create {}: {error}", dir.display()))?;
     let credentials_path = dir.join("credentials");
     std::fs::write(
         &credentials_path,
@@ -878,6 +872,52 @@ fn render_execution_worker_config(
         std::fs::set_permissions(&credentials_path, std::fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("restrict role credentials: {error}"))?;
     }
+    Ok(credentials_path)
+}
+
+/// Renders `verglas-query` config: cache S3 endpoint + `[metadata]` gateway URI.
+fn render_query_worker_config(
+    config: &verglas_core::config::Config,
+    credentials: &(String, String),
+    resolved_s3_port: u16,
+    resolved_admin_port: u16,
+) -> Result<std::path::PathBuf, String> {
+    let dir = config.cache.dir.join("query-worker");
+    let credentials_path = write_role_credentials(&dir, credentials)?;
+    let scheme = if config.listen.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    let region = config
+        .backend
+        .region
+        .clone()
+        .unwrap_or_else(|| "us-east-1".to_owned());
+    if config.catalog.is_none() {
+        return Err("execution roles require [catalog]".to_owned());
+    }
+    let rendered = format!(
+        "[listen]\nadmin_port = 0\n\n\
+         [cache]\ns3_endpoint = \"{scheme}://127.0.0.1:{resolved_s3_port}\"\nregion = \"{region}\"\ncredentials_file = \"{credentials}\"\n\n\
+         [metadata]\nuri = \"{scheme}://127.0.0.1:{resolved_admin_port}/catalog\"\n",
+        credentials = credentials_path.display(),
+    );
+    let config_path = dir.join("config.toml");
+    std::fs::write(&config_path, rendered)
+        .map_err(|error| format!("write role config: {error}"))?;
+    Ok(config_path)
+}
+
+/// Renders `verglas-write` config: cache S3 endpoint + full `[catalog]` commit target.
+fn render_write_worker_config(
+    config: &verglas_core::config::Config,
+    credentials: &(String, String),
+    resolved_s3_port: u16,
+    resolved_admin_port: u16,
+) -> Result<std::path::PathBuf, String> {
+    let dir = config.cache.dir.join("write-worker");
+    let credentials_path = write_role_credentials(&dir, credentials)?;
     let scheme = if config.listen.tls.is_some() {
         "https"
     } else {
@@ -1444,30 +1484,6 @@ async fn serve(
     let health = admin::Health::starting();
     let purger_slot: admin::PurgerSlot = Arc::new(OnceLock::new());
     let stats_slot: admin::StatsSlot = Arc::new(OnceLock::new());
-
-    // Server-instance tracking: report this node to the tenant's control plane
-    // (register on boot, heartbeat every 5 min) so the control plane can count
-    // active nodes. Spawned fully DETACHED
-    // here — before any listener binds and outside the data-plane build — so it
-    // never gates readiness and a dead control plane never affects serving. It
-    // reads the live stats through `stats_slot` (filled after recovery), so the
-    // heartbeat carries metrics once the engine is ready. PRIVACY INVARIANT: with
-    // no `[control_plane]` config (and no stored login token), `from_config`
-    // returns None — no task, no network — so a self-hosted server never phones
-    // home.
-    // Per-table metering source (#60), filled after recovery like the stats slot.
-    // The reporter reads it each heartbeat and carries this window's deltas; an
-    // unfilled slot means no metering (older-server-compatible), and no
-    // [control_plane] still means no reporter at all (the privacy invariant).
-    let metering_slot: node_report::MeteringSlot = Arc::new(OnceLock::new());
-    if let Some(reporter) = node_report::NodeReporter::from_config(config, Some(stats_slot.clone()))
-        .map(|r| r.with_metering(metering_slot.clone()))
-    {
-        eprintln!(
-            "verglas-server {VERSION} control-plane node reporting enabled (register + 5m heartbeat)"
-        );
-        tokio::spawn(reporter.run());
-    }
     let metrics_slot: admin::MetricsSlot = Arc::new(OnceLock::new());
     let table_metrics_slot: admin::TablesReportSlot = Arc::new(OnceLock::new());
     // The membership probe (#27) and the drain control (#31) exist only when
@@ -1652,13 +1668,13 @@ async fn serve(
         // ring interface). Placement rides the same `LiveRing` the engine serves
         // from, so the instance never disagrees with the read path about who
         // owns a key; the commit log is the single-node no-quorum default here.
-        // The fleet swaps in a clustered ring membership and a PG-quorum commit
-        // log behind these same traits from the host-agent/PG-WAL side. Built
-        // before the ring is moved into the engine (LiveRing is a cheap Arc
-        // handle); it adds nothing to the read/write hot path.
+        // A multi-node deployment can swap in a clustered ring membership and a
+        // PG-quorum commit log behind these same traits. Built before the ring
+        // is moved into the engine (LiveRing is a cheap Arc handle); it adds
+        // nothing to the read/write hot path.
         let cache_instance = build_cache_instance(ring.clone(), node_id.clone());
         eprintln!(
-            "verglas-server {VERSION} cache instance `{}` ready — commit seam: {} (ring member; the fleet plugs a PG quorum + clustered ring in behind the CommitLog/RingMembership traits)",
+            "verglas-server {VERSION} cache instance `{}` ready — commit seam: {} (ring member; CommitLog/RingMembership traits allow a PG quorum + clustered ring)",
             cache_instance.node_id().as_str(),
             if cache_instance.is_quorum() {
                 "quorum"
@@ -1832,24 +1848,14 @@ async fn serve(
             hooks.telemetry.clone(),
             hooks.mapper.clone(),
         ));
-        // Fill the per-table admin report and the metering source (both read the
-        // same rollup, keeping the customer-auditable-billing property). Present
-        // only when the mapper + telemetry exist (prefetch on).
+        // Fill the per-table admin report when the mapper + telemetry exist
+        // (prefetch on).
         if let (Some(telemetry), Some(mapper)) = (&hooks.telemetry, &hooks.mapper) {
-            {
-                let telemetry = telemetry.clone();
-                let mapper = mapper.clone();
-                let _ = table_metrics_slot.set(Arc::new(move || {
-                    telemetry.table_report(table_name_resolver(Some(&mapper)))
-                }));
-            }
-            {
-                let telemetry = telemetry.clone();
-                let mapper = mapper.clone();
-                let _ = metering_slot.set(Arc::new(move || {
-                    telemetry.metering_snapshot(table_name_resolver(Some(&mapper)))
-                }));
-            }
+            let telemetry = telemetry.clone();
+            let mapper = mapper.clone();
+            let _ = table_metrics_slot.set(Arc::new(move || {
+                telemetry.table_report(table_name_resolver(Some(&mapper)))
+            }));
         }
         if let (Some(slot), Some(agent)) = (&members_slot, &agent) {
             let _ = slot.set(members_source(agent.clone()));
@@ -1892,8 +1898,7 @@ async fn serve(
                         // Follow workers run continuously, not per-tick, so a
                         // dedicated manager keeps one runner alive per active
                         // follow worker — tailing a file or wrapping a command and
-                        // streaming captured lines to the target table (the cloud
-                        // lakehouse when this server is logged in).
+                        // streaming captured lines to the target table.
                         let follow_manager =
                             Arc::new(follow::FollowManager::new(catalog.clone(), sys_catalog));
                         follow::spawn_follow_manager(follow_manager);
@@ -2189,8 +2194,8 @@ async fn stream_into_store(
 /// engine serves from, so the instance and the read path never disagree about
 /// ownership. The commit log is the single-node no-quorum default
 /// ([`verglas_instance::LocalCommitLog`]): a self-hosted node records commits
-/// locally and immediately. The fleet replaces the commit log with its
-/// PG-quorum implementation and, when it lands its remote peer transport, the
+/// locally and immediately. A multi-node deployment can replace the commit log
+/// with a PG-quorum implementation and, when remote peer transport lands, the
 /// ring membership too — both behind the crate's traits, without a change here.
 fn build_cache_instance(ring: LiveRing, node_id: NodeId) -> verglas_instance::CacheInstance {
     let membership = Arc::new(verglas_instance::RingAdapter::new(

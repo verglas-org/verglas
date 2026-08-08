@@ -2,14 +2,12 @@
 
 `verglas-scheduler` is the open-source durable Postgres run queue. It records work before
 execution, gives one consumer a fenced claim, and records the result. It does
-not decide where a run executes and it does not start a process, container, or
-microVM.
+not decide where a run executes and it does not start a process or container.
 
-This boundary lets the same queue serve both deployments:
+This boundary keeps the queue independent of placement:
 
-- On-prem, the scheduler service claims a run and executes the local worker.
-- In cloud, the private cloud scheduler claims a run, chooses one of the fleet
-  servers, and asks that server's host agent to start a microVM container.
+- The scheduler service claims a run and executes the local worker harness.
+- Execution adapters live outside this crate; the queue only owns durable claims.
 
 ## Queue contract
 
@@ -37,14 +35,12 @@ The crate owns the queue types, storage interface, and state-machine rules.
 Execution begins only after a caller receives a claimed run:
 
 ```text
-trigger -> RunQueue -> claimed run
-                           /     \
-                 on-prem consumer cloud consumer
+trigger -> RunQueue -> claimed run -> local executor
 ```
 
-`RunQueue` must not contain placement, fleet capacity, host-agent RPC,
-Cloudflare, OCI, Firecracker, or an execution abstraction. A deployment consumes
-the claim and does whatever execution is appropriate outside this crate.
+`RunQueue` must not contain placement, host capacity, OCI, or an execution
+abstraction. A deployment consumes the claim and does whatever execution is
+appropriate outside this crate.
 
 ## On-prem service
 

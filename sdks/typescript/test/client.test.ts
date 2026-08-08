@@ -72,13 +72,13 @@ describe("shared SDK parity contract", () => {
 
 describe("append -> ingest contract", () => {
   it("POSTs JSONL rows to /v1/ingest/{name} and surfaces the response", async () => {
-    const res = await client.table("cloud.job_runs").append([{ a: 1 }, { a: 2 }]);
+    const res = await client.table("demo.job_runs").append([{ a: 1 }, { a: 2 }]);
     expect(res.rowsCommitted).toBe(2);
     expect(res.snapshotId).toMatch(/^snap-/);
     expect(res.idempotent).toBe(false);
 
     const ingest = endpoint.requests.find(
-      (r) => r.method === "POST" && r.path === "/v1/ingest/cloud.job_runs",
+      (r) => r.method === "POST" && r.path === "/v1/ingest/demo.job_runs",
     );
     expect(ingest?.body).toEqual({
       rows: [{ a: 1 }, { a: 2 }],

@@ -33,19 +33,14 @@ pub struct Cli {
 
 /// Top-level `verglas` subcommands.
 ///
-/// Local commands operate against the selected server and Iceberg catalog.
-/// Logged-in commands manage the tenant's container and worker deployments
-/// through the control plane. Workers are the single scheduled/event-driven
-/// compute primitive; there are no source, MV, or sink command groups.
+/// Every command operates against the selected server and Iceberg catalog.
+/// Workers are the single scheduled/event-driven compute primitive; there are
+/// no source, MV, or sink command groups.
 ///
 /// The CLI's own version is a flag (`-V`/`--version`), not a subcommand; the
 /// running server's version is reported by `verglas status`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Log in to Verglas Cloud (browser by default). Stores the API key locally
-    /// (mode 0600) and the control-plane URL in config. Local commands keep
-    /// working without it; re-run to refresh credentials.
-    Login(LoginArgs),
     /// Drain this node: stop taking new cache ownership, donate warmth to
     /// peers, then exit.
     Drain(DrainArgs),
@@ -70,38 +65,12 @@ pub enum Command {
     /// Available when the self-hosted Compose analytics profile is running.
     #[command(subcommand)]
     Dashboard(DashboardCommand),
-    /// Cloud workers — scheduled or event-driven container executions on the
-    /// Verglas cloud or a registered node. `list`/`get` read them;
-    /// `create`/`update`/`delete` manage them from a spec file; `run` dispatches
-    /// one now; `logs` tails its runtime output. Requires `verglas login`.
+    /// Scheduled or event-driven workers on the local server registry.
+    /// `list`/`get` read them; `create`/`delete` manage them from a spec file;
+    /// `run` dispatches one now; `follow` streams a local process or file into
+    /// a table.
     #[command(subcommand)]
     Workers(WorkersCommand),
-    /// Cloud containers — long-lived per-tenant container deployments on the
-    /// control plane. `list`/`get` read them; `create`/`update`/`delete` manage
-    /// them from a spec file; `scale`/`stop`/`resume` control their running
-    /// instances. Requires `verglas login`.
-    #[command(subcommand)]
-    Containers(ContainersCommand),
-    /// Cloud databases — the tenant's managed serverless Postgres databases on
-    /// the control plane. `list` shows them; `create` provisions one and prints
-    /// its one-time connection credentials; `delete` tears one down. Requires
-    /// `verglas login`.
-    #[command(subcommand)]
-    Db(DbCommand),
-    /// Cloud block volumes — the tenant's durable, cache-served block volumes on
-    /// the control plane. `list`/`get` read them; `create` reserves one at a given
-    /// size; `resize` grows one (grow only); `delete` removes one (refused while it
-    /// is attached to a deployment). Requires `verglas login`.
-    #[command(subcommand)]
-    Volumes(VolumesCommand),
-    /// Cloud secrets — the tenant's named worker secrets on the control plane. A
-    /// cloud deployment references a secret by name (`@secret:NAME` in its
-    /// config); at dispatch the value is sealed to the box that runs the worker,
-    /// so only that box can open it. `list` shows the names (values are never
-    /// returned); `set` stores a value; `delete` removes one. Requires
-    /// `verglas login`.
-    #[command(subcommand)]
-    Secrets(SecretsCommand),
     /// Set and get small raw values in the built-in persistent KV engine.
     #[command(subcommand)]
     Kv(KvCommand),
@@ -232,87 +201,31 @@ pub struct DashboardNameArgs {
     pub name: String,
 }
 
-/// `verglas secrets` subcommands. Secrets are control-plane resources; every verb
-/// calls the control plane and takes `--json`. A stored value is NEVER returned
-/// by the control plane and never printed by the CLI.
-#[derive(Debug, Subcommand)]
-pub enum SecretsCommand {
-    /// List the names of the tenant's secrets. Names only — the control plane
-    /// never returns a stored value.
-    List,
-    /// Store a secret value under `NAME`. The value comes from `--value`, from
-    /// `--file <path>`, or (the default) is read from stdin so it never lands in
-    /// your shell history. An empty value is refused. A deployment references the
-    /// secret by name as `@secret:NAME` in its config.
-    Set(SecretSetArgs),
-    /// Delete a secret by name.
-    Delete(SecretNameArgs),
-}
-
-/// Arguments for `verglas secrets set`.
-#[derive(Debug, Args)]
-pub struct SecretSetArgs {
-    /// The secret name (e.g. `EXAMPLE_API_KEY`), referenced from a deployment as
-    /// `@secret:NAME`.
-    pub name: String,
-    /// The secret value on the command line. Convenient for scripts, but it lands
-    /// in your shell history — prefer stdin (the default) or `--file`. Mutually
-    /// exclusive with `--file`.
-    #[arg(long, conflicts_with = "file")]
-    pub value: Option<String>,
-    /// Read the secret value from this file. Mutually exclusive with `--value`.
-    #[arg(long, conflicts_with = "value")]
-    pub file: Option<PathBuf>,
-}
-
-/// A secret referenced by its name.
-#[derive(Debug, Args)]
-pub struct SecretNameArgs {
-    /// The secret name.
-    pub name: String,
-}
-
-/// `verglas workers` subcommands. Workers are control-plane deployments; every
-/// verb calls the control plane and takes `--json` for a machine-readable shape.
+/// `verglas workers` subcommands against the local server registry
+/// (`/v1/workers`). Every verb takes `--json` for a machine-readable shape.
 #[derive(Debug, Subcommand)]
 pub enum WorkersCommand {
-    /// List every worker (cloud and node deployments) the control plane knows for
-    /// this tenant.
+    /// List every active worker on the local server.
     List,
-    /// Show one worker's full detail, including its code and config. Accepts the
-    /// worker's control-plane id or its name.
+    /// Show one worker's full detail by name.
     Get(WorkerRefArgs),
-    /// Register a worker from a portable spec file (`--file`, JSON or TOML). The
-    /// same file registers on the cloud (the default) or, with `--local`, on the
-    /// local server. `--name`/`--schedule` override the matching spec fields.
+    /// Register a worker from a portable spec file (`--file`, JSON or TOML).
+    /// `--name`/`--schedule` override the matching spec fields.
     Create(WorkerCreateArgs),
-    /// Update a worker from a spec file (`--file`) and/or the common overrides
-    /// (`--schedule`, `--status`). Accepts the worker's id or name.
-    Update(WorkerUpdateArgs),
-    /// Delete a worker (undeploys a cloud worker). Accepts the worker's id or name.
+    /// Archive a worker (lifecycle state transition). Accepts the worker's name.
     Delete(WorkerRefArgs),
-    /// Dispatch a manual run of the worker now. Accepts the worker's id or name.
+    /// Dispatch a manual run of the worker now. Accepts the worker's name.
     Run(WorkerRefArgs),
-    /// Tail a worker's runtime logs. Accepts the worker's id or name.
-    Logs(WorkerRefArgs),
     /// Follow a local process or file and stream every captured line into a table
     /// as rows. Wraps a command after `--`, or tails `--file <path>`. Streams
     /// until Ctrl-C, then tears the worker down; `--keep` leaves it registered.
-    /// When the server is logged in, the rows land in your cloud lakehouse.
     Follow(WorkerFollowArgs),
-    /// Push a locally-registered worker (its spec and bundled files) to the cloud
-    /// as a deployment. Secrets never ride along — a missing `@secret:` reference
-    /// is reported so you can set it in the cloud. Accepts the worker's name.
-    Push(WorkerPushArgs),
-    /// Pull a cloud worker down to a local portable spec file (the reverse of
-    /// push). Accepts the worker's id or name.
-    Pull(WorkerPullArgs),
 }
 
-/// A worker referenced by its control-plane id or its name.
+/// A worker referenced by its registered name.
 #[derive(Debug, Args)]
 pub struct WorkerRefArgs {
-    /// The worker's control-plane id, or its name (resolved via the worker list).
+    /// The worker's name in the local registry.
     pub worker: String,
 }
 
@@ -322,10 +235,6 @@ pub struct WorkerCreateArgs {
     /// The portable worker spec, a JSON (`.json`) or TOML (`.toml`) object.
     #[arg(long)]
     pub file: PathBuf,
-    /// Register on the LOCAL server instead of the cloud. The same spec file works
-    /// for both — develop and test locally, then push (or create) to the cloud.
-    #[arg(long)]
-    pub local: bool,
     /// Override the spec's `name`.
     #[arg(long)]
     pub name: Option<String>,
@@ -355,243 +264,6 @@ pub struct WorkerFollowArgs {
     /// captured as rows.
     #[arg(last = true)]
     pub command: Vec<String>,
-}
-
-/// Arguments for `verglas workers push`.
-#[derive(Debug, Args)]
-pub struct WorkerPushArgs {
-    /// The name of a locally-registered worker to push to the cloud.
-    pub worker: String,
-    /// Place the pushed worker on the bare-metal fleet instead of the default
-    /// cloud runtime.
-    #[arg(long)]
-    pub fleet: bool,
-}
-
-/// Arguments for `verglas workers pull`.
-#[derive(Debug, Args)]
-pub struct WorkerPullArgs {
-    /// The cloud worker's id, or its name.
-    pub worker: String,
-    /// Write the portable spec to this file (TOML) instead of printing it.
-    #[arg(long)]
-    pub file: Option<PathBuf>,
-}
-
-/// Arguments for `verglas workers update`.
-#[derive(Debug, Args)]
-pub struct WorkerUpdateArgs {
-    /// The worker's control-plane id, or its name (resolved via the worker list).
-    pub worker: String,
-    /// A spec file (JSON or TOML) whose fields become the update body. Omit to
-    /// send only the `--schedule`/`--status` overrides.
-    #[arg(long)]
-    pub file: Option<PathBuf>,
-    /// Set the worker's `schedule`.
-    #[arg(long)]
-    pub schedule: Option<String>,
-    /// Set the worker's `status` (e.g. `active`, `paused`).
-    #[arg(long)]
-    pub status: Option<String>,
-}
-
-/// `verglas containers` subcommands. Containers are control-plane resources;
-/// every verb calls the control plane and takes `--json`.
-#[derive(Debug, Subcommand)]
-pub enum ContainersCommand {
-    /// List every container the control plane knows for this tenant.
-    List,
-    /// Show one container's full detail. Accepts the container's id.
-    Get(ContainerRefArgs),
-    /// Create a container from a spec file (`--file`, JSON or TOML) carrying its
-    /// config (`image`, `mode`, `min_instances`, `max_instances`, `schedule`,
-    /// `resources`, `data`). `--name` overrides the spec's name.
-    Create(ContainerCreateArgs),
-    /// Update a container from a spec file (`--file`). Accepts the container's id.
-    Update(ContainerUpdateArgs),
-    /// Delete a container. Accepts the container's id.
-    Delete(ContainerRefArgs),
-    /// Scale a container to `--instances` running instances. Accepts its id.
-    Scale(ContainerScaleArgs),
-    /// Stop a container (scale to zero). Accepts its id.
-    Stop(ContainerRefArgs),
-    /// Resume a stopped container. Accepts its id.
-    Resume(ContainerRefArgs),
-    /// List the curated catalog apps you can deploy (id, description, whether each
-    /// serves a web UI, speaks MCP, and is deployed to every tenant by default).
-    Catalog,
-    /// Deploy a curated catalog app as one of this tenant's containers. Idempotent:
-    /// an app already deployed is reported and left untouched. Prints the container
-    /// id, the UI hostname when the app has one, and the MCP endpoint when declared.
-    Deploy(ContainerDeployArgs),
-    /// Show or set a curated container's configuration. With no flags it shows the
-    /// config schema and current mode/values (secrets are shown only as set/unset).
-    /// With `--set`/`--mode` it writes the config and relaunches the container.
-    Config(ContainerConfigArgs),
-    /// Push a container image into your tenant registry so the cloud can run it —
-    /// the same portability story as workers, over the bring-your-own-image path.
-    /// Give the image reference the cloud pulls (`docker://…`); the fleet converts
-    /// it to a bootable rootfs. Local container execution is out of scope.
-    Push(ContainerPushArgs),
-}
-
-/// Arguments for `verglas containers push`.
-#[derive(Debug, Args)]
-pub struct ContainerPushArgs {
-    /// The image reference to push, e.g. `docker://ghcr.io/acme/app:1.2`. The
-    /// cloud pulls and converts it; a purely-local image must first be pushed to a
-    /// registry the cloud can reach.
-    pub image: String,
-    /// The name to register the image under in your tenant registry. Defaults to
-    /// the image's repository name.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// The tag to register. Defaults to the image reference's tag, or `latest`.
-    #[arg(long)]
-    pub tag: Option<String>,
-}
-
-/// Arguments for `verglas containers deploy`.
-#[derive(Debug, Args)]
-pub struct ContainerDeployArgs {
-    /// The catalog app id to deploy (see `verglas containers catalog`).
-    pub catalog_id: String,
-}
-
-/// Arguments for `verglas containers config`.
-#[derive(Debug, Args)]
-pub struct ContainerConfigArgs {
-    /// The container's control-plane id.
-    pub container: String,
-    /// Set a config field as `KEY=VALUE`, repeatable. Use `KEY=-` to read the
-    /// value from stdin (one line per `-`, in the order given) — the right way to
-    /// pass a secret, keeping it out of your shell history.
-    #[arg(long = "set", value_name = "KEY=VALUE")]
-    pub set: Vec<String>,
-    /// The config mode to select (e.g. `default` or `custom`). When omitted while
-    /// setting fields, the container's current mode is kept.
-    #[arg(long)]
-    pub mode: Option<String>,
-}
-
-/// A container referenced by its control-plane id.
-#[derive(Debug, Args)]
-pub struct ContainerRefArgs {
-    /// The container's control-plane id.
-    pub container: String,
-}
-
-/// Arguments for `verglas containers create`.
-#[derive(Debug, Args)]
-pub struct ContainerCreateArgs {
-    /// The container spec, a JSON (`.json`) or TOML (`.toml`) object carrying the
-    /// full container config. This is the whole request body.
-    #[arg(long)]
-    pub file: PathBuf,
-    /// Override the spec's `name`.
-    #[arg(long)]
-    pub name: Option<String>,
-}
-
-/// Arguments for `verglas containers update`.
-#[derive(Debug, Args)]
-pub struct ContainerUpdateArgs {
-    /// The container's control-plane id.
-    pub container: String,
-    /// A spec file (JSON or TOML) whose fields become the update body.
-    #[arg(long)]
-    pub file: PathBuf,
-}
-
-/// Arguments for `verglas containers scale`.
-#[derive(Debug, Args)]
-pub struct ContainerScaleArgs {
-    /// The container's control-plane id.
-    pub container: String,
-    /// The number of running instances to scale to.
-    #[arg(long)]
-    pub instances: u32,
-}
-
-/// `verglas db` subcommands. Databases are control-plane resources; every verb
-/// calls the control plane and takes `--json`.
-#[derive(Debug, Subcommand)]
-pub enum DbCommand {
-    /// List every managed database the control plane knows for this tenant.
-    List,
-    /// Provision a database and print its one-time connection credentials. The
-    /// password is shown once and never stored by the CLI.
-    Create(DbCreateArgs),
-    /// Delete a database by name.
-    Delete(DbNameArgs),
-}
-
-/// A database referenced by its name.
-#[derive(Debug, Args)]
-pub struct DbNameArgs {
-    /// The database name.
-    pub name: String,
-}
-
-/// Arguments for `verglas db create`.
-#[derive(Debug, Args)]
-pub struct DbCreateArgs {
-    /// The database name.
-    pub name: String,
-    /// The database engine: `postgres` (default), `mysql`, or `clickhouse`. Every
-    /// database is its own serverless deployment (own VM, own storage, scales to
-    /// zero); the control plane validates the value and returns the engine's
-    /// connection endpoint.
-    #[arg(long = "type", default_value = "postgres")]
-    pub db_type: String,
-}
-
-/// `verglas volumes` subcommands. Volumes are control-plane resources; every verb
-/// calls the control plane and takes `--json`.
-#[derive(Debug, Subcommand)]
-pub enum VolumesCommand {
-    /// List every block volume the control plane knows for this tenant.
-    List,
-    /// Show one volume's detail: size, state, attachment, and its durable id.
-    Get(VolumeNameArgs),
-    /// Reserve a block volume of the given size. Its durable disk is created on
-    /// first attach. `--size` accepts a byte count or a suffixed size (e.g. `10GiB`,
-    /// `500MB`).
-    Create(VolumeCreateArgs),
-    /// Grow a volume to a larger size (grow only — a shrink is refused). `--size`
-    /// accepts a byte count or a suffixed size (e.g. `20GiB`).
-    Resize(VolumeResizeArgs),
-    /// Delete a volume by name. Refused while the volume is attached to a deployment.
-    Delete(VolumeNameArgs),
-}
-
-/// A volume referenced by its name.
-#[derive(Debug, Args)]
-pub struct VolumeNameArgs {
-    /// The volume name.
-    pub name: String,
-}
-
-/// Arguments for `verglas volumes create`.
-#[derive(Debug, Args)]
-pub struct VolumeCreateArgs {
-    /// The volume name.
-    pub name: String,
-    /// The volume size: a byte count (e.g. `10737418240`) or a suffixed size
-    /// (`10GiB`, `500MB`, `2T`). Binary suffixes (KiB/MiB/GiB/TiB) are powers of
-    /// 1024; decimal (KB/MB/GB/TB) are powers of 1000.
-    #[arg(long)]
-    pub size: String,
-}
-
-/// Arguments for `verglas volumes resize`.
-#[derive(Debug, Args)]
-pub struct VolumeResizeArgs {
-    /// The volume name.
-    pub name: String,
-    /// The new, larger size (grow only). Same format as `create --size`.
-    #[arg(long)]
-    pub size: String,
 }
 
 /// `verglas index` subcommands for table-scoped vector (ANN) indexes.
@@ -905,39 +577,10 @@ pub struct QueryArgs {
     pub at: Option<Vec<String>>,
 }
 
-/// Arguments for `verglas login`.
-///
-/// With no mode flag, `verglas login` runs the browser flow: it opens your
-/// browser to authorize and completes over a loopback redirect. `--device` runs
-/// the headless device-code flow (authorize on any device from a printed code).
-/// `--api-key` takes a long-lived key (positional or piped on stdin) for CI and
-/// automation.
-#[derive(Debug, Args)]
-pub struct LoginArgs {
-    /// Override the control plane URL. Default is Verglas Cloud
-    /// (`https://api.verglas.dev`); omit for a normal login.
-    #[arg(long)]
-    pub url: Option<String>,
-
-    /// Run the OAuth device-code flow: print a short code and a URL to open on any
-    /// device, then wait for you to authorize. Suits headless machines.
-    #[arg(long, conflicts_with = "api_key_mode")]
-    pub device: bool,
-
-    /// Authenticate with a long-lived API key instead of a browser flow — the
-    /// automation path. The key is the positional argument or read from stdin.
-    #[arg(long = "api-key")]
-    pub api_key_mode: bool,
-
-    /// The API key, used only with `--api-key`. Omit to read it from stdin, so it
-    /// is not recorded in your shell history.
-    pub api_key: Option<String>,
-}
-
-/// Arguments for `verglas drain` (issue, local-only since): drain the
-/// LOCAL server. The CLI takes no target — it POSTs `/admin/drain` on this
-/// machine's admin endpoint (the loopback default, `VERGLAS_ENDPOINT` /
-/// `--server-endpoint` override), never resolving or addressing other nodes.
+/// Arguments for `verglas drain`: drain the LOCAL server. The CLI takes no
+/// target — it POSTs `/admin/drain` on this machine's admin endpoint (the
+/// loopback default, `VERGLAS_ENDPOINT` / `--server-endpoint` override), never
+/// resolving or addressing other nodes.
 #[derive(Debug, Args)]
 pub struct DrainArgs {
     /// Maximum time to keep serving as a donor before exiting, e.g. `10m`,

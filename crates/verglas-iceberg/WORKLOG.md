@@ -126,3 +126,6 @@
 - #91: Updated engine integration and test documentation for the renamed
   `verglas-server` process. The engine continues to connect directly to the
   customer's catalog and use the server only as its S3 endpoint.
+
+- #66: Rewrote fixed-memory query comments and the compaction e2e header so they no longer mention microVMs or Verglas Cloud.
+- #66: Rewrote engine/connection docs so endpoints are self-host or direct object storage, without a cloud-committer contrast.

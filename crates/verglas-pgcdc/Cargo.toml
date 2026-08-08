@@ -1,6 +1,6 @@
 [package]
 name = "verglas-pgcdc"
-description = "PostgreSQL logical-replication (pgoutput) to Iceberg change-log tables: the CDC runner behind Verglas Cloud's zero-ETL feature"
+description = "PostgreSQL logical-replication (pgoutput) to Iceberg change-log tables: the CDC runner for zero-ETL Postgres-to-Iceberg pipelines"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

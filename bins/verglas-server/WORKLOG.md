@@ -613,3 +613,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   server. This keeps the full server's fragment RPC surface aligned with the
   cache-node implementation.
 - chore: Removed deployment-watermark comments from the sys registry wiring. Server no longer exposes /v1/watermark.
+- #66: Removed verglas login product wording from optional control-plane node-report comments and tests; self-host privacy invariant unchanged.
+- #66: Removed cloud lakehouse / fleet product wording from catalog watcher and cache-instance commit-seam comments.
+- #66: Removed optional external control-plane node reporting and the [control_plane] config field from the OSS server.

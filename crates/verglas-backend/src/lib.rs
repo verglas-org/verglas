@@ -13,7 +13,7 @@
 //! trip another's breaker. One credential set (the node's environment or the
 //! configured credentials file) covers the whole set. Each client hands back a
 //! plain `object_store` handle so the read/write interfaces in `verglas-s3`
-//! consume it without knowing which cloud they are talking to.
+//! consume it without knowing which object store they are talking to.
 //!
 //! The [`BackendStores`] trait is the front-end seam so `verglas-s3` can route
 //! by the request's bucket without depending on the concrete [`BackendStore`].
@@ -1036,7 +1036,7 @@ mod tests {
 
     /// Client construction picks the right builder per provider and builds the
     /// client config without a live network. Each provider's credentials come
-    /// from a file (no env, no round-trip against a real cloud), so the assertion
+    /// from a file (no env, no round-trip against a real object store), so the assertion
     /// is that selection + construction succeed, not that the bytes move.
     #[test]
     fn origin_provider_selects_the_builder_per_provider() {

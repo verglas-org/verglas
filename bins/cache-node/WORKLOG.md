@@ -66,3 +66,5 @@
 - #74: Made origin probing asynchronous so a cache node recovers and serves
   dirty ring data during an origin outage. The fragment server now exposes the
   journal-manifest discovery callback used by cross-node dirty reads.
+- #66: Rewrote block-device and NBD docs for attached NBD clients instead of microVMs, and dropped cloud-fleet wording from the package description.
+- #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.

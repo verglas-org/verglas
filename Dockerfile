@@ -13,17 +13,9 @@ COPY . .
 RUN cargo build --release \
     -p verglas-server \
     -p verglas-scheduler-bin \
-    -p verglas-gadget-runtime \
     -p verglas-container-runtime \
     -p verglas-query \
     -p verglas-write-node
-
-FROM oven/bun:1.3.8 AS gadget-host
-WORKDIR /opt/verglas-gadget-runtime
-COPY crates/verglas-gadget-runtime/runtime/package.json \
-    crates/verglas-gadget-runtime/runtime/bun.lock ./
-RUN bun install --frozen-lockfile --production
-COPY crates/verglas-gadget-runtime/runtime/host.mjs ./host.mjs
 
 FROM oven/bun:1.3.8 AS verglas-integration-runtime
 WORKDIR /opt/verglas-integration-runtime
@@ -60,14 +52,6 @@ USER verglas
 EXPOSE 8340
 ENTRYPOINT ["verglas-scheduler"]
 
-FROM runtime AS verglas-gadget-runtime
-COPY --from=build /src/target/release/verglas-gadget-runtime /usr/local/bin/verglas-gadget-runtime
-COPY --from=gadget-host /usr/local/bin/bun /usr/local/bin/bun
-COPY --from=gadget-host /opt/verglas-gadget-runtime /opt/verglas-gadget-runtime
-USER verglas
-EXPOSE 8350
-ENTRYPOINT ["verglas-gadget-runtime"]
-
 FROM runtime AS verglas-container-runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends python3 \
@@ -75,7 +59,7 @@ RUN apt-get update \
     && mkdir -p /var/lib/verglas-container-runtime
 COPY --from=build /src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime
 COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler
-COPY --from=gadget-host /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=oven/bun:1.3.8 /usr/local/bin/bun /usr/local/bin/bun
 COPY crates/verglas-integration-runtime/runtime.mjs /opt/verglas-integration-runtime/runtime.mjs
 COPY crates/verglas-integration-runtime/contract.mjs /opt/verglas-integration-runtime/contract.mjs
 COPY sdks/typescript/src /opt/verglas-integration-runtime/sdk
