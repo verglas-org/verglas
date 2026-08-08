@@ -622,8 +622,7 @@ async fn put_vessel_composition(
         rollback_services(&state, previous.as_ref(), &resolved_services).await;
         return Err(error);
     }
-    if workers_changed
-        && let Err(error) = register_workers(&endpoint, &token, &plan.workers).await
+    if workers_changed && let Err(error) = register_workers(&endpoint, &token, &plan.workers).await
     {
         rollback_workers(&endpoint, &token, previous.as_ref(), &plan.workers).await;
         rollback_services(&state, previous.as_ref(), &resolved_services).await;
