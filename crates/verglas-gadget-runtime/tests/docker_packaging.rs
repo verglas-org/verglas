@@ -1,4 +1,4 @@
-//! Packaging contract for the standalone Gadget runtime image and Compose service.
+//! Packaging contract for the standalone Gadget runtime image.
 
 /// Resolves a repository file from this crate's manifest directory.
 fn repository_file(name: &str) -> std::path::PathBuf {
@@ -19,20 +19,11 @@ fn dockerfile_builds_the_runtime_binary_and_bun_host() {
 }
 
 #[test]
-fn compose_starts_one_multi_gadget_runtime_by_default() {
+fn compose_does_not_start_a_gadget_runtime_by_default() {
     let compose = std::fs::read_to_string(repository_file("docker-compose.yml"))
         .expect("read repository Compose file");
-    let service = compose
-        .split("  verglas-gadget-runtime:")
-        .nth(1)
-        .expect("Gadget runtime service");
-    let service = service
-        .lines()
-        .take_while(|line| line.is_empty() || line.starts_with("    "))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(service.contains("target: verglas-gadget-runtime"));
-    assert!(service.contains("8350:8350"));
-    assert!(service.contains("VERGLAS_GADGET_MAX_GADGETS"));
-    assert!(!service.lines().any(|line| line.trim() == "profiles:"));
+    assert!(
+        !compose.contains("\n  verglas-gadget-runtime:"),
+        "Gadgets are not part of the Compose bootstrap; optional services use the container runtime manager"
+    );
 }
