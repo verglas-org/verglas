@@ -128,6 +128,8 @@ const delta = await table.delta(snapshot.watermark, { limit: 500 });
 
 ## Follow commits and rows
 
+Catalog commit following is not mounted on the live on-prem router today. The helpers below remain for tests and future feed support; prefer SQL/`query` for production reads until a feed returns.
+
 Follow notifications when you only need commit metadata:
 
 ```ts

@@ -137,4 +137,4 @@ Running `verglas-server` locally (non-obvious gotchas):
 
 TypeScript SDK (`sdks/typescript`): `npm run typecheck` + `npm test` (vitest,
 mock endpoint, no server needed). Bun 1.3.8 is preinstalled for the parity/
-trajectory checks (`node scripts/check-sdk-parity.mjs`, `bash scripts/check-cli-thin.sh`).
+trajectory checks (`node scripts/check-api-surface.mjs`, `bash scripts/check-cli-thin.sh`).

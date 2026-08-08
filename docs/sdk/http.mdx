@@ -1,0 +1,101 @@
+---
+title: "HTTP surface"
+description: "The live Verglas /v1 REST surface covered by the API + SDK parity contract."
+icon: "globe"
+---
+
+This page mirrors [`contracts/api-surface.json`](https://github.com/verglas-org/verglas/blob/main/contracts/api-surface.json) and [`contracts/openapi.json`](https://github.com/verglas-org/verglas/blob/main/contracts/openapi.json). High-level SDKs stay hand-written; OpenAPI is for REST visibility and CI.
+
+## Execution
+
+<!-- op:connect -->
+**connect** — SDK-only session setup (bearer auth). No HTTP route.
+
+<!-- op:ensure_table -->
+**ensure_table** — Iceberg REST `GET/POST …/v1/namespaces/{ns}/tables…` (not Verglas `/v1/tables`). TypeScript: `ensureTable`. Rust: `ensure_table`.
+
+<!-- op:query -->
+**query** — `POST /v1/query`. TypeScript JSON. Rust Arrow IPC stream.
+
+<!-- op:append -->
+**append** — TypeScript/CLI: `POST /v1/ingest/{name}` (JSONL/files). Rust: `POST /v1/write/{name}` (Arrow IPC).
+
+<!-- op:ingest -->
+**ingest** — `POST /v1/ingest/{name}` file create/append (CLI). TypeScript append reuses this route.
+
+<!-- op:namespace -->
+**namespace** — `GET /v1/namespaces`, `GET /v1/namespaces/{namespace}`, `POST …/invoke/{method}`.
+
+<!-- op:kv -->
+**kv** — `GET /v1/kv/{namespace}`, `GET|PUT|DELETE /v1/kv/{namespace}/{*key}`.
+
+## Platform
+
+<!-- op:queue_enqueue -->
+**queue_enqueue** — `POST /v1/queues/{name}/enqueue`
+
+<!-- op:queue_poll -->
+**queue_poll** — `GET /v1/queues/{name}/poll`
+
+<!-- op:queue_ack -->
+**queue_ack** — `POST /v1/queues/{name}/ack`
+
+<!-- op:graph_create -->
+**graph_create** — `POST /v1/graphs/{namespace}`
+
+<!-- op:graph_show -->
+**graph_show** — `GET /v1/graphs/{namespace}`
+
+<!-- op:graph_insert_nodes -->
+**graph_insert_nodes** — `POST /v1/graphs/{namespace}/nodes`
+
+<!-- op:graph_insert_edges -->
+**graph_insert_edges** — `POST /v1/graphs/{namespace}/edges`
+
+<!-- op:graph_build_index -->
+**graph_build_index** — `POST /v1/graphs/{namespace}/index`
+
+<!-- op:graph_query -->
+**graph_query** — `POST /v1/graphs/{namespace}/query`
+
+<!-- op:vector_declare -->
+**vector_declare** — `POST /v1/tables/{name}/indexes`
+
+<!-- op:vector_list -->
+**vector_list** — `GET /v1/tables/{name}/indexes`
+
+<!-- op:vector_search -->
+**vector_search** — `POST /v1/tables/{name}/indexes/{field}/search`
+
+<!-- op:vector_refresh -->
+**vector_refresh** — `POST /v1/tables/{name}/indexes/{field}/refresh` (server route; SDK façade not required)
+
+<!-- op:workers_register -->
+**workers_register** — `POST /v1/workers`
+
+<!-- op:workers_list -->
+**workers_list** — `GET /v1/workers`
+
+<!-- op:workers_show -->
+**workers_show** — `GET /v1/workers/{name}`
+
+<!-- op:workers_set_state -->
+**workers_set_state** — `PUT /v1/workers/{name}/state`
+
+<!-- op:workers_run -->
+**workers_run** — `POST /v1/workers/{name}/run`
+
+<!-- op:hooks -->
+**hooks** — `POST /v1/hooks/{name}`
+
+<!-- op:events -->
+**events** — `POST /v1/events`
+
+<!-- op:dynamic_http -->
+**dynamic_http** — `ANY /v1/http/{*path}`
+
+<!-- op:dashboards_create -->
+**dashboards_create** — `POST /v1/dashboards`
+
+<!-- op:dashboards_list -->
+**dashboards_list** — `GET /v1/dashboards`

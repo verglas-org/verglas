@@ -30,6 +30,16 @@ use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
 
+use crate::graph::{
+    BuildIndexRequest, EdgeInput, GraphCreateReport, GraphDirection, GraphFilter, GraphOp,
+    GraphQueryRequest, GraphQueryResponse, GraphShowReport, IndexReport as GraphIndexReport,
+    InsertEdgesRequest, InsertNodesRequest, InsertReport, NeighborView, NodeInput, PathView,
+    ReachedView,
+};
+use crate::queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult};
+use crate::vector::{
+    DeclareIndexRequest, IndexInfo, IndexReport as VectorIndexReport, SearchRequest, SearchResponse,
+};
 use crate::worker::ChangeEvent;
 
 /// MIME type used by Verglas for Arrow IPC streaming requests and responses.
@@ -459,6 +469,45 @@ impl Client {
         Ok(Kv {
             client: self.clone(),
             namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Returns a handle to one durable queue.
+    pub fn queue(&self, name: &str) -> Result<Queue, ClientError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(ClientError::Configuration(
+                "queue name must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Queue {
+            client: self.clone(),
+            name: name.to_owned(),
+        })
+    }
+
+    /// Returns a handle to one property-graph namespace.
+    pub fn graph(&self, namespace: &str) -> Result<Graph, ClientError> {
+        if namespace.is_empty() || namespace.contains('/') {
+            return Err(ClientError::Configuration(
+                "graph namespace must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Graph {
+            client: self.clone(),
+            namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Returns a handle to one table for vector-index operations.
+    pub fn table(&self, name: &str) -> Result<Table, ClientError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(ClientError::Configuration(
+                "table name must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Table {
+            client: self.clone(),
+            name: name.to_owned(),
         })
     }
 
@@ -1094,6 +1143,376 @@ impl Kv {
             }
         }
         Ok(url)
+    }
+}
+
+/// Shared traversal filters for graph neighbor, k-hop, and path reads.
+#[derive(Debug, Clone, Default)]
+pub struct GraphReadOptions {
+    /// Only follow edges with this predicate, when set.
+    pub predicate: Option<String>,
+    /// Only follow edges whose confidence is at least this, when set.
+    pub min_confidence: Option<f64>,
+    /// Direction to follow edges; defaults to [`GraphDirection::Out`].
+    pub direction: GraphDirection,
+    /// Read the graph as of this edge snapshot when set.
+    pub as_of: Option<i64>,
+}
+
+/// A durable ordered queue bound to one authenticated client.
+#[derive(Debug, Clone)]
+pub struct Queue {
+    client: Client,
+    name: String,
+}
+
+impl Queue {
+    /// Appends rows to the queue and returns the new end position.
+    pub async fn enqueue(&self, rows: Vec<Value>) -> Result<QueueEnqueueResult, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["enqueue"])?))
+                        .json(&json!({ "rows": rows })),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Polls up to `max` records for consumer group `group` from its watermark.
+    pub async fn poll(
+        &self,
+        group: &str,
+        max: Option<usize>,
+    ) -> Result<QueuePollResult, ClientError> {
+        if group.is_empty() {
+            return Err(ClientError::Configuration(
+                "queue poll requires a non-empty group".to_owned(),
+            ));
+        }
+        let mut url = self.url(&["poll"])?;
+        url.query_pairs_mut().append_pair("group", group);
+        if let Some(max) = max {
+            url.query_pairs_mut().append_pair("max", &max.to_string());
+        }
+        let response = Client::require_success(
+            self.client
+                .send(self.client.authorize(self.client.http.get(url)))
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Advances `group`'s watermark to `position` after the consumer commits work.
+    pub async fn ack(&self, group: &str, position: u64) -> Result<QueueAckResult, ClientError> {
+        if group.is_empty() {
+            return Err(ClientError::Configuration(
+                "queue ack requires a non-empty group".to_owned(),
+            ));
+        }
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["ack"])?))
+                        .json(&json!({ "group": group, "position": position })),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Builds a queue URL with path-segment encoding owned by the HTTP client.
+    fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
+        resource_url(&self.client.query_uri, "queues", &self.name, suffix)
+    }
+}
+
+/// A property-graph namespace bound to one authenticated client.
+#[derive(Debug, Clone)]
+pub struct Graph {
+    client: Client,
+    namespace: String,
+}
+
+impl Graph {
+    /// Creates the graph's nodes and edges tables. Idempotent.
+    pub async fn create(&self) -> Result<GraphCreateReport, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&[])?))
+                        .json(&json!({})),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Shows backing tables, live counts, and whether an index is bound.
+    pub async fn show(&self) -> Result<GraphShowReport, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(self.client.authorize(self.client.http.get(self.url(&[])?)))
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Appends nodes and returns the new nodes-table snapshot and count.
+    pub async fn insert_nodes(&self, nodes: Vec<NodeInput>) -> Result<InsertReport, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["nodes"])?))
+                        .json(&InsertNodesRequest { nodes }),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Appends edges and returns the new edges-table snapshot and count.
+    pub async fn insert_edges(&self, edges: Vec<EdgeInput>) -> Result<InsertReport, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["edges"])?))
+                        .json(&InsertEdgesRequest { edges }),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Builds or refreshes the adjacency index for the current edge snapshot.
+    pub async fn build_index(&self) -> Result<GraphIndexReport, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["index"])?))
+                        .json(&BuildIndexRequest::default()),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Returns the direct neighbors of `node`.
+    pub async fn neighbors(
+        &self,
+        node: &str,
+        opts: GraphReadOptions,
+    ) -> Result<Vec<NeighborView>, ClientError> {
+        let response = self
+            .query(GraphQueryRequest {
+                op: GraphOp::Neighbors,
+                start: node.to_owned(),
+                dst: None,
+                direction: opts.direction,
+                k: None,
+                max_hops: None,
+                filter: graph_filter(&opts),
+                as_of: opts.as_of,
+            })
+            .await?;
+        Ok(response.neighbors.unwrap_or_default())
+    }
+
+    /// Returns every node reached within `hops` of `node`.
+    pub async fn k_hop(
+        &self,
+        node: &str,
+        hops: u32,
+        opts: GraphReadOptions,
+    ) -> Result<Vec<ReachedView>, ClientError> {
+        let response = self
+            .query(GraphQueryRequest {
+                op: GraphOp::KHop,
+                start: node.to_owned(),
+                dst: None,
+                direction: opts.direction,
+                k: Some(hops),
+                max_hops: None,
+                filter: graph_filter(&opts),
+                as_of: opts.as_of,
+            })
+            .await?;
+        Ok(response.reached.unwrap_or_default())
+    }
+
+    /// Returns shortest paths from `src` to `dst` within `max_hops`.
+    pub async fn paths(
+        &self,
+        src: &str,
+        dst: &str,
+        max_hops: u32,
+        opts: GraphReadOptions,
+    ) -> Result<Vec<PathView>, ClientError> {
+        let response = self
+            .query(GraphQueryRequest {
+                op: GraphOp::Paths,
+                start: src.to_owned(),
+                dst: Some(dst.to_owned()),
+                direction: opts.direction,
+                k: None,
+                max_hops: Some(max_hops),
+                filter: graph_filter(&opts),
+                as_of: opts.as_of,
+            })
+            .await?;
+        Ok(response.paths.unwrap_or_default())
+    }
+
+    /// Posts one traversal request to the graph query route.
+    async fn query(&self, body: GraphQueryRequest) -> Result<GraphQueryResponse, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["query"])?))
+                        .json(&body),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Builds a graph URL with path-segment encoding owned by the HTTP client.
+    fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
+        resource_url(&self.client.query_uri, "graphs", &self.namespace, suffix)
+    }
+}
+
+/// A table handle for vector-index declaration and search.
+#[derive(Debug, Clone)]
+pub struct Table {
+    client: Client,
+    name: String,
+}
+
+impl Table {
+    /// Declares a vector index on `field` and runs the initial build.
+    pub async fn add_index(
+        &self,
+        field: &str,
+        request: DeclareIndexRequest,
+    ) -> Result<VectorIndexReport, ClientError> {
+        if field.is_empty() {
+            return Err(ClientError::Configuration(
+                "index field must be non-empty".to_owned(),
+            ));
+        }
+        let body = DeclareIndexRequest {
+            field: field.to_owned(),
+            metric: request.metric,
+            id_field: request.id_field,
+            params: request.params,
+        };
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["indexes"])?))
+                        .json(&body),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Lists the vector indexes declared on this table.
+    pub async fn list_indexes(&self) -> Result<Vec<IndexInfo>, ClientError> {
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.get(self.url(&["indexes"])?)),
+                )
+                .await?,
+        )
+        .await?;
+        let body: crate::vector::IndexListResponse =
+            response.json().await.map_err(ClientError::Transport)?;
+        Ok(body.indexes)
+    }
+
+    /// Searches an embedding field for the nearest neighbors of `request.vector`.
+    pub async fn search_index(
+        &self,
+        field: &str,
+        request: SearchRequest,
+    ) -> Result<SearchResponse, ClientError> {
+        if field.is_empty() {
+            return Err(ClientError::Configuration(
+                "index field must be non-empty".to_owned(),
+            ));
+        }
+        let response = Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(
+                            self.client
+                                .http
+                                .post(self.url(&["indexes", field, "search"])?),
+                        )
+                        .json(&request),
+                )
+                .await?,
+        )
+        .await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Builds a table URL with path-segment encoding owned by the HTTP client.
+    fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
+        resource_url(&self.client.query_uri, "tables", &self.name, suffix)
+    }
+}
+
+/// Builds a `/v1/{family}/{name}/...` URL with path-segment encoding.
+fn resource_url(
+    query_uri: &str,
+    family: &str,
+    name: &str,
+    suffix: &[&str],
+) -> Result<reqwest::Url, ClientError> {
+    let mut url = reqwest::Url::parse(query_uri)
+        .map_err(|error| ClientError::Configuration(error.to_string()))?;
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            ClientError::Configuration("query URI cannot carry path segments".to_owned())
+        })?;
+        segments.pop_if_empty().push("v1").push(family).push(name);
+        for segment in suffix {
+            segments.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+/// Maps client read options onto the wire filter object.
+fn graph_filter(opts: &GraphReadOptions) -> GraphFilter {
+    GraphFilter {
+        predicate: opts.predicate.clone(),
+        min_confidence: opts.min_confidence,
     }
 }
 
