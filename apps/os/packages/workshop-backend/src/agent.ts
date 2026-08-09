@@ -563,7 +563,7 @@ Ask the user to connect a gatekeeper resource (e.g. a ClickHouse cluster, a GitH
 `.trim();
 
 let REQUEST_PERMISSION_TOOL_DESCRIPTION = `
-Ask the user to delegate lakehouse or runtime access to a Job, Vessel, Application, Integration, or agent principal. Use stable IDs reported by Verglas: Jobs use \`job/<name>\`, Vessels use \`vessel/<name>\`, tables use \`table/<namespace>.<table>\`, vectors use \`vector/<target>/<field>\`, and graphs use \`graph/<namespace>\`. Request only the exact actions needed. The user can approve only actions they already possess and may pass; Verglas enforces this when they click Approve. Your turn ends until the user decides.
+Ask the user to delegate database or runtime access to a Job, Vessel, Application, Integration, or agent principal. Use stable IDs reported by Verglas: databases use \`database/<database>\`, Jobs use \`job/<name>\`, Vessels use \`vessel/<name>\`, tables use \`table/<database>/<namespace>.<table>\`, vectors use \`vector/<database>/<target>/<field>\`, and graphs use \`graph/<database>/<namespace>\`. Request only the exact actions needed. The user can approve only actions they already possess and may pass; Verglas enforces this when they click Approve. Your turn ends until the user decides.
 `.trim();
 
 let CREATE_SOURCE_TOOL_DESCRIPTION = `

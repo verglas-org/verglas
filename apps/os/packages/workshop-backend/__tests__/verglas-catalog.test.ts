@@ -2,6 +2,8 @@ import {describe, expect, it, vi} from "vitest";
 import {VerglasCatalogClient} from "../src/verglas-catalog.js";
 
 const env = {
+  VERGLAS_ACCESS_URI: "http://localhost:8345/",
+  VERGLAS_ACCESS_SERVICE_TOKEN: "access-secret",
   VERGLAS_ADMIN_URL: "http://localhost:8334/",
   VERGLAS_CONTAINER_RUNTIME_URL: "http://localhost:8360/",
   VERGLAS_CONTAINER_RUNTIME_TOKEN: "runtime-secret",
@@ -40,91 +42,117 @@ describe("VerglasCatalogClient", () => {
     }]);
   });
 
-  it("discovers bounded Iceberg namespaces and tables", async () => {
+  it("discovers databases as resources and scopes Iceberg tables to their lakehouse", async () => {
     const fetcher = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
-      if (url.endsWith("/admin/access")) {
-        return new Response(JSON.stringify({warehouse: "local"}));
+      if (url.endsWith("/v1/databases")) {
+        return Response.json({databases: [{
+          type: "lakehouse",
+          name: "analytics",
+          storage: {mode: "managed"},
+          catalog: {mode: "managed-lakekeeper"},
+        }, {
+          type: "postgres",
+          name: "operations",
+          engine: {mode: "managed-neon"},
+        }]});
       }
-      if (url.includes("/catalog/v1/config?warehouse=local")) {
-        return new Response(JSON.stringify({overrides: {prefix: "catalog-prefix"}}));
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+        return Response.json({namespaces: [["events"], ["knowledge"]]});
       }
-      if (url.endsWith("/catalog/v1/catalog-prefix/namespaces")) {
-        return new Response(JSON.stringify({namespaces: [["rlean"], ["agent_data"]]}));
-      }
-      if (url.endsWith("/namespaces/rlean/tables")) {
-        return new Response(JSON.stringify({identifiers: [
-          {namespace: ["rlean"], name: "runs"},
-        ]}));
-      }
-      if (url.endsWith("/namespaces/agent_data/tables")) {
-        return new Response(JSON.stringify({identifiers: [
-          {namespace: ["agent_data"], name: "documents"},
-        ]}));
-      }
-      return new Response("not found", {status: 404});
-    });
-
-    await expect(new VerglasCatalogClient(env, fetcher).listTables()).resolves.toEqual([
-      {namespace: ["agent_data"], name: "documents", qualifiedName: '"agent_data"."documents"'},
-      {namespace: ["rlean"], name: "runs", qualifiedName: '"rlean"."runs"'},
-    ]);
-  });
-
-  it("keeps empty Iceberg namespaces visible as databases", async () => {
-    const fetcher = vi.fn<typeof fetch>(async (input) => {
-      const url = String(input);
-      if (url.endsWith("/admin/access")) return Response.json({warehouse: "local"});
-      if (url.includes("/catalog/v1/config?warehouse=local")) {
-        return Response.json({overrides: {prefix: "catalog-prefix"}});
-      }
-      if (url.endsWith("/catalog/v1/catalog-prefix/namespaces")) {
-        return Response.json({namespaces: [["empty"], ["events"]]});
-      }
-      if (url.endsWith("/namespaces/empty/tables")) return Response.json({identifiers: []});
-      if (url.endsWith("/namespaces/events/tables")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/events/tables")) {
         return Response.json({identifiers: [{namespace: ["events"], name: "log"}]});
       }
-      if (url.endsWith("/v1/indexes")) return Response.json({indexes: []});
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/knowledge/tables")) {
+        return Response.json({identifiers: [
+          {namespace: ["knowledge"], name: "nodes"},
+          {namespace: ["knowledge"], name: "edges"},
+        ]});
+      }
       return new Response("not found", {status: 404});
     });
 
     await expect(new VerglasCatalogClient(env, fetcher).getCatalog()).resolves.toMatchObject({
       databases: [
-        {name: "empty", tableCount: 0, vectorCount: 0, graph: false},
-        {name: "events", tableCount: 1, vectorCount: 0, graph: false},
+        {
+          type: "lakehouse",
+          name: "analytics",
+          tableCount: 3,
+          capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true},
+        },
+        {
+          type: "postgres",
+          name: "operations",
+          tableCount: 0,
+          capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false},
+        },
       ],
+      tables: [
+        {database: "analytics", namespace: ["events"], name: "log"},
+        {database: "analytics", namespace: ["knowledge"], name: "edges"},
+        {database: "analytics", namespace: ["knowledge"], name: "nodes"},
+      ],
+      graphs: [{database: "analytics", namespace: "knowledge"}],
+      vectors: [],
     });
+    expect(fetcher).toHaveBeenCalledTimes(4);
   });
 
-  it("creates and deletes namespaces and explicit tables through the Iceberg catalog", async () => {
+  it("creates database resources and manages tables through the selected database catalog", async () => {
     const fetcher = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
-      if (url.endsWith("/admin/access")) return Response.json({warehouse: "local"});
-      if (url.includes("/catalog/v1/config?warehouse=local")) {
-        return Response.json({overrides: {prefix: "catalog-prefix"}});
+      if (url.endsWith("/v1/databases/analytics")) return Response.json({
+        type: "lakehouse",
+        name: "analytics",
+        storage: {mode: "managed"},
+        catalog: {mode: "managed-lakekeeper"},
+      });
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+        return Response.json({namespaces: [["events"]]});
+      }
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/events/tables")) {
+        return Response.json({identifiers: []});
+      }
+      if (url.endsWith("/v1/databases") && !input.toString().endsWith("/analytics")) {
+        return Response.json({
+          type: "lakehouse",
+          name: "analytics",
+          storage: {mode: "managed"},
+          catalog: {mode: "managed-lakekeeper"},
+        }, {status: 201});
       }
       return new Response(null, {status: 204});
     });
     const client = new VerglasCatalogClient(env, fetcher);
 
-    await client.createDatabase("analytics");
+    await client.createDatabase({
+      type: "lakehouse",
+      name: "analytics",
+      storage: {mode: "managed"},
+      catalog: {mode: "managed-lakekeeper"},
+    });
     await client.createTable({
-      namespace: ["analytics"],
+      database: "analytics",
+      namespace: ["events"],
       name: "events",
       columns: [{name: "id", type: "int64", nullable: false}],
     });
-    await client.deleteTable(["analytics"], "events");
+    await client.deleteTable("analytics", ["events"], "events");
     await client.deleteDatabase("analytics");
 
     const requests = fetcher.mock.calls.map(([input, init]) => [String(input), init?.method, init?.body]);
     expect(requests).toContainEqual([
-      "http://localhost:8334/catalog/v1/catalog-prefix/namespaces",
+      "http://localhost:8345/v1/databases",
       "POST",
-      JSON.stringify({namespace: ["analytics"], properties: {}}),
+      JSON.stringify({
+        type: "lakehouse",
+        name: "analytics",
+        storage: {mode: "managed"},
+        catalog: {mode: "managed-lakekeeper"},
+      }),
     ]);
     expect(requests).toContainEqual([
-      "http://localhost:8334/catalog/v1/catalog-prefix/namespaces/analytics/tables",
+      "http://localhost:8334/v1/databases/analytics/catalog/v1/namespaces/events/tables",
       "POST",
       JSON.stringify({
         name: "events",
@@ -135,107 +163,86 @@ describe("VerglasCatalogClient", () => {
       }),
     ]);
     expect(requests).toContainEqual([
-      "http://localhost:8334/catalog/v1/catalog-prefix/namespaces/analytics/tables/events",
+      "http://localhost:8334/v1/databases/analytics/catalog/v1/namespaces/events/tables/events",
       "DELETE",
       undefined,
     ]);
     expect(requests).toContainEqual([
-      "http://localhost:8334/catalog/v1/catalog-prefix/namespaces/analytics",
+      "http://localhost:8345/v1/databases/analytics",
       "DELETE",
       undefined,
     ]);
   });
 
-  it("builds a lakehouse catalog with table, vector, and graph assets", async () => {
+  it("rejects deleting a non-empty lakehouse before calling the access service delete", async () => {
     const fetcher = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
-      if (url.endsWith("/admin/access")) return new Response(JSON.stringify({warehouse: "local"}));
-      if (url.includes("/catalog/v1/config?warehouse=local")) {
-        return new Response(JSON.stringify({overrides: {prefix: "catalog-prefix"}}));
+      if (url.endsWith("/v1/databases/analytics")) return Response.json({
+        type: "lakehouse", name: "analytics", storage: {mode: "managed"},
+        catalog: {mode: "managed-lakekeeper"},
+      });
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+        return Response.json({namespaces: [["events"]]});
       }
-      if (url.endsWith("/catalog/v1/catalog-prefix/namespaces")) {
-        return new Response(JSON.stringify({namespaces: [["knowledge"], ["rlean"]]}));
-      }
-      if (url.endsWith("/namespaces/knowledge/tables")) {
-        return new Response(JSON.stringify({identifiers: [
-          {namespace: ["knowledge"], name: "nodes"},
-          {namespace: ["knowledge"], name: "edges"},
-        ]}));
-      }
-      if (url.endsWith("/namespaces/rlean/tables")) {
-        return new Response(JSON.stringify({identifiers: [{namespace: ["rlean"], name: "runs"}]}));
-      }
-      if (url.endsWith("/v1/indexes")) {
-        return new Response(JSON.stringify({indexes: [{
-          target: "tbl:rlean.runs",
-          field: "embedding",
-          metric: "cosine",
-          reflected_snapshot: 42,
-          live_count: 1200,
-        }]}));
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/events/tables")) {
+        return Response.json({identifiers: [{namespace: ["events"], name: "log"}]});
       }
       return new Response("not found", {status: 404});
     });
 
-    await expect(new VerglasCatalogClient(env, fetcher).getCatalog()).resolves.toMatchObject({
-      tables: expect.arrayContaining([
-        {namespace: ["rlean"], name: "runs", qualifiedName: '"rlean"."runs"'},
-      ]),
-      graphs: [{
-        namespace: "knowledge",
-        nodesTable: '"knowledge"."nodes"',
-        edgesTable: '"knowledge"."edges"',
-      }],
-      vectors: [{
-        target: "tbl:rlean.runs",
-        field: "embedding",
-        metric: "cosine",
-        reflectedSnapshot: 42,
-        liveCount: 1200,
-      }],
-    });
+    await expect(new VerglasCatalogClient(env, fetcher).deleteDatabase("analytics"))
+      .rejects.toThrow("contains 1 table");
+    expect(fetcher.mock.calls.some(([input, init]) =>
+      String(input).endsWith("/v1/databases/analytics") && init?.method === "DELETE")).toBe(false);
   });
 
-  it("returns selected database tables with physical and cache-usage metrics", async () => {
+  it("creates a missing namespace as part of the first table creation", async () => {
     const fetcher = vi.fn<typeof fetch>(async (input) => {
       const url = String(input);
-      if (url.endsWith("/admin/access")) return Response.json({warehouse: "local"});
-      if (url.includes("/catalog/v1/config?warehouse=local")) {
-        return Response.json({overrides: {prefix: "catalog-prefix"}});
-      }
-      if (url.endsWith("/catalog/v1/catalog-prefix/namespaces")) {
-        return Response.json({namespaces: [["analytics"]]});
-      }
-      if (url.endsWith("/namespaces/analytics/tables")) {
-        return Response.json({identifiers: [{namespace: ["analytics"], name: "events"}]});
-      }
-      if (url.endsWith("/v1/indexes")) return Response.json({indexes: []});
-      if (url.endsWith("/v1/metering/tables")) return Response.json({tables: [{
-        table: "analytics.events",
-        hits: 9,
-        misses: 1,
-        bytes_served: 4096,
-        cache_bytes: 3072,
-        requests_avoided: 9,
-        latency_saved_seconds: 0.25,
-      }]});
-      if (url.endsWith("/v1/tables/analytics.events/describe")) return Response.json({
-        row_count: 42,
-        file_count: 2,
-        size_bytes: 8192,
-        current_snapshot_id: 7,
+      if (url.endsWith("/v1/databases/analytics")) return Response.json({
+        type: "lakehouse", name: "analytics", storage: {mode: "managed"},
+        catalog: {mode: "managed-lakekeeper"},
       });
-      return new Response("not found", {status: 404});
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+        return Response.json({namespaces: []});
+      }
+      return new Response(null, {status: 204});
     });
 
-    await expect(new VerglasCatalogClient(env, fetcher).getDatabase("analytics")).resolves.toMatchObject({
-      name: "analytics",
-      tables: [{
-        name: "events",
-        physical: {rowCount: 42, fileCount: 2, sizeBytes: 8192, currentSnapshotId: 7},
-        usage: {hits: 9, bytesServed: 4096, cacheBytes: 3072},
-      }],
+    await new VerglasCatalogClient(env, fetcher).createTable({
+      database: "analytics",
+      namespace: ["events"],
+      name: "log",
+      columns: [{name: "id", type: "int64"}],
     });
+
+    expect(fetcher.mock.calls.map(([input, init]) => [String(input), init?.method, init?.body]))
+      .toContainEqual([
+        "http://localhost:8334/v1/databases/analytics/catalog/v1/namespaces",
+        "POST",
+        JSON.stringify({namespace: ["events"], properties: {}}),
+      ]);
+  });
+
+  it("reports Postgres catalog operations as unsupported without probing Iceberg routes", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({
+      type: "postgres", name: "operations", engine: {mode: "managed-neon"},
+    }));
+    const client = new VerglasCatalogClient(env, fetcher);
+
+    await expect(client.getDatabase("operations")).resolves.toMatchObject({
+      type: "postgres",
+      name: "operations",
+      capabilities: {catalog: false, tableCrud: false},
+      tables: [],
+    });
+    await expect(client.createTable({
+      database: "operations",
+      namespace: ["public"],
+      name: "events",
+      columns: [{name: "id", type: "int64"}],
+    })).rejects.toThrow("does not expose Iceberg table management");
+    expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
   it("wraps read SQL with a limit and reports truncation", async () => {

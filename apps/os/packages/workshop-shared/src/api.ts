@@ -521,26 +521,26 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Updates worker lifecycle state (pause / resume / archive-as-delete). */
   setVerglasWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void>;
 
-  /** Lists tables discoverable through the configured local Verglas catalog. */
+  /** Lists tables discoverable across the tenant's database-scoped Lakehouse catalogs. */
   listVerglasTables(): Promise<VerglasTableSummary[]>;
 
-  /** Returns the bounded Tables, Vectors, and Graphs catalog for the Lakehouse explorer. */
+  /** Returns bounded database resources and their safely scoped Tables, Vectors, and Graphs. */
   getVerglasCatalog(): Promise<VerglasCatalogSnapshot>;
 
-  /** Returns one database namespace with bounded physical and cache-usage metrics for its tables. */
+  /** Returns one tenant database resource and the data surfaces it currently exposes. */
   getVerglasDatabase(name: string): Promise<VerglasDatabaseDetail>;
 
-  /** Creates an empty Iceberg namespace, presented in the OS as a database. */
-  createVerglasDatabase(name: string): Promise<void>;
+  /** Creates one Lakehouse or Postgres database resource through the tenant access service. */
+  createVerglasDatabase(input: VerglasCreateDatabaseInput): Promise<VerglasDatabaseSummary>;
 
-  /** Deletes an empty Iceberg namespace; non-empty databases are rejected by the catalog. */
+  /** Deletes a database resource; non-empty Lakehouses are rejected before deletion. */
   deleteVerglasDatabase(name: string): Promise<void>;
 
-  /** Creates one table with an explicit Iceberg schema inside an existing or new database namespace. */
+  /** Creates one table with an explicit Iceberg schema inside a selected Lakehouse database. */
   createVerglasTable(input: VerglasCreateTableInput): Promise<VerglasTableSummary>;
 
-  /** Deletes one Iceberg table from its namespace. */
-  deleteVerglasTable(namespace: string[], name: string): Promise<void>;
+  /** Deletes one Iceberg table from a selected Lakehouse database and namespace. */
+  deleteVerglasTable(database: string, namespace: string[], name: string): Promise<void>;
 
   /** Lists local Verglas Vessels without exposing their secret configuration. */
   listVerglasVessels(): Promise<VerglasVesselSummary[]>;
@@ -1140,8 +1140,10 @@ export type VerglasWorkerDetail = VerglasWorkerSummary & {
   config: string;
 };
 
-/** One table discoverable through the local Verglas Iceberg catalog. */
+/** One table discoverable through a database-scoped Verglas Iceberg catalog. */
 export type VerglasTableSummary = {
+  /** Tenant-local database containing the catalog. */
+  database: string;
   /** Namespace components containing the table. */
   namespace: string[];
   /** Unqualified Iceberg table name. */
@@ -1170,6 +1172,8 @@ export type VerglasTablePartition = {
 
 /** Input required to create one explicit Iceberg table. */
 export type VerglasCreateTableInput = {
+  /** Tenant-local Lakehouse database that owns the table. */
+  database: string;
   /** Namespace components containing the new table. */
   namespace: string[];
   /** New unqualified table name. */
@@ -1218,26 +1222,97 @@ export type VerglasTableDetail = VerglasTableSummary & {
   usage?: VerglasTableUsageMetrics;
 };
 
-/** One Iceberg namespace rendered by the OS as a database. */
-export type VerglasDatabaseSummary = {
-  /** Dot-separated namespace name. */
-  name: string;
-  /** Number of tables in the namespace. */
-  tableCount: number;
-  /** Number of maintained vector indexes targeting tables in the namespace. */
-  vectorCount: number;
-  /** Whether the namespace is a property graph with nodes and edges backing tables. */
-  graph: boolean;
+/** Managed object storage or a pre-authorized scoped S3 binding. */
+export type VerglasLakehouseStorage =
+  | {
+    /** Verglas provisions the object storage binding. */
+    mode: "managed";
+  }
+  | {
+    /** Verglas resolves a scoped secret for the declared path. */
+    mode: "scoped-secret";
+    /** S3 URI covered by the selected secret. */
+    dataPath: string;
+  };
+
+/** Managed Lakekeeper or a pre-authorized external Iceberg REST catalog. */
+export type VerglasLakehouseCatalog =
+  | {
+    /** Verglas provisions a warehouse in the tenant Lakekeeper deployment. */
+    mode: "managed-lakekeeper";
+  }
+  | {
+    /** Verglas connects to an external Iceberg REST catalog. */
+    mode: "external";
+    /** External catalog base URI. */
+    uri: string;
+    /** Warehouse selected within the external catalog. */
+    warehouse: string;
+  };
+
+/** Public tenant database definition returned by the access service. */
+export type VerglasDatabaseDefinition =
+  | {
+    /** An Iceberg lakehouse with database-scoped catalog routing. */
+    type: "lakehouse";
+    /** Stable tenant-local database name. */
+    name: string;
+    /** Object storage selected for this Lakehouse. */
+    storage: VerglasLakehouseStorage;
+    /** Catalog selected for this Lakehouse. */
+    catalog: VerglasLakehouseCatalog;
+  }
+  | {
+    /** An independent managed Postgres database. */
+    type: "postgres";
+    /** Stable tenant-local database name. */
+    name: string;
+    /** Postgres runtime selected for this database. */
+    engine: {
+      /** Verglas' managed Neon runtime. */
+      mode: "managed-neon";
+    };
+  };
+
+/** Database declaration accepted by the tenant access service. */
+export type VerglasCreateDatabaseInput = VerglasDatabaseDefinition;
+
+/** Data operations the current database runtime exposes to the OS. */
+export type VerglasDatabaseCapabilities = {
+  /** Whether an Iceberg catalog is mounted for discovery. */
+  catalog: boolean;
+  /** Whether the OS can create and delete tables. */
+  tableCrud: boolean;
+  /** Whether physical and traffic metrics are database-scoped. */
+  tableMetrics: boolean;
+  /** Whether vector index discovery is database-scoped. */
+  vectors: boolean;
+  /** Whether graph spaces can be discovered within this database. */
+  graphs: boolean;
 };
 
-/** Bounded details returned after a user selects one database namespace. */
+/** A tenant database resource plus its bounded catalog counts. */
+export type VerglasDatabaseSummary = VerglasDatabaseDefinition & {
+  /** Operations safely exposed by the current database runtime. */
+  capabilities: VerglasDatabaseCapabilities;
+  /** Number of tables across all namespaces in this database. */
+  tableCount: number;
+  /** Number of maintained vector indexes attributed to this database. */
+  vectorCount: number;
+  /** Number of property graph spaces inferred within this database. */
+  graphCount: number;
+};
+
+/** Bounded details returned after a user selects one tenant database. */
 export type VerglasDatabaseDetail = VerglasDatabaseSummary & {
-  /** Tables and their best-available metrics in the selected database. */
+  /** Tables and their best-available metrics in the selected Lakehouse; empty for Postgres. */
   tables: VerglasTableDetail[];
 };
 
 /** One maintained vector index discoverable through the local Verglas index registry. */
 export type VerglasVectorSummary = {
+  /** Tenant-local database containing the indexed data. */
+  database: string;
   /** Stable index target, such as `tbl:rlean.runs` or `graph:agent_memory`. */
   target: string;
   /** Indexed embedding field. */
@@ -1252,6 +1327,8 @@ export type VerglasVectorSummary = {
 
 /** One property graph inferred from its paired Verglas node and edge tables. */
 export type VerglasGraphSummary = {
+  /** Tenant-local database containing the graph tables. */
+  database: string;
   /** Graph namespace used by the Verglas graph SDK. */
   namespace: string;
   /** SQL-safe qualified name of the graph's node table. */
@@ -1262,9 +1339,9 @@ export type VerglasGraphSummary = {
 
 /** Bounded lakehouse catalog snapshot rendered by the Lakehouse explorer. */
 export type VerglasCatalogSnapshot = {
-  /** Database namespaces derived from the Iceberg catalog. */
+  /** Database resources returned by the tenant access service. */
   databases: VerglasDatabaseSummary[];
-  /** Iceberg tables visible to this OS instance. */
+  /** Iceberg tables visible through database-scoped catalogs. */
   tables: VerglasTableSummary[];
   /** Maintained vector indexes visible to this OS instance. */
   vectors: VerglasVectorSummary[];

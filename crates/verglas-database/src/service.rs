@@ -5,7 +5,78 @@
 
 use async_trait::async_trait;
 
-use crate::{DatabasePlan, DatabaseRecord, DatabaseRepository, RepositoryError};
+use crate::{
+    CatalogRequest, DatabaseKind, DatabasePlan, DatabaseRecord, DatabaseRepository,
+    PostgresEngineRequest, RepositoryError, StorageRequest,
+};
+
+/// Public database definition returned without internal tenant or secret IDs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum DatabaseView {
+    /// An Iceberg lakehouse and its resolved public storage and catalog choices.
+    Lakehouse {
+        /// Stable tenant-local database name.
+        name: String,
+        /// Managed storage or the configured customer data path.
+        storage: StorageRequest,
+        /// Managed Lakekeeper or the configured external catalog.
+        catalog: CatalogRequest,
+    },
+    /// An independent managed Neon database.
+    Postgres {
+        /// Stable tenant-local database name.
+        name: String,
+        /// Managed Postgres engine declaration.
+        engine: PostgresEngineRequest,
+    },
+}
+
+impl DatabaseView {
+    /// Returns the stable tenant-local database name.
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Lakehouse { name, .. } | Self::Postgres { name, .. } => name,
+        }
+    }
+
+    /// Projects one durable record while withholding internal IDs.
+    fn from_record(record: DatabaseRecord) -> Result<Self, RepositoryError> {
+        match record.kind() {
+            DatabaseKind::Lakehouse => {
+                let storage = match record.data_path() {
+                    Some(data_path) => StorageRequest::ScopedSecret {
+                        data_path: data_path.to_owned(),
+                    },
+                    None => StorageRequest::Managed,
+                };
+                let catalog = match record.catalog_uri() {
+                    Some(uri) => CatalogRequest::External {
+                        uri: uri.to_owned(),
+                        warehouse: record
+                            .warehouse()
+                            .ok_or_else(|| {
+                                RepositoryError::Backend(
+                                    "persisted lakehouse record has no warehouse".to_owned(),
+                                )
+                            })?
+                            .to_owned(),
+                    },
+                    None => CatalogRequest::ManagedLakekeeper,
+                };
+                Ok(Self::Lakehouse {
+                    name: record.name().to_owned(),
+                    storage,
+                    catalog,
+                })
+            }
+            DatabaseKind::Postgres => Ok(Self::Postgres {
+                name: record.name().to_owned(),
+                engine: PostgresEngineRequest::ManagedNeon,
+            }),
+        }
+    }
+}
 
 /// Secret kinds a database composition may bind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -66,6 +137,14 @@ pub enum DatabaseServiceError {
         /// Existing database name.
         name: String,
     },
+    /// No database exists under this tenant-local name.
+    #[error("database {tenant_id}/{name} not found")]
+    NotFound {
+        /// Tenant searched by the service.
+        tenant_id: String,
+        /// Missing database name.
+        name: String,
+    },
     /// Required secret resolution failed closed.
     #[error(transparent)]
     Secret(#[from] SecretResolutionError),
@@ -81,14 +160,34 @@ pub struct DatabaseService<R, S> {
     secret_resolver: S,
 }
 
-/// Object-safe database creation boundary used by the REST access service.
+/// Object-safe database management boundary used by the REST access service.
 #[async_trait]
-pub trait DatabaseCreator: Send + Sync {
+pub trait DatabaseManager: Send + Sync {
     /// Resolves bindings and persists one validated database plan.
     async fn create_database(
         &self,
         plan: DatabasePlan,
-    ) -> Result<DatabaseRecord, DatabaseServiceError>;
+    ) -> Result<DatabaseView, DatabaseServiceError>;
+
+    /// Lists public database definitions for one tenant.
+    async fn list_databases(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<DatabaseView>, DatabaseServiceError>;
+
+    /// Gets one public database definition by tenant-local name.
+    async fn get_database(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<DatabaseView, DatabaseServiceError>;
+
+    /// Deletes one database by tenant-local name.
+    async fn delete_database(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<(), DatabaseServiceError>;
 }
 
 impl<R, S> DatabaseService<R, S>
@@ -158,10 +257,59 @@ where
             Err(error) => Err(DatabaseServiceError::Repository(error)),
         }
     }
+
+    /// Lists one tenant's database definitions in stable name order.
+    pub async fn list(&self, tenant_id: &str) -> Result<Vec<DatabaseView>, DatabaseServiceError> {
+        let mut databases = self
+            .repository
+            .list(tenant_id)
+            .await
+            .map_err(DatabaseServiceError::Repository)?;
+        databases.sort_by(|left, right| left.name().cmp(right.name()));
+        databases
+            .into_iter()
+            .map(DatabaseView::from_record)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(DatabaseServiceError::Repository)
+    }
+
+    /// Gets one tenant-local database without exposing its internal bindings.
+    pub async fn get(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<DatabaseView, DatabaseServiceError> {
+        let record = self
+            .repository
+            .get(tenant_id, name)
+            .await
+            .map_err(DatabaseServiceError::Repository)?
+            .ok_or_else(|| DatabaseServiceError::NotFound {
+                tenant_id: tenant_id.to_owned(),
+                name: name.to_owned(),
+            })?;
+        DatabaseView::from_record(record).map_err(DatabaseServiceError::Repository)
+    }
+
+    /// Deletes exactly one tenant-local database or reports that it is absent.
+    pub async fn delete(&self, tenant_id: &str, name: &str) -> Result<(), DatabaseServiceError> {
+        if self
+            .repository
+            .delete(tenant_id, name)
+            .await
+            .map_err(DatabaseServiceError::Repository)?
+        {
+            return Ok(());
+        }
+        Err(DatabaseServiceError::NotFound {
+            tenant_id: tenant_id.to_owned(),
+            name: name.to_owned(),
+        })
+    }
 }
 
 #[async_trait]
-impl<R, S> DatabaseCreator for DatabaseService<R, S>
+impl<R, S> DatabaseManager for DatabaseService<R, S>
 where
     R: DatabaseRepository,
     S: ScopedSecretResolver,
@@ -169,7 +317,31 @@ where
     async fn create_database(
         &self,
         plan: DatabasePlan,
-    ) -> Result<DatabaseRecord, DatabaseServiceError> {
-        self.create(plan).await
+    ) -> Result<DatabaseView, DatabaseServiceError> {
+        DatabaseView::from_record(self.create(plan).await?)
+            .map_err(DatabaseServiceError::Repository)
+    }
+
+    async fn list_databases(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<DatabaseView>, DatabaseServiceError> {
+        self.list(tenant_id).await
+    }
+
+    async fn get_database(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<DatabaseView, DatabaseServiceError> {
+        self.get(tenant_id, name).await
+    }
+
+    async fn delete_database(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<(), DatabaseServiceError> {
+        self.delete(tenant_id, name).await
     }
 }

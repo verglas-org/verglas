@@ -50,6 +50,26 @@ impl DatabaseRepository for MemoryRepository {
             .get(&(tenant_id.to_owned(), name.to_owned()))
             .cloned())
     }
+
+    async fn list(&self, tenant_id: &str) -> Result<Vec<DatabaseRecord>, RepositoryError> {
+        Ok(self
+            .records
+            .lock()
+            .expect("repository lock")
+            .values()
+            .filter(|database| database.tenant_id() == tenant_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete(&self, tenant_id: &str, name: &str) -> Result<bool, RepositoryError> {
+        Ok(self
+            .records
+            .lock()
+            .expect("repository lock")
+            .remove(&(tenant_id.to_owned(), name.to_owned()))
+            .is_some())
+    }
 }
 
 /// Resolver fixture that returns stable resource IDs and records requested
@@ -264,4 +284,77 @@ async fn duplicate_name_fails_closed_and_preserves_the_original_stable_id() {
         .expect("get")
         .expect("stored");
     assert_eq!(stored.id(), original.id());
+}
+
+#[tokio::test]
+async fn lists_only_the_requested_tenant_in_stable_name_order() {
+    let (service, _, _) = service();
+    for (tenant, name, kind) in [
+        ("tenant-a", "zeta", DatabaseKind::Postgres),
+        ("tenant-b", "hidden", DatabaseKind::Postgres),
+        ("tenant-a", "analytics", DatabaseKind::Lakehouse),
+    ] {
+        service
+            .create(CreateDatabase::new(name, kind).plan(tenant).expect("plan"))
+            .await
+            .expect("create");
+    }
+
+    let databases = service.list("tenant-a").await.expect("list");
+
+    assert_eq!(
+        databases
+            .iter()
+            .map(|database| database.name())
+            .collect::<Vec<_>>(),
+        vec!["analytics", "zeta"]
+    );
+}
+
+#[tokio::test]
+async fn gets_and_deletes_by_tenant_local_name_without_cross_tenant_access() {
+    let (service, repository, _) = service();
+    service
+        .create(
+            CreateDatabase::new("analytics", DatabaseKind::Lakehouse)
+                .plan("tenant-a")
+                .expect("plan"),
+        )
+        .await
+        .expect("create");
+
+    assert!(matches!(
+        service.get("tenant-b", "analytics").await,
+        Err(DatabaseServiceError::NotFound { .. })
+    ));
+    let database = service.get("tenant-a", "analytics").await.expect("get");
+    assert_eq!(database.name(), "analytics");
+
+    assert!(matches!(
+        service.delete("tenant-b", "analytics").await,
+        Err(DatabaseServiceError::NotFound { .. })
+    ));
+    assert!(
+        repository
+            .get("tenant-a", "analytics")
+            .await
+            .expect("repository get")
+            .is_some()
+    );
+
+    service
+        .delete("tenant-a", "analytics")
+        .await
+        .expect("delete");
+    assert!(
+        repository
+            .get("tenant-a", "analytics")
+            .await
+            .expect("repository get")
+            .is_none()
+    );
+    assert!(matches!(
+        service.delete("tenant-a", "analytics").await,
+        Err(DatabaseServiceError::NotFound { .. })
+    ));
 }

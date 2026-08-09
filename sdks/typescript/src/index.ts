@@ -13,15 +13,24 @@
 export { connect, VerglasClient, Table, Queue, Graph, Kv } from "./client";
 export { VerglasHttpError } from "./http";
 export {
+  connectAccess,
   connectAdmin,
   connectRuntime,
   connectScheduler,
   extractWorkerSource,
+  VerglasAccessClient,
   VerglasAdminClient,
   VerglasRuntimeClient,
   VerglasSchedulerClient,
 } from "./control";
-export type { ControlConnectOptions, JobSummary, WorkerRow, WorkerSpec } from "./control";
+export type {
+  ControlConnectOptions,
+  CreateDatabaseRequest,
+  DatabaseView,
+  JobSummary,
+  WorkerRow,
+  WorkerSpec,
+} from "./control";
 
 export { defineWorker, runWorker } from "./contracts";
 export type {

@@ -174,21 +174,24 @@ async function proxyRunGateway(request, url, match) {
   }
   if (run.state !== "running") return response({error: "run is not active"}, 409);
   if (service === "access") {
-    if (suffix !== "/v1/access/check" || request.method !== "POST") {
-      return response({ error: "run access endpoint only supports checks" }, 403);
+    if (suffix === "/v1/access/check" && request.method === "POST") {
+      const input = await request.clone().json();
+      if (input.tenant_id !== process.env.VERGLAS_TENANT_ID ||
+          input.principal_id !== run.principal_id) {
+        return response({ error: "run cannot check another identity" }, 403);
+      }
+      return response(await checkRunAccess(run, input.resource_id, input.action));
     }
-    const input = await request.clone().json();
-    if (input.tenant_id !== process.env.VERGLAS_TENANT_ID ||
-        input.principal_id !== run.principal_id) {
-      return response({ error: "run cannot check another identity" }, 403);
+    if (request.method !== "GET" || suffix !== "/v1/databases") {
+      return response({ error: "operation is not exposed to agent runs" }, 403);
     }
-    return response(await checkRunAccess(run, input.resource_id, input.action));
   }
 
   let action;
   if (service === "data" && request.method === "GET" &&
-      (suffix === "/admin/access" || suffix.startsWith("/catalog/v1/") ||
-       suffix.startsWith("/v1/tables/") || suffix.startsWith("/v1/graphs/"))) {
+      /^\/v1\/databases\/[^/]+\/catalog\//.test(suffix)) {
+    action = "discover";
+  } else if (service === "access" && request.method === "GET" && suffix === "/v1/databases") {
     action = "discover";
   } else if (service === "data" && request.method === "POST" && suffix === "/v1/query") {
     action = "query";
@@ -203,8 +206,16 @@ async function proxyRunGateway(request, url, match) {
   const decision = await checkRunAccess(run, "tenant", action);
   if (!decision.allowed) return response({ error: `permission denied: ${action} on tenant` }, 403);
 
-  const targetBase = service === "data" ? process.env.VERGLAS_DATA_ENDPOINT : containerRuntimeUrl;
-  const targetToken = service === "data" ? process.env.VERGLAS_DATA_TOKEN : containerRuntimeToken;
+  const targetBase = service === "data"
+    ? process.env.VERGLAS_DATA_ENDPOINT
+    : service === "access"
+      ? process.env.VERGLAS_ACCESS_URI
+      : containerRuntimeUrl;
+  const targetToken = service === "data"
+    ? process.env.VERGLAS_DATA_TOKEN
+    : service === "access"
+      ? process.env.VERGLAS_ACCESS_SERVICE_TOKEN
+      : containerRuntimeToken;
   const target = new URL(suffix, targetBase.replace(/\/+$/, "") + "/");
   target.search = url.search;
   const headers = new Headers(request.headers);

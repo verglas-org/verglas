@@ -1,4 +1,4 @@
-// Typed clients for the Verglas admin, scheduler, and local container-runtime APIs.
+// Typed clients for the Verglas access, admin, scheduler, and local container-runtime APIs.
 // Product control planes use these clients instead of duplicating HTTP route logic.
 
 import { makeTransport, type Transport } from "./http";
@@ -55,6 +55,32 @@ export interface WorkerSpec {
   config: string;
   created_by: string;
 }
+
+/** Public resolved declaration for one dynamic tenant database. */
+export type DatabaseView =
+  | {
+      /** Discriminator for an Iceberg lakehouse. */
+      type: "lakehouse";
+      /** Stable tenant-local database name. */
+      name: string;
+      /** Managed storage or a customer S3 path selected through a scoped secret. */
+      storage: { mode: "managed" } | { mode: "scoped-secret"; data_path: string };
+      /** Managed Lakekeeper or a customer Iceberg REST catalog. */
+      catalog:
+        | { mode: "managed-lakekeeper" }
+        | { mode: "external"; uri: string; warehouse: string };
+    }
+  | {
+      /** Discriminator for an independent managed Postgres database. */
+      type: "postgres";
+      /** Stable tenant-local database name. */
+      name: string;
+      /** Managed Postgres engine selection. */
+      engine: { mode: "managed-neon" };
+    };
+
+/** Create request accepted by the dynamic tenant database API. */
+export type CreateDatabaseRequest = DatabaseView;
 
 /** Bounded run-history entry returned by the scheduler. */
 export interface JobSummary {
@@ -148,6 +174,40 @@ export class VerglasAdminClient {
   /** Performs a typed JSON DELETE for catalog routes without a dedicated method. */
   deleteJson<T>(path: string, query?: Record<string, string | number | undefined>): Promise<T> {
     return this.transport.request<T>("DELETE", path, { query });
+  }
+}
+
+/** Client for protected database resources on the tenant access service. */
+export class VerglasAccessClient {
+  /** Binds this client to one validated access-service transport. */
+  constructor(private readonly transport: Transport) {}
+
+  /** Lists public definitions for every database in the connected tenant. */
+  listDatabases(): Promise<DatabaseView[]> {
+    return this.transport
+      .request<{ databases: DatabaseView[] }>("GET", "/v1/databases")
+      .then((body) => body.databases);
+  }
+
+  /** Returns one public database definition by tenant-local name. */
+  getDatabase(name: string): Promise<DatabaseView> {
+    return this.transport.request<DatabaseView>(
+      "GET",
+      `/v1/databases/${encodeURIComponent(name)}`,
+    );
+  }
+
+  /** Creates one dynamic database from an explicit managed or scoped declaration. */
+  createDatabase(request: CreateDatabaseRequest): Promise<DatabaseView> {
+    return this.transport.request<DatabaseView>("POST", "/v1/databases", { body: request });
+  }
+
+  /** Deletes one database by tenant-local name. */
+  deleteDatabase(name: string): Promise<void> {
+    return this.transport.request<void>(
+      "DELETE",
+      `/v1/databases/${encodeURIComponent(name)}`,
+    );
   }
 }
 
@@ -290,6 +350,12 @@ export class VerglasRuntimeClient {
 /** Connects to the worker registry and data-query listener. */
 export function connectAdmin(options: ControlConnectOptions): VerglasAdminClient {
   return new VerglasAdminClient(transport(options));
+}
+
+/** Connects to the mandatory tenant access and database-resource service. */
+export function connectAccess(options: ControlConnectOptions): VerglasAccessClient {
+  if (!options.token) throw new Error("connectAccess: token is required");
+  return new VerglasAccessClient(transport(options));
 }
 
 /** Connects to the scheduler control listener. */

@@ -17,3 +17,4 @@
 - #75: Added typed clients for worker administration, scheduler secrets and job history, and local Vessel runtime operations. Verglas OS can now use the canonical TypeScript SDK from the monorepo instead of carrying a generated private copy.
 
 - #52: Added typed runtime Vessel stop and resume controls. The SDK calls the runtime manager's persisted lifecycle routes instead of exposing generic Docker operations to product UIs.
+- #84: Added a typed access-service client with create, list, get, and delete methods for dynamic tenant databases. The public database union matches the managed and scoped create declarations and omits internal tenant and secret resource identifiers.

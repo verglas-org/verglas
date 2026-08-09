@@ -4,14 +4,13 @@
 //! behind the access service and never crosses this persistence boundary.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::{Executor, Row};
 
 use crate::DatabaseKind;
 
 /// Fully resolved database definition persisted for runtime provisioning.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseRecord {
     id: String,
     tenant_id: String,
@@ -125,6 +124,12 @@ pub trait DatabaseRepository: Send + Sync {
         tenant_id: &str,
         name: &str,
     ) -> Result<Option<DatabaseRecord>, RepositoryError>;
+
+    /// Lists every database belonging to one tenant in stable name order.
+    async fn list(&self, tenant_id: &str) -> Result<Vec<DatabaseRecord>, RepositoryError>;
+
+    /// Deletes one tenant-local database and reports whether it existed.
+    async fn delete(&self, tenant_id: &str, name: &str) -> Result<bool, RepositoryError>;
 }
 
 /// PostgreSQL-backed repository in the shared `verglas_permissions` database.
@@ -194,6 +199,30 @@ impl DatabaseRepository for PostgresDatabaseRepository {
         .await
         .map_err(repository_database_error)?;
         row.map(|row| record_from_row(&row)).transpose()
+    }
+
+    /// Lists complete tenant records without joining to secret ciphertext.
+    async fn list(&self, tenant_id: &str) -> Result<Vec<DatabaseRecord>, RepositoryError> {
+        let rows = sqlx::query(
+            "SELECT id, tenant_id, name, kind, data_path, catalog_uri, warehouse, storage_secret_id, catalog_secret_id FROM verglas_databases WHERE tenant_id = $1 ORDER BY name ASC",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(repository_database_error)?;
+        rows.iter().map(record_from_row).collect()
+    }
+
+    /// Deletes only the record addressed by both tenant and stable name.
+    async fn delete(&self, tenant_id: &str, name: &str) -> Result<bool, RepositoryError> {
+        let result =
+            sqlx::query("DELETE FROM verglas_databases WHERE tenant_id = $1 AND name = $2")
+                .bind(tenant_id)
+                .bind(name)
+                .execute(&self.pool)
+                .await
+                .map_err(repository_database_error)?;
+        Ok(result.rows_affected() == 1)
     }
 }
 

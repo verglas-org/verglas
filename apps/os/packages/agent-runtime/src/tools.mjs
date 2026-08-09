@@ -19,7 +19,7 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "listLakehouse",
-      description: "List bounded Verglas lakehouse tables, graphs, and vector indexes.",
+      description: "List bounded Verglas databases and each Lakehouse's scoped tables and graphs.",
       parameters: schema({}, []),
     },
   },
@@ -148,39 +148,36 @@ export function createToolExecutor(env, emit) {
       }
       case "listLakehouse": {
         await requireAccess("tenant", "discover");
-        const catalogAccess = await request(admin, dataToken, "/admin/access");
-        if (!catalogAccess.warehouse) throw new Error("Verglas catalog access has no warehouse.");
-        const warehouse = encodeURIComponent(catalogAccess.warehouse);
-        const config = await request(admin, dataToken, `/catalog/v1/config?warehouse=${warehouse}`);
-        const prefix = config.overrides?.prefix ?? config.defaults?.prefix;
-        if (!prefix) throw new Error("Verglas catalog configuration has no prefix.");
-        const catalog = `/catalog/v1/${encodeURIComponent(prefix)}`;
-        const namespaceBody = await request(admin, dataToken, `${catalog}/namespaces`);
+        const databaseBody = await request(access, accessToken, "/v1/databases");
+        const databases = (databaseBody.databases ?? []).slice(0, 100);
         const tables = [];
-        for (const namespace of (namespaceBody.namespaces ?? []).slice(0, 100)) {
-          const encoded = encodeURIComponent(namespace.join("\u001f"));
-          const listed = await request(admin, dataToken, `${catalog}/namespaces/${encoded}/tables`);
-          for (const table of (listed.identifiers ?? []).slice(0, 500)) {
+        for (const database of databases) {
+          if (database.type !== "lakehouse") continue;
+          const catalog = `/v1/databases/${encodeURIComponent(database.name)}/catalog/v1`;
+          const namespaceBody = await request(admin, dataToken, `${catalog}/namespaces`);
+          for (const namespace of (namespaceBody.namespaces ?? []).slice(0, 100)) {
+            const encoded = encodeURIComponent(namespace.join("\u001f"));
+            const listed = await request(admin, dataToken, `${catalog}/namespaces/${encoded}/tables`);
+            for (const table of (listed.identifiers ?? []).slice(0, 500)) {
+              if (tables.length === 1000) break;
+              tables.push({
+                database: database.name,
+                namespace: table.namespace,
+                name: table.name,
+                qualifiedName: [...table.namespace, table.name].join("."),
+              });
+            }
             if (tables.length === 1000) break;
-            tables.push({
-              namespace: table.namespace,
-              name: table.name,
-              qualifiedName: [...table.namespace, table.name].join("."),
-            });
           }
           if (tables.length === 1000) break;
         }
-        const indexes = [];
-        for (const table of tables.slice(0, 200)) {
-          const tableName = encodeURIComponent([...table.namespace, table.name].join("."));
-          const listed = await request(admin, dataToken, `/v1/tables/${tableName}/indexes`)
-            .catch(() => ({indexes: []}));
-          indexes.push(...(listed.indexes ?? []));
-        }
         const graphs = tables
           .filter(table => table.name.endsWith("_nodes"))
-          .map(table => ({namespace: table.name.slice(0, -"_nodes".length)}));
-        return { tables, indexes, graphs };
+          .map(table => ({
+            database: table.database,
+            namespace: table.name.slice(0, -"_nodes".length),
+          }));
+        return { databases, tables, indexes: [], graphs };
       }
       case "queryLakehouse":
         await requireAccess("tenant", "query");

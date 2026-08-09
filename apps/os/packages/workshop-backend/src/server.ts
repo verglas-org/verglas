@@ -2,7 +2,7 @@ import { throwLegacyVesselsRemoved } from "./legacy-vessels";
 import { RpcStub, RpcTarget, newWorkersRpcResponse } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasAccessAction, type VerglasAccessIdentity, type VerglasCatalogSnapshot, type VerglasCreateTableInput, type VerglasDatabaseDetail, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasAccessAction, type VerglasAccessIdentity, type VerglasCatalogSnapshot, type VerglasCreateDatabaseInput, type VerglasCreateTableInput, type VerglasDatabaseDetail, type VerglasDatabaseSummary, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
 import type { UiFeatureFlags } from "@verglas/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -395,7 +395,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     const tables = await new VerglasCatalogClient(this.env).listTables();
     const access = this.#accessClient();
     if (access) await Promise.all(tables.map(table =>
-      access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table")));
+      access.ensureResource(
+        `table/${table.database}/${[...table.namespace, table.name].join(".")}`,
+        "table",
+      )));
     return tables;
   }
 
@@ -404,12 +407,14 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     const catalog = await new VerglasCatalogClient(this.env).getCatalog();
     const access = this.#accessClient();
     if (access) await Promise.all([
+      ...catalog.databases.map(database =>
+        access.ensureResource(`database/${database.name}`, "database")),
       ...catalog.tables.map(table =>
-        access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table")),
+        access.ensureResource(`table/${table.database}/${[...table.namespace, table.name].join(".")}`, "table")),
       ...catalog.vectors.map(vector =>
-        access.ensureResource(`vector/${vector.target}/${vector.field}`, "vector_index")),
+        access.ensureResource(`vector/${vector.database}/${vector.target}/${vector.field}`, "vector_index")),
       ...catalog.graphs.map(graph =>
-        access.ensureResource(`graph/${graph.namespace}`, "graph")),
+        access.ensureResource(`graph/${graph.database}/${graph.namespace}`, "graph")),
     ]);
     return catalog;
   }
@@ -419,9 +424,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return await new VerglasCatalogClient(this.env).getDatabase(name);
   }
 
-  async createVerglasDatabase(name: string): Promise<void> {
+  async createVerglasDatabase(input: VerglasCreateDatabaseInput): Promise<VerglasDatabaseSummary> {
     await this.#requireAccess("create_child");
-    await new VerglasCatalogClient(this.env).createDatabase(name);
+    return await new VerglasCatalogClient(this.env).createDatabase(input);
   }
 
   async deleteVerglasDatabase(name: string): Promise<void> {
@@ -433,13 +438,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     await this.#requireAccess("create_child");
     const table = await new VerglasCatalogClient(this.env).createTable(input);
     const access = this.#accessClient();
-    if (access) await access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table");
+    if (access) await access.ensureResource(
+      `table/${table.database}/${[...table.namespace, table.name].join(".")}`,
+      "table",
+    );
     return table;
   }
 
-  async deleteVerglasTable(namespace: string[], name: string): Promise<void> {
+  async deleteVerglasTable(database: string, namespace: string[], name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteTable(namespace, name);
+    await new VerglasCatalogClient(this.env).deleteTable(database, namespace, name);
   }
 
   async listVerglasVessels(): Promise<VerglasVesselSummary[]> {

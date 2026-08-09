@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  connectAccess,
   connectAdmin,
   connectRuntime,
   connectScheduler,
@@ -50,6 +51,7 @@ describe("control-plane connectors", () => {
 
   it("requires credentials for scheduler and runtime control", () => {
     const options = { endpoint: "http://verglas.test", token: "" };
+    expect(() => connectAccess(options)).toThrow(/token is required/);
     expect(() => connectScheduler(options)).toThrow(/token is required/);
     expect(() => connectRuntime(options)).toThrow(/token is required/);
   });
@@ -93,6 +95,41 @@ describe("control-plane connectors", () => {
       ["POST", "/v1/vessels/warehouse%20ui/stop"],
       ["POST", "/v1/vessels/warehouse%20ui/resume"],
     ]);
+  });
+
+  it("routes typed dynamic database CRUD without exposing tenant or secret identifiers", async () => {
+    const requests: Request[] = [];
+    const database = {
+      type: "lakehouse" as const,
+      name: "analytics",
+      storage: { mode: "managed" as const },
+      catalog: { mode: "managed-lakekeeper" as const },
+    };
+    const access = connectAccess({
+      endpoint: "http://access.test",
+      token: "access-token",
+      fetch: recordingFetch(requests, {
+        "/v1/databases": { databases: [database] },
+        "/v1/databases/analytics": database,
+      }),
+    });
+
+    expect(await access.listDatabases()).toEqual([database]);
+    expect(await access.getDatabase("analytics")).toEqual(database);
+    await access.createDatabase({
+      type: "postgres",
+      name: "operational",
+      engine: { mode: "managed-neon" },
+    });
+    await access.deleteDatabase("analytics");
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ["GET", "/v1/databases"],
+      ["GET", "/v1/databases/analytics"],
+      ["POST", "/v1/databases"],
+      ["DELETE", "/v1/databases/analytics"],
+    ]);
+    expect(requests[0]?.headers.get("authorization")).toBe("Bearer access-token");
   });
 });
 

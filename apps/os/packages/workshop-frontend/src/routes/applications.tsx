@@ -12,7 +12,7 @@ import {
   CatalogPage,
   CatalogStatus,
 } from '../components/CatalogTable'
-import { applicationLifecycleAvailable } from '../applicationLifecycle'
+import { applicationLifecycleAvailable, nextApplicationLifecycleState } from '../applicationLifecycle'
 import { useServerConfig } from '../ServerConfigContext'
 import { useDocumentTitle } from '../useDocumentTitle'
 
@@ -69,7 +69,7 @@ function ApplicationsPage() {
     try {
       await authenticatedApi.setVerglasApplicationState(
         app.name,
-        app.state === 'stopped' ? 'running' : 'stopped',
+        nextApplicationLifecycleState(app.running),
       )
       await load()
     } catch (err) {
@@ -121,7 +121,7 @@ function ApplicationsPage() {
                   onClick={() => void toggleLifecycle()}
                   className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg border border-kumo-line px-3 text-[13px] text-kumo-default hover:bg-kumo-tint disabled:cursor-not-allowed disabled:opacity-40"
                 >
-                  {app.state === 'stopped' ? 'Start container' : 'Stop container'}
+                  {app.running === false ? 'Start container' : 'Stop container'}
                 </button>
               )}
               {app.previewUrl && (
@@ -202,7 +202,7 @@ function ApplicationCard({
   onOpen: () => void
 }) {
   const title = application.title || application.name
-  const running = application.state === 'running' || application.health === 'ready'
+  const running = application.running !== false && (application.state === 'running' || application.health === 'ready')
 
   return (
     <Card className="group overflow-hidden rounded-2xl transition-colors hover:border-kumo-brand/40">

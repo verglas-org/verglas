@@ -1,21 +1,23 @@
 import {
   extractWorkerSource,
+  type CreateDatabaseRequest,
+  type DatabaseView,
   type JobSummary,
   type WorkerRow,
 } from "@verglas/sdk";
 import type {
   VerglasCatalogSnapshot,
+  VerglasCreateDatabaseInput,
   VerglasCreateTableInput,
+  VerglasDatabaseCapabilities,
+  VerglasDatabaseDefinition,
   VerglasDatabaseDetail,
   VerglasDatabaseSummary,
   VerglasGraphSummary,
   VerglasIntegrationConfiguration,
   VerglasQueryResult,
   VerglasTableSummary,
-  VerglasTableDetail,
-  VerglasTableUsageMetrics,
   VerglasVesselSummary,
-  VerglasVectorSummary,
   VerglasWorkerDetail,
   VerglasWorkerRunSummary,
   VerglasWorkerSummary,
@@ -23,6 +25,7 @@ import type {
 import {
   resolveLocalContainerRuntimeConfigured,
   verglasAdmin,
+  verglasDatabaseAccess,
   verglasRuntime,
   verglasScheduler,
   type VerglasClientEnv,
@@ -34,35 +37,6 @@ export type VerglasCatalogEnv = VerglasClientEnv;
 type IcebergTableIdentifier = {
   namespace: string[];
   name: string;
-};
-
-type VectorIndexWire = {
-  target?: string;
-  field?: string;
-  metric?: string;
-  reflected_snapshot?: number;
-  reflectedSnapshot?: number;
-  live_count?: number;
-  liveCount?: number;
-};
-
-type TableDescribeWire = {
-  row_count?: number;
-  file_count?: number;
-  size_bytes?: number;
-  current_snapshot_id?: number;
-};
-
-type TableMetricsWire = {
-  tables?: Array<{
-    table?: string;
-    hits?: number;
-    misses?: number;
-    bytes_served?: number;
-    cache_bytes?: number;
-    requests_avoided?: number;
-    latency_saved_seconds?: number;
-  }>;
 };
 
 function mapWorker(row: WorkerRow, runs?: VerglasWorkerRunSummary[]): VerglasWorkerSummary {
@@ -149,11 +123,15 @@ export class VerglasCatalogClient {
   }
 
   async listTables(): Promise<VerglasTableSummary[]> {
-    return (await this.#listCatalogTables()).tables;
+    return (await this.getCatalog()).tables;
   }
 
-  async #listCatalogTables(): Promise<{namespaces: string[][]; tables: VerglasTableSummary[]}> {
-    const {admin, catalogBase} = await this.#catalog();
+  /** Lists bounded namespaces and tables from one Lakehouse's database-scoped catalog. */
+  async #listCatalogTables(
+    database: Extract<VerglasDatabaseDefinition, {type: "lakehouse"}>,
+  ): Promise<{namespaces: string[][]; tables: VerglasTableSummary[]}> {
+    const admin = verglasAdmin(this.#env, this.#fetch);
+    const catalogBase = databaseCatalogBase(database.name);
     const namespaceBody = await admin.getJson<{namespaces?: string[][]}>(`${catalogBase}/namespaces`);
     const namespaces = (namespaceBody.namespaces ?? []).slice(0, 100);
     const identifiers: IcebergTableIdentifier[] = [];
@@ -168,6 +146,7 @@ export class VerglasCatalogClient {
     }
 
     const tables = identifiers.map(({namespace, name}) => ({
+      database: database.name,
       namespace,
       name,
       qualifiedName: [...namespace, name].map(quoteIdentifier).join("."),
@@ -175,159 +154,98 @@ export class VerglasCatalogClient {
     return {namespaces, tables};
   }
 
+  /** Lists public database definitions without exposing tenant or secret resource IDs. */
+  async #listDatabases(): Promise<VerglasDatabaseDefinition[]> {
+    const result = await verglasDatabaseAccess(this.#env, this.#fetch).listDatabases();
+    return result.map(mapDatabaseDefinition)
+      .toSorted((left, right) => left.name.localeCompare(right.name));
+  }
+
+  /** Reads one public database definition by tenant-local name. */
+  async #getDatabaseDefinition(name: string): Promise<VerglasDatabaseDefinition> {
+    const database = validateIdentifier(name, "Database name");
+    const result = await verglasDatabaseAccess(this.#env, this.#fetch).getDatabase(database);
+    return mapDatabaseDefinition(result);
+  }
+
   async getCatalog(): Promise<VerglasCatalogSnapshot> {
-    const {namespaces, tables} = await this.#listCatalogTables();
+    const definitions = await this.#listDatabases();
+    const catalogs = await Promise.all(definitions.map(async (database) =>
+      database.type === "lakehouse"
+        ? await this.#listCatalogTables(database)
+        : {namespaces: [], tables: []}));
+    const tables = catalogs.flatMap((catalog) => catalog.tables)
+      .toSorted((left, right) => left.database.localeCompare(right.database) ||
+        left.qualifiedName.localeCompare(right.qualifiedName));
     const graphs = inferGraphs(tables);
-    const vectors = await this.#listVectors(tables, graphs);
-    return {databases: summarizeDatabases(namespaces, tables, vectors, graphs), tables, vectors, graphs};
+    const vectors: VerglasCatalogSnapshot["vectors"] = [];
+    return {databases: summarizeDatabases(definitions, tables, vectors, graphs), tables, vectors, graphs};
   }
 
-  /** Returns physical and cache-traffic metrics for the selected database namespace. */
+  /** Returns the selected resource and only operations safe for its database kind. */
   async getDatabase(name: string): Promise<VerglasDatabaseDetail> {
-    const namespace = parseNamespace(name);
-    const catalog = await this.getCatalog();
-    const database = catalog.databases.find((candidate) => candidate.name === namespace.join("."));
-    if (!database) throw new Error(`Database '${name}' was not found.`);
-    const usage = await this.#listTableUsage();
-    const tables = catalog.tables.filter((table) => sameNamespace(table.namespace, namespace));
-    return {
-      ...database,
-      tables: await Promise.all(tables.map(async (table): Promise<VerglasTableDetail> => {
-        const [physical, tableUsage] = await Promise.all([
-          this.#describeTable(table),
-          Promise.resolve(usage.get([...table.namespace, table.name].join("."))),
-        ]);
-        return {...table, physical, usage: tableUsage};
-      })),
-    };
+    const definition = await this.#getDatabaseDefinition(name);
+    if (definition.type === "postgres") return {...summarizeDatabase(definition, [], [], []), tables: []};
+    const {tables} = await this.#listCatalogTables(definition);
+    const graphs = inferGraphs(tables);
+    return {...summarizeDatabase(definition, tables, [], graphs), tables};
   }
 
-  /** Creates an empty Iceberg namespace, presented as a database by the OS. */
-  async createDatabase(name: string): Promise<void> {
-    const namespace = parseNamespace(name);
-    const {admin, catalogBase} = await this.#catalog();
-    await admin.postJson<void>(`${catalogBase}/namespaces`, {namespace, properties: {}});
+  /** Creates one top-level database resource through the tenant access service. */
+  async createDatabase(input: VerglasCreateDatabaseInput): Promise<VerglasDatabaseSummary> {
+    const request = createDatabaseRequest(input);
+    const result = await verglasDatabaseAccess(this.#env, this.#fetch).createDatabase(request);
+    return summarizeDatabase(mapDatabaseDefinition(result), [], [], []);
   }
 
-  /** Deletes an empty Iceberg namespace without cascading to any tables. */
+  /** Deletes a database resource after proving a Lakehouse contains no tables. */
   async deleteDatabase(name: string): Promise<void> {
-    const namespace = parseNamespace(name);
-    const {admin, catalogBase} = await this.#catalog();
-    await admin.deleteJson<void>(`${catalogBase}/namespaces/${encodeNamespace(namespace)}`);
+    const database = await this.#getDatabaseDefinition(name);
+    if (database.type === "lakehouse") {
+      const {tables} = await this.#listCatalogTables(database);
+      if (tables.length > 0) {
+        throw new Error(`Database '${database.name}' contains ${tables.length} ${tables.length === 1 ? "table" : "tables"}.`);
+      }
+    }
+    await verglasDatabaseAccess(this.#env, this.#fetch).deleteDatabase(database.name);
   }
 
   /** Creates one explicitly-schemaed Iceberg table. */
   async createTable(input: VerglasCreateTableInput): Promise<VerglasTableSummary> {
+    const database = await this.#requireLakehouse(input.database);
     const namespace = validateNamespace(input.namespace);
     const name = validateIdentifier(input.name, "Table name");
     if (!input.columns.length) throw new Error("A table requires at least one column.");
-    const {admin, catalogBase} = await this.#catalog();
+    const admin = verglasAdmin(this.#env, this.#fetch);
+    const catalogBase = databaseCatalogBase(database.name);
+    const namespaceBody = await admin.getJson<{namespaces?: string[][]}>(`${catalogBase}/namespaces`);
+    if (!(namespaceBody.namespaces ?? []).some((candidate) => sameNamespace(candidate, namespace))) {
+      await admin.postJson<void>(`${catalogBase}/namespaces`, {namespace, properties: {}});
+    }
     await admin.postJson<void>(`${catalogBase}/namespaces/${encodeNamespace(namespace)}/tables`,
       createTableRequest(name, input));
-    return {namespace, name, qualifiedName: [...namespace, name].map(quoteIdentifier).join(".")};
+    return {database: database.name, namespace, name, qualifiedName: [...namespace, name].map(quoteIdentifier).join(".")};
   }
 
   /** Deletes one Iceberg table. */
-  async deleteTable(namespace: string[], name: string): Promise<void> {
+  async deleteTable(databaseName: string, namespace: string[], name: string): Promise<void> {
+    const database = await this.#requireLakehouse(databaseName);
     const validatedNamespace = validateNamespace(namespace);
     const validatedName = validateIdentifier(name, "Table name");
-    const {admin, catalogBase} = await this.#catalog();
+    const admin = verglasAdmin(this.#env, this.#fetch);
+    const catalogBase = databaseCatalogBase(database.name);
     await admin.deleteJson<void>(
       `${catalogBase}/namespaces/${encodeNamespace(validatedNamespace)}/tables/${encodeURIComponent(validatedName)}`,
     );
   }
 
-  async #listVectors(
-    tables: VerglasTableSummary[],
-    graphs: VerglasGraphSummary[],
-  ): Promise<VerglasVectorSummary[]> {
-    const admin = verglasAdmin(this.#env, this.#fetch);
-    try {
-      const body = await admin.getJson<VectorIndexWire[] | {indexes?: VectorIndexWire[]}>("/v1/indexes");
-      return normalizeVectors(Array.isArray(body) ? body : body.indexes ?? []);
-    } catch {
-      // Older local runtimes expose only target-scoped index discovery.
+  /** Requires an existing Lakehouse before issuing catalog mutations. */
+  async #requireLakehouse(name: string): Promise<Extract<VerglasDatabaseDefinition, {type: "lakehouse"}>> {
+    const database = await this.#getDatabaseDefinition(name);
+    if (database.type !== "lakehouse") {
+      throw new Error(`Postgres database '${database.name}' does not expose Iceberg table management.`);
     }
-
-    const paths = [
-      ...tables.map((table) => ({
-        path: `/v1/tables/${encodeURIComponent([...table.namespace, table.name].join("."))}/indexes`,
-        target: `tbl:${[...table.namespace, table.name].join(".")}`,
-      })),
-      ...graphs.map((graph) => ({
-        path: `/v1/graphs/${encodeURIComponent(graph.namespace)}/indexes`,
-        target: `graph:${graph.namespace}`,
-      })),
-    ];
-    const discovered: VectorIndexWire[] = [];
-    for (let offset = 0; offset < paths.length; offset += 16) {
-      const batch = paths.slice(offset, offset + 16);
-      const pages = await Promise.all(batch.map(async ({path, target}) => {
-        try {
-          const body = await admin.getJson<{indexes?: VectorIndexWire[]}>(path);
-          return (body.indexes ?? []).map((index) => ({...index, target: index.target ?? target}));
-        } catch {
-          return [];
-        }
-      }));
-      discovered.push(...pages.flat());
-    }
-    return normalizeVectors(discovered);
-  }
-
-  async #catalog(): Promise<{admin: ReturnType<typeof verglasAdmin>; catalogBase: string}> {
-    const admin = verglasAdmin(this.#env, this.#fetch);
-    const {warehouse} = await admin.getJson<{warehouse?: string}>("/admin/access");
-    if (!warehouse) throw new Error("Verglas catalog access did not include a warehouse.");
-    const config = await admin.getJson<{
-      overrides?: {prefix?: string};
-      defaults?: {prefix?: string};
-    }>("/catalog/v1/config", {warehouse});
-    const prefix = config.overrides?.prefix ?? config.defaults?.prefix;
-    if (!prefix) throw new Error("Verglas catalog configuration did not include a prefix.");
-    return {admin, catalogBase: `/catalog/v1/${encodeURIComponent(prefix)}`};
-  }
-
-  async #describeTable(table: VerglasTableSummary): Promise<VerglasTableDetail["physical"]> {
-    try {
-      const result = await verglasAdmin(this.#env, this.#fetch).getJson<TableDescribeWire>(
-        `/v1/tables/${encodeURIComponent([...table.namespace, table.name].join("."))}/describe`,
-      );
-      if (typeof result.row_count !== "number" || typeof result.file_count !== "number" ||
-          typeof result.size_bytes !== "number") return undefined;
-      return {
-        rowCount: result.row_count,
-        fileCount: result.file_count,
-        sizeBytes: result.size_bytes,
-        currentSnapshotId: result.current_snapshot_id,
-      };
-    } catch {
-      return undefined;
-    }
-  }
-
-  async #listTableUsage(): Promise<Map<string, VerglasTableUsageMetrics>> {
-    try {
-      const result = await verglasAdmin(this.#env, this.#fetch).getJson<TableMetricsWire>("/v1/metering/tables");
-      const metrics = new Map<string, VerglasTableUsageMetrics>();
-      for (const row of result.tables ?? []) {
-        if (!row.table || typeof row.hits !== "number" || typeof row.misses !== "number" ||
-            typeof row.bytes_served !== "number" || typeof row.cache_bytes !== "number" ||
-            typeof row.requests_avoided !== "number" || typeof row.latency_saved_seconds !== "number") continue;
-        metrics.set(row.table, {
-          table: row.table,
-          hits: row.hits,
-          misses: row.misses,
-          bytesServed: row.bytes_served,
-          cacheBytes: row.cache_bytes,
-          requestsAvoided: row.requests_avoided,
-          latencySavedSeconds: row.latency_saved_seconds,
-        });
-      }
-      return metrics;
-    } catch {
-      return new Map();
-    }
+    return database;
   }
 
   async query(sql: string, maxRows = 100): Promise<VerglasQueryResult> {
@@ -400,13 +318,9 @@ function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
 }
 
-function parseNamespace(name: string): string[] {
-  return validateNamespace(name.split("."));
-}
-
 function validateNamespace(namespace: string[]): string[] {
-  if (!namespace.length) throw new Error("Database name is required.");
-  return namespace.map((part) => validateIdentifier(part, "Database name"));
+  if (!namespace.length) throw new Error("Table namespace is required.");
+  return namespace.map((part) => validateIdentifier(part, "Table namespace"));
 }
 
 function validateIdentifier(value: string, label: string): string {
@@ -422,6 +336,39 @@ function encodeNamespace(namespace: string[]): string {
 
 function sameNamespace(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((part, index) => part === right[index]);
+}
+
+function databaseCatalogBase(name: string): string {
+  return `/v1/databases/${encodeURIComponent(validateIdentifier(name, "Database name"))}/catalog/v1`;
+}
+
+function mapDatabaseDefinition(database: DatabaseView): VerglasDatabaseDefinition {
+  if (database.type === "postgres") {
+    return {type: "postgres", name: database.name, engine: {mode: "managed-neon"}};
+  }
+  return {
+    type: "lakehouse",
+    name: database.name,
+    storage: database.storage.mode === "managed"
+      ? {mode: "managed"}
+      : {mode: "scoped-secret", dataPath: database.storage.data_path},
+    catalog: database.catalog,
+  };
+}
+
+function createDatabaseRequest(input: VerglasCreateDatabaseInput): CreateDatabaseRequest {
+  const name = validateIdentifier(input.name, "Database name");
+  if (input.type === "postgres") {
+    return {type: "postgres", name, engine: {mode: "managed-neon"}};
+  }
+  return {
+    type: "lakehouse",
+    name,
+    storage: input.storage.mode === "managed"
+      ? {mode: "managed"}
+      : {mode: "scoped-secret", data_path: input.storage.dataPath},
+    catalog: input.catalog,
+  };
 }
 
 function createTableRequest(name: string, input: VerglasCreateTableInput): unknown {
@@ -470,27 +417,39 @@ function catalogType(type: string): string {
 }
 
 function summarizeDatabases(
-  namespaces: string[][],
+  definitions: VerglasDatabaseDefinition[],
   tables: VerglasTableSummary[],
-  vectors: VerglasVectorSummary[],
+  vectors: VerglasCatalogSnapshot["vectors"],
   graphs: VerglasGraphSummary[],
 ): VerglasDatabaseSummary[] {
-  const tableCounts = new Map<string, number>();
-  for (const table of tables) {
-    const name = table.namespace.join(".");
-    tableCounts.set(name, (tableCounts.get(name) ?? 0) + 1);
+  return definitions.map((database) => summarizeDatabase(
+    database,
+    tables.filter((table) => table.database === database.name),
+    vectors.filter((vector) => vector.database === database.name),
+    graphs.filter((graph) => graph.database === database.name),
+  ));
+}
+
+function summarizeDatabase(
+  database: VerglasDatabaseDefinition,
+  tables: VerglasTableSummary[],
+  vectors: VerglasCatalogSnapshot["vectors"],
+  graphs: VerglasGraphSummary[],
+): VerglasDatabaseSummary {
+  return {
+    ...database,
+    capabilities: databaseCapabilities(database.type),
+    tableCount: tables.length,
+    vectorCount: vectors.length,
+    graphCount: graphs.length,
+  };
+}
+
+function databaseCapabilities(type: VerglasDatabaseDefinition["type"]): VerglasDatabaseCapabilities {
+  if (type === "lakehouse") {
+    return {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true};
   }
-  const graphNamespaces = new Set(graphs.map((graph) => graph.namespace));
-  return namespaces.map((namespace) => {
-    const name = namespace.join(".");
-    return {
-    name,
-    tableCount: tableCounts.get(name) ?? 0,
-    vectorCount: vectors.filter((vector) => vector.target === `tbl:${name}` ||
-      vector.target.startsWith(`tbl:${name}.`)).length,
-    graph: graphNamespaces.has(name),
-    };
-  }).toSorted((a, b) => a.name.localeCompare(b.name));
+  return {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false};
 }
 
 function inferGraphs(tables: VerglasTableSummary[]): VerglasGraphSummary[] {
@@ -498,32 +457,20 @@ function inferGraphs(tables: VerglasTableSummary[]): VerglasGraphSummary[] {
   for (const table of tables) {
     if (table.namespace.length !== 1) continue;
     const namespace = table.namespace[0];
-    const entries = byNamespace.get(namespace) ?? new Map<string, VerglasTableSummary>();
+    const key = `${table.database}\u0000${namespace}`;
+    const entries = byNamespace.get(key) ?? new Map<string, VerglasTableSummary>();
     entries.set(table.name, table);
-    byNamespace.set(namespace, entries);
+    byNamespace.set(key, entries);
   }
   const graphs: VerglasGraphSummary[] = [];
-  for (const [namespace, entries] of byNamespace) {
+  for (const [key, entries] of byNamespace) {
     const nodes = entries.get("nodes");
     const edges = entries.get("edges");
     if (nodes && edges) {
-      graphs.push({namespace, nodesTable: nodes.qualifiedName, edgesTable: edges.qualifiedName});
+      const [database, namespace] = key.split("\u0000") as [string, string];
+      graphs.push({database, namespace, nodesTable: nodes.qualifiedName, edgesTable: edges.qualifiedName});
     }
   }
-  return graphs.toSorted((a, b) => a.namespace.localeCompare(b.namespace));
-}
-
-function normalizeVectors(indexes: VectorIndexWire[]): VerglasVectorSummary[] {
-  const vectors = indexes.flatMap((index): VerglasVectorSummary[] => {
-    if (!index.target || !index.field) return [];
-    return [{
-      target: index.target,
-      field: index.field,
-      metric: index.metric ?? "cosine",
-      reflectedSnapshot: index.reflected_snapshot ?? index.reflectedSnapshot,
-      liveCount: index.live_count ?? index.liveCount,
-    }];
-  });
-  return vectors.toSorted((a, b) =>
-    a.target.localeCompare(b.target) || a.field.localeCompare(b.field));
+  return graphs.toSorted((a, b) => a.database.localeCompare(b.database) ||
+    a.namespace.localeCompare(b.namespace));
 }

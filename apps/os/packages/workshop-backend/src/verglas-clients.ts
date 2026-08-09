@@ -3,9 +3,11 @@
  * fetch to VERGLAS_* /v1 paths; go through these factories.
  */
 import {
+  connectAccess,
   connectAdmin,
   connectRuntime,
   connectScheduler,
+  type VerglasAccessClient,
   type VerglasAdminClient,
   type VerglasRuntimeClient,
   type VerglasSchedulerClient,
@@ -13,6 +15,8 @@ import {
 
 /** Env vars used to construct Verglas SDK control clients. */
 export type VerglasClientEnv = {
+  VERGLAS_ACCESS_URI?: string;
+  VERGLAS_ACCESS_SERVICE_TOKEN?: string;
   VERGLAS_ADMIN_URL?: string;
   VERGLAS_SCHEDULER_URL?: string;
   VERGLAS_SCHEDULER_CONTROL_TOKEN?: string;
@@ -21,6 +25,21 @@ export type VerglasClientEnv = {
   VERGLAS_DATA_ENDPOINT?: string;
   VERGLAS_DATA_TOKEN?: string;
 };
+
+/** Mandatory tenant access service for dynamic database resources. */
+export function verglasDatabaseAccess(
+  env: VerglasClientEnv,
+  fetcher?: typeof fetch,
+): VerglasAccessClient {
+  const endpoint = env.VERGLAS_ACCESS_URI?.trim();
+  const token = env.VERGLAS_ACCESS_SERVICE_TOKEN?.trim();
+  if (!endpoint || !token) {
+    throw new Error(
+      "VERGLAS_ACCESS_URI and VERGLAS_ACCESS_SERVICE_TOKEN must be configured together.",
+    );
+  }
+  return connectAccess({endpoint, token, fetch: fetcher});
+}
 
 /** Admin/data listener (workers + query + catalog). */
 export function verglasAdmin(env: VerglasClientEnv, fetcher?: typeof fetch): VerglasAdminClient {
