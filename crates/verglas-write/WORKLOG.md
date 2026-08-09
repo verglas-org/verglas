@@ -85,3 +85,7 @@
 - #74: Added strict quorum mode for storage publications that must keep one
   acknowledgement boundary. Membership, headroom, and placement shortfalls now
   reject a strict write instead of falling back to an origin acknowledgement.
+- #74: Replicated each dirty journal to its fragment holders and added ring-wide
+  manifest discovery, so any cache node can serve an acknowledged object before
+  origin propagation. Propagation now retries until success or shutdown instead
+  of abandoning a dirty journal after eight attempts.

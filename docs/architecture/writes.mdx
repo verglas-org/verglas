@@ -36,6 +36,9 @@ publication. Their upload queue does not publish an index until every referenced
 layer PUT has reached ring durability. A PUT becomes clean only after object
 storage confirms propagation. Until then, its fragments are not candidates for
 cache eviction, regardless of their observed heat.
+The dirty journal is replicated with those fragments. Any cache node can
+discover and reconstruct the object; reads do not depend on the coordinator
+that accepted the PUT.
 
 ## Quorum staging
 
@@ -55,6 +58,8 @@ memory.
 ## Repair and scrubbing
 
 Background propagation reconstructs complete objects and uploads them to the
-origin. Scrubbing verifies fragment checksums and repairs damaged fragments
+origin. It retries indefinitely with capped backoff, so an extended outage does
+not strand a journal until process restart. Cache-node startup recovers and
+serves ring state before probing the origin. Scrubbing verifies fragment checksums and repairs damaged fragments
 while enough independent fragments remain. Both operate under hard bandwidth
 and concurrency limits so cache recovery cannot consume the host.

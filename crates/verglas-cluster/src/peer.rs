@@ -89,6 +89,9 @@ const FRAGMENT_DELETE_PATH: &str = "/peer/v0/fragment/delete";
 /// by placement to exclude a peer whose fragment store is at its budget.
 const FRAGMENT_HEADROOM_PATH: &str = "/peer/v0/fragment/headroom";
 
+/// Lists fragment keys whose object id begins with a requested prefix.
+const FRAGMENT_LIST_PATH: &str = "/peer/v0/fragment/list";
+
 /// Header carrying the byte count a headroom check asks about.
 const FRAGMENT_BYTES_HEADER: &str = "x-verglas-fragment-bytes";
 
@@ -248,6 +251,10 @@ pub type FragmentDeleteFn = Arc<
 pub type FragmentHeadroomFn =
     Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
+/// Lists locally held fragment keys for one object-id namespace prefix.
+pub type FragmentListFn =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Vec<FragmentKey>> + Send>> + Send + Sync>;
+
 /// A stream of a fragment's shard chunks in stripe order (#180).
 pub type FragmentShardStream = Pin<Box<dyn futures::Stream<Item = Bytes> + Send>>;
 
@@ -277,6 +284,8 @@ pub struct FragmentHandlers {
     pub delete: FragmentDeleteFn,
     /// Report whether this node has budget headroom for a fragment.
     pub headroom: FragmentHeadroomFn,
+    /// List keys in one object-id namespace.
+    pub list_prefix: FragmentListFn,
 }
 
 /// Shared state the block handler reads: the local-cache lookup, the optional
@@ -299,6 +308,13 @@ struct FragmentRef {
     object_id: String,
     /// The fragment index within the `k+m` set.
     index: usize,
+}
+
+/// Prefix filter for manifest discovery.
+#[derive(Debug, Serialize, Deserialize)]
+struct FragmentListRequest {
+    /// Required object-id prefix.
+    prefix: String,
 }
 
 /// The peer-fetch server: listens on this node's advertised address and serves
@@ -349,7 +365,8 @@ impl PeerServer {
                 .route(FRAGMENT_PUT_PATH, post(store_fragment))
                 .route(FRAGMENT_GET_PATH, post(load_fragment))
                 .route(FRAGMENT_DELETE_PATH, post(delete_fragment))
-                .route(FRAGMENT_HEADROOM_PATH, post(fragment_headroom));
+                .route(FRAGMENT_HEADROOM_PATH, post(fragment_headroom))
+                .route(FRAGMENT_LIST_PATH, post(list_fragments));
         }
         let app = app.with_state(ServerState {
             source,
@@ -561,6 +578,32 @@ async fn delete_fragment(
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+/// Lists fragment identities in one namespace without returning their bytes.
+async fn list_fragments(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: AxumBytes,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(handlers) = &state.fragments else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(request) = serde_json::from_slice::<FragmentListRequest>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let keys = (handlers.list_prefix)(request.prefix).await;
+    let refs = keys
+        .into_iter()
+        .map(|key| FragmentRef {
+            object_id: key.object_id,
+            index: key.index,
+        })
+        .collect::<Vec<_>>();
+    axum::Json(refs).into_response()
 }
 
 /// Answers a fragment headroom check (#180): `200` with body `1` when this
@@ -978,5 +1021,42 @@ impl FragmentClient {
                 reason: format!("peer returned HTTP {}", response.status().as_u16()),
             })
         }
+    }
+
+    /// Lists fragment keys on `node` whose object id begins with `prefix`.
+    pub async fn list_fragments(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<FragmentKey>, FragmentRpcError> {
+        let url = self.url_for(node, FRAGMENT_LIST_PATH)?;
+        let builder = self.http.post(&url).json(&FragmentListRequest {
+            prefix: prefix.to_owned(),
+        });
+        let response = self.authenticated(builder).send().await.map_err(|error| {
+            FragmentRpcError::Unavailable {
+                node: node.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(FragmentRpcError::Unavailable {
+                node: node.clone(),
+                reason: format!("peer returned HTTP {}", response.status().as_u16()),
+            });
+        }
+        let refs = response.json::<Vec<FragmentRef>>().await.map_err(|error| {
+            FragmentRpcError::Unavailable {
+                node: node.clone(),
+                reason: format!("decoding fragment list: {error}"),
+            }
+        })?;
+        Ok(refs
+            .into_iter()
+            .map(|item| FragmentKey {
+                object_id: item.object_id,
+                index: item.index,
+            })
+            .collect())
     }
 }

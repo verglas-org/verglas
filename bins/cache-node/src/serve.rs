@@ -307,17 +307,18 @@ pub async fn run(
         registry.bucket_set()
     );
 
-    // Startup probe (#233): a configured bucket that cannot be reached or
-    // authenticated must fail startup, not serve an empty store. Dev/test that
-    // runs without a reachable origin opts out via VERGLAS_DEV_ALLOW_MISSING_ORIGIN.
-    if dev_allow_missing_origin() {
+    // Origin reachability does not gate recovery. An acknowledged dirty object
+    // may exist only on the ring, so this process must recover and serve it even
+    // while the origin is unavailable. The probe runs as a persistent degraded-
+    // state signal and never terminates the data plane.
+    let _origin_probe = if dev_allow_missing_origin() {
         eprintln!(
             "verglas-cache-node {VERSION} WARNING: VERGLAS_DEV_ALLOW_MISSING_ORIGIN set — skipping the backend startup probe; the origin is NOT verified (dev/test only)"
         );
+        None
     } else {
-        registry.probe().await?;
-        eprintln!("verglas-cache-node {VERSION} backend startup probe passed");
-    }
+        Some(spawn_origin_probe(Arc::clone(&registry)))
+    };
 
     let node_metrics = Arc::new(NodeMetrics::new()?);
     let health = admin::Health::starting();
@@ -548,6 +549,28 @@ pub async fn run(
     };
 
     tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut).map(|_| ())
+}
+
+/// Probes the origin until it is reachable, then keeps checking after failures.
+fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            match registry.probe().await {
+                Ok(()) => {
+                    eprintln!("verglas-cache-node {VERSION} backend probe passed");
+                    backoff = std::time::Duration::from_secs(30);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "verglas-cache-node {VERSION} backend unavailable; serving recovered cache and dirty ring data in degraded mode: {error}"
+                    );
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+            tokio::time::sleep(backoff).await;
+        }
+    })
 }
 
 /// Serves the SigV4 S3 endpoint until the process is interrupted. Reads are

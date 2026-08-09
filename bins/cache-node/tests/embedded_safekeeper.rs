@@ -84,6 +84,17 @@ fn free_port() -> u16 {
 
 /// Writes the minimal cache-node config used by one child.
 fn write_config(root: &std::path::Path, index: usize, s3: u16, admin: u16) -> std::path::PathBuf {
+    write_config_with_endpoint(root, index, s3, admin, "http://127.0.0.1:9")
+}
+
+/// Writes a cache-node config against a caller-selected origin endpoint.
+fn write_config_with_endpoint(
+    root: &std::path::Path,
+    index: usize,
+    s3: u16,
+    admin: u16,
+    endpoint: &str,
+) -> std::path::PathBuf {
     let node = root.join(format!("node-{index}"));
     std::fs::create_dir_all(&node).expect("node cache dir");
     let credentials = node.join("credentials");
@@ -94,13 +105,101 @@ fn write_config(root: &std::path::Path, index: usize, s3: u16, admin: u16) -> st
     .expect("credentials");
     let config = node.join("config.toml");
     let body = format!(
-        "[listen]\ns3_port = {s3}\nadmin_port = {admin}\n\n[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\ndram_bytes = \"80MB\"\n\n[backend]\nbucket = \"wal-test\"\nendpoint = \"http://127.0.0.1:9\"\nallow_http = true\nregion = \"us-east-1\"\ncredentials_file = \"{}\"\n\n[auth]\ncredentials_file = \"{}\"\n",
+        "[listen]\ns3_port = {s3}\nadmin_port = {admin}\n\n[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\ndram_bytes = \"80MB\"\n\n[backend]\nbucket = \"wal-test\"\nendpoint = \"{endpoint}\"\nallow_http = true\nregion = \"us-east-1\"\ncredentials_file = \"{}\"\n\n[auth]\ncredentials_file = \"{}\"\n",
         node.display(),
         credentials.display(),
         credentials.display(),
     );
     std::fs::write(&config, body).expect("config");
     config
+}
+
+/// Origin unavailability degrades cache-node startup instead of preventing the
+/// recovered cache and dirty-ring data planes from serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cache_node_starts_while_origin_probe_fails() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("origin listener");
+    let origin_addr = origin.local_addr().expect("origin address");
+    let origin_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = origin.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                let _ = stream
+                    .write_all(
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await;
+            });
+        }
+    });
+
+    let root = tempfile::tempdir().expect("node tempdir");
+    let config = write_config_with_endpoint(
+        root.path(),
+        0,
+        free_port(),
+        free_port(),
+        &format!("http://{origin_addr}"),
+    );
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
+        .arg("--config")
+        .arg(config)
+        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cache node");
+    let pipe = child.stderr.take().expect("stderr");
+    let sink = Arc::clone(&stderr);
+    thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            let Ok(line) = line else {
+                return;
+            };
+            if let Ok(mut lines) = sink.lock() {
+                lines.push(line);
+            }
+        }
+    });
+    let mut fleet = Fleet {
+        children: vec![child],
+        stderr,
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut serving = false;
+    while Instant::now() < deadline {
+        serving = fleet
+            .stderr
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|line| line.contains("serving S3 on"));
+        if serving {
+            break;
+        }
+        if fleet.children[0]
+            .try_wait()
+            .expect("child status")
+            .is_some()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    origin_task.abort();
+    assert!(
+        serving,
+        "cache node did not serve while origin was down:\n{}",
+        fleet.stderr_snapshot()
+    );
 }
 
 /// Connects once the child has bound its safekeeper listener.

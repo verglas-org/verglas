@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -90,7 +90,13 @@ impl MemoryTransport {
 
     /// Count of stored fragments across all nodes.
     fn fragment_count(&self) -> usize {
-        self.inner.lock().expect("lock").frags.len()
+        self.inner
+            .lock()
+            .expect("lock")
+            .frags
+            .keys()
+            .filter(|(_, object_id, _)| !object_id.starts_with("journal-"))
+            .count()
     }
 
     /// Flips a byte in one stored fragment's payload while leaving its recorded
@@ -203,6 +209,28 @@ impl FragmentTransport for MemoryTransport {
         ));
         Ok(())
     }
+
+    async fn list_prefix(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<verglas_cluster::fragments::FragmentKey>, TransportError> {
+        let inner = self.inner.lock().expect("lock");
+        if inner.dead.contains(node.as_str()) {
+            return Ok(Vec::new());
+        }
+        Ok(inner
+            .frags
+            .keys()
+            .filter(|(held, object_id, _)| held == node.as_str() && object_id.starts_with(prefix))
+            .map(
+                |(_, object_id, index)| verglas_cluster::fragments::FragmentKey {
+                    object_id: object_id.clone(),
+                    index: *index,
+                },
+            )
+            .collect())
+    }
 }
 
 // ---- in-memory membership --------------------------------------------------
@@ -247,6 +275,8 @@ impl LiveMembership for FakeMembership {
 struct RecordingOrigin {
     puts: Mutex<HashMap<(String, String), Bytes>>,
     fail: AtomicBool,
+    failures_remaining: AtomicUsize,
+    attempts: AtomicUsize,
 }
 
 impl RecordingOrigin {
@@ -254,7 +284,24 @@ impl RecordingOrigin {
         Arc::new(Self {
             puts: Mutex::new(HashMap::new()),
             fail: AtomicBool::new(fail),
+            failures_remaining: AtomicUsize::new(0),
+            attempts: AtomicUsize::new(0),
         })
+    }
+
+    /// Builds an origin that recovers only after `count` failed PUT attempts.
+    fn fail_first(count: usize) -> Arc<Self> {
+        Arc::new(Self {
+            puts: Mutex::new(HashMap::new()),
+            fail: AtomicBool::new(false),
+            failures_remaining: AtomicUsize::new(count),
+            attempts: AtomicUsize::new(0),
+        })
+    }
+
+    /// Number of PUT attempts observed, including failures.
+    fn attempt_count(&self) -> usize {
+        self.attempts.load(Ordering::Relaxed)
     }
     fn get(&self, bucket: &str, key: &str) -> Option<Bytes> {
         self.puts
@@ -272,11 +319,18 @@ impl ObjectWrite for RecordingOrigin {
         _metadata: WriteMetadata,
         mut body: WriteBodyStream,
     ) -> Result<PutOutcome, WriteError> {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut buf = Vec::new();
         while let Some(chunk) = body.next().await {
             buf.extend_from_slice(&chunk?);
         }
-        if self.fail.load(Ordering::Relaxed) {
+        let counted_failure = self
+            .failures_remaining
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+        if self.fail.load(Ordering::Relaxed) || counted_failure {
             return Err(WriteError::Backend("origin down".to_owned()));
         }
         self.puts
@@ -689,6 +743,79 @@ async fn read_your_writes_before_propagation() {
     let meta = reader.head(&ck("data/x")).await.expect("head");
     assert_eq!(meta.size, payload.len() as u64);
     assert!(meta.e_tag.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn another_coordinator_discovers_and_reads_a_dirty_object() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::new(true);
+    let (writer, _writer_dir) = build(
+        Arc::clone(&transport),
+        Arc::clone(&membership),
+        Arc::clone(&origin),
+    );
+    let (reader_coordinator, _reader_dir) = build(transport, membership, origin);
+    let payload = body(9000);
+
+    writer
+        .put(
+            &ck("data/shared"),
+            &WriteMetadata::default(),
+            payload.clone(),
+            2,
+            1,
+            3,
+        )
+        .await
+        .expect("ack");
+    assert!(reader_coordinator.journals().is_idle());
+
+    let reader = WritebackReader::new(FailingReader, reader_coordinator);
+    let got = reader
+        .get(&ck("data/shared"), ReadRange::Full)
+        .await
+        .expect("remote coordinator read");
+    let chunks = got
+        .body
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()
+        .expect("body chunks");
+    assert_eq!(chunks.concat(), payload);
+}
+
+#[tokio::test(start_paused = true)]
+async fn propagation_keeps_retrying_past_eight_failures() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::fail_first(10);
+    let (coordinator, _dir) = build(transport, membership, Arc::clone(&origin));
+    let payload = body(9000);
+
+    coordinator
+        .put(
+            &ck("data/eventual"),
+            &WriteMetadata::default(),
+            payload.clone(),
+            2,
+            1,
+            3,
+        )
+        .await
+        .expect("ack");
+    for _ in 0..12 {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        tokio::task::yield_now().await;
+    }
+
+    assert!(
+        origin.attempt_count() > 8,
+        "retry queue must not stop at eight"
+    );
+    assert_eq!(origin.get("bkt", "data/eventual"), Some(payload));
+    assert!(coordinator.journals().is_idle());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

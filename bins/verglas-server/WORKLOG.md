@@ -609,3 +609,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #50: Reduced the local Compose bootstrap to the server and trusted Docker
   runtime manager; optional scheduler, database, and analytics services
   are now dynamic managed containers.
+- #74: Wired the prefix-filtered fragment identity callback into the shared peer
+  server. This keeps the full server's fragment RPC surface aligned with the
+  cache-node implementation.

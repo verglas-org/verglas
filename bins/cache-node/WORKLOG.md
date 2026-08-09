@@ -63,3 +63,6 @@
   background, and exposes write-back counters. The disk monitor gives ordinary
   cache blocks and durability fragments one physical NVMe ceiling without
   evicting acknowledged dirty data.
+- #74: Made origin probing asynchronous so a cache node recovers and serves
+  dirty ring data during an origin outage. The fragment server now exposes the
+  journal-manifest discovery callback used by cross-node dirty reads.
