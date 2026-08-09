@@ -1,0 +1,940 @@
+import { throwLegacyVesselsRemoved } from "./legacy-vessels";
+import { RpcStub, RpcTarget, newWorkersRpcResponse } from "capnweb";
+import { validateRpc } from "capnweb-validate";
+import type { JWTPayload } from "jose";
+import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, getOpenWorkspaceErrorCode, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasCatalogSnapshot, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
+import type { UiFeatureFlags } from "@verglas/workshop-shared/feature-flags";
+import { getServerConfig } from "./deployment-config.js";
+import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
+import { getAuthVendorBinding } from "./auth/auth-vendors.js";
+import { PendingLogin, LoginConnectCallbackImpl } from "./auth/login-flow.js";
+import { listFormatOffers, readAdminConfig } from "./admin-config.js";
+
+// Re-export the optional-feature Durable Objects + entrypoints so they can be bound in wrangler.
+export { PendingLogin, LoginConnectCallbackImpl };
+import { GatekeeperUiFrame } from "@verglas/workshop-shared/gatekeeper";
+import { getModel, LanguageModelGatekeeper } from "./ai-models";
+import { completeText } from "./ai-invoke.js";
+import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
+import { BlueprintKvRecord, buildBlueprintArchiveStream, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintKvRecord } from "./blueprint-archive.js";
+import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject } from "./user";
+import { OverseerDurableObject, GatekeeperLoopback, CodeModeTailLoopback, AgentSpawnerGatekeeper, GatekeeperHookLoopback, VesselTailLoopback, AgentSelfLoopback, TransientStubLoopback, VerglasQueryLoopback } from "./overseer";
+import { ExternalMessageGateway } from "./external-message-gateway";
+import { RpcStub as NativeRpcStub } from "cloudflare:workers";
+import { recordAnalytics } from "./analytics";
+import { handleClientErrorRequest } from "./client-errors.js";
+import { verifyCfAccessJwt } from "./access.js";
+import { resolveUiFeatureFlags } from "./feature-flags";
+import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
+import { createWorkshopLogger } from "./observability";
+import { ModelRuntimeManager } from "./model-runtimes.js";
+import { VerglasCatalogClient } from "./verglas-catalog.js";
+
+const logger = createWorkshopLogger("workshop.server");
+
+// Set once we've asked the AdminSettings DO to install the bundled format blueprints (see the
+// fetch handler), so later requests skip the call. The DO holds the real answer.
+let formatBlueprintInstallStarted = false;
+
+function publicBlueprintInfo(id: string, metadata: BlueprintPublicInfo['metadata']): BlueprintPublicInfo {
+  return {
+    id,
+    metadata,
+    screenshotUrl: blueprintScreenshotUrl(id, metadata),
+  };
+}
+
+// Re-export entrypoint types from ai-models.ts.
+export { LanguageModelGatekeeper };
+
+// Re-export entrypoint types from admin-settings.ts.
+export { AdminSettings };
+
+// Re-export entrypoint types from user.ts.
+export { UserDurableObject, GatekeeperConnectCallbackImpl };
+
+// Re-export entrypoint types from overseer.ts.
+export { OverseerDurableObject, GatekeeperLoopback, GatekeeperHookLoopback,
+    CodeModeTailLoopback, AgentSpawnerGatekeeper, VesselTailLoopback,
+    AgentSelfLoopback, TransientStubLoopback, VerglasQueryLoopback };
+
+// Re-export service-binding entrypoint for external channel integrations.
+export { ExternalMessageGateway };
+
+// Declare optional environment variables here since they may be omitted from wrangler.jsonc.
+type Env = Cloudflare.Env & {
+  // Set these if using Cloudflare Access for authentication, otherwise username/password is used.
+  CF_ACCESS_AUD?: string,  // audience
+  CF_ACCESS_ISS?: string,  // team URL, i.e. https://<team>.cloudflareaccess.com
+  DEV?: boolean;
+  FLAGS?: Flagship;
+}
+
+// =======================================================================================
+
+@validateRpc()
+class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
+  constructor(private ctx: ExecutionContext, private env: Env,
+      private user: DurableObjectStub<UserDurableObject>,
+      private abortSession: (reason: Error) => void) {
+    super();
+
+    this.overseers = this.ctx.exports.OverseerDurableObject;
+    this.adminSettings = this.ctx.exports.AdminSettings;
+    this.users = this.ctx.exports.UserDurableObject;
+  }
+
+  private overseers: DurableObjectNamespace<OverseerDurableObject>;
+  private adminSettings: DurableObjectNamespace<AdminSettings>;
+  private users: DurableObjectNamespace<UserDurableObject>;
+
+  #isAdmin(): boolean {
+    let name = this.user.id.name;
+    let admins = this.env.ADMINS;
+
+    if (!name || !admins) return false;
+
+    if (typeof admins === "string") {
+      // Admins should be a JSON binding of array type, but `.env` doesn't actually let you
+      // specify JSON bindings, so we also support a string that parses as JSON array.
+      admins = JSON.parse(admins);
+    }
+
+    if (!Array.isArray(admins)) {
+      throw new TypeError("ADMINS must be configured as an array of usernames.");
+    }
+
+    return admins.includes(name);
+  }
+
+  whoami(): Promise<AiChatAuthorInfo> {
+    return this.user.whoami();
+  }
+  setOwnDisplayName(name: string): Promise<void> {
+    return this.user.setOwnDisplayName(name);
+  }
+  changePassword(oldHash: Uint8Array, newHash: Uint8Array): Promise<void> {
+    return this.user.changePassword(oldHash, newHash);
+  }
+  hasPasswordLogin(): Promise<boolean> {
+    return this.user.hasPasswordLogin();
+  }
+  async listModels(): Promise<AiChatAuthorInfo[]> {
+    const records = await this.user.listModelRecords();
+    const refresh = new Map<ModelRuntimeId, typeof records[number]>();
+    for (const record of records) {
+      const match = record.profile.id.match(/^runtime:(codex|claude-code|cursor)(?::|$)/);
+      if (!match ||
+          (record.profile.id !== `runtime:${match[1]}` && record.config.catalogRank !== undefined)) {
+        continue;
+      }
+      refresh.set(match[1] as ModelRuntimeId, record);
+    }
+    for (const [runtime, record] of refresh) {
+      try {
+        const apiToken = record.config.apiToken;
+        const catalog = apiToken && runtime !== "cursor"
+          ? this.#apiTokenModels(runtime)
+          : await new ModelRuntimeManager(this.env).listModels(runtime);
+        await this.#saveRuntimeModels(runtime, apiToken, catalog);
+      } catch (error) {
+        logger.warn("failed to migrate native runtime model catalog", {
+          event: "model-runtime.catalog.migration.failed",
+          modelId: record.profile.id,
+          error,
+        });
+      }
+    }
+    return await this.user.listModels();
+  }
+  addModel(profile: AiChatAuthorInfo, config: AiModelConfig): Promise<void> {
+    return this.user.addModel(profile, config);
+  }
+  deleteModel(id: string): Promise<void> {
+    return this.user.deleteModel(id);
+  }
+  detectModelRuntimes(): Promise<ModelRuntimeDetection> {
+    return new ModelRuntimeManager(this.env).detect();
+  }
+  startModelRuntimeLogin(
+      runtime: ModelRuntimeId, sessionId: string): Promise<ModelRuntimeLoginResult> {
+    return new ModelRuntimeManager(this.env).startLogin(runtime, sessionId);
+  }
+  continueModelRuntimeLogin(
+      sessionId: string, answer?: ModelRuntimeWizardAnswer): Promise<ModelRuntimeLoginResult> {
+    return new ModelRuntimeManager(this.env).continueLogin(sessionId, answer);
+  }
+  cancelModelRuntimeLogin(sessionId: string): Promise<void> {
+    return new ModelRuntimeManager(this.env).cancelLogin(sessionId);
+  }
+  async linkSubscriptionRuntime(runtime: ModelRuntimeId): Promise<void> {
+    const manager = new ModelRuntimeManager(this.env);
+    const models = await manager.listModels(runtime);
+    const defaultModel = models.find(model => model.isDefault) ?? models[0];
+    if (!defaultModel) throw new Error(`${runtime} has no available models.`);
+    await manager.verifyLinked(runtime, defaultModel.id);
+    await this.#saveRuntimeModels(runtime, "", models);
+  }
+  async linkTokenRuntime(runtime: ModelRuntimeId, apiToken: string): Promise<void> {
+    const token = apiToken.trim();
+    if (!token) throw new Error("API token is required.");
+    const models = runtime === "cursor"
+      ? await new ModelRuntimeManager(this.env).listModels(runtime, token)
+      : this.#apiTokenModels(runtime);
+    const defaultModel = models.find(model => model.isDefault) ?? models[0];
+    if (!defaultModel) throw new Error(`${runtime} has no available models.`);
+    if (runtime === "cursor") {
+      await new ModelRuntimeManager(this.env).verifyLinked(runtime, defaultModel.id, token);
+    } else {
+      const config = this.#runtimeModelConfig(runtime, token, defaultModel.id);
+      const initiator = await this.user.whoami();
+      await completeText(getModel(this.env, config, initiator), {
+        prompt: "Reply with the single word ready.",
+        maxTokens: 8,
+      });
+    }
+    await this.#saveRuntimeModels(runtime, token, models);
+  }
+  setQuickModel(id: string | null): Promise<void> {
+    return this.user.setQuickModel(id);
+  }
+  getQuickModel(): Promise<null | string> {
+    return this.user.getQuickModel();
+  }
+
+  async #saveRuntimeModels(
+      runtime: ModelRuntimeId, apiToken: string, models: ModelRuntimeCatalogEntry[]): Promise<void> {
+    const prefix = `runtime:${runtime}`;
+    await this.user.replaceModels(prefix, models.map((model, catalogRank) => ({
+      profile: {
+        type: "agent",
+        id: `${prefix}:${model.id}`,
+        name: model.name,
+      },
+      config: this.#runtimeModelConfig(runtime, apiToken, model.id, catalogRank),
+    })));
+  }
+
+  #runtimeModelConfig(
+      runtime: ModelRuntimeId, apiToken: string, model: string, catalogRank?: number): AiModelConfig {
+    if (apiToken && runtime === "codex") {
+      return { provider: "openai", model, apiToken, catalogRank };
+    }
+    if (apiToken && runtime === "claude-code") {
+      return { provider: "anthropic", model, apiToken, catalogRank };
+    }
+    return { provider: "local-runtime", runtime, model, apiToken, catalogRank };
+  }
+
+  #apiTokenModels(runtime: Exclude<ModelRuntimeId, "cursor">): ModelRuntimeCatalogEntry[] {
+    const provider = runtime === "codex" ? "openai" : "anthropic";
+    const defaultId = runtime === "codex" ? "gpt-5.6-sol" : "claude-sonnet-5";
+    return Object.entries(SUGGESTED_MODELS[provider]).map(([id, model]) => ({
+      id,
+      name: model.name,
+      ...(id === defaultId ? { isDefault: true } : {}),
+      contextWindow: model.contextWindow,
+    }));
+  }
+
+  getPreferredModel(): Promise<string | null> {
+    return this.user.getPreferredModel();
+  }
+  setPreferredModel(id: string | null): Promise<void> {
+    return this.user.setPreferredModel(id);
+  }
+  isOnboardingCompleted(): Promise<boolean> {
+    return this.user.isOnboardingCompleted();
+  }
+  completeOnboarding(): Promise<void> {
+    return this.user.completeOnboarding();
+  }
+
+  async setAvatar(data: Uint8Array | null): Promise<void> {
+    if (data) {
+      if (data.byteLength > 100 * 1024) {
+        throw new Error("Avatar too large (max 100 KB)");
+      }
+      // Verify the data starts with a known image magic-byte header.
+      let isJpeg = data[0] === 0xFF && data[1] === 0xD8 && data[2] === 0xFF;
+      let isPng = data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4E && data[3] === 0x47;
+      if (!isJpeg && !isPng) {
+        throw new Error("Avatar must be a JPEG or PNG image");
+      }
+    }
+    // Avatar data lives in KV (global), not the user's DO storage, so we
+    // read/write it directly here to avoid routing through the DO location.
+    let userId = this.user.id.name!;
+    if (data) {
+      await this.env.AVATARS.put(userId, data);
+    } else {
+      await this.env.AVATARS.delete(userId);
+    }
+  }
+  async getAvatar(userId: string): Promise<Uint8Array | null> {
+    let result = await this.env.AVATARS.get(userId, "arrayBuffer");
+    if (!result) return null;
+    return new Uint8Array(result);
+  }
+
+  getUiFeatureFlags(): Promise<UiFeatureFlags> {
+    return resolveUiFeatureFlags(this.env, this.user.id.name!);
+  }
+
+  async #openWorkspaceInternal(id: string, shareKey?: string,
+                            configureObservers?: RpcStub<ObserverConfigCallback>)
+      : Promise<NativeRpcStub<Overseer>> {
+    let userId = this.user.id.toString();
+    let profileId = this.user.id.name!;
+    let overseerId;
+    try {
+      overseerId = this.overseers.idFromString(id);
+    } catch {
+      throw createOpenWorkspaceError(OPEN_WORKSPACE_ERROR_CODES.workspaceNotFound);
+    }
+    let overseer = this.overseers.get(overseerId);
+
+    // HACK: Detect loss of the connection to the DO by:
+    // - Pass a callback to overseer.open() which it should call when the session is disposed.
+    // - Detect if the callback itself is disposed before being called, suggesting the connection
+    //   was lost.
+    // If the connection is lost, we abort this I/O context, which kills the WebSocket from the
+    // client, forcing it to engage its reconnect logic, which should recover.
+    // TODO: Implement onRpcBroken() in the built-in RPC system, matching Cap'n Web, and use that
+    //   instead.
+    // TODO: Consider how to reconnect to one DO without resetting the whole WebSocket. Probably
+    //   needs new code on the client side. However, typically a client only ever opens one
+    //   workspace at a time (since each tab is a separate client), so it's probably fine for now.
+    let closed = false;
+    let started = false;
+    let notifyClosed = () => {
+      closed = true;
+    };
+    (notifyClosed as any)[Symbol.dispose] = () => {
+      if (started && !closed) {
+        // this.ctx.abort() would be nicer here, but it is still marked experimental in the
+        // workers runtime.
+        this.abortSession(new Error("lost connection to workspace DO"));
+      }
+    }
+
+    let result;
+    try {
+      result = await overseer.open(userId, profileId, notifyClosed, shareKey, configureObservers);
+    } catch (err) {
+      // A denial proves this user's listing for the workspace is stale: revocation tries to drop it
+      // (refreshAffectedCollaboratorListings), but that push is best-effort. Only catches entries
+      // they click; others stay frozen at revocation, as a disconnected collaborator gets no pushes.
+      if (getOpenWorkspaceErrorCode(err) === OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied) {
+        await this.user.forgetSharedWorkspace(id);
+      }
+      throw err;
+    }
+    started = true;
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "workspace_opened",
+      user_id: userId,
+      workspace_id: id,
+      source: shareKey ? "share_key" : "direct",
+    });
+    return result;
+  }
+
+  async openWorkspace(id: string, shareKey?: string,
+                   configureObservers?: RpcStub<ObserverConfigCallback>)
+      : Promise<RpcStub<Overseer>> {
+    // @ts-expect-error Cap'n Web RPC stubs and native RPC stubs are compatible but the type
+    //     system doesn't know this.
+    return this.#openWorkspaceInternal(id, shareKey, configureObservers);
+  }
+
+  async newWorkspace(): Promise<RpcStub<Overseer>> {
+    let id = this.overseers.newUniqueId().toString();
+    await this.user.newWorkspace(id, "Untitled Workspace");
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "workspace_created",
+      user_id: this.user.id.toString(),
+      workspace_id: id,
+      source: "blank",
+    });
+    let result = await this.openWorkspace(id);
+    if (!result) {
+      throw new Error("Open failed despite newly-created workspace?");
+    }
+    return result;
+  }
+
+  async listWorkspaces(): Promise<WorkspaceMetadataWithTimestamps[]> {
+    return this.user.listWorkspaces();
+  }
+
+  listOutputs(): Promise<ListOutputsResult> {
+    return this.user.listOutputs();
+  }
+
+  listVerglasWorkers(): Promise<VerglasWorkerSummary[]> {
+    return new VerglasCatalogClient(this.env).listWorkers({withRuns: true});
+  }
+
+  getVerglasWorker(name: string) {
+    return new VerglasCatalogClient(this.env).getWorker(name);
+  }
+
+  listVerglasWorkerJobs(name: string, limit?: number) {
+    return new VerglasCatalogClient(this.env).listWorkerJobs(name, limit);
+  }
+
+  runVerglasWorker(name: string) {
+    return new VerglasCatalogClient(this.env).runWorker(name, crypto.randomUUID());
+  }
+
+  async setVerglasWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void> {
+    await new VerglasCatalogClient(this.env).setWorkerState(name, state);
+  }
+
+  listVerglasTables(): Promise<VerglasTableSummary[]> {
+    return new VerglasCatalogClient(this.env).listTables();
+  }
+
+  getVerglasCatalog(): Promise<VerglasCatalogSnapshot> {
+    return new VerglasCatalogClient(this.env).getCatalog();
+  }
+
+  async listVerglasVessels(): Promise<VerglasVesselSummary[]> {
+    const vessels = await new VerglasCatalogClient(this.env).listVessels();
+    const screenshots = new Map<string, string>();
+    for (const workspace of (await this.user.listWorkspaces()).filter(entry => !entry.owner)) {
+      try {
+        const entries = await this.overseers.get(this.overseers.idFromString(workspace.id))
+            .listApplicationScreenshots();
+        for (const entry of entries) screenshots.set(entry.vesselName, entry.screenshotUrl);
+      } catch {
+        // Workspace may be half-created; listing remains useful without screenshots.
+      }
+    }
+    return vessels.map(vessel => {
+      const screenshotUrl = screenshots.get(vessel.name);
+      return screenshotUrl ? {...vessel, screenshotUrl} : vessel;
+    });
+  }
+
+  getVerglasIntegrationConfiguration(name: string): Promise<VerglasIntegrationConfiguration> {
+    return new VerglasCatalogClient(this.env).getIntegrationConfiguration(name);
+  }
+
+  async configureVerglasIntegration(name: string, values: Record<string, string>): Promise<void> {
+    // Prefer the chat-owned Overseer path so Integrations-page Save and test updates the card and
+    // resumes the waiting agent the same way the chat card does.
+    const workspaces = await this.user.listWorkspaces();
+    const prefix = /^os-([a-f0-9]{12})-integration-/.exec(name)?.[1];
+    const owned = workspaces.filter(workspace => !workspace.owner);
+    const preferred = prefix ? owned.filter(workspace => workspace.id.startsWith(prefix)) : [];
+    const candidates = preferred.length > 0 ? preferred : owned;
+    for (const workspace of candidates) {
+      // Returns false when this workspace has no matching record; throws after a match if verify fails.
+      if (await this.overseers.get(this.overseers.idFromString(workspace.id))
+          .configureIntegrationVessel(name, values)) {
+        return;
+      }
+    }
+    // Orphan vessel with no Workshop record: configure runtime only.
+    await new VerglasCatalogClient(this.env).configureIntegration(name, values);
+  }
+
+  async deleteVerglasIntegration(name: string): Promise<void> {
+    const workspaces = await this.user.listWorkspaces();
+    for (const workspace of workspaces.filter(entry => !entry.owner)) {
+      const handled = await this.overseers.get(this.overseers.idFromString(workspace.id))
+          .deleteOwnedVessel(name, "integration");
+      if (handled) return;
+    }
+    await new VerglasCatalogClient(this.env).deleteVessel(name);
+  }
+
+  async deleteVerglasApplication(name: string): Promise<void> {
+    const workspaces = await this.user.listWorkspaces();
+    for (const workspace of workspaces.filter(entry => !entry.owner)) {
+      const handled = await this.overseers.get(this.overseers.idFromString(workspace.id))
+          .deleteOwnedVessel(name, "application");
+      if (handled) return;
+    }
+    await new VerglasCatalogClient(this.env).deleteVessel(name);
+  }
+
+  async listOutputFormats(): Promise<OutputFormatOffer[]> {
+    let offers = await listFormatOffers(this.env, await readAdminConfig(this.env));
+    // Neither the agent's hint nor the binding details are part of what a user is offered here.
+    return offers.map(({agentHint: _agentHint, bindings: _bindings, ...offer}) => offer);
+  }
+
+  listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]> {
+    return this.user.listGatekeeperVendors(filter);
+  }
+
+  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
+    return this.user.connectAccount(vendorId, resourceUrlPatterns);
+  }
+
+  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
+    return this.user.ensureAccountResources(accountId, resourceUrlPatterns);
+  }
+
+  listAddableGatekeepers(): Promise<GatekeeperVendorInfo[]> {
+    return this.user.listAddableGatekeepers();
+  }
+
+  provisionAmbientAccount(vendorId: string): Promise<void> {
+    return this.user.provisionAmbientAccount(vendorId);
+  }
+
+  subscribeConnectedAccounts(
+      subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
+      : Promise<RpcStub<{}>> {
+    return this.user.subscribeConnectedAccounts(subscriber, filter);
+  }
+
+  disconnectAccount(accountId: number): Promise<void> {
+    return this.user.disconnectAccount(accountId);
+  }
+
+  reconnectAccount(accountId: number): Promise<{url: string}> {
+    return this.user.reconnectAccount(accountId);
+  }
+
+  startResourceConfigurator(
+      accountId: number,
+      resourceUrlPattern: string) {
+    return this.user.startResourceConfigurator(accountId, resourceUrlPattern);
+  }
+
+  async dismissSharedWorkspace(workspaceId: string): Promise<void> {
+    return this.user.forgetSharedWorkspace(workspaceId);
+  }
+
+  async listOwnBlueprints(): Promise<BlueprintUserSummary[]> {
+    return this.user.listBlueprints();
+  }
+
+  async getOwnBlueprint(blueprintId: string): Promise<BlueprintUserSummary | null> {
+    return this.user.getBlueprint(blueprintId);
+  }
+
+  async listLibraryBlueprints(): Promise<BlueprintLibrarySummary[]> {
+    return this.user.listLibraryBlueprints();
+  }
+
+  async setBlueprintPinned(blueprintId: string, pinned: boolean): Promise<void> {
+    return this.user.setBlueprintPinned(blueprintId, pinned);
+  }
+
+  async isBlueprintPinned(blueprintId: string): Promise<boolean> {
+    return this.user.isBlueprintPinned(blueprintId);
+  }
+
+  async listFeaturedBlueprints(): Promise<BlueprintPublicInfo[]> {
+    return (await listFeaturedBlueprintsFromKv(this.env)).map(
+        blueprint => publicBlueprintInfo(blueprint.id, blueprint.metadata));
+  }
+
+  async addBlueprintToLibrary(blueprintId: string): Promise<void> {
+    return this.user.addBlueprintToLibrary(blueprintId);
+  }
+
+  async removeBlueprintFromLibrary(blueprintId: string): Promise<void> {
+    return this.user.removeBlueprintFromLibrary(blueprintId);
+  }
+
+  isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null> {
+    return this.user.isBlueprintInLibrary(blueprintId);
+  }
+
+  async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
+    let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
+    delete metadata.screenshot;
+    let blueprintId = randomBlueprintId();
+    let r2Key = `${blueprintId}/${metadata.version}`;
+
+    try {
+      let fixedLengthStream = new FixedLengthStream(contentLength);
+
+      await Promise.all([
+        content.pipeTo(fixedLengthStream.writable),
+        this.env.BLUEPRINT_CONTENT.put(r2Key, fixedLengthStream.readable),
+      ]);
+
+      let kvRecord: BlueprintKvRecord = {
+        metadata,
+        ownerId: this.user.id.toString(),
+      };
+
+      await this.env.BLUEPRINTS.put(blueprintId, JSON.stringify(kvRecord));
+
+      await this.user.importBlueprint(blueprintId, metadata);
+
+      recordAnalytics(this.ctx, this.env, {
+        event_name: "blueprint_imported",
+        user_id: this.user.id.toString(),
+        blueprint_id: blueprintId,
+      });
+
+      return blueprintId;
+    } catch (err) {
+      // Try to delete what we uploaded, but don't wait for results becasue there's nothing we
+      // can do if they fail, and we already have an error to throw.
+      this.env.BLUEPRINTS.delete(blueprintId);
+      this.env.BLUEPRINT_CONTENT.delete(r2Key);
+      throw err;
+    }
+  }
+
+  async newWorkspaceFromBlueprint(
+    _blueprintId: string,
+    _bindings: Record<string, BlueprintBindingAssignment>
+  ): Promise<RpcStub<Overseer>> {
+    throwLegacyVesselsRemoved();
+  }
+
+  async deleteOrphanedBlueprint(blueprintId: string): Promise<void> {
+    return this.user.deleteOwnedBlueprint(blueprintId);
+  }
+
+  // --- Gatekeeper management apps ---
+
+  // The management apps available to the current user: their connected accounts that declare a
+  // top-level UI (AccountDescription.providesUi). The app id is the gatekeeper's routing id (its
+  // vendor id, e.g. "context"), so each app is hosted at /gatekeepers/<vendorId>. UI-providing
+  // accounts are auto-provisioned singletons (one per vendor), so the vendor id identifies them.
+  async listGatekeeperApps(): Promise<GatekeeperAppInfo[]> {
+    // listProvidedAccounts provisions auto-provisioned accounts first (idempotent), so their apps
+    // appear in the nav even before the user opens a workspace — in a single round trip.
+    let accounts = await this.user.listProvidedAccounts();
+    return accounts
+        .filter(account => account.description.providesUi)
+        .map(account => ({
+          id: account.vendorId,
+          title: account.description.providesUi!.title,
+          icon: account.description.providesUi!.icon,
+        }));
+  }
+
+  async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
+    // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
+    // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
+    let accounts = await this.user.listProvidedAccounts();
+    let app = accounts.find(account => account.vendorId === id && account.description.providesUi);
+    if (!app) return null;
+    // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
+    return this.user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
+  }
+
+  // --- Deployment admin ---
+
+  async amIAdmin(): Promise<boolean> {
+    return this.#isAdmin();
+  }
+
+  async getAdminApi(): Promise<RpcStub<AdminApi> | null> {
+    if (!this.#isAdmin()) return null;
+    // #isAdmin() guarantees a non-empty user id name. Forwarded to gatekeepers when listing the
+    // resource catalog so RBAC-gated ones still surface for this admin.
+    let adminUserId = this.user.id.name!;
+    // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
+    //     system doesn't know this.
+    return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId);
+  }
+}
+
+async function serveApplicationScreenshot(env: Env, vesselName: string): Promise<Response> {
+  const object = await env.BLUEPRINT_CONTENT.get(`${APPLICATION_SCREENSHOT_R2_PREFIX}${vesselName}`);
+  if (!object) return new Response("Not Found", {status: 404});
+  let contentType = object.httpMetadata?.contentType;
+  if (contentType !== "image/jpeg" && contentType !== "image/png" && contentType !== "image/svg+xml") {
+    contentType = "image/jpeg";
+  }
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": contentType,
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
+}
+
+async function serveBlueprintScreenshot(env: Env, blueprintId: string): Promise<Response> {
+  let object = await env.BLUEPRINT_CONTENT.get(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${blueprintId}`);
+  if (!object) return new Response("Not Found", {status: 404});
+
+  let contentType = object.httpMetadata?.contentType;
+  if (contentType !== "image/jpeg" && contentType !== "image/png") {
+    contentType = "image/jpeg";
+  }
+
+  return new Response(object.body, {
+    headers: {
+      "Content-Type": contentType,
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+}
+
+// Returned by startGatekeeperLogin(). Wraps the PendingLogin DO so the client awaits the login
+// result through a capability (this stub) rather than a guessable id — no login id is ever exposed
+// to the client. Disposing the stub (e.g. when the pop-up closes or the component unmounts) cancels
+// the in-flight wait and lets the DO be evicted.
+@validateRpc()
+class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
+  constructor(private pending: DurableObjectStub<PendingLogin>) {
+    super();
+  }
+
+  async wait(): Promise<string> {
+    return await this.pending.awaitResult();
+  }
+}
+
+@validateRpc()
+class PublicApiImpl extends RpcTarget implements PublicApi {
+  users: DurableObjectNamespace<UserDurableObject>;
+
+  constructor(private ctx: ExecutionContext, private env: Env,
+      private abortSession: (reason: Error) => void,
+      private accessPayload?: JWTPayload) {
+    super();
+    this.users = this.ctx.exports.UserDurableObject;
+  }
+
+  async getServerConfig(): Promise<ServerConfig> {
+    return getServerConfig(this.env);
+  }
+
+  async startGatekeeperLogin(vendorId: string): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }> {
+    if (!getAuthGatekeeperAllowlist(this.env).includes(vendorId)) {
+      throw new Error(`Sign-in via "${vendorId}" is not enabled on this deployment.`);
+    }
+    const vendor = getAuthVendorBinding(this.env, vendorId);
+    if (!vendor) throw new Error(`No such auth gatekeeper: ${vendorId}`);
+    const desc = await vendor.describe();
+    if (!desc.providesAuth) throw new Error(`"${vendorId}" does not provide authentication.`);
+
+    // The PendingLogin DO is the rendezvous between this request and the (separate) OAuth-callback
+    // invocation. The client never sees its id — we hand back an `attempt` stub instead.
+    const pendingId = this.ctx.exports.PendingLogin.newUniqueId();
+    const pending = this.ctx.exports.PendingLogin.get(pendingId);
+    const callback = this.ctx.exports.LoginConnectCallbackImpl(
+        { props: { pendingId: pendingId.toString(), vendorId } });
+    // Sign-in needs only minimal scopes to verify the user's email. Capability scopes are requested
+    // later through an explicit connected account.
+    const { url } = await vendor.connectAccount(callback, { scopes: "auth" });
+    // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
+    //     system doesn't know this.
+    return { url, attempt: new LoginAttemptImpl(pending) };
+  }
+
+  async authenticate(token: string): Promise<AuthenticatedApi> {
+    let split = token.split(':');
+    if (split.length !== 2) {
+      throw new Error("Invalid session token.");
+    }
+
+    let userId = this.users.idFromName(split[0]);
+    let stub = this.users.get(userId);
+    await stub.authenticate(split[1]);
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "user_authenticated",
+      user_id: userId.toString(),
+      source: "session_token",
+    });
+    return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
+  }
+
+  async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
+    if (!this.accessPayload) {
+      throw new Error("Not authenticated with Access.");
+    }
+
+    let email = this.accessPayload.email as string;
+    let userId = this.users.idFromName(email);
+    let stub = this.users.get(userId);
+    let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
+    let accountCreated = await stub.authenticateFromCfAccess(email, signupsEnabled);
+    if (accountCreated) {
+      recordAnalytics(this.ctx, this.env, {
+        event_name: "account_created",
+        user_id: userId.toString(),
+        source: "cf_access",
+      });
+    }
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "user_authenticated",
+      user_id: userId.toString(),
+      source: "cf_access",
+    });
+    return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
+  }
+
+  async login(username: string, passwordHash: Uint8Array): Promise<string | null> {
+    if (this.env.CF_ACCESS_AUD) {
+      throw new Error("This deployment requires Cloudflare Access authentication.");
+    }
+    if (!isPasswordAuthEnabled(this.env)) {
+      throw new Error("Password login is disabled on this deployment. Use a sign-in option.");
+    }
+
+    username = normalizeUsername(username);
+
+    let id = this.users.idFromName(username);
+    let user = this.users.get(id);
+
+    let token = await user.login(passwordHash);
+    if (!token) return null;
+
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "user_authenticated",
+      user_id: id.toString(),
+      source: "password",
+    });
+
+    return `${username}:${token}`;
+  }
+
+  async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
+      : Promise<string | null> {
+    if (this.env.CF_ACCESS_AUD) {
+      throw new Error("This deployment requires Cloudflare Access authentication.");
+    }
+    if (!isPasswordAuthEnabled(this.env)) {
+      throw new Error("Password signup is disabled on this deployment. Use a sign-in option.");
+    }
+    if (!(await readAdminConfig(this.env)).signupsEnabled) {
+      throw new Error("New signups are currently disabled on this deployment.");
+    }
+
+    username = normalizeUsername(username);
+
+    let id = this.users.idFromName(username);
+    let user = this.users.get(id);
+
+    let token = await user.createAccount(username, displayName, passwordHash);
+    if (!token) return null;
+
+    recordAnalytics(this.ctx, this.env, {
+      event_name: "account_created",
+      user_id: id.toString(),
+      source: "password",
+    });
+
+    return `${username}:${token}`;
+  }
+
+  async getBlueprint(id: string): Promise<BlueprintPublicInfo | null> {
+    let kvRecord = await readBlueprintKvRecord(this.env, id);
+    if (!kvRecord) return null;
+
+    return publicBlueprintInfo(id, kvRecord.metadata);
+  }
+
+  async downloadBlueprint(id: string): Promise<ReadableStream<Uint8Array>> {
+    let kvRecord = await readBlueprintKvRecord(this.env, id);
+    if (!kvRecord) throw new Error("Blueprint not found.");
+
+    let r2Object = await this.env.BLUEPRINT_CONTENT.get(`${id}/${kvRecord.metadata.version}`);
+    if (!r2Object) throw new Error("Blueprint content not found in R2.");
+
+    let metadata = { ...kvRecord.metadata };
+    delete metadata.screenshot;
+
+    return buildBlueprintArchiveStream(metadata, r2Object.body, r2Object.size);
+  }
+}
+
+export default {
+  async fetch(req: Request, env: Env, ctx: ExecutionContext) {
+    let url = new URL(req.url);
+
+    if (url.pathname === SITE_LOGO_PATH) {
+      return serveSiteLogo(req, env.BLUEPRINT_CONTENT);
+    }
+
+    if (url.pathname.startsWith(BLUEPRINT_SCREENSHOT_PATH_PREFIX)) {
+      let blueprintId = url.pathname.slice(BLUEPRINT_SCREENSHOT_PATH_PREFIX.length);
+      return serveBlueprintScreenshot(env, blueprintId);
+    }
+
+    if (url.pathname.startsWith(APPLICATION_SCREENSHOT_PATH_PREFIX)) {
+      const vesselName = decodeURIComponent(
+          url.pathname.slice(APPLICATION_SCREENSHOT_PATH_PREFIX.length));
+      if (!vesselName) return new Response("Not Found", {status: 404});
+      return serveApplicationScreenshot(env, vesselName);
+    }
+
+    // Sign-in via authentication gatekeepers happens entirely within each gatekeeper Worker (the
+    // OAuth redirect lands on `/gatekeeper/<name>/oauth`); the result is bridged back to the waiting
+    // browser via the `attempt` stub from PublicApi.startGatekeeperLogin(). So the backend no longer
+    // hosts /auth/* callbacks.
+
+    if (url.pathname === "/api/client-errors") {
+      return handleClientErrorRequest(req, env, ctx);
+    }
+
+    if (url.pathname === "/api") {
+      // Make sure the bundled format blueprints are installed. The AdminSettings DO doesn't wake
+      // merely because someone deployed, so the install needs a trigger; hanging it off API
+      // traffic means a fresh deployment is provisioned by its first visitor. Fire-and-forget,
+      // and the DO is idempotent.
+      if (!formatBlueprintInstallStarted) {
+        formatBlueprintInstallStarted = true;
+        ctx.waitUntil(ctx.exports.AdminSettings.getByName("").ensureFormatBlueprintsInstalled()
+            .then((complete: boolean) => {
+              // A partial install resolves rather than throwing, and nothing else will call the DO
+              // from here, so clearing this is the whole retry: one bad archive would otherwise
+              // leave the deployment half-provisioned for as long as the isolate lives.
+              if (!complete) formatBlueprintInstallStarted = false;
+            })
+            .catch((err: unknown) => {
+              // Likewise let the next request try again. The DO coalesces concurrent callers, so a
+              // retry costs one comparison once it succeeds.
+              formatBlueprintInstallStarted = false;
+              logger.warn("failed to install bundled format blueprints", {
+                event: "formats.install.trigger.failed", error: err,
+              });
+            }));
+      }
+
+      let accessPayload: JWTPayload | undefined;
+
+      if (env.CF_ACCESS_AUD) {
+        if (req.headers.get("Origin") !== url.origin) {
+          return new Response("Cross-origin API access not allowed.", { status: 403 });
+        }
+
+        const payload = await verifyCfAccessJwt(req, env);
+        if (!payload) return new Response("Invalid CF access JWT.", { status: 403 });
+
+        if (!payload.email) {
+          return new Response("Access JWT didn't specify email address.", { status: 403 });
+        }
+
+        accessPayload = payload;
+      }
+
+      // HACK: Implement `abortSession` callback by closing the websocket.
+      // TODO: When ctx.abort() becomes non-experimental, consider using that instead.
+      let resp: Response | undefined;
+      let aborted = false;
+      let abortSession = (reason: Error) => {
+        aborted = true;
+        resp?.webSocket?.close();
+      };
+
+      resp = await newWorkersRpcResponse(req,
+          new PublicApiImpl(ctx, env, abortSession, accessPayload));
+
+      if (aborted) {
+        // Oops, we missed the abortSession() call while awaiting, apply now.
+        resp?.webSocket?.close();
+      }
+      return resp;
+    }
+
+    return new Response("Not Found", {status: 404});
+  }
+} satisfies ExportedHandler<Env>;

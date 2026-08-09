@@ -99,6 +99,21 @@ The [Workers guide](docs/workers/overview.mdx) shows the complete program and
 manifest before running it manually, through an HTTP callback, on cron, and
 from a RabbitMQ CloudEvent.
 
+## Verglas OS
+
+The local agentic lakehouse application lives in [`apps/os`](apps/os). It uses
+the TypeScript SDK in this repository directly and connects to the local Verglas
+admin, scheduler, and container-runtime APIs.
+
+```sh
+cd apps/os
+pnpm run-local
+```
+
+Open `http://127.0.0.1:8787`. See the
+[`apps/os` README](apps/os/README.md) for its runtime variables and development
+commands.
+
 ## Documentation
 
 - [Architecture](docs/architecture/overview.mdx) — cache tiers, Iceberg
@@ -129,6 +144,7 @@ just lint    # cargo fmt --all --check + clippy -D warnings
 
 ## License
 
-Not yet declared. This repository has no license file and is not published to
-crates.io (`publish = false`). Until a license is added, treat it as
-all-rights-reserved and open an issue if you need clarity on use.
+The Rust workspace is not yet licensed or published to crates.io. Until a
+root license is added, treat it as all-rights-reserved. The separately licensed
+Verglas OS application retains its Apache 2.0 license in
+[`apps/os/LICENSE`](apps/os/LICENSE).

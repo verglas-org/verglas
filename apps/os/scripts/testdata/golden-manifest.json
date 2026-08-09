@@ -1,0 +1,180 @@
+{
+  "assets": {
+    "491d36a37a70c80429cfb6630ab034a6": {
+      "r2Key": "blobs/assets/491d36a37a70c80429cfb6630ab034a6",
+      "size": 44
+    },
+    "8d2e76555a7166d0e6b7da22cabfa055": {
+      "r2Key": "blobs/assets/8d2e76555a7166d0e6b7da22cabfa055",
+      "size": 28
+    },
+    "924064d945426fd30c24d0d24235610d": {
+      "r2Key": "blobs/assets/924064d945426fd30c24d0d24235610d",
+      "size": 19
+    }
+  },
+  "commit": "0000000000000000000000000000000000000000",
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "manifestVersion": 1,
+  "releaseId": "r000000-fixture",
+  "workers": {
+    "router": {
+      "assetsConfig": {
+        "not_found_handling": "single-page-application",
+        "run_worker_first": [
+          "/api",
+          "/api/*",
+          "/blueprint-screenshot",
+          "/blueprint-screenshot/*",
+          "/application-screenshot",
+          "/application-screenshot/*"
+        ],
+        "variants": {
+          "access": {
+            "manifest": {
+              "/assets/app.js": {
+                "hash": "8d2e76555a7166d0e6b7da22cabfa055",
+                "size": 28
+              },
+              "/assets/print.css": {
+                "hash": "924064d945426fd30c24d0d24235610d",
+                "size": 19
+              },
+              "/assets/shared.css": {
+                "hash": "924064d945426fd30c24d0d24235610d",
+                "size": 19
+              },
+              "/index.html": {
+                "hash": "491d36a37a70c80429cfb6630ab034a6",
+                "size": 44
+              }
+            }
+          }
+        }
+      },
+      "bindings": [
+        {
+          "name": "WORKSHOP_BACKEND",
+          "service": "$WORKER_NAME(workshop-backend)",
+          "type": "service"
+        },
+        {
+          "name": "ASSETS",
+          "type": "assets"
+        }
+      ],
+      "compatibilityDate": "2026-02-02",
+      "compatibilityFlags": [],
+      "gatekeeperBindingExpansion": {
+        "propsByPackage": {}
+      },
+      "installable": true,
+      "kind": "router",
+      "mainModule": "index.js",
+      "migrations": [],
+      "modules": [
+        {
+          "name": "index.js",
+          "r2Key": "blobs/modules/a87c6a3b69ec80c9d456d4d42db62416d2a4ad77cb8c24963ccc6923a0bca27a",
+          "sha256": "a87c6a3b69ec80c9d456d4d42db62416d2a4ad77cb8c24963ccc6923a0bca27a",
+          "size": 48,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "vars": {}
+    },
+    "workshop-backend": {
+      "bindings": [
+        {
+          "name": "BLUEPRINTS",
+          "namespace_id": "$KV_BLUEPRINTS_ID",
+          "type": "kv_namespace"
+        },
+        {
+          "name": "AVATARS",
+          "namespace_id": "$KV_AVATARS_ID",
+          "type": "kv_namespace"
+        },
+        {
+          "bucket_name": "$R2_BLUEPRINT_CONTENT_NAME",
+          "name": "BLUEPRINT_CONTENT",
+          "type": "r2_bucket"
+        },
+        {
+          "name": "BROWSER",
+          "type": "browser"
+        },
+        {
+          "name": "WORKERS_AI",
+          "type": "ai"
+        }
+      ],
+      "compatibilityDate": "2026-02-02",
+      "compatibilityFlags": [
+        "allow_irrevocable_stub_storage",
+        "enhanced_error_serialization",
+        "global_fetch_strictly_public",
+        "nodejs_compat"
+      ],
+      "gatekeeperBindingExpansion": {
+        "entrypoint": "GatekeeperVendor",
+        "propsByPackage": {
+          "gatekeeper-context": {
+            "sharingDomain": "$PUBLIC_BASE_URL"
+          }
+        }
+      },
+      "installable": true,
+      "kind": "backend",
+      "mainModule": "server.js",
+      "migrations": [
+        {
+          "new_sqlite_classes": [
+            "UserDurableObject",
+            "OverseerDurableObject"
+          ],
+          "tag": "v0"
+        },
+        {
+          "new_sqlite_classes": [
+            "AdminSettings"
+          ],
+          "tag": "v1"
+        },
+        {
+          "new_sqlite_classes": [
+            "PendingLogin"
+          ],
+          "tag": "v2"
+        }
+      ],
+      "modules": [
+        {
+          "name": "server.js",
+          "r2Key": "blobs/modules/5c9577bc881feaf2e824586af67e4c17551c7bab33be08579ace527c740e2e0d",
+          "sha256": "5c9577bc881feaf2e824586af67e4c17551c7bab33be08579ace527c740e2e0d",
+          "size": 58,
+          "type": "esm"
+        }
+      ],
+      "observability": {
+        "enabled": true,
+        "head_sampling_rate": 1,
+        "logs": {
+          "invocation_logs": false
+        }
+      },
+      "vars": {
+        "PUBLIC_BASE_URL": "$PUBLIC_BASE_URL"
+      }
+    }
+  },
+  "wranglerVersion": "0.0.0-fixture"
+}

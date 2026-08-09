@@ -11,3 +11,4 @@
 - #67: Realigned ensure/create to Iceberg REST (catalog discovery via `/admin/access` or `catalogUri`) and `table.append` to `POST /v1/ingest/{name}` JSONL. Shared surface inventory now lives in `contracts/api-surface.json`; follow/feed is documented as not live on-prem.
 - #66: Rewrote endpoint-run and README host-entry docs for the local worker harness against http://127.0.0.1:8334; kept VERGLAS_CLOUD_EVENT as the CloudEvents env binding.
 - #66: Removed local-vs-cloud endpoint product wording from README and SDK comments; renamed test fixtures `t.verglas.cloud` → `t.example.test` and `cloud.job_runs` → `demo.job_runs`.
+- #75: Added typed clients for worker administration, scheduler secrets and job history, and local Vessel runtime operations. Verglas OS can now use the canonical TypeScript SDK from the monorepo instead of carrying a generated private copy.
