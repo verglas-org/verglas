@@ -59,13 +59,16 @@ describe("VerglasCatalogClient", () => {
           engine: {mode: "managed-neon"},
         }]});
       }
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/config")) {
+        return Response.json({defaults: {prefix: "analytics-warehouse"}});
+      }
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces")) {
         return Response.json({namespaces: [["events"], ["knowledge"]]});
       }
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/events/tables")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces/events/tables")) {
         return Response.json({identifiers: [{namespace: ["events"], name: "log"}]});
       }
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/knowledge/tables")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces/knowledge/tables")) {
         return Response.json({identifiers: [
           {namespace: ["knowledge"], name: "nodes"},
           {namespace: ["knowledge"], name: "edges"},
@@ -97,7 +100,7 @@ describe("VerglasCatalogClient", () => {
       graphs: [{database: "analytics", namespace: "knowledge"}],
       vectors: [],
     });
-    expect(fetcher).toHaveBeenCalledTimes(4);
+    expect(fetcher).toHaveBeenCalledTimes(5);
   });
 
   it("creates database resources and manages tables through the selected database catalog", async () => {
@@ -109,10 +112,13 @@ describe("VerglasCatalogClient", () => {
         storage: {mode: "managed"},
         catalog: {mode: "managed-lakekeeper"},
       });
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/config")) {
+        return Response.json({defaults: {prefix: "analytics-warehouse"}});
+      }
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces")) {
         return Response.json({namespaces: [["events"]]});
       }
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/events/tables")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces/events/tables")) {
         return Response.json({identifiers: []});
       }
       if (url.endsWith("/v1/databases") && !input.toString().endsWith("/analytics")) {
@@ -154,7 +160,7 @@ describe("VerglasCatalogClient", () => {
       }),
     ]);
     expect(requests).toContainEqual([
-      "http://localhost:8334/v1/databases/analytics/catalog/v1/namespaces/events/tables",
+      "http://localhost:8334/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces/events/tables",
       "POST",
       JSON.stringify({
         name: "events",
@@ -165,7 +171,7 @@ describe("VerglasCatalogClient", () => {
       }),
     ]);
     expect(requests).toContainEqual([
-      "http://localhost:8334/v1/databases/analytics/catalog/v1/namespaces/events/tables/events",
+      "http://localhost:8334/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces/events/tables/events",
       "DELETE",
       undefined,
     ]);
@@ -183,10 +189,13 @@ describe("VerglasCatalogClient", () => {
         type: "lakehouse", name: "analytics", storage: {mode: "managed"},
         catalog: {mode: "managed-lakekeeper"},
       });
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/config")) {
+        return Response.json({defaults: {prefix: "analytics-warehouse"}});
+      }
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces")) {
         return Response.json({namespaces: [["events"]]});
       }
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces/events/tables")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces/events/tables")) {
         return Response.json({identifiers: [{namespace: ["events"], name: "log"}]});
       }
       return new Response("not found", {status: 404});
@@ -205,7 +214,10 @@ describe("VerglasCatalogClient", () => {
         type: "lakehouse", name: "analytics", storage: {mode: "managed"},
         catalog: {mode: "managed-lakekeeper"},
       });
-      if (url.endsWith("/v1/databases/analytics/catalog/v1/namespaces")) {
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/config")) {
+        return Response.json({defaults: {prefix: "analytics-warehouse"}});
+      }
+      if (url.endsWith("/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces")) {
         return Response.json({namespaces: []});
       }
       return new Response(null, {status: 204});
@@ -220,7 +232,7 @@ describe("VerglasCatalogClient", () => {
 
     expect(fetcher.mock.calls.map(([input, init]) => [String(input), init?.method, init?.body]))
       .toContainEqual([
-        "http://localhost:8334/v1/databases/analytics/catalog/v1/namespaces",
+        "http://localhost:8334/v1/databases/analytics/catalog/v1/analytics-warehouse/namespaces",
         "POST",
         JSON.stringify({namespace: ["events"], properties: {}}),
       ]);

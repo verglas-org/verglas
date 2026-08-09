@@ -1,13 +1,12 @@
 ---
 title: "Self-host Verglas"
-description: "Start Verglas against Cloudflare R2 and R2 Data Catalog with one Docker Compose file."
+description: "Start the complete OSS stack with Cloudflare R2 and tenant-managed Lakekeeper."
 icon: "server"
 ---
 
-This guide starts one Verglas server backed by Cloudflare R2. You provide the
-object-store and catalog credentials as environment variables; Docker Compose
-contains the complete server configuration. You do not create or mount a
-server `config.toml`.
+This guide starts one Verglas tenant backed by Cloudflare R2. R2 stores durable
+Iceberg objects. The Compose stack runs Lakekeeper as the tenant's managed
+Iceberg REST catalog. You do not create or mount a server `config.toml`.
 
 The running application exposes:
 
@@ -25,20 +24,14 @@ with Compose, Git, and the Rust toolchain. You also need a Cloudflare account
 with R2 enabled.
 
 <Steps>
-  <Step title="Create an R2 bucket and catalog">
+  <Step title="Create an R2 bucket">
     Follow Cloudflare's [R2 S3 setup](https://developers.cloudflare.com/r2/get-started/s3/)
     to create a bucket. This guide calls it `verglas-demo`.
 
-    Open **Storage & databases → R2 Data Catalog**, create a catalog for that
-    bucket, and record the catalog URI and warehouse name. Cloudflare documents
-    this flow in [Manage catalogs](https://developers.cloudflare.com/r2/data-catalog/manage-catalogs/).
-
-    The values have this shape:
+    Record the S3 endpoint. It has this shape:
 
     ```text
     S3 endpoint: https://ACCOUNT_ID.r2.cloudflarestorage.com
-    Catalog URI: https://catalog.cloudflarestorage.com/ACCOUNT_ID/verglas-demo
-    Warehouse:   ACCOUNT_ID_verglas-demo
     ```
   </Step>
 
@@ -137,7 +130,7 @@ with R2 enabled.
 
 ## Next: create your first table
 
-The server is connected to R2 and its Iceberg catalog. Continue with
+The server is connected to R2 and tenant Lakekeeper. Continue with
 [Create your first table](/docs/get-started/first-table) to write rows, run a
 query, and confirm that the resulting Iceberg table is visible through the
 catalog.
@@ -148,7 +141,7 @@ catalog.
 docker compose down
 ```
 
-This stops the two bootstrap services. Dynamically managed containers retain
+This stops the Compose services. Dynamically managed containers retain
 their declared state and are reconciled when the manager starts again. The
 named volumes retain the local cache and runtime desired-state document. Add
 `--volumes` only when you intentionally want to delete both.

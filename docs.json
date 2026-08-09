@@ -41,6 +41,9 @@
         "group": "Platform",
         "icon": "database",
         "pages": [
+          "docs/platform/databases",
+          "docs/platform/secrets",
+          "docs/platform/security",
           "docs/platform/kv"
         ]
       },

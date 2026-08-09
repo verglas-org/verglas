@@ -67,6 +67,17 @@ function outputSchema(tools) {
     const fn = tool?.function;
     return fn && typeof fn.name === "string" ? [fn.name] : [];
   });
+  const toolCallSchema = {
+    type: "object",
+    properties: {
+      name: toolNames.length > 0
+        ? {type: "string", enum: toolNames}
+        : {type: "string"},
+      arguments: {type: "string"},
+    },
+    required: ["name", "arguments"],
+    additionalProperties: false,
+  };
   return {
     type: "object",
     properties: {
@@ -77,17 +88,9 @@ function outputSchema(tools) {
       tool_calls: toolNames.length > 0
         ? {
           type: "array",
-          items: {
-            type: "object",
-            properties: {
-              name: {type: "string", enum: toolNames},
-              arguments: {type: "string"},
-            },
-            required: ["name", "arguments"],
-            additionalProperties: false,
-          },
+          items: toolCallSchema,
         }
-        : { type: "array", maxItems: 0 },
+        : {type: "array", items: toolCallSchema, maxItems: 0},
     },
     required: ["content", "tool_calls"],
     additionalProperties: false,

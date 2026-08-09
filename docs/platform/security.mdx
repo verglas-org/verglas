@@ -1,0 +1,174 @@
+---
+title: "Security and access control"
+description: "Understand tenant isolation, principals, resources, grants, workload credentials, and secret use."
+icon: "shield-check"
+---
+
+Verglas uses one authorization contract across lakehouses, Postgres databases,
+Workers, Vessels, Integrations, Applications, queues, graphs, vectors, and
+secrets. The policy database is part of the tenant control plane and uses the
+same Postgres service as the scheduler with separate schemas and roles.
+
+## Authorization model
+
+Every access decision contains four values:
+
+```text
+tenant + principal + resource + action -> allow or deny
+```
+
+- A **principal** is a user or process, such as an agent turn, Job run, Vessel,
+  Application, Integration, or service account.
+- A **resource** is a protected object in a hierarchy, such as a database,
+  namespace, table, graph, vector index, secret, Job, or Integration operation.
+- An **action** is one operation, such as `discover`, `query`, `append`,
+  `execute`, `use_secret`, `deploy`, or `manage_grants`.
+- A **grant** assigns one or more actions to one principal on one resource.
+
+The default result is deny. A decision names the exact or inherited grant that
+allowed the request and the policy version that was evaluated.
+
+## Separate login from data authorization
+
+Cloud deployments authenticate users at the Cloudflare control plane. Local OSS
+uses the configured access-service bearer token. In both cases, authentication
+only establishes the user principal and tenant. Verglas still evaluates that
+principal's grant before it exposes or modifies a data-plane resource.
+
+Do not pass a Cloudflare session, an AWS key, or the local administrative token
+to a workload. The control plane exchanges the authenticated session for a
+short-lived workload credential with these claims:
+
+- tenant ID
+- principal ID
+- intended audience
+- policy version
+- issue and expiration times
+- optional Job-run ID
+
+The receiving service validates the token and evaluates current policy. A token
+does not contain an account-wide administrator credential.
+
+<Warning>
+The OSS crates define and validate scoped-token claims, but the current local
+HTTP composition does not expose a production token issuer. The
+`verglas-local-access` token is a development control credential. Do not use it
+as an Application, Integration, Worker, or agent token in a shared deployment.
+</Warning>
+
+## Register a process principal
+
+The following example registers a Job, namespace, and table in the local
+development tenant:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header "Authorization: Bearer $VERGLAS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "tenant_id":"local",
+    "id":"job-orders-ingest",
+    "kind":"job"
+  }' \
+  "$VERGLAS_ACCESS_ENDPOINT/v1/access/principals"
+
+curl --fail-with-body \
+  --request POST \
+  --header "Authorization: Bearer $VERGLAS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "tenant_id":"local",
+    "id":"namespace-analytics",
+    "kind":"namespace"
+  }' \
+  "$VERGLAS_ACCESS_ENDPOINT/v1/access/resources"
+
+curl --fail-with-body \
+  --request POST \
+  --header "Authorization: Bearer $VERGLAS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "tenant_id":"local",
+    "id":"table-orders",
+    "kind":"table",
+    "parent_id":"namespace-analytics"
+  }' \
+  "$VERGLAS_ACCESS_ENDPOINT/v1/access/resources"
+```
+
+## Grant bounded access
+
+Grant the Job permission to append rows and inspect the table definition:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header "Authorization: Bearer $VERGLAS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "id":"grant-orders-ingest",
+    "tenant_id":"local",
+    "principal_id":"job-orders-ingest",
+    "resource_id":"table-orders",
+    "actions":["append","describe"]
+  }' \
+  "$VERGLAS_ACCESS_ENDPOINT/v1/access/grants"
+```
+
+Do not grant `own` when a process only needs `append`. `own` covers the complete
+resource-owner operation set.
+
+## Check access
+
+Evaluate the permission before minting or invoking a workload:
+
+```bash
+curl --fail-with-body \
+  --request POST \
+  --header "Authorization: Bearer $VERGLAS_TOKEN" \
+  --header 'Content-Type: application/json' \
+  --data '{
+    "tenant_id":"local",
+    "principal_id":"job-orders-ingest",
+    "resource_id":"table-orders",
+    "action":"append"
+  }' \
+  "$VERGLAS_ACCESS_ENDPOINT/v1/access/check"
+```
+
+An allowed response has this shape:
+
+```json
+{
+  "allowed": true,
+  "reason": "exact_grant",
+  "grant_id": "grant-orders-ingest",
+  "matched_resource_id": "table-orders",
+  "policy_version": 7
+}
+```
+
+## Delegate only permissions the user holds
+
+An agent may request a grant for a new Application, Integration, or Job. The UI
+must show the principal, resource, actions, and duration before the user
+approves it. Approval calls `/v1/access/delegations`, not the unrestricted grant
+endpoint.
+
+The authorization service permits delegation only when the acting user has
+`pass_grants` and already holds every requested action on the resource. A user
+cannot grant a process access the user does not possess.
+
+## Give a workload access to a secret
+
+Treat credential use separately from data access:
+
+1. Register the Integration or Job as a principal.
+2. Grant `use_secret` on the secret resource.
+3. Grant `execute`, `append`, or `query` on the target resources separately.
+4. Mint a short-lived credential for the workload principal.
+5. Let the trusted runtime resolve the secret for the exact provider URI.
+
+This design lets an Integration call an external API without revealing the API
+key to its UI, an agent prompt, logs, or another Vessel component.

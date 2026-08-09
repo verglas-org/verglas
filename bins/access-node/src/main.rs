@@ -271,10 +271,13 @@ async fn run(args: Args) -> Result<(), String> {
         lakehouse,
         postgres,
     ));
-    database_service
+    let recovery_failures = database_service
         .recover(&args.tenant_id)
         .await
         .map_err(|error| error.to_string())?;
+    for failure in recovery_failures {
+        eprintln!("verglas-access: database runtime recovery failed: {failure}");
+    }
     let token: Arc<str> = Arc::from(args.service_token);
     let protected = Router::new()
         .merge(verglas_rest::access::router_with_secrets(

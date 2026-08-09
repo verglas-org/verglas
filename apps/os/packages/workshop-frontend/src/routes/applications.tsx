@@ -14,6 +14,7 @@ import {
 } from '../components/CatalogTable'
 import { applicationLifecycleAvailable, nextApplicationLifecycleState } from '../applicationLifecycle'
 import { useServerConfig } from '../ServerConfigContext'
+import { useAutomaticRefresh } from '../useAutomaticRefresh'
 import { useDocumentTitle } from '../useDocumentTitle'
 
 export const Route = createFileRoute('/applications')({ component: ApplicationsPage })
@@ -30,18 +31,19 @@ function ApplicationsPage() {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
   const [lifecycleBusy, setLifecycleBusy] = useState(false)
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true)
     setError(null)
     try {
       setApplications((await authenticatedApi.listVerglasVessels()).filter((v) => v.role === 'application'))
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
     }
   }, [authenticatedApi])
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load(true) }, [load])
+  useAutomaticRefresh(load)
 
   const app = applications.find((entry) => entry.name === selected) ?? null
   const canManageLifecycle = applicationLifecycleAvailable(serverConfig?.localContainerRuntime)
@@ -83,7 +85,6 @@ function ApplicationsPage() {
     <CatalogPage
       title="Applications"
       description="Full-stack applications built over your lakehouse and integrations."
-      onRefresh={() => void load()}
       actions={
         <Link
           to="/"

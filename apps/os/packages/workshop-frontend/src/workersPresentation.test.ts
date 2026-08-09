@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { VerglasWorkerSummary } from '@verglas/workshop-shared/api'
-import { summarizeWorkers, workerScheduleSummary } from './workersPresentation'
+import { summarizeWorkers, workerLifecycleLabel, workerScheduleSummary } from './workersPresentation'
 
 const worker = (overrides: Partial<VerglasWorkerSummary> = {}): VerglasWorkerSummary => ({
   name: 'daily-orders', state: 'running', placement: 'scheduler', output: 'lake.orders',
@@ -9,6 +9,12 @@ const worker = (overrides: Partial<VerglasWorkerSummary> = {}): VerglasWorkerSum
 })
 
 describe('workers presentation', () => {
+  it('does not present worker lifecycle as a running job', () => {
+    expect(workerLifecycleLabel('running')).toBe('Active')
+    expect(workerLifecycleLabel('paused')).toBe('Disabled')
+    expect(workerLifecycleLabel('archived')).toBe('Disabled')
+  })
+
   it('renders portable trigger declarations as a concise schedule', () => {
     expect(workerScheduleSummary(worker())).toEqual({ label: 'Cron · 0 9 * * *', kind: 'scheduled' })
     expect(workerScheduleSummary(worker({ triggers: 'invalid' }))).toEqual({ label: 'Invalid trigger declaration', kind: 'unknown' })

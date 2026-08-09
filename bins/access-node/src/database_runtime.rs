@@ -2,7 +2,8 @@
 //!
 //! A create call is successful only after its managed Lakekeeper or Neon
 //! runtime is usable. Failed provisioning removes the just-created declaration;
-//! startup recovery reasserts every durable declaration after process restarts.
+//! startup recovery reasserts every durable declaration after process restarts
+//! without allowing one unavailable database to take the tenant API offline.
 
 use std::sync::Arc;
 
@@ -76,13 +77,19 @@ where
         }
     }
 
-    /// Reasserts every durable managed database before the access API listens.
-    pub(crate) async fn recover(&self, tenant_id: &str) -> Result<(), DatabaseServiceError> {
+    /// Reasserts every durable managed database and returns isolated failures.
+    pub(crate) async fn recover(
+        &self,
+        tenant_id: &str,
+    ) -> Result<Vec<String>, DatabaseServiceError> {
         self.lakehouse.bootstrap().await?;
+        let mut failures = Vec::new();
         for database in self.inner.list_databases(tenant_id).await? {
-            self.ensure_view(&database).await?;
+            if let Err(error) = self.ensure_view(&database).await {
+                failures.push(format!("{}: {error}", database.name()));
+            }
         }
-        Ok(())
+        Ok(failures)
     }
 
     /// Reconciles the managed runtime represented by one public definition.
@@ -395,11 +402,44 @@ mod tests {
         let manager =
             ProvisioningDatabaseManager::new(inner, FakeRuntime::default(), FakeRuntime::default());
 
-        manager.recover("tenant-a").await.expect("recovery");
+        assert!(
+            manager
+                .recover("tenant-a")
+                .await
+                .expect("recovery")
+                .is_empty()
+        );
 
         assert_eq!(
             manager.postgres.ensured.lock().expect("ensured").as_slice(),
             ["operational"]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_isolates_one_unavailable_database_runtime() {
+        let inner = Arc::new(MemoryManager::default());
+        let postgres_plan = CreateDatabase::new("operational", DatabaseKind::Postgres)
+            .plan("tenant-a")
+            .expect("plan");
+        inner
+            .create_database(postgres_plan)
+            .await
+            .expect("persisted database");
+        let manager = ProvisioningDatabaseManager::new(
+            inner,
+            FakeRuntime::default(),
+            FakeRuntime {
+                fail: true,
+                ..FakeRuntime::default()
+            },
+        );
+
+        let failures = manager.recover("tenant-a").await.expect("recovery");
+
+        assert_eq!(
+            failures,
+            ["operational: database runtime provisioning failed: failed"]
         );
     }
 }

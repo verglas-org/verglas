@@ -24,6 +24,7 @@ import {
 } from '../components/CatalogTable'
 import { groupIntegrationFields, missingRequiredIntegrationFields } from '../integrationConfiguration'
 import { useDocumentTitle } from '../useDocumentTitle'
+import { useAutomaticRefresh } from '../useAutomaticRefresh'
 
 export const Route = createFileRoute('/integrations')({ component: IntegrationsPage })
 
@@ -50,6 +51,7 @@ function IntegrationsPage() {
     }
   }, [authenticatedApi])
   useEffect(() => { void load() }, [load])
+  useAutomaticRefresh(load)
 
   const open = async (name: string) => {
     setSelected(name)
@@ -117,7 +119,6 @@ function IntegrationsPage() {
     <CatalogPage
       title="Integrations"
       description="Manage the credentials and connection settings for your external systems."
-      onRefresh={() => void load()}
       actions={(
         <RouterLink
           to="/"

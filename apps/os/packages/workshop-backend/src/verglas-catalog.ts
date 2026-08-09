@@ -1,5 +1,6 @@
 import {
   extractWorkerSource,
+  VerglasHttpError,
   type CreateDatabaseRequest,
   type DatabaseView,
   type JobSummary,
@@ -69,6 +70,7 @@ function mapRun(job: JobSummary): VerglasWorkerRunSummary {
 export class VerglasCatalogClient {
   readonly #env: VerglasCatalogEnv;
   readonly #fetch: typeof fetch;
+  readonly #catalogBases = new Map<string, Promise<string>>();
 
   constructor(env: VerglasCatalogEnv, fetcher: typeof fetch = fetch) {
     resolveLocalContainerRuntimeConfigured(env);
@@ -130,7 +132,7 @@ export class VerglasCatalogClient {
     database: Extract<VerglasDatabaseDefinition, {type: "lakehouse"}>,
   ): Promise<{namespaces: string[][]; tables: VerglasTableSummary[]}> {
     const admin = verglasAdmin(this.#env, this.#fetch);
-    const catalogBase = databaseCatalogBase(database.name);
+    const catalogBase = await this.#catalogBase(database.name);
     const namespaceBody = await admin.getJson<{namespaces?: string[][]}>(`${catalogBase}/namespaces`);
     const namespaces = (namespaceBody.namespaces ?? []).slice(0, 100);
     const identifiers: IcebergTableIdentifier[] = [];
@@ -151,6 +153,37 @@ export class VerglasCatalogClient {
       qualifiedName: [...namespace, name].map(quoteIdentifier).join("."),
     })).toSorted((a, b) => a.qualifiedName.localeCompare(b.qualifiedName));
     return {namespaces, tables};
+  }
+
+  /** Resolves the Iceberg REST prefix advertised for one database warehouse. */
+  async #catalogBase(name: string): Promise<string> {
+    const database = validateIdentifier(name, "Database name");
+    let pending = this.#catalogBases.get(database);
+    if (!pending) {
+      pending = this.#resolveCatalogBase(database);
+      this.#catalogBases.set(database, pending);
+    }
+    return await pending;
+  }
+
+  /** Negotiates one mounted Iceberg catalog rather than assuming an unprefixed warehouse. */
+  async #resolveCatalogBase(database: string): Promise<string> {
+    const admin = verglasAdmin(this.#env, this.#fetch);
+    const mount = databaseCatalogMount(database);
+    type CatalogConfig = {defaults?: {prefix?: string}; overrides?: {prefix?: string}};
+    let config: CatalogConfig | undefined;
+    for (let attempt = 0; attempt < 6; attempt++) {
+      try {
+        config = await admin.getJson<CatalogConfig>(`${mount}/v1/config`);
+        break;
+      } catch (error) {
+        if (!(error instanceof VerglasHttpError) || error.status !== 404 || attempt === 5) throw error;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+    }
+    if (!config) throw new Error(`Database '${database}' catalog did not become available.`);
+    const prefix = config.overrides?.prefix ?? config.defaults?.prefix;
+    return prefix ? `${mount}/v1/${encodeURIComponent(prefix)}` : `${mount}/v1`;
   }
 
   /** Lists public database definitions without exposing tenant or secret resource IDs. */
@@ -216,7 +249,7 @@ export class VerglasCatalogClient {
     const name = validateIdentifier(input.name, "Table name");
     if (!input.columns.length) throw new Error("A table requires at least one column.");
     const admin = verglasAdmin(this.#env, this.#fetch);
-    const catalogBase = databaseCatalogBase(database.name);
+    const catalogBase = await this.#catalogBase(database.name);
     const namespaceBody = await admin.getJson<{namespaces?: string[][]}>(`${catalogBase}/namespaces`);
     if (!(namespaceBody.namespaces ?? []).some((candidate) => sameNamespace(candidate, namespace))) {
       await admin.postJson<void>(`${catalogBase}/namespaces`, {namespace, properties: {}});
@@ -232,7 +265,7 @@ export class VerglasCatalogClient {
     const validatedNamespace = validateNamespace(namespace);
     const validatedName = validateIdentifier(name, "Table name");
     const admin = verglasAdmin(this.#env, this.#fetch);
-    const catalogBase = databaseCatalogBase(database.name);
+    const catalogBase = await this.#catalogBase(database.name);
     await admin.deleteJson<void>(
       `${catalogBase}/namespaces/${encodeNamespace(validatedNamespace)}/tables/${encodeURIComponent(validatedName)}`,
     );
@@ -341,8 +374,8 @@ function sameNamespace(left: string[], right: string[]): boolean {
   return left.length === right.length && left.every((part, index) => part === right[index]);
 }
 
-function databaseCatalogBase(name: string): string {
-  return `/v1/databases/${encodeURIComponent(validateIdentifier(name, "Database name"))}/catalog/v1`;
+function databaseCatalogMount(name: string): string {
+  return `/v1/databases/${encodeURIComponent(validateIdentifier(name, "Database name"))}/catalog`;
 }
 
 function mapDatabaseDefinition(database: DatabaseView): VerglasDatabaseDefinition {

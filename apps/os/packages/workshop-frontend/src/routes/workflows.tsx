@@ -13,7 +13,9 @@ import {
 } from '../components/CatalogTable'
 import { RunHistoryDots } from '../components/RunHistoryDots'
 import { WorkersBoard, WorkersEmptyState } from '../components/WorkersBoard'
+import { useAutomaticRefresh } from '../useAutomaticRefresh'
 import { useDocumentTitle } from '../useDocumentTitle'
+import { workerLifecycleLabel } from '../workersPresentation'
 
 export const Route = createFileRoute('/workflows')({ component: WorkersPage })
 
@@ -44,15 +46,15 @@ function WorkersPage() {
   const [busy, setBusy] = useState(false)
   const [confirmArchive, setConfirmArchive] = useState<string | null>(null)
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true)
     setError(null)
     try {
       setWorkers(await authenticatedApi.listVerglasWorkers())
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
     }
   }, [authenticatedApi])
 
@@ -73,7 +75,8 @@ function WorkersPage() {
     }
   }, [authenticatedApi])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load(true) }, [load])
+  useAutomaticRefresh(load, 3_000)
 
   useEffect(() => {
     if (!selected) {
@@ -84,11 +87,7 @@ function WorkersPage() {
     void loadDetail(selected)
   }, [selected, loadDetail])
 
-  useEffect(() => {
-    if (!selected || !detail?.activeRun) return
-    const id = window.setInterval(() => { void loadDetail(selected) }, 5000)
-    return () => window.clearInterval(id)
-  }, [selected, detail?.activeRun, loadDetail])
+  useAutomaticRefresh(() => selected ? loadDetail(selected) : undefined, 2_000)
 
   const open = (name: string) => setSelected(name)
   const close = () => setSelected(null)
@@ -147,7 +146,6 @@ function WorkersPage() {
     <CatalogPage
       title="Workers"
       description="Monitor scheduled and event-driven jobs across your lakehouse."
-      onRefresh={() => void load()}
       actions={<Link to="/" search={{prompt: 'Create a worker that '}} className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-kumo-brand px-3 text-[13px] font-medium text-white hover:bg-kumo-brand-hover"><Plus size={15} /> Create worker</Link>}
     >
       {error && <CatalogError message={error} />}
@@ -158,7 +156,7 @@ function WorkersPage() {
           subtitle={worker?.output || 'No output declared'}
           meta={
             <div className="flex flex-wrap items-center gap-2">
-              {worker && <CatalogStatus value={worker.state} good={worker.state === 'running'} />}
+              {worker && <CatalogStatus value={workerLifecycleLabel(worker.state)} good={worker.state === 'running'} />}
               {worker?.activeRun && (
                 <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[10px] font-semibold uppercase text-amber-600">
                   Live
@@ -184,7 +182,7 @@ function WorkersPage() {
                 className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg border border-kumo-line px-3 text-[13px] text-kumo-default disabled:opacity-40"
               >
                 {worker?.state === 'paused' ? <Play size={14} /> : <Pause size={14} />}
-                {worker?.state === 'paused' ? 'Resume' : 'Pause'}
+                {worker?.state === 'paused' ? 'Enable' : 'Disable'}
               </button>
               <button
                 type="button"

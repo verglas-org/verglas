@@ -2,6 +2,11 @@ import type { VerglasWorkerSummary } from '@verglas/workshop-shared/api'
 
 export type WorkerSchedule = { label: string; kind: 'scheduled' | 'event' | 'manual' | 'unknown' }
 
+/** Separates a registered worker's lifecycle from the state of any individual run. */
+export function workerLifecycleLabel(state: VerglasWorkerSummary['state']): 'Active' | 'Disabled' {
+  return state === 'running' ? 'Active' : 'Disabled'
+}
+
 /** Returns a compact label for the first declared trigger. */
 export function workerScheduleSummary(worker: Pick<VerglasWorkerSummary, 'triggers'>): WorkerSchedule {
   try {

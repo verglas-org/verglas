@@ -1,7 +1,6 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
   ArrowRight,
-  ArrowsClockwise,
   CirclesThreePlus,
   Database,
   DatabaseIcon,
@@ -26,6 +25,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAuthenticatedApi } from '../AuthContext'
 import { getStoredSelectedModel } from '../modelSelection'
 import { useDocumentTitle } from '../useDocumentTitle'
+import { useAutomaticRefresh } from '../useAutomaticRefresh'
 import {
   databaseCapabilityLabels,
   databaseKindLabel,
@@ -100,8 +100,8 @@ function DatabasesPage() {
     [catalog, database?.name],
   )
 
-  const loadCatalog = useCallback(async () => {
-    setLoading(true)
+  const loadCatalog = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true)
     setError(null)
     try {
       const next = await authenticatedApi.getVerglasCatalog()
@@ -115,13 +115,14 @@ function DatabasesPage() {
     } catch (reason) {
       setError(errorMessage(reason))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
     }
   }, [authenticatedApi])
 
   useEffect(() => {
-    void loadCatalog()
+    void loadCatalog(true)
   }, [loadCatalog])
+  useAutomaticRefresh(loadCatalog, 15_000)
 
   useEffect(() => {
     if (!database) {
@@ -234,7 +235,7 @@ function DatabasesPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-kumo-base">
-      <PageHeader loading={loading} onCreate={() => setCreateDatabaseOpen(true)} onRefresh={() => void loadCatalog()} />
+      <PageHeader onCreate={() => setCreateDatabaseOpen(true)} />
       <div className="grid min-h-0 flex-1 grid-cols-[250px_minmax(0,1fr)_320px]">
         <DatabaseSidebar
           databases={catalog.databases}
@@ -331,10 +332,8 @@ function DatabasesPage() {
   )
 }
 
-function PageHeader({loading, onCreate, onRefresh}: {
-  loading: boolean
+function PageHeader({onCreate}: {
   onCreate: () => void
-  onRefresh: () => void
 }) {
   return (
     <header className="flex shrink-0 items-center justify-between border-b border-kumo-line px-6 py-4">
@@ -350,9 +349,6 @@ function PageHeader({loading, onCreate, onRefresh}: {
       <div className="flex items-center gap-2">
         <button type="button" onClick={onCreate} className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg bg-kumo-brand px-3 text-[12px] font-semibold text-white">
           <Plus size={15} weight="bold" /> Create database
-        </button>
-        <button type="button" onClick={onRefresh} disabled={loading} className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-kumo-line px-3 text-[12px] font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50">
-          <ArrowsClockwise size={14} className={loading ? 'animate-spin' : ''} /> Refresh
         </button>
       </div>
     </header>
