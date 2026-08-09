@@ -756,8 +756,9 @@ where
     }
 }
 
-/// Parses the pageserver's extensible `z` feedback frame and returns its
-/// remotely durable apply LSN. Unknown fields remain forward-compatible.
+/// Parses the pageserver's extensible `z` feedback frame and returns the
+/// explicit Verglas ring-durable checkpoint. Generic apply progress does not
+/// prove that the layer set and its publishing index crossed the ring barrier.
 fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError> {
     if payload.first() != Some(&b'z') {
         return Ok(None);
@@ -774,7 +775,7 @@ fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError
         ));
     }
     let count = fields.get_u8();
-    let mut remote_consistent_lsn = None;
+    let mut ring_durable_lsn = None;
     for _ in 0..count {
         let key = take_cstr(&mut fields, "pageserver feedback key")?;
         if fields.remaining() < 4 {
@@ -789,16 +790,16 @@ fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError
             ));
         }
         let mut value = fields.split_to(len);
-        if key == "ps_applylsn" {
+        if key == "vg_durable_lsn" {
             if len != 8 {
                 return Err(ServerError::Connection(
-                    "invalid ps_applylsn length".to_owned(),
+                    "invalid vg_durable_lsn length".to_owned(),
                 ));
             }
-            remote_consistent_lsn = Some(Lsn(value.get_u64()));
+            ring_durable_lsn = Some(Lsn(value.get_u64()));
         }
     }
-    Ok(remote_consistent_lsn.filter(|lsn| *lsn != Lsn(0)))
+    Ok(ring_durable_lsn.filter(|lsn| *lsn != Lsn(0)))
 }
 
 /// Sends Neon's `IDENTIFY_SYSTEM` row followed by ReadyForQuery.
@@ -969,13 +970,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_remote_consistent_lsn_from_neon_feedback() {
+    fn parses_ring_durable_lsn_from_neon_feedback() {
         let mut fields = BytesMut::new();
-        fields.put_u8(2);
-        fields.put_slice(b"ps_writelsn\0");
-        fields.put_u32(8);
-        fields.put_u64(0x7000);
-        fields.put_slice(b"ps_applylsn\0");
+        fields.put_u8(1);
+        fields.put_slice(b"vg_durable_lsn\0");
         fields.put_u32(8);
         fields.put_u64(0x5000);
 
@@ -986,6 +984,26 @@ mod tests {
         assert_eq!(
             parse_pageserver_feedback(&frame.freeze()).expect("valid pageserver feedback"),
             Some(Lsn(0x5000))
+        );
+    }
+
+    /// A generic apply watermark does not prove that every published layer is
+    /// durable on the Verglas ring, so it cannot release retained WAL.
+    #[test]
+    fn apply_lsn_does_not_advance_ring_durability() {
+        let mut fields = BytesMut::new();
+        fields.put_u8(1);
+        fields.put_slice(b"ps_applylsn\0");
+        fields.put_u32(8);
+        fields.put_u64(0x5000);
+
+        let mut frame = BytesMut::new();
+        frame.put_u8(b'z');
+        frame.put_u64(fields.len() as u64);
+        frame.extend_from_slice(&fields);
+        assert_eq!(
+            parse_pageserver_feedback(&frame.freeze()).expect("valid pageserver feedback"),
+            None
         );
     }
 }

@@ -463,6 +463,43 @@ async fn small_pod_falls_back_to_write_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn required_quorum_rejects_without_origin_fallback() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1"]);
+    let origin = RecordingOrigin::new(false);
+    let dir = tempfile::tempdir().expect("tmp");
+    let coordinator = Arc::new(
+        WriteCoordinator::new(
+            transport.clone(),
+            membership,
+            Arc::new(JournalStore::open(dir.path()).expect("journals")),
+            Arc::new(WritebackMetrics::default()),
+            origin.clone(),
+            Duration::from_secs(5),
+        )
+        .require_quorum(),
+    );
+
+    let result = coordinator
+        .put(
+            &ck("tenants/t1/timelines/l1/index_part.json-00000001"),
+            &WriteMetadata::default(),
+            body(4096),
+            2,
+            1,
+            3,
+        )
+        .await;
+
+    assert!(result.is_err(), "ring shortfall must reject publication");
+    assert_eq!(
+        origin.get("bkt", "tenants/t1/timelines/l1/index_part.json-00000001"),
+        None
+    );
+    assert_eq!(coordinator.metrics().snapshot().acked_via_write_through, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn midflight_shortfall_rebuilds_and_writes_through() {
     let transport = MemoryTransport::new();
     // Five live nodes, geometry k=2/m=3/w=5. Two nodes fail placement, so only

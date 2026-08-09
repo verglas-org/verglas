@@ -166,7 +166,26 @@ pub(crate) fn classify_mutability(key: &str) -> Mutability {
     if in_metadata_dir(key) && filename.ends_with(".json") {
         return Mutability::Immutable;
     }
+    if is_neon_layer(key, filename) {
+        return Mutability::Immutable;
+    }
     Mutability::Mutable
+}
+
+/// Recognizes Neon's observed remote-layer contract:
+/// `tenants/<tenant>/timelines/<timeline>/<key-start>-<key-end>__<lsn...>-<generation>`.
+/// `index_part.json` does not contain the `__` separator and stays mutable.
+fn is_neon_layer(key: &str, filename: &str) -> bool {
+    key.starts_with("tenants/")
+        && key.contains("/timelines/")
+        && filename.contains("__")
+        && filename.split_once("__").is_some_and(|(keys, lsns)| {
+            keys.split_once('-').is_some()
+                && lsns.split('-').count() >= 2
+                && lsns.rsplit('-').next().is_some_and(|generation| {
+                    generation.len() == 8 && generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        })
 }
 
 /// The pre-mapper metadata heuristics. Pure and total over `(key, range)`.
@@ -254,5 +273,13 @@ mod mutability_tests {
         ] {
             assert_eq!(classify_mutability(k), Mutability::Mutable, "{k}");
         }
+    }
+
+    /// Neon layer objects carry a generation suffix and no file extension, but
+    /// the physical incarnation is immutable once published by `index_part`.
+    #[test]
+    fn neon_layer_objects_are_immutable() {
+        let key = "tenants/0123456789abcdef0123456789abcdef/timelines/abcdef0123456789abcdef0123456789/000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF__0000000001696000-00000001";
+        assert_eq!(classify_mutability(key), Mutability::Immutable);
     }
 }

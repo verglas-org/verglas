@@ -31,6 +31,12 @@ metadata is readable. A failed catalog compare-and-swap leaves unreferenced
 objects that normal Iceberg cleanup can remove; it does not publish a partial
 table state.
 
+Neon pageservers use the same barrier for immutable layers and `index_part`
+publication. Their upload queue does not publish an index until every referenced
+layer PUT has reached ring durability. A PUT becomes clean only after object
+storage confirms propagation. Until then, its fragments are not candidates for
+cache eviction, regardless of their observed heat.
+
 ## Quorum staging
 
 Reed–Solomon fragments spread a staged object across independent cache nodes.
@@ -40,9 +46,11 @@ completing stale work.
 
 ## Degraded operation
 
-If the cluster cannot meet its staging quorum, Verglas writes through to the
-origin before acknowledging. This increases latency but preserves correctness.
-It never acknowledges an object that exists only in volatile memory.
+If no fragment ring is configured, Verglas writes through to the origin before
+acknowledging. A ring-backed cache node that cannot meet its staging quorum
+rejects the write; it does not silently change Neon publication durability
+modes. Verglas never acknowledges an object that exists only in volatile
+memory.
 
 ## Repair and scrubbing
 

@@ -81,3 +81,7 @@
   to explicit customer-invoked commit operations without implying such a route.
 - #91: Updated write-back process documentation for the `verglas-server`
   rename. Durability barriers and propagation behavior are unchanged.
+
+- #74: Added strict quorum mode for storage publications that must keep one
+  acknowledgement boundary. Membership, headroom, and placement shortfalls now
+  reject a strict write instead of falling back to an origin acknowledgement.
