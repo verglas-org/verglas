@@ -11,6 +11,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::read::ObjectRead;
 use verglas_core::write::ObjectWrite;
 
@@ -108,6 +109,8 @@ pub struct SafekeeperServer<S> {
     /// receiver discovery. Connections retry forever because the broker lives
     /// in the dependent Postgres VM and may start after the cache.
     broker: Option<BrokerConfig>,
+    /// Optional cache-node foreground admission fence.
+    activity: Option<ActivityTracker>,
 }
 
 impl<S> SafekeeperServer<S>
@@ -139,7 +142,17 @@ where
             geometry,
             timelines: Mutex::new(HashMap::new()),
             broker: None,
+            activity: None,
         })
+    }
+
+    /// Attaches the host-managed foreground admission fence.
+    #[must_use]
+    pub fn with_activity_tracker(mut self: Arc<Self>, activity: ActivityTracker) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_activity_tracker must be called before cloning the server")
+            .activity = Some(activity);
+        self
     }
 
     /// Publishes every opened timeline to Neon's storage broker. The advertised
@@ -169,8 +182,19 @@ where
         }
         loop {
             let (stream, peer) = listener.accept().await?;
+            let activity_guard = match &self.activity {
+                Some(activity) => match activity.try_begin(ActivityPlane::Safekeeper) {
+                    Ok(guard) => Some(guard),
+                    Err(_) => {
+                        drop(stream);
+                        continue;
+                    }
+                },
+                None => None,
+            };
             let server = Arc::clone(&self);
             tokio::spawn(async move {
+                let _activity_guard = activity_guard;
                 if let Err(error) = server.serve_connection(stream).await {
                     tracing::warn!(%peer, %error, "safekeeper connection closed");
                 }

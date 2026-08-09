@@ -423,3 +423,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #66: Documented optional analytics config as self-hosted only (removed cloud-composes-independently contrast).
 - #66: Removed optional external control-plane node reporting and the [control_plane] config field from the OSS server.
 - #84: Added immutable storage-binding identity to object, list, multipart, and rendezvous-placement keys. Equal bucket and object names at different origins now remain distinct throughout the data plane.
+- #87: Added atomic foreground activity accounting across HTTP, NBD, fragment, and safekeeper planes. A generation-fenced admission lease makes a zero in-flight report safe for a host stop decision while retaining per-plane diagnostics.

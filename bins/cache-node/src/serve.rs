@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo};
 use verglas_core::config::Config;
 use verglas_core::metrics::NodeMetrics;
@@ -279,6 +280,18 @@ pub async fn run(
     }
 
     let node_metrics = Arc::new(NodeMetrics::new()?);
+    let activity = ActivityTracker::new();
+    let quiescence = std::env::var("VERGLAS_HOST_AGENT_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|token| admin::Quiescence::new(activity.clone(), token))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    if quiescence.is_none() {
+        tracing::warn!(
+            "VERGLAS_HOST_AGENT_TOKEN is unset; authenticated scale-to-zero fencing is unavailable"
+        );
+    }
     let health = admin::Health::starting();
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
@@ -333,7 +346,7 @@ pub async fn run(
             // Learn the ring and attach the flush write-back plane to the registry
             // before any device is ensured. With no ring configured this is a
             // no-op and FLUSH stays the synchronous origin barrier (#382).
-            ring_plane = crate::ring::setup(&config.cache.dir, &device_registry)
+            ring_plane = crate::ring::setup(&config.cache.dir, &device_registry, activity.clone())
                 .await?
                 .map(Arc::new);
             let block_addr = std::env::var("VERGLAS_BLOCK_ADDR")
@@ -377,11 +390,22 @@ pub async fn run(
         stats_slot.clone(),
         metrics_slot.clone(),
     );
+    if let Some(quiescence) = quiescence {
+        admin_app = admin_app.merge(admin::quiescence_router(quiescence));
+    }
     if let Some((device_registry, _)) = &block_registry {
-        admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
+        admin_app = admin_app.merge(admin::track_http(
+            crate::blockdev::control_router(device_registry.clone()),
+            activity.clone(),
+            ActivityPlane::Http,
+        ));
     }
     if let Some((gateway, _watcher)) = &catalog_runtime {
-        admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
+        admin_app = admin_app.merge(admin::track_http(
+            admin::catalog_router(gateway.clone()),
+            activity.clone(),
+            ActivityPlane::Http,
+        ));
     }
     let admin_fut = async move {
         axum::serve(admin_listener, admin_app)
@@ -434,6 +458,7 @@ pub async fn run(
             engine,
             registry,
             node_metrics,
+            activity.clone(),
         )
         .await
     };
@@ -441,10 +466,11 @@ pub async fn run(
     // The NBD data plane. Present only when the block tier is enabled; otherwise
     // a never-resolving future so the join waits on the admin and S3 planes. A
     // listener-accept failure tears the process down like the other listeners.
+    let nbd_activity = activity.clone();
     let nbd_fut = async move {
         match block_registry {
             Some((device_registry, block_listener)) => {
-                crate::nbd::serve(block_listener, device_registry)
+                crate::nbd::serve(block_listener, device_registry, nbd_activity)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
             }
@@ -458,10 +484,11 @@ pub async fn run(
     // The embedded PostgreSQL/Neon WAL plane. As with an absent NBD listener,
     // a node outside the fragment ring waits forever instead of inventing a
     // separate durability mode.
+    let safekeeper_activity = activity.clone();
     let safekeeper_fut = async move {
         match safekeeper_args {
             Some((stores, bucket, cache_dir, ring)) => {
-                crate::safekeeper::serve(stores, bucket, cache_dir, ring).await
+                crate::safekeeper::serve(stores, bucket, cache_dir, ring, safekeeper_activity).await
             }
             None => {
                 std::future::pending::<()>().await;
@@ -485,6 +512,7 @@ async fn serve_s3(
     engine: CacheEngine,
     registry: Arc<BackendStore>,
     node_metrics: Arc<NodeMetrics>,
+    activity: ActivityTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
@@ -508,6 +536,7 @@ async fn serve_s3(
         config.listen.domain.as_deref(),
         Some(node_metrics),
     );
+    let app = admin::track_http(app, activity, ActivityPlane::Http);
 
     let local_addr = s3_listener.local_addr()?;
     eprintln!(

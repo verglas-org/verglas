@@ -280,6 +280,8 @@ The read path does not require consensus. If a node disappears, gossip removes i
 
 NVMe entries survive process restart and checksum-failed tail entries are discarded during recovery. A permanent node loss discards that node's cache contents. If all cache nodes are unavailable, clients must use the origin endpoint directly or through deployment-level failover; this transition is not performed by the server.
 
+Host-managed scale-to-zero uses an admission fence, not a ring drain. The host authenticates to the cache node's private quiescence API, atomically closes foreground admission across S3, attached block, fragment, and Neon safekeeper planes, then waits for the already-accepted count to reach zero before stopping the process. A generation lease prevents a stale failed-stop handler from reopening a newer fence. Retained NVMe is reattached on restart: the cache rebuilds its disk indexes without eagerly copying cached bytes into DRAM, and dirty fragment/WAL state resumes its ordinary replay and background propagation. Catalog polling, recovery, warming, and propagation do not pin the process awake; their durable inputs remain on NVMe or in the origin.
+
 Write-back changes the failure model because acknowledged objects may not yet exist at the origin; §6 describes its protocol.
 
 ---

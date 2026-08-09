@@ -12,6 +12,12 @@ pub const VERSION_PATH: &str = "/admin/version";
 /// Path for the server liveness probe.
 pub const HEALTHZ_PATH: &str = "/admin/healthz";
 
+/// Path for the authenticated cache-node foreground quiescence probe.
+pub const QUIESCENCE_PATH: &str = "/admin/quiescence";
+
+/// Wire report returned by [`QUIESCENCE_PATH`].
+pub type QuiescenceInfo = crate::activity::ActivitySnapshot;
+
 /// Path for the cache purge control operation (`POST`). Drops every key→ETag
 /// mapping and clears both cache tiers so the next reads are cold misses —
 /// an honest repeat-cold benchmark leg (or operator reset) without a server

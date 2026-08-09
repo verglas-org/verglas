@@ -7641,6 +7641,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",

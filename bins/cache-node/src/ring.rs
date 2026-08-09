@@ -35,6 +35,7 @@ use verglas_cluster::peer::{
     FragmentHandlers, FragmentShardStream, LocalBlockFn, PeerResolver, PeerServer,
 };
 use verglas_cluster::{FragmentClient, FragmentIoError, FragmentKey, FragmentRecord};
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::node::NodeId;
 
 use crate::VERSION;
@@ -101,6 +102,7 @@ impl RingPlane {
 pub async fn setup(
     cache_dir: &std::path::Path,
     registry: &DeviceRegistry,
+    activity: ActivityTracker,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
     let peers = match env_var("VERGLAS_RING_PEERS") {
         Some(raw) => parse_peers(&raw),
@@ -173,7 +175,7 @@ pub async fn setup(
         ring_addr,
         secret,
         noop_block_source(),
-        fragment_handlers(local),
+        fragment_handlers(local, activity),
     )
     .await?;
     eprintln!(
@@ -234,32 +236,66 @@ fn noop_block_source() -> LocalBlockFn {
 /// Wires the local fragment store behind the peer server's fragment handlers, so
 /// a peer coordinator can place, load, delete, and headroom-check block-flush
 /// shards on this node. Mirrors verglas-server's object-tier `fragment_handlers`.
-fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
+fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> FragmentHandlers {
     let store_put = store.clone();
     let store_stream = store.clone();
     let store_get = store.clone();
     let store_del = store.clone();
     let store_room = store;
+    let store_activity = activity.clone();
+    let stream_activity = activity.clone();
+    let load_activity = activity.clone();
+    let delete_activity = activity.clone();
     FragmentHandlers {
         store: Arc::new(move |record: FragmentRecord| {
             let store = store_put.clone();
-            Box::pin(async move { store.store_fragment(&record) })
+            let activity = store_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                store.store_fragment(&record)
+            })
         }),
         store_stream: Arc::new(move |key: FragmentKey, shards| {
             let store = store_stream.clone();
-            Box::pin(async move { stream_into_store(&store, &key, shards).await })
+            let activity = stream_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                stream_into_store(&store, &key, shards).await
+            })
         }),
         load: Arc::new(move |key: FragmentKey| {
             let store = store_get.clone();
-            Box::pin(async move { store.load_fragment(&key) })
+            let activity = load_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                store.load_fragment(&key)
+            })
         }),
         delete: Arc::new(move |key: FragmentKey| {
             let store = store_del.clone();
-            Box::pin(async move { store.delete_fragment(&key) })
+            let activity = delete_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                store.delete_fragment(&key)
+            })
         }),
         headroom: Arc::new(move |bytes: u64| {
             let store = store_room.clone();
-            Box::pin(async move { store.has_headroom(bytes) })
+            let activity = activity.clone();
+            Box::pin(async move {
+                let Ok(_guard) = activity.try_begin(ActivityPlane::Fragment) else {
+                    return false;
+                };
+                store.has_headroom(bytes)
+            })
         }),
     }
 }
@@ -332,5 +368,34 @@ impl LiveMembership for StaticMembership {
 
     fn is_single_node(&self) -> bool {
         self.live.len() <= 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Once fenced, a peer cannot place a new fragment that would race the
+    /// host's zero-in-flight stop decision.
+    #[tokio::test]
+    async fn admission_fence_rejects_new_fragment_placements() {
+        let dir = tempfile::tempdir().expect("fragment dir");
+        let activity = ActivityTracker::new();
+        let _generation = activity.fence();
+        let handlers = fragment_handlers(LocalFragmentStore::new(dir.path()), activity.clone());
+        let record = FragmentRecord::new(
+            FragmentKey {
+                object_id: "fenced-object".to_owned(),
+                index: 0,
+            },
+            bytes::Bytes::from_static(b"fragment"),
+        );
+
+        let error = (handlers.store)(record)
+            .await
+            .expect_err("fenced placement");
+        assert!(error.to_string().contains("fenced"));
+        assert_eq!(activity.snapshot().accepted, 0);
+        assert!(activity.snapshot().idle);
     }
 }

@@ -42,3 +42,4 @@
 - #84: Matched the published Verglas Neon walproposer's 8 MiB append contract and
   made the durable storage binding an explicit safekeeper input. Large startup WAL
   batches are accepted and WAL drains target the cache node's actual backend.
+- #87: Added optional foreground admission accounting to the Neon listener. Cache-node deployments now reject new safekeeper connections after a host fence and retain existing connections in the in-flight count until they close, while background WAL drain remains independent.
