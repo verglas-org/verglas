@@ -7649,6 +7649,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-lakekeeper"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "futures",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "verglas-pgcdc"
 version = "0.1.1"
 dependencies = [
