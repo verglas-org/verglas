@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo, WritebackStatsInfo};
 use verglas_core::config::{CatalogConsistency, Config};
 use verglas_core::metrics::NodeMetrics;
@@ -323,6 +324,18 @@ pub async fn run(
     };
 
     let node_metrics = Arc::new(NodeMetrics::new()?);
+    let activity = ActivityTracker::new();
+    let quiescence = std::env::var("VERGLAS_HOST_AGENT_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|token| admin::Quiescence::new(activity.clone(), token))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    if quiescence.is_none() {
+        tracing::warn!(
+            "VERGLAS_HOST_AGENT_TOKEN is unset; authenticated scale-to-zero fencing is unavailable"
+        );
+    }
     let health = admin::Health::starting();
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
@@ -364,6 +377,7 @@ pub async fn run(
                 &config.cache.dir,
                 config.cache.capacity_bytes.0,
                 &device_registry,
+                activity.clone(),
             )
             .await?
             .map(Arc::new);
@@ -468,35 +482,46 @@ pub async fn run(
         stats_slot.clone(),
         metrics_slot.clone(),
     );
+    if let Some(quiescence) = quiescence {
+        admin_app = admin_app.merge(admin::quiescence_router(quiescence));
+    }
     if let Some((device_registry, _)) = &block_registry {
-        admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
+        admin_app = admin_app.merge(admin::track_http(
+            crate::blockdev::control_router(device_registry.clone()),
+            activity.clone(),
+            ActivityPlane::Http,
+        ));
     }
     if let Some(runtime) = &catalog_runtime {
-        match runtime {
+        let catalog_app = match runtime {
             CatalogRuntime::Eventual {
                 gateway,
                 watcher,
                 token,
             } => {
-                admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
+                let mut app = admin::catalog_router(gateway.clone());
                 if let Some(token) = token {
-                    admin_app = admin_app.merge(admin::eventual_catalog_event_router(
+                    app = app.merge(admin::eventual_catalog_event_router(
                         Arc::clone(watcher),
                         token.clone(),
                     ));
                 }
                 eprintln!("verglas-cache-node {VERSION} catalog consistency is eventual (polling)");
+                app
             }
             CatalogRuntime::Strong { state, token } => {
-                admin_app = admin_app.merge(admin::strong_catalog_router(
-                    Arc::clone(state),
-                    token.clone(),
-                ));
+                let app = admin::strong_catalog_router(Arc::clone(state), token.clone());
                 eprintln!(
                     "verglas-cache-node {VERSION} catalog consistency is strong (EC quorum + fenced reads)"
                 );
+                app
             }
-        }
+        };
+        admin_app = admin_app.merge(admin::track_http(
+            catalog_app,
+            activity.clone(),
+            ActivityPlane::Http,
+        ));
     }
     let admin_fut = async move {
         axum::serve(admin_listener, admin_app)
@@ -559,6 +584,7 @@ pub async fn run(
             registry,
             node_metrics,
             (object_ring, writeback_slot),
+            activity.clone(),
         )
         .await
     };
@@ -566,10 +592,11 @@ pub async fn run(
     // The NBD data plane. Present only when the block tier is enabled; otherwise
     // a never-resolving future so the join waits on the admin and S3 planes. A
     // listener-accept failure tears the process down like the other listeners.
+    let nbd_activity = activity.clone();
     let nbd_fut = async move {
         match block_registry {
             Some((device_registry, block_listener)) => {
-                crate::nbd::serve(block_listener, device_registry)
+                crate::nbd::serve(block_listener, device_registry, nbd_activity)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
             }
@@ -583,10 +610,11 @@ pub async fn run(
     // The embedded PostgreSQL/Neon WAL plane. As with an absent NBD listener,
     // a node outside the fragment ring waits forever instead of inventing a
     // separate durability mode.
+    let safekeeper_activity = activity.clone();
     let safekeeper_fut = async move {
         match safekeeper_args {
             Some((stores, bucket, cache_dir, ring)) => {
-                crate::safekeeper::serve(stores, bucket, cache_dir, ring).await
+                crate::safekeeper::serve(stores, bucket, cache_dir, ring, safekeeper_activity).await
             }
             None => {
                 std::future::pending::<()>().await;
@@ -635,6 +663,7 @@ async fn serve_s3(
     registry: Arc<BackendStore>,
     node_metrics: Arc<NodeMetrics>,
     writeback: (Option<Arc<crate::ring::RingPlane>>, WritebackSlot),
+    activity: ActivityTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (object_ring, writeback_slot) = writeback;
     // Listings always pass straight through to the origin (never cached), so the
@@ -701,6 +730,7 @@ async fn serve_s3(
             Some(node_metrics),
         )
     };
+    let app = admin::track_http(app, activity, ActivityPlane::Http);
 
     let local_addr = s3_listener.local_addr()?;
     eprintln!(

@@ -8,6 +8,7 @@
 //! acyclic: `verglas-cache`, `verglas-s3`, and `verglas-tables` all depend on
 //! `verglas-core`, never on each other's internals.
 
+pub mod activity;
 pub mod admin;
 pub mod config;
 pub mod config_template;
