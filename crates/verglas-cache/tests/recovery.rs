@@ -47,6 +47,7 @@ fn pattern(seed: u64, len: u64) -> Bytes {
 /// The logical key for an object in the test bucket.
 fn key(k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: k.to_owned(),
     }
@@ -128,7 +129,7 @@ type Engine = HybridCacheEngine<
 async fn engine_over(store: Arc<InMemory>, config: &CacheConfig) -> (Engine, BackendCalls) {
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store)),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store)),
         calls: calls.clone(),
     };
     let engine = HybridCacheEngine::single_node(backend, config)

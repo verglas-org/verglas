@@ -422,3 +422,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #66: Replaced control-plane config examples and comments that referenced api.verglas.dev / verglas login with self-host-neutral wording, and switched admin test fixtures to example.test hostnames.
 - #66: Documented optional analytics config as self-hosted only (removed cloud-composes-independently contrast).
 - #66: Removed optional external control-plane node reporting and the [control_plane] config field from the OSS server.
+- #84: Added immutable storage-binding identity to object, list, multipart, and rendezvous-placement keys. Equal bucket and object names at different origins now remain distinct throughout the data plane.
+- #84: Added dynamic-runtime validation for cache processes whose backend and catalog bindings arrive after startup. Static file configuration still requires an explicit backend and keeps its existing validation contract.

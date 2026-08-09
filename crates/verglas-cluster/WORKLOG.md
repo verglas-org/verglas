@@ -97,3 +97,4 @@
 - #74: Added a prefix-filtered fragment identity RPC for replicated write-back
   journal discovery. The response carries identities only; object bytes still
   use the checksum-verified fragment load endpoint.
+- #84: Added storage-binding identity to peer block-fetch envelopes. Peers now distinguish identical bucket, key, ETag, and block coordinates belonging to different origins.

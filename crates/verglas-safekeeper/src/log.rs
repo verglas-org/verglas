@@ -703,6 +703,7 @@ where
             .clone()
             .ok_or_else(|| AppendError::Origin("flushed segment has no S3 key".to_owned()))?;
         let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: self.bucket.clone(),
             key: s3_key,
         };
@@ -772,6 +773,7 @@ where
 /// rendezvous machinery the cache ring and the write-back placement use.
 fn placement_order(seed: &str, live: &[NodeId]) -> Vec<NodeId> {
     let key = CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "safekeeper".to_owned(),
         key: seed.to_owned(),
     };
@@ -1023,6 +1025,7 @@ where
         let bytes = self.reassemble_segment(&segment).await?;
         let s3_key = self.segment_key(&segment);
         let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: self.bucket.clone(),
             key: s3_key.clone(),
         };
@@ -1087,6 +1090,7 @@ where
             if segment.end.0 <= up_to.0 {
                 if let Some(k) = &segment.s3_key {
                     deletes.push(CacheKey {
+                        storage_binding_id: "default".to_owned(),
                         bucket: self.bucket.clone(),
                         key: k.clone(),
                     });

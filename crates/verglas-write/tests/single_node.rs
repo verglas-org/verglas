@@ -265,6 +265,7 @@ fn unused(op: &str) -> WriteError {
 
 fn ck(key: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "bkt".into(),
         key: key.into(),
     }
@@ -340,7 +341,7 @@ async fn single_node_fast_acks_from_local_durability() {
         "one local fragment (k=1,m=0)"
     );
     assert!(
-        journals.find_dirty("bkt", "data/f1").is_some(),
+        journals.find_dirty("default", "bkt", "data/f1").is_some(),
         "acked-but-unpropagated object is dirty in the journal"
     );
     // Counted as a durable ack, not a write-through: no origin round-trip.
@@ -460,7 +461,7 @@ async fn commit_barrier_waits_for_referenced_propagation() {
         .await
         .expect("fast-ack");
     assert!(
-        journals.find_dirty("bkt", "data/f1").is_some(),
+        journals.find_dirty("default", "bkt", "data/f1").is_some(),
         "buffered, not yet at origin"
     );
 
@@ -529,7 +530,7 @@ async fn commit_barrier_refuses_when_origin_unreachable() {
     }
     // The data is still buffered and dirty: nothing was dropped or abandoned.
     assert!(
-        journals.find_dirty("bkt", "data/f1").is_some(),
+        journals.find_dirty("default", "bkt", "data/f1").is_some(),
         "data safe, still in flight"
     );
     assert!(
@@ -569,7 +570,7 @@ async fn recovery_gates_serving_on_replay() {
             )
             .await
             .expect("fast-ack");
-        assert!(journals.find_dirty("bkt", "data/f1").is_some());
+        assert!(journals.find_dirty("default", "bkt", "data/f1").is_some());
         // Process death: dropping the coordinator does NOT cancel its spawned
         // propagation task (it holds its own Arc), so without shutdown() the
         // "crashed" run's retry loop would keep running and race the phase-2
@@ -582,7 +583,7 @@ async fn recovery_gates_serving_on_replay() {
     // disk — this is boot recovery, and serving of commits is gated on it.
     let journals = Arc::new(JournalStore::open(dir.path()).expect("reopen"));
     assert!(
-        journals.find_dirty("bkt", "data/f1").is_some(),
+        journals.find_dirty("default", "bkt", "data/f1").is_some(),
         "recovery rebuilt the dirty segment from the fsynced journal"
     );
     let coord = single_node_coordinator(

@@ -24,7 +24,7 @@ pub use frontend::{VerglasS3, router, router_with_passthrough};
 pub use passthrough::{PassthroughList, PassthroughRead, PassthroughWrite};
 pub use passthrough_route::BucketConfigPassthrough;
 pub use serving_api::{ApiRequest, ApiResponse, ServingApi};
-pub use verglas_backend::{BackendStore, BackendStores, MultipartObjectStore};
+pub use verglas_backend::{BackendRegistry, BackendStore, BackendStores, MultipartObjectStore};
 pub use verglas_core::CacheKey;
 pub use verglas_core::list::{ListError, ListObject, ListPage, ListRequest, ObjectList};
 pub use verglas_core::read::{
@@ -40,8 +40,9 @@ pub use verglas_core::write::{
 ///
 /// Placeholder: the real mapping will account for byte ranges and object
 /// versions.
-pub fn cache_key_for(bucket: &str, key: &str) -> verglas_core::CacheKey {
+pub fn cache_key_for(storage_binding_id: &str, bucket: &str, key: &str) -> verglas_core::CacheKey {
     verglas_core::CacheKey {
+        storage_binding_id: storage_binding_id.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
     }

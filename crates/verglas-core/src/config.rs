@@ -1507,6 +1507,18 @@ impl Config {
     /// is at least one, the cache dir exists and is writable (probed with a real
     /// file create, startup only), and the ports are non-zero and distinct.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_runtime(true)
+    }
+
+    /// Validates a server whose provider and catalog bindings are registered at runtime.
+    /// The cache, listener, worker, and resource-budget invariants remain mandatory;
+    /// only the process-global backend declaration is absent.
+    pub fn validate_dynamic(&self) -> Result<(), ConfigError> {
+        self.validate_runtime(false)
+    }
+
+    /// Applies common validation and optionally requires the legacy static backend block.
+    fn validate_runtime(&self, require_static_backend: bool) -> Result<(), ConfigError> {
         if self.backend.max_concurrent_requests == 0 {
             return Err(ConfigError::Invalid(
                 "backend.max_concurrent_requests",
@@ -1516,7 +1528,9 @@ impl Config {
         self.log.validate()?;
         self.backend.retry.validate()?;
         self.backend.breaker.validate()?;
-        self.backend.validate()?;
+        if require_static_backend {
+            self.backend.validate()?;
+        }
         self.cache.validate()?;
         self.cache.admission.validate()?;
         self.cache.warming.validate()?;

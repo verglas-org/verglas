@@ -138,6 +138,45 @@ pnpm dev-client   # Vite frontend on http://localhost:3000
 
 Then open http://localhost:3000 (or the router at http://localhost:8787).
 
+## Publishing cloud releases
+
+The monorepo publishes immutable Cloudflare deployment bundles from
+`.github/workflows/os-release.yml`. Pull requests build and retain the bundle as
+a workflow artifact. Pushes to `main` also publish it to R2 after these repository
+secrets are configured:
+
+```text
+R2_RELEASES_ACCESS_KEY_ID
+R2_RELEASES_SECRET_ACCESS_KEY
+```
+
+The workflow writes to the existing `verglas-fleet-releases` bucket in the
+Verglas Cloud account. Its `os/` prefix keeps these artifacts separate from
+host and data-plane releases.
+
+The published layout is:
+
+```text
+os/releases/<release-id>/manifest.json
+os/blobs/modules/<sha256>
+os/blobs/assets/<hash>
+```
+
+The manifest is uploaded last and carries the router, Workshop backend, frontend
+asset index, required bindings, and ordered Durable Object migrations. Reusing a
+release ID with different manifest bytes is rejected.
+
+Build the same self-contained deployment directory locally from the repository
+root:
+
+```bash
+pnpm --dir apps/os build
+node apps/os/scripts/release/build-release.mjs --out release-out
+```
+
+The resulting `release-out` directory is the complete input required by the
+Verglas Cloud deployer; it does not need an OS source checkout.
+
 ### Further reading
 
 * [Architecture](docs/architecture.md) — containerized runtime and product shape

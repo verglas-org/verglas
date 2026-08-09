@@ -82,9 +82,12 @@ async fn request_id_is_consistent_across_the_response_header_and_the_completion_
     // The router with node metrics wired, so the GET records a completion event.
     let metrics = Arc::new(NodeMetrics::new().expect("metrics registry"));
     let app = verglas_s3::router_with_passthrough(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         None,
         None,

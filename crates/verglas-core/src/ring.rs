@@ -113,7 +113,7 @@ pub struct WarmDonor {
 /// function *and* its input framing are a wire commitment shared by all
 /// members and by the weighted live ring (#28). We commit to XXH3-64 (the
 /// finalized XXH3 from upstream xxHash, via the `xxhash-rust` crate) over
-/// length-prefixed `(bucket, key, node)` fields; length prefixes keep
+/// length-prefixed `(storage binding, bucket, key, node)` fields; length prefixes keep
 /// adjacent fields from aliasing (e.g. ("ab","c") vs ("a","bc")). Per the
 /// prototype rules in AGENTS.md there is deliberately NO version tag or
 /// negotiation around this choice: changing the hash or framing is a
@@ -121,7 +121,12 @@ pub struct WarmDonor {
 /// is the extension-point marker.
 pub fn rendezvous_hash(key: &CacheKey, node: &NodeId) -> u64 {
     let mut hasher = Xxh3::new();
-    for field in [key.bucket.as_str(), key.key.as_str(), node.as_str()] {
+    for field in [
+        key.storage_binding_id.as_str(),
+        key.bucket.as_str(),
+        key.key.as_str(),
+        node.as_str(),
+    ] {
         hasher.update(&(field.len() as u64).to_le_bytes());
         hasher.update(field.as_bytes());
     }

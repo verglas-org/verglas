@@ -148,17 +148,25 @@ async fn serves_the_configured_bucket_and_rejects_others() {
     // The store is built for one bucket; that bucket resolves, every other
     // bucket is NoSuchBucket. The per-bucket client is memoized (one shared
     // handle across calls).
-    let store =
-        BackendStore::single("alpha", Arc::new(object_store::memory::InMemory::new())).clone();
-    let s1 = store.store_for("alpha").expect("configured bucket serves");
-    let s2 = store.store_for("alpha").expect("same store handed back");
+    let store = BackendStore::single(
+        "default",
+        "alpha",
+        Arc::new(object_store::memory::InMemory::new()),
+    )
+    .clone();
+    let s1 = store
+        .store_for("default", "alpha")
+        .expect("configured bucket serves");
+    let s2 = store
+        .store_for("default", "alpha")
+        .expect("same store handed back");
     assert!(
         Arc::ptr_eq(&s1, &s2),
         "the one bucket's client is memoized to a single shared handle"
     );
 
     let err = store
-        .store_for("beta")
+        .store_for("default", "beta")
         .expect_err("an unserved bucket is rejected");
     assert!(
         matches!(err, BackendError::NoSuchBucket { .. }),
@@ -166,15 +174,25 @@ async fn serves_the_configured_bucket_and_rejects_others() {
     );
     // The raw path for an unserved bucket is NoSuchBucket too.
     let raw_err = store
-        .raw_for("beta")
+        .raw_for("default", "beta")
         .expect_err("raw for an unserved bucket is rejected");
     assert!(
         matches!(raw_err, BackendError::NoSuchBucket { .. }),
         "got: {raw_err:?}"
     );
     // A breaker exists for the configured bucket, and none for any other.
-    assert!(store.breaker_for("alpha").is_some());
-    assert!(store.breaker_for("beta").is_none());
+    assert!(
+        store
+            .breaker_for("default", "alpha")
+            .expect("binding")
+            .is_some()
+    );
+    assert!(
+        store
+            .breaker_for("default", "beta")
+            .expect("binding")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -187,6 +205,7 @@ async fn glob_set_serves_matches_lazily_and_rejects_non_matches() {
     let store = {
         let b = builds.clone();
         BackendStore::with_glob_factory(
+            "default",
             None,
             vec!["*--table-s3".to_owned()],
             4,
@@ -209,7 +228,7 @@ async fn glob_set_serves_matches_lazily_and_rejects_non_matches() {
 
     // A non-matching bucket is rejected and builds nothing.
     let err = store
-        .store_for("plain-bucket")
+        .store_for("default", "plain-bucket")
         .expect_err("a bucket outside the glob set is rejected");
     assert!(
         matches!(err, BackendError::NoSuchBucket { .. }),
@@ -223,10 +242,10 @@ async fn glob_set_serves_matches_lazily_and_rejects_non_matches() {
 
     // A matching bucket builds once, then is memoized.
     let first = store
-        .store_for("abc--table-s3")
+        .store_for("default", "abc--table-s3")
         .expect("a glob-matching bucket serves");
     let again = store
-        .store_for("abc--table-s3")
+        .store_for("default", "abc--table-s3")
         .expect("memoized on the second call");
     assert!(
         Arc::ptr_eq(&first, &again),
@@ -236,14 +255,29 @@ async fn glob_set_serves_matches_lazily_and_rejects_non_matches() {
 
     // A second, different matching bucket builds its own client.
     store
-        .store_for("def--table-s3")
+        .store_for("default", "def--table-s3")
         .expect("a second matching bucket serves");
     assert_eq!(builds.load(SeqCst), 2, "each distinct bucket builds once");
 
     // Breakers are per-bucket: each served bucket has one, non-matches have none.
-    assert!(store.breaker_for("abc--table-s3").is_some());
-    assert!(store.breaker_for("def--table-s3").is_some());
-    assert!(store.breaker_for("plain-bucket").is_none());
+    assert!(
+        store
+            .breaker_for("default", "abc--table-s3")
+            .expect("binding")
+            .is_some()
+    );
+    assert!(
+        store
+            .breaker_for("default", "def--table-s3")
+            .expect("binding")
+            .is_some()
+    );
+    assert!(
+        store
+            .breaker_for("default", "plain-bucket")
+            .expect("binding")
+            .is_none()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -257,6 +291,7 @@ async fn per_bucket_budgets_are_isolated_across_matching_buckets() {
     let store = {
         let (if_, g) = (in_flight.clone(), gate.clone());
         BackendStore::with_glob_factory(
+            "default",
             None,
             vec!["*--table-s3".to_owned()],
             1, // one permit PER bucket
@@ -272,7 +307,9 @@ async fn per_bucket_budgets_are_isolated_across_matching_buckets() {
     };
 
     // Saturate bucket A: one copy parks, consuming A's single permit.
-    let a = store.store_for("a--table-s3").expect("bucket a serves");
+    let a = store
+        .store_for("default", "a--table-s3")
+        .expect("bucket a serves");
     {
         let a = a.clone();
         tokio::spawn(async move {
@@ -284,7 +321,9 @@ async fn per_bucket_budgets_are_isolated_across_matching_buckets() {
     // A request on bucket B must proceed on its own permit, not block on A's.
     // Its copy parks too (the shared gate is closed), which is fine — the point
     // is that B *starts* (in_flight reaches 2), proving B has its own budget.
-    let b = store.store_for("b--table-s3").expect("bucket b serves");
+    let b = store
+        .store_for("default", "b--table-s3")
+        .expect("bucket b serves");
     {
         let b = b.clone();
         tokio::spawn(async move {
@@ -309,17 +348,26 @@ async fn the_bucket_concurrency_budget_is_enforced() {
 
     let store = {
         let (if_, g) = (in_flight.clone(), gate.clone());
-        BackendStore::with_factory("alpha".to_owned(), 1, retry(), breaker(), move |_bucket| {
-            Ok(Arc::new(GatedStore {
-                in_flight: if_.clone(),
-                gate: g.clone(),
-            }) as Arc<dyn MultipartObjectStore>)
-        })
+        BackendStore::with_factory(
+            "default",
+            "alpha".to_owned(),
+            1,
+            retry(),
+            breaker(),
+            move |_bucket| {
+                Ok(Arc::new(GatedStore {
+                    in_flight: if_.clone(),
+                    gate: g.clone(),
+                }) as Arc<dyn MultipartObjectStore>)
+            },
+        )
         .expect("store builds")
     };
 
     // Saturate the bucket: one copy parks, consuming the single permit.
-    let client = store.store_for("alpha").expect("configured bucket serves");
+    let client = store
+        .store_for("default", "alpha")
+        .expect("configured bucket serves");
     {
         let client = client.clone();
         tokio::spawn(async move {
@@ -347,15 +395,22 @@ async fn the_bucket_concurrency_budget_is_enforced() {
 
 #[tokio::test]
 async fn construction_error_propagates() {
-    let err = BackendStore::with_factory("nope".to_owned(), 4, retry(), breaker(), |bucket| {
-        Err(BackendError::Build {
-            bucket: bucket.to_owned(),
-            source: object_store::Error::NotImplemented {
-                operation: "build".to_owned(),
-                implementer: "test".to_owned(),
-            },
-        })
-    })
+    let err = BackendStore::with_factory(
+        "default",
+        "nope".to_owned(),
+        4,
+        retry(),
+        breaker(),
+        |bucket| {
+            Err(BackendError::Build {
+                bucket: bucket.to_owned(),
+                source: object_store::Error::NotImplemented {
+                    operation: "build".to_owned(),
+                    implementer: "test".to_owned(),
+                },
+            })
+        },
+    )
     .expect_err("construction fails");
     assert!(matches!(err, BackendError::Build { .. }), "got: {err:?}");
 }

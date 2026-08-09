@@ -44,6 +44,7 @@ async fn one_file_table(
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: ident.clone(),
                 bucket: BUCKET.to_owned(),
                 metadata_key: fixture.metadata_key.clone(),
@@ -114,6 +115,7 @@ async fn table_with_no_snapshots_still_classifies_metadata() {
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: ident.clone(),
                 bucket: BUCKET.to_owned(),
                 metadata_key: fixture.metadata_key.clone(),

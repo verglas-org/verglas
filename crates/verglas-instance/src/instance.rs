@@ -95,6 +95,7 @@ mod tests {
     async fn single_node_instance_owns_its_keys_and_records_locally() {
         let instance = CacheInstance::single_node(NodeId::new("single"));
         let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "b".into(),
             key: "warehouse/t/data/0.parquet".into(),
         };

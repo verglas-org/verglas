@@ -74,6 +74,7 @@ export function startsAgentTurn(message: AiChatMessage): boolean {
     case "message": return message.author.type === "user" || message.author.type === "vessel";
     case "agentCallback": case "agentNudge": return true;
     case "connectionRequest": return message.state === "accepted";
+    case "permissionRequest": return message.state === "approved";
     default: return false;
   }
 }

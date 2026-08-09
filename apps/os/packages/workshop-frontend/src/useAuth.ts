@@ -24,6 +24,8 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   // Track current authenticated API stub for cleanup on unmount.
   // State closures go stale in cleanup functions, so we use a ref.
   const authenticatedApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
+  const pendingApiRef = useRef<RpcStub<AuthenticatedApi> | null>(null)
+  const authenticationAttemptRef = useRef(0)
   authenticatedApiRef.current = authState.authenticatedApi
 
   useEffect(() => {
@@ -38,6 +40,9 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       }
     }
     return () => {
+      authenticationAttemptRef.current += 1
+      pendingApiRef.current?.[Symbol.dispose]()
+      pendingApiRef.current = null
       // The authenticateWithXxx functions also dispose the old stub via their setAuthState
       // updater, so this may double-dispose on reconnect. That's fine — dispose is idempotent.
       authenticatedApiRef.current?.[Symbol.dispose]()
@@ -52,15 +57,26 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       return { ...prev, authenticatedApi: null, isLoading: true, error: null }
     })
 
-    // Use promise pipelining - no need to await. The CF Access JWT is already attached
-    // to the request by the browser (injected by the Access service worker/cookie), so
-    // the server validates it and returns an authenticated stub immediately.
+    const attempt = ++authenticationAttemptRef.current
     const authenticatedApi = publicApi.authenticateFromCfAccess()
-    setAuthState({
-      token: null,
-      authenticatedApi,
-      isLoading: false,
-      error: null
+    pendingApiRef.current = authenticatedApi
+    authenticatedApi.whoami().then(() => {
+      if (authenticationAttemptRef.current !== attempt) {
+        authenticatedApi[Symbol.dispose]()
+        return
+      }
+      pendingApiRef.current = null
+      setAuthState({ token: null, authenticatedApi, isLoading: false, error: null })
+    }).catch((err: unknown) => {
+      authenticatedApi[Symbol.dispose]()
+      if (authenticationAttemptRef.current !== attempt) return
+      pendingApiRef.current = null
+      setAuthState({
+        token: null,
+        authenticatedApi: null,
+        isLoading: false,
+        error: err instanceof Error ? err.message : 'Authentication failed'
+      })
     })
   }
 
@@ -78,14 +94,22 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
       }
     })
 
-    // Use promise pipelining - we can use the returned promise as a stub immediately
-    // without awaiting. Authentication errors will be handled when the stub is actually used.
+    const attempt = ++authenticationAttemptRef.current
     const authenticatedApi = publicApi.authenticate(token)
-    setAuthState({
-      token,
-      authenticatedApi,
-      isLoading: false,
-      error: null
+    pendingApiRef.current = authenticatedApi
+    authenticatedApi.whoami().then(() => {
+      if (authenticationAttemptRef.current !== attempt) {
+        authenticatedApi[Symbol.dispose]()
+        return
+      }
+      pendingApiRef.current = null
+      setAuthState({ token, authenticatedApi, isLoading: false, error: null })
+    }).catch(() => {
+      authenticatedApi[Symbol.dispose]()
+      if (authenticationAttemptRef.current !== attempt) return
+      pendingApiRef.current = null
+      localStorage.removeItem('authToken')
+      setAuthState({ token: null, authenticatedApi: null, isLoading: false, error: null })
     })
   }
 
@@ -94,6 +118,9 @@ export function useAuth(publicApi: RpcStub<PublicApi>) {
   }
 
   const logout = () => {
+    authenticationAttemptRef.current += 1
+    pendingApiRef.current?.[Symbol.dispose]()
+    pendingApiRef.current = null
     // Use functional updater to read current state (avoids stale closure).
     setAuthState(prev => {
       if (prev.authenticatedApi) {

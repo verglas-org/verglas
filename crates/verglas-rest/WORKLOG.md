@@ -1,5 +1,14 @@
 # Worklog
 
+- #84: Added database-scoped Iceberg REST proxy routes backed by the live catalog registry, replacing process-global routing for multi-database tenant runtimes.
+
+## 2026-08-08 — Issue #81
+
+- Added `/v1/access/*` principal, resource, grant, and decision routes over the backend-neutral authorizer.
+- Added route-level coverage for inherited access decisions.
+- Added `/v1/access/delegations` and `/v1/access/revocations` so user-facing approval paths cannot
+  turn the access service's trusted service credential into an account-wide grant bypass.
+
 - #43: Added the local reflected Integration namespace gateway. The primary Verglas endpoint now relays discovery and bounded or streaming method calls through the authenticated Docker runtime manager.
 - #8: Added the on-prem REST composition layer that mounts the query API and shallow catalog proxy on one service. Cloud roles continue to use their domain crates directly.
 - #11: Added the standalone scheduler HTTP ingress and inspection surface. The REST layer accepts trigger invocations and exposes durable jobs while the scheduler crate owns queue semantics, keeping transport separate from scheduling state.
@@ -11,3 +20,6 @@
 - #29: Added authenticated raw-byte KV get, put, delete, and deterministic prefix-list routes. The routes enforce tenant, namespace, and verb scopes before storage and keep keys, values, tokens, and metadata out of logs.
 - chore: Removed GET/PUT /v1/watermark and its wire-shape tests. Sys routes are worker registry only.
 - #66: Switched LocalAccess admin test fixtures from *.verglas.dev catalog hostnames to catalog.example.test.
+- #84: Added access-service routes for creating, rotating, inspecting, and resolving typed scoped
+  secrets. List and get return metadata only; the explicit resolution route requires `use_secret`
+  authorization before returning material to a trusted runtime.

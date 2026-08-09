@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use verglas_core::admin::{DEFAULT_ENDPOINT, ENDPOINT_ENV};
 
 /// Global flags shared by every subcommand.
@@ -18,6 +18,15 @@ pub struct Cli {
         global = true
     )]
     pub endpoint: String,
+
+    /// Tenant access/database API (`VERGLAS_ACCESS_ENDPOINT`).
+    #[arg(
+        long = "access-endpoint",
+        env = "VERGLAS_ACCESS_ENDPOINT",
+        default_value = "http://127.0.0.1:8345",
+        global = true
+    )]
+    pub access_endpoint: String,
 
     /// Bearer token for authenticated server APIs (`VERGLAS_TOKEN`).
     #[arg(long, env = "VERGLAS_TOKEN", global = true)]
@@ -77,6 +86,77 @@ pub enum Command {
     /// Manage and call long-lived local HTTP services in the Docker runtime.
     #[command(subcommand)]
     Vessel(VesselCommand),
+    /// Create independently bound Lakehouse and Postgres databases.
+    #[command(subcommand)]
+    Db(DbCommand),
+    /// Create scoped credentials without exposing their values in argv.
+    #[command(subcommand)]
+    Secret(SecretCommand),
+}
+
+/// `verglas db` operations against the local database resource API.
+#[derive(Debug, Subcommand)]
+pub enum DbCommand {
+    /// Create one managed or externally bound database.
+    Create(DbCreateArgs),
+}
+
+/// Arguments for `verglas db create`.
+#[derive(Debug, Args)]
+pub struct DbCreateArgs {
+    /// Stable database name.
+    pub name: String,
+    /// Database engine and resource composition.
+    #[arg(long = "type", value_enum)]
+    pub database_type: DatabaseType,
+    /// S3 prefix for a Lakehouse that uses an authorized scoped secret.
+    #[arg(long)]
+    pub data_path: Option<String>,
+    /// External Iceberg REST catalog URI for a Lakehouse.
+    #[arg(long)]
+    pub catalog: Option<String>,
+    /// Warehouse selected from the external catalog.
+    #[arg(long, requires = "catalog")]
+    pub warehouse: Option<String>,
+}
+
+/// Database types accepted by the local resource API.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum DatabaseType {
+    /// Iceberg storage with managed or externally bound services.
+    Lakehouse,
+    /// A managed Neon Postgres database.
+    Postgres,
+}
+
+/// `verglas secret` operations against the local access service.
+#[derive(Debug, Subcommand)]
+pub enum SecretCommand {
+    /// Create a typed URI-scoped secret, reading its value from standard input.
+    Create(SecretCreateArgs),
+}
+
+/// Arguments for `verglas secret create`.
+#[derive(Debug, Args)]
+pub struct SecretCreateArgs {
+    /// Stable secret name.
+    pub name: String,
+    /// Credential type used when resolving resource bindings.
+    #[arg(long = "type", value_enum)]
+    pub secret_type: SecretType,
+    /// URI prefix to which this secret grants access.
+    #[arg(long)]
+    pub scope: String,
+}
+
+/// Secret types accepted by the local access service.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SecretType {
+    /// S3-compatible object-storage credentials.
+    S3,
+    /// Iceberg REST catalog credentials.
+    #[value(name = "iceberg-rest")]
+    IcebergRest,
 }
 
 /// `verglas vessel` operations against the local Docker runtime manager.

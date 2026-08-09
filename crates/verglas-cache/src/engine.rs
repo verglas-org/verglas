@@ -4146,7 +4146,7 @@ mod ttl_clock_tests {
         };
         let node = NodeId::new(SINGLE_NODE_ID);
         HybridCacheEngine::build_engine(
-            PassthroughRead::new(BackendStore::single("b", store)),
+            PassthroughRead::new(BackendStore::single("default", "b", store)),
             NoopPeerFetch,
             RendezvousRing::single(node.clone()),
             node,
@@ -4174,6 +4174,7 @@ mod ttl_clock_tests {
         let clock = ManualClock::new();
         let engine = engine_with_clock(&tmp, store, clock.clone(), 5).await;
         let k = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "b".to_owned(),
             key: "notes.txt".to_owned(),
         };
@@ -4230,6 +4231,7 @@ mod ttl_clock_tests {
         // TTL=1s: a mutable key would revalidate almost immediately.
         let engine = engine_with_clock(&tmp, store, clock.clone(), 1).await;
         let k = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "b".to_owned(),
             key: "t/data/f.parquet".to_owned(),
         };

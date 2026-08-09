@@ -1,13 +1,13 @@
 ---
 title: "Self-host Verglas"
-description: "Start Verglas against Cloudflare R2 and R2 Data Catalog with one Docker Compose file."
+description: "Start Verglas and create managed or customer-owned database resources."
 icon: "server"
 ---
 
-This guide starts one Verglas server backed by Cloudflare R2. You provide the
-object-store and catalog credentials as environment variables; Docker Compose
-contains the complete server configuration. You do not create or mount a
-server `config.toml`.
+This guide starts a tenant-local Verglas stack with an empty provider registry.
+Object stores, catalogs, and databases are added dynamically through the access
+API. You do not put provider credentials in Compose or restart the cache when a
+database is added.
 
 The running application exposes:
 
@@ -15,50 +15,17 @@ The running application exposes:
 | --- | --- | --- |
 | `8333` | S3-compatible cache | Query engines and SDKs |
 | `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
+| `8345` | Tenant access API | Database and scoped-secret commands |
 | `8360` | Local container runtime manager | Optional managed services |
-| `9009` | Rill | Optional analytics container |
+| `8390` | Agent runtime | Verglas OS workspaces |
+| `8787` | Verglas OS | Community and development UI |
 
 ## Before you begin
 
 Install [Docker Desktop](https://docs.docker.com/desktop/) or Docker Engine
-with Compose, Git, and the Rust toolchain. You also need a Cloudflare account
-with R2 enabled.
+with Compose, Git, and the Rust toolchain.
 
 <Steps>
-  <Step title="Create an R2 bucket and catalog">
-    Follow Cloudflare's [R2 S3 setup](https://developers.cloudflare.com/r2/get-started/s3/)
-    to create a bucket. This guide calls it `verglas-demo`.
-
-    Open **Storage & databases → R2 Data Catalog**, create a catalog for that
-    bucket, and record the catalog URI and warehouse name. Cloudflare documents
-    this flow in [Manage catalogs](https://developers.cloudflare.com/r2/data-catalog/manage-catalogs/).
-
-    The values have this shape:
-
-    ```text
-    S3 endpoint: https://ACCOUNT_ID.r2.cloudflarestorage.com
-    Catalog URI: https://catalog.cloudflarestorage.com/ACCOUNT_ID/verglas-demo
-    Warehouse:   ACCOUNT_ID_verglas-demo
-    ```
-  </Step>
-
-  <Step title="Create a read-write R2 token">
-    In **R2 → Overview → Manage API Tokens**, create an **Admin Read & Write**
-    token scoped to the bucket. That permission covers both R2 objects and R2
-    Data Catalog writes. See Cloudflare's [R2 authentication guide](https://developers.cloudflare.com/r2/api/tokens/).
-
-    Record all three values shown once at creation:
-
-    - Token value, used as the Iceberg REST bearer token.
-    - Access Key ID, used for S3 requests.
-    - Secret Access Key, used for S3 requests.
-
-    <Warning>
-    Cloudflare does not show the secret access key again. Do not commit any of
-    these values.
-    </Warning>
-  </Step>
-
   <Step title="Clone Verglas and install the CLI">
     ```bash
     git clone https://github.com/verglas-org/verglas.git
@@ -66,27 +33,6 @@ with R2 enabled.
     cargo install --path bins/verglas --locked --force
     verglas --version
     ```
-  </Step>
-
-  <Step title="Export the deployment values">
-    Replace the placeholders with the values from Cloudflare. The last command
-    creates a separate credential for clients of your Verglas S3 endpoint.
-
-    ```bash
-    export R2_BUCKET=verglas-demo
-    export R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
-    export R2_ACCESS_KEY_ID=YOUR_R2_ACCESS_KEY_ID
-    export R2_SECRET_ACCESS_KEY=YOUR_R2_SECRET_ACCESS_KEY
-    export R2_CATALOG_URI=https://catalog.cloudflarestorage.com/ACCOUNT_ID/verglas-demo
-    export R2_CATALOG_WAREHOUSE=ACCOUNT_ID_verglas-demo
-    export R2_CATALOG_TOKEN=YOUR_R2_TOKEN_VALUE
-
-    export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
-    export VERGLAS_S3_SECRET_ACCESS_KEY=$(openssl rand -hex 32)
-    ```
-
-    Keep this terminal open. Compose substitutes these values when it creates
-    the containers.
   </Step>
 
   <Step title="Review the Compose bootstrap">
@@ -102,18 +48,23 @@ with R2 enabled.
   </Step>
 
   <Step title="Start Verglas">
-    Set the local Docker control-plane token, then build and start the stack:
+    Build and start the stack with no provider environment:
 
     ```bash
-    export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
     docker compose up --detach --build
     ```
+
+    Compose generates the tenant secret-encryption key once and retains it in
+    the `verglas-secret-key` named volume. It is not a provider credential and
+    is never embedded in the Compose file.
 
     Wait until the health endpoint reports `ready`, then connect the CLI:
 
     ```bash
     until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 2; done
     export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+    export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+    export VERGLAS_TOKEN=verglas-local-access
     verglas status
     ```
 
@@ -126,9 +77,6 @@ with R2 enabled.
     docker compose logs -f verglas-container-runtime
     ```
 
-    Pass the same `VERGLAS_CONTAINER_RUNTIME_TOKEN` to the local Verglas control
-    plane. Do not use the Compose file's development default on a shared machine.
-
     If startup fails, read the server log:
 
     ```bash
@@ -137,12 +85,12 @@ with R2 enabled.
   </Step>
 </Steps>
 
-## Next: create your first table
+## Next: create a database
 
-The server is connected to R2 and its Iceberg catalog. Continue with
-[Create your first table](/docs/get-started/first-table) to write rows, run a
-query, and confirm that the resulting Iceberg table is visible through the
-catalog.
+Create a managed lakehouse with `verglas db create analytics --type lakehouse`,
+or create scoped S3 and Iceberg REST secrets before declaring a customer-owned
+database. Provider values are prompted or read from stdin and never belong in
+the process environment.
 
 ## Stop the cluster
 
@@ -150,7 +98,8 @@ catalog.
 docker compose down
 ```
 
-This stops the two bootstrap services. Dynamically managed containers retain
-their declared state and are reconciled when the manager starts again. The
-named volumes retain the local cache and runtime desired-state document. Add
-`--volumes` only when you intentionally want to delete both.
+This stops the stack. Dynamically managed containers retain their declared
+state and are reconciled when the manager starts again. Named volumes retain
+the cache, access/scheduler Postgres data, runtime state, OS state, and the
+tenant secret-encryption key. Add `--volumes` only when you intentionally want
+to delete all of that local state.

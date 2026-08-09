@@ -51,19 +51,12 @@ fn assert_documented_file(page: &str, name: &str, source: &str) {
 #[test]
 fn self_hosted_compose_is_complete_and_runnable() {
     let root = workspace_root();
-    let page = fs::read_to_string(root.join("docs/get-started/self-host.mdx"))
-        .unwrap_or_else(|error| panic!("failed to read self-host guide: {error}"));
-    let compose = named_fence(&page, "docker-compose.yml");
+    let compose = fs::read_to_string(root.join("docker-compose.yml"))
+        .unwrap_or_else(|error| panic!("failed to read docker-compose.yml: {error}"));
     for required in [
         "verglas-server:",
         "verglas-container-runtime:",
-        "VERGLAS_BACKEND_BUCKET:",
-        "VERGLAS_BACKEND_ENDPOINT:",
-        "VERGLAS_CATALOG_URI:",
-        "VERGLAS_CATALOG_WAREHOUSE:",
-        "VERGLAS_CATALOG_BEARER_TOKEN:",
-        "VERGLAS_S3_ACCESS_KEY_ID:",
-        "VERGLAS_S3_SECRET_ACCESS_KEY:",
+        "VERGLAS_ACCESS_SERVICE_TOKEN:",
         "VERGLAS_SCHEDULER_URL:",
         "verglas-cache:/var/lib/verglas",
         "nofile:",
@@ -85,10 +78,19 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("config.toml"),
         "the server must be configured entirely by Compose"
     );
-    for unmanaged_service in ["postgres:", "verglas-scheduler:", "rill:"] {
+    assert!(
+        !compose.contains("rill:"),
+        "bootstrap Compose must not directly own rill:"
+    );
+    for forbidden in [
+        "R2_",
+        "VERGLAS_BACKEND_",
+        "VERGLAS_CATALOG_",
+        "AWS_ACCESS_KEY_ID",
+    ] {
         assert!(
-            !compose.contains(unmanaged_service),
-            "bootstrap Compose must not directly own {unmanaged_service}"
+            !compose.contains(forbidden),
+            "bootstrap Compose must not contain static provider configuration {forbidden}"
         );
     }
 }

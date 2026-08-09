@@ -20,6 +20,7 @@ dhat-heap.json
 # Scratch space
 /scratch/
 /tmp/
+/release-out/
 
 # Claude Code / agent local worktrees
 .claude/worktrees/

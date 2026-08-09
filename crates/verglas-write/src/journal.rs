@@ -44,6 +44,8 @@ pub struct Placement {
 pub struct Journal {
     /// Pod-unique object id assigned by the write coordinator.
     pub object_id: String,
+    /// Provider binding that owns this object namespace.
+    pub storage_binding_id: String,
     /// Origin bucket.
     pub bucket: String,
     /// Origin key.
@@ -72,9 +74,13 @@ pub struct Journal {
 }
 
 impl Journal {
-    /// The `(bucket, key)` pair used as the dirty-index key.
-    fn index_key(&self) -> (String, String) {
-        (self.bucket.clone(), self.key.clone())
+    /// The `(storage binding, bucket, key)` tuple used as the dirty-index key.
+    fn index_key(&self) -> (String, String, String) {
+        (
+            self.storage_binding_id.clone(),
+            self.bucket.clone(),
+            self.key.clone(),
+        )
     }
 }
 
@@ -82,8 +88,8 @@ impl Journal {
 pub struct JournalStore {
     /// Directory holding the JSON journals.
     dir: PathBuf,
-    /// `(bucket, key) -> object_id` for dirty objects. Guards read-your-writes.
-    dirty: RwLock<HashMap<(String, String), String>>,
+    /// `(storage binding, bucket, key) -> object_id` for dirty objects.
+    dirty: RwLock<HashMap<(String, String, String), String>>,
     /// Count of dirty entries. When zero, the read path skips the index lock.
     dirty_count: AtomicUsize,
     /// Serializes read-modify-write journal mutations so a straggler merge and
@@ -183,14 +189,20 @@ impl JournalStore {
         }
     }
 
-    /// Looks up the dirty object id for `(bucket, key)`, or `None`. Cheap when
-    /// nothing is dirty: one relaxed atomic load and no lock.
-    pub fn find_dirty(&self, bucket: &str, key: &str) -> Option<String> {
+    /// Looks up the dirty object id for one provider-scoped key, or `None`.
+    /// Cheap when nothing is dirty: one relaxed atomic load and no lock.
+    pub fn find_dirty(&self, storage_binding_id: &str, bucket: &str, key: &str) -> Option<String> {
         if self.dirty_count.load(Ordering::Relaxed) == 0 {
             return None;
         }
         let guard = self.dirty.read().ok()?;
-        guard.get(&(bucket.to_owned(), key.to_owned())).cloned()
+        guard
+            .get(&(
+                storage_binding_id.to_owned(),
+                bucket.to_owned(),
+                key.to_owned(),
+            ))
+            .cloned()
     }
 
     /// Returns true when no object is currently dirty (nothing to read back).
@@ -319,6 +331,7 @@ mod tests {
     fn dirty(object_id: &str, bucket: &str, key: &str) -> Journal {
         Journal {
             object_id: object_id.to_owned(),
+            storage_binding_id: "binding-a".to_owned(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             metadata: StoredMetadata::default(),
@@ -342,10 +355,13 @@ mod tests {
         assert!(store.is_idle());
         store.put(&dirty("obj-1", "bkt", "k")).expect("put");
         assert!(!store.is_idle());
-        assert_eq!(store.find_dirty("bkt", "k").as_deref(), Some("obj-1"));
+        assert_eq!(
+            store.find_dirty("binding-a", "bkt", "k").as_deref(),
+            Some("obj-1")
+        );
         store.mark_clean("obj-1").expect("clean");
         assert!(store.is_idle());
-        assert_eq!(store.find_dirty("bkt", "k"), None);
+        assert_eq!(store.find_dirty("binding-a", "bkt", "k"), None);
     }
 
     /// The dirty index is rebuilt from disk on reopen (crash replay).
@@ -358,6 +374,31 @@ mod tests {
         }
         let store = JournalStore::open(dir.path()).expect("reopen");
         assert!(!store.is_idle());
-        assert_eq!(store.find_dirty("bkt", "k").as_deref(), Some("obj-1"));
+        assert_eq!(
+            store.find_dirty("binding-a", "bkt", "k").as_deref(),
+            Some("obj-1")
+        );
+    }
+
+    /// Equal bucket/key pairs from different providers never share dirty state.
+    #[test]
+    fn dirty_index_isolated_by_storage_binding() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let store = JournalStore::open(dir.path()).expect("open");
+        let mut first = dirty("obj-a", "shared", "path");
+        first.storage_binding_id = "binding-a".to_owned();
+        let mut second = dirty("obj-b", "shared", "path");
+        second.storage_binding_id = "binding-b".to_owned();
+        store.put(&first).expect("put first");
+        store.put(&second).expect("put second");
+
+        assert_eq!(
+            store.find_dirty("binding-a", "shared", "path").as_deref(),
+            Some("obj-a")
+        );
+        assert_eq!(
+            store.find_dirty("binding-b", "shared", "path").as_deref(),
+            Some("obj-b")
+        );
     }
 }

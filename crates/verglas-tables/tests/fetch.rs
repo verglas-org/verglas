@@ -26,6 +26,7 @@ async fn object_store_fetch_serves_range_and_suffix() {
 
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
     let path = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "db/t/obj".to_owned(),
     };
@@ -46,6 +47,7 @@ async fn object_store_fetch_reports_not_found() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let fetch = ObjectStoreFetch::new(store);
     let path = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "missing".to_owned(),
     };
@@ -116,6 +118,7 @@ async fn through_cache_fetch_matches_range_and_suffix() {
     objects.insert("db/t/obj".to_owned(), body.clone());
     let fetch = ObjectReadFetch::new(MockRead { objects });
     let path = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "db/t/obj".to_owned(),
     };
@@ -133,6 +136,7 @@ async fn through_cache_fetch_matches_range_and_suffix() {
     let err = fetch
         .fetch_suffix(
             &CacheKey {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 bucket: "lake".to_owned(),
                 key: "nope".to_owned(),
             },

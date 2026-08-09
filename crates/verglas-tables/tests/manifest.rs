@@ -7,6 +7,7 @@ use verglas_tables::ManifestSummary;
 fn manifest_summary_holds_data_file_keys() {
     let summary = ManifestSummary {
         data_files: vec![CacheKey {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: "lake".to_owned(),
             key: "warehouse/db/t/data/f1.parquet".to_owned(),
         }],

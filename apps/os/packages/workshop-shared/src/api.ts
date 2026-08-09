@@ -285,10 +285,102 @@ function isOpenWorkspaceErrorCode(value: unknown): value is OpenWorkspaceErrorCo
       value === OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied;
 }
 
+/** Stable authorization actions shared by lakehouse and runtime resources. */
+export type VerglasAccessAction =
+    "discover" | "describe" | "query" | "append" | "modify" | "create_child" |
+    "execute" | "use_secret" | "deploy" | "pass_grants" | "manage_grants" | "own";
+
+/** Human or process category registered with the tenant authorization service. */
+export type VerglasPrincipalKind =
+    "user" | "service_account" | "agent" | "job" | "job_run" | "vessel" |
+    "application" | "integration";
+
+/** Protected resource category understood across Verglas data and runtime backends. */
+export type VerglasResourceKind =
+    "tenant" | "database" | "warehouse" | "namespace" | "table" | "view" |
+    "vector_index" | "graph" | "object_prefix" | "integration" |
+    "integration_operation" | "secret" | "job" | "vessel" | "application" |
+    "model" | "queue";
+
+/** One tenant-scoped human or process identity. */
+export type VerglasAccessPrincipal = {
+  /** Tenant that owns the identity. */
+  tenantId: string;
+  /** Stable principal identifier within the tenant. */
+  id: string;
+  /** Identity lifecycle category. */
+  kind: VerglasPrincipalKind;
+  /** Durable parent identity for derived processes. */
+  parentId?: string;
+};
+
+/** One protected object in the tenant resource hierarchy. */
+export type VerglasAccessResource = {
+  /** Tenant that owns the resource. */
+  tenantId: string;
+  /** Stable resource identifier within the tenant. */
+  id: string;
+  /** Backend-neutral resource category. */
+  kind: VerglasResourceKind;
+  /** Resource from which grants are inherited. */
+  parentId?: string;
+};
+
+/** One additive assignment of actions to a principal on a resource. */
+export type VerglasAccessGrant = {
+  /** Stable grant identifier. */
+  id: string;
+  /** Tenant containing both the principal and resource. */
+  tenantId: string;
+  /** Principal receiving the actions. */
+  principalId: string;
+  /** Resource on which the actions originate. */
+  resourceId: string;
+  /** Non-empty delegated action set. */
+  actions: VerglasAccessAction[];
+};
+
+/** Current OS user's mapped authorization identity and effective tenant-root access. */
+export type VerglasAccessIdentity = {
+  /** Tenant selected for this OS deployment. */
+  tenantId: string;
+  /** Stable principal mapped from the authenticated OS account. */
+  principalId: string;
+  /** Whether this identity owns the tenant root. */
+  tenantOwner: boolean;
+  /** Policy revision observed while constructing this view. */
+  policyVersion: number;
+};
+
+/** Bounded tenant authorization state shown to a tenant administrator. */
+export type VerglasAccessSnapshot = {
+  /** Tenant represented by every returned object. */
+  tenantId: string;
+  /** Registered human and process identities. */
+  principals: VerglasAccessPrincipal[];
+  /** Registered protected objects. */
+  resources: VerglasAccessResource[];
+  /** Explicit grants; inherited access is evaluated at use time. */
+  grants: VerglasAccessGrant[];
+};
+
+/** A user-approved request to delegate access to a process principal. */
+export type VerglasAccessGrantInput = {
+  /** Process identity receiving access. */
+  principalId: string;
+  /** Protected object the process wants to use. */
+  resourceId: string;
+  /** Exact actions requested by the process. */
+  actions: VerglasAccessAction[];
+};
+
 // Top-level API exposed to the user after they have authenticated.
 export interface AuthenticatedApi extends RpcTarget {
   // Get profile info for the user who is logged in.
   whoami(): Promise<AiChatAuthorInfo>;
+
+  /** Returns the tenant principal mapped from the current authenticated OS account. */
+  getAccessIdentity(): Promise<VerglasAccessIdentity>;
 
   // Set the user's own display name, seen in chats, etc.
   setOwnDisplayName(name: string): Promise<void>;
@@ -552,9 +644,8 @@ export interface AuthenticatedApi extends RpcTarget {
   // Returns null if not in library, or { uploaded } if it is.
   isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null>;
 
-  // Create a new workspace from a blueprint. Reads the blueprint from KV, downloads code from
-  // R2, creates a new Overseer DO, initializes it with the blueprint's code, and creates
-  // gatekeepers from the provided binding assignments.
+  // Legacy blueprint-to-workspace installation contract. New deployments reject this operation;
+  // generated interfaces are standalone Application Vessels.
   //
   // Every required binding in the blueprint must have a corresponding entry in `bindings`,
   // keyed by binding name. Throws if any are missing or if accountId/modelId are invalid.
@@ -791,6 +882,15 @@ export type AdminFormat = {
 export interface AdminApi {
   // Read all admin-managed settings for the admin UI in one call.
   getSettings(): Promise<AdminSettingsView>;
+
+  /** Lists the tenant's principals, resources, and explicit grants. */
+  getAccessSnapshot(): Promise<VerglasAccessSnapshot>;
+
+  /** Delegates access as the current user, rejecting privileges the user cannot pass. */
+  delegateAccess(input: VerglasAccessGrantInput): Promise<VerglasAccessGrant>;
+
+  /** Revokes one explicit tenant grant. */
+  revokeAccess(grantId: string): Promise<void>;
 
   // Enable or disable new account signups. Existing users can still log in while signups are closed.
   setSignupsEnabled(enabled: boolean): Promise<void>;
@@ -1288,8 +1388,8 @@ export const SUGGESTED_MODELS: Record<
   },
 };
 
-// Metadata about a workspace (one Overseer DO and everything in it). Includes everything needed
-// to render the workspace list on the front page.
+// Metadata about a Postgres-backed agent Workspace. Includes everything needed to render the
+// Workspace list on the front page.
 //
 // TODO(multi-vessel): Rename `WorkspaceMetadata`.
 export type WorkspaceMetadata = {
@@ -1755,6 +1855,12 @@ export interface Overseer extends RpcTarget {
   // Deny an agent's pending connection request. Updates the inline card. Does NOT resume the agent:
   // the turn stays ended so the user can decide what to tell the agent to do instead.
   denyConnectionRequest(requestId: string): Promise<void>;
+
+  /** Approves a pending AI access request under the current user's delegable authority. */
+  approvePermissionRequest(requestId: string): Promise<void>;
+
+  /** Denies a pending AI access request without changing tenant policy. */
+  denyPermissionRequest(requestId: string): Promise<void>;
 
   // Supplies generated Source configuration, stores secret fields in the Verglas scheduler,
   // and publishes the Source as a Verglas worker revision. This does not resume or block a chat.
@@ -2374,13 +2480,24 @@ export type AiChatMessageBody = {
   gatekeeperId?: WorkpieceId;
 
   // The name under which the resource will appear in the chat's env (`env.NAME` in executeCode)
-  // once the request is accepted. Supplied by the agent as a required parameter of the
-  // requestConnection tool -- the agent knows why it is requesting the resource, so it picks the
-  // name itself -- and recorded here at request time. The name is claimed in the chat's scope
-  // from that moment until the request is denied. Optional only because messages persisted
-  // before named chat bindings existed lack it; those are named and stamped lazily at the
-  // turn-start naming chokepoint.
+  // once the request is accepted. Optional only for persisted legacy requests.
   bindingName?: string;
+
+} | {
+  /** The AI asks the user to delegate lakehouse or runtime access to a process principal. */
+  type: "permissionRequest";
+  /** Unique identifier used to approve or deny the request. */
+  requestId: string;
+  /** Job, Vessel, Application, Integration, or agent principal receiving access. */
+  principalId: string;
+  /** Protected Verglas resource the process wants to use. */
+  resourceId: string;
+  /** Exact actions requested by the process. */
+  actions: VerglasAccessAction[];
+  /** Agent-authored explanation shown to the approving user. */
+  reason: string;
+  /** User decision lifecycle. */
+  state: "pending" | "approved" | "denied";
 };
 
 // Bytes to upload as a chat attachment.
@@ -2655,6 +2772,16 @@ export type AiToolCall = {
     bindingName?: string;
   };
   output?: string;
+} | {
+  /** Ask the user to delegate bounded Verglas access to a process. */
+  toolName: "requestPermission";
+  input: {
+    principalId: string;
+    resourceId: string;
+    actions: VerglasAccessAction[];
+    reason: string;
+  };
+  output?: string;
 });
 
 /** One generated Source configuration input mapped to a worker environment binding. */
@@ -2884,14 +3011,13 @@ export interface ActionsSubscriber {
 }
 
 // Interface implemented by the client to receive callback notifications whenever there is new
-// chat activity. Use Overseer.subscribeToChat() to register a subscriber.
+// chat activity. Use the Workspace capability's subscribeToChat() to register a subscriber.
 export interface AiChatSubscriber {
   // Sent exactly once, at the start of a subscription, before any other callbacks. Carries an
-  // opaque value identifying the current server (Overseer DO) instance. If a resubscribing client
-  // sees a different value than on its previous subscription, the DO has fully restarted since
-  // then, meaning any in-flight provisional stream content was lost and will be re-streamed from
-  // scratch; the client should discard its provisional streaming state. An unchanged value (a
-  // plain network reconnect to the same live instance) means provisional state should be kept.
+  // opaque value identifying the current chat stream generation. If a resubscribing client
+  // sees a different value than on its previous subscription, any in-flight provisional stream
+  // content was lost and will be re-streamed from scratch; the client should discard its
+  // provisional streaming state. An unchanged value means provisional state should be kept.
   streamGeneration(generation: number): void;
 
   // Metadata for the given chat thread has changed, or a new chat thread was created.

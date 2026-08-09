@@ -12,6 +12,7 @@ RUN rustup show
 COPY . .
 RUN cargo build --release \
     -p verglas-server \
+    -p verglas-access-bin \
     -p verglas-scheduler-bin \
     -p verglas-container-runtime \
     -p verglas-query \
@@ -35,8 +36,20 @@ USER bun
 EXPOSE 8380
 ENTRYPOINT ["bun", "/opt/verglas-application-runtime/runtime.mjs"]
 
+FROM oven/bun:1.3.8 AS verglas-agent-runtime
+WORKDIR /workspace/apps/os/packages/agent-runtime
+COPY apps/os/packages/agent-runtime /workspace/apps/os/packages/agent-runtime
+EXPOSE 8390
+ENTRYPOINT ["bun", "src/server.mjs"]
+CMD ["serve"]
+
 FROM node:22-bookworm-slim AS verglas-os
-RUN npm install --global pnpm@11.9.0
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install --global pnpm@11.9.0 @openai/codex@0.145.0 @anthropic-ai/claude-code@2.1.220 \
+    && curl https://cursor.com/install -fsS | bash
+ENV PATH="/root/.local/bin:${PATH}"
 WORKDIR /workspace/apps/os
 COPY sdks/typescript /workspace/sdks/typescript
 COPY apps/os /workspace/apps/os
@@ -62,6 +75,15 @@ COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-s
 USER verglas
 EXPOSE 8340
 ENTRYPOINT ["verglas-scheduler"]
+
+FROM runtime AS verglas-access
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/verglas-access /usr/local/bin/verglas-access
+USER verglas
+EXPOSE 8345
+ENTRYPOINT ["verglas-access"]
 
 FROM runtime AS verglas-container-runtime
 RUN apt-get update \

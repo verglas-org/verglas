@@ -713,6 +713,8 @@ function getToolCallSummary(
       return { verb: "Listed connectable resources", target: tc.input.vendorId };
     case "requestConnection":
       return { verb: "Requested connection", target: tc.input.vendorId };
+    case "requestPermission":
+      return { verb: "Requested access", target: tc.input.resourceId };
   }
   // Compile-time exhaustiveness check.
   const _exhaustive: never = tc;
@@ -806,6 +808,8 @@ function describeToolCallCount(toolName: AiToolCall["toolName"], count: number):
       return `Listed connectable resources`;
     case "requestConnection":
       return count === 1 ? "Requested a connection" : `Requested ${count} connections`;
+    case "requestPermission":
+      return count === 1 ? "Requested access" : `Requested access ${count} times`;
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -928,6 +932,7 @@ function getProvisionalToolVerb(toolName: AiToolCall["toolName"]): string {
     case "listBlueprints": return "Listing blueprints";
     case "listConnectableResources": return "Listing connectable resources";
     case "requestConnection": return "Requesting a connection";
+    case "requestPermission": return "Requesting access";
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -959,6 +964,7 @@ function describeProvisionalToolCount(toolName: AiToolCall["toolName"], count: n
     case "listBlueprints": return "Listing blueprints";
     case "listConnectableResources": return "Listing connectable resources";
     case "requestConnection": return `Requesting ${pluralize(count, "connection")}`;
+    case "requestPermission": return count === 1 ? "Requesting access" : `Requesting access ${count} times`;
   }
   const _exhaustive: never = toolName;
   return _exhaustive;
@@ -5925,6 +5931,25 @@ function ChatInterface({
     }
   };
 
+  const handlePermissionDecision = async (requestId: string, approve: boolean) => {
+    setProcessingConnections((previous) => new Set(previous).add(requestId));
+    try {
+      if (approve) await overseer.approvePermissionRequest(requestId);
+      else await overseer.denyPermissionRequest(requestId);
+    } catch (error) {
+      toasts.add({
+        title: error instanceof Error ? error.message : 'Failed to resolve permission request',
+        variant: 'error',
+      });
+    } finally {
+      setProcessingConnections((previous) => {
+        const next = new Set(previous);
+        next.delete(requestId);
+        return next;
+      });
+    }
+  };
+
   const setSourceValue = (requestId: string, name: string, value: string) => {
     setSourceValues((previous) => ({
       ...previous,
@@ -6363,6 +6388,32 @@ function ChatInterface({
               </div>
             )}
           </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderPermissionRequestCard = (
+    msg: AiChatMessage & {type: 'permissionRequest'},
+  ) => {
+    const pending = msg.state === 'pending';
+    const processing = processingConnections.has(msg.requestId);
+    return (
+      <div className="max-w-[860px] rounded-2xl border border-kumo-line bg-kumo-base px-4 py-3 text-[14px]">
+        <div className="flex items-start gap-3">
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-medium text-kumo-default">Grant process access</span>
+              <span className="rounded-full bg-kumo-tint px-2 py-0.5 font-mono text-[11px] text-kumo-subtle">{msg.principalId}</span>
+              {msg.state !== 'pending' && <span className={`text-xs font-medium ${msg.state === 'approved' ? 'text-kumo-success' : 'text-kumo-danger'}`}>{msg.state === 'approved' ? 'Approved' : 'Denied'}</span>}
+            </div>
+            <p className="mt-1 text-[13px] text-kumo-subtle">{msg.reason}</p>
+            <p className="mt-2 font-mono text-[11px] text-kumo-inactive">{msg.actions.join(', ')} on {msg.resourceId}</p>
+          </div>
+          {pending && <div className="flex shrink-0 items-center gap-2 self-center text-[13px]">
+            <button type="button" disabled={processing} onClick={() => void handlePermissionDecision(msg.requestId, false)} className="cursor-pointer rounded-md px-2 py-1 font-medium text-kumo-inactive hover:text-kumo-danger disabled:opacity-40">Deny</button>
+            <button type="button" disabled={processing} onClick={() => void handlePermissionDecision(msg.requestId, true)} className="cursor-pointer rounded-md bg-kumo-brand px-3 py-1 font-medium text-white hover:opacity-90 disabled:opacity-40">Approve</button>
+          </div>}
         </div>
       </div>
     );
@@ -7780,6 +7831,8 @@ function ChatInterface({
                         {msg.type === "action" && renderActionCard(msg)}
 
                         {msg.type === "connectionRequest" && renderConnectionRequestCard(msg)}
+
+                        {msg.type === "permissionRequest" && renderPermissionRequestCard(msg)}
 
                         {msg.type === "sourceConfiguration" && renderSourceConfigurationCard(msg)}
 

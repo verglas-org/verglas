@@ -22,6 +22,8 @@ use std::time::SystemTime;
 /// ever sees a raw exclusive lower bound.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListRequest {
+    /// Immutable storage binding that selects the origin provider and credentials.
+    pub storage_binding_id: String,
     /// Bucket to list, exactly as the request named it. The server serves one
     /// bucket; a request for any other bucket is `NoSuchBucket`.
     pub bucket: String,

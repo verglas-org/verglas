@@ -18,6 +18,9 @@ members = [
     "crates/verglas-graph",
     "crates/verglas-platform",
     "crates/verglas-api",
+    "crates/verglas-authz",
+    "crates/verglas-authz-openfga",
+    "crates/verglas-authz-postgres",
     "sdks/rust",
     "crates/verglas-harness",
     "crates/verglas-vector",
@@ -25,7 +28,9 @@ members = [
     "crates/verglas-scheduler",
     "crates/verglas-vessel-contract",
     "crates/verglas-container-runtime",
+    "crates/verglas-database",
     "bins/cache-node",
+    "bins/access-node",
     "crates/verglas-block",
     "crates/verglas-pgcdc",
     "bins/verglas-pgcdc",
@@ -64,6 +69,9 @@ verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }
 verglas-platform = { path = "crates/verglas-platform" }
 verglas-api = { path = "crates/verglas-api" }
+verglas-authz = { path = "crates/verglas-authz" }
+verglas-authz-openfga = { path = "crates/verglas-authz-openfga" }
+verglas-authz-postgres = { path = "crates/verglas-authz-postgres" }
 verglas-sdk = { path = "sdks/rust" }
 verglas-harness = { path = "crates/verglas-harness" }
 verglas-vector = { path = "crates/verglas-vector" }
@@ -71,6 +79,7 @@ verglas-kv = { path = "crates/verglas-kv" }
 verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-vessel-contract = { path = "crates/verglas-vessel-contract" }
 verglas-container-runtime = { path = "crates/verglas-container-runtime" }
+verglas-database = { path = "crates/verglas-database" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 tonic = "0.13.1"
@@ -120,6 +129,7 @@ aws-sigv4 = "1"
 aws-smithy-runtime-api = "1"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = "1.0.149"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
 serde_yaml = "0.9.34"
 # SHA-256 content addressing for the block-device chunk store (verglas-block,
 # #382): identical 2 MiB chunks hash to one key so they dedup across devices and

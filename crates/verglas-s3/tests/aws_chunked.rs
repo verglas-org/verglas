@@ -18,9 +18,12 @@ use verglas_s3::{
 async fn serve_authed_write() -> String {
     let store = Arc::new(InMemory::new());
     let app = verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         Some((ACCESS_KEY.to_owned(), SECRET_KEY.to_owned())),
     );
@@ -120,9 +123,11 @@ async fn aws_chunked_put_multiple_chunks_round_trips() {
 async fn aws_chunked_put_persists_at_origin() {
     let store = Arc::new(InMemory::new());
     let app = verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
         Arc::new(PassthroughList::new(BackendStore::single(
+            "default",
             BUCKET,
             store.clone(),
         ))),

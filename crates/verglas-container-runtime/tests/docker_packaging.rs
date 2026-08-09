@@ -60,10 +60,16 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert_eq!(
         services,
         [
+            "verglas-secret-key-init:",
             "verglas-server:",
+            "verglas-access:",
             "verglas-scheduler:",
             "verglas-workers-postgres:",
+            "verglas-postgres-init:",
+            "verglas-openfga-migrate:",
+            "verglas-openfga:",
             "verglas-container-runtime:",
+            "verglas-agent-runtime:",
             "verglas-os:",
         ]
     );
@@ -76,5 +82,7 @@ fn compose_bootstraps_the_complete_oss_stack() {
     );
     assert!(compose.contains("VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340"));
     assert!(compose.contains("target: verglas-os"));
+    assert!(compose.contains("target: verglas-agent-runtime"));
+    assert!(compose.contains("VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390"));
     assert!(compose.contains("127.0.0.1:8787:8787"));
 }

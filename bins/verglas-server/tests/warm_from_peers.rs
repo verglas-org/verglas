@@ -70,7 +70,7 @@ async fn build_engine(
     let dir = tempfile::tempdir().expect("temp dir");
     let gets = Arc::new(AtomicU64::new(0));
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single("lake", store)),
+        inner: PassthroughRead::new(BackendStore::single("managed-lakehouse", "lake", store)),
         gets: Arc::clone(&gets),
     };
     let cache = CacheConfig {
@@ -122,6 +122,7 @@ fn block_bytes(seed: u64) -> Bytes {
 async fn seed_key_owned_by(store: &InMemory, ring: &LiveRing, target: &NodeId) -> CacheKey {
     for i in 0..10_000u64 {
         let key = CacheKey {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: "lake".to_owned(),
             key: format!("warehouse/table/data/part-{i:05}.parquet"),
         };

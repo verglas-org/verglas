@@ -1996,7 +1996,7 @@ mod tests {
     /// admin router.
     async fn purger(dir: &std::path::Path) -> Arc<dyn CachePurger> {
         let store = std::sync::Arc::new(object_store::memory::InMemory::new());
-        let backend = PassthroughRead::new(BackendStore::single("test-bucket", store));
+        let backend = PassthroughRead::new(BackendStore::single("default", "test-bucket", store));
         let config = CacheConfig {
             dir: dir.to_path_buf(),
             capacity_bytes: ByteSize(64 * 1024 * 1024),

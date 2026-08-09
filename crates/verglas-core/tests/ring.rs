@@ -22,9 +22,32 @@ fn members(n: usize) -> Vec<NodeId> {
 /// Generates the fixed, deterministic keyspace shared by all tests.
 fn keyspace() -> impl Iterator<Item = CacheKey> {
     (0..KEYSPACE).map(|i| CacheKey {
+        storage_binding_id: "managed".to_owned(),
         bucket: format!("lake-{}", i % 7),
         key: format!("warehouse/db/table/data/part-{i:06}.parquet"),
     })
+}
+
+#[test]
+fn storage_binding_participates_in_rendezvous_ownership() {
+    let ring = RendezvousRing::new(members(5)).expect("non-empty membership");
+    let mut differing = 0;
+    for i in 0..1_000 {
+        let managed = CacheKey {
+            storage_binding_id: "managed".to_owned(),
+            bucket: "lake".to_owned(),
+            key: format!("same/key/{i}"),
+        };
+        let customer = CacheKey {
+            storage_binding_id: "customer".to_owned(),
+            ..managed.clone()
+        };
+        differing += usize::from(ring.owner(&managed) != ring.owner(&customer));
+    }
+    assert!(
+        differing > 0,
+        "binding identity must alter placement hashes"
+    );
 }
 
 #[test]

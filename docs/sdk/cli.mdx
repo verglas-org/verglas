@@ -113,21 +113,32 @@ verglas graph paths fraud customer-17 merchant-42 --max-hops 4
 verglas graph show fraud
 ```
 
-## Databases, volumes, and secrets
+## Databases and scoped secrets
 
 ```bash
-verglas db list
-verglas db create app-db --type postgres
-verglas db delete app-db
+verglas db create analytics --type lakehouse
+verglas db create my_test_db --type postgres
 
-verglas volumes list
-verglas volumes create app-data --size 20GiB
-verglas volumes resize app-data --size 50GiB
-verglas volumes delete app-data
+printf '%s' "$CUSTOMER_S3_CREDENTIALS" | verglas secret create customer_s3 \
+  --type s3 \
+  --scope s3://customer-bucket/team
 
-verglas secrets list
-printf '%s' "$API_KEY" | verglas secrets set API_KEY
-verglas secrets delete API_KEY
+verglas db create customer_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team
+
+printf '%s' "$CUSTOMER_CATALOG_TOKEN" | verglas secret create customer_catalog \
+  --type iceberg-rest \
+  --scope https://catalog.customer.com
+
+verglas db create external_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team \
+  --catalog https://catalog.customer.com \
+  --warehouse customer_warehouse
 ```
 
-Database creation prints one-time connection credentials. The CLI does not store the database password.
+`db` and `secret` use `VERGLAS_ACCESS_ENDPOINT` (localhost port 8345 by
+default). Secret values are read from stdin or a hidden prompt and never appear
+in process arguments. Database records retain stable secret resource IDs, not
+plaintext credentials.

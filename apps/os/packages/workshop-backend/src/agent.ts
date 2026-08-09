@@ -1,6 +1,6 @@
 import { throwLegacyVesselsRemoved } from "./legacy-vessels";
 import { normalizeLegacyToolName } from "@verglas/workshop-shared/legacy-wire-compat";
-import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName, type IntegrationSetupInstruction, type IntegrationVerification, type SourceConfigurationField, type SourceTrigger } from '@verglas/workshop-shared/api';
+import { AiChatMessage, AiChatAuthorInfo, AiToolCall, AiChatMessageBody, AgentSpawnerConfig, AiChatStreamEvent, BlueprintOutput, WorkpieceId, type AiModelConfig, isTextLikeAttachmentMimeType, validateBindingName, type IntegrationSetupInstruction, type IntegrationVerification, type SourceConfigurationField, type SourceTrigger, type VerglasAccessAction } from '@verglas/workshop-shared/api';
 import { PDF_MIME_TYPE, modelApiSupportsPdfAttachments } from './chat-attachment-pdf';
 import { AgentCatalog, ObservationDescription } from '@verglas/workshop-shared/gatekeeper';
 import { createWorkshopLogger } from "./observability";
@@ -339,6 +339,14 @@ export interface AgentHooks {
     bindingName: string;
   }): Promise<{ requested: boolean; message: string }>;
 
+  /** Records a pending request to delegate bounded Verglas access to a process principal. */
+  requestPermission(chatId: number, input: {
+    principalId: string;
+    resourceId: string;
+    actions: VerglasAccessAction[];
+    reason: string;
+  }): Promise<{requested: boolean; message: string}>;
+
   /** Creates a non-blocking generated Source configuration request backed by a Verglas worker. */
   createSource(chatId: number, input: {
     title: string;
@@ -552,6 +560,10 @@ List the resource types a gatekeeper vendor offers, so you can construct a resou
 
 let REQUEST_CONNECTION_TOOL_DESCRIPTION = `
 Ask the user to connect a gatekeeper resource (e.g. a ClickHouse cluster, a GitHub repo). Pre-configure as much as you can: always pass vendorId, and pass resourceUrl when you can infer it (use listConnectableResources to learn the URL patterns). The request must resolve to a specific resource: if you pass a resourceUrl it must match one of the vendor's patterns, and if the vendor offers multiple resource types with no whole-instance option you MUST pass a matching resourceUrl. Otherwise the call is rejected with guidance and no card is shown — fix the request and try again. You also choose \`bindingName\`: the name the resource will have in your env once connected (you know why you want the resource, so pick a name that reflects its role). On success this shows the user an accept/deny card in the chat. It does NOT block: your turn ends after a successful call, and you will be resumed once the user accepts (the resource becomes available as \`env.<bindingName>\`, which you can describeBinding and use from executeCode; wire it into a Workspace with setVesselBinding only if the Workspace's code needs it) or denies (your turn simply ends; wait for the user's next message).
+`.trim();
+
+let REQUEST_PERMISSION_TOOL_DESCRIPTION = `
+Ask the user to delegate lakehouse or runtime access to a Job, Vessel, Application, Integration, or agent principal. Use stable IDs reported by Verglas: Jobs use \`job/<name>\`, Vessels use \`vessel/<name>\`, tables use \`table/<namespace>.<table>\`, vectors use \`vector/<target>/<field>\`, and graphs use \`graph/<namespace>\`. Request only the exact actions needed. The user can approve only actions they already possess and may pass; Verglas enforces this when they click Approve. Your turn ends until the user decides.
 `.trim();
 
 let CREATE_SOURCE_TOOL_DESCRIPTION = `
@@ -1703,6 +1715,7 @@ export async function runAgent(
                 case "listBlueprints":
                 case "listConnectableResources":
                 case "requestConnection":
+                case "requestPermission":
                   toolOutput = {text: call.output ?? ""};
                   break;
                 case "createSource":
@@ -1984,6 +1997,25 @@ export async function runAgent(
         break;
       }
 
+      case "permissionRequest": {
+        if (msg.state === "approved") {
+          modelMessages.push({
+            role: "user",
+            content: `The user approved ${msg.actions.join(", ")} on ${msg.resourceId} for ` +
+                `${msg.principalId}. Continue using that process; do not broaden the granted scope.`,
+            timestamp: msgTimestamp,
+          });
+        } else if (msg.state === "denied") {
+          modelMessages.push({
+            role: "user",
+            content: `The user denied ${msg.actions.join(", ")} on ${msg.resourceId} for ` +
+                `${msg.principalId}. Do not retry the same request unless the user changes direction.`,
+            timestamp: msgTimestamp,
+          });
+        }
+        break;
+      }
+
       case "sourceConfiguration": {
         const status = msg.state === "ready"
             ? "configured and registered"
@@ -2135,6 +2167,7 @@ export async function runAgent(
   // without the turn ending (which would strand it, since there'd be no card to accept/deny and
   // thus no resume).
   let connectionRequested = false;
+  let permissionRequested = false;
 
   // Latched when createIntegration leaves an Integration in needs_configuration this turn.
   // shouldStopAfterTurn ends the turn until the user Save-and-tests (success or failure resumes).
@@ -2901,6 +2934,28 @@ export async function runAgent(
         }
       }
     }),
+
+    requestPermission: defineTool({
+      name: "requestPermission",
+      label: "Request access",
+      description: REQUEST_PERMISSION_TOOL_DESCRIPTION,
+      parameters: Type.Object({
+        principalId: Type.String({description: "Stable process principal receiving access."}),
+        resourceId: Type.String({description: "Stable Verglas resource identifier."}),
+        actions: Type.Array(Type.Union([
+          Type.Literal("discover"), Type.Literal("describe"), Type.Literal("query"),
+          Type.Literal("append"), Type.Literal("modify"), Type.Literal("create_child"),
+          Type.Literal("execute"), Type.Literal("use_secret"), Type.Literal("deploy"),
+          Type.Literal("pass_grants"), Type.Literal("manage_grants"),
+        ]), {minItems: 1, uniqueItems: true}),
+        reason: Type.String({description: "Concise explanation shown to the approving user."}),
+      }),
+      execute: async (_toolCallId, input) => {
+        const result = await hooks.requestPermission(chatId, input);
+        if (result.requested) permissionRequested = true;
+        return toolResult(result.message, {output: result.message});
+      },
+    }),
   };
 
   // When the agent was started to handle callbacks, add the giveUp tool so it can bail out.
@@ -3153,6 +3208,7 @@ export async function runAgent(
           // unresolvable resource) leaves this false so the agent can fix the request and retry
           // in the same turn.
           connectionRequested ||
+          permissionRequested ||
           // Wait for user Save and test on Integrations that need secrets (resume on success or failure).
           integrationsAwaitingActivation ||
           // Wait for approval before continuing against state that may not reflect the action.

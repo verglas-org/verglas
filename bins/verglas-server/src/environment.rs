@@ -4,10 +4,7 @@
 
 use std::collections::HashMap;
 
-use verglas_core::config::{
-    Analytics, Backend, ByteSize, Cache, Catalog, Config, Listen, Log, QueryWorker, Rill,
-    WriteWorker,
-};
+use verglas_core::config::{Backend, ByteSize, Cache, Config, Listen, Log};
 
 /// A validated server configuration plus the S3 credentials accepted from
 /// clients. Endpoint credentials stay outside [`Config`] so serialization of
@@ -47,6 +44,27 @@ impl EnvironmentConfig {
                 .map(str::to_owned)
                 .ok_or_else(|| format!("{name} is required in --environment mode"))
         };
+        for name in [
+            "VERGLAS_BACKEND_BUCKET",
+            "VERGLAS_BACKEND_ENDPOINT",
+            "VERGLAS_BACKEND_REGION",
+            "VERGLAS_CATALOG_URI",
+            "VERGLAS_CATALOG_WAREHOUSE",
+            "VERGLAS_CATALOG_BEARER_TOKEN",
+            "VERGLAS_S3_ACCESS_KEY_ID",
+            "VERGLAS_S3_SECRET_ACCESS_KEY",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            if values
+                .get(name)
+                .is_some_and(|value| !value.trim().is_empty())
+            {
+                return Err(format!(
+                    "{name} is not accepted in --environment mode; create provider and catalog resources through dynamic database bindings"
+                ));
+            }
+        }
 
         let cache = Cache {
             dir: required("VERGLAS_CACHE_DIR")?.into(),
@@ -58,57 +76,25 @@ impl EnvironmentConfig {
             ..Cache::default()
         };
 
-        let backend = Backend {
-            bucket: Some(required("VERGLAS_BACKEND_BUCKET")?),
-            endpoint: Some(required("VERGLAS_BACKEND_ENDPOINT")?),
-            region: Some(required("VERGLAS_BACKEND_REGION")?),
-            ..Backend::default()
-        };
-
-        let catalog = Catalog {
-            uri: required("VERGLAS_CATALOG_URI")?,
-            poll_interval_secs: 30,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            credentials_file: None,
-            credentials_profile: None,
-            bearer_token: Some(required("VERGLAS_CATALOG_BEARER_TOKEN")?),
-            sigv4_region: None,
-            sigv4_signing_name: None,
-            warehouse: Some(required("VERGLAS_CATALOG_WAREHOUSE")?),
-        };
-        let query_worker = QueryWorker {
-            binary: required("VERGLAS_QUERY_WORKER_BINARY")?,
-        };
-        let write_worker = WriteWorker {
-            binary: required("VERGLAS_WRITE_WORKER_BINARY")?,
-        };
         let endpoint_credentials = (
-            required("VERGLAS_S3_ACCESS_KEY_ID")?,
-            required("VERGLAS_S3_SECRET_ACCESS_KEY")?,
+            "verglas-local".to_owned(),
+            required("VERGLAS_ACCESS_SERVICE_TOKEN")?,
         );
-        let analytics = Analytics {
-            rill: Rill {
-                uri: required("VERGLAS_RILL_URI")?,
-                instance_id: required("VERGLAS_RILL_INSTANCE_ID")?,
-                browser_uri: required("VERGLAS_RILL_BROWSER_URI")?,
-                s3_uri: required("VERGLAS_RILL_S3_URI")?,
-            },
-        };
+        let backend = Backend::default();
         let config = Config {
             listen: Listen::default(),
             log: Log::default(),
             cache,
             backend,
             auth: None,
-            catalog: Some(catalog),
-            query_worker: Some(query_worker),
-            write_worker: Some(write_worker),
-            analytics: Some(analytics),
+            catalog: None,
+            query_worker: None,
+            write_worker: None,
+            analytics: None,
             cluster: None,
         };
         config
-            .validate()
+            .validate_dynamic()
             .map_err(|error| format!("invalid environment configuration: {error}"))?;
         Ok(Self {
             config,
@@ -156,23 +142,7 @@ mod tests {
             ("VERGLAS_CACHE_DIR", cache.as_str()),
             ("VERGLAS_CACHE_CAPACITY", "64MB"),
             ("VERGLAS_CACHE_DRAM", "80MB"),
-            ("VERGLAS_BACKEND_BUCKET", "lake"),
-            (
-                "VERGLAS_BACKEND_ENDPOINT",
-                "https://account.r2.cloudflarestorage.com",
-            ),
-            ("VERGLAS_BACKEND_REGION", "auto"),
-            ("VERGLAS_CATALOG_URI", "https://catalog.example.com"),
-            ("VERGLAS_CATALOG_WAREHOUSE", "account_lake"),
-            ("VERGLAS_CATALOG_BEARER_TOKEN", "catalog-token"),
-            ("VERGLAS_S3_ACCESS_KEY_ID", "verglas-local"),
-            ("VERGLAS_S3_SECRET_ACCESS_KEY", "endpoint-secret"),
-            ("VERGLAS_QUERY_WORKER_BINARY", "/usr/bin/true"),
-            ("VERGLAS_WRITE_WORKER_BINARY", "/usr/bin/true"),
-            ("VERGLAS_RILL_URI", "http://rill:9009"),
-            ("VERGLAS_RILL_INSTANCE_ID", "default"),
-            ("VERGLAS_RILL_BROWSER_URI", "http://127.0.0.1:9009"),
-            ("VERGLAS_RILL_S3_URI", "http://verglas-server:8333"),
+            ("VERGLAS_ACCESS_SERVICE_TOKEN", "local-access-token"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -183,24 +153,32 @@ mod tests {
     fn complete_environment_builds_the_self_hosted_server() {
         let loaded = EnvironmentConfig::from_pairs(complete_environment())
             .expect("complete environment must validate");
-        assert_eq!(loaded.config.backend.bucket.as_deref(), Some("lake"));
+        assert!(loaded.config.backend.bucket.is_none());
+        assert!(loaded.config.backend.bucket_globs.is_empty());
+        assert!(loaded.config.catalog.is_none());
         assert_eq!(loaded.config.cache.capacity_bytes.0, 64 * 1024 * 1024);
         assert_eq!(loaded.endpoint_credentials.0, "verglas-local");
-        let catalog = loaded.config.catalog.expect("catalog");
-        assert_eq!(catalog.warehouse.as_deref(), Some("account_lake"));
-        assert_eq!(catalog.bearer_token.as_deref(), Some("catalog-token"));
-        let analytics = loaded.config.analytics.expect("analytics");
-        assert_eq!(analytics.rill.uri, "http://rill:9009");
+        assert_eq!(loaded.endpoint_credentials.1, "local-access-token");
     }
 
     #[test]
     fn missing_required_value_names_the_compose_variable() {
         let environment = complete_environment()
             .into_iter()
-            .filter(|(name, _)| name != "VERGLAS_CATALOG_URI");
+            .filter(|(name, _)| name != "VERGLAS_ACCESS_SERVICE_TOKEN");
         let error = EnvironmentConfig::from_pairs(environment)
             .err()
-            .expect("missing catalog must fail");
-        assert!(error.contains("VERGLAS_CATALOG_URI"), "{error}");
+            .expect("missing access token must fail");
+        assert!(error.contains("VERGLAS_ACCESS_SERVICE_TOKEN"), "{error}");
+    }
+
+    #[test]
+    fn static_provider_environment_is_rejected() {
+        let mut environment = complete_environment();
+        environment.push(("VERGLAS_BACKEND_BUCKET".to_owned(), "legacy".to_owned()));
+        let error = EnvironmentConfig::from_pairs(environment)
+            .err()
+            .expect("static provider configuration must fail");
+        assert!(error.contains("dynamic database bindings"), "{error}");
     }
 }

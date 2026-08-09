@@ -177,10 +177,12 @@ pub fn parse_object_uri(uri: &str) -> Option<(String, String)> {
 /// Reads a whole (small) metadata object through the fetch interface.
 async fn fetch_whole(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     key: &str,
 ) -> Result<bytes::Bytes, FetchError> {
     let path = ObjectPath {
+        storage_binding_id: storage_binding_id.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
     };
@@ -315,11 +317,12 @@ pub fn parse_metadata_json(bytes: &[u8], bucket: &str, key: &str) -> Result<Meta
 /// names no such snapshot.
 pub async fn walk_snapshot(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     metadata_key: &str,
     snapshot_id: i64,
 ) -> Result<SnapshotPlan, MapError> {
-    let doc_bytes = fetch_whole(fetch, bucket, metadata_key)
+    let doc_bytes = fetch_whole(fetch, storage_binding_id, bucket, metadata_key)
         .await
         .map_err(MapError::Fetch)?;
     let doc = parse_metadata_json(&doc_bytes, bucket, metadata_key)?;
@@ -331,7 +334,8 @@ pub async fn walk_snapshot(
         })?
         .to_owned();
 
-    let (manifest_keys, data_files) = walk_manifest_list(fetch, bucket, &manifest_list_key).await?;
+    let (manifest_keys, data_files) =
+        walk_manifest_list(fetch, storage_binding_id, bucket, &manifest_list_key).await?;
 
     Ok(SnapshotPlan {
         snapshot_id,
@@ -348,17 +352,18 @@ pub async fn walk_snapshot(
 /// time.
 pub async fn walk_manifest_list(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     manifest_list_key: &str,
 ) -> Result<(Vec<String>, Vec<DataFileEntry>), MapError> {
-    let list_bytes = fetch_whole(fetch, bucket, manifest_list_key)
+    let list_bytes = fetch_whole(fetch, storage_binding_id, bucket, manifest_list_key)
         .await
         .map_err(MapError::Fetch)?;
     let manifest_keys = parse_manifest_list(&list_bytes, bucket, manifest_list_key)?;
 
     let mut data_files = Vec::new();
     for manifest_key in &manifest_keys {
-        let manifest_bytes = fetch_whole(fetch, bucket, manifest_key)
+        let manifest_bytes = fetch_whole(fetch, storage_binding_id, bucket, manifest_key)
             .await
             .map_err(MapError::Fetch)?;
         parse_manifest(&manifest_bytes, bucket, manifest_key, &mut data_files)?;

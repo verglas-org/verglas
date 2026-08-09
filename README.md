@@ -43,9 +43,9 @@ repository test tooling).
 
 ### Self-host (Docker)
 
-The Docker application is configured entirely by Compose environment values.
-Export your R2 bucket, S3 credentials, catalog URI, warehouse, catalog token,
-and a client-facing S3 secret, then start the complete OSS stack:
+The Docker application boots without a process-global object store or catalog.
+Provider credentials and database bindings are created through the access API,
+so adding a database never requires editing Compose or restarting the cache.
 
 ```sh
 docker compose up -d --build
@@ -55,6 +55,8 @@ Point the CLI at the container's API:
 
 ```sh
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+export VERGLAS_TOKEN=verglas-local-access
 verglas status
 ```
 
@@ -62,16 +64,54 @@ Verglas OS is available at `http://127.0.0.1:8787`. It is a community and
 development application in the Compose stack, not a dependency of the
 `verglas` server or CLI binaries and not a new CLI command.
 
-The [self-hosted guide](docs/get-started/self-host.mdx) covers R2 and Data
-Catalog setup, every required environment variable, the complete Compose file,
-and creating the first table.
+The [self-hosted guide](docs/get-started/self-host.mdx) covers bringing up the
+stack and adding managed or customer-owned database resources.
 
 ### Prometheus metrics
 
 `verglas-server` exposes `GET /metrics` on the admin listener (port `8334` by
 default). Metric names and labels are in `crates/verglas-core/src/metrics.rs`.
 
-## Iceberg tables: add the catalog watcher
+### Tenant databases and scoped secrets
+
+One tenant cache serves every database through explicit storage and catalog
+bindings. Managed lakehouses share the tenant's Lakekeeper deployment but each
+gets its own warehouse; managed Postgres databases use Verglas Neon.
+
+```sh
+# Managed storage + managed Lakekeeper warehouse
+verglas db create analytics --type lakehouse
+
+# Independent managed Neon Postgres
+verglas db create my_test_db --type postgres
+
+# Secret material is prompted or read from stdin, never passed in argv
+verglas secret create customer_s3 \
+  --type s3 \
+  --scope s3://customer-bucket/team
+
+# Customer storage + managed Lakekeeper
+verglas db create customer_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team
+
+# Customer storage + customer Iceberg REST catalog
+verglas secret create customer_catalog \
+  --type iceberg-rest \
+  --scope https://catalog.customer.com
+
+verglas db create external_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team \
+  --catalog https://catalog.customer.com \
+  --warehouse customer_warehouse
+```
+
+Database creation resolves the most-specific authorized secret scope once and
+stores its stable resource ID. Rotating that secret updates the same resource;
+creating a later overlapping secret cannot silently rebind the database.
+
+## Iceberg tables and catalog watchers
 
 Verglas works as a plain cache with no catalog. Point it at your Iceberg REST
 catalog and it also watches for table commits, so it can pre-warm table metadata
@@ -79,10 +119,10 @@ and hot data and carry cache heat across compaction automatically — planning
 reads hit warm statistics, and a rewrite does not force queries to re-earn the
 cache from the origin.
 
-The Docker application takes the catalog URI, warehouse, and bearer token from
-`VERGLAS_CATALOG_URI`, `VERGLAS_CATALOG_WAREHOUSE`, and
-`VERGLAS_CATALOG_BEARER_TOKEN` in `docker-compose.yml`. It watches the catalog
-and warms changed metadata through the cache path.
+Each lakehouse database owns its catalog binding. Managed databases use the
+tenant Lakekeeper deployment; external databases resolve an authorized
+`iceberg-rest` secret. The corresponding watcher is attached to that database,
+not to process-global environment variables.
 
 ## Workers and containers
 
@@ -93,7 +133,6 @@ other optional applications. A portable worker contains its bounded command,
 bundled files, target table, and cron, HTTP, or CloudEvent triggers.
 
 ```sh
-export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d --build
 verglas workers create \
   --file examples/workers/market-data-ingest/worker.toml

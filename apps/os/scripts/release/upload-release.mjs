@@ -4,11 +4,12 @@
 //
 // Blobs are content-addressed, so unchanged files dedupe across releases: each key is HEAD'd
 // first and skipped if present. The manifest is uploaded LAST — its presence under
-// releases/<id>/manifest.json is what marks a release complete, so a crashed upload never
-// leaves a manifest pointing at missing blobs.
+// os/releases/<id>/manifest.json is what marks a release complete, so a crashed upload never
+// leaves a manifest pointing at missing blobs. All keys live below `os/` so this
+// publisher can share the platform release bucket without colliding with fleet artifacts.
 //
-// With --candidate the manifest lands under candidates/<id>/manifest.json instead — invisible
-// to the deploy service (which scans only releases/) until promote-release.mjs copies it over
+// With --candidate the manifest lands under os/candidates/<id>/manifest.json instead — invisible
+// to the deploy service (which scans only os/releases/) until promote-release.mjs copies it over
 // after the e2e gate passes. Blob handling is identical either way.
 //
 // Env: R2_ENDPOINT (https://<account>.r2.cloudflarestorage.com), R2_BUCKET,
@@ -17,6 +18,7 @@
 
 import { readFileSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { AwsClient } from "aws4fetch";
 import { assetR2Key, moduleR2Key } from "./manifest-lib.mjs";
 
@@ -37,6 +39,20 @@ function parseArgs(argv) {
   }
   if (!args.release) throw new Error("--release <dir> is required");
   return args;
+}
+
+/** Returns the immutable manifest key for a candidate or published OS release. */
+export function releaseManifestKey(releaseId, candidate) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(releaseId)) {
+    throw new Error(`invalid release ID: ${releaseId}`);
+  }
+  return `os/${candidate ? "candidates" : "releases"}/${releaseId}/manifest.json`;
+}
+
+/** Rejects attempts to reuse a release key for different manifest bytes. */
+export function assertImmutableManifest(existing, desired, key) {
+  if (Buffer.from(existing).equals(Buffer.from(desired))) return;
+  throw new Error(`immutable release already exists with different content: ${key}`);
 }
 
 async function main() {
@@ -92,13 +108,42 @@ async function main() {
   await Promise.all(Array.from({ length: UPLOAD_CONCURRENCY }, worker));
   console.log(`blobs: ${uploaded} uploaded, ${skipped} already present`);
 
-  const manifestKey =
-    `${args.candidate ? "candidates" : "releases"}/${manifest.releaseId}/manifest.json`;
+  const manifestKey = releaseManifestKey(manifest.releaseId, args.candidate);
+  const manifestBody = readFileSync(join(args.release, "manifest.json"));
+  const existing = await client.fetch(keyUrl(manifestKey), { method: "GET" });
+  if (existing.ok) {
+    assertImmutableManifest(
+      new Uint8Array(await existing.arrayBuffer()),
+      manifestBody,
+      manifestKey,
+    );
+    console.log(`release already present: ${manifestKey}`);
+    return;
+  }
+  if (existing.status !== 404) {
+    throw new Error(`GET ${manifestKey}: unexpected status ${existing.status}`);
+  }
   const put = await client.fetch(keyUrl(manifestKey), {
     method: "PUT",
-    body: readFileSync(join(args.release, "manifest.json")),
-    headers: { "Content-Type": "application/json" },
+    body: manifestBody,
+    headers: {
+      "Content-Type": "application/json",
+      "If-None-Match": "*",
+    },
   });
+  if (put.status === 409 || put.status === 412) {
+    const raced = await client.fetch(keyUrl(manifestKey), { method: "GET" });
+    if (!raced.ok) {
+      throw new Error(`GET ${manifestKey} after publish race: ${raced.status}`);
+    }
+    assertImmutableManifest(
+      new Uint8Array(await raced.arrayBuffer()),
+      manifestBody,
+      manifestKey,
+    );
+    console.log(`release already present: ${manifestKey}`);
+    return;
+  }
   if (!put.ok) {
     throw new Error(`PUT ${manifestKey}: ${put.status} ${await put.text()}`);
   }
@@ -107,4 +152,6 @@ async function main() {
     : `release complete: ${manifestKey}`);
 }
 
-await main();
+if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}

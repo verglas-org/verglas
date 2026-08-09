@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 verglas-api.workspace = true
+verglas-authz.workspace = true
 verglas-core.workspace = true
 arrow-array.workspace = true
 arrow-buffer = "57"

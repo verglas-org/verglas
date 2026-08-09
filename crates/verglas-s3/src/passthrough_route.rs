@@ -123,6 +123,8 @@ fn bucket_of(uri: &Uri) -> Option<&str> {
 /// configured bucket's raw client that carries the node credentials and the
 /// bucket's resilience budget.
 pub struct BucketConfigPassthrough {
+    /// Immutable storage binding assigned to this S3 endpoint.
+    storage_binding_id: String,
     /// The backend store that hands out the configured bucket's raw origin
     /// client.
     stores: Arc<dyn BackendStores>,
@@ -131,8 +133,11 @@ pub struct BucketConfigPassthrough {
 impl BucketConfigPassthrough {
     /// Builds the route over the backend store the server already shares
     /// with the read/write passthroughs.
-    pub fn new(stores: Arc<dyn BackendStores>) -> Self {
-        BucketConfigPassthrough { stores }
+    pub fn new(storage_binding_id: impl Into<String>, stores: Arc<dyn BackendStores>) -> Self {
+        BucketConfigPassthrough {
+            storage_binding_id: storage_binding_id.into(),
+            stores,
+        }
     }
 }
 
@@ -163,7 +168,7 @@ impl S3Route for BucketConfigPassthrough {
         // than the one served surfaces as a backend error below.
         let client = self
             .stores
-            .raw_for(bucket)
+            .raw_for(&self.storage_binding_id, bucket)
             .map_err(|error| {
                 S3Error::with_message(
                     S3ErrorCode::InternalError,

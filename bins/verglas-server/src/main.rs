@@ -41,6 +41,8 @@ type ServerEngine = HybridCacheEngine<PassthroughRead, PeerClient, LiveRing>;
 /// cache engine's cluster-of-one id so turning gossip off leaves ownership
 /// byte-identical to a pre-cluster server: one member owns every key.
 const SINGLE_NODE_ID: &str = "single";
+/// Storage binding for the built-in managed lakehouse database.
+const MANAGED_STORAGE_BINDING_ID: &str = "managed-lakehouse";
 
 /// Builds the `/admin/stats` source: a closure that reads the engine's live
 /// counters and DRAM usage and stamps them alongside the configured cache
@@ -117,7 +119,7 @@ fn metrics_source(
     config: &verglas_core::config::Config,
     metrics: Arc<verglas_core::metrics::NodeMetrics>,
     storage: (ServerEngine, verglas_kv::Store),
-    backend: Arc<verglas_backend::BackendStore>,
+    backend: Arc<verglas_backend::BackendRegistry>,
     writeback: Option<Arc<WritebackMetrics>>,
     telemetry: Option<Arc<verglas_core::telemetry::Telemetry>>,
     mapper: Option<Arc<verglas_tables::mapper::Mapper>>,
@@ -397,7 +399,7 @@ fn spawn_warming(
     let reader: Arc<dyn WarmSource> = Arc::new(engine);
     let warmer = Arc::new(Warmer::new(reader, warm_config, budget));
     let progress = warmer.progress();
-    WarmingCoordinator::new(warmer, watcher).spawn();
+    WarmingCoordinator::new(MANAGED_STORAGE_BINDING_ID, warmer, watcher).spawn();
     progress
 }
 
@@ -445,7 +447,13 @@ fn spawn_prefetch(
 
     // Live logical-key map, kept current by its own single-writer updater.
     let mapper = Arc::new(Mapper::new());
-    MapUpdater::new(mapper.clone(), watcher.clone(), fetch.clone()).spawn();
+    MapUpdater::new(
+        MANAGED_STORAGE_BINDING_ID,
+        mapper.clone(),
+        watcher.clone(),
+        fetch.clone(),
+    )
+    .spawn();
 
     // Heat ledger fed from the request path via a drop-on-full channel and
     // folded by a background aggregator (classify() runs off the hot path).
@@ -477,6 +485,7 @@ fn spawn_prefetch(
     // retired at the next catalog event.
     let state_path = config.cache.dir.join("retire-state.json");
     let coordinator = PrefetchCoordinator::new(
+        MANAGED_STORAGE_BINDING_ID,
         watcher,
         fetch,
         mapper.clone(),
@@ -1077,7 +1086,7 @@ async fn serve_s3(
     credentials: (String, String),
     serving: verglas_tables::lifecycle::heat::HeatFeed<ServerEngine>,
     engine: ServerEngine,
-    registry: Arc<verglas_backend::BackendStore>,
+    registry: Arc<verglas_backend::BackendRegistry>,
     node_id: NodeId,
     agent: Option<Arc<ClusterAgent>>,
     fragment_store: Option<LocalFragmentStore>,
@@ -1153,7 +1162,7 @@ async fn run_s3<R, W>(
     writer: W,
     lister: Arc<verglas_s3::PassthroughList>,
     invalidation: Arc<ServerEngine>,
-    registry: Arc<verglas_backend::BackendStore>,
+    registry: Arc<verglas_backend::BackendRegistry>,
     credentials: (String, String),
     s3_listener: Option<tokio::net::TcpListener>,
     listen_addr: &str,
@@ -1173,6 +1182,7 @@ where
     // this SigV4-gated surface too. Path-style always works.
     let bucket = registry.bucket_set();
     let app = verglas_rest::compose_s3(
+        MANAGED_STORAGE_BINDING_ID,
         reader,
         writer,
         lister,
@@ -1403,32 +1413,30 @@ async fn serve(
     config: &verglas_core::config::Config,
     credentials: (String, String),
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // One backend store shared by the read and write passthroughs: it serves the
-    // configured bucket set (`backend.bucket` / `backend.bucket_globs`, #235),
-    // building each bucket's concurrency-limited client lazily on first request.
-    // A request for a bucket outside the set returns NoSuchBucket. The credential
-    // mode is resolved from the environment — logged so operators can eyeball it.
-    let registry = verglas_backend::BackendStore::from_config(&config.backend);
+    // File-configured servers retain one explicit static binding. Compose starts
+    // with an empty registry; database provisioning inserts provider bindings
+    // without restarting the cache process.
+    let bindings = if config.backend.bucket.is_some() || !config.backend.bucket_globs.is_empty() {
+        let binding =
+            verglas_backend::BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
+        if dev_allow_missing_origin() {
+            eprintln!(
+                "verglas-server {VERSION} WARNING: VERGLAS_DEV_ALLOW_MISSING_ORIGIN set — skipping the backend startup probe; the origin is NOT verified (dev/test only)"
+            );
+        } else {
+            binding.probe().await?;
+            eprintln!("verglas-server {VERSION} backend startup probe passed");
+        }
+        vec![binding]
+    } else {
+        Vec::new()
+    };
+    let registry = verglas_backend::BackendRegistry::new(bindings)?;
     eprintln!(
         "verglas-server {VERSION} backend resolved: {} (serving bucket set `{}`)",
         registry.describe(),
         registry.bucket_set()
     );
-
-    // Startup probe (#233): a configured backend bucket that cannot be reached or
-    // authenticated must fail startup, not serve an empty store that answers
-    // NoSuchKey for every read while looking healthy — "slow is acceptable, wrong
-    // is never". The probe HEADs the configured single bucket through the same
-    // refreshing provider chain the read path uses. Dev/test that runs without a
-    // reachable origin opts out explicitly via VERGLAS_DEV_ALLOW_MISSING_ORIGIN.
-    if dev_allow_missing_origin() {
-        eprintln!(
-            "verglas-server {VERSION} WARNING: VERGLAS_DEV_ALLOW_MISSING_ORIGIN set — skipping the backend startup probe; the origin is NOT verified (dev/test only)"
-        );
-    } else {
-        registry.probe().await?;
-        eprintln!("verglas-server {VERSION} backend startup probe passed");
-    }
 
     let backend = PassthroughRead::new(registry.clone());
 
@@ -2524,7 +2532,8 @@ mod tests {
         );
         let config = verglas_core::config::Config::from_toml_str(&toml).expect("valid config");
 
-        let registry = verglas_backend::BackendStore::from_config(&config.backend);
+        let registry =
+            verglas_backend::BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
         let backend = PassthroughRead::new(registry);
         // Build the engine over the same ring path the server uses (a
         // single-member LiveRing when no `[cluster]` is configured).

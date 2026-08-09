@@ -10,8 +10,7 @@
     "build": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && tsc",
     "types:check": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && tsc --noEmit",
     "clean": "rm -rf dist",
-    "test": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run && vitest run --config vitest.integration.config.ts",
-    "test:integration": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run --config vitest.integration.config.ts",
+    "test": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest run",
     "test:watch": "node build-browser-runtime.mjs && node scripts/build-format-blueprints.mjs && vitest",
     "build:format-blueprints": "node scripts/build-format-blueprints.mjs",
     "import:format-blueprint": "node --experimental-strip-types --no-warnings scripts/import-format-blueprint.mjs"

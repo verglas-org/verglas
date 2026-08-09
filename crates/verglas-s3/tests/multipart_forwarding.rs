@@ -264,7 +264,7 @@ impl MultipartStore for RecordingStore {
 /// A recording origin and a passthrough writer over it.
 fn writer_over_recording() -> (Arc<RecordingStore>, PassthroughWrite) {
     let store = Arc::new(RecordingStore::new());
-    let writer = PassthroughWrite::new(BackendStore::single(BUCKET, store.clone()));
+    let writer = PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone()));
     (store, writer)
 }
 
@@ -302,6 +302,7 @@ fn one_chunk_body(bytes: Bytes) -> WriteBodyStream {
 /// The cache key tests write under.
 fn key(name: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: name.to_owned(),
     }

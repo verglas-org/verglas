@@ -63,6 +63,8 @@ pub const DEFAULT_FOOTER_READ_BYTES: u64 = 64 * 1024;
 /// One table to warm: which `metadata.json` and which snapshot within it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WarmTarget {
+    /// Immutable storage binding used to resolve the table's objects.
+    pub storage_binding_id: String,
     /// Bucket the table lives in.
     pub bucket: String,
     /// The `metadata.json` object key to start the walk from.
@@ -321,7 +323,12 @@ impl Warmer {
         // metadata.json — the walk root. Full read pins the block a client's
         // planning GET will hit.
         let md = self
-            .read_object(&target.bucket, &target.metadata_key, ReadRange::Full)
+            .read_object(
+                &target.storage_binding_id,
+                &target.bucket,
+                &target.metadata_key,
+                ReadRange::Full,
+            )
             .await?;
         self.note_block(&mut summary);
         let doc = iceberg::parse_metadata_json(&md, &target.bucket, &target.metadata_key)?;
@@ -334,7 +341,12 @@ impl Warmer {
 
         // Manifest list.
         let list_bytes = self
-            .read_object(&target.bucket, &list_key, ReadRange::Full)
+            .read_object(
+                &target.storage_binding_id,
+                &target.bucket,
+                &list_key,
+                ReadRange::Full,
+            )
             .await?;
         self.note_block(&mut summary);
         let manifest_keys = iceberg::parse_manifest_list(&list_bytes, &target.bucket, &list_key)?;
@@ -343,13 +355,21 @@ impl Warmer {
         let mut data_files = Vec::new();
         for manifest_key in &manifest_keys {
             let bytes = self
-                .read_object(&target.bucket, manifest_key, ReadRange::Full)
+                .read_object(
+                    &target.storage_binding_id,
+                    &target.bucket,
+                    manifest_key,
+                    ReadRange::Full,
+                )
                 .await?;
             self.note_block(&mut summary);
             iceberg::parse_manifest(&bytes, &target.bucket, manifest_key, &mut data_files)?;
         }
 
-        summary.merge(self.warm_footers(&target.bucket, &data_files).await);
+        summary.merge(
+            self.warm_footers(&target.storage_binding_id, &target.bucket, &data_files)
+                .await,
+        );
         self.progress
             .tables_completed
             .fetch_add(1, Ordering::Relaxed);
@@ -360,7 +380,12 @@ impl Warmer {
     /// byte budget. Non-Parquet files are skipped without any read (the Avro
     /// addendum — never suffix-read a file with no footer). If the estimated
     /// footprint exceeds the budget, alerts once and caps the run.
-    pub async fn warm_footers(&self, bucket: &str, files: &[DataFileEntry]) -> WarmSummary {
+    pub async fn warm_footers(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+        files: &[DataFileEntry],
+    ) -> WarmSummary {
         let footprint: u64 = files
             .iter()
             .filter(|f| f.format == FileFormat::Parquet)
@@ -391,6 +416,7 @@ impl Warmer {
             semaphore: Arc::clone(&self.semaphore),
             used: Arc::new(AtomicU64::new(0)),
             config: self.config.clone(),
+            storage_binding_id: Arc::from(storage_binding_id),
             bucket: Arc::from(bucket),
             cap,
         };
@@ -420,11 +446,13 @@ impl Warmer {
     /// objects — footers and manifests — never data bodies.
     async fn read_object(
         &self,
+        storage_binding_id: &str,
         bucket: &str,
         key: &str,
         range: ReadRange,
     ) -> Result<Bytes, WarmError> {
         let ck = CacheKey {
+            storage_binding_id: storage_binding_id.to_owned(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
         };
@@ -454,6 +482,8 @@ struct FooterCtx {
     used: Arc<AtomicU64>,
     /// Run tunables.
     config: WarmConfig,
+    /// Immutable storage binding used to resolve footer objects.
+    storage_binding_id: Arc<str>,
     /// The bucket the files live in.
     bucket: Arc<str>,
     /// The per-run byte ceiling (`u64::MAX` when not budget-capped).
@@ -509,7 +539,15 @@ async fn warm_one_footer(ctx: FooterCtx, file: DataFileEntry) -> WarmSummary {
     ctx.budget.acquire(est).await;
 
     let window = ctx.config.footer_read_bytes;
-    let tail = match read_suffix(&ctx.reader, &ctx.bucket, &file.path, window).await {
+    let tail = match read_suffix(
+        &ctx.reader,
+        &ctx.storage_binding_id,
+        &ctx.bucket,
+        &file.path,
+        window,
+    )
+    .await
+    {
         Ok(bytes) => bytes,
         Err(error) => {
             tracing::warn!(key = %file.path, %error, "footer speculative read failed");
@@ -528,7 +566,15 @@ async fn warm_one_footer(ctx: FooterCtx, file: DataFileEntry) -> WarmSummary {
             // The footer overran the window: one exact read (the ≤2-GET rule).
             // Charge only the extra bytes against the budget.
             ctx.budget.acquire(needed.saturating_sub(est)).await;
-            match read_suffix(&ctx.reader, &ctx.bucket, &file.path, needed).await {
+            match read_suffix(
+                &ctx.reader,
+                &ctx.storage_binding_id,
+                &ctx.bucket,
+                &file.path,
+                needed,
+            )
+            .await
+            {
                 Ok(exact) => {
                     ctx.progress.footer_gets.fetch_add(1, Ordering::Relaxed);
                     ctx.progress
@@ -563,11 +609,13 @@ async fn warm_one_footer(ctx: FooterCtx, file: DataFileEntry) -> WarmSummary {
 /// Reads the last `len` bytes of `key` through the cache (pins the footer tail).
 async fn read_suffix(
     reader: &Arc<dyn WarmSource>,
+    storage_binding_id: &str,
     bucket: &str,
     key: &str,
     len: u64,
 ) -> Result<Bytes, ReadError> {
     let ck = CacheKey {
+        storage_binding_id: storage_binding_id.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
     };

@@ -41,6 +41,7 @@ fn pattern(seed: u64, len: u64) -> Bytes {
 /// A key in the warehouse bucket.
 fn key(k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: k.to_owned(),
     }
@@ -95,7 +96,7 @@ async fn engine(
     let store = Arc::new(InMemory::new());
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         calls: calls.clone(),
     };
     let config = CacheConfig {

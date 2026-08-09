@@ -1,5 +1,6 @@
 # verglas-sdk worklog
 
+- #81: Added a separately addressable access-service endpoint and typed principal, resource, grant, and policy-check APIs using scoped bearer credentials.
 - #43: Added the Rust half of the reflected Integration namespace contract. Clients can discover manifests, create a namespace handle, invoke bounded methods, and incrementally decode streaming methods through the same authenticated routes as the TypeScript SDK.
 
 - #376: Moved the generic daemon HTTP/file-ingest transport and all table/query

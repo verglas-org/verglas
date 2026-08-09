@@ -140,6 +140,7 @@ fn pattern(salt: u64, len: u64) -> Bytes {
 /// The logical key for an object in the test bucket.
 fn key(k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: k.to_owned(),
     }
@@ -216,7 +217,7 @@ async fn build_engine(
     let store = Arc::new(InMemory::new());
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         calls: calls.clone(),
     };
     let engine = HybridCacheEngine::single_node(backend, &cache_config(dir, capacity, dram))
@@ -237,7 +238,7 @@ async fn build_engine_ttl(
     let store = Arc::new(InMemory::new());
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         calls: calls.clone(),
     };
     let config = CacheConfig {
@@ -542,7 +543,7 @@ async fn concurrent_cold_reads_collapse_to_one_backend_get() {
     let (gate, mut entered) = Gate::new();
     let backend = ParkedRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         gate: gate.clone(),
@@ -680,7 +681,7 @@ async fn parked_first_fill_and_block_fill_collapse_to_one_get() {
     let (gate, mut entered) = Gate::new();
     let backend = ParkedRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         gate: gate.clone(),

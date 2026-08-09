@@ -127,6 +127,7 @@ impl Code for MetaEntryKey {
                 writer
                     .write_all(&[TAG_SUFFIX])
                     .map_err(FoyerError::io_error)?;
+                crate::entry::write_bytes(writer, object.storage_binding_id.as_bytes())?;
                 crate::entry::write_bytes(writer, object.bucket.as_bytes())?;
                 crate::entry::write_bytes(writer, object.key.as_bytes())?;
                 crate::entry::write_bytes(writer, etag.as_bytes())?;
@@ -153,6 +154,7 @@ impl Code for MetaEntryKey {
                 })
             }
             _ => {
+                let storage_binding_id = crate::entry::read_string(reader)?;
                 let bucket = crate::entry::read_string(reader)?;
                 let key = crate::entry::read_string(reader)?;
                 let etag = crate::entry::read_string(reader)?;
@@ -163,7 +165,11 @@ impl Code for MetaEntryKey {
                     .read_exact(&mut generation)
                     .map_err(FoyerError::io_error)?;
                 Ok(MetaEntryKey::Suffix {
-                    object: CacheKey { bucket, key },
+                    object: CacheKey {
+                        storage_binding_id,
+                        bucket,
+                        key,
+                    },
                     etag,
                     len: u64::from_le_bytes(len),
                     generation: u64::from_le_bytes(generation),
@@ -181,7 +187,15 @@ impl Code for MetaEntryKey {
             }
             .estimated_size(),
             MetaEntryKey::Suffix { object, etag, .. } => {
-                8 + object.bucket.len() + 8 + object.key.len() + 8 + etag.len() + 8 + 8
+                8 + object.storage_binding_id.len()
+                    + 8
+                    + object.bucket.len()
+                    + 8
+                    + object.key.len()
+                    + 8
+                    + etag.len()
+                    + 8
+                    + 8
             }
         }
     }
@@ -314,6 +328,7 @@ mod tests {
     fn meta_entry_keys_round_trip_with_generation() {
         let block = BlockKey {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "warehouse".to_owned(),
                 key: "db/t/metadata/v3.metadata.json".to_owned(),
             },
@@ -327,6 +342,7 @@ mod tests {
         });
         round_trip(&MetaEntryKey::Suffix {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "warehouse".to_owned(),
                 key: "db/t/data/f.parquet".to_owned(),
             },
@@ -339,6 +355,7 @@ mod tests {
         // distinct identities — the restart-correctness property.
         let base = MetaEntryKey::Suffix {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "b".to_owned(),
                 key: "k".to_owned(),
             },
@@ -348,6 +365,7 @@ mod tests {
         };
         let bumped = MetaEntryKey::Suffix {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "b".to_owned(),
                 key: "k".to_owned(),
             },
