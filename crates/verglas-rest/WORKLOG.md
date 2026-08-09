@@ -24,3 +24,5 @@
   secrets. List and get return metadata only; the explicit resolution route requires `use_secret`
   authorization before returning material to a trusted runtime.
 - #84: Added tenant-scoped database collection, item, and delete routes over the dynamic database repository. Database responses now use the public managed-or-scoped declaration and never serialize internal records or secret resource IDs.
+- #84: Mapped managed database provisioning failures to a bounded gateway error; the API never reports an inactive managed runtime as created.
+- #84: Replaced singleton SQL ingress with `POST /v1/databases/{database}/query`. Each turn renders an isolated query-worker config targeting that database's live catalog mount, and unknown or Postgres-only databases fail closed before process launch.

@@ -55,6 +55,8 @@ pub struct EcAppendLog<S> {
     /// Safekeepers advance and flush independently, so their replicated state
     /// keys must not collide even though they receive the same WAL stream.
     node_id: u64,
+    /// Backend binding used for durable WAL objects.
+    storage_binding_id: String,
     /// The S3 origin: flush target and flushed-range read source.
     store: Arc<S>,
     /// The bucket flushed segment objects live in.
@@ -95,6 +97,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         node_id: u64,
+        storage_binding_id: impl Into<String>,
         store: Arc<S>,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -123,6 +126,7 @@ where
         let epoch = AtomicU64::new(manifest.epoch.0);
         Ok(Self {
             node_id,
+            storage_binding_id: storage_binding_id.into(),
             store,
             bucket: bucket.into(),
             prefix: prefix.into(),
@@ -640,7 +644,7 @@ where
             .clone()
             .ok_or_else(|| AppendError::Origin("flushed segment has no S3 key".to_owned()))?;
         let key = CacheKey {
-            storage_binding_id: "default".to_owned(),
+            storage_binding_id: self.storage_binding_id.clone(),
             bucket: self.bucket.clone(),
             key: s3_key,
         };
@@ -710,7 +714,7 @@ where
 /// rendezvous machinery the cache ring and the write-back placement use.
 fn placement_order(seed: &str, live: &[NodeId]) -> Vec<NodeId> {
     let key = CacheKey {
-        storage_binding_id: "default".to_owned(),
+        storage_binding_id: "safekeeper-placement".to_owned(),
         bucket: "safekeeper".to_owned(),
         key: seed.to_owned(),
     };
@@ -914,7 +918,7 @@ where
             let bytes = self.reassemble_segment(&segment).await?;
             let s3_key = self.segment_key(&segment);
             let key = CacheKey {
-                storage_binding_id: "default".to_owned(),
+                storage_binding_id: self.storage_binding_id.clone(),
                 bucket: self.bucket.clone(),
                 key: s3_key.clone(),
             };
@@ -968,7 +972,7 @@ where
             if segment.end.0 <= up_to.0 {
                 if let Some(k) = &segment.s3_key {
                     deletes.push(CacheKey {
-                        storage_binding_id: "default".to_owned(),
+                        storage_binding_id: self.storage_binding_id.clone(),
                         bucket: self.bucket.clone(),
                         key: k.clone(),
                     });

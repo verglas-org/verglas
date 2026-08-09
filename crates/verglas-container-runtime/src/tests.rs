@@ -419,6 +419,17 @@ fn workload_cannot_receive_docker_authority() {
     ));
 }
 
+/// Carries a declared OCI platform into the normalized Docker request.
+#[test]
+fn declared_platform_reaches_the_engine_create_request() {
+    let request = ContainerSpec::new("amd64-workload", "example/image:sha")
+        .with_platform("linux/amd64")
+        .create_request()
+        .expect("request");
+
+    assert_eq!(request.platform.as_deref(), Some("linux/amd64"));
+}
+
 #[test]
 fn canonical_digest_is_stable_across_environment_insertion_order() {
     let first = ContainerSpec::new("job", "alpine:3.22")

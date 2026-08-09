@@ -1,6 +1,6 @@
 // The client and Table handle: the whole read/write surface an artifact uses.
 
-import { makeTransport, type Transport } from "./http";
+import { databasePathSegment, makeTransport, type Transport } from "./http";
 import { VerglasHttpError } from "./http";
 import { CatalogFeed, feedUrl, globalWebSocket } from "./feed";
 import { NamespaceRuntime } from "./namespace";
@@ -44,6 +44,7 @@ import type {
   QueueEnqueueResult,
   QueuePollResult,
   QueryResult,
+  QueryAt,
   Row,
   ScanOptions,
   ScanResult,
@@ -329,10 +330,14 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     });
   }
 
-  /** Executes SQL through the endpoint's language-neutral JSON representation. */
-  query(sql: string): Promise<QueryResult> {
+  /** Executes SQL through `POST /v1/databases/{database}/query`. */
+  query(database: string, sql: string, at?: QueryAt): Promise<QueryResult> {
     if (!sql) throw new Error("query: sql is required");
-    return this.transport.request<QueryResult>("POST", "/v1/query", { body: { sql } });
+    return this.transport.request<QueryResult>(
+      "POST",
+      `/v1/databases/${databasePathSegment(database)}/query`,
+      { body: { sql, ...(at === undefined ? {} : {at}) } },
+    );
   }
 }
 

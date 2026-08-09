@@ -90,3 +90,6 @@
 - #67: Added first-class `Client::queue`, `Client::graph`, and `Client::table` handles matching the TypeScript SDK surface for queue enqueue/poll/ack, graph lifecycle and traversal, and table vector-index declare/list/search. Queue wire types live in `queue.rs`; graph and vector routes reuse the existing wire modules.
 - #66: Neutralized MemoryGrantHost docs (no Firecracker) and replaced *.verglas.dev catalog fixtures in client_data_plane tests with example.test hostnames.
 - #66: Rewrote unreachable-server and follow-trigger docs for self-hosted servers only (no cloud node / cloud lakehouse contrast).
+- #84: Made `Client::query_stream` require a database name and send Arrow SQL
+  requests only to that database's `/v1/databases/{database}/query` route. The
+  SDK no longer exposes the removed singleton query endpoint.

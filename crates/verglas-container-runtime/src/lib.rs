@@ -425,6 +425,9 @@ pub struct ContainerSpec {
     pub deployment_id: String,
     /// OCI image reference supplied to the Docker Engine.
     pub image: String,
+    /// Optional OCI operating-system and architecture pair.
+    #[serde(default)]
+    pub platform: Option<String>,
     /// Optional command overriding the image command.
     #[serde(default)]
     pub command: Vec<String>,
@@ -451,6 +454,7 @@ impl ContainerSpec {
         Self {
             deployment_id: deployment_id.into(),
             image: image.into(),
+            platform: None,
             command: Vec::new(),
             entrypoint: Vec::new(),
             environment: BTreeMap::new(),
@@ -458,6 +462,13 @@ impl ContainerSpec {
             network: None,
             published_ports: Vec::new(),
         }
+    }
+
+    /// Selects an exact OCI platform for a cross-architecture image.
+    #[must_use]
+    pub fn with_platform(mut self, platform: impl Into<String>) -> Self {
+        self.platform = Some(platform.into());
+        self
     }
 
     /// Replaces the image command with the supplied argument sequence.
@@ -525,6 +536,20 @@ impl ContainerSpec {
         if self.image.trim().is_empty() {
             return Err(RuntimeError::MissingImage);
         }
+        if self.platform.as_ref().is_some_and(|platform| {
+            let mut parts = platform.split('/');
+            let valid = |part: &str| {
+                !part.is_empty()
+                    && part.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                    })
+            };
+            !parts.next().is_some_and(valid)
+                || !parts.next().is_some_and(valid)
+                || parts.next().is_some()
+        }) {
+            return Err(RuntimeError::InvalidPlatform);
+        }
         for key in self.environment.keys() {
             if key.starts_with("DOCKER_") {
                 return Err(RuntimeError::DockerAuthority {
@@ -584,6 +609,7 @@ impl ContainerSpec {
         Ok(EngineCreateRequest {
             name: self.container_name(),
             image: self.image.clone(),
+            platform: self.platform.clone(),
             command: self.command.clone(),
             entrypoint: self.entrypoint.clone(),
             environment: self.environment.clone(),
@@ -643,6 +669,9 @@ pub enum RuntimeError {
     /// An OCI image reference was not supplied.
     #[error("container image must not be empty")]
     MissingImage,
+    /// An OCI platform was not in `os/architecture` form.
+    #[error("container platform must use os/architecture form")]
+    InvalidPlatform,
     /// An explicitly selected Docker network was empty.
     #[error("container network must not be empty")]
     InvalidNetwork,
@@ -782,6 +811,7 @@ struct EngineContainer {
 struct EngineCreateRequest {
     name: String,
     image: String,
+    platform: Option<String>,
     command: Vec<String>,
     entrypoint: Vec<String>,
     environment: BTreeMap<String, String>,
@@ -1009,20 +1039,18 @@ impl DockerApi for BollardDockerApi {
 
     /// Pulls the declared image and creates one stopped Docker container.
     async fn create(&self, request: EngineCreateRequest) -> Result<(), RuntimeError> {
-        if let Err(error) = self.docker.inspect_image(&request.image).await {
-            if !is_not_found(&error) {
-                return Err(engine_error(error));
+        let must_pull = match self.docker.inspect_image(&request.image).await {
+            Ok(_) => false,
+            Err(error) if is_not_found(&error) => true,
+            Err(error) => return Err(engine_error(error)),
+        };
+        if must_pull {
+            let mut options = CreateImageOptionsBuilder::new().from_image(&request.image);
+            if let Some(platform) = &request.platform {
+                options = options.platform(platform);
             }
             self.docker
-                .create_image(
-                    Some(
-                        CreateImageOptionsBuilder::new()
-                            .from_image(&request.image)
-                            .build(),
-                    ),
-                    None,
-                    None,
-                )
+                .create_image(Some(options.build()), None, None)
                 .try_collect::<Vec<_>>()
                 .await
                 .map_err(engine_error)?;
@@ -1076,15 +1104,12 @@ impl DockerApi for BollardDockerApi {
             host_config,
             ..Default::default()
         };
+        let mut options = CreateContainerOptionsBuilder::new().name(&request.name);
+        if let Some(platform) = &request.platform {
+            options = options.platform(platform);
+        }
         self.docker
-            .create_container(
-                Some(
-                    CreateContainerOptionsBuilder::new()
-                        .name(&request.name)
-                        .build(),
-                ),
-                body,
-            )
+            .create_container(Some(options.build()), body)
             .await
             .map_err(engine_error)?;
         Ok(())

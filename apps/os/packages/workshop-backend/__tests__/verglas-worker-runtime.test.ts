@@ -9,17 +9,15 @@ describe("resolveVerglasWorkerRuntimeConfig", () => {
   it("requires the complete worker control plane", () => {
     expect(resolveVerglasWorkerRuntimeConfig({})).toBeNull();
     expect(() => resolveVerglasWorkerRuntimeConfig({
-      VERGLAS_ADMIN_URL: "http://localhost:8334",
+      VERGLAS_SCHEDULER_URL: "http://localhost:8340",
     })).toThrow(/must be configured together/);
   });
 
   it("normalizes configured endpoints", () => {
     expect(resolveVerglasWorkerRuntimeConfig({
-      VERGLAS_ADMIN_URL: "http://localhost:8334/",
       VERGLAS_SCHEDULER_URL: "http://localhost:8340/",
       VERGLAS_SCHEDULER_CONTROL_TOKEN: "control",
     })).toEqual({
-      adminEndpoint: "http://localhost:8334",
       schedulerEndpoint: "http://localhost:8340",
       schedulerToken: "control",
     });
@@ -34,7 +32,6 @@ describe("VerglasWorkerRuntimeClient", () => {
       return new Response(null, {status: 204});
     });
     const client = new VerglasWorkerRuntimeClient({
-      adminEndpoint: "http://localhost:8334",
       schedulerEndpoint: "http://localhost:8340",
       schedulerToken: "control",
     }, fetcher);
@@ -62,7 +59,6 @@ describe("VerglasWorkerRuntimeClient", () => {
       {status: 202, headers: {"content-type": "application/json"}},
     ));
     const client = new VerglasWorkerRuntimeClient({
-      adminEndpoint: "http://localhost:8334",
       schedulerEndpoint: "http://localhost:8340",
       schedulerToken: "control",
     }, fetcher);

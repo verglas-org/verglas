@@ -46,6 +46,7 @@ use verglas_vector::service::{SearchOptions, VectorService};
 use verglas_vector::{IndexKey, Metric, VamanaParams};
 
 use verglas_cache::CachePurger;
+use verglas_catalog::DatabaseId;
 use verglas_core::admin::{
     ACCESS_PATH, DRAIN_PATH, DrainAck, DrainRequest, HEALTHZ_PATH, HealthzInfo, LOG_PATH,
     LocalAccess, LogLevelInfo, LogLevelRequest, MEMBERS_PATH, METRICS_PATH, MembersInfo,
@@ -234,8 +235,8 @@ pub struct Slots {
     /// Manual and dynamically routed HTTP ingress into the scheduler queue.
     pub platform: Option<PlatformSlot>,
     /// The standalone query worker dispatcher (`[query_worker]` configured).
-    /// When present it is the sole engine for `/v1/query`; dispatch failure is
-    /// a hard error, not an embedded-engine fallback.
+    /// When present it is the sole engine for database-scoped SQL; dispatch
+    /// failure is a hard error, not an embedded-engine fallback.
     pub query_worker: Option<Arc<crate::query_worker::QueryWorkerDispatcher>>,
     /// The standalone logical write worker dispatcher.
     pub write_worker: Option<Arc<crate::write_worker::WriteWorkerDispatcher>>,
@@ -549,16 +550,14 @@ struct QueryState {
     query_worker: Option<Arc<crate::query_worker::QueryWorkerDispatcher>>,
 }
 
-/// Mounts the query gateway even when no worker is configured, returning a
-/// clear service-unavailable response instead of linking an embedded fallback.
+/// Mounts the database-scoped query gateway even when no worker is configured.
 fn query_router(query_worker: Option<Arc<crate::query_worker::QueryWorkerDispatcher>>) -> Router {
     Router::new()
-        .route("/v1/query", post(query_sql))
+        .route("/v1/databases/{database}/query", post(query_sql))
         .with_state(QueryState { query_worker })
 }
 
-/// The body of `POST /v1/query`: the SQL statement and an optional time-travel
-/// pin for one table.
+/// The database-scoped SQL body and optional time-travel pin for one table.
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
     /// The SQL to run.
@@ -580,6 +579,7 @@ struct QueryAt {
 /// Dispatches SQL to `verglas-query` and relays its streamed response.
 async fn query_sql(
     State(state): State<QueryState>,
+    Path(database): Path<String>,
     headers: HeaderMap,
     Json(request): Json<QueryRequest>,
 ) -> Response {
@@ -590,12 +590,30 @@ async fn query_sql(
         )
             .into_response();
     };
+    let Ok(database) = DatabaseId::new(database) else {
+        return (StatusCode::BAD_REQUEST, "invalid database id").into_response();
+    };
+    if !dispatcher.has_database(&database) {
+        return (
+            StatusCode::NOT_FOUND,
+            format!(
+                "database `{}` has no Lakehouse query runtime",
+                database.as_str()
+            ),
+        )
+            .into_response();
+    }
     let time_travel = request.at.map(|at| verglas_iceberg::TimeTravel {
         reference: at.reference,
         table: at.table,
     });
     match dispatcher
-        .dispatch(&request.sql, time_travel, accepts_arrow(&headers))
+        .dispatch(
+            &database,
+            &request.sql,
+            time_travel,
+            accepts_arrow(&headers),
+        )
         .await
     {
         Ok(response) => response,
@@ -2803,22 +2821,61 @@ mod tests {
         router(VERSION, Health::ready(), slots)
     }
 
-    /// A catalog handle never enables embedded SQL execution.
+    /// Database-scoped SQL never falls back to a singleton execution route.
     #[tokio::test]
-    async fn query_route_requires_an_isolated_worker() {
+    async fn query_route_requires_a_database_and_an_isolated_worker() {
         let slot = tables_slot_with_table().await;
         let app = slots_router(Slots {
             tables: Some(slot),
             ..Slots::default()
         });
         let response = call_json(
+            app.clone(),
+            "POST",
+            "/v1/databases/analytics/query",
+            serde_json::json!({"sql": "SELECT id, name FROM sdk.events"}),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let singleton = call_json(
             app,
             "POST",
             "/v1/query",
             serde_json::json!({"sql": "SELECT id, name FROM sdk.events"}),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(singleton.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A configured worker cannot query a Postgres or unknown database through the Lakehouse route.
+    #[tokio::test]
+    async fn query_route_rejects_databases_without_a_lakehouse_runtime() {
+        let dir = tempfile::tempdir().expect("query config dir").keep();
+        let query_worker = Arc::new(crate::query_worker::QueryWorkerDispatcher::new(
+            std::path::PathBuf::from("/binary/that/must/not/be/spawned"),
+            crate::query_worker::QueryWorkerRuntimeConfig {
+                config_dir: dir.join("databases"),
+                cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                region: "auto".to_owned(),
+                credentials_file: dir.join("credentials"),
+                admin_origin: "http://127.0.0.1:8334".to_owned(),
+            },
+            verglas_catalog::CatalogRuntimeRegistry::default(),
+        ));
+        let app = slots_router(Slots {
+            query_worker: Some(query_worker),
+            ..Slots::default()
+        });
+
+        let response = call_json(
+            app,
+            "POST",
+            "/v1/databases/postgres_only/query",
+            serde_json::json!({"sql": "SELECT 1"}),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     /// Proprietary table metadata routes stay absent; clients use the mounted
@@ -2841,8 +2898,7 @@ mod tests {
         );
     }
 
-    /// `POST /v1/query` answers 503 until the private catalog is wired — the
-    /// same pattern as the tables routes.
+    /// Database-scoped SQL answers 503 until its isolated worker is configured.
     #[tokio::test]
     async fn query_route_answers_503_until_the_catalog_is_wired() {
         let empty: TablesSlot = Arc::new(OnceLock::new());
@@ -2853,7 +2909,7 @@ mod tests {
         let response = call_json(
             app,
             "POST",
-            "/v1/query",
+            "/v1/databases/analytics/query",
             serde_json::json!({"sql": "SELECT 1"}),
         )
         .await;

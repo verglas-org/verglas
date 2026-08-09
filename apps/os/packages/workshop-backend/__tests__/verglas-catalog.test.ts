@@ -5,6 +5,8 @@ const env = {
   VERGLAS_ACCESS_URI: "http://localhost:8345/",
   VERGLAS_ACCESS_SERVICE_TOKEN: "access-secret",
   VERGLAS_ADMIN_URL: "http://localhost:8334/",
+  VERGLAS_SCHEDULER_URL: "http://localhost:8340/",
+  VERGLAS_SCHEDULER_CONTROL_TOKEN: "scheduler-secret",
   VERGLAS_CONTAINER_RUNTIME_URL: "http://localhost:8360/",
   VERGLAS_CONTAINER_RUNTIME_TOKEN: "runtime-secret",
 };
@@ -27,7 +29,7 @@ describe("VerglasCatalogClient", () => {
     const result = await new VerglasCatalogClient(env, fetcher).listWorkers();
 
     expect(fetcher).toHaveBeenCalledWith(
-      "http://localhost:8334/v1/workers?view=active",
+      "http://localhost:8340/v1/workers?view=active",
       expect.objectContaining({method: "GET"}),
     );
     expect(result).toEqual([{
@@ -78,13 +80,13 @@ describe("VerglasCatalogClient", () => {
           type: "lakehouse",
           name: "analytics",
           tableCount: 3,
-          capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true},
+          capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true, query: true},
         },
         {
           type: "postgres",
           name: "operations",
           tableCount: 0,
-          capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false},
+          capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false, query: false},
         },
       ],
       tables: [
@@ -233,7 +235,7 @@ describe("VerglasCatalogClient", () => {
     await expect(client.getDatabase("operations")).resolves.toMatchObject({
       type: "postgres",
       name: "operations",
-      capabilities: {catalog: false, tableCrud: false},
+      capabilities: {catalog: false, tableCrud: false, query: false},
       tables: [],
     });
     await expect(client.createTable({
@@ -245,16 +247,23 @@ describe("VerglasCatalogClient", () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it("wraps read SQL with a limit and reports truncation", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(JSON.stringify({
-      columns: ["value"],
-      rows: [{value: 1}, {value: 2}, {value: 3}],
-      row_count: 3,
-    }), {headers: {"content-type": "application/json"}}));
+  it("wraps read SQL with a limit on the selected Lakehouse query route", async () => {
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      if (String(input).endsWith("/v1/databases/analytics")) return Response.json({
+        type: "lakehouse", name: "analytics", storage: {mode: "managed"},
+        catalog: {mode: "managed-lakekeeper"},
+      });
+      return Response.json({
+        columns: ["value"],
+        rows: [{value: 1}, {value: 2}, {value: 3}],
+        row_count: 3,
+      });
+    });
 
-    const result = await new VerglasCatalogClient(env, fetcher).query("SELECT value FROM numbers", 2);
+    const result = await new VerglasCatalogClient(env, fetcher)
+      .query("analytics", "SELECT value FROM numbers", 2);
 
-    expect(fetcher).toHaveBeenCalledWith("http://localhost:8334/v1/query", expect.objectContaining({
+    expect(fetcher).toHaveBeenCalledWith("http://localhost:8334/v1/databases/analytics/query", expect.objectContaining({
       method: "POST",
       body: JSON.stringify({sql: "SELECT * FROM (SELECT value FROM numbers) AS __verglas_query LIMIT 3"}),
     }));
@@ -264,6 +273,16 @@ describe("VerglasCatalogClient", () => {
       rowCount: 2,
       truncated: true,
     });
+  });
+
+  it("rejects Postgres queries without probing the data service", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({
+      type: "postgres", name: "operations", engine: {mode: "managed-neon"},
+    }));
+
+    await expect(new VerglasCatalogClient(env, fetcher).query("operations", "SELECT 1"))
+      .rejects.toThrow("does not expose SQL query execution");
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it("authenticates Vessel discovery and exposes previews only for applications", async () => {

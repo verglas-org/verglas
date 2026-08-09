@@ -1,5 +1,6 @@
-import { createFileRoute } from '@tanstack/react-router'
+import { createFileRoute, useNavigate } from '@tanstack/react-router'
 import {
+  ArrowRight,
   ArrowsClockwise,
   CirclesThreePlus,
   Database,
@@ -23,6 +24,7 @@ import type {
 } from '@verglas/workshop-shared/api'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAuthenticatedApi } from '../AuthContext'
+import { getStoredSelectedModel } from '../modelSelection'
 import { useDocumentTitle } from '../useDocumentTitle'
 import {
   databaseCapabilityLabels,
@@ -52,7 +54,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs'
 export const Route = createFileRoute('/data')({ component: DatabasesPage })
 
 type CatalogKind = 'table' | 'vector' | 'graph'
-type CatalogItem =
+export type CatalogItem =
   | {kind: 'table'; id: string; value: VerglasTableSummary}
   | {kind: 'vector'; id: string; value: VerglasVectorSummary}
   | {kind: 'graph'; id: string; value: VerglasGraphSummary}
@@ -76,6 +78,7 @@ const EMPTY_CATALOG: VerglasCatalogSnapshot = {databases: [], tables: [], vector
 function DatabasesPage() {
   useDocumentTitle('Databases')
   const {authenticatedApi} = useAuthenticatedApi()
+  const navigate = useNavigate()
   const [catalog, setCatalog] = useState(EMPTY_CATALOG)
   const [selectedDatabaseName, setSelectedDatabaseName] = useState<string | null>(null)
   const [selectedAsset, setSelectedAsset] = useState<CatalogItem | null>(null)
@@ -210,6 +213,25 @@ function DatabasesPage() {
     }
   }, [authenticatedApi, deleteTable, loadCatalog])
 
+  const openQueryWorkspace = useCallback(async (item: CatalogItem) => {
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    const overseer = authenticatedApi.newWorkspace()
+    try {
+      const models = await authenticatedApi.listModels()
+      const modelId = getStoredSelectedModel(models)
+      const metadata = await overseer.getMetadata()
+      await overseer.newChat(workspacePromptForCatalogItem(item), modelId)
+      await navigate({to: '/workspace/$id', params: {id: metadata.id}})
+    } catch (reason) {
+      setError(errorMessage(reason))
+    } finally {
+      overseer[Symbol.dispose]()
+      setBusy(false)
+    }
+  }, [authenticatedApi, busy, navigate])
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-kumo-base">
       <PageHeader loading={loading} onCreate={() => setCreateDatabaseOpen(true)} onRefresh={() => void loadCatalog()} />
@@ -260,6 +282,9 @@ function DatabasesPage() {
                 ? detail?.tables.find((table) => table.qualifiedName === selectedAsset.value.qualifiedName)
                 : undefined}
               busy={busy}
+              onQuery={database?.capabilities.query
+                ? () => void openQueryWorkspace(selectedAsset)
+                : undefined}
               onDelete={selectedAsset.kind === 'table' ? () => setDeleteTable(selectedAsset.value) : undefined}
             />
           ) : (
@@ -578,10 +603,11 @@ function DatabaseDetails({database, detail, onDelete}: {
   )
 }
 
-function AssetDetails({item, tableDetail, busy, onDelete}: {
+function AssetDetails({item, tableDetail, busy, onQuery, onDelete}: {
   item: CatalogItem
   tableDetail?: VerglasTableDetail
   busy: boolean
+  onQuery?: () => void
   onDelete?: () => void
 }) {
   const presentation = itemPresentation(item)
@@ -605,12 +631,17 @@ function AssetDetails({item, tableDetail, busy, onDelete}: {
         {facts.map(([label, value]) => <DetailRow key={label} label={label} value={value} />)}
       </dl>
       <div className="mt-auto pt-8">
+        {onQuery && (
+          <button type="button" disabled={busy} onClick={onQuery} className="mb-2 flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-kumo-brand px-4 text-[12px] font-semibold text-white disabled:opacity-50">
+            Query in workspace <ArrowRight size={14} />
+          </button>
+        )}
         {onDelete && (
           <button type="button" disabled={busy} onClick={onDelete} className="flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-kumo-danger/40 px-4 text-[12px] font-medium text-kumo-danger hover:bg-kumo-danger-tint disabled:opacity-50">
             <Trash size={14} /> Delete table
           </button>
         )}
-        <p className="mt-3 text-[10px] leading-4 text-kumo-inactive">Workspace queries will be enabled when this database exposes a scoped query endpoint.</p>
+        {!onQuery && <p className="mt-3 text-[10px] leading-4 text-kumo-inactive">This database does not expose scoped SQL queries.</p>}
       </div>
     </div>
   )
@@ -783,6 +814,17 @@ export function namespaceGroups(tables: VerglasTableSummary[]): NamespaceGroup[]
   return [...groups.values()]
     .map((group) => ({...group, tables: group.tables.toSorted((left, right) => left.name.localeCompare(right.name))}))
     .toSorted((left, right) => left.name.localeCompare(right.name))
+}
+
+/** Builds the first chat turn for a scoped catalog asset query. */
+export function workspacePromptForCatalogItem(item: CatalogItem): string {
+  if (item.kind === 'table') {
+    return `Query table \`${item.value.qualifiedName}\` in database \`${item.value.database}\`. Inspect its schema and data, then help me analyze or visualize it. Always run SQL against the selected database.`
+  }
+  if (item.kind === 'vector') {
+    return `Explore vector index \`${item.value.field}\` on \`${item.value.target}\` in database \`${item.value.database}\`. Use only capabilities exposed for this database.`
+  }
+  return `Explore graph \`${item.value.namespace}\` in database \`${item.value.database}\`. Inspect its node and edge tables and use only capabilities exposed for this database.`
 }
 
 function databaseMetrics(database: VerglasDatabaseSummary, detail: VerglasDatabaseDetail | null): Metric[] {

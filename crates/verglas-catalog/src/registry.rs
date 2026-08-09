@@ -147,6 +147,43 @@ impl CatalogRuntimeRegistry {
             .ok()
             .and_then(|mut gateways| gateways.remove(database_id))
     }
+
+    /// Atomically replaces the complete live routing set discovered from durable databases.
+    pub fn replace_all<I>(&self, gateways: I) -> Result<(), RegistryError>
+    where
+        I: IntoIterator<Item = (DatabaseId, CatalogGateway)>,
+    {
+        let mut replacement = HashMap::new();
+        for (database_id, gateway) in gateways {
+            if replacement.insert(database_id.clone(), gateway).is_some() {
+                return Err(RegistryError::AlreadyExists(
+                    database_id.as_str().to_owned(),
+                ));
+            }
+        }
+        let mut current = self
+            .gateways
+            .write()
+            .map_err(|_| RegistryError::LockPoisoned)?;
+        *current = replacement;
+        Ok(())
+    }
+
+    /// Returns the number of database gateways in the current routing snapshot.
+    pub fn len(&self) -> Result<usize, RegistryError> {
+        self.gateways
+            .read()
+            .map(|gateways| gateways.len())
+            .map_err(|_| RegistryError::LockPoisoned)
+    }
+
+    /// Reports whether the current routing snapshot contains no database gateways.
+    pub fn is_empty(&self) -> Result<bool, RegistryError> {
+        self.gateways
+            .read()
+            .map(|gateways| gateways.is_empty())
+            .map_err(|_| RegistryError::LockPoisoned)
+    }
 }
 
 impl CatalogRegistry {

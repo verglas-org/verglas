@@ -170,7 +170,7 @@ async fn query_and_append_use_server_execution_roles() {
     let captured = Captured::default();
     let app = Router::new()
         .route("/v1/write/{name}", post(write_arrow))
-        .route("/v1/query", post(query_arrow))
+        .route("/v1/databases/analytics/query", post(query_arrow))
         .with_state(captured.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -202,7 +202,7 @@ async fn query_and_append_use_server_execution_roles() {
     assert_eq!(append.rows_committed, 2);
 
     let mut query = client
-        .query_stream("select id from sdk.events")
+        .query_stream("analytics", "select id from sdk.events")
         .await
         .expect("query");
     assert_eq!(query.next().await.expect("result").expect("batch"), batch);
@@ -211,6 +211,33 @@ async fn query_and_append_use_server_execution_roles() {
         captured.paths.lock().expect("paths").as_slice(),
         ["write:sdk.events", "query"]
     );
+}
+
+/// Query routing refuses names that cannot identify a registered database.
+#[tokio::test]
+async fn query_stream_rejects_invalid_database_names() {
+    let client = Client::connect(
+        ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://127.0.0.1:1")
+            .with_catalog_uri("http://127.0.0.1:1")
+            .with_s3_endpoint("http://127.0.0.1:8333"),
+    )
+    .await
+    .expect("client");
+
+    for database in [
+        "",
+        "9analytics",
+        "-analytics",
+        "analytics/team",
+        "analytics.db",
+    ] {
+        let result = client.query_stream(database, "SELECT 1").await;
+        assert!(
+            matches!(result, Err(ClientError::Configuration(message)) if message.contains("database name")),
+            "{database:?} must be rejected"
+        );
+    }
 }
 
 #[derive(Clone, Default)]

@@ -1,9 +1,9 @@
 //! Standalone on-prem worker scheduler for one Verglas-owned queue.
 //!
 //! Verglas pushes complete worker events to this service. The service persists
-//! them through `verglas-rest`, immediately claims ready work, and executes the
-//! local worker harness. It mounts no state and contains no connection-broker
-//! behavior.
+//! declarations, jobs, and leases in its Postgres control database, immediately
+//! claims ready work, and executes the local worker harness. It mounts no state
+//! and contains no connection-broker behavior.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -11,18 +11,20 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::State;
-use axum::http::StatusCode;
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::routing::{get, post, put};
+use axum::{Json, Router, extract::Request, middleware};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
 use verglas_harness::worker::{WorkerExec, WorkerRun, run_worker};
 use verglas_scheduler::{
     ClaimRequest, ClaimedJob, CompleteRequest, Completion, EnqueueOutcome, Invocation, Lease,
-    NextWakeRequest, PgQueue, RenewRequest, RunQueue, plan_cron,
+    NextWakeRequest, PgQueue, PgWorkerRegistry, RenewRequest, RunQueue, WorkerRecord, WorkerSpec,
+    plan_cron,
 };
 use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
 
@@ -36,9 +38,6 @@ struct Args {
     /// Postgres database that owns all durable scheduler state.
     #[arg(long, env = "VERGLAS_SCHEDULER_DATABASE_URL")]
     database_url: String,
-    /// Verglas REST API that owns worker declarations.
-    #[arg(long, env = "VERGLAS_SCHEDULER_VERGLAS_URL")]
-    verglas_url: String,
     /// Data-plane endpoint injected into worker subprocesses.
     #[arg(long, env = "VERGLAS_WORKER_ENDPOINT")]
     worker_endpoint: String,
@@ -54,23 +53,12 @@ struct Args {
     /// Address receiving pushed worker events from Verglas.
     #[arg(long, env = "VERGLAS_SCHEDULER_LISTEN", default_value = "0.0.0.0:8340")]
     listen: SocketAddr,
-}
-
-/// The worker fields returned by Verglas's registry endpoint.
-#[derive(Debug, Deserialize)]
-struct WorkerRecord {
-    /// Worker deployment name.
-    name: String,
-    /// Subprocess execution JSON.
-    code: String,
-    /// Deployment-configured output table.
-    output: Option<String>,
-    /// Trigger declarations stored in the deployment record.
-    triggers: String,
-    /// Lifecycle state; only `running` declarations are reconciled.
-    state: String,
-    /// Portable environment and bundled text files.
-    config: String,
+    /// Bearer token required by every scheduler control route.
+    #[arg(long, env = "VERGLAS_SCHEDULER_CONTROL_TOKEN")]
+    control_token: String,
+    /// Hex-encoded 256-bit key used to encrypt scheduler runtime secrets.
+    #[arg(long, env = "VERGLAS_SECRET_ENCRYPTION_KEY", hide_env_values = true)]
+    secret_encryption_key: String,
 }
 
 /// The portable portion of a worker registry config.
@@ -110,6 +98,7 @@ fn safe_bundle_path(path: &Path) -> Result<&Path, String> {
 }
 
 /// Materializes one portable worker config into an isolated run directory.
+#[cfg(test)]
 fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
     let config: WorkerConfig = serde_json::from_str(&worker.config)
         .map_err(|error| format!("worker {} config: {error}", worker.name))?;
@@ -123,6 +112,13 @@ fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
             worker.name
         ));
     }
+    prepare_worker_config(worker, config)
+}
+
+fn prepare_worker_config(
+    worker: &WorkerRecord,
+    config: WorkerConfig,
+) -> Result<PreparedWorker, String> {
     let root = tempfile::tempdir()
         .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
     for (name, contents) in &config.files {
@@ -159,6 +155,30 @@ fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
     Ok(PreparedWorker { exec, _root: root })
 }
 
+async fn prepare_registered_worker(
+    registry: &PgWorkerRegistry,
+    worker: &WorkerRecord,
+) -> Result<PreparedWorker, String> {
+    let mut config: WorkerConfig = serde_json::from_str(&worker.config)
+        .map_err(|error| format!("worker {} config: {error}", worker.name))?;
+    for (binding, value) in &mut config.env {
+        let Some(secret_name) = value.strip_prefix("@secret:") else {
+            continue;
+        };
+        *value = registry
+            .secret(secret_name)
+            .await
+            .map_err(|error| format!("worker {} secret binding {binding}: {error}", worker.name))?
+            .ok_or_else(|| {
+                format!(
+                    "worker {} secret binding {binding} references missing secret {secret_name}",
+                    worker.name
+                )
+            })?;
+    }
+    prepare_worker_config(worker, config)
+}
+
 /// Queue enqueue response returned by `verglas-rest` and this service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnqueueResponse {
@@ -168,66 +188,30 @@ struct EnqueueResponse {
     created: bool,
 }
 
-/// Thin client for worker-registry operations hosted by Verglas.
-#[derive(Clone)]
-struct VerglasClient {
-    http: reqwest::Client,
-    base: String,
-}
-
-impl VerglasClient {
-    /// Builds a client after normalizing the base URI once.
-    fn new(base: &str) -> VerglasClient {
-        VerglasClient {
-            http: reqwest::Client::new(),
-            base: base.trim_end_matches('/').to_owned(),
-        }
-    }
-
-    /// Reads the current worker declaration from the Verglas registry.
-    async fn worker(&self, name: &str) -> Result<WorkerRecord, String> {
-        self.http
-            .get(format!("{}/v1/workers/{name}", self.base))
-            .send()
-            .await
-            .map_err(|error| format!("worker request: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("worker response: {error}"))?
-            .json()
-            .await
-            .map_err(|error| format!("worker JSON: {error}"))
-    }
-
-    /// Lists the current worker registry projection owned by Verglas.
-    async fn workers(&self) -> Result<Vec<WorkerRecord>, String> {
-        self.http
-            .get(format!("{}/v1/workers?view=active", self.base))
-            .send()
-            .await
-            .map_err(|error| format!("workers request: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("workers response: {error}"))?
-            .json()
-            .await
-            .map_err(|error| format!("workers JSON: {error}"))
-    }
-}
-
 /// State shared by pushed-event handlers and the execution loop.
 #[derive(Clone)]
-struct EventIngress {
-    queue: Arc<dyn RunQueue>,
+struct SchedulerState {
+    queue: Arc<PgQueue>,
+    registry: Arc<PgWorkerRegistry>,
     ready: Arc<tokio::sync::Notify>,
 }
 
 /// Accepts one complete worker event, persists it, and wakes execution now.
 async fn submit_event(
-    State(ingress): State<EventIngress>,
+    State(state): State<SchedulerState>,
     Json(invocation): Json<Invocation>,
 ) -> Response {
-    match ingress.queue.enqueue(&invocation).await {
+    persist_event(state.queue.as_ref(), state.ready.as_ref(), &invocation).await
+}
+
+async fn persist_event(
+    queue: &dyn RunQueue,
+    ready: &tokio::sync::Notify,
+    invocation: &Invocation,
+) -> Response {
+    match queue.enqueue(invocation).await {
         Ok(outcome) => {
-            ingress.ready.notify_one();
+            ready.notify_one();
             let (status, response) = match outcome {
                 EnqueueOutcome::Created(job_id) => (
                     StatusCode::ACCEPTED,
@@ -250,26 +234,266 @@ async fn submit_event(
     }
 }
 
+#[derive(Debug, Deserialize)]
+struct ListView {
+    view: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StatePut {
+    state: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretPut {
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JobLimit {
+    limit: Option<u32>,
+}
+
+#[derive(Clone)]
+struct ControlAuth(Arc<str>);
+
+async fn authorize_control(
+    State(auth): State<ControlAuth>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let authorized = request
+        .headers()
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == auth.0.as_ref());
+    if !authorized {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "scheduler control token is required",
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
+async fn list_workers(
+    State(state): State<SchedulerState>,
+    Query(query): Query<ListView>,
+) -> Response {
+    let include_all = match query.view.as_deref() {
+        None | Some("active") => false,
+        Some("all") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown view `{other}`: expected active or all"),
+            )
+                .into_response();
+        }
+    };
+    match state.registry.list(include_all).await {
+        Ok(workers) => Json(workers).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn register_worker(
+    State(state): State<SchedulerState>,
+    Json(spec): Json<WorkerSpec>,
+) -> Response {
+    match state.registry.register(spec).await {
+        Ok(worker) => {
+            state.ready.notify_one();
+            (StatusCode::CREATED, Json(worker)).into_response()
+        }
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn get_worker(
+    State(state): State<SchedulerState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    match state.registry.get(&name).await {
+        Ok(Some(worker)) => Json(worker).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no worker named {name}")).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn set_worker_state(
+    State(state): State<SchedulerState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<StatePut>,
+) -> Response {
+    match state.registry.set_state(&name, &body.state).await {
+        Ok(Some(worker)) => {
+            state.ready.notify_one();
+            Json(worker).into_response()
+        }
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no worker named {name}")).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn run_worker_now(
+    State(state): State<SchedulerState>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(idempotency_key) = headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "idempotency-key header is required",
+        )
+            .into_response();
+    };
+    match state.registry.get(&name).await {
+        Ok(Some(worker)) if worker.state == "running" => {}
+        Ok(Some(worker)) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("worker {name} is {}, not running", worker.state),
+            )
+                .into_response();
+        }
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, format!("no worker named {name}")).into_response();
+        }
+        Err(error) => return scheduler_error(error),
+    }
+    let event = CloudEvent::new(
+        idempotency_key,
+        "urn:verglas:scheduler",
+        "org.verglas.worker.manual",
+    );
+    match state
+        .queue
+        .enqueue(&Invocation::new(name, event, Utc::now()))
+        .await
+    {
+        Ok(outcome) => {
+            state.ready.notify_one();
+            let response = match outcome {
+                EnqueueOutcome::Created(job_id) => EnqueueResponse {
+                    job_id,
+                    created: true,
+                },
+                EnqueueOutcome::Existing(job_id) => EnqueueResponse {
+                    job_id,
+                    created: false,
+                },
+            };
+            Json(response).into_response()
+        }
+        Err(error) => scheduler_error(error),
+    }
+}
+
+fn scheduler_error(error: verglas_scheduler::SchedulerError) -> Response {
+    let status = match error {
+        verglas_scheduler::SchedulerError::Invalid(_)
+        | verglas_scheduler::SchedulerError::Json(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, error.to_string()).into_response()
+}
+
+async fn list_secrets(State(state): State<SchedulerState>) -> Response {
+    match state.registry.secret_names().await {
+        Ok(secrets) => Json(serde_json::json!({"secrets": secrets})).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn put_secret(
+    State(state): State<SchedulerState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<SecretPut>,
+) -> Response {
+    match state.registry.put_secret(&name, &body.value).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn delete_secret(
+    State(state): State<SchedulerState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    match state.registry.delete_secret(&name).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, format!("no secret named {name}")).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn list_worker_jobs(
+    State(state): State<SchedulerState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<JobLimit>,
+) -> Response {
+    match state
+        .queue
+        .worker_jobs(&name, query.limit.unwrap_or(20))
+        .await
+    {
+        Ok(jobs) => Json(jobs).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
+async fn get_job(
+    State(state): State<SchedulerState>,
+    AxumPath(job_id): AxumPath<String>,
+) -> Response {
+    match state.queue.job(&job_id).await {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no job named {job_id}")).into_response(),
+        Err(error) => scheduler_error(error),
+    }
+}
+
 /// Reports that the scheduler event receiver is alive.
 async fn healthz() -> &'static str {
     "ok"
 }
 
 /// Builds the scheduler's pushed-event API.
-fn event_router(ingress: EventIngress) -> Router {
-    Router::new()
-        .route("/healthz", get(healthz))
+fn scheduler_router(state: SchedulerState, control_token: String) -> Router {
+    let control = Router::new()
         .route("/v1/events", post(submit_event))
-        .with_state(ingress)
+        .route("/v1/workers", get(list_workers).post(register_worker))
+        .route("/v1/workers/{name}", get(get_worker))
+        .route("/v1/workers/{name}/state", put(set_worker_state))
+        .route("/v1/workers/{name}/run", post(run_worker_now))
+        .route("/v1/workers/{name}/jobs", get(list_worker_jobs))
+        .route("/v1/jobs/{job_id}", get(get_job))
+        .route("/v1/secrets", get(list_secrets))
+        .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
+        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(
+            ControlAuth(Arc::from(format!("Bearer {control_token}"))),
+            authorize_control,
+        ));
+    Router::new().route("/healthz", get(healthz)).merge(control)
 }
 
 /// Reconstructs cron progress from run objects and materializes every due run.
 async fn reconcile_cron(
-    client: &VerglasClient,
+    registry: &PgWorkerRegistry,
     queue: &dyn RunQueue,
     now: DateTime<Utc>,
 ) -> Result<Option<DateTime<Utc>>, String> {
-    let workers = client.workers().await?;
+    let workers = registry
+        .list(false)
+        .await
+        .map_err(|error| error.to_string())?;
     let jobs = queue.jobs().await.map_err(|error| error.to_string())?;
     let mut next_wake_at = None;
     for worker in workers
@@ -347,16 +571,30 @@ async fn reconcile_cron(
 /// Executes one claimed run while renewing its lease until the worker returns.
 async fn execute_claimed(
     args: &Args,
-    client: &VerglasClient,
+    registry: &PgWorkerRegistry,
     queue: &dyn RunQueue,
     claimed: ClaimedJob,
 ) -> Result<(Lease, Completion), String> {
-    let worker = client.worker(&claimed.job.worker).await?;
-    let prepared = prepare_worker(&worker)?;
-    let output = worker.output.unwrap_or_default();
+    let worker = registry
+        .get(&claimed.job.worker)
+        .await
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("no worker named {}", claimed.job.worker))?;
+    let prepared = prepare_registered_worker(registry, &worker).await?;
+    execute_claimed_worker(args, &worker, prepared, queue, claimed).await
+}
+
+async fn execute_claimed_worker(
+    args: &Args,
+    worker: &WorkerRecord,
+    prepared: PreparedWorker,
+    queue: &dyn RunQueue,
+    claimed: ClaimedJob,
+) -> Result<(Lease, Completion), String> {
+    let output = worker.output.as_deref().unwrap_or_default();
     let run = WorkerRun {
         deployment: &worker.name,
-        output: &output,
+        output,
         endpoint: &args.worker_endpoint,
         token: "",
     };
@@ -397,7 +635,7 @@ async fn execute_claimed(
 /// Claims, executes, and completes one ready run.
 async fn run_one(
     args: &Args,
-    client: &VerglasClient,
+    registry: &PgWorkerRegistry,
     queue: &dyn RunQueue,
 ) -> Result<bool, String> {
     let claim = ClaimRequest {
@@ -412,7 +650,7 @@ async fn run_one(
     else {
         return Ok(false);
     };
-    let (lease, completion) = match execute_claimed(args, client, queue, claimed).await {
+    let (lease, completion) = match execute_claimed(args, registry, queue, claimed).await {
         Ok(result) => result,
         Err(error) => return Err(format!("execute claimed run: {error}")),
     };
@@ -439,14 +677,14 @@ fn until(deadline: DateTime<Utc>) -> Duration {
 /// or a pushed-event notification.
 async fn scheduler_loop(
     args: &Args,
-    client: &VerglasClient,
+    registry: &PgWorkerRegistry,
     queue: &dyn RunQueue,
     ready: &tokio::sync::Notify,
 ) -> Result<(), String> {
     loop {
         let now = Utc::now();
-        let cron_deadline = reconcile_cron(client, queue, now).await?;
-        while run_one(args, client, queue).await? {}
+        let cron_deadline = reconcile_cron(registry, queue, now).await?;
+        while run_one(args, registry, queue).await? {}
         let queue_deadline = queue
             .next_wake_at(&NextWakeRequest { now: Utc::now() })
             .await
@@ -479,12 +717,32 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let client = VerglasClient::new(&args.verglas_url);
+    let encryption_key = match hex::decode(&args.secret_encryption_key) {
+        Ok(key) if key.len() == 32 => key,
+        _ => {
+            eprintln!(
+                "verglas-scheduler: VERGLAS_SECRET_ENCRYPTION_KEY must be 64 hexadecimal characters"
+            );
+            std::process::exit(1);
+        }
+    };
+    let registry =
+        match PgWorkerRegistry::connect(&args.database_url, &args.queue, &encryption_key).await {
+            Ok(registry) => Arc::new(registry),
+            Err(error) => {
+                eprintln!("verglas-scheduler: connect worker registry: {error}");
+                std::process::exit(1);
+            }
+        };
     let ready = Arc::new(tokio::sync::Notify::new());
-    let app = event_router(EventIngress {
-        queue: queue.clone(),
-        ready: ready.clone(),
-    });
+    let app = scheduler_router(
+        SchedulerState {
+            queue: queue.clone(),
+            registry: registry.clone(),
+            ready: ready.clone(),
+        },
+        args.control_token.clone(),
+    );
     let listener = match tokio::net::TcpListener::bind(args.listen).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -493,10 +751,9 @@ async fn main() {
         }
     };
     eprintln!(
-        "verglas-scheduler {} queue={} verglas={} listen={}",
+        "verglas-scheduler {} queue={} listen={}",
         env!("CARGO_PKG_VERSION"),
         args.queue,
-        args.verglas_url,
         args.listen,
     );
     let server = axum::serve(listener, app);
@@ -506,7 +763,7 @@ async fn main() {
                 .err()
                 .map_or_else(|| "stopped".to_owned(), |error| error.to_string()));
         }
-        result = scheduler_loop(&args, &client, queue.as_ref(), &ready) => {
+        result = scheduler_loop(&args, registry.as_ref(), queue.as_ref(), &ready) => {
             eprintln!("verglas-scheduler: {}", result
                 .err()
                 .unwrap_or_else(|| "scheduler loop stopped".to_owned()));
@@ -575,18 +832,6 @@ mod tests {
         }
     }
 
-    /// Starts an in-process Verglas API and returns its base URL.
-    async fn serve(app: Router) -> String {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind mock API");
-        let address = listener.local_addr().expect("mock API address");
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("mock API");
-        });
-        format!("http://{address}")
-    }
-
     /// Bundled files and plain environment bindings are materialized for one
     /// run, and a relative cwd resolves inside that isolated bundle.
     #[test]
@@ -597,6 +842,10 @@ mod tests {
             output: Some("market.ohlcv".to_owned()),
             triggers: "[]".to_owned(),
             state: "running".to_owned(),
+            placement: "local".to_owned(),
+            created_by: "test".to_owned(),
+            created_at: Utc::now(),
+            revision: 1,
             config: r#"{
                 "env":{"SYMBOL":"SPY"},
                 "files":{"ingest.py":"print('ready')\n"}
@@ -623,17 +872,14 @@ mod tests {
     #[tokio::test]
     async fn pushed_event_is_persisted_before_acceptance() {
         let queue = Arc::new(TestQueue::default());
-        let ingress = EventIngress {
-            queue: queue.clone(),
-            ready: Arc::new(tokio::sync::Notify::new()),
-        };
+        let ready = tokio::sync::Notify::new();
         let invocation = Invocation::new(
             "http-worker",
             CloudEvent::new("request-1", "urn:verglas:http", "org.verglas.http.request"),
             Utc::now(),
         );
 
-        let response = submit_event(State(ingress), Json(invocation)).await;
+        let response = persist_event(queue.as_ref(), &ready, &invocation).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let stored = queue
             .invocation
@@ -652,23 +898,18 @@ mod tests {
             "exec": ["sh", "-c", "printf '{\"rows\":3,\"error\":null}' > \"$RESULT_PATH\""]
         })
         .to_string();
-        let api = Router::new().route(
-            "/v1/workers/{name}",
-            get(move || {
-                let code = code.clone();
-                async move {
-                    Json(serde_json::json!({
-                        "name": "worker-a",
-                        "code": code,
-                        "output": "app.output",
-                        "triggers": "[]",
-                        "state": "running",
-                        "config": "{}"
-                    }))
-                }
-            }),
-        );
-        let client = VerglasClient::new(&serve(api).await);
+        let worker = WorkerRecord {
+            name: "worker-a".to_owned(),
+            code,
+            output: Some("app.output".to_owned()),
+            triggers: "[]".to_owned(),
+            state: "running".to_owned(),
+            config: "{}".to_owned(),
+            placement: "local".to_owned(),
+            created_by: "test".to_owned(),
+            created_at: Utc::now(),
+            revision: 1,
+        };
         let now = Utc::now();
         let claimed = ClaimedJob {
             job: Job {
@@ -691,16 +932,18 @@ mod tests {
         };
         let args = Args {
             database_url: "postgres://unused".to_owned(),
-            verglas_url: "unused".to_owned(),
             worker_endpoint: "http://127.0.0.1:8334".to_owned(),
             queue: "local".to_owned(),
             consumer: "consumer-1".to_owned(),
             lease_seconds: 300,
             listen: "127.0.0.1:0".parse().expect("listen"),
+            control_token: "test-control".to_owned(),
+            secret_encryption_key: "00".repeat(32),
         };
 
         let queue = TestQueue::default();
-        let (_, completion) = execute_claimed(&args, &client, &queue, claimed)
+        let prepared = prepare_worker(&worker).expect("prepare worker");
+        let (_, completion) = execute_claimed_worker(&args, &worker, prepared, &queue, claimed)
             .await
             .expect("execute");
         assert_eq!(completion, Completion::Succeeded { rows_produced: 3 });

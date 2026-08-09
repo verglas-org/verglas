@@ -136,6 +136,26 @@ fn parses_vote_elected_and_append_vectors() {
 }
 
 #[test]
+fn parses_the_large_append_emitted_by_the_verglas_neon_compute() {
+    let wal = vec![0x5a; 512 * 1024];
+    let begin_lsn = 0x14_EE2C0_u64;
+    let mut append = BytesMut::new();
+    append.put_u8(b'a');
+    append.put_u32(0);
+    append.put_u64(2);
+    append.put_u64(begin_lsn);
+    append.put_u64(begin_lsn + wal.len() as u64);
+    append.put_u64(begin_lsn);
+    append.put_u64(begin_lsn);
+    append.put_slice(&wal);
+
+    assert!(matches!(
+        parse_proposer(append.freeze(), PROTOCOL_VERSION).expect("large append"),
+        ProposerMessage::Append(message) if message.wal.len() == wal.len()
+    ));
+}
+
+#[test]
 fn serializes_neon_v3_acceptor_vectors() {
     let greeting = serialize_acceptor(
         &AcceptorMessage::Greeting(AcceptorGreeting {

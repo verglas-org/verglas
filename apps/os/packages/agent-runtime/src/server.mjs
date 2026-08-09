@@ -188,13 +188,17 @@ async function proxyRunGateway(request, url, match) {
   }
 
   let action;
-  if (service === "data" && request.method === "GET" &&
-      /^\/v1\/databases\/[^/]+\/catalog\//.test(suffix)) {
+  let resourceId = "tenant";
+  const catalogMatch = suffix.match(/^\/v1\/databases\/([^/]+)\/catalog\//);
+  const queryMatch = suffix.match(/^\/v1\/databases\/([^/]+)\/query$/);
+  if (service === "data" && request.method === "GET" && catalogMatch) {
     action = "discover";
+    resourceId = `database/${decodeURIComponent(catalogMatch[1])}`;
   } else if (service === "access" && request.method === "GET" && suffix === "/v1/databases") {
     action = "discover";
-  } else if (service === "data" && request.method === "POST" && suffix === "/v1/query") {
+  } else if (service === "data" && request.method === "POST" && queryMatch) {
     action = "query";
+    resourceId = `database/${decodeURIComponent(queryMatch[1])}`;
   } else if (service === "data" && request.method === "POST" && suffix === "/v1/workers") {
     action = "deploy";
   } else if (service === "runtime" && request.method === "PUT" &&
@@ -203,8 +207,10 @@ async function proxyRunGateway(request, url, match) {
   } else {
     return response({ error: "operation is not exposed to agent runs" }, 403);
   }
-  const decision = await checkRunAccess(run, "tenant", action);
-  if (!decision.allowed) return response({ error: `permission denied: ${action} on tenant` }, 403);
+  const decision = await checkRunAccess(run, resourceId, action);
+  if (!decision.allowed) {
+    return response({ error: `permission denied: ${action} on ${resourceId}` }, 403);
+  }
 
   const targetBase = service === "data"
     ? process.env.VERGLAS_DATA_ENDPOINT

@@ -59,6 +59,7 @@ through the Verglas cache endpoint:
 
 ```bash
 verglas query \
+  analytics \
   'SELECT symbol, timestamp, close, volume
    FROM market.ohlcv
    ORDER BY timestamp'

@@ -2,7 +2,7 @@
 
 use std::process::Command;
 
-/// The service exposes only Postgres queue, execution, and listener settings.
+/// The service exposes only Postgres control state, execution, auth, and listener settings.
 #[test]
 fn help_has_no_cloud_callback_or_polling_modes() {
     let output = Command::new(env!("CARGO_BIN_EXE_verglas-scheduler"))
@@ -12,8 +12,10 @@ fn help_has_no_cloud_callback_or_polling_modes() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
     assert!(stdout.contains("--database-url"));
-    assert!(stdout.contains("--verglas-url"));
+    assert!(!stdout.contains("--verglas-url"));
     assert!(stdout.contains("--worker-endpoint"));
+    assert!(stdout.contains("--control-token"));
+    assert!(stdout.contains("--secret-encryption-key"));
     assert!(stdout.contains("--listen"));
     assert!(!stdout.contains("--once"));
     assert!(!stdout.contains("--poll-ms"));

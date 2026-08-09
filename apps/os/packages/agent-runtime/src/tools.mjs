@@ -27,8 +27,9 @@ export const toolDefinitions = [
     type: "function",
     function: {
       name: "queryLakehouse",
-      description: "Run a bounded SQL query against Verglas. Use this to inspect data before building.",
+      description: "Run bounded SQL against one named Verglas Lakehouse database.",
       parameters: schema({
+        database: { type: "string" },
         sql: { type: "string" },
       }),
     },
@@ -153,6 +154,7 @@ export function createToolExecutor(env, emit) {
         const tables = [];
         for (const database of databases) {
           if (database.type !== "lakehouse") continue;
+          await requireAccess(`database/${database.name}`, "discover");
           const catalog = `/v1/databases/${encodeURIComponent(database.name)}/catalog/v1`;
           const namespaceBody = await request(admin, dataToken, `${catalog}/namespaces`);
           for (const namespace of (namespaceBody.namespaces ?? []).slice(0, 100)) {
@@ -179,12 +181,20 @@ export function createToolExecutor(env, emit) {
           }));
         return { databases, tables, indexes: [], graphs };
       }
-      case "queryLakehouse":
-        await requireAccess("tenant", "query");
-        return await request(admin, dataToken, "/v1/query", {
+      case "queryLakehouse": {
+        const database = String(args.database ?? "").trim();
+        if (!database) throw new Error("queryLakehouse requires a database.");
+        await requireAccess(`database/${database}`, "query");
+        return await request(
+          admin,
+          dataToken,
+          `/v1/databases/${encodeURIComponent(database)}/query`,
+          {
           method: "POST",
           body: JSON.stringify({ sql: args.sql }),
-        });
+          },
+        );
+      }
       case "deployApplication": {
         await requireAccess("tenant", "deploy");
         const result = await request(runtime, runtimeToken,

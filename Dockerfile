@@ -15,6 +15,7 @@ RUN cargo build --release \
     -p verglas-access-bin \
     -p verglas-scheduler-bin \
     -p verglas-container-runtime \
+    -p verglas-cache-node \
     -p verglas-query \
     -p verglas-write-node
 
@@ -87,7 +88,7 @@ ENTRYPOINT ["verglas-access"]
 
 FROM runtime AS verglas-container-runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends python3 \
+    && apt-get install -y --no-install-recommends curl python3 \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /var/lib/verglas-container-runtime
 COPY --from=build /src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime
@@ -98,6 +99,17 @@ COPY crates/verglas-integration-runtime/contract.mjs /opt/verglas-integration-ru
 COPY sdks/typescript/src /opt/verglas-integration-runtime/sdk
 EXPOSE 8360
 ENTRYPOINT ["verglas-container-runtime"]
+
+FROM runtime AS verglas-cache-node
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/verglas-cache-node /usr/local/bin/verglas-cache-node
+COPY deploy/cache-node/start.sh /usr/local/bin/verglas-cache-node-start
+RUN chmod 0755 /usr/local/bin/verglas-cache-node-start
+USER verglas
+EXPOSE 5454 8333 8334 8335 8336
+ENTRYPOINT ["verglas-cache-node-start"]
 
 FROM runtime AS verglas-server
 COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server

@@ -13,6 +13,7 @@ export function databaseCapabilityLabels(database: VerglasDatabaseSummary): stri
   if (database.capabilities.tableMetrics) capabilities.push('Metrics')
   if (database.capabilities.vectors) capabilities.push('Vectors')
   if (database.capabilities.graphs) capabilities.push('Graphs')
+  if (database.capabilities.query) capabilities.push('SQL')
   return capabilities
 }
 

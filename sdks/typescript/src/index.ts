@@ -70,6 +70,7 @@ export type {
   CreateTableResult,
   EnsureTableResult,
   QueryResult,
+  QueryAt,
   QueueEnqueueResult,
   QueueRecord,
   QueuePollResult,

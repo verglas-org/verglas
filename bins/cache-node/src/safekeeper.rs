@@ -167,6 +167,7 @@ pub async fn serve(
     let mut server = SafekeeperServer::new(
         ring.safekeeper_id(),
         Arc::new(Origin::new(stores)),
+        "managed-lakehouse",
         bucket,
         "neon-wal",
         ring.transport(),

@@ -115,23 +115,19 @@ Database creation resolves the most-specific authorized secret scope once and
 stores its stable resource ID. Rotating that secret updates the same resource;
 creating a later overlapping secret cannot silently rebind the database.
 
-## Iceberg tables: add the catalog watcher
+## Iceberg tables: managed Lakekeeper catalogs
 
-Verglas works as a plain cache with no catalog. Point it at your Iceberg REST
-catalog and it also watches for table commits, so it can pre-warm table metadata
-and hot data and carry cache heat across compaction automatically — planning
-reads hit warm statistics, and a rewrite does not force queries to re-earn the
-cache from the origin.
-
-The Docker application takes the catalog URI, warehouse, and bearer token from
-`VERGLAS_CATALOG_URI`, `VERGLAS_CATALOG_WAREHOUSE`, and
-`VERGLAS_CATALOG_BEARER_TOKEN` in `docker-compose.yml`. It watches the catalog
-and warms changed metadata through the cache path.
+The Docker application starts one tenant Lakekeeper service. Each managed
+Lakehouse database receives its own warehouse and object prefix; Verglas routes
+catalog requests by database name instead of keeping a process-global catalog.
+Customer-operated catalogs are explicit database bindings with scoped secrets,
+not server-wide environment values.
 
 ## Workers and containers
 
-Compose bootstraps `verglas-server`, the local container runtime, the durable
-worker scheduler and its Postgres queue, and Verglas OS. The runtime manager
+Compose bootstraps `verglas-server`, Lakekeeper, the three-member cache and WAL
+ring, the local container runtime, the durable worker scheduler and its Postgres
+queue, and Verglas OS. The runtime manager
 owns dynamically added Vessels, database components, external brokers, and
 other optional applications. A portable worker contains its bounded command,
 bundled files, target table, and cron, HTTP, or CloudEvent triggers.

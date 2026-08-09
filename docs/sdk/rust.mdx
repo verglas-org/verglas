@@ -104,7 +104,7 @@ println!("{} rows in {} commits", result.rows_committed, result.commits);
 use futures::StreamExt;
 
 let mut batches = client
-    .query_stream("SELECT id, total FROM analytics.orders")
+    .query_stream("analytics", "SELECT id, total FROM analytics.orders")
     .await?;
 
 while let Some(batch) = batches.next().await {

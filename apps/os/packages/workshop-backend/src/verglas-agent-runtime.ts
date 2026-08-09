@@ -397,8 +397,8 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
     });
   }
 
-  async queryVerglas(sql: string, maxRows?: number): Promise<VerglasQueryResult> {
-    return await new VerglasCatalogClient(this.env).query(sql, maxRows);
+  async queryVerglas(database: string, sql: string, maxRows?: number): Promise<VerglasQueryResult> {
+    return await new VerglasCatalogClient(this.env).query(database, sql, maxRows);
   }
 
   async listVerglasQueryActivity(_afterSequence?: number): Promise<VerglasQueryActivity[]> {

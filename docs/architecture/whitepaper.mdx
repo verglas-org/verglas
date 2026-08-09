@@ -21,7 +21,9 @@ We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible 
 This open-source repository is the self-hosted Verglas stack: the Iceberg-aware
 cache server (including WAL and virtual block devices), the query and write
 roles, Docker vessel runtimes, the local worker scheduler, and the SDKs that
-talk to them — `/v1/query`, graph traversal, vector search, and table scans.
+talk to them — `/v1/databases/{database}/query`, graph traversal, vector
+search, and table scans. SQL workers receive only the selected database's
+catalog configuration; there is no process-global query catalog.
 The server is a catalog **client**, not a catalog implementation: it connects
 to the configured Iceberg REST catalog and never stores authoritative catalog
 state. The on-prem `verglas-rest` composition may expose a shallow cached proxy

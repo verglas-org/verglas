@@ -717,10 +717,24 @@ impl Client {
         Ok(result)
     }
 
-    /// Executes SQL and incrementally decodes the Arrow IPC response.
-    pub async fn query_stream(&self, sql: &str) -> Result<QueryStream, ClientError> {
+    /// Executes SQL through `POST /v1/databases/{database}/query` and incrementally decodes Arrow.
+    pub async fn query_stream(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<QueryStream, ClientError> {
+        if !is_database_name(database) {
+            return Err(ClientError::Configuration(
+                "database name must start with a letter or underscore and contain only ASCII letters, digits, underscores, or hyphens".to_owned(),
+            ));
+        }
         let request = self
-            .authorize(self.http.post(self.url("/v1/query")))
+            .authorize(self.http.post(resource_url(
+                &self.query_uri,
+                "databases",
+                database,
+                &["query"],
+            )?))
             .header(ACCEPT, ARROW_STREAM_CONTENT_TYPE)
             .json(&QueryRequest { sql });
         let response = Self::require_success(self.send(request).await?).await?;
@@ -1608,6 +1622,17 @@ fn resource_url(
         }
     }
     Ok(url)
+}
+
+/// Checks the database resource-name grammar enforced by the database API.
+fn is_database_name(name: &str) -> bool {
+    let Some((first, remainder)) = name.as_bytes().split_first() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || *first == b'_')
+        && remainder
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
 }
 
 /// Maps client read options onto the wire filter object.

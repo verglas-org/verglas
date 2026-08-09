@@ -1,10 +1,11 @@
 //! `verglas query` — SQL over Iceberg tables through the server (issue #287).
 //!
-//! Posts the SQL to the server's `POST /v1/query` (#323); the server dispatches
-//! it to an isolated query role whose object reads return through Verglas, and
-//! the CLI embeds nothing. `--at <ref> <table>` pins a table to a snapshot for
-//! time travel. Output is `--output json` (a stable `{columns, rows,
-//! row_count}` shape) or a human-readable table.
+//! Posts the SQL to the selected database's
+//! `POST /v1/databases/{database}/query` route (#84); the server dispatches it
+//! to that database's isolated query role whose object reads return through
+//! Verglas, and the CLI embeds nothing. `--at <ref> <table>` pins a table to a
+//! snapshot for time travel. Output is `--json` (a stable `{columns,
+//! rows, row_count}` shape) or a human-readable table.
 
 use std::error::Error;
 
@@ -31,7 +32,9 @@ pub async fn run(args: QueryArgs, server_endpoint: &str, json: bool) -> Result<(
     if let Some(at) = at {
         body["at"] = at;
     }
-    let report: QueryReport = client.post_json("/v1/query", &body).await?;
+    let report: QueryReport = client
+        .post_json(&format!("/v1/databases/{}/query", args.database), &body)
+        .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {

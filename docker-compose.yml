@@ -1,12 +1,31 @@
 # Complete open-source Verglas development and community stack.
 #
-# 1. Export the R2, catalog, and client-facing S3 values required below.
+# 1. Export the managed R2 and client-facing S3 values required below.
 # 2. export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 # 3. docker compose up -d --build
 # 4. Point the CLI at the admin port:
 #      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 #    Engines point S3 at http://127.0.0.1:8333 and Verglas OS is at
 #    http://127.0.0.1:8787.
+
+x-pg-cache-environment: &pg-cache-environment
+  VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
+  VERGLAS_S3_ADDR: 0.0.0.0:8333
+  VERGLAS_BLOCK_ADDR: 0.0.0.0:8335
+  VERGLAS_RING_ADDR: 0.0.0.0:8336
+  VERGLAS_RING_PEERS: cache-0=172.29.240.10:8336,cache-1=172.29.240.11:8336,cache-2=172.29.240.12:8336
+  VERGLAS_CLUSTER_SECRET: ${VERGLAS_CLUSTER_SECRET:-verglas-local-ring}
+  VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:5454
+  VERGLAS_SAFEKEEPER_BROKER_ENDPOINT: http://verglas-neon-broker:50051
+  VERGLAS_MANAGED_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+  VERGLAS_MANAGED_STORAGE_ENDPOINT: ${R2_ENDPOINT:?Set R2_ENDPOINT}
+  VERGLAS_MANAGED_STORAGE_REGION: auto
+  VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}
+  VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}
+  VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+  VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+  VERGLAS_CACHE_CAPACITY: ${VERGLAS_POSTGRES_CACHE_CAPACITY:-1GB}
+  VERGLAS_CACHE_DRAM: ${VERGLAS_POSTGRES_CACHE_DRAM:-256MB}
 
 services:
   verglas-server:
@@ -28,9 +47,6 @@ services:
       VERGLAS_BACKEND_REGION: auto
       AWS_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}
-      VERGLAS_CATALOG_URI: ${R2_CATALOG_URI:?Set R2_CATALOG_URI}
-      VERGLAS_CATALOG_WAREHOUSE: ${R2_CATALOG_WAREHOUSE:?Set R2_CATALOG_WAREHOUSE}
-      VERGLAS_CATALOG_BEARER_TOKEN: ${R2_CATALOG_TOKEN:?Set R2_CATALOG_TOKEN}
       VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
       VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
       VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
@@ -40,6 +56,7 @@ services:
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_MANAGED_CATALOG_URI: http://verglas-lakekeeper:8181
     volumes:
       - verglas-cache:/var/lib/verglas
     # Contain a future socket or cache FD leak inside this service. Docker's
@@ -49,6 +66,9 @@ services:
         soft: 8192
         hard: 8192
     restart: unless-stopped
+    depends_on:
+      verglas-access:
+        condition: service_healthy
 
   verglas-access:
     build:
@@ -65,12 +85,38 @@ services:
       VERGLAS_ACCESS_SERVICE_PRINCIPAL: ${VERGLAS_ACCESS_SERVICE_PRINCIPAL:-verglas-local-access}
       VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_LISTEN: 0.0.0.0:8345
+      VERGLAS_MANAGED_CATALOG_URI: http://verglas-lakekeeper:8181
+      VERGLAS_MANAGED_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+      VERGLAS_MANAGED_STORAGE_PREFIX: ${VERGLAS_TENANT_ID:-local}
+      VERGLAS_MANAGED_STORAGE_ENDPOINT: http://verglas-cache-node-0:8333
+      VERGLAS_MANAGED_STORAGE_REGION: auto
+      VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+      VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+      VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
+      VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
+      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454
+      VERGLAS_MANAGED_POSTGRES_CREDENTIAL_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
+      VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-cache-node-0:8333
+      VERGLAS_MANAGED_POSTGRES_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+      VERGLAS_MANAGED_POSTGRES_STORAGE_REGION: auto
+      VERGLAS_MANAGED_POSTGRES_STORAGE_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+      VERGLAS_MANAGED_POSTGRES_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
     ports:
       - "127.0.0.1:8345:8345"
     depends_on:
       verglas-postgres-init:
         condition: service_completed_successfully
       verglas-openfga:
+        condition: service_healthy
+      verglas-lakekeeper:
+        condition: service_healthy
+      verglas-container-runtime:
+        condition: service_healthy
+      verglas-cache-node-0:
+        condition: service_healthy
+      verglas-cache-node-1:
+        condition: service_healthy
+      verglas-cache-node-2:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8345/healthz"]
@@ -86,10 +132,11 @@ services:
     image: verglas/verglas-scheduler:local
     environment:
       VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_scheduler
-      VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
       VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
       VERGLAS_SCHEDULER_QUEUE: local
       VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
+      VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
+      VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
@@ -98,6 +145,11 @@ services:
         condition: service_started
       verglas-access:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8340/healthz')"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
     restart: unless-stopped
 
   verglas-workers-postgres:
@@ -158,6 +210,99 @@ services:
       retries: 15
     restart: unless-stopped
 
+  verglas-lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.1
+    command: ["migrate"]
+    environment: &lakekeeper-environment
+      LAKEKEEPER__PG_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_catalog
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_catalog
+      LAKEKEEPER__AUTHZ_BACKEND: allowall
+    depends_on:
+      verglas-postgres-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  verglas-lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.1
+    command: ["serve"]
+    environment: *lakekeeper-environment
+    depends_on:
+      verglas-lakekeeper-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 2s
+      timeout: 10s
+      retries: 15
+    restart: unless-stopped
+
+  verglas-cache-node-0:
+    build:
+      context: .
+      target: verglas-cache-node
+    image: verglas/verglas-cache-node:local
+    environment:
+      <<: *pg-cache-environment
+      VERGLAS_NODE_ID: cache-0
+      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-0:5454
+    volumes:
+      - verglas-pg-cache-0:/var/lib/verglas
+    networks:
+      default:
+      pg-ring:
+        ipv4_address: 172.29.240.10
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  verglas-cache-node-1:
+    build:
+      context: .
+      target: verglas-cache-node
+    image: verglas/verglas-cache-node:local
+    environment:
+      <<: *pg-cache-environment
+      VERGLAS_NODE_ID: cache-1
+      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-1:5454
+    volumes:
+      - verglas-pg-cache-1:/var/lib/verglas
+    networks:
+      default:
+      pg-ring:
+        ipv4_address: 172.29.240.11
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  verglas-cache-node-2:
+    build:
+      context: .
+      target: verglas-cache-node
+    image: verglas/verglas-cache-node:local
+    environment:
+      <<: *pg-cache-environment
+      VERGLAS_NODE_ID: cache-2
+      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-2:5454
+    volumes:
+      - verglas-pg-cache-2:/var/lib/verglas
+    networks:
+      default:
+      pg-ring:
+        ipv4_address: 172.29.240.12
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
   verglas-container-runtime:
     build:
       context: .
@@ -173,9 +318,11 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - verglas-runtime-state:/var/lib/verglas-container-runtime
-    depends_on:
-      verglas-server:
-        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8360/health"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
     restart: unless-stopped
 
   verglas-agent-runtime:
@@ -203,7 +350,7 @@ services:
       verglas-postgres-init:
         condition: service_completed_successfully
       verglas-container-runtime:
-        condition: service_started
+        condition: service_healthy
       verglas-access:
         condition: service_healthy
     healthcheck:
@@ -261,9 +408,17 @@ volumes:
   verglas-runtime-state:
   verglas-workers-postgres:
   verglas-os-state:
+  verglas-pg-cache-0:
+  verglas-pg-cache-1:
+  verglas-pg-cache-2:
 
 networks:
   default:
     name: verglas-runtime
     labels:
       io.verglas.managed: "true"
+  pg-ring:
+    name: verglas-pg-ring
+    ipam:
+      config:
+        - subnet: 172.29.240.0/24

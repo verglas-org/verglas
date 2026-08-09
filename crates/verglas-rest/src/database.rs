@@ -104,7 +104,9 @@ fn database_error(error: DatabaseServiceError) -> Response {
         DatabaseServiceError::Duplicate { .. } => StatusCode::CONFLICT,
         DatabaseServiceError::NotFound { .. } => StatusCode::NOT_FOUND,
         DatabaseServiceError::Secret(_) => StatusCode::FORBIDDEN,
-        DatabaseServiceError::Repository(_) => StatusCode::BAD_GATEWAY,
+        DatabaseServiceError::Repository(_) | DatabaseServiceError::Provisioning(_) => {
+            StatusCode::BAD_GATEWAY
+        }
     };
     (
         status,

@@ -1,5 +1,10 @@
 # Worklog
 
+- feat: Moved the queue-scoped worker registry into scheduler Postgres. Worker declarations,
+  immutable revisions, lifecycle state, cron reconciliation, encrypted runtime secrets, manual
+  dispatch, and bounded job history no longer depend on a singleton Iceberg system catalog or the
+  Verglas data-server worker routes.
+
 - #11: Added the immutable object-backed tenant queue, fenced lease generations, cron planning, and durable scale-to-zero callback ordering. Scheduler correctness now reconstructs entirely from create-only objects instead of process state, filesystem guards, or mutable database rows.
 - #11: Documented the scheduler crate as a durable queue rather than an execution or placement service. On-prem supplies a local executor while cloud claims the same run contract and selects a fleet microVM container in its private execution layer.
 - #11: Defined the backend-neutral `RunQueue` contract and completed lease renewal, expiry fencing, retry timing, and immutable attempt reconstruction. Worker events are limited to manual, cron, complete HTTP callbacks, and data updates; the queue contains no connection or fleet-placement logic.

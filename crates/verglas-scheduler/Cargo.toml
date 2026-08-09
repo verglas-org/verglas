@@ -16,6 +16,7 @@ sha2.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "chrono", "json"] }
 thiserror.workspace = true
 verglas-harness.workspace = true
+verglas-authz.workspace = true
 verglas-sdk.workspace = true
 
 [dev-dependencies]

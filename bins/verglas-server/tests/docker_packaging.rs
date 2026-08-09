@@ -50,9 +50,9 @@ fn docker_application_packages_execution_workers() {
         "VERGLAS_BACKEND_REGION",
         "VERGLAS_CACHE_CAPACITY",
         "VERGLAS_CACHE_DRAM",
-        "VERGLAS_CATALOG_URI",
-        "VERGLAS_CATALOG_WAREHOUSE",
-        "VERGLAS_CATALOG_BEARER_TOKEN",
+        "VERGLAS_ACCESS_URI",
+        "VERGLAS_ACCESS_SERVICE_TOKEN",
+        "VERGLAS_MANAGED_CATALOG_URI",
         "VERGLAS_S3_ACCESS_KEY_ID",
         "VERGLAS_S3_SECRET_ACCESS_KEY",
         "VERGLAS_QUERY_WORKER_BINARY",
@@ -61,6 +61,16 @@ fn docker_application_packages_execution_workers() {
         assert!(
             compose.contains(variable),
             "Compose must declare {variable}"
+        );
+    }
+    for singleton in [
+        "VERGLAS_CATALOG_URI",
+        "VERGLAS_CATALOG_WAREHOUSE",
+        "VERGLAS_CATALOG_BEARER_TOKEN",
+    ] {
+        assert!(
+            !compose.contains(singleton),
+            "Compose must not declare singleton catalog variable {singleton}"
         );
     }
 }

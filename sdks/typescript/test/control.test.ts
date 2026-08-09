@@ -23,11 +23,11 @@ function recordingFetch(
 }
 
 describe("control-plane connectors", () => {
-  it("routes admin worker operations with bearer authorization", async () => {
+  it("routes scheduler worker operations with bearer authorization", async () => {
     const requests: Request[] = [];
-    const client = connectAdmin({
-      endpoint: "http://verglas.test/",
-      token: "admin-token",
+    const client = connectScheduler({
+      endpoint: "http://scheduler.test/",
+      token: "scheduler-token",
       fetch: recordingFetch(requests, { "/v1/workers": [] }),
     });
 
@@ -42,11 +42,35 @@ describe("control-plane connectors", () => {
     });
 
     expect(requests.map((request) => [request.method, request.url])).toEqual([
-      ["GET", "http://verglas.test/v1/workers?view=all"],
-      ["POST", "http://verglas.test/v1/workers"],
+      ["GET", "http://scheduler.test/v1/workers?view=all"],
+      ["POST", "http://scheduler.test/v1/workers"],
     ]);
-    expect(requests[0]?.headers.get("authorization")).toBe("Bearer admin-token");
+    expect(requests[0]?.headers.get("authorization")).toBe("Bearer scheduler-token");
     expect(await requests[1]?.json()).toMatchObject({ name: "sync-linear" });
+  });
+
+  it("routes admin SQL queries through their validated database scope", async () => {
+    const requests: Request[] = [];
+    const admin = connectAdmin({
+      endpoint: "http://verglas.test",
+      fetch: recordingFetch(requests, {
+        "/v1/databases/analytics-dev/query": { columns: [], rows: [], row_count: 0 },
+      }),
+    });
+
+    expect(() => admin.query("", "select 1")).toThrow(/database must begin/);
+    expect(() => admin.query("analytics/dev", "select 1")).toThrow(/database must begin/);
+    expect(() => admin.query("analytics", "")).toThrow(/sql is required/);
+    await admin.query("analytics-dev", "select 1", {reference: "42", table: "events"});
+
+    expect(await requests[0]?.json()).toEqual({
+      sql: "select 1",
+      at: {reference: "42", table: "events"},
+    });
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ["POST", "/v1/databases/analytics-dev/query"],
+    ]);
   });
 
   it("requires credentials for scheduler and runtime control", () => {

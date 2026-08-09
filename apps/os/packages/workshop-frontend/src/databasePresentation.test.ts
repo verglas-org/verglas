@@ -28,20 +28,20 @@ describe('dynamic database presentation', () => {
   it('only advertises surfaces that the OS can operate for each engine', () => {
     const lakehouse: VerglasDatabaseSummary = {
       ...managedLakehouse,
-      capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true},
+      capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true, query: true},
       tableCount: 2,
       vectorCount: 0,
       graphCount: 1,
     }
     const postgres: VerglasDatabaseSummary = {
       ...managedPostgres,
-      capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false},
+      capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false, query: false},
       tableCount: 0,
       vectorCount: 0,
       graphCount: 0,
     }
 
-    expect(databaseCapabilityLabels(lakehouse)).toEqual(['Catalog', 'Table CRUD', 'Graphs'])
+    expect(databaseCapabilityLabels(lakehouse)).toEqual(['Catalog', 'Table CRUD', 'Graphs', 'SQL'])
     expect(databaseCapabilityLabels(postgres)).toEqual([])
   })
 

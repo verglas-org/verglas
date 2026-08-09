@@ -1,8 +1,8 @@
-//! Dispatches `POST /v1/query` to a standalone `verglas-query` worker,
+//! Dispatches database-scoped SQL to a standalone `verglas-query` worker,
 //! spawned on demand and killed after use, instead of running it embedded.
 //!
 //! Opt-in via `[query_worker]` in config (unset by default). When configured,
-//! this dispatcher is the sole engine for `/v1/query`: a failure to spawn or
+//! this dispatcher is the sole engine for `/v1/databases/{database}/query`: a failure to spawn or
 //! reach the worker is a hard error. When unset, the server serves queries
 //! through the embedded engine over the private upstream catalog — there is no dual
 //! path that retries the other engine.
@@ -50,6 +50,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::Response;
 use futures::StreamExt;
 use tokio::sync::Mutex;
+use verglas_catalog::{CatalogRuntimeRegistry, DatabaseId};
 use verglas_iceberg::TimeTravel;
 
 /// Dispatch counter for unique per-launch ports-file names — this process's
@@ -71,21 +72,66 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 /// standing workers without changing the wire contract.
 pub struct QueryWorkerDispatcher {
     binary: PathBuf,
-    config_path: PathBuf,
+    runtime: QueryWorkerRuntimeConfig,
+    catalogs: CatalogRuntimeRegistry,
     lock: Arc<Mutex<()>>,
 }
 
+/// Static settings used to render one query-worker config per Lakehouse database.
+#[derive(Debug, Clone)]
+pub struct QueryWorkerRuntimeConfig {
+    /// Directory that receives database-specific TOML files.
+    pub config_dir: PathBuf,
+    /// Cache-routed S3 endpoint used for every object read.
+    pub cache_s3_endpoint: String,
+    /// Region passed to the S3 client.
+    pub region: String,
+    /// Restricted credentials file for the cache S3 endpoint.
+    pub credentials_file: PathBuf,
+    /// Admin origin containing `/v1/databases/{database}/catalog`.
+    pub admin_origin: String,
+}
+
+impl QueryWorkerRuntimeConfig {
+    /// Renders the isolated worker configuration for one validated live database.
+    fn render(&self, database: &DatabaseId) -> Result<PathBuf, String> {
+        std::fs::create_dir_all(&self.config_dir)
+            .map_err(|error| format!("create {}: {error}", self.config_dir.display()))?;
+        let config_path = self.config_dir.join(format!("{}.toml", database.as_str()));
+        let rendered = format!(
+            "[listen]\nadmin_port = 0\n\n\
+             [cache]\ns3_endpoint = \"{}\"\nregion = \"{}\"\ncredentials_file = \"{}\"\n\n\
+             [metadata]\nuri = \"{}/v1/databases/{}/catalog\"\n",
+            self.cache_s3_endpoint,
+            self.region,
+            self.credentials_file.display(),
+            self.admin_origin.trim_end_matches('/'),
+            database.as_str(),
+        );
+        std::fs::write(&config_path, rendered)
+            .map_err(|error| format!("write query role config: {error}"))?;
+        Ok(config_path)
+    }
+}
+
 impl QueryWorkerDispatcher {
-    /// `binary` is the `verglas-query` executable; `config_path` is a TOML
-    /// file (rendered once at server startup, see `main.rs`) pointing it at
-    /// this server's cache endpoint and private upstream catalog with the same signing
-    /// keypair the embedded path uses.
-    pub fn new(binary: PathBuf, config_path: PathBuf) -> Self {
+    /// Creates a dispatcher using the live Lakehouse registry as its activation boundary.
+    pub fn new(
+        binary: PathBuf,
+        runtime: QueryWorkerRuntimeConfig,
+        catalogs: CatalogRuntimeRegistry,
+    ) -> Self {
         QueryWorkerDispatcher {
             binary,
-            config_path,
+            runtime,
+            catalogs,
             lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Reports whether a Lakehouse database currently has a live catalog runtime.
+    pub fn has_database(&self, database: &DatabaseId) -> bool {
+        self.catalogs.get(database).is_some()
     }
 
     /// Runs `sql` on a freshly launched query worker and returns a `Response`
@@ -96,13 +142,21 @@ impl QueryWorkerDispatcher {
     /// verbatim.
     pub async fn dispatch(
         &self,
+        database: &DatabaseId,
         sql: &str,
         at: Option<TimeTravel>,
         accept_arrow: bool,
     ) -> Result<Response, String> {
+        if !self.has_database(database) {
+            return Err(format!(
+                "database `{}` has no Lakehouse query runtime",
+                database.as_str()
+            ));
+        }
         // Owned (not borrowed from `self`), so it can move into the streamed
         // response body below and outlive this call.
         let guard = self.lock.clone().lock_owned().await;
+        let config_path = self.runtime.render(database)?;
 
         let dispatch_id = DISPATCH_COUNTER.fetch_add(1, Ordering::Relaxed);
         let ports_file = std::env::temp_dir().join(format!(
@@ -111,7 +165,7 @@ impl QueryWorkerDispatcher {
         ));
         let mut child = tokio::process::Command::new(&self.binary)
             .arg("--config")
-            .arg(&self.config_path)
+            .arg(&config_path)
             .arg("--ports-file")
             .arg(&ports_file)
             .arg("--for-query")
@@ -273,6 +327,54 @@ async fn post_query_streaming(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Per-database configs target the corresponding catalog mount and never a singleton route.
+    #[test]
+    fn runtime_config_is_database_scoped() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let runtime = QueryWorkerRuntimeConfig {
+            config_dir: dir.path().to_owned(),
+            cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+            region: "auto".to_owned(),
+            credentials_file: dir.path().join("credentials"),
+            admin_origin: "http://127.0.0.1:8334".to_owned(),
+        };
+        let database = DatabaseId::new("analytics").expect("database id");
+
+        let path = runtime.render(&database).expect("render config");
+        let config = std::fs::read_to_string(path).expect("read config");
+
+        assert!(config.contains("uri = \"http://127.0.0.1:8334/v1/databases/analytics/catalog\""));
+        assert!(!config.contains("8334/catalog\""));
+    }
+
+    /// A non-Lakehouse database is rejected before attempting to spawn a process.
+    #[tokio::test]
+    async fn dispatch_requires_a_live_database_catalog() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let dispatcher = QueryWorkerDispatcher::new(
+            PathBuf::from("/binary/that/must/not/be/spawned"),
+            QueryWorkerRuntimeConfig {
+                config_dir: dir.path().to_owned(),
+                cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                region: "auto".to_owned(),
+                credentials_file: dir.path().join("credentials"),
+                admin_origin: "http://127.0.0.1:8334".to_owned(),
+            },
+            CatalogRuntimeRegistry::default(),
+        );
+        let database = DatabaseId::new("postgres_only").expect("database id");
+
+        let error = dispatcher
+            .dispatch(&database, "SELECT 1", None, false)
+            .await
+            .expect_err("missing Lakehouse must fail");
+
+        assert_eq!(
+            error,
+            "database `postgres_only` has no Lakehouse query runtime"
+        );
+    }
 
     /// A fixture "worker" that streams a large body over many small, delayed
     /// chunks — enough to force genuinely separate TCP writes rather than

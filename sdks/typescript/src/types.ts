@@ -391,6 +391,14 @@ export interface CreateTableResult {
 /** Result of ensuring an exact table definition. */
 export type EnsureTableResult = "existing" | "created";
 
+/** Optional snapshot or timestamp pin for one table referenced by a SQL query. */
+export interface QueryAt {
+  /** Snapshot ID or RFC 3339 timestamp understood by the query runtime. */
+  reference: string;
+  /** Table whose snapshot is pinned for this query. */
+  table: string;
+}
+
 /** JSON row representation of a SQL query result. */
 export interface QueryResult {
   /** Result column names in order. */

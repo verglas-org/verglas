@@ -61,3 +61,6 @@
 - #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.
 - #84: Wired the cache node's built-in managed lakehouse binding explicitly
   through backend construction, block-device store lookup, and the S3 router.
+- #84: Added the cache-node Docker target and rendered local startup contract used by the three-member OSS fragment ring. The ring exposes one selected embedded safekeeper for managed Neon while retaining erasure-coded WAL durability across all three cache volumes.
+- #84: Passed the cache node's managed backend binding into its embedded
+  safekeeper so completed WAL segments drain to the configured object store.

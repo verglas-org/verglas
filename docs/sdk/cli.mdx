@@ -87,7 +87,7 @@ verglas table compact
 verglas table delete analytics.orders --yes
 verglas table metrics
 
-verglas query 'SELECT count(*) FROM analytics.orders'
+verglas query analytics 'SELECT count(*) FROM analytics.orders'
 ```
 
 The table import commands recognize CSV, Parquet, and JSON Lines from the file extension.

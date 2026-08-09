@@ -356,7 +356,7 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
 
     const url = new URL(req.url ?? "/", "http://localhost");
 
-    if (url.pathname === "/v1/query" && req.method === "POST") {
+    if (/^\/v1\/databases\/[^/]+\/query$/.test(url.pathname) && req.method === "POST") {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {

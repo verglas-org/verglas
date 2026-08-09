@@ -4,6 +4,7 @@
 //! local cache and reading through to the origin bucket on miss. The admin HTTP
 //! API is the private control surface the `verglas` CLI talks to.
 
+mod database_runtime;
 mod environment;
 
 use verglas_server::{VERSION, admin, follow, logging, platform};
@@ -799,35 +800,45 @@ fn internal_connection(
     })
 }
 
-/// Renders a `verglas-query` config (plus a credentials file carrying the same
-/// endpoint keypair) pointing the worker at the server's S3 cache endpoint and
-/// the server's local catalog proxy, and returns the dispatcher that spawns it on
-/// demand — or `None` when `[query_worker]` is unset or the files could not
-/// be rendered. `/v1/query` has no embedded engine; without a dispatcher it
-/// returns service unavailable.
+/// Builds the dispatcher that renders one query-worker config per live Lakehouse.
+/// Every worker reads through the cache and resolves metadata through that
+/// database's catalog mount; no process-global catalog route is available.
 fn build_query_worker_dispatcher(
     config: &verglas_core::config::Config,
     credentials: &(String, String),
     resolved_s3_port: u16,
     resolved_admin_port: u16,
+    catalogs: verglas_catalog::CatalogRuntimeRegistry,
 ) -> Option<Arc<verglas_server::query_worker::QueryWorkerDispatcher>> {
     let query_worker = config.query_worker.as_ref()?;
-    let config_path = match render_query_worker_config(
-        config,
-        credentials,
-        resolved_s3_port,
-        resolved_admin_port,
-    ) {
+    let dir = config.cache.dir.join("query-worker");
+    let credentials_file = match write_role_credentials(&dir, credentials) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("verglas-server {VERSION} cannot configure query worker: {error}");
             return None;
         }
     };
+    let scheme = if config.listen.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     Some(Arc::new(
         verglas_server::query_worker::QueryWorkerDispatcher::new(
             std::path::PathBuf::from(&query_worker.binary),
-            config_path,
+            verglas_server::query_worker::QueryWorkerRuntimeConfig {
+                config_dir: dir.join("databases"),
+                cache_s3_endpoint: format!("{scheme}://127.0.0.1:{resolved_s3_port}"),
+                region: config
+                    .backend
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_owned()),
+                credentials_file,
+                admin_origin: format!("{scheme}://127.0.0.1:{resolved_admin_port}"),
+            },
+            catalogs,
         ),
     ))
 }
@@ -882,40 +893,6 @@ fn write_role_credentials(
             .map_err(|error| format!("restrict role credentials: {error}"))?;
     }
     Ok(credentials_path)
-}
-
-/// Renders `verglas-query` config: cache S3 endpoint + `[metadata]` gateway URI.
-fn render_query_worker_config(
-    config: &verglas_core::config::Config,
-    credentials: &(String, String),
-    resolved_s3_port: u16,
-    resolved_admin_port: u16,
-) -> Result<std::path::PathBuf, String> {
-    let dir = config.cache.dir.join("query-worker");
-    let credentials_path = write_role_credentials(&dir, credentials)?;
-    let scheme = if config.listen.tls.is_some() {
-        "https"
-    } else {
-        "http"
-    };
-    let region = config
-        .backend
-        .region
-        .clone()
-        .unwrap_or_else(|| "us-east-1".to_owned());
-    if config.catalog.is_none() {
-        return Err("execution roles require [catalog]".to_owned());
-    }
-    let rendered = format!(
-        "[listen]\nadmin_port = 0\n\n\
-         [cache]\ns3_endpoint = \"{scheme}://127.0.0.1:{resolved_s3_port}\"\nregion = \"{region}\"\ncredentials_file = \"{credentials}\"\n\n\
-         [metadata]\nuri = \"{scheme}://127.0.0.1:{resolved_admin_port}/catalog\"\n",
-        credentials = credentials_path.display(),
-    );
-    let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, rendered)
-        .map_err(|error| format!("write role config: {error}"))?;
-    Ok(config_path)
 }
 
 /// Renders `verglas-write` config: cache S3 endpoint + full `[catalog]` commit target.
@@ -1061,8 +1038,12 @@ async fn serve_admin(
     listener: tokio::net::TcpListener,
     health: admin::Health,
     slots: admin::Slots,
+    database_catalogs: Option<verglas_catalog::CatalogRuntimeRegistry>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let app = admin::router(VERSION, health, slots);
+    let mut app = admin::router(VERSION, health, slots);
+    if let Some(database_catalogs) = database_catalogs {
+        app = verglas_rest::compose_database_catalogs(app, database_catalogs);
+    }
     let local_addr = listener.local_addr()?;
 
     eprintln!("verglas-server {VERSION} admin API listening on http://{local_addr}");
@@ -1412,6 +1393,7 @@ fn dev_allow_missing_origin() -> bool {
 async fn serve(
     config: &verglas_core::config::Config,
     credentials: (String, String),
+    require_database_runtime: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One backend store shared by the read and write passthroughs: it serves the
     // configured bucket set (`backend.bucket` / `backend.bucket_globs`, #235),
@@ -1585,13 +1567,17 @@ async fn serve(
         .transpose()?;
     let catalog_source = catalog_gateway.as_ref().map(|gateway| gateway.source());
 
-    // The standalone query worker dispatcher (opt-in, `[query_worker]`): a
-    // config file + credentials file rendered once here, pointing the worker
-    // at this server's own just-resolved loopback surface with the same
-    // signing keypair the cache path uses. With no configured worker the
-    // execution route returns 503; there is no embedded-engine fallback.
-    let query_worker_dispatcher =
-        build_query_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
+    let database_catalogs = verglas_catalog::CatalogRuntimeRegistry::default();
+    // The standalone query worker dispatcher renders a database-specific
+    // config at dispatch time and refuses databases absent from this live
+    // Lakehouse registry. No singleton execution route or catalog remains.
+    let query_worker_dispatcher = build_query_worker_dispatcher(
+        config,
+        &credentials,
+        resolved_s3_port,
+        resolved_admin_port,
+        database_catalogs.clone(),
+    );
     let write_worker_dispatcher =
         build_write_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
     let namespace_gateway = match (
@@ -1637,6 +1623,16 @@ async fn serve(
         }
     };
 
+    let database_catalog_synchronizer =
+        database_runtime::DatabaseCatalogSynchronizer::from_environment(
+            database_catalogs.clone(),
+            require_database_runtime,
+        )?;
+    if let Some(synchronizer) = database_catalog_synchronizer {
+        synchronizer.refresh().await?;
+        synchronizer.spawn();
+    }
+
     let admin_fut = serve_admin(
         admin_listener,
         health.clone(),
@@ -1661,6 +1657,7 @@ async fn serve(
             query_worker: query_worker_dispatcher.clone(),
             write_worker: write_worker_dispatcher.clone(),
         },
+        Some(database_catalogs),
     );
 
     // The data plane: build the engine (recovery happens here), then serve S3.
@@ -2443,7 +2440,9 @@ async fn main() {
                 .clone()
                 .map_or_else(|| resolve_auth(config), Ok)
             {
-                Ok(credentials) => serve(config, credentials).await,
+                Ok(credentials) => {
+                    serve(config, credentials, loaded.endpoint_credentials.is_some()).await
+                }
                 Err(e) => {
                     eprintln!("verglas-server: {e}");
                     std::process::exit(1);
@@ -2459,7 +2458,13 @@ async fn main() {
                 if let Ok(addr) = listener.local_addr() {
                     report_port("admin", addr);
                 }
-                serve_admin(listener, admin::Health::ready(), admin::Slots::default()).await
+                serve_admin(
+                    listener,
+                    admin::Health::ready(),
+                    admin::Slots::default(),
+                    None,
+                )
+                .await
             }
             Err(e) => Err(e.into()),
         },

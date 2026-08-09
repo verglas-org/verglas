@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { VerglasCatalogSnapshot } from '@verglas/workshop-shared/api'
-import { databaseAssets, namespaceGroups } from './routes/data'
+import { databaseAssets, namespaceGroups, workspacePromptForCatalogItem } from './routes/data'
 
 const catalog: VerglasCatalogSnapshot = {
   databases: [{
@@ -8,7 +8,7 @@ const catalog: VerglasCatalogSnapshot = {
     name: 'analytics',
     storage: {mode: 'managed'},
     catalog: {mode: 'managed-lakekeeper'},
-    capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true},
+    capabilities: {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true, query: true},
     tableCount: 2,
     vectorCount: 0,
     graphCount: 1,
@@ -16,7 +16,7 @@ const catalog: VerglasCatalogSnapshot = {
     type: 'postgres',
     name: 'operations',
     engine: {mode: 'managed-neon'},
-    capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false},
+    capabilities: {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false, query: false},
     tableCount: 0,
     vectorCount: 0,
     graphCount: 0,
@@ -40,5 +40,13 @@ describe('dynamic database catalog presentation', () => {
       {name: 'events', namespace: ['events'], tables: [expect.objectContaining({name: 'log'})]},
       {name: 'knowledge', namespace: ['knowledge'], tables: [expect.objectContaining({name: 'nodes'})]},
     ])
+  })
+
+  it('carries the selected database and table into a query workspace prompt', () => {
+    const table = catalog.tables[0]
+    expect(workspacePromptForCatalogItem({kind: 'table', id: 'table', value: table}))
+      .toContain('database `analytics`')
+    expect(workspacePromptForCatalogItem({kind: 'table', id: 'table', value: table}))
+      .toContain('`"events"."log"`')
   })
 })

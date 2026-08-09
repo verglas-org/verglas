@@ -649,12 +649,36 @@ pub struct GraphPathsArgs {
 /// JSON (`--json`): {"columns":[...],"rows":[{col:value,...}],"row_count"}.
 #[derive(Debug, Args)]
 pub struct QueryArgs {
+    /// Stable database name that owns the query catalog and runtime.
+    #[arg(value_parser = parse_database_name)]
+    pub database: String,
     /// The SQL to run. Tables are referenced as `namespace.name`.
     pub sql: String,
     /// Time travel: pin a table to a snapshot for this query, as
     /// `--at <snapshot-id|timestamp> <namespace.table>`.
     #[arg(long, num_args = 2, value_names = ["REF", "TABLE"])]
     pub at: Option<Vec<String>>,
+}
+
+/// Parses a database resource name using the API's stable-name grammar.
+fn parse_database_name(value: &str) -> Result<String, String> {
+    let Some((first, remainder)) = value.as_bytes().split_first() else {
+        return Err(database_name_error());
+    };
+    if (first.is_ascii_alphabetic() || *first == b'_')
+        && remainder
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+    {
+        Ok(value.to_owned())
+    } else {
+        Err(database_name_error())
+    }
+}
+
+/// Returns the shared database-name validation message used by Clap.
+fn database_name_error() -> String {
+    "database name must start with a letter or underscore and contain only ASCII letters, digits, underscores, or hyphens".to_owned()
 }
 
 /// Arguments for `verglas drain`: drain the LOCAL server. The CLI takes no

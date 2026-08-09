@@ -39,6 +39,7 @@ Check the accumulated range after the backfill advances:
 
 ```bash
 verglas query \
+  analytics \
   'SELECT min(timestamp), max(timestamp), count(*)
    FROM market.ohlcv
    WHERE symbol = '\''SPY'\'''

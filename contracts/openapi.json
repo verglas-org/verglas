@@ -12,7 +12,7 @@
     }
   ],
   "paths": {
-    "/v1/query": {
+    "/v1/databases/{database}/query": {
       "post": {
         "operationId": "query",
         "tags": [

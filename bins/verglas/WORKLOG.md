@@ -741,3 +741,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #66: Neutralized CLI tests that asserted removed control-plane verbs (#66); renamed catalog_delete token fixture away from cloud-catalog.token.
 - #84: Added local `db create` commands for managed Lakehouse, managed Neon Postgres, customer S3, and external Iceberg REST compositions. Added singular `secret create` with typed URI scopes and secret material accepted only through a hidden terminal prompt or stdin; both commands are thin clients of the local resource APIs and reject ambiguous compositions before sending a request.
 - #84: Routed database and secret commands to `VERGLAS_ACCESS_ENDPOINT` (localhost port 8345 by default), keeping credential and database administration off the cache server's admin API.
+- #84: Updated the runnable Compose contract test for dynamic databases: Lakekeeper, the three-member cache/safekeeper ring, and the container runtime are now mandatory services rather than singleton catalog environment values.
+- #84: Made `verglas query` require its target database and post SQL only to
+  `/v1/databases/{database}/query`. Its existing JSON report output and
+  `--at` snapshot or timestamp selection are unchanged.

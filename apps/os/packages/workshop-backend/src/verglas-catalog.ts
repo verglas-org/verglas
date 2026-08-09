@@ -78,10 +78,9 @@ export class VerglasCatalogClient {
 
   /** Lists active workers, optionally enriched with recent run dots. */
   async listWorkers(opts?: { withRuns?: boolean }): Promise<VerglasWorkerSummary[]> {
-    const admin = verglasAdmin(this.#env, this.#fetch);
-    const rows = await admin.listWorkers("active");
-    if (!opts?.withRuns) return rows.map((row) => mapWorker(row));
     const scheduler = verglasScheduler(this.#env, this.#fetch);
+    const rows = await scheduler.listWorkers("active");
+    if (!opts?.withRuns) return rows.map((row) => mapWorker(row));
     return await Promise.all(rows.map(async (row) => {
       try {
         const jobs = await scheduler.listWorkerJobs(row.name, 12);
@@ -94,11 +93,11 @@ export class VerglasCatalogClient {
 
   /** Full worker detail for the Jobs page. */
   async getWorker(name: string): Promise<VerglasWorkerDetail> {
-    const admin = verglasAdmin(this.#env, this.#fetch);
-    const row = await admin.getWorker(name);
+    const scheduler = verglasScheduler(this.#env, this.#fetch);
+    const row = await scheduler.getWorker(name);
     let recentRuns: VerglasWorkerRunSummary[] | undefined;
     try {
-      recentRuns = (await verglasScheduler(this.#env, this.#fetch).listWorkerJobs(name, 20)).map(mapRun);
+      recentRuns = (await scheduler.listWorkerJobs(name, 20)).map(mapRun);
     } catch {
       // Scheduler may be briefly unavailable; detail still useful.
     }
@@ -114,12 +113,12 @@ export class VerglasCatalogClient {
   }
 
   async runWorker(name: string, idempotencyKey: string): Promise<{jobId: string, created: boolean}> {
-    const result = await verglasAdmin(this.#env, this.#fetch).runWorker(name, idempotencyKey);
+    const result = await verglasScheduler(this.#env, this.#fetch).runWorker(name, idempotencyKey);
     return {jobId: result.job_id, created: result.created};
   }
 
   async setWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void> {
-    await verglasAdmin(this.#env, this.#fetch).setWorkerState(name, state);
+    await verglasScheduler(this.#env, this.#fetch).setWorkerState(name, state);
   }
 
   async listTables(): Promise<VerglasTableSummary[]> {
@@ -212,7 +211,7 @@ export class VerglasCatalogClient {
 
   /** Creates one explicitly-schemaed Iceberg table. */
   async createTable(input: VerglasCreateTableInput): Promise<VerglasTableSummary> {
-    const database = await this.#requireLakehouse(input.database);
+    const database = await this.#requireLakehouse(input.database, "Iceberg table management");
     const namespace = validateNamespace(input.namespace);
     const name = validateIdentifier(input.name, "Table name");
     if (!input.columns.length) throw new Error("A table requires at least one column.");
@@ -229,7 +228,7 @@ export class VerglasCatalogClient {
 
   /** Deletes one Iceberg table. */
   async deleteTable(databaseName: string, namespace: string[], name: string): Promise<void> {
-    const database = await this.#requireLakehouse(databaseName);
+    const database = await this.#requireLakehouse(databaseName, "Iceberg table management");
     const validatedNamespace = validateNamespace(namespace);
     const validatedName = validateIdentifier(name, "Table name");
     const admin = verglasAdmin(this.#env, this.#fetch);
@@ -240,20 +239,24 @@ export class VerglasCatalogClient {
   }
 
   /** Requires an existing Lakehouse before issuing catalog mutations. */
-  async #requireLakehouse(name: string): Promise<Extract<VerglasDatabaseDefinition, {type: "lakehouse"}>> {
+  async #requireLakehouse(
+    name: string,
+    operation: "Iceberg table management" | "SQL query execution",
+  ): Promise<Extract<VerglasDatabaseDefinition, {type: "lakehouse"}>> {
     const database = await this.#getDatabaseDefinition(name);
     if (database.type !== "lakehouse") {
-      throw new Error(`Postgres database '${database.name}' does not expose Iceberg table management.`);
+      throw new Error(`Postgres database '${database.name}' does not expose ${operation}.`);
     }
     return database;
   }
 
-  async query(sql: string, maxRows = 100): Promise<VerglasQueryResult> {
+  async query(databaseName: string, sql: string, maxRows = 100): Promise<VerglasQueryResult> {
+    const database = await this.#requireLakehouse(databaseName, "SQL query execution");
     const normalizedSql = sql.trim().replace(/;+\s*$/, "");
     if (!normalizedSql) throw new Error("SQL query is required.");
     const boundedRows = Math.min(Math.max(Math.trunc(maxRows), 1), 500);
     const boundedSql = `SELECT * FROM (${normalizedSql}) AS __verglas_query LIMIT ${boundedRows + 1}`;
-    const result = await verglasAdmin(this.#env, this.#fetch).query(boundedSql);
+    const result = await verglasAdmin(this.#env, this.#fetch).query(database.name, boundedSql);
     const truncated = result.rows.length > boundedRows;
     const rows = result.rows.slice(0, boundedRows);
     return {columns: result.columns, rows, rowCount: rows.length, truncated};
@@ -447,9 +450,9 @@ function summarizeDatabase(
 
 function databaseCapabilities(type: VerglasDatabaseDefinition["type"]): VerglasDatabaseCapabilities {
   if (type === "lakehouse") {
-    return {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true};
+    return {catalog: true, tableCrud: true, tableMetrics: false, vectors: false, graphs: true, query: true};
   }
-  return {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false};
+  return {catalog: false, tableCrud: false, tableMetrics: false, vectors: false, graphs: false, query: false};
 }
 
 function inferGraphs(tables: VerglasTableSummary[]): VerglasGraphSummary[] {

@@ -618,3 +618,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #84: Wired the server's built-in managed lakehouse binding explicitly through
   backend construction, S3 routing, table mapping, warming, and lifecycle
   coordination; server integration fixtures now declare the same binding.
+- #84: Replaced the OSS environment-mode singleton catalog with an access-service inventory synchronizer and database-scoped Lakekeeper gateway routes. Runtime snapshots refresh atomically and fail closed on unresolved external-catalog bindings.
+- #84: Bound the on-demand query worker to the live database registry and render one metadata config per Lakehouse. The server exposes no singleton SQL route or catalog fallback.

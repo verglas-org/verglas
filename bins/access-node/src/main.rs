@@ -1,8 +1,8 @@
-//! Mandatory standalone authorization service for one Verglas tenant stack.
+//! Mandatory access and database-control service for one Verglas tenant stack.
 //!
-//! The process owns no scheduler state. It persists canonical authorization
-//! objects in `verglas_permissions`, evaluates relations through OpenFGA, and
-//! fails startup when either dependency is unavailable.
+//! The process owns no scheduler state. It persists authorization and database
+//! declarations in `verglas_permissions`, evaluates relations through OpenFGA,
+//! and reconciles the tenant's managed Lakekeeper and Neon resources.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -25,6 +25,10 @@ use verglas_database::{
     DatabaseService, PostgresDatabaseRepository, ScopedSecretKind, ScopedSecretResolver,
     SecretResolutionError,
 };
+
+mod database_runtime;
+mod lakehouse_runtime;
+mod postgres_runtime;
 
 /// Database binding resolver backed by the authorization-owned secret service.
 struct AccessSecretResolver {
@@ -108,6 +112,66 @@ struct Args {
     /// Hex-encoded 256-bit key used only to encrypt tenant secret values.
     #[arg(long, env = "VERGLAS_SECRET_ENCRYPTION_KEY", hide_env_values = true)]
     secret_encryption_key: String,
+    /// Private tenant Lakekeeper management endpoint.
+    #[arg(long, env = "VERGLAS_MANAGED_CATALOG_URI")]
+    managed_catalog_uri: String,
+    /// Managed object-store bucket used by Lakekeeper warehouses.
+    #[arg(long, env = "VERGLAS_MANAGED_STORAGE_BUCKET")]
+    managed_storage_bucket: String,
+    /// Tenant prefix placed before each managed database warehouse.
+    #[arg(long, env = "VERGLAS_MANAGED_STORAGE_PREFIX")]
+    managed_storage_prefix: String,
+    /// Private S3-compatible endpoint used by Lakekeeper.
+    #[arg(long, env = "VERGLAS_MANAGED_STORAGE_ENDPOINT")]
+    managed_storage_endpoint: String,
+    /// Managed object-store region or `auto` for R2.
+    #[arg(long, env = "VERGLAS_MANAGED_STORAGE_REGION")]
+    managed_storage_region: String,
+    /// Managed object-store access key retained by the access service.
+    #[arg(long, env = "VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID")]
+    managed_storage_access_key_id: String,
+    /// Managed object-store secret retained by the access service.
+    #[arg(
+        long,
+        env = "VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY",
+        hide_env_values = true
+    )]
+    managed_storage_secret_access_key: String,
+    /// Authenticated local desired-container API used for managed Neon.
+    #[arg(long, env = "VERGLAS_CONTAINER_RUNTIME_URL")]
+    container_runtime_url: String,
+    /// Bearer credential accepted by the local desired-container API.
+    #[arg(long, env = "VERGLAS_CONTAINER_RUNTIME_TOKEN", hide_env_values = true)]
+    container_runtime_token: String,
+    /// Selected cache-ring safekeeper address used by managed Neon compute.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS")]
+    managed_postgres_safekeepers: String,
+    /// Hex-encoded 256-bit key deriving restart-stable managed Postgres credentials.
+    #[arg(
+        long,
+        env = "VERGLAS_MANAGED_POSTGRES_CREDENTIAL_KEY",
+        hide_env_values = true
+    )]
+    managed_postgres_credential_key: String,
+    /// Cache-routed S3 endpoint used by managed Neon pageservers.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT")]
+    managed_postgres_storage_endpoint: String,
+    /// Cache-routed durable bucket used by managed Neon pageservers.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_STORAGE_BUCKET")]
+    managed_postgres_storage_bucket: String,
+    /// Region signed by managed Neon pageservers through the cache endpoint.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_STORAGE_REGION")]
+    managed_postgres_storage_region: String,
+    /// Cache endpoint access key used by managed Neon pageservers.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_STORAGE_ACCESS_KEY_ID")]
+    managed_postgres_storage_access_key_id: String,
+    /// Cache endpoint secret used by managed Neon pageservers.
+    #[arg(
+        long,
+        env = "VERGLAS_MANAGED_POSTGRES_STORAGE_SECRET_ACCESS_KEY",
+        hide_env_values = true
+    )]
+    managed_postgres_storage_secret_access_key: String,
     /// Address serving health and authorization routes.
     #[arg(long, env = "VERGLAS_ACCESS_LISTEN", default_value = "0.0.0.0:8345")]
     listen: SocketAddr,
@@ -173,6 +237,44 @@ async fn run(args: Args) -> Result<(), String> {
             principal_id: Arc::from(args.service_principal.clone()),
         },
     ));
+    let lakehouse = lakehouse_runtime::LakekeeperProvisioner::new(
+        &args.managed_catalog_uri,
+        &args.managed_storage_bucket,
+        &args.managed_storage_prefix,
+        &args.managed_storage_endpoint,
+        &args.managed_storage_region,
+        &args.managed_storage_access_key_id,
+        &args.managed_storage_secret_access_key,
+    )
+    .map_err(|error| error.to_string())?;
+    let postgres_credential_key =
+        hex::decode(&args.managed_postgres_credential_key).map_err(|_| {
+            "VERGLAS_MANAGED_POSTGRES_CREDENTIAL_KEY must be 64 hexadecimal characters".to_owned()
+        })?;
+    let postgres = postgres_runtime::ManagedPostgresProvisioner::new(
+        postgres_runtime::ManagedPostgresConfig {
+            runtime_endpoint: args.container_runtime_url.clone(),
+            runtime_token: args.container_runtime_token.clone(),
+            tenant_id: args.tenant_id.clone(),
+            remote_endpoint: args.managed_postgres_storage_endpoint.clone(),
+            remote_bucket: args.managed_postgres_storage_bucket.clone(),
+            remote_region: args.managed_postgres_storage_region.clone(),
+            remote_access_key_id: args.managed_postgres_storage_access_key_id.clone(),
+            remote_secret_access_key: args.managed_postgres_storage_secret_access_key.clone(),
+            safekeepers: args.managed_postgres_safekeepers.clone(),
+            credential_key: postgres_credential_key,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let database_service = Arc::new(database_runtime::ProvisioningDatabaseManager::new(
+        database_service,
+        lakehouse,
+        postgres,
+    ));
+    database_service
+        .recover(&args.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
     let token: Arc<str> = Arc::from(args.service_token);
     let protected = Router::new()
         .merge(verglas_rest::access::router_with_secrets(

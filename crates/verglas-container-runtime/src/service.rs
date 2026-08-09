@@ -106,6 +106,7 @@ impl IntoResponse for ServiceError {
             | ServiceError::Runtime(
                 RuntimeError::InvalidDeploymentId { .. }
                 | RuntimeError::MissingImage
+                | RuntimeError::InvalidPlatform
                 | RuntimeError::InvalidNetwork
                 | RuntimeError::InvalidPort
                 | RuntimeError::InvalidHealthPath

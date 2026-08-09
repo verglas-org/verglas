@@ -150,9 +150,13 @@ fn mock_server(state: MockState) -> Router {
             ),
         )
         .route(
-            "/v1/query",
+            "/v1/databases/analytics/query",
             post(|Json(body): Json<Value>| async move {
                 assert_eq!(body["sql"], "SELECT 1 AS n");
+                assert_eq!(
+                    body["at"],
+                    json!({"reference": "42", "table": "sales.orders"})
+                );
                 Json(json!({
                     "columns": ["n"],
                     "rows": [{"n": 1}],
@@ -358,12 +362,34 @@ fn metadata_uses_catalog_and_execution_uses_server() {
     let v: Value = serde_json::from_str(&stdout).expect("append json");
     assert_eq!(v["operation"], "append");
 
-    // Query posts the SQL.
-    let (status, stdout, stderr) = run_cli(&endpoint, &["--json", "query", "SELECT 1 AS n"]);
+    // Query posts the SQL and optional time-travel selection to its database.
+    let (status, stdout, stderr) = run_cli(
+        &endpoint,
+        &[
+            "--json",
+            "query",
+            "analytics",
+            "SELECT 1 AS n",
+            "--at",
+            "42",
+            "sales.orders",
+        ],
+    );
     assert!(status.success(), "query failed: {stderr}");
     let v: Value = serde_json::from_str(&stdout).expect("query json");
     assert_eq!(v["row_count"], 1);
     assert_eq!(v["rows"][0]["n"], 1);
+}
+
+/// The CLI rejects names that cannot address a declared database before sending SQL.
+#[test]
+fn query_rejects_invalid_database_name() {
+    let (status, _, stderr) = run_cli("http://127.0.0.1:9", &["query", "9analytics", "SELECT 1"]);
+    assert!(!status.success(), "invalid database name must fail");
+    assert!(
+        stderr.contains("database name must start with a letter or underscore"),
+        "query reports the resource-name grammar: {stderr}"
+    );
 }
 
 /// The registry verbs speak the server registry routes: register posts the
@@ -511,7 +537,7 @@ fn server_down_is_a_clear_error_with_no_fallback() {
     let endpoint = "http://127.0.0.1:9";
     for args in [
         vec!["table", "compact"],
-        vec!["query", "SELECT 1"],
+        vec!["query", "analytics", "SELECT 1"],
         vec!["graph", "show", "kg"],
         vec!["graph", "neighbors", "kg", "a"],
     ] {

@@ -42,14 +42,12 @@ with R2 enabled.
     ```
   </Step>
 
-  <Step title="Create a read-write R2 token">
+  <Step title="Create read-write R2 credentials">
     In **R2 → Overview → Manage API Tokens**, create an **Admin Read & Write**
-    token scoped to the bucket. That permission covers both R2 objects and R2
-    Data Catalog writes. See Cloudflare's [R2 authentication guide](https://developers.cloudflare.com/r2/api/tokens/).
+    token scoped to the bucket. See Cloudflare's [R2 authentication guide](https://developers.cloudflare.com/r2/api/tokens/).
 
-    Record all three values shown once at creation:
+    Record both S3 values shown once at creation:
 
-    - Token value, used as the Iceberg REST bearer token.
     - Access Key ID, used for S3 requests.
     - Secret Access Key, used for S3 requests.
 
@@ -77,10 +75,6 @@ with R2 enabled.
     export R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
     export R2_ACCESS_KEY_ID=YOUR_R2_ACCESS_KEY_ID
     export R2_SECRET_ACCESS_KEY=YOUR_R2_SECRET_ACCESS_KEY
-    export R2_CATALOG_URI=https://catalog.cloudflarestorage.com/ACCOUNT_ID/verglas-demo
-    export R2_CATALOG_WAREHOUSE=ACCOUNT_ID_verglas-demo
-    export R2_CATALOG_TOKEN=YOUR_R2_TOKEN_VALUE
-
     export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
     export VERGLAS_S3_SECRET_ACCESS_KEY=$(openssl rand -hex 32)
     export VERGLAS_SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)
@@ -92,9 +86,10 @@ with R2 enabled.
 
   <Step title="Review the Compose bootstrap">
     The repository's `docker-compose.yml` is the source of truth for the
-    complete OSS stack. It starts the data server, the scheduler and its
-    Postgres queue, the trusted container-runtime manager, and Verglas OS. No
-    profile or additional `verglas` command is required.
+    complete OSS stack. It starts the data server, tenant Lakekeeper, the
+    three-member cache and WAL ring, the scheduler and its Postgres queue, the
+    trusted container-runtime manager, and Verglas OS. No profile or additional
+    `verglas` command is required.
 
     Only the runtime manager receives the Docker socket. It owns dynamically
     generated Vessels and other optional containers on the fixed

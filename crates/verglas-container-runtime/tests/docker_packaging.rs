@@ -67,6 +67,11 @@ fn compose_bootstraps_the_complete_oss_stack() {
             "verglas-postgres-init:",
             "verglas-openfga-migrate:",
             "verglas-openfga:",
+            "verglas-lakekeeper-migrate:",
+            "verglas-lakekeeper:",
+            "verglas-cache-node-0:",
+            "verglas-cache-node-1:",
+            "verglas-cache-node-2:",
             "verglas-container-runtime:",
             "verglas-agent-runtime:",
             "verglas-os:",
@@ -83,5 +88,6 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(compose.contains("target: verglas-os"));
     assert!(compose.contains("target: verglas-agent-runtime"));
     assert!(compose.contains("VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390"));
+    assert!(compose.contains("VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454"));
     assert!(compose.contains("127.0.0.1:8787:8787"));
 }

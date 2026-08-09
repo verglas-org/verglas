@@ -5,8 +5,7 @@
 use std::collections::HashMap;
 
 use verglas_core::config::{
-    Analytics, Backend, ByteSize, Cache, Catalog, Config, Listen, Log, QueryWorker, Rill,
-    WriteWorker,
+    Backend, ByteSize, Cache, Config, Listen, Log, QueryWorker, WriteWorker,
 };
 
 /// A validated server configuration plus the S3 credentials accepted from
@@ -65,18 +64,6 @@ impl EnvironmentConfig {
             ..Backend::default()
         };
 
-        let catalog = Catalog {
-            uri: required("VERGLAS_CATALOG_URI")?,
-            poll_interval_secs: 30,
-            include: Vec::new(),
-            exclude: Vec::new(),
-            credentials_file: None,
-            credentials_profile: None,
-            bearer_token: Some(required("VERGLAS_CATALOG_BEARER_TOKEN")?),
-            sigv4_region: None,
-            sigv4_signing_name: None,
-            warehouse: Some(required("VERGLAS_CATALOG_WAREHOUSE")?),
-        };
         let query_worker = QueryWorker {
             binary: required("VERGLAS_QUERY_WORKER_BINARY")?,
         };
@@ -87,39 +74,16 @@ impl EnvironmentConfig {
             required("VERGLAS_S3_ACCESS_KEY_ID")?,
             required("VERGLAS_S3_SECRET_ACCESS_KEY")?,
         );
-        let rill_names = [
-            "VERGLAS_RILL_URI",
-            "VERGLAS_RILL_INSTANCE_ID",
-            "VERGLAS_RILL_BROWSER_URI",
-            "VERGLAS_RILL_S3_URI",
-        ];
-        let rill_configured = rill_names.iter().any(|name| {
-            values
-                .get(*name)
-                .is_some_and(|value| !value.trim().is_empty())
-        });
-        let analytics = rill_configured
-            .then(|| -> Result<Analytics, String> {
-                Ok(Analytics {
-                    rill: Rill {
-                        uri: required("VERGLAS_RILL_URI")?,
-                        instance_id: required("VERGLAS_RILL_INSTANCE_ID")?,
-                        browser_uri: required("VERGLAS_RILL_BROWSER_URI")?,
-                        s3_uri: required("VERGLAS_RILL_S3_URI")?,
-                    },
-                })
-            })
-            .transpose()?;
         let config = Config {
             listen: Listen::default(),
             log: Log::default(),
             cache,
             backend,
             auth: None,
-            catalog: Some(catalog),
+            catalog: None,
             query_worker: Some(query_worker),
             write_worker: Some(write_worker),
-            analytics,
+            analytics: None,
             cluster: None,
         };
         config
@@ -177,17 +141,10 @@ mod tests {
                 "https://account.r2.cloudflarestorage.com",
             ),
             ("VERGLAS_BACKEND_REGION", "auto"),
-            ("VERGLAS_CATALOG_URI", "https://catalog.example.com"),
-            ("VERGLAS_CATALOG_WAREHOUSE", "account_lake"),
-            ("VERGLAS_CATALOG_BEARER_TOKEN", "catalog-token"),
             ("VERGLAS_S3_ACCESS_KEY_ID", "verglas-local"),
             ("VERGLAS_S3_SECRET_ACCESS_KEY", "endpoint-secret"),
             ("VERGLAS_QUERY_WORKER_BINARY", "/usr/bin/true"),
             ("VERGLAS_WRITE_WORKER_BINARY", "/usr/bin/true"),
-            ("VERGLAS_RILL_URI", "http://rill:9009"),
-            ("VERGLAS_RILL_INSTANCE_ID", "default"),
-            ("VERGLAS_RILL_BROWSER_URI", "http://127.0.0.1:9009"),
-            ("VERGLAS_RILL_S3_URI", "http://verglas-server:8333"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
@@ -201,42 +158,17 @@ mod tests {
         assert_eq!(loaded.config.backend.bucket.as_deref(), Some("lake"));
         assert_eq!(loaded.config.cache.capacity_bytes.0, 64 * 1024 * 1024);
         assert_eq!(loaded.endpoint_credentials.0, "verglas-local");
-        let catalog = loaded.config.catalog.expect("catalog");
-        assert_eq!(catalog.warehouse.as_deref(), Some("account_lake"));
-        assert_eq!(catalog.bearer_token.as_deref(), Some("catalog-token"));
-        let analytics = loaded.config.analytics.expect("analytics");
-        assert_eq!(analytics.rill.uri, "http://rill:9009");
-    }
-
-    #[test]
-    fn missing_required_value_names_the_compose_variable() {
-        let environment = complete_environment()
-            .into_iter()
-            .filter(|(name, _)| name != "VERGLAS_CATALOG_URI");
-        let error = EnvironmentConfig::from_pairs(environment)
-            .err()
-            .expect("missing catalog must fail");
-        assert!(error.contains("VERGLAS_CATALOG_URI"), "{error}");
-    }
-
-    #[test]
-    fn environment_mode_does_not_require_rill() {
-        let environment = complete_environment()
-            .into_iter()
-            .filter(|(name, _)| !name.starts_with("VERGLAS_RILL_"));
-        let loaded = EnvironmentConfig::from_pairs(environment)
-            .expect("Rill is an optional analytics attachment");
+        assert!(loaded.config.catalog.is_none());
         assert!(loaded.config.analytics.is_none());
     }
 
     #[test]
-    fn partial_rill_environment_fails_closed() {
+    fn singleton_catalog_values_are_not_required() {
         let environment = complete_environment()
             .into_iter()
-            .filter(|(name, _)| name != "VERGLAS_RILL_S3_URI");
-        let error = EnvironmentConfig::from_pairs(environment)
-            .err()
-            .expect("partial Rill configuration must fail");
-        assert!(error.contains("VERGLAS_RILL_S3_URI"), "{error}");
+            .filter(|(name, _)| !name.starts_with("VERGLAS_CATALOG_"));
+        let loaded = EnvironmentConfig::from_pairs(environment)
+            .expect("database-scoped catalogs replace singleton catalog configuration");
+        assert!(loaded.config.catalog.is_none());
     }
 }

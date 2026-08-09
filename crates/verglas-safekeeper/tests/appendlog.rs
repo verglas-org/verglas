@@ -361,7 +361,7 @@ fn build(
     geometry: AppendGeometry,
 ) -> EcAppendLog<MemStore> {
     EcAppendLog::open(
-        0, store, "wal-bkt", "wal", transport, membership, dir, geometry,
+        0, "default", store, "wal-bkt", "wal", transport, membership, dir, geometry,
     )
     .expect("open append log")
 }
@@ -916,6 +916,7 @@ async fn independent_safekeepers_publish_disjoint_recovery_state() {
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
     let first = EcAppendLog::open(
         1,
+        "default",
         store.clone(),
         "wal-bkt",
         "wal",
@@ -927,6 +928,7 @@ async fn independent_safekeepers_publish_disjoint_recovery_state() {
     .expect("open first safekeeper");
     let second = EcAppendLog::open(
         2,
+        "default",
         store,
         "wal-bkt",
         "wal",
@@ -1137,6 +1139,7 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
     let server = SafekeeperServer::new(
         41,
         store.clone(),
+        "default",
         "wal-bkt",
         "neon",
         transport.clone(),

@@ -11,10 +11,9 @@
 //!   scheduler service.
 //! - [`logging`]: the process-global tracing subscriber and its reloadable
 //!   level filter.
-//! - [`query_worker`]: dispatches `POST /v1/query` to a standalone
-//!   `verglas-query` worker when `[query_worker]` is configured. Opt-in; when
-//!   configured it is the sole query engine (no embedded fallback on
-//!   dispatch failure). When unset, `/v1/query` stays on the embedded engine.
+//! - [`query_worker`]: dispatches `POST /v1/databases/{database}/query` to a
+//!   standalone `verglas-query` worker with that database's catalog config.
+//!   There is no singleton or embedded query fallback.
 
 pub use verglas_rest::{admin, follow, logging, platform, query_worker, write_worker};
 

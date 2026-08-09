@@ -39,3 +39,6 @@
 
 - #66: Documented Neon broker advertise reachability as Postgres compute over the tenant network rather than a microVM.
 - #84: Updated safekeeper cache identities to include the mandatory storage binding. Durable write tracking no longer aliases equal bucket and key names from different origins.
+- #84: Matched the published Verglas Neon walproposer's 8 MiB append contract and
+  made the durable storage binding an explicit safekeeper input. Large startup WAL
+  batches are accepted and WAL drains target the cache node's actual backend.

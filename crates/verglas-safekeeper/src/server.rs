@@ -88,6 +88,8 @@ pub struct SafekeeperServer<S> {
     node_id: u64,
     /// Origin store used after WAL segments drain from EC fragments.
     origin: Arc<S>,
+    /// Backend binding used for durable WAL objects.
+    storage_binding_id: String,
     /// Origin bucket containing WAL objects.
     bucket: String,
     /// Tenant-scoped prefix before tenant/timeline ids.
@@ -117,6 +119,7 @@ where
     pub fn new(
         node_id: u64,
         origin: Arc<S>,
+        storage_binding_id: impl Into<String>,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         transport: Arc<dyn FragmentTransport>,
@@ -127,6 +130,7 @@ where
         Arc::new(Self {
             node_id,
             origin,
+            storage_binding_id: storage_binding_id.into(),
             bucket: bucket.into(),
             prefix: prefix.into(),
             transport,
@@ -239,6 +243,7 @@ where
         );
         let log = Arc::new(EcAppendLog::open(
             self.node_id,
+            self.storage_binding_id.clone(),
             Arc::clone(&self.origin),
             self.bucket.clone(),
             prefix,

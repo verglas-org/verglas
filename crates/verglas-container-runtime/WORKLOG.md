@@ -31,3 +31,9 @@
 - #75: Documented the default OSS Compose topology now that it starts the scheduler and its durable Postgres queue alongside the runtime manager. Dynamically added Vessels and database components remain owned by the runtime API.
 
 - #52: Added persisted Vessel stop intent and authenticated stop/resume routes. Reconciliation now leaves an operator-stopped Application or Integration Vessel down across manager restarts and composition updates, while the existing desired-state file shape remains readable.
+- #84: Added an explicit OCI platform to persistent container declarations and forwarded it through image pulls and container creation. Published amd64-only Neon images can now run under Docker Desktop emulation on arm64 hosts without an implicit architecture fallback.
+- #84: Updated the complete-stack packaging contract to require Lakekeeper and the three cache-ring members used by managed Neon. The trusted container runtime remains the only service with the Docker socket and starts database-local Neon components on the shared private network.
+- #84: Added a Compose health gate for the runtime manager so access-node startup recovery cannot race the manager's own desired-state recovery.
+- #84: Reuse an already-present cross-architecture image before attempting a registry pull, while
+  still applying the declared platform to pulls and container creation. This lets locally
+  authenticated pulls of the published Neon images be consumed by the socket-backed runtime.

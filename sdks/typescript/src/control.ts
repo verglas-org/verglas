@@ -1,7 +1,8 @@
 // Typed clients for the Verglas access, admin, scheduler, and local container-runtime APIs.
 // Product control planes use these clients instead of duplicating HTTP route logic.
 
-import { makeTransport, type Transport } from "./http";
+import { databasePathSegment, makeTransport, type Transport } from "./http";
+import type {QueryAt} from "./types";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 
@@ -110,51 +111,21 @@ export function extractWorkerSource(configJson: string): string | undefined {
   }
 }
 
-/** Client for worker registration and data queries on the admin listener. */
+/** Client for database-scoped data queries and catalog routes on the admin listener. */
 export class VerglasAdminClient {
   /** Binds this client to one validated transport. */
   constructor(private readonly transport: Transport) {}
 
-  /** Lists current workers or every retained worker revision. */
-  listWorkers(view: "active" | "all" = "active"): Promise<WorkerRow[]> {
-    return this.transport.request<WorkerRow[]>("GET", "/v1/workers", { query: { view } });
-  }
-
-  /** Returns the active revision for one worker. */
-  getWorker(name: string): Promise<WorkerRow> {
-    return this.transport.request<WorkerRow>("GET", `/v1/workers/${encodeURIComponent(name)}`);
-  }
-
-  /** Registers a new immutable worker revision. */
-  registerWorker(spec: WorkerSpec): Promise<void> {
-    return this.transport.request<void>("POST", "/v1/workers", { body: spec });
-  }
-
-  /** Changes whether the scheduler may run a worker. */
-  setWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<WorkerRow> {
-    return this.transport.request<WorkerRow>(
-      "PUT",
-      `/v1/workers/${encodeURIComponent(name)}/state`,
-      { body: { state } },
-    );
-  }
-
-  /** Enqueues an immediate run with caller-provided idempotency. */
-  runWorker(name: string, idempotencyKey: string): Promise<{ job_id: string; created: boolean }> {
-    return this.transport.request<{ job_id: string; created: boolean }>(
-      "POST",
-      `/v1/workers/${encodeURIComponent(name)}/run`,
-      { headers: { "idempotency-key": idempotencyKey } },
-    );
-  }
-
-  /** Executes a SQL statement through the bounded JSON query route. */
-  query(sql: string): Promise<{
+  /** Executes a SQL statement against one tenant database through the bounded JSON query route. */
+  query(database: string, sql: string, at?: QueryAt): Promise<{
     columns: string[];
     rows: Record<string, unknown>[];
     row_count: number;
   }> {
-    return this.transport.request("POST", "/v1/query", { body: { sql } });
+    if (!sql) throw new Error("query: sql is required");
+    return this.transport.request("POST", `/v1/databases/${databasePathSegment(database)}/query`, {
+      body: {sql, ...(at === undefined ? {} : {at})},
+    });
   }
 
   /** Performs a typed JSON GET for catalog routes without a dedicated method. */
@@ -215,6 +186,39 @@ export class VerglasAccessClient {
 export class VerglasSchedulerClient {
   /** Binds this client to one validated transport. */
   constructor(private readonly transport: Transport) {}
+
+  /** Lists current workers or every retained worker revision. */
+  listWorkers(view: "active" | "all" = "active"): Promise<WorkerRow[]> {
+    return this.transport.request<WorkerRow[]>("GET", "/v1/workers", { query: {view} });
+  }
+
+  /** Returns the current revision for one worker. */
+  getWorker(name: string): Promise<WorkerRow> {
+    return this.transport.request<WorkerRow>("GET", `/v1/workers/${encodeURIComponent(name)}`);
+  }
+
+  /** Registers a new immutable worker revision. */
+  registerWorker(spec: WorkerSpec): Promise<WorkerRow> {
+    return this.transport.request<WorkerRow>("POST", "/v1/workers", {body: spec});
+  }
+
+  /** Changes whether the scheduler may run a worker. */
+  setWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<WorkerRow> {
+    return this.transport.request<WorkerRow>(
+      "PUT",
+      `/v1/workers/${encodeURIComponent(name)}/state`,
+      {body: {state}},
+    );
+  }
+
+  /** Enqueues an immediate run with caller-provided idempotency. */
+  runWorker(name: string, idempotencyKey: string): Promise<{job_id: string; created: boolean}> {
+    return this.transport.request<{job_id: string; created: boolean}>(
+      "POST",
+      `/v1/workers/${encodeURIComponent(name)}/run`,
+      {headers: {"idempotency-key": idempotencyKey}},
+    );
+  }
 
   /** Lists secret names without exposing secret values. */
   listSecretNames(): Promise<string[]> {
@@ -347,7 +351,7 @@ export class VerglasRuntimeClient {
   }
 }
 
-/** Connects to the worker registry and data-query listener. */
+/** Connects to the database-scoped data-query and catalog listener. */
 export function connectAdmin(options: ControlConnectOptions): VerglasAdminClient {
   return new VerglasAdminClient(transport(options));
 }

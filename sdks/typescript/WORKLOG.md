@@ -1,5 +1,10 @@
 # Worklog
 
+- feat: Moved worker list/get/register/state/run methods from the data-server admin client to the
+  scheduler control client, matching the scheduler-owned Postgres registry and authenticated
+  execution control plane.
+
+- Database queries now require an explicit database name and use `POST /v1/databases/{database}/query`; the TypeScript SDK and admin control client both validate and URL-encode that scope.
 - #81: Added typed JSON POST and DELETE helpers to the official admin control client so
   catalog-backed management surfaces can mutate Iceberg namespaces and tables without
   reimplementing authenticated HTTP transport.
@@ -18,3 +23,4 @@
 
 - #52: Added typed runtime Vessel stop and resume controls. The SDK calls the runtime manager's persisted lifecycle routes instead of exposing generic Docker operations to product UIs.
 - #84: Added a typed access-service client with create, list, get, and delete methods for dynamic tenant databases. The public database union matches the managed and scoped create declarations and omits internal tenant and secret resource identifiers.
+- #84: Required every SDK SQL query to name its tenant database and routed it through `/v1/databases/{database}/query`. The typed client and control client also pass the optional table time-travel pin without retaining the removed singleton query route.

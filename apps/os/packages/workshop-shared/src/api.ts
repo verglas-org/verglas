@@ -1289,6 +1289,8 @@ export type VerglasDatabaseCapabilities = {
   vectors: boolean;
   /** Whether graph spaces can be discovered within this database. */
   graphs: boolean;
+  /** Whether bounded SQL executes through this database's isolated query runtime. */
+  query: boolean;
 };
 
 /** A tenant database resource plus its bounded catalog counts. */
@@ -1367,6 +1369,8 @@ export type VerglasQueryActivity = {
   sequence: number;
   /** Whether the query originated from the Data editor or an agent tool call. */
   source: "data" | "agent";
+  /** Tenant-local database whose isolated query runtime executed the SQL. */
+  database: string;
   /** SQL submitted by the caller before bounded-result wrapping. */
   sql: string;
   /** Current execution state. */
@@ -1884,8 +1888,8 @@ export interface Overseer extends RpcTarget {
   // Get metadata describing this workspace.
   getMetadata(): Promise<WorkspaceMetadata>;
 
-  /** Runs a bounded read query for the Data visual query surface. */
-  queryVerglas(sql: string, maxRows?: number): Promise<VerglasQueryResult>;
+  /** Runs a bounded read query through one selected database runtime. */
+  queryVerglas(database: string, sql: string, maxRows?: number): Promise<VerglasQueryResult>;
 
   /** Lists live Data and agent query operations after an optional sequence cursor. */
   listVerglasQueryActivity(afterSequence?: number): Promise<VerglasQueryActivity[]>;

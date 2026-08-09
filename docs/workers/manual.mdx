@@ -24,6 +24,7 @@ After the run finishes, query the rows:
 
 ```bash
 verglas query \
+  analytics \
   'SELECT symbol, min(timestamp), max(timestamp), count(*)
    FROM market.ohlcv
    GROUP BY symbol'

@@ -151,6 +151,9 @@ pub enum DatabaseServiceError {
     /// Durable repository access failed.
     #[error(transparent)]
     Repository(RepositoryError),
+    /// The declared managed runtime could not be reconciled.
+    #[error("database runtime provisioning failed: {0}")]
+    Provisioning(String),
 }
 
 /// Resolves and persists immutable database bindings.

@@ -42,11 +42,11 @@
     {
       "id": "query",
       "family": "execution",
-      "server": [{ "method": "POST", "path": "/v1/query" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/query" }],
       "guarantees": ["sql"],
       "clients": {
-        "typescript": { "status": "implemented", "symbol": "query(sql: string)", "routes": ["POST /v1/query"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn query_stream", "routes": ["POST /v1/query"] },
+        "typescript": { "status": "implemented", "symbol": "query(database: string, sql: string, at?: QueryAt)", "routes": ["POST /v1/databases/{database}/query"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn query_stream", "routes": ["POST /v1/databases/{database}/query"] },
         "cli": { "status": "implemented", "verb": "query" }
       },
       "docs": ["op:query"]
