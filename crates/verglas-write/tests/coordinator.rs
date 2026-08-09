@@ -484,7 +484,12 @@ async fn quorum_ack_places_w_fragments_and_counts_it() {
     // Three distinct fragments landed, and a dirty journal exists.
     assert_eq!(transport.fragment_count(), 3);
     assert!(!coordinator.journals().is_idle(), "object is dirty");
-    assert!(coordinator.journals().find_dirty("bkt", "data/x").is_some());
+    assert!(
+        coordinator
+            .journals()
+            .find_dirty("default", "bkt", "data/x")
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -658,7 +663,7 @@ async fn full_node_is_excluded_from_placement() {
     // No fragment landed on the full node.
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
     let journal = coordinator
         .journals()
@@ -843,7 +848,7 @@ async fn corrupt_fragment_reassembles_byte_identical() {
         .expect("ack");
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
 
     // Corrupt one data fragment (index 0) in place.
@@ -888,7 +893,7 @@ async fn more_than_m_corrupt_fails_loudly() {
         .expect("ack");
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
 
     // Corrupt two of the three fragments (indices 0 and 1).
@@ -934,7 +939,7 @@ async fn repair_verifies_and_re_encodes_a_corrupt_survivor() {
         .expect("ack");
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
     let journal = coordinator
         .journals()
@@ -987,7 +992,7 @@ async fn scrubber_repairs_a_corrupt_fragment_and_counts_it() {
         .expect("ack");
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
 
     // Corrupt one fragment on disk (all nodes stay live).
@@ -1061,7 +1066,7 @@ async fn node_loss_triggers_repair_from_survivors() {
         .expect("ack");
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
     let journal = coordinator
         .journals()
@@ -1163,7 +1168,7 @@ async fn streamed_large_object_acks_over_quorum_and_reassembles() {
     // The object reassembles byte-identically from its fragments.
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/big")
+        .find_dirty("default", "bkt", "data/big")
         .expect("dirty");
     let journal = coordinator
         .journals()
@@ -1214,7 +1219,7 @@ async fn unpropagated_fragments_survive_disk_pressure() {
     // The dirty object still reassembles byte-identically from its fragments.
     let object_id = coordinator
         .journals()
-        .find_dirty("bkt", "data/x")
+        .find_dirty("default", "bkt", "data/x")
         .expect("still dirty");
     let journal = coordinator
         .journals()

@@ -691,6 +691,7 @@ mod tests {
         ] {
             assert_eq!(
                 policy.geometry_for(&verglas_core::CacheKey {
+                    storage_binding_id: MANAGED_STORAGE_BINDING_ID.to_owned(),
                     bucket: "tenant".to_owned(),
                     key: key.to_owned(),
                 }),

@@ -373,6 +373,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     ) -> Result<PutOutcome, WriteError> {
         let journal = Journal {
             object_id: object_id.to_owned(),
+            storage_binding_id: key.storage_binding_id.clone(),
             bucket: key.bucket.clone(),
             key: key.key.clone(),
             metadata: StoredMetadata::from(metadata),
@@ -472,6 +473,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         // Rebuild from the committed fragments and upload to the origin.
         let journal = Journal {
             object_id: object_id.to_owned(),
+            storage_binding_id: key.storage_binding_id.clone(),
             bucket: key.bucket.clone(),
             key: key.key.clone(),
             metadata: StoredMetadata::from(metadata),
@@ -613,7 +615,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         }
         let bytes = self.reassemble(&journal).await?;
         let key = CacheKey {
-            storage_binding_id: "default".to_owned(),
+            storage_binding_id: journal.storage_binding_id.clone(),
             bucket: journal.bucket.clone(),
             key: journal.key.clone(),
         };
@@ -643,7 +645,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     pub async fn discover_dirty(&self, key: &CacheKey) -> Result<Option<Journal>, WritebackError> {
         let mut newest = self
             .journals
-            .find_dirty(&key.bucket, &key.key)
+            .find_dirty(&key.storage_binding_id, &key.bucket, &key.key)
             .and_then(|object_id| self.journals.read(&object_id).ok().flatten());
         let prefix = manifest_prefix(key);
         for node in self.membership.live_nodes() {
@@ -664,6 +666,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                     continue;
                 };
                 if journal.state != JournalState::Dirty
+                    || journal.storage_binding_id != key.storage_binding_id
                     || journal.bucket != key.bucket
                     || journal.key != key.key
                 {
@@ -897,7 +900,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let occupied: HashSet<String> = healthy.iter().map(|p| p.node.clone()).collect();
         let mut candidates: Vec<NodeId> = placement_order(
             &CacheKey {
-                storage_binding_id: "default".to_owned(),
+                storage_binding_id: journal.storage_binding_id.clone(),
                 bucket: journal.bucket.clone(),
                 key: journal.key.clone(),
             },
@@ -949,6 +952,8 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let mut buf = Vec::new();
         buf.extend_from_slice(self.self_id.as_str().as_bytes());
         buf.push(0);
+        buf.extend_from_slice(key.storage_binding_id.as_bytes());
+        buf.push(0);
         buf.extend_from_slice(key.bucket.as_bytes());
         buf.push(0);
         buf.extend_from_slice(key.key.as_bytes());
@@ -964,7 +969,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
 /// deterministic distinct placement that spreads load across objects.
 fn placement_order(key: &CacheKey, object_id: &str, live: &[NodeId]) -> Vec<NodeId> {
     let placement_key = CacheKey {
-        storage_binding_id: "default".to_owned(),
+        storage_binding_id: key.storage_binding_id.clone(),
         bucket: key.bucket.clone(),
         key: format!("{}#writeback#{object_id}", key.key),
     };
@@ -1051,7 +1056,10 @@ fn synthetic_object_etag(object_id: &str, object_len: u64) -> String {
 
 /// Stable namespace shared by every manifest version of one S3 key.
 fn manifest_prefix(key: &CacheKey) -> String {
-    let mut bytes = Vec::with_capacity(key.bucket.len() + key.key.len() + 1);
+    let mut bytes =
+        Vec::with_capacity(key.storage_binding_id.len() + key.bucket.len() + key.key.len() + 2);
+    bytes.extend_from_slice(key.storage_binding_id.as_bytes());
+    bytes.push(0);
     bytes.extend_from_slice(key.bucket.as_bytes());
     bytes.push(0);
     bytes.extend_from_slice(key.key.as_bytes());
@@ -1061,6 +1069,7 @@ fn manifest_prefix(key: &CacheKey) -> String {
 /// Unique replicated-manifest identity for one acknowledged object version.
 fn manifest_key(journal: &Journal) -> FragmentKey {
     let key = CacheKey {
+        storage_binding_id: journal.storage_binding_id.clone(),
         bucket: journal.bucket.clone(),
         key: journal.key.clone(),
     };
