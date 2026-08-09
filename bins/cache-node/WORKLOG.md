@@ -70,3 +70,4 @@
 - #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.
 - #84: Wired the cache node's built-in managed lakehouse binding explicitly
   through backend construction, block-device store lookup, and the S3 router.
+- #82: Added explicit eventual polling and strong quorum-backed catalog runtimes. Strong mode requires the three-node fragment ring, verifies ordered Lakekeeper events, catches query reads up to the EC tail, and returns applied event proofs without a polling fallback.

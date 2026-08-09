@@ -30,7 +30,7 @@ use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
 use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo, WritebackStatsInfo};
-use verglas_core::config::Config;
+use verglas_core::config::{CatalogConsistency, Config};
 use verglas_core::metrics::NodeMetrics;
 use verglas_core::node::NodeId;
 use verglas_core::peer::NoopPeerFetch;
@@ -328,38 +328,6 @@ pub async fn run(
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
     let writeback_slot: WritebackSlot = Arc::new(std::sync::OnceLock::new());
 
-    // The cache node is the sole owner of upstream catalog credentials and
-    // change tracking. The gateway and watcher share one response cache. In the
-    // hosted path Lakekeeper signals this node directly after a mutation; the
-    // watcher seeds once and performs no periodic steady-state polling. A
-    // self-hosted node without an event token retains the polling fallback.
-    enum CatalogWatcherRuntime {
-        Polling {
-            _watcher: verglas_tables::catalog::PollingWatcher,
-        },
-        Push(Arc<verglas_tables::catalog::PushWatcher>),
-    }
-
-    let catalog_runtime = config
-        .catalog
-        .as_ref()
-        .map(|catalog| -> Result<_, Box<dyn std::error::Error>> {
-            use verglas_tables::catalog::{PollingWatcher, PushWatcher, WatcherOptions};
-
-            let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
-            let options = WatcherOptions::from_config(catalog);
-            let watcher = match std::env::var("VERGLAS_CATALOG_EVENT_TOKEN") {
-                Ok(token) if !token.is_empty() => CatalogWatcherRuntime::Push(Arc::new(
-                    PushWatcher::spawn(gateway.source(), options),
-                )),
-                _ => CatalogWatcherRuntime::Polling {
-                    _watcher: PollingWatcher::spawn(gateway.source(), options),
-                },
-            };
-            Ok((gateway, watcher))
-        })
-        .transpose()?;
-
     // Bind the admin listener first so its port is owned before serving; it
     // answers `/admin/healthz` = starting/503 while the engine recovers below.
     let admin_addr = std::env::var("VERGLAS_ADMIN_ADDR")
@@ -420,18 +388,77 @@ pub async fn run(
     // present whenever this node belongs to the fragment ring and shares that
     // ring's transport/listener/store with block FLUSH.
     let object_ring = ring_plane.clone();
-    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane) {
+    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane.as_ref()) {
         (Some(bucket), Some(ring)) => Some((
             Arc::clone(&registry),
             bucket,
             config.cache.dir.clone(),
-            ring,
+            Arc::clone(ring),
         )),
         _ => {
             eprintln!(
                 "verglas-cache-node {VERSION} embedded safekeeper disabled: this node is not a configured fragment-ring member"
             );
             None
+        }
+    };
+
+    // Catalog consistency is explicit. Eventual mode polls any Iceberg REST
+    // catalog. Strong mode has no polling path: it requires the fragment ring,
+    // a Lakekeeper event token, and a successful strict seed + EC-log replay.
+    enum CatalogRuntime {
+        Eventual {
+            gateway: verglas_catalog::CatalogGateway,
+            watcher: Arc<verglas_tables::catalog::PollingWatcher>,
+            token: Option<String>,
+        },
+        Strong {
+            state: Arc<crate::catalog_consistency::StrongCatalog>,
+            token: String,
+        },
+    }
+
+    let catalog_runtime = match config.catalog.as_ref() {
+        None => None,
+        Some(catalog) => {
+            use verglas_tables::catalog::{PollingWatcher, StrongWatcher, WatcherOptions};
+
+            let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
+            let options = WatcherOptions::from_config(catalog);
+            let runtime = match catalog.consistency {
+                CatalogConsistency::Eventual => CatalogRuntime::Eventual {
+                    watcher: Arc::new(PollingWatcher::spawn(gateway.source(), options)),
+                    gateway,
+                    token: std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
+                        .ok()
+                        .filter(|value| !value.is_empty()),
+                },
+                CatalogConsistency::Strong => {
+                    let ring = ring_plane.as_ref().ok_or(
+                        "catalog.consistency=strong requires a configured three-node VERGLAS_RING_PEERS ring",
+                    )?;
+                    let token = std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("catalog.consistency=strong requires VERGLAS_CATALOG_EVENT_TOKEN")?;
+                    let watcher = StrongWatcher::seed(gateway.source(), options).await?;
+                    let scope = format!(
+                        "{}|{}",
+                        catalog.uri,
+                        catalog.warehouse.as_deref().unwrap_or_default()
+                    );
+                    let log = Arc::new(verglas_write::catalog_log::EcCatalogLog::new(
+                        scope,
+                        ring.transport(),
+                        ring.membership(),
+                    ));
+                    let state =
+                        crate::catalog_consistency::StrongCatalog::new(gateway, watcher, log)
+                            .await?;
+                    CatalogRuntime::Strong { state, token }
+                }
+            };
+            Some(runtime)
         }
     };
 
@@ -444,13 +471,31 @@ pub async fn run(
     if let Some((device_registry, _)) = &block_registry {
         admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
     }
-    if let Some((gateway, watcher)) = &catalog_runtime {
-        admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
-        if let CatalogWatcherRuntime::Push(watcher) = watcher {
-            let token = std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
-                .expect("push watcher requires VERGLAS_CATALOG_EVENT_TOKEN");
-            admin_app = admin_app.merge(admin::catalog_event_router(Arc::clone(watcher), token));
-            eprintln!("verglas-cache-node {VERSION} catalog changes are push-driven by Lakekeeper");
+    if let Some(runtime) = &catalog_runtime {
+        match runtime {
+            CatalogRuntime::Eventual {
+                gateway,
+                watcher,
+                token,
+            } => {
+                admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
+                if let Some(token) = token {
+                    admin_app = admin_app.merge(admin::eventual_catalog_event_router(
+                        Arc::clone(watcher),
+                        token.clone(),
+                    ));
+                }
+                eprintln!("verglas-cache-node {VERSION} catalog consistency is eventual (polling)");
+            }
+            CatalogRuntime::Strong { state, token } => {
+                admin_app = admin_app.merge(admin::strong_catalog_router(
+                    Arc::clone(state),
+                    token.clone(),
+                ));
+                eprintln!(
+                    "verglas-cache-node {VERSION} catalog consistency is strong (EC quorum + fenced reads)"
+                );
+            }
         }
     }
     let admin_fut = async move {
@@ -820,6 +865,7 @@ mod tests {
         ))
         .await;
         let catalog = verglas_core::config::Catalog {
+            consistency: verglas_core::config::CatalogConsistency::Eventual,
             uri: format!("http://{upstream}"),
             poll_interval_secs: 30,
             include: Vec::new(),

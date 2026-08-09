@@ -57,6 +57,7 @@
 //! barrier keeps published tables consistent regardless.
 
 pub mod barrier;
+pub mod catalog_log;
 pub mod coordinator;
 pub mod journal;
 pub mod membership;

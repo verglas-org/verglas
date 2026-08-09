@@ -679,12 +679,36 @@ fn catalog_section_parses_with_defaults_and_validates() {
     let config = Config::from_toml_str(&toml_text).expect("parses");
     config.validate().expect("valid catalog config validates");
     let catalog = config.catalog.expect("catalog section present");
+    assert_eq!(
+        catalog.consistency,
+        verglas_core::config::CatalogConsistency::Eventual
+    );
     assert_eq!(catalog.uri, "http://localhost:8181");
     assert_eq!(catalog.poll_interval_secs, 30);
     assert!(catalog.include.is_empty());
     assert!(catalog.exclude.is_empty());
     assert!(catalog.bearer_token.is_none());
     assert!(catalog.warehouse.is_none());
+}
+
+#[test]
+fn catalog_accepts_only_strong_or_eventual_consistency() {
+    let strong = Config::from_toml_str(&format!(
+        "{}\n[catalog]\nuri = \"http://localhost:8181\"\nconsistency = \"strong\"\n",
+        valid_toml("catalog-strong")
+    ))
+    .expect("strong parses");
+    assert_eq!(
+        strong.catalog.expect("catalog").consistency,
+        verglas_core::config::CatalogConsistency::Strong
+    );
+
+    let error = Config::from_toml_str(&format!(
+        "{}\n[catalog]\nuri = \"http://localhost:8181\"\nconsistency = \"session\"\n",
+        valid_toml("catalog-invalid-consistency")
+    ))
+    .expect_err("third consistency mode must be rejected");
+    assert!(error.to_string().contains("consistency"));
 }
 
 #[test]
