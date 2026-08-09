@@ -44,12 +44,10 @@ fn docker_application_packages_execution_workers() {
     );
     assert!(!compose.contains("\n  postgres:"));
     assert!(!compose.contains("\n  rill:"));
-    for variable in [
+    for forbidden in [
         "VERGLAS_BACKEND_BUCKET",
         "VERGLAS_BACKEND_ENDPOINT",
         "VERGLAS_BACKEND_REGION",
-        "VERGLAS_CACHE_CAPACITY",
-        "VERGLAS_CACHE_DRAM",
         "VERGLAS_CATALOG_URI",
         "VERGLAS_CATALOG_WAREHOUSE",
         "VERGLAS_CATALOG_BEARER_TOKEN",
@@ -57,10 +55,27 @@ fn docker_application_packages_execution_workers() {
         "VERGLAS_S3_SECRET_ACCESS_KEY",
         "VERGLAS_QUERY_WORKER_BINARY",
         "VERGLAS_WRITE_WORKER_BINARY",
+        "R2_BUCKET",
+        "R2_ENDPOINT",
+        "R2_ACCESS_KEY_ID",
+        "R2_SECRET_ACCESS_KEY",
+        "R2_CATALOG_URI",
+        "R2_CATALOG_WAREHOUSE",
+        "R2_CATALOG_TOKEN",
     ] {
         assert!(
-            compose.contains(variable),
-            "Compose must declare {variable}"
+            !compose.contains(forbidden),
+            "Compose must not hard-code the dynamic provider field {forbidden}"
+        );
+    }
+    for required in [
+        "VERGLAS_CACHE_CAPACITY",
+        "VERGLAS_CACHE_DRAM",
+        "VERGLAS_ACCESS_SERVICE_TOKEN",
+    ] {
+        assert!(
+            compose.contains(required),
+            "Compose must declare {required}"
         );
     }
 }
@@ -80,5 +95,23 @@ fn docker_application_caps_server_file_descriptors() {
     assert!(
         server.contains("ulimits:\n      nofile:\n        soft: 8192\n        hard: 8192"),
         "verglas-server must cap soft and hard nofile at 8192"
+    );
+}
+
+#[test]
+fn docker_application_generates_and_persists_its_secret_encryption_key() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
+        .expect("read Docker Compose application");
+
+    assert!(
+        compose.contains("verglas-secret-key-init:")
+            && compose.contains("verglas-secret-key:/run/verglas-secrets")
+            && compose.contains("/run/verglas-secrets/encryption-key"),
+        "Compose must generate the encryption key once and persist it outside provider config"
+    );
+    assert!(
+        !compose.contains(&"0".repeat(64)),
+        "Compose must not embed a fixed secret encryption key"
     );
 }

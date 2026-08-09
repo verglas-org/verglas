@@ -742,6 +742,70 @@ impl BackendRegistry {
         }))
     }
 
+    /// Returns the currently registered bindings for startup checks and metrics.
+    /// Poisoning is process-fatal because continuing without a complete registry
+    /// could route a request under the wrong credential boundary.
+    fn snapshot(&self) -> Vec<Arc<BackendStore>> {
+        match self.bindings.read() {
+            Ok(bindings) => bindings.values().cloned().collect(),
+            Err(_) => panic!("storage binding registry lock poisoned"),
+        }
+    }
+
+    /// Describes every live binding without exposing credentials.
+    pub fn describe(&self) -> String {
+        let bindings = self.snapshot();
+        if bindings.is_empty() {
+            return "dynamic registry (no bindings)".to_owned();
+        }
+        bindings
+            .iter()
+            .map(|binding| format!("{}={}", binding.storage_binding_id(), binding.describe()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Describes the bucket sets currently addressable through the registry.
+    pub fn bucket_set(&self) -> String {
+        let bindings = self.snapshot();
+        if bindings.is_empty() {
+            return "<dynamic>".to_owned();
+        }
+        bindings
+            .iter()
+            .map(|binding| format!("{}:{}", binding.storage_binding_id(), binding.bucket_set()))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Aggregates retry attempts across every live provider binding.
+    pub fn retries_total(&self) -> u64 {
+        self.snapshot()
+            .iter()
+            .map(|binding| binding.retries_total())
+            .sum()
+    }
+
+    /// Aggregates circuit-breaker state across every live provider binding.
+    pub fn aggregate_breaker_snapshot(&self) -> BreakerSnapshot {
+        let mut aggregate = BreakerSnapshot {
+            state: BreakerState::Closed,
+            trips: 0,
+            rejections: 0,
+        };
+        for binding in self.snapshot() {
+            let snapshot = binding.aggregate_breaker_snapshot();
+            aggregate.trips += snapshot.trips;
+            aggregate.rejections += snapshot.rejections;
+            aggregate.state = match (aggregate.state, snapshot.state) {
+                (BreakerState::Open, _) | (_, BreakerState::Open) => BreakerState::Open,
+                (BreakerState::HalfOpen, _) | (_, BreakerState::HalfOpen) => BreakerState::HalfOpen,
+                _ => BreakerState::Closed,
+            };
+        }
+        aggregate
+    }
+
     /// Registers a new binding for immediate routing without restarting the cache.
     pub fn insert(&self, binding: Arc<BackendStore>) -> Result<(), BackendError> {
         let id = binding.storage_binding_id().to_owned();

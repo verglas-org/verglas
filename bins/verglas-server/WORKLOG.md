@@ -621,3 +621,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #84: Wired the server's built-in managed lakehouse binding explicitly through
   backend construction, S3 routing, table mapping, warming, and lifecycle
   coordination; server integration fixtures now declare the same binding.
+- #84: Removed the Compose-only singleton backend and catalog from environment-mode startup. The server now boots an empty dynamic provider registry while file-configured third-party deployments retain an explicit static binding and startup probe.
+- #84: Removed the fixed development secret-encryption key from Compose. A
+  one-shot initializer now generates it with OS randomness, restricts it to the
+  non-root access service, and persists it in a named volume across restarts.

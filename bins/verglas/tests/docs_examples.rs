@@ -56,13 +56,7 @@ fn self_hosted_compose_is_complete_and_runnable() {
     for required in [
         "verglas-server:",
         "verglas-container-runtime:",
-        "VERGLAS_BACKEND_BUCKET:",
-        "VERGLAS_BACKEND_ENDPOINT:",
-        "VERGLAS_CATALOG_URI:",
-        "VERGLAS_CATALOG_WAREHOUSE:",
-        "VERGLAS_CATALOG_BEARER_TOKEN:",
-        "VERGLAS_S3_ACCESS_KEY_ID:",
-        "VERGLAS_S3_SECRET_ACCESS_KEY:",
+        "VERGLAS_ACCESS_SERVICE_TOKEN:",
         "VERGLAS_SCHEDULER_URL:",
         "verglas-cache:/var/lib/verglas",
         "nofile:",
@@ -88,6 +82,17 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("rill:"),
         "bootstrap Compose must not directly own rill:"
     );
+    for forbidden in [
+        "R2_",
+        "VERGLAS_BACKEND_",
+        "VERGLAS_CATALOG_",
+        "AWS_ACCESS_KEY_ID",
+    ] {
+        assert!(
+            !compose.contains(forbidden),
+            "bootstrap Compose must not contain static provider configuration {forbidden}"
+        );
+    }
 }
 
 #[test]
