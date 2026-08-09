@@ -12,6 +12,7 @@ RUN rustup show
 COPY . .
 RUN cargo build --release \
     -p verglas-server \
+    -p verglas-access-bin \
     -p verglas-scheduler-bin \
     -p verglas-container-runtime \
     -p verglas-query \
@@ -62,6 +63,15 @@ COPY --from=build /src/target/release/verglas-scheduler /usr/local/bin/verglas-s
 USER verglas
 EXPOSE 8340
 ENTRYPOINT ["verglas-scheduler"]
+
+FROM runtime AS verglas-access
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/target/release/verglas-access /usr/local/bin/verglas-access
+USER verglas
+EXPOSE 8345
+ENTRYPOINT ["verglas-access"]
 
 FROM runtime AS verglas-container-runtime
 RUN apt-get update \

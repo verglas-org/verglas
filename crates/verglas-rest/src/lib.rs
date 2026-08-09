@@ -12,6 +12,7 @@ use axum::{
 use bytes::Bytes;
 use verglas_catalog::CatalogGateway;
 
+pub mod access;
 pub mod admin;
 pub mod dashboard;
 pub mod follow;
