@@ -14,8 +14,10 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const NEON_PROTOCOL_SOURCE: &str =
     "https://github.com/neondatabase/neon/tree/8f60b04da47ffefe0e52bda2440134b42874eb75";
 
-/// Neon's maximum WAL payload in one proposer append message: 16 8-KiB pages.
-const MAX_SEND_SIZE: usize = 8 * 1024 * 16;
+/// Maximum WAL payload accepted from the Verglas Neon fork. The compute uses
+/// 8 MiB frames to amortize the safekeeper's quorum and fsync boundary; keep
+/// this wire guard in lockstep with `walproposer.h::MAX_SEND_SIZE`.
+const MAX_SEND_SIZE: usize = 8 * 1024 * 1024;
 
 /// One safekeeper member as represented in Neon's membership configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
