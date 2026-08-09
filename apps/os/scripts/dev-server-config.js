@@ -1,4 +1,4 @@
-export function getWranglerPortFromBackendHost(backendHost) {
+function parseBackendHost(backendHost) {
   const trimmed = backendHost.trim();
   if (!trimmed) return null;
   if (trimmed.includes("://")) {
@@ -15,7 +15,17 @@ export function getWranglerPortFromBackendHost(backendHost) {
     throw new Error("VITE_BACKEND_HOST must include a valid host with an optional port.");
   }
 
-  if (!url.port) return null;
+  return url;
+}
+
+export function getWranglerIpFromBackendHost(backendHost) {
+  const url = parseBackendHost(backendHost);
+  return url?.hostname.replace(/^\[|\]$/g, "") ?? null;
+}
+
+export function getWranglerPortFromBackendHost(backendHost) {
+  const url = parseBackendHost(backendHost);
+  if (!url?.port) return null;
 
   const port = Number(url.port);
   if (port < 1) {

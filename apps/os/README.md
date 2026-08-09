@@ -25,13 +25,16 @@ record; Workspaces are not.
 
 ## Quick start
 
-Install [pnpm](https://pnpm.io/), then:
+From the repository root, start the complete stack:
 
 ```bash
-pnpm run-local
+docker compose up -d --build
 ```
 
 Visit http://localhost:8787
+
+For UI-only development without rebuilding its container, install
+[pnpm](https://pnpm.io/) and run `pnpm run-local` from `apps/os`.
 
 This boots the Workshop stack locally (router + backend + frontend) and a
 loopback-only [native model-runtime adapter](docs/model-runtimes.md). Point the

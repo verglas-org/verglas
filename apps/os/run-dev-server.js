@@ -15,7 +15,10 @@ import { execFileSync, spawn } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parse } from "jsonc-parser";
-import { getWranglerPortFromBackendHost } from "./scripts/dev-server-config.js";
+import {
+  getWranglerIpFromBackendHost,
+  getWranglerPortFromBackendHost,
+} from "./scripts/dev-server-config.js";
 
 const ROOT = dirname(fileURLToPath(import.meta.url));
 const PACKAGES_DIR = join(ROOT, "packages");
@@ -388,14 +391,17 @@ const configs = [
 const args = configs.flatMap(c => ["-c", c]);
 const backendHost = process.env.VITE_BACKEND_HOST;
 if (backendHost) {
+  let wranglerIp;
   let wranglerPort;
   try {
+    wranglerIp = getWranglerIpFromBackendHost(backendHost);
     wranglerPort = getWranglerPortFromBackendHost(backendHost);
   } catch (err) {
     console.error(err.message);
     process.exit(1);
   }
 
+  if (wranglerIp) args.push("--ip", wranglerIp);
   if (wranglerPort) {
     args.push("--port", wranglerPort);
   } else {

@@ -32,10 +32,14 @@ fn dockerfile_builds_the_runtime_manager() {
     assert!(dockerfile.contains("AS verglas-integration-runtime"));
     assert!(dockerfile.contains("AS verglas-application-runtime"));
     assert!(dockerfile.contains("COPY sdks/typescript/src ./sdk"));
+    assert!(dockerfile.contains("FROM node:22-bookworm-slim AS verglas-os"));
+    assert!(
+        dockerfile.contains("CMD [\"node\", \"run-dev-server.js\", \"--serve-frontend-assets\"]")
+    );
 }
 
 #[test]
-fn compose_bootstraps_only_server_and_runtime_manager() {
+fn compose_bootstraps_the_complete_oss_stack() {
     let compose = std::fs::read_to_string(repository_file("docker-compose.yml"))
         .expect("read repository Compose file");
     let services_block = compose
@@ -53,11 +57,24 @@ fn compose_bootstraps_only_server_and_runtime_manager() {
         .map(str::trim)
         .collect::<Vec<_>>();
 
-    assert_eq!(services, ["verglas-server:", "verglas-container-runtime:"]);
+    assert_eq!(
+        services,
+        [
+            "verglas-server:",
+            "verglas-scheduler:",
+            "verglas-workers-postgres:",
+            "verglas-container-runtime:",
+            "verglas-os:",
+        ]
+    );
+    assert!(!compose.contains("profiles:"));
     assert_eq!(compose.matches("/var/run/docker.sock").count(), 2);
     assert!(compose.contains("verglas-runtime-state:/var/lib/verglas-container-runtime"));
     assert!(compose.contains("name: verglas-runtime"));
     assert!(
         compose.contains("VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360")
     );
+    assert!(compose.contains("VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340"));
+    assert!(compose.contains("target: verglas-os"));
+    assert!(compose.contains("127.0.0.1:8787:8787"));
 }

@@ -35,6 +35,17 @@ USER bun
 EXPOSE 8380
 ENTRYPOINT ["bun", "/opt/verglas-application-runtime/runtime.mjs"]
 
+FROM node:22-bookworm-slim AS verglas-os
+RUN npm install --global pnpm@11.9.0
+WORKDIR /workspace/apps/os
+COPY sdks/typescript /workspace/sdks/typescript
+COPY apps/os /workspace/apps/os
+RUN pnpm install --frozen-lockfile \
+    && pnpm --filter @verglas/typed-storage build \
+    && pnpm --filter @verglas/workshop-frontend exec vite build
+EXPOSE 8787
+CMD ["node", "run-dev-server.js", "--serve-frontend-assets"]
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \

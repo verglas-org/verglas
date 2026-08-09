@@ -45,7 +45,7 @@ repository test tooling).
 
 The Docker application is configured entirely by Compose environment values.
 Export your R2 bucket, S3 credentials, catalog URI, warehouse, catalog token,
-and a client-facing S3 secret, then start it:
+and a client-facing S3 secret, then start the complete OSS stack:
 
 ```sh
 docker compose up -d --build
@@ -57,6 +57,10 @@ Point the CLI at the container's API:
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 verglas status
 ```
+
+Verglas OS is available at `http://127.0.0.1:8787`. It is a community and
+development application in the Compose stack, not a dependency of the
+`verglas` server or CLI binaries and not a new CLI command.
 
 The [self-hosted guide](docs/get-started/self-host.mdx) covers R2 and Data
 Catalog setup, every required environment variable, the complete Compose file,
@@ -82,11 +86,11 @@ and warms changed metadata through the cache path.
 
 ## Workers and containers
 
-Compose bootstraps only `verglas-server` and `verglas-container-runtime`. The
-runtime manager owns every optional local service through Docker: scheduler,
-Neon database components, external brokers, and optional applications. A portable
-worker contains its bounded command, bundled files, target table, and cron, HTTP,
-or CloudEvent triggers.
+Compose bootstraps `verglas-server`, the local container runtime, the durable
+worker scheduler and its Postgres queue, and Verglas OS. The runtime manager
+owns dynamically added Vessels, database components, external brokers, and
+other optional applications. A portable worker contains its bounded command,
+bundled files, target table, and cron, HTTP, or CloudEvent triggers.
 
 ```sh
 export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
