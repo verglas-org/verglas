@@ -20,6 +20,7 @@ cargo install --path bins/verglas --locked --force
 
 ```text
 --server-endpoint <URL>  Local server admin API. Uses VERGLAS_ENDPOINT.
+--access-endpoint <URL>  Tenant access API. Uses VERGLAS_ACCESS_ENDPOINT.
 --token <TOKEN>          Bearer token. Uses VERGLAS_TOKEN.
 --json                   Emit machine-readable JSON.
 -V, --version            Print the CLI version.
@@ -52,27 +53,20 @@ Set `VERGLAS_TOKEN` or pass `--token` when the endpoint requires a bearer token.
 verglas workers list
 verglas workers get <id-or-name>
 verglas workers create --file ./worker.toml
-verglas workers update <id-or-name> --file ./worker.toml
 verglas workers run <id-or-name>
-verglas workers logs <id-or-name>
+verglas workers follow --name local-log -- ./my-process
 verglas workers delete <id-or-name>
 ```
 
-## Containers
+## Vessels
 
 ```bash
-verglas containers list
-verglas containers get <id>
-verglas containers create --file ./container.json
-verglas containers update <id> --file ./container.json
-verglas containers scale <id> --instances 3
-verglas containers stop <id>
-verglas containers resume <id>
-verglas containers catalog
-verglas containers deploy <catalog-id>
-verglas containers config <id>
-verglas containers push docker://ghcr.io/acme/app:1.2
-verglas containers delete <id>
+verglas vessel add --file ./vessel.yaml
+verglas vessel list
+verglas vessel get <name>
+verglas vessel curl <name> /health
+verglas vessel query <name> '{"query":"status"}'
+verglas vessel remove <name>
 ```
 
 ## Tables and queries
@@ -138,7 +132,16 @@ verglas db create external_lake \
   --warehouse customer_warehouse
 ```
 
+The external command validates secret selection and the database declaration,
+but the current OSS runtime then fails closed because scoped external runtime
+bindings are not active. Managed lakehouses and managed Postgres databases are
+the supported local runtimes.
+
 `db` and `secret` use `VERGLAS_ACCESS_ENDPOINT` (localhost port 8345 by
 default). Secret values are read from stdin or a hidden prompt and never appear
 in process arguments. Database records retain stable secret resource IDs, not
 plaintext credentials.
+
+See [Databases](/docs/platform/databases) for complete managed and external
+examples, SQL and SDK connections, current support status, and teardown. See
+[Secrets](/docs/platform/secrets) for provider value formats and scope rules.

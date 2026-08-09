@@ -13,6 +13,7 @@ import {
   CatalogTable,
 } from '../components/CatalogTable'
 import { useDocumentTitle } from '../useDocumentTitle'
+import { useAutomaticRefresh } from '../useAutomaticRefresh'
 
 export const Route = createFileRoute('/workspaces')({
   component: WorkspacesPage,
@@ -47,8 +48,8 @@ function WorkspacesPage() {
   const [deleting, setDeleting] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
 
-  const load = useCallback(async () => {
-    setLoading(true)
+  const load = useCallback(async (showLoading = false) => {
+    if (showLoading) setLoading(true)
     setError(null)
     try {
       const list = await authenticatedApi.listWorkspaces()
@@ -60,11 +61,12 @@ function WorkspacesPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoading(false)
+      if (showLoading) setLoading(false)
     }
   }, [authenticatedApi])
 
-  useEffect(() => { void load() }, [load])
+  useEffect(() => { void load(true) }, [load])
+  useAutomaticRefresh(load)
 
   const workspace = workspaces.find((entry) => entry.id === selected) ?? null
 
@@ -96,7 +98,6 @@ function WorkspacesPage() {
     <CatalogPage
       title="Workspaces"
       description="Each workspace is an isolated environment with its own conversations, gatekeepers, and outputs."
-      onRefresh={() => void load()}
       actions={
         <Link
           to="/"

@@ -102,6 +102,26 @@ const commit = await orders.append(
 console.log({ rows: page.rows.length, snapshot: commit.snapshotId });
 ```
 
+Use the control-plane client for SQL against a named dynamic database:
+
+```ts
+import { connectAdmin } from "@verglas/sdk";
+
+const admin = connectAdmin({
+  endpoint: process.env.VERGLAS_ENDPOINT!,
+  token: process.env.VERGLAS_TOKEN!,
+});
+
+const result = await admin.query(
+  "analytics",
+  "SELECT count(*) AS rows FROM analytics.orders",
+);
+console.log(result.rows);
+```
+
+The database name is required. Verglas does not select a process-wide default
+catalog for dynamic database queries.
+
 ## Work with tables
 
 Create a table with an explicit schema when inference cannot express the required types or partitioning:

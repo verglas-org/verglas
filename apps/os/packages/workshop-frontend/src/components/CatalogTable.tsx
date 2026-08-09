@@ -1,17 +1,15 @@
-import { ArrowLeft, ArrowsClockwise } from '@phosphor-icons/react'
+import { ArrowLeft } from '@phosphor-icons/react'
 import type { ReactNode } from 'react'
 
 /** Shared page chrome for Workspaces, Integrations, Applications, Jobs. */
 export function CatalogPage({
   title,
   description,
-  onRefresh,
   children,
   actions,
 }: {
   title: string
   description: string
-  onRefresh?: () => void
   children: ReactNode
   actions?: ReactNode
 }) {
@@ -24,16 +22,6 @@ export function CatalogPage({
         </div>
         <div className="flex items-center gap-2">
           {actions}
-          {onRefresh && (
-            <button
-              type="button"
-              onClick={onRefresh}
-              className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg border border-kumo-line px-3 text-[13px] text-kumo-default hover:bg-kumo-tint"
-            >
-              <ArrowsClockwise size={14} />
-              Refresh
-            </button>
-          )}
         </div>
       </header>
       {children}
