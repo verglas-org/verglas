@@ -1,0 +1,36 @@
+{
+  "$schema": "../../node_modules/wrangler/config-schema.json",
+  "name": "router",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-02-02",
+
+  "services": [
+    {
+      "binding": "WORKSHOP_BACKEND",
+      "service": "workshop-backend"
+    }
+  ],
+
+  // The router owns the public origin for customer instances, so it serves the frontend.
+  // `run_worker_first` keeps API prefixes on the worker; everything else falls through to
+  // static assets with SPA fallback.
+  "assets": {
+    "directory": "../workshop-frontend/dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api",
+      "/api/*",
+      "/blueprint-screenshot",
+      "/blueprint-screenshot/*",
+      "/application-screenshot",
+      "/application-screenshot/*"
+    ]
+  },
+
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": { "invocation_logs": false }
+  }
+}

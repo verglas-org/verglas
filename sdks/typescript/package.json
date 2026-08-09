@@ -8,6 +8,7 @@
   "types": "./src/index.ts",
   "exports": {
     ".": "./src/index.ts",
+    "./control": "./src/control.ts",
     "./logging": "./src/logging.ts",
     "./examples": "./src/examples/index.ts"
   },

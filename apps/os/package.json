@@ -1,0 +1,26 @@
+{
+  "name": "verglas-os",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm run --recursive build",
+    "run-local": "node scripts/run-local.mjs",
+    "test": "node --test scripts/*.test.js && pnpm run --recursive --if-present test",
+    "dev-client": "cd packages/workshop-frontend && pnpm run dev",
+    "dev-server": "node run-dev-server.js",
+    "clean": "pnpm run --recursive clean",
+    "lint:check": "oxlint",
+    "lint:fix": "oxlint --fix",
+    "types:check": "pnpm run --recursive --if-present types:check",
+    "lint": "pnpm run lint:check && pnpm run types:check"
+  },
+  "devDependencies": {
+    "aws4fetch": "^1.0.20",
+    "jsonc-parser": "^3.3.1",
+    "oxlint": "^1.76.0",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.6",
+    "wrangler": "^4.115.0"
+  }
+}
