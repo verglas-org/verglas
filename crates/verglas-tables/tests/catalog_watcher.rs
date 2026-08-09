@@ -18,9 +18,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde_json::json;
 use tokio::sync::broadcast;
+use verglas_catalog::{CatalogMutation, TableState};
 use verglas_tables::catalog::{
-    CatalogWatcher, PollingWatcher, RestCatalogSource, TableChanged, TableFilter, TableIdent,
-    WatcherOptions,
+    CatalogWatcher, PollingWatcher, RestCatalogSource, StrongWatcher, TableChanged, TableFilter,
+    TableIdent, WatcherOptions,
 };
 
 /// Mutable state behind the mock REST catalog: the tables it serves, an
@@ -326,6 +327,150 @@ async fn commit_detected_within_one_poll_with_correct_snapshot_ids() {
     // The watcher is usable through the trait object the mapper (#49) holds.
     let as_trait: &dyn CatalogWatcher = &watcher;
     assert_eq!(as_trait.watched_tables(), vec![ident]);
+}
+
+/// Eventual mode remains a polling watcher, but a hosted catalog notification
+/// can wake the next reconciliation without creating a third consistency mode.
+#[tokio::test(flavor = "multi_thread")]
+async fn eventual_notification_accelerates_the_next_poll() {
+    let (addr, mock) = spawn_mock().await;
+    mock.set_table("db", "events", "s3://lake/db/events/metadata/v1.json", 100);
+    let mut options = test_options();
+    options.interval = Duration::from_secs(60);
+    let watcher = PollingWatcher::spawn(RestCatalogSource::new(format!("http://{addr}")), options);
+    let ident = TableIdent::new(&["db"], "events");
+    wait_until(
+        || watcher.table_state(&ident).is_some(),
+        EVENT_TIMEOUT,
+        "eventual watcher seeded",
+    )
+    .await;
+    let mut events = watcher.subscribe();
+    mock.set_table("db", "events", "s3://lake/db/events/metadata/v2.json", 200);
+
+    watcher.request_refresh();
+    assert_eq!(
+        next_event(&mut events, EVENT_TIMEOUT).await,
+        TableChanged {
+            table: ident,
+            old_snapshot: Some(100),
+            new_snapshot: Some(200),
+        }
+    );
+}
+
+/// Strong mode applies the exact quorum-committed pointer and advances its
+/// query fence only after the new state is visible.
+#[tokio::test(flavor = "multi_thread")]
+async fn strong_watcher_applies_ordered_pointer_without_polling() {
+    let (addr, mock) = spawn_mock().await;
+    mock.set_table("db", "events", "s3://lake/db/events/metadata/v1.json", 100);
+    let watcher = StrongWatcher::seed(
+        RestCatalogSource::new(format!("http://{addr}")),
+        test_options(),
+    )
+    .await
+    .expect("strict initial seed");
+    let ident = TableIdent::new(&["db"], "events");
+    let mut events = watcher.subscribe();
+
+    let mutation = CatalogMutation {
+        sequence: 41,
+        event_id: "event-41".into(),
+        warehouse_id: "warehouse-1".into(),
+        table_id: "table-1".into(),
+        namespace: vec!["db".into()],
+        table: "events".into(),
+        previous_namespace: None,
+        previous_table: None,
+        operation: "updateTable".into(),
+        metadata_location: Some("s3://lake/db/events/metadata/v2.json".into()),
+        snapshot_id: Some(200),
+    };
+    assert!(
+        watcher
+            .apply(
+                &mutation,
+                Some(TableState {
+                    metadata_location: mutation.metadata_location.clone().expect("pointer"),
+                    current_snapshot_id: mutation.snapshot_id,
+                }),
+            )
+            .expect("ordered apply")
+    );
+    assert_eq!(watcher.applied_sequence(), 41);
+    assert_eq!(
+        watcher.table_state(&ident).expect("updated state"),
+        TableState {
+            metadata_location: "s3://lake/db/events/metadata/v2.json".into(),
+            current_snapshot_id: Some(200),
+        }
+    );
+    assert_eq!(
+        next_event(&mut events, EVENT_TIMEOUT).await,
+        TableChanged {
+            table: ident,
+            old_snapshot: Some(100),
+            new_snapshot: Some(200),
+        }
+    );
+    assert!(
+        !watcher
+            .apply(
+                &mutation,
+                Some(TableState {
+                    metadata_location: "ignored duplicate".into(),
+                    current_snapshot_id: Some(999),
+                }),
+            )
+            .expect("duplicate sequence")
+    );
+}
+
+/// A rename removes the previous identifier in the same state publication.
+#[tokio::test(flavor = "multi_thread")]
+async fn strong_watcher_renames_without_leaving_stale_identity() {
+    let (addr, mock) = spawn_mock().await;
+    mock.set_table("old", "events", "s3://lake/events/v1.json", 1);
+    let watcher = StrongWatcher::seed(
+        RestCatalogSource::new(format!("http://{addr}")),
+        test_options(),
+    )
+    .await
+    .expect("strict initial seed");
+    let mutation = CatalogMutation {
+        sequence: 2,
+        event_id: "rename-2".into(),
+        warehouse_id: "warehouse-1".into(),
+        table_id: "table-1".into(),
+        namespace: vec!["new".into()],
+        table: "renamed".into(),
+        previous_namespace: Some(vec!["old".into()]),
+        previous_table: Some("events".into()),
+        operation: "renameTable".into(),
+        metadata_location: Some("s3://lake/events/v1.json".into()),
+        snapshot_id: Some(1),
+    };
+    watcher
+        .apply(
+            &mutation,
+            Some(TableState {
+                metadata_location: "s3://lake/events/v1.json".into(),
+                current_snapshot_id: Some(1),
+            }),
+        )
+        .expect("rename apply");
+
+    assert!(
+        watcher
+            .table_state(&TableIdent::new(&["old"], "events"))
+            .is_none()
+    );
+    assert!(
+        watcher
+            .table_state(&TableIdent::new(&["new"], "renamed"))
+            .is_some()
+    );
 }
 
 /// `seeded()` starts `false` and flips to `true` once the first successful

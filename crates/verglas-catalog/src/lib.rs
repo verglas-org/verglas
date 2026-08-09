@@ -8,12 +8,42 @@ mod rest;
 use std::fmt;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 pub use registry::{
     CatalogBinding, CatalogBindingId, CatalogRegistry, CatalogRuntimeRegistry, DatabaseId,
     RegistryError, StorageBindingId,
 };
 pub use rest::{CatalogGateway, CatalogResponse, RestCatalogSource};
+
+/// One authoritative catalog-pointer mutation supplied by a transactional catalog.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogMutation {
+    /// Monotonic catalog outbox sequence. Gaps are valid.
+    pub sequence: u64,
+    /// Stable delivery id used to absorb retries.
+    pub event_id: String,
+    /// Catalog warehouse containing the table.
+    pub warehouse_id: String,
+    /// Stable catalog table id.
+    pub table_id: String,
+    /// Namespace levels used by the Iceberg REST identifier.
+    pub namespace: Vec<String>,
+    /// Table name within `namespace`.
+    pub table: String,
+    /// Namespace before a rename, otherwise absent.
+    #[serde(default)]
+    pub previous_namespace: Option<Vec<String>>,
+    /// Table name before a rename, otherwise absent.
+    #[serde(default)]
+    pub previous_table: Option<String>,
+    /// Catalog mutation operation such as `updateTable` or `dropTable`.
+    pub operation: String,
+    /// Newly committed immutable Iceberg metadata pointer, absent for a drop.
+    pub metadata_location: Option<String>,
+    /// Newly committed snapshot id when the publisher knows it.
+    pub snapshot_id: Option<i64>,
+}
 
 /// A table identity in an Iceberg catalog.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]

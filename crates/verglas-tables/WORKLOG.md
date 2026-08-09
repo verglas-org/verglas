@@ -209,3 +209,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Iceberg metadata walks, warming, snapshot diffs, prefetch fills, and retirement.
   Persisted demotions now retain the binding alongside bucket and key, preventing
   equal object names from crossing database storage origins.
+- #82: Added a strict strong watcher alongside the eventual polling watcher. It seeds completely before readiness, applies resolved quorum mutations in order, handles renames atomically, and advances its read fence only after state publication.

@@ -963,6 +963,19 @@ pub struct Auth {
     pub credentials_profile: Option<String>,
 }
 
+/// Visibility contract for catalog changes observed by this node.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum CatalogConsistency {
+    /// Poll the authoritative catalog and converge asynchronously.
+    #[default]
+    Eventual,
+    /// Accept only quorum-durable direct mutations and fence every catalog read.
+    Strong,
+}
+
 /// Iceberg REST catalog watcher settings (#47). Filters match against the
 /// dotted `namespace.table` name with `*` wildcards; empty `include` means
 /// every table, and `exclude` always wins over `include`.
@@ -971,6 +984,9 @@ pub struct Auth {
 pub struct Catalog {
     /// Base URI of the Iceberg REST catalog. Unset leaves Iceberg awareness off.
     pub uri: String,
+    /// Exactly `eventual` polling or quorum-backed `strong` direct delivery.
+    #[serde(default)]
+    pub consistency: CatalogConsistency,
     /// Seconds between catalog polls.
     #[serde(default = "default_poll_interval_secs")]
     pub poll_interval_secs: u64,

@@ -57,12 +57,21 @@
 
 - #58: Hardened the embedded safekeeper process test: wait for all three children to log listen readiness, capture stderr, and retry the Postgres startup handshake so CI does not flake on early connect.
 
+- #74: Routed pageserver layer and index PUTs through the shared EC fragment
+  ring. The S3 endpoint now acknowledges a ring-backed PUT after quorum fsync,
+  keeps dirty fragments outside cache eviction, propagates to the origin in the
+  background, and exposes write-back counters. The disk monitor gives ordinary
+  cache blocks and durability fragments one physical NVMe ceiling without
+  evicting acknowledged dirty data.
+- #74: Made origin probing asynchronous so a cache node recovers and serves
+  dirty ring data during an origin outage. The fragment server now exposes the
+  journal-manifest discovery callback used by cross-node dirty reads.
 - #66: Rewrote block-device and NBD docs for attached NBD clients instead of microVMs, and dropped cloud-fleet wording from the package description.
 - #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.
 - #84: Wired the cache node's built-in managed lakehouse binding explicitly
   through backend construction, block-device store lookup, and the S3 router.
+- #82: Added explicit eventual polling and strong quorum-backed catalog runtimes. Strong mode requires the three-node fragment ring, verifies ordered Lakekeeper events, catches query reads up to the EC tail, and returns applied event proofs without a polling fallback.
 - #84: Added the cache-node Docker target and rendered local startup contract used by the three-member OSS fragment ring. The ring exposes one selected embedded safekeeper for managed Neon while retaining erasure-coded WAL durability across all three cache volumes.
 - #84: Passed the cache node's managed backend binding into its embedded
-  safekeeper so completed WAL segments drain to the configured object store.
+   safekeeper so completed WAL segments drain to the configured object store.
 - #87: Added the authenticated host-agent quiescence API and wired one atomic admission fence across S3/catalog HTTP, NBD connections, fragment RPC operations, and embedded safekeeper connections. The fence rejects new work, reports already-accepted work until it drains, and can be reopened only with its current generation; background recovery and propagation do not create a ring-drain requirement.
-- Removed the obsolete serving-API router argument after `/v1` was removed from the S3 frontend, restoring cache-node and complete Docker image builds.

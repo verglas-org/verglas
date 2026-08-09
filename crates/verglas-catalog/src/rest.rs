@@ -44,7 +44,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
 use verglas_core::config;
 
-use super::{CatalogError, CatalogSource, TableIdent, TableState};
+use super::{CatalogError, CatalogMutation, CatalogSource, TableIdent, TableState};
 
 /// SigV4 signing settings resolved from `[catalog]`: the region, the signing
 /// name (`s3tables` / `glue`), and a credentials provider (a named AWS-INI file
@@ -159,6 +159,8 @@ pub struct RestCatalogSource {
     /// Monotonic catalog generation advanced only when a prepared REST response
     /// changes or a successful mutation invalidates the prepared response set.
     generation: Arc<AtomicU64>,
+    /// Highest quorum mutation fully reflected by the response cache.
+    applied_sequence: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for RestCatalogSource {
@@ -225,6 +227,53 @@ impl CatalogGateway {
     /// Current prepared-catalog generation for query-session invalidation.
     pub fn generation(&self) -> u64 {
         self.source.generation.load(Ordering::Acquire)
+    }
+
+    /// Highest strong catalog sequence visible to local query clients.
+    pub fn applied_sequence(&self) -> u64 {
+        self.source.applied_sequence.load(Ordering::Acquire)
+    }
+
+    /// Applies one durable pointer and invalidates prepared catalog responses.
+    ///
+    /// Replay deliberately performs no upstream table load: a REST catalog
+    /// exposes only the current pointer and cannot reproduce every historical
+    /// outbox position after a restart. The next fenced read repopulates the
+    /// response cache from the current catalog state.
+    pub async fn apply_mutation(
+        &self,
+        mutation: &CatalogMutation,
+    ) -> Result<Option<TableState>, CatalogError> {
+        if mutation.sequence <= self.applied_sequence() {
+            if mutation.operation == "dropTable" {
+                return Ok(None);
+            }
+            return Ok(mutation
+                .metadata_location
+                .as_ref()
+                .map(|location| TableState {
+                    metadata_location: location.clone(),
+                    current_snapshot_id: mutation.snapshot_id,
+                }));
+        }
+        self.source.responses.write().await.clear();
+        let dropped = mutation.operation == "dropTable";
+        let state = if dropped {
+            None
+        } else {
+            mutation
+                .metadata_location
+                .as_ref()
+                .map(|location| TableState {
+                    metadata_location: location.clone(),
+                    current_snapshot_id: mutation.snapshot_id,
+                })
+        };
+        self.source.generation.fetch_add(1, Ordering::AcqRel);
+        self.source
+            .applied_sequence
+            .store(mutation.sequence, Ordering::Release);
+        Ok(state)
     }
 
     /// Serves one local catalog request. Successful watcher or gateway GETs are
@@ -515,6 +564,7 @@ impl RestCatalogSource {
                 CATALOG_RESPONSE_CACHE_BYTES,
             ))),
             generation: Arc::new(AtomicU64::new(0)),
+            applied_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 

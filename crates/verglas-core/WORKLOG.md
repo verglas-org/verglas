@@ -423,5 +423,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #66: Documented optional analytics config as self-hosted only (removed cloud-composes-independently contrast).
 - #66: Removed optional external control-plane node reporting and the [control_plane] config field from the OSS server.
 - #84: Added immutable storage-binding identity to object, list, multipart, and rendezvous-placement keys. Equal bucket and object names at different origins now remain distinct throughout the data plane.
+- #84: Added dynamic-runtime validation for cache processes whose backend and catalog bindings arrive after startup. Static file configuration still requires an explicit backend and keeps its existing validation contract.
+- #82: Added the explicit `eventual` and `strong` catalog consistency contract. Eventual catalogs poll; strong catalogs require quorum-backed direct delivery and cannot select a third mode.
 - #87: Added atomic foreground activity accounting across HTTP, NBD, fragment, and safekeeper planes. A generation-fenced admission lease makes a zero in-flight report safe for a host stop decision while retaining per-plane diagnostics.
-- #84: Defined the shared ephemeral run-bearer environment contract used by query and write role launchers. Bearer values remain outside role configs, durable job declarations, arguments, and logs.
