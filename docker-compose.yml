@@ -174,6 +174,41 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  verglas-agent-runtime:
+    build:
+      context: .
+      target: verglas-agent-runtime
+    image: verglas/verglas-agent-runtime:local
+    ports:
+      - "127.0.0.1:8390:8390"
+    environment:
+      DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_scheduler
+      VERGLAS_AGENT_RUNTIME_TOKEN: ${VERGLAS_AGENT_RUNTIME_TOKEN:-verglas-local-agent-runtime}
+      VERGLAS_AGENT_RUNNER_IMAGE: verglas/verglas-agent-runtime:local
+      VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
+      VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
+      VERGLAS_RUNTIME_NETWORK: verglas-runtime
+      VERGLAS_DATA_ENDPOINT: http://verglas-server:8334
+      VERGLAS_DATA_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+      VERGLAS_ACCESS_URI: http://verglas-access:8345
+      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
+      LOCAL_MODEL_RUNTIME_URL: http://verglas-os:8790
+      LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
+    depends_on:
+      verglas-postgres-init:
+        condition: service_completed_successfully
+      verglas-container-runtime:
+        condition: service_started
+      verglas-access:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8390/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
   verglas-os:
     build:
       context: .
@@ -191,12 +226,19 @@ services:
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
+      LOCAL_MODEL_RUNTIME_HOST: 0.0.0.0
+      CLAUDE_CONFIG_DIR: /root/.claude
+      VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390
+      VERGLAS_AGENT_RUNTIME_TOKEN: ${VERGLAS_AGENT_RUNTIME_TOKEN:-verglas-local-agent-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
       VERGLAS_LOCAL_OWNER_BOOTSTRAP: "true"
     volumes:
       - verglas-os-state:/workspace/apps/os/.wrangler/state
+      - ${HOME}/.codex:/root/.codex
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.cursor:/root/.cursor
     depends_on:
       verglas-server:
         condition: service_started
@@ -205,6 +247,8 @@ services:
       verglas-container-runtime:
         condition: service_started
       verglas-access:
+        condition: service_healthy
+      verglas-agent-runtime:
         condition: service_healthy
     restart: unless-stopped
 

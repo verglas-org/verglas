@@ -87,14 +87,29 @@ impl EnvironmentConfig {
             required("VERGLAS_S3_ACCESS_KEY_ID")?,
             required("VERGLAS_S3_SECRET_ACCESS_KEY")?,
         );
-        let analytics = Analytics {
-            rill: Rill {
-                uri: required("VERGLAS_RILL_URI")?,
-                instance_id: required("VERGLAS_RILL_INSTANCE_ID")?,
-                browser_uri: required("VERGLAS_RILL_BROWSER_URI")?,
-                s3_uri: required("VERGLAS_RILL_S3_URI")?,
-            },
-        };
+        let rill_names = [
+            "VERGLAS_RILL_URI",
+            "VERGLAS_RILL_INSTANCE_ID",
+            "VERGLAS_RILL_BROWSER_URI",
+            "VERGLAS_RILL_S3_URI",
+        ];
+        let rill_configured = rill_names.iter().any(|name| {
+            values
+                .get(*name)
+                .is_some_and(|value| !value.trim().is_empty())
+        });
+        let analytics = rill_configured
+            .then(|| -> Result<Analytics, String> {
+                Ok(Analytics {
+                    rill: Rill {
+                        uri: required("VERGLAS_RILL_URI")?,
+                        instance_id: required("VERGLAS_RILL_INSTANCE_ID")?,
+                        browser_uri: required("VERGLAS_RILL_BROWSER_URI")?,
+                        s3_uri: required("VERGLAS_RILL_S3_URI")?,
+                    },
+                })
+            })
+            .transpose()?;
         let config = Config {
             listen: Listen::default(),
             log: Log::default(),
@@ -104,7 +119,7 @@ impl EnvironmentConfig {
             catalog: Some(catalog),
             query_worker: Some(query_worker),
             write_worker: Some(write_worker),
-            analytics: Some(analytics),
+            analytics,
             cluster: None,
         };
         config
@@ -202,5 +217,26 @@ mod tests {
             .err()
             .expect("missing catalog must fail");
         assert!(error.contains("VERGLAS_CATALOG_URI"), "{error}");
+    }
+
+    #[test]
+    fn environment_mode_does_not_require_rill() {
+        let environment = complete_environment()
+            .into_iter()
+            .filter(|(name, _)| !name.starts_with("VERGLAS_RILL_"));
+        let loaded = EnvironmentConfig::from_pairs(environment)
+            .expect("Rill is an optional analytics attachment");
+        assert!(loaded.config.analytics.is_none());
+    }
+
+    #[test]
+    fn partial_rill_environment_fails_closed() {
+        let environment = complete_environment()
+            .into_iter()
+            .filter(|(name, _)| name != "VERGLAS_RILL_S3_URI");
+        let error = EnvironmentConfig::from_pairs(environment)
+            .err()
+            .expect("partial Rill configuration must fail");
+        assert!(error.contains("VERGLAS_RILL_S3_URI"), "{error}");
     }
 }

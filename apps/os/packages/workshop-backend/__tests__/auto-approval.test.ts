@@ -1,7 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { createTypedStorage, collection } from "@verglas/typed-storage";
-import { AutoApprovalDrainer, AutoApprovalStorage, ApplyPendingActionFn } from "../src/auto-approval.js";
-import type { ActionRecord, AutoApproveTagRecord } from "../src/overseer.js";
+import {
+  AutoApprovalDrainer, type ActionRecord, type AutoApprovalStorage,
+  type ApplyPendingActionFn, type AutoApproveTagRecord,
+} from "../src/auto-approval.js";
 import type { AiChatAuthorInfo } from "@verglas/workshop-shared/api";
 import { makeMockStorage } from "./mock-storage.js";
 

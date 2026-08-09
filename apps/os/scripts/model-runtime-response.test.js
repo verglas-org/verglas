@@ -21,6 +21,17 @@ test("parseRuntimeOutput retains valid text and tool calls", () => {
   });
 });
 
+test("parseRuntimeOutput unwraps a structured assistant message returned as a JSON string", () => {
+  const assistant = JSON.stringify({
+    content: null,
+    tool_calls: [{name: "query", arguments: '{"sql":"select 1"}'}],
+  });
+  assert.deepEqual(parseRuntimeOutput(JSON.stringify(assistant)), {
+    content: null,
+    tool_calls: [{name: "query", arguments: {sql: "select 1"}}],
+  });
+});
+
 test("parseRuntimeOutput parses structured CLI tool arguments", () => {
   assert.deepEqual(parseRuntimeOutput(JSON.stringify({
     result: {

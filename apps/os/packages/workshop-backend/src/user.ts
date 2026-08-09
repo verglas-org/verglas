@@ -16,7 +16,6 @@ const logger = createWorkshopLogger("workshop.user");
 
 // How many workspaces one Outputs catch-up pass examines, bounding the Durable Objects a single
 // listOutputs() call wakes and how long it waits. The client calls again until catch-up is done.
-const OUTPUTS_BACKFILL_PAGE = 16;
 
 type ConnectedAccountRecord = {
   id: number;
@@ -114,7 +113,7 @@ export type WorkspaceOutputEntry = {
 };
 
 type OutputRecord = WorkspaceOutputEntry & {
-  // The workspace containing this output (an Overseer DO id).
+  // The Workspace containing this legacy output mirror.
   workspaceId: string;
 };
 
@@ -708,56 +707,11 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
   // drains the rest, so the list fills in while the page is open.
   async #backfillOutputs(): Promise<boolean> {
     if (this.storage.outputsBackfilled.get()) return false;
-
-    let startAfter = this.storage.outputsBackfillCursor.get() || undefined;
-    let cursor = startAfter ?? "";
-    let targets: string[] = [];
-    let examined = 0;
-    for (let workspace of this.storage.workspaces.list({startAfter, limit: OUTPUTS_BACKFILL_PAGE})) {
-      ++examined;
-      cursor = workspace.id;
-      // A shared workspace is mirrored on open, not swept; a half-created one has nothing yet.
-      if (!workspace.owner && isFullyCreated(workspace)) targets.push(workspace.id);
-    }
-    let done = examined < OUTPUTS_BACKFILL_PAGE;
-
-    let ownerId = this.ctx.id.toString();
-    let overseers = this.ctx.exports.OverseerDurableObject;
-    let results = await Promise.allSettled(targets.map(id =>
-        overseers.get(overseers.idFromString(id)).getOutputsForOwnerBackfill(ownerId)));
-
-    let failureCount = 0;
-    let firstError: unknown;
-    for (let [index, result] of results.entries()) {
-      if (result.status === "fulfilled") {
-        if (result.value) this.syncWorkspaceOutputs(targets[index], result.value);
-      } else {
-        if (failureCount === 0) firstError = result.reason;
-        ++failureCount;
-      }
-    }
-
-    if (failureCount > 0) {
-      logger.warn("failed to backfill outputs for some workspaces", {
-        event: "outputs.backfill.partial",
-        failureCount,
-        error: firstError,
-      });
-    }
-
-    // Advance past workspaces that failed, rather than retrying them. The index is self-healing,
-    // so one missed here reappears the moment it is touched, whereas holding the cursor lets a
-    // single unwakeable workspace stall the sweep forever.
-    if (done) {
-      this.storage.outputsBackfilled.put(true);
-    } else {
-      this.storage.outputsBackfillCursor.put(cursor);
-    }
-
-    // A page where everything failed looks systemic, so stop draining and let the next visit pick
-    // up from the next page: draining on would be a burst of doomed calls during an outage.
-    if (failureCount > 0 && failureCount === targets.length) return false;
-    return !done;
+    // Application Vessels and Jobs now come from Verglas directly. There is no Workspace DO to
+    // wake for the legacy output mirror, so mark the obsolete one-time backfill complete.
+    this.storage.outputsBackfilled.put(true);
+    this.storage.outputsBackfillCursor.put("");
+    return false;
   }
 
   #readOutputs(): OutputSummary[] {

@@ -153,6 +153,12 @@
             "PendingLogin"
           ],
           "tag": "v2"
+        },
+        {
+          "deleted_classes": [
+            "OverseerDurableObject"
+          ],
+          "tag": "v3"
         }
       ],
       "modules": [

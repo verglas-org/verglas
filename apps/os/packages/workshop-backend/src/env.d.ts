@@ -81,6 +81,8 @@ declare global {
       // Native coding-agent CLI adapter. The bearer token is backend-only.
       LOCAL_MODEL_RUNTIME_URL?: string;
       LOCAL_MODEL_RUNTIME_TOKEN?: string;
+      VERGLAS_AGENT_RUNTIME_URL?: string;
+      VERGLAS_AGENT_RUNTIME_TOKEN?: string;
 
     }
   }
