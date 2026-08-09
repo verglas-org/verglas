@@ -77,6 +77,23 @@ describe("control-plane connectors", () => {
     ]);
     expect(runtime.previewUrl("linear app")).toBe("http://runtime.test/apps/linear%20app/");
   });
+
+  it("routes persisted Vessel lifecycle commands", async () => {
+    const requests: Request[] = [];
+    const runtime = connectRuntime({
+      endpoint: "http://runtime.test",
+      token: "control-token",
+      fetch: recordingFetch(requests),
+    });
+
+    await runtime.stopVessel("warehouse ui");
+    await runtime.resumeVessel("warehouse ui");
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ["POST", "/v1/vessels/warehouse%20ui/stop"],
+      ["POST", "/v1/vessels/warehouse%20ui/resume"],
+    ]);
+  });
 });
 
 describe("extractWorkerSource", () => {

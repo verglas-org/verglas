@@ -1,6 +1,6 @@
 //! Authenticated local desired-state API for Docker container placement.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -188,6 +188,8 @@ impl RuntimeService {
                 "/v1/vessels/{name}",
                 get(get_vessel).put(put_vessel).delete(delete_vessel),
             )
+            .route("/v1/vessels/{name}/stop", post(stop_vessel))
+            .route("/v1/vessels/{name}/resume", post(resume_vessel))
             .route(
                 "/v1/vessels/{name}/composition",
                 put(put_vessel_composition),
@@ -253,6 +255,9 @@ struct DesiredState {
     containers: BTreeMap<String, DesiredDeployment>,
     #[serde(default)]
     vessels: BTreeMap<String, VesselSpec>,
+    /// Vessel names the reconciler must leave stopped until an explicit resume.
+    #[serde(default)]
+    stopped_vessels: BTreeSet<String>,
     #[serde(default)]
     compositions: BTreeMap<String, AppliedVessel>,
 }
@@ -281,9 +286,14 @@ impl ServiceState {
             }
         }
         for vessel in desired.vessels.values() {
-            self.runtime
-                .reconcile(&self.normalize(vessel.container_spec()?))
-                .await?;
+            let deployment_id = format!("vessel-{}", vessel.name);
+            if !desired.stopped_vessels.contains(&vessel.name) {
+                self.runtime
+                    .reconcile(&self.normalize(vessel.container_spec()?))
+                    .await?;
+            } else {
+                self.runtime.stop(&deployment_id).await?;
+            }
         }
         Ok(())
     }
@@ -459,6 +469,7 @@ struct VesselView {
     name: String,
     role: VesselRole,
     image: String,
+    running: bool,
     state: Option<ObservedState>,
     health: VesselHealth,
 }
@@ -478,17 +489,20 @@ async fn list_vessels(
     headers: HeaderMap,
 ) -> Result<Json<Vec<VesselView>>, ServiceError> {
     authorize(&headers, &state.token)?;
-    let vessels = state
-        .desired
-        .read()
-        .await
+    let desired = state.desired.read().await;
+    let vessels = desired
         .vessels
         .values()
         .cloned()
+        .map(|vessel| {
+            let running = !desired.stopped_vessels.contains(&vessel.name);
+            (vessel, running)
+        })
         .collect::<Vec<_>>();
+    drop(desired);
     let mut views = Vec::with_capacity(vessels.len());
-    for vessel in vessels {
-        views.push(vessel_view(&state, vessel).await?);
+    for (vessel, running) in vessels {
+        views.push(vessel_view(&state, vessel, running).await?);
     }
     Ok(Json(views))
 }
@@ -500,17 +514,17 @@ async fn get_vessel(
     headers: HeaderMap,
 ) -> Result<Json<VesselView>, ServiceError> {
     authorize(&headers, &state.token)?;
-    let vessel = state
-        .desired
-        .read()
-        .await
+    let desired = state.desired.read().await;
+    let vessel = desired
         .vessels
         .get(&name)
         .cloned()
         .ok_or(RuntimeError::InvalidDeploymentId {
             deployment_id: name,
         })?;
-    Ok(Json(vessel_view(&state, vessel).await?))
+    let running = !desired.stopped_vessels.contains(&vessel.name);
+    drop(desired);
+    Ok(Json(vessel_view(&state, vessel, running).await?))
 }
 
 /// Creates or replaces one desired Vessel and its single container.
@@ -529,7 +543,17 @@ async fn put_vessel(
     }
     let specification = state.normalize(vessel.container_spec()?);
     let _operation = state.operation.lock().await;
-    let outcome = state.runtime.reconcile(&specification).await?;
+    let running = !state
+        .desired
+        .read()
+        .await
+        .stopped_vessels
+        .contains(&vessel.name);
+    let outcome = if running {
+        state.runtime.reconcile(&specification).await?
+    } else {
+        ReconcileOutcome::Unchanged
+    };
     state
         .desired
         .write()
@@ -567,7 +591,17 @@ async fn put_vessel_project(
     let build = state.runtime.build_project(&project).await?;
     let vessel = project.vessel_spec(build.image.clone());
     let specification = state.normalize(vessel.container_spec()?);
-    let outcome = state.runtime.reconcile(&specification).await?;
+    let running = !state
+        .desired
+        .read()
+        .await
+        .stopped_vessels
+        .contains(&vessel.name);
+    let outcome = if running {
+        state.runtime.reconcile(&specification).await?
+    } else {
+        ReconcileOutcome::Unchanged
+    };
     state
         .desired
         .write()
@@ -667,14 +701,14 @@ async fn put_vessel_composition(
         resolved_services.push(project.vessel_spec(build.image));
     }
 
-    if let Err(error) = reconcile_services(&state, &resolved_services).await {
-        rollback_services(&state, previous.as_ref(), &resolved_services).await;
+    if let Err(error) = reconcile_services(&state, &prior_state, &resolved_services).await {
+        rollback_services(&state, &prior_state, previous.as_ref(), &resolved_services).await;
         return Err(error);
     }
     if workers_changed && let Err(error) = register_workers(&endpoint, &token, &plan.workers).await
     {
         rollback_workers(&endpoint, &token, previous.as_ref(), &plan.workers).await;
-        rollback_services(&state, previous.as_ref(), &resolved_services).await;
+        rollback_services(&state, &prior_state, previous.as_ref(), &resolved_services).await;
         return Err(error);
     }
 
@@ -694,7 +728,8 @@ async fn put_vessel_composition(
                 if workers_changed {
                     rollback_workers(&endpoint, &token, previous.as_ref(), &applied.workers).await;
                 }
-                rollback_services(&state, previous.as_ref(), &resolved_services).await;
+                rollback_services(&state, &prior_state, previous.as_ref(), &resolved_services)
+                    .await;
                 return Err(error.into());
             }
         }
@@ -709,7 +744,8 @@ async fn put_vessel_composition(
                     set_worker_state(&endpoint, &token, &worker.name, "archived").await
             {
                 rollback_workers(&endpoint, &token, previous.as_ref(), &applied.workers).await;
-                rollback_services(&state, previous.as_ref(), &resolved_services).await;
+                rollback_services(&state, &prior_state, previous.as_ref(), &resolved_services)
+                    .await;
                 return Err(error);
             }
         }
@@ -720,9 +756,16 @@ async fn put_vessel_composition(
         if let Some(old) = &previous {
             for service in &old.services {
                 desired.vessels.remove(&service.name);
+                desired.stopped_vessels.remove(&service.name);
             }
         }
         for service in &applied.services {
+            let stopped = prior_state.stopped_vessels.contains(&service.name);
+            if stopped {
+                desired.stopped_vessels.insert(service.name.clone());
+            } else {
+                desired.stopped_vessels.remove(&service.name);
+            }
             desired
                 .vessels
                 .insert(service.name.clone(), service.clone());
@@ -730,11 +773,11 @@ async fn put_vessel_composition(
         desired.compositions.insert(name, applied.clone());
     }
     if let Err(error) = state.persist().await {
-        *state.desired.write().await = prior_state;
+        *state.desired.write().await = prior_state.clone();
         if workers_changed {
             rollback_workers(&endpoint, &token, previous.as_ref(), &applied.workers).await;
         }
-        rollback_services(&state, previous.as_ref(), &resolved_services).await;
+        rollback_services(&state, &prior_state, previous.as_ref(), &resolved_services).await;
         return Err(error);
     }
 
@@ -749,9 +792,13 @@ async fn put_vessel_composition(
 /// Reconciles all already-built long-lived components.
 async fn reconcile_services(
     state: &ServiceState,
+    previous: &DesiredState,
     services: &[VesselSpec],
 ) -> Result<(), ServiceError> {
     for service in services {
+        if previous.stopped_vessels.contains(&service.name) {
+            continue;
+        }
         state
             .runtime
             .reconcile(&state.normalize(service.container_spec()?))
@@ -763,6 +810,7 @@ async fn reconcile_services(
 /// Restores the prior service set after a failed apply.
 async fn rollback_services(
     state: &ServiceState,
+    previous_state: &DesiredState,
     previous: Option<&AppliedVessel>,
     attempted: &[VesselSpec],
 ) {
@@ -784,6 +832,9 @@ async fn rollback_services(
         }
     }
     for service in old.values() {
+        if previous_state.stopped_vessels.contains(&service.name) {
+            continue;
+        }
         if let Ok(specification) = service.container_spec() {
             let _ = state
                 .runtime
@@ -893,6 +944,65 @@ fn composition_view(vessel: AppliedVessel, outcome: CompositionOutcome) -> Vesse
     }
 }
 
+/// Persists a stopped Vessel desired state before stopping its owned container.
+///
+/// Recording the intent first prevents the periodic reconciler from reviving a
+/// Vessel if the manager restarts after Docker accepts the stop request.
+async fn stop_vessel(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let _operation = state.operation.lock().await;
+    let deployment_id = {
+        let mut desired = state.desired.write().await;
+        let vessel =
+            desired
+                .vessels
+                .get(&name)
+                .ok_or_else(|| RuntimeError::InvalidDeploymentId {
+                    deployment_id: name.clone(),
+                })?;
+        let deployment_id = format!("vessel-{}", vessel.name);
+        desired.stopped_vessels.insert(name.clone());
+        deployment_id
+    };
+    state.persist().await?;
+    state.runtime.stop(&deployment_id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Persists a running Vessel desired state and reconciles its owned container.
+async fn resume_vessel(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<ReconcileOutcome>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    let _operation = state.operation.lock().await;
+    let specification = {
+        let mut desired = state.desired.write().await;
+        let vessel =
+            desired
+                .vessels
+                .get(&name)
+                .ok_or_else(|| RuntimeError::InvalidDeploymentId {
+                    deployment_id: name.clone(),
+                })?;
+        let specification = vessel.clone();
+        desired.stopped_vessels.remove(&name);
+        specification
+    };
+    state.persist().await?;
+    Ok(Json(
+        state
+            .runtime
+            .reconcile(&state.normalize(specification.container_spec()?))
+            .await?,
+    ))
+}
+
 /// Removes one desired Vessel and its owned container.
 async fn delete_vessel(
     State(state): State<Arc<ServiceState>>,
@@ -902,7 +1012,10 @@ async fn delete_vessel(
     authorize(&headers, &state.token)?;
     let _operation = state.operation.lock().await;
     state.runtime.remove(&format!("vessel-{name}")).await?;
-    state.desired.write().await.vessels.remove(&name);
+    let mut desired = state.desired.write().await;
+    desired.vessels.remove(&name);
+    desired.stopped_vessels.remove(&name);
+    drop(desired);
     state.persist().await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1165,8 +1278,12 @@ async fn send_vessel(
         .map_err(|error| ServiceError::VesselRequest(error.to_string()))
 }
 
-/// Joins a desired Vessel with its normalized Docker observation.
-async fn vessel_view(state: &ServiceState, vessel: VesselSpec) -> Result<VesselView, ServiceError> {
+/// Joins a desired Vessel and its explicit running intent with its Docker observation.
+async fn vessel_view(
+    state: &ServiceState,
+    vessel: VesselSpec,
+    running: bool,
+) -> Result<VesselView, ServiceError> {
     let observed = state
         .runtime
         .inspect(&format!("vessel-{}", vessel.name))
@@ -1194,6 +1311,7 @@ async fn vessel_view(state: &ServiceState, vessel: VesselSpec) -> Result<VesselV
         name: vessel.name,
         role: vessel.role,
         image: vessel.image,
+        running,
         state: observed.map(|container| container.state),
         health,
     })
@@ -1266,7 +1384,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        is_bootstrap_target, load_desired, validate_namespace_manifest, validate_run_identity,
+        DesiredState, is_bootstrap_target, load_desired, validate_namespace_manifest,
+        validate_run_identity,
     };
 
     /// The manager and the data-plane server cannot recursively manage themselves.
@@ -1287,6 +1406,47 @@ mod tests {
         let desired = load_desired(&path).await.expect("load missing state");
         assert!(desired.containers.is_empty());
         assert!(desired.vessels.is_empty());
+    }
+
+    /// A stopped Vessel remains stopped when its desired state is reloaded.
+    #[test]
+    fn vessel_lifecycle_state_is_persisted() {
+        let desired: DesiredState = serde_json::from_value(json!({
+            "containers": {},
+            "vessels": {
+                "warehouse": {
+                    "name": "warehouse",
+                    "role": "application",
+                    "image": "example.test/warehouse:latest",
+                    "http": { "port": 3000 }
+                }
+            },
+            "stoppedVessels": ["warehouse"],
+            "compositions": {}
+        }))
+        .expect("desired state");
+
+        assert!(desired.stopped_vessels.contains("warehouse"));
+    }
+
+    /// Existing persisted Vessel declarations remain running when no lifecycle state exists.
+    #[test]
+    fn persisted_vessels_default_to_running() {
+        let desired: DesiredState = serde_json::from_value(json!({
+            "containers": {},
+            "vessels": {
+                "warehouse": {
+                    "name": "warehouse",
+                    "role": "application",
+                    "image": "example.test/warehouse:latest",
+                    "http": { "port": 3000 }
+                }
+            },
+            "compositions": {}
+        }))
+        .expect("legacy desired state");
+
+        assert!(!desired.stopped_vessels.contains("warehouse"));
     }
 
     /// Integration containers cannot claim another Vessel's public namespace.

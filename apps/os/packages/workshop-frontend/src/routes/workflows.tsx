@@ -1,5 +1,5 @@
-import { createFileRoute } from '@tanstack/react-router'
-import { FlowArrow, Pause, Play, Trash } from '@phosphor-icons/react'
+import { Link, createFileRoute } from '@tanstack/react-router'
+import { CaretRight, Pause, Play, Plus, Trash } from '@phosphor-icons/react'
 import { useCallback, useEffect, useState } from 'react'
 import type { VerglasWorkerDetail, VerglasWorkerRunSummary, VerglasWorkerSummary } from '@verglas/workshop-shared/api'
 import { useAuthenticatedApi } from '../AuthContext'
@@ -10,12 +10,12 @@ import {
   CatalogError,
   CatalogPage,
   CatalogStatus,
-  CatalogTable,
 } from '../components/CatalogTable'
 import { RunHistoryDots } from '../components/RunHistoryDots'
+import { WorkersBoard, WorkersEmptyState } from '../components/WorkersBoard'
 import { useDocumentTitle } from '../useDocumentTitle'
 
-export const Route = createFileRoute('/workflows')({ component: JobsPage })
+export const Route = createFileRoute('/workflows')({ component: WorkersPage })
 
 function triggerLabels(raw: string): string[] {
   try {
@@ -31,8 +31,8 @@ function triggerLabels(raw: string): string[] {
   }
 }
 
-function JobsPage() {
-  useDocumentTitle('Jobs')
+function WorkersPage() {
+  useDocumentTitle('Workers')
   const { authenticatedApi } = useAuthenticatedApi()
   const [workers, setWorkers] = useState<VerglasWorkerSummary[]>([])
   const [selected, setSelected] = useState<string | null>(null)
@@ -42,7 +42,7 @@ function JobsPage() {
   const [detailLoading, setDetailLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null)
+  const [confirmArchive, setConfirmArchive] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -125,13 +125,13 @@ function JobsPage() {
   }
 
   const remove = async () => {
-    if (!confirmDelete) return
+    if (!confirmArchive) return
     setBusy(true)
     setError(null)
     try {
-      await authenticatedApi.setVerglasWorkerState(confirmDelete, 'archived')
-      setConfirmDelete(null)
-      if (selected === confirmDelete) close()
+      await authenticatedApi.setVerglasWorkerState(confirmArchive, 'archived')
+      setConfirmArchive(null)
+      if (selected === confirmArchive) close()
       await load()
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -144,7 +144,12 @@ function JobsPage() {
   const triggers = worker ? triggerLabels(worker.triggers) : []
 
   return (
-    <CatalogPage title="Jobs" description="Workers that ingest, transform, or act on lakehouse data." onRefresh={() => void load()}>
+    <CatalogPage
+      title="Workers"
+      description="Monitor scheduled and event-driven jobs across your lakehouse."
+      onRefresh={() => void load()}
+      actions={<Link to="/" search={{prompt: 'Create a worker that '}} className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-kumo-brand px-3 text-[13px] font-medium text-white hover:bg-kumo-brand-hover"><Plus size={15} /> Create worker</Link>}
+    >
       {error && <CatalogError message={error} />}
       {selected ? (
         <CatalogDetailCard
@@ -166,11 +171,11 @@ function JobsPage() {
             <>
               <button
                 type="button"
-                onClick={() => setConfirmDelete(selected)}
+                onClick={() => setConfirmArchive(selected)}
                 className="mr-auto inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg border border-kumo-line px-3 text-[13px] text-kumo-subtle hover:border-kumo-danger/40 hover:bg-kumo-danger-tint hover:text-kumo-danger"
               >
                 <Trash size={14} />
-                Delete
+                Archive
               </button>
               <button
                 type="button"
@@ -194,11 +199,19 @@ function JobsPage() {
           }
         >
           {detailLoading && !worker ? (
-            <div className="py-10 text-center text-sm text-kumo-subtle">Loading job…</div>
+            <div className="py-10 text-center text-sm text-kumo-subtle">Loading worker…</div>
           ) : worker ? (
             <div className="space-y-6">
               <section>
-                <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-kumo-inactive">Schedule</h3>
+                <h3 className="mb-2 text-[11px] font-medium uppercase tracking-wide text-kumo-inactive">Execution graph</h3>
+                <div className="grid items-center gap-2 sm:grid-cols-[1fr_auto_1fr_auto_1fr]">
+                  <GraphNode label="Trigger" value={triggers[0] ?? 'Manual only'} />
+                  <CaretRight className="mx-auto hidden text-kumo-inactive sm:block" />
+                  <GraphNode label="Worker" value={worker.name} />
+                  <CaretRight className="mx-auto hidden text-kumo-inactive sm:block" />
+                  <GraphNode label="Output" value={worker.output || 'No output'} />
+                </div>
+                <h3 className="mb-2 mt-5 text-[11px] font-medium uppercase tracking-wide text-kumo-inactive">Triggers</h3>
                 <div className="flex flex-wrap gap-1.5">
                   {triggers.map((trigger, index) => (
                     <span key={`${trigger}-${index}`} className="rounded-md bg-kumo-tint px-2 py-1 text-[11px] text-kumo-subtle">
@@ -273,46 +286,29 @@ function JobsPage() {
           ) : null}
         </CatalogDetailCard>
       ) : loading ? (
-        <CatalogEmpty>Loading Verglas workers…</CatalogEmpty>
+        <CatalogEmpty>Loading workers and scheduler activity…</CatalogEmpty>
       ) : (
-        <CatalogTable
-          empty="No workers are registered in Verglas."
-          cards={workers.map((entry) => ({
-            id: entry.name,
-            icon: <FlowArrow size={18} />,
-            primary: entry.name,
-            secondary: entry.output || 'No output declared',
-            tertiary: triggerLabels(entry.triggers).join(' · '),
-            meta: (
-              <div className="flex flex-col items-end gap-1.5">
-                <div className="flex items-center gap-1.5">
-                  {entry.activeRun && (
-                    <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-amber-600">
-                      Live
-                    </span>
-                  )}
-                  <CatalogStatus value={entry.state} good={entry.state === 'running'} />
-                </div>
-                <RunHistoryDots runs={entry.recentRuns} />
-              </div>
-            ),
-            onOpen: () => open(entry.name),
-          }))}
-        />
+        workers.length === 0 ? <WorkersEmptyState /> : <WorkersBoard workers={workers} onOpen={open} />
       )}
 
       <DeleteConfirmationDialog
-        open={confirmDelete !== null}
-        title="Delete job"
+        open={confirmArchive !== null}
+        title="Archive worker"
         description={
-          confirmDelete
-            ? `Archive “${confirmDelete}” so it leaves the active worker list. Past runs remain in scheduler history.`
+          confirmArchive
+            ? `Archive “${confirmArchive}”? It will stop receiving triggers and leave the active Workers list. Scheduler history remains available.`
             : null
         }
+        confirmLabel="Archive"
+        confirmingLabel="Archiving…"
         isDeleting={busy}
-        onOpenChange={(open) => { if (!open) setConfirmDelete(null) }}
+        onOpenChange={(nextOpen) => { if (!nextOpen) setConfirmArchive(null) }}
         onConfirm={() => void remove()}
       />
     </CatalogPage>
   )
+}
+
+function GraphNode({ label, value }: { label: string; value: string }) {
+  return <div className="min-w-0 rounded-xl border border-kumo-line bg-kumo-tint/30 p-3"><div className="text-[10px] font-medium uppercase tracking-wide text-kumo-inactive">{label}</div><div title={value} className="mt-2 truncate font-mono text-[12px] text-kumo-default">{value}</div></div>
 }

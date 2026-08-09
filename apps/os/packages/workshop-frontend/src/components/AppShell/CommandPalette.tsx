@@ -230,7 +230,7 @@ export default function CommandPalette({
       ...formatCommands,
       {
         id: 'nav-workflows',
-        label: 'Jobs',
+        label: 'Workers',
         icon: <FlowArrow size={15} />,
         run: () => navigate({ to: '/workflows' }),
       },

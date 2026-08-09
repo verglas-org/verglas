@@ -1,12 +1,14 @@
 import { createFileRoute, useNavigate } from '@tanstack/react-router'
-import { ArrowRight, ArrowsClockwise, CirclesThreePlus, Database, MagnifyingGlass, SpinnerGap, Table, VectorThree } from '@phosphor-icons/react'
-import type { VerglasCatalogSnapshot, VerglasGraphSummary, VerglasTableSummary, VerglasVectorSummary } from '@verglas/workshop-shared/api'
+import { ArrowRight, ArrowsClockwise, CirclesThreePlus, Database, MagnifyingGlass, Plus, SpinnerGap, Table, Trash, VectorThree } from '@phosphor-icons/react'
+import type { VerglasCatalogSnapshot, VerglasDatabaseDetail, VerglasGraphSummary, VerglasTableDetail, VerglasTableSummary, VerglasVectorSummary } from '@verglas/workshop-shared/api'
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useAuthenticatedApi } from '../AuthContext'
 import { getStoredSelectedModel } from '../modelSelection'
 import { useDocumentTitle } from '../useDocumentTitle'
+import { AlertDialog, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '../components/ui/alert-dialog'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '../components/ui/dialog'
 
-export const Route = createFileRoute('/data')({ component: LakehousePage })
+export const Route = createFileRoute('/data')({ component: DatabasesPage })
 
 type CatalogKind = 'table' | 'vector' | 'graph'
 type CatalogItem =
@@ -14,181 +16,107 @@ type CatalogItem =
   | {kind: 'vector'; id: string; value: VerglasVectorSummary}
   | {kind: 'graph'; id: string; value: VerglasGraphSummary}
 
-const EMPTY_CATALOG: VerglasCatalogSnapshot = {tables: [], vectors: [], graphs: []}
+export type DatabaseGroup = { id: string; name: string; namespace: string[]; tables: VerglasTableSummary[]; vectors: VerglasVectorSummary[]; graphs: VerglasGraphSummary[] }
+export type DatabaseMetric = {label: string; value: string; reported: boolean}
 
-function LakehousePage() {
-  useDocumentTitle('Lakehouse')
+const EMPTY_CATALOG: VerglasCatalogSnapshot = {databases: [], tables: [], vectors: [], graphs: []}
+
+function DatabasesPage() {
+  useDocumentTitle('Databases')
   const {authenticatedApi} = useAuthenticatedApi()
   const navigate = useNavigate()
   const [catalog, setCatalog] = useState(EMPTY_CATALOG)
-  const [activeKind, setActiveKind] = useState<CatalogKind>('table')
+  const [selectedDatabase, setSelectedDatabase] = useState<string | null>(null)
   const [selected, setSelected] = useState<CatalogItem | null>(null)
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [launching, setLaunching] = useState(false)
+  const [detail, setDetail] = useState<VerglasDatabaseDetail | null>(null)
+  const [createTableOpen, setCreateTableOpen] = useState(false)
+  const [createDatabaseOpen, setCreateDatabaseOpen] = useState(false)
+  const [deleteTable, setDeleteTable] = useState<VerglasTableSummary | null>(null)
+  const [deleteDatabase, setDeleteDatabase] = useState<DatabaseGroup | null>(null)
+  const databases = useMemo(() => databaseGroups(catalog), [catalog])
+  const database = databases.find((entry) => entry.id === selectedDatabase) ?? databases[0] ?? null
 
   const loadCatalog = useCallback(async () => {
-    setLoading(true)
-    setError(null)
+    setLoading(true); setError(null)
     try {
-      const next = await authenticatedApi.getVerglasCatalog()
-      setCatalog(next)
-      setSelected((current) => current && catalogContains(next, current) ? current : null)
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
-    } finally {
-      setLoading(false)
-    }
+      const next = await authenticatedApi.getVerglasCatalog(); const nextDatabases = databaseGroups(next)
+      setCatalog(next); setSelectedDatabase((current) => nextDatabases.some((entry) => entry.id === current) ? current : (nextDatabases[0]?.id ?? null)); setSelected((current) => current && catalogContains(next, current) ? current : null)
+    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setLoading(false) }
   }, [authenticatedApi])
-
   useEffect(() => { void loadCatalog() }, [loadCatalog])
 
-  const items = useMemo(() => {
-    const normalized = search.trim().toLocaleLowerCase()
-    return itemsForKind(catalog, activeKind).filter((item) =>
-      !normalized || searchableText(item).toLocaleLowerCase().includes(normalized))
-  }, [activeKind, catalog, search])
-
-  const querySelected = useCallback(async () => {
-    if (!selected || launching) return
-    setLaunching(true)
-    const overseer = authenticatedApi.newWorkspace()
-    try {
-      const models = await authenticatedApi.listModels()
-      const modelId = getStoredSelectedModel(models)
-      const [chat, metadata] = await Promise.all([
-        overseer.newChat(workspacePrompt(selected), modelId),
-        overseer.getMetadata(),
-      ])
-      await navigate({to: '/workspace/$id', params: {id: metadata.id}, search: {chat}})
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason))
-    } finally {
-      overseer[Symbol.dispose]()
-      setLaunching(false)
-    }
-  }, [authenticatedApi, launching, navigate, selected])
+  const openWorkspace = useCallback(async (prompt: string) => {
+    if (launching) return
+    setLaunching(true); const overseer = authenticatedApi.newWorkspace()
+    try { const models = await authenticatedApi.listModels(); const modelId = getStoredSelectedModel(models); const metadata = await overseer.getMetadata(); await overseer.newChat(prompt, modelId); await navigate({to: '/workspace/$id', params: {id: metadata.id}}) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { overseer[Symbol.dispose](); setLaunching(false) }
+  }, [authenticatedApi, launching, navigate])
+  useEffect(() => {
+    if (!database) { setDetail(null); return }
+    let cancelled = false
+    void authenticatedApi.getVerglasDatabase(database.name).then((next) => { if (!cancelled) setDetail(next) }).catch((reason) => { if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason)) })
+    return () => { cancelled = true }
+  }, [authenticatedApi, database])
+  const createTable = useCallback(async (name: string, columns: Array<{name: string; type: string; nullable?: boolean}>) => {
+    if (!database) return
+    setLaunching(true); setError(null)
+    try { await authenticatedApi.createVerglasTable({namespace: database.namespace, name, columns}); setCreateTableOpen(false); await loadCatalog() } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setLaunching(false) }
+  }, [authenticatedApi, database, loadCatalog])
+  const createDatabase = useCallback(async (name: string) => { setLaunching(true); setError(null); try { await authenticatedApi.createVerglasDatabase(name); setCreateDatabaseOpen(false); await loadCatalog(); setSelectedDatabase(name) } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setLaunching(false) } }, [authenticatedApi, loadCatalog])
+  const removeTable = useCallback(async () => { if (!deleteTable) return; setLaunching(true); setError(null); try { await authenticatedApi.deleteVerglasTable(deleteTable.namespace, deleteTable.name); setDeleteTable(null); setSelected(null); await loadCatalog() } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setLaunching(false) } }, [authenticatedApi, deleteTable, loadCatalog])
+  const removeDatabase = useCallback(async () => { if (!deleteDatabase) return; setLaunching(true); setError(null); try { await authenticatedApi.deleteVerglasDatabase(deleteDatabase.name); setDeleteDatabase(null); setSelected(null); await loadCatalog() } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) } finally { setLaunching(false) } }, [authenticatedApi, deleteDatabase, loadCatalog])
+  const matchingTables = useMemo(() => { const normalized = search.trim().toLocaleLowerCase(); return (database?.tables ?? []).filter((table) => !normalized || `${table.name} ${table.qualifiedName}`.toLocaleLowerCase().includes(normalized)) }, [database, search])
 
   return <div className="flex h-full min-h-0 flex-col bg-kumo-base">
-    <header className="flex shrink-0 items-center justify-between border-b border-kumo-line px-6 py-4">
-      <div className="flex items-center gap-3">
-        <span className="flex h-9 w-9 items-center justify-center rounded-xl border border-kumo-line bg-kumo-elevated text-kumo-brand"><Database size={19} weight="duotone" /></span>
-        <div><h1 className="text-lg font-semibold tracking-tight text-kumo-default">Lakehouse</h1><p className="text-[12px] text-kumo-subtle">Explore the data and relationships available to your agents.</p></div>
-      </div>
-      <button type="button" onClick={() => void loadCatalog()} disabled={loading} className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-kumo-line px-3 text-[12px] font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50">
-        <ArrowsClockwise size={14} className={loading ? 'animate-spin' : ''} /> Refresh
-      </button>
-    </header>
-
-    <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_340px]">
-      <main className="flex min-h-0 min-w-0 flex-col border-r border-kumo-line">
-        <div className="flex shrink-0 items-center gap-2 border-b border-kumo-line px-5 py-3">
-          {(['table', 'vector', 'graph'] as const).map((kind) => <KindButton key={kind} kind={kind} active={activeKind === kind} count={catalogCount(catalog, kind)} onClick={() => {setActiveKind(kind); setSelected(null)}} />)}
-          <label className="ml-auto flex h-9 w-[280px] items-center gap-2 rounded-lg border border-kumo-line bg-kumo-elevated px-3 focus-within:border-kumo-brand">
-            <MagnifyingGlass size={14} className="shrink-0 text-kumo-inactive" />
-            <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder={`Search ${kindLabel(activeKind).toLocaleLowerCase()}…`} className="min-w-0 flex-1 bg-transparent text-[12px] text-kumo-default outline-none placeholder:text-kumo-inactive" />
-          </label>
-        </div>
-
-        <div className="min-h-0 flex-1 overflow-auto p-5">
-          {error && <div className="mb-4 rounded-lg border border-kumo-danger/25 bg-kumo-danger-tint px-3 py-2 text-[12px] text-kumo-danger">{error}</div>}
-          {loading ? <EmptyState icon={<SpinnerGap size={22} className="animate-spin" />} title="Loading lakehouse" detail="Discovering Tables, Vectors, and Graphs from Verglas." />
-            : items.length === 0 ? <EmptyState icon={kindIcon(activeKind, 22)} title={`No ${kindLabel(activeKind).toLocaleLowerCase()} found`} detail={search ? 'Try a different search.' : `Verglas did not report any ${kindLabel(activeKind).toLocaleLowerCase()} in this catalog.`} />
-            : <div className="grid grid-cols-[repeat(auto-fill,minmax(240px,1fr))] gap-3">{items.map((item) => <CatalogCard key={item.id} item={item} selected={selected?.id === item.id} onSelect={() => setSelected(item)} />)}</div>}
-        </div>
-      </main>
-
-      <aside className="min-h-0 overflow-auto bg-kumo-elevated/30">
-        {selected ? <AssetDetails item={selected} launching={launching} onQuery={() => void querySelected()} /> : <div className="flex h-full min-h-[360px] flex-col items-center justify-center px-8 text-center">
-          <span className="mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border border-kumo-line bg-kumo-base text-kumo-inactive">{kindIcon(activeKind, 24)}</span>
-          <h2 className="text-[14px] font-medium text-kumo-default">Select {indefiniteKind(activeKind)}</h2>
-          <p className="mt-1.5 max-w-[240px] text-[12px] leading-5 text-kumo-subtle">Inspect its identity and open a Workspace with the asset already in context.</p>
-        </div>}
-      </aside>
+    <header className="flex shrink-0 items-center justify-between border-b border-kumo-line px-6 py-4"><div className="flex items-center gap-3"><span className="flex h-9 w-9 items-center justify-center rounded-xl border border-kumo-line bg-kumo-elevated text-kumo-brand"><Database size={19} weight="duotone" /></span><div><h1 className="text-lg font-semibold tracking-tight text-kumo-default">Databases</h1><p className="text-[12px] text-kumo-subtle">Browse the tables, indexes, and graph spaces available to your agents.</p></div></div><div className="flex items-center gap-2"><button type="button" onClick={() => setCreateDatabaseOpen(true)} className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg bg-kumo-brand px-3 text-[12px] font-semibold text-white"><Plus size={15} weight="bold" /> Create database</button><button type="button" onClick={() => void loadCatalog()} disabled={loading} className="inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg border border-kumo-line px-3 text-[12px] font-medium text-kumo-default hover:bg-kumo-tint disabled:opacity-50"><ArrowsClockwise size={14} className={loading ? 'animate-spin' : ''} /> Refresh</button></div></header>
+    <div className="grid min-h-0 flex-1 grid-cols-[220px_minmax(0,1fr)_340px]">
+      <DatabaseSidebar databases={databases} selected={database?.id ?? null} loading={loading} onSelect={(id) => { setSelectedDatabase(id); setSelected(null); setSearch('') }} />
+      <main className="min-h-0 min-w-0 overflow-auto border-x border-kumo-line">{error && <div className="mx-5 mt-5 rounded-lg border border-kumo-danger/25 bg-kumo-danger-tint px-3 py-2 text-[12px] text-kumo-danger">{error}</div>}{loading ? <EmptyState icon={<SpinnerGap size={22} className="animate-spin" />} title="Loading databases" detail="Discovering tables, vector indexes, and graph spaces from Verglas." /> : !database ? <EmptyState icon={<Database size={22} weight="duotone" />} title="No databases found" detail="Create a database to start building your catalog." /> : <DatabaseOverview database={database} detail={detail} search={search} tables={matchingTables} selected={selected} launching={launching} onSearch={setSearch} onSelect={setSelected} onCreate={() => setCreateTableOpen(true)} />}</main>
+      <aside className="min-h-0 overflow-auto bg-kumo-elevated/30">{selected ? <AssetDetails item={selected} tableDetail={selected.kind === 'table' ? detail?.tables.find((table) => table.qualifiedName === selected.value.qualifiedName) : undefined} launching={launching} onQuery={() => void openWorkspace(workspacePrompt(selected))} onDelete={selected.kind === 'table' ? () => setDeleteTable(selected.value) : undefined} /> : <DatabaseDetails database={database} detail={detail} onDelete={database ? () => setDeleteDatabase(database) : undefined} />}</aside>
     </div>
+    <CreateDatabaseDialog open={createDatabaseOpen} busy={launching} onOpenChange={setCreateDatabaseOpen} onCreate={(name) => void createDatabase(name)} />
+    <CreateTableDialog open={createTableOpen} database={database} busy={launching} onOpenChange={setCreateTableOpen} onCreate={(name, columns) => void createTable(name, columns)} />
+    <ConfirmDialog open={deleteTable !== null} busy={launching} title={`Delete ${deleteTable?.name ?? 'table'}?`} description="This permanently deletes the table and its data." onOpenChange={(open) => { if (!open) setDeleteTable(null) }} onConfirm={() => void removeTable()} />
+    <ConfirmDialog open={deleteDatabase !== null} busy={launching} title={`Delete ${deleteDatabase?.name ?? 'database'}?`} description="Only empty databases can be deleted. The catalog will reject this action if it still contains tables." onOpenChange={(open) => { if (!open) setDeleteDatabase(null) }} onConfirm={() => void removeDatabase()} />
   </div>
 }
 
-function KindButton({kind, count, active, onClick}: {kind: CatalogKind; count: number; active: boolean; onClick: () => void}) {
-  return <button type="button" onClick={onClick} className={`inline-flex h-9 cursor-pointer items-center gap-2 rounded-lg px-3 text-[12px] font-medium transition-colors ${active ? 'bg-kumo-fill text-kumo-default' : 'text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-default'}`}>
-    {kindIcon(kind, 15)} {kindLabel(kind)} <span className={`rounded-md px-1.5 py-0.5 font-mono text-[10px] ${active ? 'bg-kumo-base text-kumo-default' : 'bg-kumo-elevated text-kumo-inactive'}`}>{count}</span>
-  </button>
+function DatabaseSidebar({databases, selected, loading, onSelect}: {databases: DatabaseGroup[]; selected: string | null; loading: boolean; onSelect: (id: string) => void}) { return <aside className="min-h-0 overflow-auto bg-kumo-elevated/30 p-3"><div className="mb-2 px-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-kumo-inactive">Databases</div>{loading ? <div className="px-2 py-3 text-[12px] text-kumo-subtle">Loading catalog…</div> : databases.map((database) => <button key={database.id} type="button" onClick={() => onSelect(database.id)} className={`mb-1 flex w-full cursor-pointer items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] transition-colors ${selected === database.id ? 'bg-kumo-fill text-kumo-default' : 'text-kumo-subtle hover:bg-kumo-tint hover:text-kumo-default'}`}><Database size={15} weight={selected === database.id ? 'fill' : 'duotone'} className={selected === database.id ? 'text-kumo-brand' : 'text-kumo-inactive'} /><span className="min-w-0 flex-1 truncate">{database.name}</span><span className="rounded-md bg-kumo-base px-1.5 py-0.5 font-mono text-[10px] text-kumo-inactive">{database.tables.length}</span></button>)}</aside> }
+
+function DatabaseOverview({database, detail, search, tables, selected, launching, onSearch, onSelect, onCreate}: {database: DatabaseGroup; detail: VerglasDatabaseDetail | null; search: string; tables: VerglasTableSummary[]; selected: CatalogItem | null; launching: boolean; onSearch: (value: string) => void; onSelect: (item: CatalogItem) => void; onCreate: () => void}) { const metrics = databaseMetrics(database, detail); return <div className="p-5"><div className="flex flex-wrap items-start justify-between gap-4"><div><div className="flex items-center gap-2"><Database size={19} weight="duotone" className="text-kumo-brand" /><h2 className="text-lg font-semibold tracking-tight text-kumo-default">{database.name}</h2></div><p className="mt-1 font-mono text-[11px] text-kumo-inactive">{database.namespace.join('.') || 'Default namespace'}</p></div><button type="button" onClick={onCreate} disabled={launching} className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg bg-kumo-brand px-3 text-[12px] font-semibold text-white shadow-sm disabled:opacity-60"><Plus size={15} weight="bold" /> Create table</button></div><div className="mt-5 grid grid-cols-2 gap-2 xl:grid-cols-3">{metrics.map((metric) => <MetricCard key={metric.label} metric={metric} />)}</div><p className="mt-2 text-[10px] leading-4 text-kumo-inactive">Physical and cache metrics appear when reported by the configured catalog.</p><div className="mt-7 flex items-center gap-3"><h3 className="text-[13px] font-semibold text-kumo-default">Tables</h3><span className="rounded-md bg-kumo-elevated px-1.5 py-0.5 font-mono text-[10px] text-kumo-inactive">{database.tables.length}</span><label className="ml-auto flex h-9 w-[240px] items-center gap-2 rounded-lg border border-kumo-line bg-kumo-elevated px-3"><MagnifyingGlass size={14} className="shrink-0 text-kumo-inactive" /><input value={search} onChange={(event) => onSearch(event.target.value)} placeholder="Search tables…" className="min-w-0 flex-1 bg-transparent text-[12px] text-kumo-default outline-none placeholder:text-kumo-inactive" /></label></div>{tables.length === 0 ? <div className="mt-3 rounded-xl border border-dashed border-kumo-line px-4 py-8 text-center text-[12px] text-kumo-subtle">{search ? 'No tables match this search.' : 'No tables in this database yet.'}</div> : <div className="mt-3 grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">{tables.map((table) => { const item: CatalogItem = {kind: 'table', id: `table:${table.qualifiedName}`, value: table}; return <CatalogCard key={item.id} item={item} selected={selected?.id === item.id} onSelect={() => onSelect(item)} /> })}</div>}{database.vectors.length > 0 && <CatalogSection title="Vector indexes" icon={<VectorThree size={15} weight="duotone" />}>{database.vectors.map((vector) => { const item: CatalogItem = {kind: 'vector', id: `vector:${vector.target}:${vector.field}`, value: vector}; return <CatalogCard key={item.id} item={item} selected={selected?.id === item.id} onSelect={() => onSelect(item)} /> })}</CatalogSection>}{database.graphs.length > 0 && <CatalogSection title="Graph spaces" icon={<CirclesThreePlus size={15} weight="duotone" />}>{database.graphs.map((graph) => { const item: CatalogItem = {kind: 'graph', id: `graph:${graph.namespace}`, value: graph}; return <CatalogCard key={item.id} item={item} selected={selected?.id === item.id} onSelect={() => onSelect(item)} /> })}</CatalogSection>}</div> }
+function CatalogSection({title, icon, children}: {title: string; icon: React.ReactNode; children: React.ReactNode}) { return <section className="mt-8"><div className="mb-3 flex items-center gap-2 text-[13px] font-semibold text-kumo-default"><span className="text-kumo-brand">{icon}</span>{title}</div><div className="grid grid-cols-[repeat(auto-fill,minmax(220px,1fr))] gap-3">{children}</div></section> }
+function MetricCard({metric}: {metric: DatabaseMetric}) { return <div className="rounded-xl border border-kumo-line bg-kumo-elevated/45 px-3 py-2.5"><div className="text-[10px] font-medium uppercase tracking-wide text-kumo-inactive">{metric.label}</div><div className={`mt-1 text-[14px] font-semibold ${metric.reported ? 'text-kumo-default' : 'text-kumo-subtle'}`}>{metric.value}</div></div> }
+function CatalogCard({item, selected, onSelect}: {item: CatalogItem; selected: boolean; onSelect: () => void}) { const presentation = itemPresentation(item); return <button type="button" onClick={onSelect} className={`group min-h-[108px] cursor-pointer rounded-xl border p-4 text-left transition-all ${selected ? 'border-kumo-brand bg-kumo-brand/5 shadow-sm' : 'border-kumo-line bg-kumo-base hover:-translate-y-0.5 hover:border-kumo-line-strong hover:shadow-sm'}`}><div className="flex items-start justify-between gap-3"><span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${selected ? 'bg-kumo-brand text-white' : 'bg-kumo-elevated text-kumo-brand'}`}>{kindIcon(item.kind, 16)}</span><ArrowRight size={14} className={`mt-2 transition-transform ${selected ? 'translate-x-0 text-kumo-brand' : '-translate-x-1 text-kumo-inactive opacity-0 group-hover:translate-x-0 group-hover:opacity-100'}`} /></div><div className="mt-3 truncate text-[13px] font-medium text-kumo-default">{presentation.title}</div><div className="mt-0.5 truncate font-mono text-[10px] text-kumo-inactive">{presentation.subtitle}</div></button> }
+function DatabaseDetails({database, detail, onDelete}: {database: DatabaseGroup | null; detail: VerglasDatabaseDetail | null; onDelete?: () => void}) { if (!database) return <div className="flex h-full min-h-[360px] items-center justify-center px-8 text-center text-[12px] text-kumo-subtle">Select a database to inspect its catalog.</div>; return <div className="flex min-h-full flex-col p-6"><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-kumo-brand text-white"><Database size={20} weight="duotone" /></span><div className="mt-4 text-[10px] font-semibold uppercase tracking-[0.12em] text-kumo-brand">Database</div><h2 className="mt-1 break-words text-lg font-semibold tracking-tight text-kumo-default">{database.name}</h2><p className="mt-1 break-all font-mono text-[11px] leading-5 text-kumo-subtle">{database.namespace.join('.') || 'Default namespace'}</p><dl className="mt-6 divide-y divide-kumo-line border-y border-kumo-line">{databaseMetrics(database, detail).slice(0, 4).map((metric) => <div key={metric.label} className="grid grid-cols-[120px_minmax(0,1fr)] gap-3 py-3"><dt className="text-[11px] text-kumo-inactive">{metric.label}</dt><dd className="text-right font-mono text-[11px] text-kumo-default">{metric.value}</dd></div>)}</dl><div className="mt-auto pt-8"><button type="button" onClick={onDelete} className="inline-flex h-9 cursor-pointer items-center gap-1.5 rounded-lg border border-kumo-danger/40 px-3 text-[12px] text-kumo-danger hover:bg-kumo-danger-tint"><Trash size={14} /> Delete database</button><p className="mt-2 text-[10px] leading-4 text-kumo-inactive">Only an empty database can be deleted.</p></div></div> }
+function AssetDetails({item, tableDetail, launching, onQuery, onDelete}: {item: CatalogItem; tableDetail?: VerglasTableDetail; launching: boolean; onQuery: () => void; onDelete?: () => void}) { const presentation = itemPresentation(item); const facts = [...itemFacts(item), ...(tableDetail?.physical ? [['Rows', tableDetail.physical.rowCount.toLocaleString()], ['Files', tableDetail.physical.fileCount.toLocaleString()], ['Size', formatBytes(tableDetail.physical.sizeBytes)]] as Array<[string, string]> : []), ...(tableDetail?.usage ? [['Cache hits', tableDetail.usage.hits.toLocaleString()], ['Bytes served', formatBytes(tableDetail.usage.bytesServed)]] as Array<[string, string]> : [])]; return <div className="flex min-h-full flex-col p-6"><span className="flex h-10 w-10 items-center justify-center rounded-xl bg-kumo-brand text-white">{kindIcon(item.kind, 20)}</span><div className="mt-4 text-[10px] font-semibold uppercase tracking-[0.12em] text-kumo-brand">{singularKind(item.kind)}</div><h2 className="mt-1 break-words text-lg font-semibold tracking-tight text-kumo-default">{presentation.title}</h2><p className="mt-1 break-all font-mono text-[11px] leading-5 text-kumo-subtle">{presentation.subtitle}</p><dl className="mt-6 divide-y divide-kumo-line border-y border-kumo-line">{facts.map(([label, value]) => <div key={label} className="grid grid-cols-[100px_minmax(0,1fr)] gap-3 py-3"><dt className="text-[11px] text-kumo-inactive">{label}</dt><dd className="break-all text-right font-mono text-[11px] text-kumo-default">{value}</dd></div>)}</dl><div className="mt-auto pt-8">{onDelete && <button type="button" onClick={onDelete} className="mb-2 flex h-9 w-full cursor-pointer items-center justify-center gap-2 rounded-lg border border-kumo-danger/40 px-4 text-[12px] font-medium text-kumo-danger hover:bg-kumo-danger-tint"><Trash size={14} /> Delete table</button>}<button type="button" disabled={launching} onClick={onQuery} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-kumo-brand px-4 text-[12px] font-semibold text-white shadow-sm disabled:opacity-60">{launching ? <SpinnerGap size={15} className="animate-spin" /> : <ArrowRight size={15} weight="bold" />} Query in Workspace</button></div></div> }
+function EmptyState({icon, title, detail}: {icon: React.ReactNode; title: string; detail: string}) { return <div className="flex min-h-[360px] flex-col items-center justify-center text-center"><span className="text-kumo-inactive">{icon}</span><h2 className="mt-3 text-[13px] font-medium text-kumo-default">{title}</h2><p className="mt-1 text-[11px] text-kumo-subtle">{detail}</p></div> }
+/** Groups catalog objects into their database namespace for the Databases browser. */
+export function databaseGroups(catalog: VerglasCatalogSnapshot): DatabaseGroup[] { const groups = new Map<string, DatabaseGroup>(); const ensure = (namespace: string[]) => { const name = namespace.join('.') || 'default'; const existing = groups.get(name); if (existing) return existing; const next = {id: name, name, namespace, tables: [], vectors: [], graphs: []}; groups.set(name, next); return next }; for (const summary of catalog.databases) ensure(summary.name.split('.').filter(Boolean)); for (const table of catalog.tables) ensure(table.namespace).tables.push(table); for (const graph of catalog.graphs) ensure(graph.namespace.split('.').filter(Boolean)).graphs.push(graph); for (const vector of catalog.vectors) ensure(namespaceForVector(vector, catalog.tables)).vectors.push(vector); return [...groups.values()].toSorted((left, right) => left.name.localeCompare(right.name)) }
+/** Summarizes only catalog values that the backend supplied; unavailable metrics remain explicit. */
+export function databaseMetrics(database: DatabaseGroup, detail?: VerglasDatabaseDetail | null): DatabaseMetric[] { const indexedVectors = database.vectors.reduce((sum, vector) => sum + (vector.liveCount ?? 0), 0); const vectorsReported = database.vectors.some((vector) => vector.liveCount !== undefined); const physicalValues = detail?.tables.flatMap((table) => table.physical ? [table.physical.sizeBytes] : []); const usageValues = detail?.tables.flatMap((table) => table.usage ? [table.usage.bytesServed] : []); const physical = physicalValues?.length ? physicalValues.reduce((sum, bytes) => sum + bytes, 0) : detail?.tables.length === 0 ? 0 : undefined; const usage = usageValues?.length ? usageValues.reduce((sum, bytes) => sum + bytes, 0) : detail?.tables.length === 0 ? 0 : undefined; return [{label: 'Tables', value: database.tables.length.toLocaleString(), reported: true}, {label: 'Vector indexes', value: database.vectors.length.toLocaleString(), reported: true}, {label: 'Graph spaces', value: database.graphs.length.toLocaleString(), reported: true}, {label: 'Indexed vectors', value: vectorsReported ? indexedVectors.toLocaleString() : 'Not reported', reported: vectorsReported}, {label: 'Storage', value: physical === undefined ? 'Not reported' : formatBytes(physical), reported: physical !== undefined}, {label: 'Usage', value: usage === undefined ? 'Not reported' : formatBytes(usage), reported: usage !== undefined}] }
+function namespaceForVector(vector: VerglasVectorSummary, tables: VerglasTableSummary[]): string[] { const matchingTable = tables.find((table) => vector.target.includes(table.qualifiedName.replaceAll('"', '')) || vector.target === `tbl:${[...table.namespace, table.name].join('.')}`); if (matchingTable) return matchingTable.namespace; const target = vector.target.replace(/^tbl:/, '').replaceAll('"', ''); const parts = target.split('.').filter(Boolean); return parts.length > 1 ? parts.slice(0, -1) : [] }
+function catalogContains(catalog: VerglasCatalogSnapshot, item: CatalogItem): boolean { return itemsForKind(catalog, item.kind).some((candidate) => candidate.id === item.id) }
+function itemsForKind(catalog: VerglasCatalogSnapshot, kind: CatalogKind): CatalogItem[] { if (kind === 'table') return catalog.tables.map((value) => ({kind, id: `table:${value.qualifiedName}`, value})); if (kind === 'vector') return catalog.vectors.map((value) => ({kind, id: `vector:${value.target}:${value.field}`, value})); return catalog.graphs.map((value) => ({kind, id: `graph:${value.namespace}`, value})) }
+function itemPresentation(item: CatalogItem): {title: string; subtitle: string} { if (item.kind === 'table') return {title: item.value.name, subtitle: item.value.namespace.join('.') || 'default'}; if (item.kind === 'vector') return {title: item.value.field, subtitle: item.value.target}; return {title: item.value.namespace, subtitle: `${item.value.nodesTable} + ${item.value.edgesTable}`} }
+function itemFacts(item: CatalogItem): Array<[string, string]> { if (item.kind === 'table') return [['Database', item.value.namespace.join('.') || 'default'], ['Table', item.value.name], ['SQL name', item.value.qualifiedName]]; if (item.kind === 'vector') return [['Target', item.value.target], ['Field', item.value.field], ['Metric', item.value.metric], ['Vectors', item.value.liveCount?.toLocaleString() ?? 'Not reported'], ['Snapshot', item.value.reflectedSnapshot?.toString() ?? 'Not reported']]; return [['Database', item.value.namespace], ['Nodes', item.value.nodesTable], ['Edges', item.value.edgesTable]] }
+function workspacePrompt(item: CatalogItem): string { if (item.kind === 'table') return `I selected the Verglas database table ${item.value.qualifiedName}. Help me explore and query this table. Start by running this exact bounded sample query through the Verglas SDK: SELECT * FROM ${item.value.qualifiedName} LIMIT 100. Verglas supports LIMIT, not FETCH FIRST. Log the structured query result so the Workspace renders it as an interactive data widget, then explain what the data contains.`; if (item.kind === 'vector') return `I selected the Verglas vector index ${item.value.target} on field ${item.value.field} using ${item.value.metric} distance. Help me inspect and query this vector index through the Verglas SDK. Show structured results in the Workspace data widget and explain useful searches I can run.`; return `I selected the Verglas property graph ${item.value.namespace}, backed by ${item.value.nodesTable} and ${item.value.edgesTable}. Help me explore this graph through the Verglas SDK. Begin with a bounded overview of its nodes and relationships and return structured results for the Workspace data widget.` }
+function singularKind(kind: CatalogKind): string { return kind === 'table' ? 'Table' : kind === 'vector' ? 'Vector index' : 'Graph space' }
+function kindIcon(kind: CatalogKind, size: number) { if (kind === 'table') return <Table size={size} weight="duotone" />; if (kind === 'vector') return <VectorThree size={size} weight="duotone" />; return <CirclesThreePlus size={size} weight="duotone" /> }
+function formatBytes(bytes: number): string { if (bytes < 1024) return `${bytes} B`; if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`; if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`; return `${(bytes / 1024 ** 3).toFixed(1)} GB` }
+
+function CreateDatabaseDialog({open, busy, onOpenChange, onCreate}: {open: boolean; busy: boolean; onOpenChange: (open: boolean) => void; onCreate: (name: string) => void}) {
+  const [name, setName] = useState('')
+  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next) }}><DialogContent><DialogHeader><DialogTitle>Create database</DialogTitle><DialogDescription>A database is an Iceberg namespace. Use dot notation for nested namespaces.</DialogDescription></DialogHeader><div className="px-5"><label className="block text-[12px] font-medium text-kumo-default">Database name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="analytics" className="mt-1.5 h-9 w-full rounded-lg border border-kumo-line bg-kumo-elevated px-3 text-[13px] outline-none focus:border-kumo-brand" /></label></div><DialogFooter><button type="button" onClick={() => onOpenChange(false)} className="h-9 rounded-lg px-3 text-[12px] text-kumo-subtle">Cancel</button><button type="button" disabled={busy || !name.trim()} onClick={() => onCreate(name.trim())} className="h-9 rounded-lg bg-kumo-brand px-3 text-[12px] font-semibold text-white disabled:opacity-50">{busy ? 'Creating…' : 'Create database'}</button></DialogFooter></DialogContent></Dialog>
 }
 
-function CatalogCard({item, selected, onSelect}: {item: CatalogItem; selected: boolean; onSelect: () => void}) {
-  const presentation = itemPresentation(item)
-  return <button type="button" onClick={onSelect} className={`group min-h-[116px] cursor-pointer rounded-xl border p-4 text-left transition-all ${selected ? 'border-kumo-brand bg-kumo-brand/5 shadow-sm' : 'border-kumo-line bg-kumo-base hover:-translate-y-0.5 hover:border-kumo-line-strong hover:shadow-sm'}`}>
-    <div className="flex items-start justify-between gap-3"><span className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-lg ${selected ? 'bg-kumo-brand text-white' : 'bg-kumo-elevated text-kumo-brand'}`}>{kindIcon(item.kind, 16)}</span><ArrowRight size={14} className={`mt-2 transition-transform ${selected ? 'translate-x-0 text-kumo-brand' : '-translate-x-1 text-kumo-inactive opacity-0 group-hover:translate-x-0 group-hover:opacity-100'}`} /></div>
-    <div className="mt-3 truncate text-[13px] font-medium text-kumo-default">{presentation.title}</div>
-    <div className="mt-0.5 truncate font-mono text-[10px] text-kumo-inactive">{presentation.subtitle}</div>
-  </button>
+function CreateTableDialog({open, database, busy, onOpenChange, onCreate}: {open: boolean; database: DatabaseGroup | null; busy: boolean; onOpenChange: (open: boolean) => void; onCreate: (name: string, columns: Array<{name: string; type: string; nullable?: boolean}>) => void}) {
+  const [name, setName] = useState('')
+  const [schema, setSchema] = useState('id string\ncreated_at timestamp')
+  const columns = schema.split('\n').map((line) => line.trim().split(/\s+/, 2)).filter(([column, type]) => column && type).map(([column, type]) => ({name: column, type}))
+  return <Dialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next) }}><DialogContent className="w-[min(34rem,calc(100vw-2rem))]"><DialogHeader><DialogTitle>Create table</DialogTitle><DialogDescription>Create a table in {database?.name ?? 'the selected database'}. One column per line: <code>name type</code>.</DialogDescription></DialogHeader><div className="px-5"><label className="block text-[12px] font-medium text-kumo-default">Table name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="events" className="mt-1.5 h-9 w-full rounded-lg border border-kumo-line bg-kumo-elevated px-3 text-[13px] outline-none focus:border-kumo-brand" /></label><label className="mt-4 block text-[12px] font-medium text-kumo-default">Columns<textarea value={schema} onChange={(event) => setSchema(event.target.value)} rows={5} className="mt-1.5 w-full rounded-lg border border-kumo-line bg-kumo-elevated p-3 font-mono text-[12px] outline-none focus:border-kumo-brand" /></label></div><DialogFooter><button type="button" onClick={() => onOpenChange(false)} className="h-9 rounded-lg px-3 text-[12px] text-kumo-subtle">Cancel</button><button type="button" disabled={busy || !name.trim() || columns.length === 0} onClick={() => onCreate(name.trim(), columns)} className="h-9 rounded-lg bg-kumo-brand px-3 text-[12px] font-semibold text-white disabled:opacity-50">{busy ? 'Creating…' : 'Create table'}</button></DialogFooter></DialogContent></Dialog>
 }
 
-function AssetDetails({item, launching, onQuery}: {item: CatalogItem; launching: boolean; onQuery: () => void}) {
-  const presentation = itemPresentation(item)
-  const facts = itemFacts(item)
-  return <div className="flex min-h-full flex-col p-6">
-    <span className="flex h-10 w-10 items-center justify-center rounded-xl bg-kumo-brand text-white">{kindIcon(item.kind, 20)}</span>
-    <div className="mt-4 text-[10px] font-semibold uppercase tracking-[0.12em] text-kumo-brand">{singularKind(item.kind)}</div>
-    <h2 className="mt-1 break-words text-lg font-semibold tracking-tight text-kumo-default">{presentation.title}</h2>
-    <p className="mt-1 break-all font-mono text-[11px] leading-5 text-kumo-subtle">{presentation.subtitle}</p>
-    <dl className="mt-6 divide-y divide-kumo-line border-y border-kumo-line">{facts.map(([label, value]) => <div key={label} className="grid grid-cols-[100px_minmax(0,1fr)] gap-3 py-3"><dt className="text-[11px] text-kumo-inactive">{label}</dt><dd className="break-all text-right font-mono text-[11px] text-kumo-default">{value}</dd></div>)}</dl>
-    <div className="mt-auto pt-8">
-      <button type="button" disabled={launching} onClick={onQuery} className="flex h-10 w-full cursor-pointer items-center justify-center gap-2 rounded-lg bg-kumo-brand px-4 text-[12px] font-semibold text-white shadow-sm hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60">
-        {launching ? <SpinnerGap size={15} className="animate-spin" /> : <ArrowRight size={15} weight="bold" />} Query in Workspace
-      </button>
-      <p className="mt-2 text-center text-[10px] leading-4 text-kumo-inactive">Opens a new agent workspace with this asset selected.</p>
-    </div>
-  </div>
-}
-
-function EmptyState({icon, title, detail}: {icon: React.ReactNode; title: string; detail: string}) {
-  return <div className="flex min-h-[360px] flex-col items-center justify-center text-center"><span className="text-kumo-inactive">{icon}</span><h2 className="mt-3 text-[13px] font-medium text-kumo-default">{title}</h2><p className="mt-1 text-[11px] text-kumo-subtle">{detail}</p></div>
-}
-
-function itemsForKind(catalog: VerglasCatalogSnapshot, kind: CatalogKind): CatalogItem[] {
-  if (kind === 'table') return catalog.tables.map((value) => ({kind, id: `table:${value.qualifiedName}`, value}))
-  if (kind === 'vector') return catalog.vectors.map((value) => ({kind, id: `vector:${value.target}:${value.field}`, value}))
-  return catalog.graphs.map((value) => ({kind, id: `graph:${value.namespace}`, value}))
-}
-
-function catalogContains(catalog: VerglasCatalogSnapshot, item: CatalogItem): boolean {
-  return itemsForKind(catalog, item.kind).some((candidate) => candidate.id === item.id)
-}
-
-function searchableText(item: CatalogItem): string {
-  const presentation = itemPresentation(item)
-  return `${presentation.title} ${presentation.subtitle}`
-}
-
-function itemPresentation(item: CatalogItem): {title: string; subtitle: string} {
-  if (item.kind === 'table') return {title: item.value.name, subtitle: item.value.namespace.join('.') || 'default'}
-  if (item.kind === 'vector') return {title: item.value.field, subtitle: item.value.target}
-  return {title: item.value.namespace, subtitle: `${item.value.nodesTable} + ${item.value.edgesTable}`}
-}
-
-function itemFacts(item: CatalogItem): Array<[string, string]> {
-  if (item.kind === 'table') return [['Namespace', item.value.namespace.join('.') || 'default'], ['Table', item.value.name], ['SQL name', item.value.qualifiedName]]
-  if (item.kind === 'vector') return [['Target', item.value.target], ['Field', item.value.field], ['Metric', item.value.metric], ['Vectors', item.value.liveCount?.toLocaleString() ?? 'Not reported'], ['Snapshot', item.value.reflectedSnapshot?.toString() ?? 'Not reported']]
-  return [['Namespace', item.value.namespace], ['Nodes', item.value.nodesTable], ['Edges', item.value.edgesTable]]
-}
-
-function workspacePrompt(item: CatalogItem): string {
-  if (item.kind === 'table') return `I selected the Verglas lakehouse table ${item.value.qualifiedName}. Help me explore and query this table. Start by running this exact bounded sample query through the Verglas SDK: SELECT * FROM ${item.value.qualifiedName} LIMIT 100. Verglas supports LIMIT, not FETCH FIRST. Log the structured query result so the Workspace renders it as an interactive data widget, then explain what the data contains.`
-  if (item.kind === 'vector') return `I selected the Verglas vector index ${item.value.target} on field ${item.value.field} using ${item.value.metric} distance. Help me inspect and query this vector index through the Verglas SDK. Show structured results in the Workspace data widget and explain useful searches I can run.`
-  return `I selected the Verglas property graph ${item.value.namespace}, backed by ${item.value.nodesTable} and ${item.value.edgesTable}. Help me explore this graph through the Verglas SDK. Begin with a bounded overview of its nodes and relationships and return structured results for the Workspace data widget.`
-}
-
-function catalogCount(catalog: VerglasCatalogSnapshot, kind: CatalogKind): number {
-  return kind === 'table' ? catalog.tables.length : kind === 'vector' ? catalog.vectors.length : catalog.graphs.length
-}
-
-function kindLabel(kind: CatalogKind): string { return kind === 'table' ? 'Tables' : kind === 'vector' ? 'Vectors' : 'Graphs' }
-function singularKind(kind: CatalogKind): string { return kind === 'table' ? 'Table' : kind === 'vector' ? 'Vector index' : 'Graph' }
-function indefiniteKind(kind: CatalogKind): string { return kind === 'table' ? 'a table' : kind === 'vector' ? 'a vector index' : 'a graph' }
-function kindIcon(kind: CatalogKind, size: number) {
-  if (kind === 'table') return <Table size={size} weight="duotone" />
-  if (kind === 'vector') return <VectorThree size={size} weight="duotone" />
-  return <CirclesThreePlus size={size} weight="duotone" />
-}
+function ConfirmDialog({open, busy, title, description, onOpenChange, onConfirm}: {open: boolean; busy: boolean; title: string; description: string; onOpenChange: (open: boolean) => void; onConfirm: () => void}) { return <AlertDialog open={open} onOpenChange={(next) => { if (!busy) onOpenChange(next) }}><AlertDialogContent><AlertDialogHeader><AlertDialogTitle>{title}</AlertDialogTitle><AlertDialogDescription>{description}</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><button type="button" onClick={() => onOpenChange(false)} className="h-9 rounded-lg px-3 text-[12px] text-kumo-subtle">Cancel</button><button type="button" disabled={busy} onClick={onConfirm} className="h-9 rounded-lg bg-kumo-danger px-3 text-[12px] font-semibold text-white disabled:opacity-50">{busy ? 'Deleting…' : 'Delete'}</button></AlertDialogFooter></AlertDialogContent></AlertDialog> }

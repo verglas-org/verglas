@@ -124,7 +124,7 @@ export default function Sidebar({
             />
             <SidebarItem
               to="/workflows"
-              label="Jobs"
+              label="Workers"
               icon={<FlowArrow size={14} weight="regular" />}
               collapsed={collapsed}
             />
@@ -142,7 +142,7 @@ export default function Sidebar({
             />
             <SidebarItem
               to="/data"
-              label="Lakehouse"
+              label="Databases"
               icon={<Database size={14} weight="regular" />}
               collapsed={collapsed}
             />

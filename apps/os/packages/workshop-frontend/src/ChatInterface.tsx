@@ -125,6 +125,7 @@ import { useVendorBranding } from "./useVendorBranding";
 import { useSlashCommandPicker } from "./components/chat/SlashCommandPicker";
 import { formatFullTimestamp } from "./utils/formatTimestamp";
 import { copyToClipboard } from "./clipboard";
+import { PermissionRequestWidget, ResourceStatusWidget } from "./components/chat/WorkspaceChatWidgets";
 
 export interface StreamingProposedChanges {
   updates: Uint8Array[];
@@ -4230,11 +4231,23 @@ interface ChatInterfaceProps {
   onHasAnyCodeChange?: (hasAnyCode: boolean) => void;
   onSelectedChatHasProposedChangesChange?: (hasProposedChanges: boolean) => void;
   constrainChatWidth?: boolean;
+  // Workspace keeps one durable conversation. The shared editor still supports its legacy
+  // multi-chat surface, but a Workspace must never expose that surface or create a second chat.
+  singleChat?: boolean;
   onOpenVessel: (workspaceId: WorkpieceId) => void;
 
   // The output format a workpiece was built as, so a created-app card can name and draw it as the
   // Document (or whatever) it is rather than a generic app.
   outputOfWorkpiece: (workspaceId: WorkpieceId) => BlueprintOutput | undefined;
+}
+
+/** Selects the durable first chat for a Workspace independently of backend list ordering. */
+export function selectSingleWorkspaceChatId(
+  chats: readonly Pick<AiChatMetadata, "id">[],
+): number | null {
+  return chats.reduce<number | null>((first, chat) =>
+    first === null || chat.id < first ? chat.id : first,
+  null);
 }
 
 // Bucket a chat's lastActive into a time grouping for the chat list.
@@ -4414,6 +4427,7 @@ function ChatInterface({
   onHasAnyCodeChange,
   onSelectedChatHasProposedChangesChange,
   constrainChatWidth,
+  singleChat = false,
   onOpenVessel,
   outputOfWorkpiece,
 }: ChatInterfaceProps) {
@@ -4719,9 +4733,20 @@ function ChatInterface({
     }
   }, [anyHasProposedChanges, chatListReady]);
 
+  // Workspace has one durable conversation, selected independent of the runtime's list order.
+  // Its oldest chat is canonical so a legacy Workspace with multiple chats remains stable.
+  useEffect(() => {
+    if (!singleChat || !chatListReady) return;
+    const canonicalChatId = selectSingleWorkspaceChatId(chatList);
+    if (selectedChatId !== canonicalChatId) {
+      onNavigateToChatRef.current(canonicalChatId, { replace: true });
+    }
+  }, [singleChat, selectedChatId, chatListReady, chatList]);
+
   // In sidebar mode, auto-select the most recent chat when none is selected.
   useEffect(() => {
     if (
+      !singleChat &&
       sidebarMode &&
       selectedChatId === null &&
       chatListReady &&
@@ -6332,43 +6357,11 @@ function ChatInterface({
     const isDenied = msg.state === "denied";
     const isProc = processingConnections.has(msg.requestId);
 
-    const stateLabel = isAccepted ? "Connected" : isDenied ? "Denied" : null;
-    const stateLabelCls = isDenied ? "text-kumo-danger" : "text-kumo-success";
     const scope = msg.resourceTitle ?? msg.resourceUrl;
 
     return (
-      <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-        <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-3">
-          <div className="flex items-start gap-3">
-            <GatekeeperIcon
-              vendorId={msg.vendorId}
-              logoUrl={msg.vendorLogoUrl}
-              className="h-9 w-9 flex-shrink-0 rounded-lg"
-            />
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                <span className="font-medium text-kumo-default">
-                  Connect {msg.vendorName}
-                </span>
-                {scope && (
-                  <span className="rounded-full bg-kumo-tint px-2 py-0.5 text-[11px] leading-4 text-kumo-subtle">
-                    {scope}
-                  </span>
-                )}
-                {stateLabel && (
-                  <span className={`text-[12px] font-medium ${stateLabelCls}`}>
-                    {stateLabel}
-                  </span>
-                )}
-              </div>
-              {msg.reason && (
-                <p className="mt-1 text-[13px] leading-[18px] text-kumo-subtle">
-                  {msg.reason}
-                </p>
-              )}
-            </div>
-            {isPending && (
-              <div className="ml-3 flex flex-shrink-0 items-center gap-2 self-center text-[13px] leading-4">
+      <PermissionRequestWidget title={`Connect ${msg.vendorName}`} resource={scope} actions="Connect this integration" reason={msg.reason} state={isAccepted ? "approved" : isDenied ? "denied" : "pending"} icon={<GatekeeperIcon vendorId={msg.vendorId} logoUrl={msg.vendorLogoUrl} className="h-9 w-9 rounded-lg" />} controls={isPending ? (
+        <div className="flex items-center gap-2 text-[13px] leading-4">
                 <button
                   type="button"
                   onClick={() => handleDenyConnection(msg.requestId)}
@@ -6385,11 +6378,8 @@ function ChatInterface({
                 >
                   Set up
                 </button>
-              </div>
-            )}
-          </div>
         </div>
-      </div>
+      ) : undefined} />
     );
   };
 
@@ -6426,24 +6416,8 @@ function ChatInterface({
     const configured = msg.state === "ready";
     const supportsManualRun = msg.triggers?.some(trigger => trigger.type !== "webhook") ?? true;
     return (
-      <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-        <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-3">
-          <div className="flex items-start gap-3">
-            <span className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kumo-tint text-kumo-brand">
-              <Globe size={20} />
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-kumo-default">{msg.title}</span>
-                <span className="rounded-full bg-kumo-tint px-2 py-0.5 text-[11px] leading-4">
-                  Source
-                </span>
-                <span className={configured ? "text-kumo-success" : msg.state === "error" ? "text-kumo-danger" : "text-kumo-subtle"}>
-                  {configured ? "Ready" : msg.state === "error" ? "Setup failed" : "Needs configuration"}
-                </span>
-              </div>
-              <p className="mt-1 text-[13px] leading-[18px]">{msg.description}</p>
-              <p className="mt-1 text-[12px] text-kumo-inactive">Writes to {msg.outputTable}</p>
+      <ResourceStatusWidget kind="Source" title={msg.title} description={msg.description} state={msg.state} icon={<Globe size={20} />} actions={!configured ? <button type="button" disabled={processing} onClick={() => void handleConfigureSource(msg)} className="rounded-md bg-kumo-brand px-3 py-1 font-medium text-white disabled:opacity-40">{processing ? "Configuring…" : "Configure Source"}</button> : supportsManualRun ? <button type="button" disabled={processing} onClick={() => void handleRunSource(msg)} className="rounded-md bg-kumo-brand px-3 py-1 font-medium text-white disabled:opacity-40">{processing ? "Queuing…" : "Run now"}</button> : undefined}>
+              <div className="mt-2 flex items-center gap-2 text-[12px] text-kumo-inactive"><TableIcon size={14} /> Creates table <span className="font-mono text-kumo-default">{msg.outputTable}</span></div>
               {configured && msg.webhookUrls?.map(url => (
                 <div key={url} className="mt-2 rounded-lg border border-kumo-line bg-kumo-tint/30 px-3 py-2">
                   <div className="text-[11px] font-medium uppercase tracking-wide text-kumo-inactive">Webhook endpoint</div>
@@ -6485,32 +6459,7 @@ function ChatInterface({
                   })}
                 </div>
               )}
-              <div className="mt-3 flex gap-2">
-                {!configured && (
-                  <button
-                    type="button"
-                    disabled={processing}
-                    onClick={() => void handleConfigureSource(msg)}
-                    className="rounded-md bg-kumo-brand px-3 py-1 font-medium text-white disabled:opacity-40"
-                  >
-                    {processing ? "Configuring…" : "Configure Source"}
-                  </button>
-                )}
-                {configured && supportsManualRun && (
-                  <button
-                    type="button"
-                    disabled={processing}
-                    onClick={() => void handleRunSource(msg)}
-                    className="rounded-md bg-kumo-brand px-3 py-1 font-medium text-white disabled:opacity-40"
-                  >
-                    {processing ? "Queuing…" : "Run now"}
-                  </button>
-                )}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
+      </ResourceStatusWidget>
     );
   };
 
@@ -6520,13 +6469,6 @@ function ChatInterface({
     const processing = processingSources.has(msg.requestId);
     const ready = msg.state === "ready";
     const editable = !ready && msg.state !== "deploying";
-    const statusLabel = ready
-      ? "Verified"
-      : msg.state === "error"
-        ? "Verification failed"
-        : msg.state === "deploying"
-          ? "Deploying"
-          : "Needs setup";
     const statusMessage = msg.verification?.message
       ?? msg.error
       ?? (ready ? "Connection passed" : msg.state === "deploying" ? "Deploying vessel…" : "Complete setup, then Save and test.");
@@ -6536,20 +6478,7 @@ function ChatInterface({
         ? "text-kumo-danger"
         : "text-kumo-subtle";
     return (
-      <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-        <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-3">
-          <div className="flex items-start gap-3">
-            <span className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kumo-tint text-kumo-brand">
-              <Plug size={20} />
-            </span>
-            <div className="min-w-0 flex-1">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="font-medium text-kumo-default">{msg.title}</span>
-                <span className="rounded-full bg-kumo-tint px-2 py-0.5 text-[11px] leading-4">Integration</span>
-                <span className={statusTone}>{statusLabel}</span>
-              </div>
-              <p className="mt-1 text-[13px] leading-[18px]">{msg.description}</p>
-              <p className="mt-1 font-mono text-[11px] text-kumo-inactive">{msg.vesselName}</p>
+      <ResourceStatusWidget kind="Integration" title={msg.title} description={msg.description} state={msg.state} icon={<Plug size={20} />} identifier={msg.vesselName} actions={<>{editable && <button type="button" disabled={processing} onClick={() => void handleConfigureIntegration(msg)} className="rounded-md bg-kumo-brand px-3 py-1 font-medium text-white disabled:opacity-40">{processing ? "Testing…" : "Save and test"}</button>}{ready && <button type="button" disabled={processing} onClick={() => void handleTestIntegration(msg)} className="rounded-md border border-kumo-line px-3 py-1 font-medium text-kumo-default disabled:opacity-40">{processing ? "Testing…" : "Test connection"}</button>}</>}>
               {msg.instructions.length > 0 && editable && (
                 <ol className="mt-3 grid gap-2">
                   {msg.instructions.map((instruction, index) => {
@@ -6593,29 +6522,12 @@ function ChatInterface({
                   </div>
                 )}
               </div>
-              <div className="mt-3 flex gap-2">
-                {editable && <button type="button" disabled={processing} onClick={() => void handleConfigureIntegration(msg)} className="rounded-md bg-kumo-brand px-3 py-1 font-medium text-white disabled:opacity-40">{processing ? "Testing…" : "Save and test"}</button>}
-                {ready && <button type="button" disabled={processing} onClick={() => void handleTestIntegration(msg)} className="rounded-md border border-kumo-line px-3 py-1 font-medium text-kumo-default disabled:opacity-40">{processing ? "Testing…" : "Test connection"}</button>}
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
+      </ResourceStatusWidget>
     );
   };
 
   const renderJobsPipelineCard = (msg: AiChatMessage & {type: "jobsPipeline"}) => (
-    <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-      <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-3">
-        <div className="flex items-start gap-3">
-          <span className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kumo-tint text-kumo-brand">
-            <FlowArrow size={20} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium text-kumo-default">Jobs pipeline</span>
-              <span className="rounded-full bg-kumo-tint px-2 py-0.5 text-[11px] leading-4">{msg.jobs.length} job{msg.jobs.length === 1 ? "" : "s"}</span>
-            </div>
+    <ResourceStatusWidget kind="Worker" title="Workers pipeline" icon={<FlowArrow size={20} />}>
             <ul className="mt-3 grid gap-2">
               {msg.jobs.map(job => (
                 <li key={job.requestId} className="rounded-lg border border-kumo-line bg-kumo-tint/30 px-3 py-2">
@@ -6639,27 +6551,12 @@ function ChatInterface({
                 }).join(" · ")}
               </p>
             )}
-            <a href="/workflows" className="mt-3 inline-flex text-[12px] font-medium text-kumo-brand hover:underline">Open Jobs</a>
-          </div>
-        </div>
-      </div>
-    </div>
+            <a href="/workflows" className="mt-3 inline-flex text-[12px] font-medium text-kumo-brand hover:underline">Open Workers</a>
+    </ResourceStatusWidget>
   );
 
   const renderApplicationPreviewCard = (msg: AiChatMessage & {type: "applicationPreview"}) => (
-    <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-      <div className="rounded-2xl border border-kumo-line bg-kumo-base px-4 py-3">
-        <div className="flex items-start gap-3">
-          <span className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kumo-tint text-kumo-brand">
-            <Browser size={20} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <span className="font-medium text-kumo-default">{msg.title}</span>
-              <span className="rounded-full bg-kumo-tint px-2 py-0.5 text-[11px] leading-4">Application</span>
-            </div>
-            <p className="mt-1 text-[13px] leading-[18px]">{msg.description}</p>
-            <p className="mt-1 font-mono text-[11px] text-kumo-inactive">{msg.vesselName}</p>
+    <ResourceStatusWidget kind="Application" title={msg.title} description={msg.description} state="ready" icon={<Browser size={20} />} identifier={msg.vesselName}>
             <div className="mt-3 overflow-hidden rounded-lg border border-kumo-line bg-kumo-tint/40">
               {msg.screenshotUrl ? (
                 <img src={msg.screenshotUrl} alt="" className="aspect-video w-full object-cover" />
@@ -6674,10 +6571,7 @@ function ChatInterface({
                 Open preview
               </a>
             ) : null}
-          </div>
-        </div>
-      </div>
-    </div>
+    </ResourceStatusWidget>
   );
 
   const renderActionCard = (msg: ActionChatMessage) => {
@@ -6800,24 +6694,10 @@ function ChatInterface({
     }
 
     const isPending = state === "pending";
-    const isApproved = state === "approved";
-    const isRejected = state === "rejected";
     // A blocking (awaitDecision) pending action suspends the agent turn and blocks the composer, so
     // present it as a prominent callout with its details expanded by default.
     const isBlocking = isPending && log.description.awaitDecision === true;
-    // A pending request is never collapsed: its description is the thing the user has to read in
-    // order to answer it, so hiding it behind a disclosure would just add a step before every
-    // decision. Resolved actions are history, and collapse so a long thread stays scannable.
-    const showDescription = isPending || open;
     const metadata = log.resourceTitle;
-    const stateLabel = isApproved
-      ? "Approved"
-      : isRejected
-        ? "Denied"
-        : null;
-    const stateLabelCls = isRejected
-      ? "text-kumo-danger"
-      : "text-kumo-inactive";
     // Auto-approval target: offer "Always approve this type" only when enabling a rule would
     // actually apply this action -- a tagged action on a connection that the gatekeeper marked
     // auto-approvable. (A non-auto-approvable action stays a manual gate even with a rule; an
@@ -6885,92 +6765,20 @@ function ChatInterface({
       </div>
     ) : null;
 
-    // A blocking (awaitDecision) action suspends the agent turn, so present it as a prominent
-    // callout laid out like the connection-request card: a permissions icon, title + resource +
-    // details, and the approve/deny actions.
-    if (isBlocking) {
-      return (
-        <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-          <div className="rounded-2xl border border-kumo-brand/40 bg-kumo-brand/10 px-4 py-3">
-            <div className="flex items-start gap-3">
-              <span className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-lg bg-kumo-tint text-kumo-brand" aria-hidden="true">
-                <ShieldCheck size={20} weight="fill" />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-                  <span className="min-w-0 truncate font-medium text-kumo-default">
-                    {log.description.title}
-                  </span>
-                  {resourceMeta}
-                </div>
-                <div className={`chat-panel mt-1 max-h-[200px] overflow-y-auto pr-1 text-[13px] leading-[18px] text-kumo-subtle ${styles.markdownContent}`}>
-                  <MarkdownMessage message={log.description.description} />
-                </div>
-              </div>
-              <div className="ml-3 flex flex-shrink-0 items-center gap-1 self-center">
-                {actionControls}
-              </div>
-            </div>
-          </div>
-        </div>
-      );
+    // Every persisted action is a permission record, including approved and denied history.
+    if (isAct) {
+      return <PermissionRequestWidget
+        title={log.description.title}
+        resource={resourceMeta}
+        actions={log.description.actionKind?.label ?? log.description.title}
+        reason={<div className={`chat-panel max-h-[200px] overflow-y-auto pr-1 ${styles.markdownContent}`}><MarkdownMessage message={log.description.description} /></div>}
+        state={state}
+        icon={<ShieldCheck size={20} weight="fill" />}
+        controls={isPending ? actionControls : undefined}
+      />;
     }
 
-    const titleIcon = (
-      <span className="flex h-5 w-5 flex-shrink-0 items-center justify-center" aria-hidden="true">
-        {isPending ? (
-          <span className="h-1.5 w-1.5 rounded-full bg-kumo-brand" />
-        ) : (
-          <WorkIcon Icon={LinkSimple} />
-        )}
-      </span>
-    );
-
-    return (
-      <div className="group/work max-w-[860px] text-[14px] leading-5 tracking-[-0.25px] text-kumo-subtle">
-        {isPending ? (
-          <div className="flex w-full flex-wrap items-center gap-x-2 gap-y-1 px-1.5 py-1">
-            <div className="flex min-w-[8rem] flex-1 items-center gap-3">
-              {titleIcon}
-              <span className="min-w-0 flex-1 truncate text-kumo-default">
-                {log.description.title}
-              </span>
-            </div>
-            <div className="ml-auto flex flex-shrink-0 items-center gap-0.5">{actionControls}</div>
-          </div>
-        ) : (
-          <button
-            type="button"
-            onClick={() => toggleActionExpansion(msg.actionId)}
-            className="flex w-full cursor-pointer items-center gap-3 rounded-xl px-1.5 py-1 text-left transition-colors duration-150 ease-out hover:text-kumo-default focus-visible:text-kumo-default focus-visible:outline-none"
-            aria-expanded={open}
-          >
-            {titleIcon}
-            <span className="flex min-w-0 flex-1 items-center gap-2">
-              <span className="min-w-0 truncate">{log.description.title}</span>
-              {stateLabel && (
-                <span className={`flex-shrink-0 text-[12px] font-medium ${stateLabelCls}`}>
-                  {stateLabel}
-                </span>
-              )}
-              <CaretRight
-                size={13}
-                weight="bold"
-                className={`flex-shrink-0 text-kumo-inactive transition-transform duration-150 ease-out ${open ? "rotate-90" : ""}`}
-              />
-            </span>
-          </button>
-        )}
-        {showDescription && (
-          <div className="themed-surface-inset ml-8 mt-1 space-y-1.5 rounded-2xl border border-kumo-line/70 bg-kumo-elevated/45 p-3 text-[13px] leading-[19px] tracking-[-0.25px] text-kumo-subtle">
-            <div className={`chat-panel max-h-[200px] overflow-y-auto pr-1 ${styles.markdownContent}`}>
-              <MarkdownMessage message={log.description.description} />
-            </div>
-            {resourceMeta}
-          </div>
-        )}
-      </div>
-    );
+    return null;
   };
 
   // ─── sidebar list content (reused in both modes) ──────────────────────────
@@ -7207,6 +7015,37 @@ function ChatInterface({
     </div>
   );
 
+  // A Workspace begins with one prompt, then retains that same transcript. Until the chat list
+  // has established whether a durable chat exists, do not show a composer that could race a
+  // second chat into existence.
+  const singleChatEmptyState = (
+    <div className="flex flex-1 flex-col justify-end bg-kumo-base">
+      {!chatListReady || chatList.length > 0 ? (
+        <div className="flex flex-1 items-center justify-center">
+          <div className="h-5 w-5 animate-spin rounded-full border-2 border-kumo-brand border-t-transparent" />
+        </div>
+      ) : (
+        <div className={useConstrainedChatWidth ? "mx-auto w-full max-w-[920px]" : "w-full"}>
+          <ChatInput
+            createCapsuleGatekeeper={(accountId, url) =>
+              overseer.newGatekeeper(accountId, url)
+            }
+            getOverseer={getOverseer}
+            onSend={handleSend}
+            isAgentActive={false}
+            models={availableModels}
+            selectedModel={selectedModel}
+            onModelChange={handleModelChange}
+            showThinkingTraces={showThinkingTraces}
+            onToggleThinkingTraces={toggleShowThinkingTraces}
+            minRows={2}
+            newChat
+          />
+        </div>
+      )}
+    </div>
+  );
+
   // ─── main render ─────────────────────────────────────────────────────────────
   return (
     <div
@@ -7236,7 +7075,7 @@ function ChatInterface({
 
       {/* ── Non-sidebar mode: show list OR chat ────────────────────────────── */}
       {!sidebarMode && selectedChatId === null ? (
-        chatListPanel
+        singleChat ? singleChatEmptyState : chatListPanel
       ) : selectedChatId !== null ? (
         <div className="flex-1 flex flex-col overflow-auto">
           {/* Tab bar — in sidebar mode, show Chat / Connections tabs */}
@@ -7278,7 +7117,7 @@ function ChatInterface({
           {(!sidebarMode || sidebarActiveTab === "chat") && (
             <>
               {/* Chat sub-header — hidden in sidebar mode (list is always visible) */}
-              {!sidebarMode && (
+              {!sidebarMode && !singleChat && (
                 <div className="flex h-12 flex-shrink-0 items-center justify-between gap-2 border-b border-kumo-line px-4">
                   <WorkshopIconButton
                     onClick={() => onNavigateToChat(null)}

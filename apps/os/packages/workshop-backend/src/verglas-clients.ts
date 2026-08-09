@@ -53,6 +53,18 @@ export function verglasRuntime(env: VerglasClientEnv, fetcher?: typeof fetch): V
   return connectRuntime({ endpoint, token, fetch: fetcher });
 }
 
+/** True when the local container runtime endpoint and credential are configured together. */
+export function resolveLocalContainerRuntimeConfigured(env: VerglasClientEnv): boolean {
+  const endpoint = Boolean(env.VERGLAS_CONTAINER_RUNTIME_URL?.trim());
+  const token = Boolean(env.VERGLAS_CONTAINER_RUNTIME_TOKEN?.trim());
+  if (endpoint !== token) {
+    throw new Error(
+      "VERGLAS_CONTAINER_RUNTIME_URL and VERGLAS_CONTAINER_RUNTIME_TOKEN must be configured together.",
+    );
+  }
+  return endpoint;
+}
+
 /** True when admin + scheduler are configured for worker registration/runs. */
 export function resolveWorkerControlConfigured(env: VerglasClientEnv): boolean {
   const admin = Boolean(env.VERGLAS_ADMIN_URL?.trim());

@@ -11,7 +11,7 @@ type Scope = 'organization' | 'global'
 type Kind = 'workflow' | 'application' | 'integration'
 
 const kinds: Array<{id: Kind; label: string; icon: ReactNode}> = [
-  {id: 'workflow', label: 'Jobs', icon: <FlowArrow size={15} />},
+  {id: 'workflow', label: 'Workers', icon: <FlowArrow size={15} />},
   {id: 'application', label: 'Applications', icon: <Browser size={15} />},
   {id: 'integration', label: 'Integrations', icon: <PlugsConnected size={15} />},
 ]
@@ -47,7 +47,7 @@ function ExplorePage() {
   return <div className="mx-auto flex h-full w-full max-w-5xl flex-col px-6 pb-12 pt-10 sm:px-10">
     <header>
       <h1 className="text-2xl font-semibold tracking-tight text-kumo-default">Explore</h1>
-      <p className="mt-1 text-[13px] leading-5 text-kumo-subtle">Discover reusable Jobs, Applications, and Integrations exported by your organization or published globally.</p>
+      <p className="mt-1 text-[13px] leading-5 text-kumo-subtle">Discover reusable Workers, Applications, and Integrations exported by your organization or published globally.</p>
     </header>
 
     <div className="mt-6 flex flex-col gap-4 border-b border-kumo-line pb-4 sm:flex-row sm:items-center sm:justify-between">

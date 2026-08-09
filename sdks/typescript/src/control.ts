@@ -135,6 +135,20 @@ export class VerglasAdminClient {
   getJson<T>(path: string, query?: Record<string, string | number | undefined>): Promise<T> {
     return this.transport.request<T>("GET", path, { query });
   }
+
+  /** Performs a typed JSON POST for catalog routes without a dedicated method. */
+  postJson<T>(
+    path: string,
+    body: unknown,
+    query?: Record<string, string | number | undefined>,
+  ): Promise<T> {
+    return this.transport.request<T>("POST", path, { body, query });
+  }
+
+  /** Performs a typed JSON DELETE for catalog routes without a dedicated method. */
+  deleteJson<T>(path: string, query?: Record<string, string | number | undefined>): Promise<T> {
+    return this.transport.request<T>("DELETE", path, { query });
+  }
 }
 
 /** Client for scheduler secrets and bounded job history. */
@@ -212,6 +226,22 @@ export class VerglasRuntimeClient {
   /** Creates or replaces a low-level Vessel declaration. */
   putVessel(name: string, body: unknown): Promise<void> {
     return this.transport.request<void>("PUT", `/v1/vessels/${encodeURIComponent(name)}`, { body });
+  }
+
+  /** Stops a Vessel and persists that it must remain stopped across reconciliation. */
+  stopVessel(name: string): Promise<void> {
+    return this.transport.request<void>(
+      "POST",
+      `/v1/vessels/${encodeURIComponent(name)}/stop`,
+    );
+  }
+
+  /** Resumes a Vessel and persists that reconciliation must keep it running. */
+  resumeVessel(name: string): Promise<unknown> {
+    return this.transport.request(
+      "POST",
+      `/v1/vessels/${encodeURIComponent(name)}/resume`,
+    );
   }
 
   /** Builds and applies a standalone Vessel project. */

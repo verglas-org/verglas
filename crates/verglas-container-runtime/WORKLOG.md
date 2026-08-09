@@ -29,3 +29,5 @@
 
 - #65/#66: Strengthened Docker packaging assertions against gadget-runtime/gadget-host leftovers and required Bun from oven/bun; README now describes Docker-only local placement without Firecracker or Verglas Cloud.
 - #75: Documented the default OSS Compose topology now that it starts the scheduler and its durable Postgres queue alongside the runtime manager. Dynamically added Vessels and database components remain owned by the runtime API.
+
+- #52: Added persisted Vessel stop intent and authenticated stop/resume routes. Reconciliation now leaves an operator-stopped Application or Integration Vessel down across manager restarts and composition updates, while the existing desired-state file shape remains readable.

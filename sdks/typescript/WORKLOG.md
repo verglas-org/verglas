@@ -1,5 +1,8 @@
 # Worklog
 
+- #81: Added typed JSON POST and DELETE helpers to the official admin control client so
+  catalog-backed management surfaces can mutate Iceberg namespaces and tables without
+  reimplementing authenticated HTTP transport.
 - #43: Runtime callbacks now receive the connected namespace-aware SDK as both `ctx.verglas` and `this.verglas`; the legacy `ctx.client` property remains the same instance during migration.
 - #91: Updated SDK endpoint documentation to call the local process
   `verglas-server`. Client wire behavior is unchanged.
@@ -12,3 +15,5 @@
 - #66: Rewrote endpoint-run and README host-entry docs for the local worker harness against http://127.0.0.1:8334; kept VERGLAS_CLOUD_EVENT as the CloudEvents env binding.
 - #66: Removed local-vs-cloud endpoint product wording from README and SDK comments; renamed test fixtures `t.verglas.cloud` → `t.example.test` and `cloud.job_runs` → `demo.job_runs`.
 - #75: Added typed clients for worker administration, scheduler secrets and job history, and local Vessel runtime operations. Verglas OS can now use the canonical TypeScript SDK from the monorepo instead of carrying a generated private copy.
+
+- #52: Added typed runtime Vessel stop and resume controls. The SDK calls the runtime manager's persisted lifecycle routes instead of exposing generic Docker operations to product UIs.

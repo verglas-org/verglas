@@ -527,6 +527,21 @@ export interface AuthenticatedApi extends RpcTarget {
   /** Returns the bounded Tables, Vectors, and Graphs catalog for the Lakehouse explorer. */
   getVerglasCatalog(): Promise<VerglasCatalogSnapshot>;
 
+  /** Returns one database namespace with bounded physical and cache-usage metrics for its tables. */
+  getVerglasDatabase(name: string): Promise<VerglasDatabaseDetail>;
+
+  /** Creates an empty Iceberg namespace, presented in the OS as a database. */
+  createVerglasDatabase(name: string): Promise<void>;
+
+  /** Deletes an empty Iceberg namespace; non-empty databases are rejected by the catalog. */
+  deleteVerglasDatabase(name: string): Promise<void>;
+
+  /** Creates one table with an explicit Iceberg schema inside an existing or new database namespace. */
+  createVerglasTable(input: VerglasCreateTableInput): Promise<VerglasTableSummary>;
+
+  /** Deletes one Iceberg table from its namespace. */
+  deleteVerglasTable(namespace: string[], name: string): Promise<void>;
+
   /** Lists local Verglas Vessels without exposing their secret configuration. */
   listVerglasVessels(): Promise<VerglasVesselSummary[]>;
 
@@ -545,6 +560,9 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Deletes a local Application Vessel and any Workshop chat records that own it. */
   deleteVerglasApplication(name: string): Promise<void>;
+
+  /** Starts or stops an OSS Application Vessel while preserving its desired runtime state. */
+  setVerglasApplicationState(name: string, state: "running" | "stopped"): Promise<void>;
 
   // The deployment's standard output formats, in the order they should be offered -- what fills a
   // "New Document / New Slides / ..." menu. Empty when the deployment promotes none.
@@ -1019,6 +1037,9 @@ export type ServerConfig = {
   // Deployment accent (brand) color as a hex string, or "" to use the default theme. The client
   // overrides the brand CSS variables with this (and derived shades) at runtime.
   accentColor: string;
+
+  /** Whether this OSS deployment has a fully configured local container runtime. */
+  localContainerRuntime: boolean;
 };
 
 // Supported AI providers.
@@ -1129,6 +1150,92 @@ export type VerglasTableSummary = {
   qualifiedName: string;
 };
 
+/** One explicit column in a table created through the OS management UI. */
+export type VerglasTableColumn = {
+  /** Stable column name within its table. */
+  name: string;
+  /** Verglas/Arrow type name accepted by the Iceberg catalog. */
+  type: string;
+  /** Whether the column accepts null values; omitted means true. */
+  nullable?: boolean;
+};
+
+/** One ordered partition declaration in a table created through the OS management UI. */
+export type VerglasTablePartition = {
+  /** Existing source-column name. */
+  source: string;
+  /** Catalog partition transform. */
+  transform: "identity" | "month";
+};
+
+/** Input required to create one explicit Iceberg table. */
+export type VerglasCreateTableInput = {
+  /** Namespace components containing the new table. */
+  namespace: string[];
+  /** New unqualified table name. */
+  name: string;
+  /** Ordered non-empty schema. */
+  columns: VerglasTableColumn[];
+  /** Optional ordered Iceberg partition specification. */
+  partitions?: VerglasTablePartition[];
+};
+
+/** Cache-traffic usage attributed to one table by the local Verglas server. */
+export type VerglasTableUsageMetrics = {
+  /** Fully-qualified table name reported by the metering service. */
+  table: string;
+  /** Cache-served reads. */
+  hits: number;
+  /** Backend-fill reads. */
+  misses: number;
+  /** Total bytes served to readers, not physical table size. */
+  bytesServed: number;
+  /** Bytes served from cache tiers, not physical table size. */
+  cacheBytes: number;
+  /** Backend requests avoided by cache hits. */
+  requestsAvoided: number;
+  /** Estimated client latency saved by cache hits. */
+  latencySavedSeconds: number;
+};
+
+/** Physical metadata from the table describe endpoint. */
+export type VerglasTablePhysicalMetrics = {
+  /** Current live row count. */
+  rowCount: number;
+  /** Current Iceberg data-file count. */
+  fileCount: number;
+  /** Current Iceberg data-file bytes. */
+  sizeBytes: number;
+  /** Current Iceberg snapshot identifier, when the table has a snapshot. */
+  currentSnapshotId?: number;
+};
+
+/** A table plus the physical and cache-usage metrics available to the selected database view. */
+export type VerglasTableDetail = VerglasTableSummary & {
+  /** Physical metrics when the configured server exposes table inspection. */
+  physical?: VerglasTablePhysicalMetrics;
+  /** Cache-traffic metrics when the configured server exposes metering. */
+  usage?: VerglasTableUsageMetrics;
+};
+
+/** One Iceberg namespace rendered by the OS as a database. */
+export type VerglasDatabaseSummary = {
+  /** Dot-separated namespace name. */
+  name: string;
+  /** Number of tables in the namespace. */
+  tableCount: number;
+  /** Number of maintained vector indexes targeting tables in the namespace. */
+  vectorCount: number;
+  /** Whether the namespace is a property graph with nodes and edges backing tables. */
+  graph: boolean;
+};
+
+/** Bounded details returned after a user selects one database namespace. */
+export type VerglasDatabaseDetail = VerglasDatabaseSummary & {
+  /** Tables and their best-available metrics in the selected database. */
+  tables: VerglasTableDetail[];
+};
+
 /** One maintained vector index discoverable through the local Verglas index registry. */
 export type VerglasVectorSummary = {
   /** Stable index target, such as `tbl:rlean.runs` or `graph:agent_memory`. */
@@ -1155,6 +1262,8 @@ export type VerglasGraphSummary = {
 
 /** Bounded lakehouse catalog snapshot rendered by the Lakehouse explorer. */
 export type VerglasCatalogSnapshot = {
+  /** Database namespaces derived from the Iceberg catalog. */
+  databases: VerglasDatabaseSummary[];
   /** Iceberg tables visible to this OS instance. */
   tables: VerglasTableSummary[];
   /** Maintained vector indexes visible to this OS instance. */
@@ -1212,6 +1321,8 @@ export type VerglasVesselSummary = {
   image: string;
   /** Observed container lifecycle state, when available. */
   state?: string;
+  /** Persisted desired lifecycle state; false means the OSS runtime keeps this Vessel stopped. */
+  running?: boolean;
   /** Result of the Vessel's bounded health probe. */
   health: "ready" | "unhealthy" | "unknown";
   /** Local preview URL for Application Vessels. */
