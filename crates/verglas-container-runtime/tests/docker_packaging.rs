@@ -60,6 +60,7 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert_eq!(
         services,
         [
+            "verglas-secret-key-init:",
             "verglas-server:",
             "verglas-access:",
             "verglas-scheduler:",

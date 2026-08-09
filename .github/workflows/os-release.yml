@@ -37,11 +37,11 @@ jobs:
       - name: Install OS dependencies
         run: pnpm --dir apps/os install --frozen-lockfile
 
-      - name: Test OS release tooling
-        run: pnpm --dir apps/os test
-
       - name: Build OS frontend and Workers
         run: pnpm --dir apps/os build
+
+      - name: Test OS release tooling
+        run: pnpm --dir apps/os test
 
       - name: Build immutable release
         run: |
