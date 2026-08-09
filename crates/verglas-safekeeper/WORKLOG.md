@@ -36,3 +36,7 @@
   drained segments until a future pageserver-confirmed retention boundary is
   added, with a socket-level regression test covering that launch race.
 - #58: Allowed the eight-argument `EcAppendLog::open` (node identity plus ring plane) and replaced test `unwrap`s with `expect` so clippy stays clean after the cache-metadata fleet fixes.
+
+- #74: Made pageserver feedback advance WAL retention only from the explicit
+  `vg_durable_lsn` watermark. Generic `ps_applylsn` no longer implies that
+  referenced layers and index metadata crossed the Verglas durability barrier.

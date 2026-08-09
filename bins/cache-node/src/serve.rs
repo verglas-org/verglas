@@ -1,29 +1,27 @@
 //! The cache serving path: build the origin backend, probe it, build the hybrid
 //! cache engine over a single-node rendezvous ring, run the disk-full guardrail
-//! poll, and serve the SigV4 S3 endpoint with read-through / write-through.
+//! poll, and serve the SigV4 S3 endpoint with read-through and ring write-back.
 //!
 //! This is the CACHE-relevant subset of `bins/verglas-server/src/main.rs::serve`,
-//! reproduced without the cluster ring, gossip peers, write-back tier, catalog
-//! watcher, table lifecycle, or any admin surface beyond health/stats/metrics.
+//! reproduced without gossip, table lifecycle, or any admin surface beyond
+//! health/stats/metrics. Ring members provide the shared durability plane.
 //!
-//! ## Why a cluster-of-one, no peers, no write-back
+//! ## Read ownership and write durability
 //!
 //! - **Ring**: a [`RendezvousRing::single`] node owns every key, so the read
 //!   path never consults a peer. This is byte-identical ownership to a verglas-server
 //!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
 //!   dependency (gossip, peer RPC, fragment store).
 //! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
-//! - **Object write-back**: the fleet cache image's boot script renders no
-//!   `[cache.writeback]`, so the OBJECT tier is off by design; S3 PUTs pass
-//!   straight through to the origin durably (write-through), exactly what a
-//!   disabled write-back tier does in verglas-server.
+//! - **Object write-back**: a configured fragment ring stages every S3 PUT as
+//!   erasure-coded, fsynced fragments before acknowledgement. Dirty fragments
+//!   remain outside normal cache eviction while origin propagation runs.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
 //!   reaches the ring. When `VERGLAS_RING_PEERS` names a ring, a device FLUSH is
 //!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
 //!   background); see [`crate::ring`]. The embedded safekeeper shares that same
-//!   fragment store and peer RPC; the object read/serve path above is still a
-//!   peerless cluster-of-one. With no ring configured block FLUSH stays the
-//!   synchronous R2 barrier and no safekeeper listener starts.
+//!   fragment store and peer RPC. With no ring configured, object PUT and block
+//!   FLUSH retain the synchronous origin barrier and no safekeeper starts.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,13 +29,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
-use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo};
+use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo, WritebackStatsInfo};
 use verglas_core::config::Config;
 use verglas_core::metrics::NodeMetrics;
 use verglas_core::node::NodeId;
 use verglas_core::peer::NoopPeerFetch;
 use verglas_core::ring::RendezvousRing;
 use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
+use verglas_write::{
+    JournalStore, PrefixRule, WriteCoordinator, WritebackMetrics, WritebackPolicy, WritebackTier,
+};
 
 use crate::VERSION;
 use crate::admin;
@@ -56,6 +57,20 @@ const BLOCK_PORT: u16 = 8335;
 /// single-bucket passthrough backend, with a one-member rendezvous ring and the
 /// no-op peer fetch. No `verglas-cluster` types appear here.
 type CacheEngine = HybridCacheEngine<PassthroughRead, NoopPeerFetch, RendezvousRing>;
+type WritebackSlot = Arc<std::sync::OnceLock<Arc<WritebackMetrics>>>;
+
+/// Builds the all-object policy used by a tenant cache ring. Neon uploads both
+/// immutable layers and mutable publication metadata through ordinary PUTs, so
+/// every PUT must cross the same ring durability barrier.
+fn object_writeback_policy(nodes: usize) -> WritebackPolicy {
+    let layout = crate::safekeeper::geometry(nodes);
+    WritebackPolicy::new(vec![PrefixRule {
+        prefix: String::new(),
+        k: layout.k,
+        m: layout.m,
+        w: layout.w,
+    }])
+}
 
 /// Whether the operator has opted out of the backend startup probe via
 /// `VERGLAS_DEV_ALLOW_MISSING_ORIGIN`. Truthy values are `1`/`true`
@@ -78,9 +93,13 @@ fn background_fill_limit(max_concurrent_requests: usize) -> usize {
 }
 
 /// Builds the `/admin/stats` source: reads the engine's live counters and DRAM
-/// usage and stamps them next to the configured budgets. Warming and write-back
-/// are always `None` — the cache node runs neither.
-fn stats_source(config: &Config, engine: CacheEngine) -> admin::StatsSource {
+/// usage and stamps them next to the configured budgets. Write-back counters
+/// become available after a ring-backed object writer starts.
+fn stats_source(
+    config: &Config,
+    engine: CacheEngine,
+    writeback: WritebackSlot,
+) -> admin::StatsSource {
     let cache = CacheConfigInfo {
         dir: config.cache.dir.display().to_string(),
         capacity_bytes: config.cache.capacity_bytes.0,
@@ -119,7 +138,19 @@ fn stats_source(config: &Config, engine: CacheEngine) -> admin::StatsSource {
             dram_live_bytes: engine.dram_live_bytes(),
             dram_reclaimable_bytes: engine.dram_reclaimable_bytes(),
             warming: None,
-            writeback: None,
+            writeback: writeback.get().map(|metrics| {
+                let snapshot = metrics.snapshot();
+                WritebackStatsInfo {
+                    acked_via_quorum: snapshot.acked_via_quorum,
+                    acked_via_write_through: snapshot.acked_via_write_through,
+                    mode_transitions: snapshot.mode_transitions,
+                    propagated: snapshot.propagated,
+                    propagation_failures: snapshot.propagation_failures,
+                    fragments_repaired: snapshot.fragments_repaired,
+                    fragments_scrubbed: snapshot.fragments_scrubbed,
+                    corrupt_fragments_found: snapshot.corrupt_fragments_found,
+                }
+            }),
         }
     })
 }
@@ -127,14 +158,15 @@ fn stats_source(config: &Config, engine: CacheEngine) -> admin::StatsSource {
 /// Builds the `GET /metrics` source: renders the Prometheus exposition on each
 /// scrape from the shared request registry plus the engine and backend counters
 /// read at scrape time. The CACHE-relevant subset of verglas-server's `metrics_source`
-/// (no per-table telemetry, no write-back families).
+/// (no per-table telemetry).
 fn metrics_source(
     config: &Config,
     metrics: Arc<NodeMetrics>,
     engine: CacheEngine,
     backend: Arc<BackendStore>,
+    writeback: WritebackSlot,
 ) -> admin::MetricsSource {
-    use verglas_core::metrics::{MetricsSnapshot, TierSize, render};
+    use verglas_core::metrics::{MetricsSnapshot, TierSize, WritebackMetricsSnapshot, render};
     use verglas_core::read::ServedTier;
 
     let dram_capacity = config.cache.dram_bytes.0;
@@ -182,7 +214,14 @@ fn metrics_source(
                 verglas_backend::BreakerState::Open => "open",
                 verglas_backend::BreakerState::HalfOpen => "half_open",
             },
-            writeback: None,
+            writeback: writeback.get().map(|metrics| {
+                let snapshot = metrics.snapshot();
+                WritebackMetricsSnapshot {
+                    fragments_repaired: snapshot.fragments_repaired,
+                    fragments_scrubbed: snapshot.fragments_scrubbed,
+                    corrupt_fragments_found: snapshot.corrupt_fragments_found,
+                }
+            }),
         };
         render(&metrics, &snapshot)
     })
@@ -193,13 +232,14 @@ fn metrics_source(
 /// publishes one decision the fill path reads as a plain atomic: pause block
 /// admission when the filesystem nears full so a full disk degrades the node to
 /// origin fills rather than crashing it (budgets are hard ceilings). The
-/// fragment-budget sharing verglas-server's poll also does is absent — there is no
-/// write-back fragment store to grant budget to. Detached for the process
-/// lifetime.
+/// same decision publishes the unused physical budget to the fragment store.
+/// Dirty fragments remain protected when the ceiling shrinks. Detached for the
+/// process lifetime.
 fn spawn_disk_monitor(
     config: &Config,
     caching_paused: Arc<AtomicBool>,
     engine: CacheEngine,
+    object_ring: Option<Arc<crate::ring::RingPlane>>,
 ) -> tokio::task::JoinHandle<()> {
     use verglas_core::disk::{DiskParams, disk_decision, free_bytes};
 
@@ -221,9 +261,13 @@ fn spawn_disk_monitor(
             let was_paused = caching_paused.load(Ordering::Relaxed);
             let free = free_bytes(&dir);
             let room = engine.disk_growth_room_bytes();
-            // No write-back fragments on a cache node, so nothing else holds the
-            // shared budget (`frag_used = 0`).
-            let state = disk_decision(free, room, 0, was_paused, &params);
+            let frag_used = object_ring
+                .as_ref()
+                .map_or(0, |ring| ring.fragment_used_bytes());
+            let state = disk_decision(free, room, frag_used, was_paused, &params);
+            if let Some(ring) = &object_ring {
+                ring.set_fragment_ceiling(state.fragment_max);
+            }
             caching_paused.store(state.caching_paused, Ordering::Relaxed);
             if state.caching_paused != was_paused {
                 if state.caching_paused {
@@ -263,22 +307,24 @@ pub async fn run(
         registry.bucket_set()
     );
 
-    // Startup probe (#233): a configured bucket that cannot be reached or
-    // authenticated must fail startup, not serve an empty store. Dev/test that
-    // runs without a reachable origin opts out via VERGLAS_DEV_ALLOW_MISSING_ORIGIN.
-    if dev_allow_missing_origin() {
+    // Origin reachability does not gate recovery. An acknowledged dirty object
+    // may exist only on the ring, so this process must recover and serve it even
+    // while the origin is unavailable. The probe runs as a persistent degraded-
+    // state signal and never terminates the data plane.
+    let _origin_probe = if dev_allow_missing_origin() {
         eprintln!(
             "verglas-cache-node {VERSION} WARNING: VERGLAS_DEV_ALLOW_MISSING_ORIGIN set — skipping the backend startup probe; the origin is NOT verified (dev/test only)"
         );
+        None
     } else {
-        registry.probe().await?;
-        eprintln!("verglas-cache-node {VERSION} backend startup probe passed");
-    }
+        Some(spawn_origin_probe(Arc::clone(&registry)))
+    };
 
     let node_metrics = Arc::new(NodeMetrics::new()?);
     let health = admin::Health::starting();
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
+    let writeback_slot: WritebackSlot = Arc::new(std::sync::OnceLock::new());
 
     // The cache node is the sole owner of upstream catalog credentials and
     // change tracking. The gateway and watcher share one response cache. In the
@@ -344,9 +390,13 @@ pub async fn run(
             // Learn the ring and attach the flush write-back plane to the registry
             // before any device is ensured. With no ring configured this is a
             // no-op and FLUSH stays the synchronous R2 barrier (#382).
-            ring_plane = crate::ring::setup(&config.cache.dir, &device_registry)
-                .await?
-                .map(Arc::new);
+            ring_plane = crate::ring::setup(
+                &config.cache.dir,
+                config.cache.capacity_bytes.0,
+                &device_registry,
+            )
+            .await?
+            .map(Arc::new);
             let block_addr = std::env::var("VERGLAS_BLOCK_ADDR")
                 .unwrap_or_else(|_| format!("0.0.0.0:{BLOCK_PORT}"));
             let block_listener = tokio::net::TcpListener::bind(&block_addr).await?;
@@ -367,6 +417,7 @@ pub async fn run(
     // The Neon listener is another data plane of this same process. It is
     // present whenever this node belongs to the fragment ring and shares that
     // ring's transport/listener/store with block FLUSH.
+    let object_ring = ring_plane.clone();
     let safekeeper_args = match (config.backend.bucket.clone(), ring_plane) {
         (Some(bucket), Some(ring)) => Some((
             Arc::clone(&registry),
@@ -430,17 +481,26 @@ pub async fn run(
         );
 
         // Disk-full guardrail poll (#96). Held for the process lifetime.
-        let _disk_monitor =
-            spawn_disk_monitor(config, engine.caching_paused_handle(), engine.clone());
+        let _disk_monitor = spawn_disk_monitor(
+            config,
+            engine.caching_paused_handle(),
+            engine.clone(),
+            object_ring.clone(),
+        );
 
         // Recovery is done: fill the engine-dependent admin routes, then flip the
         // health gate so a load balancer may start routing here.
-        let _ = stats_slot.set(stats_source(config, engine.clone()));
+        let _ = stats_slot.set(stats_source(
+            config,
+            engine.clone(),
+            Arc::clone(&writeback_slot),
+        ));
         let _ = metrics_slot.set(metrics_source(
             config,
             node_metrics.clone(),
             engine.clone(),
             registry.clone(),
+            Arc::clone(&writeback_slot),
         ));
         health.mark_ready();
 
@@ -451,6 +511,7 @@ pub async fn run(
             engine,
             registry,
             node_metrics,
+            (object_ring, writeback_slot),
         )
         .await
     };
@@ -490,11 +551,35 @@ pub async fn run(
     tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut).map(|_| ())
 }
 
+/// Probes the origin until it is reachable, then keeps checking after failures.
+fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut backoff = std::time::Duration::from_secs(1);
+        loop {
+            match registry.probe().await {
+                Ok(()) => {
+                    eprintln!("verglas-cache-node {VERSION} backend probe passed");
+                    backoff = std::time::Duration::from_secs(30);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "verglas-cache-node {VERSION} backend unavailable; serving recovered cache and dirty ring data in degraded mode: {error}"
+                    );
+                    backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+                }
+            }
+            tokio::time::sleep(backoff).await;
+        }
+    })
+}
+
 /// Serves the SigV4 S3 endpoint until the process is interrupted. Reads are
 /// served by the hybrid cache engine over the read passthrough, filling misses
-/// from the origin; writes pass through durably and invalidate the engine's
-/// key->ETag mappings before the client is acked. Path-style always works; a
-/// configured `[listen].domain` adds virtual-hosted addressing.
+/// from the origin. On a ring, writes acknowledge after fragment quorum and
+/// propagate asynchronously; without a ring, writes acknowledge from the
+/// origin. Both paths invalidate key-to-ETag mappings before acknowledgement.
+/// Path-style always works; a configured `[listen].domain` adds virtual-hosted
+/// addressing.
 async fn serve_s3(
     config: &Config,
     s3_listener: tokio::net::TcpListener,
@@ -502,28 +587,71 @@ async fn serve_s3(
     engine: CacheEngine,
     registry: Arc<BackendStore>,
     node_metrics: Arc<NodeMetrics>,
+    writeback: (Option<Arc<crate::ring::RingPlane>>, WritebackSlot),
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let (object_ring, writeback_slot) = writeback;
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
     let lister: Arc<dyn verglas_core::list::ObjectList> =
         Arc::new(PassthroughList::new(registry.clone()));
     // The engine doubles as the write path's invalidator (one Arc bump).
     let invalidation: Arc<dyn verglas_core::write::Invalidation> = Arc::new(engine.clone());
-    let writer = PassthroughWrite::new(registry.clone());
     let bucket_set = registry.bucket_set();
+    let origin = Arc::new(PassthroughWrite::new(registry.clone()));
 
-    let app = verglas_s3::router_with_passthrough(
-        engine,
-        writer,
-        lister,
-        invalidation,
-        Some(credentials),
-        Some(registry as Arc<dyn verglas_backend::BackendStores>),
-        // The cache-node role does not serve the server's `/v1` API.
-        None,
-        config.listen.domain.as_deref(),
-        Some(node_metrics),
-    );
+    let app = if let Some(ring) = object_ring {
+        let policy = Arc::new(object_writeback_policy(ring.node_count()));
+        let journals = Arc::new(JournalStore::open(
+            config.cache.dir.join("object-writeback"),
+        )?);
+        let metrics = Arc::new(WritebackMetrics::default());
+        let _ = writeback_slot.set(Arc::clone(&metrics));
+        let membership = ring.membership();
+        let coordinator = Arc::new(
+            WriteCoordinator::new(
+                ring.transport(),
+                Arc::clone(&membership),
+                journals,
+                metrics,
+                Arc::clone(&origin),
+                std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
+            )
+            .require_quorum(),
+        );
+        let _repair = verglas_write::spawn_repair_loop(
+            Arc::clone(&coordinator),
+            membership,
+            std::time::Duration::from_secs(2),
+        );
+        let _scrub = verglas_write::spawn_scrub_loop(
+            Arc::clone(&coordinator),
+            std::time::Duration::from_secs(config.cache.writeback.scrub_interval_secs),
+        );
+        let tier = WritebackTier::new(coordinator, engine, origin, policy);
+        verglas_s3::router_with_passthrough(
+            tier.reader,
+            tier.writer,
+            lister,
+            invalidation,
+            Some(credentials),
+            Some(registry as Arc<dyn verglas_backend::BackendStores>),
+            None,
+            config.listen.domain.as_deref(),
+            Some(node_metrics),
+        )
+    } else {
+        verglas_s3::router_with_passthrough(
+            engine,
+            PassthroughWrite::new(registry.clone()),
+            lister,
+            invalidation,
+            Some(credentials),
+            Some(registry as Arc<dyn verglas_backend::BackendStores>),
+            None,
+            config.listen.domain.as_deref(),
+            Some(node_metrics),
+        )
+    };
 
     let local_addr = s3_listener.local_addr()?;
     eprintln!(
@@ -547,6 +675,25 @@ mod tests {
     use axum::routing::get;
     use std::sync::atomic::AtomicUsize;
     use verglas_core::admin::{HEALTHZ_PATH, METRICS_PATH, STATS_PATH};
+
+    /// Every object uploaded through a ring-backed tenant cache receives the
+    /// same EC durability geometry as the embedded safekeeper.
+    #[test]
+    fn neon_object_writeback_covers_layers_and_index_publication() {
+        let policy = object_writeback_policy(3);
+        for key in [
+            "tenants/t1/timelines/l1/000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF-00000001",
+            "tenants/t1/timelines/l1/index_part.json-00000001",
+        ] {
+            assert_eq!(
+                policy.geometry_for(&verglas_core::CacheKey {
+                    bucket: "tenant".to_owned(),
+                    key: key.to_owned(),
+                }),
+                Some((2, 1, 3))
+            );
+        }
+    }
 
     /// Background fills consume only their configured quarter-share and are
     /// disabled when the origin budget is too small to reserve user capacity.
@@ -574,7 +721,11 @@ mod tests {
 
         let (engine, _registry) = build_test_engine(&config).await;
         let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
-        let _ = stats_slot.set(stats_source(&config, engine));
+        let _ = stats_slot.set(stats_source(
+            &config,
+            engine,
+            Arc::new(std::sync::OnceLock::new()),
+        ));
         let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
 
         let health = admin::Health::starting();
@@ -598,7 +749,7 @@ mod tests {
         assert_eq!(body.cache.capacity_bytes, 64 * 1024 * 1024);
         // A freshly built engine has served nothing, but the gauge is live.
         assert_eq!(body.counters.disk_hits, 0);
-        // The cache node never warms or writes back, so those are always absent.
+        // This isolated engine has no warmer or running write-back coordinator.
         assert!(body.warming.is_none());
         assert!(body.writeback.is_none());
     }
@@ -702,7 +853,13 @@ mod tests {
         let node_metrics = Arc::new(NodeMetrics::new().expect("metrics"));
 
         let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
-        let _ = metrics_slot.set(metrics_source(&config, node_metrics, engine, registry));
+        let _ = metrics_slot.set(metrics_source(
+            &config,
+            node_metrics,
+            engine,
+            registry,
+            Arc::new(std::sync::OnceLock::new()),
+        ));
         let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
         let health = admin::Health::starting();
         health.mark_ready();

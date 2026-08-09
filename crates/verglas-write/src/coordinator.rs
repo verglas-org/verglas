@@ -38,12 +38,11 @@ use crate::meta::{StoredMetadata, now_unix_ms};
 use crate::metrics::WritebackMetrics;
 use crate::transport::FragmentTransport;
 
-/// Default background propagation retry attempts before giving up for this
-/// process run (a later run replays the still-dirty journal).
-const PROPAGATION_ATTEMPTS: u32 = 8;
-
 /// Base backoff between propagation retries.
 const PROPAGATION_BACKOFF: Duration = Duration::from_millis(200);
+
+/// Reserved fragment index for a replicated journal manifest.
+const MANIFEST_INDEX: usize = usize::MAX;
 
 /// Upper bound on fragment indices swept when cleaning up an abandoned object.
 /// No configured geometry places more than this many fragments (k + m), so
@@ -116,6 +115,9 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     self_id: NodeId,
     /// Deadline to gather `w` durable fragments before falling back.
     ack_deadline: Duration,
+    /// Reject a shortfall instead of changing the acknowledgement boundary to
+    /// the origin. Neon publication requires one stable durability contract.
+    require_quorum: bool,
     /// Last ack mode, for counting write-back <-> write-through transitions.
     last_mode: AtomicU8,
     /// Per-write counter feeding object-id uniqueness.
@@ -145,10 +147,19 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             origin,
             self_id,
             ack_deadline,
+            require_quorum: false,
             last_mode: AtomicU8::new(MODE_UNSET),
             object_counter: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
         }
+    }
+
+    /// Requires every eligible write to acknowledge from the fragment quorum.
+    /// A membership, headroom, or placement shortfall fails the write without
+    /// forwarding it to the origin as a different durability mode.
+    pub fn require_quorum(mut self) -> Self {
+        self.require_quorum = true;
+        self
     }
 
     /// Stops background propagation: every in-flight retry loop exits at its
@@ -226,6 +237,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             // Enforced fallback: the live view cannot place `w` distinct
             // fragments. Decided before the body is consumed, so write-through
             // re-streams it.
+            if self.require_quorum {
+                return Err(quorum_shortfall(w, live.len()));
+            }
             return self.write_through_stream(key, metadata, body).await;
         } else {
             (k, m, w)
@@ -243,6 +257,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             .nodes_with_headroom(ordered, MAX_STRIPE_CHUNK as u64)
             .await;
         if nodes.len() < w {
+            if self.require_quorum {
+                return Err(quorum_shortfall(w, nodes.len()));
+            }
             return self.write_through_stream(key, metadata, body).await;
         }
 
@@ -322,6 +339,11 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             )
             .await
         } else {
+            if self.require_quorum {
+                self.drain_placements(&mut done_rx).await;
+                self.spawn_object_cleanup(object_id);
+                return Err(quorum_shortfall(w, acked.len()));
+            }
             // Fewer than `w` fragments committed. The body is already consumed,
             // so write-through re-streams from the committed fragments: any `k`
             // reconstruct the object, which is then uploaded to the origin. If
@@ -367,6 +389,14 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         self.journals
             .put(&journal)
             .map_err(|e| WriteError::Backend(format!("write-back journal: {e}")))?;
+        if let Err(error) = self.replicate_manifest(&journal).await {
+            let _ = self.journals.delete(object_id);
+            self.delete_manifest(&journal).await;
+            self.spawn_object_cleanup(object_id.to_owned());
+            return Err(WriteError::Backend(format!(
+                "write-back journal replication failed: {error}"
+            )));
+        }
 
         WritebackMetrics::bump(&self.metrics.acked_via_quorum);
         self.record_mode(MODE_QUORUM);
@@ -548,21 +578,22 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         }
     }
 
-    /// Propagates one object to the origin with bounded retries. A still-dirty
-    /// journal after all attempts is left for a later run to replay.
+    /// Propagates one object until the origin confirms it or shutdown begins.
     pub async fn propagate(self: Arc<Self>, object_id: String) {
         let mut backoff = PROPAGATION_BACKOFF;
-        for attempt in 0..PROPAGATION_ATTEMPTS {
+        let mut attempt = 0u64;
+        loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
+            attempt = attempt.saturating_add(1);
             match self.propagate_once(&object_id).await {
                 Ok(()) => return,
                 Err(error) => {
                     WritebackMetrics::bump(&self.metrics.propagation_failures);
                     eprintln!(
                         "writeback: propagation of {object_id} attempt {} failed: {error}",
-                        attempt + 1
+                        attempt
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));
@@ -591,6 +622,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             .await
             .map_err(|e| WritebackError::Reassembly(format!("origin put: {e}")))?;
         self.journals.mark_clean(object_id)?;
+        self.delete_manifest(&journal).await;
         // Free the fragments; they were the pod's only copy and the origin now
         // has the object. Best-effort — a leftover fragment is harmless.
         for placement in &journal.placements {
@@ -604,6 +636,76 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let _ = self.journals.delete(object_id);
         WritebackMetrics::bump(&self.metrics.propagated);
         Ok(())
+    }
+
+    /// Finds the newest replicated dirty journal for an S3 key on any ring node.
+    pub async fn discover_dirty(&self, key: &CacheKey) -> Result<Option<Journal>, WritebackError> {
+        let mut newest = self
+            .journals
+            .find_dirty(&key.bucket, &key.key)
+            .and_then(|object_id| self.journals.read(&object_id).ok().flatten());
+        let prefix = manifest_prefix(key);
+        for node in self.membership.live_nodes() {
+            let Ok(manifests) = self.transport.list_prefix(&node, &prefix).await else {
+                continue;
+            };
+            for manifest_key in manifests {
+                if manifest_key.index != MANIFEST_INDEX {
+                    continue;
+                }
+                let Ok(Some(loaded)) = self.transport.load(&node, &manifest_key).await else {
+                    continue;
+                };
+                if !loaded.is_healthy() {
+                    continue;
+                }
+                let Ok(journal) = serde_json::from_slice::<Journal>(&loaded.bytes) else {
+                    continue;
+                };
+                if journal.state != JournalState::Dirty
+                    || journal.bucket != key.bucket
+                    || journal.key != key.key
+                {
+                    continue;
+                }
+                let replace = newest.as_ref().is_none_or(|current| {
+                    (journal.created_ms, journal.object_id.as_str())
+                        > (current.created_ms, current.object_id.as_str())
+                });
+                if replace {
+                    newest = Some(journal);
+                }
+            }
+        }
+        Ok(newest)
+    }
+
+    /// Replicates the fsynced journal to every node counted by the ACK quorum.
+    async fn replicate_manifest(&self, journal: &Journal) -> Result<(), WritebackError> {
+        let bytes = serde_json::to_vec(journal).map_err(|error| {
+            crate::journal::JournalError(format!("encode replicated journal: {error}"))
+        })?;
+        let key = manifest_key(journal);
+        for placement in &journal.placements {
+            self.transport
+                .place(
+                    &NodeId::new(placement.node.as_str()),
+                    FragmentRecord::new(key.clone(), Bytes::from(bytes.clone())),
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Removes this version's replicated manifest after origin durability.
+    async fn delete_manifest(&self, journal: &Journal) {
+        let key = manifest_key(journal);
+        for placement in &journal.placements {
+            let _ = self
+                .transport
+                .delete(&NodeId::new(placement.node.as_str()), &key)
+                .await;
+        }
     }
 
     /// Reassembles the object bytes from any `k` surviving fragments named in
@@ -942,6 +1044,34 @@ fn synthetic_object_etag(object_id: &str, object_len: u64) -> String {
     buf.extend_from_slice(object_id.as_bytes());
     buf.extend_from_slice(&object_len.to_le_bytes());
     format!("\"{:032x}\"", xxhash_rust::xxh3::xxh3_128(&buf))
+}
+
+/// Stable namespace shared by every manifest version of one S3 key.
+fn manifest_prefix(key: &CacheKey) -> String {
+    let mut bytes = Vec::with_capacity(key.bucket.len() + key.key.len() + 1);
+    bytes.extend_from_slice(key.bucket.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(key.key.as_bytes());
+    format!("journal-{:032x}-", xxhash_rust::xxh3::xxh3_128(&bytes))
+}
+
+/// Unique replicated-manifest identity for one acknowledged object version.
+fn manifest_key(journal: &Journal) -> FragmentKey {
+    let key = CacheKey {
+        bucket: journal.bucket.clone(),
+        key: journal.key.clone(),
+    };
+    FragmentKey {
+        object_id: format!("{}{}", manifest_prefix(&key), journal.object_id),
+        index: MANIFEST_INDEX,
+    }
+}
+
+/// Builds the stable error returned by a strict ring durability boundary.
+fn quorum_shortfall(required: usize, durable: usize) -> WriteError {
+    WriteError::Backend(format!(
+        "write-back quorum requires {required} durable fragments; only {durable} available"
+    ))
 }
 
 /// Encodes `body` with a fixed geometry chunk (repair must match the journal's

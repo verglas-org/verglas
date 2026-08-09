@@ -29,7 +29,8 @@ fn handlers_for(store: LocalFragmentStore) -> FragmentHandlers {
     let s1b = store.clone();
     let s2 = store.clone();
     let s3 = store.clone();
-    let s4 = store;
+    let s4 = store.clone();
+    let s5 = store;
     FragmentHandlers {
         store: Arc::new(move |record| {
             let s = s1.clone();
@@ -57,6 +58,15 @@ fn handlers_for(store: LocalFragmentStore) -> FragmentHandlers {
         headroom: Arc::new(move |bytes| {
             let s = s4.clone();
             Box::pin(async move { s.has_headroom(bytes) })
+        }),
+        list_prefix: Arc::new(move |prefix| {
+            let s = s5.clone();
+            Box::pin(async move {
+                s.list_fragment_keys()
+                    .into_iter()
+                    .filter(|key| key.object_id.starts_with(&prefix))
+                    .collect()
+            })
         }),
     }
 }
@@ -138,6 +148,43 @@ async fn missing_fragment_is_a_clean_miss() {
         .await
         .expect("miss is not an error");
     assert_eq!(got, None);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn list_fragments_filters_by_object_namespace() {
+    let node = NodeId::new("peer-list");
+    let (server, client, _store) = server_and_client(&node, None).await;
+    for (object_id, index) in [("journal-key-a", 0), ("journal-key-b", 1), ("data", 2)] {
+        client
+            .put_fragment(
+                &node,
+                FragmentRecord::new(
+                    FragmentKey {
+                        object_id: object_id.to_owned(),
+                        index,
+                    },
+                    Bytes::from_static(b"bytes"),
+                ),
+            )
+            .await
+            .expect("place");
+    }
+    let mut listed = client
+        .list_fragments(&node, "journal-key-")
+        .await
+        .expect("list");
+    listed.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+    assert_eq!(
+        listed
+            .into_iter()
+            .map(|key| (key.object_id, key.index))
+            .collect::<Vec<_>>(),
+        vec![
+            ("journal-key-a".to_owned(), 0),
+            ("journal-key-b".to_owned(), 1)
+        ]
+    );
     server.shutdown().await;
 }
 

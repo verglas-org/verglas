@@ -37,13 +37,11 @@ impl<R, W: ObjectWrite> WritebackReader<R, W> {
     }
 
     /// Looks up the dirty journal for `key`, or `None`. Cheap when idle.
-    fn dirty_journal(&self, key: &CacheKey) -> Option<Journal> {
-        let journals = self.coordinator.journals();
-        if journals.is_idle() {
-            return None;
-        }
-        let object_id = journals.find_dirty(&key.bucket, &key.key)?;
-        journals.read(&object_id).ok().flatten()
+    async fn dirty_journal(&self, key: &CacheKey) -> Result<Option<Journal>, ReadError> {
+        self.coordinator
+            .discover_dirty(key)
+            .await
+            .map_err(|error| ReadError::Backend(error.to_string()))
     }
 }
 
@@ -55,7 +53,7 @@ where
     /// Serves a dirty object by reassembling the requested range from
     /// fragments; delegates otherwise.
     async fn get(&self, key: &CacheKey, range: ReadRange) -> Result<ObjectGet, ReadError> {
-        let Some(journal) = self.dirty_journal(key) else {
+        let Some(journal) = self.dirty_journal(key).await? else {
             return self.inner.get(key, range).await;
         };
         let bytes = self
@@ -82,7 +80,7 @@ where
 
     /// Reports dirty metadata before propagation; delegates otherwise.
     async fn head(&self, key: &CacheKey) -> Result<ObjectMeta, ReadError> {
-        match self.dirty_journal(key) {
+        match self.dirty_journal(key).await? {
             Some(journal) => Ok(meta_for(&journal, journal.object_len)),
             None => self.inner.head(key).await,
         }
@@ -91,7 +89,7 @@ where
     /// Revalidates against the dirty journal's synthetic ETag; delegates
     /// otherwise.
     async fn revalidate(&self, key: &CacheKey, etag: &str) -> Result<Revalidation, ReadError> {
-        match self.dirty_journal(key) {
+        match self.dirty_journal(key).await? {
             Some(journal) => {
                 let meta = meta_for(&journal, journal.object_len);
                 if meta.e_tag.as_deref() == Some(etag) {

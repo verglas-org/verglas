@@ -7527,6 +7527,7 @@ dependencies = [
  "verglas-s3",
  "verglas-safekeeper",
  "verglas-tables",
+ "verglas-write",
 ]
 
 [[package]]

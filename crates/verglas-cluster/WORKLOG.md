@@ -94,3 +94,6 @@
 - #3: Updated logical-write references for the `verglas-write` package rename.
 - #91: Updated cluster process and test terminology from daemon to server for
   the `verglas-server` rename. Membership and routing behavior are unchanged.
+- #74: Added a prefix-filtered fragment identity RPC for replicated write-back
+  journal discovery. The response carries identities only; object bytes still
+  use the checksum-verified fragment load endpoint.

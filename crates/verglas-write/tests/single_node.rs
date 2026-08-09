@@ -72,7 +72,13 @@ impl MemoryTransport {
     }
 
     fn fragment_count(&self) -> usize {
-        self.inner.lock().expect("lock").frags.len()
+        self.inner
+            .lock()
+            .expect("lock")
+            .frags
+            .keys()
+            .filter(|(object_id, _)| !object_id.starts_with("journal-"))
+            .count()
     }
 }
 

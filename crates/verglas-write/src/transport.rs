@@ -70,6 +70,16 @@ pub trait FragmentTransport: Send + Sync + 'static {
 
     /// Deletes the fragment `key` from `node` (idempotent).
     async fn delete(&self, node: &NodeId, key: &FragmentKey) -> Result<(), TransportError>;
+
+    /// Lists fragment identities on `node` in one object-id namespace.
+    async fn list_prefix(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<FragmentKey>, TransportError> {
+        let _ = (node, prefix);
+        Ok(Vec::new())
+    }
 }
 
 /// The production transport: local store for this node, peer RPC for the rest.
@@ -161,6 +171,24 @@ impl FragmentTransport for PeerFragmentTransport {
         } else {
             self.client.delete_fragment(node, key).await?;
             Ok(())
+        }
+    }
+
+    /// Lists locally for self and uses the peer manifest-discovery RPC otherwise.
+    async fn list_prefix(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<FragmentKey>, TransportError> {
+        if *node == self.self_id {
+            Ok(self
+                .local
+                .list_fragment_keys()
+                .into_iter()
+                .filter(|key| key.object_id.starts_with(prefix))
+                .collect())
+        } else {
+            Ok(self.client.list_fragments(node, prefix).await?)
         }
     }
 }

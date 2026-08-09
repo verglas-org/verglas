@@ -1,6 +1,6 @@
 [package]
 name = "verglas-cache-node"
-description = "The standalone Verglas cache serving server: config + SigV4 S3 frontend + foyer cache tiers + origin read/write-through, and nothing else. The cloud fleet's single-job cache image."
+description = "The standalone Verglas cache server: SigV4 S3, shared cache tiers, and ring-durable write-back for the cloud fleet."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -12,10 +12,8 @@ name = "verglas-cache-node"
 path = "src/main.rs"
 
 [dependencies]
-# The cache serving path, and nothing off it. No verglas-cluster (single-node
-# rendezvous ring of one owns every key), no verglas-write (the fleet cache
-# image never enables it), no verglas-tables/platform/memory/iceberg (no catalog,
-# no jobs, no query engine).
+# The S3 read path uses a cluster-of-one ownership ring. The fragment ring below
+# supplies durability and does not partition read-cache ownership.
 verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-s3.workspace = true
@@ -31,12 +29,15 @@ verglas-block.workspace = true
 # ring and acks on a quorum. It reuses the object tier's fragment store and peer
 # RPC (verglas-cluster) — this binary wires the block ring peers to them and
 # serves the fragment endpoints peers place shards through. The embedded
-# safekeeper shares this transport; the object serving path stays a deliberate
-# cluster-of-one.
+# safekeeper and object writer share this transport; read ownership stays a
+# deliberate cluster-of-one.
 verglas-cluster.workspace = true
 # The Neon-compatible WAL listener is embedded in this process and places WAL
 # fragments through the same ring transport as block FLUSH.
 verglas-safekeeper.workspace = true
+# Pageserver layer and index PUTs acknowledge from the shared fragment ring;
+# origin propagation continues asynchronously behind this writer.
+verglas-write.workspace = true
 axum.workspace = true
 futures.workspace = true
 # The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.

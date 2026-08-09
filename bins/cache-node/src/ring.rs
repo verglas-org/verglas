@@ -1,8 +1,8 @@
 //! Shared fragment-ring wiring for block FLUSH and Neon WAL (#13/#382).
 //!
-//! The cache node's object serving path is a deliberate cluster-of-one (see
-//! [`crate::serve`]), but block FLUSH and the embedded safekeeper both write over
-//! the fleet ring. This module constructs their one shared transport,
+//! The cache node's read ownership is a deliberate cluster-of-one (see
+//! [`crate::serve`]), but object PUT, block FLUSH, and the embedded safekeeper
+//! write over the fleet ring. This module constructs their one shared transport,
 //! membership view, fragment store, and listener. It:
 //!
 //! - learns the ring from the environment (the same env-driven shape the block
@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use verglas_block::{
@@ -59,6 +60,11 @@ pub struct RingPlane {
     transport: Arc<dyn FragmentTransport>,
     /// Shared view of live fragment holders.
     membership: Arc<dyn LiveMembership>,
+    /// One live ceiling for block, WAL, and object fragments. The disk monitor
+    /// grants only unused cache capacity; reducing it never evicts dirty data.
+    fragment_ceiling: Arc<AtomicU64>,
+    /// Local fragments currently protected by durability state.
+    local: LocalFragmentStore,
     /// The fragment RPC listener peers place shards through.
     _peer_server: PeerServer,
     /// The background takeover loop.
@@ -90,6 +96,17 @@ impl RingPlane {
     pub fn node_count(&self) -> usize {
         self.membership.live_nodes().len()
     }
+
+    /// Bytes of dirty fragment data held on this node.
+    pub fn fragment_used_bytes(&self) -> u64 {
+        self.local.used_bytes()
+    }
+
+    /// Publishes a new admission ceiling. A ceiling below current usage only
+    /// refuses new fragments; acknowledged dirty fragments are never evicted.
+    pub fn set_fragment_ceiling(&self, bytes: u64) {
+        self.fragment_ceiling.store(bytes, Ordering::Release);
+    }
 }
 
 /// Wires the block-flush write-back plane onto `registry` from the environment,
@@ -100,6 +117,7 @@ impl RingPlane {
 /// env sets one; v1 requires none (VXLAN isolation, mirroring the NBD plane).
 pub async fn setup(
     cache_dir: &std::path::Path,
+    capacity_bytes: u64,
     registry: &DeviceRegistry,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
     let peers = match env_var("VERGLAS_RING_PEERS") {
@@ -133,7 +151,11 @@ pub async fn setup(
 
     // The fragment store this node holds block and WAL ring shards in — kept
     // under its own subdir so it never collides with the read cache.
-    let local = LocalFragmentStore::new(cache_dir.join("fragment-ring"));
+    let fragment_ceiling = Arc::new(AtomicU64::new(capacity_bytes));
+    let local = LocalFragmentStore::with_dynamic_ceiling(
+        cache_dir.join("fragment-ring"),
+        Arc::clone(&fragment_ceiling),
+    );
 
     // The peer RPC client + transport: self-directed placements go to the local
     // store, everything else over the fragment RPC to the resolved peer address.
@@ -173,7 +195,7 @@ pub async fn setup(
         ring_addr,
         secret,
         noop_block_source(),
-        fragment_handlers(local),
+        fragment_handlers(local.clone()),
     )
     .await?;
     eprintln!(
@@ -195,6 +217,8 @@ pub async fn setup(
         self_id,
         transport,
         membership,
+        fragment_ceiling,
+        local,
         _peer_server: peer_server,
         _takeover: takeover,
     }))
@@ -239,7 +263,8 @@ fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
     let store_stream = store.clone();
     let store_get = store.clone();
     let store_del = store.clone();
-    let store_room = store;
+    let store_room = store.clone();
+    let store_list = store;
     FragmentHandlers {
         store: Arc::new(move |record: FragmentRecord| {
             let store = store_put.clone();
@@ -260,6 +285,16 @@ fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
         headroom: Arc::new(move |bytes: u64| {
             let store = store_room.clone();
             Box::pin(async move { store.has_headroom(bytes) })
+        }),
+        list_prefix: Arc::new(move |prefix: String| {
+            let store = store_list.clone();
+            Box::pin(async move {
+                store
+                    .list_fragment_keys()
+                    .into_iter()
+                    .filter(|key| key.object_id.starts_with(&prefix))
+                    .collect()
+            })
         }),
     }
 }
