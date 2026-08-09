@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 
-// Promotes an e2e-verified candidate release: copies candidates/<id>/manifest.json to
-// releases/<id>/manifest.json. The blobs are already in place — content-addressed and uploaded
+// Promotes an e2e-verified candidate release: copies os/candidates/<id>/manifest.json to
+// os/releases/<id>/manifest.json. The blobs are already in place — content-addressed and uploaded
 // by upload-release.mjs before its manifest PUT — so publishing is this single manifest copy.
-// The copy is all-or-nothing (manifest-last protocol: the deploy service scans only releases/),
+// The copy is all-or-nothing (manifest-last protocol: the deploy service scans only os/releases/),
 // but NOT isolated: the newer-release guard below is check-then-act, so concurrent promotions
 // could still interleave between its LIST and the copy. The caller must serialize runs of this
 // script — workspaces-internal's CI runs it in a resource group — and the guard then catches the
 // remaining hazard, a promote that starts after a newer release has already published.
 //
 // Exit-0 guards (benign races must not fail the pipeline):
-//   - already promoted: releases/<id>/manifest.json exists (idempotent re-runs)
+//   - already promoted: os/releases/<id>/manifest.json exists (idempotent re-runs)
 //   - superseded: a CI-format id (r<run#>-<sha>) with a HIGHER run number already exists under
-//     releases/. "Latest" is decided by manifest upload time (deploy's release.ts), so promoting
+//     os/releases/. "Latest" is decided by manifest upload time (deploy's release.ts), so promoting
 //     an older candidate after a newer one shipped would ROLL PRODUCTION BACK — the stale PUT
 //     would carry the newest timestamp.
 //
@@ -67,14 +67,14 @@ async function listPublishedReleaseIds(client, keyUrl) {
   const ids = [];
   let token;
   do {
-    const params = new URLSearchParams({ "list-type": "2", prefix: "releases/" });
+    const params = new URLSearchParams({ "list-type": "2", prefix: "os/releases/" });
     if (token) params.set("continuation-token", token);
     const response = await client.fetch(`${keyUrl("")}?${params}`, { method: "GET" });
     if (!response.ok) {
       throw new Error(`ListObjectsV2: ${response.status} ${await response.text()}`);
     }
     const xml = await response.text();
-    for (const match of xml.matchAll(/<Key>releases\/([^<]+)\/manifest\.json<\/Key>/g)) {
+    for (const match of xml.matchAll(/<Key>os\/releases\/([^<]+)\/manifest\.json<\/Key>/g)) {
       ids.push(match[1]);
     }
     token = /<NextContinuationToken>([^<]+)<\/NextContinuationToken>/.exec(xml)?.[1];
@@ -94,8 +94,8 @@ async function main() {
   });
   const keyUrl = (key) => `${endpoint}/${bucket}/${key}`;
 
-  const publishedKey = `releases/${args.releaseId}/manifest.json`;
-  const candidateKey = `candidates/${args.releaseId}/manifest.json`;
+  const publishedKey = `os/releases/${args.releaseId}/manifest.json`;
+  const candidateKey = `os/candidates/${args.releaseId}/manifest.json`;
 
   const publishedHead = await client.fetch(keyUrl(publishedKey), { method: "HEAD" });
   if (publishedHead.status === 200) {

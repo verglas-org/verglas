@@ -128,7 +128,7 @@ test("worker entries carry the deploy contract", () => {
   for (const variant of Object.values(router.assetsConfig.variants)) {
     for (const { hash } of Object.values(variant.manifest)) {
       assert.ok(manifest.assets[hash], `asset blob ${hash} missing from release index`);
-      assert.equal(manifest.assets[hash].r2Key, `blobs/assets/${hash}`);
+      assert.equal(manifest.assets[hash].r2Key, `os/blobs/assets/${hash}`);
     }
   }
 
@@ -140,7 +140,7 @@ test("worker entries carry the deploy contract", () => {
     assert.ok(entry.modules.some((m) => m.name === entry.mainModule),
         `${name}: mainModule not in modules list`);
     for (const mod of entry.modules) {
-      assert.equal(mod.r2Key, `blobs/modules/${mod.sha256}`);
+      assert.equal(mod.r2Key, `os/blobs/modules/${mod.sha256}`);
     }
   }
 });
