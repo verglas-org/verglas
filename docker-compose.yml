@@ -37,6 +37,8 @@ services:
       VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
+      VERGLAS_ACCESS_URI: http://verglas-access:8345
+      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
     volumes:
       - verglas-cache:/var/lib/verglas
     # Contain a future socket or cache FD leak inside this service. Docker's
@@ -47,21 +49,47 @@ services:
         hard: 8192
     restart: unless-stopped
 
+  verglas-access:
+    build:
+      context: .
+      target: verglas-access
+    image: verglas/verglas-access:local
+    environment:
+      VERGLAS_ACCESS_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_permissions
+      VERGLAS_OPENFGA_ENDPOINT: http://verglas-openfga:8080
+      VERGLAS_OPENFGA_STORE: verglas
+      VERGLAS_OPENFGA_TOKEN: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
+      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_ACCESS_LISTEN: 0.0.0.0:8345
+    depends_on:
+      verglas-postgres-init:
+        condition: service_completed_successfully
+      verglas-openfga:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8345/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    restart: unless-stopped
+
   verglas-scheduler:
     build:
       context: .
       target: verglas-scheduler
     image: verglas/verglas-scheduler:local
     environment:
-      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas
+      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_scheduler
       VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
       VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
       VERGLAS_SCHEDULER_QUEUE: local
       VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
+      VERGLAS_ACCESS_URI: http://verglas-access:8345
+      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
     depends_on:
       verglas-server:
         condition: service_started
-      verglas-workers-postgres:
+      verglas-access:
         condition: service_healthy
     restart: unless-stopped
 
@@ -70,14 +98,57 @@ services:
     environment:
       POSTGRES_USER: verglas
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
-      POSTGRES_DB: verglas
+      POSTGRES_DB: postgres
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U verglas -d verglas"]
+      test: ["CMD-SHELL", "pg_isready -U verglas -d postgres"]
       interval: 2s
       timeout: 5s
       retries: 15
     volumes:
       - verglas-workers-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  verglas-postgres-init:
+    image: postgres:17
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-verglas}
+    command: ["psql", "-h", "verglas-workers-postgres", "-U", "verglas", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-f", "/init/init-databases.sql"]
+    volumes:
+      - ./deploy/postgres/init-databases.sql:/init/init-databases.sql:ro
+    depends_on:
+      verglas-workers-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  verglas-openfga-migrate:
+    image: openfga/openfga:v1.18.1
+    command: migrate
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_permissions?sslmode=disable
+    depends_on:
+      verglas-postgres-init:
+        condition: service_completed_successfully
+    restart: "no"
+
+  verglas-openfga:
+    image: openfga/openfga:v1.18.1
+    command: run
+    environment:
+      OPENFGA_DATASTORE_ENGINE: postgres
+      OPENFGA_DATASTORE_URI: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_permissions?sslmode=disable
+      OPENFGA_AUTHN_METHOD: preshared
+      OPENFGA_AUTHN_PRESHARED_KEYS: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
+      OPENFGA_PLAYGROUND_ENABLED: "false"
+      OPENFGA_LOG_FORMAT: json
+    depends_on:
+      verglas-openfga-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=127.0.0.1:8081"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
     restart: unless-stopped
 
   verglas-container-runtime:
@@ -117,6 +188,8 @@ services:
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
+      VERGLAS_ACCESS_URI: http://verglas-access:8345
+      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
     depends_on:
       verglas-server:
         condition: service_started
@@ -124,6 +197,8 @@ services:
         condition: service_started
       verglas-container-runtime:
         condition: service_started
+      verglas-access:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

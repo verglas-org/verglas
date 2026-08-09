@@ -46,6 +46,11 @@ pub use queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult, QueueRecord
 pub use report::{CompactReport, CompactionReport};
 /// Stable table request and response contracts from the dependency-leaf API crate.
 pub use verglas_api::table as tables_api;
+/// Universal authorization contracts used by access administration and checks.
+pub use verglas_authz::{
+    AccessCheck, AccessDecision, Action, Grant as AccessGrant, Principal, PrincipalKind, Resource,
+    ResourceKind, ScopedTokenClaims,
+};
 pub use worker::{
     Catchup, ChangeEvent, CloudEvent, CronInterval, HttpCallback, RunResult, TriggerSpec, Worker,
     WorkerContext, WorkerResult,

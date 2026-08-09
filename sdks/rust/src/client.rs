@@ -26,6 +26,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use verglas_api::table::CommitResponse;
+use verglas_authz::{AccessCheck, AccessDecision, Grant, Principal, Resource};
 use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
@@ -100,6 +101,7 @@ pub struct ConnectOptions {
     catalog_token: Option<String>,
     catalog_uri: Option<String>,
     query_uri: Option<String>,
+    access_uri: Option<String>,
     warehouse: Option<String>,
     s3_endpoint: Option<String>,
     connect_timeout: Duration,
@@ -115,6 +117,7 @@ impl ConnectOptions {
             catalog_token: None,
             catalog_uri: None,
             query_uri: None,
+            access_uri: None,
             warehouse: None,
             s3_endpoint: None,
             connect_timeout: Duration::from_secs(5),
@@ -135,6 +138,7 @@ impl ConnectOptions {
         options.catalog_token = nonempty_env("VERGLAS_CATALOG_TOKEN");
         options.catalog_uri = nonempty_env("VERGLAS_CATALOG_URI");
         options.query_uri = nonempty_env("VERGLAS_QUERY_URI");
+        options.access_uri = nonempty_env("VERGLAS_ACCESS_URI");
         options.warehouse = nonempty_env("VERGLAS_WAREHOUSE");
         options.s3_endpoint = nonempty_env("VERGLAS_S3_ENDPOINT");
         options
@@ -160,6 +164,13 @@ impl ConnectOptions {
     #[must_use]
     pub fn with_query_uri(mut self, query_uri: impl Into<String>) -> Self {
         self.query_uri = Some(query_uri.into());
+        self
+    }
+
+    /// Supplies the standalone authorization API base URL explicitly.
+    #[must_use]
+    pub fn with_access_uri(mut self, access_uri: impl Into<String>) -> Self {
+        self.access_uri = Some(access_uri.into());
         self
     }
 
@@ -361,6 +372,7 @@ pub enum ClientError {
 #[derive(Debug, Clone)]
 pub struct Client {
     query_uri: String,
+    access_uri: String,
     catalog_uri: String,
     warehouse: Option<String>,
     s3_endpoint: String,
@@ -428,8 +440,14 @@ impl Client {
             .ok_or_else(|| ClientError::Configuration("server advertises no query URI".to_owned()))?
             .trim_end_matches('/')
             .to_owned();
+        let access_uri = options
+            .access_uri
+            .unwrap_or_else(|| query_uri.clone())
+            .trim_end_matches('/')
+            .to_owned();
         Ok(Self {
             query_uri,
+            access_uri,
             catalog_uri,
             warehouse: options
                 .warehouse
@@ -509,6 +527,76 @@ impl Client {
             client: self.clone(),
             name: name.to_owned(),
         })
+    }
+
+    /// Creates one principal in the tenant authorization registry.
+    pub async fn create_principal(&self, principal: &Principal) -> Result<Principal, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/principals"))
+                .json(principal),
+        )
+        .await
+    }
+
+    /// Lists principals registered in one tenant.
+    pub async fn list_principals(&self, tenant_id: &str) -> Result<Vec<Principal>, ClientError> {
+        self.access_json(
+            self.http
+                .get(self.access_url("/v1/access/principals"))
+                .query(&[("tenant_id", tenant_id)]),
+        )
+        .await
+    }
+
+    /// Creates one protected resource in the tenant hierarchy.
+    pub async fn create_resource(&self, resource: &Resource) -> Result<Resource, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/resources"))
+                .json(resource),
+        )
+        .await
+    }
+
+    /// Lists protected resources registered in one tenant.
+    pub async fn list_resources(&self, tenant_id: &str) -> Result<Vec<Resource>, ClientError> {
+        self.access_json(
+            self.http
+                .get(self.access_url("/v1/access/resources"))
+                .query(&[("tenant_id", tenant_id)]),
+        )
+        .await
+    }
+
+    /// Creates one additive authorization grant.
+    pub async fn create_access_grant(&self, grant: &Grant) -> Result<Grant, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/grants"))
+                .json(grant),
+        )
+        .await
+    }
+
+    /// Lists authorization grants registered in one tenant.
+    pub async fn list_access_grants(&self, tenant_id: &str) -> Result<Vec<Grant>, ClientError> {
+        self.access_json(
+            self.http
+                .get(self.access_url("/v1/access/grants"))
+                .query(&[("tenant_id", tenant_id)]),
+        )
+        .await
+    }
+
+    /// Evaluates one action with the client's scoped bearer credential.
+    pub async fn check_access(&self, check: &AccessCheck) -> Result<AccessDecision, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/check"))
+                .json(check),
+        )
+        .await
     }
 
     /// Lists every reflected Integration namespace visible to this principal.
@@ -688,6 +776,15 @@ impl Client {
         }
     }
 
+    /// Sends one authenticated authorization request and decodes its JSON result.
+    async fn access_json<T: DeserializeOwned>(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<T, ClientError> {
+        let response = Self::require_success(self.send(self.authorize(request)).await?).await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+
     /// Compares a REST load-table response with the caller's exact contract.
     async fn verify_catalog_definition(
         &self,
@@ -791,6 +888,11 @@ impl Client {
     /// Joins an API path to the configured endpoint.
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.query_uri)
+    }
+
+    /// Joins an authorization path to the configured access service.
+    fn access_url(&self, path: &str) -> String {
+        format!("{}{path}", self.access_uri)
     }
 }
 
