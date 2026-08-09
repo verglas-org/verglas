@@ -2,7 +2,7 @@ import { throwLegacyVesselsRemoved } from "./legacy-vessels";
 import { RpcStub, RpcTarget, newWorkersRpcResponse } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, getOpenWorkspaceErrorCode, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasCatalogSnapshot, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, getOpenWorkspaceErrorCode, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasAccessAction, type VerglasAccessIdentity, type VerglasCatalogSnapshot, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
 import type { UiFeatureFlags } from "@verglas/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -29,6 +29,7 @@ import { serveSiteLogo, SITE_LOGO_PATH } from "./site-logo.js";
 import { createWorkshopLogger } from "./observability";
 import { ModelRuntimeManager } from "./model-runtimes.js";
 import { VerglasCatalogClient } from "./verglas-catalog.js";
+import { resolveVerglasAccessConfig, VerglasAccessClient } from "./verglas-access.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -89,6 +90,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   private users: DurableObjectNamespace<UserDurableObject>;
 
   #isAdmin(): boolean {
+    if (this.env.VERGLAS_LOCAL_OWNER_BOOTSTRAP === "true") return true;
     let name = this.user.id.name;
     let admins = this.env.ADMINS;
 
@@ -107,8 +109,37 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return admins.includes(name);
   }
 
-  whoami(): Promise<AiChatAuthorInfo> {
-    return this.user.whoami();
+  async whoami(): Promise<AiChatAuthorInfo> {
+    const profile = await this.user.whoami();
+    const access = this.#accessClient();
+    if (access) await access.ensureUser(this.#userId());
+    return profile;
+  }
+
+  async getAccessIdentity(): Promise<VerglasAccessIdentity> {
+    const access = this.#accessClient();
+    if (!access) throw new Error("Verglas tenant authorization is not configured.");
+    return await access.ensureUser(this.#userId());
+  }
+
+  #userId(): string {
+    const id = this.user.id.name;
+    if (!id) throw new Error("The authenticated user has no stable identity.");
+    return id;
+  }
+
+  #accessClient(): VerglasAccessClient | null {
+    const config = resolveVerglasAccessConfig(this.env);
+    return config ? new VerglasAccessClient(config) : null;
+  }
+
+  async #requireAccess(action: VerglasAccessAction): Promise<void> {
+    const access = this.#accessClient();
+    if (!access) return;
+    await access.ensureUser(this.#userId());
+    if (!await access.checkUser(this.#userId(), "tenant", action)) {
+      throw new Error(`Access denied: ${action} on tenant resource.`);
+    }
   }
   setOwnDisplayName(name: string): Promise<void> {
     return this.user.setOwnDisplayName(name);
@@ -372,36 +403,72 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.listOutputs();
   }
 
-  listVerglasWorkers(): Promise<VerglasWorkerSummary[]> {
-    return new VerglasCatalogClient(this.env).listWorkers({withRuns: true});
+  async listVerglasWorkers(): Promise<VerglasWorkerSummary[]> {
+    await this.#requireAccess("discover");
+    const workers = await new VerglasCatalogClient(this.env).listWorkers({withRuns: true});
+    const access = this.#accessClient();
+    if (access) await Promise.all(workers.flatMap(worker => [
+      access.ensurePrincipal(`job/${worker.name}`, "job"),
+      access.ensureResource(`job/${worker.name}`, "job"),
+    ]));
+    return workers;
   }
 
-  getVerglasWorker(name: string) {
-    return new VerglasCatalogClient(this.env).getWorker(name);
+  async getVerglasWorker(name: string) {
+    await this.#requireAccess("describe");
+    return await new VerglasCatalogClient(this.env).getWorker(name);
   }
 
-  listVerglasWorkerJobs(name: string, limit?: number) {
-    return new VerglasCatalogClient(this.env).listWorkerJobs(name, limit);
+  async listVerglasWorkerJobs(name: string, limit?: number) {
+    await this.#requireAccess("describe");
+    return await new VerglasCatalogClient(this.env).listWorkerJobs(name, limit);
   }
 
-  runVerglasWorker(name: string) {
-    return new VerglasCatalogClient(this.env).runWorker(name, crypto.randomUUID());
+  async runVerglasWorker(name: string) {
+    await this.#requireAccess("execute");
+    return await new VerglasCatalogClient(this.env).runWorker(name, crypto.randomUUID());
   }
 
   async setVerglasWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void> {
+    await this.#requireAccess("modify");
     await new VerglasCatalogClient(this.env).setWorkerState(name, state);
   }
 
-  listVerglasTables(): Promise<VerglasTableSummary[]> {
-    return new VerglasCatalogClient(this.env).listTables();
+  async listVerglasTables(): Promise<VerglasTableSummary[]> {
+    await this.#requireAccess("discover");
+    const tables = await new VerglasCatalogClient(this.env).listTables();
+    const access = this.#accessClient();
+    if (access) await Promise.all(tables.map(table =>
+      access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table")));
+    return tables;
   }
 
-  getVerglasCatalog(): Promise<VerglasCatalogSnapshot> {
-    return new VerglasCatalogClient(this.env).getCatalog();
+  async getVerglasCatalog(): Promise<VerglasCatalogSnapshot> {
+    await this.#requireAccess("discover");
+    const catalog = await new VerglasCatalogClient(this.env).getCatalog();
+    const access = this.#accessClient();
+    if (access) await Promise.all([
+      ...catalog.tables.map(table =>
+        access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table")),
+      ...catalog.vectors.map(vector =>
+        access.ensureResource(`vector/${vector.target}/${vector.field}`, "vector_index")),
+      ...catalog.graphs.map(graph =>
+        access.ensureResource(`graph/${graph.namespace}`, "graph")),
+    ]);
+    return catalog;
   }
 
   async listVerglasVessels(): Promise<VerglasVesselSummary[]> {
+    await this.#requireAccess("discover");
     const vessels = await new VerglasCatalogClient(this.env).listVessels();
+    const access = this.#accessClient();
+    if (access) await Promise.all(vessels.flatMap(vessel => {
+      const kind = vessel.role === "integration" ? "integration" : "application";
+      return [
+        access.ensurePrincipal(`vessel/${vessel.name}`, kind),
+        access.ensureResource(`vessel/${vessel.name}`, kind),
+      ];
+    }));
     const screenshots = new Map<string, string>();
     for (const workspace of (await this.user.listWorkspaces()).filter(entry => !entry.owner)) {
       try {
@@ -418,11 +485,13 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     });
   }
 
-  getVerglasIntegrationConfiguration(name: string): Promise<VerglasIntegrationConfiguration> {
-    return new VerglasCatalogClient(this.env).getIntegrationConfiguration(name);
+  async getVerglasIntegrationConfiguration(name: string): Promise<VerglasIntegrationConfiguration> {
+    await this.#requireAccess("describe");
+    return await new VerglasCatalogClient(this.env).getIntegrationConfiguration(name);
   }
 
   async configureVerglasIntegration(name: string, values: Record<string, string>): Promise<void> {
+    await this.#requireAccess("modify");
     // Prefer the chat-owned Overseer path so Integrations-page Save and test updates the card and
     // resumes the waiting agent the same way the chat card does.
     const workspaces = await this.user.listWorkspaces();
@@ -442,6 +511,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async deleteVerglasIntegration(name: string): Promise<void> {
+    await this.#requireAccess("modify");
     const workspaces = await this.user.listWorkspaces();
     for (const workspace of workspaces.filter(entry => !entry.owner)) {
       const handled = await this.overseers.get(this.overseers.idFromString(workspace.id))
@@ -452,6 +522,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async deleteVerglasApplication(name: string): Promise<void> {
+    await this.#requireAccess("modify");
     const workspaces = await this.user.listWorkspaces();
     for (const workspace of workspaces.filter(entry => !entry.owner)) {
       const handled = await this.overseers.get(this.overseers.idFromString(workspace.id))
@@ -640,7 +711,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let adminUserId = this.user.id.name!;
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
-    return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId);
+    return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId, this.#accessClient());
   }
 }
 

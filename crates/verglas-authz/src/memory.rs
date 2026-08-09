@@ -9,7 +9,8 @@ use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::{
-    AccessCheck, AccessDecision, Authorizer, AuthzError, DecisionReason, Grant, Principal, Resource,
+    AccessCheck, AccessDecision, Action, Authorizer, AuthzError, DecisionReason, Grant,
+    GrantDelegation, GrantRevocation, Principal, Resource,
 };
 
 /// One tenant-keyed snapshot of principals, resources, and grants.
@@ -239,6 +240,60 @@ impl Authorizer for MemoryAuthorizer {
         state.grants.insert(key, grant.clone());
         Self::bump_policy_version(&mut state, &grant.tenant_id);
         Ok(grant)
+    }
+
+    /// Delegates only capabilities the approving principal already holds and may pass onward.
+    async fn delegate_grant(&self, delegation: GrantDelegation) -> Result<Grant, AuthzError> {
+        delegation.validate()?;
+        let grant = &delegation.grant;
+        for action in std::iter::once(Action::PassGrants).chain(grant.actions.iter().copied()) {
+            let decision = self
+                .check(AccessCheck::new(
+                    &grant.tenant_id,
+                    &delegation.actor_principal_id,
+                    &grant.resource_id,
+                    action,
+                ))
+                .await?;
+            if !decision.allowed {
+                return Err(AuthzError::Forbidden(format!(
+                    "principal {} cannot delegate {} on resource {}",
+                    delegation.actor_principal_id,
+                    action.as_str(),
+                    grant.resource_id
+                )));
+            }
+        }
+        self.create_grant(delegation.grant).await
+    }
+
+    /// Revokes only when the approving principal can manage grants on the target resource.
+    async fn revoke_grant(&self, revocation: GrantRevocation) -> Result<(), AuthzError> {
+        revocation.validate()?;
+        let grant = self
+            .state
+            .read()
+            .await
+            .grants
+            .get(&(revocation.tenant_id.clone(), revocation.grant_id.clone()))
+            .cloned()
+            .ok_or_else(|| AuthzError::NotFound(format!("grant {}", revocation.grant_id)))?;
+        let decision = self
+            .check(AccessCheck::new(
+                &revocation.tenant_id,
+                &revocation.actor_principal_id,
+                &grant.resource_id,
+                Action::ManageGrants,
+            ))
+            .await?;
+        if !decision.allowed {
+            return Err(AuthzError::Forbidden(format!(
+                "principal {} cannot revoke grants on resource {}",
+                revocation.actor_principal_id, grant.resource_id
+            )));
+        }
+        self.delete_grant(&revocation.tenant_id, &revocation.grant_id)
+            .await
     }
 
     /// Lists all grants owned by one tenant.

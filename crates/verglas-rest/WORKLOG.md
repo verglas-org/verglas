@@ -4,6 +4,8 @@
 
 - Added `/v1/access/*` principal, resource, grant, and decision routes over the backend-neutral authorizer.
 - Added route-level coverage for inherited access decisions.
+- Added `/v1/access/delegations` and `/v1/access/revocations` so user-facing approval paths cannot
+  turn the access service's trusted service credential into an account-wide grant bypass.
 
 - #43: Added the local reflected Integration namespace gateway. The primary Verglas endpoint now relays discovery and bounded or streaming method calls through the authenticated Docker runtime manager.
 - #8: Added the on-prem REST composition layer that mounts the query API and shallow catalog proxy on one service. Cloud roles continue to use their domain crates directly.

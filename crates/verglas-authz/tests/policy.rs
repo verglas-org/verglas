@@ -3,13 +3,100 @@
 use std::collections::BTreeSet;
 
 use verglas_authz::{
-    AccessCheck, Action, Authorizer, Grant, MemoryAuthorizer, Principal, PrincipalKind, Resource,
-    ResourceKind, ScopedTokenClaims,
+    AccessCheck, Action, Authorizer, Grant, GrantDelegation, GrantRevocation, MemoryAuthorizer,
+    Principal, PrincipalKind, Resource, ResourceKind, ScopedTokenClaims,
 };
 
 /// Builds a deterministic set without depending on insertion order.
 fn actions(values: impl IntoIterator<Item = Action>) -> BTreeSet<Action> {
     values.into_iter().collect()
+}
+
+#[tokio::test]
+async fn delegation_requires_pass_grants_and_every_delegated_action() {
+    let authorizer = MemoryAuthorizer::new();
+    for id in ["owner", "job"] {
+        authorizer
+            .create_principal(Principal::new(
+                "tenant-a",
+                id,
+                if id == "owner" {
+                    PrincipalKind::User
+                } else {
+                    PrincipalKind::Job
+                },
+            ))
+            .await
+            .expect("create principal");
+    }
+    authorizer
+        .create_resource(Resource::new("tenant-a", "table-1", ResourceKind::Table))
+        .await
+        .expect("create table");
+    let requested = || {
+        Grant::new(
+            "delegated-query",
+            "tenant-a",
+            "job",
+            "table-1",
+            actions([Action::Query]),
+        )
+    };
+
+    let denied = authorizer
+        .delegate_grant(GrantDelegation::new("owner", requested()))
+        .await;
+    assert!(matches!(
+        denied,
+        Err(verglas_authz::AuthzError::Forbidden(_))
+    ));
+
+    authorizer
+        .create_grant(Grant::new(
+            "owner-capabilities",
+            "tenant-a",
+            "owner",
+            "table-1",
+            actions([Action::Query, Action::PassGrants, Action::ManageGrants]),
+        ))
+        .await
+        .expect("grant owner capabilities");
+    authorizer
+        .delegate_grant(GrantDelegation::new("owner", requested()))
+        .await
+        .expect("delegate query");
+    assert!(
+        authorizer
+            .check(AccessCheck::new(
+                "tenant-a",
+                "job",
+                "table-1",
+                Action::Query
+            ))
+            .await
+            .expect("check delegated query")
+            .allowed
+    );
+    authorizer
+        .revoke_grant(GrantRevocation {
+            tenant_id: "tenant-a".to_owned(),
+            actor_principal_id: "owner".to_owned(),
+            grant_id: "delegated-query".to_owned(),
+        })
+        .await
+        .expect("revoke delegated query");
+    assert!(
+        !authorizer
+            .check(AccessCheck::new(
+                "tenant-a",
+                "job",
+                "table-1",
+                Action::Query
+            ))
+            .await
+            .expect("check revoked query")
+            .allowed
+    );
 }
 
 #[tokio::test]

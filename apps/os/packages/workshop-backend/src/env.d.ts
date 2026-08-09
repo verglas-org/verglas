@@ -71,6 +71,13 @@ declare global {
       VERGLAS_DATA_TOKEN?: string;
       VERGLAS_INTEGRATION_RUNTIME_IMAGE?: string;
 
+      // Mandatory tenant authorization service. The service token remains backend-only.
+      VERGLAS_ACCESS_URI?: string;
+      VERGLAS_ACCESS_SERVICE_TOKEN?: string;
+      VERGLAS_TENANT_ID?: string;
+      // Explicit OSS-only bootstrap: every local account owns the local tenant.
+      VERGLAS_LOCAL_OWNER_BOOTSTRAP?: string;
+
       // Native coding-agent CLI adapter. The bearer token is backend-only.
       LOCAL_MODEL_RUNTIME_URL?: string;
       LOCAL_MODEL_RUNTIME_TOKEN?: string;

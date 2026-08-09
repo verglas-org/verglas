@@ -1,10 +1,10 @@
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
 import { useState, useEffect, useRef } from 'react'
-import { AiChatAuthorInfo } from '@verglas/workshop-shared/api'
+import { AiChatAuthorInfo, type VerglasAccessIdentity } from '@verglas/workshop-shared/api'
 import { hashPassword } from './passwordHash'
 import { CF_ACCESS_MODE } from './useAuth'
-import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash } from '@phosphor-icons/react'
+import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash, ShieldCheck } from '@phosphor-icons/react'
 import { useAvatar, invalidateAvatarCache } from './useAvatar'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
 import { useDocumentTitle } from './useDocumentTitle'
@@ -89,6 +89,7 @@ export default function SettingsPage() {
   const { authenticatedApi } = useAuthenticatedApi()
   const toasts = useKumoToastManager()
   const [userInfo, setUserInfo] = useState<AiChatAuthorInfo | null>(null)
+  const [accessIdentity, setAccessIdentity] = useState<VerglasAccessIdentity | null>(null)
   const [loading, setLoading] = useState(true)
   const [isEditingName, setIsEditingName] = useState(false)
   const [nameInput, setNameInput] = useState('')
@@ -130,9 +131,13 @@ export default function SettingsPage() {
     let cancelled = false
     const fetchUserInfo = async () => {
       try {
-        const info = await authenticatedApi.whoami()
+        const [info, identity] = await Promise.all([
+          authenticatedApi.whoami(),
+          authenticatedApi.getAccessIdentity().catch(() => null),
+        ])
         if (cancelled) return
         setUserInfo(info)
+        setAccessIdentity(identity)
         setNameInput(info.name)
       } catch (error) {
         console.error('Failed to fetch user info:', error)
@@ -372,6 +377,30 @@ export default function SettingsPage() {
               >
                 <Copy size={14} />
               </button>
+            </div>
+          </div>
+        </section>
+
+        <section className="flex flex-col gap-3">
+          <SectionLabel>Lakehouse access</SectionLabel>
+          <div className="overflow-hidden rounded-xl border border-kumo-line bg-kumo-base">
+            <div className="flex items-start gap-3 px-5 py-4">
+              <div className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-kumo-tint text-kumo-brand">
+                <ShieldCheck size={17} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-[14px] font-medium text-kumo-default">
+                  {accessIdentity?.tenantOwner ? 'Tenant owner' : 'Scoped tenant member'}
+                </p>
+                <p className="mt-1 text-[12px] leading-5 text-kumo-subtle">
+                  Agents, Jobs, Applications, and Integrations receive separate process identities.
+                  Access is delegated from your existing permissions and checked at the Verglas boundary.
+                </p>
+                <dl className="mt-3 grid gap-2 text-[12px] sm:grid-cols-2">
+                  <div><dt className="text-kumo-inactive">Tenant</dt><dd className="mt-0.5 font-mono text-kumo-default">{accessIdentity?.tenantId ?? 'Unavailable'}</dd></div>
+                  <div><dt className="text-kumo-inactive">Principal</dt><dd className="mt-0.5 truncate font-mono text-kumo-default">{accessIdentity?.principalId ?? 'Unavailable'}</dd></div>
+                </dl>
+              </div>
             </div>
           </div>
         </section>

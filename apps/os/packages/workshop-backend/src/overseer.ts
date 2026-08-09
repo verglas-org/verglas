@@ -1,6 +1,6 @@
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
 import { validateRpc } from "capnweb-validate";
-import { Overseer, WorkspaceMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, VesselClient, VesselBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintVesselSummary, AiChatStreamEvent, BlueprintScreenshotUpload, APPLICATION_SCREENSHOT_R2_PREFIX, applicationScreenshotUrl, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, resolveSiteName, type IntegrationSetupInstruction, type IntegrationVerification, type SourceConfigurationField, type SourceTrigger, type VerglasQueryActivity, type VerglasQueryResult } from '@verglas/workshop-shared/api';
+import { Overseer, WorkspaceMetadata, UiBundle, WorkpieceId, WorkpieceSummary, WorkpiecesSubscriber, VesselClient, VesselBindingInfo, GatekeeperClient, ActionState, ActionLogEntry, ActionsSubscriber, CodeUpdate, CodeSubscriber, AiChatMetadata, AiChatMessage, AiChatHistoryPage, AiChatSubscriber, AiChatAuthorInfo, AiModelConfig, AiChatMessageBody, AgentSpawnerConfig, ConsoleLogSubscriber, ConsoleLogEvent, CapsuleSpecifier, CollaboratorInfo, CollaboratorRole, AffectedCollaborator, ShareLinkInfo, GatekeeperCreationSpec, ObserverConfigCallback, ObserverBindingNeed, ObserverBindingFailure, BlueprintBindingAnnotation, BlueprintBinding, BlueprintMetadata, BlueprintOutput, MessageFormatRef, isOutputIcon, SpawnerEnvTarget, BlueprintVesselSummary, AiChatStreamEvent, BlueprintScreenshotUpload, APPLICATION_SCREENSHOT_R2_PREFIX, applicationScreenshotUrl, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ChatAttachmentUpload, ChatAttachmentHandle, ChatAttachmentRef, BoundHookInfo, PreApprovableAction, PresenceParticipant, PresenceSubscriber, SlashCommandChoice, SlashCommandRequest, validateBindingName, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, resolveSiteName, type IntegrationSetupInstruction, type IntegrationVerification, type SourceConfigurationField, type SourceTrigger, type VerglasAccessAction, type VerglasQueryActivity, type VerglasQueryResult } from '@verglas/workshop-shared/api';
 import { Gatekeeper, HookInitiator, ResourceDescription, ApprovalQueue, ActionDescription, ObservationAuthorizer, ObservationDescription, VendorDescription, SupportedResource, resolveRequestedResource, HookController, HookDescription, AGENT_CATALOG_MAX_ENTRIES, ActionKind } from "@verglas/workshop-shared/gatekeeper";
 import {
   DurableObject, WorkerEntrypoint, RpcStub as NativeRpcStub,
@@ -58,6 +58,7 @@ import {
   type IntegrationRuntimeStatus,
 } from "./verglas-integration-runtime";
 import { VerglasCatalogClient } from "./verglas-catalog";
+import { resolveVerglasAccessConfig, VerglasAccessClient } from "./verglas-access";
 
 const logger = createWorkshopLogger("workshop.overseer");
 export const AGENT_RUNNING_ERROR_MESSAGE = "Agent is running, wait for it to finish.";
@@ -1095,6 +1096,19 @@ class OverseerImpl implements AgentHooks {
     this.#verglasQueryActivity.push(activity);
     if (this.#verglasQueryActivity.length > 100) this.#verglasQueryActivity.shift();
     try {
+      if (source === "agent") {
+        const config = resolveVerglasAccessConfig(this.env);
+        if (config) {
+          const access = new VerglasAccessClient(config);
+          const principalId = `agent/${this.ctx.id.toString()}`;
+          await access.ensurePrincipal(principalId, "agent");
+          if (!await access.checkPrincipal(principalId, "tenant", "query")) {
+            throw new Error(
+              `Access denied for ${principalId}: use requestPermission to ask for query on tenant.`,
+            );
+          }
+        }
+      }
       const result = await new VerglasCatalogClient(this.env).query(sql, maxRows);
       Object.assign(activity, {
         status: "succeeded" as const,
@@ -5389,6 +5403,46 @@ class OverseerImpl implements AgentHooks {
         `access to the resource; if they deny, your turn stays ended until the user messages you.` };
   }
 
+  async requestPermission(chatId: number, input: {
+    principalId: string;
+    resourceId: string;
+    actions: VerglasAccessAction[];
+    reason: string;
+  }): Promise<{requested: boolean; message: string}> {
+    const config = resolveVerglasAccessConfig(this.env);
+    if (!config) return {requested: false, message: "Verglas tenant authorization is not configured."};
+    if (input.actions.length === 0 || !input.reason.trim()) {
+      return {requested: false, message: "A permission request needs actions and a reason."};
+    }
+    const snapshot = await new VerglasAccessClient(config).snapshot();
+    if (!snapshot.principals.some((principal) => principal.id === input.principalId)) {
+      return {requested: false, message: `Unknown process principal: ${input.principalId}.`};
+    }
+    if (!snapshot.resources.some((resource) => resource.id === input.resourceId)) {
+      return {requested: false, message: `Unknown Verglas resource: ${input.resourceId}.`};
+    }
+    const requestId = `${chatId}:${crypto.randomUUID()}`;
+    const body: AiChatMessageBody = {
+      type: "permissionRequest",
+      requestId,
+      principalId: input.principalId,
+      resourceId: input.resourceId,
+      actions: [...new Set(input.actions)],
+      reason: input.reason.trim(),
+      state: "pending",
+    };
+    let messages = this.#capturedConnectionRequests.get(chatId);
+    if (!messages) {
+      messages = [];
+      this.#capturedConnectionRequests.set(chatId, messages);
+    }
+    messages.push(body);
+    return {
+      requested: true,
+      message: "Permission request sent to the user. Awaiting approval or denial.",
+    };
+  }
+
   consumeCapturedConnectionRequests(chatId: number): AiChatMessageBody[] {
     let result = this.#capturedConnectionRequests.get(chatId) ?? [];
     this.#capturedConnectionRequests.delete(chatId);
@@ -7619,7 +7673,20 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
   }
 
   queryVerglas(sql: string, maxRows?: number): Promise<VerglasQueryResult> {
-    return this.impl.queryVerglas("data", sql, maxRows);
+    return this.#queryVerglasAsUser(sql, maxRows);
+  }
+
+  async #queryVerglasAsUser(sql: string, maxRows?: number): Promise<VerglasQueryResult> {
+    const config = resolveVerglasAccessConfig(this.impl.env);
+    if (config) {
+      const profile = await this.#getClientProfile();
+      const access = new VerglasAccessClient(config);
+      await access.ensureUser(profile.id);
+      if (!await access.checkUser(profile.id, "tenant", "query")) {
+        throw new Error("Access denied: query on tenant resource.");
+      }
+    }
+    return await this.impl.queryVerglas("data", sql, maxRows);
   }
 
   async listVerglasQueryActivity(afterSequence?: number): Promise<VerglasQueryActivity[]> {
@@ -8254,6 +8321,43 @@ class OverseerClientInterface extends RpcTarget implements Overseer {
     // request; leaving it ended lets the user say what they want done instead, rather than forcing
     // the agent to guess from a bare "denied" signal. The denial is recorded in history and the
     // agent sees it the next time the user sends a message (see the connectionRequest history case).
+  }
+
+  #findPermissionRequest(requestId: string): AiChatMessage & {type: "permissionRequest"} {
+    const colonIdx = requestId.indexOf(":");
+    if (colonIdx < 0) throw new Error(`Malformed permission request id: ${requestId}`);
+    const chatId = Number(requestId.slice(0, colonIdx));
+    if (!Number.isFinite(chatId)) throw new Error(`Malformed permission request id: ${requestId}`);
+    for (const msg of this.impl.storage.chats.list({prefix: `${keyString(chatId)}.`})) {
+      if (msg.type === "permissionRequest" && msg.requestId === requestId) return msg;
+    }
+    throw new Error(`No such permission request: ${requestId}`);
+  }
+
+  async approvePermissionRequest(requestId: string): Promise<void> {
+    const msg = this.#findPermissionRequest(requestId);
+    if (msg.state !== "pending") throw new Error(`Permission request is not pending: ${requestId}`);
+    const config = resolveVerglasAccessConfig(this.impl.env);
+    if (!config) throw new Error("Verglas tenant authorization is not configured.");
+    const userId = this.clientUser.id.name;
+    if (!userId) throw new Error("The approving user has no stable identity.");
+    await new VerglasAccessClient(config).delegate(userId, {
+      principalId: msg.principalId,
+      resourceId: msg.resourceId,
+      actions: msg.actions,
+    });
+    msg.state = "approved";
+    msg.timestamp = this.impl.getChatTimestamp();
+    this.impl.storage.chats.put(msg);
+    await this.#resumeSuspendedAgent(msg.chatId);
+  }
+
+  async denyPermissionRequest(requestId: string): Promise<void> {
+    const msg = this.#findPermissionRequest(requestId);
+    if (msg.state !== "pending") throw new Error(`Permission request is not pending: ${requestId}`);
+    msg.state = "denied";
+    msg.timestamp = this.impl.getChatTimestamp();
+    this.impl.storage.chats.put(msg);
   }
 
   #findSourceConfiguration(
@@ -9424,6 +9528,8 @@ class UseOverseerInterface extends RpcTarget implements Overseer {
   }
   async acceptConnectionRequest(_requestId: string, _result: {gatekeeperId: number}): Promise<void> { this.#deny(); }
   async denyConnectionRequest(_requestId: string): Promise<void>  { this.#deny(); }
+  async approvePermissionRequest(_requestId: string): Promise<void> { this.#deny(); }
+  async denyPermissionRequest(_requestId: string): Promise<void> { this.#deny(); }
   async configureSource(_requestId: string, _values: Record<string, string>): Promise<void> {
     this.#deny();
   }

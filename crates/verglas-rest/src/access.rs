@@ -11,7 +11,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
-use verglas_authz::{AccessCheck, Authorizer, AuthzError, Grant, Principal, Resource};
+use verglas_authz::{
+    AccessCheck, Authorizer, AuthzError, Grant, GrantDelegation, GrantRevocation, Principal,
+    Resource,
+};
 
 /// Shared authorization backend mounted by local and standalone servers.
 pub type AccessRuntime = Arc<dyn Authorizer>;
@@ -36,6 +39,8 @@ pub fn router(authorizer: AccessRuntime) -> Router {
             get(get_resource).delete(delete_resource),
         )
         .route("/v1/access/grants", post(create_grant).get(list_grants))
+        .route("/v1/access/delegations", post(delegate_grant))
+        .route("/v1/access/revocations", post(revoke_grant))
         .route("/v1/access/grants/{id}", delete(delete_grant))
         .route("/v1/access/check", post(check_access))
         .with_state(authorizer)
@@ -147,6 +152,25 @@ async fn create_grant(
     result(StatusCode::CREATED, authorizer.create_grant(grant).await)
 }
 
+/// Creates a grant under an existing principal's bounded delegation authority.
+async fn delegate_grant(
+    State(authorizer): State<AccessRuntime>,
+    Json(delegation): Json<GrantDelegation>,
+) -> Response {
+    result(
+        StatusCode::CREATED,
+        authorizer.delegate_grant(delegation).await,
+    )
+}
+
+/// Revokes a grant under the actor's bounded grant-management authority.
+async fn revoke_grant(
+    State(authorizer): State<AccessRuntime>,
+    Json(revocation): Json<GrantRevocation>,
+) -> Response {
+    deleted(authorizer.revoke_grant(revocation).await)
+}
+
 /// Lists grants in one tenant.
 async fn list_grants(
     State(authorizer): State<AccessRuntime>,
@@ -194,6 +218,7 @@ fn error_response(error: AuthzError) -> Response {
         AuthzError::Invalid(_) | AuthzError::Token(_) => StatusCode::BAD_REQUEST,
         AuthzError::NotFound(_) => StatusCode::NOT_FOUND,
         AuthzError::Conflict(_) => StatusCode::CONFLICT,
+        AuthzError::Forbidden(_) => StatusCode::FORBIDDEN,
         AuthzError::Backend(_) => StatusCode::BAD_GATEWAY,
     };
     (

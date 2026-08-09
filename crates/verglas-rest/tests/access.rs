@@ -71,3 +71,47 @@ async fn access_routes_administer_and_evaluate_policy() {
         .expect("response");
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn delegation_route_rejects_privilege_escalation() {
+    let app = verglas_rest::access::router(Arc::new(MemoryAuthorizer::new()));
+    for body in [
+        json!({"tenant_id":"tenant-a","id":"user-1","kind":"user"}),
+        json!({"tenant_id":"tenant-a","id":"job-1","kind":"job"}),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/access/principals")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/access/resources")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"tenant_id":"tenant-a","id":"table-1","kind":"table"}).to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    let response = app.oneshot(
+        Request::post("/v1/access/delegations")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({
+                "actor_principal_id":"user-1",
+                "grant":{"id":"grant-1","tenant_id":"tenant-a","principal_id":"job-1","resource_id":"table-1","actions":["query"]}
+            }).to_string())).expect("request"),
+    ).await.expect("response");
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
