@@ -612,6 +612,7 @@ fn all_indices(k: usize, m: usize) -> Vec<usize> {
 /// use.
 fn placement_order(seed: &str, live: &[NodeId]) -> Vec<NodeId> {
     let key = CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "block-writeback".to_owned(),
         key: seed.to_owned(),
     };

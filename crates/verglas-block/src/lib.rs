@@ -1,10 +1,10 @@
-//! Durable, cache-served virtual block devices for microVMs (#382).
+//! Durable, cache-served virtual block devices (#382).
 //!
-//! Workload microVMs are stateless; the verglas cache tier is the only stateful
-//! layer, and its durability is the cache's backing bucket. This crate is that
-//! stateful layer for block storage: tmpfs-resident workload state (a bundled
-//! database datadir, say) moves onto a cache-served block device that survives
-//! relaunch and attaches from any box.
+//! Workloads that attach block devices through NBD are otherwise stateless; the
+//! verglas cache tier is the only stateful layer, and its durability is the
+//! cache's backing bucket. This crate is that stateful layer for block storage:
+//! tmpfs-resident workload state (a bundled database datadir, say) moves onto a
+//! cache-served block device that survives relaunch and attaches from any box.
 //!
 //! # Shape
 //! - [`chunk`] — content addressing and 2 MiB chunk geometry. A device is a flat
@@ -29,7 +29,7 @@
 //!   later attach surface noted there.
 //! - It does not lazy-boot a rootfs from a block device, migrate the snapshot
 //!   store onto this layout, or do cross-box live attach — those build on this
-//!   (verglas-cloud #89/#90) and are out of scope.
+//!   and are out of scope.
 //! - It does not evict the local NVMe copies; the local store grows with touched
 //!   chunks. Sharing the one NVMe budget is an accounting extension point (see
 //!   [`store`]).

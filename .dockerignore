@@ -13,4 +13,10 @@ deploy/docker/credentials/*
 **/out
 **/results
 **/__pycache__
+**/node_modules
+**/dist
+**/.wrangler
+**/.run-local-stamp
+**/.dev.vars
+**/.dev.vars.*
 *.log

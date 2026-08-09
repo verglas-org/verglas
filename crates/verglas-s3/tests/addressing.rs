@@ -81,9 +81,12 @@ async fn serve(domain: Option<&str>) -> (RecordingReader, String) {
     let reader = RecordingReader::default();
     let store = Arc::new(InMemory::new());
     let app = verglas_s3::router_with_passthrough(
+        "default",
         reader.clone(),
-        PassthroughWrite::new(BackendStore::single("lake", store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single("lake", store))),
+        PassthroughWrite::new(BackendStore::single("default", "lake", store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", "lake", store,
+        ))),
         Arc::new(NoopInvalidation),
         None,
         None,
@@ -135,6 +138,7 @@ async fn virtual_hosted_and_path_style_resolve_the_same_object() {
     let seen = reader.seen();
     assert_eq!(seen.len(), 2, "one resolve per request");
     let expected = CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "lake".to_owned(),
         key: "warehouse/part-0.parquet".to_owned(),
     };
@@ -166,6 +170,7 @@ async fn without_a_domain_the_endpoint_is_path_style_only() {
     assert_eq!(
         seen[0],
         CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "lake".to_owned(),
             key: "warehouse/part-0.parquet".to_owned(),
         },

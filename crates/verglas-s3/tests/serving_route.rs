@@ -71,9 +71,12 @@ async fn serve_with_stub() -> (String, Arc<Mutex<Vec<SeenRequest>>>) {
     let seen = Arc::new(Mutex::new(Vec::new()));
     let api: Arc<dyn ServingApi> = Arc::new(StubApi { seen: seen.clone() });
     let app = verglas_s3::router_with_passthrough(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         Some((ACCESS_KEY.to_owned(), SECRET_KEY.to_owned())),
         None,

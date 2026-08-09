@@ -148,6 +148,7 @@ async fn concurrent_classify_during_swap_is_consistent() {
     let fetch = Arc::new(ObjectStoreFetch::new(Arc::clone(&store)));
 
     let inputs = BuildInputs {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         ident: ident.clone(),
         bucket: BUCKET.to_owned(),
         metadata_key: fixture.metadata_key.clone(),
@@ -220,6 +221,7 @@ async fn old_snapshot_files_resolve_after_commit_time_travel() {
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: ident.clone(),
                 bucket: BUCKET.to_owned(),
                 metadata_key: fixture.metadata_key.clone(),
@@ -250,6 +252,7 @@ async fn updater_seeds_then_rebuilds_on_commit_event() {
     watcher.set(&ident, &fixture.metadata_uri, 1, &[1]);
 
     let updater = MapUpdater::new(
+        "managed-lakehouse",
         Arc::clone(&mapper),
         Arc::clone(&watcher),
         Arc::clone(&fetch),
@@ -312,6 +315,7 @@ async fn updater_drops_table_on_removal_event() {
     watcher.set(&ident, &fixture.metadata_uri, 2, &[1, 2]);
 
     let updater = MapUpdater::new(
+        "managed-lakehouse",
         Arc::clone(&mapper),
         Arc::clone(&watcher),
         Arc::clone(&fetch),

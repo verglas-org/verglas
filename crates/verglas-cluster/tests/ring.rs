@@ -25,6 +25,7 @@ fn equal_members(n: usize) -> Vec<WeightedMember> {
 /// The fixed, deterministic keyspace shared by all tests.
 fn keyspace() -> impl Iterator<Item = CacheKey> {
     (0..KEYSPACE).map(|i| CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: format!("lake-{}", i % 7),
         key: format!("warehouse/db/table/data/part-{i:06}.parquet"),
     })

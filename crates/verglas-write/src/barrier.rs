@@ -137,7 +137,11 @@ impl JournalBarrier {
     fn pending_referenced(&self, referenced: &[CacheKey]) -> usize {
         referenced
             .iter()
-            .filter(|k| self.journals.find_dirty(&k.bucket, &k.key).is_some())
+            .filter(|k| {
+                self.journals
+                    .find_dirty(&k.storage_binding_id, &k.bucket, &k.key)
+                    .is_some()
+            })
             .count()
     }
 }

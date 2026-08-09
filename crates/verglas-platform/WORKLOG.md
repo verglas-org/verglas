@@ -53,3 +53,5 @@
   Worker registration, triggers, and watermarks retain their existing behavior.
 - #11: Aligned worker registry documentation with the executable trigger contract: cron, HTTP callback, and data update. Manual dispatch remains an ingress event rather than deployment configuration.
 - #11: Updated the worker registry row contract to describe generic CloudEvent subscriptions. Registry persistence remains unchanged.
+- chore: Removed verglas_sys.watermarks and SystemCatalog get/set_watermark. The platform registry is workers only.
+- #66: Documented Deployment placement as local-only for v0; rewrote deployment_parity as a local worker→Deployment projection test (no cloud D1 row).

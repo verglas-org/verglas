@@ -128,6 +128,7 @@ mod tests {
     /// A key in a fixed bucket.
     fn key(k: &str) -> CacheKey {
         CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "b".to_owned(),
             key: k.to_owned(),
         }

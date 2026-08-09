@@ -201,6 +201,7 @@ mod tests {
 
     fn key(bucket: &str, k: &str) -> CacheKey {
         CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: bucket.into(),
             key: k.into(),
         }

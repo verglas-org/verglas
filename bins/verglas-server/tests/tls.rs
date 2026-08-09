@@ -176,9 +176,22 @@ async fn spawn_origin(objects: &[(&str, Bytes)]) -> String {
             .expect("seed origin object");
     }
     let app = verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "managed-lakehouse",
+        PassthroughRead::new(BackendStore::single(
+            "managed-lakehouse",
+            BUCKET,
+            store.clone(),
+        )),
+        PassthroughWrite::new(BackendStore::single(
+            "managed-lakehouse",
+            BUCKET,
+            store.clone(),
+        )),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "managed-lakehouse",
+            BUCKET,
+            store,
+        ))),
         Arc::new(NoopInvalidation),
         Some((ORIGIN_KEYS.0.to_owned(), ORIGIN_KEYS.1.to_owned())),
     );

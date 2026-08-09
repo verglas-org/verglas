@@ -160,6 +160,8 @@ pub struct PartUpload {
 /// pagination cursors, plus the page size cap.
 #[derive(Debug, Clone, Default)]
 pub struct MultipartUploadsRequest {
+    /// Immutable storage binding that selects the origin provider and credentials.
+    pub storage_binding_id: String,
     /// The bucket to list uploads in.
     pub bucket: String,
     /// Restrict to uploads whose key starts with this prefix.

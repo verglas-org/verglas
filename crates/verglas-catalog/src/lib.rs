@@ -2,12 +2,17 @@
 //! Successful reads share one bounded response cache; successful mutations
 //! write through to the configured catalog and invalidate those reads.
 
+mod registry;
 mod rest;
 
 use std::fmt;
 
 use async_trait::async_trait;
 
+pub use registry::{
+    CatalogBinding, CatalogBindingId, CatalogRegistry, CatalogRuntimeRegistry, DatabaseId,
+    RegistryError, StorageBindingId,
+};
 pub use rest::{CatalogGateway, CatalogResponse, RestCatalogSource};
 
 /// A table identity in an Iceberg catalog.

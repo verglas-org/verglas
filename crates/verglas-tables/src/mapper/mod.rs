@@ -292,6 +292,8 @@ pub struct TableIndex {
     pub table: TableId,
     /// Catalog identity, for reverse lookups / metrics.
     pub ident: Arc<TableIdent>,
+    /// Immutable storage binding used to resolve this table's origin.
+    pub storage_binding_id: Arc<str>,
     /// Origin bucket (verified on the hot path against the request bucket).
     pub bucket: Arc<str>,
     /// Table root as an object-key prefix with a trailing `/`

@@ -21,3 +21,5 @@
   `verglas-server` process. No legacy executable or endpoint spelling remains.
 - #11: Made the CDC worker reject malformed scheduler event payloads instead of silently running with a fabricated trigger. The binary now shares the strict SDK subprocess contract used by the scheduler harness.
 - #11: Switched the CDC worker subprocess boundary to the shared CloudEvent envelope. The worker now validates the same single event binding as every other scheduled worker before draining WAL.
+- chore: Dropped the documented TODO that would mirror the CDC LSN to /v1/watermark. The replication slot remains the sole durable cursor.
+- #66: Rewrote CDC worker launch env docs without verglas-cloud / fleet / R2 product references.

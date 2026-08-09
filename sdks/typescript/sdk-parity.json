@@ -1,41 +1,25 @@
 {
   "version": 1,
+  "source": "contracts/api-surface.json",
+  "note": "Authoritative surface inventory is contracts/api-surface.json. This file lists TypeScript symbols for the shared implemented ops.",
   "capabilities": [
-    {
-      "operation": "connect",
-      "routes": [],
-      "guarantees": ["bearer-auth", "bounded-request-start"],
-      "symbol": "export function connect"
-    },
-    {
-      "operation": "ensure_table",
-      "routes": ["GET /v1/tables/{name}/definition", "POST /v1/tables/{name}"],
-      "guarantees": ["create-if-missing", "exact-definition-validation"],
-      "symbol": "async ensureTable"
-    },
-    {
-      "operation": "query",
-      "routes": ["POST /v1/query"],
-      "guarantees": ["sql", "ordered-columns"],
-      "symbol": "query(sql: string)"
-    },
-    {
-      "operation": "append",
-      "routes": ["POST /v1/tables/{name}/commit"],
-      "guarantees": ["bounded-batches", "idempotency-key"],
-      "symbol": "async append(rows:"
-    },
-    {
-      "operation": "follow",
-      "routes": ["WS /v1/catalog/feed"],
-      "guarantees": ["cursor-expiry-distinct", "exactly-once-sequence", "resume-after-drop"],
-      "symbol": "follow(table:"
-    },
-    {
-      "operation": "namespace",
-      "routes": ["GET /v1/namespaces", "GET /v1/namespaces/{namespace}", "POST /v1/namespaces/{namespace}/invoke/{method}"],
-      "guarantees": ["reflected-contract", "scoped-bearer-auth", "bounded-or-ndjson-stream"],
-      "symbol": "readonly namespace:"
-    }
+    { "operation": "connect", "symbol": "export function connect" },
+    { "operation": "ensure_table", "symbol": "async ensureTable" },
+    { "operation": "query", "symbol": "query(sql: string)" },
+    { "operation": "append", "symbol": "async append(rows:" },
+    { "operation": "namespace", "symbol": "readonly namespace:" },
+    { "operation": "kv", "symbol": "kv(namespace: string)" },
+    { "operation": "queue_enqueue", "symbol": "enqueue(rows:" },
+    { "operation": "queue_poll", "symbol": "poll(group:" },
+    { "operation": "queue_ack", "symbol": "ack(group:" },
+    { "operation": "graph_create", "symbol": "create(): Promise<GraphCreateResult>" },
+    { "operation": "graph_show", "symbol": "show(): Promise<GraphShowResult>" },
+    { "operation": "graph_insert_nodes", "symbol": "insertNodes(nodes:" },
+    { "operation": "graph_insert_edges", "symbol": "insertEdges(edges:" },
+    { "operation": "graph_build_index", "symbol": "buildIndex():" },
+    { "operation": "graph_query", "symbol": "neighbors(node:" },
+    { "operation": "vector_declare", "symbol": "addIndex(field:" },
+    { "operation": "vector_list", "symbol": "listIndexes()" },
+    { "operation": "vector_search", "symbol": "searchIndex(field:" }
   ]
 }

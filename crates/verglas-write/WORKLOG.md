@@ -81,7 +81,6 @@
   to explicit customer-invoked commit operations without implying such a route.
 - #91: Updated write-back process documentation for the `verglas-server`
   rename. Durability barriers and propagation behavior are unchanged.
-
 - #74: Added strict quorum mode for storage publications that must keep one
   acknowledgement boundary. Membership, headroom, and placement shortfalls now
   reject a strict write instead of falling back to an origin acknowledgement.
@@ -89,3 +88,5 @@
   manifest discovery, so any cache node can serve an acknowledged object before
   origin propagation. Propagation now retries until success or shutdown instead
   of abandoning a dirty journal after eight attempts.
+- #66: Softened single-node write-back durability comment (replicated block volume, not cloud-replicated product language).
+- #84: Updated write-back coordination and placement keys to carry immutable storage-binding identity. Equal object names from separate providers now produce independent quorum work and ownership.

@@ -6,9 +6,9 @@
 //! `@verglas/sdk`. It is purely a client — it speaks to any Iceberg REST catalog
 //! (a real one or the server's loopback gateway) and reads and writes data files
 //! through an S3 endpoint. It links no server internals and no cache: it reads
-//! and writes wherever its endpoint points (WHITEPAPER §7.4). The server points
-//! it at its own S3 surface for cache residency; the cloud committer points it
-//! straight at object storage.
+//! and writes wherever its endpoint points (WHITEPAPER §7.4). The self-hosted
+//! server typically points it at its own S3 surface for cache residency; a
+//! direct object-storage endpoint is equally valid.
 //!
 //! The moving parts:
 //!

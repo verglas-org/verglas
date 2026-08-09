@@ -15,14 +15,12 @@ files are reused by the Manual, HTTP, Cron, and CloudEvents guides.
 
 ## Before you begin
 
-Complete [Create your first table](/docs/get-started/first-table), then declare
-the Neon database components and scheduler through the local container runtime.
-They are ordinary managed containers on the `verglas-runtime` network, not a
-Compose profile. Set the server scheduler URL to the scheduler's stable managed
-name before starting the server.
+Complete [Create your first table](/docs/get-started/first-table), then start the
+default Compose stack. It includes the scheduler and its durable Postgres queue;
+the container runtime remains responsible for dynamically added Vessels and
+database components.
 
 ```bash
-export VERGLAS_SCHEDULER_URL=http://verglas-scheduler:8340
 docker compose up --detach --build
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 ```
@@ -211,7 +209,6 @@ Only after both files exist, register the manifest on the local server:
 
 ```bash
 verglas workers create \
-  --local \
   --file examples/workers/market-data-ingest/worker.toml
 ```
 

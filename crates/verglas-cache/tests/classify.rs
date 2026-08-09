@@ -14,6 +14,7 @@ use verglas_core::read::ReadRange;
 /// A key in the warehouse bucket.
 fn key(k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "warehouse".to_owned(),
         key: k.to_owned(),
     }

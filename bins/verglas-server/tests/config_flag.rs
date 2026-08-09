@@ -76,33 +76,27 @@ fn bad_config_exits_nonzero_naming_field() {
 }
 
 #[test]
-fn environment_mode_requires_the_origin_bucket() {
+fn environment_mode_rejects_static_origin_configuration() {
     let cache = tempfile::tempdir().expect("cache directory");
     let out = Command::new(env!("CARGO_BIN_EXE_verglas-server"))
         .arg("--environment")
         .env("VERGLAS_CACHE_DIR", cache.path())
         .env("VERGLAS_CACHE_CAPACITY", "64MB")
         .env("VERGLAS_CACHE_DRAM", "80MB")
-        .env_remove("VERGLAS_BACKEND_BUCKET")
+        .env("VERGLAS_BACKEND_BUCKET", "legacy")
         .env("VERGLAS_BACKEND_ENDPOINT", "https://r2.example.com")
         .env("VERGLAS_BACKEND_REGION", "auto")
-        .env("VERGLAS_CATALOG_URI", "https://catalog.example.com")
-        .env("VERGLAS_CATALOG_WAREHOUSE", "account_lake")
-        .env("VERGLAS_CATALOG_BEARER_TOKEN", "catalog-token")
-        .env("VERGLAS_S3_ACCESS_KEY_ID", "verglas-local")
-        .env("VERGLAS_S3_SECRET_ACCESS_KEY", "endpoint-secret")
-        .env("VERGLAS_QUERY_WORKER_BINARY", "/bin/true")
-        .env("VERGLAS_WRITE_WORKER_BINARY", "/bin/true")
+        .env("VERGLAS_ACCESS_SERVICE_TOKEN", "local-access-token")
         .output()
         .expect("binary runs");
     assert!(
         !out.status.success(),
-        "missing required environment must fail"
+        "static provider environment must fail"
     );
     let stderr = String::from_utf8(out.stderr).expect("utf8");
     assert!(
-        stderr.contains("VERGLAS_BACKEND_BUCKET"),
-        "stderr should name the missing variable, got: {stderr}"
+        stderr.contains("dynamic database bindings"),
+        "stderr should direct the operator to dynamic bindings, got: {stderr}"
     );
 }
 

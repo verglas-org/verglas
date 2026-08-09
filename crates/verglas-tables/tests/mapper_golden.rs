@@ -25,6 +25,7 @@ async fn apply(
     let mapper = Arc::new(Mapper::new());
     let fetch = ObjectStoreFetch::new(Arc::clone(store));
     let inputs = BuildInputs {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         ident,
         bucket: BUCKET.to_owned(),
         metadata_key: fixture.metadata_key.clone(),

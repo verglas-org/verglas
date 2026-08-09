@@ -1,8 +1,7 @@
 # Verglas Docker container runtime
 
 This crate places open-source Verglas workloads on the operator's Docker Engine. It is the local
-placement adapter for Verglas container deployments; Verglas Cloud continues to use its
-Firecracker adapter.
+placement adapter for Verglas container and vessel deployments.
 
 The runtime connects to the host engine through Docker's API and defaults to the local Docker
 socket. Only this trusted runtime process receives Docker authority. Managed workloads never
@@ -38,10 +37,11 @@ Use `POST /v1/containers/{id}/stop`, `POST /v1/containers/{id}/resume`, and
 `DELETE /v1/containers/{id}` for lifecycle changes. Deletion removes only the container whose
 Verglas ownership and deployment labels match.
 
-Compose does not statically start Postgres, Rill, or a scheduler. The locally built
-`verglas/verglas-container-runtime:local` image also carries `verglas-scheduler`. A
-declaration selects that executable with its `entrypoint`; the child receives neither the
-Docker socket nor Docker environment. Database declarations consume the separately published
+The complete OSS Compose stack starts the scheduler and its Postgres queue so Jobs work on first
+boot. The runtime still owns dynamically added application services; its locally built
+`verglas/verglas-container-runtime:local` image also carries `verglas-scheduler` for explicit
+container declarations. A child receives neither the Docker socket nor Docker environment.
+Database declarations consume the separately published
 `ghcr.io/verglas-org/verglas-neon-storage:latest` and
 `ghcr.io/verglas-org/verglas-neon-compute-v16:latest` images. Neon remains multiple declared
 services (broker, pageserver, and compute), not a hidden single Postgres container.

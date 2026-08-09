@@ -61,6 +61,8 @@ pub fn parse_table_properties(metadata_json: &[u8]) -> HashMap<String, String> {
 /// state file so a restart cannot amnesty dead bytes.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Demotion {
+    /// Immutable storage binding used to resolve the object.
+    pub storage_binding_id: String,
     /// Bucket the file lives in.
     pub bucket: String,
     /// Object key of the removed data file.
@@ -95,8 +97,8 @@ struct Retained {
 /// recently-orphaned bytes serving time-travel reads through the grace window;
 /// the sweep drains it into physical hard evictions.
 pub struct RetirementScheduler {
-    /// Demoted key → retained facts, keyed by `(bucket, key)`.
-    demoted: Mutex<HashMap<(String, String), Retained>>,
+    /// Demoted key → retained facts, keyed by `(binding, bucket, key)`.
+    demoted: Mutex<HashMap<(String, String, String), Retained>>,
 }
 
 impl Default for RetirementScheduler {
@@ -127,7 +129,11 @@ impl RetirementScheduler {
                 size: d.size,
                 generation: d.generation,
             };
-            match set.entry((d.bucket.clone(), d.key.clone())) {
+            match set.entry((
+                d.storage_binding_id.clone(),
+                d.bucket.clone(),
+                d.key.clone(),
+            )) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
                     let keep_etag = if entry.etag.is_none() {
                         o.get().etag.clone()
@@ -147,12 +153,16 @@ impl RetirementScheduler {
         }
     }
 
-    /// Whether `(bucket, key)` is currently demoted (evict-first).
-    pub fn is_demoted(&self, bucket: &str, key: &str) -> bool {
+    /// Whether `(binding, bucket, key)` is currently demoted (evict-first).
+    pub fn is_demoted(&self, storage_binding_id: &str, bucket: &str, key: &str) -> bool {
         self.demoted
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .contains_key(&(bucket.to_owned(), key.to_owned()))
+            .contains_key(&(
+                storage_binding_id.to_owned(),
+                bucket.to_owned(),
+                key.to_owned(),
+            ))
     }
 
     /// Removes and returns the demotions whose grace window closed at or before
@@ -160,15 +170,17 @@ impl RetirementScheduler {
     /// Clearing them keeps the demotion set from growing without bound.
     pub fn drain_expired(&self, now_ms: u64) -> Vec<Demotion> {
         let mut set = self.demoted.lock().unwrap_or_else(|p| p.into_inner());
-        let expired: Vec<(String, String)> = set
+        let expired: Vec<(String, String, String)> = set
             .iter()
             .filter(|(_, r)| r.deadline_ms <= now_ms)
-            .map(|((b, k), _)| (b.clone(), k.clone()))
+            .map(|((binding, b, k), _)| (binding.clone(), b.clone(), k.clone()))
             .collect();
         let mut out = Vec::with_capacity(expired.len());
-        for (bucket, key) in expired {
-            if let Some(r) = set.remove(&(bucket.clone(), key.clone())) {
+        for (storage_binding_id, bucket, key) in expired {
+            if let Some(r) = set.remove(&(storage_binding_id.clone(), bucket.clone(), key.clone()))
+            {
                 out.push(Demotion {
+                    storage_binding_id,
                     bucket,
                     key,
                     hard_evict_at_ms: r.deadline_ms,
@@ -186,7 +198,8 @@ impl RetirementScheduler {
     pub fn all(&self) -> Vec<Demotion> {
         let set = self.demoted.lock().unwrap_or_else(|p| p.into_inner());
         set.iter()
-            .map(|((bucket, key), r)| Demotion {
+            .map(|((storage_binding_id, bucket, key), r)| Demotion {
+                storage_binding_id: storage_binding_id.clone(),
                 bucket: bucket.clone(),
                 key: key.clone(),
                 hard_evict_at_ms: r.deadline_ms,
@@ -207,6 +220,7 @@ impl RetirementScheduler {
 /// manifest's path and size joined with the engine's demotion receipt for the
 /// same object (ETag + generation), stamped with the grace deadline.
 pub fn demotions_for_commit(
+    storage_binding_id: &str,
     bucket: &str,
     removed: &[DataFileEntry],
     receipts: &[verglas_cache::DemoteReceipt],
@@ -217,10 +231,13 @@ pub fn demotions_for_commit(
     removed
         .iter()
         .map(|file| {
-            let receipt = receipts
-                .iter()
-                .find(|r| r.key.bucket == bucket && r.key.key == file.path);
+            let receipt = receipts.iter().find(|r| {
+                r.key.storage_binding_id == storage_binding_id
+                    && r.key.bucket == bucket
+                    && r.key.key == file.path
+            });
             Demotion {
+                storage_binding_id: storage_binding_id.to_owned(),
                 bucket: bucket.to_owned(),
                 key: file.path.clone(),
                 hard_evict_at_ms: deadline,
@@ -343,6 +360,7 @@ mod tests {
         let removed = vec![file("t/data/old-0.parquet"), file("t/data/old-1.parquet")];
         let receipts = vec![verglas_cache::DemoteReceipt {
             key: verglas_core::CacheKey {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 bucket: "lake".to_owned(),
                 key: "t/data/old-0.parquet".to_owned(),
             },
@@ -350,7 +368,14 @@ mod tests {
             size: 1024,
             generation: 3,
         }];
-        let demotions = demotions_for_commit("lake", &removed, &receipts, 1_000, 10_000);
+        let demotions = demotions_for_commit(
+            "managed-lakehouse",
+            "lake",
+            &removed,
+            &receipts,
+            1_000,
+            10_000,
+        );
         assert_eq!(demotions.len(), 2);
         assert_eq!(demotions[0].hard_evict_at_ms, 11_000);
         assert_eq!(demotions[0].etag.as_deref(), Some("\"abc\""));
@@ -359,7 +384,7 @@ mod tests {
         assert_eq!(demotions[1].etag, None);
         assert_eq!(demotions[1].size, 1024);
         sched.record(&demotions);
-        assert!(sched.is_demoted("lake", "t/data/old-0.parquet"));
+        assert!(sched.is_demoted("managed-lakehouse", "lake", "t/data/old-0.parquet"));
         assert_eq!(sched.demoted_count(), 2);
 
         // Before the deadline nothing drains.
@@ -376,7 +401,7 @@ mod tests {
                 .any(|d| d.etag.as_deref() == Some("\"abc\"") && d.generation == 3)
         );
         assert_eq!(sched.demoted_count(), 0);
-        assert!(!sched.is_demoted("lake", "t/data/old-0.parquet"));
+        assert!(!sched.is_demoted("managed-lakehouse", "lake", "t/data/old-0.parquet"));
     }
 
     /// A re-demotion never downgrades a known ETag to `None` (#305): the first
@@ -385,6 +410,7 @@ mod tests {
     fn re_demotion_keeps_the_known_etag() {
         let sched = RetirementScheduler::new();
         let with_etag = Demotion {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: "lake".to_owned(),
             key: "t/f.parquet".to_owned(),
             hard_evict_at_ms: 1_000,
@@ -418,6 +444,7 @@ mod tests {
         let path = dir.path().join("retire-state.json");
         let mut state = RetireState::default();
         state.demotions.push(Demotion {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: "lake".to_owned(),
             key: "t/data/dead.parquet".to_owned(),
             hard_evict_at_ms: 42,

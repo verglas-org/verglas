@@ -25,9 +25,8 @@ design.
 
 ## Install
 
-Install the `verglas` CLI from the Verglas website (macOS, Linux, Windows — no
-Rust toolchain required). The cache server (`verglas-server`) ships as a Docker
-image for self-hosting; most users run against Verglas Cloud instead.
+Install the `verglas` CLI from source (macOS, Linux, Windows). The cache server
+(`verglas-server`) ships as a Docker image for self-hosting.
 
 ### Build the CLI from source
 
@@ -42,31 +41,11 @@ repository test tooling).
 
 ## Quickstart
 
-### Verglas Cloud
-
-1. Create an account at [verglas.dev](https://verglas.dev).
-2. Log the CLI into your tenant (browser PKCE by default; or pipe an API key):
-
-```sh
-verglas login
-# or: echo "$VERGLAS_API_KEY" | verglas login --api-key
-```
-
-Login verifies the key, then writes:
-
-- `~/.verglas/credentials/control-plane-token` (mode 0600)
-- `~/.verglas/config.toml` — `[control_plane]` plus lakehouse `[backend]` /
-  `[catalog]` when the tenant has a warehouse
-- scoped backend/catalog credential files under `~/.verglas/credentials/`
-
-After login, cloud verbs work (`verglas workers`, `containers`, `db`, …) and
-data verbs talk to your cloud endpoint. Re-run `login` any time to refresh.
-
 ### Self-host (Docker)
 
-The Docker application is configured entirely by Compose environment values.
-Export your R2 bucket, S3 credentials, catalog URI, warehouse, catalog token,
-and a client-facing S3 secret, then start it:
+The Docker application boots without a process-global object store or catalog.
+Provider credentials and database bindings are created through the access API,
+so adding a database never requires editing Compose or restarting the cache.
 
 ```sh
 docker compose up -d --build
@@ -76,19 +55,63 @@ Point the CLI at the container's API:
 
 ```sh
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+export VERGLAS_TOKEN=verglas-local-access
 verglas status
 ```
 
-The [self-hosted guide](docs/get-started/self-host.mdx) covers R2 and Data
-Catalog setup, every required environment variable, the complete Compose file,
-and creating the first table.
+Verglas OS is available at `http://127.0.0.1:8787`. It is a community and
+development application in the Compose stack, not a dependency of the
+`verglas` server or CLI binaries and not a new CLI command.
+
+The [self-hosted guide](docs/get-started/self-host.mdx) covers bringing up the
+stack and adding managed or customer-owned database resources.
 
 ### Prometheus metrics
 
 `verglas-server` exposes `GET /metrics` on the admin listener (port `8334` by
 default). Metric names and labels are in `crates/verglas-core/src/metrics.rs`.
 
-## Iceberg tables: add the catalog watcher
+### Tenant databases and scoped secrets
+
+One tenant cache serves every database through explicit storage and catalog
+bindings. Managed lakehouses share the tenant's Lakekeeper deployment but each
+gets its own warehouse; managed Postgres databases use Verglas Neon.
+
+```sh
+# Managed storage + managed Lakekeeper warehouse
+verglas db create analytics --type lakehouse
+
+# Independent managed Neon Postgres
+verglas db create my_test_db --type postgres
+
+# Secret material is prompted or read from stdin, never passed in argv
+verglas secret create customer_s3 \
+  --type s3 \
+  --scope s3://customer-bucket/team
+
+# Customer storage + managed Lakekeeper
+verglas db create customer_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team
+
+# Customer storage + customer Iceberg REST catalog
+verglas secret create customer_catalog \
+  --type iceberg-rest \
+  --scope https://catalog.customer.com
+
+verglas db create external_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team \
+  --catalog https://catalog.customer.com \
+  --warehouse customer_warehouse
+```
+
+Database creation resolves the most-specific authorized secret scope once and
+stores its stable resource ID. Rotating that secret updates the same resource;
+creating a later overlapping secret cannot silently rebind the database.
+
+## Iceberg tables and catalog watchers
 
 Verglas works as a plain cache with no catalog. Point it at your Iceberg REST
 catalog and it also watches for table commits, so it can pre-warm table metadata
@@ -96,30 +119,43 @@ and hot data and carry cache heat across compaction automatically — planning
 reads hit warm statistics, and a rewrite does not force queries to re-earn the
 cache from the origin.
 
-The Docker application takes the catalog URI, warehouse, and bearer token from
-`VERGLAS_CATALOG_URI`, `VERGLAS_CATALOG_WAREHOUSE`, and
-`VERGLAS_CATALOG_BEARER_TOKEN` in `docker-compose.yml`. It watches the catalog
-and warms changed metadata through the cache path.
+Each lakehouse database owns its catalog binding. Managed databases use the
+tenant Lakekeeper deployment; external databases resolve an authorized
+`iceberg-rest` secret. The corresponding watcher is attached to that database,
+not to process-global environment variables.
 
 ## Workers and containers
 
-Compose bootstraps only `verglas-server` and `verglas-container-runtime`. The
-runtime manager owns every optional local service through Docker: scheduler,
-Neon database components, external brokers, and optional applications. A portable
-worker contains its bounded command, bundled files, target table, and cron, HTTP,
-or CloudEvent triggers.
+Compose bootstraps `verglas-server`, the local container runtime, the durable
+worker scheduler and its Postgres queue, and Verglas OS. The runtime manager
+owns dynamically added Vessels, database components, external brokers, and
+other optional applications. A portable worker contains its bounded command,
+bundled files, target table, and cron, HTTP, or CloudEvent triggers.
 
 ```sh
-export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d --build
 verglas workers create \
-  --local \
   --file examples/workers/market-data-ingest/worker.toml
 ```
 
 The [Workers guide](docs/workers/overview.mdx) shows the complete program and
 manifest before running it manually, through an HTTP callback, on cron, and
 from a RabbitMQ CloudEvent.
+
+## Verglas OS
+
+The local agentic lakehouse application lives in [`apps/os`](apps/os). It uses
+the TypeScript SDK in this repository directly and connects to the local Verglas
+admin, scheduler, and container-runtime APIs.
+
+```sh
+cd apps/os
+pnpm run-local
+```
+
+Open `http://127.0.0.1:8787`. See the
+[`apps/os` README](apps/os/README.md) for its runtime variables and development
+commands.
 
 ## Documentation
 
@@ -151,6 +187,7 @@ just lint    # cargo fmt --all --check + clippy -D warnings
 
 ## License
 
-Not yet declared. This repository has no license file and is not published to
-crates.io (`publish = false`). Until a license is added, treat it as
-all-rights-reserved and open an issue if you need clarity on use.
+The Rust workspace is not yet licensed or published to crates.io. Until a
+root license is added, treat it as all-rights-reserved. The separately licensed
+Verglas OS application retains its Apache 2.0 license in
+[`apps/os/LICENSE`](apps/os/LICENSE).

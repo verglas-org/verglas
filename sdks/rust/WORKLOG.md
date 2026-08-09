@@ -1,5 +1,6 @@
 # verglas-sdk worklog
 
+- #81: Added a separately addressable access-service endpoint and typed principal, resource, grant, and policy-check APIs using scoped bearer credentials.
 - #43: Added the Rust half of the reflected Integration namespace contract. Clients can discover manifests, create a namespace handle, invoke bounded methods, and incrementally decode streaming methods through the same authenticated routes as the TypeScript SDK.
 
 - #376: Moved the generic daemon HTTP/file-ingest transport and all table/query
@@ -86,3 +87,6 @@
 - #11: Replaced runtime trigger variants with a validated CloudEvents 1.0 envelope and exact event subscription filters. Subprocess workers now read one `VERGLAS_CLOUD_EVENT` value with no legacy environment fallback.
 - #16: Added generic JSON DELETE support to the Rust server transport so pure clients can remove REST resources while preserving server status and response errors.
 - #29: Added a namespace-scoped raw-byte KV client with TTL, metadata, conditional writes, idempotency, delete, and bounded prefix listing. The client preserves opaque versions and cursors and reports whether reads came from RAM or NVMe.
+- #67: Added first-class `Client::queue`, `Client::graph`, and `Client::table` handles matching the TypeScript SDK surface for queue enqueue/poll/ack, graph lifecycle and traversal, and table vector-index declare/list/search. Queue wire types live in `queue.rs`; graph and vector routes reuse the existing wire modules.
+- #66: Neutralized MemoryGrantHost docs (no Firecracker) and replaced *.verglas.dev catalog fixtures in client_data_plane tests with example.test hostnames.
+- #66: Rewrote unreachable-server and follow-trigger docs for self-hosted servers only (no cloud node / cloud lakehouse contrast).

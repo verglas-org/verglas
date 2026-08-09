@@ -182,6 +182,8 @@ pub type LocalBlockFn =
 /// matching subsumes both).
 #[derive(Debug, Serialize, Deserialize)]
 struct BlockRequest {
+    /// Immutable storage binding selecting the origin.
+    storage_binding_id: String,
     /// Origin bucket of the object.
     bucket: String,
     /// Object key within the bucket.
@@ -198,6 +200,7 @@ impl BlockRequest {
     /// Flattens a `BlockKey` into the wire envelope.
     fn from_key(block: &BlockKey) -> Self {
         Self {
+            storage_binding_id: block.object.storage_binding_id.clone(),
             bucket: block.object.bucket.clone(),
             key: block.object.key.clone(),
             etag: block.etag.clone(),
@@ -210,6 +213,7 @@ impl BlockRequest {
     fn into_key(self) -> BlockKey {
         BlockKey {
             object: verglas_core::CacheKey {
+                storage_binding_id: self.storage_binding_id,
                 bucket: self.bucket,
                 key: self.key,
             },

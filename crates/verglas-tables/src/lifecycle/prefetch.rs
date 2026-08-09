@@ -93,6 +93,8 @@ impl Default for PrefetchConfig {
 /// cache, with its estimated byte cost and (for chunks) its heat score.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FillSpec {
+    /// Immutable storage binding used to resolve the object.
+    pub storage_binding_id: String,
     /// Bucket the object lives in.
     pub bucket: String,
     /// Object key to fill.
@@ -151,10 +153,12 @@ impl PrefetchPlan {
 /// schedules a sequential full-file fill if it clears the threshold (the Avro
 /// addendum). Returns an empty plan when the diff should not prefetch data
 /// (e.g. `append`) or prefetch is disabled. Off the request hot path (does IO).
+#[allow(clippy::too_many_arguments)]
 pub async fn plan_prefetch(
     fetch: &dyn MetadataFetch,
     ledger: &HeatLedger,
     table: TableId,
+    storage_binding_id: &str,
     bucket: &str,
     diff: &SnapshotDiff,
     config: &PrefetchConfig,
@@ -168,6 +172,7 @@ pub async fn plan_prefetch(
         fetch,
         ledger,
         table,
+        storage_binding_id,
         bucket,
         config,
         epoch,
@@ -194,6 +199,8 @@ struct PlanCtx<'a> {
     ledger: &'a HeatLedger,
     /// The table being repaired.
     table: TableId,
+    /// Immutable storage binding used to resolve planned objects.
+    storage_binding_id: &'a str,
     /// The bucket the files live in.
     bucket: &'a str,
     /// Planning tunables.
@@ -206,6 +213,7 @@ struct PlanCtx<'a> {
 async fn plan_parquet(ctx: &PlanCtx<'_>, file: &DataFileEntry, plan: &mut PrefetchPlan) {
     let est = footer_estimate(ctx.config.footer_read_bytes, file.size);
     plan.footers.push(FillSpec {
+        storage_binding_id: ctx.storage_binding_id.to_owned(),
         bucket: ctx.bucket.to_owned(),
         key: file.path.clone(),
         range: ReadRange::Suffix(ctx.config.footer_read_bytes),
@@ -216,6 +224,7 @@ async fn plan_parquet(ctx: &PlanCtx<'_>, file: &DataFileEntry, plan: &mut Prefet
     // Read the footer to learn the column-chunk layout. Best-effort: a footer
     // that will not parse just means no chunk prefetch for this file.
     let path = ObjectPath {
+        storage_binding_id: ctx.storage_binding_id.to_owned(),
         bucket: ctx.bucket.to_owned(),
         key: file.path.clone(),
     };
@@ -254,6 +263,7 @@ async fn plan_parquet(ctx: &PlanCtx<'_>, file: &DataFileEntry, plan: &mut Prefet
                 continue;
             }
             plan.chunks.push(FillSpec {
+                storage_binding_id: ctx.storage_binding_id.to_owned(),
                 bucket: ctx.bucket.to_owned(),
                 key: file.path.clone(),
                 range: ReadRange::Bounded(start, end - 1),
@@ -281,6 +291,7 @@ fn plan_row_oriented(ctx: &PlanCtx<'_>, file: &DataFileEntry, plan: &mut Prefetc
         return;
     }
     plan.whole_files.push(FillSpec {
+        storage_binding_id: ctx.storage_binding_id.to_owned(),
         bucket: ctx.bucket.to_owned(),
         key: file.path.clone(),
         range: ReadRange::Full,
@@ -525,6 +536,7 @@ async fn run_worker(inner: Arc<ExecInner>) {
         inner.budget.acquire(task.fill.est_bytes).await;
 
         let ck = CacheKey {
+            storage_binding_id: task.fill.storage_binding_id.clone(),
             bucket: task.fill.bucket.clone(),
             key: task.fill.key.clone(),
         };
@@ -558,6 +570,7 @@ mod tests {
     fn queue_orders_by_priority_then_fifo() {
         let mut heap = BinaryHeap::new();
         let fill = || FillSpec {
+            storage_binding_id: "managed-lakehouse".into(),
             bucket: "b".into(),
             key: "k".into(),
             range: ReadRange::Full,

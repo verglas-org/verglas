@@ -21,6 +21,8 @@ use crate::iceberg;
 /// implementations so the server (REST watcher + through-cache fetch) and tests
 /// (mock watcher + object_store fetch) share it.
 pub struct MapUpdater<W: CatalogWatcher, F: MetadataFetch> {
+    /// Immutable storage binding for the watched database.
+    storage_binding_id: Arc<str>,
     /// The map to keep current.
     mapper: Arc<Mapper>,
     /// Source of last-known table pointers and lineage.
@@ -31,8 +33,14 @@ pub struct MapUpdater<W: CatalogWatcher, F: MetadataFetch> {
 
 impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> MapUpdater<W, F> {
     /// Builds an updater over a mapper, watcher, and fetch interface.
-    pub fn new(mapper: Arc<Mapper>, watcher: Arc<W>, fetch: Arc<F>) -> MapUpdater<W, F> {
+    pub fn new(
+        storage_binding_id: impl Into<Arc<str>>,
+        mapper: Arc<Mapper>,
+        watcher: Arc<W>,
+        fetch: Arc<F>,
+    ) -> MapUpdater<W, F> {
         MapUpdater {
+            storage_binding_id: storage_binding_id.into(),
             mapper,
             watcher,
             fetch,
@@ -113,6 +121,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> MapUpdater<W, F> {
 
         Some(BuildInputs {
             ident: table.clone(),
+            storage_binding_id: self.storage_binding_id.to_string(),
             bucket,
             metadata_key,
             snapshot_ids,

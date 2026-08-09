@@ -14,7 +14,7 @@ fn local_access_carries_the_discovery_fields_but_never_the_secret() {
     let access = LocalAccess {
         s3_endpoint: "http://127.0.0.1:8333".to_owned(),
         query_uri: "http://127.0.0.1:8334".to_owned(),
-        catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
+        catalog_uri: Some("https://catalog.example.test".to_owned()),
         warehouse: Some("s3://warehouse/tenant".to_owned()),
         region: "us-east-1".to_owned(),
         bucket: Some("warehouse".to_owned()),

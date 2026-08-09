@@ -37,7 +37,7 @@ describe("backoffDelay", () => {
 
 describe("feedUrl", () => {
   it("maps the endpoint origin to a wss feed path", () => {
-    expect(feedUrl("https://t.verglas.cloud")).toBe("wss://t.verglas.cloud/v1/catalog/feed");
+    expect(feedUrl("https://t.example.test")).toBe("wss://t.example.test/v1/catalog/feed");
     expect(feedUrl("http://127.0.0.1:8334")).toBe("ws://127.0.0.1:8334/v1/catalog/feed");
   });
   it("drops any path, query, and fragment on the endpoint", () => {

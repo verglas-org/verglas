@@ -30,9 +30,12 @@ async fn serve_authed(objects: &[(&str, Bytes)]) -> String {
             .expect("seed object");
     }
     let app = verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         Some((ACCESS_KEY.to_owned(), SECRET_KEY.to_owned())),
     );
@@ -50,9 +53,12 @@ async fn serve_authed(objects: &[(&str, Bytes)]) -> String {
 async fn serve_authed_reader<R: ObjectRead + 'static>(reader: R) -> String {
     let store = Arc::new(InMemory::new());
     let app = verglas_s3::router(
+        "default",
         reader,
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         Some((ACCESS_KEY.to_owned(), SECRET_KEY.to_owned())),
     );

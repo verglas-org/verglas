@@ -38,3 +38,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   or stale attachments without rebuilding or scanning.
 - #91: Updated vector route documentation for the renamed `verglas-server`
   process. Snapshot-bound Puffin attachment behavior is unchanged.
+- #72: Full builds that scan source rows but index zero of them because every
+  id is unreadable under the active encoding (default integer; optional
+  uuidHash) now return `VectorError::Field` with a clear integer / UUID
+  uuidHash message instead of `Ok(None)`. Truly empty tables still yield no
+  index. Tests cover the string-id footgun and a uuidHash full-build path.

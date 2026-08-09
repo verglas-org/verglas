@@ -50,6 +50,9 @@ pub enum ServiceError {
         /// Rejected bootstrap deployment identity.
         deployment_id: String,
     },
+    /// Ephemeral run identities must use the reserved run namespace.
+    #[error("ephemeral run identity must begin with run-")]
+    InvalidRunIdentity,
     /// Reading or atomically writing the desired-state file failed.
     #[error("desired-state storage failed: {0}")]
     Storage(#[from] std::io::Error),
@@ -97,6 +100,7 @@ impl IntoResponse for ServiceError {
             ServiceError::Unauthorized => StatusCode::UNAUTHORIZED,
             ServiceError::IdentityMismatch { .. }
             | ServiceError::BootstrapTarget { .. }
+            | ServiceError::InvalidRunIdentity
             | ServiceError::InvalidVesselManifest(_)
             | ServiceError::InvalidComposition(_)
             | ServiceError::Runtime(
@@ -194,6 +198,10 @@ impl RuntimeService {
             .route(
                 "/v1/containers/{deployment_id}",
                 put(put_container).delete(delete_container),
+            )
+            .route(
+                "/v1/runs/{deployment_id}",
+                get(get_run).put(put_run).delete(delete_run),
             )
             .route("/v1/containers/{deployment_id}/stop", post(stop_container))
             .route(
@@ -337,6 +345,47 @@ async fn put_container(
     );
     state.persist().await?;
     Ok(Json(outcome))
+}
+
+/// Starts one ephemeral workload without adding it to desired-state reconciliation.
+///
+/// Completed runs remain inspectable until the caller deletes them. Unlike long-lived
+/// containers and Vessels, a stopped run is never restarted by the reconciliation loop.
+async fn put_run(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(deployment_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(specification): Json<ContainerSpec>,
+) -> Result<Json<ReconcileOutcome>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    validate_run_target(&deployment_id, &specification)?;
+    let specification = state.normalize(specification);
+    let _operation = state.operation.lock().await;
+    Ok(Json(state.runtime.reconcile(&specification).await?))
+}
+
+/// Returns the current Docker observation for one ephemeral workload.
+async fn get_run(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(deployment_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<Json<Option<ManagedContainer>>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    validate_run_identity(&deployment_id)?;
+    Ok(Json(state.runtime.inspect(&deployment_id).await?))
+}
+
+/// Deletes a completed or cancelled ephemeral workload.
+async fn delete_run(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(deployment_id): AxumPath<String>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ServiceError> {
+    authorize(&headers, &state.token)?;
+    validate_run_identity(&deployment_id)?;
+    let _operation = state.operation.lock().await;
+    state.runtime.remove(&deployment_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Removes one desired deployment and only its matching owned container.
@@ -1180,6 +1229,21 @@ fn validate_target(path: &str, specification: &ContainerSpec) -> Result<(), Serv
     Ok(())
 }
 
+/// Reserves a disjoint identity namespace for non-reconciled, one-shot workloads.
+fn validate_run_identity(deployment_id: &str) -> Result<(), ServiceError> {
+    if deployment_id.starts_with("run-") {
+        Ok(())
+    } else {
+        Err(ServiceError::InvalidRunIdentity)
+    }
+}
+
+/// Prevents a run declaration from mutating a long-lived desired deployment.
+fn validate_run_target(path: &str, specification: &ContainerSpec) -> Result<(), ServiceError> {
+    validate_target(path, specification)?;
+    validate_run_identity(path)
+}
+
 /// Returns whether an identity names one of the two Compose bootstrap services.
 fn is_bootstrap_target(deployment_id: &str) -> bool {
     matches!(
@@ -1201,7 +1265,9 @@ async fn load_desired(path: &Path) -> Result<DesiredState, ServiceError> {
 mod tests {
     use serde_json::json;
 
-    use super::{is_bootstrap_target, load_desired, validate_namespace_manifest};
+    use super::{
+        is_bootstrap_target, load_desired, validate_namespace_manifest, validate_run_identity,
+    };
 
     /// The manager and the data-plane server cannot recursively manage themselves.
     #[test]
@@ -1233,5 +1299,12 @@ mod tests {
         let error = validate_namespace_manifest("crm", mismatch)
             .expect_err("mismatched namespace must fail closed");
         assert!(error.to_string().contains("namespace must match"));
+    }
+
+    /// Ephemeral workloads cannot collide with long-lived desired deployments.
+    #[test]
+    fn ephemeral_runs_use_a_reserved_identity_prefix() {
+        assert!(validate_run_identity("run-workspace-1-turn-2").is_ok());
+        assert!(validate_run_identity("vessel-dashboard").is_err());
     }
 }

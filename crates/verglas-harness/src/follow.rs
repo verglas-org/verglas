@@ -9,11 +9,8 @@
 //!   becomes a row.
 //!
 //! Rows are batched (bounded by a row count and a flush interval) and committed
-//! through the shared CAS append path ([`verglas_iceberg::write`]). Because the
-//! append goes through the server's own catalog, the destination follows the
-//! server's login state with no branch here: logged in, the catalog points at the
-//! tenant's cloud lakehouse and the lines stream off the machine into the cloud;
-//! logged out, they land in the local lakehouse.
+//! through the shared CAS append path ([`verglas_iceberg::write`]). The append
+//! goes through the server's own catalog into the configured lakehouse.
 //!
 //! The write is inline in the read loop, so a slow sink pauses reading rather than
 //! buffering without bound — the OS pipe (command mode) or the file (file mode)

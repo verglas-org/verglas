@@ -26,6 +26,8 @@ use crate::iceberg::{self, SnapshotPlan};
 pub struct BuildInputs {
     /// Catalog identity of the table.
     pub ident: TableIdent,
+    /// Immutable storage binding used to resolve the table's objects.
+    pub storage_binding_id: String,
     /// Origin bucket the table's objects live in.
     pub bucket: String,
     /// The current `metadata.json` object key.
@@ -52,7 +54,13 @@ impl Mapper {
     ) -> Result<(), MapError> {
         // Parse metadata.json once for the table location and per-snapshot
         // manifest-list keys.
-        let doc_bytes = read_whole(fetch, &inputs.bucket, &inputs.metadata_key).await?;
+        let doc_bytes = read_whole(
+            fetch,
+            &inputs.storage_binding_id,
+            &inputs.bucket,
+            &inputs.metadata_key,
+        )
+        .await?;
         let doc = iceberg::parse_metadata_json(&doc_bytes, &inputs.bucket, &inputs.metadata_key)?;
 
         // Walk each retained snapshot into a plan (parsing metadata.json only
@@ -69,8 +77,13 @@ impl Mapper {
                 // does not — skip it rather than fail the whole rebuild.
                 continue;
             };
-            let (manifest_keys, data_files) =
-                iceberg::walk_manifest_list(fetch, &inputs.bucket, &list_key).await?;
+            let (manifest_keys, data_files) = iceberg::walk_manifest_list(
+                fetch,
+                &inputs.storage_binding_id,
+                &inputs.bucket,
+                &list_key,
+            )
+            .await?;
             plans.push(SnapshotPlan {
                 snapshot_id,
                 metadata_key: inputs.metadata_key.clone(),
@@ -86,6 +99,7 @@ impl Mapper {
         let index = self.build_index(
             table_id,
             inputs.ident.clone(),
+            &inputs.storage_binding_id,
             &inputs.bucket,
             &doc.table_location,
             &inputs.metadata_key,
@@ -139,6 +153,7 @@ impl Mapper {
             return Ok(());
         }
         let path = ObjectPath {
+            storage_binding_id: index.storage_binding_id.to_string(),
             bucket: index.bucket.to_string(),
             key: key.to_owned(),
         };
@@ -169,6 +184,7 @@ impl Mapper {
         &self,
         table_id: TableId,
         ident: TableIdent,
+        storage_binding_id: &str,
         bucket: &str,
         location: &str,
         metadata_key: &str,
@@ -215,6 +231,7 @@ impl Mapper {
         TableIndex {
             table: table_id,
             ident: Arc::new(ident),
+            storage_binding_id: Arc::from(storage_binding_id),
             bucket: Arc::from(bucket),
             prefix,
             metadata_prefix,
@@ -262,12 +279,14 @@ fn reuse_or_new(
 /// Reads a whole small metadata object through the fetch interface (growing suffix).
 async fn read_whole(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     key: &str,
 ) -> Result<bytes::Bytes, MapError> {
     // Reuse the iceberg reader's whole-object strategy via a suffix read; a
     // metadata.json is small, so one suffix window covers it.
     let path = ObjectPath {
+        storage_binding_id: storage_binding_id.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
     };

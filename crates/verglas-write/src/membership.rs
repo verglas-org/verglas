@@ -80,9 +80,9 @@ impl LiveMembership for AgentMembership {
 /// write-back degenerates to `k=1, m=0, w=1` — the single object fragment is
 /// fsynced to local NVMe and, with the fsynced journal, is the ack; propagation
 /// to the origin then runs in the background exactly as §6 specifies. The
-/// deployment story puts the buffer directory on a cloud-replicated block
-/// volume, but the server does not know or care — durability here is "one local
-/// disk until propagation completes," disclosed in the write-back docs.
+/// deployment story may put the buffer directory on a replicated block volume,
+/// but the server does not know or care — durability here is "one local disk
+/// until propagation completes," disclosed in the write-back docs.
 pub struct SingleNodeMembership {
     /// The lone node's id.
     node_id: NodeId,

@@ -1,9 +1,9 @@
 // Public types for the Verglas SDK.
 //
 // The SDK is deliberately thin: it never reads Parquet or writes Iceberg in JS.
-// It speaks a small HTTP contract to a Verglas *endpoint* — either the local
-// server or a cloud Verglas endpoint — and moves rows as JSON. The endpoint owns
-// the catalog, the snapshots, and the content-addressed write path.
+// It speaks a small HTTP contract to a Verglas *endpoint* (the self-hosted
+// server) and moves rows as JSON. The endpoint owns the catalog, the snapshots,
+// and the content-addressed write path.
 
 /** One row. Shapes are table-specific; callers narrow with a generic. */
 export type Row = Record<string, unknown>;
@@ -89,13 +89,17 @@ export type Watermark = string;
 /** Options for `connect`. */
 export interface ConnectOptions {
   /**
-   * The Verglas endpoint base URL. Local: the server's base URL (e.g.
-   * `http://127.0.0.1:8334`). Cloud: the tenant's Verglas endpoint. The SDK
-   * abstracts over the two — same interface, different endpoint.
+   * The Verglas endpoint base URL (e.g. `http://127.0.0.1:8334` for a local
+   * self-hosted server).
    */
   endpoint: string;
   /** Bearer token for the endpoint. Never logged. */
   token: string;
+  /**
+   * Iceberg REST catalog base URL. When omitted, the client discovers it from
+   * `GET /admin/access` on first catalog operation (`ensureTable` / `createTable`).
+   */
+  catalogUri?: string;
   /**
    * Override the `fetch` used for requests. Defaults to the global `fetch`
    * (present in edge/serverless runtimes and Node 18+). Handy for tests and for

@@ -1,4 +1,4 @@
-// The fleet COMMIT-ENDPOINT run mode: the bun entry a fleet microVM execs to run
+// Local COMMIT-ENDPOINT run mode: the bun entry the worker harness execs to run
 // a tenant WORKER against the live commit service for one bounded event.
 //
 // One invocation = one bounded worker run. This file maps the process
@@ -8,12 +8,12 @@
 // path), and writes the harness result file.
 //
 // There is no durable watermark here: a worker is a pure function of its trigger
-// and the committed data. The control plane owns scheduling, retry, and replay.
+// and the committed data. The scheduler owns scheduling, retry, and replay.
 //
 // Usage: `bun endpoint-run.ts <module>` where <module> default-exports a worker
 // (a `WorkerDefinition` from `defineWorker`). Environment:
 //
-//   VERGLAS_ENDPOINT  (required) commit service URL, e.g. https://api.verglas.dev
+//   VERGLAS_ENDPOINT  (required) commit service URL, e.g. http://127.0.0.1:8334
 //   VERGLAS_TOKEN     (required) per-deployment commit token — never printed
 //   DEPLOYMENT        (required) deployment/pipeline name (the `pipeline` log column)
 //   TARGET            (required) output table (its `<TARGET>_LOGS` sibling gets the run log)
@@ -25,7 +25,7 @@
 //   RESULT_PATH       (optional) where the result JSON lands; default /run/result.json
 //
 // Worker secrets are already in the environment — the worker reads them off
-// `ctx.env`, the way a fleet entry module binds its own env keys into its config.
+// `ctx.env`, the way an entry module binds its own env keys into its config.
 //
 // The result file is always written: {"rows": n, "error": null} on success,
 // {"rows": 0, "error": "<message>"} on failure; the process exits 0/1 to match.

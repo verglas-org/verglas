@@ -63,6 +63,7 @@ fn build_store() -> Arc<dyn ObjectStore> {
 /// Inputs to (re)build the table at a given current snapshot.
 fn inputs(current: i64, snapshot_ids: Vec<i64>) -> BuildInputs {
     BuildInputs {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         ident: verglas_tables::catalog::TableIdent::new(&["db"], "t"),
         bucket: BUCKET.to_owned(),
         metadata_key: format!("{ROOT}/metadata/v1.metadata.json"),

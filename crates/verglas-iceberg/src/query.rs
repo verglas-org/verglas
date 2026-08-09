@@ -80,7 +80,7 @@ impl PreparedCatalog {
     /// Builds a reusable catalog session whose spillable DataFusion operators
     /// are bounded by `memory_limit_bytes`. The runtime's disk manager remains
     /// enabled, so joins, aggregates, and sorts spill instead of exhausting a
-    /// fixed-memory microVM.
+    /// fixed memory ceiling.
     pub async fn open_with_memory_limit(
         catalog: Arc<dyn Catalog>,
         memory_limit_bytes: usize,

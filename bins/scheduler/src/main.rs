@@ -2,8 +2,8 @@
 //!
 //! Verglas pushes complete worker events to this service. The service persists
 //! them through `verglas-rest`, immediately claims ready work, and executes the
-//! local worker harness. It mounts no state and contains no cloud placement or
-//! connection-broker behavior.
+//! local worker harness. It mounts no state and contains no connection-broker
+//! behavior.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -444,26 +444,39 @@ async fn scheduler_loop(
     ready: &tokio::sync::Notify,
 ) -> Result<(), String> {
     loop {
-        let now = Utc::now();
-        let cron_deadline = reconcile_cron(client, queue, now).await?;
-        while run_one(args, client, queue).await? {}
-        let queue_deadline = queue
-            .next_wake_at(&NextWakeRequest { now: Utc::now() })
-            .await
-            .map_err(|error| error.to_string())?;
-        let deadline = match (cron_deadline, queue_deadline) {
-            (Some(cron), Some(queue)) => Some(std::cmp::min(cron, queue)),
-            (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
-            (None, None) => None,
-        };
-        match deadline {
-            Some(deadline) => {
-                tokio::select! {
-                    () = tokio::time::sleep(until(deadline)) => {}
-                    () = ready.notified() => {}
+        let iteration: Result<(), String> = async {
+            let now = Utc::now();
+            let cron_deadline = reconcile_cron(client, queue, now).await?;
+            while run_one(args, client, queue).await? {}
+            let queue_deadline = queue
+                .next_wake_at(&NextWakeRequest { now: Utc::now() })
+                .await
+                .map_err(|error| error.to_string())?;
+            let deadline = match (cron_deadline, queue_deadline) {
+                (Some(cron), Some(queue)) => Some(std::cmp::min(cron, queue)),
+                (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+                (None, None) => None,
+            };
+            match deadline {
+                Some(deadline) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(until(deadline)) => {}
+                        () = ready.notified() => {}
+                    }
                 }
+                None => ready.notified().await,
             }
-            None => ready.notified().await,
+            Ok(())
+        }
+        .await;
+        if let Err(error) = iteration {
+            eprintln!(
+                "verglas-scheduler: reconciliation unavailable: {error}; retrying in 5 seconds"
+            );
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                () = ready.notified() => {}
+            }
         }
     }
 }
@@ -704,5 +717,34 @@ mod tests {
             .await
             .expect("execute");
         assert_eq!(completion, Completion::Succeeded { rows_produced: 3 });
+    }
+
+    /// A dynamic deployment may start the scheduler before any catalog owns a
+    /// worker registry. Reconciliation failure must not discard the durable
+    /// process or turn Compose into a restart loop.
+    #[tokio::test]
+    async fn unavailable_worker_registry_keeps_scheduler_alive_for_retry() {
+        let client = VerglasClient::new(&serve(Router::new()).await);
+        let args = Args {
+            database_url: "postgres://unused".to_owned(),
+            verglas_url: "unused".to_owned(),
+            worker_endpoint: "http://127.0.0.1:8334".to_owned(),
+            queue: "local".to_owned(),
+            consumer: "consumer-1".to_owned(),
+            lease_seconds: 300,
+            listen: "127.0.0.1:0".parse().expect("listen"),
+        };
+        let queue = TestQueue::default();
+        let ready = tokio::sync::Notify::new();
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                scheduler_loop(&args, &client, &queue, &ready),
+            )
+            .await
+            .is_err(),
+            "the scheduler must remain alive while the dynamic registry is unavailable"
+        );
     }
 }

@@ -88,6 +88,7 @@ fn classify_does_not_allocate_on_the_hot_path() {
             .apply_table(
                 &fetch,
                 &BuildInputs {
+                    storage_binding_id: "managed-lakehouse".to_owned(),
                     ident: ident.clone(),
                     bucket: BUCKET.to_owned(),
                     metadata_key: fixture.metadata_key.clone(),

@@ -314,8 +314,6 @@ export interface MockEndpoint {
   tableState(name: string): MockTable;
   /** Access (or create) a graph's in-memory state, e.g. to assert on it. */
   graphState(namespace: string): MockGraph;
-  /** The single durable watermark cell (mirrors the control plane's per-deployment row). */
-  watermark(): string | null;
   /** Requests seen, for assertions. */
   requests: { method: string; path: string; body?: unknown }[];
   /** Pushes a `change` frame to every attached change-feed socket. */
@@ -342,9 +340,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     return g;
   };
   const requests: MockEndpoint["requests"] = [];
-  // A single durable watermark cell, as the control plane keeps one row per
-  // deployment (the presented token identifies the deployment).
-  let storedWatermark: string | null = null;
   const tableState = (name: string): MockTable => {
     let t = tables.get(name);
     if (!t) tables.set(name, (t = new MockTable()));
@@ -372,50 +367,115 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
       return;
     }
 
-    // GET/PUT /v1/watermark — the deployment's durable cross-run watermark cell.
-    if (url.pathname === "/v1/watermark") {
-      if (req.method === "GET") {
-        requests.push({ method: "GET", path: url.pathname });
-        return send(200, { watermark: storedWatermark });
-      }
-      if (req.method === "PUT") {
-        let raw = "";
-        req.on("data", (c) => (raw += c));
-        req.on("end", () => {
-          const body = raw ? JSON.parse(raw) : {};
-          requests.push({ method: "PUT", path: url.pathname, body });
-          storedWatermark = typeof body.watermark === "string" ? body.watermark : storedWatermark;
-          send(200, { watermark: storedWatermark });
-        });
-        return;
-      }
-      return send(405, { error: "method not allowed" });
+    if (url.pathname === "/admin/access" && req.method === "GET") {
+      requests.push({ method: "GET", path: url.pathname });
+      const { port } = server.address() as AddressInfo;
+      return send(200, {
+        catalog_uri: `http://127.0.0.1:${port}`,
+        query_uri: `http://127.0.0.1:${port}`,
+        s3_endpoint: "http://127.0.0.1:8333",
+      });
     }
 
-    // POST /v1/tables/:name — create a table from an explicit schema + partition
-    // spec. Records the definition and echoes the column names.
-    const create = url.pathname.match(/^\/v1\/tables\/([^/]+)$/);
-    if (create && req.method === "POST") {
-      const name = decodeURIComponent(create[1]);
+
+    // Iceberg REST catalog (same origin in tests via /admin/access.catalog_uri).
+    if (url.pathname === "/v1/namespaces" && req.method === "POST") {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
-        const body = raw ? JSON.parse(raw) : {};
-        requests.push({ method: "POST", path: url.pathname, body });
-        tableState(name);
-        definitions.set(name, { schema: body.schema ?? [], partitions: body.partitions ?? [] });
-        const columns = (body.schema ?? []).map((c: { name: string }) => c.name);
-        send(200, { table: name, columns });
+        requests.push({ method: "POST", path: url.pathname, body: raw ? JSON.parse(raw) : {} });
+        send(200, { namespace: [] });
       });
       return;
     }
 
-    const definition = url.pathname.match(/^\/v1\/tables\/([^/]+)\/definition$/);
-    if (definition && req.method === "GET") {
-      const name = decodeURIComponent(definition[1]);
-      requests.push({ method: "GET", path: url.pathname });
-      const body = definitions.get(name);
-      return body ? send(200, body) : send(404, { error: "missing table" });
+    const catalogTable = url.pathname.match(/^\/v1\/namespaces\/([^/]+)\/tables(?:\/([^/]+))?$/);
+    if (catalogTable) {
+      const ns = decodeURIComponent(catalogTable[1]).split("\u001f");
+      const tableName = catalogTable[2] ? decodeURIComponent(catalogTable[2]) : undefined;
+      const dotted = tableName ? `${ns.join(".")}.${tableName}` : ns.join(".");
+      if (req.method === "GET" && tableName) {
+        requests.push({ method: "GET", path: url.pathname });
+        const def = definitions.get(dotted);
+        if (!def) return send(404, { error: "NoSuchTableException" });
+        return send(200, {
+          metadata: {
+            schemas: [
+              {
+                fields: (def.schema as Array<{ name: string; type: string; nullable?: boolean }>).map(
+                  (column, index) => ({
+                    id: index + 1,
+                    name: column.name,
+                    required: column.nullable === false,
+                    type: column.type === "int64" ? "long" : column.type === "utf8" ? "string" : column.type,
+                  }),
+                ),
+              },
+            ],
+            "partition-specs": [
+              {
+                fields: ((def.partitions as Array<{ source: string; transform: string }>) ?? []).map(
+                  (partition, index) => ({
+                    "source-id":
+                      (def.schema as Array<{ name: string }>).findIndex((c) => c.name === partition.source) + 1,
+                    "field-id": 1000 + index,
+                    transform: partition.transform,
+                  }),
+                ),
+              },
+            ],
+          },
+        });
+      }
+      if (req.method === "POST" && !tableName) {
+        let raw = "";
+        req.on("data", (c) => (raw += c));
+        req.on("end", () => {
+          const body = raw ? JSON.parse(raw) : {};
+          requests.push({ method: "POST", path: url.pathname, body });
+          const name = `${ns.join(".")}.${body.name}`;
+          const schema = (body.schema?.fields ?? []).map(
+            (field: { name: string; type: string; required?: boolean }) => ({
+              name: field.name,
+              type: field.type === "long" ? "int64" : field.type === "string" ? "utf8" : field.type,
+              nullable: field.required !== true,
+            }),
+          );
+          const partitions = (body["partition-spec"]?.fields ?? []).map(
+            (field: { "source-id": number; transform: string }) => ({
+              source: schema[field["source-id"] - 1]?.name ?? String(field["source-id"]),
+              transform: field.transform,
+            }),
+          );
+          definitions.set(name, { schema, partitions });
+          tableState(name);
+          send(200, { metadata: {} });
+        });
+        return;
+      }
+    }
+
+    // POST /v1/ingest/:name — JSONL append used by the TypeScript SDK.
+    const ingest = url.pathname.match(/^\/v1\/ingest\/([^/]+)$/);
+    if (ingest && req.method === "POST") {
+      const name = decodeURIComponent(ingest[1]);
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const rows = raw
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((line) => JSON.parse(line));
+        const key = req.headers["idempotency-key"];
+        requests.push({
+          method: "POST",
+          path: url.pathname,
+          body: { rows, mode: url.searchParams.get("mode"), format: url.searchParams.get("format") },
+        });
+        send(200, tableState(name).commit(rows, typeof key === "string" ? key : undefined));
+      });
+      return;
     }
 
     // POST/GET /v1/tables/:name/indexes — declare or list vector indexes.
@@ -612,7 +672,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     token,
     tableState,
     graphState,
-    watermark: () => storedWatermark,
     requests,
     pushChange: (change) => {
       const frame = encodeWsText(

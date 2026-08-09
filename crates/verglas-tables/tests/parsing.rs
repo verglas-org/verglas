@@ -41,9 +41,15 @@ async fn walk_snapshot_resolves_data_files_and_metadata_paths() {
     .await;
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
 
-    let plan = iceberg::walk_snapshot(&fetch, BUCKET, &fixture.metadata_key, 9)
-        .await
-        .expect("walk");
+    let plan = iceberg::walk_snapshot(
+        &fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fixture.metadata_key,
+        9,
+    )
+    .await
+    .expect("walk");
     assert_eq!(plan.snapshot_id, 9);
     assert_eq!(plan.data_files.len(), 2);
     let parquet = plan
@@ -60,9 +66,15 @@ async fn walk_snapshot_resolves_data_files_and_metadata_paths() {
 
     // A snapshot the metadata does not name is an error.
     assert!(
-        iceberg::walk_snapshot(&fetch, BUCKET, &fixture.metadata_key, 999)
-            .await
-            .is_err()
+        iceberg::walk_snapshot(
+            &fetch,
+            "managed-lakehouse",
+            BUCKET,
+            &fixture.metadata_key,
+            999
+        )
+        .await
+        .is_err()
     );
 }
 
@@ -90,9 +102,15 @@ async fn walk_reads_a_large_manifest_via_the_growth_loop() {
     )
     .await;
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
-    let plan = iceberg::walk_snapshot(&fetch, BUCKET, &fixture.metadata_key, 1)
-        .await
-        .expect("walk large");
+    let plan = iceberg::walk_snapshot(
+        &fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fixture.metadata_key,
+        1,
+    )
+    .await
+    .expect("walk large");
     assert_eq!(plan.data_files.len(), 2_000);
 }
 
@@ -118,6 +136,7 @@ async fn parse_footer_yields_sorted_column_chunks() {
     let built = fixture.first_of(FileFormat::Parquet);
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
     let path = verglas_core::CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: BUCKET.to_owned(),
         key: built.key.clone(),
     };
@@ -153,6 +172,7 @@ async fn footer_cache_memoizes_by_path_and_etag() {
     let built = fixture.first_of(FileFormat::Parquet);
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
     let path = verglas_core::CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: BUCKET.to_owned(),
         key: built.key.clone(),
     };
@@ -200,6 +220,7 @@ async fn parse_footer_rejects_a_non_parquet_object() {
     let built = fixture.first_of(FileFormat::Avro);
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
     let path = verglas_core::CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: BUCKET.to_owned(),
         key: built.key.clone(),
     };

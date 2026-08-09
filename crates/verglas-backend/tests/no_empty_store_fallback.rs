@@ -26,9 +26,9 @@ fn build_failure_does_not_fall_back_to_an_empty_in_memory_store() {
         allow_http: false,
         ..Backend::default()
     };
-    let store = BackendStore::from_config(&backend);
+    let store = BackendStore::from_config("default", &backend);
     let error = store
-        .store_for("lake")
+        .store_for("default", "lake")
         .expect_err("a build failure must surface, not fall back to an empty in-memory store");
     assert!(
         matches!(error, BackendError::Build { .. }),

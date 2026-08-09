@@ -1,41 +1,25 @@
 {
   "version": 1,
+  "source": "contracts/api-surface.json",
+  "note": "Authoritative surface inventory is contracts/api-surface.json. This file lists Rust symbols for the shared implemented ops.",
   "capabilities": [
-    {
-      "operation": "connect",
-      "routes": [],
-      "guarantees": ["bearer-auth", "bounded-request-start"],
-      "symbol": "pub async fn connect"
-    },
-    {
-      "operation": "ensure_table",
-      "routes": ["GET /v1/tables/{name}/definition", "POST /v1/tables/{name}"],
-      "guarantees": ["create-if-missing", "exact-definition-validation"],
-      "symbol": "pub async fn ensure_table"
-    },
-    {
-      "operation": "query",
-      "routes": ["POST /v1/query"],
-      "guarantees": ["sql", "ordered-columns"],
-      "symbol": "pub async fn query_stream"
-    },
-    {
-      "operation": "append",
-      "routes": ["POST /v1/tables/{name}/commit"],
-      "guarantees": ["bounded-batches", "idempotency-key"],
-      "symbol": "pub async fn append_stream"
-    },
-    {
-      "operation": "follow",
-      "routes": ["WS /v1/catalog/feed"],
-      "guarantees": ["cursor-expiry-distinct", "exactly-once-sequence", "resume-after-drop"],
-      "symbol": "pub fn follow"
-    },
-    {
-      "operation": "namespace",
-      "routes": ["GET /v1/namespaces", "GET /v1/namespaces/{namespace}", "POST /v1/namespaces/{namespace}/invoke/{method}"],
-      "guarantees": ["reflected-contract", "scoped-bearer-auth", "bounded-or-ndjson-stream"],
-      "symbol": "pub fn namespace"
-    }
+    { "operation": "connect", "symbol": "pub async fn connect" },
+    { "operation": "ensure_table", "symbol": "pub async fn ensure_table" },
+    { "operation": "query", "symbol": "pub async fn query_stream" },
+    { "operation": "append", "symbol": "pub async fn append_stream" },
+    { "operation": "namespace", "symbol": "pub fn namespace" },
+    { "operation": "kv", "symbol": "pub fn kv" },
+    { "operation": "queue_enqueue", "symbol": "pub async fn enqueue" },
+    { "operation": "queue_poll", "symbol": "pub async fn poll" },
+    { "operation": "queue_ack", "symbol": "pub async fn ack" },
+    { "operation": "graph_create", "symbol": "pub async fn create" },
+    { "operation": "graph_show", "symbol": "pub async fn show" },
+    { "operation": "graph_insert_nodes", "symbol": "pub async fn insert_nodes" },
+    { "operation": "graph_insert_edges", "symbol": "pub async fn insert_edges" },
+    { "operation": "graph_build_index", "symbol": "pub async fn build_index" },
+    { "operation": "graph_query", "symbol": "pub async fn neighbors" },
+    { "operation": "vector_declare", "symbol": "pub async fn add_index" },
+    { "operation": "vector_list", "symbol": "pub async fn list_indexes" },
+    { "operation": "vector_search", "symbol": "pub async fn search_index" }
   ]
 }

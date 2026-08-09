@@ -226,8 +226,7 @@ pub struct Slots {
     /// The vector-index routes (`/v1/tables|graphs/{..}/indexes...`), backed by
     /// `verglas-vector` over snapshot-bound Iceberg attachments.
     pub vector: Option<VectorSlot>,
-    /// The `verglas_sys` registry and watermark routes (`/v1/workers`,
-    /// `/v1/watermark`).
+    /// The `verglas_sys` registry routes (`/v1/workers`).
     pub sys: Option<SysSlot>,
     /// The platform queue routes (`/v1/queues/<name>/{enqueue,poll,ack}`),
     /// backed by [`verglas_harness::queue`] under this queue root.
@@ -1449,17 +1448,15 @@ fn graph_error(error: GraphError) -> Response {
     }
 }
 
-/// The `verglas_sys` registry and watermark sub-router: register, list, show,
-/// and state transitions for workers, plus the deployment watermark store. Every
-/// route answers 503 until the registry handle is wired after recovery. Registry
-/// writes go through this server-held handle only — the CLI never writes
-/// `verglas_sys` directly.
+/// The `verglas_sys` registry sub-router: register, list, show, and state
+/// transitions for workers. Every route answers 503 until the registry handle
+/// is wired after recovery. Registry writes go through this server-held handle
+/// only — the CLI never writes `verglas_sys` directly.
 fn sys_router(sys: SysSlot) -> Router {
     Router::new()
         .route("/v1/workers", post(worker_register).get(worker_list))
         .route("/v1/workers/{name}", get(worker_show))
         .route("/v1/workers/{name}/state", put(worker_set_state))
-        .route("/v1/watermark", get(watermark_get).put(watermark_put))
         .with_state(sys)
 }
 
@@ -1815,76 +1812,6 @@ fn platform_error(error: verglas_platform::PlatformError) -> Response {
     (status, error.to_string()).into_response()
 }
 
-/// Query parameters for the local watermark routes: the deployment identifier.
-/// The cloud endpoint scopes the watermark by the caller's bearer token; the
-/// local server has no per-deployment tokens, so the deployment is named
-/// explicitly. The wire shape of the bodies is identical to the cloud's.
-#[derive(Debug, Deserialize)]
-struct WatermarkQuery {
-    /// The deployment whose watermark is read or written.
-    deployment: Option<String>,
-}
-
-/// The body of `PUT /v1/watermark` — the same one-key shape the cloud endpoint
-/// takes (client.ts `setWatermark`).
-#[derive(Debug, Deserialize)]
-struct WatermarkPut {
-    /// The opaque watermark value to store.
-    watermark: String,
-}
-
-/// `GET /v1/watermark?deployment=`: the deployment's durable cross-run
-/// watermark, `{"watermark": null}` before the first set — the same wire shape
-/// as the cloud endpoint (client.ts `watermark()`). 400 without a deployment.
-async fn watermark_get(
-    State(sys): State<SysSlot>,
-    Query(query): Query<WatermarkQuery>,
-) -> Response {
-    let Some(sys) = sys.get() else {
-        return recovering();
-    };
-    let Some(deployment) = query.deployment else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "the local watermark routes need a ?deployment= identifier \
-             (the cloud endpoint infers it from the bearer token)",
-        )
-            .into_response();
-    };
-    match sys.get_watermark(&deployment).await {
-        Ok(row) => Json(json!({
-            "watermark": row.map(|r| r.watermark)
-        }))
-        .into_response(),
-        Err(error) => platform_error(error),
-    }
-}
-
-/// `PUT /v1/watermark?deployment=`: stores the deployment's durable watermark,
-/// overwriting the previous value (a new append-only revision underneath).
-/// Answers 204 with no body, like the cloud endpoint. 400 without a deployment.
-async fn watermark_put(
-    State(sys): State<SysSlot>,
-    Query(query): Query<WatermarkQuery>,
-    Json(body): Json<WatermarkPut>,
-) -> Response {
-    let Some(sys) = sys.get() else {
-        return recovering();
-    };
-    let Some(deployment) = query.deployment else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "the local watermark routes need a ?deployment= identifier \
-             (the cloud endpoint infers it from the bearer token)",
-        )
-            .into_response();
-    };
-    match sys.set_watermark(&deployment, body.watermark).await {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => platform_error(error),
-    }
-}
-
 /// Query parameters for `GET /v1/workers`: which lifecycle view to list.
 #[derive(Debug, Deserialize)]
 struct ListView {
@@ -2069,7 +1996,7 @@ mod tests {
     /// admin router.
     async fn purger(dir: &std::path::Path) -> Arc<dyn CachePurger> {
         let store = std::sync::Arc::new(object_store::memory::InMemory::new());
-        let backend = PassthroughRead::new(BackendStore::single("test-bucket", store));
+        let backend = PassthroughRead::new(BackendStore::single("default", "test-bucket", store));
         let config = CacheConfig {
             dir: dir.to_path_buf(),
             capacity_bytes: ByteSize(64 * 1024 * 1024),
@@ -2139,7 +2066,7 @@ mod tests {
         let access = LocalAccess {
             s3_endpoint: "http://127.0.0.1:8333".to_owned(),
             query_uri: "http://127.0.0.1:8334".to_owned(),
-            catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
+            catalog_uri: Some("https://catalog.example.test".to_owned()),
             warehouse: Some("s3://warehouse/tenant".to_owned()),
             region: "us-east-1".to_owned(),
             bucket: Some("warehouse".to_owned()),
@@ -2871,31 +2798,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-    /// Builds a filled registry slot: a `SystemCatalog` over a fresh memory
-    /// catalog, wrapped as the server wires it post-recovery.
-    async fn sys_slot() -> SysSlot {
-        use iceberg::CatalogBuilder;
-        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-
-        let warehouse = tempfile::tempdir().expect("warehouse");
-        let catalog = MemoryCatalogBuilder::default()
-            .load(
-                "memory",
-                std::collections::HashMap::from([(
-                    MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    warehouse.path().to_str().expect("utf8").to_string(),
-                )]),
-            )
-            .await
-            .expect("memory catalog");
-        std::mem::forget(warehouse);
-        let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-        let sys = verglas_platform::SystemCatalog::new(catalog);
-        let slot: SysSlot = Arc::new(OnceLock::new());
-        let _ = slot.set(Arc::new(sys));
-        slot
-    }
-
     /// A ready router with only the given slots filled.
     fn slots_router(slots: Slots) -> Router {
         router(VERSION, Health::ready(), slots)
@@ -2956,77 +2858,6 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    /// `GET`/`PUT /v1/watermark` round-trips with exactly the cloud endpoint's
-    /// wire shape (client.ts `watermark()`/`setWatermark()`): the GET body is one
-    /// `watermark` key (null before the first set), the PUT body is one
-    /// `watermark` key, and the PUT answers 204 with no body. Locally the
-    /// deployment is named by the `?deployment=` parameter (the cloud identifies
-    /// it by bearer token).
-    #[tokio::test]
-    async fn watermark_round_trip_matches_the_cloud_wire_shape() {
-        let slot = sys_slot().await;
-        let router_of = || {
-            slots_router(Slots {
-                sys: Some(slot.clone()),
-                ..Slots::default()
-            })
-        };
-
-        // Null before the first set.
-        let response = call(router_of(), "GET", "/v1/watermark?deployment=dep-a").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = json_body(response).await;
-        assert_eq!(body, serde_json::json!({"watermark": null}), "wire shape");
-
-        // PUT stores it; 204, empty body.
-        let response = call_json(
-            router_of(),
-            "PUT",
-            "/v1/watermark?deployment=dep-a",
-            serde_json::json!({"watermark": "snap-42"}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        // GET returns exactly {"watermark": "snap-42"}.
-        let body =
-            json_body(call(router_of(), "GET", "/v1/watermark?deployment=dep-a").await).await;
-        assert_eq!(body, serde_json::json!({"watermark": "snap-42"}));
-
-        // Another deployment still reads null.
-        let body =
-            json_body(call(router_of(), "GET", "/v1/watermark?deployment=dep-b").await).await;
-        assert_eq!(body, serde_json::json!({"watermark": null}));
-    }
-
-    /// The local watermark routes require the `?deployment=` identifier — a
-    /// request without one is a 400, never a guess.
-    #[tokio::test]
-    async fn watermark_without_a_deployment_is_a_400() {
-        let slot = sys_slot().await;
-        let response = call(
-            slots_router(Slots {
-                sys: Some(slot.clone()),
-                ..Slots::default()
-            }),
-            "GET",
-            "/v1/watermark",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let response = call_json(
-            slots_router(Slots {
-                sys: Some(slot),
-                ..Slots::default()
-            }),
-            "PUT",
-            "/v1/watermark",
-            serde_json::json!({"watermark": "w"}),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     /// Sends a request with a raw (non-JSON) body and returns the response.

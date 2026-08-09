@@ -111,7 +111,7 @@ async fn connect_separates_catalog_from_server_cache() {
     let access = LocalAccess {
         s3_endpoint: "http://127.0.0.1:8333".to_owned(),
         query_uri: query_uri.to_owned(),
-        catalog_uri: Some("https://tenant.catalog.verglas.dev".to_owned()),
+        catalog_uri: Some("https://catalog.example.test".to_owned()),
         warehouse: Some("s3://warehouse/tenant".to_owned()),
         region: "auto".to_owned(),
         bucket: Some("warehouse".to_owned()),
@@ -136,7 +136,7 @@ async fn connect_separates_catalog_from_server_cache() {
     let client = Client::connect(ConnectOptions::new(endpoint).with_token("scoped-access-token"))
         .await
         .expect("connect client");
-    assert_eq!(client.catalog_uri(), "https://tenant.catalog.verglas.dev");
+    assert_eq!(client.catalog_uri(), "https://catalog.example.test");
     assert_eq!(client.query_uri(), query_uri);
     assert_eq!(client.s3_endpoint(), Some("http://127.0.0.1:8333"));
 }
@@ -147,14 +147,14 @@ async fn container_environment_shape_connects_without_admin_service() {
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
             .with_query_uri("http://verglas:8334")
-            .with_catalog_uri("https://tenant.catalog.verglas.dev")
+            .with_catalog_uri("https://catalog.example.test")
             .with_warehouse("s3://warehouse/tenant")
             .with_s3_endpoint("http://verglas:8333")
             .with_token("catalog-token"),
     )
     .await
     .expect("connect without admin service");
-    assert_eq!(client.catalog_uri(), "https://tenant.catalog.verglas.dev");
+    assert_eq!(client.catalog_uri(), "https://catalog.example.test");
     assert_eq!(client.s3_endpoint(), Some("http://verglas:8333"));
 }
 

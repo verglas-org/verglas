@@ -33,7 +33,7 @@ pub struct QueryConfig {
     /// `[log]` shape `verglas-server` uses.
     #[serde(default)]
     pub log: Log,
-    /// Memory-grant behavior. Fixed-memory microVMs can skip the redundant
+    /// Memory-grant behavior. Fixed-memory deployments can skip the redundant
     /// estimate pass before each query; dynamically granted workers retain it.
     #[serde(default)]
     pub memory: Memory,
@@ -50,17 +50,17 @@ pub struct QueryConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Memory {
-    /// Estimate and grow the grant before every query. A Firecracker VM with a
-    /// fixed allocation should set this false because its local grant host is
+    /// Estimate and grow the grant before every query. A process with a fixed
+    /// allocation should set this false because its local grant host is
     /// bookkeeping-only and the estimate otherwise repeats catalog I/O.
     pub estimate_on_request: bool,
     /// Hard DataFusion operator-memory ceiling. Spillable operators write
     /// temporary state to disk above this boundary rather than OOM-killing the
-    /// query microVM. The cloud launcher sets this from the assigned guest RAM.
+    /// query process. Operators set this from the assigned process memory.
     pub limit_bytes: usize,
-    /// Writable directory reserved for DataFusion spill files. Cloud query
-    /// microVMs mount their host-local ephemeral block device here; leaving it
-    /// unset retains DataFusion's normal OS temporary directory for local use.
+    /// Writable directory reserved for DataFusion spill files. Deployments may
+    /// mount a host-local ephemeral block device here; leaving it unset retains
+    /// DataFusion's normal OS temporary directory.
     pub spill_path: Option<std::path::PathBuf>,
 }
 

@@ -160,11 +160,15 @@ fn origin() -> Store {
 /// Serves the front-end over a production-shaped registry (raw client from env)
 /// on an ephemeral port; returns the proxy base URL.
 async fn serve_proxy() -> String {
-    let registry = BackendStore::from_config(&Backend {
-        bucket: Some("versioned-bucket".to_owned()),
-        ..Backend::default()
-    });
+    let registry = BackendStore::from_config(
+        "default",
+        &Backend {
+            bucket: Some("versioned-bucket".to_owned()),
+            ..Backend::default()
+        },
+    );
     let app = verglas_s3::router(
+        "default",
         PassthroughRead::new(registry.clone()),
         PassthroughWrite::new(registry.clone()),
         Arc::new(PassthroughList::new(registry)),

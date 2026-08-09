@@ -88,7 +88,7 @@ pub async fn run(
 
 /// Drops a table via the tenant's Iceberg REST catalog. This is the one table
 /// verb that does not go through the server: dropping a table is a catalog
-/// control-plane operation, so it reads the `[catalog]` uri and bearer from
+/// operation, so it reads the `[catalog]` uri and bearer from
 /// `~/.verglas/config.toml` and issues the REST drop-table call. Requires
 /// `--yes` or an interactive `y` confirmation; prints exactly what will be
 /// dropped before doing it.

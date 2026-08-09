@@ -87,6 +87,7 @@ async fn build_mapper(
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: ident.clone(),
                 bucket: sidecar.bucket.clone(),
                 metadata_key: sidecar.metadata_key.clone(),
@@ -109,6 +110,7 @@ async fn real_pyiceberg_table_walks_and_classifies() {
     // format/size/partition from pyiceberg's v2 manifest entries.
     let plan = iceberg::walk_snapshot(
         &fetch,
+        "managed-lakehouse",
         &bucket,
         &sidecar.metadata_key,
         sidecar.current_snapshot_id,
@@ -302,6 +304,7 @@ async fn corrupted_manifest_missing_file_format_fails_the_walk() {
     // Find the current snapshot's manifest via the (valid) walk first.
     let plan = iceberg::walk_snapshot(
         &fetch,
+        "managed-lakehouse",
         &bucket,
         &sidecar.metadata_key,
         sidecar.current_snapshot_id,
@@ -331,6 +334,7 @@ async fn corrupted_manifest_missing_file_format_fails_the_walk() {
     // are asserting real content, not vacuously passing.
     let err = iceberg::walk_snapshot(
         &fetch,
+        "managed-lakehouse",
         &bucket,
         &sidecar.metadata_key,
         sidecar.current_snapshot_id,
@@ -372,6 +376,7 @@ async fn corrupted_metadata_json_missing_location_fails_the_build() {
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: TableIdent::new(&["db"], "events"),
                 bucket: sidecar.bucket.clone(),
                 metadata_key: sidecar.metadata_key.clone(),

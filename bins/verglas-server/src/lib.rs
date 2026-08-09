@@ -6,7 +6,7 @@
 //! layers so they can be tested without spawning a process:
 //!
 //! - [`admin`]: the admin HTTP router and its route handlers, including the
-//!   `verglas_sys` registry, watermark, and platform queue routes.
+//!   `verglas_sys` registry and platform queue routes.
 //! - [`platform`]: optional REST and catalog trigger ingress into the external
 //!   scheduler service.
 //! - [`logging`]: the process-global tracing subscriber and its reloadable
@@ -16,7 +16,6 @@
 //!   configured it is the sole query engine (no embedded fallback on
 //!   dispatch failure). When unset, `/v1/query` stays on the embedded engine.
 
-pub mod node_report;
 pub use verglas_rest::{admin, follow, logging, platform, query_worker, write_worker};
 
 /// The server version, from the package manifest. Reported by `/admin/version`

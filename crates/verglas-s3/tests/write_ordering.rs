@@ -246,9 +246,11 @@ async fn serve_model() -> (String, Arc<InMemory>) {
     let store = Arc::new(InMemory::new());
     let model = ModelCache::new(store.clone());
     let base = serve(verglas_s3::router(
+        "default",
         model.clone(),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
         Arc::new(PassthroughList::new(BackendStore::single(
+            "default",
             BUCKET,
             store.clone(),
         ))),
@@ -600,6 +602,7 @@ async fn model_cache_serves_stale_until_invalidated() {
     let store = Arc::new(InMemory::new());
     let cache = ModelCache::new(store.clone());
     let key = CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: "proof.bin".to_owned(),
     };

@@ -132,6 +132,7 @@ async fn ring_reflects_live_membership() {
     assert_eq!(ring_a.members().len(), 3);
     for i in 0..500u32 {
         let key = verglas_core::CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "lake".to_owned(),
             key: format!("obj-{i}"),
         };
