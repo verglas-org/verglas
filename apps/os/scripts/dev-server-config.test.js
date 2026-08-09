@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 
-import { getWranglerPortFromBackendHost } from "./dev-server-config.js";
+import {
+  getWranglerIpFromBackendHost,
+  getWranglerPortFromBackendHost,
+} from "./dev-server-config.js";
+
+describe("getWranglerIpFromBackendHost", () => {
+  it("extracts the address used by a containerized Wrangler server", () => {
+    assert.equal(getWranglerIpFromBackendHost("0.0.0.0:8787"), "0.0.0.0");
+    assert.equal(getWranglerIpFromBackendHost("[::]:8787"), "::");
+  });
+});
 
 describe("getWranglerPortFromBackendHost", () => {
   it("extracts a port from a localhost backend host", () => {

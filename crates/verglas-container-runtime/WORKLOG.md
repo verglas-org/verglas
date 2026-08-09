@@ -28,3 +28,4 @@
   proxying, and Application previews stay; product examples are no longer bundled.
 
 - #65/#66: Strengthened Docker packaging assertions against gadget-runtime/gadget-host leftovers and required Bun from oven/bun; README now describes Docker-only local placement without Firecracker or Verglas Cloud.
+- #75: Documented the default OSS Compose topology now that it starts the scheduler and its durable Postgres queue alongside the runtime manager. Dynamically added Vessels and database components remain owned by the runtime API.

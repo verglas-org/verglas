@@ -1,10 +1,11 @@
-# Self-hosted Verglas cache server.
+# Complete open-source Verglas development and community stack.
 #
 # 1. Export the R2, catalog, and client-facing S3 values required below.
 # 2. docker compose up -d --build
 # 3. Point the CLI at the admin port:
 #      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
-#    Engines point S3 at http://127.0.0.1:8333.
+#    Engines point S3 at http://127.0.0.1:8333 and Verglas OS is at
+#    http://127.0.0.1:8787.
 
 services:
   verglas-server:
@@ -33,10 +34,7 @@ services:
       VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
       VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
       VERGLAS_WRITE_WORKER_BINARY: /usr/local/bin/verglas-write
-      # Leave empty to run Verglas without worker scheduling. To enable the
-      # scheduler, create it through the local container runtime and set this
-      # to its stable network address.
-      VERGLAS_SCHEDULER_URL: ${VERGLAS_SCHEDULER_URL:-}
+      VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
     volumes:
@@ -47,6 +45,39 @@ services:
       nofile:
         soft: 8192
         hard: 8192
+    restart: unless-stopped
+
+  verglas-scheduler:
+    build:
+      context: .
+      target: verglas-scheduler
+    image: verglas/verglas-scheduler:local
+    environment:
+      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas
+      VERGLAS_SCHEDULER_VERGLAS_URL: http://verglas-server:8334
+      VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
+      VERGLAS_SCHEDULER_QUEUE: local
+      VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
+    depends_on:
+      verglas-server:
+        condition: service_started
+      verglas-workers-postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  verglas-workers-postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: verglas
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
+      POSTGRES_DB: verglas
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U verglas -d verglas"]
+      interval: 2s
+      timeout: 5s
+      retries: 15
+    volumes:
+      - verglas-workers-postgres:/var/lib/postgresql/data
     restart: unless-stopped
 
   verglas-container-runtime:
@@ -69,9 +100,36 @@ services:
         condition: service_started
     restart: unless-stopped
 
+  verglas-os:
+    build:
+      context: .
+      target: verglas-os
+    image: verglas/verglas-os:local
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      VITE_BACKEND_HOST: 0.0.0.0:8787
+      VERGLAS_ADMIN_URL: http://verglas-server:8334
+      VERGLAS_DATA_ENDPOINT: http://verglas-server:8334
+      VERGLAS_DATA_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+      VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340
+      VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
+      VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
+      VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
+      LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
+    depends_on:
+      verglas-server:
+        condition: service_started
+      verglas-scheduler:
+        condition: service_started
+      verglas-container-runtime:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   verglas-cache:
   verglas-runtime-state:
+  verglas-workers-postgres:
 
 networks:
   default:
