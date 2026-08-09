@@ -3,13 +3,15 @@
 # Build:  docker build -t verglas/verglas-server .
 # Run:    see docker-compose.yml
 
-FROM rust:bookworm AS build
+FROM rust:bookworm AS build-base
 WORKDIR /src
 # Install the workspace-pinned toolchain before copying sources so layer
 # caching survives source edits.
 COPY rust-toolchain.toml ./
 RUN rustup show
 COPY . .
+
+FROM build-base AS build
 RUN cargo build --release \
     -p verglas-server \
     -p verglas-scheduler-bin \
@@ -17,6 +19,9 @@ RUN cargo build --release \
     -p verglas-container-runtime \
     -p verglas-query \
     -p verglas-write-node
+
+FROM build-base AS cache-node-build
+RUN cargo build --release -p verglas-cache-node
 
 FROM oven/bun:1.3.8 AS gadget-host
 WORKDIR /opt/verglas-gadget-runtime
@@ -89,3 +94,9 @@ COPY --from=build /src/target/release/verglas-write /usr/local/bin/verglas-write
 USER verglas
 EXPOSE 8333 8334
 ENTRYPOINT ["verglas-server", "--environment"]
+
+FROM runtime AS verglas-cache-node
+COPY --from=cache-node-build /src/target/release/verglas-cache-node /usr/local/bin/verglas-cache-node
+USER verglas
+EXPOSE 5454 8333 8334 8335 8336
+ENTRYPOINT ["verglas-cache-node"]

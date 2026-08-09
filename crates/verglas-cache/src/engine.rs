@@ -132,7 +132,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use foyer::{
     BlockEngineConfig, Cache, CacheBuilder, DeviceBuilder, FileDeviceBuilder, HybridCache,
-    HybridCacheBuilder, HybridCacheEntry, HybridCachePolicy, RecoverMode,
+    HybridCacheBuilder, HybridCacheEntry, HybridCachePolicy, LfuConfig, RecoverMode,
 };
 use futures::TryStreamExt;
 use futures::future::{BoxFuture, FutureExt, Shared};
@@ -156,6 +156,7 @@ use crate::classify::{MetaClass, MetaRouter, Mutability, classify_mutability};
 use crate::counters::CacheCounters;
 use crate::demotion::{DEMOTED_GENERATION_BIT, Demotions};
 use crate::entry::{BlockEntryKey, CachedMeta};
+use crate::materialized::{MaterializedPageError, MaterializedPageKey, POSTGRES_PAGE_BYTES};
 use crate::meta_store::{
     META_DISK_MIN_BYTES, META_PIPELINE_RESERVED_BYTES, MetaEntryKey, MetaStore, foyer_block_size,
 };
@@ -1368,6 +1369,109 @@ where
         self.inner.inflight.size.load(Ordering::Relaxed)
     }
 
+    /// Reads one exact reconstructed PostgreSQL page from the shared DRAM/NVMe
+    /// cache without consulting the object-store backend. Foyer observes every
+    /// DRAM and disk hit, so its W-TinyLFU policy learns page demand alongside
+    /// ordinary Iceberg block demand.
+    pub async fn get_materialized_page(&self, key: &MaterializedPageKey) -> Option<Bytes> {
+        let block = key.block_key();
+        let block_key = self.inner.block_entry_key(block.clone());
+        if let Some(entry) = self.inner.blocks.memory().get(&block_key) {
+            self.inner.admission.record_hit(&block_key);
+            CacheCounters::bump(&self.inner.counters.dram_hits);
+            CacheCounters::add(
+                &self.inner.counters.dram_bytes_served,
+                POSTGRES_PAGE_BYTES as u64,
+            );
+            return Some(entry.value().clone());
+        }
+        CacheCounters::bump(&self.inner.counters.dram_misses);
+
+        match self.inner.blocks.get(&block_key).await {
+            Ok(Some(entry)) if entry.value().len() == POSTGRES_PAGE_BYTES => {
+                self.inner.admission.record_hit(&block_key);
+                CacheCounters::bump(&self.inner.counters.disk_hits);
+                CacheCounters::add(
+                    &self.inner.counters.disk_bytes_served,
+                    POSTGRES_PAGE_BYTES as u64,
+                );
+                return Some(entry.value().clone());
+            }
+            Ok(_) | Err(_) => {
+                CacheCounters::bump(&self.inner.counters.disk_misses);
+            }
+        }
+
+        let owner = self.inner.ring.owner(&block.object);
+        if owner == self.inner.node {
+            return None;
+        }
+        match self.inner.peers.fetch(owner, &block).await {
+            Ok(Some(page)) if page.len() == POSTGRES_PAGE_BYTES => {
+                CacheCounters::bump(&self.inner.counters.peer_hits);
+                if self.inner.admit_block(&block_key, page.len()) {
+                    self.inner.insert_block(block_key, page.clone());
+                }
+                Some(page)
+            }
+            Ok(_) => {
+                CacheCounters::bump(&self.inner.counters.peer_misses);
+                None
+            }
+            Err(_) => {
+                CacheCounters::bump(&self.inner.counters.peer_errors);
+                None
+            }
+        }
+    }
+
+    /// Offers one exact reconstructed PostgreSQL page to the shared admission
+    /// policy. Rejection is a normal result: the caller already owns the page
+    /// bytes and serves them without caching.
+    pub async fn put_materialized_page(
+        &self,
+        key: MaterializedPageKey,
+        page: Bytes,
+    ) -> Result<bool, MaterializedPageError> {
+        if page.len() != POSTGRES_PAGE_BYTES {
+            return Err(MaterializedPageError::InvalidSize { actual: page.len() });
+        }
+        let block = key.block_key();
+        let owner = self.inner.ring.owner(&block.object);
+        if owner != self.inner.node {
+            return Ok(self
+                .inner
+                .peers
+                .store(owner, &block, page)
+                .await
+                .unwrap_or(false));
+        }
+        self.put_local_materialized_block(block, page)
+    }
+
+    /// Admits a peer-routed materialized page on this node after validating
+    /// that the request names the reserved page namespace and current owner.
+    pub fn put_local_materialized_block(
+        &self,
+        block: BlockKey,
+        page: Bytes,
+    ) -> Result<bool, MaterializedPageError> {
+        if page.len() != POSTGRES_PAGE_BYTES
+            || block.object.bucket != "@verglas-neon-pages"
+            || block.block_bytes != POSTGRES_PAGE_BYTES as u64
+            || block.block_index != 0
+            || self.inner.ring.owner(&block.object) != self.inner.node
+        {
+            return Err(MaterializedPageError::InvalidBlock);
+        }
+        let block_key = self.inner.block_entry_key(block);
+        if !self.inner.admit_block(&block_key, page.len()) {
+            return Ok(false);
+        }
+        self.inner.insert_block(block_key, page);
+        Ok(true)
+    }
+
     /// Serves one block to a *peer* (#29): the exact [`BlockKey`], from this
     /// node's local cache tiers only (DRAM then disk), or `None` on a miss.
     ///
@@ -1406,11 +1510,13 @@ where
         let block_key = self.inner.block_entry_key(block.clone());
         // Rung 1: DRAM, probed directly.
         if let Some(entry) = self.inner.blocks.memory().get(&block_key) {
+            self.inner.admission.record_hit(&block_key);
             return Some(self.record_peer_served(entry.value().clone()));
         }
         // Rung 2: disk. A failing disk tier is a miss to the peer, never an
         // error — the requester degrades to a backend fill.
         if let Ok(Some(entry)) = self.inner.blocks.get(&block_key).await {
+            self.inner.admission.record_hit(&block_key);
             return Some(self.record_peer_served(entry.value().clone()));
         }
         None
@@ -1790,6 +1896,17 @@ async fn build_caches(
         // point, and scan-resistant admission (#15) still gates what is written.
         .with_policy(HybridCachePolicy::WriteOnInsertion)
         .memory(memory_capacity)
+        // Foyer 0.22.3 documents W-TinyLFU as the default but constructs its
+        // memory cache with LRU unless this is explicit. Pin the intended
+        // policy so repeated Neon pages and Iceberg blocks beat one-touch scan
+        // candidates in the same victim comparison.
+        .with_eviction_config(LfuConfig {
+            // Keep the unfiltered recency window small. A large window lets a
+            // sequential scan displace reused entries before TinyLFU compares
+            // candidate and victim frequencies.
+            window_capacity_ratio: 0.01,
+            ..LfuConfig::default()
+        })
         // Shard count derived so a shard always fits several blocks — the
         // #122 ceiling invariant (see `shard_min_capacity_bytes`). Regression
         // tripwire: the shard-parameterized DRAM ceiling test.
@@ -3254,6 +3371,7 @@ where
         // Rung 1: local DRAM. Probed directly (rather than through the
         // hybrid getter) so DRAM and disk hits are separately observable.
         if let Some(block) = block_payload(self.blocks.memory().get(&block_key), expected_len) {
+            self.admission.record_hit(&block_key);
             CacheCounters::bump(&self.counters.dram_hits);
             return Ok(BlockServe::Buffered(block, Tier::Dram));
         }
@@ -3265,6 +3383,7 @@ where
         match self.blocks.get(&block_key).await {
             Ok(entry) => {
                 if let Some(block) = block_payload(entry, expected_len) {
+                    self.admission.record_hit(&block_key);
                     CacheCounters::bump(&self.counters.disk_hits);
                     return Ok(BlockServe::Buffered(block, Tier::Disk));
                 }
@@ -3921,11 +4040,11 @@ where
     }
 
     /// Scan-resistant admission gate (#15) for one data block: records the
-    /// access in the frequency sketch, bumps the admitted/rejected counter, and
-    /// returns whether the block should be inserted. Cold path only — every
-    /// caller is inside a backend/peer fill, never a warm hit, so this adds no
-    /// lock or allocation to the warm read path. A rejected block is still
-    /// served to the client; it is simply not cached.
+    /// miss in the frequency sketch, bumps the admitted/rejected counter, and
+    /// returns whether the block should be inserted. Every caller is inside a
+    /// backend/peer fill. Warm hits update the same lock-free sketch at their
+    /// lookup sites. A rejected block is still served to the client; it is
+    /// simply not cached.
     fn admit_block(&self, key: &BlockEntryKey, weight: usize) -> bool {
         // Runtime disk-full guardrail (#96): while caching is paused the disk is
         // out of room, so admit nothing. The block is still served to the client

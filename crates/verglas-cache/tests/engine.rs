@@ -473,6 +473,17 @@ impl PeerFetch for RecordingPeer {
         self.calls.fetch_add(1, Ordering::Relaxed);
         std::future::ready(Ok(None))
     }
+
+    /// Records owner placement as another peer call and accepts the value.
+    fn store(
+        &self,
+        _node: NodeId,
+        _block: &verglas_core::BlockKey,
+        _value: Bytes,
+    ) -> impl Future<Output = Result<bool, PeerFetchError>> + Send {
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        std::future::ready(Ok(true))
+    }
 }
 
 /// A ring whose owner is always the fixed (remote) node — the mock that

@@ -489,3 +489,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #74: Classified observed Neon immutable layer keys as immutable cache data.
   Layer ranges now enter the same scan-resistant DRAM and NVMe admission policy
   as Iceberg ranges. Mutable `index_part` publication remains version-checked.
+- #74: Added exact reconstructed Neon pages to the ordinary hybrid block store.
+  Foyer now uses explicit W-TinyLFU instead of its constructor's LRU default, so
+  every DRAM hit updates shared frequency and admission compares new entries
+  with resident victims. The outer NVMe admission sketch now records successful
+  DRAM and NVMe lookups as well as fills. Neon pages and Iceberg blocks share
+  one DRAM/NVMe budget. Mixed-size, one-touch, cyclic-scan, and shifting-hotset
+  regressions cover the shared policy.

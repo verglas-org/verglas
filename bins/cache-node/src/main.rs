@@ -19,6 +19,7 @@ mod admin;
 mod blockdev;
 mod logging;
 mod nbd;
+mod page_cache;
 mod ring;
 mod safekeeper;
 mod serve;

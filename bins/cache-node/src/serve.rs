@@ -1,5 +1,5 @@
 //! The cache serving path: build the origin backend, probe it, build the hybrid
-//! cache engine over a single-node rendezvous ring, run the disk-full guardrail
+//! cache engine over the fleet rendezvous ring, run the disk-full guardrail
 //! poll, and serve the SigV4 S3 endpoint with read-through and ring write-back.
 //!
 //! This is the CACHE-relevant subset of `bins/verglas-server/src/main.rs::serve`,
@@ -8,11 +8,11 @@
 //!
 //! ## Read ownership and write durability
 //!
-//! - **Ring**: a [`RendezvousRing::single`] node owns every key, so the read
-//!   path never consults a peer. This is byte-identical ownership to a verglas-server
-//!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
-//!   dependency (gossip, peer RPC, fragment store).
-//! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
+//! - **Ring**: configured cache nodes share one fixed rendezvous map. Object
+//!   blocks and reconstructed Neon pages therefore have one owner and one heat
+//!   economy across the fleet. A node with no ring remains a cluster of one.
+//! - **Peers**: owner lookups and materialized-page placements use the same
+//!   internal HTTP/2 listener as durable fragment RPC.
 //! - **Object write-back**: a configured fragment ring stages every S3 PUT as
 //!   erasure-coded, fsynced fragments before acknowledgement. Dirty fragments
 //!   remain outside normal cache eviction while origin propagation runs.
@@ -29,11 +29,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
+use verglas_cluster::peer::PeerClient;
 use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo, WritebackStatsInfo};
 use verglas_core::config::Config;
 use verglas_core::metrics::NodeMetrics;
 use verglas_core::node::NodeId;
-use verglas_core::peer::NoopPeerFetch;
 use verglas_core::ring::RendezvousRing;
 use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
 use verglas_write::{
@@ -54,9 +54,8 @@ const SINGLE_NODE_ID: &str = "single";
 const BLOCK_PORT: u16 = 8335;
 
 /// The concrete engine the cache node runs: the hybrid cache over the
-/// single-bucket passthrough backend, with a one-member rendezvous ring and the
-/// no-op peer fetch. No `verglas-cluster` types appear here.
-type CacheEngine = HybridCacheEngine<PassthroughRead, NoopPeerFetch, RendezvousRing>;
+/// single-bucket passthrough backend and the fleet's cache-only peer transport.
+pub(crate) type CacheEngine = HybridCacheEngine<PassthroughRead, PeerClient, RendezvousRing>;
 type WritebackSlot = Arc<std::sync::OnceLock<Arc<WritebackMetrics>>>;
 
 /// Builds the all-object policy used by a tenant cache ring. Neon uploads both
@@ -325,6 +324,7 @@ pub async fn run(
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
     let writeback_slot: WritebackSlot = Arc::new(std::sync::OnceLock::new());
+    let page_cache_slot: crate::page_cache::PageCacheSlot = Arc::new(std::sync::OnceLock::new());
 
     // The cache node is the sole owner of upstream catalog credentials and
     // change tracking. The gateway and watcher share one response cache. In the
@@ -394,6 +394,7 @@ pub async fn run(
                 &config.cache.dir,
                 config.cache.capacity_bytes.0,
                 &device_registry,
+                Arc::clone(&page_cache_slot),
             )
             .await?
             .map(Arc::new);
@@ -439,6 +440,7 @@ pub async fn run(
         stats_slot.clone(),
         metrics_slot.clone(),
     );
+    admin_app = admin_app.merge(crate::page_cache::router(Arc::clone(&page_cache_slot)));
     if let Some((device_registry, _)) = &block_registry {
         admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
     }
@@ -460,15 +462,24 @@ pub async fn run(
 
     let data_plane = async {
         let backend = PassthroughRead::new(registry.clone());
-        let node = NodeId::new(SINGLE_NODE_ID);
-        let ring = RendezvousRing::single(node.clone());
+        let (node, ring, peers) = match &object_ring {
+            Some(ring) => (ring.node_id(), ring.read_ring(), ring.read_client()),
+            None => {
+                let node = NodeId::new(SINGLE_NODE_ID);
+                (
+                    node.clone(),
+                    RendezvousRing::single(node),
+                    PeerClient::disabled(),
+                )
+            }
+        };
 
         // Disk recovery runs inside the engine build (foyer rescans its regions
         // and rebuilds the index). Time it for the operator log (#16).
         let recovery_start = std::time::Instant::now();
         let engine = HybridCacheEngine::new_with_background_fill_limit(
             backend,
-            NoopPeerFetch,
+            peers,
             ring,
             node,
             &config.cache,
@@ -502,6 +513,7 @@ pub async fn run(
             registry.clone(),
             Arc::clone(&writeback_slot),
         ));
+        let _ = page_cache_slot.set(engine.clone());
         health.mark_ready();
 
         serve_s3(
@@ -899,7 +911,7 @@ mod tests {
         let ring = RendezvousRing::single(node.clone());
         let engine = HybridCacheEngine::new_with_background_fill_limit(
             backend,
-            NoopPeerFetch,
+            PeerClient::disabled(),
             ring,
             node,
             &config.cache,

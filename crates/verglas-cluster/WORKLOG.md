@@ -97,3 +97,6 @@
 - #74: Added a prefix-filtered fragment identity RPC for replicated write-back
   journal discovery. The response carries identities only; object bytes still
   use the checksum-verified fragment load endpoint.
+- #74: Added an authenticated cache-only block placement RPC. Reconstructed
+  Neon pages use it to reach their rendezvous owner; the owner validates the
+  reserved namespace and exact page geometry before shared-policy admission.

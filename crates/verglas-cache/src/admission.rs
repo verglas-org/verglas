@@ -65,10 +65,10 @@
 //!
 //! # Hot-path discipline
 //!
-//! Every method here is lock-free (plain relaxed atomics) and is called only on
-//! the *cold* fill path — a warm cache hit never touches the sketch. The aging
-//! sweep is O(width × depth) but amortized one per sampling window and likewise
-//! off the warm path.
+//! Every method here is lock-free (plain relaxed atomics). Both hits and misses
+//! update the sketch, so admission reflects observed demand instead of refill
+//! count. The aging sweep is O(width × depth), amortized over the sampling
+//! window.
 
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -306,6 +306,15 @@ impl Admission {
             self.admitted_bytes.fetch_add(weight, Ordering::Relaxed);
         }
         admit
+    }
+
+    /// Records a successful DRAM or NVMe lookup. Foyer's W-TinyLFU records the
+    /// same access for DRAM victim comparison; this sketch also carries that
+    /// heat into the outer disk-admission gate.
+    pub(crate) fn record_hit(&self, key: &BlockEntryKey) {
+        if self.enabled {
+            self.sketch.increment_and_estimate(hash_key(key));
+        }
     }
 
     /// Records a partial-read candidate and returns whether it has demonstrated

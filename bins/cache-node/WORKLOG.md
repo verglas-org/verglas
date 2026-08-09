@@ -66,3 +66,24 @@
 - #74: Made origin probing asynchronous so a cache node recovers and serves
   dirty ring data during an origin outage. The fragment server now exposes the
   journal-manifest discovery callback used by cross-node dirty reads.
+- #74: Exposed the cache-only reconstructed-page protocol on the admin listener.
+  Neon pageservers can GET and PUT exact tenant/timeline/relation/block/LSN
+  identities through the same hybrid engine as Iceberg data. The route returns
+  503 until cache recovery installs the engine and rejects non-8-KiB bodies.
+- #74: Added a `verglas-cache-node` Docker target so the integrated cache,
+  reconstructed-page, and embedded-safekeeper process can be built and tested
+  as the same container deployed by the fleet.
+- #74: Added a four-container ring smoke test. It asserts exact reconstructed-
+  page round trips and hit accounting, stops one member, then proves a new S3
+  write is acknowledged through the remaining three-member quorum and later
+  appears at the origin.
+- #74: Extended the fleet rendezvous ring to clean cache ownership. A page PUT
+  received by any cache node is admitted by its owner, and a GET through a
+  different node fetches the exact version from that owner before keeping a
+  local hot replica. The same owner protocol now applies to ordinary object
+  blocks, so Neon and Iceberg heat is shared across nodes instead of partitioned
+  by whichever ingress received a request.
+- #74: Strengthened the four-node container test with cache-0 PUT to cache-1
+  GET, safekeeper broker publication, a real Neon query-after-write workload,
+  repeated scans that must increase reconstructed-page DRAM hits, and a quorum
+  write after one ring member stops.

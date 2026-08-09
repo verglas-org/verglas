@@ -10,8 +10,9 @@
 //! - builds the flush plane ([`RingWriteback`]) over the SAME chunk store the
 //!   device registry stages into (the plane's barrier and the devices' staging
 //!   must be one store);
-//! - serves the fragment RPC endpoints peers place shards through, on the ring
-//!   plane's own listener — bound like `:8333`/`:8335`, with no new authz in v1;
+//! - serves cache-owner reads, materialized-page placements, and fragment RPC
+//!   through the ring plane's listener — bound like `:8333`/`:8335`, with no
+//!   new authz in v1;
 //!   tenant isolation is the existing VXLAN model, exactly as the NBD plane's
 //!   stance (a shared cluster secret is honoured if the env sets one, but none is
 //!   required);
@@ -33,10 +34,12 @@ use verglas_block::{
     FragmentTransport, LiveMembership, LocalFragmentStore, PeerFragmentTransport, RingWriteback,
 };
 use verglas_cluster::peer::{
-    FragmentHandlers, FragmentShardStream, LocalBlockFn, PeerResolver, PeerServer,
+    FragmentHandlers, FragmentShardStream, LocalBlockFn, LocalBlockStoreFn, PeerClient,
+    PeerResolver, PeerServer,
 };
 use verglas_cluster::{FragmentClient, FragmentIoError, FragmentKey, FragmentRecord};
 use verglas_core::node::NodeId;
+use verglas_core::ring::RendezvousRing;
 
 use crate::VERSION;
 use crate::blockdev::DeviceRegistry;
@@ -56,6 +59,10 @@ const TAKEOVER_INTERVAL: Duration = Duration::from_secs(5);
 pub struct RingPlane {
     /// Stable identity of this cache node in the ring.
     self_id: NodeId,
+    /// Read-cache ownership shared by every node in this static fleet ring.
+    read_ring: RendezvousRing,
+    /// Peer transport used for owner lookups and materialized-page placement.
+    read_client: PeerClient,
     /// Shared local/peer fragment transport.
     transport: Arc<dyn FragmentTransport>,
     /// Shared view of live fragment holders.
@@ -72,6 +79,21 @@ pub struct RingPlane {
 }
 
 impl RingPlane {
+    /// Returns this process's stable read-cache identity.
+    pub fn node_id(&self) -> NodeId {
+        self.self_id.clone()
+    }
+
+    /// Returns the static rendezvous ownership map for ordinary cache data.
+    pub fn read_ring(&self) -> RendezvousRing {
+        self.read_ring.clone()
+    }
+
+    /// Returns the cache-only peer transport.
+    pub fn read_client(&self) -> PeerClient {
+        self.read_client.clone()
+    }
+
     /// Returns the fragment transport shared by block FLUSH and WAL.
     pub fn transport(&self) -> Arc<dyn FragmentTransport> {
         Arc::clone(&self.transport)
@@ -119,6 +141,7 @@ pub async fn setup(
     cache_dir: &std::path::Path,
     capacity_bytes: u64,
     registry: &DeviceRegistry,
+    page_cache: crate::page_cache::PageCacheSlot,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
     let peers = match env_var("VERGLAS_RING_PEERS") {
         Some(raw) => parse_peers(&raw),
@@ -160,8 +183,15 @@ pub async fn setup(
     // The peer RPC client + transport: self-directed placements go to the local
     // store, everything else over the fragment RPC to the resolved peer address.
     let resolver: Arc<dyn PeerResolver> = Arc::new(RingResolver::new(&peers));
+    let read_client = PeerClient::new(
+        Arc::clone(&resolver),
+        secret.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    );
+    let read_ring = RendezvousRing::new(peers.iter().map(|(id, _)| id.clone()).collect())?;
     let client = FragmentClient::new(
-        resolver,
+        Arc::clone(&resolver),
         secret.clone(),
         Duration::from_millis(500),
         Duration::from_secs(30),
@@ -186,15 +216,37 @@ pub async fn setup(
     );
     registry.attach_ring(Arc::clone(&ring));
 
-    // Serve the fragment endpoints peers place shards through. The block-fetch
-    // source is a no-op — the ring plane serves only fragments.
+    // Serve both the clean read-cache owner protocol and the durable fragment
+    // protocol on the ring listener. The deferred slot returns a clean miss or
+    // placement error until cache recovery completes.
     let ring_addr: SocketAddr = env_var("VERGLAS_RING_ADDR")
         .unwrap_or_else(|| DEFAULT_RING_ADDR.to_owned())
         .parse()?;
-    let peer_server = PeerServer::bind_with_fragments(
+    let source_slot = Arc::clone(&page_cache);
+    let source: LocalBlockFn = Arc::new(move |block| {
+        let slot = Arc::clone(&source_slot);
+        Box::pin(async move {
+            let engine = slot.get()?;
+            engine.local_block(&block).await
+        })
+    });
+    let store_slot = page_cache;
+    let store: LocalBlockStoreFn = Arc::new(move |block, value| {
+        let slot = Arc::clone(&store_slot);
+        Box::pin(async move {
+            let engine = slot
+                .get()
+                .ok_or_else(|| "cache recovery is not complete".to_owned())?;
+            engine
+                .put_local_materialized_block(block, value)
+                .map_err(|error| error.to_string())
+        })
+    });
+    let peer_server = PeerServer::bind_with_store_and_fragments(
         ring_addr,
         secret,
-        noop_block_source(),
+        source,
+        store,
         fragment_handlers(local.clone()),
     )
     .await?;
@@ -215,6 +267,8 @@ pub async fn setup(
 
     Ok(Some(RingPlane {
         self_id,
+        read_ring,
+        read_client,
         transport,
         membership,
         fragment_ceiling,
@@ -247,12 +301,6 @@ fn parse_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
 /// An environment variable, empty treated as absent.
 fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
-}
-
-/// A no-op block-fetch source: the ring plane serves only fragment endpoints, so
-/// every block request is a clean miss.
-fn noop_block_source() -> LocalBlockFn {
-    Arc::new(|_block| Box::pin(async { None }))
 }
 
 /// Wires the local fragment store behind the peer server's fragment handlers, so

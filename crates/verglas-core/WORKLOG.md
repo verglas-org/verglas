@@ -418,3 +418,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #8: Extended local access discovery with an explicit query API URI. On-prem clients now receive separate S3, query/write, and catalog proxy coordinates.
 - #16: Replaced the obsolete worklog-only dashboard sink concept with validated `[analytics.rill]` network configuration. The configuration names Rill's private runtime, browser address, and return S3 path, and requires an Iceberg catalog for table resolution.
 - #29: Extended the shared NVMe accounting contract to include the durable KV log alongside acknowledged write-back fragments. Both are protected from eviction while the remaining object cache stays heat-managed with no fixed partition.
+- #74: Extended the cache-only peer contract with owner placement for already
+  materialized blocks. The operation reports admission separately from
+  transport failure and does not imply origin durability.
