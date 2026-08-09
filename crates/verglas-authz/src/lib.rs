@@ -275,6 +275,51 @@ pub struct Grant {
     pub actions: BTreeSet<Action>,
 }
 
+/// A grant mutation performed under an existing principal's delegated authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GrantDelegation {
+    /// Principal approving the delegation.
+    pub actor_principal_id: PrincipalId,
+    /// Exact additive grant the actor wants to delegate.
+    pub grant: Grant,
+}
+
+/// A grant revocation performed under an existing principal's management authority.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct GrantRevocation {
+    /// Tenant containing the actor and grant.
+    pub tenant_id: TenantId,
+    /// Principal approving the revocation.
+    pub actor_principal_id: PrincipalId,
+    /// Stable grant to revoke.
+    pub grant_id: GrantId,
+}
+
+impl GrantRevocation {
+    /// Validates every identifier in the revocation request.
+    pub fn validate(&self) -> Result<(), AuthzError> {
+        validate_identifier("tenant_id", &self.tenant_id)?;
+        validate_identifier("revocation.actor_principal_id", &self.actor_principal_id)?;
+        validate_identifier("revocation.grant_id", &self.grant_id)
+    }
+}
+
+impl GrantDelegation {
+    /// Constructs a delegation request for one grant.
+    pub fn new(actor_principal_id: impl Into<PrincipalId>, grant: Grant) -> Self {
+        Self {
+            actor_principal_id: actor_principal_id.into(),
+            grant,
+        }
+    }
+
+    /// Validates both the actor identity and nested grant contract.
+    pub fn validate(&self) -> Result<(), AuthzError> {
+        validate_identifier("delegation.actor_principal_id", &self.actor_principal_id)?;
+        self.grant.validate()
+    }
+}
+
 impl Grant {
     /// Constructs one explicit grant.
     pub fn new(
@@ -528,6 +573,10 @@ pub trait Authorizer: Send + Sync {
     async fn delete_resource(&self, tenant_id: &str, resource_id: &str) -> Result<(), AuthzError>;
     /// Creates one additive grant after validating principal and resource ownership.
     async fn create_grant(&self, grant: Grant) -> Result<Grant, AuthzError>;
+    /// Creates a grant only when the actor can pass every requested action.
+    async fn delegate_grant(&self, delegation: GrantDelegation) -> Result<Grant, AuthzError>;
+    /// Revokes a grant only when the actor can manage grants on its resource.
+    async fn revoke_grant(&self, revocation: GrantRevocation) -> Result<(), AuthzError>;
     /// Lists all grants owned by one tenant.
     async fn list_grants(&self, tenant_id: &str) -> Result<Vec<Grant>, AuthzError>;
     /// Revokes one grant by stable identity.
@@ -732,6 +781,59 @@ impl Authorizer for AccessService {
         Ok(created)
     }
 
+    /// Delegates only capabilities the approving principal already holds and may pass onward.
+    async fn delegate_grant(&self, delegation: GrantDelegation) -> Result<Grant, AuthzError> {
+        delegation.validate()?;
+        let grant = &delegation.grant;
+        self.repository
+            .get_principal(&grant.tenant_id, &delegation.actor_principal_id)
+            .await?;
+        for action in std::iter::once(Action::PassGrants).chain(grant.actions.iter().copied()) {
+            let decision = self
+                .check(AccessCheck::new(
+                    &grant.tenant_id,
+                    &delegation.actor_principal_id,
+                    &grant.resource_id,
+                    action,
+                ))
+                .await?;
+            if !decision.allowed {
+                return Err(AuthzError::Forbidden(format!(
+                    "principal {} cannot delegate {} on resource {}",
+                    delegation.actor_principal_id,
+                    action.as_str(),
+                    grant.resource_id
+                )));
+            }
+        }
+        self.create_grant(delegation.grant).await
+    }
+
+    /// Revokes only when the approving principal can manage grants on the target resource.
+    async fn revoke_grant(&self, revocation: GrantRevocation) -> Result<(), AuthzError> {
+        revocation.validate()?;
+        let grant = self
+            .repository
+            .get_grant(&revocation.tenant_id, &revocation.grant_id)
+            .await?;
+        let decision = self
+            .check(AccessCheck::new(
+                &revocation.tenant_id,
+                &revocation.actor_principal_id,
+                &grant.resource_id,
+                Action::ManageGrants,
+            ))
+            .await?;
+        if !decision.allowed {
+            return Err(AuthzError::Forbidden(format!(
+                "principal {} cannot revoke grants on resource {}",
+                revocation.actor_principal_id, grant.resource_id
+            )));
+        }
+        self.delete_grant(&revocation.tenant_id, &revocation.grant_id)
+            .await
+    }
+
     /// Lists durable grants in one tenant.
     async fn list_grants(&self, tenant_id: &str) -> Result<Vec<Grant>, AuthzError> {
         self.repository.list_grants(tenant_id).await
@@ -844,6 +946,9 @@ pub enum AuthzError {
     /// The requested mutation conflicts with existing authorization state.
     #[error("authorization conflict: {0}")]
     Conflict(String),
+    /// The authenticated actor does not possess or cannot delegate the requested capability.
+    #[error("authorization forbidden: {0}")]
+    Forbidden(String),
     /// A workload credential failed claim validation.
     #[error("invalid scoped token: {0}")]
     Token(String),

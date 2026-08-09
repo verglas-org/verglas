@@ -61,6 +61,8 @@ services:
       VERGLAS_OPENFGA_TOKEN: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_ACCESS_LISTEN: 0.0.0.0:8345
+    ports:
+      - "127.0.0.1:8345:8345"
     depends_on:
       verglas-postgres-init:
         condition: service_completed_successfully
@@ -86,6 +88,7 @@ services:
       VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
       VERGLAS_ACCESS_URI: http://verglas-access:8345
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
     depends_on:
       verglas-server:
         condition: service_started
@@ -190,6 +193,10 @@ services:
       LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
+      VERGLAS_LOCAL_OWNER_BOOTSTRAP: "true"
+    volumes:
+      - verglas-os-state:/workspace/apps/os/.wrangler/state
     depends_on:
       verglas-server:
         condition: service_started
@@ -205,6 +212,7 @@ volumes:
   verglas-cache:
   verglas-runtime-state:
   verglas-workers-postgres:
+  verglas-os-state:
 
 networks:
   default:

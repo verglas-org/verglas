@@ -9,6 +9,7 @@ import { cacheBustSiteLogoUrl, prepareSiteLogo } from './siteLogoUtils'
 import SiteLogo from './components/SiteLogo'
 import { useDocumentTitle } from './useDocumentTitle'
 import AdminFormatsPanel from './components/format/AdminFormatsPanel'
+import AdminAccessPanel from './components/AdminAccessPanel'
 
 // Preset accent colors offered in the Theme section ('' = Verglas primary #3d9cf0).
 const ACCENT_PRESETS: { label: string; value: string }[] = [
@@ -334,6 +335,7 @@ export default function AdminPage() {
 
       {/* Sign-ups */}
       {activeTab === 'access' && (
+        <div className="space-y-4">
         <div className="bg-kumo-elevated border border-kumo-line rounded-xl p-6">
           <div className="flex items-center gap-4">
             <div className="w-9 h-9 rounded-lg flex-shrink-0 flex items-center justify-center bg-kumo-tint">
@@ -351,6 +353,8 @@ export default function AdminPage() {
               onCheckedChange={handleSignupsToggle}
             />
           </div>
+        </div>
+        <AdminAccessPanel admin={admin.api} />
         </div>
       )}
 

@@ -1,4 +1,4 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor } from '@verglas/workshop-shared/api';
+import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor, type VerglasAccessGrant, type VerglasAccessGrantInput, type VerglasAccessSnapshot } from '@verglas/workshop-shared/api';
 import { GatekeeperVendor } from '@verglas/workshop-shared/gatekeeper';
 import { DurableObject } from 'cloudflare:workers';
 import { RpcTarget } from 'capnweb';
@@ -13,6 +13,7 @@ import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
 import { UserDurableObject } from './user.js';
 import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
 import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
+import { VerglasAccessClient } from './verglas-access.js';
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -554,12 +555,33 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 export class AdminApiImpl extends RpcTarget implements AdminApi {
   // `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
   // resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
-  constructor(private admin: DurableObjectStub<AdminSettings>, private adminUserId: string) {
+  constructor(
+      private admin: DurableObjectStub<AdminSettings>,
+      private adminUserId: string,
+      private access: VerglasAccessClient | null = null) {
     super();
   }
 
   getSettings(): Promise<AdminSettingsView> {
     return this.admin.getSettings(this.adminUserId);
+  }
+
+  async getAccessSnapshot(): Promise<VerglasAccessSnapshot> {
+    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
+    await this.access.ensureUser(this.adminUserId);
+    return await this.access.snapshot();
+  }
+
+  async delegateAccess(input: VerglasAccessGrantInput): Promise<VerglasAccessGrant> {
+    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
+    await this.access.ensureUser(this.adminUserId);
+    return await this.access.delegate(this.adminUserId, input);
+  }
+
+  async revokeAccess(grantId: string): Promise<void> {
+    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
+    await this.access.ensureUser(this.adminUserId);
+    await this.access.revoke(this.adminUserId, grantId);
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {

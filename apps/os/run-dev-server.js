@@ -332,6 +332,13 @@ for (const gk of gatekeepers) {
     process.env.VERGLAS_CONTAINER_RUNTIME_URL || "http://127.0.0.1:8360";
   config.vars.VERGLAS_CONTAINER_RUNTIME_TOKEN =
     process.env.VERGLAS_CONTAINER_RUNTIME_TOKEN || "verglas-local-container-runtime";
+  config.vars.VERGLAS_ACCESS_URI =
+    process.env.VERGLAS_ACCESS_URI || "http://127.0.0.1:8345";
+  config.vars.VERGLAS_ACCESS_SERVICE_TOKEN =
+    process.env.VERGLAS_ACCESS_SERVICE_TOKEN || "verglas-local-access";
+  config.vars.VERGLAS_TENANT_ID = process.env.VERGLAS_TENANT_ID || "local";
+  config.vars.VERGLAS_LOCAL_OWNER_BOOTSTRAP =
+    process.env.VERGLAS_LOCAL_OWNER_BOOTSTRAP || "true";
   config.vars.VERGLAS_DATA_ENDPOINT =
     process.env.VERGLAS_DATA_ENDPOINT || "http://verglas-server:8334";
   if (localVerglasDataToken) config.vars.VERGLAS_DATA_TOKEN = localVerglasDataToken;
