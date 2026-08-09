@@ -40,3 +40,6 @@
 - #74: Made pageserver feedback advance WAL retention only from the explicit
   `vg_durable_lsn` watermark. Generic `ps_applylsn` no longer implies that
   referenced layers and index metadata crossed the Verglas durability barrier.
+- #74: Accepted Neon's read-replica `START_REPLICATION SLOT ... TIMELINE ...`
+  command. Read mirrors can now stream new WAL from the embedded safekeeper
+  instead of repeatedly disconnecting after their base backup.

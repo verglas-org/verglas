@@ -4,17 +4,26 @@
 set -euo pipefail
 
 image=${VERGLAS_CACHE_NODE_IMAGE:-codex/verglas-cache-node:shared-page}
-neon_image=${VERGLAS_NEON_STACK_IMAGE:-}
+neon_image=${VERGLAS_NEON_STACK_IMAGE:?set VERGLAS_NEON_STACK_IMAGE to the Neon stack image under test}
 network="verglas-shared-cache-$RANDOM"
 origin_network="$network-origin"
 network_octet=$((RANDOM % 180 + 40))
 subnet="172.30.${network_octet}.0/24"
 origin_subnet="172.31.${network_octet}.0/24"
-work=$(mktemp -d)
+work_root=${VERGLAS_TEST_WORK_ROOT:-${TMPDIR:-/tmp}}
+mkdir -p "$work_root"
+work=$(mktemp -d "$work_root/verglas-shared-cache.XXXXXX")
 nodes=()
 neon_node=""
+replica_ports=(55434 55435)
+row_count=${VERGLAS_TEST_ROWS:-1000000}
 
 cleanup() {
+  status=$?
+  if [[ "${VERGLAS_KEEP_FAILED_ENV:-0}" == 1 && "$status" != 0 ]]; then
+    echo "preserving failed test environment: network=$network work=$work" >&2
+    return
+  fi
   for node in ${nodes[@]-}; do docker rm -f "$node" >/dev/null 2>&1 || true; done
   [[ -z "$neon_node" ]] || docker rm -f "$neon_node" >/dev/null 2>&1 || true
   docker rm -f "$network-minio" >/dev/null 2>&1 || true
@@ -144,44 +153,238 @@ if [[ -n "$neon_image" ]]; then
   done
   docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
     'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -c \
-    "CREATE TABLE heat_test(id bigint PRIMARY KEY, payload text); INSERT INTO heat_test SELECT i, repeat(md5(i::text), 8) FROM generate_series(1,1000000) AS i; CHECKPOINT; SELECT count(*) FROM heat_test;" >/dev/null
-  writeback_stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
-    -s 'http://cache-0:8334/admin/stats')
-  python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["writeback"]["acked_via_quorum"] >= 1, s' <<<"$writeback_stats"
+    "CREATE TABLE heat_test(id bigint PRIMARY KEY, payload text); INSERT INTO heat_test SELECT i, repeat(md5(i::text), 8) FROM generate_series(1,$row_count) AS i; CHECKPOINT; SELECT count(*) FROM heat_test;" >/dev/null
+
+  # Start two independent read-only computes against the same pageserver,
+  # timeline, and Verglas safekeeper. These are real Neon Replica computes,
+  # not extra client connections to the primary Postgres process.
+  for replica_index in 0 1; do
+    replica_port=${replica_ports[$replica_index]}
+    replica_http=$((3180 + replica_index * 2))
+    replica_internal_http=$((3181 + replica_index * 2))
+    replica_vm_monitor=$((10310 + replica_index))
+    docker exec \
+      -e REPLICA_INDEX="$replica_index" \
+      -e REPLICA_PORT="$replica_port" \
+      "$neon_node" sh -ceu '
+        data=/run/neon/replica-$REPLICA_INDEX
+        spec=/run/neon/replica-$REPLICA_INDEX.json
+        socket=/run/neon/replica-$REPLICA_INDEX-sock
+        mkdir -p "$data" "$socket"
+        chown -R postgres:postgres "$data" "$socket"
+        primary_conninfo=$(printf "host=cache-0 port=5454 options=\047-c timeline_id=44444444444444444444444444444444 tenant_id=33333333333333333333333333333333\047 application_name=replica replication=true")
+        jq --arg port "$REPLICA_PORT" \
+          --arg socket "$socket" \
+          --arg endpoint "verglas-read-$REPLICA_INDEX" \
+          --arg primary_conninfo "$primary_conninfo" \
+          '\''
+            .spec.mode = "Replica"
+            | .spec.skip_pg_catalog_updates = true
+            | .spec.endpoint_id = $endpoint
+            | .spec.cluster.settings = (
+                .spec.cluster.settings
+                | map(select(
+                    .name != "port"
+                    and .name != "unix_socket_directories"
+                    and .name != "neon.safekeepers"
+                    and .name != "synchronous_standby_names"
+                    and .name != "primary_conninfo"
+                    and .name != "primary_slot_name"
+                    and .name != "hot_standby"
+                    and .name != "recovery_prefetch"
+                  ))
+                + [
+                    {"name":"port", "value":$port, "vartype":"integer"},
+                    {"name":"unix_socket_directories", "value":$socket, "vartype":"string"},
+                    {"name":"primary_conninfo", "value":$primary_conninfo, "vartype":"string"},
+                    {"name":"primary_slot_name", "value":"repl_44444444444444444444444444444444_", "vartype":"string"},
+                    {"name":"hot_standby", "value":"on", "vartype":"bool"},
+                    {"name":"recovery_prefetch", "value":"off", "vartype":"enum"}
+                  ]
+              )
+          '\'' /run/neon/compute-spec.json >"$spec"
+        chown postgres:postgres "$spec"
+      '
+    docker exec -d --user postgres \
+      -e OTEL_SDK_DISABLED=true \
+      "$neon_node" sh -c \
+      "exec /usr/local/bin/compute_ctl \
+        --pgdata /run/neon/replica-$replica_index \
+        -C postgresql://cloud_admin@127.0.0.1:$replica_port/postgres \
+        -b /usr/local/bin/postgres \
+        --compute-id verglas-read-$replica_index \
+        --config /run/neon/replica-$replica_index.json \
+        --external-http-port $replica_http \
+        --internal-http-port $replica_internal_http \
+        --vm-monitor-addr 127.0.0.1:$replica_vm_monitor \
+        --dev >/run/neon/replica-$replica_index.log 2>&1"
+  done
+
+  for replica_port in "${replica_ports[@]}"; do
+    ready=false
+    for _ in $(seq 1 180); do
+      if docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+        "postgresql://cloud_admin@127.0.0.1:$replica_port/postgres" -tAc \
+        'SELECT pg_is_in_recovery()' 2>/dev/null | grep -qx t; then
+        ready=true
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$ready" != true ]]; then
+      docker exec "$neon_node" sh -c "tail -n 120 /run/neon/replica-$((replica_port - 55434)).log 2>/dev/null || true" >&2
+      docker logs "$neon_node" >&2
+      exit 1
+    fi
+  done
+
+  # Commit on the primary after both mirrors are running. Both mirrors must
+  # observe that row through WAL replay before serving the parallel workload.
+  marker=$(date +%s%N)
+  marker_id=$((row_count + 1))
+  expected_sum=$((row_count * 256 + ${#marker}))
+  docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+    'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -c \
+    "INSERT INTO heat_test VALUES ($marker_id, '$marker');" >/dev/null
+  for replica_port in "${replica_ports[@]}"; do
+    visible=false
+    for _ in $(seq 1 120); do
+      value=$(docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+        "postgresql://cloud_admin@127.0.0.1:$replica_port/postgres" -tAc \
+        "SELECT payload FROM heat_test WHERE id=$marker_id" 2>/dev/null || true)
+      if [[ "$value" == "$marker" ]]; then
+        visible=true
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$visible" != true ]]; then
+      echo "replica on port $replica_port did not observe query-after-write" >&2
+      docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+        'postgresql://cloud_admin@127.0.0.1:55433/postgres' -x -c \
+        'SELECT pg_current_wal_lsn(), pg_current_wal_flush_lsn()' >&2 || true
+      docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+        "postgresql://cloud_admin@127.0.0.1:$replica_port/postgres" -x -c \
+        'SELECT pg_is_in_recovery(), pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), pg_last_xact_replay_timestamp()' >&2 || true
+      docker exec "$neon_node" sh -c "tail -n 160 /run/neon/replica-$((replica_port - 55434)).log" >&2 || true
+      docker logs --tail 160 "$network-cache-0" >&2 || true
+      exit 1
+    fi
+  done
+
+  # Run eight query clients across the two independent computes at once. Record
+  # shared-cache activity before the scans because those scans also warm each
+  # compute's local PostgreSQL buffers.
   before_hits=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
     -s 'http://cache-0:8334/admin/stats' | python3 -c 'import json,sys; c=json.load(sys.stdin)["counters"]; print(c["dram_hits"]+c["disk_hits"]+c["peer_hits"])')
-  for _ in 1 2 3; do
-    sum=$(docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
-      'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -tAc \
-      'SELECT sum(length(payload)) FROM heat_test')
-    [[ "$sum" == 256000000 ]]
+  query_outputs=()
+  query_pids=()
+  for replica_port in "${replica_ports[@]}"; do
+    for worker in 1 2 3 4; do
+      output="$work/query-$replica_port-$worker.out"
+      query_outputs+=("$output")
+      docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+        "postgresql://cloud_admin@127.0.0.1:$replica_port/postgres" -v ON_ERROR_STOP=1 -tAc \
+        'SELECT sum(length(payload)) FROM heat_test' >"$output" &
+      query_pids+=("$!")
+    done
+  done
+  for pid in "${query_pids[@]}"; do wait "$pid"; done
+  for output in "${query_outputs[@]}"; do
+    [[ "$(tr -d '[:space:]' <"$output")" == "$expected_sum" ]]
   done
   final_stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
     -s 'http://cache-0:8334/admin/stats')
   after_hits=$(python3 -c 'import json,sys; c=json.load(sys.stdin)["counters"]; print(c["dram_hits"]+c["disk_hits"]+c["peer_hits"])' <<<"$final_stats")
   (( after_hits > before_hits )) || {
-    echo "Neon scans produced no reconstructed-page cache hits ($before_hits -> $after_hits)" >&2
+    echo "Neon read-mirror scans produced no shared-cache hits ($before_hits -> $after_hits)" >&2
     docker logs "$neon_node" >&2
     exit 1
   }
+  writeback_stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
+    -s 'http://cache-0:8334/admin/stats')
+  python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["writeback"]["acked_via_quorum"] >= 1, s' <<<"$writeback_stats"
+  for _ in 1 2 3; do
+    sum=$(docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+      'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -tAc \
+      'SELECT sum(length(payload)) FROM heat_test')
+    [[ "$sum" == "$expected_sum" ]]
+  done
   tiers=$(python3 -c 'import json,sys; c=json.load(sys.stdin)["counters"]; print("dram=%d disk=%d peer=%d" % (c["dram_hits"],c["disk_hits"],c["peer_hits"]))' <<<"$final_stats")
   echo "Neon query-after-write and reconstructed-page reuse: PASS ($before_hits -> $after_hits total hits; $tiers)"
+  echo "two Neon read mirrors and eight concurrent query clients: PASS"
+
+  # The remaining storage failure tests deliberately stop cache-0. Tear down
+  # Neon first so its fixed test endpoint does not turn a cache-node test into
+  # a control-plane failover test.
+  docker rm -f "$neon_node" >/dev/null
+  neon_node=""
 fi
 
-# A four-node ring uses w=3. Stop one member, then prove a new S3 PUT still
-# crosses the three remaining fsync placements and reaches the origin.
-docker stop "$network-cache-3" >/dev/null
+# Dirty data remains discoverable through peers, its coordinator restarts while
+# origin is unavailable, and propagation resumes after origin recovers without
+# another coordinator restart.
+docker stop "$network-minio" >/dev/null
 docker run --rm -i --network "$network" --entrypoint sh curlimages/curl:8.12.1 -c \
-  "printf 'four-node-quorum' | curl --fail --silent --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret -X PUT --data-binary @- http://cache-0:8333/wal-test/neon/quorum-after-one-down" >/dev/null
-stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
-  -s 'http://cache-0:8334/admin/stats')
-python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["writeback"]["acked_via_quorum"] >= 1, s' <<<"$stats"
-for _ in $(seq 1 60); do
-  origin=$(docker run --rm --network "$origin_network" --entrypoint sh minio/mc:latest -c \
-    "mc alias set origin http://$network-minio:9000 origin originsecret >/dev/null && mc cat origin/wal-test/neon/quorum-after-one-down" 2>/dev/null || true)
-  [[ "$origin" == four-node-quorum ]] && break
+  "printf 'dirty-recovery' | curl --fail --silent --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret -X PUT --data-binary @- http://cache-0:8333/wal-test/neon/dirty-recovery" >/dev/null
+dirty=$(docker run --rm --network "$network" curlimages/curl:8.12.1 -s --fail \
+  --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret \
+  http://cache-1:8333/wal-test/neon/dirty-recovery)
+[[ "$dirty" == dirty-recovery ]]
+docker stop "$network-cache-0" >/dev/null
+dirty=$(docker run --rm --network "$network" curlimages/curl:8.12.1 -s --fail \
+  --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret \
+  http://cache-2:8333/wal-test/neon/dirty-recovery)
+[[ "$dirty" == dirty-recovery ]]
+docker start "$network-cache-0" >/dev/null
+for _ in $(seq 1 90); do
+  status=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
+    -s -o /dev/null -w '%{http_code}' 'http://cache-0:8334/admin/healthz' || true)
+  [[ "$status" == 200 ]] && break
   sleep 1
 done
-[[ "$origin" == four-node-quorum ]]
+[[ "$status" == 200 ]]
+dirty=$(docker run --rm --network "$network" curlimages/curl:8.12.1 -s --fail \
+  --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret \
+  http://cache-0:8333/wal-test/neon/dirty-recovery)
+[[ "$dirty" == dirty-recovery ]]
+docker start "$network-minio" >/dev/null
+for _ in $(seq 1 180); do
+  origin=$(docker run --rm --network "$origin_network" --entrypoint sh minio/mc:latest -c \
+    "mc alias set origin http://$network-minio:9000 origin originsecret >/dev/null 2>&1 && mc cat origin/wal-test/neon/dirty-recovery" 2>/dev/null || true)
+  [[ "$origin" == dirty-recovery ]] && break
+  sleep 1
+done
+[[ "$origin" == dirty-recovery ]]
+echo "dirty peer discovery, origin-less restart, and resumed propagation: PASS"
 
-echo "four-node shared Neon cache and one-member-down quorum write: PASS"
+# A four-node ring uses w=3. Rotate the failed member through every node and
+# prove each of the other members can coordinate a new quorum write.
+for failed in 0 1 2 3; do
+  coordinator=$(((failed + 1) % 4))
+  docker stop "$network-cache-$failed" >/dev/null
+  key="quorum-after-node-$failed-down"
+  value="four-node-quorum-$failed"
+  docker run --rm -i --network "$network" --entrypoint sh curlimages/curl:8.12.1 -c \
+    "printf '$value' | curl --fail --silent --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret -X PUT --data-binary @- http://cache-$coordinator:8333/wal-test/neon/$key" >/dev/null
+  stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
+    -s "http://cache-$coordinator:8334/admin/stats")
+  python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["writeback"]["acked_via_quorum"] >= 1, s' <<<"$stats"
+  docker start "$network-cache-$failed" >/dev/null
+  for _ in $(seq 1 90); do
+    status=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
+      -s -o /dev/null -w '%{http_code}' "http://cache-$failed:8334/admin/healthz" || true)
+    [[ "$status" == 200 ]] && break
+    sleep 1
+  done
+  [[ "$status" == 200 ]]
+  for _ in $(seq 1 90); do
+    origin=$(docker run --rm --network "$origin_network" --entrypoint sh minio/mc:latest -c \
+      "mc alias set origin http://$network-minio:9000 origin originsecret >/dev/null 2>&1 && mc cat origin/wal-test/neon/$key" 2>/dev/null || true)
+    [[ "$origin" == "$value" ]] && break
+    sleep 1
+  done
+  [[ "$origin" == "$value" ]]
+done
+
+echo "four-node quorum writes with each member failed in turn: PASS"

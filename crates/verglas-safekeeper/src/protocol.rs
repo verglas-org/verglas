@@ -521,10 +521,23 @@ fn parse_start_replication(command: &str) -> Result<SafekeeperCommand, ProtocolE
     let start_lsn = parse_lsn(
         next.ok_or_else(|| ProtocolError::Invalid("missing replication LSN".to_owned()))?,
     )?;
-    if fields.next().is_some() {
-        return Err(ProtocolError::Invalid(format!(
-            "malformed command {command}"
-        )));
+    if let Some(field) = fields.next() {
+        if field != "TIMELINE" {
+            return Err(ProtocolError::Invalid(format!(
+                "malformed command {command}"
+            )));
+        }
+        let timeline = fields
+            .next()
+            .ok_or_else(|| ProtocolError::Invalid("missing replication timeline".to_owned()))?;
+        timeline.parse::<u32>().map_err(|_| {
+            ProtocolError::Invalid(format!("invalid replication timeline {timeline}"))
+        })?;
+        if fields.next().is_some() {
+            return Err(ProtocolError::Invalid(format!(
+                "malformed command {command}"
+            )));
+        }
     }
     let term = command
         .split_once("term='")

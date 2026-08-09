@@ -202,10 +202,13 @@ fn parses_the_two_postgres_replication_commands_neon_uses() {
         }
     );
     assert_eq!(
-        parse_command("START_REPLICATION PHYSICAL 0/16B60A10 (term='12')").expect("replication"),
+        parse_command(
+            "START_REPLICATION SLOT \"repl_44444444444444444444444444444444_\" 0/16B60A10 TIMELINE 1"
+        )
+        .expect("replication"),
         SafekeeperCommand::StartReplication {
             start_lsn: Lsn(0x16B6_0A10),
-            term: Some(12),
+            term: None,
         }
     );
 }
