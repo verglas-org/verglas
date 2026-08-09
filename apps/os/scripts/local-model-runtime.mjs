@@ -63,25 +63,30 @@ const inferenceCwd = mkdtempSync(join(tmpdir(), "verglas-model-runtime-"));
 function outputSchema(tools) {
   // Mirror an OpenAI assistant message. Codecs/CLIs that support --output-schema /
   // --json-schema constrain to this; Cursor only gets it as a prompt target.
-  const toolCalls = tools.flatMap(tool => {
+  const toolNames = tools.flatMap(tool => {
     const fn = tool?.function;
-    if (!fn || typeof fn.name !== "string" || !fn.parameters) return [];
-    return [{
-      type: "object",
-      properties: {
-        name: { type: "string", const: fn.name },
-        arguments: fn.parameters,
-      },
-      required: ["name", "arguments"],
-      additionalProperties: false,
-    }];
+    return fn && typeof fn.name === "string" ? [fn.name] : [];
   });
   return {
     type: "object",
     properties: {
       content: { type: ["string", "null"] },
-      tool_calls: toolCalls.length > 0
-        ? { type: "array", items: { oneOf: toolCalls } }
+      // Codex structured outputs intentionally support a strict JSON Schema subset. Keep the
+      // tool name constrained, and carry its provider-specific arguments as a JSON string that
+      // parseRuntimeOutput normalizes back into an object.
+      tool_calls: toolNames.length > 0
+        ? {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: {type: "string", enum: toolNames},
+              arguments: {type: "string"},
+            },
+            required: ["name", "arguments"],
+            additionalProperties: false,
+          },
+        }
         : { type: "array", maxItems: 0 },
     },
     required: ["content", "tool_calls"],
@@ -154,7 +159,8 @@ function inferencePrompt(body) {
     "Return exactly one JSON object shaped like an assistant message — no markdown fence.",
     tools.length > 0
       ? [
-        'Shape: {"content": string|null, "tool_calls": [{"name": string, "arguments": object}]}.',
+        'Shape: {"content": string|null, "tool_calls": [{"name": string, "arguments": string}]}.',
+        "Each arguments value must be a JSON-encoded object string matching that tool's schema.",
         "If the Workshop conversation needs a listed tool, put it in tool_calls and set content to null.",
         "If you are answering the user with no tool, put the reply in content and set tool_calls to [].",
         "Use only tool names from Available tools. Prefer modest createIntegration / createApplication",

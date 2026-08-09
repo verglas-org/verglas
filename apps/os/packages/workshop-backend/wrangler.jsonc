@@ -56,10 +56,15 @@
       // login back to the waiting browser.
       "tag": "v2",
       "new_sqlite_classes": [ "PendingLogin" ]
+    },
+    {
+      // Workspace/chat state moved to the Postgres-backed Verglas agent runtime.
+      "tag": "v3",
+      "deleted_classes": [ "OverseerDurableObject" ]
     }
   ],
 
-  // All DO classes (UserDurableObject, OverseerDurableObject, AdminSettings, PendingLogin, ...) are
+  // Remaining DO classes (UserDurableObject, AdminSettings, PendingLogin, ...) are
   // reached via ctx.exports and need no explicit durable_objects binding.
   "kv_namespaces": [
     {

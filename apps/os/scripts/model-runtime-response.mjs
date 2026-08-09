@@ -98,6 +98,9 @@ export function parseRuntimeOutput(output) {
   if (parsed.result && typeof parsed.result === "object") {
     return parseRuntimeOutput(JSON.stringify(parsed.result));
   }
+  if (typeof parsed === "string" && looksLikeAssistantMessage(parsed)) {
+    return parseRuntimeOutput(parsed);
+  }
 
   // Prefer the OpenAI assistant-message shape the adapter asks for.
   if (Array.isArray(parsed.tool_calls) || "content" in parsed) {

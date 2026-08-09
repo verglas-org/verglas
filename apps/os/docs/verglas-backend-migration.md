@@ -485,7 +485,7 @@ Gatekeeper cache namespaces must be scoped by tenant, vendor, account, and resou
 | Current component | Target implementation |
 | --- | --- |
 | `UserDurableObject` | Workshop Postgres repositories and transactions |
-| `OverseerDurableObject` | Workspace service plus Postgres-sequenced Workspace invocations |
+| `OverseerDurableObject` | Removed; agent-runtime plus Postgres messages and ephemeral container runs |
 | `AdminSettings` | Postgres authoritative record plus Verglas KV hot mirror |
 | `PendingLogin` | Postgres or short-lived Verglas KV record with TTL |
 | Gatekeeper account DOs | Postgres connected-account records plus secrets |

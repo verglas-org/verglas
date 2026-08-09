@@ -4,11 +4,49 @@
 // mock storage in tests.
 
 import type { Collection } from "@verglas/typed-storage";
-import type { AiChatAuthorInfo } from "@verglas/workshop-shared/api";
+import type { ActionState, AiChatAuthorInfo, WorkpieceId } from "@verglas/workshop-shared/api";
+import type {
+  ActionDescription, ActionKind, HookDescription, ObservationDescription,
+} from "@verglas/workshop-shared/gatekeeper";
 import { createWorkshopLogger } from "./observability";
-import type { ActionRecord, AutoApproveTagRecord } from "./overseer.js";
 
 const logger = createWorkshopLogger("workshop.auto.approval");
+
+/** Persisted caller identity retained by the legacy action audit record. */
+export type ActionCaller =
+  | {from: "agent"; chatId: number}
+  | {from: "vessel"; chatId?: number; workspaceId?: WorkpieceId}
+  | {from: "user"; chatId?: number}
+  | {from: "hook"};
+
+/** Minimal action-audit record consumed by the standalone drain algorithm. */
+export type ActionRecord = {
+  id: number;
+  gatekeeperId: WorkpieceId;
+  caller: ActionCaller;
+  createdAt: Date;
+  state: ActionState;
+  resourceTitle?: string;
+  resourceUrl?: string;
+} & (
+  | {
+      type: "action";
+      action: number;
+      description: ActionDescription;
+      appliedAt?: Date;
+      resolvedBy?: AiChatAuthorInfo;
+      autoApproved?: boolean;
+    }
+  | {type: "observation"; description: ObservationDescription}
+  | {type: "bindHook"; description: HookDescription; hookId?: number; enabled: boolean}
+);
+
+/** User-authored rule allowing one stable action kind to be applied automatically. */
+export type AutoApproveTagRecord = {
+  gatekeeperId: WorkpieceId;
+  actionKind: ActionKind;
+  enabledBy: AiChatAuthorInfo;
+};
 
 export interface AutoApprovalStorage {
   actions: Collection<ActionRecord, number>;

@@ -347,6 +347,10 @@ for (const gk of gatekeepers) {
   config.vars.LOCAL_MODEL_RUNTIME_URL =
     process.env.LOCAL_MODEL_RUNTIME_URL || `http://127.0.0.1:${localModelRuntimePort}`;
   config.vars.LOCAL_MODEL_RUNTIME_TOKEN = localModelRuntimeToken;
+  config.vars.VERGLAS_AGENT_RUNTIME_URL =
+    process.env.VERGLAS_AGENT_RUNTIME_URL || "http://127.0.0.1:8390";
+  config.vars.VERGLAS_AGENT_RUNTIME_TOKEN =
+    process.env.VERGLAS_AGENT_RUNTIME_TOKEN || "verglas-local-agent-runtime";
 
   for (const gk of gatekeepers) {
     const binding = {

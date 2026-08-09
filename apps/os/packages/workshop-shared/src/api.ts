@@ -644,9 +644,8 @@ export interface AuthenticatedApi extends RpcTarget {
   // Returns null if not in library, or { uploaded } if it is.
   isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null>;
 
-  // Create a new workspace from a blueprint. Reads the blueprint from KV, downloads code from
-  // R2, creates a new Overseer DO, initializes it with the blueprint's code, and creates
-  // gatekeepers from the provided binding assignments.
+  // Legacy blueprint-to-workspace installation contract. New deployments reject this operation;
+  // generated interfaces are standalone Application Vessels.
   //
   // Every required binding in the blueprint must have a corresponding entry in `bindings`,
   // keyed by binding name. Throws if any are missing or if accountId/modelId are invalid.
@@ -1389,8 +1388,8 @@ export const SUGGESTED_MODELS: Record<
   },
 };
 
-// Metadata about a workspace (one Overseer DO and everything in it). Includes everything needed
-// to render the workspace list on the front page.
+// Metadata about a Postgres-backed agent Workspace. Includes everything needed to render the
+// Workspace list on the front page.
 //
 // TODO(multi-vessel): Rename `WorkspaceMetadata`.
 export type WorkspaceMetadata = {
@@ -3012,14 +3011,13 @@ export interface ActionsSubscriber {
 }
 
 // Interface implemented by the client to receive callback notifications whenever there is new
-// chat activity. Use Overseer.subscribeToChat() to register a subscriber.
+// chat activity. Use the Workspace capability's subscribeToChat() to register a subscriber.
 export interface AiChatSubscriber {
   // Sent exactly once, at the start of a subscription, before any other callbacks. Carries an
-  // opaque value identifying the current server (Overseer DO) instance. If a resubscribing client
-  // sees a different value than on its previous subscription, the DO has fully restarted since
-  // then, meaning any in-flight provisional stream content was lost and will be re-streamed from
-  // scratch; the client should discard its provisional streaming state. An unchanged value (a
-  // plain network reconnect to the same live instance) means provisional state should be kept.
+  // opaque value identifying the current chat stream generation. If a resubscribing client
+  // sees a different value than on its previous subscription, any in-flight provisional stream
+  // content was lost and will be re-streamed from scratch; the client should discard its
+  // provisional streaming state. An unchanged value means provisional state should be kept.
   streamGeneration(generation: number): void;
 
   // Metadata for the given chat thread has changed, or a new chat thread was created.

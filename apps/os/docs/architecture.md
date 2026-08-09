@@ -19,7 +19,7 @@ Primary surfaces in the Workshop shell:
 | Lakehouse | Tables, namespaces, and query entry points |
 | Explore | Discovery across blueprints and lake artifacts |
 
-Workspaces are still first-class sandboxed apps, but the agent is instructed to
+Workspaces are first-class agent sessions, but the agent is instructed to
 prefer lakehouse tables, Sources, workflows, and vessels over creating a Workspace
 for every task. Product SDKs may contribute ingestion definitions, graph
 mappings, blueprints, and dashboard templates; no downstream app gets a
@@ -44,9 +44,10 @@ hard-coded privileged integration in the OS.
   by the local Verglas container runtime (`VERGLAS_CONTAINER_RUNTIME_*`). The
   Workshop lists them, opens previews, and patches config — it does not embed
   their processes.
-* **Legacy Workspaces** (Dynamic Worker LOADER / facets / Workspace editor) are
-  removed. Workspaces remain Cap'n Web Overseer chat shells. Persistent UIs are
-  Application Vessels; batch work is Jobs/Sources.
+* **Legacy Workspaces** (Overseer Durable Objects, Dynamic Worker LOADER,
+  facets, and the Workspace editor) are removed. Workspace and chat records are
+  Postgres-backed. Each agent turn is an ephemeral Verglas container run;
+  persistent UIs are Application Vessels and batch work is Jobs.
 * **Model subscription CLIs** (Codex / Claude Code / Cursor) run via a narrow
   loopback (or account-scoped container) adapter. Placement of that adapter is
   control-plane owned; the Workshop does not call the Verglas scheduler per
@@ -65,7 +66,7 @@ flowchart TB
         Catalog[Verglas catalog client]
         WorkerReg[Worker runtime client]
         Vessel[Integration / Vessel client]
-        Model[Model runtime client]
+        Agent[Agent-runtime client]
     end
 
     subgraph Verglas["Local or cloud Verglas"]
@@ -73,7 +74,8 @@ flowchart TB
         Sched[Scheduler]
         Cont[Container runtime / Vessels]
         Lake[(Iceberg + S3/cache)]
-        PG[(Workshop Postgres — target)]
+        PG[(Agent state + scheduler Postgres)]
+        AgentRuns[Ephemeral agent containers]
     end
 
     Chat --> RPC
@@ -82,7 +84,7 @@ flowchart TB
     RPC --> Catalog
     RPC --> WorkerReg
     RPC --> Vessel
-    RPC --> Model
+    RPC --> Agent
     WorkerReg --> Admin
     Admin --> Sched
     Sched --> Lake
@@ -90,19 +92,28 @@ flowchart TB
     Cont --> Lake
     Catalog --> Admin
     Catalog --> Cont
-    RPC -.-> PG
+    Agent --> PG
+    Agent --> AgentRuns
+    AgentRuns --> Admin
+    AgentRuns --> Cont
 ```
 
 ## PoC vs target
 
 **Working on this branch today**
 
-* Workshop gateway still boots as a Cloudflare Worker / DO stack under Wrangler
-  for Cap'n Web, auth, and chat (User/Overseer DOs). Worker Loader / Workspace
-  facets are removed.
+* Workshop gateway still boots under Wrangler for Cap'n Web and legacy login,
+  user-list, and admin capabilities. The Overseer DO, Worker Loader, Workspace
+  facets, and DO-backed chat state are removed.
+* `agent-runtime` stores Workspace/chat/run state in the scheduler Postgres and
+  launches one isolated container per turn through `/v1/runs/*`.
+* Agent containers receive a random per-run controller capability, not shared
+  data-plane credentials. The controller maps every exposed operation to a
+  Verglas authorization check for the Workspace agent principal.
 * Backend clients talk to a local Verglas admin, scheduler, and container
   runtime for Sources, vessel deploy/config, and lakehouse catalog reads.
-* Native model-runtime adapter runs beside `pnpm run-local` on loopback.
+* Native model-runtime adapter runs beside the OS and is called from agent
+  containers through its narrow authenticated endpoint.
 * Agent prompts and UI nav are lakehouse / vessel oriented (no createVessel).
 
 **Target (see [verglas-backend-migration.md](verglas-backend-migration.md))**
@@ -111,8 +122,8 @@ flowchart TB
   R2, D1, or service bindings for the product path.
 * PostgreSQL owns transactional Workshop state; Verglas KV for cache-shaped
   data; Iceberg for analytical / append history; S3 for large blobs.
-* Every Workspace invocation, hook, cron tick, and background op executes as one
-  Verglas worker-container job.
+* Remaining login, user-list, and admin Durable Objects move to Postgres/KV;
+  agent turns already execute as Verglas container runs.
 * Cap'n Web remains the browser RPC; transport is a normal local WebSocket
   server.
 
