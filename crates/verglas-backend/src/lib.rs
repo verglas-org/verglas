@@ -1,4 +1,4 @@
-//! Backend object-store client construction and policy.
+//! Backend object-store client construction, isolation, and binding registry.
 //!
 //! On a cache miss Verglas fills from the customer's real bucket ("the
 //! backend"). The server serves a configured SET of buckets (#235): the single
@@ -10,8 +10,9 @@
 //! buckets appearing as tables are created) costs nothing until touched. Every
 //! bucket carries its OWN concurrency limiter, circuit breaker, and retry
 //! policy, so a miss storm on one bucket cannot exhaust another's permits or
-//! trip another's breaker. One credential set (the node's environment or the
-//! configured credentials file) covers the whole set. Each client hands back a
+//! trip another's breaker. One credential set covers each immutable storage
+//! binding. [`BackendRegistry`] routes multiple providers and credential sets
+//! concurrently while retaining independent resilience state. Each client hands back a
 //! plain `object_store` handle so the read/write interfaces in `verglas-s3`
 //! consume it without knowing which object store they are talking to.
 //!
@@ -45,7 +46,7 @@ pub use settings::{
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use object_store::ObjectStoreExt;
 use object_store::RetryConfig;
@@ -112,6 +113,27 @@ impl CredentialMode {
 /// Backend client construction failures. Each renders one operator-facing line.
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
+    /// A request named no registered immutable storage binding.
+    #[error("unknown storage binding `{storage_binding_id}`")]
+    UnknownStorageBinding {
+        /// Binding identifier supplied by the request.
+        storage_binding_id: String,
+    },
+    /// Registry construction attempted to reuse one immutable binding ID.
+    #[error("duplicate storage binding `{storage_binding_id}`")]
+    DuplicateStorageBinding {
+        /// Binding identifier that appeared more than once.
+        storage_binding_id: String,
+    },
+    /// A storage binding identifier was empty or malformed.
+    #[error("invalid storage binding: {message}")]
+    InvalidStorageBinding {
+        /// Operator-facing validation detail.
+        message: String,
+    },
+    /// A panic poisoned the binding registry; routing cannot remain trustworthy.
+    #[error("storage binding registry is unavailable")]
+    StorageBindingRegistryUnavailable,
     /// The underlying `object_store` client could not be constructed for the
     /// configured bucket (a malformed endpoint override, say). Surfaced at the
     /// front-end as an S3-shaped internal error.
@@ -187,15 +209,25 @@ pub trait BackendStores: Send + Sync {
     /// [`BackendError::NoSuchBucket`]. A construction failure is the other
     /// possible error; a key that does not exist at the origin is not detected
     /// here (it surfaces on the request itself).
-    fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, BackendError>;
+    fn store_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Arc<dyn MultipartObjectStore>, BackendError>;
 
     /// Returns `bucket`'s circuit breaker if the store maintains one, for
     /// subsystems that consult backend health without issuing a request (e.g.
     /// #51 prefetch yielding to an open breaker). A bucket outside the served
     /// set has no breaker. Building the breaker lazily matches `store_for`. The
     /// default is `None`.
-    fn breaker_for(&self, _bucket: &str) -> Option<Arc<CircuitBreaker>> {
-        None
+    fn breaker_for(
+        &self,
+        storage_binding_id: &str,
+        _bucket: &str,
+    ) -> Result<Option<Arc<CircuitBreaker>>, BackendError> {
+        Err(BackendError::UnknownStorageBinding {
+            storage_binding_id: storage_binding_id.to_owned(),
+        })
     }
 
     /// Returns `bucket`'s byte-exact raw request path (issue #189) when the
@@ -208,8 +240,14 @@ pub trait BackendStores: Send + Sync {
     /// typed client. Construction failures (bad endpoint, missing credentials)
     /// are errors, not `None` — a raw-requiring request must fail loudly rather
     /// than fall back to a lossy path.
-    fn raw_for(&self, _bucket: &str) -> Result<Option<Arc<ResilientRawS3>>, BackendError> {
-        Ok(None)
+    fn raw_for(
+        &self,
+        storage_binding_id: &str,
+        _bucket: &str,
+    ) -> Result<Option<Arc<ResilientRawS3>>, BackendError> {
+        Err(BackendError::UnknownStorageBinding {
+            storage_binding_id: storage_binding_id.to_owned(),
+        })
     }
 }
 
@@ -298,6 +336,8 @@ type ClientBuilder = Box<dyn Fn(&str) -> Result<BucketClients, BackendError> + S
 /// bucket outside the set is rejected with [`BackendError::NoSuchBucket`]; the
 /// server never builds a client for a bucket it does not serve.
 pub struct BackendStore {
+    /// Immutable identifier used in every cache and routing key.
+    storage_binding_id: String,
     /// The buckets this node serves.
     set: BucketSet,
     /// Builds one bucket's clients on first request.
@@ -370,7 +410,10 @@ impl BackendStore {
     /// endpoint/region/addressing/credentials overrides and the provider's env
     /// chain as the fallback (#221). The bucket set is required and gated by
     /// config validation before this runs.
-    pub fn from_config(backend: &Backend) -> Arc<BackendStore> {
+    pub fn from_config(
+        storage_binding_id: impl Into<String>,
+        backend: &Backend,
+    ) -> Arc<BackendStore> {
         let set = BucketSet::from_config(backend);
         let credential_mode = CredentialMode::resolve(backend);
         // The builder captures the config and builds one bucket's clients on
@@ -394,6 +437,7 @@ impl BackendStore {
             ))
         });
         Arc::new(BackendStore {
+            storage_binding_id: storage_binding_id.into(),
             set,
             builder,
             clients: Mutex::new(HashMap::new()),
@@ -407,6 +451,7 @@ impl BackendStore {
     /// prove lazy per-bucket construction and budget isolation. A build failure
     /// propagates from `store_for`.
     pub fn with_glob_factory<F>(
+        storage_binding_id: impl Into<String>,
         bucket: Option<String>,
         globs: Vec<String>,
         max_concurrent_requests: usize,
@@ -430,6 +475,7 @@ impl BackendStore {
             ))
         });
         Arc::new(BackendStore {
+            storage_binding_id: storage_binding_id.into(),
             set,
             builder,
             clients: Mutex::new(HashMap::new()),
@@ -441,6 +487,7 @@ impl BackendStore {
     /// on first request for `bucket`. Convenience over [`with_glob_factory`] for
     /// tests that serve exactly one bucket. A build failure propagates.
     pub fn with_factory<F>(
+        storage_binding_id: impl Into<String>,
         bucket: String,
         max_concurrent_requests: usize,
         retry: RetryPolicy,
@@ -451,6 +498,7 @@ impl BackendStore {
         F: Fn(&str) -> Result<Arc<dyn MultipartObjectStore>, BackendError> + Send + Sync + 'static,
     {
         let store = Self::with_glob_factory(
+            storage_binding_id,
             Some(bucket.clone()),
             Vec::new(),
             max_concurrent_requests,
@@ -460,7 +508,7 @@ impl BackendStore {
         );
         // Surface a build failure eagerly so callers that expect a construction
         // error (a bad factory) still see it at construction time, as before.
-        store.store_for(&bucket)?;
+        store.get_or_build(&bucket)?;
         Ok(store)
     }
 
@@ -469,11 +517,13 @@ impl BackendStore {
     /// production uses [`BackendStore::from_config`] instead. A request for any
     /// other bucket is rejected with [`BackendError::NoSuchBucket`].
     pub fn single(
+        storage_binding_id: impl Into<String>,
         bucket: impl Into<String>,
         store: Arc<dyn MultipartObjectStore>,
     ) -> Arc<BackendStore> {
         let backend = Backend::default();
         Self::with_glob_factory(
+            storage_binding_id,
             Some(bucket.into()),
             Vec::new(),
             backend.max_concurrent_requests,
@@ -486,6 +536,11 @@ impl BackendStore {
     /// A description of the served bucket set (the startup log / error text).
     pub fn bucket_set(&self) -> String {
         self.set.describe()
+    }
+
+    /// Returns the immutable identity this backend is registered under.
+    pub fn storage_binding_id(&self) -> &str {
+        &self.storage_binding_id
     }
 
     /// Total retry attempts issued across all built buckets (a metrics counter
@@ -522,7 +577,8 @@ impl BackendStore {
         };
         let credential_chain = self.credential_mode.label();
         let store = self
-            .store_for(&bucket)
+            .get_or_build(&bucket)
+            .map(|clients| clients.store.clone())
             .map_err(|source| StartupProbeError::Build {
                 bucket: bucket.clone(),
                 credential_chain,
@@ -604,23 +660,167 @@ impl BackendStore {
 impl BackendStores for BackendStore {
     /// Returns `bucket`'s typed store, building and memoizing it on first
     /// request; [`BackendError::NoSuchBucket`] for a bucket outside the set.
-    fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, BackendError> {
+    fn store_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Arc<dyn MultipartObjectStore>, BackendError> {
+        self.require_binding(storage_binding_id)?;
         Ok(self.get_or_build(bucket)?.store.clone())
     }
 
     /// Returns `bucket`'s breaker (building its clients if needed), or `None`
     /// for a bucket outside the set or when a build fails.
-    fn breaker_for(&self, bucket: &str) -> Option<Arc<CircuitBreaker>> {
-        self.get_or_build(bucket)
+    fn breaker_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Option<Arc<CircuitBreaker>>, BackendError> {
+        self.require_binding(storage_binding_id)?;
+        Ok(self
+            .get_or_build(bucket)
             .ok()
-            .map(|clients| clients.breaker.clone())
+            .map(|clients| clients.breaker.clone()))
     }
 
     /// Returns `bucket`'s resilient raw client — present when the origin is a
     /// real S3 endpoint ([`BackendStore::from_config`]); `None` for an injected
     /// typed store. A bucket outside the set is [`BackendError::NoSuchBucket`].
-    fn raw_for(&self, bucket: &str) -> Result<Option<Arc<ResilientRawS3>>, BackendError> {
+    fn raw_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Option<Arc<ResilientRawS3>>, BackendError> {
+        self.require_binding(storage_binding_id)?;
         Ok(self.get_or_build(bucket)?.raw.clone())
+    }
+}
+
+impl BackendStore {
+    /// Rejects requests addressed to a different immutable binding.
+    fn require_binding(&self, storage_binding_id: &str) -> Result<(), BackendError> {
+        if self.storage_binding_id.trim().is_empty() || storage_binding_id.trim().is_empty() {
+            return Err(BackendError::InvalidStorageBinding {
+                message: "storage binding ID must not be empty".to_owned(),
+            });
+        }
+        if self.storage_binding_id == storage_binding_id {
+            Ok(())
+        } else {
+            Err(BackendError::UnknownStorageBinding {
+                storage_binding_id: storage_binding_id.to_owned(),
+            })
+        }
+    }
+}
+
+/// Concurrent registry of independently configured storage backends.
+pub struct BackendRegistry {
+    /// Immutable binding ID to the backend with its own clients and resilience state.
+    bindings: RwLock<HashMap<String, Arc<BackendStore>>>,
+}
+
+impl BackendRegistry {
+    /// Builds a registry and rejects empty or duplicate binding identities.
+    pub fn new(bindings: Vec<Arc<BackendStore>>) -> Result<Arc<Self>, BackendError> {
+        let mut indexed = HashMap::with_capacity(bindings.len());
+        for binding in bindings {
+            let id = binding.storage_binding_id().to_owned();
+            if id.trim().is_empty() {
+                return Err(BackendError::InvalidStorageBinding {
+                    message: "storage binding ID must not be empty".to_owned(),
+                });
+            }
+            if indexed.insert(id.clone(), binding).is_some() {
+                return Err(BackendError::DuplicateStorageBinding {
+                    storage_binding_id: id,
+                });
+            }
+        }
+        Ok(Arc::new(Self {
+            bindings: RwLock::new(indexed),
+        }))
+    }
+
+    /// Registers a new binding for immediate routing without restarting the cache.
+    pub fn insert(&self, binding: Arc<BackendStore>) -> Result<(), BackendError> {
+        let id = binding.storage_binding_id().to_owned();
+        if id.trim().is_empty() {
+            return Err(BackendError::InvalidStorageBinding {
+                message: "storage binding ID must not be empty".to_owned(),
+            });
+        }
+        let mut bindings = self
+            .bindings
+            .write()
+            .map_err(|_| BackendError::StorageBindingRegistryUnavailable)?;
+        if bindings.contains_key(&id) {
+            return Err(BackendError::DuplicateStorageBinding {
+                storage_binding_id: id,
+            });
+        }
+        bindings.insert(id, binding);
+        Ok(())
+    }
+
+    /// Removes a binding so later requests fail closed instead of using stale credentials.
+    pub fn remove(&self, storage_binding_id: &str) -> Result<Arc<BackendStore>, BackendError> {
+        if storage_binding_id.trim().is_empty() {
+            return Err(BackendError::InvalidStorageBinding {
+                message: "storage binding ID must not be empty".to_owned(),
+            });
+        }
+        self.bindings
+            .write()
+            .map_err(|_| BackendError::StorageBindingRegistryUnavailable)?
+            .remove(storage_binding_id)
+            .ok_or_else(|| BackendError::UnknownStorageBinding {
+                storage_binding_id: storage_binding_id.to_owned(),
+            })
+    }
+
+    /// Resolves a registered binding or fails without consulting another origin.
+    fn binding(&self, storage_binding_id: &str) -> Result<Arc<BackendStore>, BackendError> {
+        self.bindings
+            .read()
+            .map_err(|_| BackendError::StorageBindingRegistryUnavailable)?
+            .get(storage_binding_id)
+            .cloned()
+            .ok_or_else(|| BackendError::UnknownStorageBinding {
+                storage_binding_id: storage_binding_id.to_owned(),
+            })
+    }
+}
+
+impl BackendStores for BackendRegistry {
+    /// Routes to the exact binding and then resolves that binding's bucket client.
+    fn store_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Arc<dyn MultipartObjectStore>, BackendError> {
+        self.binding(storage_binding_id)?
+            .store_for(storage_binding_id, bucket)
+    }
+
+    /// Returns only the exact binding and bucket's independent breaker.
+    fn breaker_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Option<Arc<CircuitBreaker>>, BackendError> {
+        self.binding(storage_binding_id)?
+            .breaker_for(storage_binding_id, bucket)
+    }
+
+    /// Returns only the exact binding and bucket's raw S3 client.
+    fn raw_for(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Result<Option<Arc<ResilientRawS3>>, BackendError> {
+        self.binding(storage_binding_id)?
+            .raw_for(storage_binding_id, bucket)
     }
 }
 

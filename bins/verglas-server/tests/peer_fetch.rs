@@ -73,7 +73,7 @@ async fn build_engine(
     let dir = tempfile::tempdir().expect("temp dir");
     let gets = Arc::new(AtomicU64::new(0));
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single("lake", store)),
+        inner: PassthroughRead::new(BackendStore::single("managed-lakehouse", "lake", store)),
         gets: Arc::clone(&gets),
         heads: Arc::new(AtomicU64::new(0)),
     };
@@ -140,6 +140,7 @@ async fn block_cached_on_owner_is_served_to_requester_over_peer_fetch() {
         .await
         .expect("seed");
     let key = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "hot.parquet".to_owned(),
     };
@@ -223,6 +224,7 @@ async fn pod_wide_miss_falls_through_to_a_backend_fill() {
         .await
         .expect("seed");
     let key = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "cold.parquet".to_owned(),
     };
@@ -281,6 +283,7 @@ async fn dead_owner_falls_back_to_backend_within_the_budget() {
         .await
         .expect("seed");
     let key = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "obj.parquet".to_owned(),
     };
@@ -324,6 +327,7 @@ async fn stale_etag_never_serves_peer_bytes_after_overwrite() {
     let store = Arc::new(InMemory::new());
     let v1 = pattern(1, 2 * 1024 * 1024);
     let key = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "lake".to_owned(),
         key: "mut.parquet".to_owned(),
     };

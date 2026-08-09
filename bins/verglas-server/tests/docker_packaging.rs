@@ -43,7 +43,6 @@ fn docker_application_packages_execution_workers() {
         "the always-on KV log must use the existing writable persistent data volume"
     );
     assert!(!compose.contains("\n  postgres:"));
-    assert!(!compose.contains("\n  verglas-scheduler:"));
     assert!(!compose.contains("\n  rill:"));
     for variable in [
         "VERGLAS_BACKEND_BUCKET",

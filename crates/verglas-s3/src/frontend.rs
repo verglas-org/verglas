@@ -58,6 +58,8 @@ use verglas_core::write::{
 /// passthrough (read-through-only rule) and only ever touch the cache via
 /// the [`Invalidation`] hook.
 pub struct VerglasS3<R, W> {
+    /// Immutable storage binding assigned to this database endpoint.
+    storage_binding_id: String,
     /// Where bytes and metadata come from.
     reader: R,
     /// Where writes go — always through to the backend bucket.
@@ -82,12 +84,14 @@ impl<R: ObjectRead, W: ObjectWrite> VerglasS3<R, W> {
     /// Wraps a byte source, a write sink, and a listing source in the protocol
     /// adapter, with no metrics wired (unit-test path).
     pub fn new(
+        storage_binding_id: impl Into<String>,
         reader: R,
         writer: W,
         lister: Arc<dyn ObjectList>,
         invalidation: Arc<dyn Invalidation>,
     ) -> Self {
         VerglasS3 {
+            storage_binding_id: storage_binding_id.into(),
             reader,
             writer,
             lister,
@@ -100,6 +104,7 @@ impl<R: ObjectRead, W: ObjectWrite> VerglasS3<R, W> {
     /// Like [`VerglasS3::new`] but records request metrics into `metrics` (#46) —
     /// the server path.
     pub fn with_metrics(
+        storage_binding_id: impl Into<String>,
         reader: R,
         writer: W,
         lister: Arc<dyn ObjectList>,
@@ -107,6 +112,7 @@ impl<R: ObjectRead, W: ObjectWrite> VerglasS3<R, W> {
         metrics: Arc<NodeMetrics>,
     ) -> Self {
         VerglasS3 {
+            storage_binding_id: storage_binding_id.into(),
             reader,
             writer,
             lister,
@@ -931,7 +937,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         // while the short-circuit error paths record at return.
         let started = Instant::now();
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         let ranged = input.range.is_some();
         // 206 for a ranged read, 200 for a full read (the tier rides the body).
         let ok_status: u16 = if ranged { 206 } else { 200 };
@@ -1098,6 +1104,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
             None => input.start_after.clone(),
         };
         let request = ListRequest {
+            storage_binding_id: self.storage_binding_id.clone(),
             bucket: input.bucket.clone(),
             prefix: input.prefix.clone().unwrap_or_default(),
             delimiter: delimiter.clone(),
@@ -1159,6 +1166,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         // An empty `delimiter=` is no delimiter at all (issue #145).
         let delimiter = input.delimiter.clone().filter(|d| !d.is_empty());
         let request = ListRequest {
+            storage_binding_id: self.storage_binding_id.clone(),
             bucket: input.bucket.clone(),
             prefix: input.prefix.clone().unwrap_or_default(),
             delimiter: delimiter.clone(),
@@ -1222,7 +1230,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         // Metrics (#46): a HEAD has no streamed body, so it records at return.
         let started = Instant::now();
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         // Version-ID / part-number / checksum-mode HEADs (issues #153/#154/#156)
         // go straight to the origin, exactly like the GET twin.
         let options = to_direct_read_options(
@@ -1296,7 +1304,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         // an empty `Content-MD5` as InvalidDigest — so consult the raw header.
         let md5_header_present = req.headers.contains_key("content-md5");
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         // Content-MD5 (#155): reject a malformed digest before writing
         // (InvalidDigest); a well-formed digest is checked against the body
         // as it streams and enforced after the write (BadDigest below).
@@ -1372,7 +1380,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         req: S3Request<DeleteObjectInput>,
     ) -> S3Result<S3Response<DeleteObjectOutput>> {
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         self.writer.delete(&key).await.map_err(to_s3_write_error)?;
         self.invalidate(std::slice::from_ref(&key)).await?;
         Ok(S3Response::new(DeleteObjectOutput::default()))
@@ -1404,7 +1412,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
             .delete
             .objects
             .iter()
-            .map(|object| cache_key_for(&input.bucket, &object.key))
+            .map(|object| cache_key_for(&self.storage_binding_id, &input.bucket, &object.key))
             .collect();
         let results = self
             .writer
@@ -1467,8 +1475,8 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
                 "versioned copy sources are not supported",
             ));
         }
-        let source = cache_key_for(&source_bucket, &source_key);
-        let dest = cache_key_for(&input.bucket, &input.key);
+        let source = cache_key_for(&self.storage_binding_id, &source_bucket, &source_key);
+        let dest = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         // MetadataDirective (#143): the default is COPY (retain the source's
         // stored metadata); REPLACE writes the request's metadata onto the
         // destination instead.
@@ -1523,7 +1531,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         let mut metadata = write_metadata(
             input.content_type,
             input.cache_control,
@@ -1568,7 +1576,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
     ) -> S3Result<S3Response<UploadPartOutput>> {
         let input = req.input;
         let part_number = to_part_number(input.part_number)?;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         // Forward any per-part checksum the client asserted (issue #208); the
         // origin verifies it. A present checksum routes the part over the raw
         // path, matching the raw create.
@@ -1612,7 +1620,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         let manifest = input
             .multipart_upload
             .and_then(|upload| upload.parts)
@@ -1683,7 +1691,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         self.writer
             .abort_multipart(&key, &input.upload_id)
             .await
@@ -1699,7 +1707,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         req: S3Request<ListPartsInput>,
     ) -> S3Result<S3Response<ListPartsOutput>> {
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         let parts = self
             .writer
             .list_parts(&key, &input.upload_id)
@@ -1747,7 +1755,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
         let input = req.input;
-        let key = cache_key_for(&input.bucket, &input.key);
+        let key = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         let request = AttributesRequest {
             object_attributes: input
                 .object_attributes
@@ -1854,8 +1862,8 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
         // the destination's raw client sends, so no cross-client GET+PUT is
         // needed. The source and destination may name different buckets.
         let part_number = to_part_number(input.part_number)?;
-        let source = cache_key_for(&source_bucket, &source_key);
-        let dest = cache_key_for(&input.bucket, &input.key);
+        let source = cache_key_for(&self.storage_binding_id, &source_bucket, &source_key);
+        let dest = cache_key_for(&self.storage_binding_id, &input.bucket, &input.key);
         let outcome = self
             .writer
             .upload_part_copy(
@@ -1893,6 +1901,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
             .clamp(0, MAX_LIST_KEYS);
         let delimiter = input.delimiter.clone().filter(|d| !d.is_empty());
         let request = MultipartUploadsRequest {
+            storage_binding_id: self.storage_binding_id.clone(),
             bucket: input.bucket.clone(),
             prefix: input.prefix.clone(),
             delimiter: delimiter.clone(),
@@ -1949,6 +1958,7 @@ async fn handle_http_error(_error: s3s::HttpError) -> axum::http::StatusCode {
 /// matching one of the configured static keys; unsigned requests get
 /// `AccessDenied`. With `None`, auth is disabled (unit tests only).
 pub fn router<R: ObjectRead, W: ObjectWrite>(
+    storage_binding_id: impl Into<String>,
     reader: R,
     writer: W,
     lister: Arc<dyn ObjectList>,
@@ -1956,6 +1966,7 @@ pub fn router<R: ObjectRead, W: ObjectWrite>(
     credentials: Option<(String, String)>,
 ) -> Router {
     router_with_passthrough(
+        storage_binding_id,
         reader,
         writer,
         lister,
@@ -1988,6 +1999,7 @@ pub fn router<R: ObjectRead, W: ObjectWrite>(
 ///   stays path-style rather than failing to bind.
 #[allow(clippy::too_many_arguments)]
 pub fn router_with_passthrough<R: ObjectRead, W: ObjectWrite>(
+    storage_binding_id: impl Into<String>,
     reader: R,
     writer: W,
     lister: Arc<dyn ObjectList>,
@@ -1998,10 +2010,24 @@ pub fn router_with_passthrough<R: ObjectRead, W: ObjectWrite>(
     base_domain: Option<&str>,
     metrics: Option<Arc<NodeMetrics>>,
 ) -> Router {
+    let storage_binding_id = storage_binding_id.into();
     let service = {
         let handler = match metrics {
-            Some(metrics) => VerglasS3::with_metrics(reader, writer, lister, invalidation, metrics),
-            None => VerglasS3::new(reader, writer, lister, invalidation),
+            Some(metrics) => VerglasS3::with_metrics(
+                storage_binding_id.clone(),
+                reader,
+                writer,
+                lister,
+                invalidation,
+                metrics,
+            ),
+            None => VerglasS3::new(
+                storage_binding_id.clone(),
+                reader,
+                writer,
+                lister,
+                invalidation,
+            ),
         };
         let mut builder = S3ServiceBuilder::new(handler);
         if let Some((access_key_id, secret_access_key)) = credentials {
@@ -2018,7 +2044,10 @@ pub fn router_with_passthrough<R: ObjectRead, W: ObjectWrite>(
             // Checked before typed dispatch: allowlisted bucket-config ops are
             // forwarded to the origin instead of 501ing (issue #152).
             routes.push(Box::new(
-                crate::passthrough_route::BucketConfigPassthrough::new(stores),
+                crate::passthrough_route::BucketConfigPassthrough::new(
+                    storage_binding_id.clone(),
+                    stores,
+                ),
             ));
         }
         if let Some(api) = serving_api {
@@ -2107,9 +2136,19 @@ mod tests {
         let store = std::sync::Arc::new(object_store::memory::InMemory::new());
         let build = |domain: Option<&str>| {
             router_with_passthrough(
-                crate::PassthroughRead::new(BackendStore::single("test-bucket", store.clone())),
-                PassthroughWrite::new(BackendStore::single("test-bucket", store.clone())),
+                "default",
+                crate::PassthroughRead::new(BackendStore::single(
+                    "default",
+                    "test-bucket",
+                    store.clone(),
+                )),
+                PassthroughWrite::new(BackendStore::single(
+                    "default",
+                    "test-bucket",
+                    store.clone(),
+                )),
                 Arc::new(PassthroughList::new(BackendStore::single(
+                    "default",
                     "test-bucket",
                     store.clone(),
                 ))),

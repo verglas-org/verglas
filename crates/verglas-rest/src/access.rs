@@ -13,11 +13,22 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use verglas_authz::{
     AccessCheck, Authorizer, AuthzError, Grant, GrantDelegation, GrantRevocation, Principal,
-    Resource,
+    ReplaceSecret, ResolveSecret, Resource, SecretError, SecretKind, SecretService,
 };
 
 /// Shared authorization backend mounted by local and standalone servers.
 pub type AccessRuntime = Arc<dyn Authorizer>;
+
+/// Shared encrypted-secret service mounted only by the standalone access process.
+pub type SecretRuntime = Arc<SecretService>;
+
+/// Tenant-local secret HTTP state owned by one access process.
+#[derive(Clone)]
+struct SecretHttpRuntime {
+    secrets: SecretRuntime,
+    tenant_id: Arc<str>,
+    creator_principal_id: Arc<str>,
+}
 
 /// Builds the complete access administration and decision API.
 pub fn router(authorizer: AccessRuntime) -> Router {
@@ -46,6 +57,29 @@ pub fn router(authorizer: AccessRuntime) -> Router {
         .with_state(authorizer)
 }
 
+/// Adds encrypted secret lifecycle and authorized runtime-resolution routes.
+pub fn router_with_secrets(
+    authorizer: AccessRuntime,
+    secrets: SecretRuntime,
+    tenant_id: impl Into<Arc<str>>,
+    creator_principal_id: impl Into<Arc<str>>,
+) -> Router {
+    router(authorizer).merge(secret_router(SecretHttpRuntime {
+        secrets,
+        tenant_id: tenant_id.into(),
+        creator_principal_id: creator_principal_id.into(),
+    }))
+}
+
+/// Builds the secret-specific routes with an isolated state type.
+fn secret_router(runtime: SecretHttpRuntime) -> Router {
+    Router::new()
+        .route("/v1/secrets", post(create_secret).get(list_secrets))
+        .route("/v1/access/secrets/resolve", post(resolve_secret))
+        .route("/v1/secrets/{id}", get(get_secret).put(replace_secret))
+        .with_state(runtime)
+}
+
 /// Tenant selection required by every list, get, and delete operation.
 #[derive(Debug, Deserialize)]
 struct TenantQuery {
@@ -56,6 +90,41 @@ struct TenantQuery {
 #[derive(Debug, Serialize)]
 struct Deleted {
     deleted: bool,
+}
+
+/// JSON create body whose value is consumed immediately by the encryption boundary.
+#[derive(Deserialize)]
+struct CreateSecretBody {
+    name: String,
+    #[serde(rename = "type")]
+    kind: SecretKind,
+    scope: String,
+    value: String,
+}
+
+/// JSON replacement body bound to an acting principal.
+#[derive(Deserialize)]
+struct ReplaceSecretBody {
+    principal_id: String,
+    value: String,
+}
+
+/// JSON resolution body for one provider URI.
+#[derive(Debug, Deserialize)]
+struct ResolveSecretBody {
+    tenant_id: String,
+    principal_id: String,
+    kind: SecretKind,
+    uri: String,
+}
+
+/// Authorized material returned only by the explicit resolution endpoint.
+#[derive(Debug, Serialize)]
+struct ResolvedSecretBody {
+    resource_id: String,
+    version: u64,
+    scope: String,
+    value: String,
 }
 
 /// Creates one principal.
@@ -199,11 +268,108 @@ async fn check_access(
     result(StatusCode::OK, authorizer.check(check).await)
 }
 
+/// Creates one authorization resource and its encrypted first value.
+async fn create_secret(
+    State(runtime): State<SecretHttpRuntime>,
+    Json(body): Json<CreateSecretBody>,
+) -> Response {
+    secret_result(
+        StatusCode::CREATED,
+        runtime
+            .secrets
+            .create(verglas_authz::CreateSecret::new(
+                runtime.tenant_id.as_ref(),
+                runtime.creator_principal_id.as_ref(),
+                body.name,
+                body.kind,
+                body.scope,
+                body.value.as_bytes(),
+            ))
+            .await,
+    )
+}
+
+/// Returns one secret's public metadata without loading its value.
+async fn get_secret(State(runtime): State<SecretHttpRuntime>, Path(id): Path<String>) -> Response {
+    secret_result(
+        StatusCode::OK,
+        runtime.secrets.get(runtime.tenant_id.as_ref(), &id).await,
+    )
+}
+
+/// Lists public secret metadata without loading any values.
+async fn list_secrets(State(runtime): State<SecretHttpRuntime>) -> Response {
+    secret_result(
+        StatusCode::OK,
+        runtime.secrets.list(runtime.tenant_id.as_ref()).await,
+    )
+}
+
+/// Replaces a secret's encrypted value while preserving its resource identity.
+async fn replace_secret(
+    State(runtime): State<SecretHttpRuntime>,
+    Path(id): Path<String>,
+    Json(body): Json<ReplaceSecretBody>,
+) -> Response {
+    secret_result(
+        StatusCode::OK,
+        runtime
+            .secrets
+            .replace(ReplaceSecret::new(
+                runtime.tenant_id.as_ref(),
+                body.principal_id,
+                id,
+                body.value.as_bytes(),
+            ))
+            .await,
+    )
+}
+
+/// Resolves and decrypts the longest authorized provider scope for a trusted runtime.
+async fn resolve_secret(
+    State(runtime): State<SecretHttpRuntime>,
+    Json(body): Json<ResolveSecretBody>,
+) -> Response {
+    if body.tenant_id != runtime.tenant_id.as_ref() {
+        return secret_error_response(SecretError::Forbidden(
+            "requested tenant does not match this access service".to_owned(),
+        ));
+    }
+    let resolved = runtime
+        .secrets
+        .resolve(ResolveSecret::new(
+            body.tenant_id,
+            body.principal_id,
+            body.kind,
+            body.uri,
+        ))
+        .await
+        .and_then(|resolved| {
+            String::from_utf8(resolved.expose().to_vec())
+                .map(|value| ResolvedSecretBody {
+                    resource_id: resolved.resource_id,
+                    version: resolved.version,
+                    scope: resolved.scope,
+                    value,
+                })
+                .map_err(|_| SecretError::Backend("secret value is not UTF-8".to_owned()))
+        });
+    secret_result(StatusCode::OK, resolved)
+}
+
 /// Serializes one successful typed result or maps its stable authorization error.
 fn result<T: Serialize>(status: StatusCode, value: Result<T, AuthzError>) -> Response {
     match value {
         Ok(value) => (status, Json(value)).into_response(),
         Err(error) => error_response(error),
+    }
+}
+
+/// Serializes one secret result or maps its bounded failure category.
+fn secret_result<T: Serialize>(status: StatusCode, value: Result<T, SecretError>) -> Response {
+    match value {
+        Ok(value) => (status, Json(value)).into_response(),
+        Err(error) => secret_error_response(error),
     }
 }
 
@@ -220,6 +386,22 @@ fn error_response(error: AuthzError) -> Response {
         AuthzError::Conflict(_) => StatusCode::CONFLICT,
         AuthzError::Forbidden(_) => StatusCode::FORBIDDEN,
         AuthzError::Backend(_) => StatusCode::BAD_GATEWAY,
+    };
+    (
+        status,
+        Json(serde_json::json!({ "error": error.to_string() })),
+    )
+        .into_response()
+}
+
+/// Maps secret failures without including values or ciphertext in error bodies.
+fn secret_error_response(error: SecretError) -> Response {
+    let status = match &error {
+        SecretError::Invalid(_) => StatusCode::BAD_REQUEST,
+        SecretError::NotFound(_) => StatusCode::NOT_FOUND,
+        SecretError::Conflict(_) => StatusCode::CONFLICT,
+        SecretError::Forbidden(_) => StatusCode::FORBIDDEN,
+        SecretError::Backend(_) => StatusCode::BAD_GATEWAY,
     };
     (
         status,

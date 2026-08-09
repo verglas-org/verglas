@@ -54,7 +54,11 @@ async fn foyer_disk_usage_grows_with_admissions() {
         ..CacheConfig::default()
     };
     let store = Arc::new(InMemory::new());
-    let backend = PassthroughRead::new(BackendStore::single("test-bucket", store.clone()));
+    let backend = PassthroughRead::new(BackendStore::single(
+        "default",
+        "test-bucket",
+        store.clone(),
+    ));
     let engine = HybridCacheEngine::single_node(backend, &config)
         .await
         .expect("build engine");
@@ -79,6 +83,7 @@ async fn foyer_disk_usage_grows_with_admissions() {
             .await
             .expect("seed");
         let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "test-bucket".into(),
             key: name,
         };
@@ -134,7 +139,11 @@ async fn growth_room_starts_full_and_shrinks_with_admissions() {
         ..CacheConfig::default()
     };
     let store = Arc::new(InMemory::new());
-    let backend = PassthroughRead::new(BackendStore::single("test-bucket", store.clone()));
+    let backend = PassthroughRead::new(BackendStore::single(
+        "default",
+        "test-bucket",
+        store.clone(),
+    ));
     let engine = HybridCacheEngine::single_node(backend, &config)
         .await
         .expect("build engine");
@@ -159,6 +168,7 @@ async fn growth_room_starts_full_and_shrinks_with_admissions() {
             .await
             .expect("seed");
         let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "test-bucket".into(),
             key: name,
         };

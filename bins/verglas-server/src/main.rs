@@ -41,6 +41,8 @@ type ServerEngine = HybridCacheEngine<PassthroughRead, PeerClient, LiveRing>;
 /// cache engine's cluster-of-one id so turning gossip off leaves ownership
 /// byte-identical to a pre-cluster server: one member owns every key.
 const SINGLE_NODE_ID: &str = "single";
+/// Storage binding for the built-in managed lakehouse database.
+const MANAGED_STORAGE_BINDING_ID: &str = "managed-lakehouse";
 
 /// Builds the `/admin/stats` source: a closure that reads the engine's live
 /// counters and DRAM usage and stamps them alongside the configured cache
@@ -397,7 +399,7 @@ fn spawn_warming(
     let reader: Arc<dyn WarmSource> = Arc::new(engine);
     let warmer = Arc::new(Warmer::new(reader, warm_config, budget));
     let progress = warmer.progress();
-    WarmingCoordinator::new(warmer, watcher).spawn();
+    WarmingCoordinator::new(MANAGED_STORAGE_BINDING_ID, warmer, watcher).spawn();
     progress
 }
 
@@ -445,7 +447,13 @@ fn spawn_prefetch(
 
     // Live logical-key map, kept current by its own single-writer updater.
     let mapper = Arc::new(Mapper::new());
-    MapUpdater::new(mapper.clone(), watcher.clone(), fetch.clone()).spawn();
+    MapUpdater::new(
+        MANAGED_STORAGE_BINDING_ID,
+        mapper.clone(),
+        watcher.clone(),
+        fetch.clone(),
+    )
+    .spawn();
 
     // Heat ledger fed from the request path via a drop-on-full channel and
     // folded by a background aggregator (classify() runs off the hot path).
@@ -477,6 +485,7 @@ fn spawn_prefetch(
     // retired at the next catalog event.
     let state_path = config.cache.dir.join("retire-state.json");
     let coordinator = PrefetchCoordinator::new(
+        MANAGED_STORAGE_BINDING_ID,
         watcher,
         fetch,
         mapper.clone(),
@@ -1173,6 +1182,7 @@ where
     // this SigV4-gated surface too. Path-style always works.
     let bucket = registry.bucket_set();
     let app = verglas_rest::compose_s3(
+        MANAGED_STORAGE_BINDING_ID,
         reader,
         writer,
         lister,
@@ -1408,7 +1418,8 @@ async fn serve(
     // building each bucket's concurrency-limited client lazily on first request.
     // A request for a bucket outside the set returns NoSuchBucket. The credential
     // mode is resolved from the environment — logged so operators can eyeball it.
-    let registry = verglas_backend::BackendStore::from_config(&config.backend);
+    let registry =
+        verglas_backend::BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
     eprintln!(
         "verglas-server {VERSION} backend resolved: {} (serving bucket set `{}`)",
         registry.describe(),
@@ -2524,7 +2535,8 @@ mod tests {
         );
         let config = verglas_core::config::Config::from_toml_str(&toml).expect("valid config");
 
-        let registry = verglas_backend::BackendStore::from_config(&config.backend);
+        let registry =
+            verglas_backend::BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
         let backend = PassthroughRead::new(registry);
         // Build the engine over the same ring path the server uses (a
         // single-member LiveRing when no `[cluster]` is configured).

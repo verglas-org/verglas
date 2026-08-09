@@ -25,6 +25,7 @@ fn block_keys_round_trip() {
     round_trip(&BlockEntryKey {
         block: BlockKey {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "lake".to_owned(),
                 key: "warehouse/db/t/data/part-00000.parquet".to_owned(),
             },
@@ -38,6 +39,7 @@ fn block_keys_round_trip() {
     round_trip(&BlockEntryKey {
         block: BlockKey {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: String::new(),
                 key: String::new(),
             },
@@ -58,6 +60,7 @@ fn block_keys_round_trip() {
 fn generation_is_encoded_and_distinguishes_keys() {
     let base = BlockKey {
         object: CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "lake".to_owned(),
             key: "t/data/part.parquet".to_owned(),
         },
@@ -84,10 +87,46 @@ fn generation_is_encoded_and_distinguishes_keys() {
 }
 
 #[test]
+fn storage_binding_is_encoded_and_distinguishes_blocks() {
+    let managed = BlockEntryKey {
+        block: BlockKey {
+            object: CacheKey {
+                storage_binding_id: "managed".to_owned(),
+                bucket: "lake".to_owned(),
+                key: "same.parquet".to_owned(),
+            },
+            etag: "\"same-etag\"".to_owned(),
+            block_bytes: 2 * 1024 * 1024,
+            block_index: 0,
+        },
+        generation: 0,
+    };
+    let customer = BlockEntryKey {
+        block: BlockKey {
+            object: CacheKey {
+                storage_binding_id: "customer".to_owned(),
+                ..managed.block.object.clone()
+            },
+            ..managed.block.clone()
+        },
+        generation: managed.generation,
+    };
+    let (mut managed_bytes, mut customer_bytes) = (Vec::new(), Vec::new());
+    managed.encode(&mut managed_bytes).expect("managed encode");
+    customer
+        .encode(&mut customer_bytes)
+        .expect("customer encode");
+    assert_ne!(managed_bytes, customer_bytes);
+    round_trip(&managed);
+    round_trip(&customer);
+}
+
+#[test]
 fn truncated_input_fails_to_decode() {
     let key = BlockEntryKey {
         block: BlockKey {
             object: CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "lake".to_owned(),
                 key: "k".to_owned(),
             },

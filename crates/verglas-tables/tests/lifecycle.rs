@@ -301,7 +301,7 @@ type Engine = HybridCacheEngine<
 async fn build_engine(store: Arc<InMemory>, dir: &TempDir) -> (Arc<Engine>, BackendCalls) {
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store)),
+        inner: PassthroughRead::new(BackendStore::single("managed-lakehouse", BUCKET, store)),
         calls: calls.clone(),
     };
     let config = CacheConfig {
@@ -332,6 +332,7 @@ async fn read_all(engine: &Engine, k: &CacheKey, range: ReadRange) -> Bytes {
 /// A cache key in the fixture bucket.
 fn key(k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: BUCKET.to_owned(),
         key: k.to_owned(),
     }
@@ -344,6 +345,7 @@ async fn mapper_at_append(fetch: &dyn MetadataFetch, metadata_key: &str) -> Mapp
         .apply_table(
             fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: verglas_tables::catalog::TableIdent::new(&["db"], "events"),
                 bucket: BUCKET.to_owned(),
                 metadata_key: metadata_key.to_owned(),
@@ -364,9 +366,15 @@ async fn mapper_at_append(fetch: &dyn MetadataFetch, metadata_key: &str) -> Mapp
 async fn replace_commit_diffs_added_and_removed() {
     let fx = build_parquet_fixture().await;
     let fetch = ObjectStoreFetch::new(fx.store.clone() as Arc<dyn ObjectStore>);
-    let diff = diff_snapshot(&fetch, BUCKET, &fx.metadata_key, SNAP_REPLACE)
-        .await
-        .expect("diff");
+    let diff = diff_snapshot(
+        &fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fx.metadata_key,
+        SNAP_REPLACE,
+    )
+    .await
+    .expect("diff");
     assert_eq!(diff.op, SnapshotOp::Replace);
     assert!(diff.op.is_compaction());
     let added: Vec<&str> = diff.added.iter().map(|f| f.path.as_str()).collect();
@@ -383,15 +391,22 @@ async fn replace_commit_diffs_added_and_removed() {
 async fn append_commit_prefetches_no_data() {
     let fx = build_parquet_fixture().await;
     let fetch = ObjectStoreFetch::new(fx.store.clone() as Arc<dyn ObjectStore>);
-    let diff = diff_snapshot(&fetch, BUCKET, &fx.metadata_key, SNAP_APPEND)
-        .await
-        .expect("diff");
+    let diff = diff_snapshot(
+        &fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fx.metadata_key,
+        SNAP_APPEND,
+    )
+    .await
+    .expect("diff");
     assert_eq!(diff.op, SnapshotOp::Append);
     let ledger = HeatLedger::with_defaults();
     let plan = plan_prefetch(
         &fetch,
         &ledger,
         verglas_tables::mapper::TableId(0),
+        "managed-lakehouse",
         BUCKET,
         &diff,
         &PrefetchConfig::default(),
@@ -434,13 +449,20 @@ async fn hot_column_carries_into_compacted_file() {
 
     // Plan the compaction. The hot column carried by (partition, column) must be
     // scheduled in the compacted file; cold columns must not.
-    let diff = diff_snapshot(&fetch, BUCKET, &fx.metadata_key, SNAP_REPLACE)
-        .await
-        .expect("diff");
+    let diff = diff_snapshot(
+        &fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fx.metadata_key,
+        SNAP_REPLACE,
+    )
+    .await
+    .expect("diff");
     let plan = plan_prefetch(
         &fetch,
         &ledger,
         table,
+        "managed-lakehouse",
         BUCKET,
         &diff,
         &PrefetchConfig::default(),
@@ -468,6 +490,7 @@ async fn hot_column_carries_into_compacted_file() {
         &fetch,
         &cold,
         table,
+        "managed-lakehouse",
         BUCKET,
         &diff,
         &PrefetchConfig::default(),
@@ -513,13 +536,20 @@ async fn executor_prefetches_hot_chunk_before_first_access() {
     let (engine, calls) = build_engine(fx.store.clone(), &dir).await;
 
     // Plan against the store (direct) and drain through the engine executor.
-    let diff = diff_snapshot(&store_fetch, BUCKET, &fx.metadata_key, SNAP_REPLACE)
-        .await
-        .expect("diff");
+    let diff = diff_snapshot(
+        &store_fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fx.metadata_key,
+        SNAP_REPLACE,
+    )
+    .await
+    .expect("diff");
     let plan = plan_prefetch(
         &store_fetch,
         &ledger,
         table,
+        "managed-lakehouse",
         BUCKET,
         &diff,
         &PrefetchConfig::default(),
@@ -570,6 +600,7 @@ async fn heat_feed_channel_folds_a_read_into_the_ledger() {
         .apply_table(
             &store_fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: verglas_tables::catalog::TableIdent::new(&["db"], "events"),
                 bucket: BUCKET.to_owned(),
                 metadata_key: fx.metadata_key.clone(),
@@ -642,6 +673,7 @@ async fn telemetry_feed_attributes_a_served_read_to_its_table() {
         .apply_table(
             &store_fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: verglas_tables::catalog::TableIdent::new(&["db"], "events"),
                 bucket: BUCKET.to_owned(),
                 metadata_key: fx.metadata_key.clone(),
@@ -723,9 +755,15 @@ async fn telemetry_feed_attributes_a_served_read_to_its_table() {
 async fn retirement_demotes_removed_with_grace() {
     let fx = build_parquet_fixture().await;
     let fetch = ObjectStoreFetch::new(fx.store.clone() as Arc<dyn ObjectStore>);
-    let diff = diff_snapshot(&fetch, BUCKET, &fx.metadata_key, SNAP_REPLACE)
-        .await
-        .expect("diff");
+    let diff = diff_snapshot(
+        &fetch,
+        "managed-lakehouse",
+        BUCKET,
+        &fx.metadata_key,
+        SNAP_REPLACE,
+    )
+    .await
+    .expect("diff");
     // Grace from the fixture's property (1 hour), not the 7-day default.
     let props = verglas_tables::lifecycle::retire::parse_table_properties(
         &fetch_bytes(&fetch, &fx.metadata_key).await,
@@ -736,6 +774,7 @@ async fn retirement_demotes_removed_with_grace() {
 
     let sched = RetirementScheduler::new();
     let demotions = verglas_tables::lifecycle::retire::demotions_for_commit(
+        "managed-lakehouse",
         BUCKET,
         &diff.removed,
         &[],
@@ -744,7 +783,7 @@ async fn retirement_demotes_removed_with_grace() {
     );
     sched.record(&demotions);
     assert_eq!(demotions.len(), 2);
-    assert!(sched.is_demoted(BUCKET, &fx.small[0]));
+    assert!(sched.is_demoted("managed-lakehouse", BUCKET, &fx.small[0]));
     // Within grace nothing hard-evicts; after it, both drain.
     assert!(sched.drain_expired(grace - 1).is_empty());
     assert_eq!(sched.drain_expired(grace).len(), 2);
@@ -783,7 +822,7 @@ async fn avro_compaction_carries_partition_heat_to_whole_file() {
     .await;
 
     let fetch = ObjectStoreFetch::new(store.clone() as Arc<dyn ObjectStore>);
-    let diff = diff_snapshot(&fetch, BUCKET, &metadata_key, 2002)
+    let diff = diff_snapshot(&fetch, "managed-lakehouse", BUCKET, &metadata_key, 2002)
         .await
         .expect("diff");
     assert_eq!(diff.op, SnapshotOp::Replace);
@@ -807,6 +846,7 @@ async fn avro_compaction_carries_partition_heat_to_whole_file() {
         &fetch,
         &ledger,
         table,
+        "managed-lakehouse",
         BUCKET,
         &diff,
         &PrefetchConfig::default(),
@@ -832,6 +872,7 @@ async fn column_range(
     column: ColumnId,
 ) -> std::ops::Range<u64> {
     let path = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
     };
@@ -848,6 +889,7 @@ async fn column_range(
 /// Reads a whole small object through the fetch interface.
 async fn fetch_bytes(fetch: &dyn MetadataFetch, key: &str) -> Bytes {
     let path = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
     };
@@ -965,6 +1007,7 @@ async fn coordinator_repairs_and_retires_on_replace_commit() {
     );
 
     let coord = PrefetchCoordinator::new(
+        "managed-lakehouse",
         watcher,
         store_fetch.clone(),
         mapper.clone(),
@@ -987,7 +1030,7 @@ async fn coordinator_repairs_and_retires_on_replace_commit() {
 
     // Retirement demoted both removed files with the fixture's 1-hour grace.
     assert_eq!(retire.demoted_count(), 2);
-    assert!(retire.is_demoted(BUCKET, &fx.small[0]));
+    assert!(retire.is_demoted("managed-lakehouse", BUCKET, &fx.small[0]));
 
     // The repair plan drains: the compacted file's hot chunk then serves warm.
     wait_until(|| executor.metrics().completed.load(Ordering::Relaxed) >= 1).await;
@@ -1069,6 +1112,7 @@ async fn coordinator_demotes_removed_files_in_the_engine() {
 
     // The coordinator holds the engine as its demotion sink.
     let coord = PrefetchCoordinator::new(
+        "managed-lakehouse",
         watcher,
         store_fetch.clone(),
         mapper.clone(),
@@ -1277,13 +1321,20 @@ async fn benchmark_hit_rate_recovery_prefetch_on_vs_off() {
 
         if prefetch_on {
             // Repair: plan + drain the compaction prefetch through the engine.
-            let diff = diff_snapshot(store_fetch.as_ref(), BUCKET, &metadata_key, SNAP_REPLACE)
-                .await
-                .expect("diff");
+            let diff = diff_snapshot(
+                store_fetch.as_ref(),
+                "managed-lakehouse",
+                BUCKET,
+                &metadata_key,
+                SNAP_REPLACE,
+            )
+            .await
+            .expect("diff");
             let plan = plan_prefetch(
                 store_fetch.as_ref(),
                 &ledger,
                 table,
+                "managed-lakehouse",
                 BUCKET,
                 &diff,
                 &PrefetchConfig::default(),
@@ -1354,6 +1405,7 @@ async fn coordinator_append_and_dropped_are_noops() {
         Some(SNAP_APPEND),
     );
     let coord = PrefetchCoordinator::new(
+        "managed-lakehouse",
         watcher,
         store_fetch.clone(),
         mapper.clone(),
@@ -1437,6 +1489,7 @@ async fn restore_after_restart_still_physically_reclaims() {
             Some(SNAP_REPLACE),
         );
         PrefetchCoordinator::new(
+            "managed-lakehouse",
             watcher,
             store_fetch.clone(),
             mapper.clone(),

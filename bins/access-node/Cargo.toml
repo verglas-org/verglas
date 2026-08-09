@@ -13,11 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 axum.workspace = true
+async-trait.workspace = true
 clap.workspace = true
+hex.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 verglas-authz.workspace = true
 verglas-authz-openfga.workspace = true
 verglas-authz-postgres.workspace = true
+verglas-database.workspace = true
 verglas-rest.workspace = true
 
 [lints]

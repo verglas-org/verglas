@@ -64,9 +64,9 @@ async fn fills_stream_from_a_real_s3_store() {
         bucket: Some(bucket.clone()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let store = registry
-        .store_for(&bucket)
+        .store_for("default", &bucket)
         .expect("build MinIO client for the bucket");
 
     common::assert_streamed_fill(store).await;

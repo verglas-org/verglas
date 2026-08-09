@@ -28,6 +28,7 @@ members = [
     "crates/verglas-scheduler",
     "crates/verglas-vessel-contract",
     "crates/verglas-container-runtime",
+    "crates/verglas-database",
     "bins/cache-node",
     "bins/access-node",
     "crates/verglas-block",
@@ -78,6 +79,7 @@ verglas-kv = { path = "crates/verglas-kv" }
 verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-vessel-contract = { path = "crates/verglas-vessel-contract" }
 verglas-container-runtime = { path = "crates/verglas-container-runtime" }
+verglas-database = { path = "crates/verglas-database" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 tonic = "0.13.1"

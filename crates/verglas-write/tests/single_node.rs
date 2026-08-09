@@ -265,6 +265,7 @@ fn unused(op: &str) -> WriteError {
 
 fn ck(key: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "bkt".into(),
         key: key.into(),
     }

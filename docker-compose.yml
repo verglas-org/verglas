@@ -1,8 +1,9 @@
 # Complete open-source Verglas development and community stack.
 #
 # 1. Export the R2, catalog, and client-facing S3 values required below.
-# 2. docker compose up -d --build
-# 3. Point the CLI at the admin port:
+# 2. export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+# 3. docker compose up -d --build
+# 4. Point the CLI at the admin port:
 #      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 #    Engines point S3 at http://127.0.0.1:8333 and Verglas OS is at
 #    http://127.0.0.1:8787.
@@ -60,6 +61,9 @@ services:
       VERGLAS_OPENFGA_STORE: verglas
       VERGLAS_OPENFGA_TOKEN: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
       VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
+      VERGLAS_ACCESS_SERVICE_PRINCIPAL: ${VERGLAS_ACCESS_SERVICE_PRINCIPAL:-verglas-local-access}
+      VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_LISTEN: 0.0.0.0:8345
     ports:
       - "127.0.0.1:8345:8345"

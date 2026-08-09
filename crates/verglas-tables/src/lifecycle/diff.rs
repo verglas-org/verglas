@@ -100,11 +100,12 @@ impl SnapshotDiff {
 /// diffs the full file set. Off the request hot path (does IO).
 pub async fn diff_snapshot(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     metadata_key: &str,
     snapshot_id: i64,
 ) -> Result<SnapshotDiff, MapError> {
-    let doc = read_metadata(fetch, bucket, metadata_key).await?;
+    let doc = read_metadata(fetch, storage_binding_id, bucket, metadata_key).await?;
     let snap = doc
         .snapshots
         .iter()
@@ -113,18 +114,20 @@ pub async fn diff_snapshot(
             object: metadata_key.to_owned(),
             detail: format!("metadata.json names no snapshot {snapshot_id}"),
         })?;
-    diff_from_snapshot_ref(fetch, bucket, snap).await
+    diff_from_snapshot_ref(fetch, storage_binding_id, bucket, snap).await
 }
 
 /// Diffs a specific [`SnapshotRef`] already resolved from a `metadata.json`.
 /// The core the server calls when it has parsed the doc once and holds the ref.
 pub async fn diff_from_snapshot_ref(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     snap: &SnapshotRef,
 ) -> Result<SnapshotDiff, MapError> {
     let op = SnapshotOp::classify(snap.operation.as_deref());
-    let list_bytes = read_object(fetch, bucket, &snap.manifest_list_key).await?;
+    let list_bytes =
+        read_object(fetch, storage_binding_id, bucket, &snap.manifest_list_key).await?;
     let refs = iceberg::parse_manifest_list_refs(&list_bytes, bucket, &snap.manifest_list_key)?;
 
     // Only the manifests this commit wrote carry its ADDED/DELETED entries. A
@@ -137,7 +140,7 @@ pub async fn diff_from_snapshot_ref(
         if r.added_snapshot_id != Some(snap.snapshot_id) {
             continue;
         }
-        let bytes = read_object(fetch, bucket, &r.manifest_key).await?;
+        let bytes = read_object(fetch, storage_binding_id, bucket, &r.manifest_key).await?;
         let mut entries = Vec::new();
         iceberg::parse_manifest_entries(&bytes, bucket, &r.manifest_key, &mut entries)?;
         for entry in entries {
@@ -163,10 +166,11 @@ pub async fn diff_from_snapshot_ref(
 /// Reads and parses the table's `metadata.json` through the fetch interface.
 pub(crate) async fn read_metadata(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     metadata_key: &str,
 ) -> Result<MetadataDoc, MapError> {
-    let bytes = read_object(fetch, bucket, metadata_key).await?;
+    let bytes = read_object(fetch, storage_binding_id, bucket, metadata_key).await?;
     iceberg::parse_metadata_json(&bytes, bucket, metadata_key)
 }
 
@@ -174,10 +178,12 @@ pub(crate) async fn read_metadata(
 /// generous suffix window — manifests and manifest lists comfortably fit.
 pub(crate) async fn read_object(
     fetch: &dyn MetadataFetch,
+    storage_binding_id: &str,
     bucket: &str,
     key: &str,
 ) -> Result<bytes::Bytes, MapError> {
     let path = ObjectPath {
+        storage_binding_id: storage_binding_id.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
     };

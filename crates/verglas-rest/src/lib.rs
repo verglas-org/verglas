@@ -2,7 +2,7 @@
 //! This router is the deployment-specific surface that mounts cache, admin,
 //! catalog proxy, and worker APIs in one process.
 
-use axum::extract::{OriginalUri, State};
+use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -10,11 +10,13 @@ use axum::{
     routing::{any, get},
 };
 use bytes::Bytes;
-use verglas_catalog::CatalogGateway;
+use serde::Deserialize;
+use verglas_catalog::{CatalogGateway, CatalogRuntimeRegistry, DatabaseId};
 
 pub mod access;
 pub mod admin;
 pub mod dashboard;
+pub mod database;
 pub mod follow;
 pub mod kv;
 pub mod logging;
@@ -37,6 +39,74 @@ pub fn compose_query_and_catalog(query: Router, catalog: CatalogGateway) -> Rout
             .route("/catalog/{*path}", any(catalog_request))
             .with_state(catalog),
     )
+}
+
+/// Mounts database-scoped catalog routes backed by a dynamic tenant registry.
+pub fn compose_database_catalogs(query: Router, catalogs: CatalogRuntimeRegistry) -> Router {
+    query.merge(
+        Router::new()
+            .route(
+                "/v1/databases/{database}/catalog/_verglas/generation",
+                get(database_catalog_generation),
+            )
+            .route(
+                "/v1/databases/{database}/catalog/{*path}",
+                any(database_catalog_request),
+            )
+            .with_state(catalogs),
+    )
+}
+
+/// Route parameters for a database-scoped catalog request.
+#[derive(Debug, Deserialize)]
+struct DatabaseCatalogPath {
+    database: String,
+    #[allow(dead_code)]
+    path: String,
+}
+
+/// Returns one database catalog's prepared-response generation.
+async fn database_catalog_generation(
+    State(catalogs): State<CatalogRuntimeRegistry>,
+    Path(database): Path<String>,
+) -> Response {
+    let Ok(database) = DatabaseId::new(database) else {
+        return (StatusCode::BAD_REQUEST, "invalid database id").into_response();
+    };
+    let Some(catalog) = catalogs.get(&database) else {
+        return (StatusCode::NOT_FOUND, "database catalog not found").into_response();
+    };
+    Json(serde_json::json!({ "generation": catalog.generation() })).into_response()
+}
+
+/// Routes one database's Iceberg REST request to its bound live gateway.
+async fn database_catalog_request(
+    State(catalogs): State<CatalogRuntimeRegistry>,
+    Path(path): Path<DatabaseCatalogPath>,
+    OriginalUri(uri): OriginalUri,
+    method: Method,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let database = path.database;
+    let Ok(database_id) = DatabaseId::new(database.clone()) else {
+        return (StatusCode::BAD_REQUEST, "invalid database id").into_response();
+    };
+    let Some(catalog) = catalogs.get(&database_id) else {
+        return (StatusCode::NOT_FOUND, "database catalog not found").into_response();
+    };
+    let Some(path_and_query) = uri.path_and_query().map(|value| value.as_str()) else {
+        return (StatusCode::BAD_REQUEST, "catalog request has no path").into_response();
+    };
+    let mount = format!("/v1/databases/{database}/catalog");
+    let Some(upstream_path) = path_and_query.strip_prefix(&mount) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "catalog request is outside its database mount",
+        )
+            .into_response();
+    };
+    catalog_response(catalog, method, upstream_path, headers, body).await
 }
 
 /// Cache-owned catalog generation for query-worker session fencing.
@@ -62,6 +132,17 @@ async fn catalog_request(
         )
             .into_response();
     };
+    catalog_response(catalog, method, upstream_path, headers, body).await
+}
+
+/// Converts a shallow gateway result into an Axum response.
+async fn catalog_response(
+    catalog: CatalogGateway,
+    method: Method,
+    upstream_path: &str,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
     match catalog.request(method, upstream_path, headers, body).await {
         Ok(result) => {
             let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);

@@ -73,9 +73,12 @@ async fn serve_with_metrics(key: &str, body: Bytes) -> (String, Arc<NodeMetrics>
         .expect("seed object");
     let metrics = Arc::new(NodeMetrics::new().expect("build metrics"));
     let app = verglas_s3::router_with_passthrough(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         None,
         None,

@@ -46,6 +46,8 @@ use crate::admin;
 /// The node id the single-node cache uses. Matches verglas-server's cluster-of-one id
 /// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
+/// Storage binding for the built-in managed lakehouse database.
+const MANAGED_STORAGE_BINDING_ID: &str = "managed-lakehouse";
 
 /// The default NBD listen port for the block-device tier (#382). An attach
 /// client connects a kernel NBD client here; the export name selects the
@@ -300,7 +302,7 @@ pub async fn run(
     credentials: (String, String),
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One backend store shared by the read and write passthroughs.
-    let registry = BackendStore::from_config(&config.backend);
+    let registry = BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
     eprintln!(
         "verglas-cache-node {VERSION} backend resolved: {} (serving bucket set `{}`)",
         registry.describe(),
@@ -383,7 +385,7 @@ pub async fn run(
     let mut ring_plane = None;
     let block_registry = match config.backend.bucket.as_deref() {
         Some(bucket) => {
-            let store = registry.store_for(bucket)?;
+            let store = registry.store_for(MANAGED_STORAGE_BINDING_ID, bucket)?;
             let backend: Arc<dyn ObjectBackend> = Arc::new(ObjectStoreBackend::new(store));
             let device_registry =
                 crate::blockdev::DeviceRegistry::open(&config.cache.dir, backend).await?;
@@ -629,6 +631,7 @@ async fn serve_s3(
         );
         let tier = WritebackTier::new(coordinator, engine, origin, policy);
         verglas_s3::router_with_passthrough(
+            MANAGED_STORAGE_BINDING_ID,
             tier.reader,
             tier.writer,
             lister,
@@ -641,6 +644,7 @@ async fn serve_s3(
         )
     } else {
         verglas_s3::router_with_passthrough(
+            MANAGED_STORAGE_BINDING_ID,
             engine,
             PassthroughWrite::new(registry.clone()),
             lister,
@@ -893,7 +897,7 @@ mod tests {
     /// never reached — the tests never issue a read that would fill), the same
     /// single-node rendezvous ring + no-op peer the serve path uses.
     async fn build_test_engine(config: &Config) -> (CacheEngine, Arc<BackendStore>) {
-        let registry = BackendStore::from_config(&config.backend);
+        let registry = BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
         let backend = PassthroughRead::new(registry.clone());
         let node = NodeId::new(SINGLE_NODE_ID);
         let ring = RendezvousRing::single(node.clone());

@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use verglas_authz::{
     AccessCheck, Action, AuthorizationRepository, Grant, Principal, PrincipalKind, Resource,
-    ResourceKind,
+    ResourceKind, SecretKind, SecretMetadata, SecretRepository,
 };
 use verglas_authz_postgres::PostgresAuthorizationRepository;
 
@@ -59,5 +59,58 @@ async fn grants_survive_reconnect_and_inherit_through_resources() {
     assert_eq!(
         reconnected.policy_version(&tenant).await.expect("version"),
         version
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires VERGLAS_TEST_POSTGRES_URL"]
+async fn encrypted_secret_versions_survive_reconnect_without_plaintext_metadata() {
+    let url = std::env::var("VERGLAS_TEST_POSTGRES_URL").expect("VERGLAS_TEST_POSTGRES_URL");
+    let tenant = format!("test-{}", uuid::Uuid::new_v4());
+    let repository = PostgresAuthorizationRepository::connect(&url)
+        .await
+        .expect("connect");
+    repository
+        .create_resource(Resource::new(&tenant, "secret-1", ResourceKind::Secret))
+        .await
+        .expect("resource");
+    repository
+        .create(
+            SecretMetadata {
+                tenant_id: tenant.clone(),
+                id: "secret-1".to_owned(),
+                kind: SecretKind::S3,
+                scope: "s3://bucket/team".to_owned(),
+                current_version: 1,
+                resource_kind: ResourceKind::Secret,
+            },
+            b"sealed-v1".to_vec(),
+        )
+        .await
+        .expect("secret");
+    repository
+        .replace(&tenant, "secret-1", b"sealed-v2".to_vec())
+        .await
+        .expect("replace");
+    drop(repository);
+
+    let reconnected = PostgresAuthorizationRepository::connect(&url)
+        .await
+        .expect("reconnect");
+    let metadata = reconnected
+        .get(&tenant, "secret-1")
+        .await
+        .expect("metadata");
+    assert_eq!(metadata.current_version, 2);
+    let stored = reconnected
+        .candidates(&tenant, SecretKind::S3)
+        .await
+        .expect("candidates");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].ciphertext, b"sealed-v2");
+    assert!(
+        !serde_json::to_string(&metadata)
+            .expect("json")
+            .contains("sealed")
     );
 }

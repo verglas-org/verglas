@@ -94,9 +94,12 @@ async fn serve_counting() -> (String, Arc<AtomicU64>, Arc<AtomicU64>) {
     };
     let store = Arc::new(object_store::memory::InMemory::new());
     let base = serve(verglas_s3::router(
+        "default",
         reader,
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         None,
     ))

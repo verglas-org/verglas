@@ -57,12 +57,14 @@ async fn remote_owned_key_backend_fills_locally_never_errors() {
         .map(|i| format!("obj-{i}.bin"))
         .find(|n| {
             ring.owner(&CacheKey {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 bucket: "bkt".to_owned(),
                 key: n.clone(),
             }) == remote
         })
         .expect("some key is remote-owned");
     let key = CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: "bkt".to_owned(),
         key: name.clone(),
     };
@@ -86,7 +88,7 @@ async fn remote_owned_key_backend_fills_locally_never_errors() {
         ..Default::default()
     };
     let engine = HybridCacheEngine::new(
-        PassthroughRead::new(BackendStore::single("bkt", store)),
+        PassthroughRead::new(BackendStore::single("managed-lakehouse", "bkt", store)),
         NoopPeerFetch,
         ring,
         local,

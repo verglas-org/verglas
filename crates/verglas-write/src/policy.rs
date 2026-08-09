@@ -62,6 +62,7 @@ mod tests {
     /// A key for `(bucket, key)`.
     fn ck(key: &str) -> CacheKey {
         CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: "b".to_owned(),
             key: key.to_owned(),
         }

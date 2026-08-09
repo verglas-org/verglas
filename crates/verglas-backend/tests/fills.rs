@@ -41,9 +41,9 @@ async fn fills_stream_from_an_in_process_s3_stub() {
         credentials_file: Some(creds.display().to_string()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let store = registry
-        .store_for(&bucket)
+        .store_for("default", &bucket)
         .expect("build stub client for the bucket");
 
     common::assert_streamed_fill(store).await;

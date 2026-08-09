@@ -201,6 +201,7 @@ fn registry_with(
     breaker: BreakerPolicy,
 ) -> Arc<BackendStore> {
     BackendStore::with_factory(
+        "default",
         "bucket".to_owned(),
         concurrency,
         retry,
@@ -235,7 +236,7 @@ async fn retries_a_transient_error_then_succeeds() {
     let fake = FakeOrigin::new(m, calls.clone());
     let registry = registry_with(fake, 4, fast_retry(3, 10_000), inert_breaker());
 
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
     let out = store.get_ranges(&Path::from("k"), &one_range()).await;
     assert!(
         out.is_ok(),
@@ -256,7 +257,7 @@ async fn a_non_retryable_error_is_returned_immediately() {
     let fake = FakeOrigin::new(m, calls.clone());
     let registry = registry_with(fake, 4, fast_retry(5, 10_000), inert_breaker());
 
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
     let err = store
         .get_ranges(&Path::from("k"), &one_range())
         .await
@@ -284,7 +285,7 @@ async fn a_retry_after_hint_is_honoured() {
     // initial_backoff is 1 ms; if the hint is ignored the wait would be ~1 ms.
     let registry = registry_with(fake, 4, fast_retry(3, 10_000), inert_breaker());
 
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
     let started = Instant::now();
     store
         .get_ranges(&Path::from("k"), &one_range())
@@ -305,7 +306,7 @@ async fn exhausting_the_retry_budget_returns_a_clean_error() {
     let fake = FakeOrigin::new(m, calls.clone());
     let registry = registry_with(fake, 4, fast_retry(2, 10_000), inert_breaker());
 
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
     let err = store
         .get_ranges(&Path::from("k"), &one_range())
         .await
@@ -333,7 +334,7 @@ async fn the_time_budget_bounds_the_retries() {
     };
     let registry = registry_with(fake, 4, retry, inert_breaker());
 
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
     let started = Instant::now();
     let err = store.get_ranges(&Path::from("k"), &one_range()).await;
     assert!(err.is_err(), "budget exhausted → error");
@@ -370,7 +371,7 @@ async fn a_backoff_sleep_does_not_hold_a_limiter_permit() {
         budget_ms: 10_000,
     };
     let registry = registry_with(fake, 1, retry, inert_breaker());
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
 
     // Fire "a": it will fail once, then sleep ~300 ms in backoff (no permit).
     let a_store = store.clone();
@@ -415,7 +416,7 @@ async fn an_open_breaker_fails_misses_fast() {
     };
     // No retries, so each request is exactly one origin attempt → one outcome.
     let registry = registry_with(fake, 4, fast_retry(0, 10_000), breaker);
-    let store = registry.store_for("bucket").expect("store");
+    let store = registry.store_for("default", "bucket").expect("store");
 
     // Drive four failing misses to trip the breaker.
     for _ in 0..4 {
@@ -444,6 +445,9 @@ async fn an_open_breaker_fails_misses_fast() {
     );
 
     // The breaker integration point is visible for other subsystems (e.g. #51 prefetch).
-    let seam = registry.breaker_for("bucket").expect("breaker exposed");
+    let seam = registry
+        .breaker_for("default", "bucket")
+        .expect("binding")
+        .expect("breaker exposed");
     assert_eq!(seam.state(), verglas_backend::BreakerState::Open);
 }

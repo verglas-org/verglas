@@ -187,6 +187,7 @@ impl Code for BlockEntryKey {
     /// The generation is part of the on-disk framing so restart recovery keeps
     /// old-generation entries correctly unreachable (see the type doc).
     fn encode(&self, writer: &mut impl Write) -> FoyerResult<()> {
+        write_bytes(writer, self.block.object.storage_binding_id.as_bytes())?;
         write_bytes(writer, self.block.object.bucket.as_bytes())?;
         write_bytes(writer, self.block.object.key.as_bytes())?;
         write_bytes(writer, self.block.etag.as_bytes())?;
@@ -204,6 +205,7 @@ impl Code for BlockEntryKey {
     /// Decodes what [`Code::encode`] wrote; used by foyer's disk recovery to
     /// rebuild the index, so it must be a faithful inverse.
     fn decode(reader: &mut impl Read) -> FoyerResult<Self> {
+        let storage_binding_id = read_string(reader)?;
         let bucket = read_string(reader)?;
         let key = read_string(reader)?;
         let etag = read_string(reader)?;
@@ -221,7 +223,11 @@ impl Code for BlockEntryKey {
             .map_err(FoyerError::io_error)?;
         Ok(BlockEntryKey {
             block: BlockKey {
-                object: CacheKey { bucket, key },
+                object: CacheKey {
+                    storage_binding_id,
+                    bucket,
+                    key,
+                },
                 etag,
                 block_bytes: u64::from_le_bytes(block_bytes),
                 block_index: u64::from_le_bytes(index),
@@ -233,7 +239,9 @@ impl Code for BlockEntryKey {
     /// Serialized size, exact: length prefixes + field bytes + geometry +
     /// index + generation.
     fn estimated_size(&self) -> usize {
-        8 + self.block.object.bucket.len()
+        8 + self.block.object.storage_binding_id.len()
+            + 8
+            + self.block.object.bucket.len()
             + 8
             + self.block.object.key.len()
             + 8

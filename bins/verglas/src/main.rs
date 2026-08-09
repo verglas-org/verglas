@@ -43,6 +43,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::kv::run(command, &cli.endpoint, cli.token.as_deref()).await
         }
         Command::Vessel(command) => commands::vessel::run(command, cli.json).await,
+        Command::Db(command) => {
+            commands::database::run(
+                command,
+                &cli.access_endpoint,
+                cli.token.as_deref(),
+                cli.json,
+            )
+            .await
+        }
+        Command::Secret(command) => {
+            commands::secret::run(
+                command,
+                &cli.access_endpoint,
+                cli.token.as_deref(),
+                cli.json,
+            )
+            .await
+        }
     }
 }
 
