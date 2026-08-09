@@ -134,9 +134,17 @@ services:
     image: postgres:17
     environment:
       PGPASSWORD: ${POSTGRES_PASSWORD:-verglas}
-    command: ["psql", "-h", "verglas-workers-postgres", "-U", "verglas", "-d", "postgres", "-v", "ON_ERROR_STOP=1", "-f", "/init/init-databases.sql"]
-    volumes:
-      - ./deploy/postgres/init-databases.sql:/init/init-databases.sql:ro
+    command:
+      - bash
+      - -ec
+      - |
+        for database in verglas_scheduler verglas_permissions verglas_catalog; do
+          if ! psql -h verglas-workers-postgres -U verglas -d postgres -Atc \
+            "SELECT 1 FROM pg_database WHERE datname = '$$database'" | grep -qx 1; then
+            psql -h verglas-workers-postgres -U verglas -d postgres -v ON_ERROR_STOP=1 -c \
+              "CREATE DATABASE \"$$database\" OWNER verglas"
+          fi
+        done
     depends_on:
       verglas-workers-postgres:
         condition: service_healthy
