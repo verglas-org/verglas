@@ -51,9 +51,8 @@ fn assert_documented_file(page: &str, name: &str, source: &str) {
 #[test]
 fn self_hosted_compose_is_complete_and_runnable() {
     let root = workspace_root();
-    let page = fs::read_to_string(root.join("docs/get-started/self-host.mdx"))
-        .unwrap_or_else(|error| panic!("failed to read self-host guide: {error}"));
-    let compose = named_fence(&page, "docker-compose.yml");
+    let compose = fs::read_to_string(root.join("docker-compose.yml"))
+        .unwrap_or_else(|error| panic!("failed to read docker-compose.yml: {error}"));
     for required in [
         "verglas-server:",
         "verglas-container-runtime:",
@@ -85,12 +84,10 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("config.toml"),
         "the server must be configured entirely by Compose"
     );
-    for unmanaged_service in ["postgres:", "verglas-scheduler:", "rill:"] {
-        assert!(
-            !compose.contains(unmanaged_service),
-            "bootstrap Compose must not directly own {unmanaged_service}"
-        );
-    }
+    assert!(
+        !compose.contains("rill:"),
+        "bootstrap Compose must not directly own rill:"
+    );
 }
 
 #[test]

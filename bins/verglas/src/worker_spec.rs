@@ -75,7 +75,6 @@ pub enum Trigger {
     },
 }
 
-
 /// Projects one portable trigger into the local worker registry contract.
 fn local_trigger(trigger: &Trigger) -> Value {
     match trigger {
@@ -103,7 +102,6 @@ fn local_trigger(trigger: &Trigger) -> Value {
         Trigger::Follow { file } => json!({ "type": "follow", "file": file }),
     }
 }
-
 
 /// Advisory resource hints for the worker.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -320,7 +318,6 @@ impl WorkerManifest {
         body
     }
 
-
     /// Rebuilds a spec from a worker row read back from the local server.
     /// `code`, `triggers`, and `config` are JSON
     /// strings on the row.
@@ -381,10 +378,7 @@ impl WorkerManifest {
             resources: Resources::default(),
         })
     }
-
-
 }
-
 
 /// Parses a possibly-embedded JSON string column into a `Value` (a row's `code`
 /// / `config` / `triggers` are stored as JSON strings). A plain object passes
@@ -446,7 +440,6 @@ fn triggers_from_local(triggers: &Value) -> Vec<Trigger> {
     }
     parsed
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -584,7 +577,6 @@ exec = ["python3", "worker.py"]
         );
     }
 
-
     /// JSON and TOML manifests accept the public webhook and CloudEvent forms.
     #[test]
     fn parses_event_trigger_manifests() {
@@ -668,7 +660,6 @@ path = "/callbacks/orders"
             .expect("config parses");
         assert_eq!(config["env"]["API_KEY"], "@secret:MY_KEY");
     }
-
 
     /// A spec round-trips through the local worker body and back with no edits.
     #[test]

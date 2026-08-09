@@ -45,9 +45,12 @@ repository test tooling).
 
 The Docker application is configured entirely by Compose environment values.
 Export your R2 bucket, S3 credentials, catalog URI, warehouse, catalog token,
-and a client-facing S3 secret, then start the complete OSS stack:
+and a client-facing S3 secret. Generate the access service's encryption key
+once and retain it with the deployment's other secrets, then start the complete
+OSS stack:
 
 ```sh
+export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
 docker compose up -d --build
 ```
 
@@ -55,6 +58,8 @@ Point the CLI at the container's API:
 
 ```sh
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+export VERGLAS_TOKEN="${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}"
 verglas status
 ```
 
@@ -70,6 +75,45 @@ and creating the first table.
 
 `verglas-server` exposes `GET /metrics` on the admin listener (port `8334` by
 default). Metric names and labels are in `crates/verglas-core/src/metrics.rs`.
+
+### Tenant databases and scoped secrets
+
+One tenant cache serves every database through explicit storage and catalog
+bindings. Managed lakehouses share the tenant's Lakekeeper deployment but each
+gets its own warehouse; managed Postgres databases use Verglas Neon.
+
+```sh
+# Managed storage + managed Lakekeeper warehouse
+verglas db create analytics --type lakehouse
+
+# Independent managed Neon Postgres
+verglas db create my_test_db --type postgres
+
+# Secret material is prompted or read from stdin, never passed in argv
+verglas secret create customer_s3 \
+  --type s3 \
+  --scope s3://customer-bucket/team
+
+# Customer storage + managed Lakekeeper
+verglas db create customer_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team
+
+# Customer storage + customer Iceberg REST catalog
+verglas secret create customer_catalog \
+  --type iceberg-rest \
+  --scope https://catalog.customer.com
+
+verglas db create external_lake \
+  --type lakehouse \
+  --data-path s3://customer-bucket/team \
+  --catalog https://catalog.customer.com \
+  --warehouse customer_warehouse
+```
+
+Database creation resolves the most-specific authorized secret scope once and
+stores its stable resource ID. Rotating that secret updates the same resource;
+creating a later overlapping secret cannot silently rebind the database.
 
 ## Iceberg tables: add the catalog watcher
 

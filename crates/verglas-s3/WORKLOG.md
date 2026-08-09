@@ -254,3 +254,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `verglas-server` process. The protocol surface is unchanged by the process
   rename.
 - #29: Routed the KV data-plane path through the existing SigV4 serving boundary and carried its authenticated tenant identity into the REST extension. All other serving routes retain their existing role restrictions.
+- #84: Routed every read, write, list, multipart, raw, and bucket passthrough request through its immutable storage binding. S3 endpoints now require a binding identity instead of selecting an origin from bucket name alone.

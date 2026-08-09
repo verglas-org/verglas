@@ -49,9 +49,12 @@ async fn serve(app: axum::Router) -> String {
 async fn serve_memory() -> String {
     let store = Arc::new(InMemory::new());
     serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         None,
     ))
@@ -595,9 +598,12 @@ async fn failed_backend_put_yields_error_and_no_invalidation() {
     let recording = Arc::new(RecordingInvalidation::default());
     let store = Arc::new(InMemory::new());
     let base = serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         FailingWrite,
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         recording.clone(),
         None,
     ))
@@ -625,9 +631,12 @@ async fn successful_put_invalidates_exactly_the_written_key() {
     let recording = Arc::new(RecordingInvalidation::default());
     let store = Arc::new(InMemory::new());
     let base = serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         recording.clone(),
         None,
     ))
@@ -645,6 +654,7 @@ async fn successful_put_invalidates_exactly_the_written_key() {
     assert_eq!(
         recording.calls.lock().expect("recording lock").as_slice(),
         &[CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: BUCKET.to_owned(),
             key: "lucky.bin".to_owned(),
         }],
@@ -669,9 +679,12 @@ impl Invalidation for FailingInvalidation {
 async fn failed_invalidation_blocks_the_ack() {
     let store = Arc::new(InMemory::new());
     let base = serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(FailingInvalidation),
         None,
     ))
@@ -819,13 +832,19 @@ async fn streaming_put_body_stays_bounded_ahead_of_the_writer() {
     let consumed = Arc::new(AtomicU64::new(0));
     let max_lead = Arc::new(AtomicU64::new(0));
     let base = serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, Arc::new(InMemory::new()))),
+        "default",
+        PassthroughRead::new(BackendStore::single(
+            "default",
+            BUCKET,
+            Arc::new(InMemory::new()),
+        )),
         CountingWrite {
             produced: Arc::clone(&produced),
             consumed: Arc::clone(&consumed),
             max_lead: Arc::clone(&max_lead),
         },
         Arc::new(PassthroughList::new(BackendStore::single(
+            "default",
             BUCKET,
             Arc::new(InMemory::new()),
         ))),
@@ -886,9 +905,12 @@ async fn streaming_put_body_stays_bounded_ahead_of_the_writer() {
 /// so a durable write genuinely reaches the backend before invalidation runs.
 async fn serve_with(store: Arc<InMemory>, invalidation: Arc<dyn Invalidation>) -> String {
     serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         invalidation,
         None,
     ))
@@ -940,6 +962,7 @@ async fn create_and_upload_one_part(
 /// The single written key, as the recording hook sees it.
 fn only_key(key: &str) -> Vec<CacheKey> {
     vec![CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
     }]
@@ -952,9 +975,12 @@ async fn failed_backend_delete_yields_error_and_no_invalidation() {
     let recording = Arc::new(RecordingInvalidation::default());
     let store = Arc::new(InMemory::new());
     let base = serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         FailingWrite,
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         recording.clone(),
         None,
     ))
@@ -979,9 +1005,12 @@ async fn failed_backend_copy_yields_error_and_no_invalidation() {
     let recording = Arc::new(RecordingInvalidation::default());
     let store = Arc::new(InMemory::new());
     let base = serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         FailingWrite,
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         recording.clone(),
         None,
     ))

@@ -1,5 +1,7 @@
 # Worklog
 
+- #84: Added database-scoped Iceberg REST proxy routes backed by the live catalog registry, replacing process-global routing for multi-database tenant runtimes.
+
 ## 2026-08-08 — Issue #81
 
 - Added `/v1/access/*` principal, resource, grant, and decision routes over the backend-neutral authorizer.
@@ -18,3 +20,6 @@
 - #29: Added authenticated raw-byte KV get, put, delete, and deterministic prefix-list routes. The routes enforce tenant, namespace, and verb scopes before storage and keep keys, values, tokens, and metadata out of logs.
 - chore: Removed GET/PUT /v1/watermark and its wire-shape tests. Sys routes are worker registry only.
 - #66: Switched LocalAccess admin test fixtures from *.verglas.dev catalog hostnames to catalog.example.test.
+- #84: Added access-service routes for creating, rotating, inspecting, and resolving typed scoped
+  secrets. List and get return metadata only; the explicit resolution route requires `use_secret`
+  authorization before returning material to a trusted runtime.

@@ -396,6 +396,7 @@ async fn wait_for_no_fragments(transport: &MemoryTransport) -> bool {
 
 fn ck(key: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "bkt".to_owned(),
         key: key.to_owned(),
     }

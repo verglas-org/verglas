@@ -28,6 +28,7 @@ use verglas_core::{BlockKey, CacheKey};
 fn block_key(bucket: &str, key: &str, etag: &str, index: u64) -> BlockKey {
     BlockKey {
         object: CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
         },

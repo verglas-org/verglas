@@ -461,11 +461,15 @@ fn origin() -> Store {
 /// Serves the front-end over a production-shaped registry (typed + raw
 /// clients from env) on an ephemeral port; returns the proxy base URL.
 async fn serve_proxy() -> String {
-    let registry = BackendStore::from_config(&Backend {
-        bucket: Some("fidelity-bucket".to_owned()),
-        ..Backend::default()
-    });
+    let registry = BackendStore::from_config(
+        "default",
+        &Backend {
+            bucket: Some("fidelity-bucket".to_owned()),
+            ..Backend::default()
+        },
+    );
     let app = verglas_s3::router(
+        "default",
         PassthroughRead::new(registry.clone()),
         PassthroughWrite::new(registry.clone()),
         Arc::new(PassthroughList::new(registry)),
@@ -888,10 +892,13 @@ async fn large_raw_put_splits_into_uniform_parts() {
     use verglas_core::write::{ObjectWrite, WriteMetadata};
 
     let store = origin();
-    let registry = BackendStore::from_config(&Backend {
-        bucket: Some("fidelity-bucket".to_owned()),
-        ..Backend::default()
-    });
+    let registry = BackendStore::from_config(
+        "default",
+        &Backend {
+            bucket: Some("fidelity-bucket".to_owned()),
+            ..Backend::default()
+        },
+    );
     let writer = PassthroughWrite::new(registry);
     // Raw-only key (trailing slash), so the write takes the raw client.
     let key = "raw/uniform dir/";
@@ -915,6 +922,7 @@ async fn large_raw_put_splits_into_uniform_parts() {
     writer
         .put(
             &CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: "fidelity-bucket".to_owned(),
                 key: key.to_owned(),
             },
@@ -937,15 +945,19 @@ async fn large_raw_put_splits_into_uniform_parts() {
 async fn expires_put_without_raw_surface_fails_loudly() {
     use object_store::memory::InMemory;
     let app = verglas_s3::router(
+        "default",
         PassthroughRead::new(BackendStore::single(
+            "default",
             "fidelity-bucket",
             Arc::new(InMemory::new()),
         )),
         PassthroughWrite::new(BackendStore::single(
+            "default",
             "fidelity-bucket",
             Arc::new(InMemory::new()),
         )),
         Arc::new(PassthroughList::new(BackendStore::single(
+            "default",
             "fidelity-bucket",
             Arc::new(InMemory::new()),
         ))),
@@ -987,10 +999,13 @@ async fn expires_put_without_raw_surface_fails_loudly() {
 async fn revalidate_routes_over_raw_conditional_head() {
     use verglas_core::read::{ObjectRead, Revalidation};
     let _store = origin();
-    let registry: Arc<BackendStore> = BackendStore::from_config(&Backend {
-        bucket: Some("fidelity-bucket".to_owned()),
-        ..Backend::default()
-    });
+    let registry: Arc<BackendStore> = BackendStore::from_config(
+        "default",
+        &Backend {
+            bucket: Some("fidelity-bucket".to_owned()),
+            ..Backend::default()
+        },
+    );
     let reader = PassthroughRead::new(registry);
     let proxy = serve_proxy().await;
     let client = reqwest::Client::new();
@@ -1014,7 +1029,7 @@ async fn revalidate_routes_over_raw_conditional_head() {
         .expect("etag")
         .to_owned();
 
-    let key = verglas_s3::cache_key_for("fidelity-bucket", "revalidate-key");
+    let key = verglas_s3::cache_key_for("default", "fidelity-bucket", "revalidate-key");
     let unchanged = reader.revalidate(&key, &etag).await.expect("revalidate");
     assert!(
         matches!(unchanged, Revalidation::Unchanged),
@@ -1032,7 +1047,7 @@ async fn revalidate_routes_over_raw_conditional_head() {
         other => panic!("expected Changed, got {other:?}"),
     }
 
-    let missing = verglas_s3::cache_key_for("fidelity-bucket", "never-existed");
+    let missing = verglas_s3::cache_key_for("default", "fidelity-bucket", "never-existed");
     let vanished = reader
         .revalidate(&missing, "\"any\"")
         .await

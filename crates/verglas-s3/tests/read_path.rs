@@ -56,9 +56,12 @@ async fn serve_memory(objects: &[(&str, Bytes, &str)]) -> String {
             .expect("seed object");
     }
     serve(verglas_s3::router(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
-        PassthroughWrite::new(BackendStore::single(BUCKET, store.clone())),
-        Arc::new(PassthroughList::new(BackendStore::single(BUCKET, store))),
+        "default",
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
+        PassthroughWrite::new(BackendStore::single("default", BUCKET, store.clone())),
+        Arc::new(PassthroughList::new(BackendStore::single(
+            "default", BUCKET, store,
+        ))),
         Arc::new(NoopInvalidation),
         None,
     ))
@@ -302,12 +305,18 @@ async fn streaming_body_stays_bounded_ahead_of_consumer() {
 
     let produced = Arc::new(AtomicU64::new(0));
     let base = serve(verglas_s3::router(
+        "default",
         SyntheticRead {
             size: SIZE,
             produced: Arc::clone(&produced),
         },
-        PassthroughWrite::new(BackendStore::single(BUCKET, Arc::new(InMemory::new()))),
+        PassthroughWrite::new(BackendStore::single(
+            "default",
+            BUCKET,
+            Arc::new(InMemory::new()),
+        )),
         Arc::new(PassthroughList::new(BackendStore::single(
+            "default",
             BUCKET,
             Arc::new(InMemory::new()),
         ))),

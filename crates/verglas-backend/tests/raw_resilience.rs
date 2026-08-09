@@ -217,12 +217,14 @@ async fn raw_and_typed_ops_share_one_concurrency_budget() {
         bucket: Some("shared-bucket".to_owned()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let raw = registry
-        .raw_for("shared-bucket")
+        .raw_for("default", "shared-bucket")
         .expect("raw_for")
         .expect("raw client");
-    let typed = registry.store_for("shared-bucket").expect("typed store");
+    let typed = registry
+        .store_for("default", "shared-bucket")
+        .expect("typed store");
 
     // The raw GET holds the bucket's only permit while its body is open.
     let held = raw
@@ -273,9 +275,9 @@ async fn n_plus_first_raw_get_waits_for_a_permit() {
         bucket: Some("queue-bucket".to_owned()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let raw = registry
-        .raw_for("queue-bucket")
+        .raw_for("default", "queue-bucket")
         .expect("raw_for")
         .expect("raw client");
 
@@ -309,9 +311,9 @@ async fn breaker_open_fast_fails_raw_ops() {
         bucket: Some("breaker-bucket".to_owned()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let raw = registry
-        .raw_for("breaker-bucket")
+        .raw_for("default", "breaker-bucket")
         .expect("raw_for")
         .expect("raw client");
 
@@ -354,9 +356,9 @@ async fn raw_retry_then_succeed_on_a_flaky_origin() {
         bucket: Some("retry-bucket".to_owned()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let raw = registry
-        .raw_for("retry-bucket")
+        .raw_for("default", "retry-bucket")
         .expect("raw_for")
         .expect("raw client");
 
@@ -385,9 +387,9 @@ async fn raw_put_retries_and_lands() {
         bucket: Some("retry-put-bucket".to_owned()),
         ..Backend::default()
     };
-    let registry = BackendStore::from_config(&backend);
+    let registry = BackendStore::from_config("default", &backend);
     let raw = registry
-        .raw_for("retry-put-bucket")
+        .raw_for("default", "retry-put-bucket")
         .expect("raw_for")
         .expect("raw client");
 

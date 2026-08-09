@@ -38,3 +38,4 @@
 - #58: Allowed the eight-argument `EcAppendLog::open` (node identity plus ring plane) and replaced test `unwrap`s with `expect` so clippy stays clean after the cache-metadata fleet fixes.
 
 - #66: Documented Neon broker advertise reachability as Postgres compute over the tenant network rather than a microVM.
+- #84: Updated safekeeper cache identities to include the mandatory storage binding. Durable write tracking no longer aliases equal bucket and key names from different origins.

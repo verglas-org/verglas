@@ -1996,7 +1996,7 @@ mod tests {
     /// admin router.
     async fn purger(dir: &std::path::Path) -> Arc<dyn CachePurger> {
         let store = std::sync::Arc::new(object_store::memory::InMemory::new());
-        let backend = PassthroughRead::new(BackendStore::single("test-bucket", store));
+        let backend = PassthroughRead::new(BackendStore::single("default", "test-bucket", store));
         let config = CacheConfig {
             dir: dir.to_path_buf(),
             capacity_bytes: ByteSize(64 * 1024 * 1024),
@@ -2798,7 +2798,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
-
     /// A ready router with only the given slots filled.
     fn slots_router(slots: Slots) -> Router {
         router(VERSION, Health::ready(), slots)
@@ -2860,7 +2859,6 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
-
 
     /// Sends a request with a raw (non-JSON) body and returns the response.
     /// The table inspect routes (#323) serve the CLI's list/show/history verbs:

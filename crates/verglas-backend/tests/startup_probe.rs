@@ -75,7 +75,7 @@ fn probe_backend(endpoint: String) -> Backend {
 #[tokio::test]
 async fn probe_fails_when_the_origin_rejects_credentials() {
     let (endpoint, server) = start_origin(StatusCode::FORBIDDEN).await;
-    let store = BackendStore::from_config(&probe_backend(endpoint));
+    let store = BackendStore::from_config("default", &probe_backend(endpoint));
     let error = store
         .probe()
         .await
@@ -98,7 +98,7 @@ async fn probe_fails_when_the_origin_rejects_credentials() {
 #[tokio::test]
 async fn probe_passes_when_the_origin_answers() {
     let (endpoint, server) = start_origin(StatusCode::NOT_FOUND).await;
-    let store = BackendStore::from_config(&probe_backend(endpoint));
+    let store = BackendStore::from_config("default", &probe_backend(endpoint));
     store
         .probe()
         .await
@@ -112,6 +112,7 @@ async fn probe_passes_when_the_origin_answers() {
 #[tokio::test]
 async fn probe_is_a_noop_without_a_single_bucket() {
     let store = BackendStore::with_glob_factory(
+        "default",
         None,
         vec!["*--table-s3".to_owned()],
         64,

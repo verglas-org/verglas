@@ -37,6 +37,8 @@ use crate::mapper::Mapper;
 
 /// Drives snapshot-driven prefetch and retirement from a [`CatalogWatcher`].
 pub struct PrefetchCoordinator<W, F> {
+    /// Immutable storage binding for the watched database.
+    storage_binding_id: Arc<str>,
     /// The catalog watcher whose commits trigger repairs.
     watcher: Arc<W>,
     /// The metadata reader (through the cache in the server) for diffs + footers.
@@ -71,6 +73,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
     /// Binds the coordinator to its dependencies.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
+        storage_binding_id: impl Into<Arc<str>>,
         watcher: Arc<W>,
         fetch: Arc<F>,
         mapper: Arc<Mapper>,
@@ -83,6 +86,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
         clock: EpochClock,
     ) -> PrefetchCoordinator<W, F> {
         PrefetchCoordinator {
+            storage_binding_id: storage_binding_id.into(),
             watcher,
             fetch,
             mapper,
@@ -119,6 +123,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
                     .iter()
                     .map(|d| DemoteRequest {
                         key: CacheKey {
+                            storage_binding_id: d.storage_binding_id.clone(),
                             bucket: d.bucket.clone(),
                             key: d.key.clone(),
                         },
@@ -159,6 +164,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
                 .iter()
                 .map(|d| HardEviction {
                     key: CacheKey {
+                        storage_binding_id: d.storage_binding_id.clone(),
                         bucket: d.bucket.clone(),
                         key: d.key.clone(),
                     },
@@ -206,7 +212,14 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
 
         // One metadata read serves the doc, the snapshot set, and the grace
         // property.
-        let metadata_bytes = match read_object(self.fetch.as_ref(), &bucket, &metadata_key).await {
+        let metadata_bytes = match read_object(
+            self.fetch.as_ref(),
+            &self.storage_binding_id,
+            &bucket,
+            &metadata_key,
+        )
+        .await
+        {
             Ok(bytes) => bytes,
             Err(error) => {
                 tracing::warn!(table = %change.table, %error, "metadata read failed; skipping");
@@ -242,7 +255,14 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
         let mut recorded: Vec<Demotion> = Vec::new();
         let mut newest_diff = None;
         for snap in to_process {
-            let diff = match diff_from_snapshot_ref(self.fetch.as_ref(), &bucket, snap).await {
+            let diff = match diff_from_snapshot_ref(
+                self.fetch.as_ref(),
+                &self.storage_binding_id,
+                &bucket,
+                snap,
+            )
+            .await
+            {
                 Ok(diff) => diff,
                 Err(error) => {
                     tracing::warn!(table = %change.table, snapshot = snap.snapshot_id, %error, "commit diff failed; skipping commit");
@@ -255,6 +275,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
                     .iter()
                     .map(|file| DemoteRequest {
                         key: CacheKey {
+                            storage_binding_id: self.storage_binding_id.to_string(),
                             bucket: bucket.clone(),
                             key: file.path.clone(),
                         },
@@ -266,6 +287,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
                     None => Vec::new(),
                 };
                 recorded.extend(demotions_for_commit(
+                    &self.storage_binding_id,
                     &bucket,
                     &diff.removed,
                     &receipts,
@@ -288,6 +310,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
         if let Some(w) = &watermark {
             if w.metadata_key != metadata_key && !w.metadata_key.is_empty() {
                 dead_metadata.push(CacheKey {
+                    storage_binding_id: self.storage_binding_id.to_string(),
                     bucket: bucket.clone(),
                     key: w.metadata_key.clone(),
                 });
@@ -295,6 +318,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
             for (snap_id, list_key) in &w.manifest_lists {
                 if !doc.snapshots.iter().any(|s| s.snapshot_id == *snap_id) {
                     dead_metadata.push(CacheKey {
+                        storage_binding_id: self.storage_binding_id.to_string(),
                         bucket: bucket.clone(),
                         key: list_key.clone(),
                     });
@@ -317,6 +341,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
             for key in &dead_metadata {
                 let receipt = receipts.iter().find(|r| &r.key == key);
                 recorded.push(Demotion {
+                    storage_binding_id: key.storage_binding_id.clone(),
                     bucket: key.bucket.clone(),
                     key: key.key.clone(),
                     hard_evict_at_ms: deadline,
@@ -365,6 +390,7 @@ impl<W: CatalogWatcher + 'static, F: MetadataFetch + 'static> PrefetchCoordinato
             self.fetch.as_ref(),
             &self.ledger,
             table,
+            &self.storage_binding_id,
             &bucket,
             &diff,
             &self.config,

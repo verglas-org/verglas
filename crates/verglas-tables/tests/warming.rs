@@ -127,7 +127,7 @@ async fn build_engine(
     let calls = BackendCalls::default();
     let max_in_flight = Arc::new(AtomicU64::new(0));
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single("lake", store)),
+        inner: PassthroughRead::new(BackendStore::single("managed-lakehouse", "lake", store)),
         calls: calls.clone(),
         in_flight: Arc::new(AtomicU64::new(0)),
         max_in_flight: max_in_flight.clone(),
@@ -160,6 +160,7 @@ async fn read_all(engine: &Engine, k: &CacheKey, range: ReadRange) -> Bytes {
 /// A cache key in the fixture bucket.
 fn key(bucket: &str, k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: bucket.to_owned(),
         key: k.to_owned(),
     }
@@ -176,6 +177,7 @@ async fn discover(store: &Arc<InMemory>, sidecar: &Sidecar) -> (String, Vec<Stri
     let fetch = ObjectStoreFetch::new(store.clone() as Arc<dyn ObjectStore>);
     let plan = iceberg::walk_snapshot(
         &fetch,
+        "managed-lakehouse",
         &sidecar.bucket,
         &sidecar.metadata_key,
         sidecar.current_snapshot_id,
@@ -207,6 +209,7 @@ async fn warmed_table_serves_cold_planning_walk_with_zero_backend_gets() {
     );
     let summary = warmer
         .warm_table(&WarmTarget {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: sidecar.bucket.clone(),
             metadata_key: sidecar.metadata_key.clone(),
             snapshot_id: sidecar.current_snapshot_id,
@@ -276,7 +279,9 @@ async fn footer_warming_uses_one_get_for_fitting_footers() {
         Arc::new(TokenBucket::unlimited()),
     );
     let gets_before = calls.gets.load(Ordering::SeqCst);
-    let summary = warmer.warm_footers(&sidecar.bucket, &files).await;
+    let summary = warmer
+        .warm_footers("managed-lakehouse", &sidecar.bucket, &files)
+        .await;
     let footer_gets = calls.gets.load(Ordering::SeqCst) - gets_before;
     assert_eq!(summary.footers_warmed, footers.len() as u64);
     assert_eq!(summary.footer_refetches, 0, "fixture footers fit 64 KiB");
@@ -306,7 +311,9 @@ async fn avro_data_files_are_never_suffix_read() {
         Arc::new(TokenBucket::unlimited()),
     );
     let gets_before = calls.gets.load(Ordering::SeqCst);
-    let summary = warmer.warm_footers(&sidecar.bucket, &files).await;
+    let summary = warmer
+        .warm_footers("managed-lakehouse", &sidecar.bucket, &files)
+        .await;
     assert_eq!(summary.footers_warmed, 0);
     assert_eq!(summary.skipped_non_parquet, 1);
     assert_eq!(
@@ -329,6 +336,7 @@ async fn second_warming_pass_issues_no_backend_gets() {
         Arc::new(TokenBucket::unlimited()),
     );
     let target = WarmTarget {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         bucket: sidecar.bucket.clone(),
         metadata_key: sidecar.metadata_key.clone(),
         snapshot_id: sidecar.current_snapshot_id,
@@ -367,7 +375,9 @@ async fn semaphore_bounds_in_flight_footer_reads() {
         },
         Arc::new(TokenBucket::unlimited()),
     );
-    warmer.warm_footers(&sidecar.bucket, &files).await;
+    warmer
+        .warm_footers("managed-lakehouse", &sidecar.bucket, &files)
+        .await;
     assert!(
         max_in_flight.load(Ordering::SeqCst) <= 2,
         "semaphore let more than 2 footer reads run at once: {}",
@@ -401,7 +411,9 @@ async fn over_budget_table_alerts_and_caps() {
         },
         Arc::new(TokenBucket::unlimited()),
     );
-    let summary = warmer.warm_footers(&sidecar.bucket, &files).await;
+    let summary = warmer
+        .warm_footers("managed-lakehouse", &sidecar.bucket, &files)
+        .await;
     assert!(summary.budget_alerted, "over-budget table did not alert");
     assert!(
         summary.footers_warmed < footers.len() as u64,
@@ -437,7 +449,9 @@ async fn large_footer_uses_two_gets_and_serves_warm() {
         Arc::new(TokenBucket::unlimited()),
     );
     let gets_before = calls.gets.load(Ordering::SeqCst);
-    let summary = warmer.warm_footers(&sidecar.bucket, &files).await;
+    let summary = warmer
+        .warm_footers("managed-lakehouse", &sidecar.bucket, &files)
+        .await;
     let footer_gets = calls.gets.load(Ordering::SeqCst) - gets_before;
     assert_eq!(summary.footers_warmed, footers.len() as u64);
     assert_eq!(summary.footer_refetches, footers.len() as u64);
@@ -540,7 +554,7 @@ async fn coordinator_warms_all_watched_tables() {
         Some(sidecar.current_snapshot_id),
     );
 
-    let coord = WarmingCoordinator::new(warmer.clone(), watcher);
+    let coord = WarmingCoordinator::new("managed-lakehouse", warmer.clone(), watcher);
     coord.warm_all().await;
 
     let progress = warmer.progress().snapshot();
@@ -569,7 +583,7 @@ async fn coordinator_refreshes_on_commit() {
         fixture_location(&sidecar),
         Some(sidecar.current_snapshot_id),
     );
-    let coord = WarmingCoordinator::new(warmer.clone(), watcher);
+    let coord = WarmingCoordinator::new("managed-lakehouse", warmer.clone(), watcher);
 
     coord.warm_all().await;
     assert_eq!(warmer.progress().snapshot().tables_started, 1);
@@ -607,7 +621,7 @@ async fn coordinator_ignores_dropped_tables() {
         fixture_location(&sidecar),
         Some(sidecar.current_snapshot_id),
     );
-    let coord = WarmingCoordinator::new(warmer.clone(), watcher);
+    let coord = WarmingCoordinator::new("managed-lakehouse", warmer.clone(), watcher);
     coord
         .on_change(&TableChanged {
             table,
@@ -637,7 +651,7 @@ async fn coordinator_spawn_warms_on_startup_and_events() {
         Some(sidecar.current_snapshot_id),
     );
     let progress = warmer.progress();
-    let coord = WarmingCoordinator::new(warmer, watcher.clone());
+    let coord = WarmingCoordinator::new("managed-lakehouse", warmer, watcher.clone());
     let _handle = coord.spawn();
 
     // Startup warm.
@@ -726,7 +740,7 @@ async fn preexisting_table_is_warmed_on_startup_without_a_commit() {
     };
     // Server startup order: watcher spawns, then the coordinator binds to it.
     let watcher = Arc::new(PollingWatcher::spawn(source, options));
-    let _handle = WarmingCoordinator::new(warmer, watcher).spawn();
+    let _handle = WarmingCoordinator::new("managed-lakehouse", warmer, watcher).spawn();
 
     // No commit is ever fired. The startup pass alone must warm the table.
     wait_until(|| progress.snapshot().tables_completed >= 1).await;

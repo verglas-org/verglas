@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 verglas-catalog.workspace = true
 verglas-authz.workspace = true
+verglas-database.workspace = true
 verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-iceberg.workspace = true

@@ -2,7 +2,7 @@
 //! origin bucket through an [`object_store`] client with no caching, and
 //! writes stream straight through to it (writes stay passthrough forever —
 //! Verglas is never the only copy of any byte). Both sides route by the
-//! request's bucket: they resolve the origin client from the [`BackendStores`]
+//! request's immutable storage binding and bucket: they resolve the origin client from the [`BackendStores`]
 //! seam (`verglas-backend`), which serves a configured set of buckets (#235).
 //! A request for a bucket in the set is served (its client built lazily on first
 //! request); a request for any other bucket is rejected with `NoSuchBucket`, and
@@ -318,14 +318,18 @@ impl PassthroughRead {
     }
 
     /// Resolves (building on first sight) the origin store for `bucket`.
-    fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, ReadError> {
-        self.stores.store_for(bucket).map_err(read_backend_error)
+    fn store_for(&self, key: &CacheKey) -> Result<Arc<dyn MultipartObjectStore>, ReadError> {
+        self.stores
+            .store_for(&key.storage_binding_id, &key.bucket)
+            .map_err(read_backend_error)
     }
 
     /// Resolves `bucket`'s byte-exact raw client when the origin is a real S3
     /// endpoint; `None` for injected typed stores (issue #189).
-    fn raw_for(&self, bucket: &str) -> Result<Option<Arc<ResilientRawS3>>, ReadError> {
-        self.stores.raw_for(bucket).map_err(read_backend_error)
+    fn raw_for(&self, key: &CacheKey) -> Result<Option<Arc<ResilientRawS3>>, ReadError> {
+        self.stores
+            .raw_for(&key.storage_binding_id, &key.bucket)
+            .map_err(read_backend_error)
     }
 
     /// Resolves the raw client the escape-hatch reads (version ID, part number,
@@ -333,8 +337,8 @@ impl PassthroughRead {
     /// parameters have no `object_store` typed equivalent, so an origin with no
     /// raw path cannot serve them. Absence fails the request loudly rather than
     /// silently ignoring the parameter.
-    fn raw_required(&self, bucket: &str) -> Result<Arc<ResilientRawS3>, ReadError> {
-        self.raw_for(bucket)?.ok_or_else(|| {
+    fn raw_required(&self, key: &CacheKey) -> Result<Arc<ResilientRawS3>, ReadError> {
+        self.raw_for(key)?.ok_or_else(|| {
             ReadError::Backend(
                 "this origin has no raw request path; version/part/checksum reads are unsupported"
                     .to_owned(),
@@ -436,7 +440,7 @@ impl ObjectRead for PassthroughRead {
     /// key is addressed byte-exactly and the full header set — `Expires`
     /// included, which `object_store` cannot read — comes back (issue #189).
     async fn get(&self, key: &CacheKey, range: ReadRange) -> Result<ObjectGet, ReadError> {
-        if let Some(raw) = self.raw_for(&key.bucket)? {
+        if let Some(raw) = self.raw_for(key)? {
             let got = raw
                 .get(&key.key, to_raw_range(range))
                 .await
@@ -449,7 +453,7 @@ impl ObjectRead for PassthroughRead {
                 served_from: passthrough_tier(),
             });
         }
-        let store = self.store_for(&key.bucket)?;
+        let store = self.store_for(key)?;
         let options = GetOptions {
             range: to_get_range(range),
             ..GetOptions::default()
@@ -477,11 +481,11 @@ impl ObjectRead for PassthroughRead {
     /// issue #189) for any key byte-exactly; typed stores answer through
     /// their attribute model.
     async fn head(&self, key: &CacheKey) -> Result<ObjectMeta, ReadError> {
-        if let Some(raw) = self.raw_for(&key.bucket)? {
+        if let Some(raw) = self.raw_for(key)? {
             let meta = raw.head(&key.key).await.map_err(map_raw_read_error)?;
             return Ok(raw_to_object_meta(meta));
         }
-        let store = self.store_for(&key.bucket)?;
+        let store = self.store_for(key)?;
         let options = GetOptions {
             head: true,
             ..GetOptions::default()
@@ -501,7 +505,7 @@ impl ObjectRead for PassthroughRead {
     /// `200` with the new metadata; a vanished one returns the origin's 404.
     /// Same raw-first routing as [`PassthroughRead::head`].
     async fn revalidate(&self, key: &CacheKey, etag: &str) -> Result<Revalidation, ReadError> {
-        if let Some(raw) = self.raw_for(&key.bucket)? {
+        if let Some(raw) = self.raw_for(key)? {
             return match raw.head_if_none_match(&key.key, etag).await {
                 Ok(meta) => Ok(Revalidation::Changed(Box::new(raw_to_object_meta(meta)))),
                 Err(RawError::NotModified) => Ok(Revalidation::Unchanged),
@@ -509,7 +513,7 @@ impl ObjectRead for PassthroughRead {
                 Err(other) => Err(map_raw_read_error(other)),
             };
         }
-        let store = self.store_for(&key.bucket)?;
+        let store = self.store_for(key)?;
         let options = GetOptions {
             head: true,
             if_none_match: Some(etag.to_owned()),
@@ -543,7 +547,7 @@ impl ObjectRead for PassthroughRead {
         range: ReadRange,
         options: DirectReadOptions,
     ) -> Result<DirectGet, ReadError> {
-        let raw = self.raw_required(&key.bucket)?;
+        let raw = self.raw_required(key)?;
         let extras = to_raw_read_extras(&options);
         let got = raw
             .get_ext(&key.key, to_raw_range(range), &extras)
@@ -563,7 +567,7 @@ impl ObjectRead for PassthroughRead {
         key: &CacheKey,
         options: DirectReadOptions,
     ) -> Result<DirectMeta, ReadError> {
-        let raw = self.raw_required(&key.bucket)?;
+        let raw = self.raw_required(key)?;
         let extras = to_raw_read_extras(&options);
         let meta = raw
             .head_ext(&key.key, &extras)
@@ -580,7 +584,7 @@ impl ObjectRead for PassthroughRead {
         key: &CacheKey,
         request: AttributesRequest,
     ) -> Result<ObjectAttributes, ReadError> {
-        let raw = self.raw_required(&key.bucket)?;
+        let raw = self.raw_required(key)?;
         let attributes = raw
             .get_object_attributes(
                 &key.key,
@@ -672,17 +676,19 @@ impl PassthroughWrite {
 
     /// Resolves the origin store for `bucket`. A bucket other than the one this
     /// server serves is `NoSuchBucket`.
-    fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, WriteError> {
-        self.stores.store_for(bucket).map_err(write_backend_error)
+    fn store_for(&self, key: &CacheKey) -> Result<Arc<dyn MultipartObjectStore>, WriteError> {
+        self.stores
+            .store_for(&key.storage_binding_id, &key.bucket)
+            .map_err(write_backend_error)
     }
 
     /// Resolves the raw client a data-dropping-if-typed write REQUIRES: a key
     /// `Path` cannot represent, or an `Expires` header. Absence of the raw
     /// surface fails the request loudly — degrading to the typed client would
     /// store wrong bytes at the namespace/header level (issue #189).
-    fn raw_required(&self, bucket: &str, why: &str) -> Result<Arc<ResilientRawS3>, WriteError> {
+    fn raw_required(&self, key: &CacheKey, why: &str) -> Result<Arc<ResilientRawS3>, WriteError> {
         self.stores
-            .raw_for(bucket)
+            .raw_for(&key.storage_binding_id, &key.bucket)
             .map_err(write_backend_error)?
             .ok_or_else(|| {
                 WriteError::Unsupported(format!(
@@ -1111,11 +1117,10 @@ impl ObjectWrite for PassthroughWrite {
         // path: the typed client cannot carry `x-amz-checksum-*` headers, and
         // silently dropping them would let a corrupt body pass as valid.
         if !path_faithful(&key.key) || metadata.expires.is_some() || !metadata.checksum.is_empty() {
-            let raw =
-                self.raw_required(&key.bucket, "the key, an Expires header, or a checksum")?;
+            let raw = self.raw_required(key, "the key, an Expires header, or a checksum")?;
             return raw_put(&raw, &key.key, to_raw_write_headers(&metadata), body).await;
         }
-        let store = self.store_for(&key.bucket)?;
+        let store = self.store_for(key)?;
         let path = Path::from(key.key.as_str());
         stream_body_to_store(&store, &path, write_attributes(&metadata), &mut body).await
     }
@@ -1127,13 +1132,13 @@ impl ObjectWrite for PassthroughWrite {
     /// write.
     async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
         if !path_faithful(&key.key) {
-            let raw = self.raw_required(&key.bucket, "the key")?;
+            let raw = self.raw_required(key, "the key")?;
             return match raw.delete(&key.key).await {
                 Ok(()) | Err(RawError::NoSuchKey) => Ok(()),
                 Err(other) => Err(map_raw_write_error(other)),
             };
         }
-        let store = self.store_for(&key.bucket)?;
+        let store = self.store_for(key)?;
         match store.delete(&Path::from(key.key.as_str())).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
             Err(other) => Err(WriteError::Backend(other.to_string())),
@@ -1190,7 +1195,7 @@ impl ObjectWrite for PassthroughWrite {
                 .as_ref()
                 .is_some_and(|metadata| metadata.expires.is_some())
         {
-            let raw = self.raw_required(&dest.bucket, "a copy key or the Expires header")?;
+            let raw = self.raw_required(dest, "a copy key or the Expires header")?;
             let got = raw
                 .get(&source.key, RawRange::Full)
                 .await
@@ -1210,7 +1215,7 @@ impl ObjectWrite for PassthroughWrite {
                 last_modified: head.last_modified,
             });
         }
-        let store = self.store_for(&dest.bucket)?;
+        let store = self.store_for(dest)?;
         let from = Path::from(source.key.as_str());
         let to = Path::from(dest.key.as_str());
         match metadata {
@@ -1266,8 +1271,7 @@ impl ObjectWrite for PassthroughWrite {
         // restated on a FULL_OBJECT completion, so record it now (issue #208).
         let checksum_type = metadata.checksum.checksum_type.clone();
         let creation = if via_raw {
-            let raw =
-                self.raw_required(&key.bucket, "the key, the Expires header, or a checksum")?;
+            let raw = self.raw_required(key, "the key, the Expires header, or a checksum")?;
             let created = raw
                 .create_multipart(&key.key, to_raw_write_headers(&metadata))
                 .await
@@ -1278,7 +1282,7 @@ impl ObjectWrite for PassthroughWrite {
                 checksum_type: created.checksum_type,
             }
         } else {
-            let store = self.store_for(&key.bucket)?;
+            let store = self.store_for(key)?;
             let options = PutMultipartOptions {
                 attributes: write_attributes(&metadata),
                 ..PutMultipartOptions::default()
@@ -1342,7 +1346,7 @@ impl ObjectWrite for PassthroughWrite {
         // sends the header, but a manifest-only part might not), because the
         // whole upload's parts live on one path (issue #208).
         let part = if self.upload_via_raw(key, upload_id) || !checksum.is_empty() {
-            let raw = self.raw_required(&key.bucket, "the key or a checksum")?;
+            let raw = self.raw_required(key, "the key or a checksum")?;
             let uploaded = raw
                 .put_part(
                     &key.key,
@@ -1358,7 +1362,7 @@ impl ObjectWrite for PassthroughWrite {
                 checksums: raw_to_checksums(uploaded.checksums),
             }
         } else {
-            let store = self.store_for(&key.bucket)?;
+            let store = self.store_for(key)?;
             let content_id = store
                 .put_part(
                     &Path::from(key.key.as_str()),
@@ -1418,7 +1422,7 @@ impl ObjectWrite for PassthroughWrite {
         // checksummed upload's parts live raw, so its completion must be raw
         // even when the manifest itself carries no checksums.
         let outcome = if self.upload_via_raw(key, upload_id) || !object_checksum.is_empty() {
-            let raw = self.raw_required(&key.bucket, "the key or a checksum")?;
+            let raw = self.raw_required(key, "the key or a checksum")?;
             let raw_parts = parts
                 .into_iter()
                 .map(|p| RawCompletedPart {
@@ -1448,7 +1452,7 @@ impl ObjectWrite for PassthroughWrite {
                 version_id: done.version_id,
             }
         } else {
-            let store = self.store_for(&key.bucket)?;
+            let store = self.store_for(key)?;
             let part_ids = parts
                 .into_iter()
                 .map(|p| PartId {
@@ -1481,14 +1485,14 @@ impl ObjectWrite for PassthroughWrite {
     /// raw client (issue #189).
     async fn abort_multipart(&self, key: &CacheKey, upload_id: &str) -> Result<(), WriteError> {
         if !path_faithful(&key.key) {
-            let raw = self.raw_required(&key.bucket, "the key")?;
+            let raw = self.raw_required(key, "the key")?;
             raw.abort_multipart(&key.key, upload_id)
                 .await
                 .map_err(map_raw_write_error)?;
             self.uploads().remove(upload_id);
             return Ok(());
         }
-        let store = self.store_for(&key.bucket)?;
+        let store = self.store_for(key)?;
         store
             .abort_multipart(&Path::from(key.key.as_str()), &upload_id.to_owned())
             .await
@@ -1539,7 +1543,7 @@ impl ObjectWrite for PassthroughWrite {
         part_number: u16,
         copy_range: Option<String>,
     ) -> Result<CopyOutcome, WriteError> {
-        let raw = self.raw_required(&dest.bucket, "an UploadPartCopy")?;
+        let raw = self.raw_required(dest, "an UploadPartCopy")?;
         let copy_source = format!(
             "/{}/{}",
             source.bucket,
@@ -1560,7 +1564,10 @@ impl ObjectWrite for PassthroughWrite {
         // from the SOURCE bucket's client, which may differ from the dest).
         let size = match parse_copy_range_len(copy_range.as_deref()) {
             Some(len) => len,
-            None => match self.stores.raw_for(&source.bucket) {
+            None => match self
+                .stores
+                .raw_for(&source.storage_binding_id, &source.bucket)
+            {
                 Ok(Some(src_raw)) => src_raw
                     .head(&source.key)
                     .await
@@ -1599,7 +1606,15 @@ impl ObjectWrite for PassthroughWrite {
         &self,
         request: MultipartUploadsRequest,
     ) -> Result<MultipartUploadsPage, WriteError> {
-        let raw = self.raw_required(&request.bucket, "a ListMultipartUploads")?;
+        let raw = self
+            .stores
+            .raw_for(&request.storage_binding_id, &request.bucket)
+            .map_err(write_backend_error)?
+            .ok_or_else(|| {
+                WriteError::Unsupported(
+                    "this origin has no raw request path for ListMultipartUploads".to_owned(),
+                )
+            })?;
         let page = raw
             .list_multipart_uploads(
                 request.prefix.as_deref(),
@@ -1728,8 +1743,10 @@ impl PassthroughList {
     /// Resolves the origin store for `bucket`. A bucket other than the one this
     /// server serves is `NoSuchBucket`; a construction failure is a backend
     /// error.
-    fn store_for(&self, bucket: &str) -> Result<Arc<dyn MultipartObjectStore>, ListError> {
-        self.stores.store_for(bucket).map_err(list_backend_error)
+    fn store_for(&self, request: &ListRequest) -> Result<Arc<dyn MultipartObjectStore>, ListError> {
+        self.stores
+            .store_for(&request.storage_binding_id, &request.bucket)
+            .map_err(list_backend_error)
     }
 
     /// Builds one bounded page over the raw client's ListObjectsV2 (issue
@@ -1865,12 +1882,12 @@ impl ObjectList for PassthroughList {
         // trailing-slash / empty-segment keys at all.
         if let Some(raw) = self
             .stores
-            .raw_for(&request.bucket)
+            .raw_for(&request.storage_binding_id, &request.bucket)
             .map_err(list_backend_error)?
         {
             return self.list_raw(raw, request).await;
         }
-        let store = self.store_for(&request.bucket)?;
+        let store = self.store_for(&request)?;
 
         let ancestor_path = segment_ancestor(&request.prefix).map(|a| Path::from(a.as_str()));
         // `list_with_offset` is exclusive; an empty offset admits every key.

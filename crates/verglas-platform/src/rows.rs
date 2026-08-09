@@ -251,4 +251,3 @@ pub fn decode_workers(batch: &RecordBatch) -> Result<Vec<WorkerRow>, PlatformErr
     }
     Ok(out)
 }
-

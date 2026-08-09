@@ -218,10 +218,7 @@ mod tests {
         assert_eq!(config.log.format, LogFormat::Json);
         assert_eq!(config.cache.capacity_bytes.0, 64 * 1024 * 1024);
         assert_eq!(config.cache.dram_bytes.0, 80 * 1024 * 1024);
-        assert_eq!(
-            config.backend.bucket.as_deref(),
-            Some("verglas-cache-test")
-        );
+        assert_eq!(config.backend.bucket.as_deref(), Some("verglas-cache-test"));
         assert_eq!(
             config.backend.endpoint.as_deref(),
             Some("https://accountid.r2.cloudflarestorage.com")

@@ -10,15 +10,15 @@
 //! silently. The `memory` and `skills` verbs are gone: durable agent memory is
 //! not part of this product. OS service lifecycle (`init`/`start`/`stop`/
 //! `restart`/`logs`/`dev`) is gone — the server runs in Docker. Removed
-//! control-plane verbs (`login`, `containers`, `db`, `volumes`, `secrets`) are
-//! gone (#66); workers target the local server registry only.
+//! hosted control-plane verbs (`login`, `containers`, `volumes`, `secrets`) are
+//! gone (#66). Issue #84 adds singular local `db` and `secret` resource APIs.
 
 use std::process::Command;
 
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// local `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 10] = [
+const SURVIVING_COMMANDS: [&str; 12] = [
     "drain",
     "status",
     "table",
@@ -29,10 +29,12 @@ const SURVIVING_COMMANDS: [&str; 10] = [
     "workers",
     "kv",
     "vessel",
+    "db",
+    "secret",
 ];
 
 /// Commands removed from the CLI: `--help` must not name them.
-const REMOVED_COMMANDS: [&str; 27] = [
+const REMOVED_COMMANDS: [&str; 26] = [
     "version",
     "analyze",
     "deploy",
@@ -60,7 +62,6 @@ const REMOVED_COMMANDS: [&str; 27] = [
     // Removed control-plane surface (#66).
     "login",
     "containers",
-    "db",
     "volumes",
     "secrets",
 ];
@@ -262,8 +263,9 @@ fn vessel_help_lists_the_local_http_service_contract() {
 
 #[test]
 fn removed_control_plane_commands_are_unknown() {
-    // #66 removed login and the hosted resource groups; they must not reappear.
-    for command in ["login", "containers", "db", "volumes", "secrets"] {
+    // #66 removed login and the hosted resource groups. Local `db` and singular
+    // `secret` are separate OSS APIs introduced by #84.
+    for command in ["login", "containers", "volumes", "secrets"] {
         let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
             .arg(command)
             .output()

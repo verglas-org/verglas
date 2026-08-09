@@ -12,7 +12,8 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use verglas_authz::{
     AccessCheck, Action, AuthorizationRepository, AuthzError, Grant, Principal, PrincipalKind,
-    Resource, ResourceId, ResourceKind,
+    Resource, ResourceId, ResourceKind, SecretError, SecretKind, SecretMetadata, SecretRepository,
+    StoredSecret,
 };
 
 /// Idempotent schema installed only in the platform-owned permissions database.
@@ -448,6 +449,228 @@ impl AuthorizationRepository for PostgresAuthorizationRepository {
         u64::try_from(version)
             .map_err(|_| AuthzError::Backend("negative policy version in Postgres".to_owned()))
     }
+}
+
+#[async_trait]
+impl SecretRepository for PostgresAuthorizationRepository {
+    /// Creates secret metadata and its first encrypted value in one transaction.
+    async fn create(
+        &self,
+        metadata: SecretMetadata,
+        ciphertext: Vec<u8>,
+    ) -> Result<SecretMetadata, SecretError> {
+        let mut transaction = self.pool.begin().await.map_err(secret_database_error)?;
+        sqlx::query(
+            "INSERT INTO verglas_secrets.secrets (tenant_id, id, kind, scope, current_version) \
+             VALUES ($1, $2, $3, $4, 1)",
+        )
+        .bind(&metadata.tenant_id)
+        .bind(&metadata.id)
+        .bind(encode_name(&metadata.kind).map_err(secret_authz_error)?)
+        .bind(&metadata.scope)
+        .execute(&mut *transaction)
+        .await
+        .map_err(secret_database_error)?;
+        sqlx::query(
+            "INSERT INTO verglas_secrets.secret_versions \
+             (tenant_id, secret_id, version, ciphertext) VALUES ($1, $2, 1, $3)",
+        )
+        .bind(&metadata.tenant_id)
+        .bind(&metadata.id)
+        .bind(ciphertext)
+        .execute(&mut *transaction)
+        .await
+        .map_err(secret_database_error)?;
+        transaction.commit().await.map_err(secret_database_error)?;
+        Ok(metadata)
+    }
+
+    /// Appends an encrypted version while holding the current-version row lock.
+    async fn replace(
+        &self,
+        tenant_id: &str,
+        id: &str,
+        ciphertext: Vec<u8>,
+    ) -> Result<SecretMetadata, SecretError> {
+        let mut transaction = self.pool.begin().await.map_err(secret_database_error)?;
+        let row = sqlx::query(
+            "SELECT kind, scope, current_version FROM verglas_secrets.secrets \
+             WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(secret_database_error)?
+        .ok_or_else(|| SecretError::NotFound(id.to_owned()))?;
+        let current_version: i64 = row.get("current_version");
+        let next_version = current_version
+            .checked_add(1)
+            .ok_or_else(|| SecretError::Backend("secret version overflow".to_owned()))?;
+        sqlx::query(
+            "INSERT INTO verglas_secrets.secret_versions \
+             (tenant_id, secret_id, version, ciphertext) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(next_version)
+        .bind(ciphertext)
+        .execute(&mut *transaction)
+        .await
+        .map_err(secret_database_error)?;
+        sqlx::query(
+            "UPDATE verglas_secrets.secrets SET current_version = $3 \
+             WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .bind(next_version)
+        .execute(&mut *transaction)
+        .await
+        .map_err(secret_database_error)?;
+        transaction.commit().await.map_err(secret_database_error)?;
+        let kind: String = row.get("kind");
+        Ok(SecretMetadata {
+            tenant_id: tenant_id.to_owned(),
+            id: id.to_owned(),
+            kind: decode_name(&kind).map_err(secret_authz_error)?,
+            scope: row.get("scope"),
+            current_version: u64::try_from(next_version)
+                .map_err(|_| SecretError::Backend("negative secret version".to_owned()))?,
+            resource_kind: ResourceKind::Secret,
+        })
+    }
+
+    /// Returns public metadata without joining value rows.
+    async fn get(&self, tenant_id: &str, id: &str) -> Result<SecretMetadata, SecretError> {
+        let row = sqlx::query(
+            "SELECT tenant_id, id, kind, scope, current_version \
+             FROM verglas_secrets.secrets WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(secret_database_error)?
+        .ok_or_else(|| SecretError::NotFound(id.to_owned()))?;
+        secret_metadata_from_row(&row)
+    }
+
+    /// Lists public metadata without joining value rows.
+    async fn list(&self, tenant_id: &str) -> Result<Vec<SecretMetadata>, SecretError> {
+        sqlx::query(
+            "SELECT tenant_id, id, kind, scope, current_version \
+             FROM verglas_secrets.secrets WHERE tenant_id = $1 ORDER BY id",
+        )
+        .bind(tenant_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(secret_database_error)?
+        .iter()
+        .map(secret_metadata_from_row)
+        .collect()
+    }
+
+    /// Loads one stable resource's current encrypted value.
+    async fn current(&self, tenant_id: &str, id: &str) -> Result<StoredSecret, SecretError> {
+        let row = sqlx::query(
+            "SELECT secrets.tenant_id, secrets.id, secrets.kind, secrets.scope, \
+                    secrets.current_version, versions.ciphertext \
+             FROM verglas_secrets.secrets secrets \
+             JOIN verglas_secrets.secret_versions versions \
+               ON versions.tenant_id = secrets.tenant_id \
+              AND versions.secret_id = secrets.id \
+              AND versions.version = secrets.current_version \
+             WHERE secrets.tenant_id = $1 AND secrets.id = $2",
+        )
+        .bind(tenant_id)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(secret_database_error)?
+        .ok_or_else(|| SecretError::NotFound(id.to_owned()))?;
+        Ok(StoredSecret {
+            metadata: secret_metadata_from_row(&row)?,
+            ciphertext: row.get("ciphertext"),
+        })
+    }
+
+    /// Loads only current encrypted values for the requested provider contract.
+    async fn candidates(
+        &self,
+        tenant_id: &str,
+        kind: SecretKind,
+    ) -> Result<Vec<StoredSecret>, SecretError> {
+        let rows = sqlx::query(
+            "SELECT secrets.tenant_id, secrets.id, secrets.kind, secrets.scope, \
+                    secrets.current_version, versions.ciphertext \
+             FROM verglas_secrets.secrets secrets \
+             JOIN verglas_secrets.secret_versions versions \
+               ON versions.tenant_id = secrets.tenant_id \
+              AND versions.secret_id = secrets.id \
+              AND versions.version = secrets.current_version \
+             WHERE secrets.tenant_id = $1 AND secrets.kind = $2 ORDER BY secrets.id",
+        )
+        .bind(tenant_id)
+        .bind(encode_name(&kind).map_err(secret_authz_error)?)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(secret_database_error)?;
+        rows.iter()
+            .map(|row| {
+                Ok(StoredSecret {
+                    metadata: secret_metadata_from_row(row)?,
+                    ciphertext: row.get("ciphertext"),
+                })
+            })
+            .collect()
+    }
+
+    /// Deletes metadata and all value versions through the schema cascade.
+    async fn delete(&self, tenant_id: &str, id: &str) -> Result<(), SecretError> {
+        let result =
+            sqlx::query("DELETE FROM verglas_secrets.secrets WHERE tenant_id = $1 AND id = $2")
+                .bind(tenant_id)
+                .bind(id)
+                .execute(&self.pool)
+                .await
+                .map_err(secret_database_error)?;
+        if result.rows_affected() == 0 {
+            return Err(SecretError::NotFound(id.to_owned()));
+        }
+        Ok(())
+    }
+}
+
+/// Converts one public metadata row without reading a ciphertext column.
+fn secret_metadata_from_row(row: &sqlx::postgres::PgRow) -> Result<SecretMetadata, SecretError> {
+    let kind: String = row.get("kind");
+    let current_version: i64 = row.get("current_version");
+    Ok(SecretMetadata {
+        tenant_id: row.get("tenant_id"),
+        id: row.get("id"),
+        kind: decode_name(&kind).map_err(secret_authz_error)?,
+        scope: row.get("scope"),
+        current_version: u64::try_from(current_version)
+            .map_err(|_| SecretError::Backend("negative secret version".to_owned()))?,
+        resource_kind: ResourceKind::Secret,
+    })
+}
+
+/// Converts an authorization serialization failure into a secret backend failure.
+fn secret_authz_error(error: AuthzError) -> SecretError {
+    SecretError::Backend(error.to_string())
+}
+
+/// Maps Postgres failures without ever formatting bound secret values.
+fn secret_database_error(error: sqlx::Error) -> SecretError {
+    if let Some(database) = error.as_database_error() {
+        return match database.code().as_deref() {
+            Some("23505") | Some("23503") => SecretError::Conflict(database.message().to_owned()),
+            _ => SecretError::Backend(database.message().to_owned()),
+        };
+    }
+    SecretError::Backend(error.to_string())
 }
 
 /// Serializes a snake-case enum using its public JSON contract.

@@ -116,6 +116,7 @@ async fn cold_fill_against_a_failing_origin_logs_a_structured_event_with_the_tra
     // Drive one request under a known id, exactly as the front-end would.
     let request_id = RequestId::generate();
     let key = verglas_core::CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "test-bucket".to_owned(),
         key: "cold/object.parquet".to_owned(),
     };

@@ -582,6 +582,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         }
         let bytes = self.reassemble(&journal).await?;
         let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
             bucket: journal.bucket.clone(),
             key: journal.key.clone(),
         };
@@ -794,6 +795,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let occupied: HashSet<String> = healthy.iter().map(|p| p.node.clone()).collect();
         let mut candidates: Vec<NodeId> = placement_order(
             &CacheKey {
+                storage_binding_id: "default".to_owned(),
                 bucket: journal.bucket.clone(),
                 key: journal.key.clone(),
             },
@@ -860,6 +862,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
 /// deterministic distinct placement that spreads load across objects.
 fn placement_order(key: &CacheKey, object_id: &str, live: &[NodeId]) -> Vec<NodeId> {
     let placement_key = CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: key.bucket.clone(),
         key: format!("{}#writeback#{object_id}", key.key),
     };

@@ -25,15 +25,18 @@ pub mod telemetry;
 pub mod trace;
 pub mod write;
 
-/// Logical identity of a cached object: which object a request names,
+/// Logical identity of a cached object: which binding and object a request names,
 /// independent of which version of it currently exists.
 ///
 /// This is the granularity of ring ownership (see [`ring`]) and of
-/// invalidation: every request path resolves `owner(&CacheKey)` before
+/// invalidation: binding identity prevents equal bucket/key names at different
+/// origins from colliding, and every request path resolves `owner(&CacheKey)` before
 /// touching any cache state. Versioning lives one level down, in
 /// [`BlockKey`], so that ownership is stable across object overwrites.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    /// Immutable storage binding that selects the origin provider and credentials.
+    pub storage_binding_id: String,
     /// Origin bucket the object lives in.
     pub bucket: String,
     /// Object key within the bucket.

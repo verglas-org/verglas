@@ -323,7 +323,6 @@ impl SystemCatalog {
             .filter(|r| r.name == name)
             .max_by_key(|r| r.revision))
     }
-
 }
 
 /// One deployment as a single record — the canonical shape §7.1 describes for

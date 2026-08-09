@@ -82,3 +82,4 @@
 - #91: Updated write-back process documentation for the `verglas-server`
   rename. Durability barriers and propagation behavior are unchanged.
 - #66: Softened single-node write-back durability comment (replicated block volume, not cloud-replicated product language).
+- #84: Updated write-back coordination and placement keys to carry immutable storage-binding identity. Equal object names from separate providers now produce independent quorum work and ownership.

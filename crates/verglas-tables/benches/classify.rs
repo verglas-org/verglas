@@ -49,6 +49,7 @@ fn build_mapper(n: usize) -> (Arc<Mapper>, Vec<String>) {
     let mapper = Arc::new(Mapper::new());
     let fetch = ObjectStoreFetch::new(Arc::clone(&store));
     let inputs = BuildInputs {
+        storage_binding_id: "managed-lakehouse".to_owned(),
         ident: verglas_tables::catalog::TableIdent::new(&["db"], "t"),
         bucket: BUCKET.to_owned(),
         metadata_key,

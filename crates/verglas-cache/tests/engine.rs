@@ -23,8 +23,8 @@ use verglas_core::node::NodeId;
 use verglas_core::peer::{PeerFetch, PeerFetchError};
 use verglas_core::ring::{RendezvousRing, Ring};
 use verglas_s3::{
-    BackendStore, ObjectGet, ObjectMeta, ObjectRead, PassthroughRead, ReadError, ReadRange,
-    Revalidation,
+    BackendRegistry, BackendStore, Invalidation, ObjectGet, ObjectMeta, ObjectRead,
+    PassthroughRead, ReadError, ReadRange, Revalidation,
 };
 
 /// The bucket the in-memory origin serves.
@@ -47,6 +47,7 @@ fn pattern(seed: u64, len: u64) -> Bytes {
 /// The logical key for an object in the test bucket.
 fn key(k: &str) -> CacheKey {
     CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: BUCKET.to_owned(),
         key: k.to_owned(),
     }
@@ -529,7 +530,7 @@ async fn counting_engine_cfg(
     let store = Arc::new(InMemory::new());
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         calls: calls.clone(),
     };
     let engine = HybridCacheEngine::single_node(backend, config)
@@ -581,7 +582,7 @@ async fn hit_and_miss_paths_are_byte_identical_to_origin() {
     let (store, engine, _) = counting_engine(&dir, 64 * MIB, 128 * MIB).await;
     let size = 20 * MIB + 12_345; // three blocks, odd tail
     seed(&store, "data/f.parquet", pattern(7, size)).await;
-    let origin = PassthroughRead::new(BackendStore::single(BUCKET, store.clone()));
+    let origin = PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone()));
     let k = key("data/f.parquet");
 
     let ranges = [
@@ -613,6 +614,86 @@ async fn hit_and_miss_paths_are_byte_identical_to_origin() {
             assert_eq!(meta.e_tag, want_meta.e_tag, "etag differs for {range:?}");
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_bindings_isolate_blocks_metadata_and_invalidation() {
+    let dir = TempDir::new().expect("temp dir");
+    let managed_origin = Arc::new(InMemory::new());
+    let customer_origin = Arc::new(InMemory::new());
+    seed(
+        &managed_origin,
+        "same.parquet",
+        Bytes::from_static(b"managed"),
+    )
+    .await;
+    seed(
+        &customer_origin,
+        "same.parquet",
+        Bytes::from_static(b"customer"),
+    )
+    .await;
+
+    let registry = BackendRegistry::new(vec![
+        BackendStore::single("managed", BUCKET, managed_origin.clone()),
+        BackendStore::single("customer", BUCKET, customer_origin.clone()),
+    ])
+    .expect("distinct bindings");
+    let engine = HybridCacheEngine::single_node(
+        PassthroughRead::new(registry),
+        &cache_config(&dir, 64 * MIB, 128 * MIB),
+    )
+    .await
+    .expect("build engine");
+    let managed = CacheKey {
+        storage_binding_id: "managed".to_owned(),
+        bucket: BUCKET.to_owned(),
+        key: "same.parquet".to_owned(),
+    };
+    let customer = CacheKey {
+        storage_binding_id: "customer".to_owned(),
+        ..managed.clone()
+    };
+
+    assert_eq!(
+        read_all(&engine, &managed, ReadRange::Full)
+            .await
+            .expect("managed read")
+            .2,
+        Bytes::from_static(b"managed")
+    );
+    assert_eq!(
+        read_all(&engine, &customer, ReadRange::Full)
+            .await
+            .expect("customer read")
+            .2,
+        Bytes::from_static(b"customer")
+    );
+
+    seed(
+        &managed_origin,
+        "same.parquet",
+        Bytes::from_static(b"managed-v2"),
+    )
+    .await;
+    engine
+        .invalidate(std::slice::from_ref(&managed))
+        .await
+        .expect("managed invalidation");
+    assert_eq!(
+        read_all(&engine, &managed, ReadRange::Full)
+            .await
+            .expect("managed reread")
+            .2,
+        Bytes::from_static(b"managed-v2")
+    );
+    assert_eq!(
+        read_all(&engine, &customer, ReadRange::Full)
+            .await
+            .expect("customer cached read")
+            .2,
+        Bytes::from_static(b"customer")
+    );
 }
 
 /// The configured two-MiB geometry drives cold covering-block boundaries: the
@@ -680,7 +761,11 @@ async fn configured_two_mib_data_only_disk_floor_is_rejected() {
     let data_block_bytes = 2 * MIB;
     let data_disk_floor = 4 * (data_block_bytes + 16 * 1024);
     let config = cache_config_block_size(&dir, data_disk_floor, 128 * MIB, data_block_bytes);
-    let backend = PassthroughRead::new(BackendStore::single(BUCKET, Arc::new(InMemory::new())));
+    let backend = PassthroughRead::new(BackendStore::single(
+        "default",
+        BUCKET,
+        Arc::new(InMemory::new()),
+    ));
 
     let result = HybridCacheEngine::single_node(backend, &config).await;
     assert!(matches!(
@@ -771,7 +856,7 @@ async fn cold_fill_streams_before_origin_body_completes_then_caches() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = SplitBodyRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         armed: Arc::clone(&armed),
@@ -842,7 +927,7 @@ async fn first_unmapped_partial_read_does_not_wait_for_aligned_tail() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = DelayedAlignedRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         release: Arc::clone(&release),
@@ -914,7 +999,7 @@ async fn cold_multiblock_read_starts_four_fills_before_first_completes() {
     let (started, mut entered) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = ParkedBodiesRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         started,
         release: Arc::clone(&release),
     };
@@ -964,7 +1049,7 @@ async fn saturated_background_fills_serve_next_partial_range_directly() {
     let (started, mut entered) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = RangeRecordingBodiesRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         started,
         release: Arc::clone(&release),
     };
@@ -1102,7 +1187,7 @@ async fn two_back_to_back_block_writes_both_reach_disk(block_bytes: u64) {
     {
         let calls = BackendCalls::default();
         let backend = CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         };
         let engine = HybridCacheEngine::single_node(backend, &config)
@@ -1125,7 +1210,7 @@ async fn two_back_to_back_block_writes_both_reach_disk(block_bytes: u64) {
     // the warm phase would refill here.
     let calls = BackendCalls::default();
     let backend = CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         calls: calls.clone(),
     };
     let engine = HybridCacheEngine::single_node(backend, &config)
@@ -1179,7 +1264,7 @@ async fn flush_waits_for_background_block_admission() {
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = TailGateRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         armed: Arc::clone(&armed),
@@ -1259,7 +1344,7 @@ async fn cold_aligned_block_read_probes_once_and_admits_before_returning() {
     let (repeated_tx, mut repeated) = tokio::sync::mpsc::unbounded_channel();
     let backend = RepeatAlignedGetParkedRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         aligned_gets: Arc::new(AtomicU64::new(0)),
@@ -1318,7 +1403,7 @@ async fn missing_etag_object_is_served_passthrough_and_never_admitted() {
     let store = Arc::new(InMemory::new());
     let calls = BackendCalls::default();
     let backend = NoEtagRead(CountingRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         calls: calls.clone(),
     });
     let engine = HybridCacheEngine::single_node(backend, &cache_config(&dir, 64 * MIB, 128 * MIB))
@@ -1607,7 +1692,7 @@ async fn head_serves_cached_metadata_with_origin_parity() {
     let dir = TempDir::new().expect("temp dir");
     let (store, engine, calls) = counting_engine(&dir, 64 * MIB, 128 * MIB).await;
     seed(&store, "meta.parquet", pattern(5, 3 * MIB)).await;
-    let origin = PassthroughRead::new(BackendStore::single(BUCKET, store.clone()));
+    let origin = PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone()));
     let k = key("meta.parquet");
 
     let want = origin.head(&k).await.expect("origin HEAD");
@@ -1668,6 +1753,7 @@ async fn range_resolution_matches_s3_semantics() {
     // The server serves a configured bucket set (#235). A request for a bucket
     // outside the set is rejected with NoSuchBucket before it reaches the origin.
     let other_bucket = CacheKey {
+        storage_binding_id: "default".to_owned(),
         bucket: "other-bucket".to_owned(),
         key: "nope.bin".to_owned(),
     };
@@ -1807,7 +1893,7 @@ async fn miss_ladder_consults_peer_rung_by_ring_ownership() {
     let local = NodeId::new("local");
     let peer = RecordingPeer::default();
     let engine = HybridCacheEngine::new(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         peer.clone(),
         FixedOwnerRing {
             members: vec![local.clone(), NodeId::new("remote")],
@@ -1841,7 +1927,7 @@ async fn miss_ladder_consults_peer_rung_by_ring_ownership() {
     let dir = TempDir::new().expect("temp dir");
     let peer = RecordingPeer::default();
     let engine = HybridCacheEngine::new(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         peer.clone(),
         RendezvousRing::single(local.clone()),
         local,
@@ -1927,7 +2013,7 @@ async fn local_block_refuses_a_non_owned_replica() {
     seed(&store, "replica.bin", body.clone()).await;
     let local = NodeId::new("local");
     let engine = HybridCacheEngine::new(
-        PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         RecordingPeer::default(),
         FixedOwnerRing {
             members: vec![local.clone(), NodeId::new("remote")],
@@ -2220,7 +2306,7 @@ async fn windowed_engine(
     let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let backend = WindowedRead {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
         entered: entered_tx,
         release: Arc::clone(&release),
     };
@@ -2364,7 +2450,7 @@ async fn parked_engine(
     let (gate, entered) = Gate::new();
     let backend = ParkedRead {
         inner: CountingRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             calls: calls.clone(),
         },
         gate: gate.clone(),
@@ -2544,7 +2630,7 @@ async fn suffix_larger_than_object_serves_whole_object() {
     let size = 3 * MIB;
     let body = pattern(43, size);
     seed(&store, "small-footer.parquet", body.clone()).await;
-    let origin = PassthroughRead::new(BackendStore::single(BUCKET, store.clone()));
+    let origin = PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone()));
     let k = key("small-footer.parquet");
 
     let (want_meta, want_range, want) = read_all(&origin, &k, ReadRange::Suffix(size + 999))
@@ -2720,7 +2806,7 @@ async fn backend_failure_propagates_to_all_waiters_then_refills() {
     let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let backend = CountingRead {
         inner: FlakyRead {
-            inner: PassthroughRead::new(BackendStore::single(BUCKET, store.clone())),
+            inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone())),
             fail: fail.clone(),
         },
         calls: calls.clone(),
@@ -3004,7 +3090,7 @@ async fn over_cap_suffix_reads_are_not_deduplicated() {
     let over_cap_len = TEST_BLOCK_BYTES + 1; // one byte past the cap
     let body = pattern(65, size);
     seed(&store, "huge-footer.parquet", body.clone()).await;
-    let origin = PassthroughRead::new(BackendStore::single(BUCKET, store.clone()));
+    let origin = PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone()));
     let k = key("huge-footer.parquet");
     let (_, _, want) = read_all(&origin, &k, ReadRange::Suffix(over_cap_len))
         .await
@@ -3097,7 +3183,7 @@ async fn at_cap_suffix_reads_collapse() {
 async fn purge_makes_next_reads_cold_backend_fills_and_byte_identical() {
     let dir = TempDir::new().expect("temp dir");
     let (store, engine, calls) = counting_engine(&dir, 64 * MIB, 128 * MIB).await;
-    let origin = PassthroughRead::new(BackendStore::single(BUCKET, store.clone()));
+    let origin = PassthroughRead::new(BackendStore::single("default", BUCKET, store.clone()));
 
     // A small working set of a few objects with an odd tail each.
     let objs = [("a.parquet", 3u64), ("b.parquet", 7), ("c.parquet", 11)];
@@ -3679,6 +3765,7 @@ async fn default_revalidate_reports_unchanged_changed_and_vanished() {
     let store = Arc::new(InMemory::new());
     seed(&store, "obj.bin", pattern(5, 1024)).await;
     let reader = PlainRead(PassthroughRead::new(BackendStore::single(
+        "default",
         BUCKET,
         store.clone(),
     )));
@@ -3757,7 +3844,7 @@ async fn scripted_engine(
     RendezvousRing,
 > {
     let backend = ScriptedReval {
-        inner: PassthroughRead::new(BackendStore::single(BUCKET, store)),
+        inner: PassthroughRead::new(BackendStore::single("default", BUCKET, store)),
         script,
     };
     HybridCacheEngine::single_node(backend, &cache_config_ttl(dir, 64 * MIB, 128 * MIB, 0))

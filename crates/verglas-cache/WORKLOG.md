@@ -485,3 +485,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   added.
 
 - #58: Fixed a flush-barrier race on unmapped partial reads: the aligned background fill is registered with `start_flight` before the foreground partial flight drops its in-flight count, so `flush()` cannot return in the gap and leave a warm re-read to refill from origin. The partial-read engine test now asserts flush blocks while the aligned tail is gated.
+- #84: Included storage-binding identity in cache metadata and block disk encodings. Added coverage proving equal bucket and object names do not share blocks, mappings, or invalidations across bindings while using one shared admission budget.

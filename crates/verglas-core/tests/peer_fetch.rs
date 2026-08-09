@@ -27,6 +27,7 @@ fn noop_peer_fetch_is_a_clean_miss() {
     let peer = NoopPeerFetch;
     let block = BlockKey {
         object: CacheKey {
+            storage_binding_id: "managed".to_owned(),
             bucket: "lake".to_owned(),
             key: "warehouse/db/table/data/part-000001.parquet".to_owned(),
         },

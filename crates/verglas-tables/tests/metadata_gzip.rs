@@ -157,6 +157,7 @@ async fn warming_gzip_metadata_object_succeeds() {
 
     let summary = warmer
         .warm_table(&WarmTarget {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: sidecar.bucket.clone(),
             metadata_key: gz_key,
             snapshot_id: sidecar.current_snapshot_id,
@@ -181,6 +182,7 @@ async fn warming_plain_metadata_object_still_succeeds() {
 
     let summary = warmer
         .warm_table(&WarmTarget {
+            storage_binding_id: "managed-lakehouse".to_owned(),
             bucket: sidecar.bucket.clone(),
             metadata_key: sidecar.metadata_key.clone(),
             snapshot_id: sidecar.current_snapshot_id,
@@ -205,6 +207,7 @@ async fn mapper_rebuild_over_gzip_metadata_succeeds() {
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: ident.clone(),
                 bucket: sidecar.bucket.clone(),
                 metadata_key: gz_key,
@@ -247,6 +250,7 @@ async fn mapper_rebuild_over_plain_metadata_still_succeeds() {
         .apply_table(
             &fetch,
             &BuildInputs {
+                storage_binding_id: "managed-lakehouse".to_owned(),
                 ident: ident.clone(),
                 bucket: sidecar.bucket.clone(),
                 metadata_key: sidecar.metadata_key.clone(),

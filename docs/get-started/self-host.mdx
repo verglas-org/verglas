@@ -83,6 +83,7 @@ with R2 enabled.
 
     export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
     export VERGLAS_S3_SECRET_ACCESS_KEY=$(openssl rand -hex 32)
+    export VERGLAS_SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)
     ```
 
     Keep this terminal open. Compose substitutes these values when it creates
@@ -114,6 +115,8 @@ with R2 enabled.
     ```bash
     until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 2; done
     export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+    export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+    export VERGLAS_TOKEN="${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}"
     verglas status
     ```
 

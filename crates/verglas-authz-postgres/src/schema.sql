@@ -62,3 +62,29 @@ CREATE TABLE IF NOT EXISTS verglas_authz.policy_versions (
     tenant_id TEXT PRIMARY KEY,
     version BIGINT NOT NULL CHECK (version >= 0)
 );
+
+CREATE SCHEMA IF NOT EXISTS verglas_secrets;
+
+CREATE TABLE IF NOT EXISTS verglas_secrets.secrets (
+    tenant_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    current_version BIGINT NOT NULL CHECK (current_version > 0),
+    PRIMARY KEY (tenant_id, id),
+    FOREIGN KEY (tenant_id, id)
+        REFERENCES verglas_authz.resources (tenant_id, id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS secrets_scope_lookup
+    ON verglas_secrets.secrets (tenant_id, kind, scope);
+
+CREATE TABLE IF NOT EXISTS verglas_secrets.secret_versions (
+    tenant_id TEXT NOT NULL,
+    secret_id TEXT NOT NULL,
+    version BIGINT NOT NULL CHECK (version > 0),
+    ciphertext BYTEA NOT NULL,
+    PRIMARY KEY (tenant_id, secret_id, version),
+    FOREIGN KEY (tenant_id, secret_id)
+        REFERENCES verglas_secrets.secrets (tenant_id, id) ON DELETE CASCADE
+);

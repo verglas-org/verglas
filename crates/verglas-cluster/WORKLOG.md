@@ -94,3 +94,4 @@
 - #3: Updated logical-write references for the `verglas-write` package rename.
 - #91: Updated cluster process and test terminology from daemon to server for
   the `verglas-server` rename. Membership and routing behavior are unchanged.
+- #84: Added storage-binding identity to peer block-fetch envelopes. Peers now distinguish identical bucket, key, ETag, and block coordinates belonging to different origins.

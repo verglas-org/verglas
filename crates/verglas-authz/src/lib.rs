@@ -4,6 +4,7 @@
 //! and explainable decisions without importing a database or policy product.
 
 mod memory;
+mod secrets;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -13,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use memory::MemoryAuthorizer;
+pub use secrets::{
+    AeadSecretCipher, CreateSecret, MemorySecretRepository, ReplaceSecret, ResolveSecret,
+    ResolvedSecret, SecretCipher, SecretError, SecretKind, SecretMetadata, SecretRepository,
+    SecretService, StoredSecret,
+};
 
 /// Stable tenant identifier carried by every authorization object.
 pub type TenantId = String;
