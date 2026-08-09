@@ -49,12 +49,12 @@ Deployment admin settings (the `/admin` panel) follow a few conventions worth kn
 Release pipeline (`scripts/release/`) — how customer instances get deployed:
 
 * `build-release.mjs` bundles every deployable worker byte-identically (wrangler dry-run with the pinned wrangler), builds the Access-mode frontend asset build, and generates the release manifest — the contract between this repo's CI and the deploy service, produced by `manifest-lib.mjs` from each package's wrangler.jsonc with account-specific values replaced by placeholders (`$ACCOUNT_ID`, `$WORKER_NAME(...)`, `$SECRET(...)`, `$PUBLIC_BASE_URL`, ...).
-* `upload-release.mjs` mirrors the release to R2 content-addressed, manifest last; with `--candidate` the manifest lands under `candidates/<id>/` (invisible to the deploy service) so e2e can verify it, and `promote-release.mjs` then copies it to `releases/<id>/` — publishing is that single all-or-nothing manifest copy. The copy is not isolated against concurrent promotions, so CI serializes promote runs (a GitLab resource group) and the script's newer-release guard skips candidates that a later release has already superseded.
+* `upload-release.mjs` mirrors the release to R2 content-addressed below `os/`, manifest last; with `--candidate` the manifest lands under `os/candidates/<id>/` (invisible to the deploy service) so e2e can verify it, and `promote-release.mjs` then copies it to `os/releases/<id>/` — publishing is that single all-or-nothing manifest copy. The copy is not isolated against concurrent promotions, so CI serializes promote runs and the script's newer-release guard skips candidates that a later release has already superseded.
 * The manifest is covered by a golden-file test; after an intentional manifest change, regenerate with `UPDATE_GOLDEN=1 node --test scripts/release-manifest.test.js` and review the golden diff.
 * Running the flow by hand (upload and promote need `R2_ENDPOINT`, `R2_BUCKET`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`):
     * `node scripts/release/build-release.mjs --out release-out` — build everything into `release-out/` (id defaults to `r<CI_PIPELINE_IID>-<sha7>` in CI, `dev-<timestamp>` locally; override with `--release-id <id>`).
     * `node scripts/release/upload-release.mjs --release release-out --candidate` — mirror to R2; omit `--candidate` to publish directly (bypasses the gate — CI never does this).
-    * `node scripts/release/promote-release.mjs --release-id <id>` — copy the verified candidate's manifest into `releases/<id>/`.
+    * `node scripts/release/promote-release.mjs --release-id <id>` — copy the verified candidate's manifest into `os/releases/<id>/`.
 * Deploy-wizard configuration: a per-package `deploy-inputs.json` declares user-supplied inputs. Backend instance-state vars (`ADMINS`, `DEPLOY_URL`, ...) are injected by the deploy service at PUT time, never manifest-templated.
 
 To test changes:

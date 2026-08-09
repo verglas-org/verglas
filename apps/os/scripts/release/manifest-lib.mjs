@@ -230,11 +230,11 @@ export function buildWorkerEntry({ pkgName, config, mainModule, modules, deployI
 }
 
 export function moduleR2Key(sha256) {
-  return `blobs/modules/${sha256}`;
+  return `os/blobs/modules/${sha256}`;
 }
 
 export function assetR2Key(cfHash) {
-  return `blobs/assets/${cfHash}`;
+  return `os/blobs/assets/${cfHash}`;
 }
 
 // Assembles the full manifest.
