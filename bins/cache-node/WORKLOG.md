@@ -87,3 +87,7 @@
   GET, safekeeper broker publication, a real Neon query-after-write workload,
   repeated scans that must increase reconstructed-page DRAM hits, and a quorum
   write after one ring member stops.
+- #74: Isolated the origin onto a cache-only Docker network and split origin and
+  cache-serving credentials in the Neon stack regression. Neon now proves
+  query-after-write and layer reuse without origin reachability, and its layer
+  uploads must increment the cache ring's quorum-acknowledgement counter.

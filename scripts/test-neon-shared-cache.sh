@@ -6,8 +6,10 @@ set -euo pipefail
 image=${VERGLAS_CACHE_NODE_IMAGE:-codex/verglas-cache-node:shared-page}
 neon_image=${VERGLAS_NEON_STACK_IMAGE:-}
 network="verglas-shared-cache-$RANDOM"
+origin_network="$network-origin"
 network_octet=$((RANDOM % 180 + 40))
 subnet="172.30.${network_octet}.0/24"
+origin_subnet="172.31.${network_octet}.0/24"
 work=$(mktemp -d)
 nodes=()
 neon_node=""
@@ -17,31 +19,35 @@ cleanup() {
   [[ -z "$neon_node" ]] || docker rm -f "$neon_node" >/dev/null 2>&1 || true
   docker rm -f "$network-minio" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
+  docker network rm "$origin_network" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
 
 docker network create --subnet "$subnet" "$network" >/dev/null
-docker run -d --name "$network-minio" --network "$network" --ip "172.30.${network_octet}.2" \
-  -e MINIO_ROOT_USER=test -e MINIO_ROOT_PASSWORD=testsecret \
+docker network create --subnet "$origin_subnet" "$origin_network" >/dev/null
+docker run -d --name "$network-minio" --network "$origin_network" --ip "172.31.${network_octet}.2" \
+  -e MINIO_ROOT_USER=origin -e MINIO_ROOT_PASSWORD=originsecret \
   minio/minio:latest server /data >/dev/null
 
 for _ in $(seq 1 60); do
-  if docker run --rm --network "$network" minio/mc:latest \
-    alias set origin "http://$network-minio:9000" test testsecret >/dev/null 2>&1; then
+  if docker run --rm --network "$origin_network" minio/mc:latest \
+    alias set origin "http://$network-minio:9000" origin originsecret >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
-docker run --rm --network "$network" --entrypoint sh minio/mc:latest -c \
-  "mc alias set origin http://$network-minio:9000 test testsecret >/dev/null && mc mb --ignore-existing origin/wal-test" >/dev/null
+docker run --rm --network "$origin_network" --entrypoint sh minio/mc:latest -c \
+  "mc alias set origin http://$network-minio:9000 origin originsecret >/dev/null && mc mb --ignore-existing origin/wal-test" >/dev/null
 
 peers="node-0=172.30.${network_octet}.10:8336,node-1=172.30.${network_octet}.11:8336,node-2=172.30.${network_octet}.12:8336,node-3=172.30.${network_octet}.13:8336"
 for index in 0 1 2 3; do
   node_dir="$work/node-$index"
   mkdir -p "$node_dir/cache"
-  printf '%s\n' '[default]' 'aws_access_key_id = test' \
-    'aws_secret_access_key = testsecret' >"$node_dir/credentials"
+  printf '%s\n' '[default]' 'aws_access_key_id = origin' \
+    'aws_secret_access_key = originsecret' >"$node_dir/backend-credentials"
+  printf '%s\n' '[default]' 'aws_access_key_id = cache' \
+    'aws_secret_access_key = cachesecret' >"$node_dir/cache-credentials"
   cat >"$node_dir/config.toml" <<EOF
 [listen]
 s3_port = 8333
@@ -57,14 +63,14 @@ bucket = "wal-test"
 endpoint = "http://$network-minio:9000"
 allow_http = true
 region = "us-east-1"
-credentials_file = "/data/credentials"
+credentials_file = "/data/backend-credentials"
 
 [auth]
-credentials_file = "/data/credentials"
+credentials_file = "/data/cache-credentials"
 EOF
   name="$network-cache-$index"
   nodes+=("$name")
-  docker run -d --name "$name" --hostname "cache-$index" --network "$network" \
+  docker create --name "$name" --hostname "cache-$index" --network "$network" \
     --ip "172.30.${network_octet}.$((10 + index))" \
     -v "$node_dir:/data" \
     -e VERGLAS_ADMIN_ADDR=0.0.0.0:8334 \
@@ -77,6 +83,8 @@ EOF
     -e VERGLAS_NODE_ID="node-$index" \
     -e VERGLAS_RING_PEERS="$peers" \
     "$image" --config /data/config.toml >/dev/null
+  docker network connect --ip "172.31.${network_octet}.$((10 + index))" "$origin_network" "$name"
+  docker start "$name" >/dev/null
 done
 
 for index in 0 1 2 3; do
@@ -110,11 +118,11 @@ python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["counters"]["dram_
 if [[ -n "$neon_image" ]]; then
   neon_node="$network-neon"
   docker run -d --privileged --name "$neon_node" --network "$network" \
-    -e VERGLAS_PG_REMOTE_ENDPOINT="http://$network-minio:9000" \
-    -e VERGLAS_PG_REMOTE_BUCKET=wal-test \
-    -e VERGLAS_PG_REMOTE_PREFIX=neon-e2e \
-    -e VERGLAS_PG_REMOTE_ACCESS_KEY_ID=test \
-    -e VERGLAS_PG_REMOTE_SECRET_ACCESS_KEY=testsecret \
+    -e VERGLAS_PG_CACHE_ENDPOINT="http://cache-0:8333" \
+    -e VERGLAS_PG_CACHE_BUCKET=wal-test \
+    -e VERGLAS_PG_CACHE_PREFIX=neon-e2e \
+    -e VERGLAS_PG_CACHE_ACCESS_KEY_ID=cache \
+    -e VERGLAS_PG_CACHE_SECRET_ACCESS_KEY=cachesecret \
     -e VERGLAS_PG_SAFEKEEPERS=cache-0:5454 \
     -e VERGLAS_PG_TENANT_ID=33333333333333333333333333333333 \
     -e VERGLAS_PG_TIMELINE_ID=44444444444444444444444444444444 \
@@ -122,6 +130,10 @@ if [[ -n "$neon_image" ]]; then
     -e VERGLAS_ACCESS_PASSWORD=access-secret \
     -e VERGLAS_SCHEDULER_PASSWORD=scheduler-secret \
     "$neon_image" >/dev/null
+
+  # Neon has neither a route to the origin network nor the origin keypair.
+  ! docker exec "$neon_node" getent hosts "$network-minio" >/dev/null 2>&1
+  ! docker exec "$neon_node" env | grep -q 'originsecret'
 
   for _ in $(seq 1 300); do
     if docker exec -e PGPASSWORD=cloud_admin "$neon_node" \
@@ -133,6 +145,9 @@ if [[ -n "$neon_image" ]]; then
   docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
     'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -c \
     "CREATE TABLE heat_test(id bigint PRIMARY KEY, payload text); INSERT INTO heat_test SELECT i, repeat(md5(i::text), 8) FROM generate_series(1,1000000) AS i; CHECKPOINT; SELECT count(*) FROM heat_test;" >/dev/null
+  writeback_stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
+    -s 'http://cache-0:8334/admin/stats')
+  python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["writeback"]["acked_via_quorum"] >= 1, s' <<<"$writeback_stats"
   before_hits=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
     -s 'http://cache-0:8334/admin/stats' | python3 -c 'import json,sys; c=json.load(sys.stdin)["counters"]; print(c["dram_hits"]+c["disk_hits"]+c["peer_hits"])')
   for _ in 1 2 3; do
@@ -157,13 +172,13 @@ fi
 # crosses the three remaining fsync placements and reaches the origin.
 docker stop "$network-cache-3" >/dev/null
 docker run --rm -i --network "$network" --entrypoint sh curlimages/curl:8.12.1 -c \
-  "printf 'four-node-quorum' | curl --fail --silent --aws-sigv4 aws:amz:us-east-1:s3 --user test:testsecret -X PUT --data-binary @- http://cache-0:8333/wal-test/neon/quorum-after-one-down" >/dev/null
+  "printf 'four-node-quorum' | curl --fail --silent --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret -X PUT --data-binary @- http://cache-0:8333/wal-test/neon/quorum-after-one-down" >/dev/null
 stats=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
   -s 'http://cache-0:8334/admin/stats')
 python3 -c 'import json,sys; s=json.load(sys.stdin); assert s["writeback"]["acked_via_quorum"] >= 1, s' <<<"$stats"
 for _ in $(seq 1 60); do
-  origin=$(docker run --rm --network "$network" --entrypoint sh minio/mc:latest -c \
-    "mc alias set origin http://$network-minio:9000 test testsecret >/dev/null && mc cat origin/wal-test/neon/quorum-after-one-down" 2>/dev/null || true)
+  origin=$(docker run --rm --network "$origin_network" --entrypoint sh minio/mc:latest -c \
+    "mc alias set origin http://$network-minio:9000 origin originsecret >/dev/null && mc cat origin/wal-test/neon/quorum-after-one-down" 2>/dev/null || true)
   [[ "$origin" == four-node-quorum ]] && break
   sleep 1
 done
