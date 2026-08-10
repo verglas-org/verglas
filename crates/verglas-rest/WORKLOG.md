@@ -37,3 +37,4 @@
   child-management actions; Postgres grants only the Neon service `connect`.
   Deletion removes the database first and then cleans its authorization subtree
   child-first, so retries safely repair interrupted cleanup.
+- Added the explicit `verglas-cli` audience as a bounded alias at both access-management and data-plane boundaries. One user-minted credential now supports CLI/SDK management and queries without weakening workload-only `access`, `data-plane`, or `policy-engine` audiences.

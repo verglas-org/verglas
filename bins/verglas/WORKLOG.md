@@ -756,3 +756,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #84: Made `verglas query` require its target database and post SQL only to
   `/v1/databases/{database}/query`. Its existing JSON report output and
   `--at` snapshot or timestamp selection are unchanged.
+- Changed `verglas token create` to mint the combined `verglas-cli` audience by default, matching the OS Developer access token contract.

@@ -340,7 +340,7 @@ async fn token_creation_delegates_only_the_authenticated_users_access() {
                 .body(Body::from(
                     json!({
                         "name":"Local CLI",
-                        "audience":"verglas-data-plane",
+                        "audience":"verglas-cli",
                         "expires_in_seconds":3600,
                         "grants":[{
                             "resource_id":"database/analytics",
@@ -368,6 +368,43 @@ async fn token_creation_delegates_only_the_authenticated_users_access() {
             .as_str()
             .is_some_and(|token| !token.is_empty())
     );
+
+    let cli_token = created["token"].as_str().expect("CLI token");
+    let cli_inventory = app
+        .clone()
+        .oneshot(
+            Request::get("/v1/access/tokens")
+                .header(header::AUTHORIZATION, format!("Bearer {cli_token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(cli_inventory.status(), StatusCode::OK);
+
+    let cli_query = app
+        .clone()
+        .oneshot(
+            Request::post("/v1/access/authorize")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {cli_token}"))
+                .body(Body::from(
+                    json!({
+                        "audience":"data-plane",
+                        "resource_id":"database/analytics",
+                        "action":"query"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(cli_query.status(), StatusCode::OK);
+    let cli_query = to_bytes(cli_query.into_body(), 4096).await.expect("body");
+    let cli_query: Value = serde_json::from_slice(&cli_query).expect("json");
+    assert_eq!(cli_query["identity"]["audience"], "verglas-cli");
+    assert_eq!(cli_query["decision"]["allowed"], true);
 
     let list = app
         .oneshot(

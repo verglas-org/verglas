@@ -16,6 +16,8 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use verglas_authz::{AccessDecision, Action};
 
+use crate::access::CLI_AUDIENCE;
+
 /// Verified identity inserted into a request after a successful access check.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AuthenticatedPrincipal {
@@ -150,8 +152,10 @@ impl DataPlaneAuthorizer for DataPlaneAccess {
             .json::<AuthorizationAnswer>()
             .await
             .map_err(|_| AuthorizationFailure::Unavailable)?;
-        if answer.identity.audience != self.audience.as_ref()
-            || answer.identity.tenant_id.is_empty()
+        if !matches!(
+            answer.identity.audience.as_str(),
+            audience if audience == self.audience.as_ref() || audience == CLI_AUDIENCE
+        ) || answer.identity.tenant_id.is_empty()
             || answer.identity.principal_id.is_empty()
             || answer.identity.token_id.is_empty()
         {

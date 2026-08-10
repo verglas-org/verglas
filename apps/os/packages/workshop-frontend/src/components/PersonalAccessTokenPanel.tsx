@@ -126,7 +126,7 @@ export default function PersonalAccessTokenPanel({
         <div className="space-y-5 p-5">
           <div className="grid gap-4 sm:grid-cols-2">
             <label className="text-[12px] font-medium text-kumo-subtle">Token name<input value={name} onChange={(event) => setName(event.target.value)} className={`mt-1.5 ${INPUT}`} placeholder="Local development" /></label>
-            <label className="text-[12px] font-medium text-kumo-subtle">Audience<input value={audience} onChange={(event) => setAudience(event.target.value)} className={`mt-1.5 ${INPUT}`} placeholder="verglas-cli" /></label>
+            <label className="text-[12px] font-medium text-kumo-subtle">Audience<select value={audience} onChange={(event) => setAudience(event.target.value)} className={`mt-1.5 ${INPUT}`}><option value="verglas-cli">CLI and SDK</option><option value="data-plane">Data plane only</option></select></label>
           </div>
           <div>
             <p className="text-[12px] font-medium text-kumo-subtle">Expires</p>

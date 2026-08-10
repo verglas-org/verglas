@@ -140,7 +140,7 @@ pub struct TokenCreateArgs {
     /// Human-readable label for the new token.
     pub name: String,
     /// Runtime audience that may present the token.
-    #[arg(long, default_value = "data-plane")]
+    #[arg(long, default_value = "verglas-cli")]
     pub audience: String,
     /// Token lifetime in seconds. Omit only for deliberately non-expiring local credentials.
     #[arg(long)]

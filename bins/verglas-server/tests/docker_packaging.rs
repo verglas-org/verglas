@@ -10,10 +10,9 @@ fn docker_application_packages_execution_workers() {
         std::fs::read_to_string(workspace.join("Dockerfile")).expect("read workspace Dockerfile");
     let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
         .expect("read Docker Compose application");
-    let postgres_runtime = std::fs::read_to_string(
-        workspace.join("bins/access-node/src/postgres_runtime.rs"),
-    )
-    .expect("read managed Postgres runtime");
+    let postgres_runtime =
+        std::fs::read_to_string(workspace.join("bins/access-node/src/postgres_runtime.rs"))
+            .expect("read managed Postgres runtime");
 
     for package in ["verglas-server", "verglas-query", "verglas-write-node"] {
         assert!(

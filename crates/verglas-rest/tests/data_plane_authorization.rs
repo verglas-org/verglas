@@ -64,6 +64,13 @@ fn allowed() -> Value {
     })
 }
 
+/// Returns an allowed answer for the combined CLI and SDK audience.
+fn allowed_cli() -> Value {
+    let mut value = allowed();
+    value["identity"]["audience"] = json!("verglas-cli");
+    value
+}
+
 /// Builds a request with an optional bearer credential.
 fn request(method: Method, uri: &str, token: Option<&str>) -> Request<Body> {
     let mut builder = Request::builder().method(method).uri(uri);
@@ -151,6 +158,29 @@ async fn allowed_requests_forward_the_bearer_and_receive_verified_identity() {
             })
         )]
     );
+}
+
+#[tokio::test]
+async fn cli_tokens_are_accepted_by_the_data_plane_boundary() {
+    let (endpoint, _) = authority(StatusCode::OK, allowed_cli()).await;
+    let access = DataPlaneAccess::new(endpoint, "data-plane").expect("access client");
+    let app = protect(
+        Router::new().route(
+            "/v1/databases/{database}/query",
+            post(|| async { StatusCode::OK }),
+        ),
+        access,
+    );
+
+    let response = app
+        .oneshot(request(
+            Method::POST,
+            "/v1/databases/analytics/query",
+            Some("cli-token"),
+        ))
+        .await
+        .expect("allowed response");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

@@ -30,11 +30,11 @@ The default local endpoint is `http://127.0.0.1:8334`.
 
 ## Authenticate with a scoped token
 
-Create a token in **Verglas OS → Profile → Access tokens**. Use that one-time
-value to mint a narrower CLI token. The CLI stores the new token in an
-owner-only local credential file. A token can receive grants across multiple
-lakehouse and Postgres databases, but it is authorized separately for each
-database and child resource.
+Create a token in **Verglas OS → Profile → Developer access**. The default
+`verglas-cli` audience is accepted by both access-management and data-plane
+endpoints, so you do not need separate management and query tokens. A token can
+receive grants across multiple lakehouse and Postgres databases, but it is
+authorized separately for each database and child resource.
 
 ```bash
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334

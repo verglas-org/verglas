@@ -82,7 +82,11 @@ or Integration.
 
 ## Create a personal access token
 
-Use **Profile → Access tokens** in Verglas OS:
+Use the `verglas-cli` audience for one credential that works with both the
+Verglas CLI and SDK data operations. Use `data-plane` when the credential must
+not call access-management endpoints.
+
+Use **Profile → Developer access** in Verglas OS:
 
 1. Select **Create token**.
 2. Give the token a recognizable name and expiration.
@@ -96,9 +100,9 @@ issue time, expiration, and policy version. It does not embed a permanent copy
 of permissions: each request evaluates current grants, so a revoked grant or
 token takes effect immediately.
 
-For a CLI token, use the initial token only to mint a narrower replacement. The
-CLI writes that new token to an owner-only local credentials file and uses it
-automatically for the same access endpoint:
+You can export the token directly or use it once to mint a narrower replacement.
+The CLI writes a newly minted replacement to an owner-only local credentials
+file and uses it automatically for the same access endpoint:
 
 ```bash
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334

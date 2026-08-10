@@ -40,6 +40,9 @@ pub type SecretRuntime = Arc<SecretService>;
 
 /// Audience used only for interactive access administration sessions.
 pub const ACCESS_AUDIENCE: &str = "access";
+/// Audience for a user-controlled CLI or SDK credential that may cross both
+/// access-management and data-plane boundaries.
+pub const CLI_AUDIENCE: &str = "verglas-cli";
 
 /// Audience accepted only by the trusted policy-engine check endpoint.
 pub const POLICY_ENGINE_AUDIENCE: &str = "policy-engine";
@@ -850,7 +853,20 @@ async fn authorize(
     headers: HeaderMap,
     Json(body): Json<AuthorizeBody>,
 ) -> Response {
-    let identity = match authenticate(&runtime, &headers, &body.audience).await {
+    let identity = if matches!(
+        body.audience.as_str(),
+        ACCESS_AUDIENCE | DATA_PLANE_AUDIENCE
+    ) {
+        authenticate_any(
+            &runtime,
+            &headers,
+            &[body.audience.as_str(), CLI_AUDIENCE],
+        )
+        .await
+    } else {
+        authenticate(&runtime, &headers, &body.audience).await
+    };
+    let identity = match identity {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -1392,12 +1408,9 @@ async fn create_token(
             "token grant action sets must not be empty".to_owned(),
         ));
     }
-    if matches!(
-        body.audience.as_str(),
-        ACCESS_AUDIENCE | POLICY_ENGINE_AUDIENCE
-    ) {
-        return error_response(AuthzError::Forbidden(
-            "reserved audiences cannot be issued through the personal token API".to_owned(),
+    if !matches!(body.audience.as_str(), CLI_AUDIENCE | DATA_PLANE_AUDIENCE) {
+        return error_response(AuthzError::Invalid(
+            "personal token audience must be verglas-cli or data-plane".to_owned(),
         ));
     }
     let token_id = new_access_token_id();
@@ -1616,7 +1629,13 @@ async fn require_access_identity(
     mut request: Request,
     next: Next,
 ) -> Response {
-    match authenticate(&runtime, request.headers(), ACCESS_AUDIENCE).await {
+    match authenticate_any(
+        &runtime,
+        request.headers(),
+        &[ACCESS_AUDIENCE, CLI_AUDIENCE],
+    )
+    .await
+    {
         Ok(identity) => {
             request.extensions_mut().insert(identity);
             next.run(request).await
@@ -1631,12 +1650,29 @@ async fn authenticate(
     headers: &HeaderMap,
     audience: &str,
 ) -> Result<AuthenticatedIdentity, Response> {
+    authenticate_any(runtime, headers, &[audience]).await
+}
+
+/// Validates a strict bearer against one of a bounded set of accepted audiences.
+async fn authenticate_any(
+    runtime: &AccessHttpRuntime,
+    headers: &HeaderMap,
+    audiences: &[&str],
+) -> Result<AuthenticatedIdentity, Response> {
     let token = bearer(headers).ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
-    let claims = runtime
-        .tokens
-        .authenticate(token, &runtime.tenant_id, audience, unix_time())
-        .await
-        .map_err(|_| StatusCode::UNAUTHORIZED.into_response())?;
+    let now = unix_time();
+    let mut claims = None;
+    for audience in audiences {
+        if let Ok(candidate) = runtime
+            .tokens
+            .authenticate(token, &runtime.tenant_id, audience, now)
+            .await
+        {
+            claims = Some(candidate);
+            break;
+        }
+    }
+    let claims = claims.ok_or_else(|| StatusCode::UNAUTHORIZED.into_response())?;
     let actor_principal_id = if claims.run_id.as_deref() == Some(IDENTITY_SESSION_MARKER) {
         runtime
             .tokens
