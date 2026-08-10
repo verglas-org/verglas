@@ -29,7 +29,7 @@
         }
       }
     },
-    "/v1/write/{name}": {
+    "/v1/databases/{database}/write/{name}": {
       "post": {
         "operationId": "append",
         "tags": [
@@ -212,7 +212,7 @@
         }
       }
     },
-    "/v1/graphs/{namespace}": {
+    "/v1/databases/{database}/graphs/{namespace}": {
       "post": {
         "operationId": "graph_create",
         "tags": [
@@ -244,7 +244,7 @@
         }
       }
     },
-    "/v1/graphs/{namespace}/nodes": {
+    "/v1/databases/{database}/graphs/{namespace}/nodes": {
       "post": {
         "operationId": "graph_insert_nodes",
         "tags": [
@@ -261,7 +261,7 @@
         }
       }
     },
-    "/v1/graphs/{namespace}/edges": {
+    "/v1/databases/{database}/graphs/{namespace}/edges": {
       "post": {
         "operationId": "graph_insert_edges",
         "tags": [
@@ -278,7 +278,7 @@
         }
       }
     },
-    "/v1/graphs/{namespace}/index": {
+    "/v1/databases/{database}/graphs/{namespace}/index": {
       "post": {
         "operationId": "graph_build_index",
         "tags": [
@@ -295,7 +295,7 @@
         }
       }
     },
-    "/v1/graphs/{namespace}/query": {
+    "/v1/databases/{database}/graphs/{namespace}/query": {
       "post": {
         "operationId": "graph_query",
         "tags": [
@@ -312,7 +312,7 @@
         }
       }
     },
-    "/v1/tables/{name}/indexes": {
+    "/v1/databases/{database}/tables/{name}/indexes": {
       "post": {
         "operationId": "vector_declare",
         "tags": [
@@ -344,7 +344,7 @@
         }
       }
     },
-    "/v1/tables/{name}/indexes/{field}/search": {
+    "/v1/databases/{database}/tables/{name}/indexes/{field}/search": {
       "post": {
         "operationId": "vector_search",
         "tags": [
@@ -361,7 +361,7 @@
         }
       }
     },
-    "/v1/ingest/{name}": {
+    "/v1/databases/{database}/ingest/{name}": {
       "post": {
         "operationId": "ingest",
         "tags": [
@@ -545,7 +545,7 @@
         }
       }
     },
-    "/v1/tables/{name}/indexes/{field}/refresh": {
+    "/v1/databases/{database}/tables/{name}/indexes/{field}/refresh": {
       "post": {
         "operationId": "vector_refresh",
         "tags": [

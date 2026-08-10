@@ -757,3 +757,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `/v1/databases/{database}/query`. Its existing JSON report output and
   `--at` snapshot or timestamp selection are unchanged.
 - Changed `verglas token create` to mint the combined `verglas-cli` audience by default, matching the OS Developer access token contract.
+- #97: Updated access-only CLI client construction after the Rust SDK removed
+  process-wide catalog coordinates. Token and database administration remain
+  scoped to the standalone access service and do not select a data database.

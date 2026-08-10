@@ -72,22 +72,31 @@ async fn table_index_handle_round_trips_declare_list_and_search() {
         }))
     }
     let app = Router::new()
-        .route("/v1/tables/{name}/indexes", post(declare).get(list))
-        .route("/v1/tables/{name}/indexes/{field}/search", post(search));
+        .route(
+            "/v1/databases/analytics/tables/{name}/indexes",
+            post(declare).get(list),
+        )
+        .route(
+            "/v1/databases/analytics/tables/{name}/indexes/{field}/search",
+            post(search),
+        );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!("http://{}", listener.local_addr().expect("address"));
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
     let client = Client::connect(
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("scoped"),
     )
     .await
     .expect("connect");
 
-    let table = client.table("demo.embeddings").expect("table handle");
+    let table = client
+        .database("analytics")
+        .expect("database")
+        .table("demo.embeddings")
+        .expect("table handle");
     let report = table
         .add_index(
             "embedding",
@@ -138,11 +147,14 @@ async fn table_rejects_empty_name() {
     let client = Client::connect(
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333"),
     )
     .await
     .expect("connect");
-    let error = client.table("").expect_err("empty name");
+    let error = client
+        .database("analytics")
+        .expect("database")
+        .table("")
+        .expect_err("empty name");
     assert!(error.to_string().contains("table"));
 }

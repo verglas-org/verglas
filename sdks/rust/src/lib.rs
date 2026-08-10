@@ -36,8 +36,8 @@ pub mod vector;
 
 pub use client::{
     ARROW_STREAM_CONTENT_TYPE, AppendResult, Client, ClientError, ColumnSpec, ConnectOptions,
-    EnsureTable, FollowStream, Graph, GraphReadOptions, Kv, KvDeleteResult, KvListEntry,
-    KvListPage, KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest,
+    Database, EnsureTable, Graph, GraphReadOptions, Kv, KvDeleteResult, KvListEntry, KvListPage,
+    KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest,
     NamespaceMethodManifest, NamespaceMethodMode, NamespaceStream, PartitionSpec, QueryStream,
     Queue, Table, TableDefinition,
 };

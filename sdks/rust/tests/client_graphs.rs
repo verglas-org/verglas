@@ -137,25 +137,43 @@ async fn graph_handle_round_trips_lifecycle_and_queries() {
         }
     }
     let app = Router::new()
-        .route("/v1/graphs/{namespace}", post(create).get(show))
-        .route("/v1/graphs/{namespace}/nodes", post(nodes))
-        .route("/v1/graphs/{namespace}/edges", post(edges))
-        .route("/v1/graphs/{namespace}/index", post(index))
-        .route("/v1/graphs/{namespace}/query", post(query));
+        .route(
+            "/v1/databases/analytics/graphs/{namespace}",
+            post(create).get(show),
+        )
+        .route(
+            "/v1/databases/analytics/graphs/{namespace}/nodes",
+            post(nodes),
+        )
+        .route(
+            "/v1/databases/analytics/graphs/{namespace}/edges",
+            post(edges),
+        )
+        .route(
+            "/v1/databases/analytics/graphs/{namespace}/index",
+            post(index),
+        )
+        .route(
+            "/v1/databases/analytics/graphs/{namespace}/query",
+            post(query),
+        );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!("http://{}", listener.local_addr().expect("address"));
     tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
     let client = Client::connect(
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("scoped"),
     )
     .await
     .expect("connect");
 
-    let graph = client.graph("kg").expect("graph handle");
+    let graph = client
+        .database("analytics")
+        .expect("database")
+        .graph("kg")
+        .expect("graph handle");
     let created = graph.create().await.expect("create");
     assert_eq!(created.namespace, "kg");
     assert_eq!(created.nodes_table, "kg.nodes");
@@ -256,11 +274,14 @@ async fn graph_rejects_empty_namespace() {
     let client = Client::connect(
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333"),
     )
     .await
     .expect("connect");
-    let error = client.graph("").expect_err("empty namespace");
+    let error = client
+        .database("analytics")
+        .expect("database")
+        .graph("")
+        .expect_err("empty namespace");
     assert!(error.to_string().contains("graph"));
 }

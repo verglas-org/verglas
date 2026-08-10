@@ -148,7 +148,6 @@ async fn access_client(endpoint: &str, bearer: &str) -> Result<Client, verglas_s
         ConnectOptions::new(endpoint)
             .with_access_uri(endpoint)
             .with_query_uri(endpoint)
-            .with_catalog_uri(endpoint)
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token(bearer),
     )

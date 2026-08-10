@@ -19,7 +19,6 @@ async fn client(endpoint: &str) -> Client {
     Client::connect(
         ConnectOptions::new(endpoint)
             .with_access_uri(endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_query_uri(endpoint)
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("parent-token"),

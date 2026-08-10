@@ -101,3 +101,8 @@
 - #database-tokens: Added the typed Postgres connection-token exchange. A
   caller presents its normal scoped bearer to request a short-lived Neon JWT
   for one database, which the database proxy accepts as `PGPASSWORD`.
+
+- #97: Added `Client::database` as the required boundary for Rust catalog,
+  query, write, graph, and vector operations. Removed singleton catalog
+  discovery and the dead catalog WebSocket client so every supported data
+  operation names its database in the route.

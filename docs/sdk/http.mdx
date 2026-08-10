@@ -18,7 +18,7 @@ This page mirrors [`contracts/api-surface.json`](https://github.com/verglas-org/
 **query** — `POST /v1/databases/{database}/query`. TypeScript JSON. Rust Arrow IPC stream. The named database must be an active Lakehouse; Postgres SQL uses a separate runtime contract.
 
 <!-- op:append -->
-**append** — TypeScript/CLI: `POST /v1/ingest/{name}` (JSONL/files). Rust: `POST /v1/write/{name}` (Arrow IPC).
+**append** — TypeScript/CLI: `POST /v1/ingest/{name}` (JSONL/files). Rust: `POST /v1/databases/{database}/write/{name}` (Arrow IPC).
 
 <!-- op:ingest -->
 **ingest** — `POST /v1/ingest/{name}` file create/append (CLI). TypeScript append reuses this route.

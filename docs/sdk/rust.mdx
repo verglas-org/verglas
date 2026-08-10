@@ -64,7 +64,8 @@ let definition = TableDefinition {
     partitions: vec![PartitionSpec::month("created_date")],
 };
 
-let state = client
+let analytics = client.database("analytics")?;
+let state = analytics
     .ensure_table("analytics.orders", &definition)
     .await?;
 println!("table state: {state:?}");
@@ -87,7 +88,8 @@ let batch = RecordBatch::try_new(
     vec![Arc::new(Int64Array::from(vec![1042, 1043]))],
 )?;
 
-let result = client
+let analytics = client.database("analytics")?;
+let result = analytics
     .append_stream(
         "analytics.orders",
         stream::iter(vec![Ok::<_, ClientError>(batch)]),
@@ -103,8 +105,9 @@ println!("{} rows in {} commits", result.rows_committed, result.commits);
 ```rust
 use futures::StreamExt;
 
-let mut batches = client
-    .query_stream("analytics", "SELECT id, total FROM analytics.orders")
+let analytics = client.database("analytics")?;
+let mut batches = analytics
+    .query_stream("SELECT id, total FROM analytics.orders")
     .await?;
 
 while let Some(batch) = batches.next().await {
@@ -121,16 +124,17 @@ The SDK decodes the Arrow IPC response incrementally instead of buffering the fu
 let queue = client.queue("orders")?;
 queue.enqueue(vec![serde_json::json!({"id": 1})]).await?;
 
-let graph = client.graph("knowledge")?;
+let analytics = client.database("analytics")?;
+let graph = analytics.graph("knowledge")?;
 graph.create().await?;
 
-let table = client.table("docs.embeddings")?;
+let table = analytics.table("docs.embeddings")?;
 table.list_indexes().await?;
 ```
 
-These handles speak the same `/v1/queues`, `/v1/graphs`, and `/v1/tables/.../indexes` routes as the TypeScript SDK. See [HTTP surface](/docs/sdk/http).
+Queue handles are tenant-scoped. Graph and table handles stay beneath the selected database's `/v1/databases/{database}` route. See [HTTP surface](/docs/sdk/http).
 
-Catalog commit following (`Client::follow`) is not mounted on the live on-prem router; do not rely on it until a feed returns to the shared surface.
+The on-prem router has no catalog commit feed. Poll database-scoped metadata or query results when an application needs change detection.
 
 ## Implement the worker contract
 

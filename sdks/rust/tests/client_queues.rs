@@ -57,7 +57,6 @@ async fn queue_handle_round_trips_enqueue_poll_and_ack() {
     let client = Client::connect(
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("scoped"),
     )
@@ -105,7 +104,6 @@ async fn connect_stub() -> Client {
     Client::connect(
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333"),
     )
     .await

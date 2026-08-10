@@ -27,7 +27,7 @@
         "typescript": {
           "status": "implemented",
           "symbol": "async ensureTable",
-          "routes": ["GET /v1/namespaces/{ns}/tables/{name}", "POST /v1/namespaces/{ns}/tables"]
+          "routes": ["GET /v1/databases/{database}/catalog/v1/namespaces/{ns}/tables/{name}", "POST /v1/databases/{database}/catalog/v1/namespaces/{ns}/tables"]
         },
         "rust": {
           "status": "implemented",
@@ -55,7 +55,7 @@
       "id": "append",
       "family": "execution",
       "server": [
-        { "method": "POST", "path": "/v1/write/{name}" }
+        { "method": "POST", "path": "/v1/databases/{database}/write/{name}" }
       ],
       "guarantees": ["bounded-batches", "idempotency-key"],
       "clients": {
@@ -67,12 +67,12 @@
         "rust": {
           "status": "implemented",
           "symbol": "pub async fn append_stream",
-          "routes": ["POST /v1/write/{table}"]
+          "routes": ["POST /v1/databases/{database}/write/{table}"]
         },
         "cli": { "status": "implemented", "verb": "table append" }
       },
       "docs": ["op:append"],
-      "notes": "Rust sends Arrow IPC to /v1/write; TypeScript and CLI send JSONL/files to /v1/ingest (see ingest)."
+      "notes": "Rust sends Arrow IPC to the selected database's write route. TypeScript and CLI database scoping remains in #97."
     },
     {
       "id": "namespace",
@@ -146,11 +146,11 @@
     {
       "id": "graph_create",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/graphs/{namespace}" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/graphs/{namespace}" }],
       "guarantees": ["ensure-backing-tables"],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "create(): Promise<GraphCreateResult>", "routes": ["/v1/graphs/"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn create", "routes": ["/v1/graphs/"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn create", "routes": ["/v1/databases/"] },
         "cli": { "status": "implemented", "verb": "graph create" }
       },
       "docs": ["op:graph_create"]
@@ -158,11 +158,11 @@
     {
       "id": "graph_show",
       "family": "platform",
-      "server": [{ "method": "GET", "path": "/v1/graphs/{namespace}" }],
+      "server": [{ "method": "GET", "path": "/v1/databases/{database}/graphs/{namespace}" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "show(): Promise<GraphShowResult>", "routes": ["/v1/graphs/"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn show", "routes": ["/v1/graphs/"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn show", "routes": ["/v1/databases/"] },
         "cli": { "status": "implemented", "verb": "graph show" }
       },
       "docs": ["op:graph_show"]
@@ -170,11 +170,11 @@
     {
       "id": "graph_insert_nodes",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/graphs/{namespace}/nodes" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/graphs/{namespace}/nodes" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "insertNodes(nodes:", "routes": ["/v1/graphs/"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn insert_nodes", "routes": ["/v1/graphs/"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn insert_nodes", "routes": ["/v1/databases/"] },
         "cli": { "status": "implemented", "verb": "graph add-node" }
       },
       "docs": ["op:graph_insert_nodes"]
@@ -182,11 +182,11 @@
     {
       "id": "graph_insert_edges",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/graphs/{namespace}/edges" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/graphs/{namespace}/edges" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "insertEdges(edges:", "routes": ["/v1/graphs/"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn insert_edges", "routes": ["/v1/graphs/"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn insert_edges", "routes": ["/v1/databases/"] },
         "cli": { "status": "implemented", "verb": "graph add-edge" }
       },
       "docs": ["op:graph_insert_edges"]
@@ -194,11 +194,11 @@
     {
       "id": "graph_build_index",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/graphs/{namespace}/index" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/graphs/{namespace}/index" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "buildIndex():", "routes": ["/v1/graphs/"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn build_index", "routes": ["/v1/graphs/"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn build_index", "routes": ["/v1/databases/"] },
         "cli": { "status": "implemented", "verb": "graph index" }
       },
       "docs": ["op:graph_build_index"]
@@ -206,11 +206,11 @@
     {
       "id": "graph_query",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/graphs/{namespace}/query" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/graphs/{namespace}/query" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "neighbors(node:", "routes": ["/v1/graphs/"] },
-        "rust": { "status": "implemented", "symbol": "pub async fn neighbors", "routes": ["/v1/graphs/"] },
+        "rust": { "status": "implemented", "symbol": "pub async fn neighbors", "routes": ["/v1/databases/"] },
         "cli": { "status": "implemented", "verb": "graph neighbors" }
       },
       "docs": ["op:graph_query"]
@@ -218,7 +218,7 @@
     {
       "id": "vector_declare",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/tables/{name}/indexes" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/tables/{name}/indexes" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "addIndex(field:", "routes": ["/indexes"] },
@@ -230,7 +230,7 @@
     {
       "id": "vector_list",
       "family": "platform",
-      "server": [{ "method": "GET", "path": "/v1/tables/{name}/indexes" }],
+      "server": [{ "method": "GET", "path": "/v1/databases/{database}/tables/{name}/indexes" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "listIndexes()", "routes": ["/indexes"] },
@@ -242,7 +242,7 @@
     {
       "id": "vector_search",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/tables/{name}/indexes/{field}/search" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/tables/{name}/indexes/{field}/search" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "searchIndex(field:", "routes": ["/indexes/"] },
@@ -254,7 +254,7 @@
     {
       "id": "ingest",
       "family": "execution",
-      "server": [{ "method": "POST", "path": "/v1/ingest/{name}" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/ingest/{name}" }],
       "guarantees": ["csv-jsonl-parquet"],
       "clients": {
         "typescript": { "status": "n/a" },
@@ -387,7 +387,7 @@
     {
       "id": "vector_refresh",
       "family": "platform",
-      "server": [{ "method": "POST", "path": "/v1/tables/{name}/indexes/{field}/refresh" }],
+      "server": [{ "method": "POST", "path": "/v1/databases/{database}/tables/{name}/indexes/{field}/refresh" }],
       "guarantees": [],
       "clients": {
         "typescript": { "status": "n/a" },
