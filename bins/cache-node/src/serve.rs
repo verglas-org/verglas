@@ -531,8 +531,6 @@ async fn serve_s3(
         invalidation,
         Some(credentials),
         Some(registry as Arc<dyn verglas_backend::BackendStores>),
-        // The cache-node role does not serve the server's `/v1` API.
-        None,
         config.listen.domain.as_deref(),
         Some(node_metrics),
     );

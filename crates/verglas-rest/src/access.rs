@@ -857,12 +857,7 @@ async fn authorize(
         body.audience.as_str(),
         ACCESS_AUDIENCE | DATA_PLANE_AUDIENCE
     ) {
-        authenticate_any(
-            &runtime,
-            &headers,
-            &[body.audience.as_str(), CLI_AUDIENCE],
-        )
-        .await
+        authenticate_any(&runtime, &headers, &[body.audience.as_str(), CLI_AUDIENCE]).await
     } else {
         authenticate(&runtime, &headers, &body.audience).await
     };

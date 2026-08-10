@@ -65,3 +65,4 @@
 - #84: Passed the cache node's managed backend binding into its embedded
   safekeeper so completed WAL segments drain to the configured object store.
 - #87: Added the authenticated host-agent quiescence API and wired one atomic admission fence across S3/catalog HTTP, NBD connections, fragment RPC operations, and embedded safekeeper connections. The fence rejects new work, reports already-accepted work until it drains, and can be reopened only with its current generation; background recovery and propagation do not create a ring-drain requirement.
+- Removed the obsolete serving-API router argument after `/v1` was removed from the S3 frontend, restoring cache-node and complete Docker image builds.
