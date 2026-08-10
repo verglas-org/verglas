@@ -652,7 +652,12 @@ async fn provision_internal_credentials(
             directories.server.as_path(),
             "verglas-server.token",
             verglas_rest::access::DATA_PLANE_AUDIENCE,
-            BTreeSet::from([Action::Discover]),
+            // The data-plane server resolves managed Lakekeeper warehouse
+            // configuration before it opens readiness. Lakekeeper authorizes
+            // that lookup as `describe`; granting it at the tenant root lets
+            // database and warehouse descendants inherit the authority
+            // without minting per-database credentials.
+            BTreeSet::from([Action::Discover, Action::Describe]),
         ),
         (
             "service/verglas-lakekeeper",
@@ -968,6 +973,14 @@ mod tests {
         .await
         .expect("credentials");
 
+        authorizer
+            .create_resource(
+                Resource::new("tenant-a", "database/default", ResourceKind::Database)
+                    .with_parent("tenant"),
+            )
+            .await
+            .expect("database resource");
+
         for (directory, file_name, audience) in [
             (
                 directories.access.as_path(),
@@ -1009,16 +1022,24 @@ mod tests {
                     .is_err()
             );
             if file_name == "verglas-server.token" {
-                let decision = authorizer
-                    .check(verglas_authz::AccessCheck::new(
-                        "tenant-a",
-                        claims.principal_id.clone(),
-                        "tenant",
-                        Action::Discover,
-                    ))
-                    .await
-                    .expect("decision");
-                assert!(decision.allowed);
+                for (resource_id, action) in [
+                    ("tenant", Action::Discover),
+                    ("database/default", Action::Describe),
+                ] {
+                    let decision = authorizer
+                        .check(verglas_authz::AccessCheck::new(
+                            "tenant-a",
+                            claims.principal_id.clone(),
+                            resource_id,
+                            action,
+                        ))
+                        .await
+                        .expect("decision");
+                    assert!(
+                        decision.allowed,
+                        "server token lacks {action:?} on {resource_id}"
+                    );
+                }
             }
             if file_name == "lakekeeper-management.token" {
                 for action in [Action::CreateChild, Action::Modify, Action::ManageGrants] {
