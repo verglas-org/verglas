@@ -12,8 +12,9 @@ use bytes::Bytes;
 use futures::stream;
 use verglas_core::CacheKey;
 use verglas_core::read::{
-    BodyStream, ObjectGet, ObjectMeta, ObjectRead, ReadError, ReadRange, Revalidation, ServedTier,
-    TierCell,
+    AttributesRequest, BodyStream, Checksums, DirectGet, DirectMeta, DirectReadOptions,
+    ObjectAttributes, ObjectGet, ObjectMeta, ObjectRead, ReadError, ReadRange, Revalidation,
+    ServedTier, TierCell,
 };
 use verglas_core::write::ObjectWrite;
 
@@ -102,6 +103,92 @@ where
             }
             None => self.inner.revalidate(key, etag).await,
         }
+    }
+
+    /// Preserves read-your-writes for checksum-enabled GETs.
+    ///
+    /// A quorum-acked dirty object has no origin version or multipart identity
+    /// yet, so those explicitly origin-scoped reads delegate. Checksum mode by
+    /// itself may still read the current object from fragments; its checksum
+    /// block is empty until origin propagation assigns one, matching the PUT
+    /// acknowledgement returned by the write-back coordinator.
+    async fn get_direct(
+        &self,
+        key: &CacheKey,
+        range: ReadRange,
+        options: DirectReadOptions,
+    ) -> Result<DirectGet, ReadError> {
+        let Some(journal) = self.dirty_journal(key) else {
+            return self.inner.get_direct(key, range, options).await;
+        };
+        if options.version_id.is_some() || options.part_number.is_some() {
+            return self.inner.get_direct(key, range, options).await;
+        }
+        let bytes = self
+            .coordinator
+            .reassemble(&journal)
+            .await
+            .map_err(|error| ReadError::Backend(error.to_string()))?;
+        let served = resolve_range(range, bytes.len() as u64)?;
+        let start = usize::try_from(served.start)
+            .map_err(|_| ReadError::Backend("range start overflow".to_owned()))?;
+        let end = usize::try_from(served.end)
+            .map_err(|_| ReadError::Backend("range end overflow".to_owned()))?;
+        Ok(DirectGet {
+            meta: dirty_direct_meta(&journal),
+            range: served,
+            body: once_body(bytes.slice(start..end)),
+        })
+    }
+
+    /// Preserves dirty-object metadata for checksum-enabled HEADs.
+    async fn head_direct(
+        &self,
+        key: &CacheKey,
+        options: DirectReadOptions,
+    ) -> Result<DirectMeta, ReadError> {
+        let Some(journal) = self.dirty_journal(key) else {
+            return self.inner.head_direct(key, options).await;
+        };
+        if options.version_id.is_some() || options.part_number.is_some() {
+            return self.inner.head_direct(key, options).await;
+        }
+        Ok(dirty_direct_meta(&journal))
+    }
+
+    /// Reports the currently acknowledged dirty object instead of consulting
+    /// an origin that may not contain it yet.
+    async fn object_attributes(
+        &self,
+        key: &CacheKey,
+        request: AttributesRequest,
+    ) -> Result<ObjectAttributes, ReadError> {
+        let Some(journal) = self.dirty_journal(key) else {
+            return self.inner.object_attributes(key, request).await;
+        };
+        if request.version_id.is_some() {
+            return self.inner.object_attributes(key, request).await;
+        }
+        let meta = meta_for(&journal, journal.object_len);
+        Ok(ObjectAttributes {
+            e_tag: meta.e_tag,
+            object_size: Some(meta.size),
+            storage_class: None,
+            last_modified: meta.last_modified,
+            version_id: None,
+            checksums: Checksums::default(),
+            object_parts: None,
+        })
+    }
+}
+
+/// Builds the direct-read envelope for a quorum-acked dirty object.
+fn dirty_direct_meta(journal: &Journal) -> DirectMeta {
+    DirectMeta {
+        meta: meta_for(journal, journal.object_len),
+        version_id: None,
+        parts_count: None,
+        checksums: Checksums::default(),
     }
 }
 

@@ -24,7 +24,7 @@ use futures::StreamExt;
 use verglas_cluster::fragments::{FragmentIoError, LoadedFragment};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
-use verglas_core::read::{ObjectRead, ReadError, ReadRange};
+use verglas_core::read::{DirectReadOptions, ObjectRead, ReadError, ReadRange};
 use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
@@ -658,6 +658,29 @@ async fn read_your_writes_before_propagation() {
     let meta = reader.head(&ck("data/x")).await.expect("head");
     assert_eq!(meta.size, payload.len() as u64);
     assert!(meta.e_tag.is_some());
+
+    // AWS-compatible clients commonly enable checksum mode on validation
+    // reads. That direct-read shape must preserve the same dirty-object
+    // visibility instead of falling through to an origin that has not received
+    // the asynchronous propagation yet.
+    let direct = reader
+        .get_direct(
+            &ck("data/x"),
+            ReadRange::Full,
+            DirectReadOptions {
+                checksum_mode: true,
+                ..DirectReadOptions::default()
+            },
+        )
+        .await
+        .expect("checksum-mode read");
+    let mut direct_buf = Vec::new();
+    let mut direct_stream = direct.body;
+    while let Some(chunk) = direct_stream.next().await {
+        direct_buf.extend_from_slice(&chunk.expect("chunk"));
+    }
+    assert_eq!(Bytes::from(direct_buf), payload);
+    assert_eq!(direct.meta.meta.size, payload.len() as u64);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
