@@ -469,8 +469,7 @@ pub async fn run(
                         ring.membership(),
                     ));
                     let state =
-                        crate::catalog_consistency::StrongCatalog::new(gateway, watcher, log)
-                            .await?;
+                        crate::catalog_consistency::StrongCatalog::new(gateway, watcher, log);
                     CatalogRuntime::Strong { state, token }
                 }
             };

@@ -41,20 +41,24 @@ pub struct StrongCatalog {
 }
 
 impl StrongCatalog {
-    /// Builds a strong view and replays every durable mutation before returning.
-    pub async fn new(
+    /// Builds an empty strong view without contacting the ring.
+    ///
+    /// Ring members start concurrently, so requiring a read quorum here creates
+    /// a bootstrap deadlock: every member exits before its peer listeners can
+    /// become available. Strong reads and mutation acknowledgements still call
+    /// [`Self::catch_up`] and therefore remain unavailable until a quorum can
+    /// prove the committed tail.
+    pub fn new(
         gateway: CatalogGateway,
         watcher: StrongWatcher,
         log: Arc<EcCatalogLog>,
-    ) -> Result<Arc<Self>, StrongCatalogError> {
-        let state = Arc::new(Self {
+    ) -> Arc<Self> {
+        Arc::new(Self {
             gateway,
             watcher: Arc::new(watcher),
             log,
             catch_up_lock: tokio::sync::Mutex::new(()),
-        });
-        state.catch_up().await?;
-        Ok(state)
+        })
     }
 
     /// Quorum-appends one event, catches up locally, and returns its proof.
