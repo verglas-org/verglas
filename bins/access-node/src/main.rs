@@ -249,13 +249,12 @@ async fn run(args: Args) -> Result<(), String> {
             .await
             .map_err(|error| error.to_string())?,
     );
-    let openfga = bootstrap(
+    let openfga = bootstrap_openfga(
         &args.openfga_endpoint,
         &args.openfga_store,
         &args.openfga_token,
     )
-    .await
-    .map_err(|error| error.to_string())?;
+    .await?;
     let policy = OpenFgaPolicyEngine::new(openfga).map_err(|error| error.to_string())?;
     let authorizer: Arc<dyn Authorizer> =
         Arc::new(AccessService::new(repository.clone(), Arc::new(policy)));
@@ -466,6 +465,38 @@ async fn run(args: Args) -> Result<(), String> {
         .with_graceful_shutdown(shutdown())
         .await
         .map_err(|error| error.to_string())
+}
+
+/// Bootstraps the tenant-local OpenFGA store across a cold Postgres start.
+///
+/// OpenFGA bounds each datastore operation independently, so its first request
+/// can return a backend deadline while Neon is still warming connections. A
+/// retry always begins with the idempotent store/model discovery sequence;
+/// therefore a timed-out create that committed is discovered instead of
+/// duplicated. Contract/configuration failures remain immediate and fail
+/// closed.
+async fn bootstrap_openfga(
+    endpoint: &str,
+    store: &str,
+    token: &str,
+) -> Result<verglas_authz_openfga::OpenFgaConfig, String> {
+    const MAX_ATTEMPTS: u32 = 8;
+    let mut delay = Duration::from_millis(100);
+    for attempt in 1..=MAX_ATTEMPTS {
+        match bootstrap(endpoint, store, token).await {
+            Ok(config) => return Ok(config),
+            Err(AuthzError::Backend(error)) if attempt < MAX_ATTEMPTS => {
+                eprintln!(
+                    "verglas-access: OpenFGA bootstrap attempt {attempt}/{MAX_ATTEMPTS} failed: {error}; retrying in {}ms",
+                    delay.as_millis()
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(2));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    unreachable!("bounded OpenFGA bootstrap loop always returns")
 }
 
 /// Idempotently bootstraps the tenant root and trusted local service principal.
