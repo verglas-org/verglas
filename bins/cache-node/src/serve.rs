@@ -678,9 +678,16 @@ async fn serve_s3(
 
     let app = if let Some(ring) = object_ring {
         let policy = Arc::new(object_writeback_policy(ring.node_count()));
-        let journals = Arc::new(JournalStore::open(
+        let (journal_store, migrated_journals) = JournalStore::open_for_binding(
             config.cache.dir.join("object-writeback"),
-        )?);
+            MANAGED_STORAGE_BINDING_ID,
+        )?;
+        if migrated_journals > 0 {
+            eprintln!(
+                "verglas-cache-node {VERSION} migrated {migrated_journals} legacy writeback journals to storage binding {MANAGED_STORAGE_BINDING_ID}"
+            );
+        }
+        let journals = Arc::new(journal_store);
         let metrics = Arc::new(WritebackMetrics::default());
         let _ = writeback_slot.set(Arc::clone(&metrics));
         let membership = ring.membership();

@@ -42,7 +42,7 @@ impl<R, W: ObjectWrite> WritebackReader<R, W> {
         if journals.is_idle() {
             return None;
         }
-        let object_id = journals.find_dirty(&key.bucket, &key.key)?;
+        let object_id = journals.find_dirty(&key.storage_binding_id, &key.bucket, &key.key)?;
         journals.read(&object_id).ok().flatten()
     }
 }

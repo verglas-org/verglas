@@ -73,6 +73,9 @@ pub enum WritebackError {
     /// The codec rejected an encode or geometry.
     #[error("codec: {0}")]
     Codec(String),
+    /// A durable journal is missing origin-routing identity.
+    #[error("invalid journal: {0}")]
+    InvalidJournal(String),
 }
 
 /// What one scrub pass saw and fixed (#220): fragments verified, found corrupt,
@@ -371,6 +374,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     ) -> Result<PutOutcome, WriteError> {
         let journal = Journal {
             object_id: object_id.to_owned(),
+            storage_binding_id: key.storage_binding_id.clone(),
             bucket: key.bucket.clone(),
             key: key.key.clone(),
             metadata: StoredMetadata::from(metadata),
@@ -462,6 +466,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         // Rebuild from the committed fragments and upload to the origin.
         let journal = Journal {
             object_id: object_id.to_owned(),
+            storage_binding_id: key.storage_binding_id.clone(),
             bucket: key.bucket.clone(),
             key: key.key.clone(),
             metadata: StoredMetadata::from(metadata),
@@ -601,8 +606,14 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             return Ok(());
         }
         let bytes = self.reassemble(&journal).await?;
+        if journal.storage_binding_id.is_empty() {
+            return Err(WritebackError::InvalidJournal(format!(
+                "{} has no storage binding; run the explicit journal migration",
+                journal.object_id
+            )));
+        }
         let key = CacheKey {
-            storage_binding_id: "default".to_owned(),
+            storage_binding_id: journal.storage_binding_id.clone(),
             bucket: journal.bucket.clone(),
             key: journal.key.clone(),
         };
@@ -815,7 +826,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let occupied: HashSet<String> = healthy.iter().map(|p| p.node.clone()).collect();
         let mut candidates: Vec<NodeId> = placement_order(
             &CacheKey {
-                storage_binding_id: "default".to_owned(),
+                storage_binding_id: journal.storage_binding_id.clone(),
                 bucket: journal.bucket.clone(),
                 key: journal.key.clone(),
             },
