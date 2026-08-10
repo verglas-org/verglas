@@ -39,6 +39,9 @@ struct Args {
     /// Verglas REST API that owns worker declarations.
     #[arg(long, env = "VERGLAS_SCHEDULER_VERGLAS_URL")]
     verglas_url: String,
+    /// Service credential accepted by the tenant-local Verglas REST API.
+    #[arg(long, env = "VERGLAS_SCHEDULER_CONTROL_TOKEN", hide_env_values = true)]
+    verglas_token: String,
     /// Data-plane endpoint injected into worker subprocesses.
     #[arg(long, env = "VERGLAS_WORKER_ENDPOINT")]
     worker_endpoint: String,
@@ -173,14 +176,16 @@ struct EnqueueResponse {
 struct VerglasClient {
     http: reqwest::Client,
     base: String,
+    token: Arc<str>,
 }
 
 impl VerglasClient {
     /// Builds a client after normalizing the base URI once.
-    fn new(base: &str) -> VerglasClient {
+    fn new(base: &str, token: impl Into<Arc<str>>) -> VerglasClient {
         VerglasClient {
             http: reqwest::Client::new(),
             base: base.trim_end_matches('/').to_owned(),
+            token: token.into(),
         }
     }
 
@@ -188,6 +193,7 @@ impl VerglasClient {
     async fn worker(&self, name: &str) -> Result<WorkerRecord, String> {
         self.http
             .get(format!("{}/v1/workers/{name}", self.base))
+            .bearer_auth(self.token.as_ref())
             .send()
             .await
             .map_err(|error| format!("worker request: {error}"))?
@@ -202,6 +208,7 @@ impl VerglasClient {
     async fn workers(&self) -> Result<Vec<WorkerRecord>, String> {
         self.http
             .get(format!("{}/v1/workers?view=active", self.base))
+            .bearer_auth(self.token.as_ref())
             .send()
             .await
             .map_err(|error| format!("workers request: {error}"))?
@@ -492,7 +499,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let client = VerglasClient::new(&args.verglas_url);
+    let client = VerglasClient::new(&args.verglas_url, args.verglas_token.clone());
     let ready = Arc::new(tokio::sync::Notify::new());
     let app = event_router(EventIngress {
         queue: queue.clone(),
@@ -667,7 +674,13 @@ mod tests {
         .to_string();
         let api = Router::new().route(
             "/v1/workers/{name}",
-            get(move || {
+            get(move |headers: axum::http::HeaderMap| {
+                assert_eq!(
+                    headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("Bearer scheduler-test-token")
+                );
                 let code = code.clone();
                 async move {
                     Json(serde_json::json!({
@@ -681,7 +694,7 @@ mod tests {
                 }
             }),
         );
-        let client = VerglasClient::new(&serve(api).await);
+        let client = VerglasClient::new(&serve(api).await, "scheduler-test-token");
         let now = Utc::now();
         let claimed = ClaimedJob {
             job: Job {
@@ -705,6 +718,7 @@ mod tests {
         let args = Args {
             database_url: "postgres://unused".to_owned(),
             verglas_url: "unused".to_owned(),
+            verglas_token: "scheduler-test-token".to_owned(),
             worker_endpoint: "http://127.0.0.1:8334".to_owned(),
             queue: "local".to_owned(),
             consumer: "consumer-1".to_owned(),
@@ -724,10 +738,11 @@ mod tests {
     /// process or turn Compose into a restart loop.
     #[tokio::test]
     async fn unavailable_worker_registry_keeps_scheduler_alive_for_retry() {
-        let client = VerglasClient::new(&serve(Router::new()).await);
+        let client = VerglasClient::new(&serve(Router::new()).await, "scheduler-test-token");
         let args = Args {
             database_url: "postgres://unused".to_owned(),
             verglas_url: "unused".to_owned(),
+            verglas_token: "scheduler-test-token".to_owned(),
             worker_endpoint: "http://127.0.0.1:8334".to_owned(),
             queue: "local".to_owned(),
             consumer: "consumer-1".to_owned(),
