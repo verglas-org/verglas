@@ -100,7 +100,7 @@ The trailing content bytes are the same gzip-compressed Yjs snapshot that is alr
 
 ## Admin Features and Featured Blueprints
 
-Deployments can optionally configure a set of admin usernames through the backend worker's `ADMINS` binding as an array of usernames.
+Deployments can configure admin email addresses through the backend worker's `ADMINS` binding as an array of email addresses.
 
 Admins get access to two extra RPCs:
 

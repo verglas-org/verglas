@@ -22,21 +22,21 @@ async function devAutoLogin(stub: RpcStub<PublicApi>): Promise<void> {
   if (import.meta.env.VITE_DEV_AUTO_LOGIN !== 'true') return
   if (localStorage.getItem('authToken')) return  // already logged in
 
-  const username = import.meta.env.VITE_DEV_USERNAME ?? 'dev'
+  const email = import.meta.env.VITE_DEV_EMAIL ?? 'dev@example.com'
   const password = import.meta.env.VITE_DEV_PASSWORD ?? 'devpassword'
 
   // Derive the passwordHash the same way the app does (argon2id via hashPassword),
   // but here we use the same SERVICE_SALT + SHA-256 shortcut that wrangler dev accepts
   // in local mode. We import hashPassword from the existing util.
   const { hashPassword } = await import('./passwordHash')
-  const passwordHash = await hashPassword(username, password)
+  const passwordHash = await hashPassword(email, password)
 
   // Try createAccount first — works on a fresh backend. Returns null if already exists.
-  let token = await stub.createAccount(username, username, passwordHash)
+  let token = await stub.createAccount(email, passwordHash)
 
   // If null, account already exists — just log in.
   if (!token) {
-    token = await stub.login(username, passwordHash)
+    token = await stub.login(email, passwordHash)
   }
 
   if (token) {

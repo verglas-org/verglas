@@ -21,7 +21,7 @@ The frontend supports two authentication modes, selected at build time.
 
 ### Password mode (default)
 
-Users log in with a username and password. Account creation is available via `/signup`.
+Users log in with an email address and password. Account creation is available via `/signup` when an administrator enables sign-ups.
 This is the default — no extra configuration needed.
 
 ### Cloudflare Access mode

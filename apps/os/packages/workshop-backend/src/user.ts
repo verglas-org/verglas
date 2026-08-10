@@ -332,8 +332,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     return this.#newSessionToken();
   }
 
-  async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
-      : Promise<string | null> {
+  async createAccount(email: string, passwordHash: Uint8Array): Promise<string | null> {
     if (this.storage.created.get()) {
       return null;
     }
@@ -355,8 +354,8 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     this.storage.created.put(true);
     this.storage.profile.put({
       type: "user",
-      name: displayName,
-      id: username,
+      name: email.split("@")[0],
+      id: email,
     });
 
     let passwordHashHash = new Uint8Array(await crypto.subtle.digest('SHA-256', passwordHash));
@@ -1533,12 +1532,10 @@ export class GatekeeperConnectCallbackImpl
   }
 }
 
-export function normalizeUsername(username: string) {
-  username = username.toLowerCase();
-
-  if (!username.match(/^[a-z][a-z0-9_]*$/)) {
-    throw new Error("Invalid username. Must be alphanumeric starting with a letter.")
+export function normalizeEmail(email: string): string {
+  email = email.trim().toLowerCase();
+  if (email.length > 254 || !email.match(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)) {
+    throw new Error("Invalid email address.");
   }
-
-  return username;
+  return email;
 }
