@@ -287,7 +287,7 @@ function isOpenWorkspaceErrorCode(value: unknown): value is OpenWorkspaceErrorCo
 /** Stable authorization actions shared by lakehouse and runtime resources. */
 export type VerglasAccessAction =
     "discover" | "describe" | "query" | "append" | "modify" | "create_child" |
-    "execute" | "use_secret" | "deploy" | "pass_grants" | "manage_grants" | "own";
+    "execute" | "use_secret" | "deploy" | "connect" | "pass_grants" | "manage_grants" | "own";
 
 /** Human or process category registered with the tenant authorization service. */
 export type VerglasPrincipalKind =

@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from 'react'
 import type { AuthenticatedApi, VerglasAccessAction, VerglasAccessResource } from '@verglas/workshop-shared/api'
 import { buildResourceTree, formatAccessAction, isTokenRequestComplete, toTokenGrants } from '../accessPresentation'
 
-const ACTIONS: VerglasAccessAction[] = ['discover', 'describe', 'query', 'append', 'modify', 'create_child', 'execute', 'use_secret', 'deploy']
+const ACTIONS: VerglasAccessAction[] = ['discover', 'describe', 'query', 'append', 'modify', 'create_child', 'execute', 'use_secret', 'deploy', 'connect']
 const EXPIRATIONS = [
   { label: '24 hours', seconds: 60 * 60 * 24 },
   { label: '7 days', seconds: 60 * 60 * 24 * 7 },
