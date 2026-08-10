@@ -64,7 +64,7 @@ export interface PublicApi extends RpcTarget {
   // be used to authenticate the user.
   authenticateFromCfAccess(): Promise<AuthenticatedApi>;
 
-  // Login with username and password.
+  // Login with email and password.
   //
   // Returns a token to store in local storage and pass to `authenticate()` in the future.
   //
@@ -74,7 +74,7 @@ export interface PublicApi extends RpcTarget {
   //
   //     argon2id({
   //       password,
-  //       salt: SERVICE_SALT + encode(username, 'utf8'),
+  //       salt: SERVICE_SALT + encode(normalizedEmail, 'utf8'),
   //       parallelism: 1,
   //       iterations: 3,
   //       memorySize: 64MiB,
@@ -88,18 +88,17 @@ export interface PublicApi extends RpcTarget {
   // hash on the client which tends to have more resources available than a busy server.
   //
   // This API may be disabled when the server uses SSO for authentication.
-  login(username: string, passwordHash: Uint8Array): Promise<string | null>;
+  login(email: string, passwordHash: Uint8Array): Promise<string | null>;
 
   // Create a new account. Returns a token to store in local storage and pass to `authenticate()`
   // in the future.
   //
-  // Returns null if the username already exists. (Other kinds of errors may throw exceptions.)
+  // Returns null if the email already exists. (Other kinds of errors may throw exceptions.)
   //
   // See login() (above) for an explanation of the password hashing algorithm.
   //
   // This API may be disabled when the server uses SSO for authentication.
-  createAccount(username: string, displayName: string, passwordHash: Uint8Array)
-      : Promise<string | null>;
+  createAccount(email: string, passwordHash: Uint8Array): Promise<string | null>;
 
   // Fetch blueprint metadata by ID. Returns null if the blueprint doesn't exist. No
   // authentication required (knowing the ID is sufficient, since a blueprint is "just data").
@@ -993,7 +992,7 @@ export type AdminFormatPatch = {
 };
 
 // A gatekeeper vendor offered as a sign-in method. The login/signup pages render a "Continue with
-// ..." button per entry, alongside (never replacing) username/password. Built from auth-capable
+// ..." button per entry, alongside (never replacing) email/password. Built from auth-capable
 // gatekeepers (VendorDescription.providesAuth) that are in the deployment's auth allowlist.
 export type AuthVendorInfo = {
   // The gatekeeper vendor id (the GATEKEEPER_<NAME> binding suffix, lowercased), e.g. "google".
@@ -1011,7 +1010,7 @@ export type ServerConfig = {
   // configured (password-only).
   authVendors: AuthVendorInfo[];
 
-  // Whether username/password login is available. Defaults to true; an installation can disable it
+  // Whether email/password login is available. Defaults to true; an installation can disable it
   // (DISABLE_PASSWORD_AUTH) to be OAuth-only. Forced true if no auth vendor is configured, to avoid
   // locking everyone out.
   passwordAuthEnabled: boolean;

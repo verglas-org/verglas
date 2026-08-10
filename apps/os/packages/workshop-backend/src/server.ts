@@ -17,7 +17,7 @@ import { getModel, LanguageModelGatekeeper } from "./ai-models";
 import { completeText } from "./ai-invoke.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
 import { BlueprintKvRecord, buildBlueprintArchiveStream, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintKvRecord } from "./blueprint-archive.js";
-import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject } from "./user";
+import { GatekeeperConnectCallbackImpl, normalizeEmail, UserDurableObject } from "./user";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
@@ -54,7 +54,7 @@ export { UserDurableObject, GatekeeperConnectCallbackImpl };
 
 // Declare optional environment variables here since they may be omitted from wrangler.jsonc.
 type Env = Cloudflare.Env & {
-  // Set these if using Cloudflare Access for authentication, otherwise username/password is used.
+  // Set these if using Cloudflare Access for authentication, otherwise email/password is used.
   CF_ACCESS_AUD?: string,  // audience
   CF_ACCESS_ISS?: string,  // team URL, i.e. https://<team>.cloudflareaccess.com
   DEV?: boolean;
@@ -91,7 +91,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     }
 
     if (!Array.isArray(admins)) {
-      throw new TypeError("ADMINS must be configured as an array of usernames.");
+      throw new TypeError("ADMINS must be configured as an array of email addresses.");
     }
 
     return admins.includes(name);
@@ -799,7 +799,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
   }
 
-  async login(username: string, passwordHash: Uint8Array): Promise<string | null> {
+  async login(email: string, passwordHash: Uint8Array): Promise<string | null> {
     if (this.env.CF_ACCESS_AUD) {
       throw new Error("This deployment requires Cloudflare Access authentication.");
     }
@@ -807,9 +807,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       throw new Error("Password login is disabled on this deployment. Use a sign-in option.");
     }
 
-    username = normalizeUsername(username);
+    email = normalizeEmail(email);
 
-    let id = this.users.idFromName(username);
+    let id = this.users.idFromName(email);
     let user = this.users.get(id);
 
     let token = await user.login(passwordHash);
@@ -821,11 +821,10 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       source: "password",
     });
 
-    return `${username}:${token}`;
+    return `${email}:${token}`;
   }
 
-  async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
-      : Promise<string | null> {
+  async createAccount(email: string, passwordHash: Uint8Array): Promise<string | null> {
     if (this.env.CF_ACCESS_AUD) {
       throw new Error("This deployment requires Cloudflare Access authentication.");
     }
@@ -836,12 +835,12 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       throw new Error("New signups are currently disabled on this deployment.");
     }
 
-    username = normalizeUsername(username);
+    email = normalizeEmail(email);
 
-    let id = this.users.idFromName(username);
+    let id = this.users.idFromName(email);
     let user = this.users.get(id);
 
-    let token = await user.createAccount(username, displayName, passwordHash);
+    let token = await user.createAccount(email, passwordHash);
     if (!token) return null;
 
     recordAnalytics(this.ctx, this.env, {
@@ -850,7 +849,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       source: "password",
     });
 
-    return `${username}:${token}`;
+    return `${email}:${token}`;
   }
 
   async getBlueprint(id: string): Promise<BlueprintPublicInfo | null> {

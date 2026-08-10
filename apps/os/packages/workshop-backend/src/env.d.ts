@@ -6,7 +6,7 @@ import type { ProductAnalyticsRecord } from "./analytics";
 declare global {
   namespace Cloudflare {
     interface Env {
-      // Deployment-wide admin usernames.
+      // Deployment-wide admin email addresses.
       ADMINS?: string[];
 
       // Blueprint storage bindings.
@@ -48,7 +48,7 @@ declare global {
       // no gatekeeper sign-in (password / CF Access only).
       AUTH_GATEKEEPERS?: string;
 
-      // Set to "true" to disable username/password login + signup (gatekeeper sign-in only). Only
+      // Set to "true" to disable email/password login + signup (gatekeeper sign-in only). Only
       // takes effect when at least one auth gatekeeper is allowlisted (otherwise password auth stays
       // on to avoid locking everyone out).
       DISABLE_PASSWORD_AUTH?: string;

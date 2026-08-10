@@ -20,15 +20,15 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
   const siteName = useSiteName();
   const connectionLost = useConnectionLost();
   useDocumentTitle("Create account");
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const usernameError =
-    username && !/^[a-z0-9_-]+$/i.test(username)
-      ? "Letters, numbers, underscores, and hyphens only"
+  const emailError =
+    email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      ? "Enter a valid email address"
       : undefined;
 
   const passwordError =
@@ -42,10 +42,10 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
       : undefined;
 
   const canSubmit =
-    username &&
+    email &&
     password &&
     confirmPassword &&
-    !usernameError &&
+    !emailError &&
     !passwordError &&
     !confirmError &&
     !loading;
@@ -57,17 +57,14 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
     setError(null);
 
     try {
-      const passwordHash = await hashPassword(username, password);
-      const token = await rpcStub.createAccount(
-        username,
-        username,
-        passwordHash,
-      );
+      const normalizedEmail = email.trim().toLowerCase();
+      const passwordHash = await hashPassword(normalizedEmail, password);
+      const token = await rpcStub.createAccount(normalizedEmail, passwordHash);
       if (token) {
         localStorage.setItem("authToken", token);
         window.location.href = "/";
       } else {
-        setError("Username already exists");
+        setError("An account already exists for this email");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Account creation failed");
@@ -148,14 +145,15 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
             {/* Form */}
             <form onSubmit={handleSubmit} className="space-y-4">
               <Input
-                label="Username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                type="email"
+                label="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
                 autoFocus
-                autoComplete="username"
+                autoComplete="email"
                 disabled={loading}
-                placeholder="your-username"
-                error={usernameError}
+                placeholder="you@example.com"
+                error={emailError}
               />
 
               <Input

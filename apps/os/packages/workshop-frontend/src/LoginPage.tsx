@@ -9,7 +9,7 @@ import { useServerConfig, useServerConfigError, useSiteName } from './ServerConf
 import { useDocumentTitle } from './useDocumentTitle'
 import { useConnectionLost } from './RpcContext'
 import SiteLogo from './components/SiteLogo'
-
+import { shouldShowSignupLink } from './authPresentation'
 
 interface LoginPageProps {
   rpcStub: RpcStub<PublicApi>
@@ -17,7 +17,7 @@ interface LoginPageProps {
 }
 
 export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
-  const [username, setUsername] = useState('')
+  const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -29,13 +29,14 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    if (!username || !password || loading) return
+    if (!email || !password || loading) return
     setLoading(true)
     setError(null)
 
     try {
-      const passwordHash = await hashPassword(username, password)
-      const token = await rpcStub.login(username, passwordHash)
+      const normalizedEmail = email.trim().toLowerCase()
+      const passwordHash = await hashPassword(normalizedEmail, password)
+      const token = await rpcStub.login(normalizedEmail, passwordHash)
       if (token) {
         localStorage.setItem('authToken', token)
         if (onLoginSuccess) {
@@ -44,7 +45,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
           window.location.reload()
         }
       } else {
-        setError('Invalid username or password')
+        setError('Invalid email or password')
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Login failed')
@@ -81,7 +82,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
     )
   }
 
-    const passwordAuthEnabled = serverConfig.passwordAuthEnabled
+  const passwordAuthEnabled = serverConfig.passwordAuthEnabled
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-kumo-base px-4 relative overflow-hidden">
@@ -110,16 +111,17 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
 
         {passwordAuthEnabled && (
           <>
-            {/* Username / password form */}
+            {/* Email / password form */}
             <form onSubmit={handleSubmit} className="space-y-4">
               <Input
-                label="Username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                type="email"
+                label="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
                 autoFocus
-                autoComplete="username"
+                autoComplete="email"
                 disabled={loading}
-                placeholder="your-username"
+                placeholder="you@example.com"
               />
 
               <Input
@@ -139,7 +141,7 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
               <Button
                 type="submit"
                 variant="primary"
-                disabled={!username || !password}
+                disabled={!email || !password}
                 loading={loading}
                 className="w-full justify-center"
               >
@@ -147,12 +149,14 @@ export default function LoginPage({ rpcStub, onLoginSuccess }: LoginPageProps) {
               </Button>
             </form>
 
-            <p className="text-center text-sm text-kumo-subtle mt-6">
-              Don't have an account?{' '}
-              <Link to="/signup" className="text-kumo-brand hover:underline font-medium">
-                Create one
-              </Link>
-            </p>
+            {shouldShowSignupLink(serverConfig) && (
+              <p className="text-center text-sm text-kumo-subtle mt-6">
+                Don&apos;t have an account?{' '}
+                <Link to="/signup" className="text-kumo-brand hover:underline font-medium">
+                  Create one
+                </Link>
+              </p>
+            )}
           </>
         )}
 
