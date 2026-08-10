@@ -15,6 +15,7 @@
         "execute": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "execute" } } }] } },
         "use_secret": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "use_secret" } } }] } },
         "deploy": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "deploy" } } }] } },
+        "connect": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "connect" } } }] } },
         "pass_grants": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "pass_grants" } } }] } },
         "manage_grants": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "manage_grants" } } }] } },
         "own": { "union": { "child": [{ "this": {} }, { "tupleToUserset": { "tupleset": { "object": "", "relation": "parent" }, "computedUserset": { "object": "", "relation": "own" } } }] } }
@@ -31,6 +32,7 @@
           "execute": { "directly_related_user_types": [{ "type": "principal" }] },
           "use_secret": { "directly_related_user_types": [{ "type": "principal" }] },
           "deploy": { "directly_related_user_types": [{ "type": "principal" }] },
+          "connect": { "directly_related_user_types": [{ "type": "principal" }] },
           "pass_grants": { "directly_related_user_types": [{ "type": "principal" }] },
           "manage_grants": { "directly_related_user_types": [{ "type": "principal" }] },
           "own": { "directly_related_user_types": [{ "type": "principal" }] }

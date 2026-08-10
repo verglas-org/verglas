@@ -330,7 +330,7 @@ fn grant_tuples(grant: &Grant) -> Vec<TupleKey> {
 }
 
 /// Returns every public action in stable model order.
-fn all_actions() -> [Action; 12] {
+fn all_actions() -> [Action; 13] {
     [
         Action::Discover,
         Action::Describe,
@@ -341,6 +341,7 @@ fn all_actions() -> [Action; 12] {
         Action::Execute,
         Action::UseSecret,
         Action::Deploy,
+        Action::Connect,
         Action::PassGrants,
         Action::ManageGrants,
         Action::Own,
