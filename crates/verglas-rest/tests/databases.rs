@@ -228,6 +228,7 @@ impl DatabaseManager for TrackingDatabaseManager {
     ) -> Result<DatabaseView, DatabaseServiceError> {
         self.0.store(true, Ordering::Release);
         Ok(DatabaseView::Postgres {
+            id: "database-id".to_owned(),
             name: plan.name().to_owned(),
             engine: verglas_database::PostgresEngineRequest::ManagedNeon,
         })

@@ -189,6 +189,7 @@ impl DatabaseCatalogSynchronizer {
             }
         })?;
         let catalog = Catalog {
+            consistency: verglas_core::config::CatalogConsistency::Eventual,
             uri: uri.to_string().trim_end_matches('/').to_owned(),
             poll_interval_secs: 30,
             include: Vec::new(),

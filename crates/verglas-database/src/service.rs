@@ -16,6 +16,8 @@ use crate::{
 pub enum DatabaseView {
     /// An Iceberg lakehouse and its resolved public storage and catalog choices.
     Lakehouse {
+        /// Immutable database resource identity used by runtime integrations.
+        id: String,
         /// Stable tenant-local database name.
         name: String,
         /// Managed storage or the configured customer data path.
@@ -25,6 +27,8 @@ pub enum DatabaseView {
     },
     /// An independent managed Neon database.
     Postgres {
+        /// Immutable database resource identity used by runtime integrations.
+        id: String,
         /// Stable tenant-local database name.
         name: String,
         /// Managed Postgres engine declaration.
@@ -33,6 +37,13 @@ pub enum DatabaseView {
 }
 
 impl DatabaseView {
+    /// Returns the immutable database resource identity.
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Lakehouse { id, .. } | Self::Postgres { id, .. } => id,
+        }
+    }
+
     /// Returns the stable tenant-local database name.
     pub fn name(&self) -> &str {
         match self {
@@ -65,12 +76,14 @@ impl DatabaseView {
                     None => CatalogRequest::ManagedLakekeeper,
                 };
                 Ok(Self::Lakehouse {
+                    id: record.id().to_owned(),
                     name: record.name().to_owned(),
                     storage,
                     catalog,
                 })
             }
             DatabaseKind::Postgres => Ok(Self::Postgres {
+                id: record.id().to_owned(),
                 name: record.name().to_owned(),
                 engine: PostgresEngineRequest::ManagedNeon,
             }),

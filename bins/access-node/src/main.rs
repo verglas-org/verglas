@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
@@ -132,6 +133,13 @@ struct Args {
         default_value = "/var/run/verglas/server"
     )]
     server_token_directory: PathBuf,
+    /// Isolated directory receiving the access service's Lakekeeper management credential.
+    #[arg(
+        long,
+        env = "VERGLAS_ACCESS_TOKEN_DIRECTORY",
+        default_value = "/var/run/verglas/access"
+    )]
+    access_token_directory: PathBuf,
     /// Isolated directory receiving the Lakekeeper policy credential.
     #[arg(
         long,
@@ -275,6 +283,7 @@ async fn run(args: Args) -> Result<(), String> {
     let target_jwt_signer = TargetJwtSigner::from_base64_derived(&args.target_jwt_signing_key)
         .map_err(|error| error.to_string())?;
     let credential_directories = InternalCredentialDirectories {
+        access: args.access_token_directory,
         server: args.server_token_directory,
         lakekeeper: args.lakekeeper_token_directory,
         neon: args.neon_token_directory,
@@ -283,6 +292,7 @@ async fn run(args: Args) -> Result<(), String> {
         authorizer.clone(),
         tokens.clone(),
         &args.tenant_id,
+        &args.service_principal,
         &credential_directories,
     )
     .await?;
@@ -292,7 +302,8 @@ async fn run(args: Args) -> Result<(), String> {
         authorizer.clone(),
         tokens.clone(),
         args.tenant_id.clone(),
-        credential_directories,
+        args.service_principal.clone(),
+        credential_directories.clone(),
     );
     let encryption_key = hex::decode(&args.secret_encryption_key).map_err(|_| {
         "VERGLAS_SECRET_ENCRYPTION_KEY must be 64 hexadecimal characters".to_owned()
@@ -321,6 +332,9 @@ async fn run(args: Args) -> Result<(), String> {
         &args.managed_storage_region,
         &args.managed_storage_access_key_id,
         &args.managed_storage_secret_access_key,
+        credential_directories
+            .access
+            .join("lakekeeper-management.token"),
     )
     .map_err(|error| error.to_string())?;
     let postgres_credential_key =
@@ -364,71 +378,14 @@ async fn run(args: Args) -> Result<(), String> {
     ));
     let database_service = Arc::new(database_runtime::ProvisioningDatabaseManager::new(
         database_service,
+        authorizer.clone(),
+        args.tenant_id.clone(),
         lakehouse,
         postgres,
     ));
-    let recovery_failures = database_service
-        .recover(&args.tenant_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    for failure in &recovery_failures {
-        eprintln!("verglas-access: database runtime recovery failed: {failure}");
-    }
-    if !recovery_failures.is_empty() {
-        let recovery = database_service.clone();
-        let recovery_tenant = args.tenant_id.clone();
-        tokio::spawn(async move {
-            let mut delay = Duration::from_secs(2);
-            loop {
-                tokio::time::sleep(delay).await;
-                match recovery.recover(&recovery_tenant).await {
-                    Ok(failures) if failures.is_empty() => break,
-                    Ok(failures) => {
-                        for failure in failures {
-                            eprintln!(
-                                "verglas-access: database runtime recovery retry failed: {failure}"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("verglas-access: database recovery retry failed: {error}");
-                    }
-                }
-                delay = (delay * 2).min(Duration::from_secs(60));
-            }
-        });
-    }
-    let queue_recovery_failures = queue_service
-        .recover(&args.tenant_id)
-        .await
-        .map_err(|error| error.to_string())?;
-    for failure in &queue_recovery_failures {
-        eprintln!("verglas-access: queue runtime recovery failed: {failure}");
-    }
-    if !queue_recovery_failures.is_empty() {
-        let recovery = queue_service.clone();
-        let recovery_tenant = args.tenant_id.clone();
-        tokio::spawn(async move {
-            let mut delay = Duration::from_secs(2);
-            loop {
-                tokio::time::sleep(delay).await;
-                match recovery.recover(&recovery_tenant).await {
-                    Ok(failures) if failures.is_empty() => break,
-                    Ok(failures) => {
-                        for failure in failures {
-                            eprintln!(
-                                "verglas-access: queue runtime recovery retry failed: {failure}"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("verglas-access: queue recovery retry failed: {error}");
-                    }
-                }
-                delay = (delay * 2).min(Duration::from_secs(60));
-            }
-        });
-    }
+    let recovery = database_service.clone();
+    let queue_recovery = queue_service.clone();
+    let recovery_tenant = args.tenant_id.clone();
     let access_runtime =
         verglas_rest::access::AccessHttpRuntime::new(authorizer, tokens, args.tenant_id.clone())
             .with_identity_assertion_key(identity_assertion_key)
@@ -453,17 +410,52 @@ async fn run(args: Args) -> Result<(), String> {
         args.tenant_id,
     ));
     let protected_queues = verglas_rest::data_plane::protect(queue_routes, access_runtime.clone());
+    let ready = Arc::new(AtomicBool::new(false));
+    let health_ready = ready.clone();
     let app = Router::new()
-        .route("/healthz", get(health))
+        .route("/healthz", get(move || health(health_ready.clone())))
         .merge(verglas_rest::access::router(access_runtime))
         .merge(protected_databases)
         .merge(protected_queues);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .map_err(|error| error.to_string())?;
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+    let server = tokio::spawn(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown())
+            .into_future(),
+    );
+
+    // Lakekeeper's Verglas authorizer calls this access listener while managed
+    // warehouses are reconciled. Bind first, but keep health closed until every
+    // durable database runtime has converged; no failed runtime is hidden behind
+    // a background fallback loop.
+    let recovery_failures = recovery
+        .recover(&recovery_tenant)
         .await
+        .map_err(|error| error.to_string())?;
+    if !recovery_failures.is_empty() {
+        server.abort();
+        return Err(format!(
+            "database runtime recovery failed: {}",
+            recovery_failures.join("; ")
+        ));
+    }
+    let queue_recovery_failures = queue_recovery
+        .recover(&recovery_tenant)
+        .await
+        .map_err(|error| error.to_string())?;
+    if !queue_recovery_failures.is_empty() {
+        server.abort();
+        return Err(format!(
+            "queue runtime recovery failed: {}",
+            queue_recovery_failures.join("; ")
+        ));
+    }
+    ready.store(true, Ordering::Release);
+    server
+        .await
+        .map_err(|error| format!("access server task failed: {error}"))?
         .map_err(|error| error.to_string())
 }
 
@@ -510,6 +502,12 @@ async fn ensure_tenant_identities(
     match authorizer.create_resource(tenant).await {
         Ok(_) | Err(AuthzError::Conflict(_)) => {}
         Err(error) => return Err(format!("cannot bootstrap tenant resource: {error}")),
+    }
+    let lakekeeper =
+        Resource::new(tenant_id, "lakekeeper", ResourceKind::Project).with_parent("tenant");
+    match authorizer.create_resource(lakekeeper).await {
+        Ok(_) | Err(AuthzError::Conflict(_)) => {}
+        Err(error) => return Err(format!("cannot bootstrap Lakekeeper resource: {error}")),
     }
     let principal = Principal::new(
         tenant_id,
@@ -568,6 +566,7 @@ fn decode_256_bit_hex(name: &str, value: &str) -> Result<[u8; 32], String> {
 /// Mutually isolated credential directories mounted by exactly one consumer each.
 #[derive(Clone)]
 struct InternalCredentialDirectories {
+    access: PathBuf,
     server: PathBuf,
     lakekeeper: PathBuf,
     neon: PathBuf,
@@ -578,9 +577,11 @@ async fn provision_internal_credentials(
     authorizer: Arc<dyn Authorizer>,
     tokens: Arc<AccessTokenService>,
     tenant_id: &str,
+    service_principal: &str,
     directories: &InternalCredentialDirectories,
 ) -> Result<(), String> {
     for directory in [
+        &directories.access,
         &directories.server,
         &directories.lakekeeper,
         &directories.neon,
@@ -590,27 +591,40 @@ async fn provision_internal_credentials(
             .map_err(|error| format!("cannot create access token directory: {error}"))?;
         set_directory_permissions(directory).await?;
     }
-    for (parent_id, directory, file_name, audience, action) in [
+    for (parent_id, directory, file_name, audience, actions) in [
+        (
+            service_principal,
+            directories.access.as_path(),
+            "lakekeeper-management.token",
+            verglas_rest::access::DATA_PLANE_AUDIENCE,
+            BTreeSet::from([
+                Action::Discover,
+                Action::Describe,
+                Action::CreateChild,
+                Action::Modify,
+                Action::ManageGrants,
+            ]),
+        ),
         (
             "service/verglas-server",
             directories.server.as_path(),
             "verglas-server.token",
             verglas_rest::access::DATA_PLANE_AUDIENCE,
-            Some(Action::Discover),
+            BTreeSet::from([Action::Discover]),
         ),
         (
             "service/verglas-lakekeeper",
             directories.lakekeeper.as_path(),
             "verglas-lakekeeper.token",
             verglas_rest::access::POLICY_ENGINE_AUDIENCE,
-            None,
+            BTreeSet::new(),
         ),
         (
             "service/verglas-neon",
             directories.neon.as_path(),
             "verglas-neon.token",
             verglas_rest::access::POLICY_ENGINE_AUDIENCE,
-            None,
+            BTreeSet::new(),
         ),
     ] {
         ensure_internal_principal(authorizer.as_ref(), tenant_id, parent_id).await?;
@@ -623,14 +637,14 @@ async fn provision_internal_credentials(
             )
             .await
             .map_err(|error| format!("cannot create internal token principal: {error}"))?;
-        if let Some(action) = action {
+        if !actions.is_empty() {
             authorizer
                 .create_grant(Grant::new(
                     format!("internal-token-grant/{token_id}"),
                     tenant_id,
                     &principal_id,
                     "tenant",
-                    BTreeSet::from([action]),
+                    actions,
                 ))
                 .await
                 .map_err(|error| format!("cannot grant internal token authority: {error}"))?;
@@ -735,6 +749,7 @@ fn spawn_internal_credential_rotation(
     authorizer: Arc<dyn Authorizer>,
     tokens: Arc<AccessTokenService>,
     tenant_id: String,
+    service_principal: String,
     directories: InternalCredentialDirectories,
 ) {
     tokio::spawn(async move {
@@ -746,6 +761,7 @@ fn spawn_internal_credential_rotation(
                 authorizer.clone(),
                 tokens.clone(),
                 &tenant_id,
+                &service_principal,
                 &directories,
             )
             .await
@@ -764,8 +780,12 @@ fn unix_time() -> u64 {
 }
 
 /// Reports liveness after both durable dependencies passed startup.
-async fn health() -> StatusCode {
-    StatusCode::NO_CONTENT
+async fn health(ready: Arc<AtomicBool>) -> StatusCode {
+    if ready.load(Ordering::Acquire) {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
 }
 
 /// Waits for an ordinary process termination signal.
@@ -864,6 +884,7 @@ mod tests {
         ));
         let directory = tempfile::tempdir().expect("temporary directory");
         let directories = InternalCredentialDirectories {
+            access: directory.path().join("access"),
             server: directory.path().join("server"),
             lakekeeper: directory.path().join("lakekeeper"),
             neon: directory.path().join("neon"),
@@ -873,12 +894,18 @@ mod tests {
             authorizer.clone(),
             tokens.clone(),
             "tenant-a",
+            "service/access",
             &directories,
         )
         .await
         .expect("credentials");
 
         for (directory, file_name, audience) in [
+            (
+                directories.access.as_path(),
+                "lakekeeper-management.token",
+                verglas_rest::access::DATA_PLANE_AUDIENCE,
+            ),
             (
                 directories.server.as_path(),
                 "verglas-server.token",
@@ -917,13 +944,27 @@ mod tests {
                 let decision = authorizer
                     .check(verglas_authz::AccessCheck::new(
                         "tenant-a",
-                        claims.principal_id,
+                        claims.principal_id.clone(),
                         "tenant",
                         Action::Discover,
                     ))
                     .await
                     .expect("decision");
                 assert!(decision.allowed);
+            }
+            if file_name == "lakekeeper-management.token" {
+                for action in [Action::CreateChild, Action::Modify, Action::ManageGrants] {
+                    let decision = authorizer
+                        .check(verglas_authz::AccessCheck::new(
+                            "tenant-a",
+                            claims.principal_id.clone(),
+                            "tenant",
+                            action,
+                        ))
+                        .await
+                        .expect("management decision");
+                    assert!(decision.allowed, "management token lacks {action:?}");
+                }
             }
         }
         assert!(!directory.path().join("root.token").exists());

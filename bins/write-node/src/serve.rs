@@ -244,6 +244,7 @@ mod tests {
             },
             catalog: verglas_core::config::Catalog {
                 uri: catalog_uri,
+                consistency: verglas_core::config::CatalogConsistency::Eventual,
                 poll_interval_secs: 30,
                 include: Vec::new(),
                 exclude: Vec::new(),

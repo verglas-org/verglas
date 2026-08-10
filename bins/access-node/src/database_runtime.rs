@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use verglas_authz::{Authorizer, AuthzError, Resource, ResourceKind};
 use verglas_database::{
     CatalogRequest, DatabaseManager, DatabasePlan, DatabaseServiceError, DatabaseView,
     StorageRequest,
@@ -22,10 +23,10 @@ pub(crate) trait ManagedLakehouseRuntime: Send + Sync {
     async fn bootstrap(&self) -> Result<(), DatabaseServiceError>;
 
     /// Makes one managed database warehouse usable.
-    async fn ensure_database(&self, name: &str) -> Result<(), DatabaseServiceError>;
+    async fn ensure_database(&self, id: &str, name: &str) -> Result<(), DatabaseServiceError>;
 
     /// Removes one managed database warehouse.
-    async fn delete_database(&self, name: &str) -> Result<(), DatabaseServiceError>;
+    async fn delete_database(&self, id: &str, name: &str) -> Result<(), DatabaseServiceError>;
 }
 
 /// Managed Postgres lifecycle required by the database manager.
@@ -46,19 +47,21 @@ impl ManagedLakehouseRuntime for LakekeeperProvisioner {
     }
 
     /// Ensures the database-specific Lakekeeper warehouse exists.
-    async fn ensure_database(&self, name: &str) -> Result<(), DatabaseServiceError> {
-        self.ensure_warehouse(name).await
+    async fn ensure_database(&self, id: &str, name: &str) -> Result<(), DatabaseServiceError> {
+        self.ensure_warehouse(id, name).await
     }
 
     /// Deletes the database-specific Lakekeeper warehouse.
-    async fn delete_database(&self, name: &str) -> Result<(), DatabaseServiceError> {
-        self.delete_warehouse(name).await
+    async fn delete_database(&self, id: &str, name: &str) -> Result<(), DatabaseServiceError> {
+        self.delete_warehouse(id, name).await
     }
 }
 
 /// Database manager that couples durable declarations to their managed runtimes.
 pub(crate) struct ProvisioningDatabaseManager<L, P> {
     inner: Arc<dyn DatabaseManager>,
+    authorizer: Arc<dyn Authorizer>,
+    tenant_id: String,
     lakehouse: L,
     postgres: P,
 }
@@ -69,9 +72,17 @@ where
     P: ManagedPostgresRuntime,
 {
     /// Wraps the durable database service with mandatory managed provisioners.
-    pub(crate) fn new(inner: Arc<dyn DatabaseManager>, lakehouse: L, postgres: P) -> Self {
+    pub(crate) fn new(
+        inner: Arc<dyn DatabaseManager>,
+        authorizer: Arc<dyn Authorizer>,
+        tenant_id: impl Into<String>,
+        lakehouse: L,
+        postgres: P,
+    ) -> Self {
         Self {
             inner,
+            authorizer,
+            tenant_id: tenant_id.into(),
             lakehouse,
             postgres,
         }
@@ -97,12 +108,27 @@ where
 
     /// Reconciles the managed runtime represented by one public definition.
     async fn ensure_view(&self, database: &DatabaseView) -> Result<(), DatabaseServiceError> {
+        let resource = Resource::new(
+            &self.tenant_id,
+            format!("database/{}", database.id()),
+            ResourceKind::Database,
+        )
+        .with_parent("tenant");
+        match self.authorizer.create_resource(resource).await {
+            Ok(_) | Err(AuthzError::Conflict(_)) => {}
+            Err(error) => {
+                return Err(DatabaseServiceError::Provisioning(format!(
+                    "cannot register database authorization resource: {error}"
+                )));
+            }
+        }
         match database {
             DatabaseView::Lakehouse {
+                id,
                 name,
                 storage: StorageRequest::Managed,
                 catalog: CatalogRequest::ManagedLakekeeper,
-            } => self.lakehouse.ensure_database(name).await,
+            } => self.lakehouse.ensure_database(id, name).await,
             DatabaseView::Postgres { name, .. } => self.postgres.ensure_database(name).await,
             DatabaseView::Lakehouse { name, .. } => {
                 Err(DatabaseServiceError::Provisioning(format!(
@@ -116,10 +142,11 @@ where
     async fn delete_view(&self, database: &DatabaseView) -> Result<(), DatabaseServiceError> {
         match database {
             DatabaseView::Lakehouse {
+                id,
                 name,
                 storage: StorageRequest::Managed,
                 catalog: CatalogRequest::ManagedLakekeeper,
-            } => self.lakehouse.delete_database(name).await,
+            } => self.lakehouse.delete_database(id, name).await,
             DatabaseView::Postgres { name, .. } => self.postgres.delete_database(name).await,
             DatabaseView::Lakehouse { name, .. } => {
                 Err(DatabaseServiceError::Provisioning(format!(
@@ -203,6 +230,7 @@ where
 mod tests {
     use std::sync::Mutex;
 
+    use verglas_authz::MemoryAuthorizer;
     use verglas_database::{
         CatalogRequest, CreateDatabase, DatabaseKind, PostgresEngineRequest, StorageRequest,
     };
@@ -225,11 +253,13 @@ mod tests {
         ) -> Result<DatabaseView, DatabaseServiceError> {
             let view = match plan.kind() {
                 DatabaseKind::Lakehouse => DatabaseView::Lakehouse {
+                    id: format!("db-{}", plan.name()),
                     name: plan.name().to_owned(),
                     storage: StorageRequest::Managed,
                     catalog: CatalogRequest::ManagedLakekeeper,
                 },
                 DatabaseKind::Postgres => DatabaseView::Postgres {
+                    id: format!("db-{}", plan.name()),
                     name: plan.name().to_owned(),
                     engine: PostgresEngineRequest::ManagedNeon,
                 },
@@ -305,7 +335,7 @@ mod tests {
         }
 
         /// Records or rejects a managed runtime ensure.
-        async fn ensure_database(&self, name: &str) -> Result<(), DatabaseServiceError> {
+        async fn ensure_database(&self, _id: &str, name: &str) -> Result<(), DatabaseServiceError> {
             if self.fail {
                 return Err(DatabaseServiceError::Provisioning("failed".to_owned()));
             }
@@ -314,7 +344,7 @@ mod tests {
         }
 
         /// Records managed runtime deletion.
-        async fn delete_database(&self, name: &str) -> Result<(), DatabaseServiceError> {
+        async fn delete_database(&self, _id: &str, name: &str) -> Result<(), DatabaseServiceError> {
             self.deleted.lock().expect("deleted").push(name.to_owned());
             self.events
                 .lock()
@@ -328,13 +358,22 @@ mod tests {
     impl ManagedPostgresRuntime for FakeRuntime {
         /// Records or rejects a managed runtime ensure.
         async fn ensure_database(&self, name: &str) -> Result<(), DatabaseServiceError> {
-            ManagedLakehouseRuntime::ensure_database(self, name).await
+            ManagedLakehouseRuntime::ensure_database(self, "test-database", name).await
         }
 
         /// Records managed runtime deletion.
         async fn delete_database(&self, name: &str) -> Result<(), DatabaseServiceError> {
-            ManagedLakehouseRuntime::delete_database(self, name).await
+            ManagedLakehouseRuntime::delete_database(self, "test-database", name).await
         }
+    }
+
+    async fn test_authorizer() -> Arc<dyn Authorizer> {
+        let authorizer: Arc<dyn Authorizer> = Arc::new(MemoryAuthorizer::new());
+        authorizer
+            .create_resource(Resource::new("tenant-a", "tenant", ResourceKind::Tenant))
+            .await
+            .expect("tenant resource");
+        authorizer
     }
 
     #[tokio::test]
@@ -342,6 +381,8 @@ mod tests {
         let inner = Arc::new(MemoryManager::default());
         let manager = ProvisioningDatabaseManager::new(
             inner.clone(),
+            test_authorizer().await,
+            "tenant-a",
             FakeRuntime {
                 fail: true,
                 ..FakeRuntime::default()
@@ -376,6 +417,8 @@ mod tests {
         });
         let manager = ProvisioningDatabaseManager::new(
             inner,
+            test_authorizer().await,
+            "tenant-a",
             FakeRuntime {
                 events: events.clone(),
                 ..FakeRuntime::default()
@@ -408,8 +451,13 @@ mod tests {
             .create_database(postgres_plan)
             .await
             .expect("persisted database");
-        let manager =
-            ProvisioningDatabaseManager::new(inner, FakeRuntime::default(), FakeRuntime::default());
+        let manager = ProvisioningDatabaseManager::new(
+            inner,
+            test_authorizer().await,
+            "tenant-a",
+            FakeRuntime::default(),
+            FakeRuntime::default(),
+        );
 
         assert!(
             manager
@@ -437,6 +485,8 @@ mod tests {
             .expect("persisted database");
         let manager = ProvisioningDatabaseManager::new(
             inner,
+            test_authorizer().await,
+            "tenant-a",
             FakeRuntime::default(),
             FakeRuntime {
                 fail: true,
@@ -456,6 +506,8 @@ mod tests {
     async fn startup_retries_an_unavailable_managed_catalog() {
         let manager = ProvisioningDatabaseManager::new(
             Arc::new(MemoryManager::default()),
+            test_authorizer().await,
+            "tenant-a",
             FakeRuntime {
                 bootstrap_fail: true,
                 ..FakeRuntime::default()
