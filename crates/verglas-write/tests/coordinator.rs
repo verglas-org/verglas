@@ -247,6 +247,9 @@ impl LiveMembership for FakeMembership {
 struct RecordingOrigin {
     puts: Mutex<HashMap<(String, String), Bytes>>,
     fail: AtomicBool,
+    block_put: AtomicBool,
+    put_entered: AtomicBool,
+    put_release: tokio::sync::Notify,
 }
 
 impl RecordingOrigin {
@@ -254,7 +257,17 @@ impl RecordingOrigin {
         Arc::new(Self {
             puts: Mutex::new(HashMap::new()),
             fail: AtomicBool::new(fail),
+            block_put: AtomicBool::new(false),
+            put_entered: AtomicBool::new(false),
+            put_release: tokio::sync::Notify::new(),
         })
+    }
+    fn block_put(&self) {
+        self.block_put.store(true, Ordering::SeqCst);
+    }
+    fn release_put(&self) {
+        self.block_put.store(false, Ordering::SeqCst);
+        self.put_release.notify_waiters();
     }
     fn get(&self, bucket: &str, key: &str) -> Option<Bytes> {
         self.puts
@@ -276,6 +289,10 @@ impl ObjectWrite for RecordingOrigin {
         while let Some(chunk) = body.next().await {
             buf.extend_from_slice(&chunk?);
         }
+        self.put_entered.store(true, Ordering::SeqCst);
+        while self.block_put.load(Ordering::SeqCst) {
+            self.put_release.notified().await;
+        }
         if self.fail.load(Ordering::Relaxed) {
             return Err(WriteError::Backend("origin down".to_owned()));
         }
@@ -289,7 +306,11 @@ impl ObjectWrite for RecordingOrigin {
             e_tag: Some("\"origin\"".to_owned()),
         })
     }
-    async fn delete(&self, _key: &CacheKey) -> Result<(), WriteError> {
+    async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
+        self.puts
+            .lock()
+            .expect("lock")
+            .remove(&(key.bucket.clone(), key.key.clone()));
         Ok(())
     }
     async fn delete_batch(
@@ -615,6 +636,56 @@ async fn no_disk_headroom_falls_back_to_write_through() {
     assert_eq!(transport.fragment_count(), 0, "no fragments placed");
     assert!(coordinator.journals().is_idle(), "no dirty journal");
     assert_eq!(origin.get("bkt", "data/x"), Some(payload));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::new(false);
+    origin.block_put();
+    let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
+    let key = ck("lakekeeper/storage-check");
+
+    coordinator
+        .put(&key, &WriteMetadata::default(), body(4096), 2, 1, 3)
+        .await
+        .expect("quorum ack before origin propagation");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !origin.put_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        origin.put_entered.load(Ordering::SeqCst),
+        "background propagation reached the blocked origin"
+    );
+
+    let delete_coordinator = Arc::clone(&coordinator);
+    let delete_key = key.clone();
+    let mut delete = tokio::spawn(async move { delete_coordinator.delete(&delete_key).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut delete)
+            .await
+            .is_err(),
+        "delete waits for the earlier accepted PUT instead of racing it"
+    );
+
+    origin.release_put();
+    delete
+        .await
+        .expect("delete task")
+        .expect("ordered origin delete");
+    assert_eq!(
+        origin.get("bkt", "lakekeeper/storage-check"),
+        None,
+        "the completed delete is final"
+    );
+    assert!(coordinator.journals().is_idle(), "dirty journal removed");
+    assert!(
+        wait_for_no_fragments(&transport).await,
+        "propagated fragments are released"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

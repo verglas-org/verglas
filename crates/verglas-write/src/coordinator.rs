@@ -14,14 +14,14 @@
 //! - On node loss, missing fragments are re-encoded from any surviving `k` and
 //!   re-placed on live nodes.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{StreamExt, stream};
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc};
 use verglas_cache::writeback_codec::{
     Encoded, Fragment, Geometry, MAX_STRIPE_CHUNK, StreamingStripeEncoder, StripeEncoder,
     reassemble,
@@ -125,6 +125,10 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     last_mode: AtomicU8,
     /// Per-write counter feeding object-id uniqueness.
     object_counter: AtomicU64,
+    /// Serializes origin-visible operations for one object key. A quorum-acked
+    /// PUT transfers its guard to propagation, so a later DELETE cannot race
+    /// ahead of that PUT and then be resurrected by it.
+    key_locks: Mutex<HashMap<CacheKey, Weak<AsyncMutex<()>>>>,
     /// Set by [`shutdown`](Self::shutdown): background propagation retry loops
     /// exit at their next wake instead of acting on a coordinator whose owner
     /// is gone. The journals stay dirty for the next run's recovery replay.
@@ -153,6 +157,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             require_quorum: false,
             last_mode: AtomicU8::new(MODE_UNSET),
             object_counter: AtomicU64::new(0),
+            key_locks: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
         }
     }
@@ -220,6 +225,10 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         m: usize,
         w: usize,
     ) -> Result<PutOutcome, WriteError> {
+        // Preserve completion order for operations on the same key. The guard
+        // is moved into background propagation on a quorum ack; write-through
+        // and failed writes release it when this function returns.
+        let key_guard = self.key_lock(key).lock_owned().await;
         let live = self.membership.live_nodes();
         // Single-node write-back (#286): a one-node deployment can never form a
         // fragment quorum, but it can fast-ack from local durability. Degenerate
@@ -336,7 +345,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let etag = synthetic_object_etag(&object_id, object_len);
         if acked.len() >= w {
             self.finish_stream_ack(
-                key, metadata, &object_id, &etag, geometry, object_len, acked, done_rx,
+                key, metadata, &object_id, &etag, geometry, object_len, acked, done_rx, key_guard,
             )
             .await
         } else {
@@ -371,6 +380,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         object_len: u64,
         acked: Vec<Placement>,
         rx: mpsc::UnboundedReceiver<(usize, NodeId, Result<(), crate::transport::TransportError>)>,
+        key_guard: OwnedMutexGuard<()>,
     ) -> Result<PutOutcome, WriteError> {
         let journal = Journal {
             object_id: object_id.to_owned(),
@@ -400,6 +410,11 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let me = Arc::clone(self);
         let object_id = object_id.to_owned();
         tokio::spawn(async move {
+            // Keep the key serialized from the start of the accepted PUT until
+            // every straggler is recorded and propagation has finished (or its
+            // bounded retries are exhausted). This is what makes a subsequent
+            // successful DELETE final rather than vulnerable to resurrection.
+            let _key_guard = key_guard;
             let mut rx = rx;
             while let Some((index, node, result)) = rx.recv().await {
                 if result.is_ok() {
@@ -412,7 +427,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                     );
                 }
             }
-            me.propagate(object_id).await;
+            me.propagate_locked(object_id).await;
         });
 
         Ok(PutOutcome {
@@ -573,9 +588,73 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         }
     }
 
+    /// Returns the per-key operation lock, retaining only weak references so
+    /// idle object names do not accumulate forever.
+    fn key_lock(&self, key: &CacheKey) -> Arc<AsyncMutex<()>> {
+        let mut locks = self
+            .key_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(key).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(AsyncMutex::new(()));
+        locks.insert(key.clone(), Arc::downgrade(&lock));
+        lock
+    }
+
+    /// Deletes an object after any earlier quorum-acked PUT for the same key
+    /// has either reached the origin or exhausted its propagation attempts.
+    /// The origin delete happens before the dirty journal is discarded, so a
+    /// failed delete preserves the acknowledged object for retry/recovery.
+    pub async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
+        let _key_guard = self.key_lock(key).lock_owned().await;
+        self.origin.delete(key).await?;
+
+        let Some(object_id) =
+            self.journals
+                .find_dirty(&key.storage_binding_id, &key.bucket, &key.key)
+        else {
+            return Ok(());
+        };
+        let journal = self
+            .journals
+            .read(&object_id)
+            .map_err(|error| WriteError::Backend(format!("write-back journal: {error}")))?;
+        self.journals
+            .delete(&object_id)
+            .map_err(|error| WriteError::Backend(format!("write-back journal: {error}")))?;
+        if let Some(journal) = journal {
+            for placement in journal.placements {
+                let node = NodeId::new(placement.node);
+                let fragment = FragmentKey {
+                    object_id: object_id.clone(),
+                    index: placement.index,
+                };
+                let _ = self.transport.delete(&node, &fragment).await;
+            }
+        }
+        Ok(())
+    }
+
     /// Propagates one object to the origin with bounded retries. A still-dirty
     /// journal after all attempts is left for a later run to replay.
     pub async fn propagate(self: Arc<Self>, object_id: String) {
+        let Some(journal) = self.journals.read(&object_id).ok().flatten() else {
+            return;
+        };
+        let key = CacheKey {
+            storage_binding_id: journal.storage_binding_id,
+            bucket: journal.bucket,
+            key: journal.key,
+        };
+        let _key_guard = self.key_lock(&key).lock_owned().await;
+        self.propagate_locked(object_id).await;
+    }
+
+    /// Propagates while the caller owns the per-key operation lock.
+    async fn propagate_locked(&self, object_id: String) {
         let mut backoff = PROPAGATION_BACKOFF;
         for attempt in 0..PROPAGATION_ATTEMPTS {
             if self.shutdown.load(Ordering::SeqCst) {
