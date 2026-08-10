@@ -17,10 +17,11 @@ use verglas_authz::{
     MemoryAuthorizer, Principal, PrincipalKind, Resource, ResourceKind, TargetJwtSigner,
     TokenMintRequest,
 };
-use verglas_rest::access::AccessHttpRuntime;
+use verglas_rest::access::{AccessHttpRuntime, CLI_AUDIENCE, DATA_PLANE_AUDIENCE};
+use verglas_rest::data_plane::{AuthorizationQuestion, DataPlaneAuthorizer};
 
 /// Creates an authenticated access router and an owner session credential.
-async fn authenticated_app() -> (axum::Router, String) {
+async fn authenticated_runtime() -> (AccessHttpRuntime, String) {
     let authorizer = Arc::new(MemoryAuthorizer::new());
     authorizer
         .create_resource(Resource::new("tenant-a", "tenant", ResourceKind::Tenant))
@@ -91,6 +92,12 @@ async fn authenticated_app() -> (axum::Router, String) {
     let runtime = AccessHttpRuntime::new(authorizer, Arc::new(tokens), "tenant-a")
         .with_identity_assertion_key([9_u8; 32])
         .with_target_jwt_signer(TargetJwtSigner::new("test-key", [8; 32]).expect("target signer"));
+    (runtime, token)
+}
+
+/// Creates an authenticated access router and an owner session credential.
+async fn authenticated_app() -> (axum::Router, String) {
+    let (runtime, token) = authenticated_runtime().await;
     (verglas_rest::access::router(runtime), token)
 }
 
@@ -330,7 +337,8 @@ async fn authorize_derives_identity_and_rejects_missing_bearer() {
 
 #[tokio::test]
 async fn token_creation_delegates_only_the_authenticated_users_access() {
-    let (app, owner_token) = authenticated_app().await;
+    let (runtime, owner_token) = authenticated_runtime().await;
+    let app = verglas_rest::access::router(runtime.clone());
     let response = app
         .clone()
         .oneshot(
@@ -405,6 +413,21 @@ async fn token_creation_delegates_only_the_authenticated_users_access() {
     let cli_query: Value = serde_json::from_slice(&cli_query).expect("json");
     assert_eq!(cli_query["identity"]["audience"], "verglas-cli");
     assert_eq!(cli_query["decision"]["allowed"], true);
+
+    let local_data_plane_identity = runtime
+        .authorize(
+            &format!("Bearer {cli_token}"),
+            AuthorizationQuestion {
+                audience: DATA_PLANE_AUDIENCE.into(),
+                resource_id: "database/analytics".to_owned(),
+                action: Action::Query,
+            },
+        )
+        .await;
+    let Ok(local_data_plane_identity) = local_data_plane_identity else {
+        panic!("CLI bearer must cross the colocated data-plane boundary");
+    };
+    assert_eq!(local_data_plane_identity.audience, CLI_AUDIENCE);
 
     let list = app
         .oneshot(

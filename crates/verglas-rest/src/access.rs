@@ -131,14 +131,28 @@ impl DataPlaneAuthorizer for AccessHttpRuntime {
             .strip_prefix("Bearer ")
             .filter(|value| !value.is_empty())
             .ok_or(AuthorizationFailure::Unauthenticated)?;
-        let claims = self
-            .tokens
-            .authenticate(token, &self.tenant_id, DATA_PLANE_AUDIENCE, unix_time())
-            .await
-            .map_err(|error| match error {
-                AuthzError::Backend(_) => AuthorizationFailure::Unavailable,
-                _ => AuthorizationFailure::Unauthenticated,
-            })?;
+        let now = unix_time();
+        let mut claims = None;
+        let mut backend_failure = false;
+        for audience in [DATA_PLANE_AUDIENCE, CLI_AUDIENCE] {
+            match self
+                .tokens
+                .authenticate(token, &self.tenant_id, audience, now)
+                .await
+            {
+                Ok(candidate) => {
+                    claims = Some(candidate);
+                    break;
+                }
+                Err(AuthzError::Backend(_)) => backend_failure = true,
+                Err(_) => {}
+            }
+        }
+        let claims = claims.ok_or(if backend_failure {
+            AuthorizationFailure::Unavailable
+        } else {
+            AuthorizationFailure::Unauthenticated
+        })?;
         let principal_id = if claims.run_id.as_deref() == Some(IDENTITY_SESSION_MARKER) {
             self.tokens
                 .get(&claims.tenant_id, &claims.token_id)
