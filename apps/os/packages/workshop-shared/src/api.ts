@@ -361,6 +361,8 @@ export type VerglasAccessSnapshot = {
   resources: VerglasAccessResource[];
   /** Explicit grants; inherited access is evaluated at use time. */
   grants: VerglasAccessGrant[];
+  /** User and process credentials visible to the requesting tenant owner. */
+  tokens: VerglasAccessTokenSummary[];
 };
 
 /** A user-approved request to delegate access to a process principal. */
@@ -373,6 +375,54 @@ export type VerglasAccessGrantInput = {
   actions: VerglasAccessAction[];
 };
 
+/** One resource grant requested for a new scoped credential. */
+export type VerglasAccessTokenGrantInput = {
+  /** Protected resource the credential may use. */
+  resourceId: string;
+  /** Exact actions delegated to the credential. */
+  actions: VerglasAccessAction[];
+};
+
+/** User-selected properties for a new scoped access token. */
+export type VerglasCreateAccessTokenInput = {
+  /** Human-readable token name shown in security settings. */
+  name: string;
+  /** Service audience that may accept the token. */
+  audience: string;
+  /** Token lifetime measured from creation, in seconds. */
+  expiresInSeconds: number;
+  /** Resource grants delegated from the authenticated user. */
+  grants: VerglasAccessTokenGrantInput[];
+};
+
+/** Non-secret metadata retained for an issued access token. */
+export type VerglasAccessTokenSummary = {
+  /** Stable token record identifier. */
+  id: string;
+  /** Human-readable name selected when the token was created. */
+  name: string;
+  /** Principal represented by this individual credential. */
+  principalId: string;
+  /** Human or process principal that created the credential. */
+  parentPrincipalId: string;
+  /** Service audience allowed to accept the credential. */
+  audience: string;
+  /** Unix timestamp when the credential was created. */
+  createdAt: number;
+  /** Unix timestamp after which the credential is invalid. */
+  expiresAt: number;
+  /** Unix timestamp of the latest successful use, when available. */
+  lastUsedAt?: number;
+  /** Unix timestamp when the credential was revoked, when applicable. */
+  revokedAt?: number;
+};
+
+/** Newly issued credential whose plaintext token is returned exactly once. */
+export type VerglasCreatedAccessToken = VerglasAccessTokenSummary & {
+  /** Bearer credential shown once and never retained by the OS. */
+  token: string;
+};
+
 // Top-level API exposed to the user after they have authenticated.
 export interface AuthenticatedApi extends RpcTarget {
   // Get profile info for the user who is logged in.
@@ -380,6 +430,18 @@ export interface AuthenticatedApi extends RpcTarget {
 
   /** Returns the tenant principal mapped from the current authenticated OS account. */
   getAccessIdentity(): Promise<VerglasAccessIdentity>;
+
+  /** Lists resources on which the current user may delegate access. */
+  listAccessibleAccessResources(): Promise<VerglasAccessResource[]>;
+
+  /** Lists non-secret metadata for access tokens owned by the current user. */
+  listAccessTokens(): Promise<VerglasAccessTokenSummary[]>;
+
+  /** Creates a token using only permissions the current user may delegate. */
+  createAccessToken(input: VerglasCreateAccessTokenInput): Promise<VerglasCreatedAccessToken>;
+
+  /** Revokes one token owned by the current user. */
+  revokeAccessToken(tokenId: string): Promise<void>;
 
   // Set the user's own display name, seen in chats, etc.
   setOwnDisplayName(name: string): Promise<void>;
@@ -908,6 +970,9 @@ export interface AdminApi {
 
   /** Revokes one explicit tenant grant. */
   revokeAccess(grantId: string): Promise<void>;
+
+  /** Revokes any access token visible in the tenant owner inventory. */
+  revokeAccessToken(tokenId: string): Promise<void>;
 
   // Enable or disable new account signups. Existing users can still log in while signups are closed.
   setSignupsEnabled(enabled: boolean): Promise<void>;

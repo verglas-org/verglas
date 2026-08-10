@@ -11,24 +11,33 @@ export function runDeploymentId(runId) {
   return `run-agent-${requireIdentifier(runId, "run id")}`;
 }
 
-export function runCapabilityEnvironment({runId, runToken, tenantId, principalId, chatId,
+export function runCapabilityEnvironment({runId, scopedToken, principalId, chatId,
   modelUrl, modelToken}) {
   const gateway = `http://verglas-agent-runtime:8390/v1/run-gateway/${runId}`;
   return {
     VERGLAS_AGENT_CONTROLLER_URL: `${gateway}/control`,
-    VERGLAS_AGENT_CONTROLLER_TOKEN: runToken,
     VERGLAS_DATA_ENDPOINT: `${gateway}/data`,
-    VERGLAS_DATA_TOKEN: runToken,
     VERGLAS_CONTAINER_RUNTIME_URL: `${gateway}/runtime`,
-    VERGLAS_CONTAINER_RUNTIME_TOKEN: runToken,
+    VERGLAS_TOKEN: scopedToken,
     LOCAL_MODEL_RUNTIME_URL: modelUrl,
     LOCAL_MODEL_RUNTIME_TOKEN: modelToken,
     VERGLAS_ACCESS_URI: `${gateway}/access`,
-    VERGLAS_ACCESS_SERVICE_TOKEN: runToken,
-    VERGLAS_TENANT_ID: tenantId,
     VERGLAS_AGENT_PRINCIPAL_ID: principalId,
     VERGLAS_AGENT_CHAT_ID: String(chatId),
   };
+}
+
+export function requireScopedToken(value) {
+  if (typeof value !== "string" || !value) {
+    throw new Error("A caller-minted scoped token is required for each agent run.");
+  }
+  return value;
+}
+
+export function gatewayTargetToken(service, allowed, scopedToken, containerRuntimeToken) {
+  if (!allowed) throw new Error("permission denied");
+  if (service === "runtime") return containerRuntimeToken;
+  return requireScopedToken(scopedToken);
 }
 
 export function boundedPrompt(value) {

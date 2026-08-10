@@ -14,6 +14,7 @@ bollard.workspace = true
 clap.workspace = true
 futures.workspace = true
 hex.workspace = true
+rcgen = "0.13.2"
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
@@ -22,6 +23,9 @@ tar = "0.4.44"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "time"] }
 verglas-vessel-contract.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [[bin]]
 name = "verglas-container-runtime"

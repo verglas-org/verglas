@@ -469,8 +469,8 @@ An Application may use React, Vite, deck.gl, MapLibre, charting systems, or any 
 * listen on Number(process.env.PORT || 8380);
 * answer GET /health with a successful response;
 * serve its browser assets and API from the same HTTP origin;
-* keep VERGLAS_DATA_TOKEN exclusively in server code;
-* import { connect } from @verglas/sdk, construct one scoped client from VERGLAS_DATA_ENDPOINT and VERGLAS_DATA_TOKEN, and reuse it;
+* keep VERGLAS_TOKEN exclusively in server code;
+* import { connect } from @verglas/sdk, construct one scoped client from VERGLAS_DATA_ENDPOINT and VERGLAS_TOKEN, and reuse it;
 * expose only bounded application-specific endpoints to browser code;
 * use relative browser API URLs such as ./api/status so previews mounted below /apps/<name>/ keep the request inside the Application;
 * show honest loading, empty, configuration-needed, and error states.
@@ -599,7 +599,7 @@ Build a standalone TypeScript Application Vessel. Use this whenever the user ask
 
 Provide the complete multi-file project, including package.json and all TypeScript, TSX, HTML, and CSS source. package.json must define scripts.start and may declare any exact npm dependencies needed by the application, including React, Vite, deck.gl, MapLibre, charting packages, or UI libraries. If package.json defines scripts.build, Verglas runs it while building the image. The resulting Vessel is its own OCI image and serves HTTP on process.env.PORT (8380). It must answer GET /health successfully.
 
-The platform installs @verglas/sdk into every Vessel project. Server code must use the named import \`import { connect } from "@verglas/sdk"\`, construct one client from VERGLAS_DATA_ENDPOINT and VERGLAS_DATA_TOKEN, and reuse that scoped client for tables, queries, vectors, graphs, queues, KV, and reflected Integration namespaces. Prefer \`bun server/index.ts\` for a TypeScript start script; do not add tsx just to launch Bun. Do not expose the token to browser code. Browser code calls the Vessel's own same-origin server API using relative paths such as \`./api/status\`, because previews are mounted below \`/apps/<name>/\`. Return honest empty states when source data is unavailable; never fabricate live data.
+The platform installs @verglas/sdk into every Vessel project. Server code must use the named import \`import { connect } from "@verglas/sdk"\`, construct one client from VERGLAS_DATA_ENDPOINT and VERGLAS_TOKEN, and reuse that scoped client for tables, queries, vectors, graphs, queues, KV, and reflected Integration namespaces. Prefer \`bun server/index.ts\` for a TypeScript start script; do not add tsx just to launch Bun. Do not expose the token to browser code. Browser code calls the Vessel's own same-origin server API using relative paths such as \`./api/status\`, because previews are mounted below \`/apps/<name>/\`. Return honest empty states when source data is unavailable; never fabricate live data.
 `.trim();
 
 let CREATE_VESSEL_TOOL_DESCRIPTION = `

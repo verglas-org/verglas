@@ -70,12 +70,18 @@ function mapRun(job: JobSummary): VerglasWorkerRunSummary {
 export class VerglasCatalogClient {
   readonly #env: VerglasCatalogEnv;
   readonly #fetch: typeof fetch;
+  readonly #accessToken?: string | Promise<string>;
   readonly #catalogBases = new Map<string, Promise<string>>();
 
-  constructor(env: VerglasCatalogEnv, fetcher: typeof fetch = fetch) {
+  constructor(
+    env: VerglasCatalogEnv,
+    fetcher: typeof fetch = fetch,
+    accessToken?: string | Promise<string>,
+  ) {
     resolveLocalContainerRuntimeConfigured(env);
     this.#env = env;
     this.#fetch = fetcher.bind(globalThis);
+    this.#accessToken = accessToken;
   }
 
   /** Lists active workers, optionally enriched with recent run dots. */
@@ -131,7 +137,7 @@ export class VerglasCatalogClient {
   async #listCatalogTables(
     database: Extract<VerglasDatabaseDefinition, {type: "lakehouse"}>,
   ): Promise<{namespaces: string[][]; tables: VerglasTableSummary[]}> {
-    const admin = verglasAdmin(this.#env, this.#fetch);
+    const admin = verglasAdmin(this.#env, await this.#requireAccessToken(), this.#fetch);
     const catalogBase = await this.#catalogBase(database.name);
     const namespaceBody = await admin.getJson<{namespaces?: string[][]}>(`${catalogBase}/namespaces`);
     const namespaces = (namespaceBody.namespaces ?? []).slice(0, 100);
@@ -168,7 +174,7 @@ export class VerglasCatalogClient {
 
   /** Negotiates one mounted Iceberg catalog rather than assuming an unprefixed warehouse. */
   async #resolveCatalogBase(database: string): Promise<string> {
-    const admin = verglasAdmin(this.#env, this.#fetch);
+    const admin = verglasAdmin(this.#env, await this.#requireAccessToken(), this.#fetch);
     const mount = databaseCatalogMount(database);
     type CatalogConfig = {defaults?: {prefix?: string}; overrides?: {prefix?: string}};
     let config: CatalogConfig | undefined;
@@ -188,7 +194,11 @@ export class VerglasCatalogClient {
 
   /** Lists public database definitions without exposing tenant or secret resource IDs. */
   async #listDatabases(): Promise<VerglasDatabaseDefinition[]> {
-    const result = await verglasDatabaseAccess(this.#env, this.#fetch).listDatabases();
+    const result = await verglasDatabaseAccess(
+      this.#env,
+      await this.#requireAccessToken(),
+      this.#fetch,
+    ).listDatabases();
     return result.map(mapDatabaseDefinition)
       .toSorted((left, right) => left.name.localeCompare(right.name));
   }
@@ -196,7 +206,11 @@ export class VerglasCatalogClient {
   /** Reads one public database definition by tenant-local name. */
   async #getDatabaseDefinition(name: string): Promise<VerglasDatabaseDefinition> {
     const database = validateIdentifier(name, "Database name");
-    const result = await verglasDatabaseAccess(this.#env, this.#fetch).getDatabase(database);
+    const result = await verglasDatabaseAccess(
+      this.#env,
+      await this.#requireAccessToken(),
+      this.#fetch,
+    ).getDatabase(database);
     return mapDatabaseDefinition(result);
   }
 
@@ -226,7 +240,11 @@ export class VerglasCatalogClient {
   /** Creates one top-level database resource through the tenant access service. */
   async createDatabase(input: VerglasCreateDatabaseInput): Promise<VerglasDatabaseSummary> {
     const request = createDatabaseRequest(input);
-    const result = await verglasDatabaseAccess(this.#env, this.#fetch).createDatabase(request);
+    const result = await verglasDatabaseAccess(
+      this.#env,
+      await this.#requireAccessToken(),
+      this.#fetch,
+    ).createDatabase(request);
     return summarizeDatabase(mapDatabaseDefinition(result), [], [], []);
   }
 
@@ -239,7 +257,18 @@ export class VerglasCatalogClient {
         throw new Error(`Database '${database.name}' contains ${tables.length} ${tables.length === 1 ? "table" : "tables"}.`);
       }
     }
-    await verglasDatabaseAccess(this.#env, this.#fetch).deleteDatabase(database.name);
+    await verglasDatabaseAccess(
+      this.#env,
+      await this.#requireAccessToken(),
+      this.#fetch,
+    ).deleteDatabase(database.name);
+  }
+
+  /** Requires the authenticated caller's short-lived access bearer for database-resource routes. */
+  async #requireAccessToken(): Promise<string> {
+    const token = (await this.#accessToken)?.trim();
+    if (!token) throw new Error("A user-scoped Verglas access token is required.");
+    return token;
   }
 
   /** Creates one explicitly-schemaed Iceberg table. */
@@ -248,7 +277,7 @@ export class VerglasCatalogClient {
     const namespace = validateNamespace(input.namespace);
     const name = validateIdentifier(input.name, "Table name");
     if (!input.columns.length) throw new Error("A table requires at least one column.");
-    const admin = verglasAdmin(this.#env, this.#fetch);
+    const admin = verglasAdmin(this.#env, await this.#requireAccessToken(), this.#fetch);
     const catalogBase = await this.#catalogBase(database.name);
     const namespaceBody = await admin.getJson<{namespaces?: string[][]}>(`${catalogBase}/namespaces`);
     if (!(namespaceBody.namespaces ?? []).some((candidate) => sameNamespace(candidate, namespace))) {
@@ -264,7 +293,7 @@ export class VerglasCatalogClient {
     const database = await this.#requireLakehouse(databaseName, "Iceberg table management");
     const validatedNamespace = validateNamespace(namespace);
     const validatedName = validateIdentifier(name, "Table name");
-    const admin = verglasAdmin(this.#env, this.#fetch);
+    const admin = verglasAdmin(this.#env, await this.#requireAccessToken(), this.#fetch);
     const catalogBase = await this.#catalogBase(database.name);
     await admin.deleteJson<void>(
       `${catalogBase}/namespaces/${encodeNamespace(validatedNamespace)}/tables/${encodeURIComponent(validatedName)}`,
@@ -289,7 +318,11 @@ export class VerglasCatalogClient {
     if (!normalizedSql) throw new Error("SQL query is required.");
     const boundedRows = Math.min(Math.max(Math.trunc(maxRows), 1), 500);
     const boundedSql = `SELECT * FROM (${normalizedSql}) AS __verglas_query LIMIT ${boundedRows + 1}`;
-    const result = await verglasAdmin(this.#env, this.#fetch).query(database.name, boundedSql);
+    const result = await verglasAdmin(
+      this.#env,
+      await this.#requireAccessToken(),
+      this.#fetch,
+    ).query(database.name, boundedSql);
     const truncated = result.rows.length > boundedRows;
     const rows = result.rows.slice(0, boundedRows);
     return {columns: result.columns, rows, rowCount: rows.length, truncated};

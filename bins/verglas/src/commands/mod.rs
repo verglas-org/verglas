@@ -11,5 +11,6 @@ pub mod secret;
 pub mod status;
 pub mod table;
 pub mod table_metrics;
+pub mod token;
 pub mod vessel;
 pub mod workers;

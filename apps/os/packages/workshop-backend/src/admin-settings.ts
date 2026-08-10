@@ -568,20 +568,22 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async getAccessSnapshot(): Promise<VerglasAccessSnapshot> {
     if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
-    await this.access.ensureUser(this.adminUserId);
     return await this.access.snapshot();
   }
 
   async delegateAccess(input: VerglasAccessGrantInput): Promise<VerglasAccessGrant> {
     if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
-    await this.access.ensureUser(this.adminUserId);
-    return await this.access.delegate(this.adminUserId, input);
+    return await this.access.delegate(input);
   }
 
   async revokeAccess(grantId: string): Promise<void> {
     if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
-    await this.access.ensureUser(this.adminUserId);
-    await this.access.revoke(this.adminUserId, grantId);
+    await this.access.revoke(grantId);
+  }
+
+  async revokeAccessToken(tokenId: string): Promise<void> {
+    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
+    await this.access.revokeToken(tokenId);
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {

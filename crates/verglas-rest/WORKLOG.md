@@ -26,3 +26,14 @@
 - #84: Added tenant-scoped database collection, item, and delete routes over the dynamic database repository. Database responses now use the public managed-or-scoped declaration and never serialize internal records or secret resource IDs.
 - #84: Mapped managed database provisioning failures to a bounded gateway error; the API never reports an inactive managed runtime as created.
 - #84: Replaced singleton SQL ingress with `POST /v1/databases/{database}/query`. Each turn renders an isolated query-worker config targeting that database's live catalog mount, and unknown or Postgres-only databases fail closed before process launch.
+- #81: Added the fail-closed data-plane authorization boundary that forwards opaque bearer credentials to the access service and derives tenant identity only from its verified response. Database, catalog, table, graph, vector, KV, and queue routes now map to stable resources and least-privilege actions; static KV token grants and singleton graph/vector routes were removed.
+- #81: Propagated the already-authorized caller bearer into each ephemeral query/write role through child-only environment state, allowing internal database-catalog checks without serializing authority into configs, arguments, or durable job state.
+- #RBAC: Replaced actor-supplied access administration with signed, revocable bearer identity and current-policy checks. Added OS identity session exchange, scoped token CRUD, private policy synchronization, filtered resource discovery, and short-lived database target JWT exchange with public JWKS.
+- #81: Forwarded the exact bearer verified by the data-plane boundary through database-scoped catalog routes. Requests without verified identity fail closed, and authenticated Lakekeeper responses never use the cross-request catalog cache.
+- #81: Coupled database creation and deletion to the authorization registry.
+  Creation records `database/{name}` only after provisioning succeeds, grants
+  the creator ownership, and rolls the database back if authorization cannot
+  be installed. Lakehouses grant only the Lakekeeper service its required
+  child-management actions; Postgres grants only the Neon service `connect`.
+  Deletion removes the database first and then cleans its authorization subtree
+  child-first, so retries safely repair interrupted cleanup.

@@ -3,13 +3,13 @@
 //! The vector routes are catalog-gated, and wiring a *process* server's loopback
 //! catalog needs a real Iceberg REST catalog + S3 backend (the same infra
 //! `verglas dev` needs) — not hermetic. So this drives the REAL `admin::router`
-//! (with a filled `VectorSlot` over an in-process `MemoryCatalog`) over REAL
+//! (with a database-scoped in-process `MemoryCatalog`) over REAL
 //! HTTP on a kernel-assigned high port, the same technique the server's other
 //! HTTP tests use. Nothing but this test's own server task is served on that
 //! port; no OS process, no installed server, is touched.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arrow_array::builder::{Float32Builder, ListBuilder};
 use arrow_array::{Int64Array, RecordBatch, StringArray};
@@ -17,8 +17,9 @@ use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
 
+use verglas_catalog::DatabaseId;
 use verglas_server::VERSION;
-use verglas_server::admin::{self, Health, Slots, VectorRuntime, VectorSlot};
+use verglas_server::admin::{self, DatabaseDataRuntime, Health, Slots};
 
 fn table_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
@@ -93,20 +94,19 @@ async fn declare_then_search_over_http() {
     .await
     .expect("append");
 
-    // Fill the vector slot with the real attachment service and build the admin
-    // router.
-    let service = Arc::new(verglas_vector::service::VectorService::new());
-    let slot: VectorSlot = Arc::new(OnceLock::new());
-    slot.set(Arc::new(VectorRuntime {
-        catalog: catalog.clone(),
-        service,
-    }))
-    .ok();
+    // Register the exact database catalog and build the admin router.
+    let runtime = DatabaseDataRuntime::default();
+    runtime
+        .insert(
+            DatabaseId::new("analytics".to_owned()).expect("database id"),
+            catalog.clone(),
+        )
+        .expect("register database");
     let app = admin::router(
         VERSION,
         Health::ready(),
         Slots {
-            vector: Some(slot),
+            database_data: Some(runtime),
             ..Slots::default()
         },
     );
@@ -125,7 +125,7 @@ async fn declare_then_search_over_http() {
     // No compatibility path: without an exact attachment the search fails.
     let missing = http
         .post(format!(
-            "{base}/v1/tables/default.docs/indexes/embedding/search"
+            "{base}/v1/databases/analytics/tables/default.docs/indexes/embedding/search"
         ))
         .json(&serde_json::json!({ "vector": [0.1, 0.9], "k": 1 }))
         .send()
@@ -135,7 +135,9 @@ async fn declare_then_search_over_http() {
 
     // Declare an index on the embedding field.
     let declare: serde_json::Value = http
-        .post(format!("{base}/v1/tables/default.docs/indexes"))
+        .post(format!(
+            "{base}/v1/databases/analytics/tables/default.docs/indexes"
+        ))
         .json(&serde_json::json!({ "field": "embedding", "metric": "l2" }))
         .send()
         .await
@@ -152,7 +154,7 @@ async fn declare_then_search_over_http() {
     // (1, 0).
     let search: serde_json::Value = http
         .post(format!(
-            "{base}/v1/tables/default.docs/indexes/embedding/search"
+            "{base}/v1/databases/analytics/tables/default.docs/indexes/embedding/search"
         ))
         .json(&serde_json::json!({ "vector": [0.9, 0.1], "k": 3 }))
         .send()
@@ -171,7 +173,9 @@ async fn declare_then_search_over_http() {
 
     // The index appears in the list.
     let list: serde_json::Value = http
-        .get(format!("{base}/v1/tables/default.docs/indexes"))
+        .get(format!(
+            "{base}/v1/databases/analytics/tables/default.docs/indexes"
+        ))
         .send()
         .await
         .expect("list send")
@@ -232,14 +236,19 @@ async fn corpus_table(dir: &std::path::Path) -> (Arc<dyn Catalog>, TableIdent) {
 
 /// Serves a router for `runtime` on a kernel-assigned high port, returning the
 /// base URL and the server task handle (only this test's task uses the port).
-fn serve(runtime: Arc<VectorRuntime>) -> (String, tokio::task::JoinHandle<()>) {
-    let slot: VectorSlot = Arc::new(OnceLock::new());
-    slot.set(runtime).ok();
+fn serve(catalog: Arc<dyn Catalog>) -> (String, tokio::task::JoinHandle<()>) {
+    let runtime = DatabaseDataRuntime::default();
+    runtime
+        .insert(
+            DatabaseId::new("analytics".to_owned()).expect("database id"),
+            catalog,
+        )
+        .expect("register database");
     let app = admin::router(
         VERSION,
         Health::ready(),
         Slots {
-            vector: Some(slot),
+            database_data: Some(runtime),
             ..Slots::default()
         },
     );
@@ -305,14 +314,12 @@ async fn declare_full_build_rejects_unreadable_string_ids() {
         .await
         .expect("append");
 
-    let runtime = Arc::new(VectorRuntime {
-        catalog: catalog.clone(),
-        service: Arc::new(verglas_vector::service::VectorService::new()),
-    });
-    let (base, server) = serve(runtime);
+    let (base, server) = serve(catalog.clone());
     let http = reqwest::Client::new();
     let resp = http
-        .post(format!("{base}/v1/tables/default.docs/indexes"))
+        .post(format!(
+            "{base}/v1/databases/analytics/tables/default.docs/indexes"
+        ))
         .json(&serde_json::json!({ "field": "embedding", "metric": "l2" }))
         .send()
         .await
@@ -330,7 +337,9 @@ async fn declare_full_build_rejects_unreadable_string_ids() {
 
     // List stays empty; search stays 404 — no silent empty index.
     let list: serde_json::Value = http
-        .get(format!("{base}/v1/tables/default.docs/indexes"))
+        .get(format!(
+            "{base}/v1/databases/analytics/tables/default.docs/indexes"
+        ))
         .send()
         .await
         .expect("list send")
@@ -343,7 +352,7 @@ async fn declare_full_build_rejects_unreadable_string_ids() {
     );
     let search = http
         .post(format!(
-            "{base}/v1/tables/default.docs/indexes/embedding/search"
+            "{base}/v1/databases/analytics/tables/default.docs/indexes/embedding/search"
         ))
         .json(&serde_json::json!({ "vector": [0.1, 0.9], "k": 1 }))
         .send()
@@ -362,14 +371,12 @@ async fn declare_survives_reboot_via_snapshot_attachment() {
     let (catalog, _ident) = corpus_table(cat_dir.path()).await;
 
     // First boot: declare over HTTP. The build attaches the Puffin file.
-    let runtime1 = Arc::new(VectorRuntime {
-        catalog: catalog.clone(),
-        service: Arc::new(verglas_vector::service::VectorService::new()),
-    });
-    let (base1, server1) = serve(runtime1);
+    let (base1, server1) = serve(catalog.clone());
     let http = reqwest::Client::new();
     let declare: serde_json::Value = http
-        .post(format!("{base1}/v1/tables/default.docs/indexes"))
+        .post(format!(
+            "{base1}/v1/databases/analytics/tables/default.docs/indexes"
+        ))
         .json(&serde_json::json!({ "field": "embedding", "metric": "l2" }))
         .send()
         .await
@@ -382,16 +389,11 @@ async fn declare_survives_reboot_via_snapshot_attachment() {
     server1.abort();
 
     // Reboot: a brand-new disposable cache over the same catalog.
-    let runtime2 = Arc::new(VectorRuntime {
-        catalog: catalog.clone(),
-        service: Arc::new(verglas_vector::service::VectorService::new()),
-    });
-
     // The rebooted runtime discovers and serves the same attached index.
-    let (base2, server2) = serve(runtime2);
+    let (base2, server2) = serve(catalog.clone());
     let search: serde_json::Value = http
         .post(format!(
-            "{base2}/v1/tables/default.docs/indexes/embedding/search"
+            "{base2}/v1/databases/analytics/tables/default.docs/indexes/embedding/search"
         ))
         .json(&serde_json::json!({ "vector": [0.9, 0.1], "k": 3 }))
         .send()

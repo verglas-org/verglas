@@ -14,8 +14,13 @@ use verglas_sdk::report::QueryReport;
 use crate::cli::QueryArgs;
 
 /// Runs `verglas query`.
-pub async fn run(args: QueryArgs, server_endpoint: &str, json: bool) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::server(server_endpoint)?;
+pub async fn run(
+    args: QueryArgs,
+    server_endpoint: &str,
+    token: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let client = crate::backend::server(server_endpoint, token)?;
 
     // `--at REF TABLE` arrives as a two-element vector (clap enforces the arity).
     let at = match args.at {

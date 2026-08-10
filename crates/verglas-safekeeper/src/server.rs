@@ -11,7 +11,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use verglas_core::activity::{ActivityPlane, ActivityTracker};
+use verglas_core::activity::{ActivityGuard, ActivityPlane, ActivityRejected, ActivityTracker};
 use verglas_core::read::ObjectRead;
 use verglas_core::write::ObjectWrite;
 
@@ -182,24 +182,20 @@ where
         }
         loop {
             let (stream, peer) = listener.accept().await?;
-            let activity_guard = match &self.activity {
-                Some(activity) => match activity.try_begin(ActivityPlane::Safekeeper) {
-                    Ok(guard) => Some(guard),
-                    Err(_) => {
-                        drop(stream);
-                        continue;
-                    }
-                },
-                None => None,
-            };
             let server = Arc::clone(&self);
             tokio::spawn(async move {
-                let _activity_guard = activity_guard;
                 if let Err(error) = server.serve_connection(stream).await {
                     tracing::warn!(%peer, %error, "safekeeper connection closed");
                 }
             });
         }
+    }
+
+    /// Admits one decoded safekeeper protocol message under the cache stop fence.
+    /// Idle TCP sessions do not hold the fence; only work that can mutate or serve
+    /// timeline state contributes to the in-flight count.
+    fn begin_activity(&self) -> Result<Option<ActivityGuard>, ActivityRejected> {
+        begin_safekeeper_activity(&self.activity)
     }
 
     async fn publish_broker(self: Arc<Self>, config: BrokerConfig) {
@@ -302,6 +298,9 @@ where
             let Some((tag, payload)) = read_frontend(&mut stream).await? else {
                 return Ok(());
             };
+            let Ok(activity_guard) = self.begin_activity() else {
+                return Ok(());
+            };
             match tag {
                 b'Q' => {
                     let query = payload_cstr(&payload, "query")?;
@@ -324,6 +323,7 @@ where
                             allow_timeline_creation: _,
                         } => {
                             write_copy_both(&mut stream).await?;
+                            drop(activity_guard);
                             return self
                                 .receive_wal(&mut stream, startup_key, protocol_version)
                                 .await;
@@ -345,7 +345,14 @@ where
                                 )));
                             }
                             write_copy_both(&mut stream).await?;
-                            return send_wal(&mut stream, timeline, start_lsn).await;
+                            drop(activity_guard);
+                            return send_wal(
+                                &mut stream,
+                                timeline,
+                                start_lsn,
+                                self.activity.clone(),
+                            )
+                            .await;
                         }
                         SafekeeperCommand::IdentifySystem => {
                             let key = startup_key.clone().ok_or_else(|| {
@@ -388,6 +395,9 @@ where
         let mut membership: Option<Membership> = None;
         loop {
             let Some((tag, payload)) = read_frontend(stream).await? else {
+                return Ok(());
+            };
+            let Ok(_activity_guard) = self.begin_activity() else {
                 return Ok(());
             };
             match tag {
@@ -735,6 +745,7 @@ async fn send_wal<S>(
     stream: &mut TcpStream,
     timeline: Arc<EcAppendLog<S>>,
     mut position: Lsn,
+    activity: Option<ActivityTracker>,
 ) -> Result<(), ServerError>
 where
     S: ObjectRead + ObjectWrite + 'static,
@@ -742,6 +753,9 @@ where
     loop {
         let tail = timeline.tail();
         if position.0 < tail.0 {
+            let Ok(_activity_guard) = begin_safekeeper_activity(&activity) else {
+                return Ok(());
+            };
             let end = Lsn((position.0 + REPLICATION_CHUNK).min(tail.0));
             let wal = timeline.read(position, end).await?;
             let mut payload = BytesMut::with_capacity(25 + wal.len());
@@ -758,6 +772,9 @@ where
         match tokio::time::timeout(Duration::from_secs(1), read_frontend(stream)).await {
             Ok(Ok(Some((b'X' | b'c', _)))) | Ok(Ok(None)) => return Ok(()),
             Ok(Ok(Some((b'd', feedback)))) => {
+                let Ok(_activity_guard) = begin_safekeeper_activity(&activity) else {
+                    return Ok(());
+                };
                 if let Some(remote_consistent_lsn) = parse_pageserver_feedback(&feedback)? {
                     timeline
                         .record_remote_consistent_lsn(remote_consistent_lsn)
@@ -767,6 +784,9 @@ where
             Ok(Ok(Some((_tag, _feedback)))) => {}
             Ok(Err(error)) => return Err(error),
             Err(_) => {
+                let Ok(_activity_guard) = begin_safekeeper_activity(&activity) else {
+                    return Ok(());
+                };
                 let mut keepalive = BytesMut::with_capacity(18);
                 keepalive.put_u8(b'k');
                 keepalive.put_u64(timeline.tail().0);
@@ -776,6 +796,15 @@ where
             }
         }
     }
+}
+
+fn begin_safekeeper_activity(
+    activity: &Option<ActivityTracker>,
+) -> Result<Option<ActivityGuard>, ActivityRejected> {
+    activity
+        .as_ref()
+        .map(|activity| activity.try_begin(ActivityPlane::Safekeeper))
+        .transpose()
 }
 
 /// Parses the pageserver's extensible `z` feedback frame and returns its

@@ -26,6 +26,12 @@ pub mod telemetry;
 pub mod trace;
 pub mod write;
 
+/// Inherited environment binding carrying one run's scoped bearer to an ephemeral role process.
+///
+/// Launchers must set this only on the child command. Role configs, durable job
+/// declarations, command arguments, and logs must never contain its value.
+pub const RUN_BEARER_TOKEN_ENV: &str = "VERGLAS_RUN_BEARER_TOKEN";
+
 /// Logical identity of a cached object: which binding and object a request names,
 /// independent of which version of it currently exists.
 ///

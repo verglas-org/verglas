@@ -51,7 +51,11 @@ fn docker_application_packages_execution_workers() {
         "VERGLAS_CACHE_CAPACITY",
         "VERGLAS_CACHE_DRAM",
         "VERGLAS_ACCESS_URI",
-        "VERGLAS_ACCESS_SERVICE_TOKEN",
+        "VERGLAS_INITIAL_OWNER_EMAIL",
+        "VERGLAS_TOKEN_SIGNING_KEY",
+        "VERGLAS_TARGET_JWT_SIGNING_KEY",
+        "VERGLAS_IDENTITY_ASSERTION_KEY",
+        "VERGLAS_ACCESS_TOKEN_FILE",
         "VERGLAS_MANAGED_CATALOG_URI",
         "VERGLAS_S3_ACCESS_KEY_ID",
         "VERGLAS_S3_SECRET_ACCESS_KEY",
@@ -73,6 +77,69 @@ fn docker_application_packages_execution_workers() {
             "Compose must not declare singleton catalog variable {singleton}"
         );
     }
+    for removed_variable in [
+        "VERGLAS_ACCESS_SERVICE_TOKEN",
+        "VERGLAS_LOCAL_OWNER_BOOTSTRAP",
+        "verglas-local-access",
+    ] {
+        assert!(
+            !compose.contains(removed_variable),
+            "Compose must not retain the static authorization bypass {removed_variable}"
+        );
+    }
+    let os_service = compose
+        .split("  verglas-os:\n")
+        .nth(1)
+        .expect("Verglas OS service")
+        .split("\nvolumes:")
+        .next()
+        .expect("Verglas OS service body");
+    assert!(
+        !os_service.contains("VERGLAS_DATA_TOKEN"),
+        "Verglas OS must exchange signed user assertions for scoped tokens instead of receiving a static data token"
+    );
+    assert!(
+        os_service.contains(
+            "VERGLAS_INITIAL_OWNER_EMAIL: ${VERGLAS_INITIAL_OWNER_EMAIL:?Set VERGLAS_INITIAL_OWNER_EMAIL to the first tenant owner email}"
+        ),
+        "Verglas OS must derive its ADMINS binding from the same initial owner as the access service"
+    );
+    for credential_volume in [
+        "verglas-access-server-credentials:/var/run/verglas/server",
+        "verglas-access-lakekeeper-credentials:/var/run/verglas/lakekeeper",
+        "verglas-access-neon-credentials:/var/run/verglas/neon",
+    ] {
+        assert!(
+            compose.contains(credential_volume),
+            "Compose must isolate the {credential_volume} credential volume"
+        );
+    }
+    assert!(
+        !compose.contains("verglas-access-credentials:"),
+        "Compose must not share one access credential volume among unrelated consumers"
+    );
+    assert!(
+        compose.contains("LAKEKEEPER__AUTHZ_BACKEND: verglas"),
+        "Lakekeeper must use the tenant Verglas policy adapter"
+    );
+    assert!(
+        compose.contains("LAKEKEEPER__VERGLAS__WORKLOAD_CREDENTIAL_FILE"),
+        "Lakekeeper must read only its policy-engine workload credential file"
+    );
+    assert!(
+        !compose.contains("LAKEKEEPER__AUTHZ_BACKEND: allowall"),
+        "Lakekeeper must not use the permissive allow-all authorizer"
+    );
+    assert!(
+        compose.contains(
+            "https://github.com/verglas-org/lakekeeper.git#96205cebab7704bd7bcbc91190a774e72f8c55dc"
+        ),
+        "Lakekeeper must build from the reviewed immutable Verglas fork revision"
+    );
+    assert!(
+        compose.contains("pull_policy: never"),
+        "Compose must not pull an unpublished or upstream Lakekeeper image"
+    );
 }
 
 /// #19: the self-hosted container must fail inside its own resource boundary

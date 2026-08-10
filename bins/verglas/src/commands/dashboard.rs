@@ -31,9 +31,10 @@ struct DashboardDeleted {
 pub async fn run(
     command: DashboardCommand,
     endpoint: &str,
+    token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::server(endpoint)?;
+    let client = crate::backend::server(endpoint, token)?;
     match command {
         DashboardCommand::Create(args) => {
             let mut body = serde_json::json!({"table": args.table});

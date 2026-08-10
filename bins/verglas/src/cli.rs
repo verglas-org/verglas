@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use verglas_core::admin::{DEFAULT_ENDPOINT, ENDPOINT_ENV};
 
+use crate::credentials::{CredentialsError, credentials_path, load_token};
+
 /// Global flags shared by every subcommand.
 #[derive(Debug, Parser)]
 #[command(name = "verglas", version, about = "Verglas operator CLI")]
@@ -31,6 +33,10 @@ pub struct Cli {
     /// Bearer token for authenticated server APIs (`VERGLAS_TOKEN`).
     #[arg(long, env = "VERGLAS_TOKEN", global = true)]
     pub token: Option<String>,
+
+    /// Owner-only file that stores locally minted access tokens.
+    #[arg(long, env = "VERGLAS_CREDENTIALS_FILE", global = true)]
+    pub credentials_file: Option<PathBuf>,
 
     /// Emit machine-readable JSON instead of human-readable tables.
     #[arg(long, global = true)]
@@ -92,6 +98,63 @@ pub enum Command {
     /// Create scoped credentials without exposing their values in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Mint, inspect, and revoke scoped access tokens.
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+impl Cli {
+    /// Resolves an explicit or environment bearer token before the active local credential.
+    pub fn resolved_token(&self) -> Result<Option<String>, CredentialsError> {
+        if let Some(token) = self
+            .token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+        {
+            return Ok(Some(token.to_owned()));
+        }
+        let path = credentials_path(self.credentials_file.as_deref())?;
+        Ok(load_token(&path, &self.access_endpoint)?.map(|stored| stored.token))
+    }
+
+    /// Resolves the credential-file location used for token lifecycle commands.
+    pub fn resolved_credentials_path(&self) -> Result<PathBuf, CredentialsError> {
+        credentials_path(self.credentials_file.as_deref())
+    }
+}
+
+/// `verglas token` operations against the authorization service.
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Mint a delegated token and retain its one-time plaintext value locally.
+    Create(TokenCreateArgs),
+    /// List token metadata visible to the authenticated principal.
+    List,
+    /// Revoke one token and remove an exactly matching local credential.
+    Revoke(TokenRevokeArgs),
+}
+
+/// Arguments for `verglas token create`.
+#[derive(Debug, Args)]
+pub struct TokenCreateArgs {
+    /// Human-readable label for the new token.
+    pub name: String,
+    /// Runtime audience that may present the token.
+    #[arg(long, default_value = "data-plane")]
+    pub audience: String,
+    /// Token lifetime in seconds. Omit only for deliberately non-expiring local credentials.
+    #[arg(long)]
+    pub expires_in_seconds: Option<u64>,
+    /// Delegated resource actions as RESOURCE=action,action. Repeat for multiple resources.
+    #[arg(long = "grant")]
+    pub grants: Vec<String>,
+}
+
+/// Arguments for `verglas token revoke`.
+#[derive(Debug, Args)]
+pub struct TokenRevokeArgs {
+    /// Token identifier returned by `verglas token list`.
+    pub id: String,
 }
 
 /// `verglas db` operations against the local database resource API.
@@ -99,6 +162,8 @@ pub enum Command {
 pub enum DbCommand {
     /// Create one managed or externally bound database.
     Create(DbCreateArgs),
+    /// Mint a short-lived PostgreSQL password token for one managed Postgres database.
+    Token(DbTokenArgs),
 }
 
 /// Arguments for `verglas db create`.
@@ -118,6 +183,19 @@ pub struct DbCreateArgs {
     /// Warehouse selected from the external catalog.
     #[arg(long, requires = "catalog")]
     pub warehouse: Option<String>,
+}
+
+/// Arguments for `verglas db token`.
+#[derive(Debug, Args)]
+pub struct DbTokenArgs {
+    /// Managed Postgres database identifier.
+    pub database: String,
+    /// Requested connection-token lifetime in seconds, from 1 through 900.
+    #[arg(long = "expires-in", default_value_t = 900)]
+    pub expires_in_seconds: u64,
+    /// Print only the JWT suitable for `PGPASSWORD`; omit to keep it in local secure storage.
+    #[arg(long)]
+    pub print_password: bool,
 }
 
 /// Database types accepted by the local resource API.

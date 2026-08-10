@@ -10,10 +10,10 @@ use std::io::Write as _;
 use verglas_core::admin::{HealthzInfo, StatsInfo};
 
 /// Probes `endpoint` and prints server health, version, and cache warmth.
-pub async fn run(endpoint: &str, json: bool) -> Result<(), Box<dyn Error>> {
-    let version = fetch_version(endpoint).await;
-    let health = fetch_health(endpoint).await;
-    let warmth = fetch_warmth(endpoint).await;
+pub async fn run(endpoint: &str, token: Option<&str>, json: bool) -> Result<(), Box<dyn Error>> {
+    let version = fetch_version(endpoint, token).await;
+    let health = fetch_health(endpoint, token).await;
+    let warmth = fetch_warmth(endpoint, token).await;
     let s3_hint = s3_endpoint_hint(endpoint);
 
     if json {
@@ -59,24 +59,32 @@ fn s3_endpoint_hint(admin: &str) -> String {
 }
 
 /// Fetches `/admin/version` as `name version`, or `None` if unreachable.
-async fn fetch_version(admin_endpoint: &str) -> Option<String> {
-    let client = crate::admin_client::AdminClient::new(admin_endpoint).ok()?;
+async fn fetch_version(admin_endpoint: &str, token: Option<&str>) -> Option<String> {
+    let client = crate::admin_client::AdminClient::new(admin_endpoint, token).ok()?;
     let info = client.version().await.ok()?;
     Some(format!("{} {}", info.name, info.version))
 }
 
 /// Fetches `/admin/healthz` status string, or `None` if unreachable.
-async fn fetch_health(admin_endpoint: &str) -> Option<String> {
+async fn fetch_health(admin_endpoint: &str, token: Option<&str>) -> Option<String> {
     let url = format!("{admin_endpoint}{}", verglas_core::admin::HEALTHZ_PATH);
-    let resp = reqwest::get(&url).await.ok()?;
+    let mut request = reqwest::Client::new().get(&url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request.send().await.ok()?;
     let info: HealthzInfo = resp.json().await.ok()?;
     Some(info.status)
 }
 
 /// Fetches `/admin/stats` warmth summary, or `None` if unreachable.
-async fn fetch_warmth(admin_endpoint: &str) -> Option<String> {
+async fn fetch_warmth(admin_endpoint: &str, token: Option<&str>) -> Option<String> {
     let url = format!("{admin_endpoint}{}", verglas_core::admin::STATS_PATH);
-    let resp = reqwest::get(&url).await.ok()?;
+    let mut request = reqwest::Client::new().get(&url);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let resp = request.send().await.ok()?;
     let stats: StatsInfo = resp.json().await.ok()?;
     Some(render_warmth(&stats))
 }

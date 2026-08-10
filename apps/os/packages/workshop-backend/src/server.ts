@@ -2,7 +2,7 @@ import { throwLegacyVesselsRemoved } from "./legacy-vessels";
 import { RpcStub, RpcTarget, newWorkersRpcResponse } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasAccessAction, type VerglasAccessIdentity, type VerglasCatalogSnapshot, type VerglasCreateDatabaseInput, type VerglasCreateTableInput, type VerglasDatabaseDetail, type VerglasDatabaseSummary, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
+import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasAccessAction, type VerglasAccessIdentity, type VerglasAccessResource, type VerglasAccessTokenSummary, type VerglasCreatedAccessToken, type VerglasCreateAccessTokenInput, type VerglasCatalogSnapshot, type VerglasCreateDatabaseInput, type VerglasCreateTableInput, type VerglasDatabaseDetail, type VerglasDatabaseSummary, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
 import type { UiFeatureFlags } from "@verglas/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
 import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
@@ -72,13 +72,17 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
+    const accessConfig = resolveVerglasAccessConfig(this.env);
+    this.access = accessConfig
+      ? new VerglasAccessClient(accessConfig, this.#userId())
+      : null;
   }
 
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
+  private access: VerglasAccessClient | null;
 
   #isAdmin(): boolean {
-    if (this.env.VERGLAS_LOCAL_OWNER_BOOTSTRAP === "true") return true;
     let name = this.user.id.name;
     let admins = this.env.ADMINS;
 
@@ -100,14 +104,38 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async whoami(): Promise<AiChatAuthorInfo> {
     const profile = await this.user.whoami();
     const access = this.#accessClient();
-    if (access) await access.ensureUser(this.#userId());
+    if (access) await access.identity();
     return profile;
   }
 
   async getAccessIdentity(): Promise<VerglasAccessIdentity> {
     const access = this.#accessClient();
     if (!access) throw new Error("Verglas tenant authorization is not configured.");
-    return await access.ensureUser(this.#userId());
+    return await access.identity();
+  }
+
+  async listAccessibleAccessResources(): Promise<VerglasAccessResource[]> {
+    const access = this.#accessClient();
+    if (!access) throw new Error("Verglas tenant authorization is not configured.");
+    return await access.listDelegableResources();
+  }
+
+  async listAccessTokens(): Promise<VerglasAccessTokenSummary[]> {
+    const access = this.#accessClient();
+    if (!access) throw new Error("Verglas tenant authorization is not configured.");
+    return await access.listTokens();
+  }
+
+  async createAccessToken(input: VerglasCreateAccessTokenInput): Promise<VerglasCreatedAccessToken> {
+    const access = this.#accessClient();
+    if (!access) throw new Error("Verglas tenant authorization is not configured.");
+    return await access.createToken(input);
+  }
+
+  async revokeAccessToken(tokenId: string): Promise<void> {
+    const access = this.#accessClient();
+    if (!access) throw new Error("Verglas tenant authorization is not configured.");
+    await access.revokeToken(tokenId);
   }
 
   #userId(): string {
@@ -117,17 +145,20 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   #accessClient(): VerglasAccessClient | null {
-    const config = resolveVerglasAccessConfig(this.env);
-    return config ? new VerglasAccessClient(config) : null;
+    return this.access;
   }
 
   async #requireAccess(action: VerglasAccessAction): Promise<void> {
     const access = this.#accessClient();
-    if (!access) return;
-    await access.ensureUser(this.#userId());
+    if (!access) throw new Error("Verglas tenant authorization is not configured.");
     if (!await access.checkUser(this.#userId(), "tenant", action)) {
       throw new Error(`Access denied: ${action} on tenant resource.`);
     }
+  }
+
+  #catalogClient(): VerglasCatalogClient {
+    const accessToken = this.#accessClient()?.sessionToken("data-plane");
+    return new VerglasCatalogClient(this.env, fetch, accessToken);
   }
   setOwnDisplayName(name: string): Promise<void> {
     return this.user.setOwnDisplayName(name);
@@ -361,7 +392,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async listVerglasWorkers(): Promise<VerglasWorkerSummary[]> {
     await this.#requireAccess("discover");
-    const workers = await new VerglasCatalogClient(this.env).listWorkers({withRuns: true});
+    const workers = await this.#catalogClient().listWorkers({withRuns: true});
     const access = this.#accessClient();
     if (access) await Promise.all(workers.flatMap(worker => [
       access.ensurePrincipal(`job/${worker.name}`, "job"),
@@ -372,27 +403,27 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async getVerglasWorker(name: string) {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).getWorker(name);
+    return await this.#catalogClient().getWorker(name);
   }
 
   async listVerglasWorkerJobs(name: string, limit?: number) {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).listWorkerJobs(name, limit);
+    return await this.#catalogClient().listWorkerJobs(name, limit);
   }
 
   async runVerglasWorker(name: string) {
     await this.#requireAccess("execute");
-    return await new VerglasCatalogClient(this.env).runWorker(name, crypto.randomUUID());
+    return await this.#catalogClient().runWorker(name, crypto.randomUUID());
   }
 
   async setVerglasWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).setWorkerState(name, state);
+    await this.#catalogClient().setWorkerState(name, state);
   }
 
   async listVerglasTables(): Promise<VerglasTableSummary[]> {
     await this.#requireAccess("discover");
-    const tables = await new VerglasCatalogClient(this.env).listTables();
+    const tables = await this.#catalogClient().listTables();
     const access = this.#accessClient();
     if (access) await Promise.all(tables.map(table =>
       access.ensureResource(
@@ -404,7 +435,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async getVerglasCatalog(): Promise<VerglasCatalogSnapshot> {
     await this.#requireAccess("discover");
-    const catalog = await new VerglasCatalogClient(this.env).getCatalog();
+    const catalog = await this.#catalogClient().getCatalog();
     const access = this.#accessClient();
     if (access) await Promise.all([
       ...catalog.databases.map(database =>
@@ -421,22 +452,22 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async getVerglasDatabase(name: string): Promise<VerglasDatabaseDetail> {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).getDatabase(name);
+    return await this.#catalogClient().getDatabase(name);
   }
 
   async createVerglasDatabase(input: VerglasCreateDatabaseInput): Promise<VerglasDatabaseSummary> {
     await this.#requireAccess("create_child");
-    return await new VerglasCatalogClient(this.env).createDatabase(input);
+    return await this.#catalogClient().createDatabase(input);
   }
 
   async deleteVerglasDatabase(name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteDatabase(name);
+    await this.#catalogClient().deleteDatabase(name);
   }
 
   async createVerglasTable(input: VerglasCreateTableInput): Promise<VerglasTableSummary> {
     await this.#requireAccess("create_child");
-    const table = await new VerglasCatalogClient(this.env).createTable(input);
+    const table = await this.#catalogClient().createTable(input);
     const access = this.#accessClient();
     if (access) await access.ensureResource(
       `table/${table.database}/${[...table.namespace, table.name].join(".")}`,
@@ -447,12 +478,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async deleteVerglasTable(database: string, namespace: string[], name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteTable(database, namespace, name);
+    await this.#catalogClient().deleteTable(database, namespace, name);
   }
 
   async listVerglasVessels(): Promise<VerglasVesselSummary[]> {
     await this.#requireAccess("discover");
-    const vessels = await new VerglasCatalogClient(this.env).listVessels();
+    const vessels = await this.#catalogClient().listVessels();
     const access = this.#accessClient();
     if (access) await Promise.all(vessels.flatMap(vessel => {
       const kind = vessel.role === "integration" ? "integration" : "application";
@@ -466,27 +497,27 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async getVerglasIntegrationConfiguration(name: string): Promise<VerglasIntegrationConfiguration> {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).getIntegrationConfiguration(name);
+    return await this.#catalogClient().getIntegrationConfiguration(name);
   }
 
   async configureVerglasIntegration(name: string, values: Record<string, string>): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).configureIntegration(name, values);
+    await this.#catalogClient().configureIntegration(name, values);
   }
 
   async deleteVerglasIntegration(name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteVessel(name);
+    await this.#catalogClient().deleteVessel(name);
   }
 
   async deleteVerglasApplication(name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteVessel(name);
+    await this.#catalogClient().deleteVessel(name);
   }
 
   async setVerglasApplicationState(name: string, state: "running" | "stopped"): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).setApplicationState(name, state);
+    await this.#catalogClient().setApplicationState(name, state);
   }
 
   async listOutputFormats(): Promise<OutputFormatOffer[]> {

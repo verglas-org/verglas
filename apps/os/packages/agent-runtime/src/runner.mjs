@@ -57,7 +57,7 @@ async function invokeLocalModel(config, messages) {
 
 export async function runAgent(runId) {
   const controller = process.env.VERGLAS_AGENT_CONTROLLER_URL;
-  const controllerToken = process.env.VERGLAS_AGENT_CONTROLLER_TOKEN;
+  const controllerToken = process.env.VERGLAS_TOKEN;
   if (!controller || !controllerToken) throw new Error("Agent controller capability is missing.");
   const request = async (path, options = {}) => {
     const response = await fetch(`${controller.replace(/\/+$/, "")}${path}`, {

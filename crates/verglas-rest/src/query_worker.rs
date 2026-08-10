@@ -146,7 +146,11 @@ impl QueryWorkerDispatcher {
         sql: &str,
         at: Option<TimeTravel>,
         accept_arrow: bool,
+        bearer_token: &str,
     ) -> Result<Response, String> {
+        if bearer_token.is_empty() {
+            return Err("query run bearer must not be empty".to_owned());
+        }
         if !self.has_database(database) {
             return Err(format!(
                 "database `{}` has no Lakehouse query runtime",
@@ -163,13 +167,8 @@ impl QueryWorkerDispatcher {
             "verglas-query-worker-{}-{dispatch_id}.ports",
             std::process::id()
         ));
-        let mut child = tokio::process::Command::new(&self.binary)
-            .arg("--config")
-            .arg(&config_path)
-            .arg("--ports-file")
-            .arg(&ports_file)
-            .arg("--for-query")
-            .arg(sql)
+        let mut child = self
+            .worker_command(&config_path, &ports_file, sql, bearer_token)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -200,6 +199,26 @@ impl QueryWorkerDispatcher {
         // child (and the dispatch lock) alive for exactly as long as the
         // caller is still reading the body.
         relay_response(response, (guard, child))
+    }
+
+    /// Builds one ephemeral child command with the scoped bearer only in its inherited environment.
+    fn worker_command(
+        &self,
+        config_path: &std::path::Path,
+        ports_file: &std::path::Path,
+        sql: &str,
+        bearer_token: &str,
+    ) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new(&self.binary);
+        command
+            .arg("--config")
+            .arg(config_path)
+            .arg("--ports-file")
+            .arg(ports_file)
+            .arg("--for-query")
+            .arg(sql)
+            .env(verglas_core::RUN_BEARER_TOKEN_ENV, bearer_token);
+        command
     }
 }
 
@@ -366,7 +385,7 @@ mod tests {
         let database = DatabaseId::new("postgres_only").expect("database id");
 
         let error = dispatcher
-            .dispatch(&database, "SELECT 1", None, false)
+            .dispatch(&database, "SELECT 1", None, false, "scoped-test-token")
             .await
             .expect_err("missing Lakehouse must fail");
 
@@ -374,6 +393,46 @@ mod tests {
             error,
             "database `postgres_only` has no Lakehouse query runtime"
         );
+    }
+
+    /// The scoped bearer is child-only environment state, never serialized or exposed in argv.
+    #[test]
+    fn worker_command_keeps_bearer_out_of_config_and_arguments() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let runtime = QueryWorkerRuntimeConfig {
+            config_dir: dir.path().join("databases"),
+            cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+            region: "auto".to_owned(),
+            credentials_file: dir.path().join("credentials"),
+            admin_origin: "http://127.0.0.1:8334".to_owned(),
+        };
+        let database = DatabaseId::new("analytics").expect("database id");
+        let config_path = runtime.render(&database).expect("render config");
+        let dispatcher = QueryWorkerDispatcher::new(
+            PathBuf::from("verglas-query"),
+            runtime,
+            CatalogRuntimeRegistry::default(),
+        );
+        let token = "scoped-token-that-must-not-persist";
+        let command =
+            dispatcher.worker_command(&config_path, &dir.path().join("ports"), "SELECT 1", token);
+        let command = command.as_std();
+        let arguments = command
+            .get_args()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let inherited = command
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(verglas_core::RUN_BEARER_TOKEN_ENV))
+            .and_then(|(_, value)| value)
+            .map(|value| value.to_string_lossy().into_owned());
+        let serialized = std::fs::read_to_string(config_path).expect("read config");
+
+        assert_eq!(inherited.as_deref(), Some(token));
+        assert!(!arguments.contains(token));
+        assert!(!serialized.contains(token));
+        assert!(!serialized.contains(verglas_core::RUN_BEARER_TOKEN_ENV));
     }
 
     /// A fixture "worker" that streams a large body over many small, delayed

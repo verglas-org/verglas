@@ -80,6 +80,10 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(!compose.contains("profiles:"));
     assert_eq!(compose.matches("/var/run/docker.sock").count(), 2);
     assert!(compose.contains("verglas-runtime-state:/var/lib/verglas-container-runtime"));
+    assert!(compose.contains("verglas-access-neon-credentials:/var/run/verglas/neon:ro"));
+    assert!(compose.contains(
+        "VERGLAS_MANAGED_POSTGRES_TLS_CERTIFICATE_FILE: /var/lib/verglas-container-runtime/postgres-proxy/tls.crt"
+    ));
     assert!(compose.contains("name: verglas-runtime"));
     assert!(
         compose.contains("VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360")

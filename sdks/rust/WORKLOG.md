@@ -93,3 +93,11 @@
 - #84: Made `Client::query_stream` require a database name and send Arrow SQL
   requests only to that database's `/v1/databases/{database}/query` route. The
   SDK no longer exposes the removed singleton query endpoint.
+
+- #access-tokens: Added typed create, list, and revoke calls for scoped access
+  tokens. The SDK sends the caller's bearer credential to every lifecycle route
+  and returns the plaintext value only from the creation response.
+
+- #database-tokens: Added the typed Postgres connection-token exchange. A
+  caller presents its normal scoped bearer to request a short-lived Neon JWT
+  for one database, which the database proxy accepts as `PGPASSWORD`.

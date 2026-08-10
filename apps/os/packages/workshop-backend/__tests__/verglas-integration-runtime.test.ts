@@ -11,7 +11,6 @@ const env = {
   VERGLAS_CONTAINER_RUNTIME_URL: "http://runtime:8360",
   VERGLAS_CONTAINER_RUNTIME_TOKEN: "runtime-token",
   VERGLAS_DATA_ENDPOINT: "http://verglas:8334",
-  VERGLAS_DATA_TOKEN: "data-token",
 };
 
 const module = `export default {
@@ -20,6 +19,11 @@ const module = `export default {
 };`;
 
 describe("VerglasIntegrationRuntimeClient", () => {
+  it("requires a user-scoped token argument instead of reading a deployment-wide data token", () => {
+    expect(() => new VerglasIntegrationRuntimeClient(env, vi.fn<typeof fetch>()))
+      .toThrow("user-scoped Verglas token");
+  });
+
   it("rejects generated modules without a real verifier and executable surface", () => {
     expect(() => validateGeneratedIntegrationModule("export default {}"))
       .toThrow("verify(ctx)");
@@ -27,7 +31,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
 
   it("deploys source and setup metadata into an isolated Integration Vessel", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}"));
-    await new VerglasIntegrationRuntimeClient(env, fetcher).deploy({
+    await new VerglasIntegrationRuntimeClient(env, fetcher, "data-token").deploy({
       name: "ais",
       title: "AIS Stream",
       description: "Streams vessel positions.",
@@ -45,7 +49,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
       "/usr/local/bin/bun",
       "/opt/verglas-integration-runtime/runtime.mjs",
     ]);
-    expect(body.environment.VERGLAS_DATA_TOKEN).toBe("data-token");
+    expect(body.environment.VERGLAS_TOKEN).toBe("data-token");
     expect(body.environment.VERGLAS_INTEGRATION_MODULE).not.toContain("API_KEY");
   });
 
@@ -60,7 +64,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
       Response.json({configured: true, verification}),
     );
 
-    await expect(new VerglasIntegrationRuntimeClient(env, fetcher)
+    await expect(new VerglasIntegrationRuntimeClient(env, fetcher, "data-token")
       .configure("ais", {API_KEY: "secret"})).resolves.toEqual(verification);
   });
 
@@ -78,7 +82,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
       ));
 
     try {
-      await new VerglasIntegrationRuntimeClient(env, fetcher).test("ais");
+      await new VerglasIntegrationRuntimeClient(env, fetcher, "data-token").test("ais");
       expect.unreachable("expected IntegrationVerificationFailed");
     } catch (error) {
       expect(error).toBeInstanceOf(IntegrationVerificationFailed);
@@ -114,7 +118,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
 
   it("builds an Application project with declared npm dependencies", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response("{}"));
-    const previewUrl = await new VerglasIntegrationRuntimeClient(env, fetcher).deployApplication({
+    const previewUrl = await new VerglasIntegrationRuntimeClient(env, fetcher, "data-token").deployApplication({
       name: "shipping-map",
       files: {
         "package.json": JSON.stringify({
@@ -131,7 +135,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
     const body = JSON.parse(String(init?.body));
     expect(body.role).toBe("application");
     expect(body.project.files["package.json"]).toContain("@deck.gl/core");
-    expect(body.environment.VERGLAS_DATA_TOKEN).toBe("data-token");
+    expect(body.environment.VERGLAS_TOKEN).toBe("data-token");
   });
 
   it("rejects an Application without a standalone start contract", () => {
@@ -157,7 +161,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
       previewUrl: "/apps/hormuz-tracker-map/",
       outcome: "created",
     }));
-    const client = new VerglasIntegrationRuntimeClient(env, fetcher);
+    const client = new VerglasIntegrationRuntimeClient(env, fetcher, "data-token");
     const result = await client.deployVessel({
       name: "hormuz-tracker",
       manifest: "apiVersion: verglas.io/v1alpha1\nkind: Vessel\n",
@@ -175,7 +179,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
 
   it("deletes a Vessel via DELETE /v1/vessels/{name}", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response(null, {status: 204}));
-    await new VerglasIntegrationRuntimeClient(env, fetcher).deleteVessel("shipping-map");
+    await new VerglasIntegrationRuntimeClient(env, fetcher, "data-token").deleteVessel("shipping-map");
     const [url, init] = fetcher.mock.calls[0];
     expect(url).toBe("http://runtime:8360/v1/vessels/shipping-map");
     expect(init?.method).toBe("DELETE");
@@ -183,7 +187,7 @@ describe("VerglasIntegrationRuntimeClient", () => {
 
   it("treats a missing Vessel as already deleted", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValue(new Response("gone", {status: 404}));
-    await expect(new VerglasIntegrationRuntimeClient(env, fetcher).deleteVessel("gone"))
+    await expect(new VerglasIntegrationRuntimeClient(env, fetcher, "data-token").deleteVessel("gone"))
       .resolves.toBeUndefined();
   });
 });

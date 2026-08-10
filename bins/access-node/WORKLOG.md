@@ -13,3 +13,7 @@
 - #84: Added managed database runtime reconciliation to the access node. Managed lakehouses bootstrap the tenant Lakekeeper service and receive database-specific warehouses and object prefixes; failed creates compensate the durable declaration, deletes remove runtime state first, and startup recovery reasserts all declarations.
 - #84: Added the managed Neon provisioner backed by the published Verglas storage and PostgreSQL 16 images. It reconciles a tenant broker plus database-local pageserver and compute containers, recovers stable timeline identity and credentials from the durable database identity, and requires an authenticated SQL probe before creation succeeds.
 - #84: Isolated startup recovery failures per database after the mandatory catalog bootstrap and inventory read. An unavailable managed runtime is reported without taking healthy lakehouses or the tenant access API offline; new database creation remains transactional and fail-closed.
+- #RBAC: Removed the account-wide access service token and made the configured initial email the only bootstrap owner. The access node now hosts durable signed-token authentication, protects database routes locally, publishes scoped rotating service credential files, and signs database target JWTs without retaining a root bearer.
+- #84: Put one Verglas-authenticated Neon TLS proxy in front of every managed Postgres compute.
+  Compute SCRAM remains private behind fixed bridge and NOLOGIN session roles; proxy declarations
+  reference rotating policy, bridge, and TLS files without persisting their contents.

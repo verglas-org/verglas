@@ -44,28 +44,39 @@ repository test tooling).
 ### Self-host (Docker)
 
 The Docker application is configured entirely by Compose environment values.
-Export your R2 bucket, S3 credentials, catalog URI, warehouse, catalog token,
-and a client-facing S3 secret. Generate the access service's encryption key
-once and retain it with the deployment's other secrets, then start the complete
-OSS stack:
+Export your R2 bucket and S3 credentials. Generate the tenant encryption,
+token-signing, and identity-assertion keys once, retain them with the
+deployment's secrets, and name the email address that becomes the initial
+tenant owner. This one-time bootstrap creates an ordinary owner principal; it
+does not create an administrative bearer-token bypass.
 
 ```sh
 export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+export VERGLAS_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)"
+export VERGLAS_TARGET_JWT_SIGNING_KEY="$(openssl rand -base64 32)"
+export VERGLAS_IDENTITY_ASSERTION_KEY="$(openssl rand -hex 32)"
+export VERGLAS_INITIAL_OWNER_EMAIL=you@example.com
 docker compose up -d --build
 ```
 
-Point the CLI at the container's API:
+Open Verglas OS at `http://127.0.0.1:8787`, create or sign in to the account
+whose email matches the initial owner, and create a scoped access token in
+**Profile → Access tokens**. The token is shown once. Store it in your local
+credential file, then point the CLI at the container's APIs:
 
 ```sh
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
-export VERGLAS_TOKEN="${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}"
+export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
 verglas status
 ```
 
-Verglas OS is available at `http://127.0.0.1:8787`. It is a community and
-development application in the Compose stack, not a dependency of the
-`verglas` server or CLI binaries and not a new CLI command.
+The CLI can later mint a narrower replacement with `verglas token create`; it
+writes the resulting token to its owner-only local credentials file.
+
+Verglas OS is a community and development application in the Compose stack,
+not a dependency of the `verglas` server or CLI binaries and not a new CLI
+command.
 
 The [self-hosted guide](docs/get-started/self-host.mdx) covers R2 and Data
 Catalog setup, every required environment variable, the complete Compose file,

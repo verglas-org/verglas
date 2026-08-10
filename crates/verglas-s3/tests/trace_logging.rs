@@ -92,7 +92,6 @@ async fn request_id_is_consistent_across_the_response_header_and_the_completion_
         None,
         None,
         None,
-        None,
         Some(metrics),
     );
 

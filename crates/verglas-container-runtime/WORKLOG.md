@@ -37,3 +37,8 @@
 - #84: Reuse an already-present cross-architecture image before attempting a registry pull, while
   still applying the declared platform to pulls and container creation. This lets locally
   authenticated pulls of the published Neon images be consumed by the socket-backed runtime.
+- #84: Added source-file delivery into stopped containers, content-sensitive reconciliation, and
+  Docker-assigned loopback ports. Desired state retains only trusted source paths, so rotating a
+  workload bearer replaces the consumer without persisting the bearer in deployments JSON.
+- #84: Added a stable local self-signed PostgreSQL proxy identity under runtime state. The runtime
+  creates it once before recovery and exposes only its file paths to managed proxy declarations.

@@ -9,3 +9,7 @@
 - #84: Added the `verglas_secrets` schema inside the existing `verglas_permissions` database.
   Secret metadata and encrypted value versions commit atomically, while metadata reads never join
   or return ciphertext.
+
+- #RBAC: Added the tenant-local `access_tokens` registry and its durable Postgres implementation.
+  It stores inventory metadata, expiry, last use, and revocation only; token plaintext, signatures,
+  and signing keys never enter the permissions database.

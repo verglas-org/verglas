@@ -2,7 +2,7 @@
 //! This router is the deployment-specific surface that mounts cache, admin,
 //! catalog proxy, and worker APIs in one process.
 
-use axum::extract::{OriginalUri, Path, State};
+use axum::extract::{Extension, OriginalUri, Path, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{
@@ -13,9 +13,12 @@ use bytes::Bytes;
 use serde::Deserialize;
 use verglas_catalog::{CatalogGateway, CatalogRuntimeRegistry, DatabaseId};
 
+use crate::data_plane::AuthenticatedBearer;
+
 pub mod access;
 pub mod admin;
 pub mod dashboard;
+pub mod data_plane;
 pub mod database;
 pub mod follow;
 pub mod kv;
@@ -83,11 +86,15 @@ async fn database_catalog_generation(
 async fn database_catalog_request(
     State(catalogs): State<CatalogRuntimeRegistry>,
     Path(path): Path<DatabaseCatalogPath>,
+    verified_bearer: Option<Extension<AuthenticatedBearer>>,
     OriginalUri(uri): OriginalUri,
     method: Method,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let Some(Extension(verified_bearer)) = verified_bearer else {
+        return (StatusCode::UNAUTHORIZED, "catalog authentication required").into_response();
+    };
     let database = path.database;
     let Ok(database_id) = DatabaseId::new(database.clone()) else {
         return (StatusCode::BAD_REQUEST, "invalid database id").into_response();
@@ -106,7 +113,15 @@ async fn database_catalog_request(
         )
             .into_response();
     };
-    catalog_response(catalog, method, upstream_path, headers, body).await
+    authenticated_catalog_response(
+        catalog,
+        method,
+        upstream_path,
+        headers,
+        body,
+        verified_bearer,
+    )
+    .await
 }
 
 /// Cache-owned catalog generation for query-worker session fencing.
@@ -144,6 +159,40 @@ async fn catalog_response(
     body: Bytes,
 ) -> Response {
     match catalog.request(method, upstream_path, headers, body).await {
+        Ok(result) => {
+            let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
+            let mut response = Response::new(axum::body::Body::from(result.body));
+            *response.status_mut() = status;
+            *response.headers_mut() = result.headers;
+            response
+        }
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            format!("catalog gateway error: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Converts an authenticated shallow gateway result into an Axum response.
+async fn authenticated_catalog_response(
+    catalog: CatalogGateway,
+    method: Method,
+    upstream_path: &str,
+    headers: HeaderMap,
+    body: Bytes,
+    verified_bearer: AuthenticatedBearer,
+) -> Response {
+    match catalog
+        .authenticated_request(
+            method,
+            upstream_path,
+            headers,
+            body,
+            verified_bearer.header_value().clone(),
+        )
+        .await
+    {
         Ok(result) => {
             let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::new(axum::body::Body::from(result.body));

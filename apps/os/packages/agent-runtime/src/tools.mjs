@@ -90,27 +90,19 @@ async function request(base, token, path, options = {}) {
 
 export function createToolExecutor(env, emit) {
   const admin = env.VERGLAS_DATA_ENDPOINT;
-  const dataToken = env.VERGLAS_DATA_TOKEN;
   const runtime = env.VERGLAS_CONTAINER_RUNTIME_URL;
-  const runtimeToken = env.VERGLAS_CONTAINER_RUNTIME_TOKEN;
-  if (!admin || !dataToken || !runtime || !runtimeToken) {
+  const access = env.VERGLAS_ACCESS_URI;
+  const scopedToken = env.VERGLAS_TOKEN;
+  const principalId = env.VERGLAS_AGENT_PRINCIPAL_ID;
+  if (!admin || !runtime || !access || !scopedToken || !principalId) {
     throw new Error("Agent runtime is missing Verglas data or container-runtime configuration.");
   }
 
-  const access = env.VERGLAS_ACCESS_URI;
-  const accessToken = env.VERGLAS_ACCESS_SERVICE_TOKEN;
-  const tenantId = env.VERGLAS_TENANT_ID;
-  const principalId = env.VERGLAS_AGENT_PRINCIPAL_ID;
-  if (!access || !accessToken || !tenantId || !principalId) {
-    throw new Error("Agent runtime is missing its Verglas authorization identity.");
-  }
-
   const requireAccess = async (resourceId, action) => {
-    const decision = await request(access, accessToken, "/v1/access/check", {
+    const decision = await request(access, scopedToken, "/v1/access/authorize", {
       method: "POST",
       body: JSON.stringify({
-        tenant_id: tenantId,
-        principal_id: principalId,
+        audience: "data-plane",
         resource_id: resourceId,
         action,
       }),
@@ -149,17 +141,17 @@ export function createToolExecutor(env, emit) {
       }
       case "listLakehouse": {
         await requireAccess("tenant", "discover");
-        const databaseBody = await request(access, accessToken, "/v1/databases");
+        const databaseBody = await request(access, scopedToken, "/v1/databases");
         const databases = (databaseBody.databases ?? []).slice(0, 100);
         const tables = [];
         for (const database of databases) {
           if (database.type !== "lakehouse") continue;
           await requireAccess(`database/${database.name}`, "discover");
           const catalog = `/v1/databases/${encodeURIComponent(database.name)}/catalog/v1`;
-          const namespaceBody = await request(admin, dataToken, `${catalog}/namespaces`);
+          const namespaceBody = await request(admin, scopedToken, `${catalog}/namespaces`);
           for (const namespace of (namespaceBody.namespaces ?? []).slice(0, 100)) {
             const encoded = encodeURIComponent(namespace.join("\u001f"));
-            const listed = await request(admin, dataToken, `${catalog}/namespaces/${encoded}/tables`);
+            const listed = await request(admin, scopedToken, `${catalog}/namespaces/${encoded}/tables`);
             for (const table of (listed.identifiers ?? []).slice(0, 500)) {
               if (tables.length === 1000) break;
               tables.push({
@@ -187,7 +179,7 @@ export function createToolExecutor(env, emit) {
         await requireAccess(`database/${database}`, "query");
         return await request(
           admin,
-          dataToken,
+          scopedToken,
           `/v1/databases/${encodeURIComponent(database)}/query`,
           {
           method: "POST",
@@ -197,7 +189,7 @@ export function createToolExecutor(env, emit) {
       }
       case "deployApplication": {
         await requireAccess("tenant", "deploy");
-        const result = await request(runtime, runtimeToken,
+        const result = await request(runtime, scopedToken,
           `/v1/vessels/${encodeURIComponent(args.name)}/project`, {
             method: "PUT",
             body: JSON.stringify({
@@ -219,7 +211,7 @@ export function createToolExecutor(env, emit) {
       }
       case "deployIntegration":
         await requireAccess("tenant", "deploy");
-        return await request(runtime, runtimeToken,
+        return await request(runtime, scopedToken,
           `/v1/vessels/${encodeURIComponent(args.name)}/project`, {
             method: "PUT",
             body: JSON.stringify({
@@ -232,7 +224,7 @@ export function createToolExecutor(env, emit) {
           });
       case "deployJob":
         await requireAccess("tenant", "deploy");
-        return await request(admin, dataToken, "/v1/workers", {
+        return await request(admin, scopedToken, "/v1/workers", {
           method: "POST",
           body: JSON.stringify({
             name: args.name,

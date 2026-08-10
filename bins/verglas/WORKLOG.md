@@ -742,6 +742,17 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #84: Added local `db create` commands for managed Lakehouse, managed Neon Postgres, customer S3, and external Iceberg REST compositions. Added singular `secret create` with typed URI scopes and secret material accepted only through a hidden terminal prompt or stdin; both commands are thin clients of the local resource APIs and reject ambiguous compositions before sending a request.
 - #84: Routed database and secret commands to `VERGLAS_ACCESS_ENDPOINT` (localhost port 8345 by default), keeping credential and database administration off the cache server's admin API.
 - #84: Updated the runnable Compose contract test for dynamic databases: Lakekeeper, the three-member cache/safekeeper ring, and the container runtime are now mandatory services rather than singleton catalog environment values.
+
+- #access-tokens: Added `verglas token create`, `list`, and `revoke` backed by
+  the access service. Minted bearer values are stored in an owner-only local
+  credentials file, and the CLI forwards the resolved scoped token to every
+  data-plane, runtime, and administrative request instead of using a separate
+  runtime-wide credential.
+
+- #database-tokens: Added `verglas db token <database>` for short-lived
+  Postgres connection credentials. It stores the returned Neon password token
+  in the owner-only credential file by default and prints it only when the
+  caller explicitly requests `--print-password` for `PGPASSWORD`.
 - #84: Made `verglas query` require its target database and post SQL only to
   `/v1/databases/{database}/query`. Its existing JSON report output and
   `--at` snapshot or timestamp selection are unchanged.

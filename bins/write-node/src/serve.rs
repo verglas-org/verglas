@@ -100,18 +100,26 @@ impl BatchCommitter for IcebergCommitter {
 
 /// Builds the Iceberg connection with all object I/O pinned to Verglas S3.
 pub fn connection_for(config: &WriteConfig) -> Result<Connection, String> {
+    let caller_bearer = std::env::var(verglas_core::RUN_BEARER_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "write role requires an inherited caller bearer".to_owned())?;
+    connection_for_bearer(config, caller_bearer)
+}
+
+/// Resolves a catalog connection whose bearer was supplied by the ephemeral parent process.
+fn connection_for_bearer(
+    config: &WriteConfig,
+    caller_bearer: String,
+) -> Result<Connection, String> {
     let (access_key_id, secret_access_key) = resolve_keypair(
         config.cache.credentials_file.as_deref(),
         config.cache.credentials_profile.as_deref(),
     )?
     .map_or((None, None), |(id, secret)| (Some(id), Some(secret)));
-    let token = config
-        .catalog
-        .resolve_bearer_token()
-        .map_err(|error| error.to_string())?;
     Ok(Connection {
         catalog_uri: config.catalog.uri.clone(),
-        token,
+        token: Some(caller_bearer),
         warehouse: config.catalog.warehouse.clone(),
         s3_endpoint: Some(config.cache.s3_endpoint.clone()),
         region: config
@@ -195,5 +203,89 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = control_c => {},
         _ = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+    use axum::extract::{OriginalUri, State};
+    use axum::http::{HeaderMap, header};
+    use axum::routing::get;
+    use axum::{Json, Router};
+
+    /// Captures catalog authentication while returning the two minimal REST responses this test needs.
+    async fn catalog_response(
+        State(authorization): State<Arc<Mutex<Option<String>>>>,
+        OriginalUri(uri): OriginalUri,
+        headers: HeaderMap,
+    ) -> Json<serde_json::Value> {
+        *authorization.lock().expect("authorization") = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let body = if uri.path() == "/v1/config" {
+            serde_json::json!({"defaults": {}, "overrides": {}})
+        } else {
+            serde_json::json!({"namespaces": []})
+        };
+        Json(body)
+    }
+
+    /// Builds a write-role config with all catalog credentials intentionally absent.
+    fn config(catalog_uri: String) -> WriteConfig {
+        WriteConfig {
+            listen: crate::config::Listen { admin_port: 0 },
+            cache: crate::config::CacheEndpoint {
+                s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                ..crate::config::CacheEndpoint::default()
+            },
+            catalog: verglas_core::config::Catalog {
+                uri: catalog_uri,
+                poll_interval_secs: 30,
+                include: Vec::new(),
+                exclude: Vec::new(),
+                credentials_file: None,
+                credentials_profile: None,
+                bearer_token: None,
+                sigv4_region: None,
+                sigv4_signing_name: None,
+                warehouse: None,
+            },
+        }
+    }
+
+    /// A catalog opened by the write role authenticates each internal request as its caller.
+    #[tokio::test]
+    async fn catalog_request_carries_inherited_caller_bearer() {
+        let authorization = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route("/v1/config", get(catalog_response))
+            .route("/v1/namespaces", get(catalog_response))
+            .with_state(authorization.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind catalog");
+        let endpoint = format!("http://{}", listener.local_addr().expect("catalog address"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve catalog");
+        });
+
+        let connection = connection_for_bearer(&config(endpoint), "caller-token".to_owned())
+            .expect("connection");
+        let catalog = verglas_iceberg::catalog::open_catalog(&connection)
+            .await
+            .expect("open catalog");
+        let _namespaces = catalog
+            .list_namespaces(None)
+            .await
+            .expect("list namespaces");
+
+        assert_eq!(
+            authorization.lock().expect("authorization").as_deref(),
+            Some("Bearer caller-token")
+        );
     }
 }

@@ -1,7 +1,13 @@
 # Complete open-source Verglas development and community stack.
 #
 # 1. Export the managed R2 and client-facing S3 values required below.
-# 2. export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+# 2. Export the encryption, assertion, and scoped-token signing keys. Set the
+#    first owner email once; it is not a continuing administrator bypass.
+#    export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+#    export VERGLAS_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)"
+#    export VERGLAS_TARGET_JWT_SIGNING_KEY="$(openssl rand -base64 32)"
+#    export VERGLAS_IDENTITY_ASSERTION_KEY="$(openssl rand -hex 32)"
+#    export VERGLAS_INITIAL_OWNER_EMAIL="you@example.com"
 # 3. docker compose up -d --build
 # 4. Point the CLI at the admin port:
 #      export VERGLAS_ENDPOINT=http://127.0.0.1:8334
@@ -26,6 +32,14 @@ x-pg-cache-environment: &pg-cache-environment
   VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
   VERGLAS_CACHE_CAPACITY: ${VERGLAS_POSTGRES_CACHE_CAPACITY:-1GB}
   VERGLAS_CACHE_DRAM: ${VERGLAS_POSTGRES_CACHE_DRAM:-256MB}
+
+# The Verglas Lakekeeper adapter is not yet published to GHCR. Build the exact
+# reviewed fork revision locally and never fall back to the upstream image.
+x-lakekeeper-build: &lakekeeper-build
+  context: https://github.com/verglas-org/lakekeeper.git#96205cebab7704bd7bcbc91190a774e72f8c55dc
+  dockerfile: docker/full.Dockerfile
+  args:
+    NO_CHEF: "true"
 
 services:
   verglas-server:
@@ -55,10 +69,11 @@ services:
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
-      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
+      VERGLAS_ACCESS_TOKEN_FILE: /var/run/verglas/server/verglas-server.token
       VERGLAS_MANAGED_CATALOG_URI: http://verglas-lakekeeper:8181
     volumes:
       - verglas-cache:/var/lib/verglas
+      - verglas-access-server-credentials:/var/run/verglas/server:ro
     # Contain a future socket or cache FD leak inside this service. Docker's
     # million-descriptor default is large enough to exhaust a desktop host.
     ulimits:
@@ -80,9 +95,14 @@ services:
       VERGLAS_OPENFGA_ENDPOINT: http://verglas-openfga:8080
       VERGLAS_OPENFGA_STORE: verglas
       VERGLAS_OPENFGA_TOKEN: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
-      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
-      VERGLAS_ACCESS_SERVICE_PRINCIPAL: ${VERGLAS_ACCESS_SERVICE_PRINCIPAL:-verglas-local-access}
+      VERGLAS_INITIAL_OWNER_EMAIL: ${VERGLAS_INITIAL_OWNER_EMAIL:?Set VERGLAS_INITIAL_OWNER_EMAIL to the first tenant owner email}
+      VERGLAS_TOKEN_SIGNING_KEY: ${VERGLAS_TOKEN_SIGNING_KEY:?Set VERGLAS_TOKEN_SIGNING_KEY to the base64 encoding of 32 random bytes}
+      VERGLAS_TARGET_JWT_SIGNING_KEY: ${VERGLAS_TARGET_JWT_SIGNING_KEY:?Set VERGLAS_TARGET_JWT_SIGNING_KEY to the base64 encoding of a raw 32-byte Ed25519 seed}
+      VERGLAS_IDENTITY_ASSERTION_KEY: ${VERGLAS_IDENTITY_ASSERTION_KEY:?Set VERGLAS_IDENTITY_ASSERTION_KEY to 64 hexadecimal characters}
+      VERGLAS_SERVER_TOKEN_DIRECTORY: /var/run/verglas/server
+      VERGLAS_LAKEKEEPER_TOKEN_DIRECTORY: /var/run/verglas/lakekeeper
+      VERGLAS_NEON_TOKEN_DIRECTORY: /var/run/verglas/neon
       VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_LISTEN: 0.0.0.0:8345
       VERGLAS_MANAGED_CATALOG_URI: http://verglas-lakekeeper:8181
@@ -96,19 +116,23 @@ services:
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454
       VERGLAS_MANAGED_POSTGRES_CREDENTIAL_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
+      VERGLAS_MANAGED_POSTGRES_TLS_CERTIFICATE_FILE: /var/lib/verglas-container-runtime/postgres-proxy/tls.crt
+      VERGLAS_MANAGED_POSTGRES_TLS_PRIVATE_KEY_FILE: /var/lib/verglas-container-runtime/postgres-proxy/tls.key
       VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-cache-node-0:8333
       VERGLAS_MANAGED_POSTGRES_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
       VERGLAS_MANAGED_POSTGRES_STORAGE_REGION: auto
       VERGLAS_MANAGED_POSTGRES_STORAGE_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
       VERGLAS_MANAGED_POSTGRES_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+    volumes:
+      - verglas-access-server-credentials:/var/run/verglas/server
+      - verglas-access-lakekeeper-credentials:/var/run/verglas/lakekeeper
+      - verglas-access-neon-credentials:/var/run/verglas/neon
     ports:
       - "127.0.0.1:8345:8345"
     depends_on:
       verglas-postgres-init:
         condition: service_completed_successfully
       verglas-openfga:
-        condition: service_healthy
-      verglas-lakekeeper:
         condition: service_healthy
       verglas-container-runtime:
         condition: service_healthy
@@ -138,7 +162,6 @@ services:
       VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
       VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
-      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
     depends_on:
       verglas-server:
@@ -151,7 +174,6 @@ services:
       timeout: 5s
       retries: 15
     restart: unless-stopped
-
   verglas-workers-postgres:
     image: postgres:17
     environment:
@@ -219,25 +241,37 @@ services:
     restart: unless-stopped
 
   verglas-lakekeeper-migrate:
-    image: quay.io/lakekeeper/catalog:v0.13.1
+    build: *lakekeeper-build
+    image: &lakekeeper-image ghcr.io/verglas-org/lakekeeper:96205cebab7704bd7bcbc91190a774e72f8c55dc
+    pull_policy: never
     command: ["migrate"]
     environment: &lakekeeper-environment
       LAKEKEEPER__PG_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       LAKEKEEPER__PG_DATABASE_URL_READ: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_catalog
       LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_catalog
-      LAKEKEEPER__AUTHZ_BACKEND: allowall
     depends_on:
       verglas-postgres-init:
         condition: service_completed_successfully
     restart: "no"
 
   verglas-lakekeeper:
-    image: quay.io/lakekeeper/catalog:v0.13.1
+    build: *lakekeeper-build
+    image: *lakekeeper-image
+    pull_policy: never
     command: ["serve"]
-    environment: *lakekeeper-environment
+    environment:
+      <<: *lakekeeper-environment
+      LAKEKEEPER__AUTHZ_BACKEND: verglas
+      LAKEKEEPER__VERGLAS__ENDPOINT: http://verglas-access:8345/
+      LAKEKEEPER__VERGLAS__WORKLOAD_CREDENTIAL_FILE: /var/run/verglas/lakekeeper/verglas-lakekeeper.token
+      LAKEKEEPER__VERGLAS__TENANT_ID: ${VERGLAS_TENANT_ID:-local}
+    volumes:
+      - verglas-access-lakekeeper-credentials:/var/run/verglas/lakekeeper:ro
     depends_on:
       verglas-lakekeeper-migrate:
         condition: service_completed_successfully
+      verglas-access:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
       interval: 2s
@@ -326,6 +360,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - verglas-runtime-state:/var/lib/verglas-container-runtime
+      - verglas-access-neon-credentials:/var/run/verglas/neon:ro
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8360/health"]
       interval: 2s
@@ -348,9 +383,7 @@ services:
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_RUNTIME_NETWORK: verglas-runtime
       VERGLAS_DATA_ENDPOINT: http://verglas-server:8334
-      VERGLAS_DATA_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
-      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
       LOCAL_MODEL_RUNTIME_URL: http://verglas-os:8790
       LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
@@ -367,7 +400,6 @@ services:
       timeout: 5s
       retries: 15
     restart: unless-stopped
-
   verglas-os:
     build:
       context: .
@@ -379,7 +411,6 @@ services:
       VITE_BACKEND_HOST: 0.0.0.0:8787
       VERGLAS_ADMIN_URL: http://verglas-server:8334
       VERGLAS_DATA_ENDPOINT: http://verglas-server:8334
-      VERGLAS_DATA_TOKEN: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
       VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340
       VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
@@ -390,9 +421,12 @@ services:
       VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390
       VERGLAS_AGENT_RUNTIME_TOKEN: ${VERGLAS_AGENT_RUNTIME_TOKEN:-verglas-local-agent-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
-      VERGLAS_ACCESS_SERVICE_TOKEN: ${VERGLAS_ACCESS_SERVICE_TOKEN:-verglas-local-access}
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
-      VERGLAS_LOCAL_OWNER_BOOTSTRAP: "true"
+      # run-dev-server derives the Workshop ADMINS binding from this value. Keep
+      # it identical to the access service bootstrap owner so the local control
+      # plane and tenant policy plane do not disagree about the first admin.
+      VERGLAS_INITIAL_OWNER_EMAIL: ${VERGLAS_INITIAL_OWNER_EMAIL:?Set VERGLAS_INITIAL_OWNER_EMAIL to the first tenant owner email}
+      VERGLAS_IDENTITY_ASSERTION_KEY: ${VERGLAS_IDENTITY_ASSERTION_KEY:?Set VERGLAS_IDENTITY_ASSERTION_KEY to 64 hexadecimal characters}
     volumes:
       - verglas-os-state:/workspace/apps/os/.wrangler/state
       - ${HOME}/.codex:/root/.codex
@@ -416,6 +450,9 @@ volumes:
   verglas-runtime-state:
   verglas-workers-postgres:
   verglas-os-state:
+  verglas-access-server-credentials:
+  verglas-access-lakekeeper-credentials:
+  verglas-access-neon-credentials:
   verglas-pg-cache-0:
   verglas-pg-cache-1:
   verglas-pg-cache-2:

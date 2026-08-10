@@ -15,8 +15,9 @@
 //! filled at the same moment, so they exist on the same router but answer
 //! `503 Service Unavailable` until the engine is ready.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, Path, Query, RawQuery, State};
@@ -151,28 +152,83 @@ pub type TablesSlot = Arc<OnceLock<Arc<dyn Catalog>>>;
 /// catalog slot and reaches Rill only over its private network API.
 pub type DashboardSlot = Arc<crate::dashboard::DashboardRuntime>;
 
-/// The catalog handle the `graph` verb-family routes (`/v1/graphs/...`) drive
-/// the graph-over-Iceberg engine through. A graph is not a new storage
-/// primitive — it is a namespace holding two plain Iceberg tables plus the
-/// Puffin adjacency index — so it shares the same private catalog handle as
-/// [`TablesSlot`], filled at the same moment after recovery, and answers 503
-/// until then.
-pub type GraphsSlot = Arc<OnceLock<Arc<dyn Catalog>>>;
-
-/// The runtime backing the vector-index routes (`/v1/tables|graphs/{..}/
-/// indexes`): the private catalog handle plus the disposable decoded-index
-/// cache. Durable indexes are snapshot-bound Puffin statistics attachments in
-/// the customer table.
-pub struct VectorRuntime {
-    /// The private upstream catalog used to read and commit index attachments.
-    pub catalog: Arc<dyn Catalog>,
-    /// The index service with a disposable decoded-index serving cache.
-    pub service: Arc<VectorService>,
+/// Live database-to-catalog registry for graph and vector operations.
+///
+/// Each request resolves its database before opening any graph or table. A
+/// missing database fails closed; no process-global catalog fallback exists.
+#[derive(Clone, Default)]
+pub struct DatabaseDataRuntime {
+    catalogs: Arc<RwLock<HashMap<DatabaseId, Arc<dyn Catalog>>>>,
+    vector: Arc<VectorService>,
 }
 
-/// The deferred handle the vector-index routes drive, wired after recovery like
-/// [`TablesSlot`]; the routes answer 503 until it is filled.
-pub type VectorSlot = Arc<OnceLock<Arc<VectorRuntime>>>;
+impl DatabaseDataRuntime {
+    /// Installs one database catalog and rejects duplicate identifiers.
+    pub fn insert(&self, database: DatabaseId, catalog: Arc<dyn Catalog>) -> Result<(), String> {
+        let mut catalogs = self
+            .catalogs
+            .write()
+            .map_err(|_| "database data runtime lock is poisoned".to_owned())?;
+        if catalogs.insert(database.clone(), catalog).is_some() {
+            return Err(format!(
+                "database data runtime already contains `{}`",
+                database.as_str()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Resolves one exact database catalog without a singleton fallback.
+    fn catalog(&self, database: &str) -> Result<Arc<dyn Catalog>, DatabaseDataError> {
+        let database =
+            DatabaseId::new(database.to_owned()).map_err(|_| DatabaseDataError::InvalidDatabase)?;
+        self.catalogs
+            .read()
+            .map_err(|_| DatabaseDataError::Unavailable)?
+            .get(&database)
+            .cloned()
+            .ok_or(DatabaseDataError::NotFound)
+    }
+
+    /// Builds a request-local vector runtime over the selected database catalog.
+    fn vector_runtime(&self, database: &str) -> Result<VectorRuntime, DatabaseDataError> {
+        Ok(VectorRuntime {
+            catalog: self.catalog(database)?,
+            service: self.vector.clone(),
+        })
+    }
+}
+
+/// Bounded database-selection failure shared by graph and vector routes.
+enum DatabaseDataError {
+    InvalidDatabase,
+    Unavailable,
+    NotFound,
+}
+
+impl IntoResponse for DatabaseDataError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::InvalidDatabase => {
+                (StatusCode::BAD_REQUEST, "invalid database id").into_response()
+            }
+            Self::Unavailable => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "database data runtime unavailable",
+            )
+                .into_response(),
+            Self::NotFound => {
+                (StatusCode::NOT_FOUND, "database data runtime not found").into_response()
+            }
+        }
+    }
+}
+
+/// Request-local vector service bound to one selected database catalog.
+struct VectorRuntime {
+    catalog: Arc<dyn Catalog>,
+    service: Arc<VectorService>,
+}
 
 /// The `verglas_sys` registry handle the registry and watermark routes write
 /// and read through (#322), wired lazily after recovery like [`TablesSlot`].
@@ -221,12 +277,8 @@ pub struct Slots {
     pub tables: Option<TablesSlot>,
     /// Rill-backed dashboard routes, absent when `[analytics.rill]` is unset.
     pub dashboards: Option<DashboardSlot>,
-    /// The `graph` verb-family routes (`/v1/graphs/...`), backed by
-    /// `verglas-graph` over the same private catalog as the table routes.
-    pub graphs: Option<GraphsSlot>,
-    /// The vector-index routes (`/v1/tables|graphs/{..}/indexes...`), backed by
-    /// `verglas-vector` over snapshot-bound Iceberg attachments.
-    pub vector: Option<VectorSlot>,
+    /// Database-scoped graph and vector routes with exact catalog selection.
+    pub database_data: Option<DatabaseDataRuntime>,
     /// The `verglas_sys` registry routes (`/v1/workers`).
     pub sys: Option<SysSlot>,
     /// The platform queue routes (`/v1/queues/<name>/{enqueue,poll,ack}`),
@@ -267,8 +319,7 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         access,
         tables,
         dashboards,
-        graphs,
-        vector,
+        database_data,
         sys,
         queues,
         platform,
@@ -393,11 +444,10 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         app = app.merge(dashboard_router(dashboards));
     }
     app = app.merge(v1_serving_router(query_worker, write_worker));
-    if let Some(graphs) = graphs {
-        app = app.merge(graphs_router(graphs));
-    }
-    if let Some(vector) = vector {
-        app = app.merge(vector_router(vector));
+    if let Some(database_data) = database_data {
+        app = app
+            .merge(graphs_router(database_data.clone()))
+            .merge(vector_router(database_data));
     }
     if let Some(sys) = sys {
         app = app.merge(sys_router(sys));
@@ -603,6 +653,14 @@ async fn query_sql(
         )
             .into_response();
     }
+    let Some(bearer_token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::UNAUTHORIZED, "bearer token required").into_response();
+    };
     let time_travel = request.at.map(|at| verglas_iceberg::TimeTravel {
         reference: at.reference,
         table: at.table,
@@ -613,6 +671,7 @@ async fn query_sql(
             &request.sql,
             time_travel,
             accepts_arrow(&headers),
+            bearer_token,
         )
         .await
     {
@@ -642,8 +701,14 @@ struct WriteState {
 /// Mounts the logical write gateway with no embedded table-writer fallback.
 fn write_router(write_worker: Option<Arc<crate::write_worker::WriteWorkerDispatcher>>) -> Router {
     Router::new()
-        .route("/v1/write/{name}", post(write_dispatch))
-        .route("/v1/ingest/{name}", post(ingest_dispatch))
+        .route(
+            "/v1/databases/{database}/write/{name}",
+            post(write_dispatch),
+        )
+        .route(
+            "/v1/databases/{database}/ingest/{name}",
+            post(ingest_dispatch),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             TABLES_BODY_LIMIT_BYTES,
         ))
@@ -653,7 +718,7 @@ fn write_router(write_worker: Option<Arc<crate::write_worker::WriteWorkerDispatc
 /// Relays a bounded CSV, JSONL, or Parquet ingest to `verglas-write`.
 async fn ingest_dispatch(
     State(state): State<WriteState>,
-    Path(name): Path<String>,
+    Path((database, name)): Path<(String, String)>,
     RawQuery(query): RawQuery,
     headers: HeaderMap,
     body: Bytes,
@@ -664,6 +729,18 @@ async fn ingest_dispatch(
             "write worker is not configured",
         )
             .into_response();
+    };
+    let database = match DatabaseId::new(database) {
+        Ok(database) => database,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let Some(bearer_token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::UNAUTHORIZED, "bearer token required").into_response();
     };
     let Some(query) = query else {
         return (
@@ -677,7 +754,14 @@ async fn ingest_dispatch(
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
     match dispatcher
-        .dispatch_ingest(&name, &query, body, idempotency_key)
+        .dispatch_ingest(
+            &database,
+            &name,
+            &query,
+            body,
+            idempotency_key,
+            bearer_token,
+        )
         .await
     {
         Ok(response) => response,
@@ -688,7 +772,7 @@ async fn ingest_dispatch(
 /// Relays one bounded Arrow write to `verglas-write`.
 async fn write_dispatch(
     State(state): State<WriteState>,
-    Path(name): Path<String>,
+    Path((database, name)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -698,6 +782,18 @@ async fn write_dispatch(
             "write worker is not configured",
         )
             .into_response();
+    };
+    let database = match DatabaseId::new(database) {
+        Ok(database) => database,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    let Some(bearer_token) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::UNAUTHORIZED, "bearer token required").into_response();
     };
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -714,7 +810,10 @@ async fn write_dispatch(
         .get("idempotency-key")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    match dispatcher.dispatch(&name, body, idempotency_key).await {
+    match dispatcher
+        .dispatch(&database, &name, body, idempotency_key, bearer_token)
+        .await
+    {
         Ok(response) => response,
         Err(error) => (
             StatusCode::BAD_GATEWAY,
@@ -724,7 +823,7 @@ async fn write_dispatch(
     }
 }
 
-/// The `graph` verb-family sub-router (`/v1/graphs/...`): create a graph, insert
+/// The database-scoped `graph` verb-family sub-router: create a graph, insert
 /// nodes and edges, build the Puffin adjacency index, run a traversal query, and
 /// show a graph's backing tables and index state. A graph is not a new storage
 /// primitive — it is a namespace holding two plain Iceberg tables
@@ -732,62 +831,74 @@ async fn write_dispatch(
 /// share the same private catalog handle as the table routes and answer 503
 /// until it is wired after recovery. The insert routes take the same 32 MiB body
 /// ceiling as the table commit route so a batch lands in one commit.
-fn graphs_router(graphs: GraphsSlot) -> Router {
+fn graphs_router(graphs: DatabaseDataRuntime) -> Router {
     Router::new()
         .route(
-            "/v1/graphs/{namespace}",
+            "/v1/databases/{database}/graphs/{namespace}",
             post(graphs_create).get(graphs_show),
         )
-        .route("/v1/graphs/{namespace}/nodes", post(graphs_insert_nodes))
-        .route("/v1/graphs/{namespace}/edges", post(graphs_insert_edges))
-        .route("/v1/graphs/{namespace}/index", post(graphs_build_index))
-        .route("/v1/graphs/{namespace}/query", post(graphs_query))
+        .route(
+            "/v1/databases/{database}/graphs/{namespace}/nodes",
+            post(graphs_insert_nodes),
+        )
+        .route(
+            "/v1/databases/{database}/graphs/{namespace}/edges",
+            post(graphs_insert_edges),
+        )
+        .route(
+            "/v1/databases/{database}/graphs/{namespace}/index",
+            post(graphs_build_index),
+        )
+        .route(
+            "/v1/databases/{database}/graphs/{namespace}/query",
+            post(graphs_query),
+        )
         .layer(axum::extract::DefaultBodyLimit::max(
             TABLES_BODY_LIMIT_BYTES,
         ))
         .with_state(graphs)
 }
 
-/// Why a graph route could not open its engine handle: the catalog slot is not
-/// wired yet (503), or the namespace did not parse (a graph-engine error). Kept
-/// small so the route helper returns a compact `Result` rather than a full
-/// `Response` in the error arm.
-enum GraphOpenError {
-    /// The private catalog handle is not wired yet — answer 503.
-    Recovering,
-    /// The namespace could not be opened as a graph.
-    Open(GraphError),
+/// Opens one graph only after resolving its exact database catalog.
+fn open_graph(
+    runtime: &DatabaseDataRuntime,
+    database: &str,
+    namespace: &str,
+) -> Result<Graph, GraphOpenError> {
+    let catalog = runtime.catalog(database)?;
+    Graph::open(catalog, namespace).map_err(GraphOpenError::Graph)
 }
 
-impl GraphOpenError {
-    /// Renders the open failure as the HTTP response the route returns.
+/// Graph-open failure without placing a full HTTP response in `Result::Err`.
+enum GraphOpenError {
+    Database(DatabaseDataError),
+    Graph(GraphError),
+}
+
+impl From<DatabaseDataError> for GraphOpenError {
+    fn from(error: DatabaseDataError) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl IntoResponse for GraphOpenError {
     fn into_response(self) -> Response {
         match self {
-            GraphOpenError::Recovering => recovering(),
-            GraphOpenError::Open(error) => graph_error(error),
+            Self::Database(error) => error.into_response(),
+            Self::Graph(error) => graph_error(error),
         }
     }
 }
 
-/// Opens the graph engine handle over the private catalog for `namespace`.
-/// Every graph route starts here so the slot-not-wired and bad-namespace paths
-/// are handled in one place.
-fn open_graph(graphs: &GraphsSlot, namespace: &str) -> Result<Graph, GraphOpenError> {
-    let Some(catalog) = graphs.get() else {
-        return Err(GraphOpenError::Recovering);
-    };
-    Graph::open(catalog.clone(), namespace).map_err(GraphOpenError::Open)
-}
-
-/// `POST /v1/graphs/{namespace}`: creates the graph by ensuring its two backing
+/// `POST /v1/databases/{database}/graphs/{namespace}` creates the graph by ensuring its two backing
 /// Iceberg tables exist (idempotent). Returns the namespace and the two table
 /// names, which are plain tables queryable on their own. Answers 503 until the
 /// catalog handle is wired.
 async fn graphs_create(
-    State(graphs): State<GraphsSlot>,
-    Path(namespace): Path<String>,
+    State(graphs): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
 ) -> Response {
-    let graph = match open_graph(&graphs, &namespace) {
+    let graph = match open_graph(&graphs, &database, &namespace) {
         Ok(graph) => graph,
         Err(error) => return error.into_response(),
     };
@@ -802,14 +913,14 @@ async fn graphs_create(
     }
 }
 
-/// `POST /v1/graphs/{namespace}/nodes`: appends a batch of nodes and returns the
+/// `POST /v1/databases/{database}/graphs/{namespace}/nodes` appends nodes and returns the
 /// new nodes-table snapshot id. Answers 503 until the catalog handle is wired.
 async fn graphs_insert_nodes(
-    State(graphs): State<GraphsSlot>,
-    Path(namespace): Path<String>,
+    State(graphs): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
     Json(request): Json<graph_wire::InsertNodesRequest>,
 ) -> Response {
-    let graph = match open_graph(&graphs, &namespace) {
+    let graph = match open_graph(&graphs, &database, &namespace) {
         Ok(graph) => graph,
         Err(error) => return error.into_response(),
     };
@@ -821,15 +932,15 @@ async fn graphs_insert_nodes(
     }
 }
 
-/// `POST /v1/graphs/{namespace}/edges`: appends a batch of edges (triplets) and
+/// `POST /v1/databases/{database}/graphs/{namespace}/edges` appends edges and
 /// returns the new edges-table snapshot id — the snapshot an index build binds
 /// to. Answers 503 until the catalog handle is wired.
 async fn graphs_insert_edges(
-    State(graphs): State<GraphsSlot>,
-    Path(namespace): Path<String>,
+    State(graphs): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
     Json(request): Json<graph_wire::InsertEdgesRequest>,
 ) -> Response {
-    let graph = match open_graph(&graphs, &namespace) {
+    let graph = match open_graph(&graphs, &database, &namespace) {
         Ok(graph) => graph,
         Err(error) => return error.into_response(),
     };
@@ -841,16 +952,16 @@ async fn graphs_insert_edges(
     }
 }
 
-/// `POST /v1/graphs/{namespace}/index`: builds or refreshes the adjacency index
+/// `POST /v1/databases/{database}/graphs/{namespace}/index` refreshes the adjacency index
 /// as of the requested edge snapshot (the current tip when absent) and binds it
 /// as a Puffin blob. Returns the build report, or `built: false` when the edge
 /// table has no data to index. Answers 503 until the catalog handle is wired.
 async fn graphs_build_index(
-    State(graphs): State<GraphsSlot>,
-    Path(namespace): Path<String>,
+    State(graphs): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
     body: Option<Json<graph_wire::BuildIndexRequest>>,
 ) -> Response {
-    let graph = match open_graph(&graphs, &namespace) {
+    let graph = match open_graph(&graphs, &database, &namespace) {
         Ok(graph) => graph,
         Err(error) => return error.into_response(),
     };
@@ -880,7 +991,7 @@ async fn graphs_build_index(
     }
 }
 
-/// `POST /v1/graphs/{namespace}/query`: runs one traversal (`neighbors`,
+/// `POST /v1/databases/{database}/graphs/{namespace}/query` runs one traversal (`neighbors`,
 /// `kHop`, `neighborhood`, or `paths`) over a reader opened as of `asOf` (the
 /// current tip when absent). The reader prefers the bound index and falls back
 /// to a scan of the plain tables; the response reports which path served it so
@@ -888,11 +999,11 @@ async fn graphs_build_index(
 /// requires (`k`, `maxHops`, or `dst`) is a 400. Answers 503 until the catalog
 /// handle is wired.
 async fn graphs_query(
-    State(graphs): State<GraphsSlot>,
-    Path(namespace): Path<String>,
+    State(graphs): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
     Json(request): Json<graph_wire::GraphQueryRequest>,
 ) -> Response {
-    let graph = match open_graph(&graphs, &namespace) {
+    let graph = match open_graph(&graphs, &database, &namespace) {
         Ok(graph) => graph,
         Err(error) => return error.into_response(),
     };
@@ -947,13 +1058,17 @@ async fn graphs_query(
     Json(response).into_response()
 }
 
-/// `GET /v1/graphs/{namespace}`: shows the graph's two backing tables, their
+/// `GET /v1/databases/{database}/graphs/{namespace}` shows the graph's backing tables, their
 /// live row counts, and whether an adjacency index is bound to the current edge
 /// snapshot. Answers 503 until the catalog handle is wired; a graph whose tables
 /// do not exist is a 404.
-async fn graphs_show(State(graphs): State<GraphsSlot>, Path(namespace): Path<String>) -> Response {
-    let Some(catalog) = graphs.get() else {
-        return recovering();
+async fn graphs_show(
+    State(graphs): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
+) -> Response {
+    let catalog = match graphs.catalog(&database) {
+        Ok(catalog) => catalog,
+        Err(error) => return error.into_response(),
     };
     let graph = match Graph::open(catalog.clone(), &namespace) {
         Ok(graph) => graph,
@@ -1113,7 +1228,7 @@ fn bad_request(message: &str) -> Response {
 }
 
 // ---------------------------------------------------------------------------
-// Vector-index routes (`/v1/tables|graphs/{..}/indexes...`).
+// Database-scoped table and graph vector-index routes.
 //
 // Declaring an index builds and attaches it to the source snapshot. Searching
 // requires an exact attachment for the current snapshot.
@@ -1121,26 +1236,26 @@ fn bad_request(message: &str) -> Response {
 
 /// The vector-index sub-router. Table and graph indexes share the same service;
 /// they differ only in how the source table identity is formed.
-fn vector_router(vector: VectorSlot) -> Router {
+fn vector_router(vector: DatabaseDataRuntime) -> Router {
     Router::new()
         .route(
-            "/v1/tables/{name}/indexes",
+            "/v1/databases/{database}/tables/{name}/indexes",
             post(tables_index_declare).get(tables_index_list),
         )
         .route(
-            "/v1/tables/{name}/indexes/{field}/search",
+            "/v1/databases/{database}/tables/{name}/indexes/{field}/search",
             post(tables_index_search),
         )
         .route(
-            "/v1/tables/{name}/indexes/{field}/refresh",
+            "/v1/databases/{database}/tables/{name}/indexes/{field}/refresh",
             post(tables_index_refresh),
         )
         .route(
-            "/v1/graphs/{namespace}/indexes",
+            "/v1/databases/{database}/graphs/{namespace}/indexes",
             post(graphs_index_declare).get(graphs_index_list),
         )
         .route(
-            "/v1/graphs/{namespace}/indexes/{field}/search",
+            "/v1/databases/{database}/graphs/{namespace}/indexes/{field}/search",
             post(graphs_index_search),
         )
         .layer(axum::extract::DefaultBodyLimit::max(
@@ -1149,70 +1264,77 @@ fn vector_router(vector: VectorSlot) -> Router {
         .with_state(vector)
 }
 
-/// `POST /v1/tables/{name}/indexes`: declare an index on a table field and run
+/// `POST /v1/databases/{database}/tables/{name}/indexes` declares a table index and runs
 /// the initial build.
 async fn tables_index_declare(
-    State(vector): State<VectorSlot>,
-    Path(name): Path<String>,
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, name)): Path<(String, String)>,
     Json(request): Json<vector_wire::DeclareIndexRequest>,
 ) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&name) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
     let key = IndexKey::table(&name, &request.field);
-    declare_index(rt, ident, key, request).await
+    declare_index(&rt, ident, key, request).await
 }
 
-/// `GET /v1/tables/{name}/indexes`: list indexes declared on this table.
-async fn tables_index_list(State(vector): State<VectorSlot>, Path(name): Path<String>) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+/// `GET /v1/databases/{database}/tables/{name}/indexes` lists this table's indexes.
+async fn tables_index_list(
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, name)): Path<(String, String)>,
+) -> Response {
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&name) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
-    list_indexes(rt, ident, &format!("tbl:{name}")).await
+    list_indexes(&rt, ident, &format!("tbl:{name}")).await
 }
 
-/// `POST /v1/tables/{name}/indexes/{field}/search`: ANN search over a table
+/// `POST /v1/databases/{database}/tables/{name}/indexes/{field}/search` runs ANN search over a table
 /// field. The exact current snapshot must carry the attachment.
 async fn tables_index_search(
-    State(vector): State<VectorSlot>,
-    Path((name, field)): Path<(String, String)>,
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, name, field)): Path<(String, String, String)>,
     Json(request): Json<vector_wire::SearchRequest>,
 ) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&name) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
     let key = IndexKey::table(&name, &field);
-    search_index(rt, ident, key, request).await
+    search_index(&rt, ident, key, request).await
 }
 
-/// `POST /v1/tables/{name}/indexes/{field}/refresh`: run one maintenance pass
+/// `POST /v1/databases/{database}/tables/{name}/indexes/{field}/refresh` runs maintenance
 /// for an already-declared table index, rebuilding its blob from the table's
 /// current snapshot. The prior attachment carries the refresh configuration.
 async fn tables_index_refresh(
-    State(vector): State<VectorSlot>,
-    Path((name, field)): Path<(String, String)>,
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, name, field)): Path<(String, String, String)>,
 ) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&name) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
     let key = IndexKey::table(&name, &field);
-    refresh_index(rt, ident, key).await
+    refresh_index(&rt, ident, key).await
 }
 
 /// Shared refresh path: run the maintenance pass and return the newly attached
@@ -1226,55 +1348,58 @@ async fn refresh_index(rt: &VectorRuntime, ident: iceberg::TableIdent, key: Inde
     Json(report_to_wire(key.target, key.field, metric, report)).into_response()
 }
 
-/// `POST /v1/graphs/{namespace}/indexes`: declare an index on a graph node-table
+/// `POST /v1/databases/{database}/graphs/{namespace}/indexes` declares a graph node index
 /// field. A graph's nodes live in `<namespace>.nodes`.
 async fn graphs_index_declare(
-    State(vector): State<VectorSlot>,
-    Path(namespace): Path<String>,
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
     Json(request): Json<vector_wire::DeclareIndexRequest>,
 ) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&format!("{namespace}.nodes")) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
     let key = IndexKey::graph(&namespace, &request.field);
-    declare_index(rt, ident, key, request).await
+    declare_index(&rt, ident, key, request).await
 }
 
-/// `GET /v1/graphs/{namespace}/indexes`: list indexes declared on this graph.
+/// `GET /v1/databases/{database}/graphs/{namespace}/indexes` lists graph indexes.
 async fn graphs_index_list(
-    State(vector): State<VectorSlot>,
-    Path(namespace): Path<String>,
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, namespace)): Path<(String, String)>,
 ) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&format!("{namespace}.nodes")) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
-    list_indexes(rt, ident, &format!("graph:{namespace}")).await
+    list_indexes(&rt, ident, &format!("graph:{namespace}")).await
 }
 
-/// `POST /v1/graphs/{namespace}/indexes/{field}/search`: ANN search over a graph
+/// `POST /v1/databases/{database}/graphs/{namespace}/indexes/{field}/search` searches a graph
 /// node-table field.
 async fn graphs_index_search(
-    State(vector): State<VectorSlot>,
-    Path((namespace, field)): Path<(String, String)>,
+    State(vector): State<DatabaseDataRuntime>,
+    Path((database, namespace, field)): Path<(String, String, String)>,
     Json(request): Json<vector_wire::SearchRequest>,
 ) -> Response {
-    let Some(rt) = vector.get() else {
-        return recovering();
+    let rt = match vector.vector_runtime(&database) {
+        Ok(runtime) => runtime,
+        Err(error) => return error.into_response(),
     };
     let ident = match parse_table_ident(&format!("{namespace}.nodes")) {
         Ok(ident) => ident,
         Err(error) => return table_error(error),
     };
     let key = IndexKey::graph(&namespace, &field);
-    search_index(rt, ident, key, request).await
+    search_index(&rt, ident, key, request).await
 }
 
 /// Shared declare path for tables and graphs.
@@ -2628,10 +2753,8 @@ mod tests {
         assert!(body.get("nextCursor").is_some(), "more rows remain");
     }
 
-    /// The extracted `/v1` serving router — the same surface the SigV4 S3 data
-    /// port serves once the edge re-signs a forward — commits rows and reads
-    /// them back over its own catalog slot, independent of the full admin
-    /// router. This is the unit the S3 front-end drives via `ServingApi`.
+    /// The extracted bearer-authenticated `/v1` serving router commits rows and
+    /// reads them back independently of the full admin router.
     #[tokio::test]
     #[cfg(any())]
     async fn v1_serving_router_commits_a_table_end_to_end() {
@@ -3062,12 +3185,10 @@ mod tests {
         assert_eq!(body["partition_by"], serde_json::json!(["day"]));
     }
 
-    // ----- graph verb-family routes (`/v1/graphs/...`) -----
+    // ----- database-scoped graph verb-family routes -----
 
-    /// A filled graphs slot over a fresh empty memory catalog — the post-recovery
-    /// state the server leaves the slot in. The same handle type as the tables
-    /// slot, so `/v1/tables` and `/v1/graphs` see one catalog.
-    async fn graphs_slot_ready() -> GraphsSlot {
+    /// A database registry containing one fresh in-memory lakehouse catalog.
+    async fn graphs_runtime_ready() -> DatabaseDataRuntime {
         use iceberg::CatalogBuilder;
         use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 
@@ -3084,22 +3205,89 @@ mod tests {
             .expect("memory catalog");
         std::mem::forget(warehouse);
         let catalog: Arc<dyn Catalog> = Arc::new(catalog);
-        let slot: GraphsSlot = Arc::new(OnceLock::new());
-        let _ = slot.set(catalog);
-        slot
+        let runtime = DatabaseDataRuntime::default();
+        runtime
+            .insert(
+                DatabaseId::new("analytics".to_owned()).expect("database id"),
+                catalog,
+            )
+            .expect("insert database catalog");
+        runtime
     }
 
-    /// A graph route on a router whose slot is not yet filled answers 503, like
-    /// the other engine-dependent routes before recovery.
+    /// The selected database controls the backing catalog; equal graph names in
+    /// different databases never share namespaces or tables.
     #[tokio::test]
-    async fn graph_routes_answer_503_until_the_catalog_is_wired() {
-        let empty: GraphsSlot = Arc::new(OnceLock::new());
+    async fn graph_routes_isolate_two_database_catalogs() {
+        use iceberg::CatalogBuilder;
+        use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+
+        async fn memory_catalog() -> Arc<dyn Catalog> {
+            let warehouse = tempfile::tempdir().expect("warehouse");
+            let catalog = MemoryCatalogBuilder::default()
+                .load(
+                    "memory",
+                    std::collections::HashMap::from([(
+                        MEMORY_CATALOG_WAREHOUSE.to_string(),
+                        warehouse.path().to_str().expect("utf8").to_string(),
+                    )]),
+                )
+                .await
+                .expect("memory catalog");
+            std::mem::forget(warehouse);
+            Arc::new(catalog)
+        }
+
+        let analytics = memory_catalog().await;
+        let archive = memory_catalog().await;
+        let runtime = DatabaseDataRuntime::default();
+        runtime
+            .insert(
+                DatabaseId::new("analytics".to_owned()).expect("analytics id"),
+                analytics.clone(),
+            )
+            .expect("insert analytics");
+        runtime
+            .insert(
+                DatabaseId::new("archive".to_owned()).expect("archive id"),
+                archive.clone(),
+            )
+            .expect("insert archive");
         let app = slots_router(Slots {
-            graphs: Some(empty),
+            database_data: Some(runtime),
             ..Slots::default()
         });
-        let response = call(app, "POST", "/v1/graphs/kg").await;
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = call(app, "POST", "/v1/databases/analytics/graphs/shipping").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let namespace = iceberg::NamespaceIdent::new("shipping".to_owned());
+        assert!(
+            analytics
+                .namespace_exists(&namespace)
+                .await
+                .expect("analytics namespace check")
+        );
+        assert!(
+            !archive
+                .namespace_exists(&namespace)
+                .await
+                .expect("archive namespace check")
+        );
+    }
+
+    /// A graph route fails closed when the selected database has no catalog.
+    #[tokio::test]
+    async fn graph_routes_answer_404_until_the_database_is_wired() {
+        let app = slots_router(Slots {
+            database_data: Some(DatabaseDataRuntime::default()),
+            ..Slots::default()
+        });
+        let response = call(app.clone(), "POST", "/v1/databases/analytics/graphs/kg").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            call(app, "POST", "/v1/graphs/kg").await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// Creating a graph ensures its two backing tables, which then show up as
@@ -3108,17 +3296,16 @@ mod tests {
     #[tokio::test]
     #[cfg(any())]
     async fn create_graph_makes_two_plain_tables() {
-        let slot = graphs_slot_ready().await;
-        let tables: TablesSlot = slot.clone();
+        let runtime = graphs_runtime_ready().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
-                tables: Some(tables.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
 
-        let body = json_body(call(router_of(), "POST", "/v1/graphs/kg").await).await;
+        let body =
+            json_body(call(router_of(), "POST", "/v1/databases/analytics/graphs/kg").await).await;
         assert_eq!(body["namespace"], "kg");
         assert_eq!(body["nodesTable"], "kg.nodes");
         assert_eq!(body["edgesTable"], "kg.edges");
@@ -3136,28 +3323,27 @@ mod tests {
     }
 
     /// Seeds a small graph (a→b, b→c, c→d as `knows`; a→c as `met`) through the
-    /// insert routes and returns the ready graphs slot. The router built from it
-    /// serves every graph route over this one catalog.
-    async fn seeded_graph_router() -> GraphsSlot {
-        let slot = graphs_slot_ready().await;
+    /// insert routes and returns the database registry containing it.
+    async fn seeded_graph_router() -> DatabaseDataRuntime {
+        let runtime = graphs_runtime_ready().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
-        call(router_of(), "POST", "/v1/graphs/kg").await;
+        call(router_of(), "POST", "/v1/databases/analytics/graphs/kg").await;
         call_json(
             router_of(),
             "POST",
-            "/v1/graphs/kg/nodes",
+            "/v1/databases/analytics/graphs/kg/nodes",
             json!({"nodes": [{"id":"a"},{"id":"b"},{"id":"c"},{"id":"d"}]}),
         )
         .await;
         call_json(
             router_of(),
             "POST",
-            "/v1/graphs/kg/edges",
+            "/v1/databases/analytics/graphs/kg/edges",
             json!({"edges": [
                 {"srcId":"a","predicate":"knows","dstId":"b","provenance":"m1"},
                 {"srcId":"b","predicate":"knows","dstId":"c","provenance":"m2"},
@@ -3166,26 +3352,26 @@ mod tests {
             ]}),
         )
         .await;
-        slot
+        runtime
     }
 
     /// The insert routes return the new snapshot id and the row count.
     #[tokio::test]
     async fn insert_nodes_and_edges_return_the_snapshot_and_count() {
-        let slot = graphs_slot_ready().await;
+        let runtime = graphs_runtime_ready().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
-        call(router_of(), "POST", "/v1/graphs/kg").await;
+        call(router_of(), "POST", "/v1/databases/analytics/graphs/kg").await;
 
         let body = json_body(
             call_json(
                 router_of(),
                 "POST",
-                "/v1/graphs/kg/nodes",
+                "/v1/databases/analytics/graphs/kg/nodes",
                 json!({"nodes": [{"id":"a"},{"id":"b"}]}),
             )
             .await,
@@ -3201,7 +3387,7 @@ mod tests {
             call_json(
                 router_of(),
                 "POST",
-                "/v1/graphs/kg/edges",
+                "/v1/databases/analytics/graphs/kg/edges",
                 json!({"edges": [{"srcId":"a","predicate":"knows","dstId":"b","provenance":"m1"}]}),
             )
             .await,
@@ -3215,15 +3401,23 @@ mod tests {
     /// once the index is built. Reads the small seeded graph.
     #[tokio::test]
     async fn traversal_queries_return_expected_results() {
-        let slot = seeded_graph_router().await;
+        let runtime = seeded_graph_router().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
         // Build the index so the query is served by it.
-        let index = json_body(call(router_of(), "POST", "/v1/graphs/kg/index").await).await;
+        let index = json_body(
+            call(
+                router_of(),
+                "POST",
+                "/v1/databases/analytics/graphs/kg/index",
+            )
+            .await,
+        )
+        .await;
         assert_eq!(index["built"], true);
         assert_eq!(index["edgeCount"], 4);
         assert_eq!(index["mode"], "full");
@@ -3233,7 +3427,7 @@ mod tests {
             call_json(
                 router_of(),
                 "POST",
-                "/v1/graphs/kg/query",
+                "/v1/databases/analytics/graphs/kg/query",
                 json!({"op":"neighbors","start":"a","direction":"out"}),
             )
             .await,
@@ -3254,7 +3448,7 @@ mod tests {
             call_json(
                 router_of(),
                 "POST",
-                "/v1/graphs/kg/query",
+                "/v1/databases/analytics/graphs/kg/query",
                 json!({"op":"kHop","start":"a","k":2,"direction":"out"}),
             )
             .await,
@@ -3277,7 +3471,7 @@ mod tests {
             call_json(
                 router_of(),
                 "POST",
-                "/v1/graphs/kg/query",
+                "/v1/databases/analytics/graphs/kg/query",
                 json!({"op":"paths","start":"a","dst":"d","maxHops":3,"direction":"out"}),
             )
             .await,
@@ -3299,10 +3493,10 @@ mod tests {
     /// after, by the index; the reached set is the same.
     #[tokio::test]
     async fn queries_are_identical_with_and_without_the_index() {
-        let slot = seeded_graph_router().await;
+        let runtime = seeded_graph_router().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
@@ -3311,7 +3505,7 @@ mod tests {
                 call_json(
                     router,
                     "POST",
-                    "/v1/graphs/kg/query",
+                    "/v1/databases/analytics/graphs/kg/query",
                     json!({"op":"kHop","start":"a","k":3,"direction":"out"}),
                 )
                 .await,
@@ -3324,7 +3518,12 @@ mod tests {
         assert_eq!(before["backend"], "scan");
 
         // Build the index, then the same query is served by it.
-        call(router_of(), "POST", "/v1/graphs/kg/index").await;
+        call(
+            router_of(),
+            "POST",
+            "/v1/databases/analytics/graphs/kg/index",
+        )
+        .await;
         let after = khop(router_of()).await;
         assert_eq!(after["backend"], "index");
 
@@ -3336,17 +3535,17 @@ mod tests {
     /// are 400s — the request is missing the bound its op requires.
     #[tokio::test]
     async fn query_missing_required_bound_is_a_400() {
-        let slot = seeded_graph_router().await;
+        let runtime = seeded_graph_router().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
         let response = call_json(
             router_of(),
             "POST",
-            "/v1/graphs/kg/query",
+            "/v1/databases/analytics/graphs/kg/query",
             json!({"op":"kHop","start":"a"}),
         )
         .await;
@@ -3355,7 +3554,7 @@ mod tests {
         let response = call_json(
             router_of(),
             "POST",
-            "/v1/graphs/kg/query",
+            "/v1/databases/analytics/graphs/kg/query",
             json!({"op":"paths","start":"a"}),
         )
         .await;
@@ -3366,15 +3565,16 @@ mod tests {
     /// whether an index is bound to the current edge snapshot.
     #[tokio::test]
     async fn show_reports_counts_and_index_state() {
-        let slot = seeded_graph_router().await;
+        let runtime = seeded_graph_router().await;
         let router_of = || {
             slots_router(Slots {
-                graphs: Some(slot.clone()),
+                database_data: Some(runtime.clone()),
                 ..Slots::default()
             })
         };
         // Before an index build: not indexed, counts reflect the seed.
-        let body = json_body(call(router_of(), "GET", "/v1/graphs/kg").await).await;
+        let body =
+            json_body(call(router_of(), "GET", "/v1/databases/analytics/graphs/kg").await).await;
         assert_eq!(body["namespace"], "kg");
         assert_eq!(body["nodesTable"], "kg.nodes");
         assert_eq!(body["edgesTable"], "kg.edges");
@@ -3383,8 +3583,14 @@ mod tests {
         assert_eq!(body["indexed"], false);
 
         // After an index build: indexed is true.
-        call(router_of(), "POST", "/v1/graphs/kg/index").await;
-        let body = json_body(call(router_of(), "GET", "/v1/graphs/kg").await).await;
+        call(
+            router_of(),
+            "POST",
+            "/v1/databases/analytics/graphs/kg/index",
+        )
+        .await;
+        let body =
+            json_body(call(router_of(), "GET", "/v1/databases/analytics/graphs/kg").await).await;
         assert_eq!(body["indexed"], true);
     }
 }

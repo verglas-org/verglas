@@ -9,6 +9,7 @@ use super::{
     ContainerSpec, DockerApi, DockerRuntimeCore, EngineContainer, EngineCreateRequest,
     LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError,
     TypescriptProject, VesselHttp, VesselProjectSpec, VesselRole, VesselSpec,
+    ensure_local_postgres_tls,
 };
 
 #[derive(Clone, Default)]
@@ -78,6 +79,16 @@ impl DockerApi for FakeDocker {
                 name: request.name,
                 labels: request.labels,
                 state: ObservedState::Stopped,
+                published_ports: request
+                    .published_ports
+                    .into_iter()
+                    .map(|mut port| {
+                        if port.host_port.is_none() {
+                            port.host_port = Some(40_000 + port.container_port % 10_000);
+                        }
+                        port
+                    })
+                    .collect(),
             },
         );
         Ok(())
@@ -368,6 +379,7 @@ async fn unmanaged_name_collision_fails_closed() {
         name: "verglas-scheduler".into(),
         labels: BTreeMap::new(),
         state: ObservedState::Running,
+        published_ports: Vec::new(),
     });
     let runtime = DockerRuntimeCore::new(api.clone());
 
@@ -387,6 +399,7 @@ async fn list_filters_foreign_containers_and_normalizes_identity() {
         name: "foreign".into(),
         labels: BTreeMap::new(),
         state: ObservedState::Running,
+        published_ports: Vec::new(),
     });
 
     let containers = runtime.list().await.expect("list");
@@ -495,6 +508,103 @@ fn published_ports_are_part_of_the_immutable_digest() {
 }
 
 #[test]
+fn inline_files_and_ephemeral_ports_reach_the_engine_request() {
+    let source = tempfile::NamedTempFile::new().expect("source");
+    std::fs::write(source.path(), "vgt1.secret").expect("write source");
+    let request = ContainerSpec::new("database-proxy", "example/proxy:sha")
+        .with_file(
+            source.path().to_string_lossy(),
+            "/run/secrets/workload-token",
+            0o600,
+        )
+        .with_ephemeral_port(5432)
+        .create_request()
+        .expect("request");
+
+    assert_eq!(request.files.len(), 1);
+    assert_eq!(request.files[0].path, "/run/secrets/workload-token");
+    assert_eq!(request.files[0].contents, b"vgt1.secret");
+    assert_eq!(request.files[0].mode, 0o600);
+    assert_eq!(request.published_ports[0].container_port, 5432);
+    assert_eq!(request.published_ports[0].host_port, None);
+}
+
+#[tokio::test]
+async fn source_file_rotation_replaces_container_without_persisting_bearer() {
+    let source = tempfile::NamedTempFile::new().expect("source");
+    std::fs::write(source.path(), "first-bearer").expect("first bearer");
+    let specification = ContainerSpec::new("database-proxy", "example/proxy:sha").with_file(
+        source.path().to_string_lossy(),
+        "/run/secrets/workload-token",
+        0o600,
+    );
+    assert!(
+        !serde_json::to_string(&specification)
+            .expect("serialize")
+            .contains("first-bearer")
+    );
+    let api = FakeDocker::default();
+    let runtime = DockerRuntimeCore::new(api);
+    runtime
+        .reconcile(&specification)
+        .await
+        .expect("first reconcile");
+
+    std::fs::write(source.path(), "rotated-bearer").expect("rotate bearer");
+    let outcome = runtime
+        .reconcile(&specification)
+        .await
+        .expect("rotation reconcile");
+
+    assert_eq!(outcome, ReconcileOutcome::Replaced);
+}
+
+#[tokio::test]
+async fn ephemeral_host_port_is_observable_after_reconcile() {
+    let api = FakeDocker::default();
+    let runtime = DockerRuntimeCore::new(api);
+    let specification =
+        ContainerSpec::new("database-proxy", "example/proxy:sha").with_ephemeral_port(5432);
+
+    runtime.reconcile(&specification).await.expect("reconcile");
+    let observed = runtime
+        .inspect("database-proxy")
+        .await
+        .expect("inspect")
+        .expect("container");
+
+    assert_eq!(observed.published_ports.len(), 1);
+    assert_eq!(observed.published_ports[0].container_port, 5432);
+    assert_eq!(observed.published_ports[0].host_port, Some(45_432));
+}
+
+#[test]
+fn inline_file_paths_and_modes_fail_closed() {
+    let relative =
+        ContainerSpec::new("service", "alpine:3.22").with_file("/tmp/source", "run/secret", 0o600);
+    let traversal = ContainerSpec::new("service", "alpine:3.22").with_file(
+        "/tmp/source",
+        "/run/../secret",
+        0o600,
+    );
+    let executable =
+        ContainerSpec::new("service", "alpine:3.22").with_file("/tmp/source", "/run/secret", 0o700);
+
+    assert!(matches!(
+        relative.validate(),
+        Err(RuntimeError::InvalidFile { .. })
+    ));
+    assert!(matches!(
+        traversal.validate(),
+        Err(RuntimeError::InvalidFile { .. })
+    ));
+    assert!(matches!(
+        executable.validate(),
+        Err(RuntimeError::InvalidFile { .. })
+    ));
+}
+
+#[test]
 fn entrypoint_override_is_part_of_the_immutable_digest() {
     let manager = ContainerSpec::new("scheduler", "verglas/verglas-container-runtime:local");
     let scheduler = manager.clone().with_entrypoint(["verglas-scheduler"]);
@@ -502,5 +612,33 @@ fn entrypoint_override_is_part_of_the_immutable_digest() {
     assert_ne!(
         manager.digest().expect("manager digest"),
         scheduler.digest().expect("scheduler digest")
+    );
+}
+
+#[test]
+fn local_postgres_tls_identity_is_created_once_in_runtime_state() {
+    let directory = tempfile::tempdir().expect("state directory");
+    let state = directory.path().join("deployments.json");
+
+    let first = ensure_local_postgres_tls(&state).expect("create identity");
+    let certificate = std::fs::read(&first.certificate).expect("certificate");
+    let private_key = std::fs::read(&first.private_key).expect("private key");
+    let again = ensure_local_postgres_tls(&state).expect("reuse identity");
+
+    assert_eq!(first, again);
+    assert_eq!(
+        certificate,
+        std::fs::read(&again.certificate).expect("certificate")
+    );
+    assert_eq!(private_key, std::fs::read(&again.private_key).expect("key"));
+    assert!(
+        String::from_utf8(certificate)
+            .expect("pem")
+            .contains("BEGIN CERTIFICATE")
+    );
+    assert!(
+        String::from_utf8(private_key)
+            .expect("pem")
+            .contains("BEGIN PRIVATE KEY")
     );
 }

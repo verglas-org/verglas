@@ -21,36 +21,37 @@ use crate::cli::{IndexCommand, TableCommand, TableDeleteArgs};
 pub async fn run(
     command: TableCommand,
     server_endpoint: &str,
+    token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     // Catalog metadata verbs bypass the server; execution and operational verbs
     // use its thin transport.
     match command {
-        TableCommand::Delete(args) => return run_delete(args, json).await,
+        TableCommand::Delete(args) => return run_delete(args, token, json).await,
         TableCommand::List(args) => {
-            let report = crate::commands::catalog::CatalogClient::from_agent_config()?
+            let report = crate::commands::catalog::CatalogClient::from_agent_config(token)?
                 .list_tables(args.namespace.as_deref())
                 .await?;
             return emit(&report, json, render_list);
         }
         TableCommand::Show(args) => {
-            let report = crate::commands::catalog::CatalogClient::from_agent_config()?
+            let report = crate::commands::catalog::CatalogClient::from_agent_config(token)?
                 .show_table(&args.table)
                 .await?;
             return emit(&report, json, render_show);
         }
         TableCommand::History(args) => {
-            let report = crate::commands::catalog::CatalogClient::from_agent_config()?
+            let report = crate::commands::catalog::CatalogClient::from_agent_config(token)?
                 .table_history(&args.table)
                 .await?;
             return emit(&report, json, render_history);
         }
         TableCommand::Metrics => {
-            return crate::commands::table_metrics::run(server_endpoint, json).await;
+            return crate::commands::table_metrics::run(server_endpoint, token, json).await;
         }
         _ => {}
     }
-    let client = crate::backend::server(server_endpoint)?;
+    let client = crate::backend::server(server_endpoint, token)?;
     match command {
         TableCommand::Create(args) => {
             let report: CreateReport = client
@@ -92,8 +93,12 @@ pub async fn run(
 /// `~/.verglas/config.toml` and issues the REST drop-table call. Requires
 /// `--yes` or an interactive `y` confirmation; prints exactly what will be
 /// dropped before doing it.
-async fn run_delete(args: TableDeleteArgs, json: bool) -> Result<(), Box<dyn Error>> {
-    let catalog = crate::commands::catalog::CatalogClient::from_agent_config()?;
+async fn run_delete(
+    args: TableDeleteArgs,
+    token: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let catalog = crate::commands::catalog::CatalogClient::from_agent_config(token)?;
     let (namespace, table) = crate::commands::catalog::split_ident(&args.table)?;
 
     if !args.yes {
@@ -134,9 +139,10 @@ async fn run_delete(args: TableDeleteArgs, json: bool) -> Result<(), Box<dyn Err
 pub async fn run_index_registry(
     command: IndexCommand,
     server_endpoint: &str,
+    token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::server(server_endpoint)?;
+    let client = crate::backend::server(server_endpoint, token)?;
     match command {
         IndexCommand::List(args) => {
             let response: IndexListResponse = client

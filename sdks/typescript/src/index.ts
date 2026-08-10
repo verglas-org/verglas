@@ -24,10 +24,21 @@ export {
   VerglasSchedulerClient,
 } from "./control";
 export type {
+  AccessAction,
+  AccessAuthorization,
+  AccessAuthorizationRequest,
+  AccessDecision,
+  AccessIdentity,
+  AccessTokenGrant,
+  AccessTokenSummary,
   ControlConnectOptions,
+  CreateAccessTokenRequest,
+  CreateDatabaseTokenRequest,
   CreateDatabaseRequest,
+  DatabaseAccessToken,
   DatabaseView,
   JobSummary,
+  MintedAccessToken,
   WorkerRow,
   WorkerSpec,
 } from "./control";

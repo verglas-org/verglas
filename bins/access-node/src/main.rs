@@ -6,18 +6,19 @@
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
-use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
-use axum::middleware::{Next, from_fn_with_state};
-use axum::response::{IntoResponse, Response};
+use axum::http::StatusCode;
 use axum::routing::get;
 use clap::Parser;
+use tokio::io::AsyncWriteExt;
 use verglas_authz::{
-    AccessService, Action, AeadSecretCipher, Authorizer, AuthzError, Grant, Principal,
-    PrincipalKind, ResolveSecret, Resource, ResourceKind, SecretError, SecretKind, SecretService,
+    AccessService, AccessTokenService, AccessTokenSigner, Action, AeadSecretCipher, Authorizer,
+    AuthzError, Grant, Principal, PrincipalKind, ResolveSecret, Resource, ResourceKind,
+    SecretError, SecretKind, SecretService, TargetJwtSigner, TokenMintRequest, new_access_token_id,
 };
 use verglas_authz_openfga::{OpenFgaPolicyEngine, bootstrap};
 use verglas_authz_postgres::PostgresAuthorizationRepository;
@@ -92,8 +93,15 @@ struct Args {
     #[arg(long, env = "VERGLAS_TENANT_ID")]
     tenant_id: String,
     /// Existing service principal that owns secrets created through the public API.
-    #[arg(long, env = "VERGLAS_ACCESS_SERVICE_PRINCIPAL")]
+    #[arg(
+        long,
+        env = "VERGLAS_ACCESS_SERVICE_PRINCIPAL",
+        default_value = "service/access"
+    )]
     service_principal: String,
+    /// Email address that receives the tenant's initial owner grant.
+    #[arg(long, env = "VERGLAS_INITIAL_OWNER_EMAIL")]
+    initial_owner_email: String,
     /// Dedicated `verglas_permissions` logical database.
     #[arg(long, env = "VERGLAS_ACCESS_DATABASE_URL")]
     database_url: String,
@@ -106,9 +114,49 @@ struct Args {
     /// Pre-shared token used only between access and OpenFGA.
     #[arg(long, env = "VERGLAS_OPENFGA_TOKEN")]
     openfga_token: String,
-    /// Pre-shared token accepted from trusted tenant services.
-    #[arg(long, env = "VERGLAS_ACCESS_SERVICE_TOKEN")]
-    service_token: String,
+    /// Base64-encoded 256-bit key used to sign revocable access tokens.
+    #[arg(long, env = "VERGLAS_TOKEN_SIGNING_KEY", hide_env_values = true)]
+    token_signing_key: String,
+    /// Hex-encoded 256-bit key used to verify OS identity assertions.
+    #[arg(long, env = "VERGLAS_IDENTITY_ASSERTION_KEY", hide_env_values = true)]
+    identity_assertion_key: String,
+    /// Base64-encoded Ed25519 seed used for short-lived target database JWTs.
+    #[arg(long, env = "VERGLAS_TARGET_JWT_SIGNING_KEY", hide_env_values = true)]
+    target_jwt_signing_key: String,
+    /// Isolated directory receiving the Verglas server credential.
+    #[arg(
+        long,
+        env = "VERGLAS_SERVER_TOKEN_DIRECTORY",
+        default_value = "/var/run/verglas/server"
+    )]
+    server_token_directory: PathBuf,
+    /// Isolated directory receiving the Lakekeeper policy credential.
+    #[arg(
+        long,
+        env = "VERGLAS_LAKEKEEPER_TOKEN_DIRECTORY",
+        default_value = "/var/run/verglas/lakekeeper"
+    )]
+    lakekeeper_token_directory: PathBuf,
+    /// Isolated directory receiving the Neon policy credential.
+    #[arg(
+        long,
+        env = "VERGLAS_NEON_TOKEN_DIRECTORY",
+        default_value = "/var/run/verglas/neon"
+    )]
+    neon_token_directory: PathBuf,
+    /// Private access-service origin reachable by managed database proxies.
+    #[arg(
+        long,
+        env = "VERGLAS_ACCESS_INTERNAL_ENDPOINT",
+        default_value = "http://verglas-access:8345"
+    )]
+    access_internal_endpoint: String,
+    /// PEM certificate presented by managed Postgres proxy listeners.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_TLS_CERTIFICATE_FILE")]
+    managed_postgres_tls_certificate_file: PathBuf,
+    /// PEM private key paired with the managed Postgres proxy certificate.
+    #[arg(long, env = "VERGLAS_MANAGED_POSTGRES_TLS_PRIVATE_KEY_FILE")]
+    managed_postgres_tls_private_key_file: PathBuf,
     /// Hex-encoded 256-bit key used only to encrypt tenant secret values.
     #[arg(long, env = "VERGLAS_SECRET_ENCRYPTION_KEY", hide_env_values = true)]
     secret_encryption_key: String,
@@ -194,9 +242,6 @@ async fn run(args: Args) -> Result<(), String> {
     if args.service_principal.is_empty() {
         return Err("VERGLAS_ACCESS_SERVICE_PRINCIPAL must not be empty".to_owned());
     }
-    if args.service_token.is_empty() {
-        return Err("VERGLAS_ACCESS_SERVICE_TOKEN must not be empty".to_owned());
-    }
     let repository = Arc::new(
         PostgresAuthorizationRepository::connect(&args.database_url)
             .await
@@ -212,12 +257,42 @@ async fn run(args: Args) -> Result<(), String> {
     let policy = OpenFgaPolicyEngine::new(openfga).map_err(|error| error.to_string())?;
     let authorizer: Arc<dyn Authorizer> =
         Arc::new(AccessService::new(repository.clone(), Arc::new(policy)));
-    ensure_service_identity(
+    ensure_tenant_identities(
         authorizer.as_ref(),
         &args.tenant_id,
         &args.service_principal,
+        &args.initial_owner_email,
     )
     .await?;
+    let token_signer = AccessTokenSigner::from_base64(&args.token_signing_key)
+        .map_err(|error| error.to_string())?;
+    let identity_assertion_key = decode_256_bit_hex(
+        "VERGLAS_IDENTITY_ASSERTION_KEY",
+        &args.identity_assertion_key,
+    )?;
+    let tokens = Arc::new(AccessTokenService::new(token_signer, repository.clone()));
+    let target_jwt_signer = TargetJwtSigner::from_base64_derived(&args.target_jwt_signing_key)
+        .map_err(|error| error.to_string())?;
+    let credential_directories = InternalCredentialDirectories {
+        server: args.server_token_directory,
+        lakekeeper: args.lakekeeper_token_directory,
+        neon: args.neon_token_directory,
+    };
+    provision_internal_credentials(
+        authorizer.clone(),
+        tokens.clone(),
+        &args.tenant_id,
+        &credential_directories,
+    )
+    .await?;
+    let neon_policy_token_file = credential_directories.neon.join("verglas-neon.token");
+    let postgres_credential_directory = credential_directories.neon.join("postgres");
+    spawn_internal_credential_rotation(
+        authorizer.clone(),
+        tokens.clone(),
+        args.tenant_id.clone(),
+        credential_directories,
+    );
     let encryption_key = hex::decode(&args.secret_encryption_key).map_err(|_| {
         "VERGLAS_SECRET_ENCRYPTION_KEY must be 64 hexadecimal characters".to_owned()
     })?;
@@ -263,6 +338,11 @@ async fn run(args: Args) -> Result<(), String> {
             remote_secret_access_key: args.managed_postgres_storage_secret_access_key.clone(),
             safekeepers: args.managed_postgres_safekeepers.clone(),
             credential_key: postgres_credential_key,
+            access_endpoint: args.access_internal_endpoint,
+            policy_engine_token_file: neon_policy_token_file,
+            tls_certificate_file: args.managed_postgres_tls_certificate_file,
+            tls_private_key_file: args.managed_postgres_tls_private_key_file,
+            credential_directory: postgres_credential_directory,
         },
     )
     .map_err(|error| error.to_string())?;
@@ -275,25 +355,50 @@ async fn run(args: Args) -> Result<(), String> {
         .recover(&args.tenant_id)
         .await
         .map_err(|error| error.to_string())?;
-    for failure in recovery_failures {
+    for failure in &recovery_failures {
         eprintln!("verglas-access: database runtime recovery failed: {failure}");
     }
-    let token: Arc<str> = Arc::from(args.service_token);
-    let protected = Router::new()
-        .merge(verglas_rest::access::router_with_secrets(
-            authorizer,
-            secrets,
-            args.tenant_id.clone(),
-            args.service_principal,
-        ))
-        .merge(verglas_rest::database::router(
+    if !recovery_failures.is_empty() {
+        let recovery = database_service.clone();
+        let recovery_tenant = args.tenant_id.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(2);
+            loop {
+                tokio::time::sleep(delay).await;
+                match recovery.recover(&recovery_tenant).await {
+                    Ok(failures) if failures.is_empty() => break,
+                    Ok(failures) => {
+                        for failure in failures {
+                            eprintln!(
+                                "verglas-access: database runtime recovery retry failed: {failure}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("verglas-access: database recovery retry failed: {error}");
+                    }
+                }
+                delay = (delay * 2).min(Duration::from_secs(60));
+            }
+        });
+    }
+    let access_runtime =
+        verglas_rest::access::AccessHttpRuntime::new(authorizer, tokens, args.tenant_id.clone())
+            .with_identity_assertion_key(identity_assertion_key)
+            .with_secrets(secrets)
+            .with_target_jwt_signer(target_jwt_signer);
+    let protected_databases = verglas_rest::data_plane::protect(
+        verglas_rest::database::router(
             database_service,
+            Arc::new(access_runtime.clone()),
             args.tenant_id,
-        ))
-        .layer(from_fn_with_state(token, require_service_token));
+        ),
+        access_runtime.clone(),
+    );
     let app = Router::new()
         .route("/healthz", get(health))
-        .merge(protected);
+        .merge(verglas_rest::access::router(access_runtime))
+        .merge(protected_databases);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .map_err(|error| error.to_string())?;
@@ -304,25 +409,36 @@ async fn run(args: Args) -> Result<(), String> {
 }
 
 /// Idempotently bootstraps the tenant root and trusted local service principal.
-async fn ensure_service_identity(
+async fn ensure_tenant_identities(
     authorizer: &dyn Authorizer,
     tenant_id: &str,
-    principal_id: &str,
+    service_principal_id: &str,
+    initial_owner_email: &str,
 ) -> Result<(), String> {
     let tenant = Resource::new(tenant_id, "tenant", ResourceKind::Tenant);
     match authorizer.create_resource(tenant).await {
         Ok(_) | Err(AuthzError::Conflict(_)) => {}
         Err(error) => return Err(format!("cannot bootstrap tenant resource: {error}")),
     }
-    let principal = Principal::new(tenant_id, principal_id, PrincipalKind::ServiceAccount);
+    let principal = Principal::new(
+        tenant_id,
+        service_principal_id,
+        PrincipalKind::ServiceAccount,
+    );
     match authorizer.create_principal(principal).await {
         Ok(_) | Err(AuthzError::Conflict(_)) => {}
         Err(error) => return Err(format!("cannot bootstrap service principal: {error}")),
     }
+    let owner_principal_id = initial_owner_principal_id(initial_owner_email)?;
+    let owner_principal = Principal::new(tenant_id, &owner_principal_id, PrincipalKind::User);
+    match authorizer.create_principal(owner_principal).await {
+        Ok(_) | Err(AuthzError::Conflict(_)) => {}
+        Err(error) => return Err(format!("cannot bootstrap initial owner principal: {error}")),
+    }
     let owner = Grant::new(
-        "access-service-owner",
+        "initial-owner",
         tenant_id,
-        principal_id,
+        owner_principal_id,
         "tenant",
         BTreeSet::from([Action::Own]),
     );
@@ -332,28 +448,233 @@ async fn ensure_service_identity(
     }
 }
 
+/// Maps one configured email to the stable tenant-local user principal identity.
+fn initial_owner_principal_id(email: &str) -> Result<String, String> {
+    let email = email.trim().to_lowercase();
+    let Some((local, domain)) = email.split_once('@') else {
+        return Err("VERGLAS_INITIAL_OWNER_EMAIL must be a valid email address".to_owned());
+    };
+    if local.is_empty()
+        || domain.is_empty()
+        || !domain.contains('.')
+        || domain.contains('@')
+        || email.len() > 254
+    {
+        return Err("VERGLAS_INITIAL_OWNER_EMAIL must be a valid email address".to_owned());
+    }
+    Ok(format!("user/{email}"))
+}
+
+/// Decodes one exact 256-bit hexadecimal configuration key.
+fn decode_256_bit_hex(name: &str, value: &str) -> Result<[u8; 32], String> {
+    let decoded =
+        hex::decode(value).map_err(|_| format!("{name} must be 64 hexadecimal characters"))?;
+    decoded
+        .try_into()
+        .map_err(|_| format!("{name} must be 64 hexadecimal characters"))
+}
+
+/// Mutually isolated credential directories mounted by exactly one consumer each.
+#[derive(Clone)]
+struct InternalCredentialDirectories {
+    server: PathBuf,
+    lakekeeper: PathBuf,
+    neon: PathBuf,
+}
+
+/// Mints and atomically installs least-privilege credentials for autonomous services.
+async fn provision_internal_credentials(
+    authorizer: Arc<dyn Authorizer>,
+    tokens: Arc<AccessTokenService>,
+    tenant_id: &str,
+    directories: &InternalCredentialDirectories,
+) -> Result<(), String> {
+    for directory in [
+        &directories.server,
+        &directories.lakekeeper,
+        &directories.neon,
+    ] {
+        tokio::fs::create_dir_all(directory)
+            .await
+            .map_err(|error| format!("cannot create access token directory: {error}"))?;
+        set_directory_permissions(directory).await?;
+    }
+    for (parent_id, directory, file_name, audience, action) in [
+        (
+            "service/verglas-server",
+            directories.server.as_path(),
+            "verglas-server.token",
+            verglas_rest::access::DATA_PLANE_AUDIENCE,
+            Some(Action::Discover),
+        ),
+        (
+            "service/verglas-lakekeeper",
+            directories.lakekeeper.as_path(),
+            "verglas-lakekeeper.token",
+            verglas_rest::access::POLICY_ENGINE_AUDIENCE,
+            None,
+        ),
+        (
+            "service/verglas-neon",
+            directories.neon.as_path(),
+            "verglas-neon.token",
+            verglas_rest::access::POLICY_ENGINE_AUDIENCE,
+            None,
+        ),
+    ] {
+        ensure_internal_principal(authorizer.as_ref(), tenant_id, parent_id).await?;
+        let token_id = new_access_token_id();
+        let principal_id = format!("token/{token_id}");
+        authorizer
+            .create_principal(
+                Principal::new(tenant_id, &principal_id, PrincipalKind::ServiceAccount)
+                    .with_parent(parent_id),
+            )
+            .await
+            .map_err(|error| format!("cannot create internal token principal: {error}"))?;
+        if let Some(action) = action {
+            authorizer
+                .create_grant(Grant::new(
+                    format!("internal-token-grant/{token_id}"),
+                    tenant_id,
+                    &principal_id,
+                    "tenant",
+                    BTreeSet::from([action]),
+                ))
+                .await
+                .map_err(|error| format!("cannot grant internal token authority: {error}"))?;
+        }
+        let issued_at = unix_time();
+        let expires_at = issued_at.saturating_add(24 * 60 * 60);
+        let policy_version = authorizer
+            .policy_version(tenant_id)
+            .await
+            .map_err(|error| format!("cannot read policy version: {error}"))?;
+        let minted = tokens
+            .mint(TokenMintRequest::new(
+                &token_id,
+                tenant_id,
+                parent_id,
+                &principal_id,
+                format!("Internal {parent_id}"),
+                audience,
+                policy_version,
+                issued_at,
+                expires_at,
+            ))
+            .await
+            .map_err(|error| format!("cannot mint internal credential: {error}"))?;
+        write_credential(directory, file_name, &token_id, minted.token.expose()).await?;
+    }
+    Ok(())
+}
+
+/// Ensures one non-human parent identity without granting it tenant ownership.
+async fn ensure_internal_principal(
+    authorizer: &dyn Authorizer,
+    tenant_id: &str,
+    principal_id: &str,
+) -> Result<(), String> {
+    match authorizer
+        .create_principal(Principal::new(
+            tenant_id,
+            principal_id,
+            PrincipalKind::ServiceAccount,
+        ))
+        .await
+    {
+        Ok(_) | Err(AuthzError::Conflict(_)) => Ok(()),
+        Err(error) => Err(format!("cannot bootstrap internal principal: {error}")),
+    }
+}
+
+/// Replaces one credential file without exposing a partially written bearer.
+async fn write_credential(
+    directory: &Path,
+    file_name: &str,
+    token_id: &str,
+    token: &str,
+) -> Result<(), String> {
+    let temporary = directory.join(format!(".{file_name}.{token_id}.tmp"));
+    let destination = directory.join(file_name);
+    let mut file = tokio::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .await
+        .map_err(|error| format!("cannot create temporary credential: {error}"))?;
+    file.write_all(token.as_bytes())
+        .await
+        .map_err(|error| format!("cannot write credential: {error}"))?;
+    file.sync_all()
+        .await
+        .map_err(|error| format!("cannot sync credential: {error}"))?;
+    set_file_permissions(&temporary).await?;
+    tokio::fs::rename(&temporary, &destination)
+        .await
+        .map_err(|error| format!("cannot install credential: {error}"))
+}
+
+/// Allows a consumer with a different container UID to traverse its isolated volume.
+async fn set_directory_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .await
+            .map_err(|error| format!("cannot restrict credential directory: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Makes one isolated-volume bearer immutable to its read-only consumer mount.
+async fn set_file_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+            .await
+            .map_err(|error| format!("cannot restrict credential file: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Rotates internal credentials halfway through their lifetime without stopping service.
+fn spawn_internal_credential_rotation(
+    authorizer: Arc<dyn Authorizer>,
+    tokens: Arc<AccessTokenService>,
+    tenant_id: String,
+    directories: InternalCredentialDirectories,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(12 * 60 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            if let Err(error) = provision_internal_credentials(
+                authorizer.clone(),
+                tokens.clone(),
+                &tenant_id,
+                &directories,
+            )
+            .await
+            {
+                eprintln!("verglas-access: internal credential rotation failed: {error}");
+            }
+        }
+    });
+}
+
+/// Returns the current Unix timestamp for credential validity intervals.
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
 /// Reports liveness after both durable dependencies passed startup.
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
-}
-
-/// Rejects every access API request without the configured service credential.
-async fn require_service_token(
-    State(token): State<Arc<str>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let expected = format!("Bearer {token}");
-    let authorized = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == expected);
-    if authorized {
-        next.run(request).await
-    } else {
-        StatusCode::UNAUTHORIZED.into_response()
-    }
 }
 
 /// Waits for an ordinary process termination signal.
@@ -383,17 +704,27 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use verglas_authz::MemoryAuthorizer;
+    use verglas_authz::{MemoryAccessTokenRegistry, MemoryAuthorizer};
 
     #[tokio::test]
-    async fn service_identity_bootstrap_is_idempotent() {
+    async fn tenant_identity_bootstrap_is_idempotent() {
         let authorizer = MemoryAuthorizer::new();
-        ensure_service_identity(&authorizer, "tenant-a", "local-service")
-            .await
-            .expect("first bootstrap");
-        ensure_service_identity(&authorizer, "tenant-a", "local-service")
-            .await
-            .expect("second bootstrap");
+        ensure_tenant_identities(
+            &authorizer,
+            "tenant-a",
+            "local-service",
+            "Alice@Example.com",
+        )
+        .await
+        .expect("first bootstrap");
+        ensure_tenant_identities(
+            &authorizer,
+            "tenant-a",
+            "local-service",
+            "Alice@Example.com",
+        )
+        .await
+        .expect("second bootstrap");
 
         let principal = authorizer
             .get_principal("tenant-a", "local-service")
@@ -405,6 +736,11 @@ mod tests {
             .await
             .expect("tenant resource");
         assert_eq!(tenant.kind, ResourceKind::Tenant);
+        let owner = authorizer
+            .get_principal("tenant-a", "user/alice@example.com")
+            .await
+            .expect("owner principal");
+        assert_eq!(owner.kind, PrincipalKind::User);
         assert_eq!(
             authorizer
                 .list_grants("tenant-a")
@@ -413,5 +749,92 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn initial_owner_identity_is_email_only_and_canonical() {
+        assert_eq!(
+            initial_owner_principal_id(" Alice@Example.com ").expect("email"),
+            "user/alice@example.com"
+        );
+        assert!(initial_owner_principal_id("alice").is_err());
+    }
+
+    #[tokio::test]
+    async fn internal_credentials_are_scoped_and_atomically_installed() {
+        let authorizer = Arc::new(MemoryAuthorizer::new());
+        authorizer
+            .create_resource(Resource::new("tenant-a", "tenant", ResourceKind::Tenant))
+            .await
+            .expect("tenant");
+        let tokens = Arc::new(AccessTokenService::new(
+            AccessTokenSigner::new([6; 32]),
+            Arc::new(MemoryAccessTokenRegistry::new()),
+        ));
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let directories = InternalCredentialDirectories {
+            server: directory.path().join("server"),
+            lakekeeper: directory.path().join("lakekeeper"),
+            neon: directory.path().join("neon"),
+        };
+
+        provision_internal_credentials(
+            authorizer.clone(),
+            tokens.clone(),
+            "tenant-a",
+            &directories,
+        )
+        .await
+        .expect("credentials");
+
+        for (directory, file_name, audience) in [
+            (
+                directories.server.as_path(),
+                "verglas-server.token",
+                verglas_rest::access::DATA_PLANE_AUDIENCE,
+            ),
+            (
+                directories.lakekeeper.as_path(),
+                "verglas-lakekeeper.token",
+                verglas_rest::access::POLICY_ENGINE_AUDIENCE,
+            ),
+            (
+                directories.neon.as_path(),
+                "verglas-neon.token",
+                verglas_rest::access::POLICY_ENGINE_AUDIENCE,
+            ),
+        ] {
+            let token = tokio::fs::read_to_string(directory.join(file_name))
+                .await
+                .expect("credential file");
+            let claims = tokens
+                .authenticate(&token, "tenant-a", audience, unix_time())
+                .await
+                .expect("credential authentication");
+            let wrong_audience = if audience == verglas_rest::access::DATA_PLANE_AUDIENCE {
+                verglas_rest::access::POLICY_ENGINE_AUDIENCE
+            } else {
+                verglas_rest::access::DATA_PLANE_AUDIENCE
+            };
+            assert!(
+                tokens
+                    .authenticate(&token, "tenant-a", wrong_audience, unix_time())
+                    .await
+                    .is_err()
+            );
+            if file_name == "verglas-server.token" {
+                let decision = authorizer
+                    .check(verglas_authz::AccessCheck::new(
+                        "tenant-a",
+                        claims.principal_id,
+                        "tenant",
+                        Action::Discover,
+                    ))
+                    .await
+                    .expect("decision");
+                assert!(decision.allowed);
+            }
+        }
+        assert!(!directory.path().join("root.token").exists());
     }
 }

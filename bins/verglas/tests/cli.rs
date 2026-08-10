@@ -18,7 +18,7 @@ use std::process::Command;
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// local `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 12] = [
+const SURVIVING_COMMANDS: [&str; 13] = [
     "drain",
     "status",
     "table",
@@ -31,6 +31,7 @@ const SURVIVING_COMMANDS: [&str; 12] = [
     "vessel",
     "db",
     "secret",
+    "token",
 ];
 
 /// Commands removed from the CLI: `--help` must not name them.

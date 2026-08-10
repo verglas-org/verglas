@@ -12,7 +12,6 @@ use verglas_server::{VERSION, admin, follow, logging, platform};
 use std::sync::{Arc, OnceLock};
 
 // Dependency edge reserved for the server's table-awareness wiring (M3).
-use tower::util::ServiceExt as _;
 use verglas_cache::{CachePurger, HybridCacheEngine};
 use verglas_cluster::fragments::{FragmentKey, FragmentRecord};
 use verglas_cluster::peer::{FragmentHandlers, LocalBlockFn};
@@ -849,24 +848,37 @@ fn build_write_worker_dispatcher(
     credentials: &(String, String),
     resolved_s3_port: u16,
     resolved_admin_port: u16,
+    catalogs: verglas_catalog::CatalogRuntimeRegistry,
 ) -> Option<Arc<verglas_server::write_worker::WriteWorkerDispatcher>> {
     let write_worker = config.write_worker.as_ref()?;
-    let config_path = match render_write_worker_config(
-        config,
-        credentials,
-        resolved_s3_port,
-        resolved_admin_port,
-    ) {
+    let dir = config.cache.dir.join("write-worker");
+    let credentials_file = match write_role_credentials(&dir, credentials) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("verglas-server {VERSION} cannot configure write worker: {error}");
             return None;
         }
     };
+    let scheme = if config.listen.tls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
     Some(Arc::new(
         verglas_server::write_worker::WriteWorkerDispatcher::new(
             std::path::PathBuf::from(&write_worker.binary),
-            config_path,
+            verglas_server::write_worker::WriteWorkerRuntimeConfig {
+                config_dir: dir.join("databases"),
+                cache_s3_endpoint: format!("{scheme}://127.0.0.1:{resolved_s3_port}"),
+                region: config
+                    .backend
+                    .region
+                    .clone()
+                    .unwrap_or_else(|| "us-east-1".to_owned()),
+                credentials_file,
+                admin_origin: format!("{scheme}://127.0.0.1:{resolved_admin_port}"),
+            },
+            catalogs,
         ),
     ))
 }
@@ -895,50 +907,6 @@ fn write_role_credentials(
     Ok(credentials_path)
 }
 
-/// Renders `verglas-write` config: cache S3 endpoint + full `[catalog]` commit target.
-fn render_write_worker_config(
-    config: &verglas_core::config::Config,
-    credentials: &(String, String),
-    resolved_s3_port: u16,
-    resolved_admin_port: u16,
-) -> Result<std::path::PathBuf, String> {
-    let dir = config.cache.dir.join("write-worker");
-    let credentials_path = write_role_credentials(&dir, credentials)?;
-    let scheme = if config.listen.tls.is_some() {
-        "https"
-    } else {
-        "http"
-    };
-    let region = config
-        .backend
-        .region
-        .clone()
-        .unwrap_or_else(|| "us-east-1".to_owned());
-    let mut catalog = config
-        .catalog
-        .as_ref()
-        .ok_or_else(|| "execution roles require [catalog]".to_owned())?
-        .clone();
-    catalog.uri = format!("{scheme}://127.0.0.1:{resolved_admin_port}/catalog");
-    catalog.credentials_file = None;
-    catalog.credentials_profile = None;
-    catalog.bearer_token = None;
-    catalog.sigv4_region = None;
-    catalog.sigv4_signing_name = None;
-    let catalog_toml =
-        toml::to_string(&catalog).map_err(|error| format!("serialize role catalog: {error}"))?;
-    let rendered = format!(
-        "[listen]\nadmin_port = 0\n\n\
-         [cache]\ns3_endpoint = \"{scheme}://127.0.0.1:{resolved_s3_port}\"\nregion = \"{region}\"\ncredentials_file = \"{credentials}\"\n\n\
-         [catalog]\n{catalog_toml}",
-        credentials = credentials_path.display(),
-    );
-    let config_path = dir.join("config.toml");
-    std::fs::write(&config_path, rendered)
-        .map_err(|error| format!("write role config: {error}"))?;
-    Ok(config_path)
-}
-
 /// Opens the internal catalog handle used by compaction, graph, vector, and
 /// worker subsystems through the local on-prem catalog proxy.
 async fn build_tables_catalog(
@@ -962,74 +930,6 @@ fn admin_listen_addr(config: Option<&verglas_core::config::Config>) -> String {
     })
 }
 
-/// Drives the server's execution gateway as a [`verglas_s3::ServingApi`], so
-/// the SigV4-gated S3 data port answers the same query and write requests as
-/// the loopback admin listener. The Cloudflare
-/// edge re-signs a cache-pathed `/v1` request with the cache keypair and
-/// forwards it to the data port; the s3s route validates the signature and hands
-/// the buffered request here. This reconstructs an axum request, runs it through
-/// the router once, and buffers the response. The router is a `Router<()>` built
-/// from the configured isolated role dispatchers.
-struct V1ServingApi {
-    /// The state-erased query/write dispatch router.
-    router: axum::Router,
-}
-
-#[async_trait::async_trait]
-impl verglas_s3::ServingApi for V1ServingApi {
-    async fn handle(&self, req: verglas_s3::ApiRequest) -> verglas_s3::ApiResponse {
-        let verglas_s3::ApiRequest {
-            tenant,
-            method,
-            uri,
-            headers,
-            body,
-        } = req;
-        let mut builder = axum::http::Request::builder().method(method).uri(uri);
-        if let Some(destination) = builder.headers_mut() {
-            *destination = headers;
-        }
-        let mut request = match builder.body(axum::body::Body::from(body)) {
-            Ok(request) => request,
-            Err(error) => {
-                return v1_error_response(format!("building the /v1 request failed: {error}"));
-            }
-        };
-        request
-            .extensions_mut()
-            .insert(verglas_rest::kv::AuthenticatedKvPrincipal { tenant });
-        // The axum router is infallible (its Service error is `Infallible`), so
-        // `oneshot` cannot return a transport error here.
-        let response = match self.router.clone().oneshot(request).await {
-            Ok(response) => response,
-            Err(never) => match never {},
-        };
-        let (parts, body) = response.into_parts();
-        let body = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                return v1_error_response(format!("reading the /v1 response body failed: {error}"));
-            }
-        };
-        verglas_s3::ApiResponse {
-            status: parts.status,
-            headers: parts.headers,
-            body,
-        }
-    }
-}
-
-/// A bare 500 [`verglas_s3::ApiResponse`] for the rare failures reconstructing or
-/// buffering a `/v1` round-trip (never the handler's own errors, which the
-/// router renders normally).
-fn v1_error_response(message: String) -> verglas_s3::ApiResponse {
-    verglas_s3::ApiResponse {
-        status: axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-        headers: axum::http::HeaderMap::new(),
-        body: axum::body::Bytes::from(message),
-    }
-}
-
 /// Serves the admin API on the pre-bound `listener` until the process is
 /// interrupted. The caller binds so the resolved port is known (and reported,
 /// #194) before serving; the `purger` (present only when a cache engine exists)
@@ -1044,6 +944,7 @@ async fn serve_admin(
     if let Some(database_catalogs) = database_catalogs {
         app = verglas_rest::compose_database_catalogs(app, database_catalogs);
     }
+    app = verglas_rest::data_plane::protect(app, data_plane_access()?);
     let local_addr = listener.local_addr()?;
 
     eprintln!("verglas-server {VERSION} admin API listening on http://{local_addr}");
@@ -1053,6 +954,18 @@ async fn serve_admin(
         .await?;
 
     Ok(())
+}
+
+/// Builds the mandatory data-plane authorization boundary from the access-service endpoint.
+fn data_plane_access() -> Result<verglas_rest::data_plane::DataPlaneAccess, String> {
+    match std::env::var("VERGLAS_ACCESS_URI") {
+        Ok(endpoint) if !endpoint.trim().is_empty() => {
+            verglas_rest::data_plane::DataPlaneAccess::new(endpoint, "data-plane")
+        }
+        _ => Ok(verglas_rest::data_plane::DataPlaneAccess::unavailable(
+            "data-plane",
+        )),
+    }
 }
 
 /// Binds the S3 endpoint engines point at and serves until the process is
@@ -1073,7 +986,6 @@ async fn serve_s3(
     fragment_store: Option<LocalFragmentStore>,
     writeback_metrics: Option<Arc<WritebackMetrics>>,
     node_metrics: Arc<verglas_core::metrics::NodeMetrics>,
-    serving_api: Option<Arc<dyn verglas_s3::ServingApi>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The plain path serves on the pre-bound listener (bound and reported in
     // `serve`, #194). The TLS path (production, fixed ports) binds by address
@@ -1109,7 +1021,6 @@ async fn serve_s3(
                 config.listen.domain.as_deref(),
                 config.listen.tls.as_ref(),
                 node_metrics.clone(),
-                serving_api,
             )
             .await
         }
@@ -1127,7 +1038,6 @@ async fn serve_s3(
                 config.listen.domain.as_deref(),
                 config.listen.tls.as_ref(),
                 node_metrics.clone(),
-                serving_api,
             )
             .await
         }
@@ -1150,17 +1060,15 @@ async fn run_s3<R, W>(
     domain: Option<&str>,
     tls: Option<&verglas_core::config::Tls>,
     metrics: Arc<verglas_core::metrics::NodeMetrics>,
-    serving_api: Option<Arc<dyn verglas_s3::ServingApi>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     R: verglas_core::read::ObjectRead,
     W: verglas_core::write::ObjectWrite,
 {
     // The router forwards unmodeled bucket-config operations (HeadBucket,
-    // GetBucketLocation) to the origin instead of returning 501 (#152), accepts
-    // virtual-hosted-style addressing when a base domain is configured (#11),
-    // and — when `serving_api` is present — answers the server's `/v1` API on
-    // this SigV4-gated surface too. Path-style always works.
+    // GetBucketLocation) to the origin instead of returning 501 (#152), and
+    // accepts virtual-hosted-style addressing when a base domain is configured
+    // (#11). Scoped `/v1` APIs live only on the bearer-authenticated admin port.
     let bucket = registry.bucket_set();
     let app = verglas_rest::compose_s3(
         MANAGED_STORAGE_BINDING_ID,
@@ -1170,7 +1078,6 @@ where
         invalidation,
         Some(credentials),
         Some(registry),
-        serving_api,
         domain,
         Some(metrics),
     );
@@ -1459,15 +1366,6 @@ async fn serve(
     kv_store.set_capacity_ceiling(config.cache.capacity_bytes.0.saturating_sub(non_kv_held));
     let kv_admin_runtime = verglas_rest::kv::KvRuntime {
         store: kv_store.clone(),
-        authorizer: verglas_rest::kv::KvAuthorizer::new(std::collections::HashMap::from([(
-            credentials.1.clone(),
-            verglas_rest::kv::KvGrant {
-                tenant: credentials.0.clone(),
-                namespace: "*".to_owned(),
-                read: true,
-                write: true,
-            },
-        )])),
     };
     eprintln!(
         "verglas-server {VERSION} KV recovery complete — always on under {}",
@@ -1488,18 +1386,6 @@ async fn serve(
     // Internal engine subsystems share one catalog handle. Public catalog
     // metadata calls bypass the server and use Iceberg REST directly.
     let tables_slot: Option<admin::TablesSlot> =
-        config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
-    // The `graph` verb-family routes (`/v1/graphs/...`) drive the
-    // graph-over-Iceberg engine through the same private catalog as the table
-    // routes — a graph is just two plain tables plus the Puffin index in a
-    // namespace — so the slot exists only when a catalog is configured and is
-    // filled with the same handle after recovery.
-    let graphs_slot: Option<admin::GraphsSlot> =
-        config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
-    // The vector-index routes (`/v1/tables|graphs/{..}/indexes...`) drive the
-    // streaming Vamana engine over the same private catalog. Each index is a
-    // Puffin statistics attachment on the exact source snapshot it reflects.
-    let vector_slot: Option<admin::VectorSlot> =
         config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
     // The `verglas_sys` registry routes write and read through a
     // `SystemCatalog` over the same private catalog — the server is
@@ -1578,8 +1464,15 @@ async fn serve(
         resolved_admin_port,
         database_catalogs.clone(),
     );
-    let write_worker_dispatcher =
-        build_write_worker_dispatcher(config, &credentials, resolved_s3_port, resolved_admin_port);
+    // Like query workers, write workers receive one database-scoped, token-free
+    // config per dispatch and only activate for a live Lakehouse catalog.
+    let write_worker_dispatcher = build_write_worker_dispatcher(
+        config,
+        &credentials,
+        resolved_s3_port,
+        resolved_admin_port,
+        database_catalogs.clone(),
+    );
     let namespace_gateway = match (
         std::env::var("VERGLAS_CONTAINER_RUNTIME_URL")
             .ok()
@@ -1649,8 +1542,7 @@ async fn serve(
             access,
             tables: tables_slot.clone(),
             dashboards: dashboard_runtime,
-            graphs: graphs_slot.clone(),
-            vector: vector_slot.clone(),
+            database_data: None,
             sys: sys_slot.clone(),
             queues: Some(queue_dir.clone()),
             platform: platform_slot.clone(),
@@ -1804,20 +1696,6 @@ async fn serve(
         let s3_agent = agent.clone();
         let s3_writeback_metrics = writeback_metrics.clone();
         let s3_node_metrics = node_metrics.clone();
-        // The SigV4-gated data port always serves KV and can also dispatch the
-        // configured execution roles. The authenticated access key becomes the
-        // tenant before the KV router resolves a namespace or key.
-        let s3_serving_api: Option<Arc<dyn verglas_s3::ServingApi>> =
-            Some(Arc::new(V1ServingApi {
-                router: admin::v1_serving_router(
-                    query_worker_dispatcher.clone(),
-                    write_worker_dispatcher.clone(),
-                )
-                .merge(verglas_rest::kv::router(verglas_rest::kv::KvRuntime {
-                    store: kv_store.clone(),
-                    authorizer: verglas_rest::kv::KvAuthorizer::default(),
-                })),
-            }));
         let s3_task = tokio::spawn(async move {
             serve_s3(
                 &s3_config,
@@ -1831,7 +1709,6 @@ async fn serve(
                 fragment_store,
                 s3_writeback_metrics,
                 s3_node_metrics,
-                s3_serving_api,
             )
             .await
             .map_err(|error| error.to_string())
@@ -1910,27 +1787,6 @@ async fn serve(
                         let follow_manager =
                             Arc::new(follow::FollowManager::new(catalog.clone(), sys_catalog));
                         follow::spawn_follow_manager(follow_manager);
-                    }
-                    // The shared vector-index service owns only a disposable
-                    // decoded-index cache. Iceberg metadata is the registry and
-                    // customer object storage owns the Puffin files.
-                    let vector_service = vector_slot
-                        .as_ref()
-                        .map(|_| Arc::new(verglas_vector::service::VectorService::new()));
-                    // The graph routes drive the graph engine through the same
-                    // private catalog — one write authority for the nodes and
-                    // edges tables, exactly as for any other table.
-                    if let Some(graphs) = &graphs_slot {
-                        let _ = graphs.set(catalog.clone());
-                    }
-                    // The vector routes commit and discover snapshot-bound
-                    // Puffin attachments through this private catalog handle.
-                    if let (Some(vector), Some(service)) = (&vector_slot, vector_service) {
-                        let runtime = Arc::new(admin::VectorRuntime {
-                            catalog: catalog.clone(),
-                            service,
-                        });
-                        let _ = vector.set(runtime);
                     }
                     let _ = slot.set(catalog);
                 }

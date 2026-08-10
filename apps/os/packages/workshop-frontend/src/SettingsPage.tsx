@@ -1,13 +1,14 @@
 import { useKumoToastManager } from '@cloudflare/kumo'
 import { useAuthenticatedApi } from './AuthContext'
 import { useState, useEffect, useRef } from 'react'
-import { AiChatAuthorInfo, type VerglasAccessIdentity } from '@verglas/workshop-shared/api'
+import { AiChatAuthorInfo, type VerglasAccessIdentity, type VerglasAccessResource } from '@verglas/workshop-shared/api'
 import { hashPassword } from './passwordHash'
 import { CF_ACCESS_MODE } from './useAuth'
 import { User, Pencil, Check, X, Lock, Camera, Copy, Eye, EyeSlash, ShieldCheck } from '@phosphor-icons/react'
 import { useAvatar, invalidateAvatarCache } from './useAvatar'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
 import { useDocumentTitle } from './useDocumentTitle'
+import PersonalAccessTokenPanel from './components/PersonalAccessTokenPanel'
 
 // Shared, on-language control classes (match the rest of the app: Workspaces/Blueprints headers,
 // the gatekeepers toolbar, the command palette). Kept here so the profile page reads as part of the
@@ -90,6 +91,7 @@ export default function SettingsPage() {
   const toasts = useKumoToastManager()
   const [userInfo, setUserInfo] = useState<AiChatAuthorInfo | null>(null)
   const [accessIdentity, setAccessIdentity] = useState<VerglasAccessIdentity | null>(null)
+  const [accessResources, setAccessResources] = useState<VerglasAccessResource[]>([])
   const [loading, setLoading] = useState(true)
   const [isEditingName, setIsEditingName] = useState(false)
   const [nameInput, setNameInput] = useState('')
@@ -131,13 +133,15 @@ export default function SettingsPage() {
     let cancelled = false
     const fetchUserInfo = async () => {
       try {
-        const [info, identity] = await Promise.all([
+        const [info, identity, resources] = await Promise.all([
           authenticatedApi.whoami(),
           authenticatedApi.getAccessIdentity().catch(() => null),
+          authenticatedApi.listAccessibleAccessResources().catch(() => []),
         ])
         if (cancelled) return
         setUserInfo(info)
         setAccessIdentity(identity)
+        setAccessResources(resources)
         setNameInput(info.name)
       } catch (error) {
         console.error('Failed to fetch user info:', error)
@@ -404,6 +408,8 @@ export default function SettingsPage() {
             </div>
           </div>
         </section>
+
+        <PersonalAccessTokenPanel api={authenticatedApi} resources={accessResources} />
 
         {/* Security — only for password accounts (hidden under CF Access or gatekeeper sign-in) */}
         {!CF_ACCESS_MODE && hasPassword === true && (

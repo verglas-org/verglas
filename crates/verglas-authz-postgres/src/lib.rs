@@ -11,9 +11,9 @@ use serde::de::DeserializeOwned;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 use verglas_authz::{
-    AccessCheck, Action, AuthorizationRepository, AuthzError, Grant, Principal, PrincipalKind,
-    Resource, ResourceId, ResourceKind, SecretError, SecretKind, SecretMetadata, SecretRepository,
-    StoredSecret,
+    AccessCheck, AccessTokenMetadata, AccessTokenRegistry, Action, AuthorizationRepository,
+    AuthzError, Grant, Principal, PrincipalKind, Resource, ResourceId, ResourceKind, SecretError,
+    SecretKind, SecretMetadata, SecretRepository, StoredSecret,
 };
 
 /// Idempotent schema installed only in the platform-owned permissions database.
@@ -452,6 +452,138 @@ impl AuthorizationRepository for PostgresAuthorizationRepository {
 }
 
 #[async_trait]
+impl AccessTokenRegistry for PostgresAuthorizationRepository {
+    /// Persists public token metadata without accepting bearer material or a signing secret.
+    async fn create_token(
+        &self,
+        metadata: AccessTokenMetadata,
+    ) -> Result<AccessTokenMetadata, AuthzError> {
+        metadata.validate()?;
+        sqlx::query(
+            "INSERT INTO verglas_authz.access_tokens \
+             (tenant_id, id, principal_id, parent_principal_id, name, audience, policy_version, \
+              run_id, created_at, expires_at, last_used_at, revoked_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL)",
+        )
+        .bind(&metadata.tenant_id)
+        .bind(&metadata.id)
+        .bind(&metadata.principal_id)
+        .bind(&metadata.parent_principal_id)
+        .bind(&metadata.name)
+        .bind(&metadata.audience)
+        .bind(i64::try_from(metadata.policy_version).map_err(|_| {
+            AuthzError::Invalid("token policy version exceeds Postgres range".to_owned())
+        })?)
+        .bind(&metadata.run_id)
+        .bind(i64::try_from(metadata.created_at).map_err(|_| {
+            AuthzError::Invalid("token creation time exceeds Postgres range".to_owned())
+        })?)
+        .bind(i64::try_from(metadata.expires_at).map_err(|_| {
+            AuthzError::Invalid("token expiration time exceeds Postgres range".to_owned())
+        })?)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(metadata)
+    }
+
+    /// Returns one tenant-scoped token's public metadata.
+    async fn get_token(
+        &self,
+        tenant_id: &str,
+        token_id: &str,
+    ) -> Result<AccessTokenMetadata, AuthzError> {
+        let row = sqlx::query(
+            "SELECT tenant_id, id, principal_id, parent_principal_id, name, audience, policy_version, \
+                    run_id, created_at, expires_at, last_used_at, revoked_at \
+             FROM verglas_authz.access_tokens WHERE tenant_id = $1 AND id = $2",
+        )
+        .bind(tenant_id)
+        .bind(token_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| AuthzError::NotFound(format!("token {token_id}")))?;
+        token_metadata_from_row(&row)
+    }
+
+    /// Lists public metadata delegated from one parent in stable newest-first order.
+    async fn list_tokens(
+        &self,
+        tenant_id: &str,
+        parent_principal_id: &str,
+    ) -> Result<Vec<AccessTokenMetadata>, AuthzError> {
+        let rows = sqlx::query(
+            "SELECT tenant_id, id, principal_id, parent_principal_id, name, audience, policy_version, \
+                    run_id, created_at, expires_at, last_used_at, revoked_at \
+             FROM verglas_authz.access_tokens \
+             WHERE tenant_id = $1 AND parent_principal_id = $2 \
+             ORDER BY created_at DESC, id",
+        )
+        .bind(tenant_id)
+        .bind(parent_principal_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(token_metadata_from_row).collect()
+    }
+
+    /// Revokes a credential once while retaining its inventory and audit metadata.
+    async fn revoke_token(
+        &self,
+        tenant_id: &str,
+        token_id: &str,
+        revoked_at: u64,
+    ) -> Result<AccessTokenMetadata, AuthzError> {
+        let revoked_at = i64::try_from(revoked_at).map_err(|_| {
+            AuthzError::Invalid("token revocation time exceeds Postgres range".to_owned())
+        })?;
+        let row = sqlx::query(
+            "UPDATE verglas_authz.access_tokens \
+             SET revoked_at = COALESCE(revoked_at, $3) \
+             WHERE tenant_id = $1 AND id = $2 AND $3 >= created_at \
+             RETURNING tenant_id, id, principal_id, parent_principal_id, name, audience, policy_version, \
+                       run_id, created_at, expires_at, last_used_at, revoked_at",
+        )
+        .bind(tenant_id)
+        .bind(token_id)
+        .bind(revoked_at)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| AuthzError::NotFound(format!("token {token_id}")))?;
+        token_metadata_from_row(&row)
+    }
+
+    /// Advances last-use time only for an active token inside its validity interval.
+    async fn record_token_use(
+        &self,
+        tenant_id: &str,
+        token_id: &str,
+        used_at: u64,
+    ) -> Result<(), AuthzError> {
+        let used_at = i64::try_from(used_at)
+            .map_err(|_| AuthzError::Invalid("token use time exceeds Postgres range".to_owned()))?;
+        let result = sqlx::query(
+            "UPDATE verglas_authz.access_tokens \
+             SET last_used_at = GREATEST(COALESCE(last_used_at, $3), $3) \
+             WHERE tenant_id = $1 AND id = $2 AND revoked_at IS NULL \
+               AND $3 >= created_at AND $3 <= expires_at",
+        )
+        .bind(tenant_id)
+        .bind(token_id)
+        .bind(used_at)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if result.rows_affected() == 0 {
+            return Err(AuthzError::Token("token is not active".to_owned()));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
 impl SecretRepository for PostgresAuthorizationRepository {
     /// Creates secret metadata and its first encrypted value in one transaction.
     async fn create(
@@ -657,6 +789,41 @@ fn secret_metadata_from_row(row: &sqlx::postgres::PgRow) -> Result<SecretMetadat
     })
 }
 
+/// Converts one token row without ever selecting bearer material or signing state.
+fn token_metadata_from_row(row: &sqlx::postgres::PgRow) -> Result<AccessTokenMetadata, AuthzError> {
+    let policy_version: i64 = row.get("policy_version");
+    let created_at: i64 = row.get("created_at");
+    let expires_at: i64 = row.get("expires_at");
+    let last_used_at: Option<i64> = row.get("last_used_at");
+    let revoked_at: Option<i64> = row.get("revoked_at");
+    let metadata = AccessTokenMetadata {
+        id: row.get("id"),
+        tenant_id: row.get("tenant_id"),
+        principal_id: row.get("principal_id"),
+        parent_principal_id: row.get("parent_principal_id"),
+        name: row.get("name"),
+        audience: row.get("audience"),
+        policy_version: u64::try_from(policy_version).map_err(|_| {
+            AuthzError::Backend("negative token policy version in Postgres".to_owned())
+        })?,
+        run_id: row.get("run_id"),
+        created_at: u64::try_from(created_at).map_err(|_| {
+            AuthzError::Backend("negative token creation time in Postgres".to_owned())
+        })?,
+        expires_at: u64::try_from(expires_at).map_err(|_| {
+            AuthzError::Backend("negative token expiration time in Postgres".to_owned())
+        })?,
+        last_used_at: last_used_at.map(u64::try_from).transpose().map_err(|_| {
+            AuthzError::Backend("negative token last-use time in Postgres".to_owned())
+        })?,
+        revoked_at: revoked_at.map(u64::try_from).transpose().map_err(|_| {
+            AuthzError::Backend("negative token revocation time in Postgres".to_owned())
+        })?,
+    };
+    metadata.validate()?;
+    Ok(metadata)
+}
+
 /// Converts an authorization serialization failure into a secret backend failure.
 fn secret_authz_error(error: AuthzError) -> SecretError {
     SecretError::Backend(error.to_string())
@@ -702,6 +869,7 @@ fn granting_action_names(requested: Action) -> Vec<&'static str> {
         Action::Execute,
         Action::UseSecret,
         Action::Deploy,
+        Action::Connect,
         Action::PassGrants,
         Action::ManageGrants,
         Action::Own,

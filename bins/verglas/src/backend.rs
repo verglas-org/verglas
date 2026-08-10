@@ -24,6 +24,6 @@ use verglas_sdk::server::{ServerClient, ServerError};
 /// any remote one; the client attempts no connection until its first call and
 /// then fails fast (bounded connect timeout) with a clear, remote-aware error
 /// when nothing is listening — it never silently assumes a local server.
-pub fn server(endpoint: &str) -> Result<ServerClient, ServerError> {
-    ServerClient::new(endpoint)
+pub fn server(endpoint: &str, token: Option<&str>) -> Result<ServerClient, ServerError> {
+    ServerClient::new_with_token(endpoint, token)
 }

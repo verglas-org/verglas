@@ -7,6 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
@@ -44,11 +45,17 @@ pub enum ServerError {
 pub struct ServerClient {
     base: String,
     http: reqwest::Client,
+    bearer: Option<HeaderValue>,
 }
 
 impl ServerClient {
     /// Builds a client without making a request.
     pub fn new(endpoint: &str) -> Result<Self, ServerError> {
+        Self::new_with_token(endpoint, None)
+    }
+
+    /// Builds a client that presents `token` on every server API request.
+    pub fn new_with_token(endpoint: &str, token: Option<&str>) -> Result<Self, ServerError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(5))
@@ -57,14 +64,17 @@ impl ServerClient {
         Ok(Self {
             base: endpoint.trim_end_matches('/').to_owned(),
             http,
+            bearer: token
+                .map(|token| HeaderValue::from_str(&format!("Bearer {token}")))
+                .transpose()
+                .map_err(|error| ServerError::Input(format!("invalid bearer token: {error}")))?,
         })
     }
 
     /// Sends GET and decodes the JSON response.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ServerError> {
         let response = self
-            .http
-            .get(self.url(path))
+            .authorize(self.http.get(self.url(path)))
             .send()
             .await
             .map_err(|error| self.unreachable(error))?;
@@ -78,8 +88,7 @@ impl ServerClient {
         body: &serde_json::Value,
     ) -> Result<T, ServerError> {
         let response = self
-            .http
-            .post(self.url(path))
+            .authorize(self.http.post(self.url(path)))
             .json(body)
             .send()
             .await
@@ -94,8 +103,7 @@ impl ServerClient {
         body: &serde_json::Value,
     ) -> Result<T, ServerError> {
         let response = self
-            .http
-            .put(self.url(path))
+            .authorize(self.http.put(self.url(path)))
             .json(body)
             .send()
             .await
@@ -106,8 +114,7 @@ impl ServerClient {
     /// Sends DELETE and decodes the JSON response.
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ServerError> {
         let response = self
-            .http
-            .delete(self.url(path))
+            .authorize(self.http.delete(self.url(path)))
             .send()
             .await
             .map_err(|error| self.unreachable(error))?;
@@ -144,8 +151,7 @@ impl ServerClient {
             url.push_str(&format!("&partition_by={column}"));
         }
         let response = self
-            .http
-            .post(url)
+            .authorize(self.http.post(url))
             .header("content-type", "application/octet-stream")
             .body(bytes)
             .send()
@@ -157,6 +163,14 @@ impl ServerClient {
     /// Joins an API path to the configured base endpoint.
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.base)
+    }
+
+    /// Adds the configured bearer credential to one outgoing server request.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.bearer {
+            Some(token) => request.header(AUTHORIZATION, token.clone()),
+            None => request,
+        }
     }
 
     /// Maps a transport failure to the endpoint-aware error.

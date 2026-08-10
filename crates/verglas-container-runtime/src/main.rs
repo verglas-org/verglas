@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use tokio::net::TcpListener;
-use verglas_container_runtime::{DockerRuntime, RuntimeService};
+use verglas_container_runtime::{DockerRuntime, RuntimeService, ensure_local_postgres_tls};
 
 /// Local Docker Engine runtime manager configuration.
 #[derive(Debug, Parser)]
@@ -49,6 +49,7 @@ async fn main() {
 /// Performs fallible runtime manager startup.
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    ensure_local_postgres_tls(&args.state)?;
     let runtime = DockerRuntime::connect_local()?;
     let service = RuntimeService::open(runtime, args.token, args.state, args.network).await?;
     service.recover().await?;

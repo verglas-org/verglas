@@ -33,8 +33,13 @@ the local endpoints:
 ```bash
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
-export VERGLAS_TOKEN=verglas-local-access
+export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
 ```
+
+Create this token from **Profile → Access tokens** in Verglas OS. It needs only
+the grants for the database operations you intend to perform. See
+[Security and access control](/docs/platform/security) for token creation and
+database resource inheritance.
 
 Create a lakehouse named `analytics`:
 

@@ -12,11 +12,16 @@ use verglas_container_runtime::{
 async fn real_docker_lifecycle() {
     let runtime = DockerRuntime::connect_local().expect("connect to local Docker Engine");
     let deployment_id = format!("integration-{}", std::process::id());
-    let spec = ContainerSpec::new(&deployment_id, "alpine:3.22").with_command([
-        "sh",
-        "-c",
-        "while true; do sleep 3600; done",
-    ]);
+    let source = tempfile::NamedTempFile::new().expect("source file");
+    std::fs::write(source.path(), "runtime-secret").expect("source contents");
+    let spec = ContainerSpec::new(&deployment_id, "alpine:3.22")
+        .with_command([
+            "sh",
+            "-c",
+            "test \"$(cat /run/secrets/test)\" = runtime-secret; while true; do sleep 3600; done",
+        ])
+        .with_file(source.path().to_string_lossy(), "/run/secrets/test", 0o600)
+        .with_ephemeral_port(8080);
 
     runtime.reconcile(&spec).await.expect("create and start");
     let running = runtime
@@ -25,6 +30,8 @@ async fn real_docker_lifecycle() {
         .expect("inspect")
         .expect("managed container");
     assert_eq!(running.state, ObservedState::Running);
+    assert_eq!(running.published_ports.len(), 1);
+    assert!(running.published_ports[0].host_port.is_some());
 
     assert!(runtime.stop(&deployment_id).await.expect("stop"));
     assert!(runtime.remove(&deployment_id).await.expect("remove"));

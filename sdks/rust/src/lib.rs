@@ -31,6 +31,7 @@ pub mod graph;
 pub mod queue;
 pub mod report;
 pub mod server;
+pub mod token;
 pub mod vector;
 
 pub use client::{
@@ -44,6 +45,10 @@ pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, Memory
 pub use job::{JobError, Logger, Row};
 pub use queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult, QueueRecord};
 pub use report::{CompactReport, CompactionReport};
+pub use token::{
+    AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, DatabaseConnectionToken,
+    DatabaseConnectionTokenRequest, IssuedAccessToken,
+};
 /// Stable table request and response contracts from the dependency-leaf API crate.
 pub use verglas_api::table as tables_api;
 /// Universal authorization contracts used by access administration and checks.

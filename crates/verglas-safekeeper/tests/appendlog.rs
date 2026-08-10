@@ -35,6 +35,7 @@ use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment};
 use verglas_core::CacheKey;
+use verglas_core::activity::ActivityTracker;
 use verglas_core::node::NodeId;
 use verglas_core::read::{
     BodyStream, ObjectGet, ObjectMeta, ObjectRead, ReadError, ReadRange, TierCell,
@@ -46,6 +47,43 @@ use verglas_core::write::{
 use verglas_safekeeper::server::SafekeeperServer;
 use verglas_safekeeper::{AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn};
 use verglas_safekeeper::{FragmentTransport, LiveMembership, TransportError};
+
+#[tokio::test]
+async fn idle_safekeeper_connections_do_not_hold_the_scale_to_zero_fence() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let tracker = ActivityTracker::new();
+    let server = SafekeeperServer::new(
+        41,
+        MemStore::new(),
+        "default",
+        "wal-bkt",
+        "neon",
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    )
+    .with_activity_tracker(tracker.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let address = listener.local_addr().expect("address");
+    let server_task = tokio::spawn(server.serve(listener));
+
+    let _idle_connection = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("connect idle client");
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+
+    let snapshot = tracker.snapshot();
+    assert_eq!(snapshot.planes.safekeeper.accepted, 0);
+    assert_eq!(snapshot.planes.safekeeper.inflight, 0);
+    assert!(
+        snapshot.idle,
+        "an idle TCP session is not accepted WAL work"
+    );
+    server_task.abort();
+}
 
 // ---- in-memory fragment transport (fragments persist across a simulated crash
 // because the store Arc is reused, standing in for durable NVMe) ---------------
@@ -1136,6 +1174,7 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
     let store = MemStore::new();
     let transport = MemoryTransport::new();
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let tracker = ActivityTracker::new();
     let server = SafekeeperServer::new(
         41,
         store.clone(),
@@ -1146,7 +1185,8 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
         membership,
         dir.path(),
         geom(),
-    );
+    )
+    .with_activity_tracker(tracker.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -1262,6 +1302,13 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
     assert_eq!(tag, b'd');
     assert_eq!(xlog_data[0], b'w');
     assert_eq!(&xlog_data[25..], &wal[..]);
+
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(
+        tracker.snapshot().planes.safekeeper.inflight,
+        0,
+        "an idle physical-replication stream must not hold the scale-to-zero fence",
+    );
 
     server_task.abort();
 }

@@ -3,7 +3,6 @@ import {VerglasCatalogClient} from "../src/verglas-catalog.js";
 
 const env = {
   VERGLAS_ACCESS_URI: "http://localhost:8345/",
-  VERGLAS_ACCESS_SERVICE_TOKEN: "access-secret",
   VERGLAS_ADMIN_URL: "http://localhost:8334/",
   VERGLAS_SCHEDULER_URL: "http://localhost:8340/",
   VERGLAS_SCHEDULER_CONTROL_TOKEN: "scheduler-secret",
@@ -26,7 +25,7 @@ describe("VerglasCatalogClient", () => {
       config: "secret configuration",
     }]), {headers: {"content-type": "application/json"}}));
 
-    const result = await new VerglasCatalogClient(env, fetcher).listWorkers();
+    const result = await new VerglasCatalogClient(env, fetcher, "access-secret").listWorkers();
 
     expect(fetcher).toHaveBeenCalledWith(
       "http://localhost:8340/v1/workers?view=active",
@@ -77,7 +76,7 @@ describe("VerglasCatalogClient", () => {
       return new Response("not found", {status: 404});
     });
 
-    await expect(new VerglasCatalogClient(env, fetcher).getCatalog()).resolves.toMatchObject({
+    await expect(new VerglasCatalogClient(env, fetcher, "access-secret").getCatalog()).resolves.toMatchObject({
       databases: [
         {
           type: "lakehouse",
@@ -131,7 +130,7 @@ describe("VerglasCatalogClient", () => {
       }
       return new Response(null, {status: 204});
     });
-    const client = new VerglasCatalogClient(env, fetcher);
+    const client = new VerglasCatalogClient(env, fetcher, "access-secret");
 
     await client.createDatabase({
       type: "lakehouse",
@@ -201,7 +200,7 @@ describe("VerglasCatalogClient", () => {
       return new Response("not found", {status: 404});
     });
 
-    await expect(new VerglasCatalogClient(env, fetcher).deleteDatabase("analytics"))
+    await expect(new VerglasCatalogClient(env, fetcher, "access-secret").deleteDatabase("analytics"))
       .rejects.toThrow("contains 1 table");
     expect(fetcher.mock.calls.some(([input, init]) =>
       String(input).endsWith("/v1/databases/analytics") && init?.method === "DELETE")).toBe(false);
@@ -223,7 +222,7 @@ describe("VerglasCatalogClient", () => {
       return new Response(null, {status: 204});
     });
 
-    await new VerglasCatalogClient(env, fetcher).createTable({
+    await new VerglasCatalogClient(env, fetcher, "access-secret").createTable({
       database: "analytics",
       namespace: ["events"],
       name: "log",
@@ -242,7 +241,7 @@ describe("VerglasCatalogClient", () => {
     const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({
       type: "postgres", name: "operations", engine: {mode: "managed-neon"},
     }));
-    const client = new VerglasCatalogClient(env, fetcher);
+    const client = new VerglasCatalogClient(env, fetcher, "access-secret");
 
     await expect(client.getDatabase("operations")).resolves.toMatchObject({
       type: "postgres",
@@ -272,7 +271,7 @@ describe("VerglasCatalogClient", () => {
       });
     });
 
-    const result = await new VerglasCatalogClient(env, fetcher)
+    const result = await new VerglasCatalogClient(env, fetcher, "access-secret")
       .query("analytics", "SELECT value FROM numbers", 2);
 
     expect(fetcher).toHaveBeenCalledWith("http://localhost:8334/v1/databases/analytics/query", expect.objectContaining({
@@ -292,7 +291,7 @@ describe("VerglasCatalogClient", () => {
       type: "postgres", name: "operations", engine: {mode: "managed-neon"},
     }));
 
-    await expect(new VerglasCatalogClient(env, fetcher).query("operations", "SELECT 1"))
+    await expect(new VerglasCatalogClient(env, fetcher, "access-secret").query("operations", "SELECT 1"))
       .rejects.toThrow("does not expose SQL query execution");
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
@@ -308,7 +307,7 @@ describe("VerglasCatalogClient", () => {
         description: "Connect Linear workspaces.",
       }), {headers: {"content-type": "application/json"}}));
 
-    const result = await new VerglasCatalogClient(env, fetcher).listVessels();
+    const result = await new VerglasCatalogClient(env, fetcher, "access-secret").listVessels();
 
     const requestInit = fetcher.mock.calls[0]?.[1];
     expect(requestInit).toBeDefined();
@@ -326,7 +325,7 @@ describe("VerglasCatalogClient", () => {
       ]))
       .mockResolvedValueOnce(new Response(null, {status: 204}));
 
-    await new VerglasCatalogClient(env, fetcher).setApplicationState("dashboard", "stopped");
+    await new VerglasCatalogClient(env, fetcher, "access-secret").setApplicationState("dashboard", "stopped");
 
     expect(fetcher.mock.calls.map(([input, init]) => [String(input), init?.method])).toEqual([
       ["http://localhost:8360/v1/vessels", "GET"],
@@ -346,7 +345,7 @@ describe("VerglasCatalogClient", () => {
         headers: {"content-type": "application/json"},
       }));
 
-    await expect(new VerglasCatalogClient(env, fetcher).getIntegrationConfiguration("linear"))
+    await expect(new VerglasCatalogClient(env, fetcher, "access-secret").getIntegrationConfiguration("linear"))
       .resolves.toMatchObject({title: "Linear", configured: true});
   });
 });

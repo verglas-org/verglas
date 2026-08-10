@@ -255,3 +255,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   rename.
 - #29: Routed the KV data-plane path through the existing SigV4 serving boundary and carried its authenticated tenant identity into the REST extension. All other serving routes retain their existing role restrictions.
 - #84: Routed every read, write, list, multipart, raw, and bucket passthrough request through its immutable storage binding. S3 endpoints now require a binding identity instead of selecting an origin from bucket name alone.
+- #81: Removed the legacy SigV4 `/v1` execution extension. The data port now
+  serves only S3 object operations; scoped query, write, ingest, and KV APIs
+  remain on the bearer-authenticated admin listener. This avoids treating one
+  cache access key as a user or tenant principal. Regression coverage proves a
+  signed object GET still succeeds while a signed `/v1` path is rejected as an
+  invalid S3 bucket.

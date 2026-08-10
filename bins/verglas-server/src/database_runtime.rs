@@ -4,6 +4,7 @@
 //! only its non-secret public views and materializes one explicit Lakekeeper
 //! gateway per managed lakehouse.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -34,6 +35,9 @@ pub(crate) enum DatabaseRuntimeError {
     /// The access service returned a malformed inventory document.
     #[error("database inventory response is invalid: {0}")]
     InventoryDecode(String),
+    /// The scoped service-principal credential file is absent or empty.
+    #[error("database inventory token file is invalid: {0}")]
+    TokenFile(String),
     /// An external catalog cannot be activated without its scoped credential.
     #[error("database {0} uses an external catalog without a secret-safe data-plane binding")]
     ExternalCatalog(String),
@@ -52,7 +56,7 @@ struct DatabaseListResponse {
 /// Pulls a complete inventory and atomically publishes its managed catalog gateways.
 pub(crate) struct DatabaseCatalogSynchronizer {
     access_uri: reqwest::Url,
-    service_token: String,
+    access_token_file: PathBuf,
     managed_catalog_uri: reqwest::Url,
     catalogs: CatalogRuntimeRegistry,
     http: reqwest::Client,
@@ -62,7 +66,7 @@ impl DatabaseCatalogSynchronizer {
     /// Validates the access and managed Lakekeeper endpoints and creates a synchronizer.
     pub(crate) fn new(
         access_uri: impl AsRef<str>,
-        service_token: impl Into<String>,
+        access_token_file: impl Into<PathBuf>,
         managed_catalog_uri: impl AsRef<str>,
         catalogs: CatalogRuntimeRegistry,
     ) -> Result<Self, DatabaseRuntimeError> {
@@ -71,7 +75,7 @@ impl DatabaseCatalogSynchronizer {
             parse_endpoint("VERGLAS_MANAGED_CATALOG_URI", managed_catalog_uri.as_ref())?;
         Ok(Self {
             access_uri,
-            service_token: service_token.into(),
+            access_token_file: access_token_file.into(),
             managed_catalog_uri,
             catalogs,
             http: reqwest::Client::new(),
@@ -84,30 +88,39 @@ impl DatabaseCatalogSynchronizer {
         required: bool,
     ) -> Result<Option<Self>, DatabaseRuntimeError> {
         let access_uri = nonempty_environment("VERGLAS_ACCESS_URI");
-        let service_token = nonempty_environment("VERGLAS_ACCESS_SERVICE_TOKEN");
+        let access_token_file = nonempty_environment("VERGLAS_ACCESS_TOKEN_FILE");
         let managed_catalog_uri = nonempty_environment("VERGLAS_MANAGED_CATALOG_URI");
-        match (access_uri, service_token, managed_catalog_uri) {
+        match (access_uri, access_token_file, managed_catalog_uri) {
             (None, None, None) if !required => Ok(None),
             (None, None, None) => Err(DatabaseRuntimeError::InvalidEndpoint {
                 name: "database runtime",
-                detail: "VERGLAS_ACCESS_URI, VERGLAS_ACCESS_SERVICE_TOKEN, and VERGLAS_MANAGED_CATALOG_URI are required in --environment mode".to_owned(),
+                detail: "VERGLAS_ACCESS_URI, VERGLAS_ACCESS_TOKEN_FILE, and VERGLAS_MANAGED_CATALOG_URI are required in --environment mode".to_owned(),
             }),
-            (Some(access_uri), Some(service_token), Some(managed_catalog_uri)) => Self::new(
+            (Some(access_uri), Some(access_token_file), Some(managed_catalog_uri)) => Self::new(
                 access_uri,
-                service_token,
+                access_token_file,
                 managed_catalog_uri,
                 catalogs,
             )
             .map(Some),
             _ => Err(DatabaseRuntimeError::InvalidEndpoint {
                 name: "database runtime",
-                detail: "VERGLAS_ACCESS_URI, VERGLAS_ACCESS_SERVICE_TOKEN, and VERGLAS_MANAGED_CATALOG_URI must be set together".to_owned(),
+                detail: "VERGLAS_ACCESS_URI, VERGLAS_ACCESS_TOKEN_FILE, and VERGLAS_MANAGED_CATALOG_URI must be set together".to_owned(),
             }),
         }
     }
 
     /// Fetches one complete inventory and swaps its managed gateways into the registry.
     pub(crate) async fn refresh(&self) -> Result<(), DatabaseRuntimeError> {
+        let token = tokio::fs::read_to_string(&self.access_token_file)
+            .await
+            .map_err(|error| DatabaseRuntimeError::TokenFile(error.to_string()))?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err(DatabaseRuntimeError::TokenFile(
+                "credential file is empty".to_owned(),
+            ));
+        }
         let inventory_uri = self.access_uri.join("v1/databases").map_err(|error| {
             DatabaseRuntimeError::InvalidEndpoint {
                 name: "VERGLAS_ACCESS_URI",
@@ -117,7 +130,7 @@ impl DatabaseCatalogSynchronizer {
         let response = self
             .http
             .get(inventory_uri)
-            .bearer_auth(&self.service_token)
+            .bearer_auth(token)
             .send()
             .await
             .map_err(|error| DatabaseRuntimeError::InventoryRequest(error.to_string()))?;
@@ -245,6 +258,14 @@ mod tests {
         endpoint
     }
 
+    /// Writes one scoped service-principal token without exposing it through process arguments.
+    fn token_file(token: &str) -> std::path::PathBuf {
+        let directory = tempfile::tempdir().expect("token tempdir").keep();
+        let path = directory.join("access-token");
+        std::fs::write(&path, token).expect("write token");
+        path
+    }
+
     #[tokio::test]
     async fn refresh_activates_managed_lakehouses_and_removes_deleted_routes() {
         let catalog_endpoint = serve(Router::new().route(
@@ -278,7 +299,14 @@ mod tests {
                 .route(
                     "/v1/databases",
                     get(
-                        |State(inventory): State<Arc<Mutex<serde_json::Value>>>| async move {
+                        |State(inventory): State<Arc<Mutex<serde_json::Value>>>,
+                         headers: axum::http::HeaderMap| async move {
+                            assert_eq!(
+                                headers
+                                    .get(axum::http::header::AUTHORIZATION)
+                                    .and_then(|value| value.to_str().ok()),
+                                Some("Bearer scoped-service-token")
+                            );
                             Json(inventory.lock().expect("inventory").clone())
                         },
                     ),
@@ -289,7 +317,7 @@ mod tests {
         let catalogs = CatalogRuntimeRegistry::default();
         let synchronizer = DatabaseCatalogSynchronizer::new(
             access_endpoint,
-            "service-token",
+            token_file("scoped-service-token"),
             catalog_endpoint,
             catalogs.clone(),
         )
@@ -354,7 +382,7 @@ mod tests {
         .await;
         let synchronizer = DatabaseCatalogSynchronizer::new(
             access_endpoint,
-            "service-token",
+            token_file("scoped-service-token"),
             "http://lakekeeper:8181",
             CatalogRuntimeRegistry::default(),
         )

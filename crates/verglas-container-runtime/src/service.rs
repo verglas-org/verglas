@@ -279,7 +279,12 @@ impl ServiceState {
         let desired = self.desired.read().await.clone();
         for deployment in desired.containers.values() {
             if deployment.running {
-                self.runtime.reconcile(&deployment.specification).await?;
+                if let Err(error) = self.runtime.reconcile(&deployment.specification).await {
+                    if is_deferred_source_file_error(&error) {
+                        continue;
+                    }
+                    return Err(error.into());
+                }
             } else {
                 self.runtime
                     .stop(&deployment.specification.deployment_id)
@@ -319,6 +324,11 @@ impl ServiceState {
         }
         specification
     }
+}
+
+/// Defers a persisted declaration only while its rotating source file is unavailable.
+fn is_deferred_source_file_error(error: &RuntimeError) -> bool {
+    matches!(error, RuntimeError::FileRead { .. })
 }
 
 /// Returns process health without requiring container-management authority.
@@ -1385,9 +1395,10 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DesiredState, is_bootstrap_target, load_desired, validate_namespace_manifest,
-        validate_run_identity,
+        DesiredState, is_bootstrap_target, is_deferred_source_file_error, load_desired,
+        validate_namespace_manifest, validate_run_identity,
     };
+    use crate::RuntimeError;
 
     /// The manager and the data-plane server cannot recursively manage themselves.
     #[test]
@@ -1407,6 +1418,18 @@ mod tests {
         let desired = load_desired(&path).await.expect("load missing state");
         assert!(desired.containers.is_empty());
         assert!(desired.vessels.is_empty());
+    }
+
+    /// Missing rotating source files defer recovery without hiding engine failures.
+    #[test]
+    fn only_source_file_absence_is_deferred() {
+        assert!(is_deferred_source_file_error(&RuntimeError::FileRead {
+            path: "/var/run/verglas/neon/token".to_owned(),
+            message: "not found".to_owned(),
+        }));
+        assert!(!is_deferred_source_file_error(&RuntimeError::Engine(
+            "daemon unavailable".to_owned(),
+        )));
     }
 
     /// A stopped Vessel remains stopped when its desired state is reloaded.

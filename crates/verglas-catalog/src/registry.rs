@@ -119,6 +119,7 @@ impl CatalogRuntimeRegistry {
         database_id: DatabaseId,
         gateway: CatalogGateway,
     ) -> Result<(), RegistryError> {
+        let gateway = gateway.bind_database(database_id.as_str());
         let mut gateways = self
             .gateways
             .write()
@@ -155,6 +156,7 @@ impl CatalogRuntimeRegistry {
     {
         let mut replacement = HashMap::new();
         for (database_id, gateway) in gateways {
+            let gateway = gateway.bind_database(database_id.as_str());
             if replacement.insert(database_id.clone(), gateway).is_some() {
                 return Err(RegistryError::AlreadyExists(
                     database_id.as_str().to_owned(),

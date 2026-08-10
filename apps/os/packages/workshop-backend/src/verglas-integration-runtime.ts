@@ -10,7 +10,6 @@ export interface VerglasIntegrationRuntimeEnv {
   VERGLAS_CONTAINER_RUNTIME_URL?: string;
   VERGLAS_CONTAINER_RUNTIME_TOKEN?: string;
   VERGLAS_DATA_ENDPOINT?: string;
-  VERGLAS_DATA_TOKEN?: string;
   VERGLAS_INTEGRATION_RUNTIME_IMAGE?: string;
 }
 
@@ -126,15 +125,19 @@ export class VerglasIntegrationRuntimeClient {
   readonly #image: string;
 
   /** Resolves an all-or-nothing local Integration runtime configuration. */
-  constructor(env: VerglasIntegrationRuntimeEnv, fetcher: typeof fetch = fetch) {
+  constructor(
+    env: VerglasIntegrationRuntimeEnv,
+    fetcher: typeof fetch = fetch,
+    dataToken?: string,
+  ) {
     const runtimeEndpoint = env.VERGLAS_CONTAINER_RUNTIME_URL?.trim();
     const runtimeToken = env.VERGLAS_CONTAINER_RUNTIME_TOKEN?.trim();
     const dataEndpoint = env.VERGLAS_DATA_ENDPOINT?.trim();
-    const dataToken = env.VERGLAS_DATA_TOKEN?.trim();
-    if (!runtimeEndpoint || !runtimeToken || !dataEndpoint || !dataToken) {
+    const scopedToken = dataToken?.trim();
+    if (!runtimeEndpoint || !runtimeToken || !dataEndpoint || !scopedToken) {
       throw new Error(
         "Generated Integrations require VERGLAS_CONTAINER_RUNTIME_URL, " +
-        "VERGLAS_CONTAINER_RUNTIME_TOKEN, VERGLAS_DATA_ENDPOINT, and VERGLAS_DATA_TOKEN.",
+        "VERGLAS_CONTAINER_RUNTIME_TOKEN, VERGLAS_DATA_ENDPOINT, and a user-scoped Verglas token.",
       );
     }
     this.#runtime = connectRuntime({
@@ -143,7 +146,7 @@ export class VerglasIntegrationRuntimeClient {
       fetch: fetcher,
     });
     this.#dataEndpoint = dataEndpoint.replace(/\/+$/, "");
-    this.#dataToken = dataToken;
+    this.#dataToken = scopedToken;
     this.#image = env.VERGLAS_INTEGRATION_RUNTIME_IMAGE?.trim() ||
       "verglas/verglas-container-runtime:local";
   }
@@ -171,7 +174,7 @@ export class VerglasIntegrationRuntimeClient {
         VERGLAS_INTEGRATION_MODULE: encodeBase64(deployment.module),
         VERGLAS_INTEGRATION_DEFINITION: encodeBase64(JSON.stringify(definition)),
         VERGLAS_DATA_ENDPOINT: this.#dataEndpoint,
-        VERGLAS_DATA_TOKEN: this.#dataToken,
+        VERGLAS_TOKEN: this.#dataToken,
       },
       http: {port: 8370, healthPath: "/health"},
     });
@@ -187,7 +190,7 @@ export class VerglasIntegrationRuntimeClient {
       project: {files: deployment.files},
       environment: {
         VERGLAS_DATA_ENDPOINT: this.#dataEndpoint,
-        VERGLAS_DATA_TOKEN: this.#dataToken,
+        VERGLAS_TOKEN: this.#dataToken,
         PORT: "8380",
       },
       http: {port: 8380, healthPath: "/health"},

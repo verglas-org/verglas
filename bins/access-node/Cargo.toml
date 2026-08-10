@@ -33,5 +33,8 @@ verglas-rest.workspace = true
 [lints]
 workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [package.metadata.dist]
 dist = true

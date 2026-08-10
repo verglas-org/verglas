@@ -5,6 +5,7 @@
 //! workload. Verglas-owned labels provide the authority for every mutation.
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use bollard::Docker;
@@ -15,7 +16,7 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-    ListContainersOptionsBuilder,
+    ListContainersOptionsBuilder, UploadToContainerOptionsBuilder,
 };
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -46,6 +47,60 @@ const MAX_PROJECT_FILES: usize = 128;
 const MAX_PROJECT_FILE_BYTES: usize = 512 * 1024;
 const MAX_PROJECT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUILD_ERROR_BYTES: usize = 8 * 1024;
+const MAX_CONTAINER_FILES: usize = 64;
+const MAX_CONTAINER_FILE_BYTES: usize = 1024 * 1024;
+
+/// Stable local TLS paths generated beside the desired-state document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PostgresTlsFiles {
+    /// PEM certificate suitable for the local PostgreSQL proxy listener.
+    pub certificate: PathBuf,
+    /// PEM private key paired with the local certificate.
+    pub private_key: PathBuf,
+}
+
+/// Creates the local self-signed PostgreSQL proxy identity once and reuses it.
+pub fn ensure_local_postgres_tls(state_path: &Path) -> Result<PostgresTlsFiles, RuntimeError> {
+    let directory = state_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("postgres-proxy");
+    let files = PostgresTlsFiles {
+        certificate: directory.join("tls.crt"),
+        private_key: directory.join("tls.key"),
+    };
+    match (files.certificate.exists(), files.private_key.exists()) {
+        (true, true) => return Ok(files),
+        (true, false) | (false, true) => {
+            return Err(RuntimeError::TlsIdentity(
+                "local Postgres TLS identity is incomplete".to_owned(),
+            ));
+        }
+        (false, false) => {}
+    }
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| RuntimeError::TlsIdentity(error.to_string()))?;
+    let rcgen::CertifiedKey { cert, key_pair } =
+        rcgen::generate_simple_self_signed(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
+            .map_err(|error| RuntimeError::TlsIdentity(error.to_string()))?;
+    write_private_file(&files.private_key, key_pair.serialize_pem().as_bytes())?;
+    write_private_file(&files.certificate, cert.pem().as_bytes())?;
+    Ok(files)
+}
+
+/// Atomically installs one generated private file with owner-only permissions.
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), RuntimeError> {
+    let temporary = path.with_extension("tmp");
+    std::fs::write(&temporary, contents)
+        .map_err(|error| RuntimeError::TlsIdentity(error.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .map_err(|error| RuntimeError::TlsIdentity(error.to_string()))?;
+    }
+    std::fs::rename(&temporary, path).map_err(|error| RuntimeError::TlsIdentity(error.to_string()))
+}
 
 /// Product role assigned to one long-lived local Vessel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,8 +468,20 @@ pub struct BindMount {
 pub struct PublishedPort {
     /// TCP port listened to inside the container.
     pub container_port: u16,
-    /// TCP port published on the Docker Engine host.
-    pub host_port: u16,
+    /// Fixed TCP host port, or `None` when Docker must assign a free loopback port.
+    pub host_port: Option<u16>,
+}
+
+/// One immutable regular file materialized before a managed workload starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerFile {
+    /// Absolute source path readable by the trusted runtime manager.
+    pub source: String,
+    /// Absolute path inside the container.
+    pub path: String,
+    /// Unix permission bits without executable or special bits.
+    pub mode: u32,
 }
 
 /// Immutable declaration for one locally placed container.
@@ -437,6 +504,9 @@ pub struct ContainerSpec {
     /// Workload environment sorted for deterministic hashing.
     #[serde(default)]
     pub environment: BTreeMap<String, String>,
+    /// Immutable files copied into the stopped container before first start.
+    #[serde(default)]
+    pub files: Vec<ContainerFile>,
     /// Explicit host bind mounts sorted in declaration order.
     #[serde(default)]
     pub bind_mounts: Vec<BindMount>,
@@ -458,6 +528,7 @@ impl ContainerSpec {
             command: Vec::new(),
             entrypoint: Vec::new(),
             environment: BTreeMap::new(),
+            files: Vec::new(),
             bind_mounts: Vec::new(),
             network: None,
             published_ports: Vec::new(),
@@ -497,6 +568,21 @@ impl ContainerSpec {
         self
     }
 
+    /// Adds one bounded immutable regular file to the container filesystem.
+    pub fn with_file(
+        mut self,
+        source: impl Into<String>,
+        path: impl Into<String>,
+        mode: u32,
+    ) -> Self {
+        self.files.push(ContainerFile {
+            source: source.into(),
+            path: path.into(),
+            mode,
+        });
+        self
+    }
+
     /// Adds one explicit host bind mount.
     pub fn with_bind_mount(mut self, source: impl Into<String>, target: impl Into<String>) -> Self {
         self.bind_mounts.push(BindMount {
@@ -516,7 +602,16 @@ impl ContainerSpec {
     pub fn with_published_port(mut self, container_port: u16, host_port: u16) -> Self {
         self.published_ports.push(PublishedPort {
             container_port,
-            host_port,
+            host_port: Some(host_port),
+        });
+        self
+    }
+
+    /// Publishes one container TCP port on a Docker-assigned loopback port.
+    pub fn with_ephemeral_port(mut self, container_port: u16) -> Self {
+        self.published_ports.push(PublishedPort {
+            container_port,
+            host_port: None,
         });
         self
     }
@@ -557,6 +652,29 @@ impl ContainerSpec {
                 });
             }
         }
+        if self.files.len() > MAX_CONTAINER_FILES {
+            return Err(RuntimeError::ContainerFilesTooLarge);
+        }
+        for file in &self.files {
+            let valid_path = |path: &str| {
+                path.starts_with('/')
+                    && path.len() > 1
+                    && path
+                        .trim_start_matches('/')
+                        .split('/')
+                        .all(|part| !part.is_empty() && part != "." && part != "..")
+            };
+            if !valid_path(&file.source)
+                || !valid_path(&file.path)
+                || !(0o400..=0o666).contains(&file.mode)
+                || file.mode & 0o111 != 0
+                || is_docker_socket(&file.source)
+            {
+                return Err(RuntimeError::InvalidFile {
+                    path: file.path.clone(),
+                });
+            }
+        }
         for mount in &self.bind_mounts {
             if is_docker_socket(&mount.source) || is_docker_socket(&mount.target) {
                 return Err(RuntimeError::DockerAuthority {
@@ -574,7 +692,7 @@ impl ContainerSpec {
         if self
             .published_ports
             .iter()
-            .any(|port| port.container_port == 0 || port.host_port == 0)
+            .any(|port| port.container_port == 0 || port.host_port == Some(0))
         {
             return Err(RuntimeError::InvalidPort);
         }
@@ -606,6 +724,14 @@ impl ContainerSpec {
     /// Normalizes this declaration into an engine create request.
     fn create_request(&self) -> Result<EngineCreateRequest, RuntimeError> {
         self.validate()?;
+        let files = materialize_container_files(&self.files)?;
+        let mut labels = self.labels()?;
+        if !files.is_empty() {
+            labels.insert(
+                LABEL_SPEC_DIGEST.to_owned(),
+                runtime_digest(self.digest()?, &files),
+            );
+        }
         Ok(EngineCreateRequest {
             name: self.container_name(),
             image: self.image.clone(),
@@ -613,10 +739,11 @@ impl ContainerSpec {
             command: self.command.clone(),
             entrypoint: self.entrypoint.clone(),
             environment: self.environment.clone(),
+            files,
             bind_mounts: self.bind_mounts.clone(),
             network: self.network.clone(),
             published_ports: self.published_ports.clone(),
-            labels: self.labels()?,
+            labels,
         })
     }
 }
@@ -641,6 +768,8 @@ pub struct ManagedContainer {
     pub deployment_id: String,
     /// Normalized lifecycle state.
     pub state: ObservedState,
+    /// Host loopback ports currently assigned by the Docker Engine.
+    pub published_ports: Vec<PublishedPort>,
 }
 
 /// Result of reconciling one desired container declaration.
@@ -687,6 +816,26 @@ pub enum RuntimeError {
         /// Rejected relative path.
         path: String,
     },
+    /// A desired container file path or mode is unsafe.
+    #[error("invalid container file: {path}")]
+    InvalidFile {
+        /// Rejected absolute target path.
+        path: String,
+    },
+    /// Desired inline files exceeded the count or aggregate byte ceiling.
+    #[error("container inline files exceed the size or count limit")]
+    ContainerFilesTooLarge,
+    /// A runtime-managed file could not be read without exposing its contents.
+    #[error("could not read container file {path}: {message}")]
+    FileRead {
+        /// Operator-configured source path.
+        path: String,
+        /// Filesystem failure without file content.
+        message: String,
+    },
+    /// Local PostgreSQL TLS identity generation or persistence failed.
+    #[error("local Postgres TLS identity failed: {0}")]
+    TlsIdentity(String),
     /// A required TypeScript project file was not supplied.
     #[error("Vessel project is missing required file {path}")]
     MissingProjectFile {
@@ -805,6 +954,7 @@ struct EngineContainer {
     name: String,
     labels: BTreeMap<String, String>,
     state: ObservedState,
+    published_ports: Vec<PublishedPort>,
 }
 
 #[derive(Debug, Clone)]
@@ -815,10 +965,18 @@ struct EngineCreateRequest {
     command: Vec<String>,
     entrypoint: Vec<String>,
     environment: BTreeMap<String, String>,
+    files: Vec<MaterializedContainerFile>,
     bind_mounts: Vec<BindMount>,
     network: Option<String>,
     published_ports: Vec<PublishedPort>,
     labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+struct MaterializedContainerFile {
+    path: String,
+    contents: Vec<u8>,
+    mode: u32,
 }
 
 #[async_trait]
@@ -1030,6 +1188,11 @@ impl DockerApi for BollardDockerApi {
                     } else {
                         ObservedState::Stopped
                     },
+                    published_ports: response
+                        .network_settings
+                        .and_then(|settings| settings.ports)
+                        .map(observed_port_bindings)
+                        .unwrap_or_default(),
                 }))
             }
             Err(error) if is_not_found(&error) => Ok(None),
@@ -1039,6 +1202,8 @@ impl DockerApi for BollardDockerApi {
 
     /// Pulls the declared image and creates one stopped Docker container.
     async fn create(&self, request: EngineCreateRequest) -> Result<(), RuntimeError> {
+        let container_name = request.name.clone();
+        let files = request.files.clone();
         let must_pull = match self.docker.inspect_image(&request.image).await {
             Ok(_) => false,
             Err(error) if is_not_found(&error) => true,
@@ -1078,7 +1243,7 @@ impl DockerApi for BollardDockerApi {
                     format!("{}/tcp", port.container_port),
                     Some(vec![DockerPortBinding {
                         host_ip: Some("127.0.0.1".to_owned()),
-                        host_port: Some(port.host_port.to_string()),
+                        host_port: port.host_port.map(|value| value.to_string()),
                     }]),
                 )
             })
@@ -1112,6 +1277,14 @@ impl DockerApi for BollardDockerApi {
             .create_container(Some(options.build()), body)
             .await
             .map_err(engine_error)?;
+        if !files.is_empty() {
+            let archive = archive_container_files(&files)?;
+            let options = UploadToContainerOptionsBuilder::default().path("/").build();
+            self.docker
+                .upload_to_container(&container_name, Some(options), body_full(archive.into()))
+                .await
+                .map_err(engine_error)?;
+        }
         Ok(())
     }
 
@@ -1163,6 +1336,15 @@ impl DockerApi for BollardDockerApi {
                 } else {
                     ObservedState::Stopped
                 },
+                published_ports: summary
+                    .ports
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|port| PublishedPort {
+                        container_port: port.private_port,
+                        host_port: port.public_port,
+                    })
+                    .collect(),
             })
             .collect())
     }
@@ -1241,7 +1423,98 @@ fn normalize_managed(container: &EngineContainer) -> Result<ManagedContainer, Ru
         id: container.id.clone(),
         deployment_id,
         state: container.state,
+        published_ports: container.published_ports.clone(),
     })
+}
+
+/// Encodes immutable regular files into a Docker upload archive rooted at `/`.
+fn archive_container_files(files: &[MaterializedContainerFile]) -> Result<Vec<u8>, RuntimeError> {
+    let mut archive = tar::Builder::new(Vec::new());
+    archive.mode(tar::HeaderMode::Deterministic);
+    for file in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(file.contents.len() as u64);
+        header.set_mode(file.mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        header.set_cksum();
+        archive
+            .append_data(
+                &mut header,
+                file.path.trim_start_matches('/'),
+                file.contents.as_slice(),
+            )
+            .map_err(|error| RuntimeError::BuildContext(error.to_string()))?;
+    }
+    archive
+        .into_inner()
+        .map_err(|error| RuntimeError::BuildContext(error.to_string()))
+}
+
+/// Reads source paths only at reconciliation time so desired state stores no bearer material.
+fn materialize_container_files(
+    files: &[ContainerFile],
+) -> Result<Vec<MaterializedContainerFile>, RuntimeError> {
+    let mut total = 0usize;
+    files
+        .iter()
+        .map(|file| {
+            let contents = std::fs::read(&file.source).map_err(|error| RuntimeError::FileRead {
+                path: file.source.clone(),
+                message: error.to_string(),
+            })?;
+            total = total.saturating_add(contents.len());
+            if total > MAX_CONTAINER_FILE_BYTES {
+                return Err(RuntimeError::ContainerFilesTooLarge);
+            }
+            Ok(MaterializedContainerFile {
+                path: file.path.clone(),
+                contents,
+                mode: file.mode,
+            })
+        })
+        .collect()
+}
+
+/// Extends the declaration digest with file bytes read by the trusted manager.
+fn runtime_digest(base: String, files: &[MaterializedContainerFile]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(base.as_bytes());
+    for file in files {
+        digest.update([0]);
+        digest.update(file.path.as_bytes());
+        digest.update(file.mode.to_be_bytes());
+        digest.update(&file.contents);
+    }
+    hex::encode(digest.finalize())
+}
+
+/// Normalizes Docker inspect port bindings to the public runtime vocabulary.
+fn observed_port_bindings(
+    bindings: HashMap<String, Option<Vec<DockerPortBinding>>>,
+) -> Vec<PublishedPort> {
+    let mut ports = bindings
+        .into_iter()
+        .filter_map(|(container, bindings)| {
+            let container_port = container.strip_suffix("/tcp")?.parse().ok()?;
+            Some(
+                bindings
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(move |binding| {
+                        let host_port = binding.host_port?.parse().ok()?;
+                        Some(PublishedPort {
+                            container_port,
+                            host_port: Some(host_port),
+                        })
+                    }),
+            )
+        })
+        .flatten()
+        .collect::<Vec<_>>();
+    ports.sort_by_key(|port| (port.container_port, port.host_port));
+    ports
 }
 
 /// Identifies Docker's name-not-found response without matching error strings.

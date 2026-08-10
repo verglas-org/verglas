@@ -5,6 +5,8 @@
 
 mod memory;
 mod secrets;
+mod target_jwt;
+mod tokens;
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,6 +20,15 @@ pub use secrets::{
     AeadSecretCipher, CreateSecret, MemorySecretRepository, ReplaceSecret, ResolveSecret,
     ResolvedSecret, SecretCipher, SecretError, SecretKind, SecretMetadata, SecretRepository,
     SecretService, StoredSecret,
+};
+pub use target_jwt::{
+    PublicJwk, PublicJwkSet, SecretTargetJwt, TargetJwtClaims, TargetJwtRequest, TargetJwtSigner,
+    verifying_key_from_jwk,
+};
+pub use tokens::{
+    AccessTokenId, AccessTokenMetadata, AccessTokenRegistry, AccessTokenService, AccessTokenSigner,
+    MemoryAccessTokenRegistry, MintedAccessToken, SecretAccessToken, TokenMintRequest,
+    new_access_token_id,
 };
 
 /// Stable tenant identifier carried by every authorization object.
@@ -46,6 +57,8 @@ pub enum PrincipalKind {
     Job,
     /// One execution of a Job.
     JobRun,
+    /// A named role assumed by a user or workload for one bounded operation.
+    Role,
     /// A composable Vessel definition or deployment.
     Vessel,
     /// An Application component inside a Vessel.
@@ -112,6 +125,8 @@ impl Principal {
 pub enum ResourceKind {
     /// The root of one tenant's resource hierarchy.
     Tenant,
+    /// A Lakekeeper or platform project that groups databases and grants.
+    Project,
     /// A logical lakehouse or Postgres database.
     Database,
     /// A lakehouse warehouse beneath a database.
@@ -120,6 +135,8 @@ pub enum ResourceKind {
     Namespace,
     /// A tabular data object.
     Table,
+    /// A table whose engine is selected by the owning database implementation.
+    GenericTable,
     /// A logical or materialized view.
     View,
     /// A snapshot-bound or independent vector index.
@@ -134,6 +151,10 @@ pub enum ResourceKind {
     IntegrationOperation,
     /// A credential that can be used without revealing its value.
     Secret,
+    /// A classification tag attached to data or runtime resources.
+    Tag,
+    /// A role definition that can be assumed through policy-controlled delegation.
+    Role,
     /// A durable Job definition.
     Job,
     /// A composable Vessel.
@@ -220,6 +241,8 @@ pub enum Action {
     UseSecret,
     /// Deploy or update an executable resource.
     Deploy,
+    /// Establish a database or service connection without broader data access.
+    Connect,
     /// Delegate privileges already held by the principal.
     PassGrants,
     /// Add or remove arbitrary grants on the resource.
@@ -241,6 +264,7 @@ impl Action {
             Self::Execute => "execute",
             Self::UseSecret => "use_secret",
             Self::Deploy => "deploy",
+            Self::Connect => "connect",
             Self::PassGrants => "pass_grants",
             Self::ManageGrants => "manage_grants",
             Self::Own => "own",
@@ -471,6 +495,8 @@ impl AccessDecision {
 /// Claims carried by a short-lived workload credential.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ScopedTokenClaims {
+    /// Stable credential identity used to resolve durable active or revoked state.
+    pub token_id: String,
     /// Tenant boundary enforced by every receiving service.
     pub tenant_id: TenantId,
     /// Human or process represented by the token.
@@ -491,6 +517,7 @@ pub struct ScopedTokenClaims {
 impl ScopedTokenClaims {
     /// Constructs claims for a principal and policy revision.
     pub fn new(
+        token_id: impl Into<String>,
         tenant_id: impl Into<TenantId>,
         principal_id: impl Into<PrincipalId>,
         audience: impl Into<String>,
@@ -499,6 +526,7 @@ impl ScopedTokenClaims {
         expires_at: u64,
     ) -> Self {
         Self {
+            token_id: token_id.into(),
             tenant_id: tenant_id.into(),
             principal_id: principal_id.into(),
             audience: audience.into(),
@@ -523,6 +551,7 @@ impl ScopedTokenClaims {
         expected_audience: &str,
         now: u64,
     ) -> Result<(), AuthzError> {
+        validate_identifier("token.id", &self.token_id)?;
         validate_identifier("token.tenant_id", &self.tenant_id)?;
         validate_identifier("token.principal_id", &self.principal_id)?;
         validate_identifier("token.audience", &self.audience)?;

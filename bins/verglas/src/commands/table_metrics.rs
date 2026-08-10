@@ -24,8 +24,12 @@ use verglas_core::telemetry::TablesReport;
 const S3_GET_PRICE_PER_1K: f64 = 0.0004;
 
 /// Dispatches `verglas table metrics`: the local per-table cache metrics view.
-pub async fn run(server_endpoint: &str, json: bool) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::server(server_endpoint)?;
+pub async fn run(
+    server_endpoint: &str,
+    token: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    let client = crate::backend::server(server_endpoint, token)?;
     let report: TablesReport = client.get(TABLE_METRICS_PATH).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&json_view(&report))?);

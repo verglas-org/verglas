@@ -46,30 +46,6 @@ function loadDevVars() {
 }
 loadDevVars();
 
-function resolveLocalVerglasDataToken() {
-  const configured = process.env.VERGLAS_DATA_TOKEN || process.env.VERGLAS_S3_SECRET_ACCESS_KEY;
-  if (configured) return configured;
-  try {
-    const environment = execFileSync(
-      "docker",
-      [
-        "inspect",
-        "verglas-verglas-server-1",
-        "--format",
-        "{{range .Config.Env}}{{println .}}{{end}}",
-      ],
-      { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
-    );
-    const entry = environment.split("\n").find(line =>
-      line.startsWith("VERGLAS_S3_SECRET_ACCESS_KEY="));
-    return entry?.slice("VERGLAS_S3_SECRET_ACCESS_KEY=".length);
-  } catch {
-    return undefined;
-  }
-}
-
-const localVerglasDataToken = resolveLocalVerglasDataToken();
-
 const useWorkersAi = process.argv.includes("--use-workers-ai-binding");
 const localModelRuntimePort = process.env.LOCAL_MODEL_RUNTIME_PORT || "8790";
 // Keep the loopback adapter credential stable across concurrent/restarted local dev servers. A
@@ -302,9 +278,10 @@ for (const gk of gatekeepers) {
 
   config.services = config.services || [];
 
-  // For local testing, create an account named "admin" to test admin features.
+  // Local password accounts are email-keyed, and the configured initial tenant owner is also the
+  // deployment administrator.
   config.vars = config.vars || {};
-  config.vars.ADMINS = ["admin"];
+  config.vars.ADMINS = [process.env.VERGLAS_INITIAL_OWNER_EMAIL || "dev@example.com"];
 
   // Pass through optional sign-in and public URL variables from the shell environment.
   const OPTIONAL_FEATURE_VARS = [
@@ -334,14 +311,13 @@ for (const gk of gatekeepers) {
     process.env.VERGLAS_CONTAINER_RUNTIME_TOKEN || "verglas-local-container-runtime";
   config.vars.VERGLAS_ACCESS_URI =
     process.env.VERGLAS_ACCESS_URI || "http://127.0.0.1:8345";
-  config.vars.VERGLAS_ACCESS_SERVICE_TOKEN =
-    process.env.VERGLAS_ACCESS_SERVICE_TOKEN || "verglas-local-access";
+  if (!process.env.VERGLAS_IDENTITY_ASSERTION_KEY) {
+    throw new Error("VERGLAS_IDENTITY_ASSERTION_KEY is required for local access sessions.");
+  }
+  config.vars.VERGLAS_IDENTITY_ASSERTION_KEY = process.env.VERGLAS_IDENTITY_ASSERTION_KEY;
   config.vars.VERGLAS_TENANT_ID = process.env.VERGLAS_TENANT_ID || "local";
-  config.vars.VERGLAS_LOCAL_OWNER_BOOTSTRAP =
-    process.env.VERGLAS_LOCAL_OWNER_BOOTSTRAP || "true";
   config.vars.VERGLAS_DATA_ENDPOINT =
     process.env.VERGLAS_DATA_ENDPOINT || "http://verglas-server:8334";
-  if (localVerglasDataToken) config.vars.VERGLAS_DATA_TOKEN = localVerglasDataToken;
   config.vars.VERGLAS_INTEGRATION_RUNTIME_IMAGE =
     process.env.VERGLAS_INTEGRATION_RUNTIME_IMAGE || "verglas/verglas-container-runtime:local";
   config.vars.LOCAL_MODEL_RUNTIME_URL =

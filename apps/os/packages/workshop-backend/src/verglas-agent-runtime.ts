@@ -130,6 +130,7 @@ function mapMessage(message: MessageWire): AiChatMessage {
 /** Workspace capability backed by Postgres and isolated Verglas agent runs rather than a DO. */
 export class AgentWorkspace extends RpcTarget implements Overseer {
   readonly #runtime: VerglasAgentRuntimeClient;
+  readonly #access: VerglasAccessClient | null;
   readonly #metadataSubscribers = new Set<RpcStub<(metadata: WorkspaceMetadata) => void>>();
 
   /** Creates one connection-scoped Workspace capability. */
@@ -141,6 +142,8 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
   ) {
     super();
     this.#runtime = new VerglasAgentRuntimeClient(resolveAgentRuntimeConfig(env));
+    const accessConfig = resolveVerglasAccessConfig(env);
+    this.#access = accessConfig ? new VerglasAccessClient(accessConfig, this.#ownerId()) : null;
   }
 
   #ownerId(): string {
@@ -159,6 +162,29 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
 
   async #chatContext(modelId: string | null): Promise<UserChatContext> {
     return await this.user.getChatContext(modelId);
+  }
+
+  /** Mints one short-lived bearer from the complete grants currently assigned to this agent. */
+  async #agentScopedToken(): Promise<string> {
+    if (!this.#access) throw new Error("Verglas tenant authorization is not configured.");
+    const principalId = `agent/${this.workspaceId}`;
+    const grants = await this.#access.listPrincipalGrants(principalId);
+    const byResource = new Map<string, Set<(typeof grants)[number]["actions"][number]>>();
+    for (const grant of grants) {
+      const actions = byResource.get(grant.resourceId) ?? new Set();
+      for (const action of grant.actions) actions.add(action);
+      byResource.set(grant.resourceId, actions);
+    }
+    const created = await this.#access.createToken({
+      name: `Workspace ${this.workspaceId} turn`,
+      audience: "data-plane",
+      expiresInSeconds: 15 * 60,
+      grants: [...byResource].map(([resourceId, actions]) => ({
+        resourceId,
+        actions: [...actions],
+      })),
+    });
+    return created.token;
   }
 
   async #emitMetadata(): Promise<void> {
@@ -292,6 +318,7 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
       throw new Error("Capsules and attachments are not yet supported by the agent runtime.");
     }
     const context = await this.#chatContext(modelId);
+    const scopedToken = await this.#agentScopedToken();
     const result = await this.#runtime.request<{chatId: number}>(this.#path("/chats"), {
       method: "POST",
       body: JSON.stringify({
@@ -300,6 +327,7 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
         modelConfig: context.aiModel?.config,
         prompt: initialMessage,
         principalId: `agent/${this.workspaceId}`,
+        scopedToken,
       }),
     });
     return result.chatId;
@@ -313,6 +341,7 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
       throw new Error("Capsules and attachments are not yet supported by the agent runtime.");
     }
     const context = await this.#chatContext(modelId);
+    const scopedToken = await this.#agentScopedToken();
     await this.#runtime.request(this.#path(`/chats/${chatId}/messages`), {
       method: "POST",
       body: JSON.stringify({
@@ -321,6 +350,7 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
         modelConfig: context.aiModel?.config,
         prompt: message,
         principalId: `agent/${this.workspaceId}`,
+        scopedToken,
       }),
     });
   }
@@ -356,16 +386,16 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
     if (request.state !== "pending") {
       throw new Error(`Permission request is not pending: ${requestId}`);
     }
-    const config = resolveVerglasAccessConfig(this.env);
-    if (!config) throw new Error("Verglas tenant authorization is not configured.");
-    await new VerglasAccessClient(config).delegate(this.#ownerId(), {
+    if (!this.#access) throw new Error("Verglas tenant authorization is not configured.");
+    await this.#access.delegate({
       principalId: request.principalId,
       resourceId: request.resourceId,
       actions: request.actions,
     });
+    const scopedToken = await this.#agentScopedToken();
     await this.#runtime.request(
       this.#path(`/permission-requests/${encodeURIComponent(requestId)}`),
-      {method: "PATCH", body: JSON.stringify({state: "approved"})},
+      {method: "PATCH", body: JSON.stringify({state: "approved", scopedToken})},
     );
   }
 
@@ -387,18 +417,22 @@ export class AgentWorkspace extends RpcTarget implements Overseer {
   async retryAgent(chatId: number, modelId: string): Promise<void> {
     const context = await this.#chatContext(modelId);
     if (!context.aiModel) throw new Error("Select an AI model before retrying the agent.");
+    const scopedToken = await this.#agentScopedToken();
     await this.#runtime.request(this.#path(`/chats/${chatId}/retry`), {
       method: "POST",
       body: JSON.stringify({
         modelProfile: context.aiModel.profile,
         modelConfig: context.aiModel.config,
         principalId: `agent/${this.workspaceId}`,
+        scopedToken,
       }),
     });
   }
 
   async queryVerglas(database: string, sql: string, maxRows?: number): Promise<VerglasQueryResult> {
-    return await new VerglasCatalogClient(this.env).query(database, sql, maxRows);
+    if (!this.#access) throw new Error("Verglas tenant authorization is not configured.");
+    return await new VerglasCatalogClient(this.env, fetch, this.#access.sessionToken("data-plane"))
+      .query(database, sql, maxRows);
   }
 
   async listVerglasQueryActivity(_afterSequence?: number): Promise<VerglasQueryActivity[]> {

@@ -16,36 +16,36 @@ import {
 /** Env vars used to construct Verglas SDK control clients. */
 export type VerglasClientEnv = {
   VERGLAS_ACCESS_URI?: string;
-  VERGLAS_ACCESS_SERVICE_TOKEN?: string;
   VERGLAS_ADMIN_URL?: string;
   VERGLAS_SCHEDULER_URL?: string;
   VERGLAS_SCHEDULER_CONTROL_TOKEN?: string;
   VERGLAS_CONTAINER_RUNTIME_URL?: string;
   VERGLAS_CONTAINER_RUNTIME_TOKEN?: string;
   VERGLAS_DATA_ENDPOINT?: string;
-  VERGLAS_DATA_TOKEN?: string;
 };
 
 /** Mandatory tenant access service for dynamic database resources. */
 export function verglasDatabaseAccess(
   env: VerglasClientEnv,
+  token: string,
   fetcher?: typeof fetch,
 ): VerglasAccessClient {
   const endpoint = env.VERGLAS_ACCESS_URI?.trim();
-  const token = env.VERGLAS_ACCESS_SERVICE_TOKEN?.trim();
-  if (!endpoint || !token) {
-    throw new Error(
-      "VERGLAS_ACCESS_URI and VERGLAS_ACCESS_SERVICE_TOKEN must be configured together.",
-    );
-  }
+  if (!endpoint) throw new Error("VERGLAS_ACCESS_URI is not configured.");
+  if (!token.trim()) throw new Error("A user-scoped Verglas access token is required.");
   return connectAccess({endpoint, token, fetch: fetcher});
 }
 
 /** Database-scoped data-query and catalog listener. */
-export function verglasAdmin(env: VerglasClientEnv, fetcher?: typeof fetch): VerglasAdminClient {
+export function verglasAdmin(
+  env: VerglasClientEnv,
+  token: string,
+  fetcher?: typeof fetch,
+): VerglasAdminClient {
   const endpoint = env.VERGLAS_ADMIN_URL?.trim();
   if (!endpoint) throw new Error("The local Verglas data endpoint is not configured.");
-  return connectAdmin({ endpoint, token: "", fetch: fetcher });
+  if (!token.trim()) throw new Error("A user-scoped Verglas data token is required.");
+  return connectAdmin({endpoint, token, fetch: fetcher});
 }
 
 /** Scheduler control (worker registry, runs, secrets, and job history). */

@@ -1,7 +1,8 @@
-import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AgentStore } from "./store.mjs";
 import {
-  bearerAuthorized, boundedPrompt, requireIdentifier, runCapabilityEnvironment,
+  bearerAuthorized, boundedPrompt, gatewayTargetToken, requireIdentifier, requireScopedToken,
+  runCapabilityEnvironment,
   runDeploymentId, safeJson,
 } from "./contracts.mjs";
 import { runAgent } from "./runner.mjs";
@@ -22,9 +23,7 @@ const containerRuntimeUrl = process.env.VERGLAS_CONTAINER_RUNTIME_URL;
 const containerRuntimeToken = process.env.VERGLAS_CONTAINER_RUNTIME_TOKEN;
 const agentImage = process.env.VERGLAS_AGENT_RUNNER_IMAGE || "verglas/verglas-agent-runtime:local";
 if (!token || !containerRuntimeUrl || !containerRuntimeToken ||
-    !process.env.VERGLAS_DATA_ENDPOINT || !process.env.VERGLAS_DATA_TOKEN ||
-    !process.env.VERGLAS_ACCESS_URI || !process.env.VERGLAS_ACCESS_SERVICE_TOKEN ||
-    !process.env.VERGLAS_TENANT_ID) {
+    !process.env.VERGLAS_DATA_ENDPOINT || !process.env.VERGLAS_ACCESS_URI) {
   throw new Error("Agent, container, data, and access runtime configuration is required.");
 }
 
@@ -68,15 +67,15 @@ async function body(request) {
   return await request.json();
 }
 
-async function startRun(workspaceId, chatId, principalId) {
+async function startRun(workspaceId, chatId, principalId, scopedToken) {
   const runId = randomUUID().replaceAll("-", "");
-  const runToken = randomBytes(32).toString("base64url");
+  scopedToken = requireScopedToken(scopedToken);
   await store.createRun({
     id: runId,
     workspaceId,
     chatId,
     principalId,
-    tokenHash: createHash("sha256").update(runToken).digest("hex"),
+    tokenHash: createHash("sha256").update(scopedToken).digest("hex"),
   });
   const deploymentId = runDeploymentId(runId);
   const specification = {
@@ -85,8 +84,7 @@ async function startRun(workspaceId, chatId, principalId) {
     command: ["run", runId],
     environment: runCapabilityEnvironment({
       runId,
-      runToken,
-      tenantId: process.env.VERGLAS_TENANT_ID,
+      scopedToken,
       principalId,
       chatId,
       modelUrl: process.env.LOCAL_MODEL_RUNTIME_URL,
@@ -121,16 +119,15 @@ function tokensEqual(left, rightHash) {
   return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
-async function checkRunAccess(run, resourceId, action) {
-  const accessResponse = await fetch(`${process.env.VERGLAS_ACCESS_URI}/v1/access/check`, {
+async function checkRunAccess(scopedToken, resourceId, action) {
+  const accessResponse = await fetch(`${process.env.VERGLAS_ACCESS_URI}/v1/access/authorize`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.VERGLAS_ACCESS_SERVICE_TOKEN}`,
+      Authorization: `Bearer ${scopedToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      tenant_id: process.env.VERGLAS_TENANT_ID,
-      principal_id: run.principal_id,
+      audience: "data-plane",
       resource_id: resourceId,
       action,
     }),
@@ -174,13 +171,12 @@ async function proxyRunGateway(request, url, match) {
   }
   if (run.state !== "running") return response({error: "run is not active"}, 409);
   if (service === "access") {
-    if (suffix === "/v1/access/check" && request.method === "POST") {
+    if (suffix === "/v1/access/authorize" && request.method === "POST") {
       const input = await request.clone().json();
-      if (input.tenant_id !== process.env.VERGLAS_TENANT_ID ||
-          input.principal_id !== run.principal_id) {
-        return response({ error: "run cannot check another identity" }, 403);
+      if (input.audience !== "data-plane") {
+        return response({ error: "run cannot select another authorization audience" }, 403);
       }
-      return response(await checkRunAccess(run, input.resource_id, input.action));
+      return response(await checkRunAccess(supplied, input.resource_id, input.action));
     }
     if (request.method !== "GET" || suffix !== "/v1/databases") {
       return response({ error: "operation is not exposed to agent runs" }, 403);
@@ -207,8 +203,11 @@ async function proxyRunGateway(request, url, match) {
   } else {
     return response({ error: "operation is not exposed to agent runs" }, 403);
   }
-  const decision = await checkRunAccess(run, resourceId, action);
-  if (!decision.allowed) {
+  const decision = await checkRunAccess(supplied, resourceId, action);
+  let targetToken;
+  try {
+    targetToken = gatewayTargetToken(service, decision.allowed, supplied, containerRuntimeToken);
+  } catch {
     return response({ error: `permission denied: ${action} on ${resourceId}` }, 403);
   }
 
@@ -217,11 +216,6 @@ async function proxyRunGateway(request, url, match) {
     : service === "access"
       ? process.env.VERGLAS_ACCESS_URI
       : containerRuntimeUrl;
-  const targetToken = service === "data"
-    ? process.env.VERGLAS_DATA_TOKEN
-    : service === "access"
-      ? process.env.VERGLAS_ACCESS_SERVICE_TOKEN
-      : containerRuntimeToken;
   const target = new URL(suffix, targetBase.replace(/\/+$/, "") + "/");
   target.search = url.search;
   const headers = new Headers(request.headers);
@@ -288,7 +282,7 @@ async function handler(request) {
         modelConfig: input.modelConfig,
         prompt,
       });
-      if (input.modelConfig) await startRun(workspaceId, chatId, input.principalId);
+      if (input.modelConfig) await startRun(workspaceId, chatId, input.principalId, input.scopedToken);
       return response({ chatId }, 201);
     }
   }
@@ -329,7 +323,7 @@ async function handler(request) {
         modelConfig: input.modelConfig,
         prompt: boundedPrompt(input.prompt),
       });
-      if (input.modelConfig) await startRun(workspaceId, chatId, input.principalId);
+      if (input.modelConfig) await startRun(workspaceId, chatId, input.principalId, input.scopedToken);
       return new Response(null, { status: 202 });
     }
   }
@@ -352,7 +346,7 @@ async function handler(request) {
     const decided = await store.decidePermissionRequest(workspaceId, requestId, input.state);
     if (!decided) return response({ error: "permission request changed concurrently" }, 409);
     if (input.state === "approved") {
-      await startRun(workspaceId, Number(decided.chat_id), decided.body.principalId);
+      await startRun(workspaceId, Number(decided.chat_id), decided.body.principalId, input.scopedToken);
     }
     return response(decided);
   }
@@ -382,7 +376,7 @@ async function handler(request) {
     if (!await store.setChatModel(workspaceId, chatId, input.modelProfile, input.modelConfig)) {
       return response({error: "chat not found"}, 404);
     }
-    await startRun(workspaceId, chatId, input.principalId);
+    await startRun(workspaceId, chatId, input.principalId, input.scopedToken);
     return new Response(null, {status: 202});
   }
 

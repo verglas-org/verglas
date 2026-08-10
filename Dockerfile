@@ -80,7 +80,9 @@ ENTRYPOINT ["verglas-scheduler"]
 FROM runtime AS verglas-access
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /var/run/verglas/server /var/run/verglas/lakekeeper /var/run/verglas/neon \
+    && chown -R verglas:verglas /var/run/verglas
 COPY --from=build /src/target/release/verglas-access /usr/local/bin/verglas-access
 USER verglas
 EXPOSE 8345

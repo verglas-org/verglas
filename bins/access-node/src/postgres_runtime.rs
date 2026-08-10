@@ -2,7 +2,9 @@
 //!
 //! One storage broker is shared by the tenant. Each database owns a pageserver
 //! and compute container, while pages and WAL remain durable in object storage.
+//! A per-database TLS proxy is the only host-published PostgreSQL boundary.
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,10 +20,13 @@ use verglas_database::DatabaseServiceError;
 use crate::database_runtime::ManagedPostgresRuntime;
 
 const STORAGE_IMAGE: &str =
-    "ghcr.io/verglas-org/neon-storage:da4e33a6e8090585d8181a0aa5d033c44b2006cd";
+    "ghcr.io/verglas-org/neon-storage:294a7b6e99392e60ff18aa6bef08e54b77446f7d";
 const COMPUTE_IMAGE: &str =
-    "ghcr.io/verglas-org/neon-compute-v16:da4e33a6e8090585d8181a0aa5d033c44b2006cd";
+    "ghcr.io/verglas-org/neon-compute-v16:294a7b6e99392e60ff18aa6bef08e54b77446f7d";
 const COMPUTE_PORT: u16 = 55_433;
+pub(crate) const PROXY_PORT: u16 = 5_432;
+const PROXY_HTTP_PORT: u16 = 7_001;
+const COMPUTE_CTL_PORT: u16 = 3_081;
 const PAGESERVER_HTTP_PORT: u16 = 9_898;
 const PAGESERVER_PG_PORT: u16 = 6_400;
 const BROKER_PORT: u16 = 50_051;
@@ -51,6 +56,16 @@ pub(crate) struct ManagedPostgresConfig {
     pub(crate) safekeepers: String,
     /// Required 256-bit key used for deterministic credential derivation.
     pub(crate) credential_key: Vec<u8>,
+    /// Private access-service origin used for JWKS and policy decisions.
+    pub(crate) access_endpoint: String,
+    /// Scoped policy-engine bearer file assigned to every database proxy.
+    pub(crate) policy_engine_token_file: PathBuf,
+    /// PEM certificate file presented by the local TLS PostgreSQL listener.
+    pub(crate) tls_certificate_file: PathBuf,
+    /// PEM private-key file paired with the local TLS certificate.
+    pub(crate) tls_private_key_file: PathBuf,
+    /// Private directory for derived bridge-password files.
+    pub(crate) credential_directory: PathBuf,
 }
 
 /// Private connection coordinates issued only to authorized tenant processes.
@@ -106,6 +121,7 @@ impl ManagedPostgresProvisioner {
             config.remote_access_key_id.as_str(),
             config.remote_secret_access_key.as_str(),
             config.safekeepers.as_str(),
+            config.access_endpoint.as_str(),
         ]
         .into_iter()
         .any(str::is_empty)
@@ -119,6 +135,25 @@ impl ManagedPostgresProvisioner {
                 "managed Neon credential key must contain exactly 32 bytes",
             ));
         }
+        if [
+            &config.policy_engine_token_file,
+            &config.tls_certificate_file,
+            &config.tls_private_key_file,
+            &config.credential_directory,
+        ]
+        .into_iter()
+        .any(|path| !path.is_absolute())
+        {
+            return Err(provisioning(
+                "managed Neon credential and TLS paths must be absolute",
+            ));
+        }
+        let access_endpoint = Url::parse(&config.access_endpoint).map_err(runtime_error)?;
+        if access_endpoint.scheme() != "http" && access_endpoint.scheme() != "https" {
+            return Err(provisioning(
+                "managed Neon access endpoint must use http or https",
+            ));
+        }
         Ok(Self {
             config,
             runtime_endpoint,
@@ -126,23 +161,29 @@ impl ManagedPostgresProvisioner {
         })
     }
 
-    /// Reconciles the shared broker and one database's pageserver and compute.
+    /// Reconciles private storage/compute before exposing the authenticated proxy.
     async fn ensure(&self, database: &str) -> Result<(), DatabaseServiceError> {
         let plan = self.plan(database)?;
+        self.write_bridge_credential(&plan).await?;
         self.put_container(&plan.containers[0]).await?;
         self.put_container(&plan.containers[1]).await?;
         self.ensure_timeline(&plan).await?;
         self.put_container(&plan.containers[2]).await?;
-        self.wait_for_sql(&plan.connection).await
+        self.wait_for_sql(&plan.connection).await?;
+        self.put_container(&plan.containers[3]).await?;
+        self.wait_for_proxy(&plan.containers[3].deployment_id).await
     }
 
     /// Removes database-owned compute and pageserver declarations in dependency order.
     async fn delete(&self, database: &str) -> Result<(), DatabaseServiceError> {
         let plan = self.plan(database)?;
+        self.delete_container(&plan.containers[3].deployment_id)
+            .await?;
         self.delete_container(&plan.containers[2].deployment_id)
             .await?;
         self.delete_container(&plan.containers[1].deployment_id)
-            .await
+            .await?;
+        self.remove_bridge_credential(&plan).await
     }
 
     /// Builds stable component declarations from the durable tenant/name identity.
@@ -155,6 +196,11 @@ impl ManagedPostgresProvisioner {
         let broker_id = "neon-broker".to_owned();
         let pageserver_id = format!("neon-{slug}-pageserver");
         let compute_id = format!("neon-{slug}-compute");
+        let proxy_id = format!("neon-{slug}-proxy");
+        let bridge_password_file = self
+            .config
+            .credential_directory
+            .join(format!("{proxy_id}.bridge-password"));
         let broker_host = docker_hostname(&broker_id);
         let pageserver_host = docker_hostname(&pageserver_id);
         let password = derive_credential(&self.config.credential_key, &resource_key)?;
@@ -191,23 +237,78 @@ impl ManagedPostgresProvisioner {
             .with_entrypoint(["/bin/sh", "-ec"])
             .with_command([compute_script()])
             .with_environment("VERGLAS_PG_DATABASE", database)
-            .with_environment("VERGLAS_PG_PASSWORD", &password)
             .with_environment("VERGLAS_PG_SAFEKEEPERS", &self.config.safekeepers)
             .with_environment(
                 "VERGLAS_PG_PAGESERVER",
                 format!("{pageserver_host}:{PAGESERVER_PG_PORT}"),
             )
             .with_environment("VERGLAS_PG_TENANT_ID", &tenant_id)
-            .with_environment("VERGLAS_PG_TIMELINE_ID", &timeline_id);
+            .with_environment("VERGLAS_PG_TIMELINE_ID", &timeline_id)
+            .with_file(
+                bridge_password_file.to_string_lossy(),
+                "/run/secrets/postgres-bridge-password",
+                0o600,
+            );
+        let access_origin = self.config.access_endpoint.trim_end_matches('/');
+        let proxy = ContainerSpec::new(&proxy_id, STORAGE_IMAGE)
+            .with_platform("linux/amd64")
+            .with_entrypoint(["/usr/local/bin/proxy"])
+            .with_command([
+                format!("--proxy=0.0.0.0:{PROXY_PORT}"),
+                format!("--http=0.0.0.0:{PROXY_HTTP_PORT}"),
+                "--mgmt=127.0.0.1:7000".to_owned(),
+                "--auth-backend=verglas".to_owned(),
+                "--tls-key=/run/secrets/proxy-tls.key".to_owned(),
+                "--tls-cert=/run/secrets/proxy-tls.crt".to_owned(),
+                format!("--verglas-jwks-url={access_origin}/.well-known/jwks.json"),
+                "--verglas-jwt-audience=verglas-neon".to_owned(),
+                format!("--verglas-tenant-id={}", self.config.tenant_id),
+                format!("--verglas-database-id={database}"),
+                format!("--verglas-access-check-url={access_origin}/v1/access/check"),
+                "--verglas-workload-token-file=/run/secrets/access-workload-token".to_owned(),
+                format!(
+                    "--verglas-postgres={}:{COMPUTE_PORT}",
+                    docker_hostname(&compute_id)
+                ),
+                format!(
+                    "--verglas-compute-ctl=http://{}:{COMPUTE_CTL_PORT}/",
+                    docker_hostname(&compute_id)
+                ),
+                "--verglas-bridge-password-file=/run/secrets/postgres-bridge-password".to_owned(),
+                "--verglas-bridge-role=verglas_proxy_bridge".to_owned(),
+                format!("--verglas-bridge-database={database}"),
+                "--verglas-session-role=verglas_tenant_session".to_owned(),
+            ])
+            .with_file(
+                self.config.policy_engine_token_file.to_string_lossy(),
+                "/run/secrets/access-workload-token",
+                0o600,
+            )
+            .with_file(
+                bridge_password_file.to_string_lossy(),
+                "/run/secrets/postgres-bridge-password",
+                0o600,
+            )
+            .with_file(
+                self.config.tls_certificate_file.to_string_lossy(),
+                "/run/secrets/proxy-tls.crt",
+                0o600,
+            )
+            .with_file(
+                self.config.tls_private_key_file.to_string_lossy(),
+                "/run/secrets/proxy-tls.key",
+                0o600,
+            )
+            .with_ephemeral_port(PROXY_PORT);
         Ok(ManagedPostgresPlan {
             tenant_id,
             timeline_id,
-            containers: vec![broker, pageserver, compute],
+            containers: vec![broker, pageserver, compute, proxy],
             connection: ManagedPostgresConnection {
                 host: docker_hostname(&compute_id),
                 port: COMPUTE_PORT,
                 database: database.to_owned(),
-                username: "verglas".to_owned(),
+                username: "verglas_proxy_bridge".to_owned(),
                 password,
             },
         })
@@ -383,6 +484,72 @@ impl ManagedPostgresProvisioner {
             "managed Neon compute did not pass its authenticated SQL probe",
         ))
     }
+
+    /// Waits until the public proxy process has loaded keys and serves health.
+    async fn wait_for_proxy(&self, deployment_id: &str) -> Result<(), DatabaseServiceError> {
+        let uri = Url::parse(&format!(
+            "http://{}:{PROXY_HTTP_PORT}/v1/status",
+            docker_hostname(deployment_id)
+        ))
+        .map_err(runtime_error)?;
+        for _ in 0..READY_ATTEMPTS {
+            if self
+                .http
+                .get(uri.clone())
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        Err(provisioning(
+            "managed Neon authenticated proxy did not become ready",
+        ))
+    }
+
+    /// Materializes the derived bridge password outside persisted desired state.
+    async fn write_bridge_credential(
+        &self,
+        plan: &ManagedPostgresPlan,
+    ) -> Result<(), DatabaseServiceError> {
+        tokio::fs::create_dir_all(&self.config.credential_directory)
+            .await
+            .map_err(runtime_error)?;
+        let path = self.bridge_credential_path(plan);
+        tokio::fs::write(&path, plan.connection.password.as_bytes())
+            .await
+            .map_err(runtime_error)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .await
+                .map_err(runtime_error)?;
+        }
+        Ok(())
+    }
+
+    /// Removes the derived credential after all database-owned containers stop.
+    async fn remove_bridge_credential(
+        &self,
+        plan: &ManagedPostgresPlan,
+    ) -> Result<(), DatabaseServiceError> {
+        match tokio::fs::remove_file(self.bridge_credential_path(plan)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(runtime_error(error)),
+        }
+    }
+
+    /// Returns the stable source path shared by compute and proxy declarations.
+    fn bridge_credential_path(&self, plan: &ManagedPostgresPlan) -> PathBuf {
+        self.config.credential_directory.join(format!(
+            "{}.bridge-password",
+            plan.containers[3].deployment_id
+        ))
+    }
 }
 
 #[async_trait]
@@ -506,15 +673,16 @@ export OTEL_SDK_DISABLED=true PGPASSWORD=cloud_admin
 /usr/local/bin/compute_ctl --pgdata /var/db/postgres/verglas-compute -C postgresql://cloud_admin@127.0.0.1:55433/postgres -b /usr/local/bin/postgres --compute-id "verglas-${VERGLAS_PG_TENANT_ID}" --config /var/db/postgres/verglas-spec/compute.json --dev &
 compute_pid=$!
 until /usr/local/bin/psql postgresql://cloud_admin@127.0.0.1:55433/postgres -tAc 'SELECT 1' >/dev/null 2>&1; do kill -0 "$compute_pid"; sleep 1; done
-/usr/local/bin/psql postgresql://cloud_admin@127.0.0.1:55433/postgres -v ON_ERROR_STOP=1 <<SQL
-DO \$\$ BEGIN
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'verglas') THEN
-    ALTER ROLE verglas LOGIN PASSWORD '${VERGLAS_PG_PASSWORD}';
-  ELSE
-    CREATE ROLE verglas LOGIN PASSWORD '${VERGLAS_PG_PASSWORD}';
-  END IF;
-END \$\$;
-SELECT 'CREATE DATABASE "${VERGLAS_PG_DATABASE}" OWNER verglas' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${VERGLAS_PG_DATABASE}') \gexec
+bridge_password=$(cat /run/secrets/postgres-bridge-password)
+/usr/local/bin/psql postgresql://cloud_admin@127.0.0.1:55433/postgres -v ON_ERROR_STOP=1 -v bridge_password="$bridge_password" <<SQL
+SELECT 'CREATE ROLE verglas_tenant_session NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'verglas_tenant_session') \gexec
+ALTER ROLE verglas_tenant_session NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+SELECT 'CREATE ROLE verglas_proxy_bridge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'verglas_proxy_bridge') \gexec
+ALTER ROLE verglas_proxy_bridge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'bridge_password';
+GRANT verglas_tenant_session TO verglas_proxy_bridge;
+SELECT 'CREATE DATABASE "${VERGLAS_PG_DATABASE}" OWNER verglas_tenant_session' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${VERGLAS_PG_DATABASE}') \gexec
+ALTER DATABASE "${VERGLAS_PG_DATABASE}" OWNER TO verglas_tenant_session;
+GRANT CONNECT ON DATABASE "${VERGLAS_PG_DATABASE}" TO verglas_tenant_session;
 SQL
 wait "$compute_pid""#
 }
@@ -544,6 +712,13 @@ impl ManagedPostgresConfig {
             remote_secret_access_key: "secret".to_owned(),
             safekeepers: "cache-a:5454".to_owned(),
             credential_key: vec![7; 32],
+            access_endpoint: "http://verglas-access:8345".to_owned(),
+            policy_engine_token_file: "/var/run/verglas/access/verglas-neon.token".into(),
+            tls_certificate_file: "/var/lib/verglas-container-runtime/postgres-proxy/tls.crt"
+                .into(),
+            tls_private_key_file: "/var/lib/verglas-container-runtime/postgres-proxy/tls.key"
+                .into(),
+            credential_directory: "/var/run/verglas/access/postgres".into(),
         }
     }
 }
@@ -561,11 +736,12 @@ mod tests {
             .expect("valid provisioner");
         let plan = provisioner.plan("analytics").expect("plan");
 
-        assert_eq!(plan.containers.len(), 3);
+        assert_eq!(plan.containers.len(), 4);
         assert_eq!(plan.containers[0].deployment_id, "neon-broker");
         assert_eq!(plan.containers[0].image, super::STORAGE_IMAGE);
         assert_eq!(plan.containers[1].image, super::STORAGE_IMAGE);
         assert_eq!(plan.containers[2].image, super::COMPUTE_IMAGE);
+        assert_eq!(plan.containers[3].image, super::STORAGE_IMAGE);
         assert!(
             plan.containers
                 .iter()
@@ -587,7 +763,7 @@ mod tests {
         assert_ne!(first.timeline_id, other.timeline_id);
         assert_ne!(first.connection.password, other.connection.password);
         assert_eq!(first.connection.database, "analytics");
-        assert_eq!(first.connection.username, "verglas");
+        assert_eq!(first.connection.username, "verglas_proxy_bridge");
     }
 
     /// Carries every recovery coordinate in the persisted desired declarations.
@@ -605,10 +781,79 @@ mod tests {
             plan.containers[2].environment["VERGLAS_PG_TIMELINE_ID"],
             plan.timeline_id
         );
-        assert_eq!(
-            plan.containers[2].environment["VERGLAS_PG_PASSWORD"],
-            plan.connection.password
+        assert!(
+            !plan.containers[2]
+                .environment
+                .contains_key("VERGLAS_PG_PASSWORD")
         );
+    }
+
+    /// Exposes only the TLS JWT proxy while keeping the static bridge private.
+    #[test]
+    fn postgres_proxy_is_the_only_published_database_boundary() {
+        let provisioner = ManagedPostgresProvisioner::new(ManagedPostgresConfig::fixture())
+            .expect("valid provisioner");
+        let plan = provisioner.plan("analytics").expect("plan");
+        let compute = &plan.containers[2];
+        let proxy = &plan.containers[3];
+
+        assert!(compute.published_ports.is_empty());
+        assert_eq!(proxy.published_ports.len(), 1);
+        assert_eq!(proxy.published_ports[0].container_port, super::PROXY_PORT);
+        assert_eq!(proxy.published_ports[0].host_port, None);
+        assert_eq!(proxy.files.len(), 4);
+        assert!(proxy.files.iter().all(|file| file.mode == 0o600));
+        assert_eq!(
+            proxy
+                .files
+                .iter()
+                .find(|file| file.path.ends_with("access-workload-token"))
+                .map(|file| file.source.as_str()),
+            Some("/var/run/verglas/access/verglas-neon.token")
+        );
+        assert!(
+            proxy
+                .command
+                .iter()
+                .any(|argument| argument == "--auth-backend=verglas")
+        );
+        assert!(proxy.command.iter().any(|argument| {
+            argument == "--verglas-jwks-url=http://verglas-access:8345/.well-known/jwks.json"
+        }));
+        assert!(proxy.command.iter().any(|argument| {
+            argument == "--verglas-access-check-url=http://verglas-access:8345/v1/access/check"
+        }));
+        assert!(
+            proxy
+                .command
+                .iter()
+                .any(|argument| argument == "--verglas-tenant-id=tenant-a")
+        );
+        assert!(
+            proxy
+                .command
+                .iter()
+                .any(|argument| argument == "--verglas-database-id=analytics")
+        );
+        assert!(proxy.command.iter().any(|argument| {
+            argument.starts_with("--verglas-postgres=verglas-neon-")
+                && argument.ends_with("-compute:55433")
+        }));
+        assert!(proxy.command.iter().any(|argument| {
+            argument.starts_with("--verglas-compute-ctl=http://verglas-neon-")
+                && argument.ends_with("-compute:3081/")
+        }));
+    }
+
+    /// Creates a bounded session role and a protected fixed bridge role.
+    #[test]
+    fn compute_bootstrap_has_no_public_application_login() {
+        let script = super::compute_script();
+
+        assert!(script.contains("CREATE ROLE verglas_proxy_bridge LOGIN"));
+        assert!(script.contains("CREATE ROLE verglas_tenant_session NOLOGIN"));
+        assert!(script.contains("GRANT verglas_tenant_session TO verglas_proxy_bridge"));
+        assert!(!script.contains("CREATE ROLE verglas LOGIN"));
     }
 
     /// Accepts the two state representations emitted by supported pageservers.

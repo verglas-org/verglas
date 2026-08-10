@@ -63,6 +63,33 @@ CREATE TABLE IF NOT EXISTS verglas_authz.policy_versions (
     version BIGINT NOT NULL CHECK (version >= 0)
 );
 
+-- Token rows intentionally contain no bearer value, signature, or signing key.
+CREATE TABLE IF NOT EXISTS verglas_authz.access_tokens (
+    tenant_id TEXT NOT NULL,
+    id TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    parent_principal_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    audience TEXT NOT NULL,
+    policy_version BIGINT NOT NULL CHECK (policy_version >= 0),
+    run_id TEXT,
+    created_at BIGINT NOT NULL CHECK (created_at >= 0),
+    expires_at BIGINT NOT NULL CHECK (expires_at > created_at),
+    last_used_at BIGINT,
+    revoked_at BIGINT,
+    PRIMARY KEY (tenant_id, id),
+    FOREIGN KEY (tenant_id, principal_id)
+        REFERENCES verglas_authz.principals (tenant_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (tenant_id, parent_principal_id)
+        REFERENCES verglas_authz.principals (tenant_id, id) ON DELETE RESTRICT,
+    CHECK (principal_id <> parent_principal_id),
+    CHECK (last_used_at IS NULL OR (last_used_at >= created_at AND last_used_at <= expires_at)),
+    CHECK (revoked_at IS NULL OR revoked_at >= created_at)
+);
+
+CREATE INDEX IF NOT EXISTS access_tokens_parent_inventory
+    ON verglas_authz.access_tokens (tenant_id, parent_principal_id, created_at DESC, id);
+
 CREATE SCHEMA IF NOT EXISTS verglas_secrets;
 
 CREATE TABLE IF NOT EXISTS verglas_secrets.secrets (

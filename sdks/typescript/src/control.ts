@@ -10,8 +10,8 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export interface ControlConnectOptions {
   /** Base URL for the selected control-plane listener. */
   endpoint: string;
-  /** Bearer credential accepted by the listener. */
-  token?: string;
+  /** Scoped bearer credential accepted by the listener. */
+  token: string;
   /** Optional fetch implementation for non-browser runtimes and tests. */
   fetch?: typeof fetch;
   /** Request timeout in milliseconds. */
@@ -21,13 +21,14 @@ export interface ControlConnectOptions {
 /** Creates a JSON transport after validating the shared connector options. */
 function transport(options: ControlConnectOptions): Transport {
   if (!options.endpoint) throw new Error("control connect: endpoint is required");
+  if (!options.token) throw new Error("control connect: token is required");
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (typeof fetchImpl !== "function") {
     throw new Error("control connect: no global fetch; pass ControlConnectOptions.fetch");
   }
   return makeTransport(
     options.endpoint.replace(/\/+$/, ""),
-    options.token ?? "",
+    options.token,
     fetchImpl,
     options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   );
@@ -82,6 +83,135 @@ export type DatabaseView =
 
 /** Create request accepted by the dynamic tenant database API. */
 export type CreateDatabaseRequest = DatabaseView;
+
+/** One operation a Verglas policy can grant on a protected resource. */
+export type AccessAction =
+  | "discover"
+  | "describe"
+  | "query"
+  | "append"
+  | "modify"
+  | "create_child"
+  | "execute"
+  | "use_secret"
+  | "deploy"
+  | "pass_grants"
+  | "manage_grants"
+  | "own";
+
+/** Resource actions delegated from an authenticated owner to one new token principal. */
+export interface AccessTokenGrant {
+  /** Stable ID of the database, table, queue, Vessel, or other protected resource. */
+  resource_id: string;
+  /** Operations the authenticated principal delegates to this token. */
+  actions: AccessAction[];
+}
+
+/** Parameters for minting one short-lived, independently revocable access token. */
+export interface CreateAccessTokenRequest {
+  /** Human-readable label shown in access management surfaces. */
+  name: string;
+  /** Receiving service the token may authenticate to. */
+  audience: string;
+  /** Positive lifetime in seconds. The service fixes issue and expiry timestamps. */
+  expires_in_seconds: number;
+  /** Grants to create for the token's child process principal. */
+  grants: AccessTokenGrant[];
+}
+
+/** Public metadata for one access token. It never includes the credential value. */
+export interface AccessTokenSummary {
+  /** Stable token ID used for audit and revocation. */
+  id: string;
+  /** Tenant that owns the token and its parent/child principals. */
+  tenant_id: string;
+  /** Human or process principal that delegated this token. */
+  parent_principal_id: string;
+  /** Child process principal that every receiving service authorizes. */
+  principal_id: string;
+  /** Human-readable label supplied on creation. */
+  name: string;
+  /** Receiving service the token may authenticate to. */
+  audience: string;
+  /** Policy revision evaluated when the token was minted. */
+  policy_version: number;
+  /** Optional execution identity the token is bound to. */
+  run_id?: string;
+  /** Unix creation time in seconds. */
+  created_at: number;
+  /** Unix expiry time in seconds. */
+  expires_at: number;
+  /** Unix last-use time in seconds when the token has been accepted. */
+  last_used_at?: number;
+  /** Unix revocation time in seconds when the token has been revoked. */
+  revoked_at?: number;
+}
+
+/** A newly minted access token. `token` is returned only by the create operation. */
+export interface MintedAccessToken extends AccessTokenSummary {
+  /** Bearer value. Store it securely; it cannot be retrieved again. */
+  token: string;
+}
+
+/** Parameters for one short-lived direct connection credential to a Postgres database. */
+export interface CreateDatabaseTokenRequest {
+  /** Tenant-local database ID, such as `operations` for the `database/operations` resource. */
+  database_id: string;
+  /** Optional lifetime in seconds. The access service defaults and caps it at 900 seconds. */
+  expires_in_seconds?: number;
+}
+
+/** One-time direct database credential. It must never be logged or persisted by the SDK. */
+export interface DatabaseAccessToken {
+  /** Credential passed to the database connection layer. It is returned only when minted. */
+  token: string;
+  /** Unix timestamp in seconds after which the credential is rejected. */
+  expires_at: number;
+}
+
+/** One authorization check against the principal represented by the presented token. */
+export interface AccessAuthorizationRequest {
+  /** Receiving service that must match the token's audience. */
+  audience: string;
+  /** Protected resource to check. */
+  resource_id: string;
+  /** Operation requested on the resource. */
+  action: AccessAction;
+}
+
+/** Authenticated identity the access service derived from the bearer token. */
+export interface AccessIdentity {
+  /** Tenant boundary fixed by the token. */
+  tenant_id: string;
+  /** Principal represented by the token. */
+  principal_id: string;
+  /** Token ID for audit correlation. */
+  token_id: string;
+  /** Receiving service the request is authorized for. */
+  audience: string;
+}
+
+/** Explainable allow or deny result from one policy evaluation. */
+export interface AccessDecision {
+  /** Whether the requested operation is allowed. */
+  allowed: boolean;
+  /** Stable reason for the allow or deny decision. */
+  reason: "exact_grant" | "inherited_grant" | "no_matching_grant" | "tenant_mismatch";
+  /** Grant that authorized an allowed operation. */
+  grant_id?: string;
+  /** Resource on which the granting permission was found. */
+  matched_resource_id?: string;
+  /** Policy revision evaluated for this decision. */
+  policy_version: number;
+}
+
+/** Identity and decision returned by a token-based access check. */
+export interface AccessAuthorization {
+  /** Identity derived from the presented bearer token. */
+  identity: AccessIdentity;
+  /** Result of evaluating that identity against the requested resource action. */
+  decision: AccessDecision;
+}
 
 /** Bounded run-history entry returned by the scheduler. */
 export interface JobSummary {
@@ -179,6 +309,38 @@ export class VerglasAccessClient {
       "DELETE",
       `/v1/databases/${encodeURIComponent(name)}`,
     );
+  }
+
+  /** Mints one revocable child-principal token and returns its bearer value exactly once. */
+  createToken(request: CreateAccessTokenRequest): Promise<MintedAccessToken> {
+    return this.transport.request<MintedAccessToken>("POST", "/v1/access/tokens", {body: request});
+  }
+
+  /** Lists token metadata visible to the authenticated owner without credential values. */
+  listTokens(): Promise<AccessTokenSummary[]> {
+    return this.transport.request<AccessTokenSummary[]>("GET", "/v1/access/tokens");
+  }
+
+  /** Revokes one token and returns its final public metadata. */
+  revokeToken(id: string): Promise<AccessTokenSummary> {
+    return this.transport.request<AccessTokenSummary>(
+      "DELETE",
+      `/v1/access/tokens/${encodeURIComponent(id)}`,
+    );
+  }
+
+  /** Mints a one-time short-lived credential for one authorized direct database connection. */
+  createDatabaseToken(request: CreateDatabaseTokenRequest): Promise<DatabaseAccessToken> {
+    return this.transport.request<DatabaseAccessToken>("POST", "/v1/access/database-tokens", {
+      body: request,
+    });
+  }
+
+  /** Evaluates the requested resource action using the identity derived from this client's token. */
+  authorize(request: AccessAuthorizationRequest): Promise<AccessAuthorization> {
+    return this.transport.request<AccessAuthorization>("POST", "/v1/access/authorize", {
+      body: request,
+    });
   }
 }
 
@@ -358,19 +520,16 @@ export function connectAdmin(options: ControlConnectOptions): VerglasAdminClient
 
 /** Connects to the mandatory tenant access and database-resource service. */
 export function connectAccess(options: ControlConnectOptions): VerglasAccessClient {
-  if (!options.token) throw new Error("connectAccess: token is required");
   return new VerglasAccessClient(transport(options));
 }
 
 /** Connects to the scheduler control listener. */
 export function connectScheduler(options: ControlConnectOptions): VerglasSchedulerClient {
-  if (!options.token) throw new Error("connectScheduler: token is required");
   return new VerglasSchedulerClient(transport(options));
 }
 
 /** Connects to the local container-runtime listener. */
 export function connectRuntime(options: ControlConnectOptions): VerglasRuntimeClient {
-  if (!options.token) throw new Error("connectRuntime: token is required");
   const endpoint = options.endpoint.replace(/\/+$/, "");
   const fetchImpl = options.fetch ?? globalThis.fetch;
   if (typeof fetchImpl !== "function") throw new Error("connectRuntime: no global fetch");

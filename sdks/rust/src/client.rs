@@ -38,6 +38,10 @@ use crate::graph::{
     ReachedView,
 };
 use crate::queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult};
+use crate::token::{
+    AccessTokenCreateRequest, AccessTokenSummary, DatabaseConnectionToken,
+    DatabaseConnectionTokenRequest, IssuedAccessToken,
+};
 use crate::vector::{
     DeclareIndexRequest, IndexInfo, IndexReport as VectorIndexReport, SearchRequest, SearchResponse,
 };
@@ -595,6 +599,50 @@ impl Client {
             self.http
                 .post(self.access_url("/v1/access/check"))
                 .json(check),
+        )
+        .await
+    }
+
+    /// Mints a delegated token for the authenticated principal and returns its plaintext once.
+    pub async fn create_access_token(
+        &self,
+        request: &AccessTokenCreateRequest,
+    ) -> Result<IssuedAccessToken, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/tokens"))
+                .json(request),
+        )
+        .await
+    }
+
+    /// Lists the authenticated principal's token inventory without exposing plaintext tokens.
+    pub async fn list_access_tokens(&self) -> Result<Vec<AccessTokenSummary>, ClientError> {
+        self.access_json(self.http.get(self.access_url("/v1/access/tokens")))
+            .await
+    }
+
+    /// Revokes one token owned or manageable by the authenticated principal.
+    pub async fn revoke_access_token(
+        &self,
+        token_id: &str,
+    ) -> Result<AccessTokenSummary, ClientError> {
+        self.access_json(
+            self.http
+                .delete(self.access_url(&format!("/v1/access/tokens/{token_id}"))),
+        )
+        .await
+    }
+
+    /// Exchanges the current authorized bearer for a short-lived Postgres connection token.
+    pub async fn create_database_connection_token(
+        &self,
+        request: &DatabaseConnectionTokenRequest,
+    ) -> Result<DatabaseConnectionToken, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/database-tokens"))
+                .json(request),
         )
         .await
     }

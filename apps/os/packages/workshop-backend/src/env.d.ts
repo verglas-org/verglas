@@ -66,17 +66,15 @@ declare global {
       VERGLAS_CONTAINER_RUNTIME_URL?: string;
       VERGLAS_CONTAINER_RUNTIME_TOKEN?: string;
 
-      // Data-plane capability passed only to generated Integration runtime containers.
+      // Data-plane endpoint paired with a caller-minted scoped token at deployment time.
       VERGLAS_DATA_ENDPOINT?: string;
-      VERGLAS_DATA_TOKEN?: string;
       VERGLAS_INTEGRATION_RUNTIME_IMAGE?: string;
 
-      // Mandatory tenant authorization service. The service token remains backend-only.
+      // Mandatory tenant authorization service. The shared key signs short-lived user assertions;
+      // it is never sent to the access service or exposed to a generated runtime.
       VERGLAS_ACCESS_URI?: string;
-      VERGLAS_ACCESS_SERVICE_TOKEN?: string;
+      VERGLAS_IDENTITY_ASSERTION_KEY?: string;
       VERGLAS_TENANT_ID?: string;
-      // Explicit OSS-only bootstrap: every local account owns the local tenant.
-      VERGLAS_LOCAL_OWNER_BOOTSTRAP?: string;
 
       // Native coding-agent CLI adapter. The bearer token is backend-only.
       LOCAL_MODEL_RUNTIME_URL?: string;

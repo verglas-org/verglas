@@ -7,8 +7,8 @@ test("listLakehouse discovers resources and uses only database-scoped catalogs",
   const calls = [];
   globalThis.fetch = async (input, init) => {
     const url = String(input);
-    calls.push([url, init?.method ?? "GET"]);
-    if (url === "http://access/v1/access/check") return Response.json({allowed: true});
+    calls.push([url, init?.method ?? "GET", init?.body, init?.headers]);
+    if (url === "http://access/v1/access/authorize") return Response.json({allowed: true});
     if (url === "http://access/v1/databases") return Response.json({databases: [{
       type: "lakehouse",
       name: "analytics",
@@ -30,12 +30,9 @@ test("listLakehouse discovers resources and uses only database-scoped catalogs",
   try {
     const execute = createToolExecutor({
       VERGLAS_DATA_ENDPOINT: "http://data",
-      VERGLAS_DATA_TOKEN: "data-token",
       VERGLAS_CONTAINER_RUNTIME_URL: "http://runtime",
-      VERGLAS_CONTAINER_RUNTIME_TOKEN: "runtime-token",
       VERGLAS_ACCESS_URI: "http://access",
-      VERGLAS_ACCESS_SERVICE_TOKEN: "access-token",
-      VERGLAS_TENANT_ID: "tenant",
+      VERGLAS_TOKEN: "scoped-token",
       VERGLAS_AGENT_PRINCIPAL_ID: "agent/session",
     }, async () => {});
 
@@ -52,6 +49,13 @@ test("listLakehouse discovers resources and uses only database-scoped catalogs",
       qualifiedName: "events.log",
     }]);
     assert.equal(calls.length, 5);
+    assert.ok(calls.every(([url]) => url.startsWith("http://access") || url.startsWith("http://data")));
+    assert.ok(calls.every(([, , , headers]) => headers.Authorization === "Bearer scoped-token"));
+    assert.deepEqual(calls.filter(([url]) => url === "http://access/v1/access/authorize")
+      .map(([, , body]) => JSON.parse(body)), [
+      {audience: "data-plane", resource_id: "tenant", action: "discover"},
+      {audience: "data-plane", resource_id: "database/analytics", action: "discover"},
+    ]);
   } finally {
     globalThis.fetch = originalFetch;
   }
@@ -62,8 +66,8 @@ test("queryLakehouse sends SQL only to the selected database runtime", async () 
   const calls = [];
   globalThis.fetch = async (input, init) => {
     const url = String(input);
-    calls.push([url, init?.method ?? "GET", init?.body]);
-    if (url === "http://access/v1/access/check") return Response.json({allowed: true});
+    calls.push([url, init?.method ?? "GET", init?.body, init?.headers]);
+    if (url === "http://access/v1/access/authorize") return Response.json({allowed: true});
     if (url === "http://access/v1/databases/analytics") return Response.json({
       type: "lakehouse", name: "analytics", storage: {mode: "managed"},
       catalog: {mode: "managed-lakekeeper"},
@@ -76,12 +80,9 @@ test("queryLakehouse sends SQL only to the selected database runtime", async () 
   try {
     const execute = createToolExecutor({
       VERGLAS_DATA_ENDPOINT: "http://data",
-      VERGLAS_DATA_TOKEN: "data-token",
       VERGLAS_CONTAINER_RUNTIME_URL: "http://runtime",
-      VERGLAS_CONTAINER_RUNTIME_TOKEN: "runtime-token",
       VERGLAS_ACCESS_URI: "http://access",
-      VERGLAS_ACCESS_SERVICE_TOKEN: "access-token",
-      VERGLAS_TENANT_ID: "tenant",
+      VERGLAS_TOKEN: "scoped-token",
       VERGLAS_AGENT_PRINCIPAL_ID: "agent/session",
     }, async () => {});
 
@@ -92,6 +93,15 @@ test("queryLakehouse sends SQL only to the selected database runtime", async () 
       "http://data/v1/databases/analytics/query",
       "POST",
       JSON.stringify({sql: "SELECT 1 AS id"}),
+      {
+        Authorization: "Bearer scoped-token",
+        "Content-Type": "application/json",
+      },
+    ]);
+    assert.deepEqual(calls[0].slice(0, 3), [
+      "http://access/v1/access/authorize",
+      "POST",
+      JSON.stringify({audience: "data-plane", resource_id: "database/analytics", action: "query"}),
     ]);
   } finally {
     globalThis.fetch = originalFetch;

@@ -1,5 +1,11 @@
 # verglasd worklog
 
+- #RBAC: Passed `VERGLAS_INITIAL_OWNER_EMAIL` to the local Verglas OS service.
+  Its development gateway derives the Workshop `ADMINS` binding from this
+  value, so the first UI administrator and tenant-policy owner are the same
+  principal instead of silently falling back to `dev@example.com`. Added Docker
+  packaging coverage for the invariant.
+
 - #43: Wired the optional local container-runtime namespace gateway into the primary admin endpoint through paired URL and bearer-token configuration.
 - #385: Added content-negotiated Arrow IPC query streaming, Arrow IPC table
   commits, and exact table-definition inspection to the daemon data plane. A
@@ -620,3 +626,13 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   coordination; server integration fixtures now declare the same binding.
 - #84: Replaced the OSS environment-mode singleton catalog with an access-service inventory synchronizer and database-scoped Lakekeeper gateway routes. Runtime snapshots refresh atomically and fail closed on unresolved external-catalog bindings.
 - #84: Bound the on-demand query worker to the live database registry and render one metadata config per Lakehouse. The server exposes no singleton SQL route or catalog fallback.
+- #84: Updated the self-hosted packaging contract for scoped authorization:
+  Compose supplies the server's read-only inventory credential file instead of
+  a deployment-wide access token, requires the initial-owner and token-signing
+  configuration needed by the tenant access service, including a separate
+  Ed25519 target-JWT signing seed, and does not inject a static data token into
+  Verglas OS.
+- #81: Wrapped both server data-plane entry points with access-service bearer authorization and removed the S3 access-key-to-KV-tenant bypass. Background database discovery now reloads a scoped service-principal credential from `VERGLAS_ACCESS_TOKEN_FILE`; the deployment-wide access service token is no longer accepted.
+- #81: The on-demand write launcher now renders one database-scoped, bearer-free
+  role config and passes the authorized caller token only through the short-lived
+  child environment. It refuses databases absent from the live Lakehouse registry.

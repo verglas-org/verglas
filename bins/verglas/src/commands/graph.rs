@@ -29,9 +29,10 @@ use verglas_sdk::server::ServerClient;
 pub async fn run(
     command: GraphCommand,
     server_endpoint: &str,
+    token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let client = crate::backend::server(server_endpoint)?;
+    let client = crate::backend::server(server_endpoint, token)?;
     match command {
         GraphCommand::Create(args) => create(&client, args, json).await,
         GraphCommand::AddNode(args) => add_node(&client, args, json).await,
