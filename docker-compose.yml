@@ -269,6 +269,9 @@ services:
       LAKEKEEPER__VERGLAS__ENDPOINT: http://verglas-access:8345/
       LAKEKEEPER__VERGLAS__WORKLOAD_CREDENTIAL_FILE: /var/run/verglas/lakekeeper/verglas-lakekeeper.token
       LAKEKEEPER__VERGLAS__TENANT_ID: ${VERGLAS_TENANT_ID:-local}
+      VERGLAS_CACHE_EVENT_URLS: ${VERGLAS_CACHE_EVENT_URLS:-http://verglas-server:8334/v1/events}
+      VERGLAS_CACHE_EVENT_TOKEN: ${VERGLAS_CACHE_EVENT_TOKEN:-${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}}
+      VERGLAS_CACHE_CONSISTENCY: ${VERGLAS_CACHE_CONSISTENCY:-eventual}
     volumes:
       - verglas-access-lakekeeper-credentials:/var/run/verglas/lakekeeper:ro
     depends_on:

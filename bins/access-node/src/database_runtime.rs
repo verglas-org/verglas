@@ -82,8 +82,11 @@ where
         &self,
         tenant_id: &str,
     ) -> Result<Vec<String>, DatabaseServiceError> {
-        self.lakehouse.bootstrap().await?;
         let mut failures = Vec::new();
+        if let Err(error) = self.lakehouse.bootstrap().await {
+            failures.push(format!("managed lakehouse: {error}"));
+            return Ok(failures);
+        }
         for database in self.inner.list_databases(tenant_id).await? {
             if let Err(error) = self.ensure_view(&database).await {
                 failures.push(format!("{}: {error}", database.name()));
@@ -282,6 +285,7 @@ mod tests {
     /// Deterministic managed runtime used by lifecycle tests.
     #[derive(Default)]
     struct FakeRuntime {
+        bootstrap_fail: bool,
         fail: bool,
         ensured: Mutex<Vec<String>>,
         deleted: Mutex<Vec<String>>,
@@ -292,6 +296,11 @@ mod tests {
     impl ManagedLakehouseRuntime for FakeRuntime {
         /// Accepts bootstrap in tests.
         async fn bootstrap(&self) -> Result<(), DatabaseServiceError> {
+            if self.bootstrap_fail {
+                return Err(DatabaseServiceError::Provisioning(
+                    "catalog unavailable".to_owned(),
+                ));
+            }
             Ok(())
         }
 
@@ -440,6 +449,25 @@ mod tests {
         assert_eq!(
             failures,
             ["operational: database runtime provisioning failed: failed"]
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_retries_an_unavailable_managed_catalog() {
+        let manager = ProvisioningDatabaseManager::new(
+            Arc::new(MemoryManager::default()),
+            FakeRuntime {
+                bootstrap_fail: true,
+                ..FakeRuntime::default()
+            },
+            FakeRuntime::default(),
+        );
+
+        let failures = manager.recover("tenant-a").await.expect("recovery");
+
+        assert_eq!(
+            failures,
+            ["managed lakehouse: database runtime provisioning failed: catalog unavailable"]
         );
     }
 }
