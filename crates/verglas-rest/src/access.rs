@@ -191,13 +191,14 @@ impl DatabaseAuthorization for AccessHttpRuntime {
     async fn create_database_resource(
         &self,
         principal: &AuthenticatedPrincipal,
-        database: &str,
+        database_id: &str,
+        database_name: &str,
         kind: DatabaseKind,
     ) -> Result<(), DatabaseAuthorizationError> {
         if principal.tenant_id != self.tenant_id.as_ref() {
             return Err(DatabaseAuthorizationError::new("tenant mismatch"));
         }
-        let resource_id = format!("database/{database}");
+        let resource_id = format!("database/{database_id}");
         let resource = Resource::new(
             &principal.tenant_id,
             &resource_id,
@@ -250,14 +251,14 @@ impl DatabaseAuthorization for AccessHttpRuntime {
         }
         let grants = [
             Grant::new(
-                format!("database-owner/{database}/{}", principal.principal_id),
+                format!("database-owner/{database_name}/{}", principal.principal_id),
                 &principal.tenant_id,
                 &principal.principal_id,
                 &resource_id,
                 BTreeSet::from([Action::Own]),
             ),
             Grant::new(
-                format!("database-service/{database}/{service_id}"),
+                format!("database-service/{database_name}/{service_id}"),
                 &principal.tenant_id,
                 service_id,
                 &resource_id,
@@ -285,12 +286,12 @@ impl DatabaseAuthorization for AccessHttpRuntime {
     async fn delete_database_resource(
         &self,
         principal: &AuthenticatedPrincipal,
-        database: &str,
+        database_id: &str,
     ) -> Result<(), DatabaseAuthorizationError> {
         if principal.tenant_id != self.tenant_id.as_ref() {
             return Err(DatabaseAuthorizationError::new("tenant mismatch"));
         }
-        let root_id = format!("database/{database}");
+        let root_id = format!("database/{database_id}");
         let resources = self
             .authorizer
             .list_resources(&principal.tenant_id)
@@ -1972,54 +1973,6 @@ fn unix_time() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-#[cfg(test)]
-mod lakekeeper_resource_contract_tests {
-    use super::{ResourceKind, is_lakekeeper_resource_parent};
-
-    #[test]
-    fn accepts_shared_control_and_database_resource_trees() {
-        assert!(is_lakekeeper_resource_parent(
-            ResourceKind::Project,
-            "lakekeeper/project/project-a",
-            "lakekeeper",
-        ));
-        assert!(is_lakekeeper_resource_parent(
-            ResourceKind::Warehouse,
-            "warehouse/warehouse-a",
-            "database/database-a",
-        ));
-        assert!(is_lakekeeper_resource_parent(
-            ResourceKind::Namespace,
-            "namespace/namespace-a",
-            "warehouse/warehouse-a",
-        ));
-        assert!(is_lakekeeper_resource_parent(
-            ResourceKind::Table,
-            "warehouse/warehouse-a/table/table-a",
-            "namespace/namespace-a",
-        ));
-    }
-
-    #[test]
-    fn rejects_kind_confusion_and_unbounded_paths() {
-        assert!(!is_lakekeeper_resource_parent(
-            ResourceKind::Database,
-            "database/database-a",
-            "tenant",
-        ));
-        assert!(!is_lakekeeper_resource_parent(
-            ResourceKind::Warehouse,
-            "lakekeeper/project/project-a",
-            "database/database-a",
-        ));
-        assert!(!is_lakekeeper_resource_parent(
-            ResourceKind::Table,
-            "warehouse/warehouse-a/table/table-a/extra",
-            "namespace/namespace-a",
-        ));
-    }
-}
-
 /// Serializes one successful typed result or maps its stable authorization error.
 fn result<T: Serialize>(status: StatusCode, value: Result<T, AuthzError>) -> Response {
     match value {
@@ -2071,4 +2024,52 @@ fn secret_error_response(error: SecretError) -> Response {
         Json(serde_json::json!({ "error": error.to_string() })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod lakekeeper_resource_contract_tests {
+    use super::{ResourceKind, is_lakekeeper_resource_parent};
+
+    #[test]
+    fn accepts_shared_control_and_database_resource_trees() {
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Project,
+            "lakekeeper/project/project-a",
+            "lakekeeper",
+        ));
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Warehouse,
+            "warehouse/warehouse-a",
+            "database/database-a",
+        ));
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Namespace,
+            "namespace/namespace-a",
+            "warehouse/warehouse-a",
+        ));
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Table,
+            "warehouse/warehouse-a/table/table-a",
+            "namespace/namespace-a",
+        ));
+    }
+
+    #[test]
+    fn rejects_kind_confusion_and_unbounded_paths() {
+        assert!(!is_lakekeeper_resource_parent(
+            ResourceKind::Database,
+            "database/database-a",
+            "tenant",
+        ));
+        assert!(!is_lakekeeper_resource_parent(
+            ResourceKind::Warehouse,
+            "lakekeeper/project/project-a",
+            "database/database-a",
+        ));
+        assert!(!is_lakekeeper_resource_parent(
+            ResourceKind::Table,
+            "warehouse/warehouse-a/table/table-a/extra",
+            "namespace/namespace-a",
+        ));
+    }
 }

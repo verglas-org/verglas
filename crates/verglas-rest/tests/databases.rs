@@ -94,11 +94,12 @@ impl DatabaseAuthorization for RecordingAuthorization {
     async fn create_database_resource(
         &self,
         principal: &AuthenticatedPrincipal,
-        database: &str,
+        database_id: &str,
+        database_name: &str,
         kind: DatabaseKind,
     ) -> Result<(), DatabaseAuthorizationError> {
         self.0.lock().expect("lock").push(format!(
-            "create:{}/{database}:{}:{kind:?}",
+            "create:{}/{database_id}/{database_name}:{}:{kind:?}",
             principal.tenant_id, principal.principal_id,
         ));
         Ok(())
@@ -151,25 +152,25 @@ async fn database_kind_grants_only_its_required_backend_service() {
     );
 
     runtime
-        .create_database_resource(&principal(), "lake", DatabaseKind::Lakehouse)
+        .create_database_resource(&principal(), "lake-id", "lake", DatabaseKind::Lakehouse)
         .await
         .expect("lakehouse authorization");
     runtime
-        .create_database_resource(&principal(), "pg", DatabaseKind::Postgres)
+        .create_database_resource(&principal(), "pg-id", "pg", DatabaseKind::Postgres)
         .await
         .expect("postgres authorization");
 
     let grants = authorizer.list_grants("tenant-a").await.expect("grants");
     let lake_services: Vec<_> = grants
         .iter()
-        .filter(|grant| grant.resource_id == "database/lake")
+        .filter(|grant| grant.resource_id == "database/lake-id")
         .map(|grant| grant.principal_id.as_str())
         .collect();
     assert!(lake_services.contains(&"service/verglas-lakekeeper"));
     assert!(!lake_services.contains(&"service/verglas-neon"));
     let postgres_services: Vec<_> = grants
         .iter()
-        .filter(|grant| grant.resource_id == "database/pg")
+        .filter(|grant| grant.resource_id == "database/pg-id")
         .map(|grant| grant.principal_id.as_str())
         .collect();
     assert!(postgres_services.contains(&"service/verglas-neon"));
@@ -270,7 +271,8 @@ impl DatabaseAuthorization for FailingAuthorization {
     async fn create_database_resource(
         &self,
         _principal: &AuthenticatedPrincipal,
-        _database: &str,
+        _database_id: &str,
+        _database_name: &str,
         _kind: DatabaseKind,
     ) -> Result<(), DatabaseAuthorizationError> {
         Err(DatabaseAuthorizationError::new("test failure"))
@@ -378,10 +380,12 @@ async fn create_database_injects_tenant_and_persists_resolved_binding_ids() {
         .await
         .expect("body");
     let record: serde_json::Value = serde_json::from_slice(&body).expect("record");
+    let database_id = record["id"].as_str().expect("database id").to_owned();
     assert_eq!(
         record,
         serde_json::json!({
             "type": "lakehouse",
+            "id": database_id.clone(),
             "name": "external_lake",
             "storage": {
                 "mode": "scoped-secret",
@@ -396,7 +400,9 @@ async fn create_database_injects_tenant_and_persists_resolved_binding_ids() {
     );
     assert_eq!(
         authorization.0.lock().expect("lock").as_slice(),
-        ["create:tenant-a/external_lake:user/owner@example.com:Lakehouse"]
+        [format!(
+            "create:tenant-a/{database_id}/external_lake:user/owner@example.com:Lakehouse"
+        )]
     );
 }
 
@@ -464,10 +470,12 @@ async fn database_collection_and_item_routes_are_tenant_scoped() {
         .await
         .expect("body");
     let database: serde_json::Value = serde_json::from_slice(&body).expect("database");
+    let database_id = database["id"].as_str().expect("database id").to_owned();
     assert_eq!(
         database,
         serde_json::json!({
             "type": "postgres",
+            "id": database_id.clone(),
             "name": "warehouse",
             "engine": { "mode": "managed-neon" }
         })
@@ -483,13 +491,9 @@ async fn database_collection_and_item_routes_are_tenant_scoped() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
-    assert!(
-        authorization
-            .0
-            .lock()
-            .expect("lock")
-            .contains(&"delete:tenant-a/warehouse:user/owner@example.com".to_owned())
-    );
+    assert!(authorization.0.lock().expect("lock").contains(&format!(
+        "delete:tenant-a/{database_id}:user/owner@example.com"
+    )));
 
     let response = app
         .clone()

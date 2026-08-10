@@ -25,20 +25,21 @@ pub type DatabaseAuthorizationRuntime = Arc<dyn DatabaseAuthorization>;
 /// Authorization resource operations required by the database API.
 #[async_trait]
 pub trait DatabaseAuthorization: Send + Sync {
-    /// Idempotently creates `database/{name}`, grants its creator `own`, and
+    /// Idempotently creates `database/{id}`, grants its creator `own`, and
     /// grants only the selected engine's service its required action set.
     async fn create_database_resource(
         &self,
         principal: &AuthenticatedPrincipal,
-        database: &str,
+        database_id: &str,
+        database_name: &str,
         kind: DatabaseKind,
     ) -> Result<(), DatabaseAuthorizationError>;
 
-    /// Idempotently deletes `database/{name}` and grants rooted on it.
+    /// Idempotently deletes `database/{id}` and grants rooted on it.
     async fn delete_database_resource(
         &self,
         principal: &AuthenticatedPrincipal,
-        database: &str,
+        database_id: &str,
     ) -> Result<(), DatabaseAuthorizationError>;
 }
 
@@ -120,6 +121,15 @@ async fn delete_database(
     if !require_tenant(&runtime, &principal) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let database = match runtime
+        .service
+        .get_database(&runtime.tenant_id, &name)
+        .await
+    {
+        Ok(database) => database,
+        Err(DatabaseServiceError::NotFound { .. }) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return database_error(error),
+    };
     let deletion = runtime
         .service
         .delete_database(&runtime.tenant_id, &name)
@@ -131,7 +141,7 @@ async fn delete_database(
     }
     match runtime
         .authorization
-        .delete_database_resource(&principal, &name)
+        .delete_database_resource(&principal, database.id())
         .await
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -160,7 +170,7 @@ async fn create_database(
     };
     if let Err(error) = runtime
         .authorization
-        .create_database_resource(&principal, &database_name, database_kind)
+        .create_database_resource(&principal, database.id(), &database_name, database_kind)
         .await
     {
         return match runtime

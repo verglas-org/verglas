@@ -8,10 +8,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use verglas_authz::{Authorizer, AuthzError, Resource, ResourceKind};
+use std::collections::BTreeSet;
+
+use verglas_authz::{
+    Action, Authorizer, AuthzError, Grant, Principal, PrincipalKind, Resource, ResourceKind,
+};
 use verglas_database::{
-    CatalogRequest, DatabaseManager, DatabasePlan, DatabaseServiceError, DatabaseView,
-    StorageRequest,
+    CatalogRequest, CreateDatabase, DatabaseKind, DatabaseManager, DatabasePlan,
+    DatabaseServiceError, DatabaseView, StorageRequest,
 };
 
 use crate::lakehouse_runtime::LakekeeperProvisioner;
@@ -106,6 +110,44 @@ where
         Ok(failures)
     }
 
+    /// Ensures a configured default is a durable managed Lakehouse declaration.
+    ///
+    /// The boolean reports whether this call created the declaration so callers
+    /// can roll it back if creator-ownership registration subsequently fails.
+    pub(crate) async fn ensure_default_lakehouse(
+        &self,
+        tenant_id: &str,
+        name: &str,
+    ) -> Result<(DatabaseView, bool), DatabaseServiceError> {
+        match self.inner.get_database(tenant_id, name).await {
+            Ok(database) => {
+                if !matches!(
+                    &database,
+                    DatabaseView::Lakehouse {
+                        storage: StorageRequest::Managed,
+                        catalog: CatalogRequest::ManagedLakekeeper,
+                        ..
+                    }
+                ) {
+                    return Err(DatabaseServiceError::Provisioning(format!(
+                        "configured default database {name} is not a managed Lakehouse"
+                    )));
+                }
+                self.ensure_view(&database).await?;
+                Ok((database, false))
+            }
+            Err(DatabaseServiceError::NotFound { .. }) => {
+                let plan = CreateDatabase::new(name, DatabaseKind::Lakehouse)
+                    .plan(tenant_id)
+                    .map_err(|error| DatabaseServiceError::Provisioning(error.to_string()))?;
+                self.create_database(plan)
+                    .await
+                    .map(|database| (database, true))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// Reconciles the managed runtime represented by one public definition.
     async fn ensure_view(&self, database: &DatabaseView) -> Result<(), DatabaseServiceError> {
         let resource = Resource::new(
@@ -119,6 +161,46 @@ where
             Err(error) => {
                 return Err(DatabaseServiceError::Provisioning(format!(
                     "cannot register database authorization resource: {error}"
+                )));
+            }
+        }
+        let (service_id, actions) = match database {
+            DatabaseView::Lakehouse { .. } => (
+                "service/verglas-lakekeeper",
+                BTreeSet::from([Action::CreateChild, Action::Modify]),
+            ),
+            DatabaseView::Postgres { .. } => {
+                ("service/verglas-neon", BTreeSet::from([Action::Connect]))
+            }
+        };
+        match self
+            .authorizer
+            .create_principal(Principal::new(
+                &self.tenant_id,
+                service_id,
+                PrincipalKind::ServiceAccount,
+            ))
+            .await
+        {
+            Ok(_) | Err(AuthzError::Conflict(_)) => {}
+            Err(error) => {
+                return Err(DatabaseServiceError::Provisioning(format!(
+                    "cannot register database service principal: {error}"
+                )));
+            }
+        }
+        let service_grant = Grant::new(
+            format!("database-service/{}/{service_id}", database.name()),
+            &self.tenant_id,
+            service_id,
+            format!("database/{}", database.id()),
+            actions,
+        );
+        match self.authorizer.create_grant(service_grant).await {
+            Ok(_) | Err(AuthzError::Conflict(_)) => {}
+            Err(error) => {
+                return Err(DatabaseServiceError::Provisioning(format!(
+                    "cannot grant database service authority: {error}"
                 )));
             }
         }
@@ -520,6 +602,80 @@ mod tests {
         assert_eq!(
             failures,
             ["managed lakehouse: database runtime provisioning failed: catalog unavailable"]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_lakehouse_is_created_once_and_reconciled_on_restart() {
+        let inner = Arc::new(MemoryManager::default());
+        let manager = ProvisioningDatabaseManager::new(
+            inner.clone(),
+            test_authorizer().await,
+            "tenant-a",
+            FakeRuntime::default(),
+            FakeRuntime::default(),
+        );
+
+        let (created, was_created) = manager
+            .ensure_default_lakehouse("tenant-a", "default")
+            .await
+            .expect("create default");
+        let (recovered, was_recreated) = manager
+            .ensure_default_lakehouse("tenant-a", "default")
+            .await
+            .expect("recover default");
+
+        assert!(was_created);
+        assert!(!was_recreated);
+        assert_eq!(created.id(), recovered.id());
+        assert_eq!(
+            inner
+                .list_databases("tenant-a")
+                .await
+                .expect("databases")
+                .len(),
+            1
+        );
+        assert_eq!(
+            manager
+                .lakehouse
+                .ensured
+                .lock()
+                .expect("ensured")
+                .as_slice(),
+            ["default", "default"]
+        );
+    }
+
+    #[tokio::test]
+    async fn default_lakehouse_rejects_a_conflicting_database_kind() {
+        let inner = Arc::new(MemoryManager::default());
+        inner
+            .create_database(
+                CreateDatabase::new("default", DatabaseKind::Postgres)
+                    .plan("tenant-a")
+                    .expect("plan"),
+            )
+            .await
+            .expect("persist postgres");
+        let manager = ProvisioningDatabaseManager::new(
+            inner,
+            test_authorizer().await,
+            "tenant-a",
+            FakeRuntime::default(),
+            FakeRuntime::default(),
+        );
+
+        let error = manager
+            .ensure_default_lakehouse("tenant-a", "default")
+            .await
+            .expect_err("kind mismatch must fail");
+
+        assert_eq!(
+            error,
+            DatabaseServiceError::Provisioning(
+                "configured default database default is not a managed Lakehouse".to_owned()
+            )
         );
     }
 }

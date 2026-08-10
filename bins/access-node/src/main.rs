@@ -24,10 +24,11 @@ use verglas_authz::{
 use verglas_authz_openfga::{OpenFgaPolicyEngine, bootstrap};
 use verglas_authz_postgres::PostgresAuthorizationRepository;
 use verglas_database::{
-    DatabaseService, PostgresDatabaseRepository, ScopedSecretKind, ScopedSecretResolver,
-    SecretResolutionError,
+    DatabaseManager, DatabaseService, PostgresDatabaseRepository, ScopedSecretKind,
+    ScopedSecretResolver, SecretResolutionError,
 };
 use verglas_queue::{PostgresQueueRepository, QueueService};
+use verglas_rest::database::DatabaseAuthorization;
 
 mod database_runtime;
 mod lakehouse_runtime;
@@ -173,6 +174,9 @@ struct Args {
     /// Private tenant Lakekeeper management endpoint.
     #[arg(long, env = "VERGLAS_MANAGED_CATALOG_URI")]
     managed_catalog_uri: String,
+    /// Managed Lakehouse declaration that must exist before readiness.
+    #[arg(long, env = "VERGLAS_DEFAULT_LAKEHOUSE")]
+    default_lakehouse: Option<String>,
     /// Managed object-store bucket used by Lakekeeper warehouses.
     #[arg(long, env = "VERGLAS_MANAGED_STORAGE_BUCKET")]
     managed_storage_bucket: String,
@@ -414,7 +418,7 @@ async fn run(args: Args) -> Result<(), String> {
     let health_ready = ready.clone();
     let app = Router::new()
         .route("/healthz", get(move || health(health_ready.clone())))
-        .merge(verglas_rest::access::router(access_runtime))
+        .merge(verglas_rest::access::router(access_runtime.clone()))
         .merge(protected_databases)
         .merge(protected_queues);
     let listener = tokio::net::TcpListener::bind(args.listen)
@@ -451,6 +455,44 @@ async fn run(args: Args) -> Result<(), String> {
             "queue runtime recovery failed: {}",
             queue_recovery_failures.join("; ")
         ));
+    }
+    if let Some(default_lakehouse) = args.default_lakehouse.as_deref() {
+        let (database, created) = recovery
+            .ensure_default_lakehouse(&recovery_tenant, default_lakehouse)
+            .await
+            .map_err(|error| format!("default managed Lakehouse failed: {error}"))?;
+        let owner = verglas_rest::data_plane::AuthenticatedPrincipal {
+            tenant_id: recovery_tenant.clone(),
+            principal_id: initial_owner_principal_id(&args.initial_owner_email)?,
+            token_id: "bootstrap/default-lakehouse".to_owned(),
+            audience: verglas_rest::access::DATA_PLANE_AUDIENCE.to_owned(),
+        };
+        if let Err(error) = access_runtime
+            .create_database_resource(
+                &owner,
+                database.id(),
+                database.name(),
+                verglas_database::DatabaseKind::Lakehouse,
+            )
+            .await
+        {
+            if created {
+                let rollback = recovery
+                    .delete_database(&recovery_tenant, default_lakehouse)
+                    .await;
+                let authorization_rollback = access_runtime
+                    .delete_database_resource(&owner, database.id())
+                    .await;
+                server.abort();
+                return Err(format!(
+                    "default managed Lakehouse authorization failed: {error}; declaration rollback: {rollback:?}; authorization rollback: {authorization_rollback:?}"
+                ));
+            }
+            server.abort();
+            return Err(format!(
+                "default managed Lakehouse authorization failed: {error}"
+            ));
+        }
     }
     ready.store(true, Ordering::Release);
     server
