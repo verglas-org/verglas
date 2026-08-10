@@ -599,7 +599,34 @@ async fn forward_catalog(
         )
             .into_response();
     };
-    match catalog.request(method, upstream_path, headers, body).await {
+    let authorization = headers.get(header::AUTHORIZATION).cloned();
+    let database_id = headers
+        .get("x-verglas-database-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let result = match (authorization, database_id) {
+        (Some(authorization), Some(database_id)) => {
+            catalog
+                .authenticated_request_for_database(
+                    method,
+                    upstream_path,
+                    headers,
+                    body,
+                    authorization,
+                    &database_id,
+                )
+                .await
+        }
+        (None, None) => catalog.request(method, upstream_path, headers, body).await,
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "catalog bearer and database identity are required together",
+            )
+                .into_response();
+        }
+    };
+    match result {
         Ok(result) => {
             let status = StatusCode::from_u16(result.status).unwrap_or(StatusCode::BAD_GATEWAY);
             let mut response = Response::new(axum::body::Body::from(result.body));

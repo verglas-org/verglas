@@ -47,6 +47,17 @@ impl AuthenticatedBearer {
     }
 }
 
+/// Immutable database identity resolved from a tenant-local route name after authorization.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedDatabaseId(String);
+
+impl AuthenticatedDatabaseId {
+    /// Returns the policy and catalog identity, never the user-facing route name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// One stable resource and least-privilege operation derived from an HTTP route.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuthorizationQuestion {
@@ -282,6 +293,7 @@ async fn authorize_request(
     let Some(mut target) = route_target(request.method(), request.uri().path()) else {
         return next.run(request).await;
     };
+    let mut resolved_database_id = None;
     if let Some(databases) = &runtime.databases
         && let Some(name) = database_route_name(request.uri().path())
         && target.resource_id == format!("database/{name}")
@@ -291,6 +303,7 @@ async fn authorize_request(
             Err(failure) => return failure.into_response(),
         };
         target.resource_id = format!("database/{database_id}");
+        resolved_database_id = Some(database_id);
     }
     let authorization = match bearer_header(request.headers()) {
         Ok(value) => value,
@@ -316,6 +329,11 @@ async fn authorize_request(
             request
                 .extensions_mut()
                 .insert(AuthenticatedBearer(authorization));
+            if let Some(database_id) = resolved_database_id {
+                request
+                    .extensions_mut()
+                    .insert(AuthenticatedDatabaseId(database_id));
+            }
             next.run(request).await
         }
         Err(failure) => failure.into_response(),

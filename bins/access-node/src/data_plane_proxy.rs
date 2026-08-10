@@ -6,11 +6,12 @@
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{Extension, Request, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
 use reqwest::Url;
+use verglas_rest::data_plane::AuthenticatedDatabaseId;
 
 #[derive(Clone)]
 struct DataPlaneProxy {
@@ -35,13 +36,25 @@ impl DataPlaneProxy {
     }
 
     fn target(&self, request: &Request) -> Result<Url, String> {
+        let path_and_query = request
+            .uri()
+            .path_and_query()
+            .map_or("/", |value| value.as_str());
+        let path = request.uri().path();
+        let segments = path.trim_matches('/').split('/').collect::<Vec<_>>();
+        if let ["v1", "databases", _, "catalog", rest @ ..] = segments.as_slice() {
+            let suffix = rest.join("/");
+            let mut target = if suffix.is_empty() {
+                self.endpoint.join("catalog")
+            } else {
+                self.endpoint.join(&format!("catalog/{suffix}"))
+            }
+            .map_err(|error| format!("invalid catalog request target: {error}"))?;
+            target.set_query(request.uri().query());
+            return Ok(target);
+        }
         self.endpoint
-            .join(
-                request
-                    .uri()
-                    .path_and_query()
-                    .map_or("/", |value| value.as_str()),
-            )
+            .join(path_and_query)
             .map_err(|error| format!("invalid data-plane request target: {error}"))
     }
 }
@@ -62,9 +75,11 @@ pub(crate) fn router(endpoint: &str) -> Result<Router, String> {
 
 async fn relay(
     State(proxy): State<DataPlaneProxy>,
+    database_id: Option<Extension<AuthenticatedDatabaseId>>,
     request: Request,
 ) -> Result<Response, Response> {
     let target = proxy.target(&request).map_err(internal_error)?;
+    let is_catalog = request.uri().path().contains("/catalog/");
     let method = request.method().clone();
     let headers = request.headers().clone();
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
@@ -82,6 +97,12 @@ async fn relay(
         if let Some(value) = headers.get(&name) {
             upstream = upstream.header(name, value);
         }
+    }
+    if is_catalog {
+        let Some(Extension(database_id)) = database_id else {
+            return Err(internal_error("catalog database identity was not resolved"));
+        };
+        upstream = upstream.header("x-verglas-database-id", database_id.as_str());
     }
     let upstream = upstream
         .send()
@@ -124,7 +145,7 @@ mod tests {
             .expect("request");
         assert_eq!(
             proxy.target(&request).expect("target").as_str(),
-            "http://10.42.0.10:8334/v1/databases/default/catalog/v1/config?warehouse=default",
+            "http://10.42.0.10:8334/catalog/v1/config?warehouse=default",
         );
     }
 

@@ -323,6 +323,37 @@ impl CatalogGateway {
             .ok_or_else(|| CatalogError::Auth {
                 detail: "authenticated catalog gateway has no database binding".to_owned(),
             })?;
+        self.authenticated_request_for_database(
+            method,
+            path_and_query,
+            headers,
+            body,
+            authorization,
+            database_id,
+        )
+        .await
+    }
+
+    /// Serves an authenticated request for an immutable database ID resolved by a trusted proxy.
+    pub async fn authenticated_request_for_database(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        authorization: HeaderValue,
+        database_id: &str,
+    ) -> Result<CatalogResponse, CatalogError> {
+        let valid = authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| !token.is_empty());
+        if !valid {
+            return Err(CatalogError::Auth {
+                detail: "verified catalog credential is not a bearer header".to_owned(),
+            });
+        }
         let database_id = HeaderValue::from_str(database_id).map_err(|_| CatalogError::Auth {
             detail: "catalog database binding is not a valid header value".to_owned(),
         })?;
