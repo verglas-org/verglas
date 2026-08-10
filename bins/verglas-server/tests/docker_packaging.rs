@@ -10,6 +10,10 @@ fn docker_application_packages_execution_workers() {
         std::fs::read_to_string(workspace.join("Dockerfile")).expect("read workspace Dockerfile");
     let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
         .expect("read Docker Compose application");
+    let postgres_runtime = std::fs::read_to_string(
+        workspace.join("bins/access-node/src/postgres_runtime.rs"),
+    )
+    .expect("read managed Postgres runtime");
 
     for package in ["verglas-server", "verglas-query", "verglas-write-node"] {
         assert!(
@@ -127,18 +131,48 @@ fn docker_application_packages_execution_workers() {
         "Lakekeeper must read only its policy-engine workload credential file"
     );
     assert!(
+        !compose.contains("LAKEKEEPER__VERGLAS__DATABASE_RESOURCE_ID"),
+        "Lakekeeper must receive the trusted database identity per request, not from a singleton deployment variable"
+    );
+    assert!(
         !compose.contains("LAKEKEEPER__AUTHZ_BACKEND: allowall"),
         "Lakekeeper must not use the permissive allow-all authorizer"
     );
     assert!(
         compose.contains(
-            "https://github.com/verglas-org/lakekeeper.git#96205cebab7704bd7bcbc91190a774e72f8c55dc"
+            "https://github.com/verglas-org/lakekeeper.git#34fef9c4580369900211b21c0f1db95cf8f0a876"
         ),
         "Lakekeeper must build from the reviewed immutable Verglas fork revision"
     );
     assert!(
         compose.contains("pull_policy: never"),
         "Compose must not pull an unpublished or upstream Lakekeeper image"
+    );
+    assert!(
+        !compose.contains("verglas-neon-storage-image:")
+            && !compose.contains("github.com/verglas-org/neon.git#")
+            && postgres_runtime.contains(
+                "ghcr.io/verglas-org/neon-storage:294a7b6e99392e60ff18aa6bef08e54b77446f7d"
+            )
+            && postgres_runtime.contains(
+                "ghcr.io/verglas-org/neon-compute-v16:294a7b6e99392e60ff18aa6bef08e54b77446f7d"
+            ),
+        "the managed Postgres runtime must consume published exact Verglas Neon images without a Compose source-build fallback"
+    );
+    let access_service = compose
+        .split("\n  verglas-access:\n")
+        .nth(1)
+        .expect("access service")
+        .split("\n  verglas-scheduler:")
+        .next()
+        .expect("access service body");
+    assert!(
+        access_service.contains("verglas-runtime-state:/var/lib/verglas-container-runtime:ro"),
+        "access must read the runtime-generated TLS identity without receiving runtime write authority"
+    );
+    assert!(
+        !access_service.contains("verglas-lakekeeper:\n"),
+        "access must not wait for Lakekeeper; Lakekeeper waits for access to avoid a startup cycle"
     );
 }
 

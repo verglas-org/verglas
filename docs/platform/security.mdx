@@ -148,10 +148,16 @@ interactive CLI or exposed through a UI.
 
 Lakekeeper uses a separate read-only `policy-engine` credential file. Its
 Verglas adapter evaluates each direct catalog request against the same tenant
-policy rather than using Lakekeeper's permissive `allowall` backend. Catalog
-requests carry the trusted database identity selected by the Verglas database
-gateway, so each project and warehouse is evaluated beneath its own database
-resource root.
+policy rather than using Lakekeeper's permissive `allowall` backend. The
+Verglas database gateway strips client-provided database-identity headers and
+injects the trusted stable database identity for the selected catalog route,
+so each project and warehouse is evaluated beneath its own database resource
+root. There is no deployment-wide Lakekeeper database-resource setting.
+
+The managed Neon proxy receives a different policy credential through the
+trusted container runtime, never through Lakekeeper or the data server. It
+validates a short-lived, database-targeted JWT and asks the access service to
+authorize `connect`; it does not accept a shared Postgres password.
 
 ## Secrets and Postgres credentials
 

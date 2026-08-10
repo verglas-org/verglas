@@ -137,10 +137,18 @@ with R2 enabled.
     Pass the same `VERGLAS_CONTAINER_RUNTIME_TOKEN` to the local Verglas control
     plane. Do not use the Compose file's development default on a shared machine.
 
-    The access service writes the server's short-lived inventory credential to
-    a private Compose volume. `verglas-server` mounts that volume read-only and
-    receives only the token file named in `VERGLAS_ACCESS_TOKEN_FILE`. Do not
-    copy that file to a shell, an Application, a Vessel, or a source repository.
+    The access service writes separate short-lived workload credentials to
+    separate private Compose volumes. `verglas-server` mounts only its inventory
+    token file read-only. Lakekeeper mounts only its catalog-policy credential,
+    and the trusted container runtime mounts only the Neon proxy-policy
+    credential so it can inject the file into a managed Postgres proxy. Do not
+    copy any of these files to a shell, an Application, a Vessel, or a source
+    repository.
+
+    Compose uses pinned, immutable Verglas Neon storage/proxy and compute
+    images. It never uses a mutable `latest` image. Each managed Postgres proxy
+    validates its caller's short-lived database JWT against the tenant access
+    service.
 
     If startup fails, read the server log:
 

@@ -36,7 +36,7 @@ x-pg-cache-environment: &pg-cache-environment
 # The Verglas Lakekeeper adapter is not yet published to GHCR. Build the exact
 # reviewed fork revision locally and never fall back to the upstream image.
 x-lakekeeper-build: &lakekeeper-build
-  context: https://github.com/verglas-org/lakekeeper.git#96205cebab7704bd7bcbc91190a774e72f8c55dc
+  context: https://github.com/verglas-org/lakekeeper.git#34fef9c4580369900211b21c0f1db95cf8f0a876
   dockerfile: docker/full.Dockerfile
   args:
     NO_CHEF: "true"
@@ -127,6 +127,10 @@ services:
       - verglas-access-server-credentials:/var/run/verglas/server
       - verglas-access-lakekeeper-credentials:/var/run/verglas/lakekeeper
       - verglas-access-neon-credentials:/var/run/verglas/neon
+      # The runtime creates the local proxy TLS identity before becoming
+      # healthy. Access only reads it while creating an isolated proxy
+      # container; it never receives the runtime's Docker authority.
+      - verglas-runtime-state:/var/lib/verglas-container-runtime:ro
     ports:
       - "127.0.0.1:8345:8345"
     depends_on:
@@ -242,7 +246,7 @@ services:
 
   verglas-lakekeeper-migrate:
     build: *lakekeeper-build
-    image: &lakekeeper-image ghcr.io/verglas-org/lakekeeper:96205cebab7704bd7bcbc91190a774e72f8c55dc
+    image: &lakekeeper-image ghcr.io/verglas-org/lakekeeper:34fef9c4580369900211b21c0f1db95cf8f0a876
     pull_policy: never
     command: ["migrate"]
     environment: &lakekeeper-environment
