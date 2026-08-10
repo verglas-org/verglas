@@ -26,6 +26,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use verglas_block::{
@@ -60,6 +61,10 @@ pub struct RingPlane {
     transport: Arc<dyn FragmentTransport>,
     /// Shared view of live fragment holders.
     membership: Arc<dyn LiveMembership>,
+    /// Shared admission ceiling for dirty durability fragments.
+    fragment_ceiling: Arc<AtomicU64>,
+    /// Local fragments protected by the durability state machine.
+    local: LocalFragmentStore,
     /// The fragment RPC listener peers place shards through.
     _peer_server: PeerServer,
     /// The background takeover loop.
@@ -91,6 +96,17 @@ impl RingPlane {
     pub fn node_count(&self) -> usize {
         self.membership.live_nodes().len()
     }
+
+    /// Bytes of dirty fragment data currently protected on this node.
+    pub fn fragment_used_bytes(&self) -> u64 {
+        self.local.used_bytes()
+    }
+
+    /// Refuses new fragments above the current shared-disk ceiling without
+    /// evicting already-acknowledged dirty fragments.
+    pub fn set_fragment_ceiling(&self, bytes: u64) {
+        self.fragment_ceiling.store(bytes, Ordering::Release);
+    }
 }
 
 /// Wires the block-flush write-back plane onto `registry` from the environment,
@@ -101,6 +117,7 @@ impl RingPlane {
 /// env sets one; v1 requires none (VXLAN isolation, mirroring the NBD plane).
 pub async fn setup(
     cache_dir: &std::path::Path,
+    capacity_bytes: u64,
     registry: &DeviceRegistry,
     activity: ActivityTracker,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
@@ -135,7 +152,11 @@ pub async fn setup(
 
     // The fragment store this node holds block and WAL ring shards in — kept
     // under its own subdir so it never collides with the read cache.
-    let local = LocalFragmentStore::new(cache_dir.join("fragment-ring"));
+    let fragment_ceiling = Arc::new(AtomicU64::new(capacity_bytes));
+    let local = LocalFragmentStore::with_dynamic_ceiling(
+        cache_dir.join("fragment-ring"),
+        Arc::clone(&fragment_ceiling),
+    );
 
     // The peer RPC client + transport: self-directed placements go to the local
     // store, everything else over the fragment RPC to the resolved peer address.
@@ -175,7 +196,7 @@ pub async fn setup(
         ring_addr,
         secret,
         noop_block_source(),
-        fragment_handlers(local, activity),
+        fragment_handlers(local.clone(), activity),
     )
     .await?;
     eprintln!(
@@ -197,6 +218,8 @@ pub async fn setup(
         self_id,
         transport,
         membership,
+        fragment_ceiling,
+        local,
         _peer_server: peer_server,
         _takeover: takeover,
     }))

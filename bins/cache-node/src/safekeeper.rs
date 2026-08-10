@@ -139,7 +139,7 @@ impl ObjectWrite for Origin {
 
 /// Chooses an EC layout that uses the whole configured ring while retaining
 /// two parity fragments once at least four cache nodes exist.
-fn geometry(nodes: usize) -> AppendGeometry {
+pub(crate) fn geometry(nodes: usize) -> AppendGeometry {
     match nodes {
         0 | 1 => AppendGeometry { k: 1, m: 0, w: 1 },
         2 => AppendGeometry { k: 1, m: 1, w: 2 },

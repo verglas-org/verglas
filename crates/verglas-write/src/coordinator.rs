@@ -116,6 +116,8 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     self_id: NodeId,
     /// Deadline to gather `w` durable fragments before falling back.
     ack_deadline: Duration,
+    /// Reject a shortfall instead of silently changing durability to origin.
+    require_quorum: bool,
     /// Last ack mode, for counting write-back <-> write-through transitions.
     last_mode: AtomicU8,
     /// Per-write counter feeding object-id uniqueness.
@@ -145,10 +147,17 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             origin,
             self_id,
             ack_deadline,
+            require_quorum: false,
             last_mode: AtomicU8::new(MODE_UNSET),
             object_counter: AtomicU64::new(0),
             shutdown: AtomicBool::new(false),
         }
+    }
+
+    /// Requires eligible writes to acknowledge only from the fragment quorum.
+    pub fn require_quorum(mut self) -> Self {
+        self.require_quorum = true;
+        self
     }
 
     /// Stops background propagation: every in-flight retry loop exits at its
@@ -226,6 +235,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             // Enforced fallback: the live view cannot place `w` distinct
             // fragments. Decided before the body is consumed, so write-through
             // re-streams it.
+            if self.require_quorum {
+                return Err(quorum_shortfall(w, live.len()));
+            }
             return self.write_through_stream(key, metadata, body).await;
         } else {
             (k, m, w)
@@ -243,6 +255,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             .nodes_with_headroom(ordered, MAX_STRIPE_CHUNK as u64)
             .await;
         if nodes.len() < w {
+            if self.require_quorum {
+                return Err(quorum_shortfall(w, nodes.len()));
+            }
             return self.write_through_stream(key, metadata, body).await;
         }
 
@@ -322,6 +337,11 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             )
             .await
         } else {
+            if self.require_quorum {
+                self.drain_placements(&mut done_rx).await;
+                self.spawn_object_cleanup(object_id);
+                return Err(quorum_shortfall(w, acked.len()));
+            }
             // Fewer than `w` fragments committed. The body is already consumed,
             // so write-through re-streams from the committed fragments: any `k`
             // reconstruct the object, which is then uploaded to the origin. If
@@ -856,6 +876,13 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         buf.extend_from_slice(&(len as u64).to_le_bytes());
         format!("{:032x}", xxhash_rust::xxh3::xxh3_128(&buf))
     }
+}
+
+/// Builds the stable error returned by a strict ring durability boundary.
+fn quorum_shortfall(required: usize, durable: usize) -> WriteError {
+    WriteError::Backend(format!(
+        "write-back quorum requires {required} durable fragments; only {durable} available"
+    ))
 }
 
 /// Orders `live` nodes by descending rendezvous score over the object, giving a

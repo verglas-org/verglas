@@ -13,9 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 # The cache serving path, and nothing off it. No verglas-cluster (single-node
-# rendezvous ring of one owns every key), no verglas-write (this image never
-# enables it), no verglas-tables/platform/memory/iceberg (no catalog, no jobs,
-# no query engine).
+# rendezvous ring of one owns every key). The write crate supplies the EC
+# catalog/object writeback journal used by strong-consistency cache nodes.
+# There is still no platform/memory/query engine in this image.
 verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-s3.workspace = true
@@ -38,6 +38,7 @@ verglas-cluster.workspace = true
 # The Neon-compatible WAL listener is embedded in this process and places WAL
 # fragments through the same ring transport as block FLUSH.
 verglas-safekeeper.workspace = true
+verglas-write.workspace = true
 axum.workspace = true
 futures.workspace = true
 # The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.
