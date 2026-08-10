@@ -219,6 +219,11 @@ impl CatalogGateway {
         self
     }
 
+    /// Returns the immutable database identity forwarded to the trusted catalog.
+    pub(crate) fn database_id(&self) -> Option<&str> {
+        self.database_id.as_deref()
+    }
+
     /// Returns a watcher source backed by the same client and response cache.
     pub fn source(&self) -> RestCatalogSource {
         self.source.clone()

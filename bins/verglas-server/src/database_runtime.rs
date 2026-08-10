@@ -145,11 +145,14 @@ impl DatabaseCatalogSynchronizer {
         for database in inventory.databases {
             match database {
                 DatabaseView::Lakehouse {
+                    id,
                     name,
                     catalog: CatalogRequest::ManagedLakekeeper,
                     ..
                 } => gateways.push((
                     DatabaseId::new(name.clone())
+                        .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?,
+                    DatabaseId::new(id)
                         .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?,
                     self.managed_gateway(&name)?,
                 )),
@@ -162,7 +165,7 @@ impl DatabaseCatalogSynchronizer {
             }
         }
         self.catalogs
-            .replace_all(gateways)
+            .replace_all_bound(gateways)
             .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))
     }
 
@@ -239,15 +242,14 @@ fn nonempty_environment(name: &str) -> Option<String> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use axum::body::{Body, to_bytes};
     use axum::extract::State;
-    use axum::http::Request;
+    use axum::http::{HeaderMap, Method};
     use axum::routing::get;
     use axum::{Json, Router};
+    use bytes::Bytes;
     use serde_json::json;
     use tokio::net::TcpListener;
-    use tower::ServiceExt;
-    use verglas_catalog::CatalogRuntimeRegistry;
+    use verglas_catalog::{CatalogRuntimeRegistry, DatabaseId};
 
     use super::DatabaseCatalogSynchronizer;
 
@@ -278,18 +280,21 @@ mod tests {
             "databases": [
                 {
                     "type": "lakehouse",
+                    "id": "database-analytics-id",
                     "name": "analytics",
                     "storage": {"mode": "managed"},
                     "catalog": {"mode": "managed-lakekeeper"}
                 },
                 {
                     "type": "lakehouse",
+                    "id": "database-archive-id",
                     "name": "archive",
                     "storage": {"mode": "managed"},
                     "catalog": {"mode": "managed-lakekeeper"}
                 },
                 {
                     "type": "postgres",
+                    "id": "database-operational-id",
                     "name": "operational",
                     "engine": {"mode": "managed-neon"}
                 }
@@ -325,24 +330,19 @@ mod tests {
         .expect("synchronizer");
 
         synchronizer.refresh().await.expect("refresh");
-        let app = verglas_rest::compose_database_catalogs(Router::new(), catalogs.clone());
-        let response = app
-            .oneshot(
-                Request::get("/v1/databases/analytics/catalog/v1/config")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
+        let response = catalogs
+            .get(&DatabaseId::new("analytics").expect("database"))
+            .expect("analytics gateway")
+            .request(Method::GET, "/v1/config", HeaderMap::new(), Bytes::new())
             .await
-            .expect("response");
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body");
-        assert!(serde_json::from_slice::<serde_json::Value>(&body).is_ok());
+            .expect("catalog response");
+        assert!(serde_json::from_slice::<serde_json::Value>(&response.body).is_ok());
         assert_eq!(catalogs.len().expect("catalog count"), 2);
 
         *inventory.lock().expect("inventory") = json!({
             "databases": [{
                 "type": "lakehouse",
+                "id": "database-analytics-id",
                 "name": "analytics",
                 "storage": {"mode": "managed"},
                 "catalog": {"mode": "managed-lakekeeper"}
@@ -350,15 +350,11 @@ mod tests {
         });
         synchronizer.refresh().await.expect("replacement refresh");
         assert_eq!(catalogs.len().expect("catalog count"), 1);
-        let removed = verglas_rest::compose_database_catalogs(Router::new(), catalogs.clone())
-            .oneshot(
-                Request::get("/v1/databases/archive/catalog/v1/config")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(removed.status(), axum::http::StatusCode::NOT_FOUND);
+        assert!(
+            catalogs
+                .get(&DatabaseId::new("archive").expect("database"))
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -369,6 +365,7 @@ mod tests {
                 Json(json!({
                     "databases": [{
                         "type": "lakehouse",
+                        "id": "database-customer-id",
                         "name": "customer",
                         "storage": {"mode": "scoped-secret", "data_path": "s3://customer/team"},
                         "catalog": {

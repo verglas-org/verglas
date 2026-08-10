@@ -15,6 +15,8 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use verglas_authz::{AccessDecision, Action};
+use verglas_catalog::{CatalogRuntimeRegistry, DatabaseId};
+use verglas_database::DatabaseManager;
 
 use crate::access::CLI_AUDIENCE;
 
@@ -115,6 +117,42 @@ pub trait DataPlaneAuthorizer: Send + Sync {
     ) -> Result<AuthenticatedPrincipal, AuthorizationFailure>;
 }
 
+/// Resolves a tenant-local database route name to its immutable authorization ID.
+#[async_trait]
+pub trait DatabaseResourceResolver: Send + Sync {
+    /// Returns the immutable ID registered as `database/{id}` in policy.
+    async fn resolve_database_id(&self, name: &str) -> Result<String, AuthorizationFailure>;
+}
+
+struct ManagedDatabaseResolver {
+    service: Arc<dyn DatabaseManager>,
+    tenant_id: Arc<str>,
+}
+
+#[async_trait]
+impl DatabaseResourceResolver for ManagedDatabaseResolver {
+    async fn resolve_database_id(&self, name: &str) -> Result<String, AuthorizationFailure> {
+        self.service
+            .get_database(&self.tenant_id, name)
+            .await
+            .map(|database| database.id().to_owned())
+            .map_err(|_| AuthorizationFailure::Unavailable)
+    }
+}
+
+struct CatalogDatabaseResolver(CatalogRuntimeRegistry);
+
+#[async_trait]
+impl DatabaseResourceResolver for CatalogDatabaseResolver {
+    async fn resolve_database_id(&self, name: &str) -> Result<String, AuthorizationFailure> {
+        let route = DatabaseId::new(name).map_err(|_| AuthorizationFailure::Unavailable)?;
+        self.0
+            .authorization_id(&route)
+            .map(|database| database.as_str().to_owned())
+            .ok_or(AuthorizationFailure::Unavailable)
+    }
+}
+
 #[async_trait]
 impl DataPlaneAuthorizer for DataPlaneAccess {
     /// Returns the audience configured for the remote access service.
@@ -173,28 +211,97 @@ pub fn protect<A>(router: Router, access: A) -> Router
 where
     A: DataPlaneAuthorizer + 'static,
 {
-    let access: Arc<dyn DataPlaneAuthorizer> = Arc::new(access);
-    router.layer(middleware::from_fn_with_state(access, authorize_request))
+    protect_with_resolver(router, access, None)
+}
+
+/// Protects database routes after resolving names through the durable access inventory.
+pub fn protect_managed_databases<A>(
+    router: Router,
+    access: A,
+    service: Arc<dyn DatabaseManager>,
+    tenant_id: String,
+) -> Router
+where
+    A: DataPlaneAuthorizer + 'static,
+{
+    protect_with_resolver(
+        router,
+        access,
+        Some(Arc::new(ManagedDatabaseResolver {
+            service,
+            tenant_id: Arc::from(tenant_id),
+        })),
+    )
+}
+
+/// Protects cache database routes using the exact immutable IDs bound by its registry.
+pub fn protect_catalog_databases<A>(
+    router: Router,
+    access: A,
+    catalogs: CatalogRuntimeRegistry,
+) -> Router
+where
+    A: DataPlaneAuthorizer + 'static,
+{
+    protect_with_resolver(
+        router,
+        access,
+        Some(Arc::new(CatalogDatabaseResolver(catalogs))),
+    )
+}
+
+#[derive(Clone)]
+struct AuthorizationRuntime {
+    access: Arc<dyn DataPlaneAuthorizer>,
+    databases: Option<Arc<dyn DatabaseResourceResolver>>,
+}
+
+fn protect_with_resolver<A>(
+    router: Router,
+    access: A,
+    databases: Option<Arc<dyn DatabaseResourceResolver>>,
+) -> Router
+where
+    A: DataPlaneAuthorizer + 'static,
+{
+    router.layer(middleware::from_fn_with_state(
+        AuthorizationRuntime {
+            access: Arc::new(access),
+            databases,
+        },
+        authorize_request,
+    ))
 }
 
 /// Authenticates and authorizes one protected request before running its handler.
 async fn authorize_request(
-    State(access): State<Arc<dyn DataPlaneAuthorizer>>,
+    State(runtime): State<AuthorizationRuntime>,
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(target) = route_target(request.method(), request.uri().path()) else {
+    let Some(mut target) = route_target(request.method(), request.uri().path()) else {
         return next.run(request).await;
     };
+    if let Some(databases) = &runtime.databases
+        && let Some(name) = database_route_name(request.uri().path())
+        && target.resource_id == format!("database/{name}")
+    {
+        let database_id = match databases.resolve_database_id(name).await {
+            Ok(database_id) => database_id,
+            Err(failure) => return failure.into_response(),
+        };
+        target.resource_id = format!("database/{database_id}");
+    }
     let authorization = match bearer_header(request.headers()) {
         Ok(value) => value,
         Err(failure) => return failure.into_response(),
     };
-    match access
+    match runtime
+        .access
         .authorize(
             authorization,
             AuthorizationQuestion {
-                audience: Arc::from(access.audience()),
+                audience: Arc::from(runtime.access.audience()),
                 resource_id: target.resource_id,
                 action: target.action,
             },
@@ -212,6 +319,14 @@ async fn authorize_request(
             next.run(request).await
         }
         Err(failure) => failure.into_response(),
+    }
+}
+
+fn database_route_name(path: &str) -> Option<&str> {
+    let mut segments = path.trim_matches('/').split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some("v1"), Some("databases"), Some(name)) if !name.is_empty() => Some(name),
+        _ => None,
     }
 }
 

@@ -119,17 +119,25 @@ impl CatalogRuntimeRegistry {
         database_id: DatabaseId,
         gateway: CatalogGateway,
     ) -> Result<(), RegistryError> {
-        let gateway = gateway.bind_database(database_id.as_str());
+        self.insert_bound(database_id.clone(), database_id, gateway)
+    }
+
+    /// Installs a route-name gateway bound to its immutable authorization identity.
+    pub fn insert_bound(
+        &self,
+        route_id: DatabaseId,
+        authorization_id: DatabaseId,
+        gateway: CatalogGateway,
+    ) -> Result<(), RegistryError> {
+        let gateway = gateway.bind_database(authorization_id.as_str());
         let mut gateways = self
             .gateways
             .write()
             .map_err(|_| RegistryError::LockPoisoned)?;
-        if gateways.contains_key(&database_id) {
-            return Err(RegistryError::AlreadyExists(
-                database_id.as_str().to_owned(),
-            ));
+        if gateways.contains_key(&route_id) {
+            return Err(RegistryError::AlreadyExists(route_id.as_str().to_owned()));
         }
-        gateways.insert(database_id, gateway);
+        gateways.insert(route_id, gateway);
         Ok(())
     }
 
@@ -139,6 +147,16 @@ impl CatalogRuntimeRegistry {
             .read()
             .ok()
             .and_then(|gateways| gateways.get(database_id).cloned())
+    }
+
+    /// Resolves the immutable authorization identity behind one tenant-local route name.
+    pub fn authorization_id(&self, route_id: &DatabaseId) -> Option<DatabaseId> {
+        self.gateways
+            .read()
+            .ok()
+            .and_then(|gateways| gateways.get(route_id).cloned())
+            .and_then(|gateway| gateway.database_id().map(str::to_owned))
+            .and_then(|id| DatabaseId::new(id).ok())
     }
 
     /// Removes a live gateway when a database is deleted or suspended.
@@ -154,13 +172,23 @@ impl CatalogRuntimeRegistry {
     where
         I: IntoIterator<Item = (DatabaseId, CatalogGateway)>,
     {
+        self.replace_all_bound(
+            gateways
+                .into_iter()
+                .map(|(database_id, gateway)| (database_id.clone(), database_id, gateway)),
+        )
+    }
+
+    /// Replaces all route-name gateways while retaining immutable authorization identities.
+    pub fn replace_all_bound<I>(&self, gateways: I) -> Result<(), RegistryError>
+    where
+        I: IntoIterator<Item = (DatabaseId, DatabaseId, CatalogGateway)>,
+    {
         let mut replacement = HashMap::new();
-        for (database_id, gateway) in gateways {
-            let gateway = gateway.bind_database(database_id.as_str());
-            if replacement.insert(database_id.clone(), gateway).is_some() {
-                return Err(RegistryError::AlreadyExists(
-                    database_id.as_str().to_owned(),
-                ));
+        for (route_id, authorization_id, gateway) in gateways {
+            let gateway = gateway.bind_database(authorization_id.as_str());
+            if replacement.insert(route_id.clone(), gateway).is_some() {
+                return Err(RegistryError::AlreadyExists(route_id.as_str().to_owned()));
             }
         }
         let mut current = self

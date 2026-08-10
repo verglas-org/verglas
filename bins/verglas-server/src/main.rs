@@ -942,9 +942,15 @@ async fn serve_admin(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = admin::router(VERSION, health, slots);
     if let Some(database_catalogs) = database_catalogs {
-        app = verglas_rest::compose_database_catalogs(app, database_catalogs);
+        app = verglas_rest::compose_database_catalogs(app, database_catalogs.clone());
+        app = verglas_rest::data_plane::protect_catalog_databases(
+            app,
+            data_plane_access()?,
+            database_catalogs,
+        );
+    } else {
+        app = verglas_rest::data_plane::protect(app, data_plane_access()?);
     }
-    app = verglas_rest::data_plane::protect(app, data_plane_access()?);
     let local_addr = listener.local_addr()?;
 
     eprintln!("verglas-server {VERSION} admin API listening on http://{local_addr}");

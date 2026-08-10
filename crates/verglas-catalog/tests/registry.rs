@@ -129,3 +129,23 @@ fn runtime_refresh_atomically_replaces_added_and_deleted_databases() {
     );
     assert_eq!(registry.len().expect("runtime count"), 2);
 }
+
+#[test]
+fn runtime_route_name_resolves_immutable_authorization_id() {
+    let registry = CatalogRuntimeRegistry::default();
+    registry
+        .insert_bound(
+            DatabaseId::new("default").expect("route name"),
+            DatabaseId::new("ee8f6d4f-f3a9-4121-8c26-a7e1434848dd").expect("authorization id"),
+            gateway("default"),
+        )
+        .expect("bound insert");
+
+    assert_eq!(
+        registry
+            .authorization_id(&DatabaseId::new("default").expect("route name"))
+            .expect("authorization id")
+            .as_str(),
+        "ee8f6d4f-f3a9-4121-8c26-a7e1434848dd",
+    );
+}

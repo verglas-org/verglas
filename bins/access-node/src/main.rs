@@ -400,13 +400,17 @@ async fn run(args: Args) -> Result<(), String> {
             .with_secrets(secrets)
             .with_target_jwt_signer(target_jwt_signer);
     let database_routes = verglas_rest::database::router(
-        database_service,
+        database_service.clone(),
         Arc::new(access_runtime.clone()),
         args.tenant_id.clone(),
     )
     .merge(data_plane_proxy::router(&args.admin_url)?);
-    let protected_databases =
-        verglas_rest::data_plane::protect(database_routes, access_runtime.clone());
+    let protected_databases = verglas_rest::data_plane::protect_managed_databases(
+        database_routes,
+        access_runtime.clone(),
+        database_service,
+        args.tenant_id.clone(),
+    );
     let queue_routes = verglas_rest::queue::router(
         queue_service.clone(),
         Arc::new(access_runtime.clone()),
