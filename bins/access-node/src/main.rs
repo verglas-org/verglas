@@ -30,6 +30,7 @@ use verglas_database::{
 use verglas_queue::{PostgresQueueRepository, QueueService};
 use verglas_rest::database::DatabaseAuthorization;
 
+mod data_plane_proxy;
 mod database_runtime;
 mod lakehouse_runtime;
 mod postgres_runtime;
@@ -174,6 +175,9 @@ struct Args {
     /// Private tenant Lakekeeper management endpoint.
     #[arg(long, env = "VERGLAS_MANAGED_CATALOG_URI")]
     managed_catalog_uri: String,
+    /// Private cache admin origin serving database-scoped catalog and query routes.
+    #[arg(long, env = "VERGLAS_ADMIN_URL")]
+    admin_url: String,
     /// Managed Lakehouse declaration that must exist before readiness.
     #[arg(long, env = "VERGLAS_DEFAULT_LAKEHOUSE")]
     default_lakehouse: Option<String>,
@@ -395,14 +399,14 @@ async fn run(args: Args) -> Result<(), String> {
             .with_identity_assertion_key(identity_assertion_key)
             .with_secrets(secrets)
             .with_target_jwt_signer(target_jwt_signer);
-    let protected_databases = verglas_rest::data_plane::protect(
-        verglas_rest::database::router(
-            database_service,
-            Arc::new(access_runtime.clone()),
-            args.tenant_id.clone(),
-        ),
-        access_runtime.clone(),
-    );
+    let database_routes = verglas_rest::database::router(
+        database_service,
+        Arc::new(access_runtime.clone()),
+        args.tenant_id.clone(),
+    )
+    .merge(data_plane_proxy::router(&args.admin_url)?);
+    let protected_databases =
+        verglas_rest::data_plane::protect(database_routes, access_runtime.clone());
     let queue_routes = verglas_rest::queue::router(
         queue_service.clone(),
         Arc::new(access_runtime.clone()),
@@ -411,7 +415,7 @@ async fn run(args: Args) -> Result<(), String> {
     .merge(verglas_rest::queue::data_router(
         queue_service,
         Arc::new(queue_provisioner),
-        args.tenant_id,
+        args.tenant_id.clone(),
     ));
     let protected_queues = verglas_rest::data_plane::protect(queue_routes, access_runtime.clone());
     let ready = Arc::new(AtomicBool::new(false));
