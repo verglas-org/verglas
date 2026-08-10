@@ -419,7 +419,9 @@ pub async fn run(
 
     // Catalog consistency is explicit. Eventual mode polls any Iceberg REST
     // catalog. Strong mode has no polling path: it requires the fragment ring,
-    // a Lakekeeper event token, and a successful strict seed + EC-log replay.
+    // a Lakekeeper event token, and successful EC-log replay. Strong startup
+    // never calls Lakekeeper: doing so would create a dependency cycle because
+    // Lakekeeper's Postgres is itself durable through this cache ring.
     enum CatalogRuntime {
         Eventual {
             gateway: verglas_catalog::CatalogGateway,
@@ -455,7 +457,7 @@ pub async fn run(
                         .ok()
                         .filter(|value| !value.is_empty())
                         .ok_or("catalog.consistency=strong requires VERGLAS_CATALOG_EVENT_TOKEN")?;
-                    let watcher = StrongWatcher::seed(gateway.source(), options).await?;
+                    let watcher = StrongWatcher::empty(options);
                     let scope = format!(
                         "{}|{}",
                         catalog.uri,

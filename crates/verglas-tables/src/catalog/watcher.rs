@@ -260,6 +260,21 @@ pub enum StrongApplyError {
 }
 
 impl StrongWatcher {
+    /// Creates an empty strong view for a new or restarting cache node.
+    /// Durable EC-log replay is the authoritative bootstrap; consulting the
+    /// catalog here would create a cache -> Lakekeeper -> Postgres -> cache
+    /// startup cycle and would make scale-to-zero recovery impossible.
+    pub fn empty(options: WatcherOptions) -> Self {
+        let shared = Arc::new(Shared::new());
+        shared.mark_seeded();
+        Self {
+            shared,
+            options,
+            applied_sequence: AtomicU64::new(0),
+            apply_lock: Mutex::new(()),
+        }
+    }
+
     /// Reads one complete catalog snapshot before the node may serve strong reads.
     pub async fn seed<S: CatalogSource>(
         source: S,

@@ -427,6 +427,14 @@ async fn strong_watcher_applies_ordered_pointer_without_polling() {
     );
 }
 
+#[test]
+fn empty_strong_watcher_is_ready_without_contacting_a_catalog() {
+    let watcher = StrongWatcher::empty(WatcherOptions::default());
+    assert!(*watcher.seeded().borrow());
+    assert_eq!(watcher.applied_sequence(), 0);
+    assert!(watcher.watched_tables().is_empty());
+}
+
 /// A rename removes the previous identifier in the same state publication.
 #[tokio::test(flavor = "multi_thread")]
 async fn strong_watcher_renames_without_leaving_stale_identity() {
