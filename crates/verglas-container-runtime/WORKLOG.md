@@ -1,5 +1,4 @@
 # Worklog
-
 - #84: Pinned the complete stack to immutable published Verglas Neon
   storage/proxy and compute images. The runtime consumes only its isolated
   Neon policy-token volume; access mounts runtime state read-only solely to
@@ -48,3 +47,4 @@
   workload bearer replaces the consumer without persisting the bearer in deployments JSON.
 - #84: Added a stable local self-signed PostgreSQL proxy identity under runtime state. The runtime
   creates it once before recovery and exposes only its file paths to managed proxy declarations.
+- #107: Updated the complete-stack packaging contract for the one-shot Verglas Neon bootstrap and locally built independently provisioned queue-service image, removing the vanilla Postgres bootstrap services.

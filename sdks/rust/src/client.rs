@@ -34,7 +34,7 @@ use crate::graph::{
     InsertEdgesRequest, InsertNodesRequest, InsertReport, NeighborView, NodeInput, PathView,
     ReachedView,
 };
-use crate::queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult};
+use crate::queue::{QueueEnqueueResult, QueuePollResult, QueueReceipt};
 use crate::token::{
     AccessTokenCreateRequest, AccessTokenSummary, DatabaseConnectionToken,
     DatabaseConnectionTokenRequest, IssuedAccessToken,
@@ -1278,14 +1278,14 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Appends rows to the queue and returns the new end position.
-    pub async fn enqueue(&self, rows: Vec<Value>) -> Result<QueueEnqueueResult, ClientError> {
+    /// Appends messages to the declared queue and returns their stable positions.
+    pub async fn enqueue(&self, messages: Vec<Value>) -> Result<QueueEnqueueResult, ClientError> {
         let response = Client::require_success(
             self.client
                 .send(
                     self.client
                         .authorize(self.client.http.post(self.url(&["enqueue"])?))
-                        .json(&json!({ "rows": rows })),
+                        .json(&json!({ "messages": messages })),
                 )
                 .await?,
         )
@@ -1293,44 +1293,30 @@ impl Queue {
         response.json().await.map_err(ClientError::Transport)
     }
 
-    /// Polls up to `max` records for consumer group `group` from its watermark.
+    /// Claims an exclusive batch under fenced, expiring delivery receipts.
     pub async fn poll(
         &self,
         group: &str,
+        owner: &str,
         max: Option<usize>,
+        lease_seconds: u64,
     ) -> Result<QueuePollResult, ClientError> {
-        if group.is_empty() {
+        if group.is_empty() || owner.is_empty() {
             return Err(ClientError::Configuration(
-                "queue poll requires a non-empty group".to_owned(),
-            ));
-        }
-        let mut url = self.url(&["poll"])?;
-        url.query_pairs_mut().append_pair("group", group);
-        if let Some(max) = max {
-            url.query_pairs_mut().append_pair("max", &max.to_string());
-        }
-        let response = Client::require_success(
-            self.client
-                .send(self.client.authorize(self.client.http.get(url)))
-                .await?,
-        )
-        .await?;
-        response.json().await.map_err(ClientError::Transport)
-    }
-
-    /// Advances `group`'s watermark to `position` after the consumer commits work.
-    pub async fn ack(&self, group: &str, position: u64) -> Result<QueueAckResult, ClientError> {
-        if group.is_empty() {
-            return Err(ClientError::Configuration(
-                "queue ack requires a non-empty group".to_owned(),
+                "queue poll requires non-empty group and owner".to_owned(),
             ));
         }
         let response = Client::require_success(
             self.client
                 .send(
                     self.client
-                        .authorize(self.client.http.post(self.url(&["ack"])?))
-                        .json(&json!({ "group": group, "position": position })),
+                        .authorize(self.client.http.post(self.url(&["poll"])?))
+                        .json(&json!({
+                            "group": group,
+                            "owner": owner,
+                            "max": max.unwrap_or(256),
+                            "leaseSeconds": lease_seconds,
+                        })),
                 )
                 .await?,
         )
@@ -1338,9 +1324,29 @@ impl Queue {
         response.json().await.map_err(ClientError::Transport)
     }
 
+    /// Acknowledges exactly one live delivery generation after committing its work.
+    pub async fn ack(&self, group: &str, receipt: &QueueReceipt) -> Result<(), ClientError> {
+        if group.is_empty() {
+            return Err(ClientError::Configuration(
+                "queue ack requires a non-empty group".to_owned(),
+            ));
+        }
+        Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["ack"])?))
+                        .json(&json!({ "group": group, "receipt": receipt })),
+                )
+                .await?,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Builds a queue URL with path-segment encoding owned by the HTTP client.
     fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
-        resource_url(&self.client.query_uri, "queues", &self.name, suffix)
+        resource_url(&self.client.access_uri, "queues", &self.name, suffix)
     }
 }
 

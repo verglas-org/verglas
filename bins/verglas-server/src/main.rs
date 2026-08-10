@@ -1392,17 +1392,6 @@ async fn serve(
     // the only local writer of `verglas_sys`. Filled after recovery.
     let sys_slot: Option<admin::SysSlot> =
         config.catalog.is_some().then(|| Arc::new(OnceLock::new()));
-    // The platform queue routes (#328) need only a writable queue root, not the
-    // cache engine, so the dir is created up front and the routes answer as soon
-    // as the admin listener binds. Owned under the cache dir the server already
-    // validated as writable at startup.
-    let queue_dir: admin::QueueDir = Arc::new(config.cache.dir.join("platform/queues"));
-    if let Err(e) = std::fs::create_dir_all(queue_dir.as_ref()) {
-        eprintln!(
-            "verglas-server {VERSION} could not create the platform queue dir {}: {e}",
-            queue_dir.display()
-        );
-    }
     // Worker ingress exists only when an external scheduler is configured.
     // With no URL, Verglas boots normally and mounts no worker-trigger routes.
     let scheduler_url = std::env::var("VERGLAS_SCHEDULER_URL")
@@ -1544,7 +1533,6 @@ async fn serve(
             dashboards: dashboard_runtime,
             database_data: None,
             sys: sys_slot.clone(),
-            queues: Some(queue_dir.clone()),
             platform: platform_slot.clone(),
             query_worker: query_worker_dispatcher.clone(),
             write_worker: write_worker_dispatcher.clone(),

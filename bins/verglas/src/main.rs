@@ -67,6 +67,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
+        Command::Queue(command) => {
+            commands::queue::run(command, &cli.access_endpoint, token.as_deref(), cli.json).await
+        }
         Command::Secret(command) => {
             commands::secret::run(command, &cli.access_endpoint, token.as_deref(), cli.json).await
         }

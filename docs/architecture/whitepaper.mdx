@@ -545,7 +545,9 @@ Local I/O routes through the server's own S3 surface — the cache. This is a wi
 
 ### 7.8 Queues
 
-Some stages need decoupling that a table's commit cadence does not provide: a burst-prone producer should not block on downstream consumers, and several consumers may need independent positions in one stream. A deployment may therefore be granted a queue instead of (or as well as) a table. The queue is a durable segment log — append-only segment files with per-consumer-group acknowledged positions, expired by retention. Delivery is at-least-once with consumer-side idempotency, deliberately the same discipline as the commit path (§7.2), so moving a stage between queue and table changes its coupling, not its correctness reasoning.
+Some stages need decoupling that a table's commit cadence does not provide: a burst-prone producer should not block on downstream consumers, and several consumers may need independent positions in one stream. Queues are explicit resources: `verglas queue create NAME` provisions a dedicated managed Verglas Neon database and an independently scalable, stateless queue container through the container service. No queue is created by default or as a side effect of enqueue, poll, or scheduler startup.
+
+Messages receive monotonically increasing positions in PostgreSQL. Poll claims an exclusive, expiring lease for one consumer group and owner; every delivery carries an opaque receipt containing its claim generation. Acknowledgement succeeds only for that exact live generation, so an expired worker cannot acknowledge a message after another worker has reclaimed it. Expiry re-delivers unacknowledged messages. Delivery remains at-least-once with consumer-side idempotency, deliberately the same discipline as the commit path (§7.2), while database durability and scale-to-zero recovery use the same Neon, Verglas cache-ring, and object-storage path as §7.5.
 
 ### 7.9 Sockets on hibernating edge objects
 

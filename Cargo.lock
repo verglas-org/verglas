@@ -7498,6 +7498,7 @@ dependencies = [
  "verglas-authz-postgres",
  "verglas-container-runtime",
  "verglas-database",
+ "verglas-queue",
  "verglas-rest",
 ]
 
@@ -7919,6 +7920,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-queue"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "verglas-queue-service"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "chrono",
+ "clap",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
+ "verglas-queue",
+]
+
+[[package]]
 name = "verglas-rest"
 version = "0.1.1"
 dependencies = [
@@ -7959,6 +7990,7 @@ dependencies = [
  "verglas-iceberg",
  "verglas-kv",
  "verglas-platform",
+ "verglas-queue",
  "verglas-s3",
  "verglas-scheduler",
  "verglas-sdk",

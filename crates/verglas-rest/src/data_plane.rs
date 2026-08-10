@@ -265,6 +265,22 @@ fn route_target(method: &Method, path: &str) -> Option<RouteTarget> {
                 Action::Modify
             },
         )),
+        ["v1", "queues"] => Some(RouteTarget::new(
+            "tenant",
+            if method == Method::GET {
+                Action::Discover
+            } else {
+                Action::CreateChild
+            },
+        )),
+        ["v1", "queues", name] => Some(RouteTarget::new(
+            format!("queue/{name}"),
+            if method == Method::GET {
+                Action::Describe
+            } else {
+                Action::Modify
+            },
+        )),
         ["v1", "databases", database, "query"] => Some(RouteTarget::new(
             format!("database/{database}"),
             Action::Query,

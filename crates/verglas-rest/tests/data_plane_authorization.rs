@@ -207,7 +207,7 @@ async fn routes_map_to_stable_resources_and_least_privilege_actions() {
                 get(|| async {}).put(|| async {}),
             )
             .route("/v1/queues/{name}/enqueue", post(|| async {}))
-            .route("/v1/queues/{name}/poll", get(|| async {}))
+            .route("/v1/queues/{name}/poll", post(|| async {}))
             .route("/v1/queues/{name}/ack", post(|| async {})),
         access,
     );
@@ -241,7 +241,7 @@ async fn routes_map_to_stable_resources_and_least_privilege_actions() {
         (Method::GET, "/v1/kv/workshop.blueprints/featured"),
         (Method::PUT, "/v1/kv/workshop.blueprints/featured"),
         (Method::POST, "/v1/queues/ingest/enqueue"),
-        (Method::GET, "/v1/queues/ingest/poll?group=worker"),
+        (Method::POST, "/v1/queues/ingest/poll"),
         (Method::POST, "/v1/queues/ingest/ack"),
     ];
     for (method, uri) in cases {

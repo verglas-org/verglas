@@ -161,8 +161,24 @@ impl ManagedPostgresProvisioner {
         })
     }
 
+    /// Returns the tenant used to derive managed resource identities.
+    #[allow(dead_code)]
+    pub(crate) fn tenant_id(&self) -> &str {
+        &self.config.tenant_id
+    }
+
     /// Reconciles private storage/compute before exposing the authenticated proxy.
-    async fn ensure(&self, database: &str) -> Result<(), DatabaseServiceError> {
+    pub(crate) async fn ensure(&self, database: &str) -> Result<(), DatabaseServiceError> {
+        let plan = self.ensure_private_plan(database).await?;
+        self.put_container(&plan.containers[3]).await?;
+        self.wait_for_proxy(&plan.containers[3].deployment_id).await
+    }
+
+    /// Reconciles broker, pageserver, and compute without creating a public proxy.
+    async fn ensure_private_plan(
+        &self,
+        database: &str,
+    ) -> Result<ManagedPostgresPlan, DatabaseServiceError> {
         let plan = self.plan(database)?;
         self.write_bridge_credential(&plan).await?;
         self.put_container(&plan.containers[0]).await?;
@@ -170,12 +186,42 @@ impl ManagedPostgresProvisioner {
         self.ensure_timeline(&plan).await?;
         self.put_container(&plan.containers[2]).await?;
         self.wait_for_sql(&plan.connection).await?;
-        self.put_container(&plan.containers[3]).await?;
-        self.wait_for_proxy(&plan.containers[3].deployment_id).await
+        Ok(plan)
+    }
+
+    /// Reconciles a trusted private Neon database and waits for SQL readiness.
+    #[allow(dead_code)]
+    pub(crate) async fn ensure_private(&self, database: &str) -> Result<(), DatabaseServiceError> {
+        self.ensure_private_plan(database).await.map(|_| ())
+    }
+
+    /// Reconciles broker, pageserver, and compute for the pre-Access system database.
+    #[allow(dead_code)]
+    pub(crate) async fn ensure_system(
+        &self,
+        database: &str,
+        password: &str,
+        logical_databases: &[&str],
+    ) -> Result<(), DatabaseServiceError> {
+        if password.is_empty() {
+            return Err(provisioning("system Neon password must not be empty"));
+        }
+        let mut plan = self.plan(database)?;
+        plan.connection.password = password.to_owned();
+        plan.containers[2].deployment_id = "system-postgres".to_owned();
+        plan.connection.host = docker_hostname("system-postgres");
+        self.write_bridge_credential(&plan).await?;
+        self.put_container(&plan.containers[0]).await?;
+        self.put_container(&plan.containers[1]).await?;
+        self.ensure_timeline(&plan).await?;
+        self.put_container(&plan.containers[2]).await?;
+        self.wait_for_sql(&plan.connection).await?;
+        self.ensure_logical_databases(&plan.connection, logical_databases)
+            .await
     }
 
     /// Removes database-owned compute and pageserver declarations in dependency order.
-    async fn delete(&self, database: &str) -> Result<(), DatabaseServiceError> {
+    pub(crate) async fn delete(&self, database: &str) -> Result<(), DatabaseServiceError> {
         let plan = self.plan(database)?;
         self.delete_container(&plan.containers[3].deployment_id)
             .await?;
@@ -308,10 +354,27 @@ impl ManagedPostgresProvisioner {
                 host: docker_hostname(&compute_id),
                 port: COMPUTE_PORT,
                 database: database.to_owned(),
-                username: "verglas_proxy_bridge".to_owned(),
+                username: "verglas_internal".to_owned(),
                 password,
             },
         })
+    }
+
+    /// Returns the private direct-compute URL used only by trusted managed containers.
+    #[allow(dead_code)]
+    pub(crate) fn private_database_url(
+        &self,
+        database: &str,
+    ) -> Result<String, DatabaseServiceError> {
+        let connection = self.plan(database)?.connection;
+        Ok(format!(
+            "postgres://{}:{}@{}:{}/{}",
+            connection.username,
+            connection.password,
+            connection.host,
+            connection.port,
+            connection.database
+        ))
     }
 
     /// Stores and reconciles one declaration through the runtime manager.
@@ -483,6 +546,44 @@ impl ManagedPostgresProvisioner {
         Err(provisioning(
             "managed Neon compute did not pass its authenticated SQL probe",
         ))
+    }
+
+    /// Creates the system logical databases on the already authenticated compute.
+    #[allow(dead_code)]
+    async fn ensure_logical_databases(
+        &self,
+        connection: &ManagedPostgresConnection,
+        databases: &[&str],
+    ) -> Result<(), DatabaseServiceError> {
+        let parameters = format!(
+            "host={} port={} dbname={} user={} password={}",
+            connection.host,
+            connection.port,
+            connection.database,
+            connection.username,
+            connection.password
+        );
+        let (client, transport) = tokio_postgres::connect(&parameters, NoTls)
+            .await
+            .map_err(runtime_error)?;
+        tokio::spawn(async move {
+            let _ = transport.await;
+        });
+        for database in databases {
+            validate_database_name(database)?;
+            let exists = client
+                .query_opt("SELECT 1 FROM pg_database WHERE datname=$1", &[database])
+                .await
+                .map_err(runtime_error)?
+                .is_some();
+            if !exists {
+                client
+                    .batch_execute(&format!("CREATE DATABASE \"{database}\""))
+                    .await
+                    .map_err(runtime_error)?;
+            }
+        }
+        Ok(())
     }
 
     /// Waits until the public proxy process has loaded keys and serves health.
@@ -680,9 +781,11 @@ ALTER ROLE verglas_tenant_session NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NO
 SELECT 'CREATE ROLE verglas_proxy_bridge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'verglas_proxy_bridge') \gexec
 ALTER ROLE verglas_proxy_bridge LOGIN NOINHERIT NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'bridge_password';
 GRANT verglas_tenant_session TO verglas_proxy_bridge;
-SELECT 'CREATE DATABASE "${VERGLAS_PG_DATABASE}" OWNER verglas_tenant_session' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${VERGLAS_PG_DATABASE}') \gexec
-ALTER DATABASE "${VERGLAS_PG_DATABASE}" OWNER TO verglas_tenant_session;
-GRANT CONNECT ON DATABASE "${VERGLAS_PG_DATABASE}" TO verglas_tenant_session;
+SELECT 'CREATE ROLE verglas_internal LOGIN NOINHERIT NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS' WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'verglas_internal') \gexec
+ALTER ROLE verglas_internal LOGIN NOINHERIT NOSUPERUSER CREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD :'bridge_password';
+SELECT 'CREATE DATABASE "${VERGLAS_PG_DATABASE}" OWNER verglas_internal' WHERE NOT EXISTS (SELECT 1 FROM pg_database WHERE datname = '${VERGLAS_PG_DATABASE}') \gexec
+ALTER DATABASE "${VERGLAS_PG_DATABASE}" OWNER TO verglas_internal;
+GRANT CONNECT, CREATE, TEMPORARY ON DATABASE "${VERGLAS_PG_DATABASE}" TO verglas_tenant_session;
 SQL
 wait "$compute_pid""#
 }
@@ -763,7 +866,7 @@ mod tests {
         assert_ne!(first.timeline_id, other.timeline_id);
         assert_ne!(first.connection.password, other.connection.password);
         assert_eq!(first.connection.database, "analytics");
-        assert_eq!(first.connection.username, "verglas_proxy_bridge");
+        assert_eq!(first.connection.username, "verglas_internal");
     }
 
     /// Carries every recovery coordinate in the persisted desired declarations.
@@ -851,6 +954,7 @@ mod tests {
         let script = super::compute_script();
 
         assert!(script.contains("CREATE ROLE verglas_proxy_bridge LOGIN"));
+        assert!(script.contains("CREATE ROLE verglas_internal LOGIN"));
         assert!(script.contains("CREATE ROLE verglas_tenant_session NOLOGIN"));
         assert!(script.contains("GRANT verglas_tenant_session TO verglas_proxy_bridge"));
         assert!(!script.contains("CREATE ROLE verglas LOGIN"));

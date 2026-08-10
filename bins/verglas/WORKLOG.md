@@ -760,3 +760,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #97: Updated access-only CLI client construction after the Rust SDK removed
   process-wide catalog coordinates. Token and database administration remain
   scoped to the standalone access service and do not select a data database.
+- #107: Added `verglas queue create`, `list`, `show`, and `delete` against the explicit queue resource API. Queue commands never perform message operations or create local queue state.

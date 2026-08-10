@@ -7,6 +7,7 @@ pub mod drain;
 pub mod graph;
 pub mod kv;
 pub mod query;
+pub mod queue;
 pub mod secret;
 pub mod status;
 pub mod table;

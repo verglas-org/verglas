@@ -458,14 +458,14 @@ or partitioning you need.
 
 ### Queues
 
-A worker may target a **queue** instead of a table. `client.queue(name)` returns a
-`Queue` with `enqueue(rows)`, `poll(group, { max })`, and `ack(group, position)`.
-Delivery is **at-least-once with consumer-side idempotency**: a record is durable
-before any consumer sees it, and a group's watermark advances only on an explicit
-`ack` after the consumer's downstream commit. A crash between `poll` and `ack`
-re-serves the same records, so a consumer that must not act twice dedupes on
-`QueueRecord.position`. `ack` is monotone — a regressing position is ignored.
-The self-hosted server backs the queue with a durable segment log.
+A worker may target an explicitly created **queue** instead of a table.
+`client.queue(name)` returns a `Queue` with `enqueue(messages)`,
+`poll(group, { owner, max, leaseSeconds })`, and `ack(group, receipt)`. Each queue
+owns a managed Verglas Neon database and an independently scalable queue
+container. Poll grants an exclusive expiring lease and returns a generation-fenced
+receipt. A crash before ack causes redelivery; a stale receipt cannot acknowledge
+a message reclaimed by another worker. Delivery is **at-least-once with
+consumer-side idempotency**.
 
 ### Graphs
 
@@ -625,7 +625,7 @@ The root exports exactly two layers; internals live behind subpaths.
   - `Table`: `snapshot()`, `scan(opts?)`, `delta(since, opts?)`,
     `append(rows, opts?)`, `addIndex(field, opts?)`, `listIndexes()`,
     `searchIndex(field, vector, opts?)`
-  - `Queue`: `enqueue(rows)`, `poll(group, opts?)`, `ack(group, position)`
+  - `Queue`: `enqueue(messages)`, `poll(group, { owner, max?, leaseSeconds })`, `ack(group, receipt)`
   - `Graph`: `create()`, `insertNodes()`, `insertEdges()`, `buildIndex()`,
     `show()`, `neighbors()`, `kHop()`, `paths()`
 - The worker contract: `defineWorker(def)`, `runWorker(worker, ctx, opts?)`; types

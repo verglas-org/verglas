@@ -1,5 +1,4 @@
-// The queue verb (#327): enqueue, poll by consumer group, ack. Exercises the
-// at-least-once + consumer-idempotency contract against the mock endpoint.
+// Standalone queue-container contract: append, exclusive lease, fenced ack.
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { connect, type VerglasClient } from "../src/index";
@@ -15,56 +14,33 @@ beforeEach(async () => {
 afterEach(() => endpoint.close());
 
 describe("queue verb", () => {
-  it("enqueues, polls by group, and acks", async () => {
+  it("enqueues, exclusively polls, and acknowledges a fenced receipt", async () => {
     const q = client.queue("events");
-    const res = await q.enqueue([{ n: 1 }, { n: 2 }, { n: 3 }]);
-    expect(res.enqueued).toBe(3);
-    expect(res.endPosition).toBe(3);
+    const appended = await q.enqueue([{ n: 1 }, { n: 2 }]);
+    expect(appended.positions).toEqual([0, 1]);
 
-    // Poll two records for group "g".
-    const first = await q.poll("g", { max: 2 });
-    expect(first.watermark).toBe(0);
-    expect(first.records.map((r) => r.row.n)).toEqual([1, 2]);
-    expect(first.records.map((r) => r.position)).toEqual([0, 1]);
+    const first = await q.poll("workers", {
+      owner: "consumer-a",
+      max: 1,
+      leaseSeconds: 30,
+    });
+    expect(first.deliveries).toHaveLength(1);
+    expect(first.deliveries[0].payload.n).toBe(1);
 
-    // Ack through position 2; the next poll returns only the tail.
-    await q.ack("g", 2);
-    const rest = await q.poll("g");
-    expect(rest.watermark).toBe(2);
-    expect(rest.records.map((r) => r.row.n)).toEqual([3]);
+    const competing = await q.poll("workers", {
+      owner: "consumer-b",
+      max: 1,
+      leaseSeconds: 30,
+    });
+    expect(competing.deliveries[0].position).toBe(1);
+
+    await q.ack("workers", first.deliveries[0].receipt);
   });
 
-  it("re-serves un-acked records (at-least-once)", async () => {
+  it("requires group, owner, and a fenced receipt", () => {
     const q = client.queue("events");
-    await q.enqueue([{ n: 1 }, { n: 2 }]);
-
-    // A poll without an ack (a crash) re-serves the same records.
-    const a = await q.poll("g");
-    const b = await q.poll("g");
-    expect(a.records).toEqual(b.records);
-    expect(a.records.map((r) => r.position)).toEqual([0, 1]);
-  });
-
-  it("ack is monotone: a regressing position is ignored", async () => {
-    const q = client.queue("events");
-    await q.enqueue([{ n: 1 }, { n: 2 }, { n: 3 }]);
-    await q.ack("g", 2);
-    const back = await q.ack("g", 1);
-    expect(back.watermark).toBe(2);
-  });
-
-  it("consumer groups are independent", async () => {
-    const q = client.queue("events");
-    await q.enqueue([{ n: 1 }, { n: 2 }]);
-    await q.ack("g1", 2);
-    const g2 = await q.poll("g2");
-    expect(g2.watermark).toBe(0);
-    expect(g2.records.map((r) => r.row.n)).toEqual([1, 2]);
-  });
-
-  it("requires a group name", () => {
-    const q = client.queue("events");
-    expect(() => q.poll("")).toThrow(/group is required/);
-    expect(() => q.ack("", 1)).toThrow(/group is required/);
+    expect(() => q.poll("", {owner: "consumer", leaseSeconds: 30})).toThrow(/group is required/);
+    expect(() => q.poll("workers", {owner: "", leaseSeconds: 30})).toThrow(/owner is required/);
+    expect(() => q.ack("", {position: 1, owner: "consumer", generation: 1})).toThrow(/group is required/);
   });
 });

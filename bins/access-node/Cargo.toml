@@ -11,6 +11,10 @@ publish.workspace = true
 name = "verglas-access"
 path = "src/main.rs"
 
+[[bin]]
+name = "verglas-neon-bootstrap"
+path = "src/neon_bootstrap.rs"
+
 [dependencies]
 axum.workspace = true
 async-trait.workspace = true
@@ -29,6 +33,7 @@ verglas-authz-postgres.workspace = true
 verglas-container-runtime.workspace = true
 verglas-database.workspace = true
 verglas-rest.workspace = true
+verglas-queue.workspace = true
 
 [lints]
 workspace = true

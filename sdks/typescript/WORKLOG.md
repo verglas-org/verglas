@@ -26,3 +26,4 @@
 - #84: Required every SDK SQL query to name its tenant database and routed it through `/v1/databases/{database}/query`. The typed client and control client also pass the optional table time-travel pin without retaining the removed singleton query route.
 - RBAC tokens now use the mandatory control-plane bearer credential. The SDK can mint, list, revoke, and explain scoped child-principal tokens through the access service, and every control connector rejects an empty token instead of silently sending an administrator fallback.
 - Added the one-time direct Postgres database-credential call. It is separately scoped to one database and returns only its bearer value and expiry, so SDK users do not need a reusable tenant database password.
+- #107: Replaced the local watermark queue API with PostgreSQL-backed exclusive leases and fenced receipts. Queue handles use the access endpoint and cannot implicitly create queue storage.

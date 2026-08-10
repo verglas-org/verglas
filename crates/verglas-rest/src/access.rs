@@ -31,6 +31,7 @@ use crate::data_plane::{
     AuthenticatedPrincipal, AuthorizationFailure, AuthorizationQuestion, DataPlaneAuthorizer,
 };
 use crate::database::{DatabaseAuthorization, DatabaseAuthorizationError};
+use crate::queue::{QueueAuthorization, QueueAuthorizationError};
 
 /// Shared authorization backend mounted by local and standalone servers.
 pub type AccessRuntime = Arc<dyn Authorizer>;
@@ -325,6 +326,82 @@ impl DatabaseAuthorization for AccessHttpRuntime {
     }
 }
 
+#[async_trait::async_trait]
+impl QueueAuthorization for AccessHttpRuntime {
+    /// Registers one queue resource and grants its authenticated creator ownership.
+    async fn create_queue_resource(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        queue: &str,
+    ) -> Result<(), QueueAuthorizationError> {
+        if principal.tenant_id != self.tenant_id.as_ref() {
+            return Err(QueueAuthorizationError::new("tenant mismatch"));
+        }
+        let resource_id = format!("queue/{queue}");
+        let resource = Resource::new(
+            &principal.tenant_id,
+            &resource_id,
+            verglas_authz::ResourceKind::Queue,
+        )
+        .with_parent("tenant");
+        let created = match self.authorizer.create_resource(resource.clone()).await {
+            Ok(_) => true,
+            Err(AuthzError::Conflict(_)) => {
+                let existing = self
+                    .authorizer
+                    .get_resource(&principal.tenant_id, &resource_id)
+                    .await
+                    .map_err(queue_authorization_error)?;
+                if existing != resource {
+                    return Err(QueueAuthorizationError::new(
+                        "queue resource conflicts with an existing definition",
+                    ));
+                }
+                false
+            }
+            Err(error) => return Err(queue_authorization_error(error)),
+        };
+        let grant = Grant::new(
+            format!("queue-owner/{queue}/{}", principal.principal_id),
+            &principal.tenant_id,
+            &principal.principal_id,
+            &resource_id,
+            BTreeSet::from([Action::Own]),
+        );
+        match self.authorizer.create_grant(grant).await {
+            Ok(_) | Err(AuthzError::Conflict(_)) => Ok(()),
+            Err(error) => {
+                if created {
+                    let _ = self
+                        .authorizer
+                        .delete_resource(&principal.tenant_id, &resource_id)
+                        .await;
+                }
+                Err(queue_authorization_error(error))
+            }
+        }
+    }
+
+    /// Removes one queue authorization resource after its runtime is gone.
+    async fn delete_queue_resource(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        queue: &str,
+    ) -> Result<(), QueueAuthorizationError> {
+        if principal.tenant_id != self.tenant_id.as_ref() {
+            return Err(QueueAuthorizationError::new("tenant mismatch"));
+        }
+        match self
+            .authorizer
+            .delete_resource(&principal.tenant_id, &format!("queue/{queue}"))
+            .await
+        {
+            Ok(()) | Err(AuthzError::NotFound(_)) => Ok(()),
+            Err(error) => Err(queue_authorization_error(error)),
+        }
+    }
+}
+
 /// Returns whether a resource has the database root in its parent chain.
 fn is_descendant(
     resource: &Resource,
@@ -359,6 +436,11 @@ fn resource_depth(resource: &Resource, resources: &BTreeMap<&str, &Resource>) ->
 /// Removes backend detail from a database authorization lifecycle failure.
 fn database_authorization_error(error: AuthzError) -> DatabaseAuthorizationError {
     DatabaseAuthorizationError::new(error.to_string())
+}
+
+/// Removes backend detail from a queue authorization lifecycle failure.
+fn queue_authorization_error(error: AuthzError) -> QueueAuthorizationError {
+    QueueAuthorizationError::new(error.to_string())
 }
 
 /// Identity established only after signed-token and durable registry validation.

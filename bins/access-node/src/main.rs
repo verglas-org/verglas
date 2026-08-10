@@ -26,10 +26,12 @@ use verglas_database::{
     DatabaseService, PostgresDatabaseRepository, ScopedSecretKind, ScopedSecretResolver,
     SecretResolutionError,
 };
+use verglas_queue::{PostgresQueueRepository, QueueService};
 
 mod database_runtime;
 mod lakehouse_runtime;
 mod postgres_runtime;
+mod queue_runtime;
 
 /// Database binding resolver backed by the authorization-owned secret service.
 struct AccessSecretResolver {
@@ -337,7 +339,7 @@ async fn run(args: Args) -> Result<(), String> {
             remote_access_key_id: args.managed_postgres_storage_access_key_id.clone(),
             remote_secret_access_key: args.managed_postgres_storage_secret_access_key.clone(),
             safekeepers: args.managed_postgres_safekeepers.clone(),
-            credential_key: postgres_credential_key,
+            credential_key: postgres_credential_key.clone(),
             access_endpoint: args.access_internal_endpoint,
             policy_engine_token_file: neon_policy_token_file,
             tls_certificate_file: args.managed_postgres_tls_certificate_file,
@@ -346,6 +348,21 @@ async fn run(args: Args) -> Result<(), String> {
         },
     )
     .map_err(|error| error.to_string())?;
+    let queue_repository = PostgresQueueRepository::connect(&args.database_url)
+        .await
+        .map_err(|error| error.to_string())?;
+    let queue_provisioner = queue_runtime::ManagedQueueProvisioner::new(
+        postgres.clone(),
+        queue_runtime::QueueRuntimeConfig {
+            runtime_endpoint: args.container_runtime_url.clone(),
+            runtime_token: args.container_runtime_token.clone(),
+            credential_key: postgres_credential_key,
+        },
+    )?;
+    let queue_service = Arc::new(QueueService::new(
+        queue_repository,
+        queue_provisioner.clone(),
+    ));
     let database_service = Arc::new(database_runtime::ProvisioningDatabaseManager::new(
         database_service,
         lakehouse,
@@ -382,6 +399,37 @@ async fn run(args: Args) -> Result<(), String> {
             }
         });
     }
+    let queue_recovery_failures = queue_service
+        .recover(&args.tenant_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    for failure in &queue_recovery_failures {
+        eprintln!("verglas-access: queue runtime recovery failed: {failure}");
+    }
+    if !queue_recovery_failures.is_empty() {
+        let recovery = queue_service.clone();
+        let recovery_tenant = args.tenant_id.clone();
+        tokio::spawn(async move {
+            let mut delay = Duration::from_secs(2);
+            loop {
+                tokio::time::sleep(delay).await;
+                match recovery.recover(&recovery_tenant).await {
+                    Ok(failures) if failures.is_empty() => break,
+                    Ok(failures) => {
+                        for failure in failures {
+                            eprintln!(
+                                "verglas-access: queue runtime recovery retry failed: {failure}"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("verglas-access: queue recovery retry failed: {error}");
+                    }
+                }
+                delay = (delay * 2).min(Duration::from_secs(60));
+            }
+        });
+    }
     let access_runtime =
         verglas_rest::access::AccessHttpRuntime::new(authorizer, tokens, args.tenant_id.clone())
             .with_identity_assertion_key(identity_assertion_key)
@@ -391,14 +439,26 @@ async fn run(args: Args) -> Result<(), String> {
         verglas_rest::database::router(
             database_service,
             Arc::new(access_runtime.clone()),
-            args.tenant_id,
+            args.tenant_id.clone(),
         ),
         access_runtime.clone(),
     );
+    let queue_routes = verglas_rest::queue::router(
+        queue_service.clone(),
+        Arc::new(access_runtime.clone()),
+        args.tenant_id.clone(),
+    )
+    .merge(verglas_rest::queue::data_router(
+        queue_service,
+        Arc::new(queue_provisioner),
+        args.tenant_id,
+    ));
+    let protected_queues = verglas_rest::data_plane::protect(queue_routes, access_runtime.clone());
     let app = Router::new()
         .route("/healthz", get(health))
         .merge(verglas_rest::access::router(access_runtime))
-        .merge(protected_databases);
+        .merge(protected_databases)
+        .merge(protected_queues);
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .map_err(|error| error.to_string())?;

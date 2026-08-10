@@ -236,13 +236,6 @@ struct VectorRuntime {
 /// the single local write authority for `verglas_sys`.
 pub type SysSlot = Arc<OnceLock<Arc<verglas_platform::SystemCatalog>>>;
 
-/// The queue root directory the queue routes append to and read from
-/// (`/v1/queues/<name>/{enqueue,poll,ack}`, #328). Unlike the engine slots this
-/// is a plain path, not a deferred [`OnceLock`]: a segment log needs no cache
-/// recovery, so the routes answer as soon as the server owns a writable state
-/// dir. The TS SDK queue verb targets these routes directly.
-pub type QueueDir = Arc<std::path::PathBuf>;
-
 /// The scheduler ingress handle the manual and HTTP routes enqueue through,
 /// wired after recovery opens the deployment registry.
 pub type PlatformSlot = Arc<OnceLock<Arc<crate::platform::SchedulerIngress>>>;
@@ -281,9 +274,6 @@ pub struct Slots {
     pub database_data: Option<DatabaseDataRuntime>,
     /// The `verglas_sys` registry routes (`/v1/workers`).
     pub sys: Option<SysSlot>,
-    /// The platform queue routes (`/v1/queues/<name>/{enqueue,poll,ack}`),
-    /// backed by [`verglas_harness::queue`] under this queue root.
-    pub queues: Option<QueueDir>,
     /// Manual and dynamically routed HTTP ingress into the scheduler queue.
     pub platform: Option<PlatformSlot>,
     /// The standalone query worker dispatcher (`[query_worker]` configured).
@@ -321,7 +311,6 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
         dashboards,
         database_data,
         sys,
-        queues,
         platform,
         query_worker,
         write_worker,
@@ -451,9 +440,6 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
     }
     if let Some(sys) = sys {
         app = app.merge(sys_router(sys));
-    }
-    if let Some(queues) = queues {
-        app = app.merge(queue_router(queues));
     }
     if let Some(platform) = platform {
         app = app.merge(platform_router(platform));
@@ -1601,156 +1587,6 @@ fn sys_router(sys: SysSlot) -> Router {
         .route("/v1/workers/{name}", get(worker_show))
         .route("/v1/workers/{name}/state", put(worker_set_state))
         .with_state(sys)
-}
-
-/// The platform queue sub-router (`/v1/queues/<name>/{enqueue,poll,ack}`, #328):
-/// workers can exchange batches through a queue instead of a table, and the TS
-/// SDK queue verb speaks these routes. Backed by [`verglas_harness::queue`] — a
-/// per-queue durable segment log under the queue root — with at-least-once
-/// delivery and consumer-group watermarks. The routes carry `serde_json::Value`
-/// payloads (row-shaped JSON). Segment-log operations are synchronous file IO,
-/// so each runs on the blocking pool, never on an async worker.
-fn queue_router(queues: QueueDir) -> Router {
-    Router::new()
-        .route("/v1/queues/{name}/enqueue", post(queue_enqueue))
-        .route("/v1/queues/{name}/poll", get(queue_poll))
-        .route("/v1/queues/{name}/ack", post(queue_ack))
-        .with_state(queues)
-}
-
-/// The body of `POST /v1/queues/{name}/enqueue`: the rows to append.
-#[derive(Debug, Deserialize)]
-struct QueueEnqueueBody {
-    /// The row payloads to append, in order.
-    rows: Vec<serde_json::Value>,
-}
-
-/// Query parameters for `GET /v1/queues/{name}/poll`: the consumer group and an
-/// optional page bound.
-#[derive(Debug, Deserialize)]
-struct QueuePollQuery {
-    /// The consumer group whose watermark bounds the read.
-    group: String,
-    /// The maximum records to return this poll (defaults to a page).
-    max: Option<usize>,
-}
-
-/// The body of `POST /v1/queues/{name}/ack`: the group and the position to
-/// advance its watermark to.
-#[derive(Debug, Deserialize)]
-struct QueueAckBody {
-    /// The consumer group whose watermark advances.
-    group: String,
-    /// The position acked through (typically the last polled position + 1).
-    position: u64,
-}
-
-/// The default poll page when the caller names no `max`.
-const QUEUE_POLL_DEFAULT_MAX: usize = 256;
-
-/// Maps a queue IO failure to a 500 with a plain message.
-fn queue_error(error: std::io::Error) -> Response {
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("queue: {error}")).into_response()
-}
-
-/// `POST /v1/queues/{name}/enqueue`: appends the body's rows to the named queue,
-/// returning how many landed and the queue's end position. Matches the TS SDK
-/// `QueueEnqueueResult`.
-async fn queue_enqueue(
-    State(queues): State<QueueDir>,
-    Path(name): Path<String>,
-    Json(body): Json<QueueEnqueueBody>,
-) -> Response {
-    let root = verglas_harness::queue::queue_root(&queues);
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<(usize, u64)> {
-        let log = verglas_harness::queue::SegmentLog::<serde_json::Value>::open(&root, &name)?;
-        let mut enqueued = 0usize;
-        for row in &body.rows {
-            if log.append(row)? {
-                enqueued += 1;
-            }
-        }
-        Ok((enqueued, log.end_position()?))
-    })
-    .await;
-    match result {
-        Ok(Ok((enqueued, end_position))) => Json(json!({
-            "enqueued": enqueued,
-            "endPosition": end_position,
-        }))
-        .into_response(),
-        Ok(Err(e)) => queue_error(e),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("queue task: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-/// `GET /v1/queues/{name}/poll?group=&max=`: reads up to `max` records at or
-/// after the group's watermark, plus the group's current watermark. Matches the
-/// TS SDK `QueuePollResult`. Reads without an ack re-serve the same records.
-async fn queue_poll(
-    State(queues): State<QueueDir>,
-    Path(name): Path<String>,
-    Query(query): Query<QueuePollQuery>,
-) -> Response {
-    let root = verglas_harness::queue::queue_root(&queues);
-    let max = query.max.unwrap_or(QUEUE_POLL_DEFAULT_MAX);
-    let group = query.group;
-    let result = tokio::task::spawn_blocking(
-        move || -> std::io::Result<(Vec<(u64, serde_json::Value)>, u64)> {
-            let log = verglas_harness::queue::SegmentLog::<serde_json::Value>::open(&root, &name)?;
-            let watermark = log.watermark(&group)?;
-            let records = log.read_from(watermark, max)?;
-            Ok((records, watermark))
-        },
-    )
-    .await;
-    match result {
-        Ok(Ok((records, watermark))) => {
-            let records: Vec<serde_json::Value> = records
-                .into_iter()
-                .map(|(position, row)| json!({ "position": position, "row": row }))
-                .collect();
-            Json(json!({ "records": records, "watermark": watermark })).into_response()
-        }
-        Ok(Err(e)) => queue_error(e),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("queue task: {e}"),
-        )
-            .into_response(),
-    }
-}
-
-/// `POST /v1/queues/{name}/ack`: advances the group's watermark to `position`
-/// (monotone — a regressing position is ignored), returning the resulting
-/// watermark. Matches the TS SDK `ack` reply.
-async fn queue_ack(
-    State(queues): State<QueueDir>,
-    Path(name): Path<String>,
-    Json(body): Json<QueueAckBody>,
-) -> Response {
-    let root = verglas_harness::queue::queue_root(&queues);
-    let group = body.group;
-    let position = body.position;
-    let result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-        let log = verglas_harness::queue::SegmentLog::<serde_json::Value>::open(&root, &name)?;
-        log.ack(&group, position)?;
-        log.watermark(&group)
-    })
-    .await;
-    match result {
-        Ok(Ok(watermark)) => Json(json!({ "watermark": watermark })).into_response(),
-        Ok(Err(e)) => queue_error(e),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("queue task: {e}"),
-        )
-            .into_response(),
-    }
 }
 
 /// Worker ingress routes: manual dispatch, named webhook compatibility, and

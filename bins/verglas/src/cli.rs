@@ -95,6 +95,9 @@ pub enum Command {
     /// Create independently bound Lakehouse and Postgres databases.
     #[command(subcommand)]
     Db(DbCommand),
+    /// Create and manage independently scalable PostgreSQL-backed queues.
+    #[command(subcommand)]
+    Queue(QueueCommand),
     /// Create scoped credentials without exposing their values in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
@@ -164,6 +167,26 @@ pub enum DbCommand {
     Create(DbCreateArgs),
     /// Mint a short-lived PostgreSQL password token for one managed Postgres database.
     Token(DbTokenArgs),
+}
+
+/// `verglas queue` resource lifecycle operations.
+#[derive(Debug, Subcommand)]
+pub enum QueueCommand {
+    /// Provision a dedicated Neon database and queue service container.
+    Create(QueueNameArgs),
+    /// List explicitly declared queues.
+    List,
+    /// Show one queue and both managed deployment identities.
+    Show(QueueNameArgs),
+    /// Delete the queue container and its dedicated Neon database.
+    Delete(QueueNameArgs),
+}
+
+/// Stable tenant-local queue name.
+#[derive(Debug, Args)]
+pub struct QueueNameArgs {
+    /// Queue resource name.
+    pub name: String,
 }
 
 /// Arguments for `verglas db create`.

@@ -113,7 +113,7 @@
       "server": [{ "method": "POST", "path": "/v1/queues/{name}/enqueue" }],
       "guarantees": ["durable-before-visible"],
       "clients": {
-        "typescript": { "status": "implemented", "symbol": "enqueue(rows:", "routes": ["/v1/queues/"] },
+        "typescript": { "status": "implemented", "symbol": "enqueue(messages:", "routes": ["/v1/queues/"] },
         "rust": { "status": "implemented", "symbol": "pub async fn enqueue", "routes": ["/v1/queues/"] },
         "cli": { "status": "n/a" }
       },
@@ -122,8 +122,8 @@
     {
       "id": "queue_poll",
       "family": "platform",
-      "server": [{ "method": "GET", "path": "/v1/queues/{name}/poll" }],
-      "guarantees": ["at-least-once"],
+      "server": [{ "method": "POST", "path": "/v1/queues/{name}/poll" }],
+      "guarantees": ["at-least-once", "exclusive-fenced-lease"],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "poll(group:", "routes": ["/v1/queues/"] },
         "rust": { "status": "implemented", "symbol": "pub async fn poll", "routes": ["/v1/queues/"] },
@@ -135,7 +135,7 @@
       "id": "queue_ack",
       "family": "platform",
       "server": [{ "method": "POST", "path": "/v1/queues/{name}/ack" }],
-      "guarantees": ["monotone-ack"],
+      "guarantees": ["generation-fenced-ack"],
       "clients": {
         "typescript": { "status": "implemented", "symbol": "ack(group:", "routes": ["/v1/queues/"] },
         "rust": { "status": "implemented", "symbol": "pub async fn ack", "routes": ["/v1/queues/"] },

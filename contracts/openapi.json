@@ -179,7 +179,7 @@
       }
     },
     "/v1/queues/{name}/poll": {
-      "get": {
+      "post": {
         "operationId": "queue_poll",
         "tags": [
           "platform"

@@ -43,7 +43,7 @@ pub use client::{
 };
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};
-pub use queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult, QueueRecord};
+pub use queue::{QueueDelivery, QueueEnqueueResult, QueuePollResult, QueueReceipt};
 pub use report::{CompactReport, CompactionReport};
 pub use token::{
     AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, DatabaseConnectionToken,

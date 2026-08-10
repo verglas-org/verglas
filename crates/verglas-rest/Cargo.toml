@@ -10,6 +10,7 @@ publish.workspace = true
 verglas-catalog.workspace = true
 verglas-authz.workspace = true
 verglas-database.workspace = true
+verglas-queue.workspace = true
 verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-iceberg.workspace = true

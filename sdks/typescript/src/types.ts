@@ -93,6 +93,8 @@ export interface ConnectOptions {
    * self-hosted server).
    */
   endpoint: string;
+  /** Access/queue edge when it differs from the query endpoint. */
+  accessEndpoint?: string;
   /** Bearer token for the endpoint. Never logged. */
   token: string;
   /**
@@ -327,26 +329,36 @@ export interface CommitResult {
 
 /** The result of enqueuing rows onto a queue. */
 export interface QueueEnqueueResult {
-  /** Rows appended this call. */
-  enqueued: number;
-  /** The position one past the last appended record (the queue's end). */
-  endPosition: number;
+  /** Stable ordered positions assigned by PostgreSQL. */
+  positions: number[];
 }
 
-/** One record polled from a queue: its stable global position and the row. */
-export interface QueueRecord<T extends Row = Row> {
-  /** The record's stable global position in the queue. */
+/** Opaque proof that one consumer owns a delivery generation. */
+export interface QueueReceipt {
+  /** Stable message position. */
   position: number;
-  /** The row payload. */
-  row: T;
+  /** Consumer process owning this lease. */
+  owner: string;
+  /** Monotonic generation fencing prior deliveries. */
+  generation: number;
 }
 
-/** A page polled from a queue for one consumer group. */
+/** One exclusively leased queue message. */
+export interface QueueDelivery<T extends Row = Row> {
+  /** Stable message position. */
+  position: number;
+  /** Caller-supplied JSON payload. */
+  payload: T;
+  /** Receipt required for acknowledgement. */
+  receipt: QueueReceipt;
+  /** RFC 3339 lease deadline. */
+  expiresAt: string;
+}
+
+/** Exclusive deliveries returned by one poll. */
 export interface QueuePollResult<T extends Row = Row> {
-  /** The records at or after the group's watermark, in order. */
-  records: QueueRecord<T>[];
-  /** The group's current watermark (the position it has acked through). */
-  watermark: number;
+  /** Messages claimed under distinct fenced receipts. */
+  deliveries: QueueDelivery<T>[];
 }
 
 /**

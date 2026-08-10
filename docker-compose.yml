@@ -91,7 +91,7 @@ services:
       target: verglas-access
     image: verglas/verglas-access:local
     environment:
-      VERGLAS_ACCESS_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_permissions
+      VERGLAS_ACCESS_DATABASE_URL: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_permissions
       VERGLAS_OPENFGA_ENDPOINT: http://verglas-openfga:8080
       VERGLAS_OPENFGA_STORE: verglas
       VERGLAS_OPENFGA_TOKEN: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
@@ -134,7 +134,9 @@ services:
     ports:
       - "127.0.0.1:8345:8345"
     depends_on:
-      verglas-postgres-init:
+      verglas-neon-bootstrap:
+        condition: service_completed_successfully
+      verglas-queue-image:
         condition: service_completed_successfully
       verglas-openfga:
         condition: service_healthy
@@ -159,7 +161,7 @@ services:
       target: verglas-scheduler
     image: verglas/verglas-scheduler:local
     environment:
-      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_scheduler
+      VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_scheduler
       VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
       VERGLAS_SCHEDULER_QUEUE: local
       VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
@@ -178,39 +180,43 @@ services:
       timeout: 5s
       retries: 15
     restart: unless-stopped
-  verglas-workers-postgres:
-    image: postgres:17
+  verglas-neon-bootstrap:
+    build:
+      context: .
+      target: verglas-neon-bootstrap
+    image: verglas/verglas-neon-bootstrap:local
     environment:
-      POSTGRES_USER: verglas
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
-      POSTGRES_DB: postgres
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U verglas -d postgres"]
-      interval: 2s
-      timeout: 5s
-      retries: 15
+      VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
+      VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
+      VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
+      VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-cache-node-0:8333
+      VERGLAS_MANAGED_POSTGRES_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+      VERGLAS_MANAGED_POSTGRES_STORAGE_REGION: auto
+      VERGLAS_MANAGED_POSTGRES_STORAGE_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+      VERGLAS_MANAGED_POSTGRES_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454
+      VERGLAS_MANAGED_POSTGRES_CREDENTIAL_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
+      VERGLAS_SYSTEM_POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-verglas}
+      VERGLAS_MANAGED_POSTGRES_CREDENTIAL_DIRECTORY: /var/lib/verglas-container-runtime/system-postgres
     volumes:
-      - verglas-workers-postgres:/var/lib/postgresql/data
-    restart: unless-stopped
-
-  verglas-postgres-init:
-    image: postgres:17
-    environment:
-      PGPASSWORD: ${POSTGRES_PASSWORD:-verglas}
-    command:
-      - bash
-      - -ec
-      - |
-        for database in verglas_scheduler verglas_permissions verglas_catalog; do
-          if ! psql -h verglas-workers-postgres -U verglas -d postgres -Atc \
-            "SELECT 1 FROM pg_database WHERE datname = '$$database'" | grep -qx 1; then
-            psql -h verglas-workers-postgres -U verglas -d postgres -v ON_ERROR_STOP=1 -c \
-              "CREATE DATABASE \"$$database\" OWNER verglas"
-          fi
-        done
+      - verglas-runtime-state:/var/lib/verglas-container-runtime
     depends_on:
-      verglas-workers-postgres:
+      verglas-container-runtime:
         condition: service_healthy
+      verglas-cache-node-0:
+        condition: service_healthy
+      verglas-cache-node-1:
+        condition: service_healthy
+      verglas-cache-node-2:
+        condition: service_healthy
+    restart: "no"
+
+  verglas-queue-image:
+    build:
+      context: .
+      target: verglas-queue-service
+    image: verglas/verglas-queue-service:local
+    entrypoint: ["/bin/true"]
     restart: "no"
 
   verglas-openfga-migrate:
@@ -218,9 +224,9 @@ services:
     command: migrate
     environment:
       OPENFGA_DATASTORE_ENGINE: postgres
-      OPENFGA_DATASTORE_URI: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_permissions?sslmode=disable
+      OPENFGA_DATASTORE_URI: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_permissions?sslmode=disable
     depends_on:
-      verglas-postgres-init:
+      verglas-neon-bootstrap:
         condition: service_completed_successfully
     restart: "no"
 
@@ -229,7 +235,7 @@ services:
     command: run
     environment:
       OPENFGA_DATASTORE_ENGINE: postgres
-      OPENFGA_DATASTORE_URI: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_permissions?sslmode=disable
+      OPENFGA_DATASTORE_URI: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_permissions?sslmode=disable
       OPENFGA_AUTHN_METHOD: preshared
       OPENFGA_AUTHN_PRESHARED_KEYS: ${VERGLAS_OPENFGA_TOKEN:-verglas-local-openfga}
       OPENFGA_PLAYGROUND_ENABLED: "false"
@@ -251,10 +257,10 @@ services:
     command: ["migrate"]
     environment: &lakekeeper-environment
       LAKEKEEPER__PG_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
-      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_catalog
-      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_catalog
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_catalog
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_catalog
     depends_on:
-      verglas-postgres-init:
+      verglas-neon-bootstrap:
         condition: service_completed_successfully
     restart: "no"
 
@@ -383,7 +389,7 @@ services:
     ports:
       - "127.0.0.1:8390:8390"
     environment:
-      DATABASE_URL: postgres://verglas:${POSTGRES_PASSWORD:-verglas}@verglas-workers-postgres:5432/verglas_scheduler
+      DATABASE_URL: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_scheduler
       VERGLAS_AGENT_RUNTIME_TOKEN: ${VERGLAS_AGENT_RUNTIME_TOKEN:-verglas-local-agent-runtime}
       VERGLAS_AGENT_RUNNER_IMAGE: verglas/verglas-agent-runtime:local
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
@@ -395,7 +401,7 @@ services:
       LOCAL_MODEL_RUNTIME_URL: http://verglas-os:8790
       LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
     depends_on:
-      verglas-postgres-init:
+      verglas-neon-bootstrap:
         condition: service_completed_successfully
       verglas-container-runtime:
         condition: service_healthy
@@ -455,7 +461,6 @@ services:
 volumes:
   verglas-cache:
   verglas-runtime-state:
-  verglas-workers-postgres:
   verglas-os-state:
   verglas-access-server-credentials:
   verglas-access-lakekeeper-credentials:

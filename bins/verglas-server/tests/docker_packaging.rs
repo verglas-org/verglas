@@ -192,3 +192,24 @@ fn docker_application_caps_server_file_descriptors() {
         "verglas-server must cap soft and hard nofile at 8192"
     );
 }
+
+#[test]
+fn default_stack_uses_verglas_neon_for_every_postgres_dependency() {
+    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("workspace root");
+    let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
+        .expect("read docker-compose.yml");
+    let postgres_runtime =
+        std::fs::read_to_string(workspace.join("bins/access-node/src/postgres_runtime.rs"))
+            .expect("read managed Neon runtime");
+
+    assert!(!compose.contains("image: postgres:"));
+    assert!(!compose.contains("verglas-workers-postgres:"));
+    assert!(!compose.contains("verglas-workers-postgres:/var/lib/postgresql"));
+    assert!(compose.contains("verglas-neon-bootstrap:"));
+    assert!(compose.contains("verglas-system-postgres"));
+    assert!(postgres_runtime.contains("ghcr.io/verglas-org/neon-storage:"));
+    assert!(postgres_runtime.contains("ghcr.io/verglas-org/neon-compute-v16:"));
+}

@@ -636,3 +636,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #81: The on-demand write launcher now renders one database-scoped, bearer-free
   role config and passes the authorized caller token only through the short-lived
   child environment. It refuses databases absent from the live Lakehouse registry.
+- #107: Removed all queue directories and queue data-plane routes from `verglas-server`. Queue lifecycle and traffic now terminate at Access and the independently provisioned queue container.

@@ -43,6 +43,7 @@ import type {
   GraphShowResult,
   QueueEnqueueResult,
   QueuePollResult,
+  QueueReceipt,
   QueryResult,
   QueryAt,
   Row,
@@ -70,7 +71,8 @@ export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceR
     throw new Error("connect: no global fetch; pass one via ConnectOptions.fetch");
   }
   const transport = makeTransport(opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  return new VerglasClient<Namespaces>(transport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  const queueTransport = makeTransport(opts.accessEndpoint ?? opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return new VerglasClient<Namespaces>(transport, queueTransport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 }
 
 /** A connected Verglas client. Cheap to hold; makes no requests until used. */
@@ -88,6 +90,7 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
   /** @internal */
   constructor(
     private readonly transport: Transport,
+    private readonly queueTransport: Transport,
     /** The endpoint this client is bound to (for logging/diagnostics). */
     readonly endpoint: string,
     /** Bearer token, reused to authenticate the change-feed websocket. */
@@ -231,12 +234,11 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
   }
 
   /**
-   * A handle to one queue by name — the queue a worker can target instead of a
-   * Table. The self-hosted endpoint backs it with a durable segment log.
+   * A handle to one explicitly provisioned PostgreSQL-backed queue.
    */
   queue<T extends Row = Row>(name: string): Queue<T> {
     if (!name) throw new Error("queue: name is required");
-    return new Queue<T>(this.transport, name);
+    return new Queue<T>(this.queueTransport, name);
   }
 
   /**
@@ -680,19 +682,14 @@ function reverseCatalogType(typeName: string): string {
 /**
  * A read/write handle to a single Verglas queue — the queue output type.
  *
- * A queue is a durable, ordered log of rows consumed by named consumer groups.
- * `enqueue` appends; `poll` reads a group's un-acked records from its watermark;
- * `ack` advances the group's watermark after the consumer has committed its work.
+ * A queue is an independently scalable service over a dedicated Neon database.
+ * Poll returns exclusive expiring deliveries and ack requires the exact receipt.
  *
  * # Semantics: at-least-once with consumer-side idempotency
  *
- * A record is durable before any consumer sees it, and a group's watermark
- * advances only on an explicit `ack` after the consumer's downstream commit. A
- * crash between `poll` and `ack` re-serves the same records, so delivery is
- * **at-least-once**; a consumer that must not act twice records what it has
- * already handled (dedupe on `QueueRecord.position`, say) — the same discipline
- * the commit path enforces with idempotency keys. `ack` is monotone: a
- * regressing position is ignored.
+ * A crash before ack lets the lease expire and redelivers the message under a
+ * higher generation. A stale receipt is rejected rather than acknowledging a
+ * newer consumer's delivery.
  */
 export class Queue<T extends Row = Row> {
   /** @internal */
@@ -705,34 +702,31 @@ export class Queue<T extends Row = Row> {
     return `/v1/queues/${encodeURIComponent(this.name)}`;
   }
 
-  /** Appends rows to the queue. */
-  enqueue(rows: T[]): Promise<QueueEnqueueResult> {
+  /** Appends messages to the queue. */
+  enqueue(messages: T[]): Promise<QueueEnqueueResult> {
     return this.transport.request<QueueEnqueueResult>("POST", `${this.base()}/enqueue`, {
-      body: { rows },
+      body: { messages },
     });
   }
 
   /**
-   * Reads up to `max` records for consumer group `group`, starting at the
-   * group's watermark. Reads without an `ack` re-serve the same records
-   * (at-least-once); pass `max` to bound one poll.
+   * Claims up to `max` exclusive messages for one consumer process.
    */
-  poll(group: string, opts?: { max?: number }): Promise<QueuePollResult<T>> {
+  poll(group: string, opts: { owner: string; max?: number; leaseSeconds: number }): Promise<QueuePollResult<T>> {
     if (!group) throw new Error("poll: group is required");
-    return this.transport.request<QueuePollResult<T>>("GET", `${this.base()}/poll`, {
-      query: { group, max: opts?.max },
+    if (!opts.owner) throw new Error("poll: owner is required");
+    return this.transport.request<QueuePollResult<T>>("POST", `${this.base()}/poll`, {
+      body: { group, owner: opts.owner, max: opts.max ?? 256, leaseSeconds: opts.leaseSeconds },
     });
   }
 
   /**
-   * Advances `group`'s watermark to `position` (typically the last polled
-   * record's position + 1) after the consumer has committed its work. Monotone:
-   * a regressing position is ignored.
+   * Acknowledges exactly the live delivery generation after committing work.
    */
-  ack(group: string, position: number): Promise<{ watermark: number }> {
+  ack(group: string, receipt: QueueReceipt): Promise<void> {
     if (!group) throw new Error("ack: group is required");
-    return this.transport.request<{ watermark: number }>("POST", `${this.base()}/ack`, {
-      body: { group, position },
+    return this.transport.request<void>("POST", `${this.base()}/ack`, {
+      body: { group, receipt },
     });
   }
 }

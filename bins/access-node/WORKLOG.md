@@ -17,3 +17,4 @@
 - #84: Put one Verglas-authenticated Neon TLS proxy in front of every managed Postgres compute.
   Compute SCRAM remains private behind fixed bridge and NOLOGIN session roles; proxy declarations
   reference rotating policy, bridge, and TLS files without persisting their contents.
+- #107: Added queue provisioning that creates a dedicated managed Neon runtime before an independently reconciled queue container, with rollback in reverse dependency order. Queue resources are stored in the system database and served from the tenant access API.

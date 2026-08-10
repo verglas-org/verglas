@@ -26,6 +26,7 @@ pub mod logging;
 pub mod namespace;
 pub mod platform;
 pub mod query_worker;
+pub mod queue;
 pub mod write_worker;
 
 /// REST service version reported by the admin API.

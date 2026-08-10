@@ -106,3 +106,4 @@
   query, write, graph, and vector operations. Removed singleton catalog
   discovery and the dead catalog WebSocket client so every supported data
   operation names its database in the route.
+- #107: Replaced watermark queue calls with PostgreSQL-backed fenced delivery receipts and routed queue handles through the access endpoint. Enqueue, poll, and ack now speak only the standalone queue-container contract.

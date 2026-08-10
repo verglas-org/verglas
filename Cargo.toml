@@ -29,6 +29,7 @@ members = [
     "crates/verglas-vessel-contract",
     "crates/verglas-container-runtime",
     "crates/verglas-database",
+    "crates/verglas-queue",
     "bins/cache-node",
     "bins/access-node",
     "crates/verglas-block",
@@ -37,6 +38,7 @@ members = [
     "bins/query-node",
     "bins/write-node",
     "bins/scheduler",
+    "bins/queue-service",
 ]
 # Language SDKs live under sdks/. The TypeScript package is not a Cargo crate.
 exclude = [
@@ -80,6 +82,7 @@ verglas-scheduler = { path = "crates/verglas-scheduler" }
 verglas-vessel-contract = { path = "crates/verglas-vessel-contract" }
 verglas-container-runtime = { path = "crates/verglas-container-runtime" }
 verglas-database = { path = "crates/verglas-database" }
+verglas-queue = { path = "crates/verglas-queue" }
 verglas-block = { path = "crates/verglas-block" }
 verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 tonic = "0.13.1"
