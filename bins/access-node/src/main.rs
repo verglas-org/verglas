@@ -628,6 +628,25 @@ async fn provision_internal_credentials(
         ),
     ] {
         ensure_internal_principal(authorizer.as_ref(), tenant_id, parent_id).await?;
+        if parent_id == "service/verglas-lakekeeper" {
+            match authorizer
+                .create_grant(Grant::new(
+                    "lakekeeper-control-service",
+                    tenant_id,
+                    parent_id,
+                    "lakekeeper",
+                    BTreeSet::from([Action::CreateChild, Action::Modify]),
+                ))
+                .await
+            {
+                Ok(_) | Err(AuthzError::Conflict(_)) => {}
+                Err(error) => {
+                    return Err(format!(
+                        "cannot grant Lakekeeper control-resource authority: {error}"
+                    ));
+                }
+            }
+        }
         let token_id = new_access_token_id();
         let principal_id = format!("token/{token_id}");
         authorizer
@@ -878,6 +897,13 @@ mod tests {
             .create_resource(Resource::new("tenant-a", "tenant", ResourceKind::Tenant))
             .await
             .expect("tenant");
+        authorizer
+            .create_resource(
+                Resource::new("tenant-a", "lakekeeper", ResourceKind::Project)
+                    .with_parent("tenant"),
+            )
+            .await
+            .expect("lakekeeper root");
         let tokens = Arc::new(AccessTokenService::new(
             AccessTokenSigner::new([6; 32]),
             Arc::new(MemoryAccessTokenRegistry::new()),

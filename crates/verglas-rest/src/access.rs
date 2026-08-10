@@ -21,8 +21,8 @@ use sha2::Sha256;
 use verglas_authz::{
     AccessCheck, AccessDecision, AccessTokenMetadata, AccessTokenService, Action, Authorizer,
     AuthzError, Grant, GrantDelegation, GrantRevocation, Principal, PrincipalKind, ReplaceSecret,
-    ResolveSecret, Resource, ScopedTokenClaims, SecretError, SecretKind, SecretService,
-    TargetJwtRequest, TargetJwtSigner, TokenMintRequest, new_access_token_id,
+    ResolveSecret, Resource, ResourceKind, ScopedTokenClaims, SecretError, SecretKind,
+    SecretService, TargetJwtRequest, TargetJwtSigner, TokenMintRequest, new_access_token_id,
 };
 use verglas_catalog::DatabaseId;
 use verglas_database::DatabaseKind;
@@ -1015,13 +1015,7 @@ async fn sync_resource(
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if identity.actor_principal_id != "service/verglas-lakekeeper"
-        || matches!(
-            body.kind,
-            verglas_authz::ResourceKind::Tenant | verglas_authz::ResourceKind::Database
-        )
-        || !is_lakekeeper_resource_id(&body.id)
-    {
+    if identity.actor_principal_id != "service/verglas-lakekeeper" {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(parent_id) = body.parent_id.clone() else {
@@ -1029,12 +1023,7 @@ async fn sync_resource(
             "policy-synced resources require a parent".to_owned(),
         ));
     };
-    let Some(database_root) = lakekeeper_database_root(&body.id) else {
-        return StatusCode::FORBIDDEN.into_response();
-    };
-    if parent_id != database_root
-        && (!parent_id.starts_with(&format!("{database_root}/lakekeeper/")))
-    {
+    if !is_lakekeeper_resource_parent(body.kind, &body.id, &parent_id) {
         return StatusCode::FORBIDDEN.into_response();
     }
     if let Err(response) = require_action(
@@ -1091,7 +1080,7 @@ async fn delete_synced_resource(
     };
     if identity.actor_principal_id != "service/verglas-lakekeeper"
         || resource.parent_id.is_none()
-        || !is_lakekeeper_resource_id(&resource.id)
+        || !is_lakekeeper_resource(resource.kind, &resource.id)
         || matches!(
             resource.kind,
             verglas_authz::ResourceKind::Tenant | verglas_authz::ResourceKind::Database
@@ -1184,19 +1173,66 @@ async fn delete_synced_principal(
     }
 }
 
-/// Returns whether an ID belongs beneath a canonical database Lakekeeper subtree.
-fn is_lakekeeper_resource_id(id: &str) -> bool {
-    lakekeeper_database_root(id).is_some()
+/// Accepts only Lakekeeper's deterministic resource IDs for each entity kind.
+fn is_lakekeeper_resource(kind: ResourceKind, id: &str) -> bool {
+    let nonempty_tail = |prefix: &str| {
+        id.strip_prefix(prefix)
+            .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+    };
+    match kind {
+        ResourceKind::Project => nonempty_tail("lakekeeper/project/"),
+        ResourceKind::Warehouse => nonempty_tail("warehouse/"),
+        ResourceKind::Namespace => nonempty_tail("namespace/"),
+        ResourceKind::Table => nested_lakekeeper_id(id, "table"),
+        ResourceKind::View => nested_lakekeeper_id(id, "view"),
+        ResourceKind::GenericTable => nested_lakekeeper_id(id, "generic-table"),
+        ResourceKind::Role => nonempty_tail("lakekeeper/role/"),
+        ResourceKind::Tag => nonempty_tail("lakekeeper/tag/"),
+        ResourceKind::Tenant | ResourceKind::Database => false,
+        _ => false,
+    }
 }
 
-/// Extracts the canonical database root from a Lakekeeper-owned resource ID.
-fn lakekeeper_database_root(id: &str) -> Option<String> {
-    let (database, _) = id.split_once("/lakekeeper/")?;
-    if database.starts_with("database/") && database.len() > "database/".len() {
-        Some(database.to_owned())
-    } else {
-        None
+/// Validates the exact parent shape Lakekeeper publishes for one resource kind.
+fn is_lakekeeper_resource_parent(kind: ResourceKind, id: &str, parent_id: &str) -> bool {
+    if !is_lakekeeper_resource(kind, id) {
+        return false;
     }
+    match kind {
+        ResourceKind::Project => parent_id == "lakekeeper",
+        ResourceKind::Warehouse => valid_single_segment(parent_id, "database/"),
+        ResourceKind::Namespace => {
+            valid_single_segment(parent_id, "warehouse/")
+                || valid_single_segment(parent_id, "namespace/")
+        }
+        ResourceKind::Table | ResourceKind::View | ResourceKind::GenericTable => {
+            valid_single_segment(parent_id, "namespace/")
+        }
+        ResourceKind::Role | ResourceKind::Tag => {
+            valid_single_segment(parent_id, "lakekeeper/project/")
+        }
+        ResourceKind::Tenant | ResourceKind::Database => false,
+        _ => false,
+    }
+}
+
+fn valid_single_segment(value: &str, prefix: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|tail| !tail.is_empty() && !tail.contains('/'))
+}
+
+fn nested_lakekeeper_id(id: &str, entity: &str) -> bool {
+    let Some(rest) = id.strip_prefix("warehouse/") else {
+        return false;
+    };
+    let Some((warehouse, tail)) = rest.split_once('/') else {
+        return false;
+    };
+    !warehouse.is_empty()
+        && tail
+            .strip_prefix(&format!("{entity}/"))
+            .is_some_and(|entity_id| !entity_id.is_empty() && !entity_id.contains('/'))
 }
 
 /// Accepts only shared user identities or Lakekeeper-owned role principals.
@@ -1934,6 +1970,54 @@ fn unix_time() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+#[cfg(test)]
+mod lakekeeper_resource_contract_tests {
+    use super::{ResourceKind, is_lakekeeper_resource_parent};
+
+    #[test]
+    fn accepts_shared_control_and_database_resource_trees() {
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Project,
+            "lakekeeper/project/project-a",
+            "lakekeeper",
+        ));
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Warehouse,
+            "warehouse/warehouse-a",
+            "database/database-a",
+        ));
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Namespace,
+            "namespace/namespace-a",
+            "warehouse/warehouse-a",
+        ));
+        assert!(is_lakekeeper_resource_parent(
+            ResourceKind::Table,
+            "warehouse/warehouse-a/table/table-a",
+            "namespace/namespace-a",
+        ));
+    }
+
+    #[test]
+    fn rejects_kind_confusion_and_unbounded_paths() {
+        assert!(!is_lakekeeper_resource_parent(
+            ResourceKind::Database,
+            "database/database-a",
+            "tenant",
+        ));
+        assert!(!is_lakekeeper_resource_parent(
+            ResourceKind::Warehouse,
+            "lakekeeper/project/project-a",
+            "database/database-a",
+        ));
+        assert!(!is_lakekeeper_resource_parent(
+            ResourceKind::Table,
+            "warehouse/warehouse-a/table/table-a/extra",
+            "namespace/namespace-a",
+        ));
+    }
 }
 
 /// Serializes one successful typed result or maps its stable authorization error.
