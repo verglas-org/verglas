@@ -1,5 +1,11 @@
 # Worklog
 
+- #84: Pinned the complete stack to immutable published Verglas Neon
+  storage/proxy and compute images. The runtime consumes only its isolated
+  Neon policy-token volume; access mounts runtime state read-only solely to
+  copy the manager-generated proxy TLS identity into an authenticated database
+  proxy.
+
 - #63: Added an authenticated, read-only Vessel manifest validation endpoint backed by the shared
   compositional contract; invalid compositions cannot partially mutate local desired state.
 - #63: Added atomic compositional Vessel apply. The runtime builds independently versioned
