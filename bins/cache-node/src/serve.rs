@@ -29,12 +29,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
+use verglas_cluster::peer::PeerClient;
 use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo, WritebackStatsInfo};
 use verglas_core::config::{CatalogConsistency, Config};
 use verglas_core::metrics::NodeMetrics;
 use verglas_core::node::NodeId;
-use verglas_core::peer::NoopPeerFetch;
 use verglas_core::ring::RendezvousRing;
 use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
 use verglas_write::{
@@ -59,7 +59,7 @@ const BLOCK_PORT: u16 = 8335;
 /// The concrete engine the cache node runs: the hybrid cache over the
 /// single-bucket passthrough backend, with a one-member rendezvous ring and the
 /// no-op peer fetch. No `verglas-cluster` types appear here.
-type CacheEngine = HybridCacheEngine<PassthroughRead, NoopPeerFetch, RendezvousRing>;
+pub(crate) type CacheEngine = HybridCacheEngine<PassthroughRead, PeerClient, RendezvousRing>;
 type WritebackSlot = Arc<std::sync::OnceLock<Arc<WritebackMetrics>>>;
 
 /// Builds the all-object policy used by a tenant cache ring. Neon uploads both
@@ -340,6 +340,7 @@ pub async fn run(
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
     let writeback_slot: WritebackSlot = Arc::new(std::sync::OnceLock::new());
+    let page_cache_slot: crate::page_cache::PageCacheSlot = Arc::new(std::sync::OnceLock::new());
 
     // Bind the admin listener first so its port is owned before serving; it
     // answers `/admin/healthz` = starting/503 while the engine recovers below.
@@ -377,6 +378,7 @@ pub async fn run(
                 &config.cache.dir,
                 config.cache.capacity_bytes.0,
                 &device_registry,
+                Arc::clone(&page_cache_slot),
                 activity.clone(),
             )
             .await?
@@ -486,6 +488,11 @@ pub async fn run(
     if let Some(quiescence) = quiescence {
         admin_app = admin_app.merge(admin::quiescence_router(quiescence));
     }
+    admin_app = admin_app.merge(admin::track_http(
+        crate::page_cache::router(Arc::clone(&page_cache_slot)),
+        activity.clone(),
+        ActivityPlane::Http,
+    ));
     if let Some((device_registry, _)) = &block_registry {
         admin_app = admin_app.merge(admin::track_http(
             crate::blockdev::control_router(device_registry.clone()),
@@ -533,15 +540,24 @@ pub async fn run(
 
     let data_plane = async {
         let backend = PassthroughRead::new(registry.clone());
-        let node = NodeId::new(SINGLE_NODE_ID);
-        let ring = RendezvousRing::single(node.clone());
+        let (node, ring, peers) = match &object_ring {
+            Some(ring) => (ring.node_id(), ring.read_ring(), ring.read_client()),
+            None => {
+                let node = NodeId::new(SINGLE_NODE_ID);
+                (
+                    node.clone(),
+                    RendezvousRing::single(node),
+                    PeerClient::disabled(),
+                )
+            }
+        };
 
         // Disk recovery runs inside the engine build (foyer rescans its regions
         // and rebuilds the index). Time it for the operator log (#16).
         let recovery_start = std::time::Instant::now();
         let engine = HybridCacheEngine::new_with_background_fill_limit(
             backend,
-            NoopPeerFetch,
+            peers,
             ring,
             node,
             &config.cache,
@@ -575,6 +591,7 @@ pub async fn run(
             registry.clone(),
             Arc::clone(&writeback_slot),
         ));
+        let _ = page_cache_slot.set(engine.clone());
         health.mark_ready();
 
         serve_s3(S3Serve {
@@ -998,7 +1015,7 @@ mod tests {
         let ring = RendezvousRing::single(node.clone());
         let engine = HybridCacheEngine::new_with_background_fill_limit(
             backend,
-            NoopPeerFetch,
+            PeerClient::disabled(),
             ring,
             node,
             &config.cache,

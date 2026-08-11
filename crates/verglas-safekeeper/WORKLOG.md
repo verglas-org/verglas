@@ -56,3 +56,6 @@
   commits, pressure offload/eviction, migration GC, and legacy recovery. Every
   acknowledged append now wakes the S3 drain immediately; the one-second timer
   remains only as retry insurance after origin failures.
+- #74: Made pageserver feedback advance retention only from the explicit
+  `vg_durable_lsn` watermark and accepted Neon's read-replica
+  `START_REPLICATION SLOT ... TIMELINE ...` command.

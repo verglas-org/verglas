@@ -29,7 +29,8 @@ fn handlers_for(store: LocalFragmentStore) -> FragmentHandlers {
     let s1b = store.clone();
     let s2 = store.clone();
     let s3 = store.clone();
-    let s4 = store;
+    let s4 = store.clone();
+    let s5 = store;
     FragmentHandlers {
         store: Arc::new(move |record| {
             let s = s1.clone();
@@ -57,6 +58,15 @@ fn handlers_for(store: LocalFragmentStore) -> FragmentHandlers {
         headroom: Arc::new(move |bytes| {
             let s = s4.clone();
             Box::pin(async move { s.has_headroom(bytes) })
+        }),
+        list_prefix: Arc::new(move |prefix| {
+            let s = s5.clone();
+            Box::pin(async move {
+                s.list_fragment_keys()
+                    .into_iter()
+                    .filter(|key| key.object_id.starts_with(&prefix))
+                    .collect()
+            })
         }),
     }
 }

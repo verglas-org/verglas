@@ -18,6 +18,7 @@ mod blockdev;
 mod catalog_consistency;
 mod logging;
 mod nbd;
+mod page_cache;
 mod ring;
 mod safekeeper;
 mod serve;

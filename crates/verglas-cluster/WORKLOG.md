@@ -99,3 +99,5 @@
   is refused or its atomic write fails. This closes an accounting hole exposed
   by the safekeeper's bounded manifest slots: failed metadata replacement can no
   longer make occupied NVMe appear free.
+- #74: Added prefix-filtered fragment discovery and authenticated owner fetch
+  and placement RPCs for reconstructed Neon pages and ordinary cache blocks.

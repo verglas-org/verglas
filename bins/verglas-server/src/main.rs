@@ -2015,7 +2015,8 @@ fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
     let store_stream = store.clone();
     let store_get = store.clone();
     let store_del = store.clone();
-    let store_room = store;
+    let store_room = store.clone();
+    let store_list = store;
     FragmentHandlers {
         store: Arc::new(move |record: FragmentRecord| {
             let store = store_put.clone();
@@ -2036,6 +2037,16 @@ fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
         headroom: Arc::new(move |bytes: u64| {
             let store = store_room.clone();
             Box::pin(async move { store.has_headroom(bytes) })
+        }),
+        list_prefix: Arc::new(move |prefix: String| {
+            let store = store_list.clone();
+            Box::pin(async move {
+                store
+                    .list_fragment_keys()
+                    .into_iter()
+                    .filter(|key| key.object_id.starts_with(&prefix))
+                    .collect()
+            })
         }),
     }
 }

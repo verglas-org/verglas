@@ -83,3 +83,11 @@
   fragment ring starts. The committed legacy head remains pinned, malformed or
   missing heads cause no deletion, and the new two-slot safekeeper protocol no
   longer grows this metadata without bound.
+- #74: Exposed exact reconstructed-page GET/PUT routes on the admin listener,
+  backed by the same hybrid engine and recovery gate as Iceberg data.
+- #74: Extended rendezvous ownership and cache peer transport to reconstructed
+  Neon pages and ordinary object blocks, allowing any ingress node to fetch from
+  the owner and retain a local hot replica.
+- #74: Added a four-node shared-cache regression covering cross-node page heat,
+  real Neon query-after-write, safekeeper publication, and quorum writes with a
+  ring member stopped.

@@ -72,6 +72,9 @@ const SECRET_HEADER: &str = "x-verglas-cluster-secret";
 /// wire-compat extension point (#79) — it is not negotiated (prototype rules).
 const BLOCK_PATH: &str = "/peer/v0/block";
 
+/// Cache-only owner placement for materialized blocks.
+const BLOCK_STORE_PATH: &str = "/peer/v0/block/store";
+
 /// Write-back fragment store endpoint (#180): POST stores the fragment carried
 /// in the body, identified by the object-id and index headers below.
 const FRAGMENT_PUT_PATH: &str = "/peer/v0/fragment";
@@ -88,6 +91,9 @@ const FRAGMENT_DELETE_PATH: &str = "/peer/v0/fragment/delete";
 /// in a header; the response is `200` with body `1` (room) or `0` (full). Used
 /// by placement to exclude a peer whose fragment store is at its budget.
 const FRAGMENT_HEADROOM_PATH: &str = "/peer/v0/fragment/headroom";
+
+/// Lists fragment keys whose object id begins with a requested prefix.
+const FRAGMENT_LIST_PATH: &str = "/peer/v0/fragment/list";
 
 /// Header carrying the byte count a headroom check asks about.
 const FRAGMENT_BYTES_HEADER: &str = "x-verglas-fragment-bytes";
@@ -174,6 +180,14 @@ impl PeerResolver for GossipResolver {
 pub type LocalBlockFn =
     Arc<dyn Fn(BlockKey) -> Pin<Box<dyn Future<Output = Option<Bytes>> + Send>> + Send + Sync>;
 
+/// Admits one materialized block on its rendezvous owner. `false` is an
+/// ordinary policy rejection, not a transport failure.
+pub type LocalBlockStoreFn = Arc<
+    dyn Fn(BlockKey, Bytes) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// The JSON request envelope: the full block identity, flattened. No ring epoch
 /// and no version tag travel with it (see the module docs — exact-`BlockKey`
 /// matching subsumes both).
@@ -191,6 +205,12 @@ struct BlockRequest {
     block_bytes: u64,
     /// Zero-based block index within the object.
     block_index: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BlockStoreRequest {
+    block: BlockRequest,
+    value: Vec<u8>,
 }
 
 impl BlockRequest {
@@ -252,6 +272,10 @@ pub type FragmentDeleteFn = Arc<
 pub type FragmentHeadroomFn =
     Arc<dyn Fn(u64) -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
 
+/// Lists locally held fragment keys for one object-id namespace prefix.
+pub type FragmentListFn =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Vec<FragmentKey>> + Send>> + Send + Sync>;
+
 /// A stream of a fragment's shard chunks in stripe order (#180).
 pub type FragmentShardStream = Pin<Box<dyn futures::Stream<Item = Bytes> + Send>>;
 
@@ -281,6 +305,8 @@ pub struct FragmentHandlers {
     pub delete: FragmentDeleteFn,
     /// Report whether this node has budget headroom for a fragment.
     pub headroom: FragmentHeadroomFn,
+    /// List keys in one object-id namespace.
+    pub list_prefix: FragmentListFn,
 }
 
 /// Shared state the block handler reads: the local-cache lookup, the optional
@@ -289,6 +315,8 @@ pub struct FragmentHandlers {
 struct ServerState {
     /// Cache-only block lookup (never fills — see [`LocalBlockFn`]).
     source: LocalBlockFn,
+    /// Optional cache-only materialized-block placement callback.
+    store: Option<LocalBlockStoreFn>,
     /// The secret a request must present, or `None` to accept unauthenticated
     /// requests (dev / trusted-network setups).
     secret: Option<String>,
@@ -303,6 +331,12 @@ struct FragmentRef {
     object_id: String,
     /// The fragment index within the `k+m` set.
     index: usize,
+}
+
+/// Prefix filter for fragment identity discovery.
+#[derive(Debug, Serialize, Deserialize)]
+struct FragmentListRequest {
+    prefix: String,
 }
 
 /// The peer-fetch server: listens on this node's advertised address and serves
@@ -323,7 +357,7 @@ impl PeerServer {
         secret: Option<String>,
         source: LocalBlockFn,
     ) -> std::io::Result<Self> {
-        Self::bind_inner(addr, secret, source, None).await
+        Self::bind_inner(addr, secret, source, None, None).await
     }
 
     /// Binds like [`PeerServer::bind`] and additionally serves the write-back
@@ -334,7 +368,19 @@ impl PeerServer {
         source: LocalBlockFn,
         fragments: FragmentHandlers,
     ) -> std::io::Result<Self> {
-        Self::bind_inner(addr, secret, source, Some(fragments)).await
+        Self::bind_inner(addr, secret, source, None, Some(fragments)).await
+    }
+
+    /// Binds the peer read, materialized-block placement, and write-back
+    /// fragment endpoints used by cache nodes.
+    pub async fn bind_with_store_and_fragments(
+        addr: SocketAddr,
+        secret: Option<String>,
+        source: LocalBlockFn,
+        store: LocalBlockStoreFn,
+        fragments: FragmentHandlers,
+    ) -> std::io::Result<Self> {
+        Self::bind_inner(addr, secret, source, Some(store), Some(fragments)).await
     }
 
     /// Shared bind path: registers the block route always and the fragment
@@ -343,20 +389,26 @@ impl PeerServer {
         addr: SocketAddr,
         secret: Option<String>,
         source: LocalBlockFn,
+        store: Option<LocalBlockStoreFn>,
         fragments: Option<FragmentHandlers>,
     ) -> std::io::Result<Self> {
         let listener = tokio::net::TcpListener::bind(addr).await?;
         let local_addr = listener.local_addr()?;
         let mut app = Router::new().route(BLOCK_PATH, post(serve_block));
+        if store.is_some() {
+            app = app.route(BLOCK_STORE_PATH, post(store_block));
+        }
         if fragments.is_some() {
             app = app
                 .route(FRAGMENT_PUT_PATH, post(store_fragment))
                 .route(FRAGMENT_GET_PATH, post(load_fragment))
                 .route(FRAGMENT_DELETE_PATH, post(delete_fragment))
-                .route(FRAGMENT_HEADROOM_PATH, post(fragment_headroom));
+                .route(FRAGMENT_HEADROOM_PATH, post(fragment_headroom))
+                .route(FRAGMENT_LIST_PATH, post(list_fragments));
         }
         let app = app.with_state(ServerState {
             source,
+            store,
             secret,
             fragments,
         });
@@ -442,6 +494,30 @@ async fn serve_block_inner(state: ServerState, headers: HeaderMap, body: AxumByt
             );
             StatusCode::NO_CONTENT.into_response()
         }
+    }
+}
+
+/// Places one materialized cache block on its rendezvous owner. The callback
+/// validates the namespace, geometry, body size, and current ownership before
+/// admitting it through the shared policy.
+async fn store_block(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: AxumBytes,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Ok(request) = serde_json::from_slice::<BlockStoreRequest>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(store) = &state.store else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match store(request.block.into_key(), Bytes::from(request.value)).await {
+        Ok(true) => StatusCode::CREATED.into_response(),
+        Ok(false) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
 
@@ -597,9 +673,36 @@ async fn fragment_headroom(
     (StatusCode::OK, answer).into_response()
 }
 
+/// Lists fragment identities in one namespace without returning their bytes.
+async fn list_fragments(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: AxumBytes,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(handlers) = &state.fragments else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let Ok(request) = serde_json::from_slice::<FragmentListRequest>(&body) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let refs = (handlers.list_prefix)(request.prefix)
+        .await
+        .into_iter()
+        .map(|key| FragmentRef {
+            object_id: key.object_id,
+            index: key.index,
+        })
+        .collect::<Vec<_>>();
+    axum::Json(refs).into_response()
+}
+
 /// The peer-fetch client: implements [`PeerFetch`] over HTTP/2 to a peer's
 /// advertised address, with a tight connect/request timeout budget so a slow or
 /// dead peer degrades to a backend fill fast.
+#[derive(Clone)]
 pub struct PeerClient {
     /// Pooled, multiplexed HTTP/2 client shared across all peers.
     http: reqwest::Client,
@@ -710,6 +813,51 @@ impl PeerFetch for PeerClient {
                 other => Err(PeerFetchError::Unavailable {
                     node,
                     reason: format!("peer returned HTTP {other}"),
+                }),
+            }
+        }
+    }
+
+    /// Places a materialized block on its rendezvous owner through the same
+    /// authenticated, bounded peer transport used by lookups.
+    fn store(
+        &self,
+        node: NodeId,
+        block: &BlockKey,
+        value: Bytes,
+    ) -> impl Future<Output = Result<bool, PeerFetchError>> + Send {
+        let addr = self.resolver.resolve(&node);
+        let request = BlockStoreRequest {
+            block: BlockRequest::from_key(block),
+            value: value.to_vec(),
+        };
+        let http = self.http.clone();
+        let secret = self.secret.clone();
+        async move {
+            let Some(addr) = addr else {
+                return Err(PeerFetchError::Unavailable {
+                    node,
+                    reason: "peer has no advertised endpoint".to_owned(),
+                });
+            };
+            let url = format!("http://{addr}{BLOCK_STORE_PATH}");
+            let mut builder = http.post(&url).json(&request);
+            if let Some(secret) = &secret {
+                builder = builder.header(SECRET_HEADER, secret);
+            }
+            let response = builder
+                .send()
+                .await
+                .map_err(|error| PeerFetchError::Unavailable {
+                    node: node.clone(),
+                    reason: error.to_string(),
+                })?;
+            match response.status().as_u16() {
+                201 => Ok(true),
+                204 => Ok(false),
+                other => Err(PeerFetchError::Unavailable {
+                    node,
+                    reason: format!("peer store returned HTTP {other}"),
                 }),
             }
         }
@@ -982,5 +1130,42 @@ impl FragmentClient {
                 reason: format!("peer returned HTTP {}", response.status().as_u16()),
             })
         }
+    }
+
+    /// Lists fragment keys on `node` whose object id begins with `prefix`.
+    pub async fn list_fragments(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<FragmentKey>, FragmentRpcError> {
+        let url = self.url_for(node, FRAGMENT_LIST_PATH)?;
+        let builder = self.http.post(&url).json(&FragmentListRequest {
+            prefix: prefix.to_owned(),
+        });
+        let response = self.authenticated(builder).send().await.map_err(|error| {
+            FragmentRpcError::Unavailable {
+                node: node.clone(),
+                reason: error.to_string(),
+            }
+        })?;
+        if !response.status().is_success() {
+            return Err(FragmentRpcError::Unavailable {
+                node: node.clone(),
+                reason: format!("peer returned HTTP {}", response.status().as_u16()),
+            });
+        }
+        let refs = response.json::<Vec<FragmentRef>>().await.map_err(|error| {
+            FragmentRpcError::Unavailable {
+                node: node.clone(),
+                reason: format!("decoding fragment list: {error}"),
+            }
+        })?;
+        Ok(refs
+            .into_iter()
+            .map(|item| FragmentKey {
+                object_id: item.object_id,
+                index: item.index,
+            })
+            .collect())
     }
 }

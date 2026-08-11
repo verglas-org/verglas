@@ -426,3 +426,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #84: Added dynamic-runtime validation for cache processes whose backend and catalog bindings arrive after startup. Static file configuration still requires an explicit backend and keeps its existing validation contract.
 - #82: Added the explicit `eventual` and `strong` catalog consistency contract. Eventual catalogs poll; strong catalogs require quorum-backed direct delivery and cannot select a third mode.
 - #87: Added atomic foreground activity accounting across HTTP, NBD, fragment, and safekeeper planes. A generation-fenced admission lease makes a zero in-flight report safe for a host stop decision while retaining per-plane diagnostics.
+- #74: Extended the cache peer contract with rendezvous-owner placement for
+  materialized blocks, reporting admission separately from transport failure.
