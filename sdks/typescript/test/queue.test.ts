@@ -16,11 +16,15 @@ afterEach(() => endpoint.close());
 describe("queue verb", () => {
   it("enqueues, exclusively polls, and acknowledges a fenced receipt", async () => {
     const q = client.queue("events");
-    const appended = await q.enqueue([{ n: 1 }, { n: 2 }]);
+    const appended = await q.enqueue([
+      {id: "event-1", topic: "orders", payload: {n: 1}},
+      {id: "event-2", topic: "orders", payload: {n: 2}},
+    ]);
     expect(appended.positions).toEqual([0, 1]);
 
     const first = await q.poll("workers", {
       owner: "consumer-a",
+      topics: ["orders"],
       max: 1,
       leaseSeconds: 30,
     });
@@ -29,6 +33,7 @@ describe("queue verb", () => {
 
     const competing = await q.poll("workers", {
       owner: "consumer-b",
+      topics: ["orders"],
       max: 1,
       leaseSeconds: 30,
     });
@@ -39,8 +44,8 @@ describe("queue verb", () => {
 
   it("requires group, owner, and a fenced receipt", () => {
     const q = client.queue("events");
-    expect(() => q.poll("", {owner: "consumer", leaseSeconds: 30})).toThrow(/group is required/);
-    expect(() => q.poll("workers", {owner: "", leaseSeconds: 30})).toThrow(/owner is required/);
+    expect(() => q.poll("", {owner: "consumer", topics: ["orders"], leaseSeconds: 30})).toThrow(/group is required/);
+    expect(() => q.poll("workers", {owner: "", topics: ["orders"], leaseSeconds: 30})).toThrow(/owner is required/);
     expect(() => q.ack("", {position: 1, owner: "consumer", generation: 1})).toThrow(/group is required/);
   });
 });

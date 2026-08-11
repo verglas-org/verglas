@@ -290,6 +290,7 @@ async fn routes_map_to_stable_resources_and_least_privilege_actions() {
             )
             .route("/v1/queues/{name}/enqueue", post(|| async {}))
             .route("/v1/queues/{name}/poll", post(|| async {}))
+            .route("/v1/queues/{name}/subscribe", post(|| async {}))
             .route("/v1/queues/{name}/ack", post(|| async {}))
             .route("/v1/workers", get(|| async {}).post(|| async {}))
             .route("/v1/workers/{name}", get(|| async {}))
@@ -336,6 +337,7 @@ async fn routes_map_to_stable_resources_and_least_privilege_actions() {
         (Method::PUT, "/v1/kv/workshop.blueprints/featured"),
         (Method::POST, "/v1/queues/ingest/enqueue"),
         (Method::POST, "/v1/queues/ingest/poll"),
+        (Method::POST, "/v1/queues/ingest/subscribe"),
         (Method::POST, "/v1/queues/ingest/ack"),
         (Method::GET, "/v1/workers"),
         (Method::POST, "/v1/workers"),
@@ -373,6 +375,7 @@ async fn routes_map_to_stable_resources_and_least_privilege_actions() {
             json!({"audience":"data-plane","resource_id":"kv/workshop.blueprints","action":"query"}),
             json!({"audience":"data-plane","resource_id":"kv/workshop.blueprints","action":"modify"}),
             json!({"audience":"data-plane","resource_id":"queue/ingest","action":"append"}),
+            json!({"audience":"data-plane","resource_id":"queue/ingest","action":"query"}),
             json!({"audience":"data-plane","resource_id":"queue/ingest","action":"query"}),
             json!({"audience":"data-plane","resource_id":"queue/ingest","action":"modify"}),
             json!({"audience":"data-plane","resource_id":"tenant","action":"discover"}),

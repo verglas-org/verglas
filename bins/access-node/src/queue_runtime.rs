@@ -43,7 +43,7 @@ impl QueueProxy for ManagedQueueProvisioner {
         operation: &str,
         body: Bytes,
     ) -> Result<QueueProxyResponse, String> {
-        if !matches!(operation, "enqueue" | "poll" | "ack") {
+        if !matches!(operation, "enqueue" | "poll" | "subscribe" | "ack") {
             return Err("unsupported queue operation".to_owned());
         }
         let plan = CreateQueueRequest {
@@ -69,11 +69,18 @@ impl QueueProxy for ManagedQueueProvisioner {
             .await
             .map_err(|error| format!("queue upstream failed: {error}"))?;
         let status = response.status().as_u16();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| format!("queue upstream body failed: {error}"))?;
-        Ok(QueueProxyResponse { status, body })
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let body = axum::body::Body::from_stream(response.bytes_stream());
+        Ok(QueueProxyResponse {
+            status,
+            content_type,
+            body,
+        })
     }
 }
 

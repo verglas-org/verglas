@@ -44,3 +44,4 @@
   table ingest remains table-scoped and requires `append`, with no manual Postgres/OpenFGA edit.
 - #81: Kept authorization registration after durable database creation so the resource uses the
   immutable database ID. A failed database create now leaves no authorization resource to remove.
+- #20: Added streaming queue subscription proxying and authorized subscribe operations as queue queries. Proxy responses now preserve upstream content types and bodies without buffering long-lived delivery streams.

@@ -851,6 +851,15 @@ fn build_write_worker_dispatcher(
     catalogs: verglas_catalog::CatalogRuntimeRegistry,
 ) -> Option<Arc<verglas_server::write_worker::WriteWorkerDispatcher>> {
     let write_worker = config.write_worker.as_ref()?;
+    let access_uri = std::env::var("VERGLAS_ACCESS_URI")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let Some(access_uri) = access_uri else {
+        eprintln!(
+            "verglas-server {VERSION} cannot configure write worker: VERGLAS_ACCESS_URI is required"
+        );
+        return None;
+    };
     let dir = config.cache.dir.join("write-worker");
     let credentials_file = match write_role_credentials(&dir, credentials) {
         Ok(path) => path,
@@ -877,6 +886,7 @@ fn build_write_worker_dispatcher(
                     .unwrap_or_else(|| "us-east-1".to_owned()),
                 credentials_file,
                 admin_origin: format!("{scheme}://127.0.0.1:{resolved_admin_port}"),
+                access_uri,
             },
             catalogs,
         ),

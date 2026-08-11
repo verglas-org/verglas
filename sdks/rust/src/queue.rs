@@ -4,6 +4,18 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// One idempotent message published to an exact topic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMessage {
+    /// Producer-defined idempotency identity.
+    pub id: String,
+    /// Exact topic used for subscription filtering.
+    pub topic: String,
+    /// Caller-supplied message body.
+    pub payload: Value,
+}
+
 /// Result of atomically appending one message batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueEnqueueResult {
@@ -29,6 +41,8 @@ pub struct QueueReceipt {
 pub struct QueueDelivery {
     /// Stable queue position.
     pub position: i64,
+    /// Exact topic that matched this subscription.
+    pub topic: String,
     /// Caller-supplied JSON message.
     pub payload: Value,
     /// Receipt required for acknowledgement.

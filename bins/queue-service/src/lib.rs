@@ -3,15 +3,18 @@
 
 use std::sync::Arc;
 
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use chrono::Utc;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use verglas_queue::{AckRequest, PollRequest, QueueError, QueueStore, Receipt};
+use verglas_queue::{
+    AckRequest, PollRequest, QueueError, QueueMessage, QueueStore, Receipt, SubscribeRequest,
+};
 
 /// Shared queue service state fixed at process startup.
 #[derive(Clone)]
@@ -26,6 +29,7 @@ pub fn router(store: Arc<dyn QueueStore>, token: String) -> Router {
         .route("/healthz", get(health))
         .route("/v1/enqueue", post(enqueue))
         .route("/v1/poll", post(poll))
+        .route("/v1/subscribe", post(subscribe))
         .route("/v1/ack", post(ack))
         .with_state(ServiceState {
             store,
@@ -41,7 +45,7 @@ async fn health() -> StatusCode {
 /// Bounded append body accepted by the queue container.
 #[derive(Debug, Deserialize)]
 struct EnqueueBody {
-    messages: Vec<Value>,
+    messages: Vec<QueueMessage>,
 }
 
 /// Stable positions assigned to one append batch.
@@ -56,7 +60,19 @@ struct EnqueueResponse {
 struct PollBody {
     group: String,
     owner: String,
+    topics: Vec<String>,
     max: u32,
+    lease_seconds: u64,
+}
+
+/// Consumer subscription body; service time remains server-owned.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubscribeBody {
+    group: String,
+    owner: String,
+    topics: Vec<String>,
+    max: Option<u32>,
     lease_seconds: u64,
 }
 
@@ -94,12 +110,52 @@ async fn poll(
     let request = PollRequest {
         group: body.group,
         owner: body.owner,
+        topics: body.topics,
         max: body.max,
         now: Utc::now(),
         lease_seconds: body.lease_seconds,
     };
     match state.store.poll(&request).await {
         Ok(deliveries) => Json(serde_json::json!({ "deliveries": deliveries })).into_response(),
+        Err(error) => queue_error(error),
+    }
+}
+
+/// Streams committed matching messages as NDJSON without client polling.
+async fn subscribe(
+    State(state): State<ServiceState>,
+    headers: HeaderMap,
+    Json(body): Json<SubscribeBody>,
+) -> Response {
+    if !authorized(&headers, &state.token) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let request = SubscribeRequest {
+        group: body.group,
+        owner: body.owner,
+        topics: body.topics,
+        max: body.max.unwrap_or(256),
+        lease_seconds: body.lease_seconds,
+    };
+    match state.store.subscribe(request).await {
+        Ok(deliveries) => {
+            let body = Body::from_stream(deliveries.map(|delivery| {
+                delivery
+                    .and_then(|delivery| {
+                        let mut frame = serde_json::to_vec(&delivery)
+                            .map_err(|error| QueueError::Invalid(error.to_string()))?;
+                        frame.push(b'\n');
+                        Ok(Bytes::from(frame))
+                    })
+                    .map_err(std::io::Error::other)
+            }));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/x-ndjson")],
+                body,
+            )
+                .into_response()
+        }
         Err(error) => queue_error(error),
     }
 }

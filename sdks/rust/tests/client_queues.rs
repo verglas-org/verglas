@@ -5,13 +5,14 @@ use axum::http::HeaderMap;
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::{Json, Router};
+use futures::StreamExt;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use verglas_sdk::{Client, ConnectOptions};
+use verglas_sdk::{Client, ConnectOptions, QueueMessage};
 
-/// The Rust queue handle enqueues, polls, and acks with the same paths and bodies as TypeScript.
+/// The Rust queue handle publishes, subscribes, and acks through one pushed stream.
 #[tokio::test]
-async fn queue_handle_round_trips_enqueue_poll_and_ack() {
+async fn queue_handle_round_trips_enqueue_subscribe_and_ack() {
     async fn enqueue(
         Path(name): Path<String>,
         headers: HeaderMap,
@@ -19,10 +20,17 @@ async fn queue_handle_round_trips_enqueue_poll_and_ack() {
     ) -> impl IntoResponse {
         assert_eq!(headers["authorization"], "Bearer scoped");
         assert_eq!(name, "events.ingest");
-        assert_eq!(body, json!({"messages":[{"id":1},{"id":2}]}));
+        assert_eq!(
+            body,
+            json!({"messages":[{
+                "id":"commit-40",
+                "topic":"database/trading/table/rlean.custom_points",
+                "payload":{"id":1}
+            }]})
+        );
         Json(json!({"positions": [40, 41]}))
     }
-    async fn poll(
+    async fn subscribe(
         Path(name): Path<String>,
         headers: HeaderMap,
         Json(body): Json<Value>,
@@ -34,18 +42,20 @@ async fn queue_handle_round_trips_enqueue_poll_and_ack() {
             json!({
                 "group":"workers",
                 "owner":"consumer-a",
+                "topics":["database/trading/table/rlean.custom_points"],
                 "max":10,
                 "leaseSeconds":30
             })
         );
-        Json(json!({
-            "deliveries":[{
-                "position":40,
-                "payload":{"id":1},
-                "receipt":{"position":40,"owner":"consumer-a","generation":1},
-                "expiresAt":"2026-08-10T00:00:30Z"
-            }]
-        }))
+        (
+            [("content-type", "application/x-ndjson")],
+            concat!(
+                "{\"position\":40,\"topic\":\"database/trading/table/rlean.custom_points\",",
+                "\"payload\":{\"id\":1},\"receipt\":{\"position\":40,",
+                "\"owner\":\"consumer-a\",\"generation\":1},",
+                "\"expiresAt\":\"2026-08-10T00:00:30Z\"}\n"
+            ),
+        )
     }
     async fn ack(
         Path(name): Path<String>,
@@ -65,7 +75,7 @@ async fn queue_handle_round_trips_enqueue_poll_and_ack() {
     }
     let app = Router::new()
         .route("/v1/queues/{name}/enqueue", post(enqueue))
-        .route("/v1/queues/{name}/poll", post(poll))
+        .route("/v1/queues/{name}/subscribe", post(subscribe))
         .route("/v1/queues/{name}/ack", post(ack));
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let endpoint = format!("http://{}", listener.local_addr().expect("address"));
@@ -82,23 +92,33 @@ async fn queue_handle_round_trips_enqueue_poll_and_ack() {
 
     let queue = client.queue("events.ingest").expect("queue handle");
     let enqueued = queue
-        .enqueue(vec![json!({"id":1}), json!({"id":2})])
+        .enqueue(vec![QueueMessage {
+            id: "commit-40".to_owned(),
+            topic: "database/trading/table/rlean.custom_points".to_owned(),
+            payload: json!({"id":1}),
+        }])
         .await
         .expect("enqueue");
     assert_eq!(enqueued.positions, vec![40, 41]);
 
-    let polled = queue
-        .poll("workers", "consumer-a", Some(10), 30)
+    let mut subscription = queue
+        .subscribe(
+            "workers",
+            "consumer-a",
+            ["database/trading/table/rlean.custom_points"],
+            Some(10),
+            30,
+        )
+        .expect("subscribe");
+    let delivery = subscription
+        .next()
         .await
-        .expect("poll");
-    assert_eq!(polled.deliveries.len(), 1);
-    assert_eq!(polled.deliveries[0].position, 40);
-    assert_eq!(polled.deliveries[0].payload, json!({"id":1}));
+        .expect("delivery")
+        .expect("valid delivery");
+    assert_eq!(delivery.position, 40);
+    assert_eq!(delivery.payload, json!({"id":1}));
 
-    queue
-        .ack("workers", &polled.deliveries[0].receipt)
-        .await
-        .expect("ack");
+    queue.ack("workers", &delivery.receipt).await.expect("ack");
 }
 
 /// Rejects empty queue names before any HTTP call.

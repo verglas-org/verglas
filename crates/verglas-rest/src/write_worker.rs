@@ -36,6 +36,8 @@ pub struct WriteWorkerRuntimeConfig {
     pub credentials_file: PathBuf,
     /// Admin origin containing `/v1/databases/{database}/catalog`.
     pub admin_origin: String,
+    /// Access edge that owns durable database commit subscriptions.
+    pub access_uri: String,
 }
 
 impl WriteWorkerRuntimeConfig {
@@ -199,6 +201,7 @@ impl WriteWorkerDispatcher {
             .arg("--config")
             .arg(config_path)
             .env(verglas_core::RUN_BEARER_TOKEN_ENV, caller_bearer)
+            .env("VERGLAS_ACCESS_URI", &self.runtime.access_uri)
             .arg("--ports-file")
             .arg(ports_file)
             .stdin(Stdio::null())
@@ -223,6 +226,7 @@ mod tests {
             region: "auto".to_owned(),
             credentials_file: dir.path().join("credentials"),
             admin_origin: "http://127.0.0.1:8334".to_owned(),
+            access_uri: "http://127.0.0.1:8345".to_owned(),
         };
         let database = DatabaseId::new("analytics").expect("database id");
         let bearer = "Bearer caller-secret";
@@ -245,6 +249,7 @@ mod tests {
             region: "auto".to_owned(),
             credentials_file: dir.path().join("credentials"),
             admin_origin: "http://127.0.0.1:8334".to_owned(),
+            access_uri: "http://127.0.0.1:8345".to_owned(),
         };
         let caller_bearer = "caller-secret";
 
@@ -266,6 +271,7 @@ mod tests {
                 region: "auto".to_owned(),
                 credentials_file: dir.path().join("credentials"),
                 admin_origin: "http://127.0.0.1:8334".to_owned(),
+                access_uri: "http://127.0.0.1:8345".to_owned(),
             },
             CatalogRuntimeRegistry::default(),
         );
@@ -286,6 +292,10 @@ mod tests {
             name == std::ffi::OsStr::new(verglas_core::RUN_BEARER_TOKEN_ENV)
                 && value == Some(std::ffi::OsStr::new(bearer))
         }));
+        assert!(command.as_std().get_envs().any(|(name, value)| {
+            name == std::ffi::OsStr::new("VERGLAS_ACCESS_URI")
+                && value == Some(std::ffi::OsStr::new("http://127.0.0.1:8345"))
+        }));
     }
 
     /// A non-Lakehouse database is rejected before its bearer can reach a child process.
@@ -300,6 +310,7 @@ mod tests {
                 region: "auto".to_owned(),
                 credentials_file: dir.path().join("credentials"),
                 admin_origin: "http://127.0.0.1:8334".to_owned(),
+                access_uri: "http://127.0.0.1:8345".to_owned(),
             },
             CatalogRuntimeRegistry::default(),
         );

@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -69,8 +69,10 @@ struct QueueApi {
 pub struct QueueProxyResponse {
     /// Upstream queue-service status.
     pub status: u16,
-    /// Bounded JSON or text response bytes.
-    pub body: Bytes,
+    /// Upstream representation retained across the streaming proxy.
+    pub content_type: String,
+    /// Bounded or long-lived upstream body.
+    pub body: Body,
 }
 
 /// Private queue-container transport implemented by the local provisioner.
@@ -120,6 +122,10 @@ pub fn data_router(service: QueueRuntime, proxy: Arc<dyn QueueProxy>, tenant_id:
     Router::new()
         .route("/v1/queues/{name}/enqueue", axum::routing::post(enqueue))
         .route("/v1/queues/{name}/poll", axum::routing::post(poll))
+        .route(
+            "/v1/queues/{name}/subscribe",
+            axum::routing::post(subscribe),
+        )
         .route("/v1/queues/{name}/ack", axum::routing::post(ack))
         .with_state(QueueDataApi {
             service,
@@ -243,6 +249,15 @@ async fn poll(State(api): State<QueueDataApi>, Path(name): Path<String>, body: B
     proxy_operation(api, name, "poll", body).await
 }
 
+/// Proxies one push-only consumer-group subscription.
+async fn subscribe(
+    State(api): State<QueueDataApi>,
+    Path(name): Path<String>,
+    body: Bytes,
+) -> Response {
+    proxy_operation(api, name, "subscribe", body).await
+}
+
 /// Proxies one fenced acknowledgement after proving the named queue was declared.
 async fn ack(State(api): State<QueueDataApi>, Path(name): Path<String>, body: Bytes) -> Response {
     proxy_operation(api, name, "ack", body).await
@@ -264,7 +279,7 @@ async fn proxy_operation(
             let status = StatusCode::from_u16(upstream.status).unwrap_or(StatusCode::BAD_GATEWAY);
             (
                 status,
-                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                [(axum::http::header::CONTENT_TYPE, upstream.content_type)],
                 upstream.body,
             )
                 .into_response()

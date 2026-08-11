@@ -21,3 +21,4 @@
 - #109: Removed an invalid `Eq` derivation from managed Postgres plans after bounded worker CPU limits made container specifications intentionally floating-point and only partially comparable.
 - #84: Switched managed Postgres to exact multi-platform Verglas Neon images and removed the forced amd64 platform. Docker now selects a native image for the host architecture, which keeps storage and compute off emulation on arm64 hosts.
 - #109: Make the managed Postgres bridge password readable by the non-root Neon compute process. The secret remains scoped to its isolated compute container.
+- #20: Added database-scoped table commit publication, subscription, and acknowledgement routes over an explicitly configured durable queue. Access now provisions that configured queue during bootstrap, filters subscriptions by immutable database and table topics, and streams queue responses without buffering.

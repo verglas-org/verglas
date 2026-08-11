@@ -8,12 +8,52 @@ use iceberg::Catalog;
 use verglas_api::table::CommitResponse;
 use verglas_iceberg::Connection;
 
-use crate::admin::{self, AppState, BatchCommitter};
+use crate::admin::{self, AppState, BatchCommitter, CommitPublisher};
 use crate::config::WriteConfig;
 
 /// Production committer over a real Iceberg REST catalog.
 struct IcebergCommitter {
     catalog: Arc<dyn Catalog>,
+}
+
+/// Authenticated publisher for the database-scoped durable table event queue.
+struct HttpCommitPublisher {
+    endpoint: reqwest::Url,
+    database: String,
+    bearer: String,
+    http: reqwest::Client,
+}
+
+#[async_trait]
+impl CommitPublisher for HttpCommitPublisher {
+    async fn publish(&self, table: &str, snapshot_id: &str) -> Result<(), String> {
+        let mut endpoint = self.endpoint.clone();
+        endpoint
+            .path_segments_mut()
+            .map_err(|_| "table event endpoint cannot carry path segments".to_owned())?
+            .pop_if_empty()
+            .push("v1")
+            .push("databases")
+            .push(&self.database)
+            .push("commits")
+            .push(table);
+        let response = self
+            .http
+            .post(endpoint)
+            .bearer_auth(&self.bearer)
+            .json(&serde_json::json!({ "snapshotId": snapshot_id }))
+            .send()
+            .await
+            .map_err(|error| format!("table event request failed: {error}"))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "table event endpoint returned HTTP {}",
+                response.status()
+            ))
+        }
+    }
 }
 
 #[async_trait]
@@ -137,10 +177,30 @@ pub async fn run(
     config: &WriteConfig,
     ports_file: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
-    let catalog = verglas_iceberg::catalog::open_catalog(&connection_for(config)?)
-        .await
-        .map_err(|error| format!("cannot open catalog: {error}"))?;
-    let state = AppState::new(Arc::new(IcebergCommitter { catalog }));
+    let caller_bearer = std::env::var(verglas_core::RUN_BEARER_TOKEN_ENV)
+        .ok()
+        .filter(|token| !token.trim().is_empty())
+        .ok_or_else(|| "write role requires an inherited caller bearer".to_owned())?;
+    let catalog = verglas_iceberg::catalog::open_catalog(&connection_for_bearer(
+        config,
+        caller_bearer.clone(),
+    )?)
+    .await
+    .map_err(|error| format!("cannot open catalog: {error}"))?;
+    let access_uri = std::env::var("VERGLAS_ACCESS_URI")
+        .map_err(|_| "write role requires VERGLAS_ACCESS_URI".to_owned())?;
+    let endpoint = reqwest::Url::parse(&access_uri)
+        .map_err(|error| format!("invalid VERGLAS_ACCESS_URI: {error}"))?;
+    let database = database_from_catalog_uri(&config.catalog.uri)?;
+    let state = AppState::new(
+        Arc::new(IcebergCommitter { catalog }),
+        Arc::new(HttpCommitPublisher {
+            endpoint,
+            database,
+            bearer: caller_bearer,
+            http: reqwest::Client::new(),
+        }),
+    );
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.listen.admin_port))
         .await
         .map_err(|error| format!("cannot bind write role: {error}"))?;
@@ -154,6 +214,21 @@ pub async fn run(
         .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|error| format!("write role server failed: {error}"))
+}
+
+/// Extracts the database route from the writer's database-scoped catalog mount.
+fn database_from_catalog_uri(uri: &str) -> Result<String, String> {
+    let uri = reqwest::Url::parse(uri).map_err(|error| format!("invalid catalog URI: {error}"))?;
+    let segments = uri
+        .path_segments()
+        .ok_or_else(|| "catalog URI has no path segments".to_owned())?
+        .collect::<Vec<_>>();
+    match segments.as_slice() {
+        ["v1", "databases", database, "catalog"] if !database.is_empty() => {
+            Ok((*database).to_owned())
+        }
+        _ => Err("catalog URI must end with /v1/databases/{database}/catalog".to_owned()),
+    }
 }
 
 /// Resolves the cache endpoint keypair from an AWS-INI file.

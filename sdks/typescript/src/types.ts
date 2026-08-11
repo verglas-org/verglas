@@ -333,6 +333,16 @@ export interface QueueEnqueueResult {
   positions: number[];
 }
 
+/** One idempotent message published to an exact topic. */
+export interface QueueMessage<T extends Row = Row> {
+  /** Producer-defined idempotency identity. */
+  id: string;
+  /** Exact subscription topic. */
+  topic: string;
+  /** Caller-supplied message body. */
+  payload: T;
+}
+
 /** Opaque proof that one consumer owns a delivery generation. */
 export interface QueueReceipt {
   /** Stable message position. */
@@ -347,6 +357,8 @@ export interface QueueReceipt {
 export interface QueueDelivery<T extends Row = Row> {
   /** Stable message position. */
   position: number;
+  /** Exact topic that matched this subscription. */
+  topic: string;
   /** Caller-supplied JSON payload. */
   payload: T;
   /** Receipt required for acknowledgement. */

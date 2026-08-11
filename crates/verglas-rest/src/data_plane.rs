@@ -367,13 +367,27 @@ async fn authorize_request(
     let mut resolved_database_id = None;
     if let Some(databases) = &runtime.databases
         && let Some(name) = database_route_name(request.uri().path())
-        && target.resource_id == format!("database/{name}")
     {
         let database_id = match databases.resolve_database_id(name).await {
             Ok(database_id) => database_id,
             Err(failure) => return failure.into_response(),
         };
-        target.resource_id = format!("database/{database_id}");
+        for family in ["database", "table", "vector", "graph"] {
+            let route_prefix = format!("{family}/{name}");
+            if target.resource_id == route_prefix
+                || target
+                    .resource_id
+                    .strip_prefix(&route_prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+            {
+                target.resource_id = target.resource_id.replacen(
+                    &route_prefix,
+                    &format!("{family}/{database_id}"),
+                    1,
+                );
+                break;
+            }
+        }
         if let Some(resource) = &mut target.resource {
             resource.parent_id = format!("database/{database_id}");
             if let Some((_, table)) = resource.id.rsplit_once('/') {
@@ -512,6 +526,15 @@ fn route_target(method: &Method, uri: &axum::http::Uri) -> Option<RouteTarget> {
             format!("database/{database}"),
             Action::Query,
         )),
+        ["v1", "databases", database, "subscribe"]
+        | ["v1", "databases", database, "subscriptions", "ack"] => Some(RouteTarget::new(
+            format!("database/{database}"),
+            Action::Query,
+        )),
+        ["v1", "databases", database, "commits", table] => Some(RouteTarget::new(
+            format!("table/{database}/{table}"),
+            Action::Append,
+        )),
         ["v1", "databases", database, "catalog", rest @ ..] if !rest.is_empty() => Some(
             RouteTarget::new(format!("database/{database}"), catalog_action(method, rest)),
         ),
@@ -630,7 +653,7 @@ fn route_target(method: &Method, uri: &axum::http::Uri) -> Option<RouteTarget> {
         ["v1", "queues", name, operation] => Some(RouteTarget::new(
             format!("queue/{name}"),
             match *operation {
-                "poll" => Action::Query,
+                "poll" | "subscribe" => Action::Query,
                 "enqueue" => Action::Append,
                 _ => Action::Modify,
             },

@@ -42,6 +42,8 @@ import type {
   GraphReached,
   GraphShowResult,
   QueueEnqueueResult,
+  QueueDelivery,
+  QueueMessage,
   QueuePollResult,
   QueueReceipt,
   QueryResult,
@@ -703,7 +705,7 @@ export class Queue<T extends Row = Row> {
   }
 
   /** Appends messages to the queue. */
-  enqueue(messages: T[]): Promise<QueueEnqueueResult> {
+  enqueue(messages: QueueMessage<T>[]): Promise<QueueEnqueueResult> {
     return this.transport.request<QueueEnqueueResult>("POST", `${this.base()}/enqueue`, {
       body: { messages },
     });
@@ -712,12 +714,59 @@ export class Queue<T extends Row = Row> {
   /**
    * Claims up to `max` exclusive messages for one consumer process.
    */
-  poll(group: string, opts: { owner: string; max?: number; leaseSeconds: number }): Promise<QueuePollResult<T>> {
+  poll(group: string, opts: { owner: string; topics: string[]; max?: number; leaseSeconds: number }): Promise<QueuePollResult<T>> {
     if (!group) throw new Error("poll: group is required");
     if (!opts.owner) throw new Error("poll: owner is required");
+    if (opts.topics.length === 0) throw new Error("poll: topics are required");
     return this.transport.request<QueuePollResult<T>>("POST", `${this.base()}/poll`, {
-      body: { group, owner: opts.owner, max: opts.max ?? 256, leaseSeconds: opts.leaseSeconds },
+      body: { group, owner: opts.owner, topics: opts.topics, max: opts.max ?? 256, leaseSeconds: opts.leaseSeconds },
     });
+  }
+
+  /** Pushes matching deliveries and reconnects without issuing poll requests. */
+  async *subscribe(
+    group: string,
+    opts: { owner: string; topics: string[]; max?: number; leaseSeconds: number },
+  ): AsyncGenerator<QueueDelivery<T>> {
+    if (!group) throw new Error("subscribe: group is required");
+    if (!opts.owner) throw new Error("subscribe: owner is required");
+    if (opts.topics.length === 0) throw new Error("subscribe: topics are required");
+    let delay = 250;
+    for (;;) {
+      try {
+        const response = await this.transport.requestRaw("POST", `${this.base()}/subscribe`, {
+          headers: { "content-type": "application/json", accept: "application/x-ndjson" },
+          body: JSON.stringify({
+            group,
+            owner: opts.owner,
+            topics: opts.topics,
+            max: opts.max ?? 256,
+            leaseSeconds: opts.leaseSeconds,
+          }),
+        });
+        delay = 250;
+        const reader = response.body?.getReader();
+        if (!reader) throw new Error("subscribe: response body is unavailable");
+        const decoder = new TextDecoder();
+        let buffered = "";
+        for (;;) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          buffered += decoder.decode(chunk.value, { stream: true });
+          let newline = buffered.indexOf("\n");
+          while (newline >= 0) {
+            const frame = buffered.slice(0, newline);
+            buffered = buffered.slice(newline + 1);
+            if (frame) yield JSON.parse(frame) as QueueDelivery<T>;
+            newline = buffered.indexOf("\n");
+          }
+        }
+      } catch (error) {
+        if (error instanceof VerglasHttpError && error.status < 500) throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 2, 30_000);
+    }
   }
 
   /**

@@ -17,6 +17,7 @@ arrow-schema.workspace = true
 # emit. Pinned to the workspace's Arrow major version.
 arrow-ipc = "57"
 async-trait.workspace = true
+async-stream = "0.3"
 bytes.workspace = true
 futures.workspace = true
 reqwest.workspace = true

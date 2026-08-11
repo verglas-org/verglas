@@ -83,6 +83,7 @@ export type {
   QueryResult,
   QueryAt,
   QueueEnqueueResult,
+  QueueMessage,
   QueueReceipt,
   QueueDelivery,
   QueuePollResult,

@@ -39,11 +39,12 @@ pub use client::{
     Database, EnsureTable, Graph, GraphReadOptions, Kv, KvDeleteResult, KvListEntry, KvListPage,
     KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest,
     NamespaceMethodManifest, NamespaceMethodMode, NamespaceStream, PartitionSpec, QueryStream,
-    Queue, Table, TableDefinition,
+    Queue, QueueStream, Table, TableChangeDelivery, TableChangeStream, TableDefinition,
+    TableSubscriptionEvent,
 };
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};
-pub use queue::{QueueDelivery, QueueEnqueueResult, QueuePollResult, QueueReceipt};
+pub use queue::{QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt};
 pub use report::{CompactReport, CompactionReport};
 pub use token::{
     AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, DatabaseConnectionToken,

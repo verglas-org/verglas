@@ -2,12 +2,14 @@
 //! A queue owns both a managed Neon deployment and a separately scalable service container.
 
 use std::sync::Mutex;
+use std::{pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::postgres::{PgPool, PgPoolOptions};
+use sqlx::postgres::{PgListener, PgPool, PgPoolOptions};
 use sqlx::{Row, Transaction};
 
 /// Public request to create one tenant-local queue.
@@ -117,6 +119,8 @@ pub struct Receipt {
 pub struct Delivery {
     /// Stable ordered message position.
     pub position: i64,
+    /// Exact topic used to filter independent subscriptions.
+    pub topic: String,
     /// Caller-supplied JSON message.
     pub payload: Value,
     /// Receipt required to acknowledge exactly this delivery generation.
@@ -124,6 +128,37 @@ pub struct Delivery {
     /// Deadline after which another consumer may reclaim this message.
     pub expires_at: DateTime<Utc>,
 }
+
+/// One idempotent message published to a topic.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMessage {
+    /// Producer-defined idempotency identity.
+    pub id: String,
+    /// Exact topic used for subscription matching.
+    pub topic: String,
+    /// Caller-supplied message body.
+    pub payload: Value,
+}
+
+/// One long-lived topic subscription using normal queue consumer-group semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscribeRequest {
+    /// Independent fan-out position. Owners in the same group compete.
+    pub group: String,
+    /// Stable identity of this subscriber process.
+    pub owner: String,
+    /// Exact topics delivered to this subscription.
+    pub topics: Vec<String>,
+    /// Maximum number of messages claimed by one wake-up.
+    pub max: u32,
+    /// Lease duration before unacknowledged delivery is eligible again.
+    pub lease_seconds: u64,
+}
+
+/// A push-only sequence of fenced deliveries.
+pub type DeliveryStream = Pin<Box<dyn Stream<Item = Result<Delivery, QueueError>> + Send>>;
 
 /// Bounded request for exclusive deliveries in one consumer group.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -133,6 +168,8 @@ pub struct PollRequest {
     pub group: String,
     /// Stable identity of this consumer process.
     pub owner: String,
+    /// Exact topics eligible for this claim.
+    pub topics: Vec<String>,
     /// Maximum number of messages claimed in this transaction.
     pub max: u32,
     /// Authoritative current time supplied by the service.
@@ -176,10 +213,13 @@ pub enum QueueError {
 #[async_trait]
 pub trait QueueStore: Send + Sync {
     /// Appends a bounded ordered batch and returns its stable positions.
-    async fn enqueue(&self, payloads: &[Value]) -> Result<Vec<i64>, QueueError>;
+    async fn enqueue(&self, messages: &[QueueMessage]) -> Result<Vec<i64>, QueueError>;
 
     /// Claims messages transactionally without delivering one generation twice.
     async fn poll(&self, request: &PollRequest) -> Result<Vec<Delivery>, QueueError>;
+
+    /// Pushes matching messages as they commit without client polling.
+    async fn subscribe(&self, request: SubscribeRequest) -> Result<DeliveryStream, QueueError>;
 
     /// Acknowledges only the current unexpired generation of one delivery.
     async fn ack(&self, request: &AckRequest) -> Result<(), QueueError>;
@@ -189,6 +229,7 @@ pub trait QueueStore: Send + Sync {
 #[derive(Clone)]
 pub struct PgQueue {
     pool: PgPool,
+    database_url: Arc<str>,
 }
 
 impl PgQueue {
@@ -198,7 +239,10 @@ impl PgQueue {
             .max_connections(16)
             .connect(database_url)
             .await?;
-        let queue = Self { pool };
+        let queue = Self {
+            pool,
+            database_url: Arc::from(database_url),
+        };
         queue.migrate().await?;
         Ok(queue)
     }
@@ -207,7 +251,8 @@ impl PgQueue {
     async fn migrate(&self) -> Result<(), QueueError> {
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS verglas_queue_messages (\
-             position BIGSERIAL PRIMARY KEY, payload JSONB NOT NULL, \
+             position BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, \
+             topic TEXT NOT NULL, payload JSONB NOT NULL, \
              created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
         )
         .execute(&self.pool)
@@ -239,23 +284,38 @@ impl PgQueue {
 
 #[async_trait]
 impl QueueStore for PgQueue {
-    async fn enqueue(&self, payloads: &[Value]) -> Result<Vec<i64>, QueueError> {
-        if payloads.is_empty() || payloads.len() > 1_000 {
+    async fn enqueue(&self, messages: &[QueueMessage]) -> Result<Vec<i64>, QueueError> {
+        validate_messages(messages)?;
+        if messages.is_empty() || messages.len() > 1_000 {
             return Err(QueueError::Invalid(
                 "enqueue batch must contain 1 through 1000 messages".to_owned(),
             ));
         }
         let mut transaction = self.transaction().await?;
-        let mut positions = Vec::with_capacity(payloads.len());
-        for payload in payloads {
+        let mut positions = Vec::with_capacity(messages.len());
+        for message in messages {
             let row = sqlx::query(
-                "INSERT INTO verglas_queue_messages (payload) VALUES ($1) RETURNING position",
+                "INSERT INTO verglas_queue_messages (event_id,topic,payload) VALUES ($1,$2,$3) \
+                 ON CONFLICT (event_id) DO UPDATE SET event_id=EXCLUDED.event_id \
+                 WHERE verglas_queue_messages.topic=EXCLUDED.topic \
+                 AND verglas_queue_messages.payload=EXCLUDED.payload RETURNING position",
             )
-            .bind(payload)
-            .fetch_one(&mut *transaction)
-            .await?;
+            .bind(&message.id)
+            .bind(&message.topic)
+            .bind(&message.payload)
+            .fetch_optional(&mut *transaction)
+            .await?
+            .ok_or_else(|| {
+                QueueError::Invalid(format!(
+                    "message id `{}` was already used with different content",
+                    message.id
+                ))
+            })?;
             positions.push(row.try_get("position")?);
         }
+        sqlx::query("SELECT pg_notify('verglas_queue_messages', '')")
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         Ok(positions)
     }
@@ -270,7 +330,8 @@ impl QueueStore for PgQueue {
                SELECT m.position FROM verglas_queue_messages m \
                LEFT JOIN verglas_queue_deliveries d \
                  ON d.consumer_group=$1 AND d.position=m.position \
-               WHERE d.position IS NULL OR (d.acked=false AND d.lease_expires_at <= $2) \
+               WHERE m.topic = ANY($6) AND \
+                 (d.position IS NULL OR (d.acked=false AND d.lease_expires_at <= $2)) \
                ORDER BY m.position FOR UPDATE OF m SKIP LOCKED LIMIT $3\
              ), leased AS (\
                INSERT INTO verglas_queue_deliveries \
@@ -280,7 +341,7 @@ impl QueueStore for PgQueue {
                  owner=EXCLUDED.owner,generation=verglas_queue_deliveries.generation+1,\
                  lease_expires_at=EXCLUDED.lease_expires_at,acked=false,acked_at=NULL \
                RETURNING position,owner,generation,lease_expires_at\
-             ) SELECT l.position,l.owner,l.generation,l.lease_expires_at,m.payload \
+             ) SELECT l.position,l.owner,l.generation,l.lease_expires_at,m.topic,m.payload \
                FROM leased l JOIN verglas_queue_messages m ON m.position=l.position \
                ORDER BY l.position",
         )
@@ -289,6 +350,7 @@ impl QueueStore for PgQueue {
         .bind(i64::from(request.max))
         .bind(&request.owner)
         .bind(expires_at)
+        .bind(&request.topics)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -300,6 +362,7 @@ impl QueueStore for PgQueue {
                 let owner = row.try_get("owner")?;
                 Ok(Delivery {
                     position,
+                    topic: row.try_get("topic")?,
                     payload: row.try_get("payload")?,
                     receipt: Receipt {
                         position,
@@ -310,6 +373,42 @@ impl QueueStore for PgQueue {
                 })
             })
             .collect()
+    }
+
+    async fn subscribe(&self, request: SubscribeRequest) -> Result<DeliveryStream, QueueError> {
+        validate_subscription(&request)?;
+        let mut listener = PgListener::connect(&self.database_url).await?;
+        listener.listen("verglas_queue_messages").await?;
+        let queue = self.clone();
+        Ok(Box::pin(async_stream::try_stream! {
+            loop {
+                let deliveries = queue.poll(&PollRequest {
+                    group: request.group.clone(),
+                    owner: request.owner.clone(),
+                    topics: request.topics.clone(),
+                    max: request.max,
+                    now: Utc::now(),
+                    lease_seconds: request.lease_seconds,
+                }).await?;
+                if !deliveries.is_empty() {
+                    for delivery in deliveries {
+                        yield delivery;
+                    }
+                    continue;
+                }
+                match queue.next_delivery_at(&request).await? {
+                    Some(deadline) => {
+                        let wait = (deadline - Utc::now()).to_std().unwrap_or_default();
+                        let wake = tokio::select! {
+                            notification = listener.recv() => notification.map(|_| ()),
+                            _ = tokio::time::sleep(wait) => Ok(()),
+                        };
+                        wake?;
+                    }
+                    None => { listener.recv().await?; }
+                }
+            }
+        }))
     }
 
     async fn ack(&self, request: &AckRequest) -> Result<(), QueueError> {
@@ -342,9 +441,29 @@ impl QueueStore for PgQueue {
     }
 }
 
+impl PgQueue {
+    /// Returns the first lease expiration that can make a subscribed topic deliverable.
+    async fn next_delivery_at(
+        &self,
+        request: &SubscribeRequest,
+    ) -> Result<Option<DateTime<Utc>>, QueueError> {
+        let row = sqlx::query(
+            "SELECT min(d.lease_expires_at) AS ready_at \
+             FROM verglas_queue_deliveries d \
+             JOIN verglas_queue_messages m ON m.position=d.position \
+             WHERE d.consumer_group=$1 AND d.acked=false AND m.topic=ANY($2)",
+        )
+        .bind(&request.group)
+        .bind(&request.topics)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.try_get("ready_at")?)
+    }
+}
+
 /// Validates the bounded consumer contract before beginning a transaction.
 fn validate_consumer(request: &PollRequest) -> Result<(), QueueError> {
-    if request.group.is_empty() || request.owner.is_empty() {
+    if request.group.is_empty() || request.owner.is_empty() || request.topics.is_empty() {
         return Err(QueueError::Invalid(
             "poll group and owner must not be empty".to_owned(),
         ));
@@ -357,6 +476,31 @@ fn validate_consumer(request: &PollRequest) -> Result<(), QueueError> {
     if !(1..=3_600).contains(&request.lease_seconds) {
         return Err(QueueError::Invalid(
             "lease seconds must be from 1 through 3600".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a long-lived subscription before opening a PostgreSQL listener.
+fn validate_subscription(request: &SubscribeRequest) -> Result<(), QueueError> {
+    validate_consumer(&PollRequest {
+        group: request.group.clone(),
+        owner: request.owner.clone(),
+        topics: request.topics.clone(),
+        max: request.max,
+        now: Utc::now(),
+        lease_seconds: request.lease_seconds,
+    })
+}
+
+/// Rejects empty identities and topics before beginning an enqueue transaction.
+fn validate_messages(messages: &[QueueMessage]) -> Result<(), QueueError> {
+    if messages
+        .iter()
+        .any(|message| message.id.trim().is_empty() || message.topic.trim().is_empty())
+    {
+        return Err(QueueError::Invalid(
+            "message id and topic must not be empty".to_owned(),
         ));
     }
     Ok(())

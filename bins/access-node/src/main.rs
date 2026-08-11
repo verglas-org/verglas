@@ -27,14 +27,18 @@ use verglas_database::{
     DatabaseManager, DatabaseService, PostgresDatabaseRepository, ScopedSecretKind,
     ScopedSecretResolver, SecretResolutionError,
 };
-use verglas_queue::{PostgresQueueRepository, QueueService};
+use verglas_queue::{
+    CreateQueueRequest, PostgresQueueRepository, QueueManager, QueueService, QueueServiceError,
+};
 use verglas_rest::database::DatabaseAuthorization;
+use verglas_rest::queue::QueueAuthorization;
 
 mod data_plane_proxy;
 mod database_runtime;
 mod lakehouse_runtime;
 mod postgres_runtime;
 mod queue_runtime;
+mod table_events;
 
 /// Lakekeeper's built-in project created by its single-tenant bootstrap.
 const LAKEKEEPER_DEFAULT_PROJECT: &str = "lakekeeper/project/00000000-0000-0000-0000-000000000000";
@@ -184,6 +188,13 @@ struct Args {
     /// Managed Lakehouse declaration that must exist before readiness.
     #[arg(long, env = "VERGLAS_DEFAULT_LAKEHOUSE")]
     default_lakehouse: Option<String>,
+    /// Explicit durable queue carrying acknowledged table commits.
+    #[arg(
+        long,
+        env = "VERGLAS_TABLE_EVENT_QUEUE",
+        default_value = "table-events"
+    )]
+    table_event_queue: String,
     /// Managed object-store bucket used by Lakekeeper warehouses.
     #[arg(long, env = "VERGLAS_MANAGED_STORAGE_BUCKET")]
     managed_storage_bucket: String,
@@ -407,7 +418,13 @@ async fn run(args: Args) -> Result<(), String> {
         Arc::new(access_runtime.clone()),
         args.tenant_id.clone(),
     )
-    .merge(data_plane_proxy::router(&args.admin_url)?);
+    .merge(data_plane_proxy::router(&args.admin_url)?)
+    .merge(table_events::router(
+        queue_service.clone(),
+        Arc::new(queue_provisioner.clone()),
+        args.tenant_id.clone(),
+        args.table_event_queue.clone(),
+    ));
     let protected_databases = verglas_rest::data_plane::protect_managed_databases(
         database_routes,
         access_runtime.clone(),
@@ -420,8 +437,8 @@ async fn run(args: Args) -> Result<(), String> {
         args.tenant_id.clone(),
     )
     .merge(verglas_rest::queue::data_router(
-        queue_service,
-        Arc::new(queue_provisioner),
+        queue_service.clone(),
+        Arc::new(queue_provisioner.clone()),
         args.tenant_id.clone(),
     ));
     let protected_queues = verglas_rest::data_plane::protect(queue_routes, access_runtime.clone());
@@ -467,6 +484,38 @@ async fn run(args: Args) -> Result<(), String> {
             queue_recovery_failures.join("; ")
         ));
     }
+    let table_event_queue = match queue_recovery
+        .get_queue(&recovery_tenant, &args.table_event_queue)
+        .await
+    {
+        Ok(queue) => queue,
+        Err(QueueServiceError::NotFound { .. }) => {
+            let plan = CreateQueueRequest {
+                name: args.table_event_queue.clone(),
+            }
+            .plan(&recovery_tenant)
+            .map_err(|error| format!("invalid table event queue: {error}"))?;
+            queue_recovery
+                .create_queue(plan)
+                .await
+                .map_err(|error| format!("table event queue provisioning failed: {error}"))?
+        }
+        Err(error) => {
+            return Err(format!(
+                "configured table event queue is unavailable: {error}"
+            ));
+        }
+    };
+    let owner = verglas_rest::data_plane::AuthenticatedPrincipal {
+        tenant_id: recovery_tenant.clone(),
+        principal_id: initial_owner_principal_id(&args.initial_owner_email)?,
+        token_id: "bootstrap/table-events".to_owned(),
+        audience: verglas_rest::access::DATA_PLANE_AUDIENCE.to_owned(),
+    };
+    access_runtime
+        .create_queue_resource(&owner, &table_event_queue.name)
+        .await
+        .map_err(|error| format!("table event queue authorization failed: {error}"))?;
     if let Some(default_lakehouse) = args.default_lakehouse.as_deref() {
         let (database, created) = recovery
             .ensure_default_lakehouse(&recovery_tenant, default_lakehouse)

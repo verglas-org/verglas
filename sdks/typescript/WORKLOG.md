@@ -27,3 +27,4 @@
 - RBAC tokens now use the mandatory control-plane bearer credential. The SDK can mint, list, revoke, and explain scoped child-principal tokens through the access service, and every control connector rejects an empty token instead of silently sending an administrator fallback.
 - Added the one-time direct Postgres database-credential call. It is separately scoped to one database and returns only its bearer value and expiry, so SDK users do not need a reusable tenant database password.
 - #107: Replaced the local watermark queue API with PostgreSQL-backed exclusive leases and fenced receipts. Queue handles use the access endpoint and cannot implicitly create queue storage.
+- #20: Added topic-aware queue messages and an async push subscription generator with reconnect. Queue delivery types now preserve the matching topic and polling callers must select exact topics.

@@ -34,7 +34,9 @@ use crate::graph::{
     InsertEdgesRequest, InsertNodesRequest, InsertReport, NeighborView, NodeInput, PathView,
     ReachedView,
 };
-use crate::queue::{QueueEnqueueResult, QueuePollResult, QueueReceipt};
+use crate::queue::{
+    QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt,
+};
 use crate::token::{
     AccessTokenCreateRequest, AccessTokenSummary, DatabaseConnectionToken,
     DatabaseConnectionTokenRequest, IssuedAccessToken,
@@ -42,12 +44,48 @@ use crate::token::{
 use crate::vector::{
     DeclareIndexRequest, IndexInfo, IndexReport as VectorIndexReport, SearchRequest, SearchResponse,
 };
+use crate::worker::ChangeEvent;
 
 /// MIME type used by Verglas for Arrow IPC streaming requests and responses.
 pub const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
 
 /// A stream of Arrow record batches returned by a query.
 pub type QueryStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, ClientError>> + Send>>;
+
+/// A reconnecting push-only stream of fenced queue deliveries.
+pub type QueueStream = Pin<Box<dyn Stream<Item = Result<QueueDelivery, ClientError>> + Send>>;
+
+/// One durable table commit and the queue receipt that fences its acknowledgement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableChangeDelivery {
+    /// Committed table snapshot notification.
+    pub change: ChangeEvent,
+    /// Receipt acknowledged after the subscriber closes its durable read frontier.
+    pub receipt: QueueReceipt,
+}
+
+/// Connection lifecycle and durable deliveries from a database subscription.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableSubscriptionEvent {
+    /// The authenticated push response is established.
+    Connected,
+    /// The transport dropped and the SDK is reconnecting from queue state.
+    Disconnected,
+    /// One fenced table commit delivery.
+    Delivery(TableChangeDelivery),
+}
+
+/// A reconnecting push-only stream of acknowledged table commits.
+pub type TableChangeStream =
+    Pin<Box<dyn Stream<Item = Result<TableSubscriptionEvent, ClientError>> + Send>>;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TableChangePayload {
+    table: String,
+    snapshot_id: String,
+    committed_at: String,
+}
 
 /// A stream of reflected Integration method results decoded from NDJSON.
 pub type NamespaceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ClientError>> + Send>>;
@@ -312,6 +350,9 @@ pub enum ClientError {
     /// A reflected namespace response was not valid JSON.
     #[error("namespace JSON failed: {0}")]
     NamespaceJson(#[from] serde_json::Error),
+    /// A queue subscription frame was not valid NDJSON.
+    #[error("queue subscription JSON failed: {0}")]
+    QueueJson(serde_json::Error),
     /// The existing table differs from the requested contract.
     #[error("table {table} definition mismatch: expected {expected:?}, actual {actual:?}")]
     DefinitionMismatch {
@@ -876,6 +917,127 @@ impl Database {
         self.client.query_stream_for(&self.name, sql).await
     }
 
+    /// Subscribes to exact table commits through one durable push stream.
+    pub fn subscribe<I, T>(
+        &self,
+        group: &str,
+        owner: &str,
+        tables: I,
+        lease_seconds: u64,
+    ) -> Result<TableChangeStream, ClientError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let tables = tables.into_iter().map(Into::into).collect::<Vec<_>>();
+        if group.is_empty()
+            || owner.is_empty()
+            || tables.is_empty()
+            || tables.iter().any(|table| table.trim().is_empty())
+        {
+            return Err(ClientError::Configuration(
+                "database subscribe requires non-empty group, owner, and tables".to_owned(),
+            ));
+        }
+        let database = self.clone();
+        let group = group.to_owned();
+        let owner = owner.to_owned();
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut backoff = Duration::from_millis(250);
+            loop {
+                let url = resource_url(
+                    &database.client.access_uri,
+                    "databases",
+                    &database.name,
+                    &["subscribe"],
+                )?;
+                let request = database.client.authorize(database.client.http.post(url)).json(&json!({
+                    "group": group,
+                    "owner": owner,
+                    "tables": tables,
+                    "max": 256,
+                    "leaseSeconds": lease_seconds,
+                }));
+                let response = match database.client.send(request).await {
+                    Ok(response) if response.status().is_success() => response,
+                    Ok(response) if is_transient_subscription_status(response.status()) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Ok(response) => Err(Client::http_error(response).await)?,
+                    Err(ClientError::Transport(_) | ClientError::RequestTimeout) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Err(error) => Err(error)?,
+                };
+                backoff = Duration::from_millis(250);
+                yield TableSubscriptionEvent::Connected;
+                let mut chunks = response.bytes_stream();
+                let mut buffer = Vec::new();
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => break,
+                    };
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let frame = buffer.drain(..=newline).collect::<Vec<_>>();
+                        if frame.len() == 1 {
+                            continue;
+                        }
+                        let delivery: QueueDelivery = serde_json::from_slice(&frame[..frame.len() - 1])
+                            .map_err(ClientError::QueueJson)?;
+                        let payload: TableChangePayload = serde_json::from_value(delivery.payload)
+                            .map_err(ClientError::QueueJson)?;
+                        yield TableSubscriptionEvent::Delivery(TableChangeDelivery {
+                            change: ChangeEvent {
+                                seq: u64::try_from(delivery.position).map_err(|_| {
+                                    ClientError::Configuration("negative table event position".to_owned())
+                                })?,
+                                table: payload.table,
+                                snapshot_id: payload.snapshot_id,
+                                committed_at: payload.committed_at,
+                            },
+                            receipt: delivery.receipt,
+                        });
+                    }
+                }
+                yield TableSubscriptionEvent::Disconnected;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }))
+    }
+
+    /// Acknowledges one table event after its durable rows have been published downstream.
+    pub async fn ack(&self, group: &str, receipt: &QueueReceipt) -> Result<(), ClientError> {
+        if group.is_empty() {
+            return Err(ClientError::Configuration(
+                "database subscription ack requires a non-empty group".to_owned(),
+            ));
+        }
+        let url = resource_url(
+            &self.client.access_uri,
+            "databases",
+            &self.name,
+            &["subscriptions", "ack"],
+        )?;
+        Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(url))
+                        .json(&json!({ "group": group, "receipt": receipt })),
+                )
+                .await?,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Returns a property-graph handle within this database.
     pub fn graph(&self, namespace: &str) -> Result<Graph, ClientError> {
         if namespace.is_empty() || namespace.contains('/') {
@@ -1279,7 +1441,10 @@ pub struct Queue {
 
 impl Queue {
     /// Appends messages to the declared queue and returns their stable positions.
-    pub async fn enqueue(&self, messages: Vec<Value>) -> Result<QueueEnqueueResult, ClientError> {
+    pub async fn enqueue(
+        &self,
+        messages: Vec<QueueMessage>,
+    ) -> Result<QueueEnqueueResult, ClientError> {
         let response = Client::require_success(
             self.client
                 .send(
@@ -1298,10 +1463,11 @@ impl Queue {
         &self,
         group: &str,
         owner: &str,
+        topics: &[String],
         max: Option<usize>,
         lease_seconds: u64,
     ) -> Result<QueuePollResult, ClientError> {
-        if group.is_empty() || owner.is_empty() {
+        if group.is_empty() || owner.is_empty() || topics.is_empty() {
             return Err(ClientError::Configuration(
                 "queue poll requires non-empty group and owner".to_owned(),
             ));
@@ -1314,6 +1480,7 @@ impl Queue {
                         .json(&json!({
                             "group": group,
                             "owner": owner,
+                            "topics": topics,
                             "max": max.unwrap_or(256),
                             "leaseSeconds": lease_seconds,
                         })),
@@ -1322,6 +1489,84 @@ impl Queue {
         )
         .await?;
         response.json().await.map_err(ClientError::Transport)
+    }
+
+    /// Subscribes to exact topics and reconnects without issuing poll requests.
+    pub fn subscribe<I, T>(
+        &self,
+        group: &str,
+        owner: &str,
+        topics: I,
+        max: Option<usize>,
+        lease_seconds: u64,
+    ) -> Result<QueueStream, ClientError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let topics = topics.into_iter().map(Into::into).collect::<Vec<_>>();
+        if group.is_empty()
+            || owner.is_empty()
+            || topics.is_empty()
+            || topics.iter().any(|topic| topic.trim().is_empty())
+        {
+            return Err(ClientError::Configuration(
+                "queue subscribe requires non-empty group, owner, and topics".to_owned(),
+            ));
+        }
+        let queue = self.clone();
+        let group = group.to_owned();
+        let owner = owner.to_owned();
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut backoff = Duration::from_millis(250);
+            loop {
+                let request = queue.client.authorize(
+                    queue.client.http.post(queue.url(&["subscribe"])?),
+                ).json(&json!({
+                    "group": group,
+                    "owner": owner,
+                    "topics": topics,
+                    "max": max.unwrap_or(256),
+                    "leaseSeconds": lease_seconds,
+                }));
+                let response = match queue.client.send(request).await {
+                    Ok(response) if response.status().is_success() => response,
+                    Ok(response) if is_transient_subscription_status(response.status()) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Ok(response) => Err(Client::http_error(response).await)?,
+                    Err(ClientError::Transport(_) | ClientError::RequestTimeout) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Err(error) => Err(error)?,
+                };
+                backoff = Duration::from_millis(250);
+                let mut chunks = response.bytes_stream();
+                let mut buffer = Vec::new();
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => break,
+                    };
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let frame = buffer.drain(..=newline).collect::<Vec<_>>();
+                        if frame.len() == 1 {
+                            continue;
+                        }
+                        let delivery = serde_json::from_slice(&frame[..frame.len() - 1])
+                            .map_err(ClientError::QueueJson)?;
+                        yield delivery;
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }))
     }
 
     /// Acknowledges exactly one live delivery generation after committing its work.
@@ -1697,6 +1942,13 @@ fn invalid_database_name() -> ClientError {
     ClientError::Configuration(
         "database name must start with a letter or underscore and contain only ASCII letters, digits, underscores, or hyphens".to_owned(),
     )
+}
+
+/// Returns whether a subscription handshake should reconnect from durable state.
+fn is_transient_subscription_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
 /// Maps client read options onto the wire filter object.
