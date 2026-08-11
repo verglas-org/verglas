@@ -379,7 +379,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       - verglas-runtime-state:/var/lib/verglas-container-runtime
       - verglas-access-neon-credentials:/var/run/verglas/neon:ro
-      - ${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}:${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}
+      - ${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}:/var/lib/verglas-worker-scratch
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8360/health"]
       interval: 2s
