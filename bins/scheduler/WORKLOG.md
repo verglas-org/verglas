@@ -15,3 +15,4 @@
 - #109: Records build lifecycle transitions around container-runtime builds and exposes the immutable digest on worker records. Cron and manual dispatch now reject revisions that have not completed a verified build.
 - #66: Dropped cloud-placement wording from the standalone scheduler binary docs.
 - #109: Forwarded validated worker scratch targets to the container runtime so scheduled large-file jobs use operator-owned storage.
+- #109: Preserved bounded container-runtime rejection bodies in durable job errors so operators can diagnose failed builds and runs without server log access.

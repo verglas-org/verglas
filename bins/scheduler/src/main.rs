@@ -32,6 +32,9 @@ use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
 /// CloudEvent type emitted for a planned cron interval.
 const CRON_EVENT_TYPE: &str = "org.verglas.schedule.tick";
 
+/// Maximum runtime error response retained in durable scheduler state.
+const RUNTIME_ERROR_BODY_LIMIT: usize = 4_096;
+
 /// Standalone scheduler process configuration.
 #[derive(Debug, Parser)]
 #[command(name = "verglas-scheduler", version)]
@@ -225,9 +228,8 @@ impl RuntimeClient {
             .json(project)
             .send()
             .await
-            .map_err(|error| format!("worker build request: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("worker build rejected: {error}"))?;
+            .map_err(|error| format!("worker build request: {error}"))?;
+        let response = runtime_response(response, "worker build").await?;
         response
             .json::<WorkerProjectView>()
             .await
@@ -236,7 +238,8 @@ impl RuntimeClient {
 
     /// Executes one built image through the bounded runtime API.
     async fn run(&self, invocation: &WorkerInvocation) -> Result<WorkerRunResult, String> {
-        self.http
+        let response = self
+            .http
             .put(format!(
                 "{}/v1/worker-runs/{}",
                 self.endpoint, invocation.run_id
@@ -248,13 +251,30 @@ impl RuntimeClient {
             .json(invocation)
             .send()
             .await
-            .map_err(|error| format!("worker run request: {error}"))?
-            .error_for_status()
-            .map_err(|error| format!("worker run rejected: {error}"))?
+            .map_err(|error| format!("worker run request: {error}"))?;
+        runtime_response(response, "worker run")
+            .await?
             .json::<WorkerRunResult>()
             .await
             .map_err(|error| format!("worker run response: {error}"))
     }
+}
+
+/// Preserves a bounded runtime rejection body so operators can diagnose runs.
+async fn runtime_response(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<reqwest::Response, String> {
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|error| format!("failed to read response body: {error}"));
+    let body: String = body.chars().take(RUNTIME_ERROR_BODY_LIMIT).collect();
+    Err(format!("{operation} rejected with HTTP {status}: {body}"))
 }
 
 /// Accepts one complete worker event, persists it, and wakes execution now.
@@ -1029,6 +1049,33 @@ mod tests {
             .expect("stored event");
         assert_eq!(stored.worker, "http-worker");
         assert_eq!(stored.event.event_type, "org.verglas.http.request");
+    }
+
+    /// Runtime rejection details remain visible without allowing unbounded output.
+    #[tokio::test]
+    async fn runtime_rejection_preserves_a_bounded_response_body() {
+        let oversized = format!("diagnostic:{}", "x".repeat(RUNTIME_ERROR_BODY_LIMIT + 100));
+        let app = Router::new().route(
+            "/reject",
+            get(move || {
+                let oversized = oversized.clone();
+                async move { (StatusCode::UNPROCESSABLE_ENTITY, oversized) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let endpoint = format!("http://{}/reject", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("runtime server") });
+
+        let response = reqwest::get(endpoint).await.expect("response");
+        let error = runtime_response(response, "worker run")
+            .await
+            .expect_err("rejection");
+
+        assert!(error.contains("422 Unprocessable Entity"));
+        assert!(error.contains("diagnostic:"));
+        assert!(error.len() < RUNTIME_ERROR_BODY_LIMIT + 100);
     }
 
     /// A claimed worker executes through the container runtime and becomes a completion.
