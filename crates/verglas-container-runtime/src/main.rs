@@ -35,6 +35,13 @@ struct Args {
         default_value = "verglas-runtime"
     )]
     network: String,
+    /// Docker host path used for persistent per-worker scratch storage.
+    #[arg(
+        long,
+        env = "VERGLAS_WORKER_SCRATCH_ROOT",
+        default_value = "/var/lib/verglas-worker-scratch"
+    )]
+    worker_scratch_root: PathBuf,
 }
 
 /// Connects to Docker, restores desired state, and serves the local API.
@@ -50,7 +57,7 @@ async fn main() {
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     ensure_local_postgres_tls(&args.state)?;
-    let runtime = DockerRuntime::connect_local()?;
+    let runtime = DockerRuntime::connect_local(args.worker_scratch_root)?;
     let service = RuntimeService::open(runtime, args.token, args.state, args.network).await?;
     service.recover().await?;
     let listener = TcpListener::bind(args.listen).await?;

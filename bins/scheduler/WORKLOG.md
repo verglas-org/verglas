@@ -12,4 +12,6 @@
 - #11: Materialized worker bundles into a fresh temporary directory for each execution and passed declared environment variables to the subprocess. Relative bundled entrypoints now run without a shared filesystem, while unresolved secrets and unsafe paths fail before execution.
 - #18: Renamed the scheduler's portable-bundle fixture to the neutral market-data ingestion example used by the worker guides. SPY remains test input data instead of becoming a worker, file, or table name.
 - #109: Replaced scheduler subprocess execution with authenticated container-runtime builds and bounded runs. Registration stores an immutable image identity, while each claim resolves secrets at run time and renews its durable lease during the container call.
+- #109: Records build lifecycle transitions around container-runtime builds and exposes the immutable digest on worker records. Cron and manual dispatch now reject revisions that have not completed a verified build.
 - #66: Dropped cloud-placement wording from the standalone scheduler binary docs.
+- #109: Forwarded validated worker scratch targets to the container runtime so scheduled large-file jobs use operator-owned storage.

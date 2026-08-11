@@ -24,8 +24,8 @@ use verglas_container_runtime::{
 };
 use verglas_scheduler::{
     ClaimRequest, ClaimedJob, CompleteRequest, Completion, EnqueueOutcome, Invocation, Lease,
-    NextWakeRequest, PgQueue, PgWorkerRegistry, RenewRequest, RunQueue, WorkerRecord, WorkerSpec,
-    plan_cron,
+    NextWakeRequest, PgQueue, PgWorkerRegistry, RenewRequest, RunQueue, WorkerBuildStatus,
+    WorkerRecord, WorkerSpec, plan_cron,
 };
 use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
 
@@ -78,6 +78,8 @@ struct WorkerConfig {
     /// Hard invocation limits.
     #[serde(default)]
     resources: WorkerResourceConfig,
+    /// Absolute container path backed by the runtime's operator-owned scratch root.
+    scratch_target: Option<String>,
 }
 
 /// Optional portable limits with operator-safe defaults.
@@ -103,6 +105,7 @@ struct PreparedWorker {
     environment: BTreeMap<String, String>,
     resources: WorkerResources,
     timeout_seconds: u64,
+    scratch_target: Option<String>,
 }
 
 async fn prepare_registered_worker(
@@ -134,8 +137,25 @@ fn prepare_worker_config(
     worker: &WorkerRecord,
     config: WorkerConfig,
 ) -> Result<PreparedWorker, String> {
+    if worker.build_status != WorkerBuildStatus::Ready {
+        return Err(format!(
+            "worker {} build is {:?}",
+            worker.name, worker.build_status
+        ));
+    }
     let code: BuiltWorkerCode = serde_json::from_str(&worker.code)
         .map_err(|error| format!("worker {} built code: {error}", worker.name))?;
+    let digest = worker
+        .image_digest
+        .as_deref()
+        .ok_or_else(|| format!("worker {} ready build has no image digest", worker.name))?;
+    let digest_tag = digest.replacen(':', "-", 1);
+    if !code.image.ends_with(&digest_tag) {
+        return Err(format!(
+            "worker {} image does not match its registered digest",
+            worker.name
+        ));
+    }
     Ok(PreparedWorker {
         image: code.image,
         entrypoint: code.entrypoint,
@@ -146,6 +166,7 @@ fn prepare_worker_config(
             pids: config.resources.pids.unwrap_or(512),
         },
         timeout_seconds: config.resources.timeout_secs.unwrap_or(3_600),
+        scratch_target: config.scratch_target,
     })
 }
 
@@ -179,6 +200,7 @@ struct RuntimeClient {
 #[serde(rename_all = "camelCase")]
 struct WorkerProjectView {
     image: String,
+    image_digest: String,
 }
 
 impl RuntimeClient {
@@ -191,8 +213,8 @@ impl RuntimeClient {
         }
     }
 
-    /// Builds one locked project and returns its immutable image identity.
-    async fn build(&self, project: &WorkerProjectSpec) -> Result<String, String> {
+    /// Builds one locked project and returns its immutable image and digest.
+    async fn build(&self, project: &WorkerProjectSpec) -> Result<WorkerProjectView, String> {
         let response = self
             .http
             .put(format!(
@@ -209,7 +231,6 @@ impl RuntimeClient {
         response
             .json::<WorkerProjectView>()
             .await
-            .map(|view| view.image)
             .map_err(|error| format!("worker build response: {error}"))
     }
 
@@ -340,7 +361,7 @@ async fn list_workers(
 
 async fn register_worker(
     State(state): State<SchedulerState>,
-    Json(mut spec): Json<WorkerSpec>,
+    Json(spec): Json<WorkerSpec>,
 ) -> Response {
     let project: WorkerProjectSpec = match serde_json::from_str(&spec.code) {
         Ok(project) => project,
@@ -355,18 +376,51 @@ async fn register_worker(
         )
             .into_response();
     }
-    let image = match state.runtime.build(&project).await {
-        Ok(image) => image,
-        Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+    let building = match state.registry.begin_build(spec).await {
+        Ok(worker) => worker,
+        Err(error) => return scheduler_error(error),
+    };
+    let build = match state.runtime.build(&project).await {
+        Ok(build) => build,
+        Err(error) => {
+            return match state
+                .registry
+                .finish_build(
+                    &building.name,
+                    building.revision,
+                    WorkerBuildStatus::Failed,
+                    None,
+                    None,
+                )
+                .await
+            {
+                Ok(_) => (StatusCode::BAD_GATEWAY, error).into_response(),
+                Err(registry_error) => (
+                    StatusCode::BAD_GATEWAY,
+                    format!("{error}; recording failed build: {registry_error}"),
+                )
+                    .into_response(),
+            };
+        }
     };
     let mut built = match serde_json::to_value(&project) {
         Ok(serde_json::Value::Object(value)) => value,
         Ok(_) => unreachable!("worker project serializes as an object"),
         Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     };
-    built.insert("image".to_owned(), serde_json::Value::String(image));
-    spec.code = serde_json::Value::Object(built).to_string();
-    match state.registry.register(spec).await {
+    built.insert("image".to_owned(), serde_json::Value::String(build.image));
+    let built_code = serde_json::Value::Object(built).to_string();
+    match state
+        .registry
+        .finish_build(
+            &building.name,
+            building.revision,
+            WorkerBuildStatus::Ready,
+            Some(&build.image_digest),
+            Some(&built_code),
+        )
+        .await
+    {
         Ok(worker) => {
             state.ready.notify_one();
             (StatusCode::CREATED, Json(worker)).into_response()
@@ -418,7 +472,15 @@ async fn run_worker_now(
             .into_response();
     };
     match state.registry.get(&name).await {
-        Ok(Some(worker)) if worker.state == "running" => {}
+        Ok(Some(worker))
+            if worker.state == "running" && worker.build_status == WorkerBuildStatus::Ready => {}
+        Ok(Some(worker)) if worker.build_status != WorkerBuildStatus::Ready => {
+            return (
+                StatusCode::CONFLICT,
+                format!("worker {name} build is {:?}", worker.build_status),
+            )
+                .into_response();
+        }
         Ok(Some(worker)) => {
             return (
                 StatusCode::CONFLICT,
@@ -560,10 +622,9 @@ async fn reconcile_cron(
         .map_err(|error| error.to_string())?;
     let jobs = queue.jobs().await.map_err(|error| error.to_string())?;
     let mut next_wake_at = None;
-    for worker in workers
-        .into_iter()
-        .filter(|worker| worker.state == "running")
-    {
+    for worker in workers.into_iter().filter(|worker| {
+        worker.state == "running" && worker.build_status == WorkerBuildStatus::Ready
+    }) {
         let triggers: Vec<TriggerSpec> = serde_json::from_str(&worker.triggers)
             .map_err(|error| format!("worker {} triggers: {error}", worker.name))?;
         for (index, trigger) in triggers.into_iter().enumerate() {
@@ -674,6 +735,7 @@ async fn execute_claimed_worker(
             .map_err(|error| format!("serialize worker event: {error}"))?,
         resources: prepared.resources,
         timeout_seconds: prepared.timeout_seconds,
+        scratch_target: prepared.scratch_target,
     };
     let mut lease = claimed.lease;
     let renew_every = Duration::from_secs((args.lease_seconds / 2).max(1));
@@ -926,6 +988,8 @@ mod tests {
             created_by: "test".to_owned(),
             created_at: Utc::now(),
             revision: 1,
+            build_status: WorkerBuildStatus::Ready,
+            image_digest: Some("sha256:test".to_owned()),
             config: r#"{
                 "env":{"SYMBOL":"SPY"},
                 "resources":{"vcpus":2.0,"mem_mib":4096,"pids":128,"timeout_secs":900}
@@ -986,6 +1050,8 @@ mod tests {
             created_by: "test".to_owned(),
             created_at: Utc::now(),
             revision: 1,
+            build_status: WorkerBuildStatus::Ready,
+            image_digest: Some("sha256:test".to_owned()),
         };
         let now = Utc::now();
         let claimed = ClaimedJob {

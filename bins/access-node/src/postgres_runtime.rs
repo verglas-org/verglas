@@ -84,7 +84,7 @@ pub(crate) struct ManagedPostgresConnection {
 }
 
 /// Deterministic desired state for one database.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ManagedPostgresPlan {
     tenant_id: String,
     timeline_id: String,

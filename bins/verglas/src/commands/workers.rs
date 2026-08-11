@@ -174,6 +174,7 @@ async fn run_follow(
         env: Default::default(),
         triggers: vec![trigger],
         target_tables: vec![table.clone()],
+        scratch_target: None,
         resources: Default::default(),
     };
     manifest.validate()?;

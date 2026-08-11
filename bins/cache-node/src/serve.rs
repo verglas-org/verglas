@@ -424,7 +424,7 @@ pub async fn run(
     // Lakekeeper's Postgres is itself durable through this cache ring.
     enum CatalogRuntime {
         Eventual {
-            gateway: verglas_catalog::CatalogGateway,
+            gateway: Box<verglas_catalog::CatalogGateway>,
             watcher: Arc<verglas_tables::catalog::PollingWatcher>,
             token: Option<String>,
         },
@@ -444,7 +444,7 @@ pub async fn run(
             let runtime = match catalog.consistency {
                 CatalogConsistency::Eventual => CatalogRuntime::Eventual {
                     watcher: Arc::new(PollingWatcher::spawn(gateway.source(), options)),
-                    gateway,
+                    gateway: Box::new(gateway),
                     token: std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
                         .ok()
                         .filter(|value| !value.is_empty()),
@@ -500,7 +500,7 @@ pub async fn run(
                 watcher,
                 token,
             } => {
-                let mut app = admin::catalog_router(gateway.clone());
+                let mut app = admin::catalog_router(gateway.as_ref().clone());
                 if let Some(token) = token {
                     app = app.merge(admin::eventual_catalog_event_router(
                         Arc::clone(watcher),
@@ -577,16 +577,16 @@ pub async fn run(
         ));
         health.mark_ready();
 
-        serve_s3(
+        serve_s3(S3Serve {
             config,
             s3_listener,
             credentials,
             engine,
             registry,
             node_metrics,
-            (object_ring, writeback_slot),
-            activity.clone(),
-        )
+            writeback: (object_ring, writeback_slot),
+            activity: activity.clone(),
+        })
         .await
     };
 
@@ -656,8 +656,8 @@ fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()
 /// origin. Both paths invalidate key-to-ETag mappings before acknowledgement.
 /// Path-style always works; a configured `[listen].domain` adds virtual-hosted
 /// addressing.
-async fn serve_s3(
-    config: &Config,
+struct S3Serve<'a> {
+    config: &'a Config,
     s3_listener: tokio::net::TcpListener,
     credentials: (String, String),
     engine: CacheEngine,
@@ -665,7 +665,19 @@ async fn serve_s3(
     node_metrics: Arc<NodeMetrics>,
     writeback: (Option<Arc<crate::ring::RingPlane>>, WritebackSlot),
     activity: ActivityTracker,
-) -> Result<(), Box<dyn std::error::Error>> {
+}
+
+async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let S3Serve {
+        config,
+        s3_listener,
+        credentials,
+        engine,
+        registry,
+        node_metrics,
+        writeback,
+        activity,
+    } = context;
     let (object_ring, writeback_slot) = writeback;
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.

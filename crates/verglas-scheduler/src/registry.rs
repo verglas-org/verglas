@@ -23,6 +23,18 @@ pub struct WorkerSpec {
     pub created_by: String,
 }
 
+/// Build lifecycle for one immutable worker source revision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerBuildStatus {
+    /// The container runtime is building the submitted project.
+    Building,
+    /// The immutable image and digest are available for dispatch.
+    Ready,
+    /// The container runtime rejected or could not build the project.
+    Failed,
+}
+
 fn empty_triggers() -> String {
     "[]".to_owned()
 }
@@ -44,6 +56,10 @@ pub struct WorkerRecord {
     pub created_by: String,
     pub created_at: DateTime<Utc>,
     pub revision: i64,
+    /// Current build lifecycle for this source revision.
+    pub build_status: WorkerBuildStatus,
+    /// Content digest returned by the project builder after a successful build.
+    pub image_digest: Option<String>,
 }
 
 /// Queue-scoped worker registry stored beside scheduler jobs and leases.
@@ -83,8 +99,12 @@ impl PgWorkerRegistry {
              queue TEXT NOT NULL, name TEXT NOT NULL, revision BIGINT NOT NULL, \
              code TEXT NOT NULL, triggers TEXT NOT NULL, output TEXT, config TEXT NOT NULL, \
              state TEXT NOT NULL, placement TEXT NOT NULL, created_by TEXT NOT NULL, \
+             build_status TEXT NOT NULL, image_digest TEXT, \
              created_at TIMESTAMPTZ NOT NULL, revised_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-             PRIMARY KEY (queue, name, revision))",
+             PRIMARY KEY (queue, name, revision), \
+             CHECK (build_status IN ('building','ready','failed')), \
+             CHECK ((build_status = 'ready' AND image_digest IS NOT NULL) OR \
+                    (build_status <> 'ready' AND image_digest IS NULL)))",
         )
         .execute(&self.pool)
         .await?;
@@ -104,8 +124,8 @@ impl PgWorkerRegistry {
         Ok(())
     }
 
-    /// Appends a running revision, preserving the declaration's creation time.
-    pub async fn register(&self, spec: WorkerSpec) -> Result<WorkerRecord, SchedulerError> {
+    /// Appends a building revision before the runtime receives its source.
+    pub async fn begin_build(&self, spec: WorkerSpec) -> Result<WorkerRecord, SchedulerError> {
         validate_spec(&spec)?;
         let mut tx = self.pool.begin().await?;
         lock_worker(&mut tx, &self.queue, &spec.name).await?;
@@ -121,8 +141,51 @@ impl PgWorkerRegistry {
             created_by: spec.created_by,
             created_at: current.as_ref().map_or_else(Utc::now, |row| row.created_at),
             revision: current.map_or(1, |row| row.revision + 1),
+            build_status: WorkerBuildStatus::Building,
+            image_digest: None,
         };
         insert_worker(&mut tx, &self.queue, &record).await?;
+        tx.commit().await?;
+        Ok(record)
+    }
+
+    /// Seals one building revision as ready or failed without creating a new source revision.
+    pub async fn finish_build(
+        &self,
+        name: &str,
+        revision: i64,
+        status: WorkerBuildStatus,
+        image_digest: Option<&str>,
+        built_code: Option<&str>,
+    ) -> Result<WorkerRecord, SchedulerError> {
+        validate_build_completion(status, image_digest, built_code)?;
+        let mut tx = self.pool.begin().await?;
+        lock_worker(&mut tx, &self.queue, name).await?;
+        let result = sqlx::query(
+            "UPDATE verglas_scheduler_workers SET build_status=$1,image_digest=$2,\
+             code=COALESCE($3,code),revised_at=now() WHERE queue=$4 AND name=$5 \
+             AND revision=$6 AND build_status='building'",
+        )
+        .bind(build_status_name(status))
+        .bind(image_digest)
+        .bind(built_code)
+        .bind(&self.queue)
+        .bind(name)
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Err(SchedulerError::Invalid(format!(
+                "worker `{name}` revision {revision} is not building"
+            )));
+        }
+        let record = worker_revision(&mut tx, &self.queue, name, revision)
+            .await?
+            .ok_or_else(|| {
+                SchedulerError::Invalid(format!(
+                    "worker `{name}` revision {revision} disappeared after build"
+                ))
+            })?;
         tx.commit().await?;
         Ok(record)
     }
@@ -133,12 +196,12 @@ impl PgWorkerRegistry {
         include_all_revisions: bool,
     ) -> Result<Vec<WorkerRecord>, SchedulerError> {
         let query = if include_all_revisions {
-            "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision \
+            "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision,build_status,image_digest \
              FROM verglas_scheduler_workers WHERE queue=$1 ORDER BY name,revision"
         } else {
-            "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision \
+            "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision,build_status,image_digest \
              FROM (SELECT DISTINCT ON (name) name,code,triggers,output,config,state,placement,\
-             created_by,created_at,revision FROM verglas_scheduler_workers WHERE queue=$1 \
+             created_by,created_at,revision,build_status,image_digest FROM verglas_scheduler_workers WHERE queue=$1 \
              ORDER BY name,revision DESC) current WHERE state <> 'archived' ORDER BY name"
         };
         sqlx::query(query)
@@ -239,6 +302,49 @@ impl PgWorkerRegistry {
     }
 }
 
+/// Validates the terminal build transition and its immutable identity.
+fn validate_build_completion(
+    status: WorkerBuildStatus,
+    image_digest: Option<&str>,
+    built_code: Option<&str>,
+) -> Result<(), SchedulerError> {
+    let valid = match status {
+        WorkerBuildStatus::Building => false,
+        WorkerBuildStatus::Ready => {
+            image_digest.is_some_and(|value| value.starts_with("sha256:")) && built_code.is_some()
+        }
+        WorkerBuildStatus::Failed => image_digest.is_none() && built_code.is_none(),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(SchedulerError::Invalid(
+            "worker build completion has an invalid status, digest, or code".to_owned(),
+        ))
+    }
+}
+
+/// Returns the constrained database representation of one build status.
+fn build_status_name(status: WorkerBuildStatus) -> &'static str {
+    match status {
+        WorkerBuildStatus::Building => "building",
+        WorkerBuildStatus::Ready => "ready",
+        WorkerBuildStatus::Failed => "failed",
+    }
+}
+
+/// Parses the constrained database representation of one build status.
+fn parse_build_status(value: &str) -> Result<WorkerBuildStatus, SchedulerError> {
+    match value {
+        "building" => Ok(WorkerBuildStatus::Building),
+        "ready" => Ok(WorkerBuildStatus::Ready),
+        "failed" => Ok(WorkerBuildStatus::Failed),
+        value => Err(SchedulerError::Invalid(format!(
+            "unknown worker build status `{value}`"
+        ))),
+    }
+}
+
 fn validate_spec(spec: &WorkerSpec) -> Result<(), SchedulerError> {
     if spec.name.is_empty() || spec.name.contains('/') || spec.name == "." || spec.name == ".." {
         return Err(SchedulerError::Invalid(format!(
@@ -295,11 +401,32 @@ async fn current_worker(
     name: &str,
 ) -> Result<Option<WorkerRecord>, SchedulerError> {
     sqlx::query(
-        "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision \
+        "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision,build_status,image_digest \
          FROM verglas_scheduler_workers WHERE queue=$1 AND name=$2 ORDER BY revision DESC LIMIT 1",
     )
     .bind(queue)
     .bind(name)
+    .fetch_optional(&mut **tx)
+    .await?
+    .as_ref()
+    .map(decode_worker)
+    .transpose()
+}
+
+/// Returns one exact worker revision while a build transition holds its lock.
+async fn worker_revision(
+    tx: &mut Transaction<'_, sqlx::Postgres>,
+    queue: &str,
+    name: &str,
+    revision: i64,
+) -> Result<Option<WorkerRecord>, SchedulerError> {
+    sqlx::query(
+        "SELECT name,code,triggers,output,config,state,placement,created_by,created_at,revision,build_status,image_digest \
+         FROM verglas_scheduler_workers WHERE queue=$1 AND name=$2 AND revision=$3",
+    )
+    .bind(queue)
+    .bind(name)
+    .bind(revision)
     .fetch_optional(&mut **tx)
     .await?
     .as_ref()
@@ -314,8 +441,8 @@ async fn insert_worker(
 ) -> Result<(), SchedulerError> {
     sqlx::query(
         "INSERT INTO verglas_scheduler_workers \
-         (queue,name,revision,code,triggers,output,config,state,placement,created_by,created_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+         (queue,name,revision,code,triggers,output,config,state,placement,created_by,created_at,build_status,image_digest) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
     )
     .bind(queue)
     .bind(&row.name)
@@ -328,12 +455,15 @@ async fn insert_worker(
     .bind(&row.placement)
     .bind(&row.created_by)
     .bind(row.created_at)
+    .bind(build_status_name(row.build_status))
+    .bind(&row.image_digest)
     .execute(&mut **tx)
     .await?;
     Ok(())
 }
 
 fn decode_worker(row: &PgRow) -> Result<WorkerRecord, SchedulerError> {
+    let build_status: String = row.try_get("build_status")?;
     Ok(WorkerRecord {
         name: row.try_get("name")?,
         code: row.try_get("code")?,
@@ -345,5 +475,40 @@ fn decode_worker(row: &PgRow) -> Result<WorkerRecord, SchedulerError> {
         created_by: row.try_get("created_by")?,
         created_at: row.try_get("created_at")?,
         revision: row.try_get("revision")?,
+        build_status: parse_build_status(&build_status)?,
+        image_digest: row.try_get("image_digest")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A ready build requires both its immutable digest and built image declaration.
+    #[test]
+    fn ready_build_completion_requires_digest_and_code() {
+        assert!(
+            validate_build_completion(
+                WorkerBuildStatus::Ready,
+                Some("sha256:abc"),
+                Some(r#"{"image":"worker:sha256-abc"}"#),
+            )
+            .is_ok()
+        );
+        assert!(validate_build_completion(WorkerBuildStatus::Ready, None, Some("{}"),).is_err());
+        assert!(
+            validate_build_completion(WorkerBuildStatus::Ready, Some("not-a-digest"), Some("{}"),)
+                .is_err()
+        );
+    }
+
+    /// A failed build records no image identity or replacement code.
+    #[test]
+    fn failed_build_completion_cannot_publish_an_image() {
+        assert!(validate_build_completion(WorkerBuildStatus::Failed, None, None).is_ok());
+        assert!(
+            validate_build_completion(WorkerBuildStatus::Failed, Some("sha256:abc"), None,)
+                .is_err()
+        );
+    }
 }

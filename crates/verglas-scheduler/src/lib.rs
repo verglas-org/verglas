@@ -14,4 +14,4 @@ pub use queue::{
     Job, JobSummary, Lease, LeaseError, NextWakeRequest, PgQueue, RenewRequest, RunQueue,
     SchedulerError,
 };
-pub use registry::{PgWorkerRegistry, WorkerRecord, WorkerSpec};
+pub use registry::{PgWorkerRegistry, WorkerBuildStatus, WorkerRecord, WorkerSpec};

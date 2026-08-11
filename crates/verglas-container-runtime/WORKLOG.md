@@ -49,3 +49,5 @@
   creates it once before recovery and exposes only its file paths to managed proxy declarations.
 - #107: Updated the complete-stack packaging contract for the one-shot Verglas Neon bootstrap and locally built independently provisioned queue-service image, removing the vanilla Postgres bootstrap services.
 - #109: Added content-addressed locked worker builds for Python and Bun plus explicit Dockerfile projects. Added bounded one-shot execution with hard CPU, memory, PID, and timeout limits, runtime environment injection, result capture, bounded logs, and deterministic cleanup.
+- #109: Unified Vessel and worker packaging behind one deterministic `ProjectBuildContext`. The runtime now returns the explicit SHA-256 build-context digest with every immutable worker image.
+- #109: Added operator-owned per-worker scratch mounts for large bounded jobs. Worker declarations select only the container target; the runtime selects and validates the host root.

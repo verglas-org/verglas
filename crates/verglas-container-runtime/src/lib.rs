@@ -56,6 +56,15 @@ const MAX_CONTAINER_FILE_BYTES: usize = 1024 * 1024;
 const MAX_WORKER_LOG_BYTES: usize = 64 * 1024;
 const WORKER_RESULT_PATH: &str = "/tmp/verglas-result.json";
 
+fn valid_absolute_container_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() > 1
+        && path
+            .trim_start_matches('/')
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
 /// Stable local TLS paths generated beside the desired-state document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostgresTlsFiles {
@@ -177,11 +186,13 @@ pub struct VesselProjectSpec {
     pub http: VesselHttp,
 }
 
-/// Normalized content-addressed Docker build for a TypeScript Vessel project.
+/// Normalized content-addressed OCI build shared by Vessels and workers.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VesselBuildContext {
+pub struct ProjectBuildContext {
     /// Immutable local OCI image tag derived from the normalized project.
     pub image: String,
+    /// SHA-256 digest of the exact deterministic build context.
+    pub image_digest: String,
     /// Platform-owned Dockerfile included in the build context.
     pub dockerfile: String,
     /// Deterministic uncompressed tar archive sent to the Docker Engine.
@@ -212,17 +223,6 @@ pub struct WorkerProjectSpec {
     pub entrypoint: Vec<String>,
     /// UTF-8 source, dependency declarations, and lockfiles.
     pub files: BTreeMap<String, String>,
-}
-
-/// Normalized content-addressed Docker build for one bounded worker project.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkerBuildContext {
-    /// Immutable local OCI image tag derived from the normalized project.
-    pub image: String,
-    /// Platform-owned or explicitly submitted Dockerfile.
-    pub dockerfile: String,
-    /// Deterministic uncompressed tar archive sent to the Docker Engine.
-    pub context: Vec<u8>,
 }
 
 /// One fully resolved bounded worker invocation accepted by the runtime.
@@ -257,6 +257,9 @@ pub struct WorkerInvocation {
     pub resources: WorkerResources,
     /// Wall-clock ceiling for the invocation.
     pub timeout_seconds: u64,
+    /// Optional absolute container path backed by operator-owned scratch storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_target: Option<String>,
 }
 
 /// Completed output returned from one bounded worker container.
@@ -277,7 +280,7 @@ struct WorkerResultFile {
 
 impl WorkerProjectSpec {
     /// Validates dependency locking and archives one deterministic worker build.
-    pub fn build_context(&self) -> Result<WorkerBuildContext, RuntimeError> {
+    pub fn build_context(&self) -> Result<ProjectBuildContext, RuntimeError> {
         ContainerSpec::new(format!("worker-{}", self.name), "validation").validate()?;
         if self.entrypoint.is_empty() || self.entrypoint.iter().any(|part| part.is_empty()) {
             return Err(RuntimeError::MissingWorkerEntrypoint);
@@ -300,13 +303,7 @@ impl WorkerProjectSpec {
         };
         let mut files = self.files.clone();
         files.remove("Dockerfile");
-        let context = archive_project(&files, &dockerfile)?;
-        let digest = hex::encode(Sha256::digest(&context));
-        Ok(WorkerBuildContext {
-            image: format!("verglas/worker-{}:sha256-{digest}", self.name),
-            dockerfile,
-            context,
-        })
+        build_project_context(ProjectKind::Worker, &self.name, &files, dockerfile)
     }
 }
 
@@ -340,7 +337,7 @@ fn bun_worker_dockerfile() -> String {
 
 impl VesselProjectSpec {
     /// Validates and archives this project into a platform-owned Docker build.
-    pub fn build_context(&self) -> Result<VesselBuildContext, RuntimeError> {
+    pub fn build_context(&self) -> Result<ProjectBuildContext, RuntimeError> {
         ContainerSpec::new(format!("vessel-{}", self.name), "validation").validate()?;
         if self.http.port == 0 {
             return Err(RuntimeError::InvalidPort);
@@ -362,14 +359,7 @@ impl VesselProjectSpec {
 
         let dockerfile = typescript_dockerfile();
         let files = materialize_project(&self.project.files, self.role)?;
-        let context = archive_project(&files, &dockerfile)?;
-        let digest = hex::encode(Sha256::digest(&context));
-        let image = format!("verglas/vessel-{}:sha256-{digest}", self.name);
-        Ok(VesselBuildContext {
-            image,
-            dockerfile,
-            context,
-        })
+        build_project_context(ProjectKind::Vessel, &self.name, &files, dockerfile)
     }
 
     /// Maps a completed project build to the existing Vessel runtime record.
@@ -384,6 +374,42 @@ impl VesselProjectSpec {
             http: self.http.clone(),
         }
     }
+}
+
+/// Product shape that selects the stable OCI repository namespace.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectKind {
+    /// A long-running Vessel service.
+    Vessel,
+    /// A bounded worker invocation image.
+    Worker,
+}
+
+impl ProjectKind {
+    /// Returns the image repository prefix for this product shape.
+    fn image_prefix(self) -> &'static str {
+        match self {
+            Self::Vessel => "vessel",
+            Self::Worker => "worker",
+        }
+    }
+}
+
+/// Creates one deterministic build context and content identity for any project.
+fn build_project_context(
+    kind: ProjectKind,
+    name: &str,
+    files: &BTreeMap<String, String>,
+    dockerfile: String,
+) -> Result<ProjectBuildContext, RuntimeError> {
+    let context = archive_project(files, &dockerfile)?;
+    let digest = hex::encode(Sha256::digest(&context));
+    Ok(ProjectBuildContext {
+        image: format!("verglas/{}-{}:sha256-{digest}", kind.image_prefix(), name),
+        image_digest: format!("sha256:{digest}"),
+        dockerfile,
+        context,
+    })
 }
 
 /// Adds the platform SDK as an ordinary local package inside the standalone image.
@@ -838,16 +864,8 @@ impl ContainerSpec {
             return Err(RuntimeError::ContainerFilesTooLarge);
         }
         for file in &self.files {
-            let valid_path = |path: &str| {
-                path.starts_with('/')
-                    && path.len() > 1
-                    && path
-                        .trim_start_matches('/')
-                        .split('/')
-                        .all(|part| !part.is_empty() && part != "." && part != "..")
-            };
-            if !valid_path(&file.source)
-                || !valid_path(&file.path)
+            if !valid_absolute_container_path(&file.source)
+                || !valid_absolute_container_path(&file.path)
                 || !(0o400..=0o666).contains(&file.mode)
                 || file.mode & 0o111 != 0
                 || is_docker_socket(&file.source)
@@ -1006,6 +1024,12 @@ pub enum RuntimeError {
     /// A worker invocation used a zero-second wall-clock ceiling.
     #[error("worker timeout must be positive")]
     InvalidWorkerTimeout,
+    /// A worker requested scratch storage but the runtime has no operator root.
+    #[error("worker scratch storage is not configured")]
+    WorkerScratchUnavailable,
+    /// A worker scratch target or worker identity was unsafe.
+    #[error("worker scratch target or identity is invalid")]
+    InvalidWorkerScratch,
     /// A run identity already belongs to an existing container.
     #[error("worker run {run_id} already exists")]
     RunAlreadyExists {
@@ -1114,11 +1138,12 @@ pub struct DockerRuntime {
 
 impl DockerRuntime {
     /// Connects to the configured local Docker socket using Docker defaults.
-    pub fn connect_local() -> Result<Self, RuntimeError> {
+    pub fn connect_local(worker_scratch_root: PathBuf) -> Result<Self, RuntimeError> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|error| RuntimeError::Engine(error.to_string()))?;
         Ok(Self {
-            core: DockerRuntimeCore::new(BollardDockerApi { docker }),
+            core: DockerRuntimeCore::new(BollardDockerApi { docker })
+                .with_worker_scratch_root(worker_scratch_root),
         })
     }
 
@@ -1162,7 +1187,7 @@ impl DockerRuntime {
     pub async fn build_project(
         &self,
         project: &VesselProjectSpec,
-    ) -> Result<VesselBuildContext, RuntimeError> {
+    ) -> Result<ProjectBuildContext, RuntimeError> {
         let build = project.build_context()?;
         self.core
             .api
@@ -1175,7 +1200,7 @@ impl DockerRuntime {
     pub async fn build_worker_project(
         &self,
         project: &WorkerProjectSpec,
-    ) -> Result<WorkerBuildContext, RuntimeError> {
+    ) -> Result<ProjectBuildContext, RuntimeError> {
         let build = project.build_context()?;
         self.core
             .api
@@ -1273,6 +1298,7 @@ trait DockerApi: Send + Sync {
 
 struct DockerRuntimeCore<A> {
     api: A,
+    worker_scratch_root: Option<PathBuf>,
 }
 
 impl<A> DockerRuntimeCore<A>
@@ -1281,7 +1307,17 @@ where
 {
     /// Creates a reconciler around one Docker API implementation.
     fn new(api: A) -> Self {
-        Self { api }
+        Self {
+            api,
+            worker_scratch_root: None,
+        }
+    }
+
+    /// Selects the operator-owned host root for persistent worker scratch data.
+    #[must_use]
+    fn with_worker_scratch_root(mut self, root: PathBuf) -> Self {
+        self.worker_scratch_root = Some(root);
+        self
     }
 
     /// Creates, runs, observes, and removes one bounded worker container.
@@ -1302,6 +1338,23 @@ where
         let mut specification = ContainerSpec::new(&invocation.run_id, &invocation.image)
             .with_command(invocation.entrypoint.clone())
             .with_resources(invocation.resources);
+        if let Some(target) = &invocation.scratch_target {
+            let root = self
+                .worker_scratch_root
+                .as_ref()
+                .ok_or(RuntimeError::WorkerScratchUnavailable)?;
+            if !valid_absolute_container_path(target)
+                || invocation.worker.is_empty()
+                || !invocation
+                    .worker
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            {
+                return Err(RuntimeError::InvalidWorkerScratch);
+            }
+            specification = specification
+                .with_bind_mount(root.join(&invocation.worker).to_string_lossy(), target);
+        }
         specification.network = invocation.network.clone();
         specification.environment = invocation.environment.clone();
         specification.environment.extend(BTreeMap::from([

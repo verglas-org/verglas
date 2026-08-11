@@ -7,9 +7,10 @@ use async_trait::async_trait;
 
 use super::{
     ContainerSpec, DockerApi, DockerRuntimeCore, EngineContainer, EngineCreateRequest,
-    LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError,
-    TypescriptProject, VesselHttp, VesselProjectSpec, VesselRole, VesselSpec, WorkerInvocation,
-    WorkerProjectSpec, WorkerResources, WorkerRunResult, WorkerRuntime, ensure_local_postgres_tls,
+    LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ProjectBuildContext, ReconcileOutcome,
+    RuntimeError, TypescriptProject, VesselHttp, VesselProjectSpec, VesselRole, VesselSpec,
+    WorkerInvocation, WorkerProjectSpec, WorkerResources, WorkerRunResult, WorkerRuntime,
+    ensure_local_postgres_tls,
 };
 
 #[derive(Clone, Default)]
@@ -72,6 +73,7 @@ struct FakeState {
     result_file: Option<Vec<u8>>,
     logs: String,
     wait_error: bool,
+    last_bind_mounts: Vec<super::BindMount>,
 }
 
 /// A bounded run receives reserved bindings, returns its result, and is removed.
@@ -98,6 +100,7 @@ async fn bounded_worker_run_returns_result_and_cleans_up() {
             event: serde_json::json!({"id":"tick-1","source":"urn:test","specversion":"1.0","type":"test"}),
             resources: WorkerResources { vcpus: 1.0, memory_mib: 1024, pids: 64 },
             timeout_seconds: 600,
+            scratch_target: None,
         })
         .await
         .expect("worker result");
@@ -164,6 +167,7 @@ impl DockerApi for FakeDocker {
     /// Creates a stopped container from a normalized request.
     async fn create(&self, request: EngineCreateRequest) -> Result<(), RuntimeError> {
         let mut state = self.state.lock().expect("fake state lock");
+        state.last_bind_mounts = request.bind_mounts.clone();
         state.events.push_back(format!("create:{}", request.name));
         state.containers.insert(
             request.name.clone(),
@@ -278,6 +282,45 @@ impl DockerApi for FakeDocker {
     }
 }
 
+/// Operator-owned scratch storage is mounted per worker and never selected by worker code.
+#[tokio::test]
+async fn bounded_worker_uses_operator_scratch_root() {
+    let api = FakeDocker::default();
+    api.state.lock().expect("fake state").result_file =
+        Some(br#"{"rows":1,"error":null}"#.to_vec());
+    let runtime = DockerRuntimeCore::new(api.clone())
+        .with_worker_scratch_root("/Volumes/data_cache/verglas/workers".into());
+    let invocation = WorkerInvocation {
+        run_id: "run-scratch".to_owned(),
+        worker: "massive-options".to_owned(),
+        image: "verglas/worker-massive-options:sha256-test".to_owned(),
+        entrypoint: vec!["python".to_owned(), "worker.py".to_owned()],
+        environment: BTreeMap::new(),
+        target: "market.options".to_owned(),
+        endpoint: "http://verglas-server:8334".to_owned(),
+        token: String::new(),
+        network: None,
+        event: serde_json::json!({}),
+        resources: WorkerResources {
+            vcpus: 1.0,
+            memory_mib: 1024,
+            pids: 64,
+        },
+        timeout_seconds: 600,
+        scratch_target: Some("/scratch".to_owned()),
+    };
+
+    runtime.run_worker(&invocation).await.expect("worker run");
+
+    assert_eq!(
+        api.state.lock().expect("fake state").last_bind_mounts,
+        vec![super::BindMount {
+            source: "/Volumes/data_cache/verglas/workers/massive-options".to_owned(),
+            target: "/scratch".to_owned(),
+        }]
+    );
+}
+
 /// Runtime observation failures still remove the ephemeral worker container.
 #[tokio::test]
 async fn bounded_worker_run_cleans_up_after_engine_failure() {
@@ -301,6 +344,7 @@ async fn bounded_worker_run_cleans_up_after_engine_failure() {
             pids: 16,
         },
         timeout_seconds: 30,
+        scratch_target: None,
     };
 
     assert!(runtime.run_worker(&invocation).await.is_err());
@@ -382,7 +426,7 @@ fn bun_worker_project() -> WorkerProjectSpec {
 
 #[test]
 fn python_worker_build_is_locked_and_content_addressed() {
-    let original = python_worker_project()
+    let original: ProjectBuildContext = python_worker_project()
         .build_context()
         .expect("python build context");
     assert!(
@@ -485,7 +529,7 @@ fn custom_worker_uses_the_submitted_dockerfile() {
 fn typescript_project_is_content_addressed_and_generates_a_owned_build() {
     let project = typescript_project();
 
-    let build = project.build_context().expect("build context");
+    let build: ProjectBuildContext = project.build_context().expect("build context");
 
     assert!(
         build

@@ -42,7 +42,7 @@ fn docker_application_packages_execution_workers() {
     );
     assert!(
         dockerfile.contains("chown -R verglas:verglas /var/lib/verglas")
-            && compose.contains("verglas-cache:/var/lib/verglas"),
+            && compose.contains("${VERGLAS_CACHE_HOST_DIR:-verglas-cache}:/var/lib/verglas"),
         "the always-on KV log must use the existing writable persistent data volume"
     );
     assert!(!compose.contains("\n  postgres:"));

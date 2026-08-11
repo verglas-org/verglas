@@ -374,10 +374,12 @@ services:
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_CONTAINER_RUNTIME_NETWORK: verglas-runtime
       VERGLAS_CONTAINER_RUNTIME_STATE: /var/lib/verglas-container-runtime/deployments.json
+      VERGLAS_WORKER_SCRATCH_ROOT: ${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - verglas-runtime-state:/var/lib/verglas-container-runtime
       - verglas-access-neon-credentials:/var/run/verglas/neon:ro
+      - ${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}:${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8360/health"]
       interval: 2s

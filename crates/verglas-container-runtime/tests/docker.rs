@@ -15,7 +15,8 @@ use verglas_container_runtime::{
 #[tokio::test]
 #[ignore = "requires a local Docker Engine and pulls alpine:3.22"]
 async fn real_docker_lifecycle() {
-    let runtime = DockerRuntime::connect_local().expect("connect to local Docker Engine");
+    let runtime = DockerRuntime::connect_local(std::env::temp_dir().join("verglas-worker-scratch"))
+        .expect("connect to local Docker Engine");
     let deployment_id = format!("integration-{}", std::process::id());
     let source = tempfile::NamedTempFile::new().expect("source file");
     std::fs::write(source.path(), "runtime-secret").expect("source contents");
@@ -81,7 +82,8 @@ async fn real_python_worker_parses_a_large_compressed_file() {
             ("worker.py".to_owned(), read("worker.py")),
         ]),
     };
-    let runtime = DockerRuntime::connect_local().expect("Docker runtime");
+    let runtime = DockerRuntime::connect_local(std::env::temp_dir().join("verglas-worker-scratch"))
+        .expect("Docker runtime");
     let build = runtime
         .build_worker_project(&project)
         .await
@@ -112,6 +114,7 @@ async fn real_python_worker_parses_a_large_compressed_file() {
                 pids: 256,
             },
             timeout_seconds: 1_800,
+            scratch_target: None,
         })
         .await
         .expect("bounded worker run");
@@ -134,7 +137,8 @@ async fn real_typescript_worker_runs_with_a_locked_dependency() {
             ("worker.ts".to_owned(), read("worker.ts")),
         ]),
     };
-    let runtime = DockerRuntime::connect_local().expect("Docker runtime");
+    let runtime = DockerRuntime::connect_local(std::env::temp_dir().join("verglas-worker-scratch"))
+        .expect("Docker runtime");
     let build = runtime
         .build_worker_project(&project)
         .await
@@ -162,6 +166,7 @@ async fn real_typescript_worker_runs_with_a_locked_dependency() {
                 pids: 64,
             },
             timeout_seconds: 60,
+            scratch_target: None,
         })
         .await
         .expect("bounded Bun worker run");
@@ -171,7 +176,8 @@ async fn real_typescript_worker_runs_with_a_locked_dependency() {
 #[tokio::test]
 #[ignore = "requires a local Docker Engine and downloads one npm dependency"]
 async fn real_docker_builds_a_dependency_bearing_typescript_vessel() {
-    let runtime = DockerRuntime::connect_local().expect("connect to local Docker Engine");
+    let runtime = DockerRuntime::connect_local(std::env::temp_dir().join("verglas-worker-scratch"))
+        .expect("connect to local Docker Engine");
     let name = format!("dependency-app-{}", std::process::id());
     let project = VesselProjectSpec {
         name: name.clone(),

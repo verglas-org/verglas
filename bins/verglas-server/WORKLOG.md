@@ -637,3 +637,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   role config and passes the authorized caller token only through the short-lived
   child environment. It refuses databases absent from the live Lakehouse registry.
 - #107: Removed all queue directories and queue data-plane routes from `verglas-server`. Queue lifecycle and traffic now terminate at Access and the independently provisioned queue container.
+- #109: Updated Docker application coverage to accept the configurable local cache bind mount while preserving the named-volume default.
+- #109: Updated the process-level KV durability test to provide the mandatory access authority instead of relying on the removed unauthenticated local data-plane path.

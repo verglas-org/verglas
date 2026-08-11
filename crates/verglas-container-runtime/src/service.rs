@@ -599,6 +599,7 @@ struct VesselProjectView {
 struct WorkerProjectView {
     name: String,
     image: String,
+    image_digest: String,
 }
 
 /// Builds one bounded worker project without starting a long-lived container.
@@ -620,6 +621,7 @@ async fn put_worker_project(
     Ok(Json(WorkerProjectView {
         name: project.name,
         image: build.image,
+        image_digest: build.image_digest,
     }))
 }
 

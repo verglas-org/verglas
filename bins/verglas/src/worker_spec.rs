@@ -160,6 +160,9 @@ pub struct WorkerManifest {
     /// The Iceberg tables the worker writes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub target_tables: Vec<String>,
+    /// Optional absolute path backed by operator-owned persistent scratch storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scratch_target: Option<String>,
     /// Resource hints.
     #[serde(default, skip_serializing_if = "is_default_resources")]
     pub resources: Resources,
@@ -266,6 +269,13 @@ impl WorkerManifest {
                 return Err("an event trigger needs an event_type".into());
             }
         }
+        if self.scratch_target.as_ref().is_some_and(|path| {
+            !path.starts_with('/')
+                || path.len() == 1
+                || path.split('/').any(|part| matches!(part, "." | ".."))
+        }) {
+            return Err("scratch_target must be a clean absolute container path".into());
+        }
         Ok(())
     }
 
@@ -324,6 +334,9 @@ impl WorkerManifest {
             config.insert("env".to_owned(), json!(self.env));
         }
         config.insert("resources".to_owned(), json!(self.resources));
+        if let Some(target) = &self.scratch_target {
+            config.insert("scratch_target".to_owned(), json!(target));
+        }
         Value::String(Value::Object(config).to_string())
     }
 
@@ -400,6 +413,10 @@ impl WorkerManifest {
             .map(serde_json::from_value)
             .transpose()?
             .unwrap_or_default();
+        let scratch_target = config
+            .get("scratch_target")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         Ok(WorkerManifest {
             spec_version: SPEC_VERSION,
             name,
@@ -409,6 +426,7 @@ impl WorkerManifest {
             env,
             triggers,
             target_tables,
+            scratch_target,
             resources,
         })
     }
@@ -487,6 +505,7 @@ mod tests {
 name = "massive-options"
 runtime = "python"
 entrypoint = ["python", "worker.py"]
+scratch_target = "/scratch"
 
 [files]
 "pyproject.toml" = "[project]\nname='worker'\nversion='0.1.0'\n"
@@ -498,6 +517,7 @@ entrypoint = ["python", "worker.py"]
 
         assert_eq!(manifest.runtime, WorkerRuntime::Python);
         assert_eq!(manifest.entrypoint, ["python", "worker.py"]);
+        assert_eq!(manifest.scratch_target.as_deref(), Some("/scratch"));
         assert!(manifest.validate().is_ok());
     }
 
@@ -525,6 +545,7 @@ entrypoint = ["python", "worker.py"]
                 catchup: None,
             }],
             target_tables: vec!["metrics.samples".to_owned()],
+            scratch_target: None,
             resources: Resources {
                 vcpus: Some(0.25),
                 mem_mib: Some(256),
@@ -772,6 +793,7 @@ path = "/callbacks/orders"
                 file: Some("/var/log/app.log".to_owned()),
             }],
             target_tables: vec!["follow.app".to_owned()],
+            scratch_target: None,
             resources: Resources::default(),
         };
         assert!(manifest.validate().is_ok());

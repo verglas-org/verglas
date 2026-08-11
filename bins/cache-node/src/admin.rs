@@ -425,7 +425,7 @@ pub fn quiescence_router(quiescence: Quiescence) -> Router {
 /// Returns foreground activity only to the configured host agent.
 async fn quiescence_status(State(quiescence): State<Quiescence>, headers: HeaderMap) -> Response {
     if let Err(response) = authenticate_host(&headers, &quiescence.token) {
-        return response;
+        return *response;
     }
     Json(quiescence.tracker.snapshot()).into_response()
 }
@@ -433,7 +433,7 @@ async fn quiescence_status(State(quiescence): State<Quiescence>, headers: Header
 /// Atomically closes foreground admission before reporting the current fence.
 async fn fence_admission(State(quiescence): State<Quiescence>, headers: HeaderMap) -> Response {
     if let Err(response) = authenticate_host(&headers, &quiescence.token) {
-        return response;
+        return *response;
     }
     let _generation = quiescence.tracker.fence();
     Json(quiescence.tracker.snapshot()).into_response()
@@ -446,7 +446,7 @@ async fn unfence_admission(
     headers: HeaderMap,
 ) -> Response {
     if let Err(response) = authenticate_host(&headers, &quiescence.token) {
-        return response;
+        return *response;
     }
     if !quiescence.tracker.unfence(generation) {
         return (
@@ -491,7 +491,7 @@ async fn track_http_request(
 }
 
 /// Validates the host-agent bearer credential or returns a bounded 401.
-fn authenticate_host(headers: &HeaderMap, expected: &str) -> Result<(), Response> {
+fn authenticate_host(headers: &HeaderMap, expected: &str) -> Result<(), Box<Response>> {
     let supplied = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
@@ -499,12 +499,14 @@ fn authenticate_host(headers: &HeaderMap, expected: &str) -> Result<(), Response
     if supplied.is_some_and(|value| constant_time_eq(value, expected)) {
         Ok(())
     } else {
-        Err((
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, "Bearer")],
-            "host-agent bearer token required",
-        )
-            .into_response())
+        Err(Box::new(
+            (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, "Bearer")],
+                "host-agent bearer token required",
+            )
+                .into_response(),
+        ))
     }
 }
 
