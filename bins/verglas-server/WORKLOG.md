@@ -639,3 +639,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #107: Removed all queue directories and queue data-plane routes from `verglas-server`. Queue lifecycle and traffic now terminate at Access and the independently provisioned queue container.
 - #109: Updated Docker application coverage to accept the configurable local cache bind mount while preserving the named-volume default.
 - #109: Updated the process-level KV durability test to provide the mandatory access authority instead of relying on the removed unauthenticated local data-plane path.
+- #84: Updated the self-hosted packaging contract to pin the native multi-platform Verglas Neon images used by managed Postgres. The contract still rejects source-build and unpublished image fallbacks.

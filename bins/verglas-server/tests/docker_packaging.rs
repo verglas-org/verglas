@@ -151,10 +151,10 @@ fn docker_application_packages_execution_workers() {
         !compose.contains("verglas-neon-storage-image:")
             && !compose.contains("github.com/verglas-org/neon.git#")
             && postgres_runtime.contains(
-                "ghcr.io/verglas-org/neon-storage:294a7b6e99392e60ff18aa6bef08e54b77446f7d"
+                "ghcr.io/verglas-org/neon-storage:bc9110da9698a05559fcbf557dcbf427891ab61d"
             )
             && postgres_runtime.contains(
-                "ghcr.io/verglas-org/neon-compute-v16:294a7b6e99392e60ff18aa6bef08e54b77446f7d"
+                "ghcr.io/verglas-org/neon-compute-v16:bc9110da9698a05559fcbf557dcbf427891ab61d"
             ),
         "the managed Postgres runtime must consume published exact Verglas Neon images without a Compose source-build fallback"
     );

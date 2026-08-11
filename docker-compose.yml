@@ -33,6 +33,13 @@ x-pg-cache-environment: &pg-cache-environment
   VERGLAS_CACHE_CAPACITY: ${VERGLAS_POSTGRES_CACHE_CAPACITY:-1GB}
   VERGLAS_CACHE_DRAM: ${VERGLAS_POSTGRES_CACHE_DRAM:-256MB}
 
+# Coolify owns the Compose default network. Keep a second, stable network for
+# containers created through the Docker Engine API and every service that must
+# reach them by name.
+x-runtime-networks: &runtime-networks
+  - default
+  - runtime
+
 # The Verglas Lakekeeper adapter is not yet published to GHCR. Build the exact
 # reviewed fork revision locally and never fall back to the upstream image.
 x-lakekeeper-build: &lakekeeper-build
@@ -74,6 +81,7 @@ services:
     volumes:
       - ${VERGLAS_CACHE_HOST_DIR:-verglas-cache}:/var/lib/verglas
       - verglas-access-server-credentials:/var/run/verglas/server:ro
+    networks: *runtime-networks
     # Contain a future socket or cache FD leak inside this service. Docker's
     # million-descriptor default is large enough to exhaust a desktop host.
     ulimits:
@@ -133,6 +141,7 @@ services:
       - verglas-runtime-state:/var/lib/verglas-container-runtime:ro
     ports:
       - "127.0.0.1:8345:8345"
+    networks: *runtime-networks
     depends_on:
       verglas-neon-bootstrap:
         condition: service_completed_successfully
@@ -178,6 +187,7 @@ services:
         condition: service_healthy
       verglas-container-runtime:
         condition: service_healthy
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8340/healthz')"]
       interval: 2s
@@ -204,6 +214,7 @@ services:
       VERGLAS_MANAGED_POSTGRES_CREDENTIAL_DIRECTORY: /var/lib/verglas-container-runtime/system-postgres
     volumes:
       - verglas-runtime-state:/var/lib/verglas-container-runtime
+    networks: *runtime-networks
     depends_on:
       verglas-container-runtime:
         condition: service_healthy
@@ -232,6 +243,7 @@ services:
     depends_on:
       verglas-neon-bootstrap:
         condition: service_completed_successfully
+    networks: *runtime-networks
     restart: "no"
 
   verglas-openfga:
@@ -247,6 +259,7 @@ services:
     depends_on:
       verglas-openfga-migrate:
         condition: service_completed_successfully
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=127.0.0.1:8081"]
       interval: 2s
@@ -266,6 +279,7 @@ services:
     depends_on:
       verglas-neon-bootstrap:
         condition: service_completed_successfully
+    networks: *runtime-networks
     restart: "no"
 
   verglas-lakekeeper:
@@ -284,6 +298,7 @@ services:
       VERGLAS_CACHE_CONSISTENCY: ${VERGLAS_CACHE_CONSISTENCY:-eventual}
     volumes:
       - verglas-access-lakekeeper-credentials:/var/run/verglas/lakekeeper:ro
+    networks: *runtime-networks
     depends_on:
       verglas-lakekeeper-migrate:
         condition: service_completed_successfully
@@ -309,6 +324,7 @@ services:
       - verglas-pg-cache-0:/var/lib/verglas
     networks:
       default:
+      runtime:
       pg-ring:
         ipv4_address: 172.29.240.10
     healthcheck:
@@ -331,6 +347,7 @@ services:
       - verglas-pg-cache-1:/var/lib/verglas
     networks:
       default:
+      runtime:
       pg-ring:
         ipv4_address: 172.29.240.11
     healthcheck:
@@ -353,6 +370,7 @@ services:
       - verglas-pg-cache-2:/var/lib/verglas
     networks:
       default:
+      runtime:
       pg-ring:
         ipv4_address: 172.29.240.12
     healthcheck:
@@ -380,6 +398,7 @@ services:
       - verglas-runtime-state:/var/lib/verglas-container-runtime
       - verglas-access-neon-credentials:/var/run/verglas/neon:ro
       - ${VERGLAS_WORKER_SCRATCH_HOST_DIR:-/var/lib/verglas-worker-scratch}:/var/lib/verglas-worker-scratch
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8360/health"]
       interval: 2s
@@ -413,6 +432,7 @@ services:
         condition: service_healthy
       verglas-access:
         condition: service_healthy
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:8390/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
       interval: 2s
@@ -451,6 +471,7 @@ services:
       - ${HOME}/.codex:/root/.codex
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.cursor:/root/.cursor
+    networks: *runtime-networks
     depends_on:
       verglas-server:
         condition: service_started
@@ -476,7 +497,7 @@ volumes:
   verglas-pg-cache-2:
 
 networks:
-  default:
+  runtime:
     name: verglas-runtime
     labels:
       io.verglas.managed: "true"

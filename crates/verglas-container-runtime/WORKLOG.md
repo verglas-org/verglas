@@ -51,3 +51,4 @@
 - #109: Added content-addressed locked worker builds for Python and Bun plus explicit Dockerfile projects. Added bounded one-shot execution with hard CPU, memory, PID, and timeout limits, runtime environment injection, result capture, bounded logs, and deterministic cleanup.
 - #109: Unified Vessel and worker packaging behind one deterministic `ProjectBuildContext`. The runtime now returns the explicit SHA-256 build-context digest with every immutable worker image.
 - #109: Added operator-owned per-worker scratch mounts for large bounded jobs. Worker declarations select only the container target; the runtime selects and validates the host root.
+- #109: Added a separate named runtime network to the Compose application and attached the control plane and cache nodes explicitly. Runtime-created workers and database containers remain reachable when a deployment platform replaces the Compose default network.

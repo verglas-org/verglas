@@ -20,9 +20,9 @@ use verglas_database::DatabaseServiceError;
 use crate::database_runtime::ManagedPostgresRuntime;
 
 const STORAGE_IMAGE: &str =
-    "ghcr.io/verglas-org/neon-storage:294a7b6e99392e60ff18aa6bef08e54b77446f7d";
+    "ghcr.io/verglas-org/neon-storage:bc9110da9698a05559fcbf557dcbf427891ab61d";
 const COMPUTE_IMAGE: &str =
-    "ghcr.io/verglas-org/neon-compute-v16:294a7b6e99392e60ff18aa6bef08e54b77446f7d";
+    "ghcr.io/verglas-org/neon-compute-v16:bc9110da9698a05559fcbf557dcbf427891ab61d";
 const COMPUTE_PORT: u16 = 55_433;
 pub(crate) const PROXY_PORT: u16 = 5_432;
 const PROXY_HTTP_PORT: u16 = 7_001;
@@ -251,14 +251,11 @@ impl ManagedPostgresProvisioner {
         let pageserver_host = docker_hostname(&pageserver_id);
         let password = derive_credential(&self.config.credential_key, &resource_key)?;
 
-        let broker = ContainerSpec::new(&broker_id, STORAGE_IMAGE)
-            .with_platform("linux/amd64")
-            .with_command([
-                "/usr/local/bin/storage_broker",
-                "--listen-addr=0.0.0.0:50051",
-            ]);
+        let broker = ContainerSpec::new(&broker_id, STORAGE_IMAGE).with_command([
+            "/usr/local/bin/storage_broker",
+            "--listen-addr=0.0.0.0:50051",
+        ]);
         let pageserver = ContainerSpec::new(&pageserver_id, STORAGE_IMAGE)
-            .with_platform("linux/amd64")
             .with_entrypoint(["/bin/sh", "-ec"])
             .with_command([pageserver_script()])
             .with_environment(
@@ -279,7 +276,6 @@ impl ManagedPostgresProvisioner {
                 format!("postgres/{tenant_id}"),
             );
         let compute = ContainerSpec::new(&compute_id, COMPUTE_IMAGE)
-            .with_platform("linux/amd64")
             .with_entrypoint(["/bin/sh", "-ec"])
             .with_command([compute_script()])
             .with_environment("VERGLAS_PG_DATABASE", database)
@@ -297,7 +293,6 @@ impl ManagedPostgresProvisioner {
             );
         let access_origin = self.config.access_endpoint.trim_end_matches('/');
         let proxy = ContainerSpec::new(&proxy_id, STORAGE_IMAGE)
-            .with_platform("linux/amd64")
             .with_entrypoint(["/usr/local/bin/proxy"])
             .with_command([
                 format!("--proxy=0.0.0.0:{PROXY_PORT}"),
@@ -832,9 +827,9 @@ mod tests {
 
     use super::{ManagedPostgresConfig, ManagedPostgresProvisioner, tenant_is_active};
 
-    /// Pins raw component images and cross-architecture execution explicitly.
+    /// Pins multi-platform component images and lets Docker select the host architecture.
     #[test]
-    fn managed_postgres_uses_published_images_on_their_only_platform() {
+    fn managed_postgres_uses_native_published_images() {
         let provisioner = ManagedPostgresProvisioner::new(ManagedPostgresConfig::fixture())
             .expect("valid provisioner");
         let plan = provisioner.plan("analytics").expect("plan");
@@ -848,7 +843,7 @@ mod tests {
         assert!(
             plan.containers
                 .iter()
-                .all(|container| container.platform.as_deref() == Some("linux/amd64"))
+                .all(|container| container.platform.is_none())
         );
     }
 

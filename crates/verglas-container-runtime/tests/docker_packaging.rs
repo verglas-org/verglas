@@ -86,6 +86,13 @@ fn compose_bootstraps_the_complete_oss_stack() {
     ));
     assert!(compose.contains("name: verglas-runtime"));
     assert!(
+        compose.contains("x-runtime-networks: &runtime-networks")
+            && compose.contains("runtime:\n    name: verglas-runtime")
+            && compose.matches("networks: *runtime-networks").count() >= 9
+            && compose.matches("      runtime:").count() >= 3,
+        "control-plane and cache services must join the explicit runtime network"
+    );
+    assert!(
         compose.contains("VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360")
     );
     assert!(compose.contains("VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340"));
