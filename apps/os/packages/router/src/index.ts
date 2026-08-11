@@ -9,10 +9,15 @@ export interface Env {
 
 function backendFetch(env: Env, req: Request): Promise<Response> {
   if (!env.WORKSHOP_BACKEND) {
-    return Promise.resolve(new Response(
-      "WORKSHOP_BACKEND service binding is missing. Restart via `pnpm run-local` / `pnpm dev-server` so wrangler.dev.jsonc is regenerated.",
-      { status: 503, headers: { "content-type": "text/plain; charset=utf-8" } },
-    ));
+    return Promise.resolve(
+      new Response(
+        "WORKSHOP_BACKEND service binding is missing. Restart via `pnpm run-local` / `pnpm dev-server` so wrangler.dev.jsonc is regenerated.",
+        {
+          status: 503,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        },
+      ),
+    );
   }
   return env.WORKSHOP_BACKEND.fetch(req);
 }
@@ -21,12 +26,15 @@ export default {
   async fetch(req, env) {
     const url = new URL(req.url);
 
-    if (url.pathname === "/api" || url.pathname.startsWith("/api/") ||
-        url.pathname === "/blueprint-screenshot" ||
-        url.pathname.startsWith("/blueprint-screenshot/") ||
-        url.pathname === "/application-screenshot" ||
-        url.pathname.startsWith("/application-screenshot/") ||
-        url.pathname.startsWith("/apps/")) {
+    if (
+      url.pathname === "/api" ||
+      url.pathname.startsWith("/api/") ||
+      url.pathname === "/blueprint-screenshot" ||
+      url.pathname.startsWith("/blueprint-screenshot/") ||
+      url.pathname === "/application-screenshot" ||
+      url.pathname.startsWith("/application-screenshot/") ||
+      url.pathname.startsWith("/apps/")
+    ) {
       return backendFetch(env, req);
     }
 

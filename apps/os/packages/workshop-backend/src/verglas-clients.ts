@@ -32,8 +32,9 @@ export function verglasDatabaseAccess(
 ): VerglasAccessClient {
   const endpoint = env.VERGLAS_ACCESS_URI?.trim();
   if (!endpoint) throw new Error("VERGLAS_ACCESS_URI is not configured.");
-  if (!token.trim()) throw new Error("A user-scoped Verglas access token is required.");
-  return connectAccess({endpoint, token, fetch: fetcher});
+  if (!token.trim())
+    throw new Error("A user-scoped Verglas access token is required.");
+  return connectAccess({ endpoint, token, fetch: fetcher });
 }
 
 /** Database-scoped data-query and catalog listener. */
@@ -43,13 +44,18 @@ export function verglasAdmin(
   fetcher?: typeof fetch,
 ): VerglasAdminClient {
   const endpoint = env.VERGLAS_ADMIN_URL?.trim();
-  if (!endpoint) throw new Error("The local Verglas data endpoint is not configured.");
-  if (!token.trim()) throw new Error("A user-scoped Verglas data token is required.");
-  return connectAdmin({endpoint, token, fetch: fetcher});
+  if (!endpoint)
+    throw new Error("The local Verglas data endpoint is not configured.");
+  if (!token.trim())
+    throw new Error("A user-scoped Verglas data token is required.");
+  return connectAdmin({ endpoint, token, fetch: fetcher });
 }
 
 /** Scheduler control (worker registry, runs, secrets, and job history). */
-export function verglasScheduler(env: VerglasClientEnv, fetcher?: typeof fetch): VerglasSchedulerClient {
+export function verglasScheduler(
+  env: VerglasClientEnv,
+  fetcher?: typeof fetch,
+): VerglasSchedulerClient {
   const endpoint = env.VERGLAS_SCHEDULER_URL?.trim();
   const token = env.VERGLAS_SCHEDULER_CONTROL_TOKEN?.trim();
   if (!endpoint || !token) {
@@ -61,7 +67,10 @@ export function verglasScheduler(env: VerglasClientEnv, fetcher?: typeof fetch):
 }
 
 /** Local container runtime (Vessels). */
-export function verglasRuntime(env: VerglasClientEnv, fetcher?: typeof fetch): VerglasRuntimeClient {
+export function verglasRuntime(
+  env: VerglasClientEnv,
+  fetcher?: typeof fetch,
+): VerglasRuntimeClient {
   const endpoint = env.VERGLAS_CONTAINER_RUNTIME_URL?.trim();
   const token = env.VERGLAS_CONTAINER_RUNTIME_TOKEN?.trim();
   if (!endpoint || !token) {
@@ -73,7 +82,9 @@ export function verglasRuntime(env: VerglasClientEnv, fetcher?: typeof fetch): V
 }
 
 /** True when the local container runtime endpoint and credential are configured together. */
-export function resolveLocalContainerRuntimeConfigured(env: VerglasClientEnv): boolean {
+export function resolveLocalContainerRuntimeConfigured(
+  env: VerglasClientEnv,
+): boolean {
   const endpoint = Boolean(env.VERGLAS_CONTAINER_RUNTIME_URL?.trim());
   const token = Boolean(env.VERGLAS_CONTAINER_RUNTIME_TOKEN?.trim());
   if (endpoint !== token) {

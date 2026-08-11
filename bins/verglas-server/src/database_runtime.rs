@@ -160,7 +160,7 @@ impl DatabaseCatalogSynchronizer {
                         .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?,
                     DatabaseId::new(id.clone())
                         .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?,
-                    self.managed_gateway(&name)?,
+                    self.managed_gateway(name)?,
                 )),
                 DatabaseView::Lakehouse {
                     name,

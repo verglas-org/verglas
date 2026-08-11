@@ -6,7 +6,7 @@
   "scripts": {
     "build": "pnpm run --recursive build",
     "run-local": "node scripts/run-local.mjs",
-    "test": "node --test scripts/*.test.js && pnpm run --recursive --if-present test",
+    "test": "node --test scripts/*.test.js && pnpm --filter @verglas/typed-storage build && pnpm run --recursive --if-present test",
     "dev-client": "cd packages/workshop-frontend && pnpm run dev",
     "dev-server": "node run-dev-server.js",
     "clean": "pnpm run --recursive clean",

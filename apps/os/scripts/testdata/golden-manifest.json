@@ -27,7 +27,8 @@
           "/blueprint-screenshot",
           "/blueprint-screenshot/*",
           "/application-screenshot",
-          "/application-screenshot/*"
+          "/application-screenshot/*",
+          "/apps/*"
         ],
         "variants": {
           "access": {
@@ -136,28 +137,19 @@
       "mainModule": "server.js",
       "migrations": [
         {
-          "new_sqlite_classes": [
-            "UserDurableObject",
-            "OverseerDurableObject"
-          ],
+          "new_sqlite_classes": ["UserDurableObject", "OverseerDurableObject"],
           "tag": "v0"
         },
         {
-          "new_sqlite_classes": [
-            "AdminSettings"
-          ],
+          "new_sqlite_classes": ["AdminSettings"],
           "tag": "v1"
         },
         {
-          "new_sqlite_classes": [
-            "PendingLogin"
-          ],
+          "new_sqlite_classes": ["PendingLogin"],
           "tag": "v2"
         },
         {
-          "deleted_classes": [
-            "OverseerDurableObject"
-          ],
+          "deleted_classes": ["OverseerDurableObject"],
           "tag": "v3"
         }
       ],

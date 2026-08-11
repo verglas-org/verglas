@@ -1,4 +1,4 @@
-import {connectScheduler} from "@verglas/sdk";
+import { connectScheduler } from "@verglas/sdk";
 
 /** Environment values used to register and configure local Verglas workers. */
 export interface VerglasWorkerRuntimeEnv {
@@ -25,21 +25,31 @@ export interface VerglasWorkerRuntimeConfig {
 /** Rejects generated modules that do not implement the executable Verglas worker contract. */
 export function validateVerglasWorkerModule(module: string): void {
   const requirements: Array<[RegExp, string]> = [
-    [/from\s+["']\/sdks\/typescript\/src\/index\.ts["']/, "import the bundled Verglas SDK"],
+    [
+      /from\s+["']\/sdks\/typescript\/src\/index\.ts["']/,
+      "import the bundled Verglas SDK",
+    ],
     [/defineWorker\s*(?:<[^>]+>)?\s*\(/, "call defineWorker()"],
     [/export\s+default\b/, "default-export the worker definition"],
     [/\bhandler\s*\(/, "define a handler(ctx) method"],
-    [/ctx\.client\.ensureTable\s*\(\s*ctx\.output\s*,\s*\{\s*schema\s*:/s,
-      "ensure ctx.output with a schema array"],
-    [/ctx\.client\.table\s*\(\s*ctx\.output\s*\)\.append\s*\(/,
-      "append rows through ctx.client.table(ctx.output)"],
+    [
+      /ctx\.client\.ensureTable\s*\(\s*ctx\.output\s*,\s*\{\s*schema\s*:/s,
+      "ensure ctx.output with a schema array",
+    ],
+    [
+      /ctx\.client\.table\s*\(\s*ctx\.output\s*\)\.append\s*\(/,
+      "append rows through ctx.client.table(ctx.output)",
+    ],
     [/\browsWritten\b/, "return rowsWritten for scheduler observability"],
   ];
   for (const [pattern, instruction] of requirements) {
-    if (!pattern.test(module)) throw new Error(`A Source module must ${instruction}.`);
+    if (!pattern.test(module))
+      throw new Error(`A Source module must ${instruction}.`);
   }
   if (/ctx\.output\.append\s*\(/.test(module)) {
-    throw new Error("ctx.output is a table name; append through ctx.client.table(ctx.output).");
+    throw new Error(
+      "ctx.output is a table name; append through ctx.client.table(ctx.output).",
+    );
   }
   if (/\b(?:async\s+)?run\s*\(\s*ctx\b/.test(module)) {
     throw new Error("defineWorker() invokes handler(ctx), not run(ctx).");
@@ -48,7 +58,8 @@ export function validateVerglasWorkerModule(module: string): void {
 
 /** Resolves an all-or-nothing local worker control-plane configuration. */
 export function resolveVerglasWorkerRuntimeConfig(
-    env: VerglasWorkerRuntimeEnv): VerglasWorkerRuntimeConfig | null {
+  env: VerglasWorkerRuntimeEnv,
+): VerglasWorkerRuntimeConfig | null {
   const schedulerEndpoint = env.VERGLAS_SCHEDULER_URL?.trim();
   const schedulerToken = env.VERGLAS_SCHEDULER_CONTROL_TOKEN?.trim();
   if (!schedulerEndpoint && !schedulerToken) return null;
@@ -69,7 +80,10 @@ export class VerglasWorkerRuntimeClient {
   readonly #schedulerToken: string;
   readonly #fetch: typeof fetch;
 
-  constructor(config: VerglasWorkerRuntimeConfig, fetcher: typeof fetch = fetch) {
+  constructor(
+    config: VerglasWorkerRuntimeConfig,
+    fetcher: typeof fetch = fetch,
+  ) {
     this.#schedulerEndpoint = config.schedulerEndpoint;
     this.#schedulerToken = config.schedulerToken;
     this.#fetch = fetcher.bind(globalThis);
@@ -91,7 +105,10 @@ export class VerglasWorkerRuntimeClient {
     }).registerWorker(deployment);
   }
 
-  async run(name: string, idempotencyKey: string): Promise<{job_id: string, created: boolean}> {
+  async run(
+    name: string,
+    idempotencyKey: string,
+  ): Promise<{ job_id: string; created: boolean }> {
     return await connectScheduler({
       endpoint: this.#schedulerEndpoint,
       token: this.#schedulerToken,

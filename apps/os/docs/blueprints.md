@@ -26,7 +26,7 @@ A blueprint does **not** capture:
 
 - The workspace's SQLite storage contents.
 - AI chat history or edit history.
-- Live connections or credentials. Only the *shape* of each binding (its type, gatekeeper name, URL pattern, etc.) is recorded.
+- Live connections or credentials. Only the _shape_ of each binding (its type, gatekeeper name, URL pattern, etc.) is recorded.
 
 ## Binding Annotations
 
@@ -118,7 +118,7 @@ Featured blueprint state is split across two stores:
 
 A **format** is an ordinary blueprint the deployment has promoted, so that "New Doc" or "New Slides" appears in the composer's `+` menu and in the list the agent is told to prefer. Promotion is admin curation (`AdminConfig.formats`, managed in the admin **Formats** panel); nothing about the blueprint itself changes.
 
-What a blueprint may declare is `BlueprintMetadata.output`: a grouping `id`, a `noun` and `plural` ("Doc"/"Docs"), and an `icon` from the closed `OUTPUT_ICONS` set. A workspace instantiated from the blueprint inherits it, and that is what the workspace tab, chat cards and the Outputs page draw. Declaring it is presentation only and grants nothing -- any user can publish a blueprint calling itself a Document. Being *offered* as one of the deployment's standard formats is the separate, admin-curated decision. An admin can override any of these fields (`FormatCuration.overrides`), and the override is applied on every instantiation path, so a rename reaches workspaces the agent builds as well as ones made from the menu.
+What a blueprint may declare is `BlueprintMetadata.output`: a grouping `id`, a `noun` and `plural` ("Doc"/"Docs"), and an `icon` from the closed `OUTPUT_ICONS` set. A workspace instantiated from the blueprint inherits it, and that is what the workspace tab, chat cards and the Outputs page draw. Declaring it is presentation only and grants nothing -- any user can publish a blueprint calling itself a Document. Being _offered_ as one of the deployment's standard formats is the separate, admin-curated decision. An admin can override any of these fields (`FormatCuration.overrides`), and the override is applied on every instantiation path, so a rename reaches workspaces the agent builds as well as ones made from the menu.
 
 A deployment can also ship blueprints as data. `packages/workshop-backend/format-blueprints/` holds a `<name>.blueprint` archive plus a `<name>.json` sidecar for each, and `scripts/build-format-blueprints.mjs` bundles that directory (overridable with `FORMAT_BLUEPRINTS_DIR`, so a fork can ship its own set) into a generated module. These differ from published blueprints in three ways:
 
@@ -164,7 +164,7 @@ The new workspace is independent from the blueprint source: it has its own stora
 
 ### Instantiation by the agent
 
-The AI agent can also instantiate a blueprint as an *additional* workspace within an existing workspace:
+The AI agent can also instantiate a blueprint as an _additional_ workspace within an existing workspace:
 
 - The `listBlueprints` tool lists the blueprints available to the workspace owner (the deployment's standard formats, listed first and marked as preferred, then their own published blueprints, their library, and the deployment's featured set) as formatted text; there is no search index, so the model scans the list itself.
 - Passing a `blueprintId` to the `createVessel` tool creates the new workspace from the blueprint's code instead of empty. The workspace is provisional to the chat like any agent-created workspace, and the blueprint's files are copied into the chat's proposed changes (recorded in the same `changes` message as the creation), so accepting or reverting the chat's changes covers the files and the creation together.

@@ -9,10 +9,16 @@ export async function proxyApplicationPreview(
   fetcher: typeof fetch = fetch,
 ): Promise<Response> {
   const endpoint = env.VERGLAS_CONTAINER_RUNTIME_URL?.trim();
-  if (!endpoint) return new Response("Application previews are unavailable.", {status: 503});
+  if (!endpoint)
+    return new Response("Application previews are unavailable.", {
+      status: 503,
+    });
 
   const incoming = new URL(request.url);
-  const target = new URL(incoming.pathname + incoming.search, endpoint.replace(/\/+$/, "") + "/");
+  const target = new URL(
+    incoming.pathname + incoming.search,
+    endpoint.replace(/\/+$/, "") + "/",
+  );
   const headers = new Headers(request.headers);
   headers.delete("authorization");
   headers.delete("cookie");
@@ -22,7 +28,10 @@ export async function proxyApplicationPreview(
   return await fetcher(target, {
     method: request.method,
     headers,
-    body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body,
+    body:
+      request.method === "GET" || request.method === "HEAD"
+        ? undefined
+        : request.body,
     redirect: "manual",
   });
 }

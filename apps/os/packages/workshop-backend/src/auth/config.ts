@@ -12,7 +12,10 @@
 export function getAuthGatekeeperAllowlist(env: Cloudflare.Env): string[] {
   const raw = (env as { AUTH_GATEKEEPERS?: string }).AUTH_GATEKEEPERS;
   if (!raw) return [];
-  return raw.split(",").map(s => s.trim().toLowerCase()).filter(Boolean);
+  return raw
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
 }
 
 // Whether the deployment has opted any gatekeeper into sign-in.

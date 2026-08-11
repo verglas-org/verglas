@@ -7,6 +7,8 @@ export type SignupPresentationConfig = {
 };
 
 /** Returns whether the login surface should offer account creation. */
-export function shouldShowSignupLink(config: SignupPresentationConfig): boolean {
+export function shouldShowSignupLink(
+  config: SignupPresentationConfig,
+): boolean {
   return config.passwordAuthEnabled && config.signupsEnabled;
 }

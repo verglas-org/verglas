@@ -1,15 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  authorizationDecision, boundedPrompt, gatewayTargetToken, requireIdentifier, requireScopedToken,
-  runCapabilityEnvironment, runDeploymentId,
+  authorizationDecision,
+  boundedPrompt,
+  gatewayTargetToken,
+  requireIdentifier,
+  requireScopedToken,
+  runCapabilityEnvironment,
+  runDeploymentId,
 } from "../src/contracts.mjs";
 
 test("authorizationDecision unwraps the access service response", () => {
-  assert.deepEqual(authorizationDecision({
-    identity: {principal_id: "token/example"},
-    decision: {allowed: true, policy_version: 7},
-  }), {allowed: true, policy_version: 7});
+  assert.deepEqual(
+    authorizationDecision({
+      identity: { principal_id: "token/example" },
+      decision: { allowed: true, policy_version: 7 },
+    }),
+    { allowed: true, policy_version: 7 },
+  );
 });
 
 test("agent runs use the container runtime ephemeral namespace", () => {
@@ -20,7 +28,10 @@ test("agent runs use the container runtime ephemeral namespace", () => {
 test("prompts are non-empty and bounded", () => {
   assert.equal(boundedPrompt("  inspect data  "), "inspect data");
   assert.throws(() => boundedPrompt(""), /required/);
-  assert.equal(requireIdentifier("workspace-a.1", "workspace"), "workspace-a.1");
+  assert.equal(
+    requireIdentifier("workspace-a.1", "workspace"),
+    "workspace-a.1",
+  );
 });
 
 test("agent runs receive one scoped token rather than controller credentials", () => {
@@ -43,7 +54,10 @@ test("agent runs receive one scoped token rather than controller credentials", (
 });
 
 test("agent runtime accepts only a caller-minted scoped token", () => {
-  assert.equal(requireScopedToken("already-minted-token"), "already-minted-token");
+  assert.equal(
+    requireScopedToken("already-minted-token"),
+    "already-minted-token",
+  );
   assert.throws(() => requireScopedToken(""), /scoped token/);
   assert.throws(() => requireScopedToken(undefined), /scoped token/);
 });
@@ -58,7 +72,13 @@ test("gateway translates to its private container token only after authorization
     "run-token",
   );
   assert.throws(
-    () => gatewayTargetToken("runtime", false, "run-token", "container-runtime-token"),
+    () =>
+      gatewayTargetToken(
+        "runtime",
+        false,
+        "run-token",
+        "container-runtime-token",
+      ),
     /permission denied/,
   );
 });

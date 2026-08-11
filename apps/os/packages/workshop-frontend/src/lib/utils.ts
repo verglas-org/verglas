@@ -1,4 +1,4 @@
-import { cn as kumoCn } from '@cloudflare/kumo'
+import { cn as kumoCn } from "@cloudflare/kumo";
 
 /**
  * Combines Tailwind class values with the same conflict resolution used by Kumo.
@@ -6,5 +6,5 @@ import { cn as kumoCn } from '@cloudflare/kumo'
  * This is the conventional shadcn import point: `@/lib/utils`.
  */
 export function cn(...inputs: Parameters<typeof kumoCn>) {
-  return kumoCn(...inputs)
+  return kumoCn(...inputs);
 }

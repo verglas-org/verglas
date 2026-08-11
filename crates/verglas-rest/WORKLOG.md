@@ -42,3 +42,5 @@
 - #81: Authorized `ingest?mode=create` against the owning database's `create_child` permission
   and idempotently declared the canonical table resource before dispatching the write. Existing-
   table ingest remains table-scoped and requires `append`, with no manual Postgres/OpenFGA edit.
+- #81: Kept authorization registration after durable database creation so the resource uses the
+  immutable database ID. A failed database create now leaves no authorization resource to remove.

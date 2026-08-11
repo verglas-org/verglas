@@ -10,11 +10,11 @@ declare global {
       ADMINS?: string[];
 
       // Blueprint storage bindings.
-      BLUEPRINTS: KVNamespace;             // Workers KV for blueprint metadata lookup
-      BLUEPRINT_CONTENT: R2Bucket;         // R2 bucket for blueprint code snapshots
+      BLUEPRINTS: KVNamespace; // Workers KV for blueprint metadata lookup
+      BLUEPRINT_CONTENT: R2Bucket; // R2 bucket for blueprint code snapshots
 
       // User avatar storage.
-      AVATARS: KVNamespace;                // Workers KV for user avatar images
+      AVATARS: KVNamespace; // Workers KV for user avatar images
 
       // Note: gatekeeper service bindings (GATEKEEPER_*) are intentionally NOT declared here. Core
       // discovers them generically by scanning env for the GATEKEEPER_ prefix (buildGatekeeperVendorMap)
@@ -40,8 +40,8 @@ declare global {
 
       // Cloudflare Access configuration. When CF_ACCESS_AUD is set, the deployment authenticates via
       // Cloudflare Access (SSO). (Also referenced via a local Env extension in server.ts.)
-      CF_ACCESS_AUD?: string;   // audience
-      CF_ACCESS_ISS?: string;   // team URL, e.g. https://<team>.cloudflareaccess.com
+      CF_ACCESS_AUD?: string; // audience
+      CF_ACCESS_ISS?: string; // team URL, e.g. https://<team>.cloudflareaccess.com
 
       // Comma-separated allowlist of gatekeeper vendor ids permitted to drive sign-in (e.g.
       // "google,github,cloudflare"). A listed gatekeeper must also advertise providesAuth. Empty =
@@ -55,7 +55,6 @@ declare global {
 
       // Public base URL of the deployment.
       PUBLIC_BASE_URL?: string;
-
 
       // Local Verglas worker control plane used by generated Sources.
       VERGLAS_ADMIN_URL?: string;
@@ -81,7 +80,6 @@ declare global {
       LOCAL_MODEL_RUNTIME_TOKEN?: string;
       VERGLAS_AGENT_RUNTIME_URL?: string;
       VERGLAS_AGENT_RUNTIME_TOKEN?: string;
-
     }
   }
 }

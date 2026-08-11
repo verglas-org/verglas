@@ -10,7 +10,13 @@
 // Env:
 //   VITE_BACKEND_HOST=localhost:9000  Also pass --port 9000 to wrangler dev.
 
-import { existsSync, readFileSync, writeFileSync, readdirSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  readdirSync,
+  statSync,
+} from "node:fs";
 import { execFileSync, spawn } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -37,8 +43,10 @@ function loadDevVars() {
     const key = line.slice(0, eq).trim();
     let value = line.slice(eq + 1).trim();
     // Strip surrounding single or double quotes.
-    if ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))) {
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
       value = value.slice(1, -1);
     }
     if (process.env[key] === undefined) process.env[key] = value;
@@ -73,15 +81,15 @@ const serveFrontendAssets = process.argv.includes("--serve-frontend-assets");
 function findGatekeepers(parentDir) {
   try {
     return readdirSync(parentDir)
-        .filter(name => name.startsWith("gatekeeper-"))
-        .filter(name => {
-      try {
-        return statSync(join(parentDir, name, "wrangler.jsonc")).isFile();
-      } catch {
-        return false;
-      }
-    })
-        .map(name => ({ name, dir: join(parentDir, name) }));
+      .filter((name) => name.startsWith("gatekeeper-"))
+      .filter((name) => {
+        try {
+          return statSync(join(parentDir, name, "wrangler.jsonc")).isFile();
+        } catch {
+          return false;
+        }
+      })
+      .map((name) => ({ name, dir: join(parentDir, name) }));
   } catch {
     return [];
   }
@@ -105,23 +113,31 @@ function spawnDevWatcher(label, command, args) {
   const watcher = spawn(command, args, { stdio: "inherit", cwd: ROOT });
   watcher.on("exit", (code, signal) => {
     if (stoppingDevWatchers) return;
-    console.error(`${label} exited unexpectedly (code=${code}, signal=${signal}).`);
+    console.error(
+      `${label} exited unexpectedly (code=${code}, signal=${signal}).`,
+    );
   });
   devWatchers.push(watcher);
 }
 
-const localModelRuntime = spawn(process.execPath, [join(ROOT, "scripts", "local-model-runtime.mjs")], {
-  stdio: "inherit",
-  cwd: ROOT,
-  env: {
-    ...process.env,
-    LOCAL_MODEL_RUNTIME_PORT: localModelRuntimePort,
-    LOCAL_MODEL_RUNTIME_TOKEN: localModelRuntimeToken,
+const localModelRuntime = spawn(
+  process.execPath,
+  [join(ROOT, "scripts", "local-model-runtime.mjs")],
+  {
+    stdio: "inherit",
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      LOCAL_MODEL_RUNTIME_PORT: localModelRuntimePort,
+      LOCAL_MODEL_RUNTIME_TOKEN: localModelRuntimeToken,
+    },
   },
-});
+);
 localModelRuntime.on("exit", (code, signal) => {
   if (stoppingDevWatchers) return;
-  console.error(`native model runtime adapter exited unexpectedly (code=${code}, signal=${signal}).`);
+  console.error(
+    `native model runtime adapter exited unexpectedly (code=${code}, signal=${signal}).`,
+  );
 });
 devWatchers.push(localModelRuntime);
 
@@ -130,15 +146,18 @@ async function waitForLocalModelRuntime() {
   let detail = "did not become ready";
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${localModelRuntimePort}/health`, {
-        headers: { Authorization: `Bearer ${localModelRuntimeToken}` },
-      });
+      const response = await fetch(
+        `http://127.0.0.1:${localModelRuntimePort}/health`,
+        {
+          headers: { Authorization: `Bearer ${localModelRuntimeToken}` },
+        },
+      );
       if (response.ok) return;
       detail = `returned HTTP ${response.status}`;
     } catch (error) {
       detail = error instanceof Error ? error.message : String(error);
     }
-    await new Promise(resolve => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, 100));
   }
   throw new Error(`Native model runtime adapter ${detail}.`);
 }
@@ -149,7 +168,10 @@ for (const gk of gatekeepers) {
   // Configurator UI (compiled by build-gatekeeper-configurator.mjs).
   if (existsSync(join(gk.dir, "src", "configurator"))) {
     const script = join(ROOT, "scripts", "build-gatekeeper-configurator.mjs");
-    execFileSync(process.execPath, [script, gk.dir, "--quiet"], { stdio: "inherit", cwd: ROOT });
+    execFileSync(process.execPath, [script, gk.dir, "--quiet"], {
+      stdio: "inherit",
+      cwd: ROOT,
+    });
     spawnDevWatcher(
       `configurator UI watcher for ${gk.name}`,
       process.execPath,
@@ -161,7 +183,10 @@ for (const gk of gatekeepers) {
   if (existsSync(join(gk.dir, "build-app.mjs"))) {
     const script = join(gk.dir, "build-app.mjs");
     execFileSync(process.execPath, [script], { stdio: "inherit", cwd: gk.dir });
-    spawnDevWatcher(`app UI watcher for ${gk.name}`, process.execPath, [script, "--watch"]);
+    spawnDevWatcher(`app UI watcher for ${gk.name}`, process.execPath, [
+      script,
+      "--watch",
+    ]);
   }
 }
 
@@ -194,8 +219,11 @@ function bindingName(gk) {
 
   config.services = config.services || [];
   // Always keep the backend binding; a stale emptied services list breaks every non-API request.
-  if (!config.services.some(s => s.binding === "WORKSHOP_BACKEND")) {
-    config.services.unshift({ binding: "WORKSHOP_BACKEND", service: "workshop-backend" });
+  if (!config.services.some((s) => s.binding === "WORKSHOP_BACKEND")) {
+    config.services.unshift({
+      binding: "WORKSHOP_BACKEND",
+      service: "workshop-backend",
+    });
   }
   for (const gk of gatekeepers) {
     config.services.push({ binding: bindingName(gk), service: gk.name });
@@ -217,13 +245,34 @@ function bindingName(gk) {
 
 // Maps a gatekeeper name to the shared env vars whose values seed its CLIENT_ID / CLIENT_SECRET.
 const SHARED_GATEKEEPER_CREDS = {
-  "gatekeeper-github": { id: "GITHUB_CLIENT_ID", secret: "GITHUB_CLIENT_SECRET" },
-  "gatekeeper-google": { id: "GOOGLE_CLIENT_ID", secret: "GOOGLE_CLIENT_SECRET" },
-  "gatekeeper-cloudflare": { id: "CLOUDFLARE_OAUTH_CLIENT_ID", secret: "CLOUDFLARE_OAUTH_CLIENT_SECRET" },
-  "gatekeeper-supabase": { id: "SUPABASE_CLIENT_ID", secret: "SUPABASE_CLIENT_SECRET" },
-  "gatekeeper-notion": { id: "NOTION_CLIENT_ID", secret: "NOTION_CLIENT_SECRET" },
-  "gatekeeper-zoominfo": { id: "ZOOMINFO_CLIENT_ID", secret: "ZOOMINFO_CLIENT_SECRET" },
-  "gatekeeper-confluence": { id: "CONFLUENCE_CLIENT_ID", secret: "CONFLUENCE_CLIENT_SECRET" },
+  "gatekeeper-github": {
+    id: "GITHUB_CLIENT_ID",
+    secret: "GITHUB_CLIENT_SECRET",
+  },
+  "gatekeeper-google": {
+    id: "GOOGLE_CLIENT_ID",
+    secret: "GOOGLE_CLIENT_SECRET",
+  },
+  "gatekeeper-cloudflare": {
+    id: "CLOUDFLARE_OAUTH_CLIENT_ID",
+    secret: "CLOUDFLARE_OAUTH_CLIENT_SECRET",
+  },
+  "gatekeeper-supabase": {
+    id: "SUPABASE_CLIENT_ID",
+    secret: "SUPABASE_CLIENT_SECRET",
+  },
+  "gatekeeper-notion": {
+    id: "NOTION_CLIENT_ID",
+    secret: "NOTION_CLIENT_SECRET",
+  },
+  "gatekeeper-zoominfo": {
+    id: "ZOOMINFO_CLIENT_ID",
+    secret: "ZOOMINFO_CLIENT_SECRET",
+  },
+  "gatekeeper-confluence": {
+    id: "CONFLUENCE_CLIENT_ID",
+    secret: "CONFLUENCE_CLIENT_SECRET",
+  },
   "gatekeeper-slack": { id: "SLACK_CLIENT_ID", secret: "SLACK_CLIENT_SECRET" },
 };
 
@@ -236,8 +285,12 @@ const SHARED_GATEKEEPER_CREDS = {
 // `CLIENT_SECRET` already does, via SHARED_GATEKEEPER_CREDS above.
 const PASSTHROUGH_GATEKEEPER_VARS = {
   "gatekeeper-mcp-portal": [
-    "MCP_PORTAL_URL", "MCP_PORTAL_NAME", "MCP_PORTAL_AUTH", "MCP_PORTAL_TOKEN",
-    "MCP_PORTAL_TRUST_ANNOTATIONS", "MCP_ALLOW_INSECURE",
+    "MCP_PORTAL_URL",
+    "MCP_PORTAL_NAME",
+    "MCP_PORTAL_AUTH",
+    "MCP_PORTAL_TOKEN",
+    "MCP_PORTAL_TRUST_ANNOTATIONS",
+    "MCP_ALLOW_INSECURE",
   ],
   "gatekeeper-mcp": ["MCP_ALLOW_INSECURE"],
 };
@@ -250,8 +303,10 @@ for (const gk of gatekeepers) {
   const shared = SHARED_GATEKEEPER_CREDS[gk.name];
   if (shared && process.env[shared.id] && process.env[shared.secret]) {
     config.vars = config.vars || {};
-    if (config.vars.CLIENT_ID === undefined) config.vars.CLIENT_ID = process.env[shared.id];
-    if (config.vars.CLIENT_SECRET === undefined) config.vars.CLIENT_SECRET = process.env[shared.secret];
+    if (config.vars.CLIENT_ID === undefined)
+      config.vars.CLIENT_ID = process.env[shared.id];
+    if (config.vars.CLIENT_SECRET === undefined)
+      config.vars.CLIENT_SECRET = process.env[shared.secret];
   }
 
   // The shell wins over the committed default, so `MCP_ALLOW_INSECURE=true` can override the
@@ -281,11 +336,15 @@ for (const gk of gatekeepers) {
   // Local password accounts are email-keyed, and the configured initial tenant owner is also the
   // deployment administrator.
   config.vars = config.vars || {};
-  config.vars.ADMINS = [process.env.VERGLAS_INITIAL_OWNER_EMAIL || "dev@example.com"];
+  config.vars.ADMINS = [
+    process.env.VERGLAS_INITIAL_OWNER_EMAIL || "dev@example.com",
+  ];
 
   // Pass through optional sign-in and public URL variables from the shell environment.
   const OPTIONAL_FEATURE_VARS = [
-    "DISABLE_PASSWORD_AUTH", "AUTH_GATEKEEPERS", "PUBLIC_BASE_URL",
+    "DISABLE_PASSWORD_AUTH",
+    "AUTH_GATEKEEPERS",
+    "PUBLIC_BASE_URL",
   ];
   // OAuth app credentials (GOOGLE_/GITHUB_/CLOUDFLARE_OAUTH_*) are NOT passed to the backend anymore;
   // they are injected into the gatekeeper Workers (see SHARED_GATEKEEPER_CREDS below).
@@ -308,20 +367,26 @@ for (const gk of gatekeepers) {
   config.vars.VERGLAS_CONTAINER_RUNTIME_URL =
     process.env.VERGLAS_CONTAINER_RUNTIME_URL || "http://127.0.0.1:8360";
   config.vars.VERGLAS_CONTAINER_RUNTIME_TOKEN =
-    process.env.VERGLAS_CONTAINER_RUNTIME_TOKEN || "verglas-local-container-runtime";
+    process.env.VERGLAS_CONTAINER_RUNTIME_TOKEN ||
+    "verglas-local-container-runtime";
   config.vars.VERGLAS_ACCESS_URI =
     process.env.VERGLAS_ACCESS_URI || "http://127.0.0.1:8345";
   if (!process.env.VERGLAS_IDENTITY_ASSERTION_KEY) {
-    throw new Error("VERGLAS_IDENTITY_ASSERTION_KEY is required for local access sessions.");
+    throw new Error(
+      "VERGLAS_IDENTITY_ASSERTION_KEY is required for local access sessions.",
+    );
   }
-  config.vars.VERGLAS_IDENTITY_ASSERTION_KEY = process.env.VERGLAS_IDENTITY_ASSERTION_KEY;
+  config.vars.VERGLAS_IDENTITY_ASSERTION_KEY =
+    process.env.VERGLAS_IDENTITY_ASSERTION_KEY;
   config.vars.VERGLAS_TENANT_ID = process.env.VERGLAS_TENANT_ID || "local";
   config.vars.VERGLAS_DATA_ENDPOINT =
     process.env.VERGLAS_DATA_ENDPOINT || "http://verglas-server:8334";
   config.vars.VERGLAS_INTEGRATION_RUNTIME_IMAGE =
-    process.env.VERGLAS_INTEGRATION_RUNTIME_IMAGE || "verglas/verglas-container-runtime:local";
+    process.env.VERGLAS_INTEGRATION_RUNTIME_IMAGE ||
+    "verglas/verglas-container-runtime:local";
   config.vars.LOCAL_MODEL_RUNTIME_URL =
-    process.env.LOCAL_MODEL_RUNTIME_URL || `http://127.0.0.1:${localModelRuntimePort}`;
+    process.env.LOCAL_MODEL_RUNTIME_URL ||
+    `http://127.0.0.1:${localModelRuntimePort}`;
   config.vars.LOCAL_MODEL_RUNTIME_TOKEN = localModelRuntimeToken;
   config.vars.VERGLAS_AGENT_RUNTIME_URL =
     process.env.VERGLAS_AGENT_RUNTIME_URL || "http://127.0.0.1:8390";
@@ -366,7 +431,12 @@ for (const gk of gatekeepers) {
 
   config.build = { ...config.build, cwd: WORKSHOP_BACKEND_DIR };
 
-  const outPath = join(ROOT, "packages", "workshop-backend", "wrangler.dev.jsonc");
+  const outPath = join(
+    ROOT,
+    "packages",
+    "workshop-backend",
+    "wrangler.dev.jsonc",
+  );
   writeFileSync(outPath, JSON.stringify(config, null, 2) + "\n");
   console.log(`generated: ${outPath}`);
 }
@@ -378,10 +448,10 @@ for (const gk of gatekeepers) {
 const configs = [
   "wrangler.dev.jsonc",
   join("packages", "workshop-backend", "wrangler.dev.jsonc"),
-  ...gatekeepers.map(gk => join(gk.dir, "wrangler.dev.jsonc")),
+  ...gatekeepers.map((gk) => join(gk.dir, "wrangler.dev.jsonc")),
 ];
 
-const args = configs.flatMap(c => ["-c", c]);
+const args = configs.flatMap((c) => ["-c", c]);
 const backendHost = process.env.VITE_BACKEND_HOST;
 if (backendHost) {
   let wranglerIp;
@@ -399,15 +469,18 @@ if (backendHost) {
     args.push("--port", wranglerPort);
   } else {
     console.warn(
-        "VITE_BACKEND_HOST did not include a port, so run-dev-server.js could not derive " +
-        "a Wrangler --port override.");
+      "VITE_BACKEND_HOST did not include a port, so run-dev-server.js could not derive " +
+        "a Wrangler --port override.",
+    );
   }
 }
 console.log(`\nStarting: wrangler dev ${args.join(" ")}\n`);
 
 try {
-  execFileSync("pnpm", ["exec", "wrangler", "dev", ...args],
-      { stdio: "inherit", cwd: ROOT });
+  execFileSync("pnpm", ["exec", "wrangler", "dev", ...args], {
+    stdio: "inherit",
+    cwd: ROOT,
+  });
 } catch (e) {
   // wrangler was killed or exited with an error; the output was already shown
   // via stdio: "inherit", so just propagate the exit code.

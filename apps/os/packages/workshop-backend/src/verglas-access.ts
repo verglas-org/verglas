@@ -74,7 +74,7 @@ type AccessTokenWire = {
   revoked_at?: number;
 };
 
-type CreatedAccessTokenWire = AccessTokenWire & {token: string};
+type CreatedAccessTokenWire = AccessTokenWire & { token: string };
 
 /** Resolved authorization endpoint and assertion issuer configuration. */
 export type VerglasAccessConfig = {
@@ -84,15 +84,21 @@ export type VerglasAccessConfig = {
 };
 
 /** Resolves the identity-assertion configuration as one mandatory pair. */
-export function resolveVerglasAccessConfig(env: VerglasAccessEnv): VerglasAccessConfig | null {
+export function resolveVerglasAccessConfig(
+  env: VerglasAccessEnv,
+): VerglasAccessConfig | null {
   const endpoint = env.VERGLAS_ACCESS_URI?.trim();
   const identityAssertionKey = env.VERGLAS_IDENTITY_ASSERTION_KEY?.trim();
   if (!endpoint && !identityAssertionKey) return null;
   if (!endpoint || !identityAssertionKey) {
-    throw new Error("VERGLAS_ACCESS_URI and the identity assertion key must be configured together.");
+    throw new Error(
+      "VERGLAS_ACCESS_URI and the identity assertion key must be configured together.",
+    );
   }
   if (!/^[0-9a-fA-F]{64}$/.test(identityAssertionKey)) {
-    throw new Error("VERGLAS_IDENTITY_ASSERTION_KEY must contain exactly 64 hexadecimal characters.");
+    throw new Error(
+      "VERGLAS_IDENTITY_ASSERTION_KEY must contain exactly 64 hexadecimal characters.",
+    );
   }
   return {
     endpoint: endpoint.replace(/\/+$/, ""),
@@ -114,7 +120,11 @@ export class VerglasAccessClient {
   readonly #sessions = new Map<string, Promise<SessionWire>>();
 
   /** Binds every operation to the authenticated OS identity supplied by the server. */
-  constructor(config: VerglasAccessConfig, userId: string, fetcher: typeof fetch = fetch) {
+  constructor(
+    config: VerglasAccessConfig,
+    userId: string,
+    fetcher: typeof fetch = fetch,
+  ) {
     this.#config = config;
     this.#userId = userId;
     this.#fetch = fetcher.bind(globalThis);
@@ -132,20 +142,28 @@ export class VerglasAccessClient {
   }
 
   /** Idempotently registers a process identity under the caller's current tenant authority. */
-  async ensurePrincipal(id: string, kind: VerglasPrincipalKind, parentId?: string): Promise<void> {
+  async ensurePrincipal(
+    id: string,
+    kind: VerglasPrincipalKind,
+    parentId?: string,
+  ): Promise<void> {
     await this.#ensure("/v1/access/principals", {
       id,
       kind,
-      ...(parentId ? {parent_id: parentId} : {}),
+      ...(parentId ? { parent_id: parentId } : {}),
     });
   }
 
   /** Idempotently registers a protected resource beneath the tenant root. */
-  async ensureResource(id: string, kind: VerglasResourceKind, parentId = "tenant"): Promise<void> {
+  async ensureResource(
+    id: string,
+    kind: VerglasResourceKind,
+    parentId = "tenant",
+  ): Promise<void> {
     await this.#ensure("/v1/access/resources", {
       id,
       kind,
-      ...(parentId ? {parent_id: parentId} : {}),
+      ...(parentId ? { parent_id: parentId } : {}),
     });
   }
 
@@ -156,10 +174,13 @@ export class VerglasAccessClient {
       this.#request<ResourceWire[]>("/v1/access/resources"),
       this.#request<GrantWire[]>("/v1/access/grants"),
     ]);
-    const tokenLists = await Promise.all(principals.map((principal) =>
-      this.#request<AccessTokenWire[]>(
-        `/v1/access/tokens?principal_id=${encodeURIComponent(principal.id)}`,
-      )));
+    const tokenLists = await Promise.all(
+      principals.map((principal) =>
+        this.#request<AccessTokenWire[]>(
+          `/v1/access/tokens?principal_id=${encodeURIComponent(principal.id)}`,
+        ),
+      ),
+    );
     const tokens = new Map(tokenLists.flat().map((token) => [token.id, token]));
     return {
       tenantId: this.#config.tenantId,
@@ -172,36 +193,58 @@ export class VerglasAccessClient {
 
   /** Lists resources on which the authenticated user can pass grants. */
   async listDelegableResources(): Promise<VerglasAccessResource[]> {
-    const resources = await this.#request<ResourceWire[]>("/v1/access/resources");
-    const decisions = await Promise.all(resources.map(async (resource) => ({
-      resource,
-      allowed: (await this.#authorize(resource.id, "pass_grants")).decision.allowed,
-    })));
-    return decisions.filter(({allowed}) => allowed).map(({resource}) => mapResource(resource));
+    const resources = await this.#request<ResourceWire[]>(
+      "/v1/access/resources",
+    );
+    const decisions = await Promise.all(
+      resources.map(async (resource) => ({
+        resource,
+        allowed: (await this.#authorize(resource.id, "pass_grants")).decision
+          .allowed,
+      })),
+    );
+    return decisions
+      .filter(({ allowed }) => allowed)
+      .map(({ resource }) => mapResource(resource));
   }
 
   /** Lists explicit grants assigned to one child process visible to the current user. */
-  async listPrincipalGrants(principalId: string): Promise<VerglasAccessGrant[]> {
+  async listPrincipalGrants(
+    principalId: string,
+  ): Promise<VerglasAccessGrant[]> {
     const grants = await this.#request<GrantWire[]>(
       `/v1/access/grants?principal_id=${encodeURIComponent(principalId)}`,
     );
-    return grants.filter((grant) => grant.principal_id === principalId).map(mapGrant);
+    return grants
+      .filter((grant) => grant.principal_id === principalId)
+      .map(mapGrant);
   }
 
   /** Evaluates one action on a registered resource for this authenticated user. */
-  async checkUser(_userId: string, resourceId: string, action: VerglasAccessAction): Promise<boolean> {
+  async checkUser(
+    _userId: string,
+    resourceId: string,
+    action: VerglasAccessAction,
+  ): Promise<boolean> {
     return (await this.#authorize(resourceId, action)).decision.allowed;
   }
 
   /** Delegates only actions the authenticated user already holds and may pass. */
   async delegate(input: VerglasAccessGrantInput): Promise<VerglasAccessGrant> {
-    if (input.actions.length === 0) throw new Error("At least one access action is required.");
-    const existing = (await this.listPrincipalGrants(input.principalId)).find((grant) =>
-      grant.resourceId === input.resourceId);
-    if (existing && input.actions.every((action) => existing.actions.includes(action))) {
+    if (input.actions.length === 0)
+      throw new Error("At least one access action is required.");
+    const existing = (await this.listPrincipalGrants(input.principalId)).find(
+      (grant) => grant.resourceId === input.resourceId,
+    );
+    if (
+      existing &&
+      input.actions.every((action) => existing.actions.includes(action))
+    ) {
       return existing;
     }
-    const actions = [...new Set([...(existing?.actions ?? []), ...input.actions])];
+    const actions = [
+      ...new Set([...(existing?.actions ?? []), ...input.actions]),
+    ];
     if (existing) await this.revoke(existing.id);
     const wire = await this.#request<GrantWire>("/v1/access/delegations", {
       method: "POST",
@@ -221,52 +264,72 @@ export class VerglasAccessClient {
   async revoke(grantId: string): Promise<void> {
     await this.#request("/v1/access/revocations", {
       method: "POST",
-      body: JSON.stringify({grant_id: grantId}),
+      body: JSON.stringify({ grant_id: grantId }),
     });
   }
 
   /** Lists non-secret token metadata visible to the authenticated principal. */
   async listTokens(principalId?: string): Promise<VerglasAccessTokenSummary[]> {
-    const query = principalId ? `?principal_id=${encodeURIComponent(principalId)}` : "";
-    return (await this.#request<AccessTokenWire[]>(`/v1/access/tokens${query}`)).map(mapAccessToken);
+    const query = principalId
+      ? `?principal_id=${encodeURIComponent(principalId)}`
+      : "";
+    return (
+      await this.#request<AccessTokenWire[]>(`/v1/access/tokens${query}`)
+    ).map(mapAccessToken);
   }
 
   /** Creates a delegated token and returns its plaintext bearer exactly once. */
-  async createToken(input: VerglasCreateAccessTokenInput): Promise<VerglasCreatedAccessToken> {
+  async createToken(
+    input: VerglasCreateAccessTokenInput,
+  ): Promise<VerglasCreatedAccessToken> {
     validateTokenInput(input);
-    const wire = await this.#request<CreatedAccessTokenWire>("/v1/access/tokens", {
-      method: "POST",
-      body: JSON.stringify({
-        name: input.name.trim(),
-        audience: input.audience.trim(),
-        expires_in_seconds: input.expiresInSeconds,
-        grants: input.grants.map((grant) => ({
-          resource_id: grant.resourceId,
-          actions: [...new Set(grant.actions)],
-        })),
-      }),
-    });
-    return {...mapAccessToken(wire), token: wire.token};
+    const wire = await this.#request<CreatedAccessTokenWire>(
+      "/v1/access/tokens",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          name: input.name.trim(),
+          audience: input.audience.trim(),
+          expires_in_seconds: input.expiresInSeconds,
+          grants: input.grants.map((grant) => ({
+            resource_id: grant.resourceId,
+            actions: [...new Set(grant.actions)],
+          })),
+        }),
+      },
+    );
+    return { ...mapAccessToken(wire), token: wire.token };
   }
 
   /** Revokes a user-owned token, or any tenant token when called through an owner capability. */
   async revokeToken(tokenId: string): Promise<void> {
     const id = tokenId.trim();
     if (!id) throw new Error("Token ID is required.");
-    await this.#request(`/v1/access/tokens/${encodeURIComponent(id)}`, {method: "DELETE"});
+    await this.#request(`/v1/access/tokens/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    });
   }
 
   /** Returns the short-lived bearer used for user-scoped Verglas control calls. */
-  async sessionToken(audience: "access" | "data-plane" = "access"): Promise<string> {
+  async sessionToken(
+    audience: "access" | "data-plane" = "access",
+  ): Promise<string> {
     const session = await this.#getSession(audience);
     return session.token;
   }
 
   /** Evaluates an action while allowing the service to derive tenant and actor from the bearer. */
-  async #authorize(resourceId: string, action: VerglasAccessAction): Promise<AuthorizationWire> {
+  async #authorize(
+    resourceId: string,
+    action: VerglasAccessAction,
+  ): Promise<AuthorizationWire> {
     return await this.#request<AuthorizationWire>("/v1/access/authorize", {
       method: "POST",
-      body: JSON.stringify({audience: "access", resource_id: resourceId, action}),
+      body: JSON.stringify({
+        audience: "access",
+        resource_id: resourceId,
+        action,
+      }),
     });
   }
 
@@ -282,7 +345,10 @@ export class VerglasAccessClient {
   }
 
   /** Sends one authenticated JSON request using the current short-lived user session. */
-  async #request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
+  async #request<T = unknown>(
+    path: string,
+    init: RequestInit = {},
+  ): Promise<T> {
     const response = await this.#fetch(`${this.#config.endpoint}${path}`, {
       ...init,
       headers: await this.#headers(init.headers),
@@ -304,25 +370,29 @@ export class VerglasAccessClient {
   async #getSession(audience: "access" | "data-plane"): Promise<SessionWire> {
     const existing = this.#sessions.get(audience);
     const current = existing ? await existing : undefined;
-    if (current && current.expires_at > Math.floor(Date.now() / 1000) + 30) return current;
+    if (current && current.expires_at > Math.floor(Date.now() / 1000) + 30)
+      return current;
     const pending = this.#exchangeIdentityAssertion(audience);
     this.#sessions.set(audience, pending);
     try {
       return await pending;
     } catch (error) {
-      if (this.#sessions.get(audience) === pending) this.#sessions.delete(audience);
+      if (this.#sessions.get(audience) === pending)
+        this.#sessions.delete(audience);
       throw error;
     }
   }
 
   /** Exchanges a 60-second signed OS identity assertion for an access-session bearer. */
-  async #exchangeIdentityAssertion(audience: "access" | "data-plane"): Promise<SessionWire> {
+  async #exchangeIdentityAssertion(
+    audience: "access" | "data-plane",
+  ): Promise<SessionWire> {
     const assertion = await signIdentityAssertion(this.#config, this.#userId);
     const path = "/v1/access/sessions";
     const response = await this.#fetch(`${this.#config.endpoint}${path}`, {
       method: "POST",
-      headers: {"content-type": "application/json"},
-      body: JSON.stringify({assertion, audience}),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ assertion, audience }),
     });
     if (!response.ok) throw await accessError(path, response);
     return await response.json<SessionWire>();
@@ -330,9 +400,12 @@ export class VerglasAccessClient {
 }
 
 /** Signs a compact HS256 identity assertion for one OS-authenticated user. */
-async function signIdentityAssertion(config: VerglasAccessConfig, userId: string): Promise<string> {
+async function signIdentityAssertion(
+  config: VerglasAccessConfig,
+  userId: string,
+): Promise<string> {
   const now = Math.floor(Date.now() / 1000);
-  const header = base64UrlJson({alg: "HS256", typ: "JWT"});
+  const header = base64UrlJson({ alg: "HS256", typ: "JWT" });
   const payload = base64UrlJson({
     sub: userPrincipalId(userId),
     tenant_id: config.tenantId,
@@ -345,11 +418,15 @@ async function signIdentityAssertion(config: VerglasAccessConfig, userId: string
   const key = await crypto.subtle.importKey(
     "raw",
     decodeHexKey(config.identityAssertionKey),
-    {name: "HMAC", hash: "SHA-256"},
+    { name: "HMAC", hash: "SHA-256" },
     false,
     ["sign"],
   );
-  const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(unsigned));
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(unsigned),
+  );
   return `${unsigned}.${base64UrlBytes(new Uint8Array(signature))}`;
 }
 
@@ -371,17 +448,30 @@ function base64UrlJson(value: unknown): string {
 function base64UrlBytes(bytes: Uint8Array): string {
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+  return btoa(binary)
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replace(/=+$/, "");
 }
 
 /** Maps one service principal record into the browser-safe API contract. */
 function mapPrincipal(value: PrincipalWire): VerglasAccessPrincipal {
-  return {tenantId: value.tenant_id, id: value.id, kind: value.kind, parentId: value.parent_id};
+  return {
+    tenantId: value.tenant_id,
+    id: value.id,
+    kind: value.kind,
+    parentId: value.parent_id,
+  };
 }
 
 /** Maps one service resource record into the browser-safe API contract. */
 function mapResource(value: ResourceWire): VerglasAccessResource {
-  return {tenantId: value.tenant_id, id: value.id, kind: value.kind, parentId: value.parent_id};
+  return {
+    tenantId: value.tenant_id,
+    id: value.id,
+    kind: value.kind,
+    parentId: value.parent_id,
+  };
 }
 
 /** Maps one explicit service grant into the browser-safe API contract. */
@@ -412,9 +502,18 @@ function mapAccessToken(value: AccessTokenWire): VerglasAccessTokenSummary {
 
 /** Rejects malformed or unbounded token requests before they cross the RPC boundary. */
 function validateTokenInput(input: VerglasCreateAccessTokenInput): void {
-  if (!input.name.trim() || input.name.length > 100) throw new Error("Token name is required and must not exceed 100 characters.");
-  if (!input.audience.trim() || input.audience.length > 100) throw new Error("Token audience is required and must not exceed 100 characters.");
-  if (!Number.isSafeInteger(input.expiresInSeconds) || input.expiresInSeconds < 60) {
+  if (!input.name.trim() || input.name.length > 100)
+    throw new Error(
+      "Token name is required and must not exceed 100 characters.",
+    );
+  if (!input.audience.trim() || input.audience.length > 100)
+    throw new Error(
+      "Token audience is required and must not exceed 100 characters.",
+    );
+  if (
+    !Number.isSafeInteger(input.expiresInSeconds) ||
+    input.expiresInSeconds < 60
+  ) {
     throw new Error("Token expiration must be at least 60 seconds.");
   }
   if (input.grants.length > 100) {
@@ -422,7 +521,9 @@ function validateTokenInput(input: VerglasCreateAccessTokenInput): void {
   }
   for (const grant of input.grants) {
     if (!grant.resourceId.trim() || grant.actions.length === 0) {
-      throw new Error("Every token grant requires a resource and at least one action.");
+      throw new Error(
+        "Every token grant requires a resource and at least one action.",
+      );
     }
   }
 }
@@ -430,5 +531,7 @@ function validateTokenInput(input: VerglasCreateAccessTokenInput): void {
 /** Converts a failed access-service response into one bounded diagnostic error. */
 async function accessError(path: string, response: Response): Promise<Error> {
   const detail = (await response.text()).slice(0, 1000);
-  return new Error(`Verglas access ${path} failed: HTTP ${response.status}${detail ? ` — ${detail}` : ""}`);
+  return new Error(
+    `Verglas access ${path} failed: HTTP ${response.status}${detail ? ` — ${detail}` : ""}`,
+  );
 }

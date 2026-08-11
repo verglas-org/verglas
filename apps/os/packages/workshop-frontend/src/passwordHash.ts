@@ -1,4 +1,4 @@
-import { SERVICE_SALT } from '@verglas/workshop-shared/api'
+import { SERVICE_SALT } from "@verglas/workshop-shared/api";
 
 /**
  * Hash a password using Argon2id for authentication.
@@ -10,15 +10,18 @@ import { SERVICE_SALT } from '@verglas/workshop-shared/api'
  * @param password - The user's plaintext password
  * @returns The password hash as a Uint8Array
  */
-export async function hashPassword(email: string, password: string): Promise<Uint8Array> {
+export async function hashPassword(
+  email: string,
+  password: string,
+): Promise<Uint8Array> {
   // Dynamic import - Vite will split this into a separate chunk
-  const { argon2id } = await import('hash-wasm')
+  const { argon2id } = await import("hash-wasm");
 
   // Build salt: SERVICE_SALT + utf8(normalized email)
-  const emailBuf = new TextEncoder().encode(email.trim().toLowerCase())
-  const salt = new Uint8Array(SERVICE_SALT.length + emailBuf.length)
-  salt.set(SERVICE_SALT)
-  salt.set(emailBuf, SERVICE_SALT.length)
+  const emailBuf = new TextEncoder().encode(email.trim().toLowerCase());
+  const salt = new Uint8Array(SERVICE_SALT.length + emailBuf.length);
+  salt.set(SERVICE_SALT);
+  salt.set(emailBuf, SERVICE_SALT.length);
 
   const hash = await argon2id({
     password,
@@ -27,8 +30,8 @@ export async function hashPassword(email: string, password: string): Promise<Uin
     iterations: 3,
     memorySize: 65536, // 64 MiB in KiB
     hashLength: 32,
-    outputType: 'binary',
-  })
+    outputType: "binary",
+  });
 
-  return hash
+  return hash;
 }

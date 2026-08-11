@@ -24,11 +24,24 @@
 // Workspace a stub pointing to the Workspace's server-side Durable Object interface.
 
 import { RpcCompatible, RpcStub, RpcTarget } from "capnweb";
-import { AccountDescription, ActionKind, ActionDescription, AvatarImage, GatekeeperUiFrame, ObservationDescription, ResourceDescription, ResourceConfiguratorFrame, SupportedResource, VendorDescription, HookDescription } from "./gatekeeper.js";
+import {
+  AccountDescription,
+  ActionKind,
+  ActionDescription,
+  AvatarImage,
+  GatekeeperUiFrame,
+  ObservationDescription,
+  ResourceDescription,
+  ResourceConfiguratorFrame,
+  SupportedResource,
+  VendorDescription,
+  HookDescription,
+} from "./gatekeeper.js";
 import type { UiFeatureFlags } from "./feature-flags.js";
 
 export const SERVICE_SALT = new Uint8Array([
-  0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34, 0x6d, 0x8f, 0x21
+  0xd9, 0x4e, 0x54, 0x1d, 0x29, 0xc1, 0x03, 0x74, 0x73, 0x7e, 0xb3, 0xe3, 0x34,
+  0x6d, 0x8f, 0x21,
 ]);
 
 // A pending gatekeeper sign-in attempt, returned by `PublicApi.startGatekeeperLogin()`. Holding this
@@ -53,7 +66,9 @@ export interface PublicApi extends RpcTarget {
   //
   // Dispose `attempt` to abandon the sign-in (e.g. the user closed the popup); this cancels the wait
   // server-side.
-  startGatekeeperLogin(vendorId: string): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }>;
+  startGatekeeperLogin(
+    vendorId: string,
+  ): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }>;
 
   // Authenticates the user using an auth token (typically stored in localStorage).
   authenticate(token: string): Promise<AuthenticatedApi>;
@@ -98,7 +113,10 @@ export interface PublicApi extends RpcTarget {
   // See login() (above) for an explanation of the password hashing algorithm.
   //
   // This API may be disabled when the server uses SSO for authentication.
-  createAccount(email: string, passwordHash: Uint8Array): Promise<string | null>;
+  createAccount(
+    email: string,
+    passwordHash: Uint8Array,
+  ): Promise<string | null>;
 
   // Fetch blueprint metadata by ID. Returns null if the blueprint doesn't exist. No
   // authentication required (knowing the ID is sufficient, since a blueprint is "just data").
@@ -113,8 +131,14 @@ export interface PublicApi extends RpcTarget {
 export interface ConnectedAccountsSubscriber {
   // If `credentialsValid` is false, the account's credentials are known to be expired, and the
   // UI should call reconnectAccount() to fix this if the user tries to select this account.
-  add(id: number, description: AccountDescription, vendor: VendorDescription,
-      supportedResources: SupportedResource[], credentialsValid: boolean, vendorId: string): void;
+  add(
+    id: number,
+    description: AccountDescription,
+    vendor: VendorDescription,
+    supportedResources: SupportedResource[],
+    credentialsValid: boolean,
+    vendorId: string,
+  ): void;
   remove(id: number): void;
 
   // Called after add() has been called for all accounts known so far.
@@ -125,7 +149,7 @@ export interface ConnectedAccountsSubscriber {
 // that support certain features. This type specifies the filter.
 export type GatekeeperVendorFilter = {
   // Filter for vendors that can connect to the given resource.
-  resourceUrl?: string,
+  resourceUrl?: string;
 };
 
 /** Options for subscribing to connected accounts. */
@@ -151,13 +175,53 @@ const IDENTIFIER_REGEX = /^[A-Za-z_][A-Za-z0-9_]*$/;
 // per IDENTIFIER_REGEX but cannot follow `.` in all contexts and would confuse both agents and
 // humans as binding names.
 const RESERVED_WORDS = new Set([
-  "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do",
-  "else", "enum", "export", "extends", "false", "finally", "for", "function", "if", "import",
-  "in", "instanceof", "new", "null", "return", "super", "switch", "this", "throw", "true", "try",
-  "typeof", "var", "void", "while", "with",
+  "break",
+  "case",
+  "catch",
+  "class",
+  "const",
+  "continue",
+  "debugger",
+  "default",
+  "delete",
+  "do",
+  "else",
+  "enum",
+  "export",
+  "extends",
+  "false",
+  "finally",
+  "for",
+  "function",
+  "if",
+  "import",
+  "in",
+  "instanceof",
+  "new",
+  "null",
+  "return",
+  "super",
+  "switch",
+  "this",
+  "throw",
+  "true",
+  "try",
+  "typeof",
+  "var",
+  "void",
+  "while",
+  "with",
   // Strict-mode / contextual reservations.
-  "await", "implements", "interface", "let", "package", "private", "protected", "public",
-  "static", "yield",
+  "await",
+  "implements",
+  "interface",
+  "let",
+  "package",
+  "private",
+  "protected",
+  "public",
+  "static",
+  "yield",
 ]);
 
 // Validates a binding name, throwing a descriptive Error if it is unacceptable. This is the one
@@ -176,15 +240,19 @@ const RESERVED_WORDS = new Set([
 export function validateBindingName(name: string): void {
   if (!IDENTIFIER_REGEX.test(name)) {
     throw new Error(
-        `Invalid binding name "${name}": binding names must be JavaScript identifiers ` +
-        `(letters, digits, and '_', not starting with a digit).`);
+      `Invalid binding name "${name}": binding names must be JavaScript identifiers ` +
+        `(letters, digits, and '_', not starting with a digit).`,
+    );
   }
   if (RESERVED_WORDS.has(name)) {
-    throw new Error(`Invalid binding name "${name}": this is a reserved word in JavaScript.`);
+    throw new Error(
+      `Invalid binding name "${name}": this is a reserved word in JavaScript.`,
+    );
   }
   if (name === "prototype" || name in Object.prototype) {
     throw new Error(
-        `Invalid binding name "${name}": this name collides with a built-in object property.`);
+      `Invalid binding name "${name}": this name collides with a built-in object property.`,
+    );
   }
 }
 
@@ -258,48 +326,88 @@ export const OPEN_WORKSPACE_ERROR_CODES = {
 
 /** An expected failure code from `AuthenticatedApi.openWorkspace()`. */
 export type OpenWorkspaceErrorCode =
-    typeof OPEN_WORKSPACE_ERROR_CODES[keyof typeof OPEN_WORKSPACE_ERROR_CODES];
+  (typeof OPEN_WORKSPACE_ERROR_CODES)[keyof typeof OPEN_WORKSPACE_ERROR_CODES];
 
 const OPEN_WORKSPACE_ERROR_MESSAGES: Record<OpenWorkspaceErrorCode, string> = {
   [OPEN_WORKSPACE_ERROR_CODES.workspaceNotFound]: "Workspace not found.",
-  [OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied]: "You don't have access to this workspace.",
+  [OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied]:
+    "You don't have access to this workspace.",
 };
 
 /** Creates an expected `openWorkspace()` error with a machine-readable code. */
 export function createOpenWorkspaceError(
-    code: OpenWorkspaceErrorCode): Error & { code: OpenWorkspaceErrorCode } {
-  return Object.assign(new Error(OPEN_WORKSPACE_ERROR_MESSAGES[code]), { code });
+  code: OpenWorkspaceErrorCode,
+): Error & { code: OpenWorkspaceErrorCode } {
+  return Object.assign(new Error(OPEN_WORKSPACE_ERROR_MESSAGES[code]), {
+    code,
+  });
 }
 
 /** Reads the machine-readable code from an expected `openWorkspace()` error. */
-export function getOpenWorkspaceErrorCode(error: unknown): OpenWorkspaceErrorCode | undefined {
+export function getOpenWorkspaceErrorCode(
+  error: unknown,
+): OpenWorkspaceErrorCode | undefined {
   if (typeof error !== "object" || error === null) return undefined;
 
   const candidate = "code" in error ? error.code : undefined;
   return isOpenWorkspaceErrorCode(candidate) ? candidate : undefined;
 }
 
-function isOpenWorkspaceErrorCode(value: unknown): value is OpenWorkspaceErrorCode {
-  return value === OPEN_WORKSPACE_ERROR_CODES.workspaceNotFound ||
-      value === OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied;
+function isOpenWorkspaceErrorCode(
+  value: unknown,
+): value is OpenWorkspaceErrorCode {
+  return (
+    value === OPEN_WORKSPACE_ERROR_CODES.workspaceNotFound ||
+    value === OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied
+  );
 }
 
 /** Stable authorization actions shared by lakehouse and runtime resources. */
 export type VerglasAccessAction =
-    "discover" | "describe" | "query" | "append" | "modify" | "create_child" |
-    "execute" | "use_secret" | "deploy" | "connect" | "pass_grants" | "manage_grants" | "own";
+  | "discover"
+  | "describe"
+  | "query"
+  | "append"
+  | "modify"
+  | "create_child"
+  | "execute"
+  | "use_secret"
+  | "deploy"
+  | "connect"
+  | "pass_grants"
+  | "manage_grants"
+  | "own";
 
 /** Human or process category registered with the tenant authorization service. */
 export type VerglasPrincipalKind =
-    "user" | "service_account" | "agent" | "job" | "job_run" | "vessel" |
-    "application" | "integration";
+  | "user"
+  | "service_account"
+  | "agent"
+  | "job"
+  | "job_run"
+  | "vessel"
+  | "application"
+  | "integration";
 
 /** Protected resource category understood across Verglas data and runtime backends. */
 export type VerglasResourceKind =
-    "tenant" | "database" | "warehouse" | "namespace" | "table" | "view" |
-    "vector_index" | "graph" | "object_prefix" | "integration" |
-    "integration_operation" | "secret" | "job" | "vessel" | "application" |
-    "model" | "queue";
+  | "tenant"
+  | "database"
+  | "warehouse"
+  | "namespace"
+  | "table"
+  | "view"
+  | "vector_index"
+  | "graph"
+  | "object_prefix"
+  | "integration"
+  | "integration_operation"
+  | "secret"
+  | "job"
+  | "vessel"
+  | "application"
+  | "model"
+  | "queue";
 
 /** One tenant-scoped human or process identity. */
 export type VerglasAccessPrincipal = {
@@ -438,7 +546,9 @@ export interface AuthenticatedApi extends RpcTarget {
   listAccessTokens(): Promise<VerglasAccessTokenSummary[]>;
 
   /** Creates a token using only permissions the current user may delegate. */
-  createAccessToken(input: VerglasCreateAccessTokenInput): Promise<VerglasCreatedAccessToken>;
+  createAccessToken(
+    input: VerglasCreateAccessTokenInput,
+  ): Promise<VerglasCreatedAccessToken>;
 
   /** Revokes one token owned by the current user. */
   revokeAccessToken(tokenId: string): Promise<void>;
@@ -472,11 +582,16 @@ export interface AuthenticatedApi extends RpcTarget {
   detectModelRuntimes(): Promise<ModelRuntimeDetection>;
 
   /** Starts the selected coding-agent CLI's provider-owned subscription login flow. */
-  startModelRuntimeLogin(runtime: ModelRuntimeId, sessionId: string): Promise<ModelRuntimeLoginResult>;
+  startModelRuntimeLogin(
+    runtime: ModelRuntimeId,
+    sessionId: string,
+  ): Promise<ModelRuntimeLoginResult>;
 
   /** Advances an active provider login flow with the answer to its current step. */
   continueModelRuntimeLogin(
-      sessionId: string, answer?: ModelRuntimeWizardAnswer): Promise<ModelRuntimeLoginResult>;
+    sessionId: string,
+    answer?: ModelRuntimeWizardAnswer,
+  ): Promise<ModelRuntimeLoginResult>;
 
   /** Cancels an active provider login flow. */
   cancelModelRuntimeLogin(sessionId: string): Promise<void>;
@@ -534,8 +649,11 @@ export interface AuthenticatedApi extends RpcTarget {
   // so the common-case open is still a single pipelined round trip.
   //
   // TODO(multi-vessel): This should be renamed to openWorkspace().
-  openWorkspace(id: string, shareKey?: string,
-             configureObservers?: RpcStub<ObserverConfigCallback>): Promise<RpcStub<Overseer>>;
+  openWorkspace(
+    id: string,
+    shareKey?: string,
+    configureObservers?: RpcStub<ObserverConfigCallback>,
+  ): Promise<RpcStub<Overseer>>;
 
   // Create a new workspace. It will start out titled "Untitled Workspace".
   //
@@ -574,13 +692,19 @@ export interface AuthenticatedApi extends RpcTarget {
   getVerglasWorker(name: string): Promise<VerglasWorkerDetail>;
 
   /** Recent scheduler jobs for one worker (newest first). */
-  listVerglasWorkerJobs(name: string, limit?: number): Promise<VerglasWorkerRunSummary[]>;
+  listVerglasWorkerJobs(
+    name: string,
+    limit?: number,
+  ): Promise<VerglasWorkerRunSummary[]>;
 
   /** Queues an immediate run of a registered worker. */
-  runVerglasWorker(name: string): Promise<{jobId: string, created: boolean}>;
+  runVerglasWorker(name: string): Promise<{ jobId: string; created: boolean }>;
 
   /** Updates worker lifecycle state (pause / resume / archive-as-delete). */
-  setVerglasWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void>;
+  setVerglasWorkerState(
+    name: string,
+    state: "running" | "paused" | "archived",
+  ): Promise<void>;
 
   /** Lists tables discoverable across the tenant's database-scoped Lakehouse catalogs. */
   listVerglasTables(): Promise<VerglasTableSummary[]>;
@@ -592,29 +716,42 @@ export interface AuthenticatedApi extends RpcTarget {
   getVerglasDatabase(name: string): Promise<VerglasDatabaseDetail>;
 
   /** Creates one Lakehouse or Postgres database resource through the tenant access service. */
-  createVerglasDatabase(input: VerglasCreateDatabaseInput): Promise<VerglasDatabaseSummary>;
+  createVerglasDatabase(
+    input: VerglasCreateDatabaseInput,
+  ): Promise<VerglasDatabaseSummary>;
 
   /** Deletes a database resource; non-empty Lakehouses are rejected before deletion. */
   deleteVerglasDatabase(name: string): Promise<void>;
 
   /** Creates one table with an explicit Iceberg schema inside a selected Lakehouse database. */
-  createVerglasTable(input: VerglasCreateTableInput): Promise<VerglasTableSummary>;
+  createVerglasTable(
+    input: VerglasCreateTableInput,
+  ): Promise<VerglasTableSummary>;
 
   /** Deletes one Iceberg table from a selected Lakehouse database and namespace. */
-  deleteVerglasTable(database: string, namespace: string[], name: string): Promise<void>;
+  deleteVerglasTable(
+    database: string,
+    namespace: string[],
+    name: string,
+  ): Promise<void>;
 
   /** Lists local Verglas Vessels without exposing their secret configuration. */
   listVerglasVessels(): Promise<VerglasVesselSummary[]>;
 
   /** Reads the declarative configuration UI and readiness state for one Integration Vessel. */
-  getVerglasIntegrationConfiguration(name: string): Promise<VerglasIntegrationConfiguration>;
+  getVerglasIntegrationConfiguration(
+    name: string,
+  ): Promise<VerglasIntegrationConfiguration>;
 
   /**
    * Applies user-supplied configuration to one Integration Vessel.
    * When the Vessel is chat-owned, updates that chat card and resumes the waiting agent
    * on both successful and failed verification (same path as the chat Save and test card).
    */
-  configureVerglasIntegration(name: string, values: Record<string, string>): Promise<void>;
+  configureVerglasIntegration(
+    name: string,
+    values: Record<string, string>,
+  ): Promise<void>;
 
   /** Deletes a local Integration Vessel and any Workshop chat records that own it. */
   deleteVerglasIntegration(name: string): Promise<void>;
@@ -623,7 +760,10 @@ export interface AuthenticatedApi extends RpcTarget {
   deleteVerglasApplication(name: string): Promise<void>;
 
   /** Starts or stops an OSS Application Vessel while preserving its desired runtime state. */
-  setVerglasApplicationState(name: string, state: "running" | "stopped"): Promise<void>;
+  setVerglasApplicationState(
+    name: string,
+    state: "running" | "stopped",
+  ): Promise<void>;
 
   // The deployment's standard output formats, in the order they should be offered -- what fills a
   // "New Document / New Slides / ..." menu. Empty when the deployment promotes none.
@@ -632,7 +772,9 @@ export interface AuthenticatedApi extends RpcTarget {
   listOutputFormats(): Promise<OutputFormatOffer[]>;
 
   // List all third-party services that this account can connect to.
-  listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]>;
+  listGatekeeperVendors(
+    filter?: GatekeeperVendorFilter,
+  ): Promise<GatekeeperVendorInfo[]>;
 
   // Connect this account to a specific account on a third-party service. Returns the URL which
   // should be opened in a new tab in the user's browser to complete the authorization. When the
@@ -642,13 +784,19 @@ export interface AuthenticatedApi extends RpcTarget {
   // `resourceUrlPatterns`, if given, limits the connection to the authorization needed for those
   // grantable resource types (those with `grantable`; see `SupportedResource`). If omitted,
   // authorization for all of the vendor's resource types is requested.
-  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}>;
+  connectAccount(
+    vendorId: string,
+    resourceUrlPatterns?: string[],
+  ): Promise<{ url: string }>;
 
   // Ensure the authorization for the listed grantable resource types (by `urlPattern`) is granted
   // on a connected account, expanding if needed. Returns a URL to open in a new tab to authorize
   // them, or no url if nothing was needed. The updated grant is observable via
   // subscribeConnectedAccounts().
-  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}>;
+  ensureAccountResources(
+    accountId: number,
+    resourceUrlPatterns: string[],
+  ): Promise<{ url?: string }>;
 
   // List the auto-provisioning ("ambient") gatekeepers the user can opt into right now: those set to
   // 'optional' by the admin that the user hasn't added yet. Rendered as an "Available" section on the
@@ -670,8 +818,9 @@ export interface AuthenticatedApi extends RpcTarget {
   // window. When it completes, we want the list of accounts in the Workshop UI to update
   // immediately, to give the user feedback that the account is now connected.
   subscribeConnectedAccounts(
-      subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
-      : Promise<RpcStub<{}>>;
+    subscriber: RpcStub<ConnectedAccountsSubscriber>,
+    filter?: ConnectedAccountsFilter,
+  ): Promise<RpcStub<{}>>;
 
   // Remove a connected account, revoking the token.
   disconnectAccount(accountId: number): Promise<void>;
@@ -721,7 +870,9 @@ export interface AuthenticatedApi extends RpcTarget {
 
   // Returns info about whether the blueprint is in the user's library.
   // Returns null if not in library, or { uploaded } if it is.
-  isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null>;
+  isBlueprintInLibrary(
+    blueprintId: string,
+  ): Promise<{ uploaded: boolean } | null>;
 
   // Legacy blueprint-to-workspace installation contract. New deployments reject this operation;
   // generated interfaces are standalone Application Vessels.
@@ -732,7 +883,7 @@ export interface AuthenticatedApi extends RpcTarget {
   // The returned Overseer can be used immediately (pipelining-friendly).
   newWorkspaceFromBlueprint(
     blueprintId: string,
-    bindings: Record<string, BlueprintBindingAssignment>
+    bindings: Record<string, BlueprintBindingAssignment>,
   ): Promise<RpcStub<Overseer>>;
 
   // Delete a blueprint that the user owns. Works even if the source workspace has been deleted
@@ -746,7 +897,7 @@ export interface AuthenticatedApi extends RpcTarget {
   // Re-authenticate a connected account whose credentials have expired (or may be about to
   // expire). Returns the URL to open in a new tab. When the OAuth flow completes, the account
   // is updated and subscribers are notified with credentialsValid: true.
-  reconnectAccount(accountId: number): Promise<{url: string}>;
+  reconnectAccount(accountId: number): Promise<{ url: string }>;
 
   // --- Gatekeeper management apps ---
 
@@ -802,15 +953,24 @@ export const MAX_ANNOUNCEMENT_LENGTH = 2000;
 
 // Accent colors available for the full-width announcement banner. Soft status tints plus the brand
 // color, so a banner need not look like an alert.
-export type BannerColor = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'brand';
+export type BannerColor =
+  "neutral" | "info" | "success" | "warning" | "danger" | "brand";
 
-export const BANNER_COLORS: BannerColor[] =
-    ['neutral', 'info', 'success', 'warning', 'danger', 'brand'];
+export const BANNER_COLORS: BannerColor[] = [
+  "neutral",
+  "info",
+  "success",
+  "warning",
+  "danger",
+  "brand",
+];
 
-export const DEFAULT_BANNER_COLOR: BannerColor = 'info';
+export const DEFAULT_BANNER_COLOR: BannerColor = "info";
 
 export function isBannerColor(value: unknown): value is BannerColor {
-  return typeof value === 'string' && (BANNER_COLORS as string[]).includes(value);
+  return (
+    typeof value === "string" && (BANNER_COLORS as string[]).includes(value)
+  );
 }
 
 // The deployment-wide full-width banner configuration.
@@ -824,7 +984,10 @@ export type BannerConfig = {
 // Whether `value` is a valid 3- or 6-digit hex color (e.g. "#abc" or "#aabbcc"). Used to validate
 // the admin accent color before it's interpolated into CSS, preventing CSS injection.
 export function isHexColor(value: unknown): value is string {
-  return typeof value === 'string' && /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value);
+  return (
+    typeof value === "string" &&
+    /^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.test(value)
+  );
 }
 
 // A single gatekeeper resource type in the admin resource-config UI.
@@ -843,10 +1006,16 @@ export type AdminResource = {
 //   - 'disabled': not available; no account is provisioned and any existing one is dormant.
 //   - 'optional': users opt in from the Connectors page; not forced on anyone (the default).
 //   - 'enabled':  auto-provisioned for every user (forced); they can't remove it.
-export const AMBIENT_GATEKEEPER_MODES = ['disabled', 'optional', 'enabled'] as const;
-export type AmbientGatekeeperMode = typeof AMBIENT_GATEKEEPER_MODES[number];
+export const AMBIENT_GATEKEEPER_MODES = [
+  "disabled",
+  "optional",
+  "enabled",
+] as const;
+export type AmbientGatekeeperMode = (typeof AMBIENT_GATEKEEPER_MODES)[number];
 
-export function isAmbientGatekeeperMode(value: unknown): value is AmbientGatekeeperMode {
+export function isAmbientGatekeeperMode(
+  value: unknown,
+): value is AmbientGatekeeperMode {
   return AMBIENT_GATEKEEPER_MODES.includes(value as AmbientGatekeeperMode);
 }
 
@@ -992,14 +1161,21 @@ export interface AdminApi {
   // Enable or disable a single gatekeeper resource type, keyed by vendor id + resource urlPattern.
   // Soft enforcement: disabling hides the resource from the connect UI, the resource picker, and the
   // agent; it doesn't revoke a capability a workspace already holds.
-  setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void>;
+  setResourceEnabled(
+    vendorId: string,
+    urlPattern: string,
+    enabled: boolean,
+  ): Promise<void>;
 
   // Set a gatekeeper's availability. For an auto-provisioning ("ambient") gatekeeper, `mode` is the
   // full three-state (disabled / optional / enabled); for an ordinary gatekeeper only 'disabled' /
   // 'enabled' are valid ('optional' is rejected). Soft enforcement: it doesn't revoke a capability a
   // workspace already holds, and 'disabled' leaves an ambient account's data dormant rather than deleting
   // it.
-  setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void>;
+  setGatekeeperMode(
+    vendorId: string,
+    mode: AmbientGatekeeperMode,
+  ): Promise<void>;
 
   // Set the top-bar notice (centered text in the top navigation bar). Pass "" to clear. Rejects over
   // MAX_ANNOUNCEMENT_LENGTH.
@@ -1053,7 +1229,7 @@ export type AdminFormatPatch = {
   agentHint?: string;
   // Per-field presentation overrides. A field set to null reverts to the blueprint's declaration;
   // a field left absent is unchanged.
-  overrides?: {[K in keyof BlueprintOutput]?: BlueprintOutput[K] | null};
+  overrides?: { [K in keyof BlueprintOutput]?: BlueprintOutput[K] | null };
 };
 
 // A gatekeeper vendor offered as a sign-in method. The login/signup pages render a "Continue with
@@ -1108,7 +1284,7 @@ export type ServerConfig = {
 
 // Supported AI providers.
 export type AiModelProvider =
-    "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "local-runtime";
+  "openai" | "anthropic" | "google" | "cloudflare" | "ollama" | "local-runtime";
 
 // Configuration specifying how to connect to an AI model provider.
 export type AiModelConfig = {
@@ -1289,54 +1465,54 @@ export type VerglasTableDetail = VerglasTableSummary & {
 /** Managed object storage or a pre-authorized scoped S3 binding. */
 export type VerglasLakehouseStorage =
   | {
-    /** Verglas provisions the object storage binding. */
-    mode: "managed";
-  }
+      /** Verglas provisions the object storage binding. */
+      mode: "managed";
+    }
   | {
-    /** Verglas resolves a scoped secret for the declared path. */
-    mode: "scoped-secret";
-    /** S3 URI covered by the selected secret. */
-    dataPath: string;
-  };
+      /** Verglas resolves a scoped secret for the declared path. */
+      mode: "scoped-secret";
+      /** S3 URI covered by the selected secret. */
+      dataPath: string;
+    };
 
 /** Managed Lakekeeper or a pre-authorized external Iceberg REST catalog. */
 export type VerglasLakehouseCatalog =
   | {
-    /** Verglas provisions a warehouse in the tenant Lakekeeper deployment. */
-    mode: "managed-lakekeeper";
-  }
+      /** Verglas provisions a warehouse in the tenant Lakekeeper deployment. */
+      mode: "managed-lakekeeper";
+    }
   | {
-    /** Verglas connects to an external Iceberg REST catalog. */
-    mode: "external";
-    /** External catalog base URI. */
-    uri: string;
-    /** Warehouse selected within the external catalog. */
-    warehouse: string;
-  };
+      /** Verglas connects to an external Iceberg REST catalog. */
+      mode: "external";
+      /** External catalog base URI. */
+      uri: string;
+      /** Warehouse selected within the external catalog. */
+      warehouse: string;
+    };
 
 /** Public tenant database definition returned by the access service. */
 export type VerglasDatabaseDefinition =
   | {
-    /** An Iceberg lakehouse with database-scoped catalog routing. */
-    type: "lakehouse";
-    /** Stable tenant-local database name. */
-    name: string;
-    /** Object storage selected for this Lakehouse. */
-    storage: VerglasLakehouseStorage;
-    /** Catalog selected for this Lakehouse. */
-    catalog: VerglasLakehouseCatalog;
-  }
+      /** An Iceberg lakehouse with database-scoped catalog routing. */
+      type: "lakehouse";
+      /** Stable tenant-local database name. */
+      name: string;
+      /** Object storage selected for this Lakehouse. */
+      storage: VerglasLakehouseStorage;
+      /** Catalog selected for this Lakehouse. */
+      catalog: VerglasLakehouseCatalog;
+    }
   | {
-    /** An independent managed Postgres database. */
-    type: "postgres";
-    /** Stable tenant-local database name. */
-    name: string;
-    /** Postgres runtime selected for this database. */
-    engine: {
-      /** Verglas' managed Neon runtime. */
-      mode: "managed-neon";
+      /** An independent managed Postgres database. */
+      type: "postgres";
+      /** Stable tenant-local database name. */
+      name: string;
+      /** Postgres runtime selected for this database. */
+      engine: {
+        /** Verglas' managed Neon runtime. */
+        mode: "managed-neon";
+      };
     };
-  };
 
 /** Database declaration accepted by the tenant access service. */
 export type VerglasCreateDatabaseInput = VerglasDatabaseDefinition;
@@ -1535,7 +1711,14 @@ export type ModelRuntimeWizardStep = {
   /** Opaque step identifier returned with the user's answer. */
   id: string;
   /** Rendering behavior requested by the provider flow. */
-  type: "note" | "select" | "text" | "confirm" | "multiselect" | "progress" | "action";
+  type:
+    | "note"
+    | "select"
+    | "text"
+    | "confirm"
+    | "multiselect"
+    | "progress"
+    | "action";
   /** Optional step heading. */
   title?: string;
   /** Optional explanatory body. */
@@ -1609,38 +1792,52 @@ export const WORKERS_AI_OUTPUT_LIMIT = 32768;
 // leaving the remainder as the prompt budget context compaction sizes against.
 export const SUGGESTED_MODELS: Record<
   AiModelProvider,
-  Record<string, {name: string, contextWindow: number, outputLimit?: number}>
+  Record<string, { name: string; contextWindow: number; outputLimit?: number }>
 > = {
-  "cloudflare": {
+  cloudflare: {
     "@cf/moonshotai/kimi-k2.7-code": {
-      name: "Kimi K2.7 Code (Workers AI)", contextWindow: 262144,
+      name: "Kimi K2.7 Code (Workers AI)",
+      contextWindow: 262144,
       outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
     "@cf/zai-org/glm-5.2": {
-      name: "GLM 5.2 (Workers AI)", contextWindow: 262144, outputLimit: WORKERS_AI_OUTPUT_LIMIT,
+      name: "GLM 5.2 (Workers AI)",
+      contextWindow: 262144,
+      outputLimit: WORKERS_AI_OUTPUT_LIMIT,
     },
   },
-  "anthropic": {
+  anthropic: {
     // TODO: Include Fable -- but we need an admin option to disable it, since many orgs don't
     //   allow it for ZDR reasons. It's sort of overkill for building workspaces anyway.
-    "claude-opus-5": {name: "Claude Opus 5", contextWindow: 1000000},
-    "claude-sonnet-5": {name: "Claude Sonnet 5", contextWindow: 1000000},
-    "claude-haiku-4-5": {name: "Claude Haiku 4.5", contextWindow: 200000},
+    "claude-opus-5": { name: "Claude Opus 5", contextWindow: 1000000 },
+    "claude-sonnet-5": { name: "Claude Sonnet 5", contextWindow: 1000000 },
+    "claude-haiku-4-5": { name: "Claude Haiku 4.5", contextWindow: 200000 },
   },
-  "openai": {
-    "gpt-5.6-sol": {name: "GPT 5.6 Sol", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-luna": {name: "GPT 5.6 Luna", contextWindow: 1050000, outputLimit: 128000},
-    "gpt-5.6-terra": {name: "GPT 5.6 Terra", contextWindow: 1050000, outputLimit: 128000},
+  openai: {
+    "gpt-5.6-sol": {
+      name: "GPT 5.6 Sol",
+      contextWindow: 1050000,
+      outputLimit: 128000,
+    },
+    "gpt-5.6-luna": {
+      name: "GPT 5.6 Luna",
+      contextWindow: 1050000,
+      outputLimit: 128000,
+    },
+    "gpt-5.6-terra": {
+      name: "GPT 5.6 Terra",
+      contextWindow: 1050000,
+      outputLimit: 128000,
+    },
   },
-  "google": {
-    "gemini-3.6-flash": {name: "Gemini 3.6 Flash", contextWindow: 1048576},
+  google: {
+    "gemini-3.6-flash": { name: "Gemini 3.6 Flash", contextWindow: 1048576 },
   },
-  "ollama": {
-  },
+  ollama: {},
   "local-runtime": {
-    "codex": {name: "Codex subscription", contextWindow: 128000},
-    "claude-code": {name: "Claude Code subscription", contextWindow: 128000},
-    "cursor": {name: "Cursor subscription", contextWindow: 128000},
+    codex: { name: "Codex subscription", contextWindow: 128000 },
+    "claude-code": { name: "Claude Code subscription", contextWindow: 128000 },
+    cursor: { name: "Cursor subscription", contextWindow: 128000 },
   },
 };
 
@@ -1687,27 +1884,40 @@ export type WorkspaceMetadata = {
   // TODO:
   // - created / modified / activity times
   // - icon? thumbnail?
-}
+};
 
 // WorkspaceMetadata extended with timestamps. These are available when listing workspaces from the
 // user's collection, but not from the Overseer (which doesn't track them).
 export type WorkspaceMetadataWithTimestamps = WorkspaceMetadata & {
   created: Date;
   lastActive: Date;
-}
+};
 
 // The icons an output format may be drawn with. A closed set because we want them to look consistent.
 // The glyphs themselves live in the frontend, so only these keys ever cross the wire.
-export const OUTPUT_ICONS = ["fileText", "gridNine", "presentation", "appWindow", "flowArrow",
-    "kanban", "chartBar", "table", "notebook", "listChecks"] as const;
+export const OUTPUT_ICONS = [
+  "fileText",
+  "gridNine",
+  "presentation",
+  "appWindow",
+  "flowArrow",
+  "kanban",
+  "chartBar",
+  "table",
+  "notebook",
+  "listChecks",
+] as const;
 
 // One of `OUTPUT_ICONS`, naming a glyph the frontend knows how to draw.
-export type OutputIcon = typeof OUTPUT_ICONS[number];
+export type OutputIcon = (typeof OUTPUT_ICONS)[number];
 
 // Whether an unknown value names one of the icons this deployment can draw. Used wherever an icon
 // arrives from outside the kernel: a published blueprint, an admin override, or the browser.
 export function isOutputIcon(value: unknown): value is OutputIcon {
-  return typeof value === "string" && (OUTPUT_ICONS as readonly string[]).includes(value);
+  return (
+    typeof value === "string" &&
+    (OUTPUT_ICONS as readonly string[]).includes(value)
+  );
 }
 
 // What instantiating a blueprint produces: a Document, a Spreadsheet, a Workflow, etc. Declared
@@ -1791,7 +2001,7 @@ export type OutputSummary = {
   // when attempted. Absent for the caller's own workspaces, and for a shared one whose last open
   // predates this field.
   role?: CollaboratorRole;
-}
+};
 
 // Describes the client-side UI code for a Workspace. Such code is intended to run inside an iframe
 // sandbox with no access to the outside world except through an RPC interface to the Workshop
@@ -1804,7 +2014,7 @@ export type UiBundle = {
   // TODO: Specify the format of what this URL returns. A raw HTML page doesn't quite work because
   //   the client needs to initialize the sandbox with some platform libraries before loading the
   //   Workspace itself.
-//  url: string;
+  //  url: string;
 
   // Returns the raw JS code to execute in the Workspace iframe.
   // TODO: For now we just return the code but we should switch to serving over HTTP as described
@@ -1829,7 +2039,7 @@ export type CodeUpdate = {
   //
   // All encoded updates use V2 format.
   update: Uint8Array;
-}
+};
 
 // Callback interface used to receive code updates from the server.
 export interface CodeSubscriber {
@@ -1868,35 +2078,39 @@ export type ActionLogEntry = {
   appliedAt?: Date;
 
   state: ActionState;
-} & ({
-  type: "action";
-  description: ActionDescription;
-  // Who resolved the action (approved or rejected it). Set when the action leaves "pending"; absent
-  // while still pending (or for legacy actions resolved before this was tracked). For an
-  // auto-approved action this is the user who enabled the rule -- auto-approvals run under their
-  // authority (see `autoApproved`).
-  resolvedBy?: AiChatAuthorInfo;
+} & (
+  | {
+      type: "action";
+      description: ActionDescription;
+      // Who resolved the action (approved or rejected it). Set when the action leaves "pending"; absent
+      // while still pending (or for legacy actions resolved before this was tracked). For an
+      // auto-approved action this is the user who enabled the rule -- auto-approvals run under their
+      // authority (see `autoApproved`).
+      resolvedBy?: AiChatAuthorInfo;
 
-  // True when the action was applied automatically by an auto-approval rule rather than by a human
-  // clicking Approve. Only ever set alongside state "approved" (there is no automatic rejection).
-  autoApproved?: boolean;
-} | {
-  type: "observation";
-  description: ObservationDescription;
-} | {
-  type: "bindHook";
+      // True when the action was applied automatically by an auto-approval rule rather than by a human
+      // clicking Approve. Only ever set alongside state "approved" (there is no automatic rejection).
+      autoApproved?: boolean;
+    }
+  | {
+      type: "observation";
+      description: ObservationDescription;
+    }
+  | {
+      type: "bindHook";
 
-  description: HookDescription;
+      description: HookDescription;
 
-  // Hook that was created by this action. `undefined` if it was later deleted.
-  hookId?: number;
+      // Hook that was created by this action. `undefined` if it was later deleted.
+      hookId?: number;
 
-  // Is the hook currently enabled?
-  enabled: boolean;
+      // Is the hook currently enabled?
+      enabled: boolean;
 
-  // Note that `state` is not meaningful for hooks. Instead of being "approved" or "rejected", they
-  // are enabled/disabled, which the user can freely toggle as often as they want.
-});
+      // Note that `state` is not meaningful for hooks. Instead of being "approved" or "rejected", they
+      // are enabled/disabled, which the user can freely toggle as often as they want.
+    }
+);
 
 export type BoundHookInfo = {
   id: number;
@@ -1926,12 +2140,12 @@ export type BoundHookInfo = {
 // between email threads.
 export type AgentSpawnerConfig = {
   // Display name for the binding, shown in the binding list.
-  displayName: string,
+  displayName: string;
 
   // Model ID to run, of the workspace owner's available models. Can be `null` to just create a chat
   // that doesn't actually run an agent -- the chat will be notified that the chat needs attention,
   // same as for an agent chat where the agent fails to mark the task complete.
-  modelId: string | null,
+  modelId: string | null;
 
   // The bindings available to agents spawned by this spawner: binding name (as it appears as
   // `env.NAME` in the spawned agent's executeCode environment) -> target workpiece. When an agent
@@ -1941,7 +2155,7 @@ export type AgentSpawnerConfig = {
   //
   // The entries are deliberately not limited to bindings held by the workspace that owns the
   // spawner: a spawner may define bindings of its own, with its own names and targets.
-  env: Record<string, WorkpieceId>,
+  env: Record<string, WorkpieceId>;
 };
 
 // Interface to a workspace's Overseer, used to display the Workspace Workshop shell UI around that
@@ -1953,10 +2167,16 @@ export interface Overseer extends RpcTarget {
   getMetadata(): Promise<WorkspaceMetadata>;
 
   /** Runs a bounded read query through one selected database runtime. */
-  queryVerglas(database: string, sql: string, maxRows?: number): Promise<VerglasQueryResult>;
+  queryVerglas(
+    database: string,
+    sql: string,
+    maxRows?: number,
+  ): Promise<VerglasQueryResult>;
 
   /** Lists live Data and agent query operations after an optional sequence cursor. */
-  listVerglasQueryActivity(afterSequence?: number): Promise<VerglasQueryActivity[]>;
+  listVerglasQueryActivity(
+    afterSequence?: number,
+  ): Promise<VerglasQueryActivity[]>;
 
   // Get metadata describing this workspace and subscribe to changes.
   //
@@ -1965,12 +2185,14 @@ export interface Overseer extends RpcTarget {
   //
   // Disposing the returned `RpcStub` will cancel the subscription.
   subscribeToMetadata(
-      callback: RpcStub<(metadata: WorkspaceMetadata) => void>)
-      : Promise<RpcStub<{}>>;
+    callback: RpcStub<(metadata: WorkspaceMetadata) => void>,
+  ): Promise<RpcStub<{}>>;
 
   // Receive the current viewer roster, then incremental updates as viewers come and go.
   // A viewer is present for the lifetime of the openWorkspace() session.
-  subscribeToPresence(subscriber: RpcStub<PresenceSubscriber>): Promise<RpcStub<{}>>;
+  subscribeToPresence(
+    subscriber: RpcStub<PresenceSubscriber>,
+  ): Promise<RpcStub<{}>>;
 
   // Change the workspace title.
   setTitle(title: string): Promise<void>;
@@ -1991,7 +2213,9 @@ export interface Overseer extends RpcTarget {
   // only workspace-type workpieces are delivered (see WorkpieceSummary).
   //
   // Disposing the returned `RpcStub` will cancel the subscription.
-  subscribeToWorkpieces(subscriber: RpcStub<WorkpiecesSubscriber>): Promise<RpcStub<{}>>;
+  subscribeToWorkpieces(
+    subscriber: RpcStub<WorkpiecesSubscriber>,
+  ): Promise<RpcStub<{}>>;
 
   // Create a new workspace workpiece in this workspace. `title` is required -- workspaces have no
   // default title. The new workspace starts with no files and no bindings.
@@ -2006,8 +2230,11 @@ export interface Overseer extends RpcTarget {
   // default binding list (see validateBindingName()). When absent, the server chooses one from
   // the title (via the quick model when configured, else a generic fallback). Workspace binding
   // Legacy Dynamic Worker Workspaces removed — live calls throw. Kept for Cap'n Web history typing.
-  createWorkpiece(title: string, chatId?: number, bindingName?: string)
-      : Promise<RpcStub<VesselClient>>;
+  createWorkpiece(
+    title: string,
+    chatId?: number,
+    bindingName?: string,
+  ): Promise<RpcStub<VesselClient>>;
 
   // Get the workspace with the given workpiece ID. To allow for pipelining, this throws an
   // exception if there is no such workspace.
@@ -2024,7 +2251,10 @@ export interface Overseer extends RpcTarget {
   // scratch, omit the version (or pass zero).
   //
   // Disposing the returned `RpcStub` will cancel the subscription.
-  subscribeToCode(subscriber: RpcStub<CodeSubscriber>, fromVersion?: number): Promise<RpcStub<{}>>;
+  subscribeToCode(
+    subscriber: RpcStub<CodeSubscriber>,
+    fromVersion?: number,
+  ): Promise<RpcStub<{}>>;
 
   // Send a Yjs update to the server.
   //
@@ -2043,7 +2273,10 @@ export interface Overseer extends RpcTarget {
   //
   // The new gatekeeper is a workspace-level workpiece; it is not bound into any workspace's `env` by
   // default. Use VesselClient.bind() / bindWithSuggestedName() to expose it to a workspace.
-  newGatekeeper(accountId: number, resourceUrl: string): Promise<GatekeeperClient<any> | null>;
+  newGatekeeper(
+    accountId: number,
+    resourceUrl: string,
+  ): Promise<GatekeeperClient<any> | null>;
 
   // Create a new gatekeeper for an AI model binding. The model can be any returned by
   // listModels().
@@ -2051,7 +2284,9 @@ export interface Overseer extends RpcTarget {
 
   // Create a new gatekeeper for an agent spawner binding. This allows the workspace to
   // programmatically spawn AI agents to complete tasks.
-  newAgentSpawnerGatekeeper(config: AgentSpawnerConfig): Promise<GatekeeperClient<any>>;
+  newAgentSpawnerGatekeeper(
+    config: AgentSpawnerConfig,
+  ): Promise<GatekeeperClient<any>>;
 
   // List history of actions.
   // TODO: This should be paginated.
@@ -2087,14 +2322,22 @@ export interface Overseer extends RpcTarget {
   //
   // Auto-approval rules are workspace-wide per gatekeeper: approving an action kind approves it
   // no matter which workspace invokes it.
-  setAutoApprovedActionKind(gatekeeperId: WorkpieceId, actionKind: ActionKind): Promise<void>;
+  setAutoApprovedActionKind(
+    gatekeeperId: WorkpieceId,
+    actionKind: ActionKind,
+  ): Promise<void>;
 
   // Remove the auto-approval rule for `tag` on the given gatekeeper; matching actions then
   // require manual approval again.
-  removeAutoApprovedActionKind(gatekeeperId: WorkpieceId, tag: string): Promise<void>;
+  removeAutoApprovedActionKind(
+    gatekeeperId: WorkpieceId,
+    tag: string,
+  ): Promise<void>;
 
   // List the currently-enabled auto-approval rules.
-  listAutoApprovedActionKinds(): Promise<Array<{ gatekeeperId: WorkpieceId; actionKind: ActionKind }>>;
+  listAutoApprovedActionKinds(): Promise<
+    Array<{ gatekeeperId: WorkpieceId; actionKind: ActionKind }>
+  >;
 
   // List the auto-approvable action kinds offered by gatekeepers bound in this workspace. Each
   // entry identifies its connection and reports whether a matching auto-approval rule is enabled.
@@ -2106,7 +2349,10 @@ export interface Overseer extends RpcTarget {
   // chat's env, under the name the agent chose when it made the request (see
   // `connectionRequest.bindingName`). This marks the request accepted, updates the inline card,
   // and resumes the agent so it can use the resource.
-  acceptConnectionRequest(requestId: string, result: {gatekeeperId: WorkpieceId}): Promise<void>;
+  acceptConnectionRequest(
+    requestId: string,
+    result: { gatekeeperId: WorkpieceId },
+  ): Promise<void>;
 
   // Deny an agent's pending connection request. Updates the inline card. Does NOT resume the agent:
   // the turn stays ended so the user can decide what to tell the agent to do instead.
@@ -2120,13 +2366,19 @@ export interface Overseer extends RpcTarget {
 
   // Supplies generated Source configuration, stores secret fields in the Verglas scheduler,
   // and publishes the Source as a Verglas worker revision. This does not resume or block a chat.
-  configureSource(requestId: string, values: Record<string, string>): Promise<void>;
+  configureSource(
+    requestId: string,
+    values: Record<string, string>,
+  ): Promise<void>;
 
   // Queues an immediate run of a configured Source and returns its durable Verglas job ID.
-  runSource(requestId: string): Promise<{jobId: string, created: boolean}>;
+  runSource(requestId: string): Promise<{ jobId: string; created: boolean }>;
 
   /** Saves generated Integration configuration and requires its live verification to pass. */
-  configureIntegration(requestId: string, values: Record<string, string>): Promise<void>;
+  configureIntegration(
+    requestId: string,
+    values: Record<string, string>,
+  ): Promise<void>;
 
   /** Re-runs an Integration's generated live verification without changing its configuration. */
   testIntegration(requestId: string): Promise<IntegrationVerification>;
@@ -2139,7 +2391,10 @@ export interface Overseer extends RpcTarget {
 
   // Subscribe to action adds/updates. Dispose the returned stub to unsubscribe.
   // If `startAfter` is set, replay actions changed after that timestamp.
-  subscribeToActions(subscriber: RpcStub<ActionsSubscriber>, startAfter?: Date): Promise<RpcStub<{}>>;
+  subscribeToActions(
+    subscriber: RpcStub<ActionsSubscriber>,
+    startAfter?: Date,
+  ): Promise<RpcStub<{}>>;
 
   // List past AI chats.
   listChats(): Promise<AiChatMetadata[]>;
@@ -2157,10 +2412,16 @@ export interface Overseer extends RpcTarget {
   //
   // In typical usage, the client subscribes to all chat activity upfront, but only fetches
   // histories if and when the user opens a specific.
-  getChatHistory(chatId: number, beforeSequence?: number): Promise<AiChatHistoryPage>;
+  getChatHistory(
+    chatId: number,
+    beforeSequence?: number,
+  ): Promise<AiChatHistoryPage>;
 
   // Fetch a single message from a chat thread.
-  getChatMessage(chatId: number, sequence: number): Promise<AiChatMessage | undefined>;
+  getChatMessage(
+    chatId: number,
+    sequence: number,
+  ): Promise<AiChatMessage | undefined>;
 
   // Subscribe to all new chat messages (across all threads).
   //
@@ -2173,7 +2434,10 @@ export interface Overseer extends RpcTarget {
   // these calls after `subscribeToChat()`, so that there's no chance of missing a message. (It is
   // not necessary to wait for `subscribeToChat()` to return -- only to initiate the call before
   // other read calls.)
-  subscribeToChat(subscriber: RpcStub<AiChatSubscriber>, startAfter?: Date): Promise<RpcStub<{}>>;
+  subscribeToChat(
+    subscriber: RpcStub<AiChatSubscriber>,
+    startAfter?: Date,
+  ): Promise<RpcStub<{}>>;
 
   // Lists slash commands available from Gatekeepers currently attached to this Workspace, including
   // ambient ones.
@@ -2189,9 +2453,13 @@ export interface Overseer extends RpcTarget {
   // `formats` records where the message names one of the deployment's standard output formats, so
   // the transcript can draw it as a chip. Display only -- what the agent reads is the noun, which
   // is already in the text.
-  newChat(initialMessage: string | SlashCommandRequest, modelId: string | null,
-          capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-          formats?: MessageFormatRef[]): Promise<number>;
+  newChat(
+    initialMessage: string | SlashCommandRequest,
+    modelId: string | null,
+    capsules?: CapsuleSpecifier[],
+    attachments?: ChatAttachmentHandle[],
+    formats?: MessageFormatRef[],
+  ): Promise<number>;
 
   // Send a message to the chat from this client. Sending a message causes the LLM to start
   // running if it isn't already.
@@ -2202,16 +2470,24 @@ export interface Overseer extends RpcTarget {
   // `modelId` is one of the IDs in the result of `listModels()`, or null to inhibit AI response
   // (useful when using chat to talk between humans).
   //
-  sendChatMessage(chatId: number, message: string | SlashCommandRequest, modelId: string | null,
-                  capsules?: CapsuleSpecifier[], attachments?: ChatAttachmentHandle[],
-                  formats?: MessageFormatRef[]): Promise<void>;
+  sendChatMessage(
+    chatId: number,
+    message: string | SlashCommandRequest,
+    modelId: string | null,
+    capsules?: CapsuleSpecifier[],
+    attachments?: ChatAttachmentHandle[],
+    formats?: MessageFormatRef[],
+  ): Promise<void>;
 
   // Upload an attachment for use in a future chat message. This way by the time the user wants to
   // send the message, likely uploading is complete. `modelId` determines whether the
   // selected provider can receive a raw file attachment.
   //
   // Pass the returned handle to newChat() or sendChatMessage() to commit the attachment into chat history.
-  uploadChatAttachment(attachment: ChatAttachmentUpload, modelId: string | null): Promise<ChatAttachmentHandle>;
+  uploadChatAttachment(
+    attachment: ChatAttachmentUpload,
+    modelId: string | null,
+  ): Promise<ChatAttachmentHandle>;
 
   // Fetch the bytes of a committed chat attachment over RPC. The canonical metadata is already
   // present in the message's ChatAttachmentRef. Images are inlined there, so this is normally used
@@ -2231,8 +2507,10 @@ export interface Overseer extends RpcTarget {
   // If `options.includeDraft` is true, any current live draft for the chat is first materialized
   // into one durable `changes` message and included in the merge.
   mergeChanges(
-      chatId: number, mergeThrough: number | null,
-      options?: { includeDraft?: boolean }): Promise<void>;
+    chatId: number,
+    mergeThrough: number | null,
+    options?: { includeDraft?: boolean },
+  ): Promise<void>;
 
   // Indicates that the user has requested that proposed changes starting from the given sequence
   // number in the chat thread be reverted.
@@ -2269,7 +2547,9 @@ export interface Overseer extends RpcTarget {
   // happen.
   //
   // To unsubscribe, dispose the returned stub.
-  subscribeToConsoleLogs(subscriber: RpcStub<ConsoleLogSubscriber>): Promise<RpcStub<{}>>;
+  subscribeToConsoleLogs(
+    subscriber: RpcStub<ConsoleLogSubscriber>,
+  ): Promise<RpcStub<{}>>;
 
   // --- Blueprint management ---
   //
@@ -2289,13 +2569,16 @@ export interface Overseer extends RpcTarget {
   //   the source workspace's current bindings without changing the code snapshot.
   //
   // At least one option must be provided.
-  updateBlueprint(blueprintId: string, options: {
-    title?: string;
-    description?: string;
-    updateCode?: boolean;
-    updateBindings?: boolean;
-    screenshot?: BlueprintScreenshotUpload | null;
-  }): Promise<void>;
+  updateBlueprint(
+    blueprintId: string,
+    options: {
+      title?: string;
+      description?: string;
+      updateCode?: boolean;
+      updateBindings?: boolean;
+      screenshot?: BlueprintScreenshotUpload | null;
+    },
+  ): Promise<void>;
 
   // Delete a blueprint. Cleans up KV, R2, User DO, and local storage.
   deleteBlueprint(blueprintId: string): Promise<void>;
@@ -2311,7 +2594,9 @@ export interface Overseer extends RpcTarget {
    * the order the connections were created. Reports what sharing will cost the recipient; it
    * grants nothing and mints no capability.
    */
-  listObserverRequirements(role: CollaboratorRole): Promise<ObserverBindingNeed[]>;
+  listObserverRequirements(
+    role: CollaboratorRole,
+  ): Promise<ObserverBindingNeed[]>;
 
   // List all collaborators. Available to owner and all collaborators.
   listCollaborators(): Promise<CollaboratorInfo[]>;
@@ -2320,8 +2605,11 @@ export interface Overseer extends RpcTarget {
   // collaborator. `role` is the access level to grant; the caller may not grant a role higher
   // than their own effective role. Returns the new collaborator's info, or null if the username
   // doesn't correspond to an existing account.
-  addCollaborator(username: string, role: CollaboratorRole,
-                  note?: string): Promise<CollaboratorInfo | null>;
+  addCollaborator(
+    username: string,
+    role: CollaboratorRole,
+    note?: string,
+  ): Promise<CollaboratorInfo | null>;
 
   // Remove a collaborator (identified by profile.id).
   //
@@ -2337,7 +2625,10 @@ export interface Overseer extends RpcTarget {
   // Returns the list of users whose access actually changed (removed or downgraded), including
   // the primary target. An empty array means the caller's edge was removed but no one's effective
   // access changed (the target retained their role through other edges).
-  removeCollaborator(profileId: string, keepUsers: string[]): Promise<AffectedCollaborator[]>;
+  removeCollaborator(
+    profileId: string,
+    keepUsers: string[],
+  ): Promise<AffectedCollaborator[]>;
 
   // Preview what would happen if a collaborator were removed. For a non-owner caller,
   // if the target has edges from other sources that would survive, returns an empty array
@@ -2356,8 +2647,10 @@ export interface Overseer extends RpcTarget {
   // caller constructs a URL from the key. The raw key is never stored server-side. `role` is the
   // access level granted to anyone who redeems the link; the caller may not grant a role higher
   // than their own effective role.
-  createShareLink(role: CollaboratorRole, note?: string)
-      : Promise<{ key: string; linkId: string }>;
+  createShareLink(
+    role: CollaboratorRole,
+    note?: string,
+  ): Promise<{ key: string; linkId: string }>;
 
   // Mint a fresh secret for an existing link so the user can copy a new URL without creating a
   // whole new link. The old secrets remain valid, and revoking the link revokes them all together.
@@ -2374,7 +2667,10 @@ export interface Overseer extends RpcTarget {
   // gained access through the link may be transitively removed or downgraded. `keepUsers` lists
   // profile.ids of users who should be retained at their prior role with fresh edges from the
   // caller. Returns the list of users whose access actually changed (removed or downgraded).
-  revokeShareLink(linkId: string, keepUsers: string[]): Promise<AffectedCollaborator[]>;
+  revokeShareLink(
+    linkId: string,
+    keepUsers: string[],
+  ): Promise<AffectedCollaborator[]>;
 
   // Preview what would happen if a share link were revoked. Returns the list of users whose access
   // would change (lose access or be downgraded to a lower role) as a consequence, so the caller
@@ -2383,14 +2679,14 @@ export interface Overseer extends RpcTarget {
 }
 
 export type AiChatMetadata = {
-  id: number,
-  title: string,
-  started: Date,
-  lastActive: Date,
+  id: number;
+  title: string;
+  started: Date;
+  lastActive: Date;
 
   // If present, an LLM (described by the author info) is currently actively responding to the
   // chat.
-  activeAgent?: AiChatAuthorInfo,
+  activeAgent?: AiChatAuthorInfo;
 
   // If true, this chat thread has proposed changes which have not been accepted yet,
   // including any live draft edits that have not yet been materialized into a durable
@@ -2459,302 +2755,325 @@ export type AiChatMessage = {
   author: AiChatAuthorInfo;
 } & AiChatMessageBody;
 
-export type AiChatMessageBody = {
-  // A regular chat message.
-  type: "message";
-  message: string;
+export type AiChatMessageBody =
+  | {
+      // A regular chat message.
+      type: "message";
+      message: string;
 
-  // The message may contain "capsules", which are embedded capabilities that reference external
-  // resources. See `CapsuleSpecifier` for more.
-  capsules?: CapsuleSpecifier[];
+      // The message may contain "capsules", which are embedded capabilities that reference external
+      // resources. See `CapsuleSpecifier` for more.
+      capsules?: CapsuleSpecifier[];
 
-  // Standard output formats the message names, e.g. "create a Doc for homework and Slides for the
-  // presentation". See `MessageFormatRef`.
-  formats?: MessageFormatRef[];
+      // Standard output formats the message names, e.g. "create a Doc for homework and Slides for the
+      // presentation". See `MessageFormatRef`.
+      formats?: MessageFormatRef[];
 
-  // If the AI produces any thinking/reasoning text, this is it. This should be hidden by default
-  // but the user should have the option to expand it.
-  reasoning?: string;
+      // If the AI produces any thinking/reasoning text, this is it. This should be hidden by default
+      // but the user should have the option to expand it.
+      reasoning?: string;
 
-  // Messages from an AI agent can invoke tools.
-  toolCalls?: AiToolCall[];
+      // Messages from an AI agent can invoke tools.
+      toolCalls?: AiToolCall[];
 
-  // Attachments that were sent with this message. Actual bytes stored separately.
-  attachments?: ChatAttachmentRef[];
+      // Attachments that were sent with this message. Actual bytes stored separately.
+      attachments?: ChatAttachmentRef[];
 
-  // Sequence of the visible slash-command event that generated this agent-visible message.
-  // Clients use this to group the two records for display.
-  generatedBySlashCommandSequence?: number;
-} | {
-  // A generated Source (Gatekeeper) that will ingest external data through a Verglas worker.
-  // The card remains independent of the Workspace draft lifecycle and never blocks the chat.
-  type: "sourceConfiguration";
+      // Sequence of the visible slash-command event that generated this agent-visible message.
+      // Clients use this to group the two records for display.
+      generatedBySlashCommandSequence?: number;
+    }
+  | {
+      // A generated Source (Gatekeeper) that will ingest external data through a Verglas worker.
+      // The card remains independent of the Workspace draft lifecycle and never blocks the chat.
+      type: "sourceConfiguration";
 
-  // Stable request identifier used to configure or run this Source.
-  requestId: string;
+      // Stable request identifier used to configure or run this Source.
+      requestId: string;
 
-  // User-facing Source identity and purpose.
-  title: string;
-  description: string;
+      // User-facing Source identity and purpose.
+      title: string;
+      description: string;
 
-  // Verglas output table receiving successfully ingested rows.
-  outputTable: string;
+      // Verglas output table receiving successfully ingested rows.
+      outputTable: string;
 
-  // Generated, bounded configuration fields. Values are never included in chat messages.
-  fields: SourceConfigurationField[];
+      // Generated, bounded configuration fields. Values are never included in chat messages.
+      fields: SourceConfigurationField[];
 
-  /** Deployment triggers for this Source. */
-  triggers?: SourceTrigger[];
+      /** Deployment triggers for this Source. */
+      triggers?: SourceTrigger[];
 
-  /** Fully resolved public ingress URLs for webhook triggers, when configured. */
-  webhookUrls?: string[];
+      /** Fully resolved public ingress URLs for webhook triggers, when configured. */
+      webhookUrls?: string[];
 
-  // Deployment lifecycle of the generated Source worker.
-  state: "needs_configuration" | "ready" | "error";
+      // Deployment lifecycle of the generated Source worker.
+      state: "needs_configuration" | "ready" | "error";
 
-  // Last deployment failure, safe for display and absent after a successful configuration.
-  error?: string;
-} | {
-  /** A generated, isolated Integration Vessel and its user-assisted setup lifecycle. */
-  type: "integrationConfiguration";
+      // Last deployment failure, safe for display and absent after a successful configuration.
+      error?: string;
+    }
+  | {
+      /** A generated, isolated Integration Vessel and its user-assisted setup lifecycle. */
+      type: "integrationConfiguration";
 
-  /** Stable request identifier used to configure and re-test this Integration. */
-  requestId: string;
+      /** Stable request identifier used to configure and re-test this Integration. */
+      requestId: string;
 
-  /** Runtime Vessel identity. */
-  vesselName: string;
+      /** Runtime Vessel identity. */
+      vesselName: string;
 
-  /** User-facing Integration identity and purpose. */
-  title: string;
-  description: string;
+      /** User-facing Integration identity and purpose. */
+      title: string;
+      description: string;
 
-  /** Generated setup work the user must complete outside Verglas. */
-  instructions: IntegrationSetupInstruction[];
+      /** Generated setup work the user must complete outside Verglas. */
+      instructions: IntegrationSetupInstruction[];
 
-  /** Generated configuration fields. Values never enter chat storage. */
-  fields: SourceConfigurationField[];
+      /** Generated configuration fields. Values never enter chat storage. */
+      fields: SourceConfigurationField[];
 
-  /** Integration deployment and verification lifecycle. */
-  state: "deploying" | "needs_configuration" | "ready" | "error";
+      /** Integration deployment and verification lifecycle. */
+      state: "deploying" | "needs_configuration" | "ready" | "error";
 
-  /** Most recent live verification result. */
-  verification?: IntegrationVerification;
+      /** Most recent live verification result. */
+      verification?: IntegrationVerification;
 
-  /** Last safe deployment or verification failure. */
-  error?: string;
-} | {
-  /**
-   * Lightweight Jobs pipeline surface for a chat: workers, triggers, output tables, and
-   * edges inferred from outputs feeding later jobs. Not a mini-app — links to `/workflows`.
-   */
-  type: "jobsPipeline";
+      /** Last safe deployment or verification failure. */
+      error?: string;
+    }
+  | {
+      /**
+       * Lightweight Jobs pipeline surface for a chat: workers, triggers, output tables, and
+       * edges inferred from outputs feeding later jobs. Not a mini-app — links to `/workflows`.
+       */
+      type: "jobsPipeline";
 
-  /** Jobs owned by this chat, newest last. */
-  jobs: Array<{
-    /** Source configuration request id when this job came from createSource. */
-    requestId: string;
-    /** Runtime worker name. */
-    workerName: string;
-    /** User-facing job title. */
-    title: string;
-    /** Destination lakehouse table. */
-    outputTable: string;
-    /** Declared triggers for this job. */
-    triggers: SourceTrigger[];
-    /** Deployment lifecycle. */
-    state: "needs_configuration" | "ready" | "error";
-  }>;
+      /** Jobs owned by this chat, newest last. */
+      jobs: Array<{
+        /** Source configuration request id when this job came from createSource. */
+        requestId: string;
+        /** Runtime worker name. */
+        workerName: string;
+        /** User-facing job title. */
+        title: string;
+        /** Destination lakehouse table. */
+        outputTable: string;
+        /** Declared triggers for this job. */
+        triggers: SourceTrigger[];
+        /** Deployment lifecycle. */
+        state: "needs_configuration" | "ready" | "error";
+      }>;
 
-  /** Simple DAG edges: from job requestId to job requestId when outputs feed later jobs. */
-  edges: Array<{from: string; to: string}>;
-} | {
-  /**
-   * Lightweight Application preview card: title, description, and preview URL.
-   * Screenshot is optional; primary CTA opens the preview.
-   */
-  type: "applicationPreview";
+      /** Simple DAG edges: from job requestId to job requestId when outputs feed later jobs. */
+      edges: Array<{ from: string; to: string }>;
+    }
+  | {
+      /**
+       * Lightweight Application preview card: title, description, and preview URL.
+       * Screenshot is optional; primary CTA opens the preview.
+       */
+      type: "applicationPreview";
 
-  /** Runtime Vessel identity. */
-  vesselName: string;
+      /** Runtime Vessel identity. */
+      vesselName: string;
 
-  /** Local preview URL served by the container runtime. */
-  previewUrl: string;
+      /** Local preview URL served by the container runtime. */
+      previewUrl: string;
 
-  /** User-facing Application identity. */
-  title: string;
-  description: string;
+      /** User-facing Application identity. */
+      title: string;
+      description: string;
 
-  /** Optional screenshot URL when capture is available. */
-  screenshotUrl?: string;
-} | {
-  // A slash command exactly as requested by the client, retained for display and never included in
-  // model context. A gatekeeper command does not itself start an agent turn -- the prompt it expands
-  // to arrives as a separate `message`. A built-in command is handled by the Workshop, and this
-  // record is what drives the turn it runs.
-  type: "slashCommand";
-  request: SlashCommandRequest;
+      /** Optional screenshot URL when capture is available. */
+      screenshotUrl?: string;
+    }
+  | {
+      // A slash command exactly as requested by the client, retained for display and never included in
+      // model context. A gatekeeper command does not itself start an agent turn -- the prompt it expands
+      // to arrives as a separate `message`. A built-in command is handled by the Workshop, and this
+      // record is what drives the turn it runs.
+      type: "slashCommand";
+      request: SlashCommandRequest;
 
-  // Provider-supplied skill name for the display badge. Commands without one show no badge.
-  skillName?: string;
-} | {
-  // Represents changes made to the code by an agent tool call or by a collaborating user as part
-  // of a chat. These changes are provisional until they are accepted.
-  type: "changes";
+      // Provider-supplied skill name for the display badge. Commands without one show no badge.
+      skillName?: string;
+    }
+  | {
+      // Represents changes made to the code by an agent tool call or by a collaborating user as part
+      // of a chat. These changes are provisional until they are accepted.
+      type: "changes";
 
-  // The code changes themselves, as a Yjs-encoded (V2) update against the workspace code Y.Doc.
-  // Absent when the batch records only workspace creations and/or binding additions with no
-  // accompanying code edits.
-  update?: Uint8Array;
+      // The code changes themselves, as a Yjs-encoded (V2) update against the workspace code Y.Doc.
+      // Absent when the batch records only workspace creations and/or binding additions with no
+      // accompanying code edits.
+      update?: Uint8Array;
 
-  // The workspace code version that `update` was built against. Once an agent session observes
-  // the code at some version, the chat stays locked to that version (see
-  // AiToolCall.observedCodeVersion), so history replay must learn each update's base version
-  // *before* it reconstructs the session's code state. Present whenever `update` is, except in
-  // messages persisted before this field existed. For user-authored batches this records the
-  // mainline base at the time the user's edits were captured, which may legitimately differ
-  // from the version an agent session is locked to (the user can accept changes -- advancing
-  // mainline -- and keep editing); such stamps seed a session's version lock but are never
-  // checked against it.
-  observedCodeVersion?: number;
+      // The workspace code version that `update` was built against. Once an agent session observes
+      // the code at some version, the chat stays locked to that version (see
+      // AiToolCall.observedCodeVersion), so history replay must learn each update's base version
+      // *before* it reconstructs the session's code state. Present whenever `update` is, except in
+      // messages persisted before this field existed. For user-authored batches this records the
+      // mainline base at the time the user's edits were captured, which may legitimately differ
+      // from the version an agent session is locked to (the user can accept changes -- advancing
+      // mainline -- and keep editing); such stamps seed a session's version lock but are never
+      // checked against it.
+      observedCodeVersion?: number;
 
-  // Workspaces created as part of this batch of changes (by the agent's `createVessel` tool, or by
-  // the user via Overseer.createVessel() with a chat open -- in the latter case `update` is
-  // omitted). Like the code changes themselves, the creations are provisional: a merge
-  // through this message makes them permanent, and a revert covering it deletes them. Titles are
-  // denormalized for display, since a reverted creation's registry record is gone. `bindingName`
-  // is the name under which the workspace appears in the creating chat's env (and, once merged, the
-  // workspace default binding list); recording it here lets the creating chat pick the name back
-  // up on replay.
-  createdVessels?: {workspaceId: WorkpieceId, title: string, bindingName: string}[];
+      // Workspaces created as part of this batch of changes (by the agent's `createVessel` tool, or by
+      // the user via Overseer.createVessel() with a chat open -- in the latter case `update` is
+      // omitted). Like the code changes themselves, the creations are provisional: a merge
+      // through this message makes them permanent, and a revert covering it deletes them. Titles are
+      // denormalized for display, since a reverted creation's registry record is gone. `bindingName`
+      // is the name under which the workspace appears in the creating chat's env (and, once merged, the
+      // workspace default binding list); recording it here lets the creating chat pick the name back
+      // up on replay.
+      createdVessels?: {
+        workspaceId: WorkpieceId;
+        title: string;
+        bindingName: string;
+      }[];
 
-  // Binding edges added to workspaces as part of this batch of changes (by the agent's
-  // setVesselBinding tool, or by the user binding a connection with a chat open -- in the latter
-  // case `update` is omitted). Like `createdVessels`, the additions are
-  // provisional: the edge is visible only from this chat until a merge through this message
-  // makes it permanent, and a revert covering it deletes the edge. `name` is the binding's name
-  // within the workspace identified by `workspaceId`; `target` is the bound workpiece.
-  addedBindings?: {workspaceId: WorkpieceId, name: string, target: WorkpieceId}[];
-} | {
-  // Indicates that at this point in the chat, the user chose to merge all (non-reverted) changes
-  // in this chat up to and including the given sequence number.
-  type: "merge";
-  mergeThrough: number;
+      // Binding edges added to workspaces as part of this batch of changes (by the agent's
+      // setVesselBinding tool, or by the user binding a connection with a chat open -- in the latter
+      // case `update` is omitted). Like `createdVessels`, the additions are
+      // provisional: the edge is visible only from this chat until a merge through this message
+      // makes it permanent, and a revert covering it deletes the edge. `name` is the binding's name
+      // within the workspace identified by `workspaceId`; `target` is the bound workpiece.
+      addedBindings?: {
+        workspaceId: WorkpieceId;
+        name: string;
+        target: WorkpieceId;
+      }[];
+    }
+  | {
+      // Indicates that at this point in the chat, the user chose to merge all (non-reverted) changes
+      // in this chat up to and including the given sequence number.
+      type: "merge";
+      mergeThrough: number;
 
-  // Code version at which the merge was applied. (A merge covering only workspace creations /
-  // binding additions writes no new code version; this then records the bumped version counter.)
-  version: number;
-} | {
-  // Indicates that at this point in the chat, the user chose to revert all changes starting at the
-  // given sequence number through the end of the chat as of that time. These changes are
-  // completely erased from the Yjs history. Subsequent changes will be based only on what existed
-  // before this point, and any later merge will not include the reverted changes.
-  type: "revert";
-  revertFrom: number;
-} | {
-  // Indicates that the agent in this chat performed an action.
-  type: "action",
-  actionId: number;
+      // Code version at which the merge was applied. (A merge covering only workspace creations /
+      // binding additions writes no new code version; this then records the bumped version counter.)
+      version: number;
+    }
+  | {
+      // Indicates that at this point in the chat, the user chose to revert all changes starting at the
+      // given sequence number through the end of the chat as of that time. These changes are
+      // completely erased from the Yjs history. Subsequent changes will be based only on what existed
+      // before this point, and any later merge will not include the reverted changes.
+      type: "revert";
+      revertFrom: number;
+    }
+  | {
+      // Indicates that the agent in this chat performed an action.
+      type: "action";
+      actionId: number;
 
-  // Denormalized description of the action.
-  //
-  // This is inlined into the message at the time of query, so it is always present and always
-  // current in messages delivered to the client. It is marked optional only because it is not
-  // present in messages stored in the chat table on the server side.
-  actionLog?: ActionLogEntry;
-} | {
-  // Indicates that the AI agent accessed the workspace one or more times. This is logged in order
-  // to track whether information known to the workspace may have tainted the agent session.
-  type: "useVessel";
-} | {
-  // Indicates that the agent run ended with an error (e.g. LLM API failure, abort, server
-  // restart). This is displayed to the user with a "retry" button, but is NOT included in the
-  // chat log sent to the LLM so the agent does not react to it.
-  type: "error";
-  message: string;
-  // Optional machine-readable code so the client can react specially.
-  code?: string;
-} | {
-  // Indicates that a callback was received on the agent's `self` object. When the agent uses
-  // `executeCode`, the executed code receives a `self` parameter. Calling any method on `self`
-  // (e.g., `self.onUpdate(data)`) delivers a callback message back to this chat thread and
-  // activates the agent to respond.
-  type: "agentCallback";
+      // Denormalized description of the action.
+      //
+      // This is inlined into the message at the time of query, so it is always present and always
+      // current in messages delivered to the client. It is marked optional only because it is not
+      // present in messages stored in the chat table on the server side.
+      actionLog?: ActionLogEntry;
+    }
+  | {
+      // Indicates that the AI agent accessed the workspace one or more times. This is logged in order
+      // to track whether information known to the workspace may have tainted the agent session.
+      type: "useVessel";
+    }
+  | {
+      // Indicates that the agent run ended with an error (e.g. LLM API failure, abort, server
+      // restart). This is displayed to the user with a "retry" button, but is NOT included in the
+      // chat log sent to the LLM so the agent does not react to it.
+      type: "error";
+      message: string;
+      // Optional machine-readable code so the client can react specially.
+      code?: string;
+    }
+  | {
+      // Indicates that a callback was received on the agent's `self` object. When the agent uses
+      // `executeCode`, the executed code receives a `self` parameter. Calling any method on `self`
+      // (e.g., `self.onUpdate(data)`) delivers a callback message back to this chat thread and
+      // activates the agent to respond.
+      type: "agentCallback";
 
-  // The method name that was called on `self`.
-  methodName: string;
+      // The method name that was called on `self`.
+      methodName: string;
 
-  // A depth-limited summary string of the arguments for the agent's context window.
-  argsSummary: string;
-} | {
-  // A system-generated nudge message sent to the agent when it tries to end its turn while
-  // agent callbacks are still unresolved. This is displayed as a user message to the LLM
-  // so it can be prompted to continue.
-  type: "agentNudge";
-  text: string;
-} | {
-  // The agent requested that the user connect a gatekeeper (e.g. "I need ClickHouse cluster X").
-  // Rendered inline in the chat as an accept/deny card. State is mutated in-place when the user
-  // accepts or denies; the message is re-delivered to subscribers so the card updates. On accept the
-  // agent is resumed with the outcome (see the history builder in agent.ts); on deny the agent is
-  // not resumed (the user drives what happens next).
-  type: "connectionRequest";
+      // A depth-limited summary string of the arguments for the agent's context window.
+      argsSummary: string;
+    }
+  | {
+      // A system-generated nudge message sent to the agent when it tries to end its turn while
+      // agent callbacks are still unresolved. This is displayed as a user message to the LLM
+      // so it can be prompted to continue.
+      type: "agentNudge";
+      text: string;
+    }
+  | {
+      // The agent requested that the user connect a gatekeeper (e.g. "I need ClickHouse cluster X").
+      // Rendered inline in the chat as an accept/deny card. State is mutated in-place when the user
+      // accepts or denies; the message is re-delivered to subscribers so the card updates. On accept the
+      // agent is resumed with the outcome (see the history builder in agent.ts); on deny the agent is
+      // not resumed (the user drives what happens next).
+      type: "connectionRequest";
 
-  // Unique id used by acceptConnectionRequest()/denyConnectionRequest().
-  requestId: string;
+      // Unique id used by acceptConnectionRequest()/denyConnectionRequest().
+      requestId: string;
 
-  // The gatekeeper vendor the agent is requesting (id + denormalized display name).
-  vendorId: string;
-  vendorName: string;
+      // The gatekeeper vendor the agent is requesting (id + denormalized display name).
+      vendorId: string;
+      vendorName: string;
 
-  // Denormalized vendor logo URL, for the connection card icon.
-  vendorLogoUrl?: string;
+      // Denormalized vendor logo URL, for the connection card icon.
+      vendorLogoUrl?: string;
 
-  // Denormalized human-readable resource type/scope being requested (e.g. "Home Assistant
-  // Instance", "Gmail Mailbox"), resolved from the vendor's supported resources at request time.
-  resourceTitle?: string;
+      // Denormalized human-readable resource type/scope being requested (e.g. "Home Assistant
+      // Instance", "Gmail Mailbox"), resolved from the vendor's supported resources at request time.
+      resourceTitle?: string;
 
-  // A fully- or partially-specified resource URL, if the agent could infer one. When absent (or
-  // incomplete) the accept flow opens the vendor's resource configurator to fill in the gaps.
-  resourceUrl?: string;
+      // A fully- or partially-specified resource URL, if the agent could infer one. When absent (or
+      // incomplete) the accept flow opens the vendor's resource configurator to fill in the gaps.
+      resourceUrl?: string;
 
-  // The urlPattern of the supported resource this request resolved to at request time (one of the
-  // vendor's SupportedResource.urlPattern values, e.g. "https://github.com/:owner/:repo" or the
-  // whole-instance "https://*"). The backend guarantees every connection request resolves to a
-  // concrete resource (see resolveRequestedResource), and the accept modal pre-selects exactly this
-  // resource — so accepting never opens a blank "create new connection" picker.
-  resourceUrlPattern?: string;
+      // The urlPattern of the supported resource this request resolved to at request time (one of the
+      // vendor's SupportedResource.urlPattern values, e.g. "https://github.com/:owner/:repo" or the
+      // whole-instance "https://*"). The backend guarantees every connection request resolves to a
+      // concrete resource (see resolveRequestedResource), and the accept modal pre-selects exactly this
+      // resource — so accepting never opens a blank "create new connection" picker.
+      resourceUrlPattern?: string;
 
-  // Why the agent wants this connection. Shown to the user to inform their decision.
-  reason: string;
+      // Why the agent wants this connection. Shown to the user to inform their decision.
+      reason: string;
 
-  // Lifecycle state. Starts "pending"; set by the user's accept/deny.
-  state: "pending" | "accepted" | "denied";
+      // Lifecycle state. Starts "pending"; set by the user's accept/deny.
+      state: "pending" | "accepted" | "denied";
 
-  // Once accepted, the id of the created gatekeeper. The resource is surfaced to the agent as a
-  // named binding in the chat's env; the agent can additionally bind it into a workspace via
-  // setVesselBinding if its workspace code needs it.
-  gatekeeperId?: WorkpieceId;
+      // Once accepted, the id of the created gatekeeper. The resource is surfaced to the agent as a
+      // named binding in the chat's env; the agent can additionally bind it into a workspace via
+      // setVesselBinding if its workspace code needs it.
+      gatekeeperId?: WorkpieceId;
 
-  // The name under which the resource will appear in the chat's env (`env.NAME` in executeCode)
-  // once the request is accepted. Optional only for persisted legacy requests.
-  bindingName?: string;
-
-} | {
-  /** The AI asks the user to delegate lakehouse or runtime access to a process principal. */
-  type: "permissionRequest";
-  /** Unique identifier used to approve or deny the request. */
-  requestId: string;
-  /** Job, Vessel, Application, Integration, or agent principal receiving access. */
-  principalId: string;
-  /** Protected Verglas resource the process wants to use. */
-  resourceId: string;
-  /** Exact actions requested by the process. */
-  actions: VerglasAccessAction[];
-  /** Agent-authored explanation shown to the approving user. */
-  reason: string;
-  /** User decision lifecycle. */
-  state: "pending" | "approved" | "denied";
-};
+      // The name under which the resource will appear in the chat's env (`env.NAME` in executeCode)
+      // once the request is accepted. Optional only for persisted legacy requests.
+      bindingName?: string;
+    }
+  | {
+      /** The AI asks the user to delegate lakehouse or runtime access to a process principal. */
+      type: "permissionRequest";
+      /** Unique identifier used to approve or deny the request. */
+      requestId: string;
+      /** Job, Vessel, Application, Integration, or agent principal receiving access. */
+      principalId: string;
+      /** Protected Verglas resource the process wants to use. */
+      resourceId: string;
+      /** Exact actions requested by the process. */
+      actions: VerglasAccessAction[];
+      /** Agent-authored explanation shown to the approving user. */
+      reason: string;
+      /** User decision lifecycle. */
+      state: "pending" | "approved" | "denied";
+    };
 
 // Bytes to upload as a chat attachment.
 //
@@ -2790,8 +3109,10 @@ export type ChatAttachmentRef = ChatAttachmentHandle & {
 // Whether attachment bytes can be decoded and inlined into the agent's prompt as text.
 export function isTextLikeAttachmentMimeType(mimeType: string): boolean {
   if (mimeType.startsWith("image/")) return false;
-  return mimeType.startsWith("text/") ||
-      /\b(json|javascript|typescript|xml|yaml|csv|markdown)\b/.test(mimeType);
+  return (
+    mimeType.startsWith("text/") ||
+    /\b(json|javascript|typescript|xml|yaml|csv|markdown)\b/.test(mimeType)
+  );
 }
 
 // Describes a tool call performed by an AI agent as part of a message.
@@ -2813,232 +3134,269 @@ export type AiToolCall = {
 
   // If the tool failed, the error.
   error?: string;
-} & ({
-  // Any workpiece can potentially export files. Workspaces, in particular, export their source code
-  // as files, but other workpieces may export other filesystems. Hence, a file is identified by
-  // the pair of a workpiece reference (the `workpiece` chat binding name) and `filename`.
-  toolName: "readFile";
-  input: {workpiece?: string, filename: string};
-} | {
-  // Creates a generated Source backed by one Verglas worker deployment.
-  toolName: "createSource";
-  input: {
-    title: string;
-    description: string;
-    outputTable: string;
-    workerModule: string;
-    triggers: SourceTrigger[];
-    configFields: SourceConfigurationField[];
-  };
-  output?: {requestId: string};
-} | {
-  /** Creates a generated Integration Vessel with declarative setup and live verification. */
-  toolName: "createIntegration";
-  input: {
-    title: string;
-    description: string;
-    module: string;
-    instructions: IntegrationSetupInstruction[];
-    configFields: SourceConfigurationField[];
-  };
-  output?: {requestId: string; vesselName: string; state: string};
-} | {
-  /** Inspects a chat-owned Integration's state, verification, and runtime health. */
-  toolName: "inspectIntegration";
-  input: {requestId: string};
-  output?: Record<string, unknown>;
-} | {
-  /** Re-runs live verification for a chat-owned Integration. */
-  toolName: "testIntegration";
-  input: {requestId: string};
-  output?: IntegrationVerification;
-} | {
-  /** Redeploys an Integration module onto the same Vessel. */
-  toolName: "updateIntegration";
-  input: {
-    requestId: string;
-    module: string;
-    title?: string;
-    description?: string;
-    instructions?: IntegrationSetupInstruction[];
-    configFields?: SourceConfigurationField[];
-  };
-  output?: {requestId: string; vesselName: string; state: string};
-} | {
-  /** Builds a standalone TypeScript Application Vessel with its own dependencies. */
-  toolName: "createApplication";
-  input: {
-    title: string;
-    description: string;
-    files: Record<string, string>;
-  };
-  output?: {vesselName: string; previewUrl: string; screenshotUrl?: string};
-} | {
-  /** Builds one versioned composition of Integration, Worker, and Interface projects. */
-  toolName: "createVessel";
-  input: {
-    /** Stable Vessel identity matching the manifest. */
-    name: string;
-    /** Portable compositional Vessel YAML. */
-    manifest: string;
-    /** Complete component projects keyed by manifest-relative project path. */
-    projects: Record<string, {files: Record<string, string>}>;
-  };
-  output?: {vesselName: string; version: string; previewUrl: string};
-} | {
-  toolName: "writeFile";
-  input: {
-    workpiece?: string;
-    filename: string;
-    content: string;
-  };
-} | {
-  toolName: "editFile";
-  input: {
-    workpiece?: string;
-    filename: string;
-    textToReplace: string;
-    replacement: string;
-  };
-} | {
-  // Describe one of the chat's bindings by name. Numeric names appear only in logs persisted
-  // before named chat bindings (they were capsule indices).
-  toolName: "describeBinding";
-  input: {
-    name: string | number;
-  };
-} | {
-  toolName: "setBindingHook";
-  input: {
-    bindingName: string;
-    entrypoint: string | null;
-  };
-} | {
-  // Wire one of the chat's bindings into a workspace's own binding list. The addition is provisional
-  // to the chat, recorded by a "changes" message (see `addedBindings`).
-  toolName: "setVesselBinding";
-  input: {
-    // Chat binding name of the target workspace.
-    workspace: string;
-    // Chat binding name of the resource to wire into the workspace.
-    source: string;
-    // Name to bind the resource under within the workspace; defaults to `source`.
-    name?: string;
-  };
+} & (
+  | {
+      // Any workpiece can potentially export files. Workspaces, in particular, export their source code
+      // as files, but other workpieces may export other filesystems. Hence, a file is identified by
+      // the pair of a workpiece reference (the `workpiece` chat binding name) and `filename`.
+      toolName: "readFile";
+      input: { workpiece?: string; filename: string };
+    }
+  | {
+      // Creates a generated Source backed by one Verglas worker deployment.
+      toolName: "createSource";
+      input: {
+        title: string;
+        description: string;
+        outputTable: string;
+        workerModule: string;
+        triggers: SourceTrigger[];
+        configFields: SourceConfigurationField[];
+      };
+      output?: { requestId: string };
+    }
+  | {
+      /** Creates a generated Integration Vessel with declarative setup and live verification. */
+      toolName: "createIntegration";
+      input: {
+        title: string;
+        description: string;
+        module: string;
+        instructions: IntegrationSetupInstruction[];
+        configFields: SourceConfigurationField[];
+      };
+      output?: { requestId: string; vesselName: string; state: string };
+    }
+  | {
+      /** Inspects a chat-owned Integration's state, verification, and runtime health. */
+      toolName: "inspectIntegration";
+      input: { requestId: string };
+      output?: Record<string, unknown>;
+    }
+  | {
+      /** Re-runs live verification for a chat-owned Integration. */
+      toolName: "testIntegration";
+      input: { requestId: string };
+      output?: IntegrationVerification;
+    }
+  | {
+      /** Redeploys an Integration module onto the same Vessel. */
+      toolName: "updateIntegration";
+      input: {
+        requestId: string;
+        module: string;
+        title?: string;
+        description?: string;
+        instructions?: IntegrationSetupInstruction[];
+        configFields?: SourceConfigurationField[];
+      };
+      output?: { requestId: string; vesselName: string; state: string };
+    }
+  | {
+      /** Builds a standalone TypeScript Application Vessel with its own dependencies. */
+      toolName: "createApplication";
+      input: {
+        title: string;
+        description: string;
+        files: Record<string, string>;
+      };
+      output?: {
+        vesselName: string;
+        previewUrl: string;
+        screenshotUrl?: string;
+      };
+    }
+  | {
+      /** Builds one versioned composition of Integration, Worker, and Interface projects. */
+      toolName: "createVessel";
+      input: {
+        /** Stable Vessel identity matching the manifest. */
+        name: string;
+        /** Portable compositional Vessel YAML. */
+        manifest: string;
+        /** Complete component projects keyed by manifest-relative project path. */
+        projects: Record<string, { files: Record<string, string> }>;
+      };
+      output?: { vesselName: string; version: string; previewUrl: string };
+    }
+  | {
+      toolName: "writeFile";
+      input: {
+        workpiece?: string;
+        filename: string;
+        content: string;
+      };
+    }
+  | {
+      toolName: "editFile";
+      input: {
+        workpiece?: string;
+        filename: string;
+        textToReplace: string;
+        replacement: string;
+      };
+    }
+  | {
+      // Describe one of the chat's bindings by name. Numeric names appear only in logs persisted
+      // before named chat bindings (they were capsule indices).
+      toolName: "describeBinding";
+      input: {
+        name: string | number;
+      };
+    }
+  | {
+      toolName: "setBindingHook";
+      input: {
+        bindingName: string;
+        entrypoint: string | null;
+      };
+    }
+  | {
+      // Wire one of the chat's bindings into a workspace's own binding list. The addition is provisional
+      // to the chat, recorded by a "changes" message (see `addedBindings`).
+      toolName: "setVesselBinding";
+      input: {
+        // Chat binding name of the target workspace.
+        workspace: string;
+        // Chat binding name of the resource to wire into the workspace.
+        source: string;
+        // Name to bind the resource under within the workspace; defaults to `source`.
+        name?: string;
+      };
 
-  // The added binding edge as resolved when the tool ran, recorded so crash recovery can re-adopt
-  // an addition whose "changes" message never flushed (see `addedBindings`), mirroring
-  // createVessel's recorded output. `changeId` is the change number of the batch that records the
-  // addition. Absent only when the call failed (`error` is set).
-  output?: {workspaceId: WorkpieceId, name: string, target: WorkpieceId, changeId: number};
-} | {
-  // Obsolete predecessor of `setVesselBinding`, from before named chat bindings; appears only in
-  // old chat logs. Its additions were immediate and permanent (nothing provisional to recover),
-  // so replay is a recorded no-op.
-  toolName: "saveCapsuleAsBinding";
-  input: {
-    capsuleId: number;
-    bindingName: string;
-  };
-} | {
-  // Create a new workspace workpiece in the workspace, either empty or instantiated from a blueprint.
-  toolName: "createWorkpiece";
-  input: {
-    // Human-readable title for the new workspace. Required: the agent always names its creations.
-    title: string;
+      // The added binding edge as resolved when the tool ran, recorded so crash recovery can re-adopt
+      // an addition whose "changes" message never flushed (see `addedBindings`), mirroring
+      // createVessel's recorded output. `changeId` is the change number of the batch that records the
+      // addition. Absent only when the call failed (`error` is set).
+      output?: {
+        workspaceId: WorkpieceId;
+        name: string;
+        target: WorkpieceId;
+        changeId: number;
+      };
+    }
+  | {
+      // Obsolete predecessor of `setVesselBinding`, from before named chat bindings; appears only in
+      // old chat logs. Its additions were immediate and permanent (nothing provisional to recover),
+      // so replay is a recorded no-op.
+      toolName: "saveCapsuleAsBinding";
+      input: {
+        capsuleId: number;
+        bindingName: string;
+      };
+    }
+  | {
+      // Create a new workspace workpiece in the workspace, either empty or instantiated from a blueprint.
+      toolName: "createWorkpiece";
+      input: {
+        // Human-readable title for the new workspace. Required: the agent always names its creations.
+        title: string;
 
-    // Name under which the workspace appears in the chat's env and, once merged, the workspace
-    // default binding list (see validateBindingName()).
-    bindingName: string;
+        // Name under which the workspace appears in the chat's env and, once merged, the workspace
+        // default binding list (see validateBindingName()).
+        bindingName: string;
 
-    // If present, the new workspace starts with the named blueprint's files (copied into the chat's
-    // proposed changes) instead of empty.
-    blueprintId?: string;
-  };
+        // If present, the new workspace starts with the named blueprint's files (copied into the chat's
+        // proposed changes) instead of empty.
+        blueprintId?: string;
+      };
 
-  // The created workspace's workpiece ID, recorded when the workspace was actually created. History
-  // replay reconstructs tool outputs by re-running persisted calls, but a creation tool can't be
-  // re-run; replay returns this recorded result without creating anything.
-  //
-  // `changeId` is the change number of the "changes" batch that records the creation (see
-  // `createdVessels` on the "changes" message body), reported like writeFile/editFile report
-  // theirs so reverts can be referred to precisely.
-  //
-  // `blueprintNotes` is present for blueprint instantiations: formatted text describing the files
-  // copied in and the bindings the blueprint expects the agent to wire up. Recorded so replay
-  // doesn't have to re-fetch the blueprint (whose content may have changed since).
-  output?: {workspaceId: WorkpieceId, changeId?: number, blueprintNotes?: string};
-} | {
-  toolName: "executeCode";
-  input: {
-    code: string;
-  };
+      // The created workspace's workpiece ID, recorded when the workspace was actually created. History
+      // replay reconstructs tool outputs by re-running persisted calls, but a creation tool can't be
+      // re-run; replay returns this recorded result without creating anything.
+      //
+      // `changeId` is the change number of the "changes" batch that records the creation (see
+      // `createdVessels` on the "changes" message body), reported like writeFile/editFile report
+      // theirs so reverts can be referred to precisely.
+      //
+      // `blueprintNotes` is present for blueprint instantiations: formatted text describing the files
+      // copied in and the bindings the blueprint expects the agent to wire up. Recorded so replay
+      // doesn't have to re-fetch the blueprint (whose content may have changed since).
+      output?: {
+        workspaceId: WorkpieceId;
+        changeId?: number;
+        blueprintNotes?: string;
+      };
+    }
+  | {
+      toolName: "executeCode";
+      input: {
+        code: string;
+      };
 
-  // Output, if the code actually ran. (Otherwise, `error` should be present.)
-  output?: string;
-} | {
-  toolName: "giveUp";
-  input: {
-    error: string;
-  };
-} | {
-  toolName: "webFetch";
-  input: {
-    url: string;
-    // If true, return the raw response body without Markdown conversion.
-    raw?: boolean;
-  };
+      // Output, if the code actually ran. (Otherwise, `error` should be present.)
+      output?: string;
+    }
+  | {
+      toolName: "giveUp";
+      input: {
+        error: string;
+      };
+    }
+  | {
+      toolName: "webFetch";
+      input: {
+        url: string;
+        // If true, return the raw response body without Markdown conversion.
+        raw?: boolean;
+      };
 
-  // Output, if the fetch actually completed. (Otherwise, `error` should be present.) This is
-  // stored so that the agent's chat history can be replayed without re-issuing the fetch.
-  // Formatted as a YAML-frontmatter header followed by the body (see formatWebFetchResult).
-  output?: string;
-} | {
-  // This actually shouldn't ever appear in logs unless the agent misunderstands the tool.
-  toolName: "observeUserChanges";
-  input: {};
-} | {
-  // List the blueprints the workspace owner could instantiate (their own blueprints, their
-  // library, and the deployment's featured blueprints), so the agent can pass a blueprintId to
-  // createVessel. The formatted text output is recorded so replay doesn't re-list.
-  toolName: "listBlueprints";
-  input: {};
-  output?: string;
-} | {
-  // List the resource types a gatekeeper vendor offers, so the agent can construct a resourceUrl
-  // for requestConnection. Resource patterns are only surfaced on demand (not in the system prompt).
-  toolName: "listConnectableResources";
-  input: {
-    vendorId: string;
-  };
-  output?: string;
-} | {
-  // Ask the user to connect a gatekeeper, pre-configured as much as the agent can manage. Renders
-  // an accept/deny card in the chat; non-blocking (the turn ends, and the agent is resumed if the
-  // user accepts; on deny the agent is not resumed).
-  toolName: "requestConnection";
-  input: {
-    vendorId: string;
-    resourceUrl?: string;
-    reason: string;
+      // Output, if the fetch actually completed. (Otherwise, `error` should be present.) This is
+      // stored so that the agent's chat history can be replayed without re-issuing the fetch.
+      // Formatted as a YAML-frontmatter header followed by the body (see formatWebFetchResult).
+      output?: string;
+    }
+  | {
+      // This actually shouldn't ever appear in logs unless the agent misunderstands the tool.
+      toolName: "observeUserChanges";
+      input: {};
+    }
+  | {
+      // List the blueprints the workspace owner could instantiate (their own blueprints, their
+      // library, and the deployment's featured blueprints), so the agent can pass a blueprintId to
+      // createVessel. The formatted text output is recorded so replay doesn't re-list.
+      toolName: "listBlueprints";
+      input: {};
+      output?: string;
+    }
+  | {
+      // List the resource types a gatekeeper vendor offers, so the agent can construct a resourceUrl
+      // for requestConnection. Resource patterns are only surfaced on demand (not in the system prompt).
+      toolName: "listConnectableResources";
+      input: {
+        vendorId: string;
+      };
+      output?: string;
+    }
+  | {
+      // Ask the user to connect a gatekeeper, pre-configured as much as the agent can manage. Renders
+      // an accept/deny card in the chat; non-blocking (the turn ends, and the agent is resumed if the
+      // user accepts; on deny the agent is not resumed).
+      toolName: "requestConnection";
+      input: {
+        vendorId: string;
+        resourceUrl?: string;
+        reason: string;
 
-    // Name under which the resource will appear in the chat's env once accepted (see
-    // `connectionRequest.bindingName`). Optional only because logs persisted before named chat
-    // bindings lack it.
-    bindingName?: string;
-  };
-  output?: string;
-} | {
-  /** Ask the user to delegate bounded Verglas access to a process. */
-  toolName: "requestPermission";
-  input: {
-    principalId: string;
-    resourceId: string;
-    actions: VerglasAccessAction[];
-    reason: string;
-  };
-  output?: string;
-});
+        // Name under which the resource will appear in the chat's env once accepted (see
+        // `connectionRequest.bindingName`). Optional only because logs persisted before named chat
+        // bindings lack it.
+        bindingName?: string;
+      };
+      output?: string;
+    }
+  | {
+      /** Ask the user to delegate bounded Verglas access to a process. */
+      toolName: "requestPermission";
+      input: {
+        principalId: string;
+        resourceId: string;
+        actions: VerglasAccessAction[];
+        reason: string;
+      };
+      output?: string;
+    }
+);
 
 /** One generated Source configuration input mapped to a worker environment binding. */
 export type SourceConfigurationField = {
@@ -3082,9 +3440,14 @@ export type IntegrationVerification = {
 
 /** Portable trigger declaration accepted by the Verglas worker registry. */
 export type SourceTrigger =
-  | {type: "cron"; schedule: string; startDate?: string; catchup?: "none" | "sequential" | "parallel"}
-  | {type: "webhook"; path: string}
-  | {type: "event"; eventType: string};
+  | {
+      type: "cron";
+      schedule: string;
+      startDate?: string;
+      catchup?: "none" | "sequential" | "parallel";
+    }
+  | { type: "webhook"; path: string }
+  | { type: "event"; eventType: string };
 
 // TODO: Extend AiToolCall for code-mode tool calls.
 // - Includes inline audit logs from the action.
@@ -3151,14 +3514,16 @@ export type CapsuleSpecifier = {
 };
 
 // Identifies a Gatekeeper slash command or the built-in `/compact` command.
-export type SlashCommandId = {
-  gatekeeperId: WorkpieceId;
-  commandId: string;
-  builtin?: never;
-} | {
-  builtin: true;
-  commandId: "compact";
-};
+export type SlashCommandId =
+  | {
+      gatekeeperId: WorkpieceId;
+      commandId: string;
+      builtin?: never;
+    }
+  | {
+      builtin: true;
+      commandId: "compact";
+    };
 
 // A slash command invocation parsed by the client.
 export type SlashCommandRequest = {
@@ -3190,7 +3555,6 @@ export type SlashCommandChoice = {
 
   // Optional resource label used when multiple commands share a name.
   resourceLabel?: string;
-
 };
 
 // One provisional streaming event emitted while an agent step is still in progress.
@@ -3199,66 +3563,79 @@ export type SlashCommandChoice = {
 // these events. Instead, it should display them temporarily and discard them as soon as the
 // corresponding durable `message()` and/or `changes` message arrives, or when the agent stops
 // running (`activeAgent` becomes unset in the chat metadata).
-export type AiChatStreamEvent = {
-  // The turn is summarizing older context before it can continue, or before `/compact` ends.
-  type: "compacting";
-} | {
-  // The compaction attempt ended, whether it compacted, failed, was cancelled, or found nothing to
-  // do.
-  type: "compacted";
+export type AiChatStreamEvent =
+  | {
+      // The turn is summarizing older context before it can continue, or before `/compact` ends.
+      type: "compacting";
+    }
+  | {
+      // The compaction attempt ended, whether it compacted, failed, was cancelled, or found nothing to
+      // do.
+      type: "compacted";
 
-  // Set when the attempt made no checkpoint because nothing precedes the newest message to
-  // summarize. Only `/compact` reports this, since an explicit command is otherwise silent.
-  nothingToCompact?: boolean;
-} | {
-  type: "textDelta";
-  delta: string;
-} | {
-  type: "reasoningDelta";
-  delta: string;
-} | {
-  type: "toolCallStarted";
-  toolCallId: string;
-  toolName: AiToolCall["toolName"];
-} | {
-  // For the executeCode tool specifically, we stream the code as the AI writes it. (For all other
-  // tool calls, the tool inputs are not streamed -- though writeFile and editFile separately
-  // stream codeUpdate messages.)
-  type: "toolCodeDelta";
-  toolCallId: string;
-  delta: string;
-} | {
-  // This is a provisional UI lifecycle event. For most tools it means the full tool call input has
-  // been received, so the tool is no longer visually "in progress". executeCode does not emit this
-  // during streaming; its provisional card is cleared when the final durable message arrives.
-  type: "toolCallFinished";
-  toolCallId: string;
-} | {
-  // Indicates which file the agent is currently editing, if any. This is emitted while a
-  // writeFile/editFile call is streaming, and set to null when a non-edit tool becomes active.
-  type: "setActiveFile";
-  file: { workpieceId: WorkpieceId, filename: string } | null;
-} | {
-  // Streaming write/edit target file, used by the UI before the finalized tool call arrives.
-  type: "toolCallTarget";
-  toolCallId: string;
-  file: { workpieceId: WorkpieceId, filename: string };
-} | {
-  // Streaming createVessel output format, used by the UI before the finalized tool call arrives.
-  // Has the deployment's overrides applied, so it matches what the workspace is stamped with.
-  type: "toolCallOutputFormat";
-  toolCallId: string;
-  output: BlueprintOutput;
-} | {
-  type: "toolOutputDelta";
-  toolCallId: string;
-  delta: string;
-} | {
-  type: "codeReset";
-} | {
-  type: "codeUpdate";
-  update: Uint8Array;
-};
+      // Set when the attempt made no checkpoint because nothing precedes the newest message to
+      // summarize. Only `/compact` reports this, since an explicit command is otherwise silent.
+      nothingToCompact?: boolean;
+    }
+  | {
+      type: "textDelta";
+      delta: string;
+    }
+  | {
+      type: "reasoningDelta";
+      delta: string;
+    }
+  | {
+      type: "toolCallStarted";
+      toolCallId: string;
+      toolName: AiToolCall["toolName"];
+    }
+  | {
+      // For the executeCode tool specifically, we stream the code as the AI writes it. (For all other
+      // tool calls, the tool inputs are not streamed -- though writeFile and editFile separately
+      // stream codeUpdate messages.)
+      type: "toolCodeDelta";
+      toolCallId: string;
+      delta: string;
+    }
+  | {
+      // This is a provisional UI lifecycle event. For most tools it means the full tool call input has
+      // been received, so the tool is no longer visually "in progress". executeCode does not emit this
+      // during streaming; its provisional card is cleared when the final durable message arrives.
+      type: "toolCallFinished";
+      toolCallId: string;
+    }
+  | {
+      // Indicates which file the agent is currently editing, if any. This is emitted while a
+      // writeFile/editFile call is streaming, and set to null when a non-edit tool becomes active.
+      type: "setActiveFile";
+      file: { workpieceId: WorkpieceId; filename: string } | null;
+    }
+  | {
+      // Streaming write/edit target file, used by the UI before the finalized tool call arrives.
+      type: "toolCallTarget";
+      toolCallId: string;
+      file: { workpieceId: WorkpieceId; filename: string };
+    }
+  | {
+      // Streaming createVessel output format, used by the UI before the finalized tool call arrives.
+      // Has the deployment's overrides applied, so it matches what the workspace is stamped with.
+      type: "toolCallOutputFormat";
+      toolCallId: string;
+      output: BlueprintOutput;
+    }
+  | {
+      type: "toolOutputDelta";
+      toolCallId: string;
+      delta: string;
+    }
+  | {
+      type: "codeReset";
+    }
+  | {
+      type: "codeUpdate";
+      update: Uint8Array;
+    };
 
 // Interface implemented by the client to receive action-log upserts.
 export interface ActionsSubscriber {
@@ -3288,7 +3665,12 @@ export interface AiChatSubscriber {
   // Delivers one persisted live-draft update for a chat branch. Subscriptions replay all currently
   // stored draft updates for a chat so newly-joined clients can reconstruct the editable branch
   // state without a separate fetch.
-  draftUpdate(chatId: number, timestamp: Date, author: AiChatAuthorInfo, update: Uint8Array): void;
+  draftUpdate(
+    chatId: number,
+    timestamp: Date,
+    author: AiChatAuthorInfo,
+    update: Uint8Array,
+  ): void;
 
   // Indicates that all persisted live-draft updates for the given chat were cleared.
   draftCleared(chatId: number): void;
@@ -3317,7 +3699,7 @@ export type ConsoleLogEvent = {
   // The parameters that were passed to the log function, represented as an array of serializable
   // values.
   message: any[];
-}
+};
 
 // Summary of one workpiece, delivered via Overseer.subscribeToWorkpieces(). In v1 only
 // workspace-type workpieces are published (gatekeeper workpieces -- chat capsules, ambient
@@ -3398,33 +3780,37 @@ export type PreApprovableAction = {
 
 // Describes how a gatekeeper was originally created. Stored on each GatekeeperRecord so that
 // bindings can be recreated and blueprint metadata can be derived.
-export type GatekeeperCreationSpec = {
-  type: "gatekeeper";
-  vendorId: string;        // identifies the gatekeeper adapter (e.g. "google")
-  resourceUrl: string;
-  typeUrlPattern: string;  // URL pattern from the vendor's SupportedResource (not the specific URL)
-} | {
-  type: "aiModel";
-  modelId: string;         // the user's configured model ID
-  provider: string;        // provider name (e.g. "anthropic")
-  modelName: string;       // model name on the provider's API (e.g. "claude-sonnet-4-6")
-} | {
-  type: "agentSpawner";
-  config: AgentSpawnerConfig;
+export type GatekeeperCreationSpec =
+  | {
+      type: "gatekeeper";
+      vendorId: string; // identifies the gatekeeper adapter (e.g. "google")
+      resourceUrl: string;
+      typeUrlPattern: string; // URL pattern from the vendor's SupportedResource (not the specific URL)
+    }
+  | {
+      type: "aiModel";
+      modelId: string; // the user's configured model ID
+      provider: string; // provider name (e.g. "anthropic")
+      modelName: string; // model name on the provider's API (e.g. "claude-sonnet-4-6")
+    }
+  | {
+      type: "agentSpawner";
+      config: AgentSpawnerConfig;
 
-  // Denormalized from the creating user's model config at binding creation time.
-  // Absent when config.modelId is null. Used to populate blueprint suggestedModel
-  // without requiring a live lookup.
-  modelProvider?: string;
-  modelName?: string;
-} | {
-  // A singleton gatekeeper account (e.g. the Context Library) auto-provided to every workspace as an
-  // unnamed capsule so the agent can read/search it in code. Not user-configured, so excluded from
-  // blueprints; re-added automatically if missing.
-  type: "ambient";
-  vendorId: string;        // the singleton gatekeeper's id (GATEKEEPER_<ID> suffix, lowercased)
-  accountId: number;       // the owner's connected-account id for this singleton (in their user DO)
-};
+      // Denormalized from the creating user's model config at binding creation time.
+      // Absent when config.modelId is null. Used to populate blueprint suggestedModel
+      // without requiring a live lookup.
+      modelProvider?: string;
+      modelName?: string;
+    }
+  | {
+      // A singleton gatekeeper account (e.g. the Context Library) auto-provided to every workspace as an
+      // unnamed capsule so the agent can read/search it in code. Not user-configured, so excluded from
+      // blueprints; re-added automatically if missing.
+      type: "ambient";
+      vendorId: string; // the singleton gatekeeper's id (GATEKEEPER_<ID> suffix, lowercased)
+      accountId: number; // the owner's connected-account id for this singleton (in their user DO)
+    };
 
 // User-provided metadata controlling how a gatekeeper binding should appear in blueprints.
 // Stored on the binding edge (a workspace's binding-name -> gatekeeper mapping), not on the
@@ -3435,9 +3821,9 @@ export type GatekeeperCreationSpec = {
 // Legacy field `included` may still be present on records written by older versions of
 // the workshop. The backend still honors `included: false`, but new writes omit it.
 export type BlueprintBindingAnnotation = {
-  title: string;           // friendly name shown to people using the blueprint
-  description: string;     // explains what resource to connect (may be empty)
-  suggestValue?: boolean;  // include the specific URL/model as a suggestion
+  title: string; // friendly name shown to people using the blueprint
+  description: string; // explains what resource to connect (may be empty)
+  suggestValue?: boolean; // include the specific URL/model as a suggestion
 };
 
 // Symbolic target of one agent-spawner env entry in a blueprint. Workpiece IDs are
@@ -3446,102 +3832,115 @@ export type BlueprintBindingAnnotation = {
 // name -- the user fills it at instantiation time like any other binding, and the spawner env
 // entry resolves to the gatekeeper created for it -- or the blueprint's workspace itself, resolving
 // to the newly instantiated workspace.
-export type SpawnerEnvTarget = {
-  type: "binding";
+export type SpawnerEnvTarget =
+  | {
+      type: "binding";
 
-  // Key into BlueprintMetadata.bindings. May reference a binding that is also bound into the
-  // workspace, or one synthesized purely to feed this spawner (see BlueprintBinding.spawnerOnly).
-  name: string;
-} | {
-  // This spawner binding refers back to the workspace itself (the one instantiated from the
-  // blueprint).
-  type: "vessel";
-};
+      // Key into BlueprintMetadata.bindings. May reference a binding that is also bound into the
+      // workspace, or one synthesized purely to feed this spawner (see BlueprintBinding.spawnerOnly).
+      name: string;
+    }
+  | {
+      // This spawner binding refers back to the workspace itself (the one instantiated from the
+      // blueprint).
+      type: "vessel";
+    };
 
 // Describes one binding required by a blueprint. Stored in BlueprintMetadata.bindings as a
 // Record keyed by binding name. Consumers identify bindings by their key (the binding name)
 // while `title` and `description` provide user-facing text.
 export type BlueprintBinding = {
-  title: string;        // friendly name shown to people using the blueprint
-  description: string;  // explains what resource to connect here (may be empty)
+  title: string; // friendly name shown to people using the blueprint
+  description: string; // explains what resource to connect here (may be empty)
 
   // If true, this binding exists only to satisfy an agent spawner's env (it is referenced by
   // some spawner's `env` entry as a SpawnerEnvTarget). The user fills it at instantiation time
   // like any other binding, but the created gatekeeper is fed only to the spawner(s) referencing
   // it -- it is not bound into the workspace itself.
   spawnerOnly?: true;
-} & ({
-  // A regular external-resource gatekeeper binding.
-  type: "gatekeeper";
+} & (
+  | {
+      // A regular external-resource gatekeeper binding.
+      type: "gatekeeper";
 
-  // Identifies the gatekeeper adapter (currently mapped to the workshop's
-  // GATEKEEPER_<name> service binding).
-  gatekeeperName: string;
+      // Identifies the gatekeeper adapter (currently mapped to the workshop's
+      // GATEKEEPER_<name> service binding).
+      gatekeeperName: string;
 
-  // URL pattern describing the type of resource this binding accepts.
-  typeUrlPattern: string;
+      // URL pattern describing the type of resource this binding accepts.
+      typeUrlPattern: string;
 
-  // The specific resource URL from the source workspace (suggestion only).
-  resourceUrl?: string;
-} | {
-  // An AI model binding. The user instantiating the blueprint picks one of their own
-  // configured models.
-  type: "aiModel";
+      // The specific resource URL from the source workspace (suggestion only).
+      resourceUrl?: string;
+    }
+  | {
+      // An AI model binding. The user instantiating the blueprint picks one of their own
+      // configured models.
+      type: "aiModel";
 
-  // The blueprint creator may suggest a particular model to use, or omit this to leave
-  // it up to the recipient.
-  suggestedModel?: {provider: string, modelName: string};
-} | {
-  // An agent spawner binding.
-  type: "agentSpawner";
+      // The blueprint creator may suggest a particular model to use, or omit this to leave
+      // it up to the recipient.
+      suggestedModel?: { provider: string; modelName: string };
+    }
+  | {
+      // An agent spawner binding.
+      type: "agentSpawner";
 
-  // The blueprint creator may suggest a particular model to use, or omit this. (The
-  // value is `null` if the suggestion is that AgentSpawnerConfig.modelId should be
-  // configured as `null`. This is different from `undefined`, which means no suggestion.)
-  suggestedModel?: {provider: string, modelName: string} | null;
+      // The blueprint creator may suggest a particular model to use, or omit this. (The
+      // value is `null` if the suggestion is that AgentSpawnerConfig.modelId should be
+      // configured as `null`. This is different from `undefined`, which means no suggestion.)
+      suggestedModel?: { provider: string; modelName: string } | null;
 
-  // Symbolic form of AgentSpawnerConfig.env: env name -> target, resolved to concrete workpiece
-  // IDs at instantiation time (see SpawnerEnvTarget).
-  env: Record<string, SpawnerEnvTarget>;
-});
+      // Symbolic form of AgentSpawnerConfig.env: env name -> target, resolved to concrete workpiece
+      // IDs at instantiation time (see SpawnerEnvTarget).
+      env: Record<string, SpawnerEnvTarget>;
+    }
+);
 
 export type BlueprintScreenshotUpload = {
   mimeType: "image/jpeg" | "image/png";
   content: Uint8Array;
 };
 
-export const BLUEPRINT_SCREENSHOT_R2_PREFIX = 'screenshots/';
-export const BLUEPRINT_SCREENSHOT_PATH_PREFIX = '/blueprint-screenshot/';
+export const BLUEPRINT_SCREENSHOT_R2_PREFIX = "screenshots/";
+export const BLUEPRINT_SCREENSHOT_PATH_PREFIX = "/blueprint-screenshot/";
 
 /** R2 key prefix for Application Vessel screenshots captured at create time. */
-export const APPLICATION_SCREENSHOT_R2_PREFIX = 'application-screenshots/';
+export const APPLICATION_SCREENSHOT_R2_PREFIX = "application-screenshots/";
 
 /** Public path prefix that serves Application Vessel screenshots. */
-export const APPLICATION_SCREENSHOT_PATH_PREFIX = '/application-screenshot/';
+export const APPLICATION_SCREENSHOT_PATH_PREFIX = "/application-screenshot/";
 
 /**
  * Browser-loadable URL for an Application screenshot stored under
  * {@link APPLICATION_SCREENSHOT_R2_PREFIX}.
  */
-export function applicationScreenshotUrl(vesselName: string, versionMs?: number): string {
+export function applicationScreenshotUrl(
+  vesselName: string,
+  versionMs?: number,
+): string {
   const base = `${APPLICATION_SCREENSHOT_PATH_PREFIX}${encodeURIComponent(vesselName)}`;
   return versionMs === undefined ? base : `${base}?v=${versionMs}`;
 }
 
-export function blueprintScreenshotUrl(id: string, metadata: { screenshot?: true, lastUpdated: Date }): string | undefined {
-  return metadata.screenshot ?
-      `${BLUEPRINT_SCREENSHOT_PATH_PREFIX}${id}?v=${metadata.lastUpdated.valueOf()}` : undefined;
+export function blueprintScreenshotUrl(
+  id: string,
+  metadata: { screenshot?: true; lastUpdated: Date },
+): string | undefined {
+  return metadata.screenshot
+    ? `${BLUEPRINT_SCREENSHOT_PATH_PREFIX}${id}?v=${metadata.lastUpdated.valueOf()}`
+    : undefined;
 }
 
 // General metadata about a blueprint. Stored (in slightly different wrapper records) in
 // three locations: Workspace DO, User DO, and KV.
 export type BlueprintMetadata = {
   title: string;
-  description: string;  // longer-form description of what the blueprint does
+  description: string; // longer-form description of what the blueprint does
   author: AiChatAuthorInfo;
   created: Date;
 
-  version: number;       // increments every time the blueprint is updated
+  version: number; // increments every time the blueprint is updated
   lastUpdated: Date;
 
   // If present, a screenshot is stored separately from the metadata. The server uses this
@@ -3571,9 +3970,9 @@ export type BlueprintVesselSummary = {
   title: string;
   description: string;
   version: number;
-  codeVersionDate: Date;  // timestamp of the exported code version
+  codeVersionDate: Date; // timestamp of the exported code version
   screenshotUrl?: string;
-  dirty?: boolean;        // true if last publish failed and needs retry
+  dirty?: boolean; // true if last publish failed and needs retry
 };
 
 // Where a blueprint the user owns came from. This distinguishes the case the UI cares about — the
@@ -3581,11 +3980,11 @@ export type BlueprintVesselSummary = {
 // the two cases where it does not, so no caller has to infer that from display text. `workspaceId`
 // is reachable only in the case where opening it is meaningful.
 export type BlueprintSource =
-    // Published from a workspace that still exists. `workspaceTitle` is its current title.
-    { type: "workspace"; workspaceId: string; workspaceTitle: string }
-    // Published from a workspace that has since been deleted.
+  // Published from a workspace that still exists. `workspaceTitle` is its current title.
+  | { type: "workspace"; workspaceId: string; workspaceTitle: string }
+  // Published from a workspace that has since been deleted.
   | { type: "deletedWorkspace" }
-    // Added to the user's library rather than published from one of their workspaces.
+  // Added to the user's library rather than published from one of their workspaces.
   | { type: "imported" };
 
 // User-side summary (returned by AuthenticatedApi.listOwnBlueprints and getOwnBlueprint).
@@ -3612,17 +4011,20 @@ export type BlueprintLibrarySummary = {
 // Binding assignment (input to newWorkspaceFromBlueprint).
 // When instantiating a blueprint, the user provides a Record mapping binding name ->
 // assignment. Every required binding in the blueprint must have a corresponding entry.
-export type BlueprintBindingAssignment = {
-  type: "gatekeeper";
-  accountId: number;      // user's connected account ID
-  resourceUrl: string;
-} | {
-  type: "aiModel";
-  modelId: string;        // one of the user's configured models
-} | {
-  type: "agentSpawner";
-  modelId: string | null; // model to run, or null for no agent
-};
+export type BlueprintBindingAssignment =
+  | {
+      type: "gatekeeper";
+      accountId: number; // user's connected account ID
+      resourceUrl: string;
+    }
+  | {
+      type: "aiModel";
+      modelId: string; // one of the user's configured models
+    }
+  | {
+      type: "agentSpawner";
+      modelId: string | null; // model to run, or null for no agent
+    };
 
 // Common base interface for per-workpiece capabilities. Each workpiece type has its own
 // subinterface (VesselClient, GatekeeperClient<T>) for type-specific operations; this base holds
@@ -3717,10 +4119,15 @@ export interface VesselClient extends WorkpieceClient {
 
   // Get the blueprint annotation for the named binding, if one has been set. Annotations live on
   // the binding edge, not on the target gatekeeper (see BlueprintBindingAnnotation).
-  getBlueprintAnnotation(name: string): Promise<BlueprintBindingAnnotation | null>;
+  getBlueprintAnnotation(
+    name: string,
+  ): Promise<BlueprintBindingAnnotation | null>;
 
   // Set the blueprint annotation for the named binding.
-  setBlueprintAnnotation(name: string, annotation: BlueprintBindingAnnotation): Promise<void>;
+  setBlueprintAnnotation(
+    name: string,
+    annotation: BlueprintBindingAnnotation,
+  ): Promise<void>;
 
   // Create a new blueprint from this workspace's current committed code.
   // `title` defaults to the workspace's title if omitted.
@@ -3730,13 +4137,19 @@ export interface VesselClient extends WorkpieceClient {
   // Steps: generate ID, snapshot code, collect binding metadata, store locally, propagate
   // to User DO + KV + R2. Maintenance of existing blueprints stays on Overseer (see
   // Overseer.updateBlueprint() etc.).
-  createBlueprint(title?: string, description?: string, screenshot?: BlueprintScreenshotUpload): Promise<BlueprintVesselSummary>;
+  createBlueprint(
+    title?: string,
+    description?: string,
+    screenshot?: BlueprintScreenshotUpload,
+  ): Promise<BlueprintVesselSummary>;
 }
 
 // Capability representing one gatekeeper (connection) workpiece. Note that binding-edge
 // operations -- binding names and blueprint annotations -- live on VesselClient, since a
 // gatekeeper may be bound by several workspaces under different names.
-export interface GatekeeperClient<Session extends RpcCompatible<Session>> extends WorkpieceClient {
+export interface GatekeeperClient<
+  Session extends RpcCompatible<Session>,
+> extends WorkpieceClient {
   // Get the resource description, including the schema of its RPC interface.
   describe(): Promise<ResourceDescription>;
 
@@ -3785,19 +4198,22 @@ export type PermissionEdge = {
   // The role granted by this edge. Absent on edges created before roles were introduced; such
   // edges are treated as "build" for backwards compatibility.
   role?: CollaboratorRole;
-} & ({
-  // Granted directly by another user.
-  type: "user";
-  sharer: string;  // profile.id of the person who shared
-  note?: string;
-} | {
-  // Gained by redeeming a share key.
-  type: "shareKey";
+} & (
+  | {
+      // Granted directly by another user.
+      type: "user";
+      sharer: string; // profile.id of the person who shared
+      note?: string;
+    }
+  | {
+      // Gained by redeeming a share key.
+      type: "shareKey";
 
-  // The id of the share link that was redeemed (the hash of its first key). Every key of the link
-  // resolves to this id, so redeeming any of them yields this one edge.
-  keyId: string;
-});
+      // The id of the share link that was redeemed (the hash of its first key). Every key of the link
+      // resolves to this id, so redeeming any of them yields this one edge.
+      keyId: string;
+    }
+);
 
 // Information about a single collaborator, returned by list/add operations.
 export type CollaboratorInfo = {

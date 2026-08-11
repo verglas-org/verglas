@@ -8,11 +8,11 @@ Sign-in is provided by **authentication gatekeepers**: each auth-capable gatekee
 Cloudflare) uses its single OAuth app both to authenticate the user (by verified email) and to
 connect the account's capabilities. There's no single switch — the pieces turn on independently:
 
-| Configure | Effect |
-| --- | --- |
-| `AUTH_GATEKEEPERS=cloudflare,google,github` | Allowlists which connected gatekeepers may be used to sign in. Each shows a "Continue with …" button alongside email/password. |
+| Configure                                                      | Effect                                                                                                                                                          |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `AUTH_GATEKEEPERS=cloudflare,google,github`                    | Allowlists which connected gatekeepers may be used to sign in. Each shows a "Continue with …" button alongside email/password.                                  |
 | Each gatekeeper's OAuth credentials (on the gatekeeper Worker) | Required for that gatekeeper to actually authenticate. In dev, seeded from `GOOGLE_*` / `GITHUB_*` / `CLOUDFLARE_OAUTH_*` shell vars (see `run-dev-server.js`). |
-| `DISABLE_PASSWORD_AUTH=true` | Hides email/password, leaving gatekeeper sign-in only (ignored unless `AUTH_GATEKEEPERS` is non-empty, to avoid lockout). |
+| `DISABLE_PASSWORD_AUTH=true`                                   | Hides email/password, leaving gatekeeper sign-in only (ignored unless `AUTH_GATEKEEPERS` is non-empty, to avoid lockout).                                       |
 
 The primary account key is always the user's **verified email**: signing in with any allowlisted
 gatekeeper that yields the same verified email maps to the same account.
