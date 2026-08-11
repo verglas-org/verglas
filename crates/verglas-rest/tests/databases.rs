@@ -317,7 +317,7 @@ async fn failed_authorization_registration_rolls_back_the_database() {
 }
 
 #[tokio::test]
-async fn failed_database_creation_never_creates_an_authorization_resource() {
+async fn failed_database_creation_rolls_back_its_authorization_resource() {
     let authorization = Arc::new(RecordingAuthorization::default());
     let app = verglas_rest::database::router(
         Arc::new(FailingDatabaseManager),
@@ -342,7 +342,13 @@ async fn failed_database_creation_never_creates_an_authorization_resource() {
         .await
         .expect("response");
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-    assert!(authorization.0.lock().expect("lock").is_empty());
+    assert_eq!(
+        authorization.0.lock().expect("lock").as_slice(),
+        [
+            "create:tenant-a/warehouse:user/owner@example.com:Postgres",
+            "delete:tenant-a/warehouse:user/owner@example.com"
+        ]
+    );
 }
 
 #[tokio::test]

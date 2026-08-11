@@ -16,3 +16,6 @@
 - #66: Dropped cloud-placement wording from the standalone scheduler binary docs.
 - #109: Forwarded validated worker scratch targets to the container runtime so scheduled large-file jobs use operator-owned storage.
 - #109: Preserved bounded container-runtime rejection bodies in durable job errors so operators can diagnose failed builds and runs without server log access.
+- #11: Preserved a resolved `VERGLAS_TOKEN` as the worker harness's reserved runtime credential
+  instead of letting the harness overwrite it with an empty token. Postgres-backed scheduler
+  secrets can now authenticate table writes without appearing in worker metadata or generic env.

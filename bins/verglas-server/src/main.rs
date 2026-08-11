@@ -1403,8 +1403,29 @@ async fn serve(
     let scheduler_url = std::env::var("VERGLAS_SCHEDULER_URL")
         .ok()
         .filter(|value| !value.trim().is_empty());
-    let platform_slot: Option<admin::PlatformSlot> =
-        (config.catalog.is_some() && scheduler_url.is_some()).then(|| Arc::new(OnceLock::new()));
+    let scheduler_control_token = std::env::var("VERGLAS_SCHEDULER_CONTROL_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let platform_slot: Option<admin::PlatformSlot> = match (
+        scheduler_url.as_ref(),
+        scheduler_control_token.as_ref(),
+    ) {
+        (Some(url), Some(token)) => {
+            let slot = Arc::new(OnceLock::new());
+            let _ = slot.set(Arc::new(platform::SchedulerIngress::new(
+                url.clone(),
+                token.clone(),
+            )));
+            Some(slot)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(
+                    "VERGLAS_SCHEDULER_URL and VERGLAS_SCHEDULER_CONTROL_TOKEN must be configured together"
+                        .into(),
+                );
+        }
+    };
 
     // Bind the admin and S3 listeners now, before serving, so their
     // kernel-assigned ports are known (issue #194): `verglas dev` passes
@@ -1764,15 +1785,13 @@ async fn serve(
                     // and pushes complete worker events to the scheduler. Cron
                     // reconciliation and execution live only in that separate
                     // container.
-                    if let (Some(platform), Some(scheduler_url)) = (&platform_slot, &scheduler_url)
+                    if let Some(ingress) = platform_slot
+                        .as_ref()
+                        .and_then(|platform| platform.get())
+                        .cloned()
                     {
-                        let ingress = Arc::new(platform::SchedulerIngress::new(
-                            sys_catalog.clone(),
-                            scheduler_url.clone(),
-                        ));
-                        let _ = platform.set(ingress.clone());
                         if let Some(watcher) = hooks.watcher.clone() {
-                            spawn_scheduler_catalog_events(watcher, ingress);
+                            spawn_scheduler_catalog_events(watcher, ingress.clone());
                         }
                         // Follow workers run continuously, not per-tick, so a
                         // dedicated manager keeps one runner alive per active

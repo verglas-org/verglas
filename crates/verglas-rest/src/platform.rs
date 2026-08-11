@@ -9,8 +9,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use verglas_platform::{SystemCatalog, SystemState, WorkerRow};
-use verglas_scheduler::{EnqueueOutcome, Invocation};
+use verglas_scheduler::{EnqueueOutcome, Invocation, WorkerRecord, WorkerSpec};
 use verglas_sdk::worker::{CloudEvent, HttpCallback, TriggerSpec};
 
 /// CloudEvent type used for caller-requested immediate runs.
@@ -21,9 +20,6 @@ const HTTP_EVENT_TYPE: &str = "org.verglas.http.request";
 /// An ingress request could not resolve or enqueue a runnable deployment.
 #[derive(Debug, thiserror::Error)]
 pub enum IngressError {
-    /// The platform registry could not be read.
-    #[error("worker registry: {0}")]
-    Registry(#[from] verglas_platform::PlatformError),
     /// The named worker does not exist or cannot accept this trigger.
     #[error("{0}")]
     Invalid(String),
@@ -51,19 +47,80 @@ struct EventResponse {
 
 /// On-prem ingress backed by the deployment registry and scheduler event API.
 pub struct SchedulerIngress {
-    sys: Arc<SystemCatalog>,
     scheduler_url: String,
+    control_token: Arc<str>,
     http: reqwest::Client,
 }
 
 impl SchedulerIngress {
     /// Couples the current deployment registry to a pushed-event scheduler.
-    pub fn new(sys: Arc<SystemCatalog>, scheduler_url: String) -> SchedulerIngress {
+    pub fn new(scheduler_url: String, control_token: String) -> SchedulerIngress {
         SchedulerIngress {
-            sys,
             scheduler_url: scheduler_url.trim_end_matches('/').to_owned(),
+            control_token: Arc::from(control_token),
             http: reqwest::Client::new(),
         }
+    }
+
+    /// Lists durable scheduler-owned worker declarations.
+    pub async fn list_workers(&self, include_all: bool) -> Result<Vec<WorkerRecord>, IngressError> {
+        let view = if include_all { "all" } else { "active" };
+        Ok(self
+            .authorized(
+                self.http
+                    .get(format!("{}/v1/workers?view={view}", self.scheduler_url)),
+            )
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Registers one durable scheduler-owned worker declaration.
+    pub async fn register_worker(&self, spec: WorkerSpec) -> Result<WorkerRecord, IngressError> {
+        Ok(self
+            .authorized(self.http.post(format!("{}/v1/workers", self.scheduler_url)))
+            .json(&spec)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
+    /// Returns one durable worker declaration when present.
+    pub async fn get_worker(&self, name: &str) -> Result<Option<WorkerRecord>, IngressError> {
+        let response = self
+            .authorized(
+                self.http
+                    .get(format!("{}/v1/workers/{name}", self.scheduler_url)),
+            )
+            .send()
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.error_for_status()?.json().await?))
+    }
+
+    /// Applies one scheduler-owned worker lifecycle transition.
+    pub async fn set_worker_state(
+        &self,
+        name: &str,
+        state: &str,
+    ) -> Result<WorkerRecord, IngressError> {
+        Ok(self
+            .authorized(
+                self.http
+                    .put(format!("{}/v1/workers/{name}/state", self.scheduler_url)),
+            )
+            .json(&serde_json::json!({"state": state}))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
     }
 
     /// Enqueues a caller-requested run after validating the worker is running.
@@ -86,7 +143,7 @@ impl SchedulerIngress {
         request: HttpCallback,
     ) -> Result<EnqueueOutcome, IngressError> {
         let worker = self.running_worker(name).await?;
-        if !parse_triggers(&worker)?
+        if !parse_triggers(&worker.name, &worker.triggers)?
             .iter()
             .any(|trigger| matches!(trigger, TriggerSpec::Webhook { .. }))
         {
@@ -111,12 +168,12 @@ impl SchedulerIngress {
         request_id: String,
         request: HttpCallback,
     ) -> Result<EnqueueOutcome, IngressError> {
-        let workers = self.sys.list_active_workers().await?;
+        let workers = self.list_workers(false).await?;
         for worker in workers {
-            if worker.state != SystemState::Running {
+            if worker.state != "running" {
                 continue;
             }
-            let matches = parse_triggers(&worker)?.iter().any(|trigger| {
+            let matches = parse_triggers(&worker.name, &worker.triggers)?.iter().any(|trigger| {
                 matches!(trigger, TriggerSpec::Webhook { path: Some(configured) } if configured == route_path)
             });
             if matches {
@@ -137,11 +194,11 @@ impl SchedulerIngress {
         event
             .validate()
             .map_err(|error| IngressError::Invalid(format!("invalid CloudEvent: {error}")))?;
-        let workers = self.sys.list_active_workers().await?;
+        let workers = self.list_workers(false).await?;
         let mut outcomes = Vec::new();
         for worker in workers {
-            if worker.state != SystemState::Running
-                || !parse_triggers(&worker)?
+            if worker.state != "running"
+                || !parse_triggers(&worker.name, &worker.triggers)?
                     .iter()
                     .any(|trigger| trigger.matches(&event))
             {
@@ -156,16 +213,15 @@ impl SchedulerIngress {
     }
 
     /// Reads one running worker or reports why it cannot be dispatched.
-    async fn running_worker(&self, name: &str) -> Result<WorkerRow, IngressError> {
+    async fn running_worker(&self, name: &str) -> Result<WorkerRecord, IngressError> {
         let worker = self
-            .sys
             .get_worker(name)
             .await?
             .ok_or_else(|| IngressError::Invalid(format!("no worker named {name}")))?;
-        if worker.state != SystemState::Running {
+        if worker.state != "running" {
             return Err(IngressError::Invalid(format!(
                 "worker {name} is {}, not running",
-                worker.state.as_str()
+                worker.state
             )));
         }
         Ok(worker)
@@ -174,8 +230,7 @@ impl SchedulerIngress {
     /// Pushes one complete event to the scheduler, which persists before replying.
     async fn enqueue(&self, invocation: &Invocation) -> Result<EnqueueOutcome, IngressError> {
         let response: EventResponse = self
-            .http
-            .post(format!("{}/v1/events", self.scheduler_url))
+            .authorized(self.http.post(format!("{}/v1/events", self.scheduler_url)))
             .json(invocation)
             .send()
             .await?
@@ -188,12 +243,20 @@ impl SchedulerIngress {
             EnqueueOutcome::Existing(response.job_id)
         })
     }
+
+    /// Adds the private scheduler control credential without exposing it to callers.
+    fn authorized(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        request.bearer_auth(self.control_token.as_ref())
+    }
 }
 
 /// Decodes a worker's trigger declarations without silently disabling them.
-pub(crate) fn parse_triggers(worker: &WorkerRow) -> Result<Vec<TriggerSpec>, IngressError> {
-    serde_json::from_str(&worker.triggers).map_err(|source| IngressError::Triggers {
-        worker: worker.name.clone(),
+pub(crate) fn parse_triggers(
+    worker: &str,
+    triggers: &str,
+) -> Result<Vec<TriggerSpec>, IngressError> {
+    serde_json::from_str(triggers).map_err(|source| IngressError::Triggers {
+        worker: worker.to_owned(),
         source,
     })
 }

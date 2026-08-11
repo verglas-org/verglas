@@ -28,6 +28,7 @@ import { ModelRuntimeManager } from "./model-runtimes.js";
 import { AgentWorkspace } from "./verglas-agent-runtime.js";
 import { VerglasCatalogClient } from "./verglas-catalog.js";
 import { resolveVerglasAccessConfig, userPrincipalId, VerglasAccessClient } from "./verglas-access.js";
+import { proxyApplicationPreview } from "./application-preview.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -922,6 +923,10 @@ export default {
           url.pathname.slice(APPLICATION_SCREENSHOT_PATH_PREFIX.length));
       if (!vesselName) return new Response("Not Found", {status: 404});
       return serveApplicationScreenshot(env, vesselName);
+    }
+
+    if (url.pathname.startsWith("/apps/")) {
+      return proxyApplicationPreview(req, env);
     }
 
     // Sign-in via authentication gatekeepers happens entirely within each gatekeeper Worker (the

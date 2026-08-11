@@ -27,7 +27,7 @@ use verglas_scheduler::{
     NextWakeRequest, PgQueue, PgWorkerRegistry, RenewRequest, RunQueue, WorkerBuildStatus,
     WorkerRecord, WorkerSpec, plan_cron,
 };
-use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
+use verglas_sdk::worker::{Catchup, CloudEvent, ENV_TOKEN, TriggerSpec};
 
 /// CloudEvent type emitted for a planned cron interval.
 const CRON_EVENT_TYPE: &str = "org.verglas.schedule.tick";
@@ -106,6 +106,7 @@ struct PreparedWorker {
     image: String,
     entrypoint: Vec<String>,
     environment: BTreeMap<String, String>,
+    token: Option<String>,
     resources: WorkerResources,
     timeout_seconds: u64,
     scratch_target: Option<String>,
@@ -138,7 +139,7 @@ async fn prepare_registered_worker(
 /// Converts persisted built code and resolved runtime config into one invocation.
 fn prepare_worker_config(
     worker: &WorkerRecord,
-    config: WorkerConfig,
+    mut config: WorkerConfig,
 ) -> Result<PreparedWorker, String> {
     if worker.build_status != WorkerBuildStatus::Ready {
         return Err(format!(
@@ -159,10 +160,12 @@ fn prepare_worker_config(
             worker.name
         ));
     }
+    let token = config.env.remove(ENV_TOKEN);
     Ok(PreparedWorker {
         image: code.image,
         entrypoint: code.entrypoint,
         environment: config.env,
+        token,
         resources: WorkerResources {
             vcpus: config.resources.vcpus.unwrap_or(4.0),
             memory_mib: config.resources.mem_mib.unwrap_or(8_192),
@@ -749,7 +752,7 @@ async fn execute_claimed_worker(
         environment: prepared.environment,
         target: worker.output.clone().unwrap_or_default(),
         endpoint: args.worker_endpoint.clone(),
-        token: String::new(),
+        token: prepared.token.unwrap_or_default(),
         network: None,
         event: serde_json::to_value(&claimed.job.event)
             .map_err(|error| format!("serialize worker event: {error}"))?,
@@ -1011,7 +1014,7 @@ mod tests {
             build_status: WorkerBuildStatus::Ready,
             image_digest: Some("sha256:test".to_owned()),
             config: r#"{
-                "env":{"SYMBOL":"SPY"},
+                "env":{"SYMBOL":"SPY","VERGLAS_TOKEN":"database-token"},
                 "resources":{"vcpus":2.0,"mem_mib":4096,"pids":128,"timeout_secs":900}
             }"#
             .to_owned(),
@@ -1023,6 +1026,8 @@ mod tests {
             prepared.environment.get("SYMBOL").map(String::as_str),
             Some("SPY")
         );
+        assert!(!prepared.environment.contains_key(ENV_TOKEN));
+        assert_eq!(prepared.token.as_deref(), Some("database-token"));
         assert_eq!(prepared.image, "verglas/worker-ingest:sha256-test");
         assert_eq!(prepared.resources.memory_mib, 4096);
         assert_eq!(prepared.timeout_seconds, 900);

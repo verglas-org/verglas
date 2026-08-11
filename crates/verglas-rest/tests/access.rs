@@ -16,6 +16,14 @@ use verglas_rest::access::AccessHttpRuntime;
 
 /// Creates one access session backed by an owner or unprivileged human principal.
 async fn app(owner: bool) -> (axum::Router, String, Arc<MemoryAuthorizer>) {
+    app_with_audience(owner, "access").await
+}
+
+/// Creates one test session for the requested bounded audience.
+async fn app_with_audience(
+    owner: bool,
+    audience: &str,
+) -> (axum::Router, String, Arc<MemoryAuthorizer>) {
     let authorizer = Arc::new(MemoryAuthorizer::new());
     authorizer
         .create_resource(Resource::new("tenant-a", "tenant", ResourceKind::Tenant))
@@ -59,7 +67,7 @@ async fn app(owner: bool) -> (axum::Router, String, Arc<MemoryAuthorizer>) {
                 "user-1",
                 "session-1",
                 "Test session",
-                "access",
+                audience,
                 authorizer
                     .policy_version("tenant-a")
                     .await
@@ -74,6 +82,67 @@ async fn app(owner: bool) -> (axum::Router, String, Arc<MemoryAuthorizer>) {
     let token = minted.token.expose().to_owned();
     let runtime = AccessHttpRuntime::new(authorizer.clone(), tokens, "tenant-a");
     (verglas_rest::access::router(runtime), token, authorizer)
+}
+
+#[tokio::test]
+async fn data_plane_create_declares_a_canonical_table_child_idempotently() {
+    let (app, token, authorizer) = app_with_audience(true, "verglas-cli").await;
+    authorizer
+        .create_resource(
+            Resource::new("tenant-a", "database/analytics", ResourceKind::Database)
+                .with_parent("tenant"),
+        )
+        .await
+        .expect("database");
+    let declaration = json!({
+        "id":"table/analytics/events.new",
+        "kind":"table",
+        "parent_id":"database/analytics"
+    });
+
+    for _ in 0..2 {
+        let response = app
+            .clone()
+            .oneshot(
+                authorized(Request::post("/v1/access/data-plane/resources"), &token)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(declaration.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(
+        authorizer
+            .get_resource("tenant-a", "table/analytics/events.new")
+            .await
+            .expect("table resource"),
+        Resource::new(
+            "tenant-a",
+            "table/analytics/events.new",
+            ResourceKind::Table,
+        )
+        .with_parent("database/analytics")
+    );
+
+    let invalid = app
+        .oneshot(
+            authorized(Request::post("/v1/access/data-plane/resources"), &token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "id":"table/analytics/events.other",
+                        "kind":"table",
+                        "parent_id":"database/other"
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("invalid response");
+    assert_eq!(invalid.status(), StatusCode::FORBIDDEN);
 }
 
 /// Adds the authenticated access-session bearer to one request builder.

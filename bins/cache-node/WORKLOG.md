@@ -79,3 +79,7 @@
 - #109: Resolved DNS names in `VERGLAS_RING_PEERS` at startup. Containerized
   cache peers can now use stable Compose service names while the fragment RPC
   client retains its concrete socket-address contract.
+- Reclaim stale revision-keyed safekeeper recovery descriptors when the shared
+  fragment ring starts. The committed legacy head remains pinned, malformed or
+  missing heads cause no deletion, and the new two-slot safekeeper protocol no
+  longer grows this metadata without bound.

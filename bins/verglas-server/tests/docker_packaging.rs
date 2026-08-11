@@ -22,9 +22,7 @@ fn docker_application_packages_execution_workers() {
     }
     for binary in ["verglas-server", "verglas-query", "verglas-write"] {
         assert!(
-            dockerfile.contains(&format!(
-                "/src/target/release/{binary} /usr/local/bin/{binary}"
-            )),
+            dockerfile.contains(&format!("/{binary} /usr/local/bin/{binary}")),
             "Docker image must install {binary}"
         );
     }

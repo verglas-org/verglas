@@ -8,6 +8,10 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::{Row, Transaction};
 use verglas_sdk::worker::CloudEvent;
 
+/// Two connections cover one claim transaction plus reconciliation without
+/// consuming the small tenant compute's client connection budget.
+const TENANT_POOL_MAX_CONNECTIONS: u32 = 2;
+
 /// A scheduler storage, encoding, or input error.
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -233,7 +237,7 @@ impl PgQueue {
         let queue = queue.into();
         validate_queue(&queue)?;
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(TENANT_POOL_MAX_CONNECTIONS)
             .connect(database_url)
             .await?;
         let result = PgQueue { pool, queue };

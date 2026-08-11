@@ -118,6 +118,7 @@ pub async fn run(
     }
 
     let connection = connection_for(config)?;
+    let generation_bearer = connection.token.clone();
     let catalog = catalog::open_catalog(&connection)
         .await
         .map_err(|e| format!("cannot open catalog: {e}"))?;
@@ -147,6 +148,7 @@ pub async fn run(
     let prepared_catalog = admin::PreparedQueryCatalog::open(
         catalog.clone(),
         Some(&config.metadata.uri),
+        generation_bearer,
         config.memory.limit_bytes,
         config.memory.spill_path.clone(),
     )

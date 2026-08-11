@@ -156,6 +156,7 @@ describe("VerglasAccessClient", () => {
       if (path === "/v1/access/sessions") {
         return Response.json({token: "session-token", expires_at: 9_999_999_999});
       }
+      if (path === "/v1/access/grants") return Response.json([]);
       const body = JSON.parse(String(init?.body));
       expect(body.actor_principal_id).toBeUndefined();
       expect(body.tenant_id).toBeUndefined();
@@ -185,5 +186,94 @@ describe("VerglasAccessClient", () => {
       resourceId: "database/analytics",
       actions: ["query"],
     });
+  });
+
+  it("reuses an existing grant that already covers the requested delegation", async () => {
+    const existing = {
+      id: "delegated/existing",
+      tenant_id: "tenant-a",
+      principal_id: "agent/workspace-1",
+      resource_id: "tenant",
+      actions: ["discover", "describe"],
+    };
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/access/sessions") {
+        return Response.json({token: "session-token", expires_at: 9_999_999_999});
+      }
+      if (url.pathname === "/v1/access/grants" && init?.method === undefined) {
+        expect(url.searchParams.get("principal_id")).toBe("agent/workspace-1");
+        return Response.json([existing]);
+      }
+      return new Response("duplicate delegation must not be posted", {status: 500});
+    });
+    const config = resolveVerglasAccessConfig({
+      VERGLAS_ACCESS_URI: "http://access:8345",
+      VERGLAS_IDENTITY_ASSERTION_KEY: ASSERTION_KEY,
+      VERGLAS_TENANT_ID: "tenant-a",
+    })!;
+
+    await expect(new VerglasAccessClient(config, "owner@example.com", fetcher).delegate({
+      principalId: "agent/workspace-1",
+      resourceId: "tenant",
+      actions: ["discover"],
+    })).resolves.toMatchObject({
+      id: "delegated/existing",
+      actions: ["discover", "describe"],
+    });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("replaces a partial grant with the union of its existing and requested actions", async () => {
+    const requests: Array<{path: string; body?: unknown}> = [];
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/v1/access/sessions") {
+        return Response.json({token: "session-token", expires_at: 9_999_999_999});
+      }
+      if (url.pathname === "/v1/access/grants") {
+        return Response.json([{
+          id: "delegated/existing",
+          tenant_id: "tenant-a",
+          principal_id: "agent/workspace-1",
+          resource_id: "tenant",
+          actions: ["discover"],
+        }]);
+      }
+      requests.push({
+        path: url.pathname,
+        body: init?.body ? JSON.parse(String(init.body)) : undefined,
+      });
+      if (url.pathname === "/v1/access/revocations") return new Response(null, {status: 204});
+      if (url.pathname === "/v1/access/delegations") {
+        const body = JSON.parse(String(init?.body));
+        return Response.json({
+          id: body.grant.id,
+          tenant_id: "tenant-a",
+          principal_id: body.grant.principal_id,
+          resource_id: body.grant.resource_id,
+          actions: body.grant.actions,
+        }, {status: 201});
+      }
+      return new Response("unexpected request", {status: 500});
+    });
+    const config = resolveVerglasAccessConfig({
+      VERGLAS_ACCESS_URI: "http://access:8345",
+      VERGLAS_IDENTITY_ASSERTION_KEY: ASSERTION_KEY,
+      VERGLAS_TENANT_ID: "tenant-a",
+    })!;
+
+    await expect(new VerglasAccessClient(config, "owner@example.com", fetcher).delegate({
+      principalId: "agent/workspace-1",
+      resourceId: "tenant",
+      actions: ["describe"],
+    })).resolves.toMatchObject({actions: ["discover", "describe"]});
+    expect(requests).toEqual([{
+      path: "/v1/access/revocations",
+      body: {grant_id: "delegated/existing"},
+    }, {
+      path: "/v1/access/delegations",
+      body: {grant: expect.objectContaining({actions: ["discover", "describe"]})},
+    }]);
   });
 });

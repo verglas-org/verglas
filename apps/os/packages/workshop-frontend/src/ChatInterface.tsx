@@ -4303,6 +4303,19 @@ function formatChatRowTime(date: Date, bucket: ChatTimeBucket, now: Date): strin
   );
 }
 
+export function applyPermissionDecisionToMessages(
+  messages: AiChatMessage[],
+  requestId: string,
+  state: "approved" | "denied",
+): AiChatMessage[] {
+  const index = messages.findIndex((message) =>
+    message?.type === "permissionRequest" && message.requestId === requestId);
+  if (index < 0) return messages;
+  const next = [...messages];
+  next[index] = {...next[index], state} as AiChatMessage;
+  return next;
+}
+
 // A compaction checkpoint reported with a history page.
 export type CompactionBoundary = NonNullable<AiChatHistoryPage["compacted"]>;
 
@@ -5961,6 +5974,19 @@ function ChatInterface({
     try {
       if (approve) await overseer.approvePermissionRequest(requestId);
       else await overseer.denyPermissionRequest(requestId);
+      let changed = false;
+      for (const [chatId, messages] of cacheRef.current.messages) {
+        const next = applyPermissionDecisionToMessages(
+          messages,
+          requestId,
+          approve ? "approved" : "denied",
+        );
+        if (next !== messages) {
+          cacheRef.current.messages.set(chatId, next);
+          changed = true;
+        }
+      }
+      if (changed) forceUpdate();
     } catch (error) {
       toasts.add({
         title: error instanceof Error ? error.message : 'Failed to resolve permission request',

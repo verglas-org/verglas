@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
-use verglas_authz::{AccessDecision, Action};
+use verglas_authz::{AccessDecision, Action, ResourceKind};
 use verglas_catalog::{CatalogRuntimeRegistry, DatabaseId};
 use verglas_database::DatabaseManager;
 
@@ -67,6 +67,39 @@ pub struct AuthorizationQuestion {
     pub resource_id: String,
     /// Operation required by the route.
     pub action: Action,
+}
+
+/// One table resource declared as part of an authorized create-ingest request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DataPlaneResource {
+    /// Stable tenant-local table resource identifier.
+    pub id: String,
+    /// Resource category. The data plane accepts only table declarations.
+    pub kind: ResourceKind,
+    /// Owning database resource that grants child-creation authority.
+    pub parent_id: String,
+}
+
+impl DataPlaneResource {
+    /// Validates the canonical table-to-database edge derived from the route.
+    pub fn validate(&self) -> Result<(), AuthorizationFailure> {
+        let Some(remainder) = self.id.strip_prefix("table/") else {
+            return Err(AuthorizationFailure::Forbidden);
+        };
+        let Some((database, table)) = remainder.split_once('/') else {
+            return Err(AuthorizationFailure::Forbidden);
+        };
+        if self.kind != ResourceKind::Table
+            || database.is_empty()
+            || table.is_empty()
+            || table.contains('/')
+            || self.parent_id != format!("database/{database}")
+        {
+            return Err(AuthorizationFailure::Forbidden);
+        }
+        Ok(())
+    }
 }
 
 /// Successful access-service response containing verified identity and policy decision.
@@ -126,6 +159,15 @@ pub trait DataPlaneAuthorizer: Send + Sync {
         authorization: &str,
         question: AuthorizationQuestion,
     ) -> Result<AuthenticatedPrincipal, AuthorizationFailure>;
+
+    /// Idempotently declares one route-derived table below an authorized database.
+    async fn ensure_resource(
+        &self,
+        _authorization: &str,
+        _resource: DataPlaneResource,
+    ) -> Result<(), AuthorizationFailure> {
+        Err(AuthorizationFailure::Unavailable)
+    }
 }
 
 /// Resolves a tenant-local database route name to its immutable authorization ID.
@@ -215,6 +257,35 @@ impl DataPlaneAuthorizer for DataPlaneAccess {
         }
         Ok(answer.identity)
     }
+
+    /// Sends one authenticated, canonical child-resource declaration to Access.
+    async fn ensure_resource(
+        &self,
+        authorization: &str,
+        resource: DataPlaneResource,
+    ) -> Result<(), AuthorizationFailure> {
+        resource.validate()?;
+        let Some(endpoint) = &self.endpoint else {
+            return Err(AuthorizationFailure::Unavailable);
+        };
+        let uri = endpoint
+            .join("v1/access/data-plane/resources")
+            .map_err(|_| AuthorizationFailure::Unavailable)?;
+        let response = self
+            .http
+            .post(uri)
+            .header(header::AUTHORIZATION.as_str(), authorization)
+            .json(&resource)
+            .send()
+            .await
+            .map_err(|_| AuthorizationFailure::Unavailable)?;
+        match response.status() {
+            status if status.is_success() => Ok(()),
+            StatusCode::UNAUTHORIZED => Err(AuthorizationFailure::Unauthenticated),
+            StatusCode::FORBIDDEN => Err(AuthorizationFailure::Forbidden),
+            _ => Err(AuthorizationFailure::Unavailable),
+        }
+    }
 }
 
 /// Mounts mandatory authorization around every recognized data-plane route.
@@ -290,7 +361,7 @@ async fn authorize_request(
     mut request: Request,
     next: Next,
 ) -> Response {
-    let Some(mut target) = route_target(request.method(), request.uri().path()) else {
+    let Some(mut target) = route_target(request.method(), request.uri()) else {
         return next.run(request).await;
     };
     let mut resolved_database_id = None;
@@ -303,12 +374,19 @@ async fn authorize_request(
             Err(failure) => return failure.into_response(),
         };
         target.resource_id = format!("database/{database_id}");
+        if let Some(resource) = &mut target.resource {
+            resource.parent_id = format!("database/{database_id}");
+            if let Some((_, table)) = resource.id.rsplit_once('/') {
+                resource.id = format!("table/{database_id}/{table}");
+            }
+        }
         resolved_database_id = Some(database_id);
     }
     let authorization = match bearer_header(request.headers()) {
         Ok(value) => value,
         Err(failure) => return failure.into_response(),
     };
+    let resource = target.resource;
     match runtime
         .access
         .authorize(
@@ -322,6 +400,14 @@ async fn authorize_request(
         .await
     {
         Ok(principal) => {
+            if let Some(resource) = resource
+                && let Err(failure) = runtime
+                    .access
+                    .ensure_resource(authorization, resource)
+                    .await
+            {
+                return failure.into_response();
+            }
             let Some(authorization) = request.headers().get(header::AUTHORIZATION).cloned() else {
                 return AuthorizationFailure::Unauthenticated.into_response();
             };
@@ -366,6 +452,7 @@ fn bearer_header(headers: &HeaderMap) -> Result<&str, AuthorizationFailure> {
 struct RouteTarget {
     resource_id: String,
     action: Action,
+    resource: Option<DataPlaneResource>,
 }
 
 impl RouteTarget {
@@ -374,13 +461,20 @@ impl RouteTarget {
         Self {
             resource_id: resource_id.into(),
             action,
+            resource: None,
         }
+    }
+
+    /// Adds one child resource that must exist before the authorized handler runs.
+    fn declaring(mut self, resource: DataPlaneResource) -> Self {
+        self.resource = Some(resource);
+        self
     }
 }
 
 /// Maps every data-plane family to its registered resource and least-privilege action.
-fn route_target(method: &Method, path: &str) -> Option<RouteTarget> {
-    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+fn route_target(method: &Method, uri: &axum::http::Uri) -> Option<RouteTarget> {
+    let segments: Vec<&str> = uri.path().trim_matches('/').split('/').collect();
     match segments.as_slice() {
         ["v1", "databases"] => Some(RouteTarget::new(
             "tenant",
@@ -469,10 +563,23 @@ fn route_target(method: &Method, path: &str) -> Option<RouteTarget> {
             ))
         }
         ["v1", "databases", database, "write", name]
-        | ["v1", "databases", database, "ingest", name] => Some(RouteTarget::new(
-            format!("table/{database}/{name}"),
-            Action::Append,
-        )),
+        | ["v1", "databases", database, "ingest", name] => {
+            if query_parameter(uri, "mode") == Some("create") {
+                Some(
+                    RouteTarget::new(format!("database/{database}"), Action::CreateChild)
+                        .declaring(DataPlaneResource {
+                            id: format!("table/{database}/{name}"),
+                            kind: ResourceKind::Table,
+                            parent_id: format!("database/{database}"),
+                        }),
+                )
+            } else {
+                Some(RouteTarget::new(
+                    format!("table/{database}/{name}"),
+                    Action::Append,
+                ))
+            }
+        }
         ["v1", "databases", database, "graphs", namespace] => Some(RouteTarget::new(
             format!("graph/{database}/{namespace}"),
             if method == Method::GET {
@@ -528,8 +635,30 @@ fn route_target(method: &Method, path: &str) -> Option<RouteTarget> {
                 _ => Action::Modify,
             },
         )),
+        ["v1", "workers"] => Some(RouteTarget::new(
+            "tenant",
+            if method == Method::GET {
+                Action::Discover
+            } else {
+                Action::CreateChild
+            },
+        )),
+        ["v1", "workers", _] => Some(RouteTarget::new("tenant", Action::Discover)),
+        ["v1", "workers", _, "state"] => Some(RouteTarget::new("tenant", Action::Modify)),
+        ["v1", "workers", _, "run"] => Some(RouteTarget::new("tenant", Action::Execute)),
         _ => None,
     }
+}
+
+/// Returns one unescaped enum-like query value used by the serving API.
+///
+/// Write modes are restricted identifiers, so encoded alternatives are not
+/// aliases for the canonical value and cannot change the authorization target.
+fn query_parameter<'a>(uri: &'a axum::http::Uri, name: &str) -> Option<&'a str> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (key, value) = pair.split_once('=')?;
+        (key == name).then_some(value)
+    })
 }
 
 /// Maps an Iceberg REST catalog operation to a database-level action.

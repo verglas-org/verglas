@@ -196,6 +196,13 @@ export class VerglasAccessClient {
   /** Delegates only actions the authenticated user already holds and may pass. */
   async delegate(input: VerglasAccessGrantInput): Promise<VerglasAccessGrant> {
     if (input.actions.length === 0) throw new Error("At least one access action is required.");
+    const existing = (await this.listPrincipalGrants(input.principalId)).find((grant) =>
+      grant.resourceId === input.resourceId);
+    if (existing && input.actions.every((action) => existing.actions.includes(action))) {
+      return existing;
+    }
+    const actions = [...new Set([...(existing?.actions ?? []), ...input.actions])];
+    if (existing) await this.revoke(existing.id);
     const wire = await this.#request<GrantWire>("/v1/access/delegations", {
       method: "POST",
       body: JSON.stringify({
@@ -203,7 +210,7 @@ export class VerglasAccessClient {
           id: `delegated/${crypto.randomUUID()}`,
           principal_id: input.principalId,
           resource_id: input.resourceId,
-          actions: [...new Set(input.actions)],
+          actions,
         },
       }),
     });

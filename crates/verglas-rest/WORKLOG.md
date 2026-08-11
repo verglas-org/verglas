@@ -39,3 +39,6 @@
   child-first, so retries safely repair interrupted cleanup.
 - Added the explicit `verglas-cli` audience as a bounded alias at both access-management and data-plane boundaries. One user-minted credential now supports CLI/SDK management and queries without weakening workload-only `access`, `data-plane`, or `policy-engine` audiences.
 - #107: Added explicit queue resource create, list, get, and delete routes backed by a mandatory queue lifecycle service. The REST layer only manages declarations; message operations stay in independently provisioned queue containers.
+- #81: Authorized `ingest?mode=create` against the owning database's `create_child` permission
+  and idempotently declared the canonical table resource before dispatching the write. Existing-
+  table ingest remains table-scoped and requires `append`, with no manual Postgres/OpenFGA edit.

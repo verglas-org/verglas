@@ -36,6 +36,9 @@ mod lakehouse_runtime;
 mod postgres_runtime;
 mod queue_runtime;
 
+/// Lakekeeper's built-in project created by its single-tenant bootstrap.
+const LAKEKEEPER_DEFAULT_PROJECT: &str = "lakekeeper/project/00000000-0000-0000-0000-000000000000";
+
 /// Database binding resolver backed by the authorization-owned secret service.
 struct AccessSecretResolver {
     secrets: Arc<SecretService>,
@@ -558,6 +561,17 @@ async fn ensure_tenant_identities(
     match authorizer.create_resource(lakekeeper).await {
         Ok(_) | Err(AuthzError::Conflict(_)) => {}
         Err(error) => return Err(format!("cannot bootstrap Lakekeeper resource: {error}")),
+    }
+    let lakekeeper_default_project =
+        Resource::new(tenant_id, LAKEKEEPER_DEFAULT_PROJECT, ResourceKind::Project)
+            .with_parent("lakekeeper");
+    match authorizer.create_resource(lakekeeper_default_project).await {
+        Ok(_) | Err(AuthzError::Conflict(_)) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot bootstrap Lakekeeper default project: {error}"
+            ));
+        }
     }
     let principal = Principal::new(
         tenant_id,

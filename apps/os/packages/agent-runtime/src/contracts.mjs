@@ -40,6 +40,10 @@ export function gatewayTargetToken(service, allowed, scopedToken, containerRunti
   return requireScopedToken(scopedToken);
 }
 
+export function authorizationDecision(response) {
+  return response?.decision ?? response;
+}
+
 export function boundedPrompt(value) {
   if (typeof value !== "string" || !value.trim()) throw new Error("A prompt is required.");
   if (value.length > 256 * 1024) throw new Error("The prompt exceeds 256 KiB.");

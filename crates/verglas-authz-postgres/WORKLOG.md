@@ -1,5 +1,9 @@
 # Worklog
 
+- cloud acceptance: bounded the access authorization repository to two
+  Postgres connections so metadata traffic cannot exhaust a tenant's client
+  connection budget.
+
 ## 2026-08-08 — Issue #81
 
 - Added the durable authorization registry for the `verglas_permissions` logical database.

@@ -24,7 +24,8 @@
       "/blueprint-screenshot",
       "/blueprint-screenshot/*",
       "/application-screenshot",
-      "/application-screenshot/*"
+      "/application-screenshot/*",
+      "/apps/*"
     ]
   },
 

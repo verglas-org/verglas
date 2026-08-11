@@ -20,6 +20,32 @@ RUN cargo build --release \
     -p verglas-query \
     -p verglas-write-node
 
+# Keep access-only iteration independent from the full multi-binary build. The
+# cache mounts make local and emergency replacement builds incremental while the
+# copied artifact remains available to the final image stage.
+FROM rust:bookworm AS build-access
+WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup show
+COPY . .
+RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=verglas-access-target,target=/src/target \
+    cargo build --release -p verglas-access-bin \
+    && cp /src/target/release/verglas-access /tmp/verglas-access
+
+FROM rust:bookworm AS build-server
+WORKDIR /src
+COPY rust-toolchain.toml ./
+RUN rustup show
+COPY . .
+RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=verglas-server-target,target=/src/target \
+    cargo build --release -p verglas-server -p verglas-query -p verglas-write-node \
+    && mkdir -p /tmp/verglas-server \
+    && cp /src/target/release/verglas-server /tmp/verglas-server/ \
+    && cp /src/target/release/verglas-query /tmp/verglas-server/ \
+    && cp /src/target/release/verglas-write /tmp/verglas-server/
+
 FROM oven/bun:1.3.8 AS verglas-integration-runtime
 WORKDIR /opt/verglas-integration-runtime
 COPY crates/verglas-integration-runtime/runtime.mjs ./runtime.mjs
@@ -82,9 +108,9 @@ FROM runtime AS verglas-access
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/* \
-    && mkdir -p /var/run/verglas/server /var/run/verglas/lakekeeper /var/run/verglas/neon \
+    && mkdir -p /var/run/verglas/access /var/run/verglas/server /var/run/verglas/lakekeeper /var/run/verglas/neon \
     && chown -R verglas:verglas /var/run/verglas
-COPY --from=build /src/target/release/verglas-access /usr/local/bin/verglas-access
+COPY --from=build-access /tmp/verglas-access /usr/local/bin/verglas-access
 USER verglas
 EXPOSE 8345
 ENTRYPOINT ["verglas-access"]
@@ -126,9 +152,9 @@ EXPOSE 5454 8333 8334 8335 8336
 ENTRYPOINT ["verglas-cache-node-start"]
 
 FROM runtime AS verglas-server
-COPY --from=build /src/target/release/verglas-server /usr/local/bin/verglas-server
-COPY --from=build /src/target/release/verglas-query /usr/local/bin/verglas-query
-COPY --from=build /src/target/release/verglas-write /usr/local/bin/verglas-write
+COPY --from=build-server /tmp/verglas-server/verglas-server /usr/local/bin/verglas-server
+COPY --from=build-server /tmp/verglas-server/verglas-query /usr/local/bin/verglas-query
+COPY --from=build-server /tmp/verglas-server/verglas-write /usr/local/bin/verglas-write
 USER verglas
 EXPOSE 8333 8334
 ENTRYPOINT ["verglas-server", "--environment"]

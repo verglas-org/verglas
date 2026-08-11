@@ -19,6 +19,9 @@ use verglas_authz::{
 /// Idempotent schema installed only in the platform-owned permissions database.
 const SCHEMA: &str = include_str!("schema.sql");
 
+/// Access shares a small tenant compute with the other metadata services.
+const TENANT_POOL_MAX_CONNECTIONS: u32 = 2;
+
 /// Postgres-backed authorization object registry.
 #[derive(Debug, Clone)]
 pub struct PostgresAuthorizationRepository {
@@ -29,7 +32,7 @@ impl PostgresAuthorizationRepository {
     /// Connects to `verglas_permissions`, installs its schema, and bounds the pool.
     pub async fn connect(database_url: &str) -> Result<Self, AuthzError> {
         let pool = PgPoolOptions::new()
-            .max_connections(10)
+            .max_connections(TENANT_POOL_MAX_CONNECTIONS)
             .connect(database_url)
             .await
             .map_err(database_error)?;

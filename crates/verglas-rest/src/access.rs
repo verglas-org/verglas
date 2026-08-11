@@ -29,6 +29,7 @@ use verglas_database::DatabaseKind;
 
 use crate::data_plane::{
     AuthenticatedPrincipal, AuthorizationFailure, AuthorizationQuestion, DataPlaneAuthorizer,
+    DataPlaneResource,
 };
 use crate::database::{DatabaseAuthorization, DatabaseAuthorizationError};
 use crate::queue::{QueueAuthorization, QueueAuthorizationError};
@@ -182,6 +183,45 @@ impl DataPlaneAuthorizer for AccessHttpRuntime {
             token_id: claims.token_id,
             audience: claims.audience,
         })
+    }
+
+    /// Registers one canonical table child after independently checking the
+    /// caller's current create-child authority on its database.
+    async fn ensure_resource(
+        &self,
+        authorization: &str,
+        resource: DataPlaneResource,
+    ) -> Result<(), AuthorizationFailure> {
+        resource.validate()?;
+        let principal = self
+            .authorize(
+                authorization,
+                AuthorizationQuestion {
+                    audience: Arc::from(DATA_PLANE_AUDIENCE),
+                    resource_id: resource.parent_id.clone(),
+                    action: Action::CreateChild,
+                },
+            )
+            .await?;
+        let declaration = Resource::new(&principal.tenant_id, &resource.id, ResourceKind::Table)
+            .with_parent(&resource.parent_id);
+        match self.authorizer.create_resource(declaration.clone()).await {
+            Ok(_) => Ok(()),
+            Err(AuthzError::Conflict(_)) => self
+                .authorizer
+                .get_resource(&principal.tenant_id, &resource.id)
+                .await
+                .map_err(|_| AuthorizationFailure::Unavailable)
+                .and_then(|existing| {
+                    if existing == declaration {
+                        Ok(())
+                    } else {
+                        Err(AuthorizationFailure::Forbidden)
+                    }
+                }),
+            Err(AuthzError::Forbidden(_)) => Err(AuthorizationFailure::Forbidden),
+            Err(_) => Err(AuthorizationFailure::Unavailable),
+        }
     }
 }
 
@@ -488,6 +528,10 @@ pub fn router(runtime: AccessHttpRuntime) -> Router {
     let mut routes = Router::new()
         .route("/v1/access/sessions", post(create_session))
         .route("/v1/access/authorize", post(authorize))
+        .route(
+            "/v1/access/data-plane/resources",
+            post(ensure_data_plane_resource),
+        )
         .route("/.well-known/jwks.json", get(target_jwks))
         .route("/v1/access/check", post(check_access))
         .route("/v1/access/policy/resources", post(sync_resource))
@@ -509,6 +553,25 @@ pub fn router(runtime: AccessHttpRuntime) -> Router {
         }));
     }
     routes
+}
+
+/// Idempotently installs one route-derived table resource for an authenticated
+/// data-plane or CLI caller with create-child authority on the database.
+async fn ensure_data_plane_resource(
+    State(runtime): State<AccessHttpRuntime>,
+    headers: HeaderMap,
+    Json(resource): Json<DataPlaneResource>,
+) -> Response {
+    let Some(authorization) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return AuthorizationFailure::Unauthenticated.into_response();
+    };
+    match runtime.ensure_resource(authorization, resource).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(failure) => failure.into_response(),
+    }
 }
 
 /// Builds the secret-specific routes with an isolated state type.

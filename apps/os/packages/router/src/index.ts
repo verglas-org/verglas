@@ -25,7 +25,8 @@ export default {
         url.pathname === "/blueprint-screenshot" ||
         url.pathname.startsWith("/blueprint-screenshot/") ||
         url.pathname === "/application-screenshot" ||
-        url.pathname.startsWith("/application-screenshot/")) {
+        url.pathname.startsWith("/application-screenshot/") ||
+        url.pathname.startsWith("/apps/")) {
       return backendFetch(env, req);
     }
 

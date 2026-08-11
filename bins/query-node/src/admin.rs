@@ -98,13 +98,11 @@ impl PreparedQueryCatalog {
     pub async fn open(
         catalog: Arc<dyn Catalog>,
         metadata_uri: Option<&str>,
+        generation_bearer: Option<String>,
         memory_limit_bytes: usize,
         spill_path: Option<std::path::PathBuf>,
     ) -> Result<Self, AgentError> {
         let http = reqwest::Client::new();
-        let generation_bearer = std::env::var(verglas_core::RUN_BEARER_TOKEN_ENV)
-            .ok()
-            .filter(|token| !token.is_empty());
         let generation_url =
             metadata_uri.map(|uri| format!("{}/_verglas/generation", uri.trim_end_matches('/')));
         let (generation, prepared) = match &generation_url {

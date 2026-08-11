@@ -73,6 +73,7 @@ services:
       VERGLAS_QUERY_WORKER_BINARY: /usr/local/bin/verglas-query
       VERGLAS_WRITE_WORKER_BINARY: /usr/local/bin/verglas-write
       VERGLAS_SCHEDULER_URL: http://verglas-scheduler:8340
+      VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
       VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345

@@ -438,7 +438,9 @@ pub fn router(server_version: &'static str, health: Health, slots: Slots) -> Rou
             .merge(graphs_router(database_data.clone()))
             .merge(vector_router(database_data));
     }
-    if let Some(sys) = sys {
+    if platform.is_none()
+        && let Some(sys) = sys
+    {
         app = app.merge(sys_router(sys));
     }
     if let Some(platform) = platform {
@@ -1593,11 +1595,86 @@ fn sys_router(sys: SysSlot) -> Router {
 /// deployment-configured dynamic HTTP paths. Each creates a durable job object.
 fn platform_router(platform: PlatformSlot) -> Router {
     Router::new()
+        .route(
+            "/v1/workers",
+            post(scheduler_worker_register).get(scheduler_worker_list),
+        )
+        .route("/v1/workers/{name}", get(scheduler_worker_show))
+        .route("/v1/workers/{name}/state", put(scheduler_worker_set_state))
         .route("/v1/events", post(worker_event))
         .route("/v1/workers/{name}/run", post(worker_run_now))
         .route("/v1/hooks/{name}", post(worker_webhook))
         .route("/v1/http/{*path}", any(worker_dynamic_http))
         .with_state(platform)
+}
+
+/// Registers a worker in the scheduler-owned Postgres registry.
+async fn scheduler_worker_register(
+    State(platform): State<PlatformSlot>,
+    Json(spec): Json<verglas_scheduler::WorkerSpec>,
+) -> Response {
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    match ingress.register_worker(spec).await {
+        Ok(worker) => (StatusCode::CREATED, Json(worker)).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+/// Lists workers from the scheduler-owned Postgres registry.
+async fn scheduler_worker_list(
+    State(platform): State<PlatformSlot>,
+    Query(query): Query<ListView>,
+) -> Response {
+    let include_all = match query.view.as_deref() {
+        None | Some("active") => false,
+        Some("all") => true,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown view `{other}`: expected active or all"),
+            )
+                .into_response();
+        }
+    };
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    match ingress.list_workers(include_all).await {
+        Ok(workers) => Json(workers).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+/// Returns one scheduler-owned worker declaration.
+async fn scheduler_worker_show(
+    State(platform): State<PlatformSlot>,
+    Path(name): Path<String>,
+) -> Response {
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    match ingress.get_worker(&name).await {
+        Ok(Some(worker)) => Json(worker).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, format!("no worker named {name}")).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
+}
+
+/// Applies one scheduler-owned worker lifecycle transition.
+async fn scheduler_worker_set_state(
+    State(platform): State<PlatformSlot>,
+    Path(name): Path<String>,
+    Json(body): Json<StatePut>,
+) -> Response {
+    let Some(ingress) = platform.get() else {
+        return recovering();
+    };
+    match ingress.set_worker_state(&name, &body.state).await {
+        Ok(worker) => Json(worker).into_response(),
+        Err(error) => (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    }
 }
 
 /// Accepts one structured CloudEvent and fans it out to exact worker
