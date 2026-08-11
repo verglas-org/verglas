@@ -108,3 +108,4 @@
   operation names its database in the route.
 - #107: Replaced watermark queue calls with PostgreSQL-backed fenced delivery receipts and routed queue handles through the access endpoint. Enqueue, poll, and ack now speak only the standalone queue-container contract.
 - #20: Added topic-aware queue messages and reconnecting push subscriptions. Database handles now expose one table subscription stream plus fenced acknowledgement, while the SDK owns NDJSON framing and transport reconnection without a polling fallback.
+- #20: Added an opt-in deployment test that proves an acknowledged Iceberg append wakes one durable table subscription and remains queryable afterward.

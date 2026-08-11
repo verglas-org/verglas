@@ -13,15 +13,17 @@ async fn postgres_queue_redelivers_expired_and_fences_stale_receipts() {
     let queue = PgQueue::connect(&database_url)
         .await
         .expect("connect queue");
+    let suffix = Utc::now().timestamp_nanos_opt().expect("timestamp");
+    let group = format!("workers-{suffix}");
     let positions = queue
         .enqueue(&[
             QueueMessage {
-                id: "event-1".to_owned(),
+                id: format!("event-1-{suffix}"),
                 topic: "orders".to_owned(),
                 payload: json!({"event": 1}),
             },
             QueueMessage {
-                id: "event-2".to_owned(),
+                id: format!("event-2-{suffix}"),
                 topic: "orders".to_owned(),
                 payload: json!({"event": 2}),
             },
@@ -33,7 +35,7 @@ async fn postgres_queue_redelivers_expired_and_fences_stale_receipts() {
     let now = Utc::now();
     let first = queue
         .poll(&PollRequest {
-            group: "workers".to_owned(),
+            group: group.clone(),
             owner: "consumer-a".to_owned(),
             topics: vec!["orders".to_owned()],
             max: 1,
@@ -46,7 +48,7 @@ async fn postgres_queue_redelivers_expired_and_fences_stale_receipts() {
 
     let competing = queue
         .poll(&PollRequest {
-            group: "workers".to_owned(),
+            group: group.clone(),
             owner: "consumer-b".to_owned(),
             topics: vec!["orders".to_owned()],
             max: 1,
@@ -60,7 +62,7 @@ async fn postgres_queue_redelivers_expired_and_fences_stale_receipts() {
 
     let redelivered = queue
         .poll(&PollRequest {
-            group: "workers".to_owned(),
+            group: group.clone(),
             owner: "consumer-c".to_owned(),
             topics: vec!["orders".to_owned()],
             max: 1,
@@ -74,7 +76,7 @@ async fn postgres_queue_redelivers_expired_and_fences_stale_receipts() {
 
     let stale = queue
         .ack(&AckRequest {
-            group: "workers".to_owned(),
+            group: group.clone(),
             receipt: first[0].receipt.clone(),
             now: now + Duration::seconds(12),
         })
@@ -84,7 +86,7 @@ async fn postgres_queue_redelivers_expired_and_fences_stale_receipts() {
 
     queue
         .ack(&AckRequest {
-            group: "workers".to_owned(),
+            group,
             receipt: redelivered[0].receipt.clone(),
             now: now + Duration::seconds(12),
         })

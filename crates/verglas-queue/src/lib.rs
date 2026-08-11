@@ -249,13 +249,17 @@ impl PgQueue {
 
     /// Installs the queue-owned schema without any filesystem state.
     async fn migrate(&self) -> Result<(), QueueError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtext('verglas_queue_schema_v1'))")
+            .execute(&mut *transaction)
+            .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS verglas_queue_messages (\
              position BIGSERIAL PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, \
              topic TEXT NOT NULL, payload JSONB NOT NULL, \
              created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query(
             "CREATE TABLE IF NOT EXISTS verglas_queue_deliveries (\
@@ -265,14 +269,15 @@ impl PgQueue {
              lease_expires_at TIMESTAMPTZ NOT NULL, acked BOOLEAN NOT NULL DEFAULT false, \
              acked_at TIMESTAMPTZ, PRIMARY KEY (consumer_group, position))",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
         sqlx::query(
             "CREATE INDEX IF NOT EXISTS verglas_queue_delivery_candidates \
              ON verglas_queue_deliveries (consumer_group, acked, lease_expires_at, position)",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await?;
+        transaction.commit().await?;
         Ok(())
     }
 
