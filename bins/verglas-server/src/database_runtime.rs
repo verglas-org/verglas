@@ -60,6 +60,7 @@ pub(crate) struct DatabaseCatalogSynchronizer {
     managed_catalog_uri: reqwest::Url,
     catalogs: CatalogRuntimeRegistry,
     http: reqwest::Client,
+    last_inventory: tokio::sync::Mutex<Option<Vec<DatabaseView>>>,
 }
 
 impl DatabaseCatalogSynchronizer {
@@ -79,6 +80,7 @@ impl DatabaseCatalogSynchronizer {
             managed_catalog_uri,
             catalogs,
             http: reqwest::Client::new(),
+            last_inventory: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -141,8 +143,12 @@ impl DatabaseCatalogSynchronizer {
             .json::<DatabaseListResponse>()
             .await
             .map_err(|error| DatabaseRuntimeError::InventoryDecode(error.to_string()))?;
+        let mut last_inventory = self.last_inventory.lock().await;
+        if last_inventory.as_ref() == Some(&inventory.databases) {
+            return Ok(());
+        }
         let mut gateways = Vec::new();
-        for database in inventory.databases {
+        for database in &inventory.databases {
             match database {
                 DatabaseView::Lakehouse {
                     id,
@@ -152,7 +158,7 @@ impl DatabaseCatalogSynchronizer {
                 } => gateways.push((
                     DatabaseId::new(name.clone())
                         .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?,
-                    DatabaseId::new(id)
+                    DatabaseId::new(id.clone())
                         .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?,
                     self.managed_gateway(&name)?,
                 )),
@@ -160,13 +166,15 @@ impl DatabaseCatalogSynchronizer {
                     name,
                     catalog: CatalogRequest::External { .. },
                     ..
-                } => return Err(DatabaseRuntimeError::ExternalCatalog(name)),
+                } => return Err(DatabaseRuntimeError::ExternalCatalog(name.clone())),
                 DatabaseView::Postgres { .. } => {}
             }
         }
         self.catalogs
             .replace_all_bound(gateways)
-            .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))
+            .map_err(|error| DatabaseRuntimeError::Catalog(error.to_string()))?;
+        *last_inventory = Some(inventory.databases);
+        Ok(())
     }
 
     /// Continuously refreshes the live routing snapshot after a successful initial sync.
