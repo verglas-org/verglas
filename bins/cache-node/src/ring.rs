@@ -157,6 +157,15 @@ pub async fn setup(
         cache_dir.join("fragment-ring"),
         Arc::clone(&fragment_ceiling),
     );
+    match verglas_safekeeper::reclaim_legacy_state_descriptors(&local) {
+        Ok(0) => {}
+        Ok(count) => eprintln!(
+            "verglas-cache-node {VERSION} reclaimed {count} stale safekeeper state descriptors"
+        ),
+        Err(error) => eprintln!(
+            "verglas-cache-node {VERSION} could not reclaim stale safekeeper state descriptors: {error}"
+        ),
+    }
 
     // The peer RPC client + transport: self-directed placements go to the local
     // store, everything else over the fragment RPC to the resolved peer address.

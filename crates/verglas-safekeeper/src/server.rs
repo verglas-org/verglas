@@ -38,6 +38,10 @@ const REPLICATION_CHUNK: u64 = 128 * 1024;
 const WAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// A snapshotted/paused replication client retains its TCP connection but no
+/// longer drains the receive buffer. Never let a keepalive or WAL response hold
+/// a safekeeper activity guard forever and make the cache impossible to fence.
+const REPLICATION_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct BrokerConfig {
@@ -530,7 +534,10 @@ where
         let mut interval = tokio::time::interval(WAL_DRAIN_INTERVAL);
         interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = timeline.wait_for_flush_request() => {}
+            }
             match timeline.flush().await {
                 Ok(flushed) => {
                     let state = timeline.safekeeper_state().await;
@@ -739,6 +746,16 @@ async fn write_copy_data(stream: &mut TcpStream, payload: Bytes) -> Result<(), S
     write_backend(stream, b'd', &payload).await
 }
 
+async fn write_replication_data(stream: &mut TcpStream, payload: Bytes) -> Result<(), ServerError> {
+    tokio::time::timeout(REPLICATION_WRITE_TIMEOUT, write_copy_data(stream, payload))
+        .await
+        .map_err(|_| {
+            ServerError::Connection(
+                "replication client stopped draining safekeeper responses".to_owned(),
+            )
+        })?
+}
+
 /// Streams WAL from the EC/origin log using PostgreSQL physical replication
 /// `XLogData` frames, then stays attached for future appends and feedback.
 async fn send_wal<S>(
@@ -764,7 +781,7 @@ where
             payload.put_u64(tail.0);
             payload.put_i64(0);
             payload.put_slice(&wal);
-            write_copy_data(stream, payload.freeze()).await?;
+            write_replication_data(stream, payload.freeze()).await?;
             position = end;
             continue;
         }
@@ -792,7 +809,7 @@ where
                 keepalive.put_u64(timeline.tail().0);
                 keepalive.put_i64(0);
                 keepalive.put_u8(0);
-                write_copy_data(stream, keepalive.freeze()).await?;
+                write_replication_data(stream, keepalive.freeze()).await?;
             }
         }
     }

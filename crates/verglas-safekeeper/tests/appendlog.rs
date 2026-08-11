@@ -33,7 +33,9 @@ use std::sync::Mutex;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment};
+use verglas_cluster::fragments::{
+    FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment, LocalFragmentStore,
+};
 use verglas_core::CacheKey;
 use verglas_core::activity::ActivityTracker;
 use verglas_core::node::NodeId;
@@ -45,7 +47,10 @@ use verglas_core::write::{
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
 use verglas_safekeeper::server::SafekeeperServer;
-use verglas_safekeeper::{AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn};
+use verglas_safekeeper::{
+    AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn,
+    reclaim_legacy_state_descriptors,
+};
 use verglas_safekeeper::{FragmentTransport, LiveMembership, TransportError};
 
 #[tokio::test]
@@ -93,6 +98,7 @@ struct TransportInner {
     frags: HashMap<(String, String, usize), (Bytes, u32)>,
     dead: HashSet<String>,
     fail_place: HashSet<String>,
+    budget_per_node: Option<u64>,
 }
 
 struct MemoryTransport {
@@ -103,6 +109,15 @@ impl MemoryTransport {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(TransportInner::default()),
+        })
+    }
+
+    fn with_budget_per_node(bytes: u64) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(TransportInner {
+                budget_per_node: Some(bytes),
+                ..TransportInner::default()
+            }),
         })
     }
 
@@ -135,13 +150,21 @@ impl MemoryTransport {
 
 #[async_trait::async_trait]
 impl FragmentTransport for MemoryTransport {
-    async fn has_headroom(&self, node: &NodeId, _bytes: u64) -> bool {
-        !self
-            .inner
-            .lock()
-            .expect("lock")
-            .dead
-            .contains(node.as_str())
+    async fn has_headroom(&self, node: &NodeId, bytes: u64) -> bool {
+        let inner = self.inner.lock().expect("lock");
+        if inner.dead.contains(node.as_str()) {
+            return false;
+        }
+        let Some(budget) = inner.budget_per_node else {
+            return true;
+        };
+        let used: u64 = inner
+            .frags
+            .iter()
+            .filter(|((stored_node, _, _), _)| stored_node == node.as_str())
+            .map(|(_, (stored, _))| stored.len() as u64)
+            .sum();
+        used.saturating_add(bytes) <= budget
     }
 
     async fn place(&self, node: &NodeId, record: FragmentRecord) -> Result<(), TransportError> {
@@ -151,6 +174,29 @@ impl FragmentTransport for MemoryTransport {
             return Err(TransportError::Local(FragmentIoError::Io(format!(
                 "{n} cannot store"
             ))));
+        }
+        if let Some(budget) = inner.budget_per_node {
+            let key = (n.to_owned(), record.key.object_id.clone(), record.key.index);
+            let replaced = inner
+                .frags
+                .get(&key)
+                .map_or(0, |(stored, _)| stored.len() as u64);
+            let used: u64 = inner
+                .frags
+                .iter()
+                .filter(|((stored_node, _, _), _)| stored_node == n)
+                .map(|(_, (stored, _))| stored.len() as u64)
+                .sum();
+            if used
+                .saturating_sub(replaced)
+                .saturating_add(record.bytes.len() as u64)
+                > budget
+            {
+                return Err(TransportError::Local(FragmentIoError::Full {
+                    needed: record.bytes.len() as u64,
+                    available: budget.saturating_sub(used.saturating_sub(replaced)),
+                }));
+            }
         }
         inner.frags.insert(
             (n.to_owned(), record.key.object_id, record.key.index),
@@ -726,6 +772,102 @@ async fn flush_drains_to_s3_then_drops_local_fragments() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repeated_commits_keep_writing_after_the_fragment_store_reaches_steady_state() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::with_budget_per_node(32 * 1024);
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(
+        store.clone(),
+        transport.clone(),
+        membership,
+        dir.path(),
+        geom(),
+    );
+
+    let mut lsn = Lsn(0);
+    for commit in 0..64 {
+        let payload = bytes(512);
+        log.append(Epoch(0), lsn, payload)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("commit {commit} must not be blocked by cache: {error}")
+            });
+        lsn = log.tail();
+        log.flush()
+            .await
+            .unwrap_or_else(|error| panic!("commit {commit} must stream to origin: {error}"));
+    }
+
+    assert_eq!(log.flushed_through(), log.tail());
+    assert_eq!(transport.wal_fragment_count(), 0);
+    assert_eq!(store.object_count(), 64);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_pressure_offloads_and_evicts_the_acked_tail_before_rejecting_a_commit() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::with_budget_per_node(24 * 1024);
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let log = build(store.clone(), transport, membership, dir.path(), geom());
+
+    let mut lsn = Lsn(0);
+    for commit in 0..24 {
+        log.append(Epoch(0), lsn, bytes(2048))
+            .await
+            .unwrap_or_else(|error| panic!("pressure rejected commit {commit}: {error}"));
+        lsn = log.tail();
+    }
+
+    assert!(store.object_count() > 0, "pressure streamed WAL to origin");
+    assert!(
+        log.flushed_through().0 > 0,
+        "pressure advanced the durable origin watermark"
+    );
+    assert_eq!(log.tail(), Lsn(24 * 2048));
+}
+
+#[test]
+fn upgrade_reclaims_only_legacy_descriptors_not_named_by_the_committed_head() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let fragments = LocalFragmentStore::new(dir.path());
+    let prefix = "sk/0123456789abcdef";
+    for revision in 1_u64..=3 {
+        fragments
+            .store_fragment(&FragmentRecord::new(
+                FragmentKey {
+                    object_id: format!("{prefix}/state/{revision:020}"),
+                    index: usize::MAX - 1,
+                },
+                Bytes::from(format!("manifest-{revision}")),
+            ))
+            .expect("legacy descriptor");
+    }
+    fragments
+        .store_fragment(&FragmentRecord::new(
+            FragmentKey {
+                object_id: format!("{prefix}/head"),
+                index: usize::MAX,
+            },
+            Bytes::copy_from_slice(&3_u64.to_be_bytes()),
+        ))
+        .expect("legacy head");
+
+    assert_eq!(
+        reclaim_legacy_state_descriptors(&fragments).expect("reclaim"),
+        2
+    );
+    let remaining: Vec<_> = fragments
+        .list_fragment_keys()
+        .into_iter()
+        .filter(|key| key.index == usize::MAX - 1)
+        .collect();
+    assert_eq!(remaining.len(), 1);
+    assert!(remaining[0].object_id.ends_with("00000000000000000003"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_spans_a_flushed_segment_and_the_ec_tail() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
@@ -836,6 +978,53 @@ async fn replacement_coordinator_recovers_without_the_failed_nodes_manifest() {
             .expect("reassemble on replacement"),
         payload
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_coordinator_recovers_a_pre_slot_descriptor_during_upgrade() {
+    let original_dir = tempfile::tempdir().expect("original tmp");
+    let replacement_dir = tempfile::tempdir().expect("replacement tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
+    let payload = bytes(4096);
+    {
+        let log = build(
+            store.clone(),
+            transport.clone(),
+            membership.clone(),
+            original_dir.path(),
+            geom(),
+        );
+        log.append(Epoch(0), Lsn(0x1000), payload.clone())
+            .await
+            .expect("append");
+    }
+
+    {
+        let mut inner = transport.inner.lock().expect("lock");
+        let descriptors: Vec<_> = inner
+            .frags
+            .keys()
+            .filter(|(_, _, index)| *index == usize::MAX - 1)
+            .cloned()
+            .collect();
+        for old_key in descriptors {
+            let (node, object_id, index) = old_key.clone();
+            let value = inner.frags.remove(&old_key).expect("slot descriptor");
+            let legacy_id = object_id.replace("/state/slot-1", "/state/00000000000000000001");
+            inner.frags.insert((node, legacy_id, index), value);
+        }
+    }
+
+    let replacement = build(store, transport, membership, replacement_dir.path(), geom());
+    assert!(
+        replacement
+            .recover_from_ring()
+            .await
+            .expect("legacy recovery")
+    );
+    assert_eq!(replacement.tail(), Lsn(0x1000 + payload.len() as u64));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1021,7 +1210,7 @@ async fn flush_compacts_fragment_placements_out_of_recovery_state() {
         .frags
         .iter()
         .filter(|((_, object_id, index), _)| {
-            *index == usize::MAX - 1 && object_id.ends_with("/state/00000000000000000002")
+            *index == usize::MAX - 1 && object_id.ends_with("/state/slot-0")
         })
         .map(|(_, (bytes, _))| bytes.clone())
         .next()
@@ -1264,13 +1453,13 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
         "flush_lsn advances only after the EC append"
     );
 
-    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+    tokio::time::timeout(std::time::Duration::from_millis(500), async {
         while store.object_count() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("background WAL drain reached object storage");
+    .expect("append notification streamed WAL without waiting for retry timer");
     assert_eq!(
         transport.wal_fragment_count(),
         0,
