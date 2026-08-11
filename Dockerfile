@@ -28,7 +28,7 @@ WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN rustup show
 COPY . .
-RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=verglas-access-target,target=/src/target \
     cargo build --release -p verglas-access-bin \
     && cp /src/target/release/verglas-access /tmp/verglas-access
@@ -38,7 +38,7 @@ WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN rustup show
 COPY . .
-RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry \
+RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=verglas-server-target,target=/src/target \
     cargo build --release -p verglas-server -p verglas-query -p verglas-write-node \
     && mkdir -p /tmp/verglas-server \
