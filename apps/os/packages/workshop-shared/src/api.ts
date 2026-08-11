@@ -1310,13 +1310,16 @@ export type AiModelConfig = {
   // "local-runtime" models; older saved configurations encode the runtime in `model`.
   runtime?: ModelRuntimeId;
 
+  /** Stable user scope used by Pi to isolate and refresh subscription credentials. */
+  credentialScope?: string;
+
   // Zero-based capability order reported by the provider's live model catalog. Lower values are
   // presented first; undefined is used for manually configured models without catalog metadata.
   catalogRank?: number;
 };
 
 /** Branded coding-agent runtimes that Verglas OS can execute through its native host adapter. */
-export type ModelRuntimeId = "codex" | "claude-code" | "cursor";
+export type ModelRuntimeId = "codex" | "claude-code" | "github-copilot";
 
 /** One selectable model exposed by a branded coding-agent runtime. */
 export type ModelRuntimeCatalogEntry = {
@@ -1837,7 +1840,10 @@ export const SUGGESTED_MODELS: Record<
   "local-runtime": {
     codex: { name: "Codex subscription", contextWindow: 128000 },
     "claude-code": { name: "Claude Code subscription", contextWindow: 128000 },
-    cursor: { name: "Cursor subscription", contextWindow: 128000 },
+    "github-copilot": {
+      name: "GitHub Copilot subscription",
+      contextWindow: 128000,
+    },
   },
 };
 

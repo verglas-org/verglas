@@ -32,7 +32,31 @@ export function runCapabilityEnvironment({
     VERGLAS_ACCESS_URI: `${gateway}/access`,
     VERGLAS_AGENT_PRINCIPAL_ID: principalId,
     VERGLAS_AGENT_CHAT_ID: String(chatId),
+    VERGLAS_AGENT_WORKSPACE: "/workspace",
   };
+}
+
+/** Returns the additional authorization required before proxying a gateway call. */
+export function runtimeGatewayAuthorization(service, method, path) {
+  if (service === "data" || service === "access") return null;
+  if (service !== "runtime" || !/^\/v1\/vessels(?:\/|$)/.test(path)) {
+    throw new Error("operation is not exposed to agent runs");
+  }
+  const vesselHttp = path.match(/^\/v1\/vessels\/([^/]+)\/http(?:\/|$)/);
+  if (vesselHttp) {
+    const vessel = requireIdentifier(
+      decodeURIComponent(vesselHttp[1]),
+      "vessel name",
+    );
+    return { resourceId: `vessel/${vessel}`, action: "execute" };
+  }
+  if (method === "GET" || method === "HEAD") {
+    return { resourceId: "tenant", action: "discover" };
+  }
+  if (["PUT", "POST", "PATCH", "DELETE"].includes(method)) {
+    return { resourceId: "tenant", action: "deploy" };
+  }
+  throw new Error("operation is not exposed to agent runs");
 }
 
 export function requireScopedToken(value) {

@@ -6,6 +6,7 @@ import {
   gatewayTargetToken,
   requireIdentifier,
   requireScopedToken,
+  runtimeGatewayAuthorization,
   runCapabilityEnvironment,
   runDeploymentId,
 } from "../src/contracts.mjs";
@@ -51,6 +52,42 @@ test("agent runs receive one scoped token rather than controller credentials", (
   assert.equal("VERGLAS_AGENT_CONTROLLER_TOKEN" in environment, false);
   assert.equal("DATABASE_URL" in environment, false);
   assert.equal("VERGLAS_AGENT_RUNTIME_TOKEN" in environment, false);
+  assert.equal(environment.VERGLAS_AGENT_WORKSPACE, "/workspace");
+});
+
+test("data and access APIs retain the run token while runtime routes require explicit RBAC", () => {
+  assert.equal(
+    runtimeGatewayAuthorization("data", "POST", "/v1/anything"),
+    null,
+  );
+  assert.equal(
+    runtimeGatewayAuthorization("access", "GET", "/v1/databases"),
+    null,
+  );
+  assert.deepEqual(
+    runtimeGatewayAuthorization(
+      "runtime",
+      "PUT",
+      "/v1/vessels/dashboard/project",
+    ),
+    { resourceId: "tenant", action: "deploy" },
+  );
+  assert.deepEqual(
+    runtimeGatewayAuthorization("runtime", "GET", "/v1/vessels"),
+    { resourceId: "tenant", action: "discover" },
+  );
+  assert.deepEqual(
+    runtimeGatewayAuthorization(
+      "runtime",
+      "POST",
+      "/v1/vessels/dashboard/http/api/refresh",
+    ),
+    { resourceId: "vessel/dashboard", action: "execute" },
+  );
+  assert.throws(
+    () => runtimeGatewayAuthorization("runtime", "POST", "/v1/internal"),
+    /not exposed/,
+  );
 });
 
 test("agent runtime accepts only a caller-minted scoped token", () => {

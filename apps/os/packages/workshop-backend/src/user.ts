@@ -593,25 +593,33 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     const pending = new Map<ModelRuntimeId, UserAiModelRecord[]>();
     for (const record of records) {
       const match = record.profile.id.match(
-        /^runtime:(codex|claude-code|cursor):/,
+        /^runtime:(codex|claude-code|github-copilot):/,
       );
-      if (!match || record.config.catalogRank !== undefined) continue;
+      if (!match) continue;
       const runtime = match[1] as ModelRuntimeId;
+      if (
+        record.config.provider === "local-runtime" &&
+        record.config.credentialScope !== this.ctx.id.toString()
+      ) {
+        record.config.credentialScope = this.ctx.id.toString();
+        this.storage.aiModels.put(record);
+      }
+      if (record.config.catalogRank !== undefined) continue;
       pending.set(runtime, [...(pending.get(runtime) ?? []), record]);
     }
     for (const [runtime, runtimeRecords] of pending) {
       try {
         const apiToken = runtimeRecords[0].config.apiToken;
         const modelIds =
-          apiToken && runtime !== "cursor"
+          apiToken && runtime !== "github-copilot"
             ? Object.keys(
                 SUGGESTED_MODELS[runtime === "codex" ? "openai" : "anthropic"],
               )
             : (
-                await new ModelRuntimeManager(this.env).listModels(
-                  runtime,
-                  runtime === "cursor" ? apiToken : undefined,
-                )
+                await new ModelRuntimeManager(
+                  this.env,
+                  this.ctx.id.toString(),
+                ).listModels(runtime)
               ).map((model) => model.id);
         const ranks = new Map(modelIds.map((id, rank) => [id, rank]));
         for (const record of runtimeRecords) {
@@ -639,6 +647,9 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
     config: AiModelConfig,
   ): Promise<void> {
     profile.type = "agent";
+    if (config.provider === "local-runtime") {
+      config.credentialScope = this.ctx.id.toString();
+    }
     this.storage.aiModels.put({ profile, config });
   }
 
@@ -705,7 +716,7 @@ export class UserDurableObject extends DurableObject<Cloudflare.Env> {
       result.aiModel = this.storage.aiModels.get(modelId);
       if (
         !result.aiModel &&
-        /^runtime:(codex|claude-code|cursor)$/.test(modelId)
+        /^runtime:(codex|claude-code|github-copilot)$/.test(modelId)
       ) {
         result.aiModel = [...this.storage.aiModels.list()]
           .filter((model) => model.profile.id.startsWith(`${modelId}:`))

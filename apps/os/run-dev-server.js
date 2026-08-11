@@ -122,7 +122,7 @@ function spawnDevWatcher(label, command, args) {
 
 const localModelRuntime = spawn(
   process.execPath,
-  [join(ROOT, "scripts", "local-model-runtime.mjs")],
+  [join(ROOT, "scripts", "pi-model-runtime.mjs")],
   {
     stdio: "inherit",
     cwd: ROOT,
@@ -136,7 +136,7 @@ const localModelRuntime = spawn(
 localModelRuntime.on("exit", (code, signal) => {
   if (stoppingDevWatchers) return;
   console.error(
-    `native model runtime adapter exited unexpectedly (code=${code}, signal=${signal}).`,
+    `Pi model runtime exited unexpectedly (code=${code}, signal=${signal}).`,
   );
 });
 devWatchers.push(localModelRuntime);
@@ -149,7 +149,10 @@ async function waitForLocalModelRuntime() {
       const response = await fetch(
         `http://127.0.0.1:${localModelRuntimePort}/health`,
         {
-          headers: { Authorization: `Bearer ${localModelRuntimeToken}` },
+          headers: {
+            Authorization: `Bearer ${localModelRuntimeToken}`,
+            "X-Verglas-Credential-Scope": "healthcheck",
+          },
         },
       );
       if (response.ok) return;
@@ -159,7 +162,7 @@ async function waitForLocalModelRuntime() {
     }
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  throw new Error(`Native model runtime adapter ${detail}.`);
+  throw new Error(`Pi model runtime ${detail}.`);
 }
 
 await waitForLocalModelRuntime();

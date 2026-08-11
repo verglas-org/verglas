@@ -6,5 +6,9 @@
   "scripts": {
     "start": "bun src/server.mjs serve",
     "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@earendil-works/pi-agent-core": "0.83.0",
+    "@earendil-works/pi-ai": "0.83.0"
   }
 }

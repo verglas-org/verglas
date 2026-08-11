@@ -1,61 +1,38 @@
-# Native model runtimes
+# Pi subscription model runtime
 
-Verglas OS can use Codex, Claude Code, and Cursor with the credentials already owned by each
-installed CLI. OpenClaw is not installed, launched, or called by this integration.
+Verglas OS uses Pi for subscription-backed Codex, Claude, and GitHub Copilot models. The
+Workshop owns the Pi agent loop; `scripts/pi-model-runtime.mjs` owns provider OAuth, credential
+refresh, and native model streaming. No coding-agent CLI or OpenAI-compatible translation layer
+is involved.
 
-## Local open-source deployment
+## Local deployment
 
-`pnpm run-local` starts a loopback-only model-runtime adapter alongside Wrangler. The adapter:
+`pnpm run-local` starts the Pi model service alongside Wrangler. The service:
 
-- detects `codex`, `claude`, and `cursor-agent` on the user's machine;
-- asks each CLI for its current subscription login state;
-- launches the CLI's own browser login command when the user selects **Continue with
-  subscription**;
-- invokes the selected CLI for model turns without copying its subscription credential into the
-  Workshop database; and
-- accepts requests only with an ephemeral backend-only bearer token generated at startup.
+- registers Pi's `openai-codex`, `anthropic`, and `github-copilot` providers;
+- runs Pi-owned OAuth flows and persists refreshed credentials per user scope;
+- exposes the provider's live model catalog; and
+- streams Pi assistant events over the native `pi-messages` protocol.
 
-The Workshop frontend never receives that adapter token. The backend receives
-`LOCAL_MODEL_RUNTIME_URL` and `LOCAL_MODEL_RUNTIME_TOKEN` from `run-dev-server.js` and calls the
-adapter over loopback.
+The frontend never receives the deployment bearer token or provider credentials. The backend
+sends a stable `X-Verglas-Credential-Scope` on every management and inference request so one
+user cannot read or refresh another user's credentials.
 
-The three branded connection flows map directly to native CLIs:
+Direct OpenAI and Anthropic API keys remain separate Workshop model credentials. They do not
+enter the Pi subscription credential store.
 
-| UI choice | Subscription runtime | API-key behavior |
-| --- | --- | --- |
-| Codex | `codex` and ChatGPT sign-in | Saved as a normal OpenAI model credential |
-| Claude Code | `claude` and Claude subscription sign-in | Saved as a normal Anthropic model credential |
-| Cursor | `cursor-agent` and Cursor sign-in | Passed only to the local Cursor invocation |
+## Service contract
 
-API keys remain user model credentials in Workshop storage. They are not written into global CLI
-configuration. Subscription credentials remain wherever the vendor CLI normally stores them.
+- `GET /v1/runtimes` reports Pi provider login status.
+- `GET /v1/runtimes/{id}/models` returns the provider-owned catalog.
+- `POST /v1/runtimes/{id}/login` starts Pi OAuth.
+- `POST /v1/login-sessions/{id}` advances or polls OAuth.
+- `DELETE /v1/login-sessions/{id}` cancels OAuth.
+- `POST /v1/runtimes/{id}/verify` performs a bounded native inference.
+- `POST /messages` streams Pi assistant-message events.
 
-## Runtime contract
+Every route requires the deployment bearer token. Every route except the process health check
+also requires a credential scope. The local service binds to loopback by default; Compose exposes
+only the Workshop origin.
 
-The local adapter exposes a deliberately narrow HTTP API:
-
-- `GET /v1/runtimes` reports installation and login status.
-- `POST /v1/runtimes/{id}/login` launches the vendor CLI login.
-- `POST /v1/login-sessions/{id}` polls a running login.
-- `DELETE /v1/login-sessions/{id}` cancels a login process.
-- `POST /v1/chat/completions` runs a model turn through the selected CLI.
-
-`/v1/chat/completions` is an OpenAI-compatible façade. Subscription CLIs are not native
-tool-calling APIs, so the adapter asks each CLI for a structured assistant message
-(`content` + `tool_calls`) via vendor output-schema support where it exists (Codex/Claude),
-or via prompt alone (Cursor), then forwards that as a normal chat completion. That bridge is
-a local-dev compromise, not a product requirement for cloud model providers.
-
-Every route requires the deployment-owned bearer token. The server binds to `127.0.0.1` by
-default. Do not expose it as public ingress.
-
-## Cloud deployment
-
-The frontend and Workshop RPC API remain unchanged in the cloud. A cloud deployment supplies the
-same adapter contract from the account's model-runtime container instead of spawning it on the
-dashboard host. Container placement and lifecycle belong to the cloud runtime control plane; the
-Workshop does not call the Verglas scheduler for each model turn.
-
-This is separate from Application Vessels and Source workers: those use the Verglas admin /
-scheduler / container-runtime APIs described in [architecture.md](architecture.md). Model turns
-only need this narrow chat-completions adapter.
+Cloud deployments provide the same Pi service contract from their model-runtime container.

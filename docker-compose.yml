@@ -449,7 +449,7 @@ services:
       VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       LOCAL_MODEL_RUNTIME_TOKEN: ${LOCAL_MODEL_RUNTIME_TOKEN:-verglas-local-model-runtime}
       LOCAL_MODEL_RUNTIME_HOST: 0.0.0.0
-      CLAUDE_CONFIG_DIR: /root/.claude
+      PI_CREDENTIALS_DIR: /root/.verglas/pi-credentials
       VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390
       VERGLAS_AGENT_RUNTIME_TOKEN: ${VERGLAS_AGENT_RUNTIME_TOKEN:-verglas-local-agent-runtime}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
@@ -461,9 +461,7 @@ services:
       VERGLAS_IDENTITY_ASSERTION_KEY: ${VERGLAS_IDENTITY_ASSERTION_KEY:?Set VERGLAS_IDENTITY_ASSERTION_KEY to 64 hexadecimal characters}
     volumes:
       - verglas-os-state:/workspace/apps/os/.wrangler/state
-      - ${HOME}/.codex:/root/.codex
-      - ${HOME}/.claude:/root/.claude
-      - ${HOME}/.cursor:/root/.cursor
+      - verglas-pi-credentials:/root/.verglas/pi-credentials
     networks: *runtime-networks
     depends_on:
       verglas-server:
@@ -482,6 +480,7 @@ volumes:
   verglas-cache:
   verglas-runtime-state:
   verglas-os-state:
+  verglas-pi-credentials:
   verglas-access-server-credentials:
   verglas-access-lakekeeper-credentials:
   verglas-access-neon-credentials:

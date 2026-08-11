@@ -7,6 +7,7 @@ import {
   gatewayTargetToken,
   requireIdentifier,
   requireScopedToken,
+  runtimeGatewayAuthorization,
   runCapabilityEnvironment,
   runDeploymentId,
   safeJson,
@@ -225,43 +226,27 @@ async function proxyRunGateway(request, url, match) {
         await checkRunAccess(supplied, input.resource_id, input.action),
       );
     }
-    if (request.method !== "GET" || suffix !== "/v1/databases") {
-      return response({ error: "operation is not exposed to agent runs" }, 403);
-    }
   }
-
-  let action;
-  let resourceId = "tenant";
-  const catalogMatch = suffix.match(/^\/v1\/databases\/([^/]+)\/catalog\//);
-  const queryMatch = suffix.match(/^\/v1\/databases\/([^/]+)\/query$/);
-  if (service === "data" && request.method === "GET" && catalogMatch) {
-    action = "describe";
-    resourceId = `database/${decodeURIComponent(catalogMatch[1])}`;
-  } else if (
-    service === "access" &&
-    request.method === "GET" &&
-    suffix === "/v1/databases"
-  ) {
-    action = "discover";
-  } else if (service === "data" && request.method === "POST" && queryMatch) {
-    action = "query";
-    resourceId = `database/${decodeURIComponent(queryMatch[1])}`;
-  } else if (
-    service === "data" &&
-    request.method === "POST" &&
-    suffix === "/v1/workers"
-  ) {
-    action = "deploy";
-  } else if (
-    service === "runtime" &&
-    request.method === "PUT" &&
-    suffix.startsWith("/v1/vessels/")
-  ) {
-    action = "deploy";
-  } else {
-    return response({ error: "operation is not exposed to agent runs" }, 403);
+  let authorization;
+  try {
+    authorization = runtimeGatewayAuthorization(
+      service,
+      request.method,
+      suffix,
+    );
+  } catch (error) {
+    return response(
+      { error: error instanceof Error ? error.message : String(error) },
+      403,
+    );
   }
-  const decision = await checkRunAccess(supplied, resourceId, action);
+  const decision = authorization
+    ? await checkRunAccess(
+        supplied,
+        authorization.resourceId,
+        authorization.action,
+      )
+    : { allowed: true };
   let targetToken;
   try {
     targetToken = gatewayTargetToken(
@@ -271,8 +256,13 @@ async function proxyRunGateway(request, url, match) {
       containerRuntimeToken,
     );
   } catch {
+    const denied = authorization
+      ? `${authorization.action} on ${authorization.resourceId}`
+      : "the scoped gateway request";
     return response(
-      { error: `permission denied: ${action} on ${resourceId}` },
+      {
+        error: `permission denied: ${denied}`,
+      },
       403,
     );
   }

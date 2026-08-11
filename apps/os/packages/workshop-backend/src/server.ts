@@ -259,7 +259,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     const refresh = new Map<ModelRuntimeId, (typeof records)[number]>();
     for (const record of records) {
       const match = record.profile.id.match(
-        /^runtime:(codex|claude-code|cursor)(?::|$)/,
+        /^runtime:(codex|claude-code|github-copilot)(?::|$)/,
       );
       if (
         !match ||
@@ -274,9 +274,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
       try {
         const apiToken = record.config.apiToken;
         const catalog =
-          apiToken && runtime !== "cursor"
+          apiToken && runtime !== "github-copilot"
             ? this.#apiTokenModels(runtime)
-            : await new ModelRuntimeManager(this.env).listModels(runtime);
+            : await new ModelRuntimeManager(
+                this.env,
+                this.#userId(),
+              ).listModels(runtime);
         await this.#saveRuntimeModels(runtime, apiToken, catalog);
       } catch (error) {
         logger.warn("failed to migrate native runtime model catalog", {
@@ -295,25 +298,33 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.deleteModel(id);
   }
   detectModelRuntimes(): Promise<ModelRuntimeDetection> {
-    return new ModelRuntimeManager(this.env).detect();
+    return new ModelRuntimeManager(this.env, this.#userId()).detect();
   }
   startModelRuntimeLogin(
     runtime: ModelRuntimeId,
     sessionId: string,
   ): Promise<ModelRuntimeLoginResult> {
-    return new ModelRuntimeManager(this.env).startLogin(runtime, sessionId);
+    return new ModelRuntimeManager(this.env, this.#userId()).startLogin(
+      runtime,
+      sessionId,
+    );
   }
   continueModelRuntimeLogin(
     sessionId: string,
     answer?: ModelRuntimeWizardAnswer,
   ): Promise<ModelRuntimeLoginResult> {
-    return new ModelRuntimeManager(this.env).continueLogin(sessionId, answer);
+    return new ModelRuntimeManager(this.env, this.#userId()).continueLogin(
+      sessionId,
+      answer,
+    );
   }
   cancelModelRuntimeLogin(sessionId: string): Promise<void> {
-    return new ModelRuntimeManager(this.env).cancelLogin(sessionId);
+    return new ModelRuntimeManager(this.env, this.#userId()).cancelLogin(
+      sessionId,
+    );
   }
   async linkSubscriptionRuntime(runtime: ModelRuntimeId): Promise<void> {
-    const manager = new ModelRuntimeManager(this.env);
+    const manager = new ModelRuntimeManager(this.env, this.#userId());
     const models = await manager.listModels(runtime);
     const defaultModel = models.find((model) => model.isDefault) ?? models[0];
     if (!defaultModel) throw new Error(`${runtime} has no available models.`);
@@ -326,26 +337,20 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   ): Promise<void> {
     const token = apiToken.trim();
     if (!token) throw new Error("API token is required.");
-    const models =
-      runtime === "cursor"
-        ? await new ModelRuntimeManager(this.env).listModels(runtime, token)
-        : this.#apiTokenModels(runtime);
+    if (runtime === "github-copilot") {
+      throw new Error(
+        "GitHub Copilot is linked through Pi OAuth, not an API token.",
+      );
+    }
+    const models = this.#apiTokenModels(runtime);
     const defaultModel = models.find((model) => model.isDefault) ?? models[0];
     if (!defaultModel) throw new Error(`${runtime} has no available models.`);
-    if (runtime === "cursor") {
-      await new ModelRuntimeManager(this.env).verifyLinked(
-        runtime,
-        defaultModel.id,
-        token,
-      );
-    } else {
-      const config = this.#runtimeModelConfig(runtime, token, defaultModel.id);
-      const initiator = await this.user.whoami();
-      await completeText(getModel(this.env, config, initiator), {
-        prompt: "Reply with the single word ready.",
-        maxTokens: 8,
-      });
-    }
+    const config = this.#runtimeModelConfig(runtime, token, defaultModel.id);
+    const initiator = await this.user.whoami();
+    await completeText(getModel(this.env, config, initiator), {
+      prompt: "Reply with the single word ready.",
+      maxTokens: 8,
+    });
     await this.#saveRuntimeModels(runtime, token, models);
   }
   setQuickModel(id: string | null): Promise<void> {
@@ -391,11 +396,18 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     if (apiToken && runtime === "claude-code") {
       return { provider: "anthropic", model, apiToken, catalogRank };
     }
-    return { provider: "local-runtime", runtime, model, apiToken, catalogRank };
+    return {
+      provider: "local-runtime",
+      runtime,
+      model,
+      apiToken,
+      catalogRank,
+      credentialScope: this.#userId(),
+    };
   }
 
   #apiTokenModels(
-    runtime: Exclude<ModelRuntimeId, "cursor">,
+    runtime: Exclude<ModelRuntimeId, "github-copilot">,
   ): ModelRuntimeCatalogEntry[] {
     const provider = runtime === "codex" ? "openai" : "anthropic";
     const defaultId = runtime === "codex" ? "gpt-5.6-sol" : "claude-sonnet-5";
