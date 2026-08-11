@@ -122,17 +122,24 @@ export function createToolExecutor(env, emit) {
           "discover", "describe", "query", "append", "modify", "create_child",
           "execute", "use_secret", "deploy", "pass_grants", "manage_grants", "own",
         ]);
+        const resourceId = String(args.resourceId ?? "");
         const actions = [...new Set(Array.isArray(args.actions) ? args.actions : [])];
-        if (!args.resourceId || !args.reason?.trim() || actions.length === 0 ||
+        const hasControlCharacter = [...resourceId]
+          .some(character => character.codePointAt(0) <= 0x1f || character.codePointAt(0) === 0x7f);
+        const validResourceId = new TextEncoder().encode(resourceId).length <= 256 &&
+          resourceId.length > 0 && !hasControlCharacter && !resourceId.includes(":");
+        if (!validResourceId || !args.reason?.trim() || actions.length === 0 ||
             actions.some(action => !allowedActions.has(action))) {
-          throw new Error("A permission request requires a resource, valid actions, and a reason.");
+          throw new Error(
+            "A permission request requires a valid resource identifier, valid actions, and a reason.",
+          );
         }
         const requestId = `${env.VERGLAS_AGENT_CHAT_ID}:${crypto.randomUUID()}`;
         await emit({
           type: "permissionRequest",
           requestId,
           principalId,
-          resourceId: args.resourceId,
+          resourceId,
           actions,
           reason: args.reason.trim(),
           state: "pending",
@@ -146,7 +153,7 @@ export function createToolExecutor(env, emit) {
         const tables = [];
         for (const database of databases) {
           if (database.type !== "lakehouse") continue;
-          await requireAccess(`database/${database.name}`, "discover");
+          await requireAccess(`database/${database.name}`, "describe");
           const catalog = `/v1/databases/${encodeURIComponent(database.name)}/catalog/v1`;
           const namespaceBody = await request(admin, scopedToken, `${catalog}/namespaces`);
           for (const namespace of (namespaceBody.namespaces ?? []).slice(0, 100)) {

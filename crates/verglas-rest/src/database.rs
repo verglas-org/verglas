@@ -154,26 +154,28 @@ async fn create_database(
     };
     let database_name = plan.name().to_owned();
     let database_kind = plan.kind();
-    let database = match runtime.service.create_database(plan).await {
-        Ok(database) => database,
-        Err(error) => return database_error(error),
-    };
     if let Err(error) = runtime
         .authorization
         .create_database_resource(&principal, &database_name, database_kind)
         .await
     {
-        return match runtime
-            .service
-            .delete_database(&runtime.tenant_id, &database_name)
-            .await
-        {
-            Ok(()) => authorization_error(error),
-            Err(rollback) => authorization_error(DatabaseAuthorizationError::new(format!(
-                "{error}; database rollback failed: {rollback}"
-            ))),
-        };
+        return authorization_error(error);
     }
+    let database = match runtime.service.create_database(plan).await {
+        Ok(database) => database,
+        Err(error) => {
+            return match runtime
+                .authorization
+                .delete_database_resource(&principal, &database_name)
+                .await
+            {
+                Ok(()) => database_error(error),
+                Err(rollback) => authorization_error(DatabaseAuthorizationError::new(format!(
+                    "{error}; authorization rollback failed: {rollback}"
+                ))),
+            };
+        }
+    };
     (StatusCode::CREATED, Json(database)).into_response()
 }
 

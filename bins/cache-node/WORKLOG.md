@@ -66,3 +66,7 @@
   safekeeper so completed WAL segments drain to the configured object store.
 - #87: Added the authenticated host-agent quiescence API and wired one atomic admission fence across S3/catalog HTTP, NBD connections, fragment RPC operations, and embedded safekeeper connections. The fence rejects new work, reports already-accepted work until it drains, and can be reopened only with its current generation; background recovery and propagation do not create a ring-drain requirement.
 - Removed the obsolete serving-API router argument after `/v1` was removed from the S3 frontend, restoring cache-node and complete Docker image builds.
+- Reclaim stale revision-keyed safekeeper recovery descriptors when the shared
+  fragment ring starts. The committed legacy head remains pinned, malformed or
+  missing heads cause no deletion, and the new two-slot safekeeper protocol no
+  longer grows this metadata without bound.

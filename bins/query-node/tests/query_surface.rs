@@ -100,6 +100,7 @@ async fn serve(catalog: Arc<dyn Catalog>, initial_grant_bytes: u64) -> (String, 
     let prepared_catalog = verglas_query::admin::PreparedQueryCatalog::open(
         catalog.clone(),
         None,
+        None,
         64 * 1024 * 1024,
         None,
     )

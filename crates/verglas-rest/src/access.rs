@@ -21,14 +21,15 @@ use sha2::Sha256;
 use verglas_authz::{
     AccessCheck, AccessDecision, AccessTokenMetadata, AccessTokenService, Action, Authorizer,
     AuthzError, Grant, GrantDelegation, GrantRevocation, Principal, PrincipalKind, ReplaceSecret,
-    ResolveSecret, Resource, ScopedTokenClaims, SecretError, SecretKind, SecretService,
-    TargetJwtRequest, TargetJwtSigner, TokenMintRequest, new_access_token_id,
+    ResolveSecret, Resource, ResourceKind, ScopedTokenClaims, SecretError, SecretKind,
+    SecretService, TargetJwtRequest, TargetJwtSigner, TokenMintRequest, new_access_token_id,
 };
 use verglas_catalog::DatabaseId;
 use verglas_database::DatabaseKind;
 
 use crate::data_plane::{
     AuthenticatedPrincipal, AuthorizationFailure, AuthorizationQuestion, DataPlaneAuthorizer,
+    DataPlaneResource,
 };
 use crate::database::{DatabaseAuthorization, DatabaseAuthorizationError};
 
@@ -181,6 +182,45 @@ impl DataPlaneAuthorizer for AccessHttpRuntime {
             token_id: claims.token_id,
             audience: claims.audience,
         })
+    }
+
+    /// Registers one canonical table child after independently checking the
+    /// caller's current create-child authority on its database.
+    async fn ensure_resource(
+        &self,
+        authorization: &str,
+        resource: DataPlaneResource,
+    ) -> Result<(), AuthorizationFailure> {
+        resource.validate()?;
+        let principal = self
+            .authorize(
+                authorization,
+                AuthorizationQuestion {
+                    audience: Arc::from(DATA_PLANE_AUDIENCE),
+                    resource_id: resource.parent_id.clone(),
+                    action: Action::CreateChild,
+                },
+            )
+            .await?;
+        let declaration = Resource::new(&principal.tenant_id, &resource.id, ResourceKind::Table)
+            .with_parent(&resource.parent_id);
+        match self.authorizer.create_resource(declaration.clone()).await {
+            Ok(_) => Ok(()),
+            Err(AuthzError::Conflict(_)) => self
+                .authorizer
+                .get_resource(&principal.tenant_id, &resource.id)
+                .await
+                .map_err(|_| AuthorizationFailure::Unavailable)
+                .and_then(|existing| {
+                    if existing == declaration {
+                        Ok(())
+                    } else {
+                        Err(AuthorizationFailure::Forbidden)
+                    }
+                }),
+            Err(AuthzError::Forbidden(_)) => Err(AuthorizationFailure::Forbidden),
+            Err(_) => Err(AuthorizationFailure::Unavailable),
+        }
     }
 }
 
@@ -405,6 +445,10 @@ pub fn router(runtime: AccessHttpRuntime) -> Router {
     let mut routes = Router::new()
         .route("/v1/access/sessions", post(create_session))
         .route("/v1/access/authorize", post(authorize))
+        .route(
+            "/v1/access/data-plane/resources",
+            post(ensure_data_plane_resource),
+        )
         .route("/.well-known/jwks.json", get(target_jwks))
         .route("/v1/access/check", post(check_access))
         .route("/v1/access/policy/resources", post(sync_resource))
@@ -426,6 +470,25 @@ pub fn router(runtime: AccessHttpRuntime) -> Router {
         }));
     }
     routes
+}
+
+/// Idempotently installs one route-derived table resource for an authenticated
+/// data-plane or CLI caller with create-child authority on the database.
+async fn ensure_data_plane_resource(
+    State(runtime): State<AccessHttpRuntime>,
+    headers: HeaderMap,
+    Json(resource): Json<DataPlaneResource>,
+) -> Response {
+    let Some(authorization) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return AuthorizationFailure::Unauthenticated.into_response();
+    };
+    match runtime.ensure_resource(authorization, resource).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(failure) => failure.into_response(),
+    }
 }
 
 /// Builds the secret-specific routes with an isolated state type.
@@ -938,7 +1001,7 @@ async fn sync_resource(
             body.kind,
             verglas_authz::ResourceKind::Tenant | verglas_authz::ResourceKind::Database
         )
-        || !is_lakekeeper_resource_id(&body.id)
+        || !is_lakekeeper_resource_id(&body.id, body.kind)
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -947,23 +1010,8 @@ async fn sync_resource(
             "policy-synced resources require a parent".to_owned(),
         ));
     };
-    let Some(database_root) = lakekeeper_database_root(&body.id) else {
+    if !is_lakekeeper_parent(body.kind, &parent_id) {
         return StatusCode::FORBIDDEN.into_response();
-    };
-    if parent_id != database_root
-        && (!parent_id.starts_with(&format!("{database_root}/lakekeeper/")))
-    {
-        return StatusCode::FORBIDDEN.into_response();
-    }
-    if let Err(response) = require_action(
-        &runtime,
-        &identity.actor_principal_id,
-        &parent_id,
-        Action::CreateChild,
-    )
-    .await
-    {
-        return response;
     }
     let mut resource = Resource::new(&identity.claims.tenant_id, body.id, body.kind);
     resource.parent_id = Some(parent_id);
@@ -1009,23 +1057,13 @@ async fn delete_synced_resource(
     };
     if identity.actor_principal_id != "service/verglas-lakekeeper"
         || resource.parent_id.is_none()
-        || !is_lakekeeper_resource_id(&resource.id)
+        || !is_lakekeeper_resource_id(&resource.id, resource.kind)
         || matches!(
             resource.kind,
             verglas_authz::ResourceKind::Tenant | verglas_authz::ResourceKind::Database
         )
     {
         return StatusCode::FORBIDDEN.into_response();
-    }
-    if let Err(response) = require_action(
-        &runtime,
-        &identity.actor_principal_id,
-        &resource.id,
-        Action::Modify,
-    )
-    .await
-    {
-        return response;
     }
     deleted(
         runtime
@@ -1102,18 +1140,38 @@ async fn delete_synced_principal(
     }
 }
 
-/// Returns whether an ID belongs beneath a canonical database Lakekeeper subtree.
-fn is_lakekeeper_resource_id(id: &str) -> bool {
-    lakekeeper_database_root(id).is_some()
+/// Restricts the policy-engine credential to Lakekeeper's canonical resource IDs.
+fn is_lakekeeper_resource_id(id: &str, kind: ResourceKind) -> bool {
+    match kind {
+        ResourceKind::Project => id.starts_with("lakekeeper/project/"),
+        ResourceKind::Warehouse => id.starts_with("warehouse/"),
+        ResourceKind::Namespace => id.starts_with("namespace/"),
+        ResourceKind::Table => id.contains("/table/") && id.starts_with("warehouse/"),
+        ResourceKind::View => id.contains("/view/") && id.starts_with("warehouse/"),
+        ResourceKind::GenericTable => {
+            id.contains("/generic-table/") && id.starts_with("warehouse/")
+        }
+        ResourceKind::Role => id.starts_with("lakekeeper/role/"),
+        ResourceKind::Tag => id.starts_with("lakekeeper/tag/"),
+        _ => false,
+    }
 }
 
-/// Extracts the canonical database root from a Lakekeeper-owned resource ID.
-fn lakekeeper_database_root(id: &str) -> Option<String> {
-    let (database, _) = id.split_once("/lakekeeper/")?;
-    if database.starts_with("database/") && database.len() > "database/".len() {
-        Some(database.to_owned())
-    } else {
-        None
+/// Restricts each Lakekeeper resource category to its canonical parent category.
+fn is_lakekeeper_parent(kind: ResourceKind, parent_id: &str) -> bool {
+    match kind {
+        ResourceKind::Project => parent_id == "lakekeeper",
+        ResourceKind::Warehouse => {
+            parent_id.starts_with("database/") && parent_id.len() > "database/".len()
+        }
+        ResourceKind::Namespace => {
+            parent_id.starts_with("warehouse/") || parent_id.starts_with("namespace/")
+        }
+        ResourceKind::Table | ResourceKind::View | ResourceKind::GenericTable => {
+            parent_id.starts_with("namespace/")
+        }
+        ResourceKind::Role | ResourceKind::Tag => parent_id.starts_with("lakekeeper/project/"),
+        _ => false,
     }
 }
 
@@ -1905,4 +1963,31 @@ fn secret_error_response(error: SecretError) -> Response {
         Json(serde_json::json!({ "error": error.to_string() })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ResourceKind, is_lakekeeper_parent, is_lakekeeper_resource_id};
+
+    #[test]
+    fn lakekeeper_policy_sync_accepts_only_canonical_resource_edges() {
+        assert!(is_lakekeeper_resource_id(
+            "lakekeeper/project/00000000-0000-0000-0000-000000000000",
+            ResourceKind::Project,
+        ));
+        assert!(is_lakekeeper_parent(ResourceKind::Project, "lakekeeper"));
+        assert!(is_lakekeeper_resource_id(
+            "warehouse/72cd47e8-b3ee-45bb-a70c-19be37802ef9",
+            ResourceKind::Warehouse,
+        ));
+        assert!(is_lakekeeper_parent(
+            ResourceKind::Warehouse,
+            "database/rlean",
+        ));
+        assert!(!is_lakekeeper_resource_id(
+            "database/rlean",
+            ResourceKind::Database,
+        ));
+        assert!(!is_lakekeeper_parent(ResourceKind::Warehouse, "tenant"));
+    }
 }

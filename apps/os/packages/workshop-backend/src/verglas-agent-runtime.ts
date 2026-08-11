@@ -70,7 +70,7 @@ export class VerglasAgentRuntimeClient {
 
   /** Calls one bounded agent-runtime JSON endpoint. */
   async request<T>(path: string, init?: RequestInit): Promise<T> {
-    const response = await this.fetcher(`${this.config.endpoint}${path}`, {
+    const response = await this.fetcher.call(globalThis, `${this.config.endpoint}${path}`, {
       ...init,
       headers: {
         Authorization: `Bearer ${this.config.token}`,

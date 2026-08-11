@@ -9,6 +9,9 @@ use sqlx::{Executor, Row};
 
 use crate::DatabaseKind;
 
+/// Database declarations are control-plane operations, not query traffic.
+const TENANT_POOL_MAX_CONNECTIONS: u32 = 2;
+
 /// Fully resolved database definition persisted for runtime provisioning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseRecord {
@@ -142,7 +145,7 @@ impl PostgresDatabaseRepository {
     /// Connects to `verglas_permissions` and creates the database resource table.
     pub async fn connect(database_url: &str) -> Result<Self, RepositoryError> {
         let pool = PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(TENANT_POOL_MAX_CONNECTIONS)
             .connect(database_url)
             .await
             .map_err(repository_database_error)?;

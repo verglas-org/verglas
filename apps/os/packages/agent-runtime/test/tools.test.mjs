@@ -2,6 +2,28 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {createToolExecutor} from "../src/tools.mjs";
 
+test("permission requests reject resource identifiers the access service cannot grant", async () => {
+  const emitted = [];
+  const execute = createToolExecutor({
+    VERGLAS_DATA_ENDPOINT: "http://data",
+    VERGLAS_CONTAINER_RUNTIME_URL: "http://runtime",
+    VERGLAS_ACCESS_URI: "http://access",
+    VERGLAS_TOKEN: "scoped-token",
+    VERGLAS_AGENT_PRINCIPAL_ID: "agent/session",
+    VERGLAS_AGENT_CHAT_ID: "1",
+  }, async message => emitted.push(message));
+
+  await assert.rejects(
+    execute("requestPermission", {
+      resourceId: "tool:listLakehouse",
+      actions: ["execute"],
+      reason: "Inspect the lakehouse.",
+    }),
+    /valid resource identifier/,
+  );
+  assert.deepEqual(emitted, []);
+});
+
 test("listLakehouse discovers resources and uses only database-scoped catalogs", async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -54,7 +76,7 @@ test("listLakehouse discovers resources and uses only database-scoped catalogs",
     assert.deepEqual(calls.filter(([url]) => url === "http://access/v1/access/authorize")
       .map(([, , body]) => JSON.parse(body)), [
       {audience: "data-plane", resource_id: "tenant", action: "discover"},
-      {audience: "data-plane", resource_id: "database/analytics", action: "discover"},
+      {audience: "data-plane", resource_id: "database/analytics", action: "describe"},
     ]);
   } finally {
     globalThis.fetch = originalFetch;

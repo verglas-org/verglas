@@ -12,3 +12,6 @@
 - #11: Materialized worker bundles into a fresh temporary directory for each execution and passed declared environment variables to the subprocess. Relative bundled entrypoints now run without a shared filesystem, while unresolved secrets and unsafe paths fail before execution.
 - #18: Renamed the scheduler's portable-bundle fixture to the neutral market-data ingestion example used by the worker guides. SPY remains test input data instead of becoming a worker, file, or table name.
 - #66: Dropped cloud-placement wording from the standalone scheduler binary docs.
+- #11: Preserved a resolved `VERGLAS_TOKEN` as the worker harness's reserved runtime credential
+  instead of letting the harness overwrite it with an empty token. Postgres-backed scheduler
+  secrets can now authenticate table writes without appearing in worker metadata or generic env.

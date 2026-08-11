@@ -74,6 +74,23 @@ describe('useWorkspaceOpen', () => {
     vi.restoreAllMocks()
   })
 
+  it('opens an owned Workspace without the removed observer-configuration capability', async () => {
+    const overseer = disposableStub({
+      subscribeToMetadata: vi.fn<() => Promise<RpcStub<{}>>>(
+        async () => disposableStub({}) as RpcStub<{}>,
+      ),
+    }) as unknown as RpcStub<Overseer>
+    const openWorkspace = vi.fn<() => RpcStub<Overseer>>(() => overseer)
+    const authenticatedApi = { openWorkspace } as unknown as RpcStub<AuthenticatedApi>
+
+    container = document.createElement('div')
+    document.body.append(container)
+    root = createRoot(container)
+    await act(async () => root!.render(<WorkspaceProbe authenticatedApi={authenticatedApi} />))
+
+    expect(openWorkspace).toHaveBeenCalledWith('workspace-1', undefined)
+  })
+
   it('disposes a metadata subscription that resolves after its load attempt is cleaned up', async () => {
     const pendingSubscription = deferred<RpcStub<{}>>()
     const overseerDispose = vi.fn<() => void>()

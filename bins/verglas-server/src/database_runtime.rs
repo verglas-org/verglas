@@ -238,6 +238,7 @@ fn nonempty_environment(name: &str) -> Option<String> {
 mod tests {
     use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::extract::State;
     use axum::http::Request;
@@ -247,8 +248,33 @@ mod tests {
     use tokio::net::TcpListener;
     use tower::ServiceExt;
     use verglas_catalog::CatalogRuntimeRegistry;
+    use verglas_rest::data_plane::{
+        AuthenticatedPrincipal, AuthorizationFailure, AuthorizationQuestion, DataPlaneAuthorizer,
+    };
 
     use super::DatabaseCatalogSynchronizer;
+
+    struct AllowTestAccess;
+
+    #[async_trait]
+    impl DataPlaneAuthorizer for AllowTestAccess {
+        fn audience(&self) -> &str {
+            "verglas-cli"
+        }
+
+        async fn authorize(
+            &self,
+            _authorization: &str,
+            _question: AuthorizationQuestion,
+        ) -> Result<AuthenticatedPrincipal, AuthorizationFailure> {
+            Ok(AuthenticatedPrincipal {
+                tenant_id: "test".to_owned(),
+                principal_id: "user/test".to_owned(),
+                token_id: "test-token".to_owned(),
+                audience: "verglas-cli".to_owned(),
+            })
+        }
+    }
 
     /// Serves one router on an ephemeral loopback listener.
     async fn serve(app: Router) -> String {
@@ -324,10 +350,14 @@ mod tests {
         .expect("synchronizer");
 
         synchronizer.refresh().await.expect("refresh");
-        let app = verglas_rest::compose_database_catalogs(Router::new(), catalogs.clone());
+        let app = verglas_rest::data_plane::protect(
+            verglas_rest::compose_database_catalogs(Router::new(), catalogs.clone()),
+            AllowTestAccess,
+        );
         let response = app
             .oneshot(
                 Request::get("/v1/databases/analytics/catalog/v1/config")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -349,14 +379,18 @@ mod tests {
         });
         synchronizer.refresh().await.expect("replacement refresh");
         assert_eq!(catalogs.len().expect("catalog count"), 1);
-        let removed = verglas_rest::compose_database_catalogs(Router::new(), catalogs.clone())
-            .oneshot(
-                Request::get("/v1/databases/archive/catalog/v1/config")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let removed = verglas_rest::data_plane::protect(
+            verglas_rest::compose_database_catalogs(Router::new(), catalogs.clone()),
+            AllowTestAccess,
+        )
+        .oneshot(
+            Request::get("/v1/databases/archive/catalog/v1/config")
+                .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
         assert_eq!(removed.status(), axum::http::StatusCode::NOT_FOUND);
     }
 

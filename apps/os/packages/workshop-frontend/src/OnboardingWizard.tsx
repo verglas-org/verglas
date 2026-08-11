@@ -17,14 +17,15 @@ import {
   Check,
   Plus,
   PlugsConnected,
-  Sparkle,
-  UsersThree,
-  Key,
-  Plugs,
+  Database,
+  FlowArrow,
+  ChartLineUp,
+  LinkSimple,
   Hexagon,
 } from '@phosphor-icons/react'
 import AddModelModal from './AddModelModal'
 import { persistSelectedModel } from './modelSelection'
+import { canContinueWithOnboardingModel, onboardingModelStatus } from './onboardingPresentation'
 import { logoComponents } from './components/ConnectionLogos'
 import { getVendorIconBackground } from './components/vendorColors'
 import { compressAvatar, avatarBlobUrl } from './avatarUtils'
@@ -87,6 +88,8 @@ export default function OnboardingWizard({
   const [selectedModelId, setSelectedModelId] = useState<string | null>(null)
   const [addModelOpen, setAddModelOpen] = useState(false)
   const [modelsLoading, setModelsLoading] = useState(true)
+  const [modelsLoadError, setModelsLoadError] = useState(false)
+  const [useAsQuickModel, setUseAsQuickModel] = useState(true)
 
   // Connections state
   const [vendors, setVendors] = useState<VendorEntry[]>([])
@@ -116,15 +119,24 @@ export default function OnboardingWizard({
 
   // Load models.
   const fetchModels = useCallback(async () => {
+    setModelsLoading(true)
+    setModelsLoadError(false)
     try {
-      const modelList = await authenticatedApi.listModels()
+      const [modelList, preferredModelId] = await Promise.all([
+        authenticatedApi.listModels(),
+        authenticatedApi.getPreferredModel(),
+      ])
       setModels(modelList)
-      // Default to the first model in the list
-      if (modelList.length > 0) {
-        setSelectedModelId((prev) => prev ?? modelList[0].id)
-      }
+      setSelectedModelId((current) => {
+        if (current && modelList.some((model) => model.id === current)) return current
+        if (preferredModelId && modelList.some((model) => model.id === preferredModelId)) {
+          return preferredModelId
+        }
+        return null
+      })
     } catch (err) {
       console.error('Failed to load models:', err)
+      setModelsLoadError(true)
     } finally {
       setModelsLoading(false)
     }
@@ -292,6 +304,11 @@ export default function OnboardingWizard({
   const goBack = () => setStep((s) => Math.max(s - 1, 0))
 
   const handleFinish = async () => {
+    if (!canContinueWithOnboardingModel(models, selectedModelId, modelsLoading, modelsLoadError)) {
+      setStep(1)
+      toasts.add({ title: 'Choose an AI model before finishing setup.', variant: 'error' })
+      return
+    }
     setFinishing(true)
     try {
       // Save display name if changed
@@ -303,8 +320,8 @@ export default function OnboardingWizard({
         await authenticatedApi.setAvatar(avatarData)
         if (currentUser?.id) invalidateAvatarCache(currentUser.id)
       }
-      // selectedModelId is null when the user chose "No agent" or didn't pick one
       await authenticatedApi.setPreferredModel(selectedModelId)
+      if (useAsQuickModel) await authenticatedApi.setQuickModel(selectedModelId)
       persistSelectedModel(selectedModelId)
       await authenticatedApi.completeOnboarding()
       onComplete()
@@ -324,6 +341,15 @@ export default function OnboardingWizard({
     if (aConnected !== bConnected) return aConnected ? -1 : 1
     return a.description.displayName.localeCompare(b.description.displayName)
   })
+  const modelStatus = onboardingModelStatus(models, selectedModelId, modelsLoading, modelsLoadError)
+  const selectedModel = models.find((model) => model.id === selectedModelId) ?? null
+  const modelStepReady = canContinueWithOnboardingModel(
+    models,
+    selectedModelId,
+    modelsLoading,
+    modelsLoadError,
+  )
+  const canAdvance = step !== 1 || modelStepReady
 
   // ── render ────────────────────────────────────────────────────────────────────
 
@@ -365,14 +391,14 @@ export default function OnboardingWizard({
               mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'
             }`}
           >
-            Let&apos;s set you up
+            Put your company knowledge to work
           </h1>
           <p
             className={`mt-2 text-sm text-kumo-subtle transition-all duration-500 delay-200 ${
               mounted ? 'opacity-100 translate-y-0' : 'opacity-0 translate-y-2'
             }`}
           >
-            Just a few things before you start building
+            Connect information, run governed workflows, and deliver evidence-backed results.
           </p>
         </div>
 
@@ -489,16 +515,31 @@ export default function OnboardingWizard({
             {/* ── Step 1: Model selection ───────────────────────────────────── */}
             <div className="w-full flex-shrink-0 p-8 min-h-[420px]">
               <div>
+                <p className="mb-2 font-mono text-[10px] font-medium uppercase tracking-[0.12em] text-kumo-brand">
+                  Primary agent
+                </p>
                 <h2 className="text-lg font-medium text-kumo-default mb-1">
-                  Choose your model
+                  Choose the model that does the work
                 </h2>
                 <p className="text-sm text-kumo-subtle mb-6">
-                  Pick the AI model you&apos;d like to use by default
+                  This model powers chats, builds workflows, and creates Applications. A working model is required.
                 </p>
 
-                {modelsLoading ? (
+                {modelStatus === 'loading' ? (
                   <div className="flex items-center justify-center py-12">
                     <div className="w-6 h-6 border-2 border-kumo-brand border-t-transparent rounded-full animate-spin" />
+                  </div>
+                ) : modelStatus === 'error' ? (
+                  <div className="rounded-xl border border-kumo-danger/40 bg-kumo-danger/5 px-5 py-6 text-center">
+                    <p className="text-sm font-medium text-kumo-default">We couldn&apos;t load your AI models</p>
+                    <p className="mt-1 text-xs leading-5 text-kumo-subtle">Setup cannot finish until Verglas can confirm an available model.</p>
+                    <button
+                      type="button"
+                      onClick={() => void fetchModels()}
+                      className="mt-4 rounded-lg border border-kumo-line bg-kumo-elevated px-3 py-2 text-xs font-medium text-kumo-default hover:bg-kumo-tint"
+                    >
+                      Try again
+                    </button>
                   </div>
                 ) : (
                   <>
@@ -546,13 +587,11 @@ export default function OnboardingWizard({
                         </button>
                       ))}
 
-                      {models.length === 0 && (
-                        <div className="text-center py-8">
-                          <p className="text-sm text-kumo-subtle mb-1">
-                            No models configured yet
-                          </p>
-                          <p className="text-xs text-kumo-inactive">
-                            Add a model to get started
+                      {modelStatus === 'empty' && (
+                        <div className="rounded-xl border border-dashed border-kumo-line bg-kumo-base px-5 py-8 text-center">
+                          <p className="text-sm font-medium text-kumo-default">Connect an AI provider to continue</p>
+                          <p className="mt-1 text-xs leading-5 text-kumo-subtle">
+                            Verglas needs one model for agents, workflows, and Application generation.
                           </p>
                         </div>
                       )}
@@ -563,8 +602,23 @@ export default function OnboardingWizard({
                       className="mt-3 w-full flex items-center justify-center gap-2 px-4 py-2.5 text-sm font-medium text-kumo-subtle border border-dashed border-kumo-line rounded-xl hover:border-kumo-fill hover:text-kumo-default hover:bg-kumo-tint transition-colors"
                     >
                       <Plus size={14} weight="bold" />
-                      Add new model...
+                      {models.length === 0 ? 'Connect AI provider' : 'Add another model'}
                     </button>
+
+                    {selectedModel && (
+                      <label className="mt-4 flex cursor-pointer items-start gap-3 rounded-xl bg-kumo-base px-4 py-3">
+                        <input
+                          type="checkbox"
+                          checked={useAsQuickModel}
+                          onChange={(event) => setUseAsQuickModel(event.target.checked)}
+                          className="mt-0.5 h-4 w-4 accent-kumo-brand"
+                        />
+                        <span>
+                          <span className="block text-xs font-medium text-kumo-default">Use {selectedModel.name} for quick tasks too</span>
+                          <span className="mt-0.5 block text-[11px] leading-4 text-kumo-subtle">Titles and other lightweight background work will use the same model.</span>
+                        </span>
+                      </label>
+                    )}
                   </>
                 )}
               </div>
@@ -656,7 +710,13 @@ export default function OnboardingWizard({
 
             {/* ── Final step: What you can do ────────────────────────────────── */}
             <div className="w-full flex-shrink-0 p-8 min-h-[420px]">
-              <ShowcaseStep active={step === showcaseStep} siteName={siteName} />
+              <ShowcaseStep
+                active={step === showcaseStep}
+                siteName={siteName}
+                selectedModel={selectedModel}
+                connectionCount={connectedVendorIds.size}
+                useAsQuickModel={useAsQuickModel}
+              />
             </div>
           </div>
 
@@ -679,9 +739,14 @@ export default function OnboardingWizard({
               {step < totalSteps - 1 ? (
                 <button
                   onClick={goNext}
-                  className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg transition-all duration-150 text-kumo-inverse bg-kumo-brand hover:bg-kumo-brand-hover"
+                  disabled={!canAdvance}
+                  className={`flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg transition-all duration-150 ${
+                    canAdvance
+                      ? 'text-kumo-inverse bg-kumo-brand hover:bg-kumo-brand-hover'
+                      : 'cursor-not-allowed bg-kumo-tint text-kumo-inactive'
+                  }`}
                 >
-                  Next
+                  {step === 1 && selectedModel ? `Use ${selectedModel.name}` : 'Continue'}
                   <ArrowRight size={14} weight="bold" />
                 </button>
               ) : (
@@ -704,7 +769,7 @@ export default function OnboardingWizard({
                     </>
                   ) : (
                     <>
-                      Let&apos;s build
+                      Finish setup
                       <ArrowRight size={14} weight="bold" />
                     </>
                   )}
@@ -735,7 +800,7 @@ export default function OnboardingWizard({
 // ─── showcase step ──────────────────────────────────────────────────────────────
 
 interface ShowcaseFeature {
-  icon: typeof Sparkle
+  icon: typeof Database
   iconColor: string
   iconBg: string
   title: string
@@ -744,40 +809,52 @@ interface ShowcaseFeature {
 
 const SHOWCASE_FEATURES: ShowcaseFeature[] = [
   {
-    icon: Sparkle,
+    icon: Database,
     iconColor: 'text-media-100',
     iconBg: 'bg-media-200',
-    title: 'Build workspaces or just chat',
+    title: 'Connect company knowledge',
     description:
-      'Create full web apps, or keep it simple with agent-only conversations. Your call.',
+      'Bring databases, documents, and external systems into one governed information layer.',
   },
   {
-    icon: UsersThree,
+    icon: FlowArrow,
     iconColor: 'text-compute-100',
     iconBg: 'bg-compute-200',
-    title: 'Collaborate in real time',
+    title: 'Run repeatable workflows',
     description:
-      'Share a workspace with teammates and work on it together, live.',
+      'Turn recurring work into Jobs with explicit inputs, permissions, and durable results.',
   },
   {
-    icon: Key,
+    icon: ChartLineUp,
     iconColor: 'text-kumo-warning',
     iconBg: 'bg-kumo-warning-tint',
-    title: 'Bring your own models',
+    title: 'Deliver Applications and analytics',
     description:
-      'Use direct provider API tokens or attach a subscription-backed model runtime.',
+      'Publish useful control surfaces and Rill dashboards over the lakehouse.',
   },
   {
-    icon: Plugs,
+    icon: LinkSimple,
     iconColor: 'text-storage-100',
     iconBg: 'bg-storage-200',
-    title: 'AI meets your tools',
+    title: 'Keep every answer traceable',
     description:
-      'Have AI review a Google Doc, summarize Slack threads, triage Jira tickets, and more.',
+      'Follow outputs back through graph relationships to the source evidence that supports them.',
   },
 ]
 
-function ShowcaseStep({ active, siteName }: { active: boolean; siteName: string }) {
+function ShowcaseStep({
+  active,
+  siteName,
+  selectedModel,
+  connectionCount,
+  useAsQuickModel,
+}: {
+  active: boolean
+  siteName: string
+  selectedModel: AiChatAuthorInfo | null
+  connectionCount: number
+  useAsQuickModel: boolean
+}) {
   // Mount-trigger for staggered fade-in when the step becomes visible
   const [revealed, setRevealed] = useState(false)
 
@@ -793,11 +870,24 @@ function ShowcaseStep({ active, siteName }: { active: boolean; siteName: string 
     <div>
       <div className="text-center mb-6">
         <h2 className="text-lg font-medium text-kumo-default mb-1">
-          You&apos;re all set
+          Ready to put your knowledge to work
         </h2>
         <p className="text-sm text-kumo-subtle">
-          Here&apos;s a taste of what you can do with {siteName}
+          {siteName} will start with the choices below. You can change them later.
         </p>
+      </div>
+
+      <div className="mb-5 grid grid-cols-2 gap-2">
+        <div className="rounded-xl border border-kumo-line bg-kumo-base px-3.5 py-3">
+          <p className="text-[10px] font-medium uppercase tracking-[0.1em] text-kumo-inactive">Primary agent</p>
+          <p className="mt-1 truncate text-sm font-medium text-kumo-default">{selectedModel?.name ?? 'Not selected'}</p>
+          <p className="mt-0.5 text-[11px] text-kumo-subtle">{useAsQuickModel ? 'Also handles quick tasks' : 'Quick model unchanged'}</p>
+        </div>
+        <div className="rounded-xl border border-kumo-line bg-kumo-base px-3.5 py-3">
+          <p className="text-[10px] font-medium uppercase tracking-[0.1em] text-kumo-inactive">Knowledge connections</p>
+          <p className="mt-1 text-sm font-medium text-kumo-default">{connectionCount || 'None yet'}</p>
+          <p className="mt-0.5 text-[11px] text-kumo-subtle">{connectionCount === 1 ? 'Service connected' : connectionCount > 1 ? 'Services connected' : 'Add them whenever you are ready'}</p>
+        </div>
       </div>
 
       <div className="space-y-2.5">

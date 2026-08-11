@@ -9,8 +9,11 @@ use verglas_authz::{AeadSecretCipher, SecretCipher};
 
 use crate::SchedulerError;
 
+/// Registry calls are short and serialized by the scheduler service.
+const TENANT_POOL_MAX_CONNECTIONS: u32 = 2;
+
 /// A portable worker declaration accepted by the scheduler.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct WorkerSpec {
     pub name: String,
     #[serde(default)]
@@ -64,7 +67,7 @@ impl PgWorkerRegistry {
         let queue = queue.into();
         super::queue::validate_queue(&queue)?;
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(TENANT_POOL_MAX_CONNECTIONS)
             .connect(database_url)
             .await?;
         let cipher = Arc::new(AeadSecretCipher::new(encryption_key)?);

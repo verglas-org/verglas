@@ -1,7 +1,8 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { AgentStore } from "./store.mjs";
 import {
-  bearerAuthorized, boundedPrompt, gatewayTargetToken, requireIdentifier, requireScopedToken,
+  authorizationDecision, bearerAuthorized, boundedPrompt, gatewayTargetToken, requireIdentifier,
+  requireScopedToken,
   runCapabilityEnvironment,
   runDeploymentId, safeJson,
 } from "./contracts.mjs";
@@ -135,7 +136,7 @@ async function checkRunAccess(scopedToken, resourceId, action) {
   if (!accessResponse.ok) {
     throw new Error(`Authorization check failed: HTTP ${accessResponse.status}`);
   }
-  return await accessResponse.json();
+  return authorizationDecision(await accessResponse.json());
 }
 
 async function proxyRunGateway(request, url, match) {
@@ -188,7 +189,7 @@ async function proxyRunGateway(request, url, match) {
   const catalogMatch = suffix.match(/^\/v1\/databases\/([^/]+)\/catalog\//);
   const queryMatch = suffix.match(/^\/v1\/databases\/([^/]+)\/query$/);
   if (service === "data" && request.method === "GET" && catalogMatch) {
-    action = "discover";
+    action = "describe";
     resourceId = `database/${decodeURIComponent(catalogMatch[1])}`;
   } else if (service === "access" && request.method === "GET" && suffix === "/v1/databases") {
     action = "discover";

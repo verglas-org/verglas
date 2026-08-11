@@ -89,10 +89,17 @@ not call access-management endpoints.
 Use **Profile → Developer access** in Verglas OS:
 
 1. Select **Create token**.
-2. Give the token a recognizable name and expiration.
-3. Select the databases or individual resources it needs.
-4. Select only the required actions.
+2. Name the device or script that will use it.
+3. Choose one database, or all databases in the tenant.
+4. Choose **Read only** or **Read and write**, then select an expiration.
 5. Copy the token when it is shown once and save it locally.
+
+The database scope includes its tables through permission inheritance. Use
+**Custom permissions** only when a token needs an individual table, Job, or
+another low-level resource/action combination. The profile lists only personal
+tokens created for devices and scripts; short-lived browser login sessions are
+intentionally hidden. Personal tokens must expire; the longest available
+lifetime is one year.
 
 The token is a child principal of its creator. A user can delegate only actions
 the user already holds. A token identifies its tenant, principal, audience,

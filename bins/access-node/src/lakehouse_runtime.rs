@@ -4,6 +4,8 @@
 //! Lakekeeper receives them over its private management API; database discovery
 //! and the Verglas data plane receive only the public database definition.
 
+use std::path::{Path, PathBuf};
+
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use verglas_database::DatabaseServiceError;
@@ -20,6 +22,7 @@ pub(crate) struct LakekeeperProvisioner {
     region: String,
     access_key_id: String,
     secret_access_key: String,
+    caller_credential_file: PathBuf,
     http: reqwest::Client,
 }
 
@@ -110,6 +113,7 @@ impl LakekeeperProvisioner {
         region: impl Into<String>,
         access_key_id: impl Into<String>,
         secret_access_key: impl Into<String>,
+        caller_credential_file: impl Into<PathBuf>,
     ) -> Result<Self, DatabaseServiceError> {
         let mut endpoint = Url::parse(endpoint.as_ref()).map_err(provisioning_error)?;
         if !matches!(endpoint.scheme(), "http" | "https") {
@@ -128,6 +132,7 @@ impl LakekeeperProvisioner {
             region: region.into(),
             access_key_id: access_key_id.into(),
             secret_access_key: secret_access_key.into(),
+            caller_credential_file: caller_credential_file.into(),
             http: reqwest::Client::new(),
         };
         if [
@@ -154,8 +159,8 @@ impl LakekeeperProvisioner {
             .join("management/v1/info")
             .map_err(provisioning_error)?;
         let info = self
-            .http
-            .get(info_uri)
+            .authenticated(self.http.get(info_uri))
+            .await?
             .send()
             .await
             .map_err(provisioning_error)?;
@@ -178,8 +183,8 @@ impl LakekeeperProvisioner {
             .join("management/v1/bootstrap")
             .map_err(provisioning_error)?;
         let response = self
-            .http
-            .post(bootstrap_uri)
+            .authenticated(self.http.post(bootstrap_uri))
+            .await?
             .json(&serde_json::json!({"accept-terms-of-use": true}))
             .send()
             .await
@@ -223,8 +228,8 @@ impl LakekeeperProvisioner {
             },
         };
         let response = self
-            .http
-            .post(self.management_uri()?)
+            .authenticated_for_database(self.http.post(self.management_uri()?), database)
+            .await?
             .json(&request)
             .send()
             .await
@@ -256,8 +261,8 @@ impl LakekeeperProvisioner {
             .join(&format!("warehouse/{}", warehouse.warehouse_id))
             .map_err(provisioning_error)?;
         let response = self
-            .http
-            .delete(uri)
+            .authenticated_for_database(self.http.delete(uri), database)
+            .await?
             .send()
             .await
             .map_err(provisioning_error)?;
@@ -276,8 +281,8 @@ impl LakekeeperProvisioner {
         database: &str,
     ) -> Result<Option<Warehouse>, DatabaseServiceError> {
         let response = self
-            .http
-            .get(self.management_uri()?)
+            .authenticated_for_database(self.http.get(self.management_uri()?), database)
+            .await?
             .send()
             .await
             .map_err(provisioning_error)?;
@@ -312,6 +317,41 @@ impl LakekeeperProvisioner {
             format!("{}/lakehouses/{database}", self.key_prefix)
         }
     }
+
+    /// Adds the rotating access-service caller credential required by Lakekeeper.
+    async fn authenticated(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<reqwest::RequestBuilder, DatabaseServiceError> {
+        let token = read_credential(&self.caller_credential_file).await?;
+        Ok(request.bearer_auth(token))
+    }
+
+    /// Adds caller authorization and the trusted database identity used for resource sync.
+    async fn authenticated_for_database(
+        &self,
+        request: reqwest::RequestBuilder,
+        database: &str,
+    ) -> Result<reqwest::RequestBuilder, DatabaseServiceError> {
+        Ok(self
+            .authenticated(request)
+            .await?
+            .header("x-verglas-database-id", database))
+    }
+}
+
+/// Reads a rotated bearer without retaining an obsolete credential in memory.
+async fn read_credential(path: &Path) -> Result<String, DatabaseServiceError> {
+    let token = tokio::fs::read_to_string(path)
+        .await
+        .map_err(provisioning_error)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(DatabaseServiceError::Provisioning(
+            "Lakekeeper caller credential is empty".to_owned(),
+        ));
+    }
+    Ok(token.to_owned())
 }
 
 /// Removes transport internals and credential-bearing values from public failures.
@@ -324,7 +364,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use axum::extract::{Path, State};
-    use axum::http::StatusCode;
+    use axum::http::{HeaderMap, StatusCode};
     use axum::routing::{delete, get, post};
     use axum::{Json, Router};
     use serde_json::{Value, json};
@@ -335,7 +375,7 @@ mod tests {
     /// Shared request state for the Lakekeeper management stub.
     #[derive(Clone, Default)]
     struct StubState {
-        requests: Arc<Mutex<Vec<Value>>>,
+        requests: Arc<Mutex<Vec<(Value, String, String)>>>,
     }
 
     /// Serves a deterministic Lakekeeper management stub.
@@ -359,9 +399,24 @@ mod tests {
     /// Captures one create request without returning credential material.
     async fn capture_create(
         State(state): State<StubState>,
+        headers: HeaderMap,
         Json(request): Json<Value>,
     ) -> StatusCode {
-        state.requests.lock().expect("requests").push(request);
+        let authorization = headers
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        let database = headers
+            .get("x-verglas-database-id")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        state
+            .requests
+            .lock()
+            .expect("requests")
+            .push((request, authorization, database));
         StatusCode::CREATED
     }
 
@@ -369,6 +424,8 @@ mod tests {
     async fn managed_warehouse_uses_database_specific_prefix_and_private_credentials() {
         let state = StubState::default();
         let endpoint = serve(state.clone()).await;
+        let credential = tempfile::NamedTempFile::new().expect("credential");
+        std::fs::write(credential.path(), "caller-token").expect("write credential");
         let provisioner = LakekeeperProvisioner::new(
             endpoint,
             "managed",
@@ -377,6 +434,7 @@ mod tests {
             "auto",
             "access",
             "secret",
+            credential.path(),
         )
         .expect("provisioner");
 
@@ -387,15 +445,17 @@ mod tests {
 
         let requests = state.requests.lock().expect("requests");
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["warehouse-name"], "analytics");
+        assert_eq!(requests[0].0["warehouse-name"], "analytics");
         assert_eq!(
-            requests[0]["storage-profile"]["key-prefix"],
+            requests[0].0["storage-profile"]["key-prefix"],
             "tenant-a/lakehouses/analytics"
         );
         assert_eq!(
-            requests[0]["storage-credential"]["secret-access-key"],
+            requests[0].0["storage-credential"]["secret-access-key"],
             "secret"
         );
+        assert_eq!(requests[0].1, "Bearer caller-token");
+        assert_eq!(requests[0].2, "analytics");
     }
 
     #[tokio::test]
@@ -412,6 +472,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let endpoint = format!("http://{}", listener.local_addr().expect("address"));
         tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+        let credential = tempfile::NamedTempFile::new().expect("credential");
+        std::fs::write(credential.path(), "caller-token").expect("write credential");
         let provisioner = LakekeeperProvisioner::new(
             endpoint,
             "managed",
@@ -420,6 +482,7 @@ mod tests {
             "auto",
             "access",
             "secret",
+            credential.path(),
         )
         .expect("provisioner");
 

@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildResourceTree,
+  describeAccessAction,
   formatAccessAction,
   isTokenRequestComplete,
+  personalAccessTokens,
+  simpleTokenResources,
+  toPresetTokenGrants,
   toTokenGrants,
 } from './accessPresentation'
 
@@ -54,7 +58,9 @@ describe('access presentation', () => {
   })
 
   it('formats action identifiers for UI labels', () => {
-    expect(formatAccessAction('create_child')).toBe('Create child')
+    expect(formatAccessAction('create_child')).toBe('Create databases or tables')
+    expect(describeAccessAction('connect')).toBe('Open a database or service connection. This does not grant data access by itself.')
+    expect(describeAccessAction('use_secret')).toBe('Use a saved credential without revealing its value.')
   })
 
   it('applies selected actions to every selected resource when building a token request', () => {
@@ -62,5 +68,43 @@ describe('access presentation', () => {
       { resourceId: 'database:analytics', actions: ['discover', 'query'] },
       { resourceId: 'database:operations', actions: ['discover', 'query'] },
     ])
+  })
+
+  it('keeps OS login sessions out of the personal token inventory', () => {
+    const tokens = [
+      { id: 'session-record', name: 'OS session', principalId: 'session/browser', parentPrincipalId: 'user/dev@example.com', audience: 'access', createdAt: 1, expiresAt: 2 },
+      { id: 'personal-record', name: 'Laptop', principalId: 'token/laptop', parentPrincipalId: 'user/dev@example.com', audience: 'verglas-cli', createdAt: 1, expiresAt: 2 },
+    ]
+
+    expect(personalAccessTokens(tokens)).toEqual([tokens[1]])
+  })
+
+  it('offers only meaningful inherited scopes in the simple resource picker', () => {
+    const resources = [
+      { tenantId: 'acme', id: 'table/analytics/events', kind: 'table' as const, parentId: 'database/analytics' },
+      { tenantId: 'acme', id: 'database/analytics', kind: 'database' as const, parentId: 'tenant' },
+      { tenantId: 'acme', id: 'job/nightly', kind: 'job' as const, parentId: 'tenant' },
+      { tenantId: 'acme', id: 'tenant', kind: 'tenant' as const },
+    ]
+
+    expect(simpleTokenResources(resources).map(({ id }) => id)).toEqual([
+      'database/analytics',
+      'tenant',
+    ])
+  })
+
+  it('turns plain-language access levels into bounded inherited grants', () => {
+    expect(toPresetTokenGrants('database/analytics', 'read')).toEqual([{
+      resourceId: 'database/analytics',
+      actions: ['query', 'connect'],
+    }])
+    expect(toPresetTokenGrants('database/analytics', 'write')).toEqual([{
+      resourceId: 'database/analytics',
+      actions: ['modify', 'create_child', 'connect'],
+    }])
+    expect(toPresetTokenGrants('tenant', 'read')).toEqual([{
+      resourceId: 'tenant',
+      actions: ['query', 'connect'],
+    }])
   })
 })

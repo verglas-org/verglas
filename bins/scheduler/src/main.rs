@@ -26,7 +26,7 @@ use verglas_scheduler::{
     NextWakeRequest, PgQueue, PgWorkerRegistry, RenewRequest, RunQueue, WorkerRecord, WorkerSpec,
     plan_cron,
 };
-use verglas_sdk::worker::{Catchup, CloudEvent, TriggerSpec};
+use verglas_sdk::worker::{Catchup, CloudEvent, ENV_TOKEN, TriggerSpec};
 
 /// CloudEvent type emitted for a planned cron interval.
 const CRON_EVENT_TYPE: &str = "org.verglas.schedule.tick";
@@ -77,6 +77,8 @@ struct WorkerConfig {
 struct PreparedWorker {
     /// Executable subprocess contract.
     exec: WorkerExec,
+    /// Data-plane bearer token injected through the harness's reserved binding.
+    token: Option<String>,
     /// Isolated directory removed after the run finishes.
     _root: tempfile::TempDir,
 }
@@ -117,8 +119,9 @@ fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
 
 fn prepare_worker_config(
     worker: &WorkerRecord,
-    config: WorkerConfig,
+    mut config: WorkerConfig,
 ) -> Result<PreparedWorker, String> {
+    let token = config.env.remove(ENV_TOKEN);
     let root = tempfile::tempdir()
         .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
     for (name, contents) in &config.files {
@@ -152,7 +155,11 @@ fn prepare_worker_config(
         exec.cwd = Some(root.path().to_string_lossy().into_owned());
     }
     exec.env = config.env;
-    Ok(PreparedWorker { exec, _root: root })
+    Ok(PreparedWorker {
+        exec,
+        token,
+        _root: root,
+    })
 }
 
 async fn prepare_registered_worker(
@@ -596,7 +603,7 @@ async fn execute_claimed_worker(
         deployment: &worker.name,
         output,
         endpoint: &args.worker_endpoint,
-        token: "",
+        token: prepared.token.as_deref().unwrap_or_default(),
     };
     let mut lease = claimed.lease;
     let renew_every = Duration::from_secs((args.lease_seconds / 2).max(1));
@@ -865,6 +872,33 @@ mod tests {
         assert_eq!(
             prepared.exec.cwd.as_deref(),
             Some(prepared._root.path().join("").to_string_lossy().as_ref())
+        );
+    }
+
+    /// The data-plane credential is carried by the reserved harness binding,
+    /// not left in the generic subprocess environment where the harness would
+    /// overwrite it with an empty token.
+    #[test]
+    fn prepares_the_worker_runtime_token() {
+        let worker = WorkerRecord {
+            name: "authenticated-writer".to_owned(),
+            code: r#"{"exec":["true"]}"#.to_owned(),
+            output: Some("app.output".to_owned()),
+            triggers: "[]".to_owned(),
+            state: "running".to_owned(),
+            config: r#"{"env":{"VERGLAS_TOKEN":"tenant-token","PLAIN":"value"}}"#.to_owned(),
+            placement: "local".to_owned(),
+            created_by: "test".to_owned(),
+            created_at: Utc::now(),
+            revision: 1,
+        };
+
+        let prepared = prepare_worker(&worker).expect("prepare worker");
+        assert_eq!(prepared.token.as_deref(), Some("tenant-token"));
+        assert!(!prepared.exec.env.contains_key("VERGLAS_TOKEN"));
+        assert_eq!(
+            prepared.exec.env.get("PLAIN").map(String::as_str),
+            Some("value")
         );
     }
 

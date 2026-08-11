@@ -1,9 +1,16 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
-  boundedPrompt, gatewayTargetToken, requireIdentifier, requireScopedToken,
+  authorizationDecision, boundedPrompt, gatewayTargetToken, requireIdentifier, requireScopedToken,
   runCapabilityEnvironment, runDeploymentId,
 } from "../src/contracts.mjs";
+
+test("authorizationDecision unwraps the access service response", () => {
+  assert.deepEqual(authorizationDecision({
+    identity: {principal_id: "token/example"},
+    decision: {allowed: true, policy_version: 7},
+  }), {allowed: true, policy_version: 7});
+});
 
 test("agent runs use the container runtime ephemeral namespace", () => {
   assert.equal(runDeploymentId("abc123"), "run-agent-abc123");

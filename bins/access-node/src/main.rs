@@ -31,6 +31,9 @@ mod database_runtime;
 mod lakehouse_runtime;
 mod postgres_runtime;
 
+/// Lakekeeper's built-in project created by its single-tenant bootstrap.
+const LAKEKEEPER_DEFAULT_PROJECT: &str = "lakekeeper/project/00000000-0000-0000-0000-000000000000";
+
 /// Database binding resolver backed by the authorization-owned secret service.
 struct AccessSecretResolver {
     secrets: Arc<SecretService>,
@@ -130,6 +133,13 @@ struct Args {
         default_value = "/var/run/verglas/server"
     )]
     server_token_directory: PathBuf,
+    /// Private directory receiving the access service's Lakekeeper caller credential.
+    #[arg(
+        long,
+        env = "VERGLAS_ACCESS_TOKEN_DIRECTORY",
+        default_value = "/var/run/verglas/access"
+    )]
+    access_token_directory: PathBuf,
     /// Isolated directory receiving the Lakekeeper policy credential.
     #[arg(
         long,
@@ -274,6 +284,7 @@ async fn run(args: Args) -> Result<(), String> {
     let target_jwt_signer = TargetJwtSigner::from_base64_derived(&args.target_jwt_signing_key)
         .map_err(|error| error.to_string())?;
     let credential_directories = InternalCredentialDirectories {
+        access: args.access_token_directory,
         server: args.server_token_directory,
         lakekeeper: args.lakekeeper_token_directory,
         neon: args.neon_token_directory,
@@ -291,7 +302,7 @@ async fn run(args: Args) -> Result<(), String> {
         authorizer.clone(),
         tokens.clone(),
         args.tenant_id.clone(),
-        credential_directories,
+        credential_directories.clone(),
     );
     let encryption_key = hex::decode(&args.secret_encryption_key).map_err(|_| {
         "VERGLAS_SECRET_ENCRYPTION_KEY must be 64 hexadecimal characters".to_owned()
@@ -320,6 +331,7 @@ async fn run(args: Args) -> Result<(), String> {
         &args.managed_storage_region,
         &args.managed_storage_access_key_id,
         &args.managed_storage_secret_access_key,
+        credential_directories.access.join("verglas-access.token"),
     )
     .map_err(|error| error.to_string())?;
     let postgres_credential_key =
@@ -420,6 +432,23 @@ async fn ensure_tenant_identities(
         Ok(_) | Err(AuthzError::Conflict(_)) => {}
         Err(error) => return Err(format!("cannot bootstrap tenant resource: {error}")),
     }
+    let lakekeeper =
+        Resource::new(tenant_id, "lakekeeper", ResourceKind::Project).with_parent("tenant");
+    match authorizer.create_resource(lakekeeper).await {
+        Ok(_) | Err(AuthzError::Conflict(_)) => {}
+        Err(error) => return Err(format!("cannot bootstrap Lakekeeper root: {error}")),
+    }
+    let lakekeeper_default_project =
+        Resource::new(tenant_id, LAKEKEEPER_DEFAULT_PROJECT, ResourceKind::Project)
+            .with_parent("lakekeeper");
+    match authorizer.create_resource(lakekeeper_default_project).await {
+        Ok(_) | Err(AuthzError::Conflict(_)) => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot bootstrap Lakekeeper default project: {error}"
+            ));
+        }
+    }
     let principal = Principal::new(
         tenant_id,
         service_principal_id,
@@ -477,6 +506,7 @@ fn decode_256_bit_hex(name: &str, value: &str) -> Result<[u8; 32], String> {
 /// Mutually isolated credential directories mounted by exactly one consumer each.
 #[derive(Clone)]
 struct InternalCredentialDirectories {
+    access: PathBuf,
     server: PathBuf,
     lakekeeper: PathBuf,
     neon: PathBuf,
@@ -490,6 +520,7 @@ async fn provision_internal_credentials(
     directories: &InternalCredentialDirectories,
 ) -> Result<(), String> {
     for directory in [
+        &directories.access,
         &directories.server,
         &directories.lakekeeper,
         &directories.neon,
@@ -500,6 +531,13 @@ async fn provision_internal_credentials(
         set_directory_permissions(directory).await?;
     }
     for (parent_id, directory, file_name, audience, action) in [
+        (
+            "service/verglas-access",
+            directories.access.as_path(),
+            "verglas-access.token",
+            verglas_rest::access::DATA_PLANE_AUDIENCE,
+            Some(Action::Own),
+        ),
         (
             "service/verglas-server",
             directories.server.as_path(),
@@ -736,6 +774,12 @@ mod tests {
             .await
             .expect("tenant resource");
         assert_eq!(tenant.kind, ResourceKind::Tenant);
+        let project = authorizer
+            .get_resource("tenant-a", LAKEKEEPER_DEFAULT_PROJECT)
+            .await
+            .expect("Lakekeeper default project");
+        assert_eq!(project.kind, ResourceKind::Project);
+        assert_eq!(project.parent_id.as_deref(), Some("lakekeeper"));
         let owner = authorizer
             .get_principal("tenant-a", "user/alice@example.com")
             .await
@@ -773,6 +817,7 @@ mod tests {
         ));
         let directory = tempfile::tempdir().expect("temporary directory");
         let directories = InternalCredentialDirectories {
+            access: directory.path().join("access"),
             server: directory.path().join("server"),
             lakekeeper: directory.path().join("lakekeeper"),
             neon: directory.path().join("neon"),
@@ -788,6 +833,11 @@ mod tests {
         .expect("credentials");
 
         for (directory, file_name, audience) in [
+            (
+                directories.access.as_path(),
+                "verglas-access.token",
+                verglas_rest::access::DATA_PLANE_AUDIENCE,
+            ),
             (
                 directories.server.as_path(),
                 "verglas-server.token",

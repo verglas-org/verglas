@@ -26,6 +26,7 @@ describe('router', () => {
     expect(await route(env, '/api/rpc')).toBe('backend');
     expect(await route(env, '/blueprint-screenshot/x')).toBe('backend');
     expect(await route(env, '/application-screenshot/x')).toBe('backend');
+    expect(await route(env, '/apps/hormuz-ship-watch/')).toBe('backend');
   });
 
   it('serves everything else from ASSETS when the binding is present', async () => {
