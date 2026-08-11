@@ -325,9 +325,7 @@ services:
       VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-0:5454
     volumes:
       - verglas-pg-cache-0:/var/lib/verglas
-    networks:
-      default:
-      runtime:
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
       interval: 2s
@@ -346,9 +344,7 @@ services:
       VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-1:5454
     volumes:
       - verglas-pg-cache-1:/var/lib/verglas
-    networks:
-      default:
-      runtime:
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
       interval: 2s
@@ -367,9 +363,7 @@ services:
       VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-2:5454
     volumes:
       - verglas-pg-cache-2:/var/lib/verglas
-    networks:
-      default:
-      runtime:
+    networks: *runtime-networks
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
       interval: 2s

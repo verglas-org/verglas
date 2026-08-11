@@ -88,8 +88,7 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(
         compose.contains("x-runtime-networks: &runtime-networks")
             && compose.contains("runtime:\n    name: verglas-runtime")
-            && compose.matches("networks: *runtime-networks").count() >= 9
-            && compose.matches("      runtime:").count() >= 3,
+            && compose.matches("networks: *runtime-networks").count() >= 12,
         "control-plane and cache services must join the explicit runtime network"
     );
     assert!(

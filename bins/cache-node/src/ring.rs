@@ -122,7 +122,7 @@ pub async fn setup(
     activity: ActivityTracker,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
     let peers = match env_var("VERGLAS_RING_PEERS") {
-        Some(raw) => parse_peers(&raw),
+        Some(raw) => resolve_peers(&raw).await,
         None => Vec::new(),
     };
     // A production cache ring needs at least three boxes; fewer is a
@@ -225,18 +225,37 @@ pub async fn setup(
     }))
 }
 
-/// Parses `VERGLAS_RING_PEERS` — `id=host:port` entries, comma-separated —
-/// skipping any malformed entry with a warning rather than failing startup.
-fn parse_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
+/// Resolves `VERGLAS_RING_PEERS` — `id=host:port` entries, comma-separated —
+/// skipping any malformed or unresolvable entry instead of failing startup.
+async fn resolve_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
     let mut peers = Vec::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match entry.split_once('=') {
-            Some((id, addr)) => match addr.trim().parse::<SocketAddr>() {
-                Ok(addr) => peers.push((NodeId::new(id.trim()), addr)),
-                Err(error) => eprintln!(
-                    "verglas-cache-node {VERSION} ignoring malformed ring peer `{entry}`: {error}"
-                ),
-            },
+            Some((id, addr)) => {
+                let addr = addr.trim();
+                let resolved = match addr.parse::<SocketAddr>() {
+                    Ok(addr) => Some(addr),
+                    Err(_) => match tokio::net::lookup_host(addr).await {
+                        Ok(addrs) => {
+                            let addrs: Vec<_> = addrs.collect();
+                            addrs
+                                .iter()
+                                .find(|candidate| candidate.is_ipv4())
+                                .or_else(|| addrs.first())
+                                .copied()
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "verglas-cache-node {VERSION} ignoring unresolvable ring peer `{entry}`: {error}"
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(addr) = resolved {
+                    peers.push((NodeId::new(id.trim()), addr));
+                }
+            }
             None => eprintln!(
                 "verglas-cache-node {VERSION} ignoring malformed ring peer `{entry}` (want id=host:port)"
             ),
@@ -397,6 +416,20 @@ impl LiveMembership for StaticMembership {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn ring_peers_accept_ip_addresses_and_dns_names() {
+        let peers = resolve_peers("cache-0=127.0.0.1:8336,cache-1=localhost:8337").await;
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].0, NodeId::new("cache-0"));
+        assert_eq!(
+            peers[0].1,
+            "127.0.0.1:8336".parse().expect("literal address")
+        );
+        assert_eq!(peers[1].0, NodeId::new("cache-1"));
+        assert_eq!(peers[1].1.port(), 8337);
+    }
 
     /// Once fenced, a peer cannot place a new fragment that would race the
     /// host's zero-in-flight stop decision.
