@@ -19,7 +19,7 @@ x-pg-cache-environment: &pg-cache-environment
   VERGLAS_S3_ADDR: 0.0.0.0:8333
   VERGLAS_BLOCK_ADDR: 0.0.0.0:8335
   VERGLAS_RING_ADDR: 0.0.0.0:8336
-  VERGLAS_RING_PEERS: cache-0=172.29.240.10:8336,cache-1=172.29.240.11:8336,cache-2=172.29.240.12:8336
+  VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336,cache-1=verglas-cache-node-1:8336,cache-2=verglas-cache-node-2:8336
   VERGLAS_CLUSTER_SECRET: ${VERGLAS_CLUSTER_SECRET:-verglas-local-ring}
   VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:5454
   VERGLAS_SAFEKEEPER_BROKER_ENDPOINT: http://verglas-neon-broker:50051
@@ -328,8 +328,6 @@ services:
     networks:
       default:
       runtime:
-      pg-ring:
-        ipv4_address: 172.29.240.10
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
       interval: 2s
@@ -351,8 +349,6 @@ services:
     networks:
       default:
       runtime:
-      pg-ring:
-        ipv4_address: 172.29.240.11
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
       interval: 2s
@@ -374,8 +370,6 @@ services:
     networks:
       default:
       runtime:
-      pg-ring:
-        ipv4_address: 172.29.240.12
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
       interval: 2s
@@ -503,8 +497,3 @@ networks:
   runtime:
     name: verglas-runtime
     external: true
-  pg-ring:
-    name: verglas-pg-ring
-    ipam:
-      config:
-        - subnet: 172.29.240.0/24

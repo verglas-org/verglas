@@ -90,6 +90,17 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("rill:"),
         "bootstrap Compose must not directly own rill:"
     );
+    assert!(
+        !compose.contains("pg-ring:"),
+        "cache nodes must not consume a redundant fourth Coolify network"
+    );
+    for peer in [
+        "cache-0=verglas-cache-node-0:8336",
+        "cache-1=verglas-cache-node-1:8336",
+        "cache-2=verglas-cache-node-2:8336",
+    ] {
+        assert!(compose.contains(peer), "cache ring is missing peer {peer}");
+    }
 }
 
 #[test]
