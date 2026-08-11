@@ -12,7 +12,7 @@ RUN rustup show
 COPY . .
 RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=verglas-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=verglas-build-target,target=/src/target,sharing=locked \
+    --mount=type=cache,id=verglas-server-target,target=/src/target,sharing=locked \
     cargo build --release \
     -p verglas-server \
     -p verglas-access-bin \
