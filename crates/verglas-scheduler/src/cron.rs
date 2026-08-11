@@ -56,8 +56,11 @@ pub fn plan_cron(
         instants.push(instant);
         candidate = schedule.next_after(&instant);
     }
+    let sequential_backlog_remaining = catchup == Catchup::Sequential && instants.len() > 1;
     if catchup == Catchup::None && instants.len() > 1 {
         instants = instants.last().copied().into_iter().collect::<Vec<_>>();
+    } else if sequential_backlog_remaining {
+        instants.truncate(1);
     }
     let mut previous = from;
     let intervals = instants
@@ -72,11 +75,15 @@ pub fn plan_cron(
             interval
         })
         .collect();
-    let next_wake_at = schedule.next_after(&now).ok_or_else(|| {
-        SchedulerError::Cron(format!(
-            "`{expression}` has no occurrence in the next four years"
-        ))
-    })?;
+    let next_wake_at = if sequential_backlog_remaining {
+        now
+    } else {
+        schedule.next_after(&now).ok_or_else(|| {
+            SchedulerError::Cron(format!(
+                "`{expression}` has no occurrence in the next four years"
+            ))
+        })?
+    };
     Ok(CronPlan {
         intervals,
         next_wake_at,

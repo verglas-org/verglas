@@ -15,3 +15,4 @@
 
 - #66: Rewrote the crate README so the durable queue boundary is local-executor only and no longer mentions Firecracker, microVMs, or a cloud consumer plane.
 - #66: Neutralized RunQueue docs (no local-vs-cloud scheduler contrast).
+- #109: Bound sequential cron reconciliation to one oldest due interval per pass. This lets the scheduler execute ordered backfills incrementally instead of materializing years of jobs before it can run live work.

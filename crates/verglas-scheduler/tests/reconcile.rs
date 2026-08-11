@@ -18,21 +18,32 @@ fn cron_plan_returns_due_intervals_and_next_deadline() {
         .expect("now");
     let plan = plan_cron(Some(cursor), now, None, Catchup::Sequential, "0 * * * *").expect("plan");
 
-    assert_eq!(plan.intervals.len(), 3);
+    assert_eq!(plan.intervals.len(), 1);
     assert_eq!(plan.intervals[0].interval_start, cursor.to_rfc3339());
     assert_eq!(
-        plan.intervals[2].interval_end,
-        Utc.with_ymd_and_hms(2026, 8, 1, 12, 0, 0)
+        plan.intervals[0].interval_end,
+        Utc.with_ymd_and_hms(2026, 8, 1, 10, 0, 0)
             .single()
             .expect("end")
             .to_rfc3339()
     );
-    assert_eq!(
-        plan.next_wake_at,
-        Utc.with_ymd_and_hms(2026, 8, 1, 13, 0, 0)
-            .single()
-            .expect("next")
-    );
+    assert_eq!(plan.next_wake_at, now);
+}
+
+/// Parallel catch-up retains every due interval for immediate fan-out.
+#[test]
+fn parallel_cron_plan_returns_every_due_interval() {
+    let cursor = Utc
+        .with_ymd_and_hms(2026, 8, 1, 9, 30, 0)
+        .single()
+        .expect("cursor");
+    let now = Utc
+        .with_ymd_and_hms(2026, 8, 1, 12, 15, 0)
+        .single()
+        .expect("now");
+    let plan = plan_cron(Some(cursor), now, None, Catchup::Parallel, "0 * * * *").expect("plan");
+
+    assert_eq!(plan.intervals.len(), 3);
 }
 
 /// A new live cron must materialize its first future run. Merely returning a
