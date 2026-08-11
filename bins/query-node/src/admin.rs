@@ -75,6 +75,7 @@ pub struct AppState {
 pub struct PreparedQueryCatalog {
     catalog: Arc<dyn Catalog>,
     generation_url: Option<String>,
+    generation_bearer: Option<String>,
     http: reqwest::Client,
     memory_limit_bytes: usize,
     spill_path: Option<std::path::PathBuf>,
@@ -101,18 +102,21 @@ impl PreparedQueryCatalog {
         spill_path: Option<std::path::PathBuf>,
     ) -> Result<Self, AgentError> {
         let http = reqwest::Client::new();
+        let generation_bearer = std::env::var(verglas_core::RUN_BEARER_TOKEN_ENV)
+            .ok()
+            .filter(|token| !token.is_empty());
         let generation_url =
             metadata_uri.map(|uri| format!("{}/_verglas/generation", uri.trim_end_matches('/')));
         let (generation, prepared) = match &generation_url {
             Some(url) => loop {
-                let before = fetch_generation(&http, url).await?;
+                let before = fetch_generation(&http, url, generation_bearer.as_deref()).await?;
                 let prepared = verglas_iceberg::PreparedCatalog::open_with_memory_limit(
                     catalog.clone(),
                     memory_limit_bytes,
                     spill_path.clone(),
                 )
                 .await?;
-                let after = fetch_generation(&http, url).await?;
+                let after = fetch_generation(&http, url, generation_bearer.as_deref()).await?;
                 if before == after {
                     break (after, prepared);
                 }
@@ -130,6 +134,7 @@ impl PreparedQueryCatalog {
         Ok(Self {
             catalog,
             generation_url,
+            generation_bearer,
             http,
             memory_limit_bytes,
             spill_path,
@@ -160,7 +165,7 @@ impl PreparedQueryCatalog {
         let Some(url) = &self.generation_url else {
             return Ok(());
         };
-        let observed = fetch_generation(&self.http, url).await?;
+        let observed = fetch_generation(&self.http, url, self.generation_bearer.as_deref()).await?;
         if self.current.read().await.generation == observed {
             return Ok(());
         }
@@ -169,7 +174,7 @@ impl PreparedQueryCatalog {
         // not all rebuild the same generation. Re-check after taking it because
         // another request may have completed the refresh while this one waited.
         let mut current = self.current.write().await;
-        let observed = fetch_generation(&self.http, url).await?;
+        let observed = fetch_generation(&self.http, url, self.generation_bearer.as_deref()).await?;
         if current.generation == observed {
             return Ok(());
         }
@@ -179,7 +184,8 @@ impl PreparedQueryCatalog {
             self.spill_path.clone(),
         )
         .await?;
-        let completed_generation = fetch_generation(&self.http, url).await?;
+        let completed_generation =
+            fetch_generation(&self.http, url, self.generation_bearer.as_deref()).await?;
         if completed_generation != observed {
             return Err(AgentError::Query(
                 "catalog changed while rebuilding the query session; retry the query".to_owned(),
@@ -193,9 +199,16 @@ impl PreparedQueryCatalog {
     }
 }
 
-async fn fetch_generation(http: &reqwest::Client, url: &str) -> Result<u64, AgentError> {
-    let response = http
-        .get(url)
+async fn fetch_generation(
+    http: &reqwest::Client,
+    url: &str,
+    bearer: Option<&str>,
+) -> Result<u64, AgentError> {
+    let mut request = http.get(url);
+    if let Some(bearer) = bearer {
+        request = request.bearer_auth(bearer);
+    }
+    let response = request
         .send()
         .await
         .map_err(|error| AgentError::Query(format!("read catalog generation: {error}")))?

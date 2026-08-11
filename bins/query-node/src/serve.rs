@@ -103,6 +103,20 @@ pub async fn run(
     for_query: Option<String>,
     ports_file: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
+    // Bind before catalog preparation so the parent can connect while this
+    // ephemeral worker loads Iceberg metadata. The accepted request remains
+    // queued by the listener until Axum starts serving below.
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.listen.admin_port))
+        .await
+        .map_err(|e| format!("cannot bind admin port {}: {e}", config.listen.admin_port))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read bound admin address: {e}"))?;
+    tracing::info!(port = bound_addr.port(), "query worker listener bound");
+    if let Some(path) = &ports_file {
+        report_port(path, "admin", bound_addr);
+    }
+
     let connection = connection_for(config)?;
     let catalog = catalog::open_catalog(&connection)
         .await
@@ -148,16 +162,7 @@ pub async fn run(
     };
 
     let app = admin::router(state.clone());
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.listen.admin_port))
-        .await
-        .map_err(|e| format!("cannot bind admin port {}: {e}", config.listen.admin_port))?;
-    let bound_addr = listener
-        .local_addr()
-        .map_err(|e| format!("cannot read bound admin address: {e}"))?;
     tracing::info!(port = bound_addr.port(), "serving");
-    if let Some(path) = &ports_file {
-        report_port(path, "admin", bound_addr);
-    }
 
     let idle_watch = tokio::spawn(idle_shutdown_watch(last_activity));
 
