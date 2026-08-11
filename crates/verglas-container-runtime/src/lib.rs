@@ -5,6 +5,7 @@
 //! workload. Verglas-owned labels provide the authority for every mutation.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -16,7 +17,8 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     BuildImageOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-    ListContainersOptionsBuilder, UploadToContainerOptionsBuilder,
+    DownloadFromContainerOptionsBuilder, ListContainersOptionsBuilder, LogsOptionsBuilder,
+    UploadToContainerOptionsBuilder, WaitContainerOptionsBuilder,
 };
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
@@ -42,13 +44,17 @@ pub const LABEL_DEPLOYMENT: &str = "io.verglas.deployment";
 pub const LABEL_SPEC_DIGEST: &str = "io.verglas.spec-sha256";
 
 const CONTAINER_NAME_PREFIX: &str = "verglas-";
-const TYPESCRIPT_BASE_IMAGE: &str = "oven/bun:1.2.20";
+const TYPESCRIPT_BASE_IMAGE: &str = "oven/bun:1.3.8";
+const PYTHON_BASE_IMAGE: &str = "python:3.13-slim";
+const UV_BASE_IMAGE: &str = "ghcr.io/astral-sh/uv:0.9.17";
 const MAX_PROJECT_FILES: usize = 128;
 const MAX_PROJECT_FILE_BYTES: usize = 512 * 1024;
 const MAX_PROJECT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_BUILD_ERROR_BYTES: usize = 8 * 1024;
 const MAX_CONTAINER_FILES: usize = 64;
 const MAX_CONTAINER_FILE_BYTES: usize = 1024 * 1024;
+const MAX_WORKER_LOG_BYTES: usize = 64 * 1024;
+const WORKER_RESULT_PATH: &str = "/tmp/verglas-result.json";
 
 /// Stable local TLS paths generated beside the desired-state document.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +188,156 @@ pub struct VesselBuildContext {
     pub context: Vec<u8>,
 }
 
+/// Platform-owned build policy selected for one bounded worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRuntime {
+    /// Python dependencies resolved exactly from `pyproject.toml` and `uv.lock`.
+    Python,
+    /// JavaScript or TypeScript dependencies resolved exactly from `package.json` and `bun.lock`.
+    Bun,
+    /// An operator-auditable Dockerfile supplied with the worker project.
+    Container,
+}
+
+/// One dependency-bearing bounded worker project.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerProjectSpec {
+    /// Stable worker name used in the immutable image tag.
+    pub name: String,
+    /// Platform build policy or explicit container build.
+    pub runtime: WorkerRuntime,
+    /// Command executed for each trigger invocation.
+    pub entrypoint: Vec<String>,
+    /// UTF-8 source, dependency declarations, and lockfiles.
+    pub files: BTreeMap<String, String>,
+}
+
+/// Normalized content-addressed Docker build for one bounded worker project.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerBuildContext {
+    /// Immutable local OCI image tag derived from the normalized project.
+    pub image: String,
+    /// Platform-owned or explicitly submitted Dockerfile.
+    pub dockerfile: String,
+    /// Deterministic uncompressed tar archive sent to the Docker Engine.
+    pub context: Vec<u8>,
+}
+
+/// One fully resolved bounded worker invocation accepted by the runtime.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerInvocation {
+    /// Unique run identity. It also names the ephemeral Docker container.
+    pub run_id: String,
+    /// Stable worker deployment name exposed to the worker SDK.
+    pub worker: String,
+    /// Immutable image produced from the registered worker project.
+    pub image: String,
+    /// Command and arguments executed inside the image.
+    pub entrypoint: Vec<String>,
+    /// Resolved runtime environment, including secret values.
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    /// Configured output table exposed as `TARGET`.
+    #[serde(default)]
+    pub target: String,
+    /// Verglas data endpoint exposed to the worker SDK.
+    pub endpoint: String,
+    /// Short-lived data-plane bearer token.
+    #[serde(default)]
+    pub token: String,
+    /// Existing Docker network used to reach Verglas and bound services.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+    /// Complete CloudEvents 1.0 envelope for this invocation.
+    pub event: serde_json::Value,
+    /// Hard cgroup ceilings applied by Docker.
+    pub resources: WorkerResources,
+    /// Wall-clock ceiling for the invocation.
+    pub timeout_seconds: u64,
+}
+
+/// Completed output returned from one bounded worker container.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerRunResult {
+    /// Rows reported by the worker SDK result contract.
+    pub rows_produced: u64,
+    /// Bounded combined stdout and stderr captured for run diagnostics.
+    pub logs: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkerResultFile {
+    rows: u64,
+    error: Option<String>,
+}
+
+impl WorkerProjectSpec {
+    /// Validates dependency locking and archives one deterministic worker build.
+    pub fn build_context(&self) -> Result<WorkerBuildContext, RuntimeError> {
+        ContainerSpec::new(format!("worker-{}", self.name), "validation").validate()?;
+        if self.entrypoint.is_empty() || self.entrypoint.iter().any(|part| part.is_empty()) {
+            return Err(RuntimeError::MissingWorkerEntrypoint);
+        }
+        validate_project_files(&self.files, self.runtime == WorkerRuntime::Container)?;
+        let dockerfile = match self.runtime {
+            WorkerRuntime::Python => {
+                require_project_file(&self.files, "pyproject.toml")?;
+                require_project_file(&self.files, "uv.lock")?;
+                python_worker_dockerfile()
+            }
+            WorkerRuntime::Bun => {
+                let package = require_project_file(&self.files, "package.json")?;
+                serde_json::from_str::<serde_json::Value>(package)
+                    .map_err(|error| RuntimeError::InvalidPackageJson(error.to_string()))?;
+                require_project_file(&self.files, "bun.lock")?;
+                bun_worker_dockerfile()
+            }
+            WorkerRuntime::Container => require_project_file(&self.files, "Dockerfile")?.to_owned(),
+        };
+        let mut files = self.files.clone();
+        files.remove("Dockerfile");
+        let context = archive_project(&files, &dockerfile)?;
+        let digest = hex::encode(Sha256::digest(&context));
+        Ok(WorkerBuildContext {
+            image: format!("verglas/worker-{}:sha256-{digest}", self.name),
+            dockerfile,
+            context,
+        })
+    }
+}
+
+/// Returns one required project file or a stable validation error.
+fn require_project_file<'a>(
+    files: &'a BTreeMap<String, String>,
+    path: &str,
+) -> Result<&'a str, RuntimeError> {
+    files
+        .get(path)
+        .filter(|source| !source.trim().is_empty())
+        .map(String::as_str)
+        .ok_or_else(|| RuntimeError::MissingProjectFile {
+            path: path.to_owned(),
+        })
+}
+
+/// Returns the locked Python worker image policy.
+fn python_worker_dockerfile() -> String {
+    format!(
+        "FROM {UV_BASE_IMAGE} AS uv\nFROM {PYTHON_BASE_IMAGE}\nCOPY --from=uv /uv /uvx /bin/\nWORKDIR /app\nCOPY pyproject.toml uv.lock ./\nRUN uv sync --frozen --no-dev\nCOPY . .\nENV PATH=\"/app/.venv/bin:$PATH\" PYTHONUNBUFFERED=1\n"
+    )
+}
+
+/// Returns the locked Bun worker image policy for JavaScript and TypeScript.
+fn bun_worker_dockerfile() -> String {
+    format!(
+        "FROM {TYPESCRIPT_BASE_IMAGE}\nWORKDIR /app\nCOPY package.json bun.lock ./\nRUN bun install --frozen-lockfile --production\nCOPY . .\nUSER bun\n"
+    )
+}
+
 impl VesselProjectSpec {
     /// Validates and archives this project into a platform-owned Docker build.
     pub fn build_context(&self) -> Result<VesselBuildContext, RuntimeError> {
@@ -197,7 +353,7 @@ impl VesselProjectSpec {
         {
             return Err(RuntimeError::InvalidHealthPath);
         }
-        validate_project_files(&self.project.files)?;
+        validate_project_files(&self.project.files, false)?;
         validate_package_json(self.project.files.get("package.json").ok_or_else(|| {
             RuntimeError::MissingProjectFile {
                 path: "package.json".to_owned(),
@@ -341,7 +497,10 @@ const TYPESCRIPT_SDK_FILES: &[(&str, &str)] = &[
 ];
 
 /// Validates bounded safe paths before creating an engine build context.
-fn validate_project_files(files: &BTreeMap<String, String>) -> Result<(), RuntimeError> {
+fn validate_project_files(
+    files: &BTreeMap<String, String>,
+    allow_dockerfile: bool,
+) -> Result<(), RuntimeError> {
     if files.len() > MAX_PROJECT_FILES {
         return Err(RuntimeError::ProjectTooLarge);
     }
@@ -353,7 +512,7 @@ fn validate_project_files(files: &BTreeMap<String, String>) -> Result<(), Runtim
             && path.split('/').all(|part| {
                 !part.is_empty() && part != "." && part != ".." && !part.contains('\\')
             })
-            && path != "Dockerfile"
+            && (allow_dockerfile || path != "Dockerfile")
             && path != ".dockerignore";
         if !valid_path {
             return Err(RuntimeError::InvalidProjectPath { path: path.clone() });
@@ -484,8 +643,20 @@ pub struct ContainerFile {
     pub mode: u32,
 }
 
+/// Hard Docker limits applied to one bounded worker invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerResources {
+    /// Maximum CPU bandwidth expressed as fractional host CPUs.
+    pub vcpus: f64,
+    /// Maximum resident memory in mebibytes.
+    pub memory_mib: u64,
+    /// Maximum number of processes visible to the worker cgroup.
+    pub pids: i64,
+}
+
 /// Immutable declaration for one locally placed container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerSpec {
     /// Stable deployment identity used to derive the Docker container name.
@@ -516,6 +687,9 @@ pub struct ContainerSpec {
     /// TCP ports explicitly published to the Docker Engine host.
     #[serde(default)]
     pub published_ports: Vec<PublishedPort>,
+    /// Optional hard cgroup limits for bounded invocations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<WorkerResources>,
 }
 
 impl ContainerSpec {
@@ -532,6 +706,7 @@ impl ContainerSpec {
             bind_mounts: Vec::new(),
             network: None,
             published_ports: Vec::new(),
+            resources: None,
         }
     }
 
@@ -616,6 +791,13 @@ impl ContainerSpec {
         self
     }
 
+    /// Applies hard CPU, memory, and process ceilings to this container.
+    #[must_use]
+    pub fn with_resources(mut self, resources: WorkerResources) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
     /// Validates identity, image, and the Docker authority boundary.
     pub fn validate(&self) -> Result<(), RuntimeError> {
         if self.deployment_id.is_empty()
@@ -696,6 +878,16 @@ impl ContainerSpec {
         {
             return Err(RuntimeError::InvalidPort);
         }
+        if self.resources.is_some_and(|resources| {
+            !resources.vcpus.is_finite()
+                || resources.vcpus <= 0.0
+                || resources.vcpus * 1_000_000_000.0 > i64::MAX as f64
+                || resources.memory_mib == 0
+                || resources.memory_mib > (i64::MAX as u64) / (1024 * 1024)
+                || resources.pids <= 0
+        }) {
+            return Err(RuntimeError::InvalidWorkerResources);
+        }
         Ok(())
     }
 
@@ -743,6 +935,7 @@ impl ContainerSpec {
             bind_mounts: self.bind_mounts.clone(),
             network: self.network.clone(),
             published_ports: self.published_ports.clone(),
+            resources: self.resources,
             labels,
         })
     }
@@ -807,6 +1000,34 @@ pub enum RuntimeError {
     /// A published TCP port used the reserved zero value.
     #[error("published container and host ports must be non-zero")]
     InvalidPort,
+    /// Worker resource limits were zero, negative, or not finite.
+    #[error("worker CPU, memory, and PID limits must be positive")]
+    InvalidWorkerResources,
+    /// A worker invocation used a zero-second wall-clock ceiling.
+    #[error("worker timeout must be positive")]
+    InvalidWorkerTimeout,
+    /// A run identity already belongs to an existing container.
+    #[error("worker run {run_id} already exists")]
+    RunAlreadyExists {
+        /// Colliding run identity.
+        run_id: String,
+    },
+    /// A worker exceeded its declared wall-clock ceiling.
+    #[error("worker {worker} exceeded its {timeout_seconds}-second timeout")]
+    WorkerTimedOut {
+        /// Worker deployment name.
+        worker: String,
+        /// Enforced wall-clock ceiling.
+        timeout_seconds: u64,
+    },
+    /// A worker process or result file reported failure.
+    #[error("worker {worker} failed: {message}")]
+    WorkerFailed {
+        /// Worker deployment name.
+        worker: String,
+        /// Bounded diagnostic detail.
+        message: String,
+    },
     /// A Vessel health path was not origin-relative.
     #[error("vessel health path must begin with '/'")]
     InvalidHealthPath,
@@ -848,6 +1069,9 @@ pub enum RuntimeError {
     /// The submitted package does not define the standalone runtime command.
     #[error("Vessel package.json must define scripts.start")]
     MissingStartScript,
+    /// A bounded worker omitted the command executed for each invocation.
+    #[error("worker project must define a non-empty entrypoint")]
+    MissingWorkerEntrypoint,
     /// The submitted project exceeded a bounded source limit.
     #[error("Vessel project exceeds the source size or file count limit")]
     ProjectTooLarge,
@@ -946,6 +1170,27 @@ impl DockerRuntime {
             .await?;
         Ok(build)
     }
+
+    /// Builds one locked worker project into its immutable local image.
+    pub async fn build_worker_project(
+        &self,
+        project: &WorkerProjectSpec,
+    ) -> Result<WorkerBuildContext, RuntimeError> {
+        let build = project.build_context()?;
+        self.core
+            .api
+            .build(&build.image, build.context.clone())
+            .await?;
+        Ok(build)
+    }
+
+    /// Executes one bounded invocation and removes its ephemeral container.
+    pub async fn run_worker(
+        &self,
+        invocation: &WorkerInvocation,
+    ) -> Result<WorkerRunResult, RuntimeError> {
+        self.core.run_worker(invocation).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -969,6 +1214,7 @@ struct EngineCreateRequest {
     bind_mounts: Vec<BindMount>,
     network: Option<String>,
     published_ports: Vec<PublishedPort>,
+    resources: Option<WorkerResources>,
     labels: BTreeMap<String, String>,
 }
 
@@ -992,6 +1238,15 @@ trait DockerApi: Send + Sync {
 
     /// Starts one existing stopped container.
     async fn start(&self, name: &str) -> Result<(), RuntimeError>;
+
+    /// Waits for the workload process and returns its exit code.
+    async fn wait(&self, name: &str) -> Result<i64, RuntimeError>;
+
+    /// Reads bounded combined stdout and stderr after the workload exits.
+    async fn logs(&self, name: &str) -> Result<String, RuntimeError>;
+
+    /// Reads one regular file from a stopped container.
+    async fn read_file(&self, name: &str, path: &str) -> Result<Option<Vec<u8>>, RuntimeError>;
 
     /// Stops one existing running container.
     async fn stop(&self, name: &str) -> Result<(), RuntimeError>;
@@ -1027,6 +1282,76 @@ where
     /// Creates a reconciler around one Docker API implementation.
     fn new(api: A) -> Self {
         Self { api }
+    }
+
+    /// Creates, runs, observes, and removes one bounded worker container.
+    async fn run_worker(
+        &self,
+        invocation: &WorkerInvocation,
+    ) -> Result<WorkerRunResult, RuntimeError> {
+        if invocation.timeout_seconds == 0 {
+            return Err(RuntimeError::InvalidWorkerTimeout);
+        }
+        if invocation.entrypoint.is_empty()
+            || invocation.entrypoint.iter().any(|part| part.is_empty())
+        {
+            return Err(RuntimeError::MissingWorkerEntrypoint);
+        }
+        let event = serde_json::to_string(&invocation.event)
+            .map_err(|error| RuntimeError::SpecificationEncoding(error.to_string()))?;
+        let mut specification = ContainerSpec::new(&invocation.run_id, &invocation.image)
+            .with_command(invocation.entrypoint.clone())
+            .with_resources(invocation.resources);
+        specification.network = invocation.network.clone();
+        specification.environment = invocation.environment.clone();
+        specification.environment.extend(BTreeMap::from([
+            ("DEPLOYMENT".to_owned(), invocation.worker.clone()),
+            ("TARGET".to_owned(), invocation.target.clone()),
+            ("VERGLAS_ENDPOINT".to_owned(), invocation.endpoint.clone()),
+            ("VERGLAS_TOKEN".to_owned(), invocation.token.clone()),
+            ("RESULT_PATH".to_owned(), WORKER_RESULT_PATH.to_owned()),
+            ("VERGLAS_CLOUD_EVENT".to_owned(), event),
+        ]));
+        let request = specification.create_request()?;
+        if self.api.inspect(&request.name).await?.is_some() {
+            return Err(RuntimeError::RunAlreadyExists {
+                run_id: invocation.run_id.clone(),
+            });
+        }
+        self.api.create(request.clone()).await?;
+        let result: Result<WorkerRunResult, RuntimeError> = async {
+            self.api.start(&request.name).await?;
+            let wait = tokio::time::timeout(
+                std::time::Duration::from_secs(invocation.timeout_seconds),
+                self.api.wait(&request.name),
+            )
+            .await;
+            match wait {
+                Ok(exit) => {
+                    let exit_code = exit?;
+                    let logs = self.api.logs(&request.name).await?;
+                    let body = self
+                        .api
+                        .read_file(&request.name, WORKER_RESULT_PATH)
+                        .await?;
+                    parse_worker_result(&invocation.worker, exit_code, body, logs)
+                }
+                Err(_) => {
+                    self.api.stop(&request.name).await?;
+                    Err(RuntimeError::WorkerTimedOut {
+                        worker: invocation.worker.clone(),
+                        timeout_seconds: invocation.timeout_seconds,
+                    })
+                }
+            }
+        }
+        .await;
+        let cleanup = self.api.remove(&request.name).await;
+        match (result, cleanup) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
     }
 
     /// Reconciles one immutable container specification.
@@ -1131,6 +1456,43 @@ where
             .await?;
         Ok(true)
     }
+}
+
+/// Interprets the shared SDK result-file contract after a worker exits.
+fn parse_worker_result(
+    worker: &str,
+    exit_code: i64,
+    body: Option<Vec<u8>>,
+    logs: String,
+) -> Result<WorkerRunResult, RuntimeError> {
+    let parsed = body
+        .as_deref()
+        .map(serde_json::from_slice::<WorkerResultFile>)
+        .transpose()
+        .map_err(|error| RuntimeError::WorkerFailed {
+            worker: worker.to_owned(),
+            message: format!("invalid result file: {error}"),
+        })?;
+    if let Some(WorkerResultFile {
+        error: Some(message),
+        ..
+    }) = parsed
+    {
+        return Err(RuntimeError::WorkerFailed {
+            worker: worker.to_owned(),
+            message,
+        });
+    }
+    if exit_code != 0 {
+        return Err(RuntimeError::WorkerFailed {
+            worker: worker.to_owned(),
+            message: format!("container exited {exit_code}: {}", logs.trim()),
+        });
+    }
+    Ok(WorkerRunResult {
+        rows_produced: parsed.map_or(0, |result| result.rows),
+        logs,
+    })
 }
 
 #[derive(Clone)]
@@ -1248,17 +1610,25 @@ impl DockerApi for BollardDockerApi {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let host_config =
-            if binds.is_empty() && request.network.is_none() && port_bindings.is_empty() {
-                None
-            } else {
-                Some(HostConfig {
-                    binds: (!binds.is_empty()).then_some(binds),
-                    network_mode: request.network,
-                    port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
-                    ..Default::default()
-                })
-            };
+        let resources = request.resources;
+        let host_config = if binds.is_empty()
+            && request.network.is_none()
+            && port_bindings.is_empty()
+            && resources.is_none()
+        {
+            None
+        } else {
+            Some(HostConfig {
+                binds: (!binds.is_empty()).then_some(binds),
+                network_mode: request.network,
+                port_bindings: (!port_bindings.is_empty()).then_some(port_bindings),
+                nano_cpus: resources.map(|limits| (limits.vcpus * 1_000_000_000.0) as i64),
+                memory: resources.map(|limits| (limits.memory_mib * 1024 * 1024) as i64),
+                memory_swap: resources.map(|limits| (limits.memory_mib * 1024 * 1024) as i64),
+                pids_limit: resources.map(|limits| limits.pids),
+                ..Default::default()
+            })
+        };
         let body = ContainerCreateBody {
             image: Some(request.image),
             cmd: (!request.command.is_empty()).then_some(request.command),
@@ -1294,6 +1664,71 @@ impl DockerApi for BollardDockerApi {
             .start_container(name, None)
             .await
             .map_err(engine_error)
+    }
+
+    /// Waits until one Docker container is no longer running.
+    async fn wait(&self, name: &str) -> Result<i64, RuntimeError> {
+        let options = WaitContainerOptionsBuilder::default()
+            .condition("not-running")
+            .build();
+        match self.docker.wait_container(name, Some(options)).next().await {
+            Some(Ok(response)) => Ok(response.status_code),
+            Some(Err(BollardError::DockerContainerWaitError { code, .. })) => Ok(code),
+            Some(Err(error)) => Err(engine_error(error)),
+            None => Err(RuntimeError::Engine(format!(
+                "Docker returned no wait result for {name}"
+            ))),
+        }
+    }
+
+    /// Reads bounded stdout and stderr from one Docker container.
+    async fn logs(&self, name: &str) -> Result<String, RuntimeError> {
+        let options = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(true)
+            .build();
+        let mut bytes = Vec::new();
+        let mut stream = self.docker.logs(name, Some(options));
+        while let Some(output) = stream.next().await {
+            let output = output.map_err(engine_error)?.to_string();
+            let remaining = MAX_WORKER_LOG_BYTES.saturating_sub(bytes.len());
+            bytes.extend_from_slice(&output.as_bytes()[..output.len().min(remaining)]);
+            if bytes.len() == MAX_WORKER_LOG_BYTES {
+                break;
+            }
+        }
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Downloads and extracts one regular file from a stopped container.
+    async fn read_file(&self, name: &str, path: &str) -> Result<Option<Vec<u8>>, RuntimeError> {
+        let options = DownloadFromContainerOptionsBuilder::default()
+            .path(path)
+            .build();
+        let chunks = match self
+            .docker
+            .download_from_container(name, Some(options))
+            .try_collect::<Vec<_>>()
+            .await
+        {
+            Ok(chunks) => chunks,
+            Err(error) if is_not_found(&error) => return Ok(None),
+            Err(error) => return Err(engine_error(error)),
+        };
+        let archive_bytes = chunks.concat();
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let mut entries = archive
+            .entries()
+            .map_err(|error| RuntimeError::BuildContext(error.to_string()))?;
+        let Some(entry) = entries.next() else {
+            return Ok(None);
+        };
+        let mut entry = entry.map_err(|error| RuntimeError::BuildContext(error.to_string()))?;
+        let mut body = Vec::new();
+        entry
+            .read_to_end(&mut body)
+            .map_err(|error| RuntimeError::BuildContext(error.to_string()))?;
+        Ok(Some(body))
     }
 
     /// Stops one Docker container.

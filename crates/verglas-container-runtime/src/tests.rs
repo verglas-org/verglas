@@ -8,13 +8,58 @@ use async_trait::async_trait;
 use super::{
     ContainerSpec, DockerApi, DockerRuntimeCore, EngineContainer, EngineCreateRequest,
     LABEL_MANAGED, LABEL_SPEC_DIGEST, ObservedState, ReconcileOutcome, RuntimeError,
-    TypescriptProject, VesselHttp, VesselProjectSpec, VesselRole, VesselSpec,
-    ensure_local_postgres_tls,
+    TypescriptProject, VesselHttp, VesselProjectSpec, VesselRole, VesselSpec, WorkerInvocation,
+    WorkerProjectSpec, WorkerResources, WorkerRunResult, WorkerRuntime, ensure_local_postgres_tls,
 };
 
 #[derive(Clone, Default)]
 struct FakeDocker {
     state: Arc<Mutex<FakeState>>,
+}
+
+/// Hard worker limits are part of the immutable engine request.
+#[test]
+fn worker_limits_reach_the_engine_create_request() {
+    let specification = ContainerSpec::new("run-limited", "verglas/worker:sha256-test")
+        .with_resources(WorkerResources {
+            vcpus: 0.5,
+            memory_mib: 768,
+            pids: 64,
+        });
+
+    let request = specification.create_request().expect("create request");
+    let resources = request.resources.expect("resource limits");
+    assert_eq!(resources.vcpus, 0.5);
+    assert_eq!(resources.memory_mib, 768);
+    assert_eq!(resources.pids, 64);
+}
+
+/// Non-positive CPU or empty memory/PID ceilings are rejected.
+#[test]
+fn worker_limits_fail_closed() {
+    for resources in [
+        WorkerResources {
+            vcpus: 0.0,
+            memory_mib: 512,
+            pids: 64,
+        },
+        WorkerResources {
+            vcpus: 1.0,
+            memory_mib: 0,
+            pids: 64,
+        },
+        WorkerResources {
+            vcpus: 1.0,
+            memory_mib: 512,
+            pids: 0,
+        },
+    ] {
+        let error = ContainerSpec::new("run-limited", "image")
+            .with_resources(resources)
+            .validate()
+            .expect_err("invalid resources");
+        assert!(matches!(error, RuntimeError::InvalidWorkerResources));
+    }
 }
 
 #[derive(Default)]
@@ -23,6 +68,54 @@ struct FakeState {
     networks: BTreeMap<String, BTreeMap<String, String>>,
     events: VecDeque<String>,
     builds: BTreeMap<String, Vec<u8>>,
+    exit_code: i64,
+    result_file: Option<Vec<u8>>,
+    logs: String,
+    wait_error: bool,
+}
+
+/// A bounded run receives reserved bindings, returns its result, and is removed.
+#[tokio::test]
+async fn bounded_worker_run_returns_result_and_cleans_up() {
+    let api = FakeDocker::default();
+    {
+        let mut state = api.state.lock().expect("fake state");
+        state.result_file = Some(br#"{"rows":2346855,"error":null}"#.to_vec());
+        state.logs = "parsed options\n".to_owned();
+    }
+    let runtime = DockerRuntimeCore::new(api.clone());
+    let result = runtime
+        .run_worker(&WorkerInvocation {
+            run_id: "run-options-20260808".to_owned(),
+            worker: "massive-options".to_owned(),
+            image: "verglas/worker-massive-options:sha256-test".to_owned(),
+            entrypoint: vec!["python".to_owned(), "worker.py".to_owned()],
+            environment: BTreeMap::from([("API_KEY".to_owned(), "secret".to_owned())]),
+            target: "market.options".to_owned(),
+            endpoint: "http://verglas-server:8334".to_owned(),
+            token: String::new(),
+            network: None,
+            event: serde_json::json!({"id":"tick-1","source":"urn:test","specversion":"1.0","type":"test"}),
+            resources: WorkerResources { vcpus: 1.0, memory_mib: 1024, pids: 64 },
+            timeout_seconds: 600,
+        })
+        .await
+        .expect("worker result");
+
+    assert_eq!(
+        result,
+        WorkerRunResult {
+            rows_produced: 2_346_855,
+            logs: "parsed options\n".to_owned()
+        }
+    );
+    let events = api.events();
+    assert_eq!(events[0], "create:verglas-run-options-20260808");
+    assert_eq!(events[1], "start:verglas-run-options-20260808");
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("remove:verglas-run-options-20260808")
+    );
 }
 
 impl FakeDocker {
@@ -104,6 +197,30 @@ impl DockerApi for FakeDocker {
         Ok(())
     }
 
+    /// Returns the configured fake workload exit code.
+    async fn wait(&self, name: &str) -> Result<i64, RuntimeError> {
+        let mut state = self.state.lock().expect("fake state lock");
+        state.events.push_back(format!("wait:{name}"));
+        if state.wait_error {
+            return Err(RuntimeError::Engine("wait failed".to_owned()));
+        }
+        Ok(state.exit_code)
+    }
+
+    /// Returns the configured fake workload logs.
+    async fn logs(&self, name: &str) -> Result<String, RuntimeError> {
+        let mut state = self.state.lock().expect("fake state lock");
+        state.events.push_back(format!("logs:{name}"));
+        Ok(state.logs.clone())
+    }
+
+    /// Returns the configured fake worker result file.
+    async fn read_file(&self, name: &str, path: &str) -> Result<Option<Vec<u8>>, RuntimeError> {
+        let mut state = self.state.lock().expect("fake state lock");
+        state.events.push_back(format!("read:{name}:{path}"));
+        Ok(state.result_file.clone())
+    }
+
     /// Stops an existing running container.
     async fn stop(&self, name: &str) -> Result<(), RuntimeError> {
         let mut state = self.state.lock().expect("fake state lock");
@@ -161,6 +278,38 @@ impl DockerApi for FakeDocker {
     }
 }
 
+/// Runtime observation failures still remove the ephemeral worker container.
+#[tokio::test]
+async fn bounded_worker_run_cleans_up_after_engine_failure() {
+    let api = FakeDocker::default();
+    api.state.lock().expect("fake state").wait_error = true;
+    let runtime = DockerRuntimeCore::new(api.clone());
+    let invocation = WorkerInvocation {
+        run_id: "run-engine-failure".to_owned(),
+        worker: "failure".to_owned(),
+        image: "verglas/worker-failure:sha256-test".to_owned(),
+        entrypoint: vec!["false".to_owned()],
+        environment: BTreeMap::new(),
+        target: String::new(),
+        endpoint: "http://verglas-server:8334".to_owned(),
+        token: String::new(),
+        network: None,
+        event: serde_json::json!({}),
+        resources: WorkerResources {
+            vcpus: 1.0,
+            memory_mib: 128,
+            pids: 16,
+        },
+        timeout_seconds: 30,
+    };
+
+    assert!(runtime.run_worker(&invocation).await.is_err());
+    assert_eq!(
+        api.events().last().map(String::as_str),
+        Some("remove:verglas-run-engine-failure")
+    );
+}
+
 fn typescript_project() -> VesselProjectSpec {
     VesselProjectSpec {
         name: "shipping-map".to_owned(),
@@ -185,6 +334,151 @@ fn typescript_project() -> VesselProjectSpec {
             health_path: Some("/health".to_owned()),
         },
     }
+}
+
+/// Returns one locked Python worker project with a third-party dependency.
+fn python_worker_project() -> WorkerProjectSpec {
+    WorkerProjectSpec {
+        name: "massive-parser".to_owned(),
+        runtime: WorkerRuntime::Python,
+        entrypoint: vec!["python".to_owned(), "worker.py".to_owned()],
+        files: BTreeMap::from([
+            (
+                "pyproject.toml".to_owned(),
+                "[project]\nname = \"massive-parser\"\nversion = \"0.1.0\"\ndependencies = [\"polars==1.34.0\"]\n"
+                    .to_owned(),
+            ),
+            ("uv.lock".to_owned(), "version = 1\nrevision = 1\n".to_owned()),
+            (
+                "worker.py".to_owned(),
+                "import polars as pl\nprint(pl.__version__)\n".to_owned(),
+            ),
+        ]),
+    }
+}
+
+/// Returns one locked Bun worker project that executes TypeScript directly.
+fn bun_worker_project() -> WorkerProjectSpec {
+    WorkerProjectSpec {
+        name: "event-parser".to_owned(),
+        runtime: WorkerRuntime::Bun,
+        entrypoint: vec!["bun".to_owned(), "worker.ts".to_owned()],
+        files: BTreeMap::from([
+            (
+                "package.json".to_owned(),
+                r#"{"dependencies":{"csv-parse":"6.1.0"}}"#.to_owned(),
+            ),
+            (
+                "bun.lock".to_owned(),
+                "{\"lockfileVersion\": 1}\n".to_owned(),
+            ),
+            (
+                "worker.ts".to_owned(),
+                "import { parse } from 'csv-parse/sync'; console.log(parse('a\\n1'));\n".to_owned(),
+            ),
+        ]),
+    }
+}
+
+#[test]
+fn python_worker_build_is_locked_and_content_addressed() {
+    let original = python_worker_project()
+        .build_context()
+        .expect("python build context");
+    assert!(
+        original
+            .image
+            .starts_with("verglas/worker-massive-parser:sha256-")
+    );
+    assert!(original.dockerfile.contains("FROM python:3.13"));
+    assert!(original.dockerfile.contains("uv sync --frozen --no-dev"));
+    assert!(!original.context.is_empty());
+
+    let mut changed = python_worker_project();
+    changed.files.insert(
+        "uv.lock".to_owned(),
+        "version = 1\nrevision = 2\n".to_owned(),
+    );
+    assert_ne!(
+        original.image,
+        changed.build_context().expect("changed context").image
+    );
+}
+
+#[test]
+fn python_worker_rejects_an_unlocked_project() {
+    let mut project = python_worker_project();
+    project.files.remove("uv.lock");
+    assert!(matches!(
+        project.build_context(),
+        Err(RuntimeError::MissingProjectFile { path }) if path == "uv.lock"
+    ));
+}
+
+#[test]
+fn bun_worker_build_is_locked_and_content_addressed() {
+    let original = bun_worker_project()
+        .build_context()
+        .expect("bun build context");
+    assert!(
+        original
+            .image
+            .starts_with("verglas/worker-event-parser:sha256-")
+    );
+    assert!(original.dockerfile.contains("FROM oven/bun:1.3.8"));
+    assert!(
+        original
+            .dockerfile
+            .contains("bun install --frozen-lockfile --production")
+    );
+
+    let mut changed = bun_worker_project();
+    changed.files.insert(
+        "bun.lock".to_owned(),
+        "{\"lockfileVersion\": 2}\n".to_owned(),
+    );
+    assert_ne!(
+        original.image,
+        changed.build_context().expect("changed context").image
+    );
+}
+
+#[test]
+fn bun_worker_rejects_an_unlocked_project() {
+    let mut project = bun_worker_project();
+    project.files.remove("bun.lock");
+    assert!(matches!(
+        project.build_context(),
+        Err(RuntimeError::MissingProjectFile { path }) if path == "bun.lock"
+    ));
+}
+
+#[test]
+fn custom_worker_uses_the_submitted_dockerfile() {
+    let project = WorkerProjectSpec {
+        name: "native-parser".to_owned(),
+        runtime: WorkerRuntime::Container,
+        entrypoint: vec!["/app/parser".to_owned()],
+        files: BTreeMap::from([
+            (
+                "Dockerfile".to_owned(),
+                "FROM rust:1.96 AS build\nWORKDIR /src\nCOPY . .\nRUN rustc worker.rs -o /worker\nFROM debian:bookworm-slim\nCOPY --from=build /worker /app/parser\n"
+                    .to_owned(),
+            ),
+            (
+                "worker.rs".to_owned(),
+                "fn main() { println!(\"ok\"); }\n".to_owned(),
+            ),
+        ]),
+    };
+
+    let build = project.build_context().expect("custom build context");
+    assert_eq!(build.dockerfile, project.files["Dockerfile"]);
+    assert!(
+        build
+            .image
+            .starts_with("verglas/worker-native-parser:sha256-")
+    );
 }
 
 #[test]

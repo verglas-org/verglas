@@ -4,7 +4,7 @@ description: "Package one market-data ingestion worker and reuse it with every t
 icon: "workflow"
 ---
 
-A worker is a bounded command plus trigger declarations. Every run receives one
+A worker is a locked OCI project plus trigger declarations. Every run receives one
 [CloudEvents 1.0](https://cloudevents.io/) envelope in `VERGLAS_CLOUD_EVENT`.
 The scheduler stores the job in Postgres before acknowledging the trigger, and
 the worker uses the CloudEvent identity as its Iceberg idempotency key.
@@ -16,9 +16,8 @@ files are reused by the Manual, HTTP, Cron, and CloudEvents guides.
 ## Before you begin
 
 Complete [Create your first table](/docs/get-started/first-table), then start the
-default Compose stack. It includes the scheduler and its durable Postgres queue;
-the container runtime remains responsible for dynamically added Vessels and
-database components.
+default Compose stack. It includes the scheduler, its durable Postgres queue,
+and the container runtime that builds and executes worker images.
 
 ```bash
 docker compose up --detach --build
@@ -162,18 +161,21 @@ if __name__ == "__main__":
 ## Create the worker manifest
 
 Create `examples/workers/market-data-ingest/worker.toml`. The manifest bundles
-`ingest.py`, grants the target table, selects SPY through an environment value,
-and declares the three automatic triggers. Manual dispatch needs no declaration.
+`ingest.py`, its Python project and lockfile, grants the target table, selects
+SPY through an environment value, and declares the three automatic triggers.
+Manual dispatch needs no declaration.
 
 ```toml worker.toml
 spec_version = 1
 name = "market-data-ingest"
-exec = ["python3", "ingest.py"]
-cwd = "."
+runtime = "python"
+entrypoint = ["python", "ingest.py"]
 target_tables = ["market.ohlcv"]
 
 [files]
 "ingest.py" = "@file:ingest.py"
+"pyproject.toml" = "@file:pyproject.toml"
+"uv.lock" = "@file:uv.lock"
 
 [env]
 SYMBOL = "SPY"
@@ -195,13 +197,15 @@ source = "urn:rabbitmq:market-data"
 subject = "SPY"
 
 [resources]
-vcpus = 0.25
-mem_mib = 256
+vcpus = 1.0
+mem_mib = 1024
+pids = 128
+timeout_secs = 300
 ```
 
-`@file:ingest.py` means the CLI reads the file next to the manifest and embeds
-its contents in the registered worker. The scheduler does not need a shared
-filesystem.
+An `@file:` value makes the CLI embed the adjacent source into the submitted
+project. Registration builds a content-addressed image with `uv sync --frozen`.
+The scheduler does not need a shared filesystem or a Python installation.
 
 ## Register the worker
 

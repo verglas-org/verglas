@@ -1,13 +1,13 @@
 //! The one portable worker spec.
 //!
 //! A single versioned file (TOML or JSON) describes a worker completely: its
-//! name, the command to run, the files it bundles, its environment (with
+//! name, its locked build runtime, container command, files, environment (with
 //! `@secret:` references), its trigger, its target tables, and its resource
 //! hints. The CLI translates it into the local server's `POST /v1/workers`
 //! body so the same file registers and round-trips without edits.
 //!
-//! A JS-module worker is not a special kind: it is just a spec whose `exec`
-//! starts with `bun`. Nothing here assumes a runtime.
+//! Python and Bun projects use platform-owned OCI build policies. A container
+//! project supplies its own auditable Dockerfile.
 //!
 //! Secrets never travel in the spec beyond a NAME. An env value of the form
 //! `@secret:NAME` is a reference the server resolves from its own secret store
@@ -20,6 +20,18 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use verglas_sdk::worker::Catchup;
+
+/// Build policy used to create an immutable worker image.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkerRuntime {
+    /// Python project locked by `uv.lock`.
+    Python,
+    /// JavaScript or TypeScript project locked by `bun.lock`.
+    Bun,
+    /// Project with an explicit Dockerfile.
+    Container,
+}
 
 /// The spec version this CLI writes and understands.
 pub const SPEC_VERSION: u32 = 1;
@@ -112,6 +124,12 @@ pub struct Resources {
     /// Memory the worker is sized for, in MiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_mib: Option<u64>,
+    /// Maximum number of processes in one invocation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pids: Option<i64>,
+    /// Maximum wall-clock duration in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 /// The portable worker spec, version 1.
@@ -123,13 +141,10 @@ pub struct WorkerManifest {
     pub spec_version: u32,
     /// The worker name.
     pub name: String,
-    /// The command and its arguments. Element 0 is the program. May be empty only
-    /// for a follow worker that tails a file.
-    #[serde(default)]
-    pub exec: Vec<String>,
-    /// The working directory the command and bundled files resolve against.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<String>,
+    /// Platform-owned build policy for this worker project.
+    pub runtime: WorkerRuntime,
+    /// Container command and arguments. Element 0 is the executable.
+    pub entrypoint: Vec<String>,
     /// Files bundled with the worker, path to text content. Written under the
     /// worker's directory on the local server.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -155,7 +170,7 @@ fn default_spec_version() -> u32 {
 }
 
 fn is_default_resources(r: &Resources) -> bool {
-    r.vcpus.is_none() && r.mem_mib.is_none()
+    r.vcpus.is_none() && r.mem_mib.is_none() && r.pids.is_none() && r.timeout_secs.is_none()
 }
 
 impl WorkerManifest {
@@ -223,12 +238,19 @@ impl WorkerManifest {
             return Err("a follow worker cannot declare bounded triggers".into());
         }
         let follow_file = matches!(follows.first(), Some(Trigger::Follow { file: Some(_) }));
-        if self.exec.is_empty() && !follow_file {
-            return Err(
-                "the worker spec needs an `exec` command (only a follow worker that tails a \
-                 file may omit it)"
-                    .into(),
-            );
+        if self.entrypoint.is_empty() && !follow_file {
+            return Err("the worker spec needs a non-empty `entrypoint`".into());
+        }
+        for required in match self.runtime {
+            WorkerRuntime::Python => &["pyproject.toml", "uv.lock"][..],
+            WorkerRuntime::Bun => &["package.json", "bun.lock"][..],
+            WorkerRuntime::Container => &["Dockerfile"][..],
+        } {
+            if !self.files.contains_key(*required) {
+                return Err(
+                    format!("the {:?} worker project needs `{required}`", self.runtime).into(),
+                );
+            }
         }
         for trigger in &self.triggers {
             if let Trigger::Webhook { path: Some(path) } = trigger
@@ -275,13 +297,17 @@ impl WorkerManifest {
         self.target_tables.first().map(String::as_str)
     }
 
-    /// The `code` JSON a local worker row carries: the exec array and cwd.
+    /// The immutable worker project encoded in the registry's `code` column.
     fn code_json(&self) -> Value {
-        let mut code = json!({ "exec": self.exec });
-        if let Some(cwd) = &self.cwd {
-            code["cwd"] = Value::String(cwd.clone());
-        }
-        Value::String(code.to_string())
+        Value::String(
+            json!({
+                "name": self.name,
+                "runtime": self.runtime,
+                "entrypoint": self.entrypoint,
+                "files": self.files,
+            })
+            .to_string(),
+        )
     }
 
     /// The `triggers` JSON array a local worker row carries.
@@ -297,9 +323,7 @@ impl WorkerManifest {
         if !self.env.is_empty() {
             config.insert("env".to_owned(), json!(self.env));
         }
-        if !self.files.is_empty() {
-            config.insert("files".to_owned(), json!(self.files));
-        }
+        config.insert("resources".to_owned(), json!(self.resources));
         Value::String(Value::Object(config).to_string())
     }
 
@@ -329,8 +353,13 @@ impl WorkerManifest {
             .ok_or("worker row has no name")?
             .to_owned();
         let code: Value = parse_embedded(row.get("code"));
-        let exec: Vec<String> = code
-            .get("exec")
+        let runtime = serde_json::from_value(
+            code.get("runtime")
+                .cloned()
+                .ok_or("worker row has no runtime")?,
+        )?;
+        let entrypoint: Vec<String> = code
+            .get("entrypoint")
             .and_then(Value::as_array)
             .map(|a| {
                 a.iter()
@@ -338,7 +367,6 @@ impl WorkerManifest {
                     .collect()
             })
             .unwrap_or_default();
-        let cwd = code.get("cwd").and_then(Value::as_str).map(str::to_owned);
         let config: Value = parse_embedded(row.get("config"));
         let env: BTreeMap<String, String> = config
             .get("env")
@@ -349,7 +377,7 @@ impl WorkerManifest {
                     .collect()
             })
             .unwrap_or_default();
-        let files: BTreeMap<String, String> = config
+        let files: BTreeMap<String, String> = code
             .get("files")
             .and_then(Value::as_object)
             .map(|o| {
@@ -366,16 +394,22 @@ impl WorkerManifest {
             .filter(|s| !s.is_empty())
             .map(|s| vec![s.to_owned()])
             .unwrap_or_default();
+        let resources = config
+            .get("resources")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
         Ok(WorkerManifest {
             spec_version: SPEC_VERSION,
             name,
-            exec,
-            cwd,
+            runtime,
+            entrypoint,
             files,
             env,
             triggers,
             target_tables,
-            resources: Resources::default(),
+            resources,
         })
     }
 }
@@ -445,13 +479,42 @@ fn triggers_from_local(triggers: &Value) -> Vec<Trigger> {
 mod tests {
     use super::*;
 
+    /// A Python worker declares its runtime, locked dependencies, and container entrypoint.
+    #[test]
+    fn parses_dependency_aware_python_worker() {
+        let manifest: WorkerManifest = toml::from_str(
+            r#"
+name = "massive-options"
+runtime = "python"
+entrypoint = ["python", "worker.py"]
+
+[files]
+"pyproject.toml" = "[project]\nname='worker'\nversion='0.1.0'\n"
+"uv.lock" = "version = 1\n"
+"worker.py" = "print('ok')\n"
+"#,
+        )
+        .expect("worker manifest");
+
+        assert_eq!(manifest.runtime, WorkerRuntime::Python);
+        assert_eq!(manifest.entrypoint, ["python", "worker.py"]);
+        assert!(manifest.validate().is_ok());
+    }
+
     fn cron_manifest() -> WorkerManifest {
         WorkerManifest {
             spec_version: 1,
             name: "collector".to_owned(),
-            exec: vec!["python3".to_owned(), "collect.py".to_owned()],
-            cwd: Some("/app".to_owned()),
-            files: BTreeMap::new(),
+            runtime: WorkerRuntime::Python,
+            entrypoint: vec!["python".to_owned(), "collect.py".to_owned()],
+            files: BTreeMap::from([
+                (
+                    "pyproject.toml".to_owned(),
+                    "[project]\nname='collector'\nversion='0.1.0'\n".to_owned(),
+                ),
+                ("uv.lock".to_owned(), "version = 1\n".to_owned()),
+                ("collect.py".to_owned(), "print('ok')\n".to_owned()),
+            ]),
             env: BTreeMap::from([
                 ("LOG_LEVEL".to_owned(), "info".to_owned()),
                 ("API_KEY".to_owned(), "@secret:MY_KEY".to_owned()),
@@ -465,6 +528,8 @@ mod tests {
             resources: Resources {
                 vcpus: Some(0.25),
                 mem_mib: Some(256),
+                pids: Some(64),
+                timeout_secs: Some(300),
             },
         }
     }
@@ -476,8 +541,13 @@ mod tests {
         let manifest: WorkerManifest = toml::from_str(
             r#"
 name = "market-data-ingest"
-exec = ["python3", "ingest.py"]
-cwd = "."
+runtime = "python"
+entrypoint = ["python", "ingest.py"]
+
+[files]
+"pyproject.toml" = "[project]\nname='ingest'\nversion='0.1.0'\n"
+"uv.lock" = "version = 1\n"
+"ingest.py" = "print('ok')\n"
 
 [[triggers]]
 type = "webhook"
@@ -521,8 +591,11 @@ subject = "SPY"
             dir.path().join("worker.toml"),
             r#"
 name = "spy"
-exec = ["python3", "worker.py"]
+runtime = "python"
+entrypoint = ["python", "worker.py"]
 [files]
+"pyproject.toml" = "[project]\nname='spy'\nversion='0.1.0'\n"
+"uv.lock" = "version = 1\n"
 "worker.py" = "@file:worker.py"
 "#,
         )
@@ -583,7 +656,11 @@ exec = ["python3", "worker.py"]
         let webhook: WorkerManifest = toml::from_str(
             r#"
 name = "hook"
-exec = ["sh", "worker.sh"]
+runtime = "container"
+entrypoint = ["sh", "worker.sh"]
+[files]
+"Dockerfile" = "FROM alpine:3.22\nWORKDIR /app\nCOPY . .\n"
+"worker.sh" = "exit 0\n"
 [[triggers]]
 type = "webhook"
 path = "/callbacks/orders"
@@ -597,7 +674,12 @@ path = "/callbacks/orders"
 
         let event: WorkerManifest = serde_json::from_value(json!({
             "name": "changed",
-            "exec": ["sh", "worker.sh"],
+            "runtime": "container",
+            "entrypoint": ["sh", "worker.sh"],
+            "files": {
+                "Dockerfile": "FROM alpine:3.22\nWORKDIR /app\nCOPY . .\n",
+                "worker.sh": "exit 0\n"
+            },
             "triggers": [{
                 "type": "event",
                 "event_type": "org.apache.iceberg.snapshot.committed",
@@ -640,8 +722,7 @@ path = "/callbacks/orders"
         assert_eq!(cron_manifest().secret_names(), vec!["MY_KEY".to_owned()]);
     }
 
-    /// The local worker body carries the exec array in `code`, the cron trigger,
-    /// the output table, and env/files in `config`.
+    /// The local worker body carries the build project, trigger, output, and runtime config.
     #[test]
     fn translates_to_a_local_worker() {
         let body = cron_manifest().to_local_worker();
@@ -649,8 +730,9 @@ path = "/callbacks/orders"
         assert_eq!(body["output"], "metrics.samples");
         let code: Value =
             serde_json::from_str(body["code"].as_str().expect("code string")).expect("code parses");
-        assert_eq!(code["exec"][0], "python3");
-        assert_eq!(code["cwd"], "/app");
+        assert_eq!(code["runtime"], "python");
+        assert_eq!(code["entrypoint"][0], "python");
+        assert!(code["files"]["uv.lock"].is_string());
         let triggers: Value =
             serde_json::from_str(body["triggers"].as_str().expect("triggers string"))
                 .expect("triggers parse");
@@ -668,22 +750,23 @@ path = "/callbacks/orders"
         let row = manifest.to_local_worker();
         let back = WorkerManifest::from_local_worker(&row).expect("rebuild");
         assert_eq!(back.name, manifest.name);
-        assert_eq!(back.exec, manifest.exec);
-        assert_eq!(back.cwd, manifest.cwd);
+        assert_eq!(back.runtime, manifest.runtime);
+        assert_eq!(back.entrypoint, manifest.entrypoint);
+        assert_eq!(back.files, manifest.files);
         assert_eq!(back.env, manifest.env);
         assert!(matches!(back.triggers.as_slice(), [Trigger::Cron { .. }]));
         assert_eq!(back.target_tables, manifest.target_tables);
     }
 
-    /// A follow worker is recognized; a file-follow may omit exec.
+    /// A follow worker is recognized; a file-follow may omit an entrypoint.
     #[test]
     fn follow_worker_validates_without_exec_when_tailing_a_file() {
         let manifest = WorkerManifest {
             spec_version: 1,
             name: "tail".to_owned(),
-            exec: vec![],
-            cwd: None,
-            files: BTreeMap::new(),
+            runtime: WorkerRuntime::Container,
+            entrypoint: vec![],
+            files: BTreeMap::from([("Dockerfile".to_owned(), "FROM alpine:3.22\n".to_owned())]),
             env: BTreeMap::new(),
             triggers: vec![Trigger::Follow {
                 file: Some("/var/log/app.log".to_owned()),

@@ -23,7 +23,7 @@ use crate::{
     AppliedComponent, AppliedIntegration, AppliedVessel, CompositionError, ContainerSpec,
     DockerRuntime, ManagedContainer, ObservedState, ReconcileOutcome, RuntimeError,
     VesselApplyPlan, VesselApplyRequest, VesselProjectSpec, VesselRole, VesselSpec,
-    WorkerRegistration,
+    WorkerInvocation, WorkerProjectSpec, WorkerRegistration, WorkerRunResult,
 };
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
@@ -109,6 +109,8 @@ impl IntoResponse for ServiceError {
                 | RuntimeError::InvalidPlatform
                 | RuntimeError::InvalidNetwork
                 | RuntimeError::InvalidPort
+                | RuntimeError::InvalidWorkerResources
+                | RuntimeError::InvalidWorkerTimeout
                 | RuntimeError::InvalidHealthPath
                 | RuntimeError::InvalidProjectPath { .. }
                 | RuntimeError::MissingProjectFile { .. }
@@ -117,7 +119,12 @@ impl IntoResponse for ServiceError {
                 | RuntimeError::ProjectTooLarge
                 | RuntimeError::DockerAuthority { .. },
             ) => StatusCode::BAD_REQUEST,
-            ServiceError::Runtime(RuntimeError::UnmanagedCollision { .. }) => StatusCode::CONFLICT,
+            ServiceError::Runtime(
+                RuntimeError::UnmanagedCollision { .. } | RuntimeError::RunAlreadyExists { .. },
+            ) => StatusCode::CONFLICT,
+            ServiceError::Runtime(RuntimeError::WorkerFailed { .. }) => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
             ServiceError::VesselRequest(_) | ServiceError::VesselResponseTooLarge => {
                 StatusCode::BAD_GATEWAY
             }
@@ -197,6 +204,8 @@ impl RuntimeService {
             )
             .route("/v1/vessel-compositions", get(list_vessel_compositions))
             .route("/v1/vessels/{name}/project", put(put_vessel_project))
+            .route("/v1/worker-projects/{name}", put(put_worker_project))
+            .route("/v1/worker-runs/{run_id}", put(put_worker_run))
             .route("/v1/vessels/{name}/http/{*path}", any(proxy_vessel))
             .route(
                 "/v1/containers/{deployment_id}",
@@ -582,6 +591,57 @@ struct VesselProjectView {
     name: String,
     image: String,
     outcome: ReconcileOutcome,
+}
+
+/// Immutable image identity returned after a locked worker build.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerProjectView {
+    name: String,
+    image: String,
+}
+
+/// Builds one bounded worker project without starting a long-lived container.
+async fn put_worker_project(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(name): AxumPath<String>,
+    headers: HeaderMap,
+    Json(project): Json<WorkerProjectSpec>,
+) -> Result<Json<WorkerProjectView>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    if name != project.name {
+        return Err(ServiceError::IdentityMismatch {
+            path: name,
+            body: project.name,
+        });
+    }
+    let _operation = state.operation.lock().await;
+    let build = state.runtime.build_worker_project(&project).await?;
+    Ok(Json(WorkerProjectView {
+        name: project.name,
+        image: build.image,
+    }))
+}
+
+/// Executes one worker image synchronously inside a bounded ephemeral container.
+async fn put_worker_run(
+    State(state): State<Arc<ServiceState>>,
+    AxumPath(run_id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(mut invocation): Json<WorkerInvocation>,
+) -> Result<Json<WorkerRunResult>, ServiceError> {
+    authorize(&headers, &state.token)?;
+    if run_id != invocation.run_id {
+        return Err(ServiceError::IdentityMismatch {
+            path: run_id,
+            body: invocation.run_id,
+        });
+    }
+    validate_run_identity(&run_id)?;
+    if invocation.network.is_none() {
+        invocation.network = Some(state.default_network.clone());
+    }
+    Ok(Json(state.runtime.run_worker(&invocation).await?))
 }
 
 /// Builds a standalone TypeScript project and starts its immutable Vessel image.

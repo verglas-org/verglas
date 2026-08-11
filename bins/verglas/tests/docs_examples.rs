@@ -66,7 +66,7 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "VERGLAS_S3_ACCESS_KEY_ID:",
         "VERGLAS_S3_SECRET_ACCESS_KEY:",
         "VERGLAS_SCHEDULER_URL:",
-        "verglas-cache:/var/lib/verglas",
+        "VERGLAS_CACHE_HOST_DIR:-verglas-cache",
         "nofile:",
         "soft: 8192",
         "hard: 8192",

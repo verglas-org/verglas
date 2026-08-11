@@ -72,7 +72,7 @@ services:
       VERGLAS_ACCESS_TOKEN_FILE: /var/run/verglas/server/verglas-server.token
       VERGLAS_MANAGED_CATALOG_URI: http://verglas-lakekeeper:8181
     volumes:
-      - verglas-cache:/var/lib/verglas
+      - ${VERGLAS_CACHE_HOST_DIR:-verglas-cache}:/var/lib/verglas
       - verglas-access-server-credentials:/var/run/verglas/server:ro
     # Contain a future socket or cache FD leak inside this service. Docker's
     # million-descriptor default is large enough to exhaust a desktop host.
@@ -166,6 +166,8 @@ services:
       VERGLAS_SCHEDULER_QUEUE: local
       VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
       VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
+      VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360
+      VERGLAS_CONTAINER_RUNTIME_TOKEN: ${VERGLAS_CONTAINER_RUNTIME_TOKEN:-verglas-local-container-runtime}
       VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_URI: http://verglas-access:8345
       VERGLAS_TENANT_ID: ${VERGLAS_TENANT_ID:-local}
@@ -173,6 +175,8 @@ services:
       verglas-server:
         condition: service_started
       verglas-access:
+        condition: service_healthy
+      verglas-container-runtime:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8340/healthz')"]

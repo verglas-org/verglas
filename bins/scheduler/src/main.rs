@@ -2,12 +2,11 @@
 //!
 //! Verglas pushes complete worker events to this service. The service persists
 //! declarations, jobs, and leases in its Postgres control database, immediately
-//! claims ready work, and executes the local worker harness. It mounts no state
-//! and contains no connection-broker behavior.
+//! claims ready work, and delegates tenant code to the container runtime. It
+//! mounts no state and contains no connection-broker behavior.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::path::{Component, Path};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,7 +19,9 @@ use axum::{Json, Router, extract::Request, middleware};
 use chrono::{DateTime, Utc};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use verglas_harness::worker::{WorkerExec, WorkerRun, run_worker};
+use verglas_container_runtime::{
+    WorkerInvocation, WorkerProjectSpec, WorkerResources, WorkerRunResult,
+};
 use verglas_scheduler::{
     ClaimRequest, ClaimedJob, CompleteRequest, Completion, EnqueueOutcome, Invocation, Lease,
     NextWakeRequest, PgQueue, PgWorkerRegistry, RenewRequest, RunQueue, WorkerRecord, WorkerSpec,
@@ -38,7 +39,7 @@ struct Args {
     /// Postgres database that owns all durable scheduler state.
     #[arg(long, env = "VERGLAS_SCHEDULER_DATABASE_URL")]
     database_url: String,
-    /// Data-plane endpoint injected into worker subprocesses.
+    /// Data-plane endpoint injected into worker containers.
     #[arg(long, env = "VERGLAS_WORKER_ENDPOINT")]
     worker_endpoint: String,
     /// Queue identity served by the configured Verglas instance.
@@ -59,100 +60,49 @@ struct Args {
     /// Hex-encoded 256-bit key used to encrypt scheduler runtime secrets.
     #[arg(long, env = "VERGLAS_SECRET_ENCRYPTION_KEY", hide_env_values = true)]
     secret_encryption_key: String,
+    /// Authenticated Verglas container runtime endpoint.
+    #[arg(long, env = "VERGLAS_CONTAINER_RUNTIME_URL")]
+    container_runtime_url: String,
+    /// Bearer token accepted by the Verglas container runtime.
+    #[arg(long, env = "VERGLAS_CONTAINER_RUNTIME_TOKEN", hide_env_values = true)]
+    container_runtime_token: String,
 }
 
 /// The portable portion of a worker registry config.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct WorkerConfig {
-    /// Plain subprocess environment bindings.
+    /// Plain container environment bindings.
     #[serde(default)]
     env: BTreeMap<String, String>,
-    /// Text files materialized into one isolated run directory.
+    /// Hard invocation limits.
     #[serde(default)]
-    files: BTreeMap<String, String>,
+    resources: WorkerResourceConfig,
 }
 
-/// One prepared subprocess and the temporary bundle that keeps its files live.
+/// Optional portable limits with operator-safe defaults.
+#[derive(Default, Deserialize)]
+struct WorkerResourceConfig {
+    vcpus: Option<f64>,
+    mem_mib: Option<u64>,
+    pids: Option<i64>,
+    timeout_secs: Option<u64>,
+}
+
+/// Built worker identity stored with its immutable source declaration.
+#[derive(Deserialize)]
+struct BuiltWorkerCode {
+    image: String,
+    entrypoint: Vec<String>,
+}
+
+/// Prepared image and runtime-only configuration for one invocation.
 struct PreparedWorker {
-    /// Executable subprocess contract.
-    exec: WorkerExec,
-    /// Isolated directory removed after the run finishes.
-    _root: tempfile::TempDir,
-}
-
-/// Validates that a bundled file path stays below the isolated run directory.
-fn safe_bundle_path(path: &Path) -> Result<&Path, String> {
-    if path.as_os_str().is_empty()
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        return Err(format!(
-            "worker bundle path `{}` is not a relative file path",
-            path.display()
-        ));
-    }
-    Ok(path)
-}
-
-/// Materializes one portable worker config into an isolated run directory.
-#[cfg(test)]
-fn prepare_worker(worker: &WorkerRecord) -> Result<PreparedWorker, String> {
-    let config: WorkerConfig = serde_json::from_str(&worker.config)
-        .map_err(|error| format!("worker {} config: {error}", worker.name))?;
-    if let Some((name, _)) = config
-        .env
-        .iter()
-        .find(|(_, value)| value.starts_with("@secret:"))
-    {
-        return Err(format!(
-            "worker {} secret binding {name} is unresolved",
-            worker.name
-        ));
-    }
-    prepare_worker_config(worker, config)
-}
-
-fn prepare_worker_config(
-    worker: &WorkerRecord,
-    config: WorkerConfig,
-) -> Result<PreparedWorker, String> {
-    let root = tempfile::tempdir()
-        .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
-    for (name, contents) in &config.files {
-        let relative = safe_bundle_path(Path::new(name))?;
-        let target = root.path().join(relative);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| format!("worker {} bundle directory: {error}", worker.name))?;
-        }
-        std::fs::write(&target, contents)
-            .map_err(|error| format!("worker {} bundle file {name}: {error}", worker.name))?;
-    }
-    let mut exec =
-        WorkerExec::from_config(&worker.name, &worker.code).map_err(|error| error.to_string())?;
-    if let Some(cwd) = exec.cwd.as_deref() {
-        let cwd = Path::new(cwd);
-        if !cwd.is_absolute() {
-            let relative = if cwd == Path::new(".") {
-                Path::new("")
-            } else {
-                safe_bundle_path(cwd)?
-            };
-            exec.cwd = Some(root.path().join(relative).to_string_lossy().into_owned());
-        } else if !config.files.is_empty() {
-            return Err(format!(
-                "worker {} has bundled files and an absolute cwd",
-                worker.name
-            ));
-        }
-    } else if !config.files.is_empty() {
-        exec.cwd = Some(root.path().to_string_lossy().into_owned());
-    }
-    exec.env = config.env;
-    Ok(PreparedWorker { exec, _root: root })
+    image: String,
+    entrypoint: Vec<String>,
+    environment: BTreeMap<String, String>,
+    resources: WorkerResources,
+    timeout_seconds: u64,
 }
 
 async fn prepare_registered_worker(
@@ -179,6 +129,26 @@ async fn prepare_registered_worker(
     prepare_worker_config(worker, config)
 }
 
+/// Converts persisted built code and resolved runtime config into one invocation.
+fn prepare_worker_config(
+    worker: &WorkerRecord,
+    config: WorkerConfig,
+) -> Result<PreparedWorker, String> {
+    let code: BuiltWorkerCode = serde_json::from_str(&worker.code)
+        .map_err(|error| format!("worker {} built code: {error}", worker.name))?;
+    Ok(PreparedWorker {
+        image: code.image,
+        entrypoint: code.entrypoint,
+        environment: config.env,
+        resources: WorkerResources {
+            vcpus: config.resources.vcpus.unwrap_or(4.0),
+            memory_mib: config.resources.mem_mib.unwrap_or(8_192),
+            pids: config.resources.pids.unwrap_or(512),
+        },
+        timeout_seconds: config.resources.timeout_secs.unwrap_or(3_600),
+    })
+}
+
 /// Queue enqueue response returned by `verglas-rest` and this service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnqueueResponse {
@@ -194,6 +164,76 @@ struct SchedulerState {
     queue: Arc<PgQueue>,
     registry: Arc<PgWorkerRegistry>,
     ready: Arc<tokio::sync::Notify>,
+    runtime: RuntimeClient,
+}
+
+/// Authenticated client for immutable worker builds and bounded runs.
+#[derive(Clone)]
+struct RuntimeClient {
+    endpoint: Arc<str>,
+    token: Arc<str>,
+    http: reqwest::Client,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerProjectView {
+    image: String,
+}
+
+impl RuntimeClient {
+    /// Creates one client without exposing its bearer through request payloads.
+    fn new(endpoint: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            endpoint: Arc::from(endpoint.into().trim_end_matches('/').to_owned()),
+            token: Arc::from(token.into()),
+            http: reqwest::Client::new(),
+        }
+    }
+
+    /// Builds one locked project and returns its immutable image identity.
+    async fn build(&self, project: &WorkerProjectSpec) -> Result<String, String> {
+        let response = self
+            .http
+            .put(format!(
+                "{}/v1/worker-projects/{}",
+                self.endpoint, project.name
+            ))
+            .bearer_auth(self.token.as_ref())
+            .json(project)
+            .send()
+            .await
+            .map_err(|error| format!("worker build request: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("worker build rejected: {error}"))?;
+        response
+            .json::<WorkerProjectView>()
+            .await
+            .map(|view| view.image)
+            .map_err(|error| format!("worker build response: {error}"))
+    }
+
+    /// Executes one built image through the bounded runtime API.
+    async fn run(&self, invocation: &WorkerInvocation) -> Result<WorkerRunResult, String> {
+        self.http
+            .put(format!(
+                "{}/v1/worker-runs/{}",
+                self.endpoint, invocation.run_id
+            ))
+            .bearer_auth(self.token.as_ref())
+            .timeout(Duration::from_secs(
+                invocation.timeout_seconds.saturating_add(30),
+            ))
+            .json(invocation)
+            .send()
+            .await
+            .map_err(|error| format!("worker run request: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("worker run rejected: {error}"))?
+            .json::<WorkerRunResult>()
+            .await
+            .map_err(|error| format!("worker run response: {error}"))
+    }
 }
 
 /// Accepts one complete worker event, persists it, and wakes execution now.
@@ -300,8 +340,32 @@ async fn list_workers(
 
 async fn register_worker(
     State(state): State<SchedulerState>,
-    Json(spec): Json<WorkerSpec>,
+    Json(mut spec): Json<WorkerSpec>,
 ) -> Response {
+    let project: WorkerProjectSpec = match serde_json::from_str(&spec.code) {
+        Ok(project) => project,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, format!("worker project: {error}")).into_response();
+        }
+    };
+    if project.name != spec.name {
+        return (
+            StatusCode::BAD_REQUEST,
+            "worker project name does not match registry name",
+        )
+            .into_response();
+    }
+    let image = match state.runtime.build(&project).await {
+        Ok(image) => image,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error).into_response(),
+    };
+    let mut built = match serde_json::to_value(&project) {
+        Ok(serde_json::Value::Object(value)) => value,
+        Ok(_) => unreachable!("worker project serializes as an object"),
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+    built.insert("image".to_owned(), serde_json::Value::String(image));
+    spec.code = serde_json::Value::Object(built).to_string();
     match state.registry.register(spec).await {
         Ok(worker) => {
             state.ready.notify_one();
@@ -581,27 +645,40 @@ async fn execute_claimed(
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("no worker named {}", claimed.job.worker))?;
     let prepared = prepare_registered_worker(registry, &worker).await?;
-    execute_claimed_worker(args, &worker, prepared, queue, claimed).await
+    let runtime = RuntimeClient::new(
+        args.container_runtime_url.clone(),
+        args.container_runtime_token.clone(),
+    );
+    execute_claimed_worker(args, &runtime, &worker, prepared, queue, claimed).await
 }
 
 async fn execute_claimed_worker(
     args: &Args,
+    runtime: &RuntimeClient,
     worker: &WorkerRecord,
     prepared: PreparedWorker,
     queue: &dyn RunQueue,
     claimed: ClaimedJob,
 ) -> Result<(Lease, Completion), String> {
-    let output = worker.output.as_deref().unwrap_or_default();
-    let run = WorkerRun {
-        deployment: &worker.name,
-        output,
-        endpoint: &args.worker_endpoint,
-        token: "",
+    let invocation = WorkerInvocation {
+        run_id: format!("run-{}", claimed.job.id),
+        worker: worker.name.clone(),
+        image: prepared.image,
+        entrypoint: prepared.entrypoint,
+        environment: prepared.environment,
+        target: worker.output.clone().unwrap_or_default(),
+        endpoint: args.worker_endpoint.clone(),
+        token: String::new(),
+        network: None,
+        event: serde_json::to_value(&claimed.job.event)
+            .map_err(|error| format!("serialize worker event: {error}"))?,
+        resources: prepared.resources,
+        timeout_seconds: prepared.timeout_seconds,
     };
     let mut lease = claimed.lease;
     let renew_every = Duration::from_secs((args.lease_seconds / 2).max(1));
     let mut renewal_error = None;
-    let mut execution = Box::pin(run_worker(&run, &prepared.exec, &claimed.job.event));
+    let mut execution = Box::pin(runtime.run(&invocation));
     let outcome = loop {
         tokio::select! {
             result = &mut execution => break result,
@@ -740,6 +817,10 @@ async fn main() {
             queue: queue.clone(),
             registry: registry.clone(),
             ready: ready.clone(),
+            runtime: RuntimeClient::new(
+                args.container_runtime_url.clone(),
+                args.container_runtime_token.clone(),
+            ),
         },
         args.control_token.clone(),
     );
@@ -832,13 +913,12 @@ mod tests {
         }
     }
 
-    /// Bundled files and plain environment bindings are materialized for one
-    /// run, and a relative cwd resolves inside that isolated bundle.
+    /// Built image identity and hard limits are prepared for one container run.
     #[test]
-    fn prepares_a_portable_worker_bundle() {
+    fn prepares_a_bounded_worker_invocation() {
         let worker = WorkerRecord {
             name: "market-data-ingest".to_owned(),
-            code: r#"{"exec":["python3","ingest.py"],"cwd":"."}"#.to_owned(),
+            code: r#"{"image":"verglas/worker-ingest:sha256-test","entrypoint":["python","ingest.py"]}"#.to_owned(),
             output: Some("market.ohlcv".to_owned()),
             triggers: "[]".to_owned(),
             state: "running".to_owned(),
@@ -848,24 +928,20 @@ mod tests {
             revision: 1,
             config: r#"{
                 "env":{"SYMBOL":"SPY"},
-                "files":{"ingest.py":"print('ready')\n"}
+                "resources":{"vcpus":2.0,"mem_mib":4096,"pids":128,"timeout_secs":900}
             }"#
             .to_owned(),
         };
 
-        let prepared = prepare_worker(&worker).expect("prepare bundle");
+        let config: WorkerConfig = serde_json::from_str(&worker.config).expect("config");
+        let prepared = prepare_worker_config(&worker, config).expect("prepare worker");
         assert_eq!(
-            prepared.exec.env.get("SYMBOL").map(String::as_str),
+            prepared.environment.get("SYMBOL").map(String::as_str),
             Some("SPY")
         );
-        assert_eq!(
-            std::fs::read_to_string(prepared._root.path().join("ingest.py")).expect("bundled file"),
-            "print('ready')\n"
-        );
-        assert_eq!(
-            prepared.exec.cwd.as_deref(),
-            Some(prepared._root.path().join("").to_string_lossy().as_ref())
-        );
+        assert_eq!(prepared.image, "verglas/worker-ingest:sha256-test");
+        assert_eq!(prepared.resources.memory_mib, 4096);
+        assert_eq!(prepared.timeout_seconds, 900);
     }
 
     /// The pushed-event API acknowledges only after the queue persists the event.
@@ -891,11 +967,12 @@ mod tests {
         assert_eq!(stored.event.event_type, "org.verglas.http.request");
     }
 
-    /// A claimed worker executes through the harness and becomes a completion.
+    /// A claimed worker executes through the container runtime and becomes a completion.
     #[tokio::test]
     async fn claimed_worker_executes_as_one_bounded_run() {
         let code = serde_json::json!({
-            "exec": ["sh", "-c", "printf '{\"rows\":3,\"error\":null}' > \"$RESULT_PATH\""]
+            "image": "verglas/worker-a:sha256-test",
+            "entrypoint": ["python", "worker.py"]
         })
         .to_string();
         let worker = WorkerRecord {
@@ -939,13 +1016,32 @@ mod tests {
             listen: "127.0.0.1:0".parse().expect("listen"),
             control_token: "test-control".to_owned(),
             secret_encryption_key: "00".repeat(32),
+            container_runtime_url: String::new(),
+            container_runtime_token: "runtime-token".to_owned(),
         };
 
         let queue = TestQueue::default();
-        let prepared = prepare_worker(&worker).expect("prepare worker");
-        let (_, completion) = execute_claimed_worker(&args, &worker, prepared, &queue, claimed)
+        let app = Router::new().route(
+            "/v1/worker-runs/{run_id}",
+            put(|| async {
+                Json(WorkerRunResult {
+                    rows_produced: 3,
+                    logs: String::new(),
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("execute");
+            .expect("listener");
+        let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("runtime server") });
+        let runtime = RuntimeClient::new(endpoint, "runtime-token");
+        let config: WorkerConfig = serde_json::from_str(&worker.config).expect("config");
+        let prepared = prepare_worker_config(&worker, config).expect("prepare worker");
+        let (_, completion) =
+            execute_claimed_worker(&args, &runtime, &worker, prepared, &queue, claimed)
+                .await
+                .expect("execute");
         assert_eq!(completion, Completion::Succeeded { rows_produced: 3 });
     }
 }

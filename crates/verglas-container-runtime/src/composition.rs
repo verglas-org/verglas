@@ -258,7 +258,7 @@ impl VesselApplyPlan {
         }
         for worker in &manifest.workers {
             let project = request.projects[&worker.project].clone();
-            validate_project_files(&project.files)?;
+            validate_project_files(&project.files, false)?;
             if !project.files.contains_key("src/worker.ts") {
                 return Err(CompositionError::MissingWorkerEntrypoint {
                     worker: worker.name.clone(),

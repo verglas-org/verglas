@@ -761,3 +761,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   process-wide catalog coordinates. Token and database administration remain
   scoped to the standalone access service and do not select a data database.
 - #107: Added `verglas queue create`, `list`, `show`, and `delete` against the explicit queue resource API. Queue commands never perform message operations or create local queue state.
+- #109: Replaced portable worker `exec` and `cwd` fields with explicit Python, Bun, or container build policies, locked project files, container entrypoints, and enforced CPU, memory, PID, and timeout declarations.
+- #109: Made the local Compose cache host path configurable while preserving the named-volume default. Local large-worker tests can keep cache data on a dedicated disk instead of the system disk.

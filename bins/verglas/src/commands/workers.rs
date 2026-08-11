@@ -162,15 +162,15 @@ async fn run_follow(
             crate::worker_spec::Trigger::Follow { file: None }
         }
     };
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
     let manifest = WorkerManifest {
         spec_version: crate::worker_spec::SPEC_VERSION,
         name: name.clone(),
-        exec: args.command,
-        cwd,
-        files: Default::default(),
+        runtime: crate::worker_spec::WorkerRuntime::Container,
+        entrypoint: args.command,
+        files: std::collections::BTreeMap::from([(
+            "Dockerfile".to_owned(),
+            "FROM alpine:3.22\nWORKDIR /app\n".to_owned(),
+        )]),
         env: Default::default(),
         triggers: vec![trigger],
         target_tables: vec![table.clone()],

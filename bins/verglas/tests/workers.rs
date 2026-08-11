@@ -148,7 +148,13 @@ fn write_spec(dir: &Path) -> std::path::PathBuf {
         &path,
         r#"
 name = "collector"
-exec = ["python3", "collect.py"]
+runtime = "python"
+entrypoint = ["python", "collect.py"]
+
+[files]
+"pyproject.toml" = "[project]\nname='collector'\nversion='0.1.0'\n"
+"uv.lock" = "version = 1\n"
+"collect.py" = "print('ok')\n"
 
 [[triggers]]
 type = "cron"

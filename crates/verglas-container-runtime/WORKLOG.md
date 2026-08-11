@@ -48,3 +48,4 @@
 - #84: Added a stable local self-signed PostgreSQL proxy identity under runtime state. The runtime
   creates it once before recovery and exposes only its file paths to managed proxy declarations.
 - #107: Updated the complete-stack packaging contract for the one-shot Verglas Neon bootstrap and locally built independently provisioned queue-service image, removing the vanilla Postgres bootstrap services.
+- #109: Added content-addressed locked worker builds for Python and Bun plus explicit Dockerfile projects. Added bounded one-shot execution with hard CPU, memory, PID, and timeout limits, runtime environment injection, result capture, bounded logs, and deterministic cleanup.
