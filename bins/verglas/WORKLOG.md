@@ -764,3 +764,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #109: Replaced portable worker `exec` and `cwd` fields with explicit Python, Bun, or container build policies, locked project files, container entrypoints, and enforced CPU, memory, PID, and timeout declarations.
 - #109: Made the local Compose cache host path configurable while preserving the named-volume default. Local large-worker tests can keep cache data on a dedicated disk instead of the system disk.
 - #109: Added portable `scratch_target` declarations. The CLI carries only the container path, while the trusted runtime owns the backing host location.
+- #109: Updated the documented self-hosted Compose contract to require the external runtime network preserved by deployment platforms.

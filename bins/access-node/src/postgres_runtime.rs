@@ -289,7 +289,9 @@ impl ManagedPostgresProvisioner {
             .with_file(
                 bridge_password_file.to_string_lossy(),
                 "/run/secrets/postgres-bridge-password",
-                0o600,
+                // The Neon compute image runs as a non-root user. The secret is
+                // scoped to this isolated container and must be readable there.
+                0o644,
             );
         let access_origin = self.config.access_endpoint.trim_end_matches('/');
         let proxy = ContainerSpec::new(&proxy_id, STORAGE_IMAGE)
@@ -894,6 +896,13 @@ mod tests {
         let plan = provisioner.plan("analytics").expect("plan");
         let compute = &plan.containers[2];
         let proxy = &plan.containers[3];
+
+        let compute_bridge_password = compute
+            .files
+            .iter()
+            .find(|file| file.path.ends_with("postgres-bridge-password"))
+            .expect("compute bridge password");
+        assert_eq!(compute_bridge_password.mode, 0o644);
 
         assert!(compute.published_ports.is_empty());
         assert_eq!(proxy.published_ports.len(), 1);

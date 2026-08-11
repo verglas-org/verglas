@@ -170,9 +170,54 @@ fn docker_application_packages_execution_workers() {
         "access must read the runtime-generated TLS identity without receiving runtime write authority"
     );
     assert!(
+        access_service.contains("VERGLAS_ADMIN_URL: http://verglas-server:8334"),
+        "access must receive the required admin API URL"
+    );
+    let scheduler_service = compose
+        .split("\n  verglas-scheduler:\n")
+        .nth(1)
+        .expect("scheduler service")
+        .split("\n  verglas-neon-bootstrap:")
+        .next()
+        .expect("scheduler service body");
+    assert!(
+        scheduler_service.contains("VERGLAS_WORKER_ENDPOINT: http://verglas-access:8345"),
+        "workers must write through the authenticated database ingress"
+    );
+    assert!(
         !access_service.contains("verglas-lakekeeper:\n"),
         "access must not wait for Lakekeeper; Lakekeeper waits for access to avoid a startup cycle"
     );
+    let lakekeeper_service = compose
+        .split("\n  verglas-lakekeeper:\n")
+        .nth(1)
+        .expect("Lakekeeper service")
+        .split("\n  verglas-cache-node-0:")
+        .next()
+        .expect("Lakekeeper service body");
+    assert!(
+        lakekeeper_service.contains("verglas-access:\n        condition: service_started"),
+        "Lakekeeper must start after Access binds while Access keeps readiness closed during Lakekeeper recovery"
+    );
+}
+
+/// The stable runtime network must survive Compose transformations by hosting
+/// platforms so Docker API containers can resolve platform services.
+#[test]
+fn docker_application_uses_an_external_runtime_network() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let compose = std::fs::read_to_string(workspace.join("docker-compose.yml"))
+        .expect("read Docker Compose application");
+    let runtime_network = compose
+        .split("\nnetworks:\n")
+        .nth(1)
+        .expect("network declarations")
+        .split("\n  pg-ring:")
+        .next()
+        .expect("runtime network declaration");
+
+    assert!(runtime_network.contains("external: true"));
+    assert!(runtime_network.contains("name: verglas-runtime"));
 }
 
 /// #19: the self-hosted container must fail inside its own resource boundary

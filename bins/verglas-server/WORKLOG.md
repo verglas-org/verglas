@@ -640,3 +640,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #109: Updated Docker application coverage to accept the configurable local cache bind mount while preserving the named-volume default.
 - #109: Updated the process-level KV durability test to provide the mandatory access authority instead of relying on the removed unauthenticated local data-plane path.
 - #84: Updated the self-hosted packaging contract to pin the native multi-platform Verglas Neon images used by managed Postgres. The contract still rejects source-build and unpublished image fallbacks.
+- #109: Declare the Docker API runtime network as an external platform resource so hosting transforms preserve it. Supply Access with its required admin API endpoint in the self-hosted stack.
+- #109: Start Lakekeeper after the Access listener binds instead of waiting for Access readiness. Access deliberately keeps readiness closed until its Lakekeeper-backed database recovery completes, so waiting for health created a startup cycle.
+- #109: Route scheduled worker writes through the authenticated Access database ingress. Sending workers to the cache admin listener allowed empty runs but rejected every run that produced rows.

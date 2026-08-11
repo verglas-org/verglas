@@ -113,6 +113,7 @@ services:
       VERGLAS_NEON_TOKEN_DIRECTORY: /var/run/verglas/neon
       VERGLAS_SECRET_ENCRYPTION_KEY: ${VERGLAS_SECRET_ENCRYPTION_KEY:?Set VERGLAS_SECRET_ENCRYPTION_KEY to 64 hexadecimal characters}
       VERGLAS_ACCESS_LISTEN: 0.0.0.0:8345
+      VERGLAS_ADMIN_URL: http://verglas-server:8334
       VERGLAS_MANAGED_CATALOG_URI: http://verglas-lakekeeper:8181
       VERGLAS_MANAGED_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
       VERGLAS_MANAGED_STORAGE_PREFIX: ${VERGLAS_TENANT_ID:-local}
@@ -171,7 +172,7 @@ services:
     image: verglas/verglas-scheduler:local
     environment:
       VERGLAS_SCHEDULER_DATABASE_URL: postgres://verglas_internal:${POSTGRES_PASSWORD:-verglas}@verglas-system-postgres:55433/verglas_scheduler
-      VERGLAS_WORKER_ENDPOINT: http://verglas-server:8334
+      VERGLAS_WORKER_ENDPOINT: http://verglas-access:8345
       VERGLAS_SCHEDULER_QUEUE: local
       VERGLAS_SCHEDULER_LISTEN: 0.0.0.0:8340
       VERGLAS_SCHEDULER_CONTROL_TOKEN: ${VERGLAS_SCHEDULER_CONTROL_TOKEN:-verglas-local-scheduler}
@@ -302,8 +303,10 @@ services:
     depends_on:
       verglas-lakekeeper-migrate:
         condition: service_completed_successfully
+      # Access binds before it reconciles durable Lakekeeper resources and
+      # keeps /healthz closed until that reconciliation completes.
       verglas-access:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
       interval: 2s
@@ -499,8 +502,7 @@ volumes:
 networks:
   runtime:
     name: verglas-runtime
-    labels:
-      io.verglas.managed: "true"
+    external: true
   pg-ring:
     name: verglas-pg-ring
     ipam:

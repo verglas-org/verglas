@@ -73,7 +73,7 @@ fn self_hosted_compose_is_complete_and_runnable() {
         "/var/run/docker.sock:/var/run/docker.sock",
         "verglas-runtime-state:/var/lib/verglas-container-runtime",
         "name: verglas-runtime",
-        "io.verglas.managed: \"true\"",
+        "external: true",
         "verglas-cache:",
         "verglas-runtime-state:",
     ] {
