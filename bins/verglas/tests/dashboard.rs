@@ -5,7 +5,7 @@ use std::process::Command;
 
 use axum::extract::Path;
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Json, Router, http::HeaderMap};
 use serde_json::{Value, json};
 
 /// Serves the dashboard API shape expected from `verglas-rest`.
@@ -13,7 +13,8 @@ fn spawn_mock() -> String {
     let app = Router::new()
         .route(
             "/v1/dashboards",
-            post(|Json(body): Json<Value>| async move {
+            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
+                assert_eq!(headers["authorization"], "Bearer dashboard-token");
                 assert_eq!(body["table"], "sales.orders");
                 Json(json!({
                     "name": "sales_orders",
@@ -21,7 +22,8 @@ fn spawn_mock() -> String {
                     "url": "http://127.0.0.1:9009/explore/sales_orders",
                 }))
             })
-            .get(|| async {
+            .get(|headers: HeaderMap| async move {
+                assert_eq!(headers["authorization"], "Bearer dashboard-token");
                 Json(json!({"dashboards": [{
                     "name": "sales_orders",
                     "table": "sales.orders",
@@ -31,7 +33,8 @@ fn spawn_mock() -> String {
         )
         .route(
             "/v1/dashboards/{name}",
-            get(|Path(name): Path<String>| async move {
+            get(|headers: HeaderMap, Path(name): Path<String>| async move {
+                assert_eq!(headers["authorization"], "Bearer dashboard-token");
                 assert_eq!(name, "sales_orders");
                 Json(json!({
                     "name": name,
@@ -39,7 +42,8 @@ fn spawn_mock() -> String {
                     "url": "http://127.0.0.1:9009/explore/sales_orders",
                 }))
             })
-            .delete(|Path(name): Path<String>| async move {
+            .delete(|headers: HeaderMap, Path(name): Path<String>| async move {
+                assert_eq!(headers["authorization"], "Bearer dashboard-token");
                 assert_eq!(name, "sales_orders");
                 Json(json!({"deleted": name}))
             }),
@@ -67,6 +71,7 @@ fn run(endpoint: &str, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .arg("--server-endpoint")
         .arg(endpoint)
+        .args(["--token", "dashboard-token"])
         .args(args)
         .output()
         .expect("run CLI");

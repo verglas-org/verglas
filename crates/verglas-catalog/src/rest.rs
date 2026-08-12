@@ -38,13 +38,13 @@ use reqwest::header::{
     ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_ENCODING, CONTENT_LENGTH, HOST,
     TRANSFER_ENCODING,
 };
-use reqwest::{Method, header::HeaderMap};
+use reqwest::{Method, header::HeaderMap, header::HeaderValue};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
 use verglas_core::config;
 
-use super::{CatalogError, CatalogSource, TableIdent, TableState};
+use super::{CatalogError, CatalogMutation, CatalogSource, TableIdent, TableState};
 
 /// SigV4 signing settings resolved from `[catalog]`: the region, the signing
 /// name (`s3tables` / `glue`), and a credentials provider (a named AWS-INI file
@@ -136,7 +136,7 @@ impl CachedResponses {
 }
 
 /// An Iceberg REST catalog as a [`CatalogSource`].
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RestCatalogSource {
     /// Base URI (before `/v1/...`), no trailing slash.
     base: String,
@@ -159,6 +159,25 @@ pub struct RestCatalogSource {
     /// Monotonic catalog generation advanced only when a prepared REST response
     /// changes or a successful mutation invalidates the prepared response set.
     generation: Arc<AtomicU64>,
+    /// Highest quorum mutation fully reflected by the response cache.
+    applied_sequence: Arc<AtomicU64>,
+}
+
+impl std::fmt::Debug for RestCatalogSource {
+    /// Describes transport state without exposing bearer credentials.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RestCatalogSource")
+            .field("base", &self.base)
+            .field(
+                "authenticated",
+                &(self.bearer_token.is_some() || self.sigv4.is_some()),
+            )
+            .field("warehouse", &self.warehouse)
+            .field("nested_namespaces", &self.nested_namespaces)
+            .field("generation", &self.generation.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
 }
 
 /// One buffered Iceberg REST response returned through the loopback gateway.
@@ -181,6 +200,8 @@ pub struct CatalogResponse {
 pub struct CatalogGateway {
     /// Shared authenticated upstream client and response cache.
     source: RestCatalogSource,
+    /// Stable database identity injected only by the trusted runtime registry.
+    database_id: Option<String>,
 }
 
 impl CatalogGateway {
@@ -188,7 +209,19 @@ impl CatalogGateway {
     pub fn from_config(config: &config::Catalog) -> Result<Self, config::ConfigError> {
         Ok(Self {
             source: RestCatalogSource::from_config(config)?,
+            database_id: None,
         })
+    }
+
+    /// Binds this gateway to the stable database selected by the runtime registry.
+    pub(crate) fn bind_database(mut self, database_id: &str) -> Self {
+        self.database_id = Some(database_id.to_owned());
+        self
+    }
+
+    /// Returns the immutable database identity forwarded to the trusted catalog.
+    pub(crate) fn database_id(&self) -> Option<&str> {
+        self.database_id.as_deref()
     }
 
     /// Returns a watcher source backed by the same client and response cache.
@@ -199,6 +232,53 @@ impl CatalogGateway {
     /// Current prepared-catalog generation for query-session invalidation.
     pub fn generation(&self) -> u64 {
         self.source.generation.load(Ordering::Acquire)
+    }
+
+    /// Highest strong catalog sequence visible to local query clients.
+    pub fn applied_sequence(&self) -> u64 {
+        self.source.applied_sequence.load(Ordering::Acquire)
+    }
+
+    /// Applies one durable pointer and invalidates prepared catalog responses.
+    ///
+    /// Replay deliberately performs no upstream table load: a REST catalog
+    /// exposes only the current pointer and cannot reproduce every historical
+    /// outbox position after a restart. The next fenced read repopulates the
+    /// response cache from the current catalog state.
+    pub async fn apply_mutation(
+        &self,
+        mutation: &CatalogMutation,
+    ) -> Result<Option<TableState>, CatalogError> {
+        if mutation.sequence <= self.applied_sequence() {
+            if mutation.operation == "dropTable" {
+                return Ok(None);
+            }
+            return Ok(mutation
+                .metadata_location
+                .as_ref()
+                .map(|location| TableState {
+                    metadata_location: location.clone(),
+                    current_snapshot_id: mutation.snapshot_id,
+                }));
+        }
+        self.source.responses.write().await.clear();
+        let dropped = mutation.operation == "dropTable";
+        let state = if dropped {
+            None
+        } else {
+            mutation
+                .metadata_location
+                .as_ref()
+                .map(|location| TableState {
+                    metadata_location: location.clone(),
+                    current_snapshot_id: mutation.snapshot_id,
+                })
+        };
+        self.source.generation.fetch_add(1, Ordering::AcqRel);
+        self.source
+            .applied_sequence
+            .store(mutation.sequence, Ordering::Release);
+        Ok(state)
     }
 
     /// Serves one local catalog request. Successful watcher or gateway GETs are
@@ -212,7 +292,80 @@ impl CatalogGateway {
         body: Bytes,
     ) -> Result<CatalogResponse, CatalogError> {
         self.source
-            .gateway_request(method, path_and_query, headers, body)
+            .gateway_request(method, path_and_query, headers, body, None, None)
+            .await
+    }
+
+    /// Serves one request using the exact bearer verified at the public data-plane boundary.
+    /// Authenticated reads always go upstream and are never inserted into or served from the
+    /// watcher cache, preventing responses from crossing principal boundaries.
+    pub async fn authenticated_request(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        authorization: HeaderValue,
+    ) -> Result<CatalogResponse, CatalogError> {
+        let valid = authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| !token.is_empty());
+        if !valid {
+            return Err(CatalogError::Auth {
+                detail: "verified catalog credential is not a bearer header".to_owned(),
+            });
+        }
+        let database_id = self
+            .database_id
+            .as_deref()
+            .ok_or_else(|| CatalogError::Auth {
+                detail: "authenticated catalog gateway has no database binding".to_owned(),
+            })?;
+        self.authenticated_request_for_database(
+            method,
+            path_and_query,
+            headers,
+            body,
+            authorization,
+            database_id,
+        )
+        .await
+    }
+
+    /// Serves an authenticated request for an immutable database ID resolved by a trusted proxy.
+    pub async fn authenticated_request_for_database(
+        &self,
+        method: Method,
+        path_and_query: &str,
+        headers: HeaderMap,
+        body: Bytes,
+        authorization: HeaderValue,
+        database_id: &str,
+    ) -> Result<CatalogResponse, CatalogError> {
+        let valid = authorization
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| !token.is_empty());
+        if !valid {
+            return Err(CatalogError::Auth {
+                detail: "verified catalog credential is not a bearer header".to_owned(),
+            });
+        }
+        let database_id = HeaderValue::from_str(database_id).map_err(|_| CatalogError::Auth {
+            detail: "catalog database binding is not a valid header value".to_owned(),
+        })?;
+        self.source
+            .gateway_request(
+                method,
+                path_and_query,
+                headers,
+                body,
+                Some(authorization),
+                Some(database_id),
+            )
             .await
     }
 }
@@ -447,6 +600,7 @@ impl RestCatalogSource {
                 CATALOG_RESPONSE_CACHE_BYTES,
             ))),
             generation: Arc::new(AtomicU64::new(0)),
+            applied_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -476,6 +630,8 @@ impl RestCatalogSource {
         url: &str,
         headers: HeaderMap,
         body: Bytes,
+        forwarded_authorization: Option<&HeaderValue>,
+        trusted_database_id: Option<&HeaderValue>,
     ) -> Result<CatalogResponse, CatalogError> {
         let mut request = self.http.request(method.clone(), url);
         for (name, value) in &headers {
@@ -485,18 +641,26 @@ impl RestCatalogSource {
                 || name == TRANSFER_ENCODING
                 || name == AUTHORIZATION
                 || name == ACCEPT_ENCODING
+                || name.as_str().eq_ignore_ascii_case("x-verglas-database-id")
             {
                 continue;
             }
             request = request.header(name, value);
         }
-        if let Some(token) = &self.bearer_token {
-            request = request.bearer_auth(token);
+        if let Some(authorization) = forwarded_authorization {
+            request = request.header(AUTHORIZATION, authorization);
+        } else {
+            if let Some(token) = &self.bearer_token {
+                request = request.bearer_auth(token);
+            }
+            if let Some(sigv4) = &self.sigv4 {
+                request = self
+                    .sign(sigv4, &method, url, &headers, &body, request)
+                    .await?;
+            }
         }
-        if let Some(sigv4) = &self.sigv4 {
-            request = self
-                .sign(sigv4, &method, url, &headers, &body, request)
-                .await?;
+        if let Some(database_id) = trusted_database_id {
+            request = request.header("x-verglas-database-id", database_id);
         }
         // The daemon negotiates compression with the upstream itself and always
         // hands clients decoded JSON, so the client's own Accept-Encoding never
@@ -543,6 +707,8 @@ impl RestCatalogSource {
         path_and_query: &str,
         headers: HeaderMap,
         body: Bytes,
+        forwarded_authorization: Option<HeaderValue>,
+        trusted_database_id: Option<HeaderValue>,
     ) -> Result<CatalogResponse, CatalogError> {
         if !path_and_query.starts_with('/') {
             return Err(CatalogError::Malformed {
@@ -551,7 +717,8 @@ impl RestCatalogSource {
             });
         }
         let resolved_path = self.gateway_path(path_and_query);
-        if method == Method::GET
+        if forwarded_authorization.is_none()
+            && method == Method::GET
             && let Some(response) = self.responses.read().await.get(&resolved_path)
         {
             return Ok(response);
@@ -559,10 +726,17 @@ impl RestCatalogSource {
 
         let url = format!("{}{}", self.base, resolved_path);
         let response = self
-            .send_upstream(method.clone(), &url, headers, body)
+            .send_upstream(
+                method.clone(),
+                &url,
+                headers,
+                body,
+                forwarded_authorization.as_ref(),
+                trusted_database_id.as_ref(),
+            )
             .await?;
         if (200..300).contains(&response.status) {
-            if method == Method::GET {
+            if method == Method::GET && forwarded_authorization.is_none() {
                 let changed = self
                     .responses
                     .write()
@@ -585,7 +759,7 @@ impl RestCatalogSource {
     /// (a GET carries an empty body, whose payload hash SigV4 signs).
     async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T, CatalogError> {
         let response = self
-            .send_upstream(Method::GET, url, HeaderMap::new(), Bytes::new())
+            .send_upstream(Method::GET, url, HeaderMap::new(), Bytes::new(), None, None)
             .await?;
         if !(200..300).contains(&response.status) {
             return Err(CatalogError::Status {

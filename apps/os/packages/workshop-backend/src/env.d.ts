@@ -6,15 +6,15 @@ import type { ProductAnalyticsRecord } from "./analytics";
 declare global {
   namespace Cloudflare {
     interface Env {
-      // Deployment-wide admin usernames.
+      // Deployment-wide admin email addresses.
       ADMINS?: string[];
 
       // Blueprint storage bindings.
-      BLUEPRINTS: KVNamespace;             // Workers KV for blueprint metadata lookup
-      BLUEPRINT_CONTENT: R2Bucket;         // R2 bucket for blueprint code snapshots
+      BLUEPRINTS: KVNamespace; // Workers KV for blueprint metadata lookup
+      BLUEPRINT_CONTENT: R2Bucket; // R2 bucket for blueprint code snapshots
 
       // User avatar storage.
-      AVATARS: KVNamespace;                // Workers KV for user avatar images
+      AVATARS: KVNamespace; // Workers KV for user avatar images
 
       // Note: gatekeeper service bindings (GATEKEEPER_*) are intentionally NOT declared here. Core
       // discovers them generically by scanning env for the GATEKEEPER_ prefix (buildGatekeeperVendorMap)
@@ -40,22 +40,21 @@ declare global {
 
       // Cloudflare Access configuration. When CF_ACCESS_AUD is set, the deployment authenticates via
       // Cloudflare Access (SSO). (Also referenced via a local Env extension in server.ts.)
-      CF_ACCESS_AUD?: string;   // audience
-      CF_ACCESS_ISS?: string;   // team URL, e.g. https://<team>.cloudflareaccess.com
+      CF_ACCESS_AUD?: string; // audience
+      CF_ACCESS_ISS?: string; // team URL, e.g. https://<team>.cloudflareaccess.com
 
       // Comma-separated allowlist of gatekeeper vendor ids permitted to drive sign-in (e.g.
       // "google,github,cloudflare"). A listed gatekeeper must also advertise providesAuth. Empty =
       // no gatekeeper sign-in (password / CF Access only).
       AUTH_GATEKEEPERS?: string;
 
-      // Set to "true" to disable username/password login + signup (gatekeeper sign-in only). Only
+      // Set to "true" to disable email/password login + signup (gatekeeper sign-in only). Only
       // takes effect when at least one auth gatekeeper is allowlisted (otherwise password auth stays
       // on to avoid locking everyone out).
       DISABLE_PASSWORD_AUTH?: string;
 
       // Public base URL of the deployment.
       PUBLIC_BASE_URL?: string;
-
 
       // Local Verglas worker control plane used by generated Sources.
       VERGLAS_ADMIN_URL?: string;
@@ -66,24 +65,21 @@ declare global {
       VERGLAS_CONTAINER_RUNTIME_URL?: string;
       VERGLAS_CONTAINER_RUNTIME_TOKEN?: string;
 
-      // Data-plane capability passed only to generated Integration runtime containers.
+      // Data-plane endpoint paired with a caller-minted scoped token at deployment time.
       VERGLAS_DATA_ENDPOINT?: string;
-      VERGLAS_DATA_TOKEN?: string;
       VERGLAS_INTEGRATION_RUNTIME_IMAGE?: string;
 
-      // Mandatory tenant authorization service. The service token remains backend-only.
+      // Mandatory tenant authorization service. The shared key signs short-lived user assertions;
+      // it is never sent to the access service or exposed to a generated runtime.
       VERGLAS_ACCESS_URI?: string;
-      VERGLAS_ACCESS_SERVICE_TOKEN?: string;
+      VERGLAS_IDENTITY_ASSERTION_KEY?: string;
       VERGLAS_TENANT_ID?: string;
-      // Explicit OSS-only bootstrap: every local account owns the local tenant.
-      VERGLAS_LOCAL_OWNER_BOOTSTRAP?: string;
 
       // Native coding-agent CLI adapter. The bearer token is backend-only.
       LOCAL_MODEL_RUNTIME_URL?: string;
       LOCAL_MODEL_RUNTIME_TOKEN?: string;
       VERGLAS_AGENT_RUNTIME_URL?: string;
       VERGLAS_AGENT_RUNTIME_TOKEN?: string;
-
     }
   }
 }

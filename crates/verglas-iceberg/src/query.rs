@@ -228,28 +228,12 @@ async fn catalog_context_with_runtime(
 fn query_session_config(bounded: bool) -> SessionConfig {
     let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
     if bounded {
-        // Keep DataFusion's hash-join preference in bounded workers. The query
-        // service sizes the fair memory pool explicitly; forcing merge joins
-        // made join-heavy SF10 queries sort and spill the complete 60M-row
-        // lineitem input even when every build side fit comfortably in the
-        // configured pool.
-        config.options_mut().optimizer.prefer_hash_join = true;
-        // DataFusion's 1 MiB broadcast threshold is too conservative for an
-        // analytical worker with an explicitly bounded multi-GiB pool. At
-        // SF10 it forces a 60M-row fact table through a hash repartition even
-        // when the filtered dimension side is only a few MiB. Broadcast such
-        // dimension inputs and reserve partitioned joins for genuinely large
-        // build sides.
-        config
-            .options_mut()
-            .optimizer
-            .hash_join_single_partition_threshold = 64 * 1024 * 1024;
-        config
-            .options_mut()
-            .optimizer
-            .hash_join_single_partition_threshold_rows = 1024 * 1024;
-        // Amortize Arrow scheduling and channel overhead for analytical scans.
-        config.options_mut().execution.batch_size = 64 * 1024;
+        // HashJoin materializes its build side and can exhaust a fixed memory
+        // ceiling before the spill pool can reclaim enough memory (TPC-H Q18
+        // is the concrete regression). SortMergeJoin participates in
+        // DataFusion's disk-spill path, so bounded workers prefer it while the
+        // unbounded embedded/CLI path retains DataFusion's faster default.
+        config.options_mut().optimizer.prefer_hash_join = false;
     }
     config
 }
@@ -485,25 +469,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixed_memory_sessions_prefer_hash_joins() {
-        let config = query_session_config(true);
-        assert!(config.options().optimizer.prefer_hash_join);
-        assert_eq!(
-            config
+    fn fixed_memory_sessions_prefer_spillable_merge_joins() {
+        assert!(
+            !query_session_config(true)
                 .options()
                 .optimizer
-                .hash_join_single_partition_threshold,
-            64 * 1024 * 1024
+                .prefer_hash_join
         );
-        assert_eq!(
-            config
-                .options()
-                .optimizer
-                .hash_join_single_partition_threshold_rows,
-            1024 * 1024
-        );
-        assert!(config.options().optimizer.repartition_joins);
-        assert_eq!(config.options().execution.batch_size, 64 * 1024);
         assert!(
             query_session_config(false)
                 .options()

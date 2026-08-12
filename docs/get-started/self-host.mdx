@@ -1,13 +1,12 @@
 ---
 title: "Self-host Verglas"
-description: "Start Verglas and create managed or customer-owned database resources."
+description: "Start the complete OSS stack with Cloudflare R2 and tenant-managed Lakekeeper."
 icon: "server"
 ---
 
-This guide starts a tenant-local Verglas stack with an empty provider registry.
-Object stores, catalogs, and databases are added dynamically through the access
-API. You do not put provider credentials in Compose or restart the cache when a
-database is added.
+This guide starts one Verglas tenant backed by Cloudflare R2. R2 stores durable
+Iceberg objects. The Compose stack runs Lakekeeper as the tenant's managed
+Iceberg REST catalog. You do not create or mount a server `config.toml`.
 
 The running application exposes:
 
@@ -15,17 +14,42 @@ The running application exposes:
 | --- | --- | --- |
 | `8333` | S3-compatible cache | Query engines and SDKs |
 | `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
-| `8345` | Tenant access API | Database and scoped-secret commands |
 | `8360` | Local container runtime manager | Optional managed services |
-| `8390` | Agent runtime | Verglas OS workspaces |
-| `8787` | Verglas OS | Community and development UI |
+| `9009` | Rill | Optional analytics container |
 
 ## Before you begin
 
 Install [Docker Desktop](https://docs.docker.com/desktop/) or Docker Engine
-with Compose, Git, and the Rust toolchain.
+with Compose, Git, and the Rust toolchain. You also need a Cloudflare account
+with R2 enabled.
 
 <Steps>
+  <Step title="Create an R2 bucket">
+    Follow Cloudflare's [R2 S3 setup](https://developers.cloudflare.com/r2/get-started/s3/)
+    to create a bucket. This guide calls it `verglas-demo`.
+
+    Record the S3 endpoint. It has this shape:
+
+    ```text
+    S3 endpoint: https://ACCOUNT_ID.r2.cloudflarestorage.com
+    ```
+  </Step>
+
+  <Step title="Create read-write R2 credentials">
+    In **R2 → Overview → Manage API Tokens**, create an **Admin Read & Write**
+    token scoped to the bucket. See Cloudflare's [R2 authentication guide](https://developers.cloudflare.com/r2/api/tokens/).
+
+    Record both S3 values shown once at creation:
+
+    - Access Key ID, used for S3 requests.
+    - Secret Access Key, used for S3 requests.
+
+    <Warning>
+    Cloudflare does not show the secret access key again. Do not commit any of
+    these values.
+    </Warning>
+  </Step>
+
   <Step title="Clone Verglas and install the CLI">
     ```bash
     git clone https://github.com/verglas-org/verglas.git
@@ -35,11 +59,35 @@ with Compose, Git, and the Rust toolchain.
     ```
   </Step>
 
+  <Step title="Export the deployment values">
+    Replace the placeholders with the values from Cloudflare. The last command
+    creates a separate credential for clients of your Verglas S3 endpoint.
+
+    ```bash
+    export R2_BUCKET=verglas-demo
+    export R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+    export R2_ACCESS_KEY_ID=YOUR_R2_ACCESS_KEY_ID
+    export R2_SECRET_ACCESS_KEY=YOUR_R2_SECRET_ACCESS_KEY
+    export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
+    export VERGLAS_S3_SECRET_ACCESS_KEY=$(openssl rand -hex 32)
+    export VERGLAS_SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)
+    export VERGLAS_TOKEN_SIGNING_KEY=$(openssl rand -base64 32)
+    export VERGLAS_TARGET_JWT_SIGNING_KEY=$(openssl rand -base64 32)
+    export VERGLAS_IDENTITY_ASSERTION_KEY=$(openssl rand -hex 32)
+    export VERGLAS_INITIAL_OWNER_EMAIL=you@example.com
+    ```
+
+    Keep this terminal open. Compose substitutes these values when it creates
+    the containers.
+
+  </Step>
+
   <Step title="Review the Compose bootstrap">
     The repository's `docker-compose.yml` is the source of truth for the
-    complete OSS stack. It starts the data server, the scheduler and its
-    Postgres queue, the trusted container-runtime manager, and Verglas OS. No
-    profile or additional `verglas` command is required.
+    complete OSS stack. It starts the data server, tenant Lakekeeper, the
+    three-member cache and WAL ring, the scheduler and its Postgres queue, the
+    trusted container-runtime manager, and Verglas OS. No profile or additional
+    `verglas` command is required.
 
     Only the runtime manager receives the Docker socket. It owns dynamically
     generated Vessels and other optional containers on the fixed
@@ -48,25 +96,34 @@ with Compose, Git, and the Rust toolchain.
   </Step>
 
   <Step title="Start Verglas">
-    Build and start the stack with no provider environment:
+    Set the local Docker control-plane token, then build and start the stack.
+    `VERGLAS_INITIAL_OWNER_EMAIL` is consumed only to create the first owner
+    principal. The signing keys must remain stable for the lifetime of the
+    tenant because they protect token verification and signed login assertions.
 
     ```bash
+    export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
     docker compose up --detach --build
     ```
 
-    Compose generates the tenant secret-encryption key once and retains it in
-    the `verglas-secret-key` named volume. It is not a provider credential and
-    is never embedded in the Compose file.
-
-    Wait until the health endpoint reports `ready`, then connect the CLI:
+    Wait until the health endpoint reports `ready`. Open Verglas OS and create
+    or sign in to the account whose email matches
+    `VERGLAS_INITIAL_OWNER_EMAIL`. In **Profile → Access tokens**, create a
+    token with the minimum database and action grants needed by the CLI, and
+    save the value displayed once to the local credentials file. Then connect
+    the CLI:
 
     ```bash
     until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 2; done
     export VERGLAS_ENDPOINT=http://127.0.0.1:8334
     export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
-    export VERGLAS_TOKEN=verglas-local-access
+    export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
     verglas status
     ```
+
+    `TOKEN_SHOWN_ONCE` is the token copied from the Access tokens page. After
+    creating a database, use `verglas token create` to mint a narrower
+    replacement; the CLI saves that token in its owner-only credential file.
 
     Open Verglas OS at `http://127.0.0.1:8787`.
 
@@ -77,6 +134,22 @@ with Compose, Git, and the Rust toolchain.
     docker compose logs -f verglas-container-runtime
     ```
 
+    Pass the same `VERGLAS_CONTAINER_RUNTIME_TOKEN` to the local Verglas control
+    plane. Do not use the Compose file's development default on a shared machine.
+
+    The access service writes separate short-lived workload credentials to
+    separate private Compose volumes. `verglas-server` mounts only its inventory
+    token file read-only. Lakekeeper mounts only its catalog-policy credential,
+    and the trusted container runtime mounts only the Neon proxy-policy
+    credential so it can inject the file into a managed Postgres proxy. Do not
+    copy any of these files to a shell, an Application, a Vessel, or a source
+    repository.
+
+    Compose uses pinned, immutable Verglas Neon storage/proxy and compute
+    images. It never uses a mutable `latest` image. Each managed Postgres proxy
+    validates its caller's short-lived database JWT against the tenant access
+    service.
+
     If startup fails, read the server log:
 
     ```bash
@@ -85,12 +158,12 @@ with Compose, Git, and the Rust toolchain.
   </Step>
 </Steps>
 
-## Next: create a database
+## Next: create your first table
 
-Create a managed lakehouse with `verglas db create analytics --type lakehouse`,
-or create scoped S3 and Iceberg REST secrets before declaring a customer-owned
-database. Provider values are prompted or read from stdin and never belong in
-the process environment.
+The server is connected to R2 and tenant Lakekeeper. Continue with
+[Create your first table](/docs/get-started/first-table) to write rows, run a
+query, and confirm that the resulting Iceberg table is visible through the
+catalog.
 
 ## Stop the cluster
 
@@ -98,8 +171,7 @@ the process environment.
 docker compose down
 ```
 
-This stops the stack. Dynamically managed containers retain their declared
-state and are reconciled when the manager starts again. Named volumes retain
-the cache, access/scheduler Postgres data, runtime state, OS state, and the
-tenant secret-encryption key. Add `--volumes` only when you intentionally want
-to delete all of that local state.
+This stops the Compose services. Dynamically managed containers retain
+their declared state and are reconciled when the manager starts again. The
+named volumes retain the local cache and runtime desired-state document. Add
+`--volumes` only when you intentionally want to delete both.

@@ -3,3 +3,6 @@ WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'verglas_scheduler')\g
 
 SELECT 'CREATE DATABASE verglas_permissions OWNER verglas'
 WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'verglas_permissions')\gexec
+
+SELECT 'CREATE DATABASE verglas_catalog OWNER verglas'
+WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname = 'verglas_catalog')\gexec

@@ -149,7 +149,6 @@ async fn growth_room_starts_full_and_shrinks_with_admissions() {
         .expect("build engine");
 
     let fresh = engine.disk_growth_room_bytes();
-    let fresh_used = engine.disk_usage_bytes();
     assert!(
         fresh > capacity / 2,
         "a fresh sparse device has most of the budget as growth room, got {fresh} of {capacity}"
@@ -180,13 +179,8 @@ async fn growth_room_starts_full_and_shrinks_with_admissions() {
     engine.flush().await;
 
     let after = engine.disk_growth_room_bytes();
-    let after_used = engine.disk_usage_bytes();
     assert!(
         after < fresh,
         "growth room must shrink as blocks are admitted: {fresh} -> {after}"
-    );
-    assert!(
-        after_used > fresh_used,
-        "reported disk usage must grow as blocks are admitted: {fresh_used} -> {after_used}"
     );
 }

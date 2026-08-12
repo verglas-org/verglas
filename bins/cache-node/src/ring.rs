@@ -10,8 +10,9 @@
 //! - builds the flush plane ([`RingWriteback`]) over the SAME chunk store the
 //!   device registry stages into (the plane's barrier and the devices' staging
 //!   must be one store);
-//! - serves the fragment RPC endpoints peers place shards through, on the ring
-//!   plane's own listener — bound like `:8333`/`:8335`, with no new authz in v1;
+//! - serves cache-owner reads, materialized-page placements, and fragment RPC
+//!   through the ring plane's listener — bound like `:8333`/`:8335`, with no
+//!   new authz in v1;
 //!   tenant isolation is the existing VXLAN model, exactly as the NBD plane's
 //!   stance (a shared cluster secret is honoured if the env sets one, but none is
 //!   required);
@@ -33,10 +34,13 @@ use verglas_block::{
     FragmentTransport, LiveMembership, LocalFragmentStore, PeerFragmentTransport, RingWriteback,
 };
 use verglas_cluster::peer::{
-    FragmentHandlers, FragmentShardStream, LocalBlockFn, PeerResolver, PeerServer,
+    FragmentHandlers, FragmentShardStream, LocalBlockFn, LocalBlockStoreFn, PeerClient,
+    PeerResolver, PeerServer,
 };
 use verglas_cluster::{FragmentClient, FragmentIoError, FragmentKey, FragmentRecord};
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::node::NodeId;
+use verglas_core::ring::RendezvousRing;
 
 use crate::VERSION;
 use crate::blockdev::DeviceRegistry;
@@ -56,6 +60,10 @@ const TAKEOVER_INTERVAL: Duration = Duration::from_secs(5);
 pub struct RingPlane {
     /// Stable identity of this cache node in the ring.
     self_id: NodeId,
+    /// Read-cache ownership shared by every node in this static fleet ring.
+    read_ring: RendezvousRing,
+    /// Peer transport used for owner lookups and materialized-page placement.
+    read_client: PeerClient,
     /// Shared local/peer fragment transport.
     transport: Arc<dyn FragmentTransport>,
     /// Shared view of live fragment holders.
@@ -72,6 +80,21 @@ pub struct RingPlane {
 }
 
 impl RingPlane {
+    /// Returns this process's stable read-cache identity.
+    pub fn node_id(&self) -> NodeId {
+        self.self_id.clone()
+    }
+
+    /// Returns the static rendezvous ownership map for ordinary cache data.
+    pub fn read_ring(&self) -> RendezvousRing {
+        self.read_ring.clone()
+    }
+
+    /// Returns the cache-only peer transport.
+    pub fn read_client(&self) -> PeerClient {
+        self.read_client.clone()
+    }
+
     /// Returns the fragment transport shared by block FLUSH and WAL.
     pub fn transport(&self) -> Arc<dyn FragmentTransport> {
         Arc::clone(&self.transport)
@@ -119,9 +142,11 @@ pub async fn setup(
     cache_dir: &std::path::Path,
     capacity_bytes: u64,
     registry: &DeviceRegistry,
+    page_cache: crate::page_cache::PageCacheSlot,
+    activity: ActivityTracker,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
     let peers = match env_var("VERGLAS_RING_PEERS") {
-        Some(raw) => parse_peers(&raw),
+        Some(raw) => resolve_peers(&raw).await,
         None => Vec::new(),
     };
     // A production cache ring needs at least three boxes; fewer is a
@@ -156,12 +181,28 @@ pub async fn setup(
         cache_dir.join("fragment-ring"),
         Arc::clone(&fragment_ceiling),
     );
+    match verglas_safekeeper::reclaim_legacy_state_descriptors(&local) {
+        Ok(0) => {}
+        Ok(count) => eprintln!(
+            "verglas-cache-node {VERSION} reclaimed {count} stale safekeeper state descriptors"
+        ),
+        Err(error) => eprintln!(
+            "verglas-cache-node {VERSION} could not reclaim stale safekeeper state descriptors: {error}"
+        ),
+    }
 
     // The peer RPC client + transport: self-directed placements go to the local
     // store, everything else over the fragment RPC to the resolved peer address.
     let resolver: Arc<dyn PeerResolver> = Arc::new(RingResolver::new(&peers));
+    let read_client = PeerClient::new(
+        Arc::clone(&resolver),
+        secret.clone(),
+        Duration::from_millis(50),
+        Duration::from_millis(100),
+    );
+    let read_ring = RendezvousRing::new(peers.iter().map(|(id, _)| id.clone()).collect())?;
     let client = FragmentClient::new(
-        resolver,
+        Arc::clone(&resolver),
         secret.clone(),
         Duration::from_millis(500),
         Duration::from_secs(30),
@@ -186,16 +227,38 @@ pub async fn setup(
     );
     registry.attach_ring(Arc::clone(&ring));
 
-    // Serve the fragment endpoints peers place shards through. The block-fetch
-    // source is a no-op — the ring plane serves only fragments.
+    // Serve both the clean read-cache owner protocol and the durable fragment
+    // protocol on the ring listener. The deferred slot returns a clean miss or
+    // placement error until cache recovery completes.
     let ring_addr: SocketAddr = env_var("VERGLAS_RING_ADDR")
         .unwrap_or_else(|| DEFAULT_RING_ADDR.to_owned())
         .parse()?;
-    let peer_server = PeerServer::bind_with_fragments(
+    let source_slot = Arc::clone(&page_cache);
+    let source: LocalBlockFn = Arc::new(move |block| {
+        let slot = Arc::clone(&source_slot);
+        Box::pin(async move {
+            let engine = slot.get()?;
+            engine.local_block(&block).await
+        })
+    });
+    let store_slot = page_cache;
+    let store: LocalBlockStoreFn = Arc::new(move |block, value| {
+        let slot = Arc::clone(&store_slot);
+        Box::pin(async move {
+            let engine = slot
+                .get()
+                .ok_or_else(|| "cache recovery is not complete".to_owned())?;
+            engine
+                .put_local_materialized_block(block, value)
+                .map_err(|error| error.to_string())
+        })
+    });
+    let peer_server = PeerServer::bind_with_store_and_fragments(
         ring_addr,
         secret,
-        noop_block_source(),
-        fragment_handlers(local.clone()),
+        source,
+        store,
+        fragment_handlers(local.clone(), activity),
     )
     .await?;
     eprintln!(
@@ -215,6 +278,8 @@ pub async fn setup(
 
     Ok(Some(RingPlane {
         self_id,
+        read_ring,
+        read_client,
         transport,
         membership,
         fragment_ceiling,
@@ -226,16 +291,35 @@ pub async fn setup(
 
 /// Parses `VERGLAS_RING_PEERS` — `id=host:port` entries, comma-separated —
 /// skipping any malformed entry with a warning rather than failing startup.
-fn parse_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
+async fn resolve_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
     let mut peers = Vec::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match entry.split_once('=') {
-            Some((id, addr)) => match addr.trim().parse::<SocketAddr>() {
-                Ok(addr) => peers.push((NodeId::new(id.trim()), addr)),
-                Err(error) => eprintln!(
-                    "verglas-cache-node {VERSION} ignoring malformed ring peer `{entry}`: {error}"
-                ),
-            },
+            Some((id, addr)) => {
+                let addr = addr.trim();
+                let resolved = match addr.parse::<SocketAddr>() {
+                    Ok(addr) => Some(addr),
+                    Err(_) => match tokio::net::lookup_host(addr).await {
+                        Ok(addrs) => {
+                            let addrs: Vec<_> = addrs.collect();
+                            addrs
+                                .iter()
+                                .find(|candidate| candidate.is_ipv4())
+                                .or_else(|| addrs.first())
+                                .copied()
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "verglas-cache-node {VERSION} ignoring unresolvable ring peer `{entry}`: {error}"
+                            );
+                            None
+                        }
+                    },
+                };
+                if let Some(addr) = resolved {
+                    peers.push((NodeId::new(id.trim()), addr));
+                }
+            }
             None => eprintln!(
                 "verglas-cache-node {VERSION} ignoring malformed ring peer `{entry}` (want id=host:port)"
             ),
@@ -249,46 +333,80 @@ fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
 
-/// A no-op block-fetch source: the ring plane serves only fragment endpoints, so
-/// every block request is a clean miss.
-fn noop_block_source() -> LocalBlockFn {
-    Arc::new(|_block| Box::pin(async { None }))
-}
-
 /// Wires the local fragment store behind the peer server's fragment handlers, so
 /// a peer coordinator can place, load, delete, and headroom-check block-flush
 /// shards on this node. Mirrors verglas-server's object-tier `fragment_handlers`.
-fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
+fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> FragmentHandlers {
     let store_put = store.clone();
     let store_stream = store.clone();
     let store_get = store.clone();
     let store_del = store.clone();
     let store_room = store.clone();
     let store_list = store;
+    let store_activity = activity.clone();
+    let stream_activity = activity.clone();
+    let load_activity = activity.clone();
+    let delete_activity = activity.clone();
+    let room_activity = activity.clone();
+    let list_activity = activity;
     FragmentHandlers {
         store: Arc::new(move |record: FragmentRecord| {
             let store = store_put.clone();
-            Box::pin(async move { store.store_fragment(&record) })
+            let activity = store_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                store.store_fragment(&record)
+            })
         }),
         store_stream: Arc::new(move |key: FragmentKey, shards| {
             let store = store_stream.clone();
-            Box::pin(async move { stream_into_store(&store, &key, shards).await })
+            let activity = stream_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                stream_into_store(&store, &key, shards).await
+            })
         }),
         load: Arc::new(move |key: FragmentKey| {
             let store = store_get.clone();
-            Box::pin(async move { store.load_fragment(&key) })
+            let activity = load_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                store.load_fragment(&key)
+            })
         }),
         delete: Arc::new(move |key: FragmentKey| {
             let store = store_del.clone();
-            Box::pin(async move { store.delete_fragment(&key) })
+            let activity = delete_activity.clone();
+            Box::pin(async move {
+                let _guard = activity
+                    .try_begin(ActivityPlane::Fragment)
+                    .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
+                store.delete_fragment(&key)
+            })
         }),
         headroom: Arc::new(move |bytes: u64| {
             let store = store_room.clone();
-            Box::pin(async move { store.has_headroom(bytes) })
+            let activity = room_activity.clone();
+            Box::pin(async move {
+                let Ok(_guard) = activity.try_begin(ActivityPlane::Fragment) else {
+                    return false;
+                };
+                store.has_headroom(bytes)
+            })
         }),
         list_prefix: Arc::new(move |prefix: String| {
             let store = store_list.clone();
+            let activity = list_activity.clone();
             Box::pin(async move {
+                let Ok(_guard) = activity.try_begin(ActivityPlane::Fragment) else {
+                    return Vec::new();
+                };
                 store
                     .list_fragment_keys()
                     .into_iter()
@@ -367,5 +485,42 @@ impl LiveMembership for StaticMembership {
 
     fn is_single_node(&self) -> bool {
         self.live.len() <= 1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ring_peers_accept_ip_addresses_and_dns_names() {
+        let peers = resolve_peers("cache-0=127.0.0.1:8336,cache-1=localhost:8337").await;
+
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].0, NodeId::new("cache-0"));
+        assert_eq!(peers[1].0, NodeId::new("cache-1"));
+        assert_eq!(peers[1].1.port(), 8337);
+    }
+
+    #[tokio::test]
+    async fn admission_fence_rejects_new_fragment_placements() {
+        let dir = tempfile::tempdir().expect("fragment dir");
+        let activity = ActivityTracker::new();
+        let _generation = activity.fence();
+        let handlers = fragment_handlers(LocalFragmentStore::new(dir.path()), activity.clone());
+        let record = FragmentRecord::new(
+            FragmentKey {
+                object_id: "fenced-object".to_owned(),
+                index: 0,
+            },
+            bytes::Bytes::from_static(b"fragment"),
+        );
+
+        let error = (handlers.store)(record)
+            .await
+            .expect_err("fenced placement");
+        assert!(error.to_string().contains("fenced"));
+        assert_eq!(activity.snapshot().accepted, 0);
+        assert!(activity.snapshot().idle);
     }
 }

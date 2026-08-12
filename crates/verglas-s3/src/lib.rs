@@ -18,12 +18,10 @@ mod middleware;
 pub mod passthrough;
 pub mod passthrough_route;
 pub mod preconditions;
-pub mod serving_api;
 
 pub use frontend::{VerglasS3, router, router_with_passthrough};
 pub use passthrough::{PassthroughList, PassthroughRead, PassthroughWrite};
 pub use passthrough_route::BucketConfigPassthrough;
-pub use serving_api::{ApiRequest, ApiResponse, ServingApi};
 pub use verglas_backend::{BackendRegistry, BackendStore, BackendStores, MultipartObjectStore};
 pub use verglas_core::CacheKey;
 pub use verglas_core::list::{ListError, ListObject, ListPage, ListRequest, ObjectList};

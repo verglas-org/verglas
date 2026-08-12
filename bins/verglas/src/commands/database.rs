@@ -5,8 +5,11 @@
 
 use reqwest::Url;
 use serde::Serialize;
+use std::path::Path;
 
-use crate::cli::{DatabaseType, DbCommand, DbCreateArgs};
+use crate::cli::{DatabaseType, DbCommand, DbCreateArgs, DbTokenArgs};
+use crate::credentials::{StoredDatabaseToken, save_database_token};
+use verglas_sdk::{Client, ConnectOptions, DatabaseConnectionTokenRequest};
 
 /// Request sent to the local database resource API.
 #[derive(Debug, Serialize)]
@@ -71,11 +74,84 @@ pub async fn run(
     command: DbCommand,
     endpoint: &str,
     token: Option<&str>,
+    credentials_path: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         DbCommand::Create(args) => create(endpoint, token, args, json).await,
+        DbCommand::Token(args) => {
+            mint_connection_token(endpoint, token, credentials_path, args, json).await
+        }
     }
+}
+
+/// Exchanges the caller's scoped bearer for a short-lived database connection password.
+async fn mint_connection_token(
+    endpoint: &str,
+    bearer: Option<&str>,
+    credentials_path: &Path,
+    args: DbTokenArgs,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_name(&args.database)?;
+    if args.expires_in_seconds == 0 || args.expires_in_seconds > 900 {
+        return Err("--expires-in must be between 1 and 900 seconds".into());
+    }
+    if args.print_password && json {
+        return Err("--print-password cannot be combined with --json".into());
+    }
+    let bearer = bearer.ok_or(
+        "a bearer credential is required; pass --token, set VERGLAS_TOKEN, or mint one from the Verglas OS Access page",
+    )?;
+    let client = access_client(endpoint, bearer).await?;
+    let response = client
+        .create_database_connection_token(
+            &DatabaseConnectionTokenRequest::new(&args.database)
+                .with_expiration_seconds(args.expires_in_seconds),
+        )
+        .await?;
+    if args.print_password {
+        println!("{}", response.token);
+        return Ok(());
+    }
+    save_database_token(
+        credentials_path,
+        endpoint,
+        &args.database,
+        StoredDatabaseToken {
+            token: response.token,
+            expires_at: response.expires_at,
+        },
+    )?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "database": args.database,
+                "expires_at": response.expires_at,
+                "credentials_file": credentials_path,
+            }))?
+        );
+    } else {
+        println!(
+            "stored a database connection token for {} until {}",
+            args.database, response.expires_at
+        );
+        println!("Use --print-password only when piping the token to PGPASSWORD.");
+    }
+    Ok(())
+}
+
+/// Builds an SDK client that targets the standalone access service without discovery calls.
+async fn access_client(endpoint: &str, bearer: &str) -> Result<Client, verglas_sdk::ClientError> {
+    Client::connect(
+        ConnectOptions::new(endpoint)
+            .with_access_uri(endpoint)
+            .with_query_uri(endpoint)
+            .with_s3_endpoint("http://127.0.0.1:8333")
+            .with_token(bearer),
+    )
+    .await
 }
 
 /// Validates a database declaration and sends its typed request.

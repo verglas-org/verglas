@@ -6,19 +6,23 @@
   "scripts": {
     "build": "pnpm run --recursive build",
     "run-local": "node scripts/run-local.mjs",
-    "test": "node --test scripts/*.test.js && pnpm run --recursive --if-present test",
+    "test": "node --test scripts/*.test.js && pnpm --filter @verglas/typed-storage build && pnpm run --recursive --if-present test",
     "dev-client": "cd packages/workshop-frontend && pnpm run dev",
     "dev-server": "node run-dev-server.js",
     "clean": "pnpm run --recursive clean",
+    "format:check": "node scripts/check-changed-quality.mjs format",
     "lint:check": "oxlint",
+    "lint:strict": "node scripts/check-changed-quality.mjs lint",
     "lint:fix": "oxlint --fix",
     "types:check": "pnpm run --recursive --if-present types:check",
     "lint": "pnpm run lint:check && pnpm run types:check"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
     "aws4fetch": "^1.0.20",
     "jsonc-parser": "^3.3.1",
     "oxlint": "^1.76.0",
+    "prettier": "3.9.6",
     "typescript": "^5.9.3",
     "vite": "^7.3.6",
     "wrangler": "^4.115.0"

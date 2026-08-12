@@ -1,46 +1,49 @@
-import { StrictMode, useState, useEffect } from 'react'
-import { createRoot } from 'react-dom/client'
-import { RouterProvider } from '@tanstack/react-router'
-import { RpcStub, newWebSocketRpcSession } from 'capnweb'
-import { PublicApi, ServerConfig } from '@verglas/workshop-shared/api'
-import { RpcContext } from './RpcContext'
-import { ServerConfigContext, ServerConfigErrorContext } from './ServerConfigContext'
-import { ThemeProvider } from './ThemeContext'
-import { createRouter } from './router'
-import AnnouncementBanner from './components/AnnouncementBanner'
-import { applyAccentColor, applyStoredThemeMode } from './theme'
-import './styles.css'
-import FrontendErrorBoundary from './FrontendErrorBoundary'
-import { installWorkshopErrorReporting, reportIssue } from './errorReporting'
-import { applySiteFavicon, cacheBustSiteLogoUrl } from './siteLogoUtils'
+import { StrictMode, useState, useEffect } from "react";
+import { createRoot } from "react-dom/client";
+import { RouterProvider } from "@tanstack/react-router";
+import { RpcStub, newWebSocketRpcSession } from "capnweb";
+import { PublicApi, ServerConfig } from "@verglas/workshop-shared/api";
+import { RpcContext } from "./RpcContext";
+import {
+  ServerConfigContext,
+  ServerConfigErrorContext,
+} from "./ServerConfigContext";
+import { ThemeProvider } from "./ThemeContext";
+import { createRouter } from "./router";
+import AnnouncementBanner from "./components/AnnouncementBanner";
+import { applyAccentColor, applyStoredThemeMode } from "./theme";
+import "./styles.css";
+import FrontendErrorBoundary from "./FrontendErrorBoundary";
+import { installWorkshopErrorReporting, reportIssue } from "./errorReporting";
+import { applySiteFavicon, cacheBustSiteLogoUrl } from "./siteLogoUtils";
 
 // ---------------------------------------------------------------------------
 // Dev auto-login: if VITE_DEV_AUTO_LOGIN=true, automatically create/login
 // with the dev account before React renders, so you never see the login page.
 // ---------------------------------------------------------------------------
 async function devAutoLogin(stub: RpcStub<PublicApi>): Promise<void> {
-  if (import.meta.env.VITE_DEV_AUTO_LOGIN !== 'true') return
-  if (localStorage.getItem('authToken')) return  // already logged in
+  if (import.meta.env.VITE_DEV_AUTO_LOGIN !== "true") return;
+  if (localStorage.getItem("authToken")) return; // already logged in
 
-  const username = import.meta.env.VITE_DEV_USERNAME ?? 'dev'
-  const password = import.meta.env.VITE_DEV_PASSWORD ?? 'devpassword'
+  const email = import.meta.env.VITE_DEV_EMAIL ?? "dev@example.com";
+  const password = import.meta.env.VITE_DEV_PASSWORD ?? "devpassword";
 
   // Derive the passwordHash the same way the app does (argon2id via hashPassword),
   // but here we use the same SERVICE_SALT + SHA-256 shortcut that wrangler dev accepts
   // in local mode. We import hashPassword from the existing util.
-  const { hashPassword } = await import('./passwordHash')
-  const passwordHash = await hashPassword(username, password)
+  const { hashPassword } = await import("./passwordHash");
+  const passwordHash = await hashPassword(email, password);
 
   // Try createAccount first — works on a fresh backend. Returns null if already exists.
-  let token = await stub.createAccount(username, username, passwordHash)
+  let token = await stub.createAccount(email, passwordHash);
 
   // If null, account already exists — just log in.
   if (!token) {
-    token = await stub.login(username, passwordHash)
+    token = await stub.login(email, passwordHash);
   }
 
   if (token) {
-    localStorage.setItem('authToken', token)
+    localStorage.setItem("authToken", token);
   }
 }
 
@@ -64,27 +67,35 @@ function getBackendHost(): string {
 
   // When opening the Vite dev server directly (localhost:3000), the backend is at localhost:8787.
   // Otherwise, the API is on the same host as the frontend.
-  return window.location.hostname === 'localhost' ? 'localhost:8787' : window.location.host;
+  return window.location.hostname === "localhost"
+    ? "localhost:8787"
+    : window.location.host;
 }
 
 function startConnection(): RpcStub<PublicApi> {
   lastConnectTime = Date.now();
   const apiHost = getBackendHost();
-  const wsUrl = (window.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + apiHost + '/api';
+  const wsUrl =
+    (window.location.protocol === "https:" ? "wss:" : "ws:") +
+    "//" +
+    apiHost +
+    "/api";
   return newWebSocketRpcSession<PublicApi>(wsUrl);
 }
 
 async function handleBroken(error: any) {
-  console.warn('RPC connection lost:', error);
+  console.warn("RPC connection lost:", error);
 
   isConnectionLost = true;
-  for (let cb of notifyCurrentStubUpdated) { cb(); }
+  for (let cb of notifyCurrentStubUpdated) {
+    cb();
+  }
 
   let timeSinceConnect = Date.now() - lastConnectTime;
   if (timeSinceConnect < backoff) {
     let waitTime = backoff - timeSinceConnect;
-    console.warn(`Will try again in ${Math.round(waitTime / 1000)} seconds...`)
-    await new Promise(resolve => setTimeout(resolve, waitTime));
+    console.warn(`Will try again in ${Math.round(waitTime / 1000)} seconds...`);
+    await new Promise((resolve) => setTimeout(resolve, waitTime));
     console.warn(`Retrying connection...`);
     backoff = Math.min(backoff * 2, 10000);
   } else {
@@ -110,19 +121,24 @@ let isConnectionLost = false;
 export function markConnectionRestored() {
   if (!isConnectionLost) return;
   isConnectionLost = false;
-  for (let cb of notifyCurrentStubUpdated) { cb(); }
+  for (let cb of notifyCurrentStubUpdated) {
+    cb();
+  }
 }
 
 // Current stub. handleBroken() will replace this on disconnect.
-installWorkshopErrorReporting()
+installWorkshopErrorReporting();
 let currentStub = startConnection();
 currentStub.onRpcBroken(handleBroken);
 
-const router = createRouter()
-applyStoredThemeMode()
+const router = createRouter();
+applyStoredThemeMode();
 
 function AppWithConnection() {
-  const [rpcState, setRpcState] = useState<{stub: RpcStub<PublicApi>; connectionLost: boolean}>({
+  const [rpcState, setRpcState] = useState<{
+    stub: RpcStub<PublicApi>;
+    connectionLost: boolean;
+  }>({
     stub: currentStub,
     connectionLost: isConnectionLost,
   });
@@ -130,9 +146,12 @@ function AppWithConnection() {
   const [serverConfigError, setServerConfigError] = useState(false);
 
   useEffect(() => {
-    let cb = () => setRpcState({ stub: currentStub, connectionLost: isConnectionLost });
+    let cb = () =>
+      setRpcState({ stub: currentStub, connectionLost: isConnectionLost });
     notifyCurrentStubUpdated.add(cb);
-    return () => { notifyCurrentStubUpdated.delete(cb); };
+    return () => {
+      notifyCurrentStubUpdated.delete(cb);
+    };
   }, []);
 
   // Fetch deployment config once the (re)connected stub is available. Re-fetch on reconnect so a
@@ -140,22 +159,31 @@ function AppWithConnection() {
   useEffect(() => {
     let cancelled = false;
     setServerConfigError(false);
-    rpcState.stub.getServerConfig()
+    rpcState.stub
+      .getServerConfig()
       .then((cfg) => {
         if (!cancelled) {
-          setServerConfig(cfg.siteLogo ? {
-            ...cfg,
-            siteLogo: { url: cacheBustSiteLogoUrl(cfg.siteLogo.url) },
-          } : cfg);
+          setServerConfig(
+            cfg.siteLogo
+              ? {
+                  ...cfg,
+                  siteLogo: { url: cacheBustSiteLogoUrl(cfg.siteLogo.url) },
+                }
+              : cfg,
+          );
         }
       })
-      .catch(() => { if (!cancelled) setServerConfigError(true); });
-    return () => { cancelled = true; };
+      .catch(() => {
+        if (!cancelled) setServerConfigError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [rpcState.stub]);
 
   // Apply the deployment's admin-chosen accent color (overrides brand CSS vars at runtime).
   useEffect(() => {
-    applyAccentColor(serverConfig?.accentColor ?? '');
+    applyAccentColor(serverConfig?.accentColor ?? "");
   }, [serverConfig?.accentColor]);
 
   useEffect(() => {
@@ -176,22 +204,25 @@ function AppWithConnection() {
   );
 }
 
-const root = createRoot(document.getElementById('root')!, {
-  onUncaughtError: (error) => reportIssue('workshop.react-root', error, {
-    handled: false, severity: 'fatal', captureMechanism: 'react',
-  }),
-})
+const root = createRoot(document.getElementById("root")!, {
+  onUncaughtError: (error) =>
+    reportIssue("workshop.react-root", error, {
+      handled: false,
+      severity: "fatal",
+      captureMechanism: "react",
+    }),
+});
 
 // Kick off dev auto-login in the background. If it completes before
 // useAuth checks the token, the user skips the login page. If the backend
 // is unreachable, the app still renders immediately (showing a connection
 // banner or login page) instead of hanging on a blank screen.
-devAutoLogin(currentStub).catch(() => {})
+devAutoLogin(currentStub).catch(() => {});
 
 root.render(
   <StrictMode>
     <FrontendErrorBoundary>
       <AppWithConnection />
     </FrontendErrorBoundary>
-  </StrictMode>
-)
+  </StrictMode>,
+);

@@ -65,16 +65,20 @@ pub async fn bootstrap(
     .json::<ModelList>()
     .await
     .map_err(|error| AuthzError::Backend(error.to_string()))?;
-    let authorization_model_id = match models.authorization_models.into_iter().next() {
+    let current_model: serde_json::Value = serde_json::from_str(AUTHORIZATION_MODEL_JSON)
+        .map_err(|error| AuthzError::Backend(error.to_string()))?;
+    let authorization_model_id = match models
+        .authorization_models
+        .into_iter()
+        .find(|model| model_contains(&model.body(), &current_model))
+    {
         Some(model) => model.id,
         None => {
-            let model: serde_json::Value = serde_json::from_str(AUTHORIZATION_MODEL_JSON)
-                .map_err(|error| AuthzError::Backend(error.to_string()))?;
             request(
                 bearer_token,
                 client
                     .post(format!("{endpoint}/stores/{store_id}/authorization-models"))
-                    .json(&model),
+                    .json(&current_model),
             )
             .await?
             .json::<ModelId>()
@@ -130,6 +134,68 @@ struct ModelList {
 #[derive(Debug, Deserialize)]
 struct Model {
     id: String,
+    schema_version: String,
+    type_definitions: serde_json::Value,
+}
+
+impl Model {
+    fn body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": self.schema_version,
+            "type_definitions": self.type_definitions,
+        })
+    }
+}
+
+/// OpenFGA adds default fields while storing a model. Treat the configured
+/// model as current when every authored field is present with the same value.
+fn model_contains(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    match (actual, expected) {
+        (serde_json::Value::Object(actual), serde_json::Value::Object(expected)) => {
+            expected.iter().all(|(key, expected)| {
+                actual
+                    .get(key)
+                    .is_some_and(|actual| model_contains(actual, expected))
+            })
+        }
+        (serde_json::Value::Array(actual), serde_json::Value::Array(expected)) => {
+            actual.len() == expected.len()
+                && actual
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| model_contains(actual, expected))
+        }
+        _ => actual == expected,
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::model_contains;
+    use serde_json::json;
+
+    #[test]
+    fn accepts_openfga_defaults_but_rejects_missing_contract_fields() {
+        let expected = json!({
+            "schema_version": "1.1",
+            "type_definitions": [{"type": "resource", "relations": {"connect": {"this": {}}}}]
+        });
+        let actual = json!({
+            "schema_version": "1.1",
+            "type_definitions": [{
+                "type": "resource",
+                "relations": {"connect": {"this": {}}},
+                "metadata": {"module": ""}
+            }]
+        });
+        assert!(model_contains(&actual, &expected));
+
+        let obsolete = json!({
+            "schema_version": "1.1",
+            "type_definitions": [{"type": "resource", "relations": {}}]
+        });
+        assert!(!model_contains(&obsolete, &expected));
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -330,7 +396,7 @@ fn grant_tuples(grant: &Grant) -> Vec<TupleKey> {
 }
 
 /// Returns every public action in stable model order.
-fn all_actions() -> [Action; 12] {
+fn all_actions() -> [Action; 13] {
     [
         Action::Discover,
         Action::Describe,
@@ -341,6 +407,7 @@ fn all_actions() -> [Action; 12] {
         Action::Execute,
         Action::UseSecret,
         Action::Deploy,
+        Action::Connect,
         Action::PassGrants,
         Action::ManageGrants,
         Action::Own,

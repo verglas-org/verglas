@@ -13,15 +13,35 @@
 export { connect, VerglasClient, Table, Queue, Graph, Kv } from "./client";
 export { VerglasHttpError } from "./http";
 export {
+  connectAccess,
   connectAdmin,
   connectRuntime,
   connectScheduler,
   extractWorkerSource,
+  VerglasAccessClient,
   VerglasAdminClient,
   VerglasRuntimeClient,
   VerglasSchedulerClient,
 } from "./control";
-export type { ControlConnectOptions, JobSummary, WorkerRow, WorkerSpec } from "./control";
+export type {
+  AccessAction,
+  AccessAuthorization,
+  AccessAuthorizationRequest,
+  AccessDecision,
+  AccessIdentity,
+  AccessTokenGrant,
+  AccessTokenSummary,
+  ControlConnectOptions,
+  CreateAccessTokenRequest,
+  CreateDatabaseTokenRequest,
+  CreateDatabaseRequest,
+  DatabaseAccessToken,
+  DatabaseView,
+  JobSummary,
+  MintedAccessToken,
+  WorkerRow,
+  WorkerSpec,
+} from "./control";
 
 export { defineWorker, runWorker } from "./contracts";
 export type {
@@ -61,8 +81,11 @@ export type {
   CreateTableResult,
   EnsureTableResult,
   QueryResult,
+  QueryAt,
   QueueEnqueueResult,
-  QueueRecord,
+  QueueMessage,
+  QueueReceipt,
+  QueueDelivery,
   QueuePollResult,
   GraphDirection,
   GraphNodeInput,

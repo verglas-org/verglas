@@ -1,8 +1,10 @@
 //! Database-scoped catalog routing for a tenant with multiple lakehouses.
 
 use verglas_catalog::{
-    CatalogBinding, CatalogBindingId, CatalogRegistry, DatabaseId, StorageBindingId,
+    CatalogBinding, CatalogBindingId, CatalogGateway, CatalogRegistry, CatalogRuntimeRegistry,
+    DatabaseId, StorageBindingId,
 };
+use verglas_core::config::Config;
 
 fn binding(database: &str, catalog: &str, storage: &str) -> CatalogBinding {
     CatalogBinding::new(
@@ -72,4 +74,78 @@ fn invalid_identifiers_and_catalog_urls_fail_closed() {
         None,
     );
     assert!(result.is_err());
+}
+
+/// Builds a gateway whose URI is only inspected as registry identity in this test.
+fn gateway(label: &str) -> CatalogGateway {
+    let config = Config::from_toml_str(&format!(
+        "[cache]\ndir = '/tmp/verglas-catalog-registry-{label}'\ncapacity_bytes = '64MB'\n\
+         [backend]\nbucket = 'test'\n[catalog]\nuri = 'https://{label}.example.com'\n"
+    ))
+    .expect("catalog config");
+    CatalogGateway::from_config(config.catalog.as_ref().expect("catalog")).expect("gateway")
+}
+
+#[test]
+fn runtime_refresh_atomically_replaces_added_and_deleted_databases() {
+    let registry = CatalogRuntimeRegistry::default();
+    registry
+        .replace_all([
+            (
+                DatabaseId::new("analytics").expect("database"),
+                gateway("analytics"),
+            ),
+            (
+                DatabaseId::new("archive").expect("database"),
+                gateway("archive"),
+            ),
+        ])
+        .expect("initial refresh");
+
+    registry
+        .replace_all([
+            (
+                DatabaseId::new("analytics").expect("database"),
+                gateway("analytics-next"),
+            ),
+            (
+                DatabaseId::new("realtime").expect("database"),
+                gateway("realtime"),
+            ),
+        ])
+        .expect("replacement refresh");
+
+    assert!(
+        registry
+            .get(&DatabaseId::new("archive").expect("database"))
+            .is_none(),
+        "deleted databases must disappear from the live routing set"
+    );
+    assert!(
+        registry
+            .get(&DatabaseId::new("realtime").expect("database"))
+            .is_some(),
+        "new databases must become routable"
+    );
+    assert_eq!(registry.len().expect("runtime count"), 2);
+}
+
+#[test]
+fn runtime_route_name_resolves_immutable_authorization_id() {
+    let registry = CatalogRuntimeRegistry::default();
+    registry
+        .insert_bound(
+            DatabaseId::new("default").expect("route name"),
+            DatabaseId::new("ee8f6d4f-f3a9-4121-8c26-a7e1434848dd").expect("authorization id"),
+            gateway("default"),
+        )
+        .expect("bound insert");
+
+    assert_eq!(
+        registry
+            .authorization_id(&DatabaseId::new("default").expect("route name"))
+            .expect("authorization id")
+            .as_str(),
+        "ee8f6d4f-f3a9-4121-8c26-a7e1434848dd",
+    );
 }

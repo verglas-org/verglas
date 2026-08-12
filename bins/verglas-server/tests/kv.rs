@@ -5,7 +5,10 @@ use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use reqwest::StatusCode;
+use serde_json::json;
 
 /// Reserves an unused loopback address for a child listener.
 fn free_addr() -> SocketAddr {
@@ -21,6 +24,8 @@ fn spawn(
     admin: SocketAddr,
     s3: SocketAddr,
     log: &std::path::Path,
+    access_uri: &str,
+    access_token_file: &std::path::Path,
 ) -> Child {
     Command::new(env!("CARGO_BIN_EXE_verglas-server"))
         .arg("--config")
@@ -28,6 +33,9 @@ fn spawn(
         .env("VERGLAS_ADMIN_ADDR", admin.to_string())
         .env("VERGLAS_S3_ADDR", s3.to_string())
         .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
+        .env("VERGLAS_ACCESS_URI", access_uri)
+        .env("VERGLAS_ACCESS_TOKEN_FILE", access_token_file)
+        .env("VERGLAS_MANAGED_CATALOG_URI", "http://127.0.0.1:9")
         .stdout(Stdio::null())
         .stderr(Stdio::from(
             std::fs::File::create(log).expect("create server log"),
@@ -36,8 +44,43 @@ fn spawn(
         .expect("spawn server")
 }
 
+/// Starts the access authority required by the production data-plane boundary.
+async fn access_authority() -> String {
+    let app = Router::new()
+        .route(
+            "/v1/access/authorize",
+            post(|| async {
+                Json(json!({
+                "identity": {
+                    "tenant_id": "local-tenant",
+                    "principal_id": "token/local-test",
+                    "token_id": "local-test",
+                    "audience": "data-plane"
+                },
+                "decision": {
+                    "allowed": true,
+                    "reason": "exact_grant",
+                    "grant_id": "local-test",
+                    "matched_resource_id": "kv/local",
+                    "policy_version": 1
+                }
+                }))
+            }),
+        )
+        .route(
+            "/v1/databases",
+            get(|| async { Json(json!({"databases": []})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind access authority");
+    let endpoint = format!("http://{}", listener.local_addr().expect("access address"));
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("access authority") });
+    endpoint
+}
+
 /// Waits for the server recovery gate to report ready.
-async fn ready(client: &reqwest::Client, admin: SocketAddr) {
+async fn ready(client: &reqwest::Client, admin: SocketAddr, log: &std::path::Path) {
     for _ in 0..200 {
         if client
             .get(format!("http://{admin}/admin/healthz"))
@@ -49,7 +92,10 @@ async fn ready(client: &reqwest::Client, admin: SocketAddr) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("server did not become ready");
+    panic!(
+        "server did not become ready: {}",
+        std::fs::read_to_string(log).expect("read server log")
+    );
 }
 
 /// Always-on KV data survives abrupt termination and ignores object-cache purge.
@@ -81,11 +127,21 @@ async fn acknowledged_kv_survives_sigkill_and_object_purge_without_config() {
     );
 
     let client = reqwest::Client::new();
+    let access_uri = access_authority().await;
+    let access_token_file = scratch.path().join("access-token");
+    std::fs::write(&access_token_file, "local-access-token").expect("access token file");
     let admin = free_addr();
     let s3 = free_addr();
     let first_log = scratch.path().join("first.log");
-    let mut first = spawn(&config, admin, s3, &first_log);
-    ready(&client, admin).await;
+    let mut first = spawn(
+        &config,
+        admin,
+        s3,
+        &first_log,
+        &access_uri,
+        &access_token_file,
+    );
+    ready(&client, admin, &first_log).await;
     let endpoint = format!("http://{admin}/v1/kv/workshop.blueprints/featured");
     assert_eq!(
         client
@@ -105,7 +161,14 @@ async fn acknowledged_kv_survives_sigkill_and_object_purge_without_config() {
         .send()
         .await
         .expect("put");
-    assert_eq!(response.status(), StatusCode::CREATED);
+    let status = response.status();
+    let body = response.text().await.expect("put response body");
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "response={body}; server={}",
+        std::fs::read_to_string(&first_log).expect("read first log")
+    );
     first.kill().expect("SIGKILL child");
     let _ = first.wait();
     let log = std::fs::read_to_string(&first_log).expect("read first log");
@@ -118,8 +181,16 @@ async fn acknowledged_kv_survives_sigkill_and_object_purge_without_config() {
 
     let admin = free_addr();
     let s3 = free_addr();
-    let mut second = spawn(&config, admin, s3, &scratch.path().join("second.log"));
-    ready(&client, admin).await;
+    let second_log = scratch.path().join("second.log");
+    let mut second = spawn(
+        &config,
+        admin,
+        s3,
+        &second_log,
+        &access_uri,
+        &access_token_file,
+    );
+    ready(&client, admin, &second_log).await;
     let endpoint = format!("http://{admin}/v1/kv/workshop.blueprints/featured");
     let response = client
         .get(&endpoint)

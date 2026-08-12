@@ -87,7 +87,7 @@ fn spawn_mock() -> String {
 fn run(endpoint: &str, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_verglas"))
         .env("VERGLAS_CONTAINER_RUNTIME_URL", endpoint)
-        .env("VERGLAS_CONTAINER_RUNTIME_TOKEN", "runtime-secret")
+        .args(["--token", "runtime-secret"])
         .args(args)
         .output()
         .expect("run verglas")

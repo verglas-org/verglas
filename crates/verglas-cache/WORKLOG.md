@@ -485,7 +485,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   added.
 
 - #58: Fixed a flush-barrier race on unmapped partial reads: the aligned background fill is registered with `start_flight` before the foreground partial flight drops its in-flight count, so `flush()` cannot return in the gap and leave a warm re-read to refill from origin. The partial-read engine test now asserts flush blocks while the aligned tail is gated.
-- #74: Classified observed Neon immutable layer keys as immutable cache data.
-  Layer ranges now enter the same scan-resistant DRAM and NVMe admission policy
-  as Iceberg ranges. Mutable `index_part` publication remains version-checked.
 - #84: Included storage-binding identity in cache metadata and block disk encodings. Added coverage proving equal bucket and object names do not share blocks, mappings, or invalidations across bindings while using one shared admission budget.
+- #74: Classified immutable Neon layers and exact reconstructed pages as
+  ordinary hybrid-cache data. DRAM uses explicit W-TinyLFU and the shared NVMe
+  admission sketch records hits as well as fills, with mixed-size scan and
+  shifting-hotset regressions.

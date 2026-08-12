@@ -45,16 +45,27 @@ pub trait BatchCommitter: Send + Sync {
     ) -> Result<Value, String>;
 }
 
+/// Publishes only snapshots that the authoritative catalog already acknowledged.
+#[async_trait]
+pub trait CommitPublisher: Send + Sync {
+    /// Durably publishes one table/snapshot identity before the write response is acknowledged.
+    async fn publish(&self, table: &str, snapshot_id: &str) -> Result<(), String>;
+}
+
 /// State shared by all write-role handlers.
 #[derive(Clone)]
 pub struct AppState {
     committer: Arc<dyn BatchCommitter>,
+    publisher: Arc<dyn CommitPublisher>,
 }
 
 impl AppState {
     /// Creates role state around one production or test committer.
-    pub fn new(committer: Arc<dyn BatchCommitter>) -> Self {
-        Self { committer }
+    pub fn new(committer: Arc<dyn BatchCommitter>, publisher: Arc<dyn CommitPublisher>) -> Self {
+        Self {
+            committer,
+            publisher,
+        }
     }
 }
 
@@ -100,7 +111,22 @@ async fn ingest_file(
         )
         .await
     {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => {
+            let snapshot_id = response.get("snapshot_id").and_then(Value::as_i64);
+            if let Some(snapshot_id) = snapshot_id
+                && let Err(error) = state
+                    .publisher
+                    .publish(&name, &snapshot_id.to_string())
+                    .await
+            {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("snapshot committed but event publication failed: {error}"),
+                )
+                    .into_response();
+            }
+            Json(response).into_response()
+        }
         Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
     }
 }
@@ -140,7 +166,14 @@ async fn write_arrow(
         .commit(&name, batches, idempotency_key)
         .await
     {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => match state.publisher.publish(&name, &response.snapshot_id).await {
+            Ok(()) => Json(response).into_response(),
+            Err(error) => (
+                StatusCode::BAD_GATEWAY,
+                format!("snapshot committed but event publication failed: {error}"),
+            )
+                .into_response(),
+        },
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
     }
 }

@@ -2,10 +2,63 @@ import { throwLegacyVesselsRemoved } from "./legacy-vessels";
 import { RpcStub, RpcTarget, newWorkersRpcResponse } from "capnweb";
 import { validateRpc } from "capnweb-validate";
 import type { JWTPayload } from "jose";
-import { PublicApi, AuthenticatedApi, Overseer, WorkspaceMetadataWithTimestamps, AiChatAuthorInfo, AiModelConfig, ConnectedAccountsSubscriber, ConnectedAccountsFilter, GatekeeperVendorFilter, ObserverConfigCallback, BlueprintLibrarySummary, BlueprintPublicInfo, BlueprintUserSummary, BlueprintBindingAssignment, APPLICATION_SCREENSHOT_PATH_PREFIX, APPLICATION_SCREENSHOT_R2_PREFIX, BLUEPRINT_SCREENSHOT_PATH_PREFIX, BLUEPRINT_SCREENSHOT_R2_PREFIX, blueprintScreenshotUrl, ServerConfig, LoginAttempt, GatekeeperAppInfo, AdminApi, GatekeeperVendorInfo, OutputFormatOffer, ListOutputsResult, SUGGESTED_MODELS, createOpenWorkspaceError, OPEN_WORKSPACE_ERROR_CODES, type ModelRuntimeCatalogEntry, type ModelRuntimeDetection, type ModelRuntimeId, type ModelRuntimeLoginResult, type ModelRuntimeWizardAnswer, type VerglasAccessAction, type VerglasAccessIdentity, type VerglasCatalogSnapshot, type VerglasIntegrationConfiguration, type VerglasTableSummary, type VerglasVesselSummary, type VerglasWorkerSummary } from '@verglas/workshop-shared/api';
+import {
+  PublicApi,
+  AuthenticatedApi,
+  Overseer,
+  WorkspaceMetadataWithTimestamps,
+  AiChatAuthorInfo,
+  AiModelConfig,
+  ConnectedAccountsSubscriber,
+  ConnectedAccountsFilter,
+  GatekeeperVendorFilter,
+  ObserverConfigCallback,
+  BlueprintLibrarySummary,
+  BlueprintPublicInfo,
+  BlueprintUserSummary,
+  BlueprintBindingAssignment,
+  APPLICATION_SCREENSHOT_PATH_PREFIX,
+  APPLICATION_SCREENSHOT_R2_PREFIX,
+  BLUEPRINT_SCREENSHOT_PATH_PREFIX,
+  BLUEPRINT_SCREENSHOT_R2_PREFIX,
+  blueprintScreenshotUrl,
+  ServerConfig,
+  LoginAttempt,
+  GatekeeperAppInfo,
+  AdminApi,
+  GatekeeperVendorInfo,
+  OutputFormatOffer,
+  ListOutputsResult,
+  SUGGESTED_MODELS,
+  createOpenWorkspaceError,
+  OPEN_WORKSPACE_ERROR_CODES,
+  type ModelRuntimeCatalogEntry,
+  type ModelRuntimeDetection,
+  type ModelRuntimeId,
+  type ModelRuntimeLoginResult,
+  type ModelRuntimeWizardAnswer,
+  type VerglasAccessAction,
+  type VerglasAccessIdentity,
+  type VerglasAccessResource,
+  type VerglasAccessTokenSummary,
+  type VerglasCreatedAccessToken,
+  type VerglasCreateAccessTokenInput,
+  type VerglasCatalogSnapshot,
+  type VerglasCreateDatabaseInput,
+  type VerglasCreateTableInput,
+  type VerglasDatabaseDetail,
+  type VerglasDatabaseSummary,
+  type VerglasIntegrationConfiguration,
+  type VerglasTableSummary,
+  type VerglasVesselSummary,
+  type VerglasWorkerSummary,
+} from "@verglas/workshop-shared/api";
 import type { UiFeatureFlags } from "@verglas/workshop-shared/feature-flags";
 import { getServerConfig } from "./deployment-config.js";
-import { isPasswordAuthEnabled, getAuthGatekeeperAllowlist } from "./auth/config.js";
+import {
+  isPasswordAuthEnabled,
+  getAuthGatekeeperAllowlist,
+} from "./auth/config.js";
 import { getAuthVendorBinding } from "./auth/auth-vendors.js";
 import { PendingLogin, LoginConnectCallbackImpl } from "./auth/login-flow.js";
 import { listFormatOffers, readAdminConfig } from "./admin-config.js";
@@ -16,8 +69,19 @@ import { GatekeeperUiFrame } from "@verglas/workshop-shared/gatekeeper";
 import { getModel, LanguageModelGatekeeper } from "./ai-models";
 import { completeText } from "./ai-invoke.js";
 import { AdminSettings, AdminApiImpl } from "./admin-settings.js";
-import { BlueprintKvRecord, buildBlueprintArchiveStream, listFeaturedBlueprintsFromKv, parseBlueprintArchive, randomBlueprintId, readBlueprintKvRecord } from "./blueprint-archive.js";
-import { GatekeeperConnectCallbackImpl, normalizeUsername, UserDurableObject } from "./user";
+import {
+  BlueprintKvRecord,
+  buildBlueprintArchiveStream,
+  listFeaturedBlueprintsFromKv,
+  parseBlueprintArchive,
+  randomBlueprintId,
+  readBlueprintKvRecord,
+} from "./blueprint-archive.js";
+import {
+  GatekeeperConnectCallbackImpl,
+  normalizeEmail,
+  UserDurableObject,
+} from "./user";
 import { recordAnalytics } from "./analytics";
 import { handleClientErrorRequest } from "./client-errors.js";
 import { verifyCfAccessJwt } from "./access.js";
@@ -27,7 +91,12 @@ import { createWorkshopLogger } from "./observability";
 import { ModelRuntimeManager } from "./model-runtimes.js";
 import { AgentWorkspace } from "./verglas-agent-runtime.js";
 import { VerglasCatalogClient } from "./verglas-catalog.js";
-import { resolveVerglasAccessConfig, userPrincipalId, VerglasAccessClient } from "./verglas-access.js";
+import {
+  resolveVerglasAccessConfig,
+  userPrincipalId,
+  VerglasAccessClient,
+} from "./verglas-access.js";
+import { proxyApplicationPreview } from "./application-preview.js";
 
 const logger = createWorkshopLogger("workshop.server");
 
@@ -35,7 +104,10 @@ const logger = createWorkshopLogger("workshop.server");
 // fetch handler), so later requests skip the call. The DO holds the real answer.
 let formatBlueprintInstallStarted = false;
 
-function publicBlueprintInfo(id: string, metadata: BlueprintPublicInfo['metadata']): BlueprintPublicInfo {
+function publicBlueprintInfo(
+  id: string,
+  metadata: BlueprintPublicInfo["metadata"],
+): BlueprintPublicInfo {
   return {
     id,
     metadata,
@@ -54,31 +126,38 @@ export { UserDurableObject, GatekeeperConnectCallbackImpl };
 
 // Declare optional environment variables here since they may be omitted from wrangler.jsonc.
 type Env = Cloudflare.Env & {
-  // Set these if using Cloudflare Access for authentication, otherwise username/password is used.
-  CF_ACCESS_AUD?: string,  // audience
-  CF_ACCESS_ISS?: string,  // team URL, i.e. https://<team>.cloudflareaccess.com
+  // Set these if using Cloudflare Access for authentication, otherwise email/password is used.
+  CF_ACCESS_AUD?: string; // audience
+  CF_ACCESS_ISS?: string; // team URL, i.e. https://<team>.cloudflareaccess.com
   DEV?: boolean;
   FLAGS?: Flagship;
-}
+};
 
 // =======================================================================================
 
 @validateRpc()
 class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
-  constructor(private ctx: ExecutionContext, private env: Env,
-      private user: DurableObjectStub<UserDurableObject>,
-      private abortSession: (reason: Error) => void) {
+  constructor(
+    private ctx: ExecutionContext,
+    private env: Env,
+    private user: DurableObjectStub<UserDurableObject>,
+    private abortSession: (reason: Error) => void,
+  ) {
     super();
 
     this.adminSettings = this.ctx.exports.AdminSettings;
     this.users = this.ctx.exports.UserDurableObject;
+    const accessConfig = resolveVerglasAccessConfig(this.env);
+    this.access = accessConfig
+      ? new VerglasAccessClient(accessConfig, this.#userId())
+      : null;
   }
 
   private adminSettings: DurableObjectNamespace<AdminSettings>;
   private users: DurableObjectNamespace<UserDurableObject>;
+  private access: VerglasAccessClient | null;
 
   #isAdmin(): boolean {
-    if (this.env.VERGLAS_LOCAL_OWNER_BOOTSTRAP === "true") return true;
     let name = this.user.id.name;
     let admins = this.env.ADMINS;
 
@@ -91,7 +170,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     }
 
     if (!Array.isArray(admins)) {
-      throw new TypeError("ADMINS must be configured as an array of usernames.");
+      throw new TypeError(
+        "ADMINS must be configured as an array of email addresses.",
+      );
     }
 
     return admins.includes(name);
@@ -100,14 +181,45 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async whoami(): Promise<AiChatAuthorInfo> {
     const profile = await this.user.whoami();
     const access = this.#accessClient();
-    if (access) await access.ensureUser(this.#userId());
+    if (access) await access.identity();
     return profile;
   }
 
   async getAccessIdentity(): Promise<VerglasAccessIdentity> {
     const access = this.#accessClient();
-    if (!access) throw new Error("Verglas tenant authorization is not configured.");
-    return await access.ensureUser(this.#userId());
+    if (!access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    return await access.identity();
+  }
+
+  async listAccessibleAccessResources(): Promise<VerglasAccessResource[]> {
+    const access = this.#accessClient();
+    if (!access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    return await access.listDelegableResources();
+  }
+
+  async listAccessTokens(): Promise<VerglasAccessTokenSummary[]> {
+    const access = this.#accessClient();
+    if (!access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    return await access.listTokens();
+  }
+
+  async createAccessToken(
+    input: VerglasCreateAccessTokenInput,
+  ): Promise<VerglasCreatedAccessToken> {
+    const access = this.#accessClient();
+    if (!access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    return await access.createToken(input);
+  }
+
+  async revokeAccessToken(tokenId: string): Promise<void> {
+    const access = this.#accessClient();
+    if (!access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    await access.revokeToken(tokenId);
   }
 
   #userId(): string {
@@ -117,17 +229,21 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   #accessClient(): VerglasAccessClient | null {
-    const config = resolveVerglasAccessConfig(this.env);
-    return config ? new VerglasAccessClient(config) : null;
+    return this.access;
   }
 
   async #requireAccess(action: VerglasAccessAction): Promise<void> {
     const access = this.#accessClient();
-    if (!access) return;
-    await access.ensureUser(this.#userId());
-    if (!await access.checkUser(this.#userId(), "tenant", action)) {
+    if (!access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    if (!(await access.checkUser(this.#userId(), "tenant", action))) {
       throw new Error(`Access denied: ${action} on tenant resource.`);
     }
+  }
+
+  #catalogClient(): VerglasCatalogClient {
+    const accessToken = this.#accessClient()?.sessionToken("data-plane");
+    return new VerglasCatalogClient(this.env, fetch, accessToken);
   }
   setOwnDisplayName(name: string): Promise<void> {
     return this.user.setOwnDisplayName(name);
@@ -140,11 +256,16 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
   async listModels(): Promise<AiChatAuthorInfo[]> {
     const records = await this.user.listModelRecords();
-    const refresh = new Map<ModelRuntimeId, typeof records[number]>();
+    const refresh = new Map<ModelRuntimeId, (typeof records)[number]>();
     for (const record of records) {
-      const match = record.profile.id.match(/^runtime:(codex|claude-code|cursor)(?::|$)/);
-      if (!match ||
-          (record.profile.id !== `runtime:${match[1]}` && record.config.catalogRank !== undefined)) {
+      const match = record.profile.id.match(
+        /^runtime:(codex|claude-code|github-copilot)(?::|$)/,
+      );
+      if (
+        !match ||
+        (record.profile.id !== `runtime:${match[1]}` &&
+          record.config.catalogRank !== undefined)
+      ) {
         continue;
       }
       refresh.set(match[1] as ModelRuntimeId, record);
@@ -152,9 +273,13 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     for (const [runtime, record] of refresh) {
       try {
         const apiToken = record.config.apiToken;
-        const catalog = apiToken && runtime !== "cursor"
-          ? this.#apiTokenModels(runtime)
-          : await new ModelRuntimeManager(this.env).listModels(runtime);
+        const catalog =
+          apiToken && runtime !== "github-copilot"
+            ? this.#apiTokenModels(runtime)
+            : await new ModelRuntimeManager(
+                this.env,
+                this.#userId(),
+              ).listModels(runtime);
         await this.#saveRuntimeModels(runtime, apiToken, catalog);
       } catch (error) {
         logger.warn("failed to migrate native runtime model catalog", {
@@ -173,45 +298,59 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.deleteModel(id);
   }
   detectModelRuntimes(): Promise<ModelRuntimeDetection> {
-    return new ModelRuntimeManager(this.env).detect();
+    return new ModelRuntimeManager(this.env, this.#userId()).detect();
   }
   startModelRuntimeLogin(
-      runtime: ModelRuntimeId, sessionId: string): Promise<ModelRuntimeLoginResult> {
-    return new ModelRuntimeManager(this.env).startLogin(runtime, sessionId);
+    runtime: ModelRuntimeId,
+    sessionId: string,
+  ): Promise<ModelRuntimeLoginResult> {
+    return new ModelRuntimeManager(this.env, this.#userId()).startLogin(
+      runtime,
+      sessionId,
+    );
   }
   continueModelRuntimeLogin(
-      sessionId: string, answer?: ModelRuntimeWizardAnswer): Promise<ModelRuntimeLoginResult> {
-    return new ModelRuntimeManager(this.env).continueLogin(sessionId, answer);
+    sessionId: string,
+    answer?: ModelRuntimeWizardAnswer,
+  ): Promise<ModelRuntimeLoginResult> {
+    return new ModelRuntimeManager(this.env, this.#userId()).continueLogin(
+      sessionId,
+      answer,
+    );
   }
   cancelModelRuntimeLogin(sessionId: string): Promise<void> {
-    return new ModelRuntimeManager(this.env).cancelLogin(sessionId);
+    return new ModelRuntimeManager(this.env, this.#userId()).cancelLogin(
+      sessionId,
+    );
   }
   async linkSubscriptionRuntime(runtime: ModelRuntimeId): Promise<void> {
-    const manager = new ModelRuntimeManager(this.env);
+    const manager = new ModelRuntimeManager(this.env, this.#userId());
     const models = await manager.listModels(runtime);
-    const defaultModel = models.find(model => model.isDefault) ?? models[0];
+    const defaultModel = models.find((model) => model.isDefault) ?? models[0];
     if (!defaultModel) throw new Error(`${runtime} has no available models.`);
     await manager.verifyLinked(runtime, defaultModel.id);
     await this.#saveRuntimeModels(runtime, "", models);
   }
-  async linkTokenRuntime(runtime: ModelRuntimeId, apiToken: string): Promise<void> {
+  async linkTokenRuntime(
+    runtime: ModelRuntimeId,
+    apiToken: string,
+  ): Promise<void> {
     const token = apiToken.trim();
     if (!token) throw new Error("API token is required.");
-    const models = runtime === "cursor"
-      ? await new ModelRuntimeManager(this.env).listModels(runtime, token)
-      : this.#apiTokenModels(runtime);
-    const defaultModel = models.find(model => model.isDefault) ?? models[0];
-    if (!defaultModel) throw new Error(`${runtime} has no available models.`);
-    if (runtime === "cursor") {
-      await new ModelRuntimeManager(this.env).verifyLinked(runtime, defaultModel.id, token);
-    } else {
-      const config = this.#runtimeModelConfig(runtime, token, defaultModel.id);
-      const initiator = await this.user.whoami();
-      await completeText(getModel(this.env, config, initiator), {
-        prompt: "Reply with the single word ready.",
-        maxTokens: 8,
-      });
+    if (runtime === "github-copilot") {
+      throw new Error(
+        "GitHub Copilot is linked through Pi OAuth, not an API token.",
+      );
     }
+    const models = this.#apiTokenModels(runtime);
+    const defaultModel = models.find((model) => model.isDefault) ?? models[0];
+    if (!defaultModel) throw new Error(`${runtime} has no available models.`);
+    const config = this.#runtimeModelConfig(runtime, token, defaultModel.id);
+    const initiator = await this.user.whoami();
+    await completeText(getModel(this.env, config, initiator), {
+      prompt: "Reply with the single word ready.",
+      maxTokens: 8,
+    });
     await this.#saveRuntimeModels(runtime, token, models);
   }
   setQuickModel(id: string | null): Promise<void> {
@@ -222,30 +361,54 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async #saveRuntimeModels(
-      runtime: ModelRuntimeId, apiToken: string, models: ModelRuntimeCatalogEntry[]): Promise<void> {
+    runtime: ModelRuntimeId,
+    apiToken: string,
+    models: ModelRuntimeCatalogEntry[],
+  ): Promise<void> {
     const prefix = `runtime:${runtime}`;
-    await this.user.replaceModels(prefix, models.map((model, catalogRank) => ({
-      profile: {
-        type: "agent",
-        id: `${prefix}:${model.id}`,
-        name: model.name,
-      },
-      config: this.#runtimeModelConfig(runtime, apiToken, model.id, catalogRank),
-    })));
+    await this.user.replaceModels(
+      prefix,
+      models.map((model, catalogRank) => ({
+        profile: {
+          type: "agent",
+          id: `${prefix}:${model.id}`,
+          name: model.name,
+        },
+        config: this.#runtimeModelConfig(
+          runtime,
+          apiToken,
+          model.id,
+          catalogRank,
+        ),
+      })),
+    );
   }
 
   #runtimeModelConfig(
-      runtime: ModelRuntimeId, apiToken: string, model: string, catalogRank?: number): AiModelConfig {
+    runtime: ModelRuntimeId,
+    apiToken: string,
+    model: string,
+    catalogRank?: number,
+  ): AiModelConfig {
     if (apiToken && runtime === "codex") {
       return { provider: "openai", model, apiToken, catalogRank };
     }
     if (apiToken && runtime === "claude-code") {
       return { provider: "anthropic", model, apiToken, catalogRank };
     }
-    return { provider: "local-runtime", runtime, model, apiToken, catalogRank };
+    return {
+      provider: "local-runtime",
+      runtime,
+      model,
+      apiToken,
+      catalogRank,
+      credentialScope: this.#userId(),
+    };
   }
 
-  #apiTokenModels(runtime: Exclude<ModelRuntimeId, "cursor">): ModelRuntimeCatalogEntry[] {
+  #apiTokenModels(
+    runtime: Exclude<ModelRuntimeId, "github-copilot">,
+  ): ModelRuntimeCatalogEntry[] {
     const provider = runtime === "codex" ? "openai" : "anthropic";
     const defaultId = runtime === "codex" ? "gpt-5.6-sol" : "claude-sonnet-5";
     return Object.entries(SUGGESTED_MODELS[provider]).map(([id, model]) => ({
@@ -275,8 +438,12 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
         throw new Error("Avatar too large (max 100 KB)");
       }
       // Verify the data starts with a known image magic-byte header.
-      let isJpeg = data[0] === 0xFF && data[1] === 0xD8 && data[2] === 0xFF;
-      let isPng = data[0] === 0x89 && data[1] === 0x50 && data[2] === 0x4E && data[3] === 0x47;
+      let isJpeg = data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+      let isPng =
+        data[0] === 0x89 &&
+        data[1] === 0x50 &&
+        data[2] === 0x4e &&
+        data[3] === 0x47;
       if (!isJpeg && !isPng) {
         throw new Error("Avatar must be a JPEG or PNG image");
       }
@@ -300,21 +467,31 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return resolveUiFeatureFlags(this.env, this.user.id.name!);
   }
 
-  async #openWorkspaceInternal(id: string, shareKey?: string,
-                            configureObservers?: RpcStub<ObserverConfigCallback>)
-      : Promise<AgentWorkspace> {
+  async #openWorkspaceInternal(
+    id: string,
+    shareKey?: string,
+    configureObservers?: RpcStub<ObserverConfigCallback>,
+  ): Promise<AgentWorkspace> {
     if (shareKey || configureObservers) {
-      throw createOpenWorkspaceError(OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied);
+      throw createOpenWorkspaceError(
+        OPEN_WORKSPACE_ERROR_CODES.workspaceAccessDenied,
+      );
     }
     const record = await this.user.getVessel(id);
     if (!record || record.owner) {
-      throw createOpenWorkspaceError(OPEN_WORKSPACE_ERROR_CODES.workspaceNotFound);
+      throw createOpenWorkspaceError(
+        OPEN_WORKSPACE_ERROR_CODES.workspaceNotFound,
+      );
     }
     const result = new AgentWorkspace(this.ctx, this.env, this.user, id);
     const access = this.#accessClient();
     await Promise.all([
       result.ensure(record.title),
-      access?.ensurePrincipal(`agent/${id}`, "agent", userPrincipalId(this.#userId())),
+      access?.ensurePrincipal(
+        `agent/${id}`,
+        "agent",
+        userPrincipalId(this.#userId()),
+      ),
     ]);
     recordAnalytics(this.ctx, this.env, {
       event_name: "workspace_opened",
@@ -325,9 +502,11 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return result;
   }
 
-  async openWorkspace(id: string, shareKey?: string,
-                   configureObservers?: RpcStub<ObserverConfigCallback>)
-      : Promise<RpcStub<Overseer>> {
+  async openWorkspace(
+    id: string,
+    shareKey?: string,
+    configureObservers?: RpcStub<ObserverConfigCallback>,
+  ): Promise<RpcStub<Overseer>> {
     // @ts-expect-error Cap'n Web RPC stubs and native RPC stubs are compatible but the type
     //     system doesn't know this.
     return this.#openWorkspaceInternal(id, shareKey, configureObservers);
@@ -336,7 +515,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   async newWorkspace(): Promise<RpcStub<Overseer>> {
     const bytes = new Uint8Array(32);
     crypto.getRandomValues(bytes);
-    const id = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
+    const id = Array.from(bytes, (byte) =>
+      byte.toString(16).padStart(2, "0"),
+    ).join("");
     await this.user.newWorkspace(id, "Untitled Workspace");
     recordAnalytics(this.ctx, this.env, {
       event_name: "workspace_created",
@@ -361,108 +542,207 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async listVerglasWorkers(): Promise<VerglasWorkerSummary[]> {
     await this.#requireAccess("discover");
-    const workers = await new VerglasCatalogClient(this.env).listWorkers({withRuns: true});
+    const workers = await this.#catalogClient().listWorkers({ withRuns: true });
     const access = this.#accessClient();
-    if (access) await Promise.all(workers.flatMap(worker => [
-      access.ensurePrincipal(`job/${worker.name}`, "job"),
-      access.ensureResource(`job/${worker.name}`, "job"),
-    ]));
+    if (access)
+      await Promise.all(
+        workers.flatMap((worker) => [
+          access.ensurePrincipal(`job/${worker.name}`, "job"),
+          access.ensureResource(`job/${worker.name}`, "job"),
+        ]),
+      );
     return workers;
   }
 
   async getVerglasWorker(name: string) {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).getWorker(name);
+    return await this.#catalogClient().getWorker(name);
   }
 
   async listVerglasWorkerJobs(name: string, limit?: number) {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).listWorkerJobs(name, limit);
+    return await this.#catalogClient().listWorkerJobs(name, limit);
   }
 
   async runVerglasWorker(name: string) {
     await this.#requireAccess("execute");
-    return await new VerglasCatalogClient(this.env).runWorker(name, crypto.randomUUID());
+    return await this.#catalogClient().runWorker(name, crypto.randomUUID());
   }
 
-  async setVerglasWorkerState(name: string, state: "running" | "paused" | "archived"): Promise<void> {
+  async setVerglasWorkerState(
+    name: string,
+    state: "running" | "paused" | "archived",
+  ): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).setWorkerState(name, state);
+    await this.#catalogClient().setWorkerState(name, state);
   }
 
   async listVerglasTables(): Promise<VerglasTableSummary[]> {
     await this.#requireAccess("discover");
-    const tables = await new VerglasCatalogClient(this.env).listTables();
+    const tables = await this.#catalogClient().listTables();
     const access = this.#accessClient();
-    if (access) await Promise.all(tables.map(table =>
-      access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table")));
+    if (access)
+      await Promise.all(
+        tables.map((table) =>
+          access.ensureResource(
+            `table/${table.database}/${[...table.namespace, table.name].join(".")}`,
+            "table",
+          ),
+        ),
+      );
     return tables;
   }
 
   async getVerglasCatalog(): Promise<VerglasCatalogSnapshot> {
     await this.#requireAccess("discover");
-    const catalog = await new VerglasCatalogClient(this.env).getCatalog();
+    const catalog = await this.#catalogClient().getCatalog();
     const access = this.#accessClient();
-    if (access) await Promise.all([
-      ...catalog.tables.map(table =>
-        access.ensureResource(`table/${[...table.namespace, table.name].join(".")}`, "table")),
-      ...catalog.vectors.map(vector =>
-        access.ensureResource(`vector/${vector.target}/${vector.field}`, "vector_index")),
-      ...catalog.graphs.map(graph =>
-        access.ensureResource(`graph/${graph.namespace}`, "graph")),
-    ]);
+    if (access)
+      await Promise.all([
+        ...catalog.databases.map((database) =>
+          access.ensureResource(`database/${database.name}`, "database"),
+        ),
+        ...catalog.tables.map((table) =>
+          access.ensureResource(
+            `table/${table.database}/${[...table.namespace, table.name].join(".")}`,
+            "table",
+          ),
+        ),
+        ...catalog.vectors.map((vector) =>
+          access.ensureResource(
+            `vector/${vector.database}/${vector.target}/${vector.field}`,
+            "vector_index",
+          ),
+        ),
+        ...catalog.graphs.map((graph) =>
+          access.ensureResource(
+            `graph/${graph.database}/${graph.namespace}`,
+            "graph",
+          ),
+        ),
+      ]);
     return catalog;
+  }
+
+  async getVerglasDatabase(name: string): Promise<VerglasDatabaseDetail> {
+    await this.#requireAccess("describe");
+    return await this.#catalogClient().getDatabase(name);
+  }
+
+  async createVerglasDatabase(
+    input: VerglasCreateDatabaseInput,
+  ): Promise<VerglasDatabaseSummary> {
+    await this.#requireAccess("create_child");
+    return await this.#catalogClient().createDatabase(input);
+  }
+
+  async deleteVerglasDatabase(name: string): Promise<void> {
+    await this.#requireAccess("modify");
+    await this.#catalogClient().deleteDatabase(name);
+  }
+
+  async createVerglasTable(
+    input: VerglasCreateTableInput,
+  ): Promise<VerglasTableSummary> {
+    await this.#requireAccess("create_child");
+    const table = await this.#catalogClient().createTable(input);
+    const access = this.#accessClient();
+    if (access)
+      await access.ensureResource(
+        `table/${table.database}/${[...table.namespace, table.name].join(".")}`,
+        "table",
+      );
+    return table;
+  }
+
+  async deleteVerglasTable(
+    database: string,
+    namespace: string[],
+    name: string,
+  ): Promise<void> {
+    await this.#requireAccess("modify");
+    await this.#catalogClient().deleteTable(database, namespace, name);
   }
 
   async listVerglasVessels(): Promise<VerglasVesselSummary[]> {
     await this.#requireAccess("discover");
-    const vessels = await new VerglasCatalogClient(this.env).listVessels();
+    const vessels = await this.#catalogClient().listVessels();
     const access = this.#accessClient();
-    if (access) await Promise.all(vessels.flatMap(vessel => {
-      const kind = vessel.role === "integration" ? "integration" : "application";
-      return [
-        access.ensurePrincipal(`vessel/${vessel.name}`, kind),
-        access.ensureResource(`vessel/${vessel.name}`, kind),
-      ];
-    }));
+    if (access)
+      await Promise.all(
+        vessels.flatMap((vessel) => {
+          const kind =
+            vessel.role === "integration" ? "integration" : "application";
+          return [
+            access.ensurePrincipal(`vessel/${vessel.name}`, kind),
+            access.ensureResource(`vessel/${vessel.name}`, kind),
+          ];
+        }),
+      );
     return vessels;
   }
 
-  async getVerglasIntegrationConfiguration(name: string): Promise<VerglasIntegrationConfiguration> {
+  async getVerglasIntegrationConfiguration(
+    name: string,
+  ): Promise<VerglasIntegrationConfiguration> {
     await this.#requireAccess("describe");
-    return await new VerglasCatalogClient(this.env).getIntegrationConfiguration(name);
+    return await this.#catalogClient().getIntegrationConfiguration(name);
   }
 
-  async configureVerglasIntegration(name: string, values: Record<string, string>): Promise<void> {
+  async configureVerglasIntegration(
+    name: string,
+    values: Record<string, string>,
+  ): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).configureIntegration(name, values);
+    await this.#catalogClient().configureIntegration(name, values);
   }
 
   async deleteVerglasIntegration(name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteVessel(name);
+    await this.#catalogClient().deleteVessel(name);
   }
 
   async deleteVerglasApplication(name: string): Promise<void> {
     await this.#requireAccess("modify");
-    await new VerglasCatalogClient(this.env).deleteVessel(name);
+    await this.#catalogClient().deleteVessel(name);
+  }
+
+  async setVerglasApplicationState(
+    name: string,
+    state: "running" | "stopped",
+  ): Promise<void> {
+    await this.#requireAccess("modify");
+    await this.#catalogClient().setApplicationState(name, state);
   }
 
   async listOutputFormats(): Promise<OutputFormatOffer[]> {
-    let offers = await listFormatOffers(this.env, await readAdminConfig(this.env));
+    let offers = await listFormatOffers(
+      this.env,
+      await readAdminConfig(this.env),
+    );
     // Neither the agent's hint nor the binding details are part of what a user is offered here.
-    return offers.map(({agentHint: _agentHint, bindings: _bindings, ...offer}) => offer);
+    return offers.map(
+      ({ agentHint: _agentHint, bindings: _bindings, ...offer }) => offer,
+    );
   }
 
-  listGatekeeperVendors(filter?: GatekeeperVendorFilter): Promise<GatekeeperVendorInfo[]> {
+  listGatekeeperVendors(
+    filter?: GatekeeperVendorFilter,
+  ): Promise<GatekeeperVendorInfo[]> {
     return this.user.listGatekeeperVendors(filter);
   }
 
-  connectAccount(vendorId: string, resourceUrlPatterns?: string[]): Promise<{url: string}> {
+  connectAccount(
+    vendorId: string,
+    resourceUrlPatterns?: string[],
+  ): Promise<{ url: string }> {
     return this.user.connectAccount(vendorId, resourceUrlPatterns);
   }
 
-  ensureAccountResources(accountId: number, resourceUrlPatterns: string[]): Promise<{url?: string}> {
+  ensureAccountResources(
+    accountId: number,
+    resourceUrlPatterns: string[],
+  ): Promise<{ url?: string }> {
     return this.user.ensureAccountResources(accountId, resourceUrlPatterns);
   }
 
@@ -475,8 +755,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   subscribeConnectedAccounts(
-      subscriber: RpcStub<ConnectedAccountsSubscriber>, filter?: ConnectedAccountsFilter)
-      : Promise<RpcStub<{}>> {
+    subscriber: RpcStub<ConnectedAccountsSubscriber>,
+    filter?: ConnectedAccountsFilter,
+  ): Promise<RpcStub<{}>> {
     return this.user.subscribeConnectedAccounts(subscriber, filter);
   }
 
@@ -484,13 +765,11 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.disconnectAccount(accountId);
   }
 
-  reconnectAccount(accountId: number): Promise<{url: string}> {
+  reconnectAccount(accountId: number): Promise<{ url: string }> {
     return this.user.reconnectAccount(accountId);
   }
 
-  startResourceConfigurator(
-      accountId: number,
-      resourceUrlPattern: string) {
+  startResourceConfigurator(accountId: number, resourceUrlPattern: string) {
     return this.user.startResourceConfigurator(accountId, resourceUrlPattern);
   }
 
@@ -502,7 +781,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.listBlueprints();
   }
 
-  async getOwnBlueprint(blueprintId: string): Promise<BlueprintUserSummary | null> {
+  async getOwnBlueprint(
+    blueprintId: string,
+  ): Promise<BlueprintUserSummary | null> {
     return this.user.getBlueprint(blueprintId);
   }
 
@@ -510,7 +791,10 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.listLibraryBlueprints();
   }
 
-  async setBlueprintPinned(blueprintId: string, pinned: boolean): Promise<void> {
+  async setBlueprintPinned(
+    blueprintId: string,
+    pinned: boolean,
+  ): Promise<void> {
     return this.user.setBlueprintPinned(blueprintId, pinned);
   }
 
@@ -519,8 +803,9 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
   }
 
   async listFeaturedBlueprints(): Promise<BlueprintPublicInfo[]> {
-    return (await listFeaturedBlueprintsFromKv(this.env)).map(
-        blueprint => publicBlueprintInfo(blueprint.id, blueprint.metadata));
+    return (await listFeaturedBlueprintsFromKv(this.env)).map((blueprint) =>
+      publicBlueprintInfo(blueprint.id, blueprint.metadata),
+    );
   }
 
   async addBlueprintToLibrary(blueprintId: string): Promise<void> {
@@ -531,12 +816,15 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     return this.user.removeBlueprintFromLibrary(blueprintId);
   }
 
-  isBlueprintInLibrary(blueprintId: string): Promise<{ uploaded: boolean } | null> {
+  isBlueprintInLibrary(
+    blueprintId: string,
+  ): Promise<{ uploaded: boolean } | null> {
     return this.user.isBlueprintInLibrary(blueprintId);
   }
 
   async importBlueprint(archive: ReadableStream<Uint8Array>): Promise<string> {
-    let { metadata, contentLength, content } = await parseBlueprintArchive(archive);
+    let { metadata, contentLength, content } =
+      await parseBlueprintArchive(archive);
     delete metadata.screenshot;
     let blueprintId = randomBlueprintId();
     let r2Key = `${blueprintId}/${metadata.version}`;
@@ -576,7 +864,7 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
 
   async newWorkspaceFromBlueprint(
     _blueprintId: string,
-    _bindings: Record<string, BlueprintBindingAssignment>
+    _bindings: Record<string, BlueprintBindingAssignment>,
   ): Promise<RpcStub<Overseer>> {
     throwLegacyVesselsRemoved();
   }
@@ -596,22 +884,26 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     // appear in the nav even before the user opens a workspace — in a single round trip.
     let accounts = await this.user.listProvidedAccounts();
     return accounts
-        .filter(account => account.description.providesUi)
-        .map(account => ({
-          id: account.vendorId,
-          title: account.description.providesUi!.title,
-          icon: account.description.providesUi!.icon,
-        }));
+      .filter((account) => account.description.providesUi)
+      .map((account) => ({
+        id: account.vendorId,
+        title: account.description.providesUi!.title,
+        icon: account.description.providesUi!.icon,
+      }));
   }
 
   async getGatekeeperApp(id: string): Promise<GatekeeperUiFrame | null> {
     // Self-sufficient: listProvidedAccounts provisions auto-provisioned accounts first (idempotent),
     // so a direct URL load of /gatekeepers/$id works without racing the Header's listGatekeeperApps.
     let accounts = await this.user.listProvidedAccounts();
-    let app = accounts.find(account => account.vendorId === id && account.description.providesUi);
+    let app = accounts.find(
+      (account) => account.vendorId === id && account.description.providesUi,
+    );
     if (!app) return null;
     // isAdmin is supplied fresh per open so admin-gated features reflect the user's current status.
-    return this.user.startAccountAppUi(app.accountId, { isAdmin: this.#isAdmin() });
+    return this.user.startAccountAppUi(app.accountId, {
+      isAdmin: this.#isAdmin(),
+    });
   }
 
   // --- Deployment admin ---
@@ -627,15 +919,28 @@ class AuthenticatedApiImpl extends RpcTarget implements AuthenticatedApi {
     let adminUserId = this.user.id.name!;
     // @ts-expect-error Cap'n Web RPC stubs and native RPC targets are compatible but the type
     //     system doesn't know this.
-    return new AdminApiImpl(this.adminSettings.getByName(""), adminUserId, this.#accessClient());
+    return new AdminApiImpl(
+      this.adminSettings.getByName(""),
+      adminUserId,
+      this.#accessClient(),
+    );
   }
 }
 
-async function serveApplicationScreenshot(env: Env, vesselName: string): Promise<Response> {
-  const object = await env.BLUEPRINT_CONTENT.get(`${APPLICATION_SCREENSHOT_R2_PREFIX}${vesselName}`);
-  if (!object) return new Response("Not Found", {status: 404});
+async function serveApplicationScreenshot(
+  env: Env,
+  vesselName: string,
+): Promise<Response> {
+  const object = await env.BLUEPRINT_CONTENT.get(
+    `${APPLICATION_SCREENSHOT_R2_PREFIX}${vesselName}`,
+  );
+  if (!object) return new Response("Not Found", { status: 404 });
   let contentType = object.httpMetadata?.contentType;
-  if (contentType !== "image/jpeg" && contentType !== "image/png" && contentType !== "image/svg+xml") {
+  if (
+    contentType !== "image/jpeg" &&
+    contentType !== "image/png" &&
+    contentType !== "image/svg+xml"
+  ) {
     contentType = "image/jpeg";
   }
   return new Response(object.body, {
@@ -646,9 +951,14 @@ async function serveApplicationScreenshot(env: Env, vesselName: string): Promise
   });
 }
 
-async function serveBlueprintScreenshot(env: Env, blueprintId: string): Promise<Response> {
-  let object = await env.BLUEPRINT_CONTENT.get(`${BLUEPRINT_SCREENSHOT_R2_PREFIX}${blueprintId}`);
-  if (!object) return new Response("Not Found", {status: 404});
+async function serveBlueprintScreenshot(
+  env: Env,
+  blueprintId: string,
+): Promise<Response> {
+  let object = await env.BLUEPRINT_CONTENT.get(
+    `${BLUEPRINT_SCREENSHOT_R2_PREFIX}${blueprintId}`,
+  );
+  if (!object) return new Response("Not Found", { status: 404 });
 
   let contentType = object.httpMetadata?.contentType;
   if (contentType !== "image/jpeg" && contentType !== "image/png") {
@@ -682,9 +992,12 @@ class LoginAttemptImpl extends RpcTarget implements LoginAttempt {
 class PublicApiImpl extends RpcTarget implements PublicApi {
   users: DurableObjectNamespace<UserDurableObject>;
 
-  constructor(private ctx: ExecutionContext, private env: Env,
-      private abortSession: (reason: Error) => void,
-      private accessPayload?: JWTPayload) {
+  constructor(
+    private ctx: ExecutionContext,
+    private env: Env,
+    private abortSession: (reason: Error) => void,
+    private accessPayload?: JWTPayload,
+  ) {
     super();
     this.users = this.ctx.exports.UserDurableObject;
   }
@@ -693,21 +1006,27 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     return getServerConfig(this.env);
   }
 
-  async startGatekeeperLogin(vendorId: string): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }> {
+  async startGatekeeperLogin(
+    vendorId: string,
+  ): Promise<{ url: string; attempt: RpcStub<LoginAttempt> }> {
     if (!getAuthGatekeeperAllowlist(this.env).includes(vendorId)) {
-      throw new Error(`Sign-in via "${vendorId}" is not enabled on this deployment.`);
+      throw new Error(
+        `Sign-in via "${vendorId}" is not enabled on this deployment.`,
+      );
     }
     const vendor = getAuthVendorBinding(this.env, vendorId);
     if (!vendor) throw new Error(`No such auth gatekeeper: ${vendorId}`);
     const desc = await vendor.describe();
-    if (!desc.providesAuth) throw new Error(`"${vendorId}" does not provide authentication.`);
+    if (!desc.providesAuth)
+      throw new Error(`"${vendorId}" does not provide authentication.`);
 
     // The PendingLogin DO is the rendezvous between this request and the (separate) OAuth-callback
     // invocation. The client never sees its id — we hand back an `attempt` stub instead.
     const pendingId = this.ctx.exports.PendingLogin.newUniqueId();
     const pending = this.ctx.exports.PendingLogin.get(pendingId);
-    const callback = this.ctx.exports.LoginConnectCallbackImpl(
-        { props: { pendingId: pendingId.toString(), vendorId } });
+    const callback = this.ctx.exports.LoginConnectCallbackImpl({
+      props: { pendingId: pendingId.toString(), vendorId },
+    });
     // Sign-in needs only minimal scopes to verify the user's email. Capability scopes are requested
     // later through an explicit connected account.
     const { url } = await vendor.connectAccount(callback, { scopes: "auth" });
@@ -717,7 +1036,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
   }
 
   async authenticate(token: string): Promise<AuthenticatedApi> {
-    let split = token.split(':');
+    let split = token.split(":");
     if (split.length !== 2) {
       throw new Error("Invalid session token.");
     }
@@ -730,7 +1049,12 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "session_token",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
+    return new AuthenticatedApiImpl(
+      this.ctx,
+      this.env,
+      stub,
+      this.abortSession,
+    );
   }
 
   async authenticateFromCfAccess(): Promise<AuthenticatedApi> {
@@ -742,7 +1066,10 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     let userId = this.users.idFromName(email);
     let stub = this.users.get(userId);
     let signupsEnabled = (await readAdminConfig(this.env)).signupsEnabled;
-    let accountCreated = await stub.authenticateFromCfAccess(email, signupsEnabled);
+    let accountCreated = await stub.authenticateFromCfAccess(
+      email,
+      signupsEnabled,
+    );
     if (accountCreated) {
       recordAnalytics(this.ctx, this.env, {
         event_name: "account_created",
@@ -755,20 +1082,29 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       user_id: userId.toString(),
       source: "cf_access",
     });
-    return new AuthenticatedApiImpl(this.ctx, this.env, stub, this.abortSession);
+    return new AuthenticatedApiImpl(
+      this.ctx,
+      this.env,
+      stub,
+      this.abortSession,
+    );
   }
 
-  async login(username: string, passwordHash: Uint8Array): Promise<string | null> {
+  async login(email: string, passwordHash: Uint8Array): Promise<string | null> {
     if (this.env.CF_ACCESS_AUD) {
-      throw new Error("This deployment requires Cloudflare Access authentication.");
+      throw new Error(
+        "This deployment requires Cloudflare Access authentication.",
+      );
     }
     if (!isPasswordAuthEnabled(this.env)) {
-      throw new Error("Password login is disabled on this deployment. Use a sign-in option.");
+      throw new Error(
+        "Password login is disabled on this deployment. Use a sign-in option.",
+      );
     }
 
-    username = normalizeUsername(username);
+    email = normalizeEmail(email);
 
-    let id = this.users.idFromName(username);
+    let id = this.users.idFromName(email);
     let user = this.users.get(id);
 
     let token = await user.login(passwordHash);
@@ -780,27 +1116,33 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       source: "password",
     });
 
-    return `${username}:${token}`;
+    return `${email}:${token}`;
   }
 
-  async createAccount(username: string, displayName: string, passwordHash: Uint8Array)
-      : Promise<string | null> {
+  async createAccount(
+    email: string,
+    passwordHash: Uint8Array,
+  ): Promise<string | null> {
     if (this.env.CF_ACCESS_AUD) {
-      throw new Error("This deployment requires Cloudflare Access authentication.");
+      throw new Error(
+        "This deployment requires Cloudflare Access authentication.",
+      );
     }
     if (!isPasswordAuthEnabled(this.env)) {
-      throw new Error("Password signup is disabled on this deployment. Use a sign-in option.");
+      throw new Error(
+        "Password signup is disabled on this deployment. Use a sign-in option.",
+      );
     }
     if (!(await readAdminConfig(this.env)).signupsEnabled) {
       throw new Error("New signups are currently disabled on this deployment.");
     }
 
-    username = normalizeUsername(username);
+    email = normalizeEmail(email);
 
-    let id = this.users.idFromName(username);
+    let id = this.users.idFromName(email);
     let user = this.users.get(id);
 
-    let token = await user.createAccount(username, displayName, passwordHash);
+    let token = await user.createAccount(email, passwordHash);
     if (!token) return null;
 
     recordAnalytics(this.ctx, this.env, {
@@ -809,7 +1151,7 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
       source: "password",
     });
 
-    return `${username}:${token}`;
+    return `${email}:${token}`;
   }
 
   async getBlueprint(id: string): Promise<BlueprintPublicInfo | null> {
@@ -823,7 +1165,9 @@ class PublicApiImpl extends RpcTarget implements PublicApi {
     let kvRecord = await readBlueprintKvRecord(this.env, id);
     if (!kvRecord) throw new Error("Blueprint not found.");
 
-    let r2Object = await this.env.BLUEPRINT_CONTENT.get(`${id}/${kvRecord.metadata.version}`);
+    let r2Object = await this.env.BLUEPRINT_CONTENT.get(
+      `${id}/${kvRecord.metadata.version}`,
+    );
     if (!r2Object) throw new Error("Blueprint content not found in R2.");
 
     let metadata = { ...kvRecord.metadata };
@@ -842,15 +1186,22 @@ export default {
     }
 
     if (url.pathname.startsWith(BLUEPRINT_SCREENSHOT_PATH_PREFIX)) {
-      let blueprintId = url.pathname.slice(BLUEPRINT_SCREENSHOT_PATH_PREFIX.length);
+      let blueprintId = url.pathname.slice(
+        BLUEPRINT_SCREENSHOT_PATH_PREFIX.length,
+      );
       return serveBlueprintScreenshot(env, blueprintId);
     }
 
     if (url.pathname.startsWith(APPLICATION_SCREENSHOT_PATH_PREFIX)) {
       const vesselName = decodeURIComponent(
-          url.pathname.slice(APPLICATION_SCREENSHOT_PATH_PREFIX.length));
-      if (!vesselName) return new Response("Not Found", {status: 404});
+        url.pathname.slice(APPLICATION_SCREENSHOT_PATH_PREFIX.length),
+      );
+      if (!vesselName) return new Response("Not Found", { status: 404 });
       return serveApplicationScreenshot(env, vesselName);
+    }
+
+    if (url.pathname.startsWith("/apps/")) {
+      return proxyApplicationPreview(req, env);
     }
 
     // Sign-in via authentication gatekeepers happens entirely within each gatekeeper Worker (the
@@ -869,7 +1220,9 @@ export default {
       // and the DO is idempotent.
       if (!formatBlueprintInstallStarted) {
         formatBlueprintInstallStarted = true;
-        ctx.waitUntil(ctx.exports.AdminSettings.getByName("").ensureFormatBlueprintsInstalled()
+        ctx.waitUntil(
+          ctx.exports.AdminSettings.getByName("")
+            .ensureFormatBlueprintsInstalled()
             .then((complete: boolean) => {
               // A partial install resolves rather than throwing, and nothing else will call the DO
               // from here, so clearing this is the whole retry: one bad archive would otherwise
@@ -881,23 +1234,30 @@ export default {
               // retry costs one comparison once it succeeds.
               formatBlueprintInstallStarted = false;
               logger.warn("failed to install bundled format blueprints", {
-                event: "formats.install.trigger.failed", error: err,
+                event: "formats.install.trigger.failed",
+                error: err,
               });
-            }));
+            }),
+        );
       }
 
       let accessPayload: JWTPayload | undefined;
 
       if (env.CF_ACCESS_AUD) {
         if (req.headers.get("Origin") !== url.origin) {
-          return new Response("Cross-origin API access not allowed.", { status: 403 });
+          return new Response("Cross-origin API access not allowed.", {
+            status: 403,
+          });
         }
 
         const payload = await verifyCfAccessJwt(req, env);
-        if (!payload) return new Response("Invalid CF access JWT.", { status: 403 });
+        if (!payload)
+          return new Response("Invalid CF access JWT.", { status: 403 });
 
         if (!payload.email) {
-          return new Response("Access JWT didn't specify email address.", { status: 403 });
+          return new Response("Access JWT didn't specify email address.", {
+            status: 403,
+          });
         }
 
         accessPayload = payload;
@@ -912,8 +1272,10 @@ export default {
         resp?.webSocket?.close();
       };
 
-      resp = await newWorkersRpcResponse(req,
-          new PublicApiImpl(ctx, env, abortSession, accessPayload));
+      resp = await newWorkersRpcResponse(
+        req,
+        new PublicApiImpl(ctx, env, abortSession, accessPayload),
+      );
 
       if (aborted) {
         // Oops, we missed the abortSession() call while awaiting, apply now.
@@ -922,6 +1284,6 @@ export default {
       return resp;
     }
 
-    return new Response("Not Found", {status: 404});
-  }
+    return new Response("Not Found", { status: 404 });
+  },
 } satisfies ExportedHandler<Env>;

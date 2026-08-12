@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use verglas_core::CacheKey;
+use verglas_core::activity::ActivityTracker;
 use verglas_core::read::{ObjectGet, ObjectMeta, ObjectRead, ReadError, ReadRange};
 use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
@@ -158,6 +159,7 @@ pub async fn serve(
     bucket: String,
     cache_dir: std::path::PathBuf,
     ring: Arc<RingPlane>,
+    activity: ActivityTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::var("VERGLAS_SAFEKEEPER_ADDR")
         .unwrap_or_else(|_| DEFAULT_SAFEKEEPER_ADDR.to_owned())
@@ -167,13 +169,15 @@ pub async fn serve(
     let mut server = SafekeeperServer::new(
         ring.safekeeper_id(),
         Arc::new(Origin::new(stores)),
+        "managed-lakehouse",
         bucket,
         "neon-wal",
         ring.transport(),
         ring.membership(),
         cache_dir.join("safekeeper"),
         layout,
-    );
+    )
+    .with_activity_tracker(activity);
     if let Ok(endpoint) = std::env::var("VERGLAS_SAFEKEEPER_BROKER_ENDPOINT") {
         let advertise = std::env::var("VERGLAS_SAFEKEEPER_ADVERTISE_ADDR")
             .map_err(|_| "VERGLAS_SAFEKEEPER_ADVERTISE_ADDR is required with broker endpoint")?;

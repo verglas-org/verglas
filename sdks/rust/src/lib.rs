@@ -31,19 +31,25 @@ pub mod graph;
 pub mod queue;
 pub mod report;
 pub mod server;
+pub mod token;
 pub mod vector;
 
 pub use client::{
     ARROW_STREAM_CONTENT_TYPE, AppendResult, Client, ClientError, ColumnSpec, ConnectOptions,
-    EnsureTable, FollowStream, Graph, GraphReadOptions, Kv, KvDeleteResult, KvListEntry,
-    KvListPage, KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest,
+    Database, EnsureTable, Graph, GraphReadOptions, Kv, KvDeleteResult, KvListEntry, KvListPage,
+    KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace, NamespaceManifest,
     NamespaceMethodManifest, NamespaceMethodMode, NamespaceStream, PartitionSpec, QueryStream,
-    Queue, Table, TableDefinition,
+    Queue, QueueStream, Table, TableChangeDelivery, TableChangeStream, TableDefinition,
+    TableSubscriptionEvent,
 };
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};
-pub use queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult, QueueRecord};
+pub use queue::{QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt};
 pub use report::{CompactReport, CompactionReport};
+pub use token::{
+    AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, DatabaseConnectionToken,
+    DatabaseConnectionTokenRequest, IssuedAccessToken,
+};
 /// Stable table request and response contracts from the dependency-leaf API crate.
 pub use verglas_api::table as tables_api;
 /// Universal authorization contracts used by access administration and checks.

@@ -144,34 +144,42 @@ class MockTable {
   }
 }
 
-/** An in-memory queue mirroring the platform segment log: ordered records with
- *  stable positions and per-group watermarks, at-least-once. */
+/** In-memory approximation of exclusive PostgreSQL queue leases. */
 class MockQueue {
-  records: Record<string, unknown>[] = [];
-  groups = new Map<string, number>();
+  records: {id: string; topic: string; payload: Record<string, unknown>}[] = [];
+  claims = new Map<string, Set<number>>();
 
-  enqueue(rows: Record<string, unknown>[]) {
-    for (const row of rows) this.records.push(row);
-    return { enqueued: rows.length, endPosition: this.records.length };
+  enqueue(messages: {id: string; topic: string; payload: Record<string, unknown>}[]) {
+    const positions: number[] = [];
+    for (const message of messages) {
+      positions.push(this.records.length);
+      this.records.push(message);
+    }
+    return { positions };
   }
 
-  watermark(group: string): number {
-    return this.groups.get(group) ?? 0;
+  poll(group: string, owner: string, topics: string[], max: number) {
+    const claims = this.claims.get(group) ?? new Set<number>();
+    this.claims.set(group, claims);
+    const deliveries = this.records
+      .map((message, position) => ({position, message}))
+      .filter(({position, message}) => !claims.has(position) && topics.includes(message.topic))
+      .slice(0, max)
+      .map(({position, message}) => {
+        claims.add(position);
+        return {
+          position,
+          topic: message.topic,
+          payload: message.payload,
+          receipt: {position, owner, generation: 1},
+          expiresAt: "2026-08-10T00:00:30Z",
+        };
+      });
+    return {deliveries};
   }
 
-  poll(group: string, max?: number) {
-    const from = this.watermark(group);
-    const all = this.records
-      .map((row, position) => ({ position, row }))
-      .filter((r) => r.position >= from);
-    const records = max ? all.slice(0, max) : all;
-    return { records, watermark: from };
-  }
-
-  ack(group: string, position: number) {
-    // Monotone: a regressing ack is ignored.
-    if (position > this.watermark(group)) this.groups.set(group, position);
-    return { watermark: this.watermark(group) };
+  ack(_group: string, _receipt: {position: number; owner: string; generation: number}) {
+    return undefined;
   }
 }
 
@@ -356,7 +364,7 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
 
     const url = new URL(req.url ?? "/", "http://localhost");
 
-    if (url.pathname === "/v1/query" && req.method === "POST") {
+    if (/^\/v1\/databases\/[^/]+\/query$/.test(url.pathname) && req.method === "POST") {
       let raw = "";
       req.on("data", (c) => (raw += c));
       req.on("end", () => {
@@ -575,20 +583,17 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     if (q) {
       const queue = queueState(decodeURIComponent(q[1]));
       const action = q[2];
-      if (req.method === "GET" && action === "poll") {
-        requests.push({ method: "GET", path: url.pathname });
-        const group = url.searchParams.get("group") ?? "";
-        const max = url.searchParams.get("max");
-        return send(200, queue.poll(group, max ? Number(max) : undefined));
-      }
-      if (req.method === "POST" && (action === "enqueue" || action === "ack")) {
+      if (req.method === "POST") {
         let raw = "";
         req.on("data", (c) => (raw += c));
         req.on("end", () => {
           const body = raw ? JSON.parse(raw) : {};
           requests.push({ method: "POST", path: url.pathname, body });
-          if (action === "enqueue") return send(200, queue.enqueue(body.rows ?? []));
-          return send(200, queue.ack(body.group ?? "", Number(body.position ?? 0)));
+          if (action === "enqueue") return send(200, queue.enqueue(body.messages ?? []));
+          if (action === "poll") return send(200, queue.poll(body.group ?? "", body.owner ?? "", body.topics ?? [], Number(body.max ?? 256)));
+          queue.ack(body.group ?? "", body.receipt);
+          res.writeHead(204);
+          return res.end();
         });
         return;
       }

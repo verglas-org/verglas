@@ -83,7 +83,6 @@ async fn serve_with_metrics(key: &str, body: Bytes) -> (String, Arc<NodeMetrics>
         None,
         None,
         None,
-        None,
         Some(metrics.clone()),
     );
     (serve(app).await, metrics)

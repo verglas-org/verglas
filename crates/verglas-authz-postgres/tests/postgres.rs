@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 
 use verglas_authz::{
-    AccessCheck, Action, AuthorizationRepository, Grant, Principal, PrincipalKind, Resource,
-    ResourceKind, SecretKind, SecretMetadata, SecretRepository,
+    AccessCheck, AccessTokenMetadata, AccessTokenRegistry, Action, AuthorizationRepository, Grant,
+    Principal, PrincipalKind, Resource, ResourceKind, SecretKind, SecretMetadata, SecretRepository,
 };
 use verglas_authz_postgres::PostgresAuthorizationRepository;
 
@@ -112,5 +112,57 @@ async fn encrypted_secret_versions_survive_reconnect_without_plaintext_metadata(
         !serde_json::to_string(&metadata)
             .expect("json")
             .contains("sealed")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires VERGLAS_TEST_POSTGRES_URL"]
+async fn token_registry_persists_metadata_and_revocation_without_bearer_material() {
+    let url = std::env::var("VERGLAS_TEST_POSTGRES_URL").expect("VERGLAS_TEST_POSTGRES_URL");
+    let tenant = format!("test-{}", uuid::Uuid::new_v4());
+    let repository = PostgresAuthorizationRepository::connect(&url)
+        .await
+        .expect("connect");
+    for id in ["user-alice", "token/cli-alice"] {
+        repository
+            .create_principal(Principal::new(&tenant, id, PrincipalKind::ServiceAccount))
+            .await
+            .expect("principal");
+    }
+    let metadata = AccessTokenMetadata {
+        id: "cli-token-1".to_owned(),
+        tenant_id: tenant.clone(),
+        principal_id: "token/cli-alice".to_owned(),
+        parent_principal_id: "user-alice".to_owned(),
+        name: "Local CLI".to_owned(),
+        audience: "verglas-data-plane".to_owned(),
+        policy_version: 2,
+        run_id: None,
+        created_at: 1_000,
+        expires_at: 2_000,
+        last_used_at: None,
+        revoked_at: None,
+    };
+    repository
+        .create_token(metadata)
+        .await
+        .expect("create metadata");
+    repository
+        .record_token_use(&tenant, "cli-token-1", 1_500)
+        .await
+        .expect("use");
+    let revoked = repository
+        .revoke_token(&tenant, "cli-token-1", 1_600)
+        .await
+        .expect("revoke");
+    assert_eq!(revoked.last_used_at, Some(1_500));
+    assert_eq!(revoked.revoked_at, Some(1_600));
+    assert_eq!(
+        repository
+            .list_tokens(&tenant, "user-alice")
+            .await
+            .expect("list")
+            .len(),
+        1
     );
 }

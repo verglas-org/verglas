@@ -136,22 +136,22 @@ fn parses_vote_elected_and_append_vectors() {
 }
 
 #[test]
-fn accepts_the_verglas_eight_mib_wal_frame_boundary() {
-    const FRAME_BYTES: usize = 8 * 1024 * 1024;
-    let mut append = BytesMut::with_capacity(1 + 44 + FRAME_BYTES);
+fn parses_the_large_append_emitted_by_the_verglas_neon_compute() {
+    let wal = vec![0x5a; 512 * 1024];
+    let begin_lsn = 0x14_EE2C0_u64;
+    let mut append = BytesMut::new();
     append.put_u8(b'a');
-    append.put_u32(7);
-    append.put_u64(12);
-    append.put_u64(0x20);
-    append.put_u64(0x20 + FRAME_BYTES as u64);
-    append.put_u64(0x18);
-    append.put_u64(0x10);
-    append.resize(append.len() + FRAME_BYTES, 0x5a);
+    append.put_u32(0);
+    append.put_u64(2);
+    append.put_u64(begin_lsn);
+    append.put_u64(begin_lsn + wal.len() as u64);
+    append.put_u64(begin_lsn);
+    append.put_u64(begin_lsn);
+    append.put_slice(&wal);
 
-    let parsed = parse_proposer(append.freeze(), PROTOCOL_VERSION).expect("8 MiB append");
     assert!(matches!(
-        parsed,
-        ProposerMessage::Append(request) if request.wal.len() == FRAME_BYTES
+        parse_proposer(append.freeze(), PROTOCOL_VERSION).expect("large append"),
+        ProposerMessage::Append(message) if message.wal.len() == wal.len()
     ));
 }
 
@@ -202,10 +202,13 @@ fn parses_the_two_postgres_replication_commands_neon_uses() {
         }
     );
     assert_eq!(
-        parse_command("START_REPLICATION PHYSICAL 0/16B60A10 (term='12')").expect("replication"),
+        parse_command(
+            "START_REPLICATION SLOT \"repl_44444444444444444444444444444444_\" 0/16B60A10 TIMELINE 1"
+        )
+        .expect("replication"),
         SafekeeperCommand::StartReplication {
             start_lsn: Lsn(0x16B6_0A10),
-            term: Some(12),
+            term: None,
         }
     );
 }

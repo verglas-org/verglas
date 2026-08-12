@@ -27,7 +27,6 @@ async fn client_checks_access_with_its_scoped_bearer_token() {
         ConnectOptions::new(&endpoint)
             .with_query_uri(&endpoint)
             .with_access_uri(&endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("scoped"),
     )

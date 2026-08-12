@@ -1,39 +1,28 @@
-import { useEffect, useRef, useState } from 'react'
-import { RpcStub, RpcTarget } from 'capnweb'
+import { useEffect, useRef, useState } from "react";
+import { RpcStub } from "capnweb";
 import type {
   AuthenticatedApi,
   WorkspaceMetadata,
-  ObserverAccountChoice,
-  ObserverBindingNeed,
-  ObserverConfigCallback,
   Overseer,
-} from '@verglas/workshop-shared/api'
-import { reportIssue } from './errorReporting'
-import { useDocumentTitle } from './useDocumentTitle'
+} from "@verglas/workshop-shared/api";
+import { reportIssue } from "./errorReporting";
+import { useDocumentTitle } from "./useDocumentTitle";
 import {
   classifyWorkspaceOpenFailure,
   type WorkspaceOpenFailureKind,
-} from './components/WorkspaceOpenErrorPage'
-
-const OBSERVER_CANCELLED = 'OBSERVER_CONFIG_CANCELLED'
+} from "./components/WorkspaceOpenErrorPage";
 
 export type WorkspaceLoadError =
-  | { kind: 'open'; failure: WorkspaceOpenFailureKind }
-  | { kind: 'message'; message: string }
-
-type ObserverConfigState = {
-  needs: ObserverBindingNeed[]
-  resolve: (choices: ObserverAccountChoice[]) => void
-  reject: (error: unknown) => void
-}
+  | { kind: "open"; failure: WorkspaceOpenFailureKind }
+  | { kind: "message"; message: string };
 
 type Options = {
-  id: string | undefined
-  authenticatedApi: RpcStub<AuthenticatedApi>
-  onMetadata: (metadata: WorkspaceMetadata) => void
-  onShareKeyConsumed: () => void
-  onInvalidShareKey: () => void
-}
+  id: string | undefined;
+  authenticatedApi: RpcStub<AuthenticatedApi>;
+  onMetadata: (metadata: WorkspaceMetadata) => void;
+  onShareKeyConsumed: () => void;
+  onInvalidShareKey: () => void;
+};
 
 export function useWorkspaceOpen({
   id,
@@ -42,156 +31,127 @@ export function useWorkspaceOpen({
   onShareKeyConsumed,
   onInvalidShareKey,
 }: Options) {
-  const [overseer, setOverseer] = useState<{ stub: RpcStub<Overseer> } | null>(null)
-  const [metadata, setMetadata] = useState<WorkspaceMetadata | null>(null)
-  const [error, setError] = useState<WorkspaceLoadError | null>(null)
-  const [connectionLost, setConnectionLost] = useState(false)
-  const [observerConfig, setObserverConfig] = useState<ObserverConfigState | null>(null)
-  const [reloadNonce, setReloadNonce] = useState(0)
-  const openWorkspaceIdRef = useRef<string | undefined>(undefined)
-  const pendingObserverRejectRef = useRef<((error: unknown) => void) | null>(null)
-  const callbacksRef = useRef({ onMetadata, onShareKeyConsumed, onInvalidShareKey })
-  callbacksRef.current = { onMetadata, onShareKeyConsumed, onInvalidShareKey }
+  const [overseer, setOverseer] = useState<{ stub: RpcStub<Overseer> } | null>(
+    null,
+  );
+  const [metadata, setMetadata] = useState<WorkspaceMetadata | null>(null);
+  const [error, setError] = useState<WorkspaceLoadError | null>(null);
+  const [connectionLost, setConnectionLost] = useState(false);
+  const [reloadNonce, setReloadNonce] = useState(0);
+  const openWorkspaceIdRef = useRef<string | undefined>(undefined);
+  const callbacksRef = useRef({
+    onMetadata,
+    onShareKeyConsumed,
+    onInvalidShareKey,
+  });
+  callbacksRef.current = { onMetadata, onShareKeyConsumed, onInvalidShareKey };
 
-  useDocumentTitle(error ? '' : metadata?.title)
+  useDocumentTitle(error ? "" : metadata?.title);
 
   useEffect(() => {
-    let overseerStub: RpcStub<Overseer> | null = null
-    let metadataSubscription: RpcStub<{}> | null = null
-    let configureObservers: RpcStub<ObserverConfigCallback> | null = null
-    let cancelled = false
-    const hadOpenWorkspace = id !== undefined && openWorkspaceIdRef.current === id
+    let overseerStub: RpcStub<Overseer> | null = null;
+    let metadataSubscription: RpcStub<{}> | null = null;
+    let cancelled = false;
+    const hadOpenWorkspace =
+      id !== undefined && openWorkspaceIdRef.current === id;
 
     const disposeAttempt = () => {
-      metadataSubscription?.[Symbol.dispose]()
-      overseerStub?.[Symbol.dispose]()
-      configureObservers?.[Symbol.dispose]()
-      metadataSubscription = null
-      overseerStub = null
-      configureObservers = null
-    }
+      metadataSubscription?.[Symbol.dispose]();
+      overseerStub?.[Symbol.dispose]();
+      metadataSubscription = null;
+      overseerStub = null;
+    };
 
     const showTerminalError = (nextError: WorkspaceLoadError) => {
-      disposeAttempt()
-      openWorkspaceIdRef.current = undefined
-      setOverseer(null)
-      setMetadata(null)
-      setConnectionLost(false)
-      setError(nextError)
-    }
+      disposeAttempt();
+      openWorkspaceIdRef.current = undefined;
+      setOverseer(null);
+      setMetadata(null);
+      setConnectionLost(false);
+      setError(nextError);
+    };
 
     const load = async () => {
       if (!id) {
-        showTerminalError({ kind: 'open', failure: 'not-found' })
-        return
+        showTerminalError({ kind: "open", failure: "not-found" });
+        return;
       }
-      if (!hadOpenWorkspace) setError(null)
+      if (!hadOpenWorkspace) setError(null);
 
       try {
-        const hash = window.location.hash
-        const shareKey = hash.startsWith('#share=') ? hash.slice('#share='.length) : undefined
-        if (shareKey) callbacksRef.current.onShareKeyConsumed()
+        const hash = window.location.hash;
+        const shareKey = hash.startsWith("#share=")
+          ? hash.slice("#share=".length)
+          : undefined;
+        if (shareKey) callbacksRef.current.onShareKeyConsumed();
 
-        const configureObserversTarget = new (class extends RpcTarget implements ObserverConfigCallback {
-          configure(needs: ObserverBindingNeed[]): Promise<ObserverAccountChoice[]> {
-            if (cancelled) return Promise.reject(new Error('Cancelled'))
-            return new Promise<ObserverAccountChoice[]>((resolve, reject) => {
-              pendingObserverRejectRef.current = reject
-              setObserverConfig({
-                needs,
-                resolve: choices => {
-                  pendingObserverRejectRef.current = null
-                  setObserverConfig(null)
-                  resolve(choices)
-                },
-                reject: observerError => {
-                  pendingObserverRejectRef.current = null
-                  setObserverConfig(null)
-                  reject(observerError)
-                },
-              })
-            })
-          }
-        })()
-        configureObservers = new RpcStub(configureObserversTarget)
+        overseerStub = authenticatedApi.openWorkspace(id, shareKey);
+        setOverseer({ stub: overseerStub });
 
-        overseerStub = authenticatedApi.openWorkspace(id, shareKey, configureObservers)
-        setOverseer({ stub: overseerStub })
-
-        const resolvedSubscription = await overseerStub.subscribeToMetadata((nextMetadata) => {
-          if (cancelled) return
-          setMetadata(nextMetadata)
-          callbacksRef.current.onMetadata(nextMetadata)
-        })
+        const resolvedSubscription = await overseerStub.subscribeToMetadata(
+          (nextMetadata) => {
+            if (cancelled) return;
+            setMetadata(nextMetadata);
+            callbacksRef.current.onMetadata(nextMetadata);
+          },
+        );
         if (cancelled) {
-          resolvedSubscription[Symbol.dispose]()
-          return
+          resolvedSubscription[Symbol.dispose]();
+          return;
         }
-        metadataSubscription = resolvedSubscription
+        metadataSubscription = resolvedSubscription;
 
-        openWorkspaceIdRef.current = id
-        setError(null)
-        if (connectionLost) setConnectionLost(false)
+        openWorkspaceIdRef.current = id;
+        setError(null);
+        if (connectionLost) setConnectionLost(false);
       } catch (caught) {
-        if (cancelled) return
-        console.error('Failed to load workspace:', caught)
+        if (cancelled) return;
+        console.error("Failed to load workspace:", caught);
 
         // TODO: Give share-link and observer failures stable codes so this remaining legacy
         // message classification can be removed.
-        const message = caught instanceof Error ? caught.message : ''
-        if (message.includes('Invalid or expired share key')) {
-          callbacksRef.current.onInvalidShareKey()
+        const message = caught instanceof Error ? caught.message : "";
+        if (message.includes("Invalid or expired share key")) {
+          callbacksRef.current.onInvalidShareKey();
         }
-        if (message.includes(OBSERVER_CANCELLED)) {
-          showTerminalError({
-            kind: 'message',
-            message: 'To open this workspace, you must choose connected accounts for the services it uses.',
-          })
-        } else if (message.includes('permitted to observe') ||
-                   message.includes('no longer connected') ||
-                   message.includes('connect an account for every service')) {
-          showTerminalError({ kind: 'message', message })
+        if (
+          message.includes("permitted to observe") ||
+          message.includes("no longer connected") ||
+          message.includes("connect an account for every service")
+        ) {
+          showTerminalError({ kind: "message", message });
         } else {
-          const failure = classifyWorkspaceOpenFailure(caught)
-          if (failure !== 'unexpected') {
-            showTerminalError({ kind: 'open', failure })
+          const failure = classifyWorkspaceOpenFailure(caught);
+          if (failure !== "unexpected") {
+            showTerminalError({ kind: "open", failure });
           } else if (!hadOpenWorkspace) {
-            reportIssue('workspace.load', caught, { workspaceId: id })
-            showTerminalError({ kind: 'open', failure })
+            reportIssue("workspace.load", caught, { workspaceId: id });
+            showTerminalError({ kind: "open", failure });
           } else if (!connectionLost) {
-            setConnectionLost(true)
+            setConnectionLost(true);
           }
         }
       }
-    }
+    };
 
-    void load()
+    void load();
     return () => {
-      cancelled = true
-      if (pendingObserverRejectRef.current) {
-        pendingObserverRejectRef.current(new Error('Cancelled'))
-        pendingObserverRejectRef.current = null
-      }
-      setObserverConfig(null)
-      disposeAttempt()
-    }
-  }, [id, authenticatedApi, reloadNonce])
+      cancelled = true;
+      disposeAttempt();
+    };
+  }, [id, authenticatedApi, reloadNonce]);
 
   return {
     overseer,
     metadata,
     error,
     connectionLost,
-    observerConfig,
     retry() {
-      setError(null)
-      setReloadNonce(value => value + 1)
-    },
-    cancelObserverConfig() {
-      observerConfig?.reject(new Error(OBSERVER_CANCELLED))
+      setError(null);
+      setReloadNonce((value) => value + 1);
     },
     updateTitle(title: string) {
-      setMetadata(previous => previous ? { ...previous, title } : null)
+      setMetadata((previous) => (previous ? { ...previous, title } : null));
     },
-  }
+  };
 }

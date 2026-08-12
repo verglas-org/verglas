@@ -72,6 +72,16 @@ pub trait PeerFetch: Send + Sync {
         node: NodeId,
         block: &BlockKey,
     ) -> impl Future<Output = Result<Option<Bytes>, PeerFetchError>> + Send;
+
+    /// Offers an already-materialized cache block to its rendezvous owner.
+    /// Returns whether the owner admitted the value. This is cache placement,
+    /// not durable write-back: a failure is safe for callers to ignore.
+    fn store(
+        &self,
+        node: NodeId,
+        block: &BlockKey,
+        value: Bytes,
+    ) -> impl Future<Output = Result<bool, PeerFetchError>> + Send;
 }
 
 /// The M1 cluster-of-one implementation: there are no peers, so every fetch
@@ -87,5 +97,18 @@ impl PeerFetch for NoopPeerFetch {
         _block: &BlockKey,
     ) -> impl Future<Output = Result<Option<Bytes>, PeerFetchError>> + Send {
         std::future::ready(Ok(None))
+    }
+
+    /// A one-node ring never routes a store to a peer.
+    fn store(
+        &self,
+        node: NodeId,
+        _block: &BlockKey,
+        _value: Bytes,
+    ) -> impl Future<Output = Result<bool, PeerFetchError>> + Send {
+        std::future::ready(Err(PeerFetchError::Unavailable {
+            node,
+            reason: "peer storage is disabled".to_owned(),
+        }))
     }
 }

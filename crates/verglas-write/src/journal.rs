@@ -44,7 +44,9 @@ pub struct Placement {
 pub struct Journal {
     /// Pod-unique object id assigned by the write coordinator.
     pub object_id: String,
-    /// Provider binding that owns this object namespace.
+    /// Immutable storage binding selecting the origin provider and credentials.
+    /// Empty only while decoding a pre-binding journal for explicit migration.
+    #[serde(default)]
     pub storage_binding_id: String,
     /// Origin bucket.
     pub bucket: String,
@@ -101,6 +103,29 @@ impl JournalStore {
     /// Opens (creating if needed) a journal store under `cache_dir`, rebuilding
     /// the dirty index from any journals left by a previous run.
     pub fn open(cache_dir: impl AsRef<Path>) -> Result<Self, JournalError> {
+        Self::open_inner(cache_dir, None).map(|(store, _)| store)
+    }
+
+    /// Opens a single-binding cache journal and durably upgrades records
+    /// written before journals carried immutable storage-binding identity.
+    /// The caller must supply the cache's configured binding explicitly; this
+    /// is a one-time schema migration, never a runtime routing fallback.
+    pub fn open_for_binding(
+        cache_dir: impl AsRef<Path>,
+        legacy_binding: &str,
+    ) -> Result<(Self, usize), JournalError> {
+        if legacy_binding.trim().is_empty() {
+            return Err(JournalError(
+                "legacy storage binding migration requires a non-empty binding".to_owned(),
+            ));
+        }
+        Self::open_inner(cache_dir, Some(legacy_binding))
+    }
+
+    fn open_inner(
+        cache_dir: impl AsRef<Path>,
+        legacy_binding: Option<&str>,
+    ) -> Result<(Self, usize), JournalError> {
         let dir = cache_dir.as_ref().join("writeback-journals");
         fs::create_dir_all(&dir)
             .map_err(|e| JournalError(format!("create journal dir {}: {e}", dir.display())))?;
@@ -110,12 +135,20 @@ impl JournalStore {
             dirty_count: AtomicUsize::new(0),
             write_lock: std::sync::Mutex::new(()),
         };
-        for journal in store.list()? {
+        let mut migrated = 0;
+        for mut journal in store.list()? {
+            if journal.storage_binding_id.is_empty()
+                && let Some(binding) = legacy_binding
+            {
+                journal.storage_binding_id = binding.to_owned();
+                store.write_fsynced(&journal)?;
+                migrated += 1;
+            }
             if journal.state == JournalState::Dirty {
                 store.insert_index(&journal);
             }
         }
-        Ok(store)
+        Ok((store, migrated))
     }
 
     /// Writes and fsyncs `journal`, and if it is dirty registers it in the
@@ -189,8 +222,8 @@ impl JournalStore {
         }
     }
 
-    /// Looks up the dirty object id for one provider-scoped key, or `None`.
-    /// Cheap when nothing is dirty: one relaxed atomic load and no lock.
+    /// Looks up the dirty object id for an immutable origin identity, or
+    /// `None`. Cheap when nothing is dirty: one relaxed atomic load and no lock.
     pub fn find_dirty(&self, storage_binding_id: &str, bucket: &str, key: &str) -> Option<String> {
         if self.dirty_count.load(Ordering::Relaxed) == 0 {
             return None;
@@ -331,7 +364,7 @@ mod tests {
     fn dirty(object_id: &str, bucket: &str, key: &str) -> Journal {
         Journal {
             object_id: object_id.to_owned(),
-            storage_binding_id: "binding-a".to_owned(),
+            storage_binding_id: "default".to_owned(),
             bucket: bucket.to_owned(),
             key: key.to_owned(),
             metadata: StoredMetadata::default(),
@@ -356,12 +389,12 @@ mod tests {
         store.put(&dirty("obj-1", "bkt", "k")).expect("put");
         assert!(!store.is_idle());
         assert_eq!(
-            store.find_dirty("binding-a", "bkt", "k").as_deref(),
+            store.find_dirty("default", "bkt", "k").as_deref(),
             Some("obj-1")
         );
         store.mark_clean("obj-1").expect("clean");
         assert!(store.is_idle());
-        assert_eq!(store.find_dirty("binding-a", "bkt", "k"), None);
+        assert_eq!(store.find_dirty("default", "bkt", "k"), None);
     }
 
     /// The dirty index is rebuilt from disk on reopen (crash replay).
@@ -375,30 +408,67 @@ mod tests {
         let store = JournalStore::open(dir.path()).expect("reopen");
         assert!(!store.is_idle());
         assert_eq!(
-            store.find_dirty("binding-a", "bkt", "k").as_deref(),
+            store.find_dirty("default", "bkt", "k").as_deref(),
             Some("obj-1")
         );
     }
 
-    /// Equal bucket/key pairs from different providers never share dirty state.
+    /// Provider identity is part of read-your-writes addressing; two origins
+    /// may legitimately use the same bucket and key without aliasing journals.
     #[test]
-    fn dirty_index_isolated_by_storage_binding() {
+    fn dirty_index_isolates_storage_bindings() {
         let dir = tempfile::tempdir().expect("tmp");
         let store = JournalStore::open(dir.path()).expect("open");
-        let mut first = dirty("obj-a", "shared", "path");
-        first.storage_binding_id = "binding-a".to_owned();
-        let mut second = dirty("obj-b", "shared", "path");
-        second.storage_binding_id = "binding-b".to_owned();
-        store.put(&first).expect("put first");
-        store.put(&second).expect("put second");
-
+        let mut first = dirty("obj-1", "bkt", "k");
+        first.storage_binding_id = "provider-a".to_owned();
+        let mut second = dirty("obj-2", "bkt", "k");
+        second.storage_binding_id = "provider-b".to_owned();
+        store.put(&first).expect("first");
+        store.put(&second).expect("second");
         assert_eq!(
-            store.find_dirty("binding-a", "shared", "path").as_deref(),
-            Some("obj-a")
+            store.find_dirty("provider-a", "bkt", "k").as_deref(),
+            Some("obj-1")
         );
         assert_eq!(
-            store.find_dirty("binding-b", "shared", "path").as_deref(),
-            Some("obj-b")
+            store.find_dirty("provider-b", "bkt", "k").as_deref(),
+            Some("obj-2")
+        );
+    }
+
+    /// Pre-binding journals are rewritten and fsynced only when the single
+    /// configured origin is supplied explicitly by the cache-node bootstrap.
+    #[test]
+    fn explicitly_migrates_legacy_journal_binding() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let journal_path = {
+            let store = JournalStore::open(dir.path()).expect("open");
+            let journal = dirty("obj-1", "bkt", "k");
+            store.put(&journal).expect("put");
+            store.path("obj-1")
+        };
+        let bytes = fs::read(&journal_path).expect("journal");
+        let mut legacy: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+        legacy
+            .as_object_mut()
+            .expect("object")
+            .remove("storage_binding_id");
+        fs::write(&journal_path, serde_json::to_vec(&legacy).expect("encode"))
+            .expect("write legacy journal");
+
+        let (store, migrated) =
+            JournalStore::open_for_binding(dir.path(), "managed-lakehouse").expect("migrate");
+        assert_eq!(migrated, 1);
+        assert_eq!(
+            store
+                .read("obj-1")
+                .expect("read")
+                .expect("journal")
+                .storage_binding_id,
+            "managed-lakehouse"
+        );
+        assert_eq!(
+            store.find_dirty("managed-lakehouse", "bkt", "k").as_deref(),
+            Some("obj-1")
         );
     }
 }

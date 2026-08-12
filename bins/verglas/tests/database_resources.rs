@@ -39,6 +39,15 @@ async fn spawn_api() -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
                     capture("/v1/secrets", captured, headers, body)
                 }
             }),
+        )
+        .route(
+            "/v1/queues",
+            post({
+                let captured = Arc::clone(&captured);
+                move |headers: HeaderMap, body: Bytes| {
+                    capture("/v1/queues", captured, headers, body)
+                }
+            }),
         );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -143,6 +152,20 @@ async fn creates_managed_lakehouse_and_postgres_database_requests() {
         );
         assert_eq!(request.body, expected);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queue_create_declares_an_explicit_resource() {
+    let (endpoint, captured) = spawn_api().await;
+    let output = run(&endpoint, &["queue", "create", "events"], None);
+    assert!(
+        output.status.success(),
+        "CLI failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let request = one_request(&captured);
+    assert_eq!(request.path, "/v1/queues");
+    assert_eq!(request.body, serde_json::json!({"name": "events"}));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

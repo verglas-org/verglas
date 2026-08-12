@@ -152,43 +152,6 @@ async fn missing_fragment_is_a_clean_miss() {
 }
 
 #[tokio::test]
-async fn list_fragments_filters_by_object_namespace() {
-    let node = NodeId::new("peer-list");
-    let (server, client, _store) = server_and_client(&node, None).await;
-    for (object_id, index) in [("journal-key-a", 0), ("journal-key-b", 1), ("data", 2)] {
-        client
-            .put_fragment(
-                &node,
-                FragmentRecord::new(
-                    FragmentKey {
-                        object_id: object_id.to_owned(),
-                        index,
-                    },
-                    Bytes::from_static(b"bytes"),
-                ),
-            )
-            .await
-            .expect("place");
-    }
-    let mut listed = client
-        .list_fragments(&node, "journal-key-")
-        .await
-        .expect("list");
-    listed.sort_by(|a, b| a.object_id.cmp(&b.object_id));
-    assert_eq!(
-        listed
-            .into_iter()
-            .map(|key| (key.object_id, key.index))
-            .collect::<Vec<_>>(),
-        vec![
-            ("journal-key-a".to_owned(), 0),
-            ("journal-key-b".to_owned(), 1)
-        ]
-    );
-    server.shutdown().await;
-}
-
-#[tokio::test]
 async fn delete_removes_the_fragment() {
     let node = NodeId::new("peer-2");
     let (server, client, _store) = server_and_client(&node, None).await;

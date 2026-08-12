@@ -70,3 +70,4 @@
   dependency. The harness commit path is keyed idempotent appends only; workers
   have no cross-run watermark cell.
 - #66: Removed cloud queue-backing and cloud-lakehouse dual-plane docs from queue, follow, and worker harness comments.
+- #107: Removed the local JSONL segment-log queue implementation. Declared queues now run exclusively in the standalone PostgreSQL-backed queue service.

@@ -1,19 +1,65 @@
-import { AdminApi, AdminFormat, AdminFormatPatch, AdminResourceVendor, AdminSettingsView, AmbientGatekeeperMode, BannerColor, BlueprintPublicInfo, MAX_ANNOUNCEMENT_LENGTH, MAX_INSTANCE_INSTRUCTIONS_LENGTH, MAX_SITE_NAME_LENGTH, isAmbientGatekeeperMode, isBannerColor, isHexColor, type VerglasAccessGrant, type VerglasAccessGrantInput, type VerglasAccessSnapshot } from '@verglas/workshop-shared/api';
-import { GatekeeperVendor } from '@verglas/workshop-shared/gatekeeper';
-import { DurableObject } from 'cloudflare:workers';
-import { RpcTarget } from 'capnweb';
-import { validateRpc } from 'capnweb-validate';
-import { collection, createTypedStorage } from '@verglas/typed-storage';
+import {
+  AdminApi,
+  AdminFormat,
+  AdminFormatPatch,
+  AdminResourceVendor,
+  AdminSettingsView,
+  AmbientGatekeeperMode,
+  BannerColor,
+  BlueprintPublicInfo,
+  MAX_ANNOUNCEMENT_LENGTH,
+  MAX_INSTANCE_INSTRUCTIONS_LENGTH,
+  MAX_SITE_NAME_LENGTH,
+  isAmbientGatekeeperMode,
+  isBannerColor,
+  isHexColor,
+  type VerglasAccessGrant,
+  type VerglasAccessGrantInput,
+  type VerglasAccessSnapshot,
+} from "@verglas/workshop-shared/api";
+import { GatekeeperVendor } from "@verglas/workshop-shared/gatekeeper";
+import { DurableObject } from "cloudflare:workers";
+import { RpcTarget } from "capnweb";
+import { validateRpc } from "capnweb-validate";
+import { collection, createTypedStorage } from "@verglas/typed-storage";
 import { createWorkshopLogger } from "./observability";
-import { ADMIN_CONFIG_KEY, FEATURED_BLUEPRINTS_KEY, isReservedBlueprintKey, parseBlueprintKvRecord, readBlueprintKvRecord, sanitizeBlueprintOutput, serializeFeaturedBlueprints } from './blueprint-archive.js';
-import { AdminConfig, DEFAULT_ADMIN_CONFIG, FormatCuration, MAX_AGENT_HINT, defaultOutputFormatId, listPromotedFormats, reorderFormats, sanitizeOutputOverrides, serializeAdminConfig } from './admin-config.js';
-import { SITE_LOGO_R2_KEY, siteLogoImage, validateSiteLogo } from './site-logo.js';
-import { ambientGatekeeperMode, DEFAULT_AMBIENT_GATEKEEPER_MODE } from './provisioning-policy.js';
-import { buildGatekeeperVendorMap } from './auth/auth-vendors.js';
-import { UserDurableObject } from './user.js';
-import { formatBlueprintsManifestVersion, installFormatBlueprints } from './format-blueprints.js';
-import { FORMAT_BLUEPRINTS } from './generated/format-blueprints.js';
-import { VerglasAccessClient } from './verglas-access.js';
+import {
+  ADMIN_CONFIG_KEY,
+  FEATURED_BLUEPRINTS_KEY,
+  isReservedBlueprintKey,
+  parseBlueprintKvRecord,
+  readBlueprintKvRecord,
+  sanitizeBlueprintOutput,
+  serializeFeaturedBlueprints,
+} from "./blueprint-archive.js";
+import {
+  AdminConfig,
+  DEFAULT_ADMIN_CONFIG,
+  FormatCuration,
+  MAX_AGENT_HINT,
+  defaultOutputFormatId,
+  listPromotedFormats,
+  reorderFormats,
+  sanitizeOutputOverrides,
+  serializeAdminConfig,
+} from "./admin-config.js";
+import {
+  SITE_LOGO_R2_KEY,
+  siteLogoImage,
+  validateSiteLogo,
+} from "./site-logo.js";
+import {
+  ambientGatekeeperMode,
+  DEFAULT_AMBIENT_GATEKEEPER_MODE,
+} from "./provisioning-policy.js";
+import { buildGatekeeperVendorMap } from "./auth/auth-vendors.js";
+import { UserDurableObject } from "./user.js";
+import {
+  formatBlueprintsManifestVersion,
+  installFormatBlueprints,
+} from "./format-blueprints.js";
+import { FORMAT_BLUEPRINTS } from "./generated/format-blueprints.js";
+import { VerglasAccessClient } from "./verglas-access.js";
 
 const logger = createWorkshopLogger("workshop.admin.settings");
 
@@ -23,7 +69,7 @@ function makeAdminSettingsStorage(storage: DurableObjectStorage) {
       // Mirror of the currently-featured blueprint public records. The user DO owns the
       // authoritative featured bit; this DO keeps the publishable deployment-wide copy.
       featuredBlueprints: collection<BlueprintPublicInfo>()({
-        primaryKey: 'id',
+        primaryKey: "id",
       }),
     },
     singletons: {
@@ -84,8 +130,11 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // Callers are coalesced onto one run, or two isolates racing on a fresh deployment both promote
   // the same blueprints, and a duplicated id makes setFormatOrder() reject every reordering.
   ensureFormatBlueprintsInstalled(): Promise<boolean> {
-    return this.#installInFlight ??= this.#installFormatBlueprints()
-        .finally(() => { this.#installInFlight = undefined; });
+    return (this.#installInFlight ??= this.#installFormatBlueprints().finally(
+      () => {
+        this.#installInFlight = undefined;
+      },
+    ));
   }
 
   #installInFlight?: Promise<boolean>;
@@ -136,18 +185,20 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // bundled set ever changes.
   async #promoteBundledFormats(): Promise<void> {
     let promoted = new Set(this.storage.promotedFormatBlueprints.get());
-    let pending = FORMAT_BLUEPRINTS.filter(entry => !promoted.has(entry.blueprintId));
+    let pending = FORMAT_BLUEPRINTS.filter(
+      (entry) => !promoted.has(entry.blueprintId),
+    );
     if (pending.length === 0) return;
 
     let config = this.#config();
-    let known = new Set(config.formats.map(f => f.blueprintId));
+    let known = new Set(config.formats.map((f) => f.blueprintId));
     let added = pending
-        .filter(entry => !known.has(entry.blueprintId))
-        .map(entry => ({blueprintId: entry.blueprintId, enabled: true}));
+      .filter((entry) => !known.has(entry.blueprintId))
+      .map((entry) => ({ blueprintId: entry.blueprintId, enabled: true }));
     // Always write, even when every pending format is already in DO storage. That is the retry
     // state after a prior KV mirror failure; stamping promotion without writing would strand the
     // hot-path mirror on its old config forever.
-    await this.updateAdminConfig({formats: [...config.formats, ...added]});
+    await this.updateAdminConfig({ formats: [...config.formats, ...added] });
 
     for (let entry of pending) promoted.add(entry.blueprintId);
     this.storage.promotedFormatBlueprints.put([...promoted]);
@@ -155,12 +206,18 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
 
   async #writeFeaturedSnapshot(): Promise<void> {
     let featured = [...this.storage.featuredBlueprints.list()];
-    await this.env.BLUEPRINTS.put(FEATURED_BLUEPRINTS_KEY, serializeFeaturedBlueprints(featured));
+    await this.env.BLUEPRINTS.put(
+      FEATURED_BLUEPRINTS_KEY,
+      serializeFeaturedBlueprints(featured),
+    );
   }
 
   // Reconcile the mirrored featured list to match the authoritative bit stored in the owner
   // User DO, while also refreshing stale metadata snapshots for featured entries.
-  async #syncFeaturedMirror(publicInfo: BlueprintPublicInfo, featured: boolean): Promise<void> {
+  async #syncFeaturedMirror(
+    publicInfo: BlueprintPublicInfo,
+    featured: boolean,
+  ): Promise<void> {
     let existing = this.storage.featuredBlueprints.get(publicInfo.id);
     let changed = false;
 
@@ -172,7 +229,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     } else if (
       !existing ||
       existing.metadata.version !== publicInfo.metadata.version ||
-      existing.metadata.lastUpdated.valueOf() !== publicInfo.metadata.lastUpdated.valueOf()
+      existing.metadata.lastUpdated.valueOf() !==
+        publicInfo.metadata.lastUpdated.valueOf()
     ) {
       this.storage.featuredBlueprints.put(publicInfo);
       changed = true;
@@ -190,20 +248,20 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     featureable: boolean;
   }> {
     if (isReservedBlueprintKey(blueprintId)) {
-      throw new Error('Blueprint not found.');
+      throw new Error("Blueprint not found.");
     }
 
     let raw = await this.env.BLUEPRINTS.get(blueprintId);
     if (!raw) {
-      throw new Error('Blueprint not found.');
+      throw new Error("Blueprint not found.");
     }
 
     let kvRecord = parseBlueprintKvRecord(raw);
 
     return {
       owner: kvRecord.ownerId
-          ? this.users.get(this.users.idFromString(kvRecord.ownerId))
-          : undefined,
+        ? this.users.get(this.users.idFromString(kvRecord.ownerId))
+        : undefined,
       publicInfo: {
         id: blueprintId,
         metadata: kvRecord.metadata,
@@ -216,7 +274,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   }
 
   async isBlueprintFeatured(blueprintId: string): Promise<boolean | null> {
-    let { owner, publicInfo, featureable } = await this.#getOwnerBlueprint(blueprintId);
+    let { owner, publicInfo, featureable } =
+      await this.#getOwnerBlueprint(blueprintId);
     if (!featureable || !owner) {
       return null;
     }
@@ -231,10 +290,14 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     return featured;
   }
 
-  async setBlueprintFeatured(blueprintId: string, featured: boolean): Promise<void> {
-    let { owner, publicInfo, featureable } = await this.#getOwnerBlueprint(blueprintId);
+  async setBlueprintFeatured(
+    blueprintId: string,
+    featured: boolean,
+  ): Promise<void> {
+    let { owner, publicInfo, featureable } =
+      await this.#getOwnerBlueprint(blueprintId);
     if (!featureable || !owner) {
-      throw new Error('Blueprint not featureable.');
+      throw new Error("Blueprint not featureable.");
     }
 
     await owner.setBlueprintFeatured(blueprintId, featured);
@@ -267,17 +330,24 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     return this.#config();
   }
 
-  async #mutateAdminConfig(mutate: (config: AdminConfig) => AdminConfig): Promise<void> {
+  async #mutateAdminConfig(
+    mutate: (config: AdminConfig) => AdminConfig,
+  ): Promise<void> {
     let previousMutation = this.adminConfigMutationTail;
     let release!: () => void;
-    this.adminConfigMutationTail = new Promise<void>(resolve => { release = resolve; });
+    this.adminConfigMutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     await previousMutation;
     try {
       let current = this.#config();
       let next = mutate(current);
       this.storage.adminConfig.put(next);
       try {
-        await this.env.BLUEPRINTS.put(ADMIN_CONFIG_KEY, serializeAdminConfig(next));
+        await this.env.BLUEPRINTS.put(
+          ADMIN_CONFIG_KEY,
+          serializeAdminConfig(next),
+        );
       } catch (error) {
         this.storage.adminConfig.put(current);
         throw error;
@@ -290,7 +360,7 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // Merge a partial update into the admin config and mirror it to KV. Callers (AdminApiImpl) validate
   // scalar values; this just persists atomically.
   updateAdminConfig(patch: Partial<AdminConfig>): Promise<void> {
-    return this.#mutateAdminConfig(config => ({ ...config, ...patch }));
+    return this.#mutateAdminConfig((config) => ({ ...config, ...patch }));
   }
 
   // Read all admin-managed settings for the admin UI in one call: the stored config plus the live
@@ -320,34 +390,36 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // Admin view of the promoted formats: the deployment's curation joined with each blueprint, so
   // the panel can show what is being curated and flag entries whose blueprint has been deleted.
   async #listFormatConfig(config: AdminConfig): Promise<AdminFormat[]> {
-    let bundled = new Set(FORMAT_BLUEPRINTS.map(entry => entry.blueprintId));
+    let bundled = new Set(FORMAT_BLUEPRINTS.map((entry) => entry.blueprintId));
 
     // Every entry, not just the offered ones: the panel exists to show what is disabled and what
     // points at a deleted blueprint.
     return (await listPromotedFormats(this.env, config.formats)).map(
-        ({entry, metadata, declared, output}) => ({
-          blueprintId: entry.blueprintId,
-          blueprintTitle: metadata?.title ?? "",
-          blueprintDescription: metadata?.description ?? "",
-          output,
-          declared,
-          overrides: entry.overrides,
-          enabled: entry.enabled,
-          agentHint: entry.agentHint ?? "",
-          missing: !metadata,
-          bundled: bundled.has(entry.blueprintId),
-        }));
+      ({ entry, metadata, declared, output }) => ({
+        blueprintId: entry.blueprintId,
+        blueprintTitle: metadata?.title ?? "",
+        blueprintDescription: metadata?.description ?? "",
+        output,
+        declared,
+        overrides: entry.overrides,
+        enabled: entry.enabled,
+        agentHint: entry.agentHint ?? "",
+        missing: !metadata,
+        bundled: bundled.has(entry.blueprintId),
+      }),
+    );
   }
 
   // Read-modify-write one format entry within the DO, so concurrent admin edits can't clobber each
   // other. `mutate` returns the replacement list, or null to leave the config untouched.
-  async #mutateFormats(mutate: (formats: FormatCuration[]) => FormatCuration[] | null)
-      : Promise<void> {
-    await this.#mutateAdminConfig(config => {
+  async #mutateFormats(
+    mutate: (formats: FormatCuration[]) => FormatCuration[] | null,
+  ): Promise<void> {
+    await this.#mutateAdminConfig((config) => {
       let next = mutate(config.formats);
       // A no-op may be a retry after the prior KV write failed but DO storage succeeded. Mirror the
       // current config again so idempotent retries repair that partial failure.
-      return next ? {...config, formats: next} : config;
+      return next ? { ...config, formats: next } : config;
     });
   }
 
@@ -356,18 +428,23 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     if (!record) {
       throw new Error("Blueprint not found.");
     }
-    await this.#mutateFormats(formats => {
+    await this.#mutateFormats((formats) => {
       // Idempotent so retrying after a KV mirror failure reaches #mutateFormats()'s repair write.
-      if (formats.some(f => f.blueprintId === blueprintId)) return null;
+      if (formats.some((f) => f.blueprintId === blueprintId)) return null;
       // A blueprint that declares no output still needs a stable grouping key before the admin can
       // name it. Generate that hidden implementation detail here; the panel only asks the admin for
       // the human-facing noun, plural and icon.
       let declared = sanitizeBlueprintOutput(record.metadata.output);
-      return [...formats, {
-        blueprintId,
-        enabled: true,
-        ...(declared ? {} : {overrides: {id: defaultOutputFormatId(blueprintId)}}),
-      }];
+      return [
+        ...formats,
+        {
+          blueprintId,
+          enabled: true,
+          ...(declared
+            ? {}
+            : { overrides: { id: defaultOutputFormatId(blueprintId) } }),
+        },
+      ];
     });
   }
 
@@ -375,53 +452,70 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
     // Enforced here, not just in the panel: this is an RPC an admin session can call directly.
     // Withdrawing a bundled entry is `enabled: false`, which keeps its overrides, hint and
     // position.
-    if (FORMAT_BLUEPRINTS.some(entry => entry.blueprintId === blueprintId)) {
+    if (FORMAT_BLUEPRINTS.some((entry) => entry.blueprintId === blueprintId)) {
       throw new Error(
-          "This format ships with the deployment, so it can't be removed. Turn it off instead.");
+        "This format ships with the deployment, so it can't be removed. Turn it off instead.",
+      );
     }
-    await this.#mutateFormats(formats => {
-      let next = formats.filter(f => f.blueprintId !== blueprintId);
+    await this.#mutateFormats((formats) => {
+      let next = formats.filter((f) => f.blueprintId !== blueprintId);
       return next.length === formats.length ? null : next;
     });
   }
 
-  async updateFormat(blueprintId: string, patch: AdminFormatPatch): Promise<void> {
-    await this.#mutateFormats(formats => formats.map(entry => {
-      if (entry.blueprintId !== blueprintId) return entry;
+  async updateFormat(
+    blueprintId: string,
+    patch: AdminFormatPatch,
+  ): Promise<void> {
+    await this.#mutateFormats((formats) =>
+      formats.map((entry) => {
+        if (entry.blueprintId !== blueprintId) return entry;
 
-      let next: FormatCuration = {...entry};
-      if (patch.enabled !== undefined) next.enabled = patch.enabled;
-      if (patch.agentHint !== undefined) {
-        // Truncated because every hint is repeated in the system prompt on every turn, so an
-        // over-long one costs tokens on requests nobody connects back to this panel.
-        let hint = patch.agentHint.trim().slice(0, MAX_AGENT_HINT);
-        if (hint) next.agentHint = hint; else delete next.agentHint;
-      }
-      if (patch.overrides) {
-        // null reverts a field to the blueprint's own declaration; absent leaves it alone.
-        let merged: Record<string, unknown> = {...entry.overrides};
-        for (let [key, value] of Object.entries(patch.overrides)) {
-          if (value === null) delete merged[key]; else merged[key] = value;
+        let next: FormatCuration = { ...entry };
+        if (patch.enabled !== undefined) next.enabled = patch.enabled;
+        if (patch.agentHint !== undefined) {
+          // Truncated because every hint is repeated in the system prompt on every turn, so an
+          // over-long one costs tokens on requests nobody connects back to this panel.
+          let hint = patch.agentHint.trim().slice(0, MAX_AGENT_HINT);
+          if (hint) next.agentHint = hint;
+          else delete next.agentHint;
         }
-        let clean = sanitizeOutputOverrides(merged);
-        if (clean) next.overrides = clean; else delete next.overrides;
-      }
-      return next;
-    }));
+        if (patch.overrides) {
+          // null reverts a field to the blueprint's own declaration; absent leaves it alone.
+          let merged: Record<string, unknown> = { ...entry.overrides };
+          for (let [key, value] of Object.entries(patch.overrides)) {
+            if (value === null) delete merged[key];
+            else merged[key] = value;
+          }
+          let clean = sanitizeOutputOverrides(merged);
+          if (clean) next.overrides = clean;
+          else delete next.overrides;
+        }
+        return next;
+      }),
+    );
   }
 
   async setFormatOrder(blueprintIds: string[]): Promise<void> {
-    await this.#mutateFormats(formats => reorderFormats(formats, blueprintIds));
+    await this.#mutateFormats((formats) =>
+      reorderFormats(formats, blueprintIds),
+    );
   }
 
   // Enable/disable a single gatekeeper resource type atomically (read-modify-write within the DO).
-  async setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
+  async setResourceEnabled(
+    vendorId: string,
+    urlPattern: string,
+    enabled: boolean,
+  ): Promise<void> {
     vendorId = vendorId.toLowerCase();
-    await this.#mutateAdminConfig(config => {
+    await this.#mutateAdminConfig((config) => {
       let map = { ...config.disabledResources };
       let disabled = new Set(map[vendorId] ?? []);
-      if (enabled) disabled.delete(urlPattern); else disabled.add(urlPattern);
-      if (disabled.size === 0) delete map[vendorId]; else map[vendorId] = [...disabled];
+      if (enabled) disabled.delete(urlPattern);
+      else disabled.add(urlPattern);
+      if (disabled.size === 0) delete map[vendorId];
+      else map[vendorId] = [...disabled];
       return { ...config, disabledResources: map };
     });
   }
@@ -429,7 +523,9 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   async setSiteLogo(data: Uint8Array | null): Promise<boolean> {
     let previous = this.siteLogoMutationTail;
     let release!: () => void;
-    this.siteLogoMutationTail = new Promise<void>(resolve => { release = resolve; });
+    this.siteLogoMutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     await previous;
     try {
       let current = this.#config();
@@ -439,7 +535,8 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
           await this.env.BLUEPRINT_CONTENT.delete(SITE_LOGO_R2_KEY);
         } catch (error) {
           logger.warn("failed to delete disabled site logo", {
-            event: "site.logo.delete.failed", error,
+            event: "site.logo.delete.failed",
+            error,
           });
         }
         return false;
@@ -461,23 +558,31 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // auto-provisioning ("ambient") gatekeeper stores its three-state mode in ambientGatekeeperModes
   // (default stored as absence); an ordinary gatekeeper stores a binary enabled/disabled in
   // disabledGatekeepers and rejects the ambient-only 'optional'.
-  async setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+  async setGatekeeperMode(
+    vendorId: string,
+    mode: AmbientGatekeeperMode,
+  ): Promise<void> {
     vendorId = vendorId.toLowerCase();
     let vendor = this.vendors.get(vendorId);
-    let autoProvisions = !!vendor && (await vendor.describe()).autoProvisionsAccount === true;
+    let autoProvisions =
+      !!vendor && (await vendor.describe()).autoProvisionsAccount === true;
     if (autoProvisions) {
-      await this.#mutateAdminConfig(config => {
+      await this.#mutateAdminConfig((config) => {
         let modes = { ...config.ambientGatekeeperModes };
-        if (mode === DEFAULT_AMBIENT_GATEKEEPER_MODE) delete modes[vendorId]; else modes[vendorId] = mode;
+        if (mode === DEFAULT_AMBIENT_GATEKEEPER_MODE) delete modes[vendorId];
+        else modes[vendorId] = mode;
         return { ...config, ambientGatekeeperModes: modes };
       });
     } else {
       if (mode === "optional") {
-        throw new Error(`"${vendorId}" is not an auto-provisioning gatekeeper; use 'enabled' or 'disabled'.`);
+        throw new Error(
+          `"${vendorId}" is not an auto-provisioning gatekeeper; use 'enabled' or 'disabled'.`,
+        );
       }
-      await this.#mutateAdminConfig(config => {
+      await this.#mutateAdminConfig((config) => {
         let disabled = new Set(config.disabledGatekeepers);
-        if (mode === "enabled") disabled.delete(vendorId); else disabled.add(vendorId);
+        if (mode === "enabled") disabled.delete(vendorId);
+        else disabled.add(vendorId);
         return { ...config, disabledGatekeepers: [...disabled] };
       });
     }
@@ -487,57 +592,66 @@ export class AdminSettings extends DurableObject<Cloudflare.Env> {
   // Unlike the user-facing listGatekeeperVendors, this does NOT hide disabled resources (so admins
   // can re-enable them). `adminUserId` is forwarded to getSupportedResources() so RBAC-gated
   // gatekeepers still surface for an admin who has access to them.
-  async #listResourceConfig(config: AdminConfig, adminUserId: string): Promise<AdminResourceVendor[]> {
+  async #listResourceConfig(
+    config: AdminConfig,
+    adminUserId: string,
+  ): Promise<AdminResourceVendor[]> {
     let disabledGatekeeperSet = new Set(config.disabledGatekeepers);
 
     let promises: Promise<AdminResourceVendor | null>[] = [];
     for (let [id, vendor] of this.vendors) {
-      promises.push((async () => {
-        try {
-          let [description, supportedResources] = await Promise.all([
-            vendor.describe(),
-            vendor.getSupportedResources({ userId: adminUserId }),
-          ]);
-          if (description.autoProvisionsAccount) {
-            // Auto-provisioning ("ambient") gatekeeper: a three-state mode, no resources to toggle.
-            let mode = ambientGatekeeperMode(config, id);
+      promises.push(
+        (async () => {
+          try {
+            let [description, supportedResources] = await Promise.all([
+              vendor.describe(),
+              vendor.getSupportedResources({ userId: adminUserId }),
+            ]);
+            if (description.autoProvisionsAccount) {
+              // Auto-provisioning ("ambient") gatekeeper: a three-state mode, no resources to toggle.
+              let mode = ambientGatekeeperMode(config, id);
+              return {
+                vendorId: id,
+                displayName: description.displayName,
+                logo: description.logo,
+                autoProvisions: true,
+                ambientMode: mode,
+              };
+            }
+            if (supportedResources.length === 0) {
+              // Nothing to toggle for this gatekeeper.
+              return null;
+            }
+            let disabled = new Set(config.disabledResources[id] ?? []);
             return {
               vendorId: id,
               displayName: description.displayName,
               logo: description.logo,
-              autoProvisions: true,
-              ambientMode: mode,
+              autoProvisions: false,
+              enabled: !disabledGatekeeperSet.has(id),
+              resources: supportedResources.map((r) => ({
+                urlPattern: r.urlPattern,
+                title: r.title,
+                description: r.description,
+                icon: r.icon,
+                enabled: !disabled.has(r.urlPattern),
+              })),
             };
-          }
-          if (supportedResources.length === 0) {
-            // Nothing to toggle for this gatekeeper.
+          } catch (err) {
+            logger.warn("failed to read resource config for gatekeeper", {
+              event: "gatekeeper.resource.config.read.failed",
+              gatekeeperId: id,
+              error: err,
+            });
             return null;
           }
-          let disabled = new Set(config.disabledResources[id] ?? []);
-          return {
-            vendorId: id,
-            displayName: description.displayName,
-            logo: description.logo,
-            autoProvisions: false,
-            enabled: !disabledGatekeeperSet.has(id),
-            resources: supportedResources.map(r => ({
-              urlPattern: r.urlPattern,
-              title: r.title,
-              description: r.description,
-              icon: r.icon,
-              enabled: !disabled.has(r.urlPattern),
-            })),
-          };
-        } catch (err) {
-          logger.warn("failed to read resource config for gatekeeper", {
-            event: "gatekeeper.resource.config.read.failed", gatekeeperId: id, error: err,
-          });
-          return null;
-        }
-      })());
+        })(),
+      );
     }
 
-    let vendors = (await Promise.all(promises)).filter((v): v is AdminResourceVendor => v !== null);
+    let vendors = (await Promise.all(promises)).filter(
+      (v): v is AdminResourceVendor => v !== null,
+    );
     // Show auto-provisioned ("ambient") gatekeepers first; preserve the existing order otherwise.
     vendors.sort((a, b) => Number(b.autoProvisions) - Number(a.autoProvisions));
     return vendors;
@@ -556,9 +670,10 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   // `adminUserId` is the requesting admin's identity, forwarded to gatekeepers when listing the
   // resource catalog (some are RBAC-gated per user). It's plain data — not a user-DO dependency.
   constructor(
-      private admin: DurableObjectStub<AdminSettings>,
-      private adminUserId: string,
-      private access: VerglasAccessClient | null = null) {
+    private admin: DurableObjectStub<AdminSettings>,
+    private adminUserId: string,
+    private access: VerglasAccessClient | null = null,
+  ) {
     super();
   }
 
@@ -567,21 +682,29 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
   }
 
   async getAccessSnapshot(): Promise<VerglasAccessSnapshot> {
-    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
-    await this.access.ensureUser(this.adminUserId);
+    if (!this.access)
+      throw new Error("Verglas tenant authorization is not configured.");
     return await this.access.snapshot();
   }
 
-  async delegateAccess(input: VerglasAccessGrantInput): Promise<VerglasAccessGrant> {
-    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
-    await this.access.ensureUser(this.adminUserId);
-    return await this.access.delegate(this.adminUserId, input);
+  async delegateAccess(
+    input: VerglasAccessGrantInput,
+  ): Promise<VerglasAccessGrant> {
+    if (!this.access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    return await this.access.delegate(input);
   }
 
   async revokeAccess(grantId: string): Promise<void> {
-    if (!this.access) throw new Error("Verglas tenant authorization is not configured.");
-    await this.access.ensureUser(this.adminUserId);
-    await this.access.revoke(this.adminUserId, grantId);
+    if (!this.access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    await this.access.revoke(grantId);
+  }
+
+  async revokeAccessToken(tokenId: string): Promise<void> {
+    if (!this.access)
+      throw new Error("Verglas tenant authorization is not configured.");
+    await this.access.revokeToken(tokenId);
   }
 
   async setSignupsEnabled(enabled: boolean): Promise<void> {
@@ -590,28 +713,41 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async setSiteName(name: string): Promise<void> {
     if (name.length > MAX_SITE_NAME_LENGTH) {
-      throw new Error(`Site name too long (max ${MAX_SITE_NAME_LENGTH} characters).`);
+      throw new Error(
+        `Site name too long (max ${MAX_SITE_NAME_LENGTH} characters).`,
+      );
     }
     await this.admin.updateAdminConfig({ siteName: name });
   }
 
-  async setSiteLogo(data: Uint8Array | null): Promise<AdminSettingsView['siteLogo']> {
+  async setSiteLogo(
+    data: Uint8Array | null,
+  ): Promise<AdminSettingsView["siteLogo"]> {
     if (data !== null) validateSiteLogo(data);
     return siteLogoImage(await this.admin.setSiteLogo(data));
   }
 
   async setInstanceInstructions(text: string): Promise<void> {
     if (text.length > MAX_INSTANCE_INSTRUCTIONS_LENGTH) {
-      throw new Error(`Instructions too long (max ${MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters).`);
+      throw new Error(
+        `Instructions too long (max ${MAX_INSTANCE_INSTRUCTIONS_LENGTH} characters).`,
+      );
     }
     await this.admin.updateAdminConfig({ instanceInstructions: text });
   }
 
-  setResourceEnabled(vendorId: string, urlPattern: string, enabled: boolean): Promise<void> {
+  setResourceEnabled(
+    vendorId: string,
+    urlPattern: string,
+    enabled: boolean,
+  ): Promise<void> {
     return this.admin.setResourceEnabled(vendorId, urlPattern, enabled);
   }
 
-  setGatekeeperMode(vendorId: string, mode: AmbientGatekeeperMode): Promise<void> {
+  setGatekeeperMode(
+    vendorId: string,
+    mode: AmbientGatekeeperMode,
+  ): Promise<void> {
     if (!isAmbientGatekeeperMode(mode)) {
       throw new Error(`Invalid gatekeeper mode: ${mode}`);
     }
@@ -620,14 +756,18 @@ export class AdminApiImpl extends RpcTarget implements AdminApi {
 
   async setAnnouncement(text: string): Promise<void> {
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
-      throw new Error(`Announcement too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
+      throw new Error(
+        `Announcement too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`,
+      );
     }
     await this.admin.updateAdminConfig({ announcement: text });
   }
 
   async setBanner(text: string, color: BannerColor): Promise<void> {
     if (text.length > MAX_ANNOUNCEMENT_LENGTH) {
-      throw new Error(`Banner too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`);
+      throw new Error(
+        `Banner too long (max ${MAX_ANNOUNCEMENT_LENGTH} characters).`,
+      );
     }
     if (!isBannerColor(color)) {
       throw new Error(`Invalid banner color: ${color}`);

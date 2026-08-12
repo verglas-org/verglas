@@ -1975,7 +1975,6 @@ pub fn router<R: ObjectRead, W: ObjectWrite>(
         None,
         None,
         None,
-        None,
     )
 }
 
@@ -1985,12 +1984,6 @@ pub fn router<R: ObjectRead, W: ObjectWrite>(
 ///   operations (HeadBucket, GetBucketLocation) are forwarded to the origin
 ///   resolved through `stores` before s3s's typed dispatch would 501 them.
 ///   `None` keeps s3s's default 501 for unmodeled operations.
-/// - `serving_api`: when `Some`, the server's query and logical-write execution
-///   API is served on this SigV4-gated
-///   surface too, forwarded to the given handler before s3s's typed dispatch.
-///   Unsigned requests are rejected with `AccessDenied` by the route's default
-///   access check, exactly as for a modeled S3 request. `None` leaves the `/v1`
-///   surface to the loopback admin listener only.
 /// - `base_domain` (issue #11): when `Some`, virtual-hosted-style requests are
 ///   accepted, whose bucket is the leading Host label under that domain
 ///   (`bucket.<domain>`); path-style still works, because s3s only extracts a
@@ -2006,7 +1999,6 @@ pub fn router_with_passthrough<R: ObjectRead, W: ObjectWrite>(
     invalidation: Arc<dyn Invalidation>,
     credentials: Option<(String, String)>,
     passthrough: Option<Arc<dyn verglas_backend::BackendStores>>,
-    serving_api: Option<Arc<dyn crate::serving_api::ServingApi>>,
     base_domain: Option<&str>,
     metrics: Option<Arc<NodeMetrics>>,
 ) -> Router {
@@ -2035,33 +2027,13 @@ pub fn router_with_passthrough<R: ObjectRead, W: ObjectWrite>(
             // Default `S3Access`: authenticated requests proceed, anonymous
             // requests are rejected with AccessDenied before the handler runs.
         }
-        // s3s takes a single custom route, so the bucket-config passthrough
-        // (#152) and the `/v1` serving route are composed into one when both are
-        // present. Each is checked before s3s's typed dispatch; the composite is
-        // installed only when at least one is configured.
-        let mut routes: Vec<Box<dyn s3s::route::S3Route>> = Vec::new();
         if let Some(stores) = passthrough {
             // Checked before typed dispatch: allowlisted bucket-config ops are
             // forwarded to the origin instead of 501ing (issue #152).
-            routes.push(Box::new(
-                crate::passthrough_route::BucketConfigPassthrough::new(
-                    storage_binding_id.clone(),
-                    stores,
-                ),
+            builder.set_route(crate::passthrough_route::BucketConfigPassthrough::new(
+                storage_binding_id.clone(),
+                stores,
             ));
-        }
-        if let Some(api) = serving_api {
-            // The server's `/v1` serving API on the SigV4-gated surface: the
-            // edge re-signs cache-pathed `/v1` forwards with the cache keypair
-            // and they land here.
-            routes.push(Box::new(crate::serving_api::V1ServingRoute::new(api)));
-            // s3s validates the leading path segment as a bucket name before it
-            // consults a custom route; `v1` (2 chars) fails AWS rules, so reserve
-            // it or `/v1/...` is rejected `InvalidBucketName` before the route.
-            builder.set_validation(crate::serving_api::ServingNameValidation);
-        }
-        if !routes.is_empty() {
-            builder.set_route(crate::serving_api::CompositeRoute::new(routes));
         }
         if let Some(domain) = base_domain {
             match s3s::host::SingleDomain::new(domain) {
@@ -2153,7 +2125,6 @@ mod tests {
                     store.clone(),
                 ))),
                 Arc::new(crate::NoopInvalidation),
-                None,
                 None,
                 None,
                 domain,

@@ -229,8 +229,16 @@ async fn one_grant_owns_each_principal_resource_tuple_set() {
 
 #[test]
 fn scoped_claims_validate_audience_tenant_and_lifetime() {
-    let claims = ScopedTokenClaims::new("tenant-a", "job-1", "data-plane-west", 12, 1_000, 1_100)
-        .with_run("run-9");
+    let claims = ScopedTokenClaims::new(
+        "token-run-9",
+        "tenant-a",
+        "job-1",
+        "data-plane-west",
+        12,
+        1_000,
+        1_100,
+    )
+    .with_run("run-9");
     assert!(
         claims
             .validate("tenant-a", "data-plane-west", 1_050)
@@ -250,5 +258,37 @@ fn scoped_claims_validate_audience_tenant_and_lifetime() {
         claims
             .validate("tenant-a", "data-plane-west", 1_101)
             .is_err()
+    );
+}
+
+#[test]
+fn lakekeeper_resource_categories_use_stable_generic_wire_names() {
+    let cases = [
+        (ResourceKind::Project, "project"),
+        (ResourceKind::GenericTable, "generic_table"),
+        (ResourceKind::Role, "role"),
+        (ResourceKind::Tag, "tag"),
+    ];
+    for (kind, expected) in cases {
+        assert_eq!(
+            serde_json::to_string(&kind).expect("serialize"),
+            format!("\"{expected}\"")
+        );
+        assert_eq!(
+            serde_json::from_str::<ResourceKind>(&format!("\"{expected}\"")).expect("deserialize"),
+            kind
+        );
+    }
+}
+
+#[test]
+fn assumed_role_principals_use_a_stable_wire_name() {
+    assert_eq!(
+        serde_json::to_string(&PrincipalKind::Role).expect("serialize"),
+        "\"role\""
+    );
+    assert_eq!(
+        serde_json::from_str::<PrincipalKind>("\"role\"").expect("deserialize"),
+        PrincipalKind::Role
     );
 }

@@ -29,6 +29,14 @@ export interface Transport {
   ): Promise<Response>;
 }
 
+/** Validates and URL-encodes one tenant-local database resource name. */
+export function databasePathSegment(database: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_-]*$/.test(database)) {
+    throw new Error("query: database must begin with a letter or underscore and contain only letters, numbers, underscores, or hyphens");
+  }
+  return encodeURIComponent(database);
+}
+
 /** Joins the endpoint base and a path, tolerating a trailing slash on either. */
 function joinUrl(endpoint: string, path: string): string {
   const base = endpoint.replace(/\/+$/, "");

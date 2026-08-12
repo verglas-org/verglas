@@ -1,43 +1,59 @@
-//! Queue wire types for the `/v1/queues/...` data-plane routes.
-//!
-//! A queue is a durable ordered log of JSON rows consumed by named consumer
-//! groups. These structs are the transport contract the Rust SDK and TypeScript
-//! SDK share with the server.
+//! Fenced delivery types for declared PostgreSQL-backed queue deployments.
+//! Queue handles speak to the access edge, which resolves and wakes the queue container.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Result of appending rows onto a queue.
+/// One idempotent message published to an exact topic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueMessage {
+    /// Producer-defined idempotency identity.
+    pub id: String,
+    /// Exact topic used for subscription filtering.
+    pub topic: String,
+    /// Caller-supplied message body.
+    pub payload: Value,
+}
+
+/// Result of atomically appending one message batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueEnqueueResult {
+    /// Stable ordered positions assigned by PostgreSQL.
+    pub positions: Vec<i64>,
+}
+
+/// Opaque proof that a consumer owns one delivery generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueueEnqueueResult {
-    /// Rows appended by this call.
-    pub enqueued: u64,
-    /// The position one past the last appended record.
-    pub end_position: u64,
+pub struct QueueReceipt {
+    /// Stable queue position.
+    pub position: i64,
+    /// Consumer process that owns the lease.
+    pub owner: String,
+    /// Monotonic generation fencing prior deliveries.
+    pub generation: u64,
 }
 
-/// One record returned by a queue poll.
+/// One exclusively leased queue message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct QueueRecord {
-    /// Stable global position in the queue.
-    pub position: u64,
-    /// Row payload.
-    pub row: Value,
+#[serde(rename_all = "camelCase")]
+pub struct QueueDelivery {
+    /// Stable queue position.
+    pub position: i64,
+    /// Exact topic that matched this subscription.
+    pub topic: String,
+    /// Caller-supplied JSON message.
+    pub payload: Value,
+    /// Receipt required for acknowledgement.
+    pub receipt: QueueReceipt,
+    /// RFC 3339 deadline after which redelivery is permitted.
+    pub expires_at: String,
 }
 
-/// A page polled for one consumer group.
+/// Bounded exclusive deliveries returned by one poll.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuePollResult {
-    /// Records at or after the group's watermark, in order.
-    pub records: Vec<QueueRecord>,
-    /// The group's current watermark (acked-through position).
-    pub watermark: u64,
-}
-
-/// Result of advancing a consumer group's watermark.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct QueueAckResult {
-    /// The group's watermark after the monotone ack.
-    pub watermark: u64,
+    /// Messages claimed under distinct fenced receipts.
+    pub deliveries: Vec<QueueDelivery>,
 }

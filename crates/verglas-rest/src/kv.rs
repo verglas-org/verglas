@@ -2,8 +2,7 @@
 //! router authorizes a tenant and exact namespace before constructing a storage
 //! scope, and it never logs keys, values, tokens, or application metadata.
 
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
@@ -16,6 +15,8 @@ use serde::Deserialize;
 use serde_json::json;
 use verglas_kv::{DeleteOptions, Error, PutOptions, Scope};
 
+use crate::data_plane::AuthenticatedPrincipal;
+
 const DEFAULT_LIST_LIMIT: usize = 100;
 const MAX_VALUE_BYTES: usize = 8 * 1024 * 1024;
 const METADATA_PREFIX: &str = "x-verglas-meta-";
@@ -26,92 +27,11 @@ const IDEMPOTENCY_HEADER: &str = "idempotency-key";
 
 type ApiResult<T> = Result<T, Box<Response>>;
 
-/// A verb granted on one KV namespace.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KvVerb {
-    /// Get and list.
-    Read,
-    /// Put and delete.
-    Write,
-}
-
-/// Identity already authenticated by the outer data-plane boundary.
-#[derive(Debug, Clone)]
-pub struct AuthenticatedKvPrincipal {
-    /// Tenant that owns every resolved key.
-    pub tenant: String,
-}
-
-/// One bearer token's tenant, namespace, and verb grant.
-#[derive(Debug, Clone)]
-pub struct KvGrant {
-    /// Tenant that owns the namespace.
-    pub tenant: String,
-    /// Exact namespace, or `*` for the single-tenant local boundary.
-    pub namespace: String,
-    /// Whether get and list are allowed.
-    pub read: bool,
-    /// Whether put and delete are allowed.
-    pub write: bool,
-}
-
-/// Immutable bearer-token grant map used by the open-source composition.
-#[derive(Clone, Default)]
-pub struct KvAuthorizer {
-    grants: Arc<HashMap<String, KvGrant>>,
-}
-
-impl KvAuthorizer {
-    /// Builds an authorizer from tokens and their exact scoped grants.
-    pub fn new(grants: HashMap<String, KvGrant>) -> Self {
-        Self {
-            grants: Arc::new(grants),
-        }
-    }
-
-    /// Resolves one bearer token and checks its exact namespace verb grant.
-    fn authorize(&self, headers: &HeaderMap, namespace: &str, verb: KvVerb) -> AuthResult {
-        let Some(value) = headers.get(header::AUTHORIZATION) else {
-            return AuthResult::Unauthenticated;
-        };
-        let Ok(value) = value.to_str() else {
-            return AuthResult::Unauthenticated;
-        };
-        let Some(token) = value
-            .strip_prefix("Bearer ")
-            .filter(|token| !token.is_empty())
-        else {
-            return AuthResult::Unauthenticated;
-        };
-        let Some(grant) = self.grants.get(token) else {
-            return AuthResult::Unauthenticated;
-        };
-        let namespace_allowed = grant.namespace == "*" || grant.namespace == namespace;
-        let verb_allowed = match verb {
-            KvVerb::Read => grant.read,
-            KvVerb::Write => grant.write,
-        };
-        if namespace_allowed && verb_allowed {
-            AuthResult::Authorized(grant.tenant.clone())
-        } else {
-            AuthResult::Forbidden
-        }
-    }
-}
-
-enum AuthResult {
-    Authorized(String),
-    Unauthenticated,
-    Forbidden,
-}
-
-/// KV engine plus authorization policy shared by all KV routes.
+/// KV engine shared by routes authorized at the common data-plane boundary.
 #[derive(Clone)]
 pub struct KvRuntime {
     /// Durable engine handle.
     pub store: verglas_kv::Store,
-    /// Bearer-token authorizer used when no outer principal is present.
-    pub authorizer: KvAuthorizer,
 }
 
 /// Builds the authenticated get, put, delete, and prefix-list router.
@@ -128,21 +48,14 @@ pub fn router(runtime: KvRuntime) -> Router {
 
 /// Authorizes before constructing the tenant/namespace storage scope.
 fn authorize_scope(
-    runtime: &KvRuntime,
-    headers: &HeaderMap,
-    principal: Option<Extension<AuthenticatedKvPrincipal>>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
     namespace: &str,
-    verb: KvVerb,
 ) -> ApiResult<Scope> {
-    let result = match principal {
-        Some(Extension(principal)) => AuthResult::Authorized(principal.tenant),
-        None => runtime.authorizer.authorize(headers, namespace, verb),
-    };
-    match result {
-        AuthResult::Authorized(tenant) => {
-            Scope::new(tenant, namespace).map_err(|error| Box::new(kv_error(error)))
+    match principal {
+        Some(Extension(principal)) => {
+            Scope::new(principal.tenant_id, namespace).map_err(|error| Box::new(kv_error(error)))
         }
-        AuthResult::Unauthenticated => Err(Box::new(
+        None => Err(Box::new(
             (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],
@@ -150,20 +63,16 @@ fn authorize_scope(
             )
                 .into_response(),
         )),
-        AuthResult::Forbidden => Err(Box::new(
-            (StatusCode::FORBIDDEN, "KV namespace access denied").into_response(),
-        )),
     }
 }
 
 /// Returns one raw value with bounded metadata headers.
 async fn get_value(
     State(runtime): State<KvRuntime>,
-    principal: Option<Extension<AuthenticatedKvPrincipal>>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
     Path((namespace, key)): Path<(String, String)>,
-    headers: HeaderMap,
 ) -> Response {
-    let scope = match authorize_scope(&runtime, &headers, principal, &namespace, KvVerb::Read) {
+    let scope = match authorize_scope(principal, &namespace) {
         Ok(scope) => scope,
         Err(response) => return *response,
     };
@@ -177,12 +86,12 @@ async fn get_value(
 /// Durably stores one raw value before returning its committed version.
 async fn put_value(
     State(runtime): State<KvRuntime>,
-    principal: Option<Extension<AuthenticatedKvPrincipal>>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
     Path((namespace, key)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let scope = match authorize_scope(&runtime, &headers, principal, &namespace, KvVerb::Write) {
+    let scope = match authorize_scope(principal, &namespace) {
         Ok(scope) => scope,
         Err(response) => return *response,
     };
@@ -209,11 +118,11 @@ async fn put_value(
 /// Durably records an idempotent deletion and returns whether a live value existed.
 async fn delete_value(
     State(runtime): State<KvRuntime>,
-    principal: Option<Extension<AuthenticatedKvPrincipal>>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
     Path((namespace, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    let scope = match authorize_scope(&runtime, &headers, principal, &namespace, KvVerb::Write) {
+    let scope = match authorize_scope(principal, &namespace) {
         Ok(scope) => scope,
         Err(response) => return *response,
     };
@@ -237,12 +146,11 @@ struct ListQuery {
 /// Returns one bounded metadata-only page in deterministic bytewise order.
 async fn list(
     State(runtime): State<KvRuntime>,
-    principal: Option<Extension<AuthenticatedKvPrincipal>>,
+    principal: Option<Extension<AuthenticatedPrincipal>>,
     Path(namespace): Path<String>,
     Query(query): Query<ListQuery>,
-    headers: HeaderMap,
 ) -> Response {
-    let scope = match authorize_scope(&runtime, &headers, principal, &namespace, KvVerb::Read) {
+    let scope = match authorize_scope(principal, &namespace) {
         Ok(scope) => scope,
         Err(response) => return *response,
     };

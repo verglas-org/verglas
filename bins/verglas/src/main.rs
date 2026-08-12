@@ -18,6 +18,7 @@ mod admin_client;
 mod backend;
 mod cli;
 mod commands;
+mod credentials;
 mod output;
 mod worker_spec;
 
@@ -26,37 +27,58 @@ use cli::{Cli, Command};
 
 /// Runs the parsed CLI command against the configured admin endpoint.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let token = cli.resolved_token()?;
+    let credentials_path = cli.resolved_credentials_path()?;
     match cli.command {
-        Command::Drain(args) => commands::drain::run(&cli.endpoint, &args, cli.json).await,
-        Command::Status => commands::status::run(&cli.endpoint, cli.json).await,
-        Command::Table(command) => commands::table::run(command, &cli.endpoint, cli.json).await,
-        Command::Graph(command) => commands::graph::run(command, &cli.endpoint, cli.json).await,
-        Command::Query(args) => commands::query::run(args, &cli.endpoint, cli.json).await,
+        Command::Drain(args) => {
+            commands::drain::run(&cli.endpoint, token.as_deref(), &args, cli.json).await
+        }
+        Command::Status => commands::status::run(&cli.endpoint, token.as_deref(), cli.json).await,
+        Command::Table(command) => {
+            commands::table::run(command, &cli.endpoint, token.as_deref(), cli.json).await
+        }
+        Command::Graph(command) => {
+            commands::graph::run(command, &cli.endpoint, token.as_deref(), cli.json).await
+        }
+        Command::Query(args) => {
+            commands::query::run(args, &cli.endpoint, token.as_deref(), cli.json).await
+        }
         Command::Index(command) => {
-            commands::table::run_index_registry(command, &cli.endpoint, cli.json).await
+            commands::table::run_index_registry(command, &cli.endpoint, token.as_deref(), cli.json)
+                .await
         }
         Command::Dashboard(command) => {
-            commands::dashboard::run(command, &cli.endpoint, cli.json).await
+            commands::dashboard::run(command, &cli.endpoint, token.as_deref(), cli.json).await
         }
-        Command::Workers(command) => commands::workers::run(command, &cli.endpoint, cli.json).await,
-        Command::Kv(command) => {
-            commands::kv::run(command, &cli.endpoint, cli.token.as_deref()).await
+        Command::Workers(command) => {
+            commands::workers::run(command, &cli.endpoint, token.as_deref(), cli.json).await
         }
-        Command::Vessel(command) => commands::vessel::run(command, cli.json).await,
+        Command::Kv(command) => commands::kv::run(command, &cli.endpoint, token.as_deref()).await,
+        Command::Vessel(command) => {
+            commands::vessel::run(command, token.as_deref(), cli.json).await
+        }
         Command::Db(command) => {
             commands::database::run(
                 command,
                 &cli.access_endpoint,
-                cli.token.as_deref(),
+                token.as_deref(),
+                &credentials_path,
                 cli.json,
             )
             .await
         }
+        Command::Queue(command) => {
+            commands::queue::run(command, &cli.access_endpoint, token.as_deref(), cli.json).await
+        }
         Command::Secret(command) => {
-            commands::secret::run(
+            commands::secret::run(command, &cli.access_endpoint, token.as_deref(), cli.json).await
+        }
+        Command::Token(command) => {
+            commands::token::run(
                 command,
                 &cli.access_endpoint,
-                cli.token.as_deref(),
+                token.as_deref(),
+                &credentials_path,
                 cli.json,
             )
             .await

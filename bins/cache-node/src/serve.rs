@@ -29,11 +29,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
+use verglas_cluster::peer::PeerClient;
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::admin::{CacheConfigInfo, CountersInfo, StatsInfo, WritebackStatsInfo};
-use verglas_core::config::Config;
+use verglas_core::config::{CatalogConsistency, Config};
 use verglas_core::metrics::NodeMetrics;
 use verglas_core::node::NodeId;
-use verglas_core::peer::NoopPeerFetch;
 use verglas_core::ring::RendezvousRing;
 use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
 use verglas_write::{
@@ -58,7 +59,7 @@ const BLOCK_PORT: u16 = 8335;
 /// The concrete engine the cache node runs: the hybrid cache over the
 /// single-bucket passthrough backend, with a one-member rendezvous ring and the
 /// no-op peer fetch. No `verglas-cluster` types appear here.
-type CacheEngine = HybridCacheEngine<PassthroughRead, NoopPeerFetch, RendezvousRing>;
+pub(crate) type CacheEngine = HybridCacheEngine<PassthroughRead, PeerClient, RendezvousRing>;
 type WritebackSlot = Arc<std::sync::OnceLock<Arc<WritebackMetrics>>>;
 
 /// Builds the all-object policy used by a tenant cache ring. Neon uploads both
@@ -323,42 +324,23 @@ pub async fn run(
     };
 
     let node_metrics = Arc::new(NodeMetrics::new()?);
+    let activity = ActivityTracker::new();
+    let quiescence = std::env::var("VERGLAS_HOST_AGENT_TOKEN")
+        .ok()
+        .filter(|token| !token.is_empty())
+        .map(|token| admin::Quiescence::new(activity.clone(), token))
+        .transpose()
+        .map_err(std::io::Error::other)?;
+    if quiescence.is_none() {
+        tracing::warn!(
+            "VERGLAS_HOST_AGENT_TOKEN is unset; authenticated scale-to-zero fencing is unavailable"
+        );
+    }
     let health = admin::Health::starting();
     let stats_slot: admin::StatsSlot = Arc::new(std::sync::OnceLock::new());
     let metrics_slot: admin::MetricsSlot = Arc::new(std::sync::OnceLock::new());
     let writeback_slot: WritebackSlot = Arc::new(std::sync::OnceLock::new());
-
-    // The cache node is the sole owner of upstream catalog credentials and
-    // change tracking. The gateway and watcher share one response cache. In the
-    // hosted path Lakekeeper signals this node directly after a mutation; the
-    // watcher seeds once and performs no periodic steady-state polling. A
-    // self-hosted node without an event token retains the polling fallback.
-    enum CatalogWatcherRuntime {
-        Polling {
-            _watcher: verglas_tables::catalog::PollingWatcher,
-        },
-        Push(Arc<verglas_tables::catalog::PushWatcher>),
-    }
-
-    let catalog_runtime = config
-        .catalog
-        .as_ref()
-        .map(|catalog| -> Result<_, Box<dyn std::error::Error>> {
-            use verglas_tables::catalog::{PollingWatcher, PushWatcher, WatcherOptions};
-
-            let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
-            let options = WatcherOptions::from_config(catalog);
-            let watcher = match std::env::var("VERGLAS_CATALOG_EVENT_TOKEN") {
-                Ok(token) if !token.is_empty() => CatalogWatcherRuntime::Push(Arc::new(
-                    PushWatcher::spawn(gateway.source(), options),
-                )),
-                _ => CatalogWatcherRuntime::Polling {
-                    _watcher: PollingWatcher::spawn(gateway.source(), options),
-                },
-            };
-            Ok((gateway, watcher))
-        })
-        .transpose()?;
+    let page_cache_slot: crate::page_cache::PageCacheSlot = Arc::new(std::sync::OnceLock::new());
 
     // Bind the admin listener first so its port is owned before serving; it
     // answers `/admin/healthz` = starting/503 while the engine recovers below.
@@ -396,6 +378,8 @@ pub async fn run(
                 &config.cache.dir,
                 config.cache.capacity_bytes.0,
                 &device_registry,
+                Arc::clone(&page_cache_slot),
+                activity.clone(),
             )
             .await?
             .map(Arc::new);
@@ -420,12 +404,12 @@ pub async fn run(
     // present whenever this node belongs to the fragment ring and shares that
     // ring's transport/listener/store with block FLUSH.
     let object_ring = ring_plane.clone();
-    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane) {
+    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane.as_ref()) {
         (Some(bucket), Some(ring)) => Some((
             Arc::clone(&registry),
             bucket,
             config.cache.dir.clone(),
-            ring,
+            Arc::clone(ring),
         )),
         _ => {
             eprintln!(
@@ -435,23 +419,117 @@ pub async fn run(
         }
     };
 
+    // Catalog consistency is explicit. Eventual mode polls any Iceberg REST
+    // catalog. Strong mode has no polling path: it requires the fragment ring,
+    // a Lakekeeper event token, and successful EC-log replay. Strong startup
+    // never calls Lakekeeper: doing so would create a dependency cycle because
+    // Lakekeeper's Postgres is itself durable through this cache ring.
+    enum CatalogRuntime {
+        Eventual {
+            gateway: Box<verglas_catalog::CatalogGateway>,
+            watcher: Arc<verglas_tables::catalog::PollingWatcher>,
+            token: Option<String>,
+        },
+        Strong {
+            state: Arc<crate::catalog_consistency::StrongCatalog>,
+            token: String,
+        },
+    }
+
+    let catalog_runtime = match config.catalog.as_ref() {
+        None => None,
+        Some(catalog) => {
+            use verglas_tables::catalog::{PollingWatcher, StrongWatcher, WatcherOptions};
+
+            let gateway = verglas_catalog::CatalogGateway::from_config(catalog)?;
+            let options = WatcherOptions::from_config(catalog);
+            let runtime = match catalog.consistency {
+                CatalogConsistency::Eventual => CatalogRuntime::Eventual {
+                    watcher: Arc::new(PollingWatcher::spawn(gateway.source(), options)),
+                    gateway: Box::new(gateway),
+                    token: std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
+                        .ok()
+                        .filter(|value| !value.is_empty()),
+                },
+                CatalogConsistency::Strong => {
+                    let ring = ring_plane.as_ref().ok_or(
+                        "catalog.consistency=strong requires a configured three-node VERGLAS_RING_PEERS ring",
+                    )?;
+                    let token = std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
+                        .ok()
+                        .filter(|value| !value.is_empty())
+                        .ok_or("catalog.consistency=strong requires VERGLAS_CATALOG_EVENT_TOKEN")?;
+                    let watcher = StrongWatcher::empty(options);
+                    let scope = format!(
+                        "{}|{}",
+                        catalog.uri,
+                        catalog.warehouse.as_deref().unwrap_or_default()
+                    );
+                    let log = Arc::new(verglas_write::catalog_log::EcCatalogLog::new(
+                        scope,
+                        ring.transport(),
+                        ring.membership(),
+                    ));
+                    let state =
+                        crate::catalog_consistency::StrongCatalog::new(gateway, watcher, log);
+                    CatalogRuntime::Strong { state, token }
+                }
+            };
+            Some(runtime)
+        }
+    };
+
     let mut admin_app = admin::router(
         VERSION,
         health.clone(),
         stats_slot.clone(),
         metrics_slot.clone(),
     );
-    if let Some((device_registry, _)) = &block_registry {
-        admin_app = admin_app.merge(crate::blockdev::control_router(device_registry.clone()));
+    if let Some(quiescence) = quiescence {
+        admin_app = admin_app.merge(admin::quiescence_router(quiescence));
     }
-    if let Some((gateway, watcher)) = &catalog_runtime {
-        admin_app = admin_app.merge(admin::catalog_router(gateway.clone()));
-        if let CatalogWatcherRuntime::Push(watcher) = watcher {
-            let token = std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
-                .expect("push watcher requires VERGLAS_CATALOG_EVENT_TOKEN");
-            admin_app = admin_app.merge(admin::catalog_event_router(Arc::clone(watcher), token));
-            eprintln!("verglas-cache-node {VERSION} catalog changes are push-driven by Lakekeeper");
-        }
+    admin_app = admin_app.merge(admin::track_http(
+        crate::page_cache::router(Arc::clone(&page_cache_slot)),
+        activity.clone(),
+        ActivityPlane::Http,
+    ));
+    if let Some((device_registry, _)) = &block_registry {
+        admin_app = admin_app.merge(admin::track_http(
+            crate::blockdev::control_router(device_registry.clone()),
+            activity.clone(),
+            ActivityPlane::Http,
+        ));
+    }
+    if let Some(runtime) = &catalog_runtime {
+        let catalog_app = match runtime {
+            CatalogRuntime::Eventual {
+                gateway,
+                watcher,
+                token,
+            } => {
+                let mut app = admin::catalog_router(gateway.as_ref().clone());
+                if let Some(token) = token {
+                    app = app.merge(admin::eventual_catalog_event_router(
+                        Arc::clone(watcher),
+                        token.clone(),
+                    ));
+                }
+                eprintln!("verglas-cache-node {VERSION} catalog consistency is eventual (polling)");
+                app
+            }
+            CatalogRuntime::Strong { state, token } => {
+                let app = admin::strong_catalog_router(Arc::clone(state), token.clone());
+                eprintln!(
+                    "verglas-cache-node {VERSION} catalog consistency is strong (EC quorum + fenced reads)"
+                );
+                app
+            }
+        };
+        admin_app = admin_app.merge(admin::track_http(
+            catalog_app,
+            activity.clone(),
+            ActivityPlane::Http,
+        ));
     }
     let admin_fut = async move {
         axum::serve(admin_listener, admin_app)
@@ -462,15 +540,24 @@ pub async fn run(
 
     let data_plane = async {
         let backend = PassthroughRead::new(registry.clone());
-        let node = NodeId::new(SINGLE_NODE_ID);
-        let ring = RendezvousRing::single(node.clone());
+        let (node, ring, peers) = match &object_ring {
+            Some(ring) => (ring.node_id(), ring.read_ring(), ring.read_client()),
+            None => {
+                let node = NodeId::new(SINGLE_NODE_ID);
+                (
+                    node.clone(),
+                    RendezvousRing::single(node),
+                    PeerClient::disabled(),
+                )
+            }
+        };
 
         // Disk recovery runs inside the engine build (foyer rescans its regions
         // and rebuilds the index). Time it for the operator log (#16).
         let recovery_start = std::time::Instant::now();
         let engine = HybridCacheEngine::new_with_background_fill_limit(
             backend,
-            NoopPeerFetch,
+            peers,
             ring,
             node,
             &config.cache,
@@ -504,27 +591,30 @@ pub async fn run(
             registry.clone(),
             Arc::clone(&writeback_slot),
         ));
+        let _ = page_cache_slot.set(engine.clone());
         health.mark_ready();
 
-        serve_s3(
+        serve_s3(S3Serve {
             config,
             s3_listener,
             credentials,
             engine,
             registry,
             node_metrics,
-            (object_ring, writeback_slot),
-        )
+            writeback: (object_ring, writeback_slot),
+            activity: activity.clone(),
+        })
         .await
     };
 
     // The NBD data plane. Present only when the block tier is enabled; otherwise
     // a never-resolving future so the join waits on the admin and S3 planes. A
     // listener-accept failure tears the process down like the other listeners.
+    let nbd_activity = activity.clone();
     let nbd_fut = async move {
         match block_registry {
             Some((device_registry, block_listener)) => {
-                crate::nbd::serve(block_listener, device_registry)
+                crate::nbd::serve(block_listener, device_registry, nbd_activity)
                     .await
                     .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
             }
@@ -538,10 +628,11 @@ pub async fn run(
     // The embedded PostgreSQL/Neon WAL plane. As with an absent NBD listener,
     // a node outside the fragment ring waits forever instead of inventing a
     // separate durability mode.
+    let safekeeper_activity = activity.clone();
     let safekeeper_fut = async move {
         match safekeeper_args {
             Some((stores, bucket, cache_dir, ring)) => {
-                crate::safekeeper::serve(stores, bucket, cache_dir, ring).await
+                crate::safekeeper::serve(stores, bucket, cache_dir, ring, safekeeper_activity).await
             }
             None => {
                 std::future::pending::<()>().await;
@@ -582,15 +673,28 @@ fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()
 /// origin. Both paths invalidate key-to-ETag mappings before acknowledgement.
 /// Path-style always works; a configured `[listen].domain` adds virtual-hosted
 /// addressing.
-async fn serve_s3(
-    config: &Config,
+struct S3Serve<'a> {
+    config: &'a Config,
     s3_listener: tokio::net::TcpListener,
     credentials: (String, String),
     engine: CacheEngine,
     registry: Arc<BackendStore>,
     node_metrics: Arc<NodeMetrics>,
     writeback: (Option<Arc<crate::ring::RingPlane>>, WritebackSlot),
-) -> Result<(), Box<dyn std::error::Error>> {
+    activity: ActivityTracker,
+}
+
+async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>> {
+    let S3Serve {
+        config,
+        s3_listener,
+        credentials,
+        engine,
+        registry,
+        node_metrics,
+        writeback,
+        activity,
+    } = context;
     let (object_ring, writeback_slot) = writeback;
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
@@ -603,9 +707,16 @@ async fn serve_s3(
 
     let app = if let Some(ring) = object_ring {
         let policy = Arc::new(object_writeback_policy(ring.node_count()));
-        let journals = Arc::new(JournalStore::open(
+        let (journal_store, migrated_journals) = JournalStore::open_for_binding(
             config.cache.dir.join("object-writeback"),
-        )?);
+            MANAGED_STORAGE_BINDING_ID,
+        )?;
+        if migrated_journals > 0 {
+            eprintln!(
+                "verglas-cache-node {VERSION} migrated {migrated_journals} legacy writeback journals to storage binding {MANAGED_STORAGE_BINDING_ID}"
+            );
+        }
+        let journals = Arc::new(journal_store);
         let metrics = Arc::new(WritebackMetrics::default());
         let _ = writeback_slot.set(Arc::clone(&metrics));
         let membership = ring.membership();
@@ -638,7 +749,6 @@ async fn serve_s3(
             invalidation,
             Some(credentials),
             Some(registry as Arc<dyn verglas_backend::BackendStores>),
-            None,
             config.listen.domain.as_deref(),
             Some(node_metrics),
         )
@@ -651,11 +761,11 @@ async fn serve_s3(
             invalidation,
             Some(credentials),
             Some(registry as Arc<dyn verglas_backend::BackendStores>),
-            None,
             config.listen.domain.as_deref(),
             Some(node_metrics),
         )
     };
+    let app = admin::track_http(app, activity, ActivityPlane::Http);
 
     let local_addr = s3_listener.local_addr()?;
     eprintln!(
@@ -820,6 +930,7 @@ mod tests {
         ))
         .await;
         let catalog = verglas_core::config::Catalog {
+            consistency: verglas_core::config::CatalogConsistency::Eventual,
             uri: format!("http://{upstream}"),
             poll_interval_secs: 30,
             include: Vec::new(),
@@ -904,7 +1015,7 @@ mod tests {
         let ring = RendezvousRing::single(node.clone());
         let engine = HybridCacheEngine::new_with_background_fill_limit(
             backend,
-            NoopPeerFetch,
+            PeerClient::disabled(),
             ring,
             node,
             &config.cache,

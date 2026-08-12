@@ -70,3 +70,24 @@
 - #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.
 - #84: Wired the cache node's built-in managed lakehouse binding explicitly
   through backend construction, block-device store lookup, and the S3 router.
+- #82: Added explicit eventual polling and strong quorum-backed catalog runtimes. Strong mode requires the three-node fragment ring, verifies ordered Lakekeeper events, catches query reads up to the EC tail, and returns applied event proofs without a polling fallback.
+- #84: Added the cache-node Docker target and rendered local startup contract used by the three-member OSS fragment ring. The ring exposes one selected embedded safekeeper for managed Neon while retaining erasure-coded WAL durability across all three cache volumes.
+- #84: Passed the cache node's managed backend binding into its embedded
+   safekeeper so completed WAL segments drain to the configured object store.
+- #87: Added the authenticated host-agent quiescence API and wired one atomic admission fence across S3/catalog HTTP, NBD connections, fragment RPC operations, and embedded safekeeper connections. The fence rejects new work, reports already-accepted work until it drains, and can be reopened only with its current generation; background recovery and propagation do not create a ring-drain requirement.
+- #109: Kept the stacked cache-node base compatible with the current Rust lint gate by boxing large response/catalog values and grouping the S3 server inputs in one explicit context.
+- #109: Resolved DNS names in `VERGLAS_RING_PEERS` at startup. Containerized
+  cache peers can now use stable Compose service names while the fragment RPC
+  client retains its concrete socket-address contract.
+- Reclaim stale revision-keyed safekeeper recovery descriptors when the shared
+  fragment ring starts. The committed legacy head remains pinned, malformed or
+  missing heads cause no deletion, and the new two-slot safekeeper protocol no
+  longer grows this metadata without bound.
+- #74: Exposed exact reconstructed-page GET/PUT routes on the admin listener,
+  backed by the same hybrid engine and recovery gate as Iceberg data.
+- #74: Extended rendezvous ownership and cache peer transport to reconstructed
+  Neon pages and ordinary object blocks, allowing any ingress node to fetch from
+  the owner and retain a local hot replica.
+- #74: Added a four-node shared-cache regression covering cross-node page heat,
+  real Neon query-after-write, safekeeper publication, and quorum writes with a
+  ring member stopped.

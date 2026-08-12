@@ -14,8 +14,6 @@
 //!   trigger.
 //! - [`policy`]: the runaway-worker guard policy (single-flight, host-wide cap,
 //!   backoff, child-marker suppression), composed from [`guard`].
-//! - [`queue`]: the local durable queue (per-name JSONL segments with
-//!   consumer-group offsets).
 //!
 //! Run-event logging and `_LOGS` retention are catalog-side lakekeeping, not
 //! this crate's job.
@@ -34,7 +32,6 @@ pub mod cron;
 pub mod follow;
 pub mod guard;
 pub mod policy;
-pub mod queue;
 pub mod worker;
 
 pub use commit::{CommitOutcome, HarnessError};

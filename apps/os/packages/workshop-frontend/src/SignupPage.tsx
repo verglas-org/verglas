@@ -5,7 +5,11 @@ import { PublicApi } from "@verglas/workshop-shared/api";
 import { Hexagon } from "@phosphor-icons/react";
 import { Input, Button, Banner, Loader } from "@cloudflare/kumo";
 import { hashPassword } from "./passwordHash";
-import { useServerConfig, useServerConfigError, useSiteName } from "./ServerConfigContext";
+import {
+  useServerConfig,
+  useServerConfigError,
+  useSiteName,
+} from "./ServerConfigContext";
 import { useDocumentTitle } from "./useDocumentTitle";
 import SiteLogo from "./components/SiteLogo";
 import { useConnectionLost } from "./RpcContext";
@@ -20,15 +24,15 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
   const siteName = useSiteName();
   const connectionLost = useConnectionLost();
   useDocumentTitle("Create account");
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const usernameError =
-    username && !/^[a-z0-9_-]+$/i.test(username)
-      ? "Letters, numbers, underscores, and hyphens only"
+  const emailError =
+    email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())
+      ? "Enter a valid email address"
       : undefined;
 
   const passwordError =
@@ -42,10 +46,10 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
       : undefined;
 
   const canSubmit =
-    username &&
+    email &&
     password &&
     confirmPassword &&
-    !usernameError &&
+    !emailError &&
     !passwordError &&
     !confirmError &&
     !loading;
@@ -57,17 +61,14 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
     setError(null);
 
     try {
-      const passwordHash = await hashPassword(username, password);
-      const token = await rpcStub.createAccount(
-        username,
-        username,
-        passwordHash,
-      );
+      const normalizedEmail = email.trim().toLowerCase();
+      const passwordHash = await hashPassword(normalizedEmail, password);
+      const token = await rpcStub.createAccount(normalizedEmail, passwordHash);
       if (token) {
         localStorage.setItem("authToken", token);
         window.location.href = "/";
       } else {
-        setError("Username already exists");
+        setError("An account already exists for this email");
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Account creation failed");
@@ -86,7 +87,9 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
           <p className="text-sm text-kumo-danger text-center">
             Couldn&apos;t load deployment settings.
           </p>
-          <Button variant="secondary" onClick={() => window.location.reload()}>Reload</Button>
+          <Button variant="secondary" onClick={() => window.location.reload()}>
+            Reload
+          </Button>
         </div>
       );
     }
@@ -101,7 +104,8 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
   }
   const signupsEnabled = serverConfig.signupsEnabled;
   // The password create-account form requires both password auth AND open signups.
-  const passwordAuthEnabled = serverConfig.passwordAuthEnabled && signupsEnabled;
+  const passwordAuthEnabled =
+    serverConfig.passwordAuthEnabled && signupsEnabled;
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-kumo-base px-4 relative overflow-hidden">
@@ -134,11 +138,7 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
         </div>
 
         {!signupsEnabled && (
-          <Banner
-            variant="default"
-            title="Signups are closed"
-            className="mb-4"
-          >
+          <Banner variant="default" title="Signups are closed" className="mb-4">
             New account registration is currently disabled on this deployment.
           </Banner>
         )}
@@ -148,14 +148,15 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
             {/* Form */}
             <form onSubmit={handleSubmit} className="space-y-4">
               <Input
-                label="Username"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                type="email"
+                label="Email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
                 autoFocus
-                autoComplete="username"
+                autoComplete="email"
                 disabled={loading}
-                placeholder="your-username"
-                error={usernameError}
+                placeholder="you@example.com"
+                error={emailError}
               />
 
               <Input
@@ -201,7 +202,10 @@ export default function SignupPage({ rpcStub }: SignupPageProps) {
         {passwordAuthEnabled && (
           <p className="text-center text-sm text-kumo-subtle mt-6">
             Already have an account?{" "}
-            <Link to="/" className="text-kumo-brand hover:underline font-medium">
+            <Link
+              to="/"
+              className="text-kumo-brand hover:underline font-medium"
+            >
               Sign in
             </Link>
           </p>

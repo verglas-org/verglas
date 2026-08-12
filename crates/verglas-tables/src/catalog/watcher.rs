@@ -4,15 +4,16 @@
 //! Glue watcher (#48), which only needs to implement [`CatalogSource`].
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{Notify, broadcast, watch};
 use verglas_core::config;
 
 use super::{
-    CatalogSource, CatalogWatcher, EVENT_CHANNEL_CAPACITY, SnapshotEntry, TableChanged,
-    TableFilter, TableIdent, TableState,
+    CatalogMutation, CatalogSource, CatalogWatcher, EVENT_CHANNEL_CAPACITY, SnapshotEntry,
+    TableChanged, TableFilter, TableIdent, TableState,
 };
 
 /// Lineage entries retained per table by default: enough for downstream
@@ -167,6 +168,8 @@ pub struct PollingWatcher {
     shared: Arc<Shared>,
     /// The background polling task; aborted on drop.
     task: tokio::task::JoinHandle<()>,
+    /// Optional notification that wakes the next periodic reconciliation.
+    wake: Arc<Notify>,
 }
 
 impl PollingWatcher {
@@ -174,8 +177,14 @@ impl PollingWatcher {
     /// consumers query and subscribe through.
     pub fn spawn<S: CatalogSource>(source: S, options: WatcherOptions) -> PollingWatcher {
         let shared = Arc::new(Shared::new());
-        let task = tokio::spawn(run(source, options, Arc::clone(&shared)));
-        PollingWatcher { shared, task }
+        let wake = Arc::new(Notify::new());
+        let task = tokio::spawn(run(source, options, Arc::clone(&shared), Arc::clone(&wake)));
+        PollingWatcher { shared, task, wake }
+    }
+
+    /// Wakes the next eventual reconciliation without changing its semantics.
+    pub fn request_refresh(&self) {
+        self.wake.notify_one();
     }
 }
 
@@ -213,75 +222,228 @@ impl CatalogWatcher for PollingWatcher {
     }
 }
 
-/// A catalog watcher seeded once from the source and refreshed only by explicit
-/// mutation notifications. This is the hosted-catalog path: Lakekeeper pushes
-/// every successful table mutation directly to the cache node, so steady-state
-/// catalog polling is unnecessary. A failed seed or refresh retries with the
-/// same bounded backoff as [`PollingWatcher`].
-pub struct PushWatcher {
+/// A catalog watcher whose state advances only from quorum-committed mutations.
+pub struct StrongWatcher {
     shared: Arc<Shared>,
-    task: tokio::task::JoinHandle<()>,
-    refresh: mpsc::Sender<()>,
+    options: WatcherOptions,
+    applied_sequence: AtomicU64,
+    apply_lock: Mutex<()>,
 }
 
-impl PushWatcher {
-    /// Starts the initial seed and returns a handle whose
-    /// [`request_refresh`](Self::request_refresh) method coalesces mutation
-    /// notifications into full catalog-pointer reconciliation passes.
-    pub fn spawn<S: CatalogSource>(source: S, options: WatcherOptions) -> PushWatcher {
+/// A direct mutation that cannot safely update the strong watcher.
+#[derive(Debug, thiserror::Error)]
+pub enum StrongApplyError {
+    /// A non-drop mutation did not resolve to the catalog pointer it names.
+    #[error("strong catalog mutation {event_id} has no resolved table state")]
+    MissingState {
+        /// Event whose state was missing.
+        event_id: String,
+    },
+    /// The resolved catalog pointer differs from the committed event pointer.
+    #[error(
+        "strong catalog mutation {event_id} resolved metadata `{resolved}` instead of `{expected}`"
+    )]
+    PointerMismatch {
+        /// Event whose pointer did not match.
+        event_id: String,
+        /// Metadata location committed by Lakekeeper.
+        expected: String,
+        /// Metadata location resolved from the catalog.
+        resolved: String,
+    },
+    /// A rename carried only one half of its previous identifier.
+    #[error("strong catalog rename {event_id} has an incomplete previous identifier")]
+    IncompleteRename {
+        /// Event carrying the malformed rename.
+        event_id: String,
+    },
+}
+
+impl StrongWatcher {
+    /// Creates an empty strong view for a new or restarting cache node.
+    /// Durable EC-log replay is the authoritative bootstrap; consulting the
+    /// catalog here would create a cache -> Lakekeeper -> Postgres -> cache
+    /// startup cycle and would make scale-to-zero recovery impossible.
+    pub fn empty(options: WatcherOptions) -> Self {
         let shared = Arc::new(Shared::new());
-        let (refresh, refresh_rx) = mpsc::channel(1);
-        let task = tokio::spawn(run_push(source, options, Arc::clone(&shared), refresh_rx));
-        PushWatcher {
+        shared.mark_seeded();
+        Self {
             shared,
-            task,
-            refresh,
+            options,
+            applied_sequence: AtomicU64::new(0),
+            apply_lock: Mutex::new(()),
         }
     }
 
-    /// Schedules a refresh. A full channel means one is already pending and is
-    /// treated as success; catalog state is level-triggered, so duplicate event
-    /// delivery never requires duplicate catalog reads.
-    pub fn request_refresh(&self) -> bool {
-        match self.refresh.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(())) => true,
-            Err(mpsc::error::TrySendError::Closed(())) => false,
+    /// Reads one complete catalog snapshot before the node may serve strong reads.
+    pub async fn seed<S: CatalogSource>(
+        source: S,
+        options: WatcherOptions,
+    ) -> Result<Self, super::CatalogError> {
+        let shared = Arc::new(Shared::new());
+        seed_strict(&source, &options, &shared).await?;
+        shared.mark_seeded();
+        Ok(Self {
+            shared,
+            options,
+            applied_sequence: AtomicU64::new(0),
+            apply_lock: Mutex::new(()),
+        })
+    }
+
+    /// Highest quorum-log sequence fully visible through this watcher.
+    pub fn applied_sequence(&self) -> u64 {
+        self.applied_sequence.load(Ordering::Acquire)
+    }
+
+    /// Atomically publishes one resolved mutation and then advances the fence.
+    pub fn apply(
+        &self,
+        mutation: &CatalogMutation,
+        resolved: Option<TableState>,
+    ) -> Result<bool, StrongApplyError> {
+        let _guard = self
+            .apply_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if mutation.sequence <= self.applied_sequence() {
+            return Ok(false);
         }
+
+        let dropped = mutation.operation == "dropTable";
+        let state = if dropped {
+            None
+        } else {
+            let state = resolved.ok_or_else(|| StrongApplyError::MissingState {
+                event_id: mutation.event_id.clone(),
+            })?;
+            if let Some(expected) = &mutation.metadata_location
+                && state.metadata_location != *expected
+            {
+                return Err(StrongApplyError::PointerMismatch {
+                    event_id: mutation.event_id.clone(),
+                    expected: expected.clone(),
+                    resolved: state.metadata_location,
+                });
+            }
+            Some(state)
+        };
+
+        let ident = TableIdent {
+            namespace: mutation.namespace.clone(),
+            name: mutation.table.clone(),
+        };
+        let previous_ident = match (&mutation.previous_namespace, &mutation.previous_table) {
+            (Some(namespace), Some(table)) => Some(TableIdent {
+                namespace: namespace.clone(),
+                name: table.clone(),
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(StrongApplyError::IncompleteRename {
+                    event_id: mutation.event_id.clone(),
+                });
+            }
+        };
+
+        let mut emitted = Vec::new();
+        {
+            let mut tables = self.shared.tables();
+            if let Some(previous) = previous_ident.filter(|previous| previous != &ident)
+                && let Some(record) = tables.remove(&previous)
+            {
+                emitted.push(TableChanged {
+                    table: previous,
+                    old_snapshot: record.state.current_snapshot_id,
+                    new_snapshot: None,
+                });
+            }
+            match state {
+                Some(state) if self.options.filter.matches(&ident) => {
+                    if let Some(event) =
+                        apply_one(&mut tables, ident, state, self.options.history_depth, true)
+                    {
+                        emitted.push(event);
+                    }
+                }
+                _ => {
+                    if let Some(record) = tables.remove(&ident) {
+                        emitted.push(TableChanged {
+                            table: ident,
+                            old_snapshot: record.state.current_snapshot_id,
+                            new_snapshot: None,
+                        });
+                    }
+                }
+            }
+        }
+        for event in emitted {
+            let _ = self.shared.events.send(event);
+        }
+        self.applied_sequence
+            .store(mutation.sequence, Ordering::Release);
+        Ok(true)
     }
 }
 
-impl Drop for PushWatcher {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
-}
-
-impl CatalogWatcher for PushWatcher {
+impl CatalogWatcher for StrongWatcher {
+    /// Returns the quorum-applied watched table set.
     fn watched_tables(&self) -> Vec<TableIdent> {
         self.shared.watched_tables()
     }
 
+    /// Returns one quorum-applied table pointer.
     fn table_state(&self, table: &TableIdent) -> Option<TableState> {
         self.shared.table_state(table)
     }
 
+    /// Returns recent quorum-applied snapshot lineage.
     fn lineage(&self, table: &TableIdent) -> Vec<SnapshotEntry> {
         self.shared.lineage(table)
     }
 
+    /// Subscribes to mutations after they become query-visible.
     fn subscribe(&self) -> broadcast::Receiver<TableChanged> {
         self.shared.subscribe()
     }
 
+    /// Strong construction finishes only after seeding succeeds.
     fn seeded(&self) -> watch::Receiver<bool> {
         self.shared.seeded_rx()
     }
 }
 
+/// Performs a fail-closed initial snapshot; one table failure fails readiness.
+async fn seed_strict<S: CatalogSource>(
+    source: &S,
+    options: &WatcherOptions,
+    shared: &Shared,
+) -> Result<(), super::CatalogError> {
+    let listed = source.list_tables().await?;
+    let mut pointers = Vec::new();
+    for table in listed
+        .into_iter()
+        .filter(|table| options.filter.matches(table))
+    {
+        let state = source.table_pointer(&table).await?;
+        pointers.push((table, state));
+    }
+    let mut tables = shared.tables();
+    for (ident, state) in pointers {
+        let _ = apply_one(&mut tables, ident, state, options.history_depth, false);
+    }
+    Ok(())
+}
+
 /// The poll-forever task: sleep-with-jitter between successful cycles,
 /// exponential backoff (state intact) while the catalog is unreachable.
 /// Never panics, never exits — resilience is this loop's whole job.
-async fn run<S: CatalogSource>(source: S, options: WatcherOptions, shared: Arc<Shared>) {
+async fn run<S: CatalogSource>(
+    source: S,
+    options: WatcherOptions,
+    shared: Arc<Shared>,
+    wake: Arc<Notify>,
+) {
     // The first successful cycle seeds state silently (no event flood on
     // startup); only later cycles emit appearance events.
     let mut seeded = false;
@@ -297,7 +459,10 @@ async fn run<S: CatalogSource>(source: S, options: WatcherOptions, shared: Arc<S
                 // read of the catalog. Idempotent on every later successful cycle.
                 shared.mark_seeded();
                 failures = 0;
-                tokio::time::sleep(options.interval + jitter(options.jitter)).await;
+                tokio::select! {
+                    () = tokio::time::sleep(options.interval + jitter(options.jitter)) => {},
+                    () = wake.notified() => {},
+                }
             }
             Err(error) => {
                 failures = failures.saturating_add(1);
@@ -308,40 +473,6 @@ async fn run<S: CatalogSource>(source: S, options: WatcherOptions, shared: Arc<S
                     ?delay,
                     "catalog poll failed; backing off with last-known state intact"
                 );
-                tokio::time::sleep(delay + jitter(options.jitter)).await;
-            }
-        }
-    }
-}
-
-/// Seed once, then reconcile only after a direct catalog mutation signal. A
-/// failed read retries automatically because waiting for another mutation
-/// would otherwise strand the watcher after a transient catalog outage.
-async fn run_push<S: CatalogSource>(
-    source: S,
-    options: WatcherOptions,
-    shared: Arc<Shared>,
-    mut refresh: mpsc::Receiver<()>,
-) {
-    let mut seeded = false;
-    let mut failures: u32 = 0;
-    loop {
-        match poll_once(&source, &options, &shared, seeded).await {
-            Ok(()) => {
-                if failures > 0 {
-                    tracing::info!(failures, "catalog refresh recovered");
-                }
-                seeded = true;
-                shared.mark_seeded();
-                failures = 0;
-                if refresh.recv().await.is_none() {
-                    return;
-                }
-            }
-            Err(error) => {
-                failures = failures.saturating_add(1);
-                let delay = backoff_delay(options.interval, options.max_backoff, failures);
-                tracing::warn!(%error, failures, ?delay, "catalog refresh failed; retrying with last-known state intact");
                 tokio::time::sleep(delay + jitter(options.jitter)).await;
             }
         }

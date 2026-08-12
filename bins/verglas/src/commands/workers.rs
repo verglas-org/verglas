@@ -22,22 +22,23 @@ const DASH: &str = "-";
 pub async fn run(
     command: WorkersCommand,
     endpoint: &str,
+    token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     match command {
         WorkersCommand::List => {
-            let server = crate::backend::server(endpoint)?;
+            let server = crate::backend::server(endpoint, token)?;
             let rows: Value = server.get("/v1/workers").await?;
             emit_list(&rows, &["name", "state", "output", "created_by"], json)
         }
         WorkersCommand::Get(WorkerRefArgs { worker }) => {
-            let server = crate::backend::server(endpoint)?;
+            let server = crate::backend::server(endpoint, token)?;
             let detail: Value = server.get(&format!("/v1/workers/{worker}")).await?;
             emit_object(&detail, json)
         }
-        WorkersCommand::Create(args) => run_create(endpoint, args, json).await,
+        WorkersCommand::Create(args) => run_create(endpoint, token, args, json).await,
         WorkersCommand::Delete(WorkerRefArgs { worker }) => {
-            let server = crate::backend::server(endpoint)?;
+            let server = crate::backend::server(endpoint, token)?;
             let response: Value = server
                 .put_json(
                     &format!("/v1/workers/{worker}/state"),
@@ -51,21 +52,24 @@ pub async fn run(
             }
             Ok(())
         }
-        WorkersCommand::Run(WorkerRefArgs { worker }) => run_now(endpoint, &worker, json).await,
-        WorkersCommand::Follow(args) => run_follow(endpoint, args).await,
+        WorkersCommand::Run(WorkerRefArgs { worker }) => {
+            run_now(endpoint, token, &worker, json).await
+        }
+        WorkersCommand::Follow(args) => run_follow(endpoint, token, args).await,
     }
 }
 
 /// Registers a worker from a portable spec file (`POST /v1/workers`).
 async fn run_create(
     endpoint: &str,
+    token: Option<&str>,
     args: WorkerCreateArgs,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let mut manifest = WorkerManifest::from_file(&args.file)?;
     apply_create_overrides(&mut manifest, args.name, args.schedule);
     manifest.validate()?;
-    let server = crate::backend::server(endpoint)?;
+    let server = crate::backend::server(endpoint, token)?;
     let row: Value = server
         .post_json("/v1/workers", &manifest.to_local_worker())
         .await?;
@@ -100,13 +104,22 @@ fn apply_create_overrides(
 
 /// Dispatches a manual run (`POST /v1/workers/{name}/run`) with a fresh
 /// Idempotency-Key so the server accepts the request.
-async fn run_now(endpoint: &str, worker: &str, json: bool) -> Result<(), Box<dyn Error>> {
+async fn run_now(
+    endpoint: &str,
+    token: Option<&str>,
+    worker: &str,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
     let base = endpoint.trim_end_matches('/');
     let url = format!("{base}/v1/workers/{worker}/run");
     let key = format!("cli-{}", short_id());
-    let response = reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(&url)
-        .header("Idempotency-Key", &key)
+        .header("Idempotency-Key", &key);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
+    let response = request
         .send()
         .await
         .map_err(|e| format!("could not reach server at {base}: {e}"))?;
@@ -125,7 +138,11 @@ async fn run_now(endpoint: &str, worker: &str, json: bool) -> Result<(), Box<dyn
 
 /// Registers a throwaway follow worker and streams until Ctrl-C (or the wrapped
 /// command finishes). Torn down on exit unless `--keep` is set.
-async fn run_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(), Box<dyn Error>> {
+async fn run_follow(
+    endpoint: &str,
+    token: Option<&str>,
+    args: WorkerFollowArgs,
+) -> Result<(), Box<dyn Error>> {
     let name = args
         .name
         .unwrap_or_else(|| format!("follow-{}", short_id()));
@@ -145,23 +162,24 @@ async fn run_follow(endpoint: &str, args: WorkerFollowArgs) -> Result<(), Box<dy
             crate::worker_spec::Trigger::Follow { file: None }
         }
     };
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string());
     let manifest = WorkerManifest {
         spec_version: crate::worker_spec::SPEC_VERSION,
         name: name.clone(),
-        exec: args.command,
-        cwd,
-        files: Default::default(),
+        runtime: crate::worker_spec::WorkerRuntime::Container,
+        entrypoint: args.command,
+        files: std::collections::BTreeMap::from([(
+            "Dockerfile".to_owned(),
+            "FROM alpine:3.22\nWORKDIR /app\n".to_owned(),
+        )]),
         env: Default::default(),
         triggers: vec![trigger],
         target_tables: vec![table.clone()],
+        scratch_target: None,
         resources: Default::default(),
     };
     manifest.validate()?;
 
-    let server = crate::backend::server(endpoint)?;
+    let server = crate::backend::server(endpoint, token)?;
     let _row: Value = server
         .post_json("/v1/workers", &manifest.to_local_worker())
         .await?;

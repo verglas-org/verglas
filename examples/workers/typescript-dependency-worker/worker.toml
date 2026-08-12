@@ -1,0 +1,15 @@
+spec_version = 1
+name = "typescript-dependency-worker"
+runtime = "bun"
+entrypoint = ["bun", "worker.ts"]
+
+[files]
+"package.json" = "@file:package.json"
+"bun.lock" = "@file:bun.lock"
+"worker.ts" = "@file:worker.ts"
+
+[resources]
+vcpus = 1.0
+mem_mib = 512
+pids = 64
+timeout_secs = 60

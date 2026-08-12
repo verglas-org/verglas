@@ -1,15 +1,15 @@
 //! HTTP contract tests for the authenticated native KV API.
 
-use std::collections::HashMap;
-
 use axum::body::{Body, to_bytes};
+use axum::extract::Extension;
 use axum::http::{Method, Request, StatusCode, header};
 use bytes::Bytes;
 use tower::ServiceExt;
 use verglas_kv::{Store, StoreConfig};
-use verglas_rest::kv::{KvAuthorizer, KvGrant, KvRuntime};
+use verglas_rest::data_plane::AuthenticatedPrincipal;
+use verglas_rest::kv::KvRuntime;
 
-/// Builds a router with read-only and read/write namespace-scoped tokens.
+/// Builds a router behind an already authenticated tenant boundary.
 fn app(capacity_bytes: u64) -> axum::Router {
     let dir = tempfile::tempdir().expect("tempdir").keep();
     let store = Store::open(
@@ -20,39 +20,12 @@ fn app(capacity_bytes: u64) -> axum::Router {
         },
     )
     .expect("store");
-    let grants = HashMap::from([
-        (
-            "rw-blueprints".to_owned(),
-            KvGrant {
-                tenant: "tenant-a".to_owned(),
-                namespace: "workshop.blueprints".to_owned(),
-                read: true,
-                write: true,
-            },
-        ),
-        (
-            "read-blueprints".to_owned(),
-            KvGrant {
-                tenant: "tenant-a".to_owned(),
-                namespace: "workshop.blueprints".to_owned(),
-                read: true,
-                write: false,
-            },
-        ),
-        (
-            "rw-other-tenant".to_owned(),
-            KvGrant {
-                tenant: "tenant-b".to_owned(),
-                namespace: "workshop.blueprints".to_owned(),
-                read: true,
-                write: true,
-            },
-        ),
-    ]);
-    verglas_rest::kv::router(KvRuntime {
-        store,
-        authorizer: KvAuthorizer::new(grants),
-    })
+    verglas_rest::kv::router(KvRuntime { store }).layer(Extension(AuthenticatedPrincipal {
+        tenant_id: "tenant-a".to_owned(),
+        principal_id: "token/test".to_owned(),
+        token_id: "test-token".to_owned(),
+        audience: "data-plane".to_owned(),
+    }))
 }
 
 /// Builds one authenticated request.
@@ -213,69 +186,30 @@ async fn list_is_prefix_bounded_paginated_and_never_contains_values() {
     assert_eq!(page["entries"][0]["key"], "user/c");
 }
 
-/// Authentication, exact namespace grants, verbs, and tenant identity are enforced first.
+/// KV rejects direct use without the common authenticated principal extension.
 #[tokio::test]
-async fn authorization_enforces_namespace_verb_and_tenant_isolation() {
-    let app = app(1024 * 1024);
-    assert_eq!(
-        app.clone()
-            .oneshot(request(
-                Method::GET,
-                "/v1/kv/workshop.blueprints/key",
-                None,
-                Body::empty(),
-            ))
-            .await
-            .expect("response")
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
-    assert_eq!(
-        app.clone()
-            .oneshot(request(
-                Method::PUT,
-                "/v1/kv/workshop.blueprints/key",
-                Some("read-blueprints"),
-                Body::from("forbidden"),
-            ))
-            .await
-            .expect("response")
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    assert_eq!(
-        app.clone()
-            .oneshot(request(
-                Method::GET,
-                "/v1/kv/other/key",
-                Some("read-blueprints"),
-                Body::empty(),
-            ))
-            .await
-            .expect("response")
-            .status(),
-        StatusCode::FORBIDDEN
-    );
-    app.clone()
-        .oneshot(request(
-            Method::PUT,
-            "/v1/kv/workshop.blueprints/key",
-            Some("rw-blueprints"),
-            Body::from("tenant-a"),
-        ))
-        .await
-        .expect("put");
+async fn authorization_requires_the_common_data_plane_principal() {
+    let dir = tempfile::tempdir().expect("tempdir").keep();
+    let store = Store::open(
+        &dir,
+        StoreConfig {
+            capacity_bytes: 1024 * 1024,
+            ram_bytes: 4096,
+        },
+    )
+    .expect("store");
+    let app = verglas_rest::kv::router(KvRuntime { store });
     assert_eq!(
         app.oneshot(request(
             Method::GET,
             "/v1/kv/workshop.blueprints/key",
-            Some("rw-other-tenant"),
+            None,
             Body::empty(),
         ))
         .await
-        .expect("other tenant")
+        .expect("response")
         .status(),
-        StatusCode::NOT_FOUND
+        StatusCode::UNAUTHORIZED
     );
 }
 

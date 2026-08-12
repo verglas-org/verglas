@@ -20,12 +20,41 @@ cargo install --path bins/verglas --locked --force
 
 ```text
 --server-endpoint <URL>  Local server admin API. Uses VERGLAS_ENDPOINT.
+--access-endpoint <URL>  Tenant access API. Uses VERGLAS_ACCESS_ENDPOINT.
 --token <TOKEN>          Bearer token. Uses VERGLAS_TOKEN.
 --json                   Emit machine-readable JSON.
 -V, --version            Print the CLI version.
 ```
 
 The default local endpoint is `http://127.0.0.1:8334`.
+
+## Authenticate with a scoped token
+
+Create a token in **Verglas OS → Profile → Developer access**. The default
+`verglas-cli` audience is accepted by both access-management and data-plane
+endpoints, so you do not need separate management and query tokens. A token can
+receive grants across multiple lakehouse and Postgres databases, but it is
+authorized separately for each database and child resource.
+
+```bash
+export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
+
+verglas token create local-cli \
+  --grant database/analytics=discover,describe,query \
+  --expires-in-seconds 2592000
+unset VERGLAS_TOKEN
+```
+
+The default credential file is `~/.config/verglas/credentials.json`. Set
+`VERGLAS_CREDENTIALS_FILE` to select another owner-only file. Use
+`verglas token list` to inspect token metadata and `verglas token revoke ID` to
+revoke a token and remove its matching local record.
+
+Never use an owner, scheduler, container-runtime, or another workload's
+credential for the CLI. For setup and revocation instructions, see
+[Security and access control](/docs/platform/security).
 
 ## Server operations
 
@@ -52,27 +81,20 @@ Set `VERGLAS_TOKEN` or pass `--token` when the endpoint requires a bearer token.
 verglas workers list
 verglas workers get <id-or-name>
 verglas workers create --file ./worker.toml
-verglas workers update <id-or-name> --file ./worker.toml
 verglas workers run <id-or-name>
-verglas workers logs <id-or-name>
+verglas workers follow --name local-log -- ./my-process
 verglas workers delete <id-or-name>
 ```
 
-## Containers
+## Vessels
 
 ```bash
-verglas containers list
-verglas containers get <id>
-verglas containers create --file ./container.json
-verglas containers update <id> --file ./container.json
-verglas containers scale <id> --instances 3
-verglas containers stop <id>
-verglas containers resume <id>
-verglas containers catalog
-verglas containers deploy <catalog-id>
-verglas containers config <id>
-verglas containers push docker://ghcr.io/acme/app:1.2
-verglas containers delete <id>
+verglas vessel add --file ./vessel.yaml
+verglas vessel list
+verglas vessel get <name>
+verglas vessel curl <name> /health
+verglas vessel query <name> '{"query":"status"}'
+verglas vessel remove <name>
 ```
 
 ## Tables and queries
@@ -87,7 +109,7 @@ verglas table compact
 verglas table delete analytics.orders --yes
 verglas table metrics
 
-verglas query 'SELECT count(*) FROM analytics.orders'
+verglas query analytics 'SELECT count(*) FROM analytics.orders'
 ```
 
 The table import commands recognize CSV, Parquet, and JSON Lines from the file extension.
@@ -138,7 +160,43 @@ verglas db create external_lake \
   --warehouse customer_warehouse
 ```
 
+The external command validates secret selection and the database declaration,
+but the current OSS runtime then fails closed because scoped external runtime
+bindings are not active. Managed lakehouses and managed Postgres databases are
+the supported local runtimes.
+
+## Connect to managed Postgres
+
+Postgres connections use a separate, short-lived database token. The access
+service checks `connect` permission on the selected Postgres database before it
+issues a token. Lakehouses do not use this command.
+
+By default, the CLI stores the token in the owner-only credentials file and
+does not print it:
+
+```bash
+verglas db token my_test_db --expires-in 300
+```
+
+Use `--print-password` only when a client needs the token as `PGPASSWORD`.
+The option writes only the temporary password token to standard output, so it
+can be used with command substitution without exposing it in command arguments:
+
+```bash
+export PGPASSWORD="$(verglas db token my_test_db --expires-in 300 --print-password)"
+psql "$VERGLAS_POSTGRES_CONNECTION_URL"
+unset PGPASSWORD
+```
+
+The token expires after the requested lifetime. The access service accepts one
+through 900 seconds and defaults to 900 seconds. Do not save it in source,
+shell profiles, or application configuration.
+
 `db` and `secret` use `VERGLAS_ACCESS_ENDPOINT` (localhost port 8345 by
 default). Secret values are read from stdin or a hidden prompt and never appear
 in process arguments. Database records retain stable secret resource IDs, not
 plaintext credentials.
+
+See [Databases](/docs/platform/databases) for complete managed and external
+examples, SQL and SDK connections, current support status, and teardown. See
+[Secrets](/docs/platform/secrets) for provider value formats and scope rules.

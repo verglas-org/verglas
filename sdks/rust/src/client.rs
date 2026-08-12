@@ -4,7 +4,7 @@
 //! table-contract validation in the SDK. Applications and the CLI therefore
 //! call the same implementation instead of rebuilding HTTP behavior.
 
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -13,7 +13,7 @@ use arrow_buffer::Buffer;
 use arrow_ipc::reader::StreamDecoder;
 use arrow_ipc::writer::StreamWriter;
 use bytes::Bytes;
-use futures::{SinkExt, Stream, StreamExt, TryStream, stream};
+use futures::{Stream, StreamExt, TryStream, stream};
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_TYPE, ETAG, HeaderName, HeaderValue, IF_MATCH, IF_NONE_MATCH,
 };
@@ -22,9 +22,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::sync::OnceCell;
-use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::tungstenite::client::IntoClientRequest;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use verglas_api::table::CommitResponse;
 use verglas_authz::{AccessCheck, AccessDecision, Grant, Principal, Resource};
 use verglas_core::admin::{ACCESS_PATH, LocalAccess};
@@ -37,7 +34,13 @@ use crate::graph::{
     InsertEdgesRequest, InsertNodesRequest, InsertReport, NeighborView, NodeInput, PathView,
     ReachedView,
 };
-use crate::queue::{QueueAckResult, QueueEnqueueResult, QueuePollResult};
+use crate::queue::{
+    QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt,
+};
+use crate::token::{
+    AccessTokenCreateRequest, AccessTokenSummary, DatabaseConnectionToken,
+    DatabaseConnectionTokenRequest, IssuedAccessToken,
+};
 use crate::vector::{
     DeclareIndexRequest, IndexInfo, IndexReport as VectorIndexReport, SearchRequest, SearchResponse,
 };
@@ -49,8 +52,40 @@ pub const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream
 /// A stream of Arrow record batches returned by a query.
 pub type QueryStream = Pin<Box<dyn Stream<Item = Result<RecordBatch, ClientError>> + Send>>;
 
-/// A resumable stream of catalog commit notifications.
-pub type FollowStream = Pin<Box<dyn Stream<Item = Result<ChangeEvent, ClientError>> + Send>>;
+/// A reconnecting push-only stream of fenced queue deliveries.
+pub type QueueStream = Pin<Box<dyn Stream<Item = Result<QueueDelivery, ClientError>> + Send>>;
+
+/// One durable table commit and the queue receipt that fences its acknowledgement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableChangeDelivery {
+    /// Committed table snapshot notification.
+    pub change: ChangeEvent,
+    /// Receipt acknowledged after the subscriber closes its durable read frontier.
+    pub receipt: QueueReceipt,
+}
+
+/// Connection lifecycle and durable deliveries from a database subscription.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableSubscriptionEvent {
+    /// The authenticated push response is established.
+    Connected,
+    /// The transport dropped and the SDK is reconnecting from queue state.
+    Disconnected,
+    /// One fenced table commit delivery.
+    Delivery(TableChangeDelivery),
+}
+
+/// A reconnecting push-only stream of acknowledged table commits.
+pub type TableChangeStream =
+    Pin<Box<dyn Stream<Item = Result<TableSubscriptionEvent, ClientError>> + Send>>;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TableChangePayload {
+    table: String,
+    snapshot_id: String,
+    committed_at: String,
+}
 
 /// A stream of reflected Integration method results decoded from NDJSON.
 pub type NamespaceStream<T> = Pin<Box<dyn Stream<Item = Result<T, ClientError>> + Send>>;
@@ -98,11 +133,8 @@ pub struct NamespaceManifest {
 pub struct ConnectOptions {
     endpoint: String,
     token: Option<String>,
-    catalog_token: Option<String>,
-    catalog_uri: Option<String>,
     query_uri: Option<String>,
     access_uri: Option<String>,
-    warehouse: Option<String>,
     s3_endpoint: Option<String>,
     connect_timeout: Duration,
     request_timeout: Duration,
@@ -114,11 +146,8 @@ impl ConnectOptions {
         Self {
             endpoint: endpoint.into(),
             token: None,
-            catalog_token: None,
-            catalog_uri: None,
             query_uri: None,
             access_uri: None,
-            warehouse: None,
             s3_endpoint: None,
             connect_timeout: Duration::from_secs(5),
             request_timeout: Duration::from_secs(120),
@@ -135,11 +164,8 @@ impl ConnectOptions {
             .unwrap_or_else(|_| "http://127.0.0.1:8334".to_owned());
         let mut options = Self::new(endpoint);
         options.token = nonempty_env("VERGLAS_TOKEN");
-        options.catalog_token = nonempty_env("VERGLAS_CATALOG_TOKEN");
-        options.catalog_uri = nonempty_env("VERGLAS_CATALOG_URI");
         options.query_uri = nonempty_env("VERGLAS_QUERY_URI");
         options.access_uri = nonempty_env("VERGLAS_ACCESS_URI");
-        options.warehouse = nonempty_env("VERGLAS_WAREHOUSE");
         options.s3_endpoint = nonempty_env("VERGLAS_S3_ENDPOINT");
         options
     }
@@ -147,16 +173,7 @@ impl ConnectOptions {
     /// Adds the bearer token sent with every request.
     #[must_use]
     pub fn with_token(mut self, token: impl Into<String>) -> Self {
-        let token = token.into();
-        self.token = Some(token.clone());
-        self.catalog_token = Some(token);
-        self
-    }
-
-    /// Supplies the Iceberg REST endpoint clients should use explicitly.
-    #[must_use]
-    pub fn with_catalog_uri(mut self, catalog_uri: impl Into<String>) -> Self {
-        self.catalog_uri = Some(catalog_uri.into());
+        self.token = Some(token.into());
         self
     }
 
@@ -174,24 +191,10 @@ impl ConnectOptions {
         self
     }
 
-    /// Supplies the Iceberg warehouse identifier explicitly.
-    #[must_use]
-    pub fn with_warehouse(mut self, warehouse: impl Into<String>) -> Self {
-        self.warehouse = Some(warehouse.into());
-        self
-    }
-
     /// Supplies the S3-compatible Verglas object-cache endpoint explicitly.
     #[must_use]
     pub fn with_s3_endpoint(mut self, s3_endpoint: impl Into<String>) -> Self {
         self.s3_endpoint = Some(s3_endpoint.into());
-        self
-    }
-
-    /// Supplies the catalog bearer token without changing server authentication.
-    #[must_use]
-    pub fn with_catalog_token(mut self, token: impl Into<String>) -> Self {
-        self.catalog_token = Some(token.into());
         self
     }
 
@@ -347,6 +350,9 @@ pub enum ClientError {
     /// A reflected namespace response was not valid JSON.
     #[error("namespace JSON failed: {0}")]
     NamespaceJson(#[from] serde_json::Error),
+    /// A queue subscription frame was not valid NDJSON.
+    #[error("queue subscription JSON failed: {0}")]
+    QueueJson(serde_json::Error),
     /// The existing table differs from the requested contract.
     #[error("table {table} definition mismatch: expected {expected:?}, actual {actual:?}")]
     DefinitionMismatch {
@@ -357,15 +363,6 @@ pub enum ClientError {
         /// Definition returned by the server.
         actual: TableDefinition,
     },
-    /// The websocket change feed could not connect or exchanged invalid data.
-    #[error("catalog change feed failed: {0}")]
-    Feed(String),
-    /// The requested replay cursor has aged out of feed retention.
-    #[error("catalog change feed cursor expired: {reason}")]
-    CursorExpired {
-        /// Server-provided resynchronization reason.
-        reason: String,
-    },
 }
 
 /// Reusable authenticated client for a Verglas server.
@@ -373,13 +370,8 @@ pub enum ClientError {
 pub struct Client {
     query_uri: String,
     access_uri: String,
-    catalog_uri: String,
-    warehouse: Option<String>,
     s3_endpoint: String,
-    raw_catalog_token: Option<String>,
     server_token: Option<HeaderValue>,
-    catalog_token: Option<HeaderValue>,
-    catalog_prefix: std::sync::Arc<OnceCell<Option<String>>>,
     request_timeout: Duration,
     http: reqwest::Client,
 }
@@ -396,19 +388,10 @@ impl Client {
             .map(|token| HeaderValue::from_str(&format!("Bearer {token}")))
             .transpose()
             .map_err(|error| ClientError::Configuration(error.to_string()))?;
-        let raw_catalog_token = options.catalog_token.or(options.token);
-        let catalog_token = raw_catalog_token
-            .clone()
-            .map(|token| HeaderValue::from_str(&format!("Bearer {token}")))
-            .transpose()
-            .map_err(|error| ClientError::Configuration(error.to_string()))?;
         let http = reqwest::Client::builder()
             .connect_timeout(options.connect_timeout)
             .build()?;
-        let access = if options.catalog_uri.is_none()
-            || options.query_uri.is_none()
-            || options.s3_endpoint.is_none()
-        {
+        let access = if options.query_uri.is_none() || options.s3_endpoint.is_none() {
             let mut request = http.get(format!("{endpoint}{ACCESS_PATH}"));
             if let Some(token) = &server_token {
                 request = request.header(AUTHORIZATION, token.clone());
@@ -420,14 +403,6 @@ impl Client {
         } else {
             None
         };
-        let catalog_uri = options
-            .catalog_uri
-            .or_else(|| access.as_ref().and_then(|value| value.catalog_uri.clone()))
-            .ok_or_else(|| {
-                ClientError::Configuration("server advertises no catalog URI".to_owned())
-            })?
-            .trim_end_matches('/')
-            .to_owned();
         let s3_endpoint = options
             .s3_endpoint
             .or_else(|| access.as_ref().map(|value| value.s3_endpoint.clone()))
@@ -448,23 +423,11 @@ impl Client {
         Ok(Self {
             query_uri,
             access_uri,
-            catalog_uri,
-            warehouse: options
-                .warehouse
-                .or_else(|| access.as_ref().and_then(|value| value.warehouse.clone())),
             s3_endpoint,
-            raw_catalog_token,
             server_token,
-            catalog_token,
-            catalog_prefix: std::sync::Arc::new(OnceCell::new()),
             request_timeout: options.request_timeout,
             http,
         })
-    }
-
-    /// Returns the discovered Iceberg REST catalog URI.
-    pub fn catalog_uri(&self) -> &str {
-        &self.catalog_uri
     }
 
     /// Returns the query and write API base URL.
@@ -475,6 +438,18 @@ impl Client {
     /// Returns the S3-compatible Verglas object-cache endpoint.
     pub fn s3_endpoint(&self) -> Option<&str> {
         Some(&self.s3_endpoint)
+    }
+
+    /// Selects one named database for every catalog and execution operation.
+    pub fn database(&self, name: &str) -> Result<Database, ClientError> {
+        if !is_database_name(name) {
+            return Err(invalid_database_name());
+        }
+        Ok(Database {
+            client: self.clone(),
+            name: name.to_owned(),
+            catalog_prefix: std::sync::Arc::new(OnceCell::new()),
+        })
     }
 
     /// Returns a thin raw-byte handle to one tenant-authorized KV namespace.
@@ -498,32 +473,6 @@ impl Client {
             ));
         }
         Ok(Queue {
-            client: self.clone(),
-            name: name.to_owned(),
-        })
-    }
-
-    /// Returns a handle to one property-graph namespace.
-    pub fn graph(&self, namespace: &str) -> Result<Graph, ClientError> {
-        if namespace.is_empty() || namespace.contains('/') {
-            return Err(ClientError::Configuration(
-                "graph namespace must be non-empty and contain no slash".to_owned(),
-            ));
-        }
-        Ok(Graph {
-            client: self.clone(),
-            namespace: namespace.to_owned(),
-        })
-    }
-
-    /// Returns a handle to one table for vector-index operations.
-    pub fn table(&self, name: &str) -> Result<Table, ClientError> {
-        if name.is_empty() || name.contains('/') {
-            return Err(ClientError::Configuration(
-                "table name must be non-empty and contain no slash".to_owned(),
-            ));
-        }
-        Ok(Table {
             client: self.clone(),
             name: name.to_owned(),
         })
@@ -599,6 +548,50 @@ impl Client {
         .await
     }
 
+    /// Mints a delegated token for the authenticated principal and returns its plaintext once.
+    pub async fn create_access_token(
+        &self,
+        request: &AccessTokenCreateRequest,
+    ) -> Result<IssuedAccessToken, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/tokens"))
+                .json(request),
+        )
+        .await
+    }
+
+    /// Lists the authenticated principal's token inventory without exposing plaintext tokens.
+    pub async fn list_access_tokens(&self) -> Result<Vec<AccessTokenSummary>, ClientError> {
+        self.access_json(self.http.get(self.access_url("/v1/access/tokens")))
+            .await
+    }
+
+    /// Revokes one token owned or manageable by the authenticated principal.
+    pub async fn revoke_access_token(
+        &self,
+        token_id: &str,
+    ) -> Result<AccessTokenSummary, ClientError> {
+        self.access_json(
+            self.http
+                .delete(self.access_url(&format!("/v1/access/tokens/{token_id}"))),
+        )
+        .await
+    }
+
+    /// Exchanges the current authorized bearer for a short-lived Postgres connection token.
+    pub async fn create_database_connection_token(
+        &self,
+        request: &DatabaseConnectionTokenRequest,
+    ) -> Result<DatabaseConnectionToken, ClientError> {
+        self.access_json(
+            self.http
+                .post(self.access_url("/v1/access/database-tokens"))
+                .json(request),
+        )
+        .await
+    }
+
     /// Lists every reflected Integration namespace visible to this principal.
     pub async fn namespaces(&self) -> Result<Vec<NamespaceManifest>, ClientError> {
         let response = Self::require_success(
@@ -624,18 +617,24 @@ impl Client {
     }
 
     /// Creates a missing table or verifies the exact existing definition.
-    pub async fn ensure_table(
+    async fn ensure_table_for(
         &self,
+        database: &str,
+        catalog_prefix: &OnceCell<Option<String>>,
         table: &str,
         definition: &TableDefinition,
     ) -> Result<EnsureTable, ClientError> {
         let (namespace, name) = split_table_name(table)?;
         let namespace_path = namespace.join("\u{1f}");
         let table_url = self
-            .catalog_url(&["namespaces", &namespace_path, "tables", name])
+            .catalog_url(
+                database,
+                catalog_prefix,
+                &["namespaces", &namespace_path, "tables", name],
+            )
             .await?;
         let response = self
-            .send(self.authorize_catalog(self.http.get(table_url.clone())))
+            .send(self.authorize(self.http.get(table_url.clone())))
             .await?;
         if response.status().is_success() {
             return self
@@ -646,10 +645,12 @@ impl Client {
             return Err(Self::http_error(response).await);
         }
 
-        let namespaces_url = self.catalog_url(&["namespaces"]).await?;
+        let namespaces_url = self
+            .catalog_url(database, catalog_prefix, &["namespaces"])
+            .await?;
         let namespace_response = self
             .send(
-                self.authorize_catalog(self.http.post(namespaces_url))
+                self.authorize(self.http.post(namespaces_url))
                     .json(&json!({"namespace": namespace, "properties": {}})),
             )
             .await?;
@@ -660,20 +661,22 @@ impl Client {
         }
 
         let create_url = self
-            .catalog_url(&["namespaces", &namespace_path, "tables"])
+            .catalog_url(
+                database,
+                catalog_prefix,
+                &["namespaces", &namespace_path, "tables"],
+            )
             .await?;
         let response = self
             .send(
-                self.authorize_catalog(self.http.post(create_url))
+                self.authorize(self.http.post(create_url))
                     .json(&catalog_create_request(name, definition)?),
             )
             .await?;
         if response.status().is_success() {
             Ok(EnsureTable::Created)
         } else if response.status() == reqwest::StatusCode::CONFLICT {
-            let response = self
-                .send(self.authorize_catalog(self.http.get(table_url)))
-                .await?;
+            let response = self.send(self.authorize(self.http.get(table_url))).await?;
             self.verify_catalog_definition(table, definition, response)
                 .await
         } else {
@@ -681,9 +684,11 @@ impl Client {
         }
     }
 
-    /// Appends each incoming Arrow batch as its own bounded idempotent commit.
-    pub async fn append_stream<S>(
+    /// Appends batches through `POST /v1/databases/{database}/write/{table}`.
+    /// Each batch is one bounded idempotent commit.
+    async fn append_stream_for<S>(
         &self,
+        database: &str,
         table: &str,
         batches: S,
         idempotency_key: &str,
@@ -703,7 +708,7 @@ impl Client {
         {
             let bytes = encode_batch(&batch)?;
             let commit_key = format!("{idempotency_key}:{}", result.commits);
-            let url = self.url(&format!("/v1/write/{table}"));
+            let url = database_resource_url(&self.query_uri, database, "write", table, &[])?;
             let request = self
                 .authorize(self.http.post(url))
                 .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
@@ -717,10 +722,19 @@ impl Client {
         Ok(result)
     }
 
-    /// Executes SQL and incrementally decodes the Arrow IPC response.
-    pub async fn query_stream(&self, sql: &str) -> Result<QueryStream, ClientError> {
+    /// Executes SQL through `POST /v1/databases/{database}/query` and incrementally decodes Arrow.
+    async fn query_stream_for(
+        &self,
+        database: &str,
+        sql: &str,
+    ) -> Result<QueryStream, ClientError> {
         let request = self
-            .authorize(self.http.post(self.url("/v1/query")))
+            .authorize(self.http.post(resource_url(
+                &self.query_uri,
+                "databases",
+                database,
+                &["query"],
+            )?))
             .header(ACCEPT, ARROW_STREAM_CONTENT_TYPE)
             .json(&QueryRequest { sql });
         let response = Self::require_success(self.send(request).await?).await?;
@@ -734,43 +748,9 @@ impl Client {
         Ok(Box::pin(stream::try_unfold(state, decode_next)))
     }
 
-    /// Follows commit notifications for the named tables, reconnecting from
-    /// the last observed sequence after a socket drop.
-    pub fn follow<I, T>(&self, tables: I, cursor: Option<u64>) -> Result<FollowStream, ClientError>
-    where
-        I: IntoIterator<Item = T>,
-        T: Into<String>,
-    {
-        let tables: HashSet<String> = tables.into_iter().map(Into::into).collect();
-        if tables.is_empty() || tables.iter().any(String::is_empty) {
-            return Err(ClientError::Configuration(
-                "follow requires at least one non-empty table".to_owned(),
-            ));
-        }
-        let state = FollowState {
-            url: feed_url(&self.catalog_uri)?,
-            token: self.raw_catalog_token.clone(),
-            tables,
-            cursor,
-            socket: None,
-            connected_once: false,
-            reconnect_delay: None,
-            backoff: Duration::from_millis(250),
-        };
-        Ok(Box::pin(stream::try_unfold(state, follow_next)))
-    }
-
     /// Adds authentication to a request when configured.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.server_token {
-            Some(token) => request.header(AUTHORIZATION, token.clone()),
-            None => request,
-        }
-    }
-
-    /// Adds catalog authentication to a direct REST request.
-    fn authorize_catalog(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.catalog_token {
             Some(token) => request.header(AUTHORIZATION, token.clone()),
             None => request,
         }
@@ -807,13 +787,16 @@ impl Client {
     }
 
     /// Builds one standard Iceberg REST URL using the catalog-advertised prefix.
-    async fn catalog_url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
-        let prefix = self
-            .catalog_prefix
-            .get_or_try_init(|| self.discover_catalog_prefix())
+    async fn catalog_url(
+        &self,
+        database: &str,
+        catalog_prefix: &OnceCell<Option<String>>,
+        suffix: &[&str],
+    ) -> Result<reqwest::Url, ClientError> {
+        let prefix = catalog_prefix
+            .get_or_try_init(|| self.discover_catalog_prefix(database))
             .await?;
-        let mut url = reqwest::Url::parse(&self.catalog_uri)
-            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+        let mut url = database_catalog_url(&self.query_uri, database)?;
         {
             let mut segments = url.path_segments_mut().map_err(|_| {
                 ClientError::Configuration("catalog URI cannot carry path segments".to_owned())
@@ -832,22 +815,15 @@ impl Client {
     }
 
     /// Reads the REST catalog configuration without pulling in an Iceberg engine.
-    async fn discover_catalog_prefix(&self) -> Result<Option<String>, ClientError> {
-        let mut url = reqwest::Url::parse(&self.catalog_uri)
-            .map_err(|error| ClientError::Configuration(error.to_string()))?;
+    async fn discover_catalog_prefix(&self, database: &str) -> Result<Option<String>, ClientError> {
+        let mut url = database_catalog_url(&self.query_uri, database)?;
         url.path_segments_mut()
             .map_err(|_| ClientError::Configuration("invalid catalog URI".to_owned()))?
             .pop_if_empty()
             .push("v1")
             .push("config");
-        if let Some(warehouse) = &self.warehouse {
-            url.query_pairs_mut().append_pair("warehouse", warehouse);
-        }
-        let response = Self::require_success(
-            self.send(self.authorize_catalog(self.http.get(url)))
-                .await?,
-        )
-        .await?;
+        let response =
+            Self::require_success(self.send(self.authorize(self.http.get(url))).await?).await?;
         let value: Value = response.json().await?;
         Ok(value
             .pointer("/overrides/prefix")
@@ -893,6 +869,201 @@ impl Client {
     /// Joins an authorization path to the configured access service.
     fn access_url(&self, path: &str) -> String {
         format!("{}{path}", self.access_uri)
+    }
+}
+
+/// One named database selected for all catalog and execution operations.
+#[derive(Debug, Clone)]
+pub struct Database {
+    client: Client,
+    name: String,
+    catalog_prefix: std::sync::Arc<OnceCell<Option<String>>>,
+}
+
+impl Database {
+    /// Returns the database resource name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Creates a missing table or verifies the exact existing definition.
+    pub async fn ensure_table(
+        &self,
+        table: &str,
+        definition: &TableDefinition,
+    ) -> Result<EnsureTable, ClientError> {
+        self.client
+            .ensure_table_for(&self.name, &self.catalog_prefix, table, definition)
+            .await
+    }
+
+    /// Appends each incoming Arrow batch as its own bounded idempotent commit.
+    pub async fn append_stream<S>(
+        &self,
+        table: &str,
+        batches: S,
+        idempotency_key: &str,
+    ) -> Result<AppendResult, ClientError>
+    where
+        S: TryStream<Ok = RecordBatch, Error = ClientError> + Send,
+    {
+        self.client
+            .append_stream_for(&self.name, table, batches, idempotency_key)
+            .await
+    }
+
+    /// Executes SQL and incrementally decodes Arrow result batches.
+    pub async fn query_stream(&self, sql: &str) -> Result<QueryStream, ClientError> {
+        self.client.query_stream_for(&self.name, sql).await
+    }
+
+    /// Subscribes to exact table commits through one durable push stream.
+    pub fn subscribe<I, T>(
+        &self,
+        group: &str,
+        owner: &str,
+        tables: I,
+        lease_seconds: u64,
+    ) -> Result<TableChangeStream, ClientError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let tables = tables.into_iter().map(Into::into).collect::<Vec<_>>();
+        if group.is_empty()
+            || owner.is_empty()
+            || tables.is_empty()
+            || tables.iter().any(|table| table.trim().is_empty())
+        {
+            return Err(ClientError::Configuration(
+                "database subscribe requires non-empty group, owner, and tables".to_owned(),
+            ));
+        }
+        let database = self.clone();
+        let group = group.to_owned();
+        let owner = owner.to_owned();
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut backoff = Duration::from_millis(250);
+            loop {
+                let url = resource_url(
+                    &database.client.access_uri,
+                    "databases",
+                    &database.name,
+                    &["subscribe"],
+                )?;
+                let request = database.client.authorize(database.client.http.post(url)).json(&json!({
+                    "group": group,
+                    "owner": owner,
+                    "tables": tables,
+                    "max": 256,
+                    "leaseSeconds": lease_seconds,
+                }));
+                let response = match database.client.send(request).await {
+                    Ok(response) if response.status().is_success() => response,
+                    Ok(response) if is_transient_subscription_status(response.status()) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Ok(response) => Err(Client::http_error(response).await)?,
+                    Err(ClientError::Transport(_) | ClientError::RequestTimeout) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Err(error) => Err(error)?,
+                };
+                backoff = Duration::from_millis(250);
+                yield TableSubscriptionEvent::Connected;
+                let mut chunks = response.bytes_stream();
+                let mut buffer = Vec::new();
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => break,
+                    };
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let frame = buffer.drain(..=newline).collect::<Vec<_>>();
+                        if frame.len() == 1 {
+                            continue;
+                        }
+                        let delivery: QueueDelivery = serde_json::from_slice(&frame[..frame.len() - 1])
+                            .map_err(ClientError::QueueJson)?;
+                        let payload: TableChangePayload = serde_json::from_value(delivery.payload)
+                            .map_err(ClientError::QueueJson)?;
+                        yield TableSubscriptionEvent::Delivery(TableChangeDelivery {
+                            change: ChangeEvent {
+                                seq: u64::try_from(delivery.position).map_err(|_| {
+                                    ClientError::Configuration("negative table event position".to_owned())
+                                })?,
+                                table: payload.table,
+                                snapshot_id: payload.snapshot_id,
+                                committed_at: payload.committed_at,
+                            },
+                            receipt: delivery.receipt,
+                        });
+                    }
+                }
+                yield TableSubscriptionEvent::Disconnected;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }))
+    }
+
+    /// Acknowledges one table event after its durable rows have been published downstream.
+    pub async fn ack(&self, group: &str, receipt: &QueueReceipt) -> Result<(), ClientError> {
+        if group.is_empty() {
+            return Err(ClientError::Configuration(
+                "database subscription ack requires a non-empty group".to_owned(),
+            ));
+        }
+        let url = resource_url(
+            &self.client.access_uri,
+            "databases",
+            &self.name,
+            &["subscriptions", "ack"],
+        )?;
+        Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(url))
+                        .json(&json!({ "group": group, "receipt": receipt })),
+                )
+                .await?,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Returns a property-graph handle within this database.
+    pub fn graph(&self, namespace: &str) -> Result<Graph, ClientError> {
+        if namespace.is_empty() || namespace.contains('/') {
+            return Err(ClientError::Configuration(
+                "graph namespace must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Graph {
+            client: self.client.clone(),
+            database: self.name.clone(),
+            namespace: namespace.to_owned(),
+        })
+    }
+
+    /// Returns a table handle for vector-index operations in this database.
+    pub fn table(&self, name: &str) -> Result<Table, ClientError> {
+        if name.is_empty() || name.contains('/') {
+            return Err(ClientError::Configuration(
+                "table name must be non-empty and contain no slash".to_owned(),
+            ));
+        }
+        Ok(Table {
+            client: self.client.clone(),
+            database: self.name.clone(),
+            name: name.to_owned(),
+        })
     }
 }
 
@@ -1269,14 +1440,17 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Appends rows to the queue and returns the new end position.
-    pub async fn enqueue(&self, rows: Vec<Value>) -> Result<QueueEnqueueResult, ClientError> {
+    /// Appends messages to the declared queue and returns their stable positions.
+    pub async fn enqueue(
+        &self,
+        messages: Vec<QueueMessage>,
+    ) -> Result<QueueEnqueueResult, ClientError> {
         let response = Client::require_success(
             self.client
                 .send(
                     self.client
                         .authorize(self.client.http.post(self.url(&["enqueue"])?))
-                        .json(&json!({ "rows": rows })),
+                        .json(&json!({ "messages": messages })),
                 )
                 .await?,
         )
@@ -1284,44 +1458,32 @@ impl Queue {
         response.json().await.map_err(ClientError::Transport)
     }
 
-    /// Polls up to `max` records for consumer group `group` from its watermark.
+    /// Claims an exclusive batch under fenced, expiring delivery receipts.
     pub async fn poll(
         &self,
         group: &str,
+        owner: &str,
+        topics: &[String],
         max: Option<usize>,
+        lease_seconds: u64,
     ) -> Result<QueuePollResult, ClientError> {
-        if group.is_empty() {
+        if group.is_empty() || owner.is_empty() || topics.is_empty() {
             return Err(ClientError::Configuration(
-                "queue poll requires a non-empty group".to_owned(),
-            ));
-        }
-        let mut url = self.url(&["poll"])?;
-        url.query_pairs_mut().append_pair("group", group);
-        if let Some(max) = max {
-            url.query_pairs_mut().append_pair("max", &max.to_string());
-        }
-        let response = Client::require_success(
-            self.client
-                .send(self.client.authorize(self.client.http.get(url)))
-                .await?,
-        )
-        .await?;
-        response.json().await.map_err(ClientError::Transport)
-    }
-
-    /// Advances `group`'s watermark to `position` after the consumer commits work.
-    pub async fn ack(&self, group: &str, position: u64) -> Result<QueueAckResult, ClientError> {
-        if group.is_empty() {
-            return Err(ClientError::Configuration(
-                "queue ack requires a non-empty group".to_owned(),
+                "queue poll requires non-empty group and owner".to_owned(),
             ));
         }
         let response = Client::require_success(
             self.client
                 .send(
                     self.client
-                        .authorize(self.client.http.post(self.url(&["ack"])?))
-                        .json(&json!({ "group": group, "position": position })),
+                        .authorize(self.client.http.post(self.url(&["poll"])?))
+                        .json(&json!({
+                            "group": group,
+                            "owner": owner,
+                            "topics": topics,
+                            "max": max.unwrap_or(256),
+                            "leaseSeconds": lease_seconds,
+                        })),
                 )
                 .await?,
         )
@@ -1329,9 +1491,107 @@ impl Queue {
         response.json().await.map_err(ClientError::Transport)
     }
 
+    /// Subscribes to exact topics and reconnects without issuing poll requests.
+    pub fn subscribe<I, T>(
+        &self,
+        group: &str,
+        owner: &str,
+        topics: I,
+        max: Option<usize>,
+        lease_seconds: u64,
+    ) -> Result<QueueStream, ClientError>
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<String>,
+    {
+        let topics = topics.into_iter().map(Into::into).collect::<Vec<_>>();
+        if group.is_empty()
+            || owner.is_empty()
+            || topics.is_empty()
+            || topics.iter().any(|topic| topic.trim().is_empty())
+        {
+            return Err(ClientError::Configuration(
+                "queue subscribe requires non-empty group, owner, and topics".to_owned(),
+            ));
+        }
+        let queue = self.clone();
+        let group = group.to_owned();
+        let owner = owner.to_owned();
+        Ok(Box::pin(async_stream::try_stream! {
+            let mut backoff = Duration::from_millis(250);
+            loop {
+                let request = queue.client.authorize(
+                    queue.client.http.post(queue.url(&["subscribe"])?),
+                ).json(&json!({
+                    "group": group,
+                    "owner": owner,
+                    "topics": topics,
+                    "max": max.unwrap_or(256),
+                    "leaseSeconds": lease_seconds,
+                }));
+                let response = match queue.client.send(request).await {
+                    Ok(response) if response.status().is_success() => response,
+                    Ok(response) if is_transient_subscription_status(response.status()) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Ok(response) => Err(Client::http_error(response).await)?,
+                    Err(ClientError::Transport(_) | ClientError::RequestTimeout) => {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(30));
+                        continue;
+                    }
+                    Err(error) => Err(error)?,
+                };
+                backoff = Duration::from_millis(250);
+                let mut chunks = response.bytes_stream();
+                let mut buffer = Vec::new();
+                while let Some(chunk) = chunks.next().await {
+                    let chunk = match chunk {
+                        Ok(chunk) => chunk,
+                        Err(_) => break,
+                    };
+                    buffer.extend_from_slice(&chunk);
+                    while let Some(newline) = buffer.iter().position(|byte| *byte == b'\n') {
+                        let frame = buffer.drain(..=newline).collect::<Vec<_>>();
+                        if frame.len() == 1 {
+                            continue;
+                        }
+                        let delivery = serde_json::from_slice(&frame[..frame.len() - 1])
+                            .map_err(ClientError::QueueJson)?;
+                        yield delivery;
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }))
+    }
+
+    /// Acknowledges exactly one live delivery generation after committing its work.
+    pub async fn ack(&self, group: &str, receipt: &QueueReceipt) -> Result<(), ClientError> {
+        if group.is_empty() {
+            return Err(ClientError::Configuration(
+                "queue ack requires a non-empty group".to_owned(),
+            ));
+        }
+        Client::require_success(
+            self.client
+                .send(
+                    self.client
+                        .authorize(self.client.http.post(self.url(&["ack"])?))
+                        .json(&json!({ "group": group, "receipt": receipt })),
+                )
+                .await?,
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Builds a queue URL with path-segment encoding owned by the HTTP client.
     fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
-        resource_url(&self.client.query_uri, "queues", &self.name, suffix)
+        resource_url(&self.client.access_uri, "queues", &self.name, suffix)
     }
 }
 
@@ -1339,6 +1599,7 @@ impl Queue {
 #[derive(Debug, Clone)]
 pub struct Graph {
     client: Client,
+    database: String,
     namespace: String,
 }
 
@@ -1497,7 +1758,13 @@ impl Graph {
 
     /// Builds a graph URL with path-segment encoding owned by the HTTP client.
     fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
-        resource_url(&self.client.query_uri, "graphs", &self.namespace, suffix)
+        database_resource_url(
+            &self.client.query_uri,
+            &self.database,
+            "graphs",
+            &self.namespace,
+            suffix,
+        )
     }
 }
 
@@ -1505,6 +1772,7 @@ impl Graph {
 #[derive(Debug, Clone)]
 pub struct Table {
     client: Client,
+    database: String,
     name: String,
 }
 
@@ -1585,7 +1853,13 @@ impl Table {
 
     /// Builds a table URL with path-segment encoding owned by the HTTP client.
     fn url(&self, suffix: &[&str]) -> Result<reqwest::Url, ClientError> {
-        resource_url(&self.client.query_uri, "tables", &self.name, suffix)
+        database_resource_url(
+            &self.client.query_uri,
+            &self.database,
+            "tables",
+            &self.name,
+            suffix,
+        )
     }
 }
 
@@ -1608,6 +1882,73 @@ fn resource_url(
         }
     }
     Ok(url)
+}
+
+/// Builds a `/v1/databases/{database}/{family}/{name}/...` URL.
+fn database_resource_url(
+    query_uri: &str,
+    database: &str,
+    family: &str,
+    name: &str,
+    suffix: &[&str],
+) -> Result<reqwest::Url, ClientError> {
+    let mut url = reqwest::Url::parse(query_uri)
+        .map_err(|error| ClientError::Configuration(error.to_string()))?;
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            ClientError::Configuration("query URI cannot carry path segments".to_owned())
+        })?;
+        segments
+            .pop_if_empty()
+            .push("v1")
+            .push("databases")
+            .push(database)
+            .push(family)
+            .push(name);
+        for segment in suffix {
+            segments.push(segment);
+        }
+    }
+    Ok(url)
+}
+
+/// Builds the database-scoped Iceberg REST catalog mount.
+fn database_catalog_url(query_uri: &str, database: &str) -> Result<reqwest::Url, ClientError> {
+    let mut url = reqwest::Url::parse(query_uri)
+        .map_err(|error| ClientError::Configuration(error.to_string()))?;
+    url.path_segments_mut()
+        .map_err(|_| ClientError::Configuration("query URI cannot carry path segments".to_owned()))?
+        .pop_if_empty()
+        .push("v1")
+        .push("databases")
+        .push(database)
+        .push("catalog");
+    Ok(url)
+}
+
+/// Checks the database resource-name grammar enforced by the database API.
+fn is_database_name(name: &str) -> bool {
+    let Some((first, remainder)) = name.as_bytes().split_first() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || *first == b'_')
+        && remainder
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'_' | b'-'))
+}
+
+/// Returns the shared database-name configuration error.
+fn invalid_database_name() -> ClientError {
+    ClientError::Configuration(
+        "database name must start with a letter or underscore and contain only ASCII letters, digits, underscores, or hyphens".to_owned(),
+    )
+}
+
+/// Returns whether a subscription handshake should reconnect from durable state.
+fn is_transient_subscription_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
 }
 
 /// Maps client read options onto the wire filter object.
@@ -1870,180 +2211,6 @@ struct DecodeState {
     decoder: StreamDecoder,
     buffer: Buffer,
     finished: bool,
-}
-
-/// Connected websocket type used by the change feed.
-type FeedSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
-
-struct FollowState {
-    url: String,
-    token: Option<String>,
-    tables: HashSet<String>,
-    cursor: Option<u64>,
-    socket: Option<FeedSocket>,
-    connected_once: bool,
-    reconnect_delay: Option<Duration>,
-    backoff: Duration,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum ServerFeedMessage {
-    Hello {
-        cursor: u64,
-    },
-    Change {
-        seq: u64,
-        table: String,
-        snapshot_id: String,
-        committed_at: String,
-    },
-    Resync {
-        reason: String,
-    },
-}
-
-/// Reads the next matching change, transparently reconnecting and resuming.
-async fn follow_next(
-    mut state: FollowState,
-) -> Result<Option<(ChangeEvent, FollowState)>, ClientError> {
-    loop {
-        if state.socket.is_none() {
-            if let Some(delay) = state.reconnect_delay.take() {
-                tokio::time::sleep(delay).await;
-            }
-            match connect_feed(&state).await {
-                Ok((socket, hello_cursor)) => {
-                    if state.cursor.is_none() {
-                        state.cursor = Some(hello_cursor);
-                    }
-                    state.socket = Some(socket);
-                    state.connected_once = true;
-                    state.backoff = Duration::from_millis(250);
-                }
-                Err(error) if !state.connected_once => return Err(error),
-                Err(_) => {
-                    state.reconnect_delay = Some(state.backoff);
-                    state.backoff = (state.backoff * 2).min(Duration::from_secs(60));
-                    continue;
-                }
-            }
-        }
-
-        let message = state
-            .socket
-            .as_mut()
-            .expect("feed socket was connected")
-            .next()
-            .await;
-        let text = match message {
-            Some(Ok(Message::Text(text))) => text,
-            Some(Ok(_)) => continue,
-            Some(Err(_)) | None => {
-                state.socket = None;
-                state.reconnect_delay = Some(state.backoff);
-                state.backoff = (state.backoff * 2).min(Duration::from_secs(60));
-                continue;
-            }
-        };
-        let message: ServerFeedMessage = match serde_json::from_str(&text) {
-            Ok(message) => message,
-            Err(_) => continue,
-        };
-        match message {
-            ServerFeedMessage::Hello { .. } => continue,
-            ServerFeedMessage::Resync { reason } => {
-                return Err(ClientError::CursorExpired { reason });
-            }
-            ServerFeedMessage::Change {
-                seq,
-                table,
-                snapshot_id,
-                committed_at,
-            } => {
-                if state.cursor.is_some_and(|cursor| seq <= cursor) {
-                    continue;
-                }
-                state.cursor = Some(seq);
-                if !state.tables.contains(&table) {
-                    continue;
-                }
-                return Ok(Some((
-                    ChangeEvent {
-                        seq,
-                        table,
-                        snapshot_id,
-                        committed_at,
-                    },
-                    state,
-                )));
-            }
-        }
-    }
-}
-
-/// Opens one authenticated feed session, waits for hello, and subscribes from
-/// the caller's cursor.
-async fn connect_feed(state: &FollowState) -> Result<(FeedSocket, u64), ClientError> {
-    let mut request = state
-        .url
-        .as_str()
-        .into_client_request()
-        .map_err(|error| ClientError::Feed(error.to_string()))?;
-    if let Some(token) = &state.token {
-        request.headers_mut().insert(
-            tokio_tungstenite::tungstenite::http::header::AUTHORIZATION,
-            tokio_tungstenite::tungstenite::http::HeaderValue::from_str(&format!("Bearer {token}"))
-                .map_err(|error| ClientError::Feed(error.to_string()))?,
-        );
-    }
-    let (mut socket, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .map_err(|error| ClientError::Feed(error.to_string()))?;
-    loop {
-        match socket.next().await {
-            Some(Ok(Message::Text(text))) => {
-                let message: ServerFeedMessage = serde_json::from_str(&text)
-                    .map_err(|error| ClientError::Feed(error.to_string()))?;
-                if let ServerFeedMessage::Hello { cursor } = message {
-                    let subscribe = serde_json::to_string(&serde_json::json!({
-                        "type": "subscribe",
-                        "cursor": state.cursor,
-                    }))
-                    .map_err(|error| ClientError::Feed(error.to_string()))?;
-                    socket
-                        .send(Message::Text(subscribe))
-                        .await
-                        .map_err(|error| ClientError::Feed(error.to_string()))?;
-                    return Ok((socket, cursor));
-                }
-            }
-            Some(Ok(_)) => {}
-            Some(Err(error)) => return Err(ClientError::Feed(error.to_string())),
-            None => return Err(ClientError::Feed("socket closed before hello".to_owned())),
-        }
-    }
-}
-
-/// Derives the websocket feed URL from an HTTP endpoint origin.
-fn feed_url(endpoint: &str) -> Result<String, ClientError> {
-    let mut url = reqwest::Url::parse(endpoint)
-        .map_err(|error| ClientError::Configuration(error.to_string()))?;
-    let scheme = match url.scheme() {
-        "http" => "ws",
-        "https" => "wss",
-        other => {
-            return Err(ClientError::Configuration(format!(
-                "endpoint scheme `{other}` cannot carry a websocket feed"
-            )));
-        }
-    };
-    url.set_scheme(scheme)
-        .map_err(|_| ClientError::Configuration("could not derive websocket scheme".to_owned()))?;
-    url.set_path("/v1/catalog/feed");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url.to_string())
 }
 
 /// Decodes one batch while retaining decoder state across arbitrary HTTP chunks.

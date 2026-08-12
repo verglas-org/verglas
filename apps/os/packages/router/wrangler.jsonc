@@ -7,8 +7,8 @@
   "services": [
     {
       "binding": "WORKSHOP_BACKEND",
-      "service": "workshop-backend"
-    }
+      "service": "workshop-backend",
+    },
   ],
 
   // The router owns the public origin for customer instances, so it serves the frontend.
@@ -24,13 +24,14 @@
       "/blueprint-screenshot",
       "/blueprint-screenshot/*",
       "/application-screenshot",
-      "/application-screenshot/*"
-    ]
+      "/application-screenshot/*",
+      "/apps/*",
+    ],
   },
 
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,
-    "logs": { "invocation_logs": false }
-  }
+    "logs": { "invocation_logs": false },
+  },
 }

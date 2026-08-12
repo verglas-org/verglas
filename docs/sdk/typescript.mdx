@@ -102,6 +102,26 @@ const commit = await orders.append(
 console.log({ rows: page.rows.length, snapshot: commit.snapshotId });
 ```
 
+Use the control-plane client for SQL against a named dynamic database:
+
+```ts
+import { connectAdmin } from "@verglas/sdk";
+
+const admin = connectAdmin({
+  endpoint: process.env.VERGLAS_ENDPOINT!,
+  token: process.env.VERGLAS_TOKEN!,
+});
+
+const result = await admin.query(
+  "analytics",
+  "SELECT count(*) AS rows FROM analytics.orders",
+);
+console.log(result.rows);
+```
+
+The database name is required. Verglas does not select a process-wide default
+catalog for dynamic database queries.
+
 ## Work with tables
 
 Create a table with an explicit schema when inference cannot express the required types or partitioning:
@@ -156,15 +176,19 @@ One edge websocket multiplexes all `follow` subscriptions on a client. An idle s
 const queue = client.queue<{ orderId: string }>("orders-to-enrich");
 await queue.enqueue([{ orderId: "order-1042" }]);
 
-const batch = await queue.poll("enrichment-workers", { max: 100 });
-// Process batch.records idempotently.
-const nextPosition = batch.records.at(-1)?.position;
-if (nextPosition !== undefined) {
-  await queue.ack("enrichment-workers", nextPosition + 1);
+const batch = await queue.poll("enrichment-workers", {
+  owner: "worker-17",
+  max: 100,
+  leaseSeconds: 30,
+});
+for (const delivery of batch.deliveries) {
+  // Process delivery.payload idempotently before acknowledging its live lease.
+  await queue.ack("enrichment-workers", delivery.receipt);
 }
 ```
 
-Queues deliver at least once. Consumers must make processing idempotent.
+Queues deliver at least once. Leases are exclusive until expiry, stale receipts
+are fenced, and consumers must make processing idempotent.
 
 ## Use property graphs
 

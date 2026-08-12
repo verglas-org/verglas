@@ -35,8 +35,8 @@ verglas table create market.ohlcv ./market-bars.jsonl
 ```
 
 Expected output includes the table name and one committed row. Verglas writes
-ordinary Iceberg metadata and Parquet files to the R2 bucket, then commits the
-new metadata location to R2 Data Catalog.
+ordinary Iceberg metadata and Parquet files to the deployment's R2 bucket, then
+commits the new metadata location through the tenant Lakekeeper catalog.
 
 ## Append another row
 
@@ -59,6 +59,7 @@ through the Verglas cache endpoint:
 
 ```bash
 verglas query \
+  analytics \
   'SELECT symbol, timestamp, close, volume
    FROM market.ohlcv
    ORDER BY timestamp'

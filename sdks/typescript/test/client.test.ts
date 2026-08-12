@@ -65,8 +65,27 @@ describe("shared SDK parity contract", () => {
       }),
     ).rejects.toThrow(/definition mismatch/);
 
-    const result = await client.query("select 1 as id");
+    const result = await client.query("analytics", "select 1 as id", {
+      reference: "42",
+      table: "sdk.events",
+    });
     expect(result).toEqual({ columns: ["id"], rows: [{ id: 1 }], row_count: 1 });
+    expect(endpoint.requests).toContainEqual({
+      method: "POST",
+      path: "/v1/databases/analytics/query",
+      body: {sql: "select 1 as id", at: {reference: "42", table: "sdk.events"}},
+    });
+  });
+
+  it("requires a valid database resource name", async () => {
+    expect(() => client.query("", "select 1")).toThrow(/database must begin/);
+    expect(() => client.query("analytics/dev", "select 1")).toThrow(/database must begin/);
+    await client.query("analytics-dev", "select 1");
+    expect(endpoint.requests).toContainEqual({
+      method: "POST",
+      path: "/v1/databases/analytics-dev/query",
+      body: { sql: "select 1" },
+    });
   });
 });
 

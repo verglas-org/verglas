@@ -130,6 +130,66 @@ Inside a worker you never call `connect` yourself — the runner hands you a
 connected `ctx.verglas`. You call `connect` only when driving the SDK directly
 (tests, a script, a harness entry).
 
+## Scoped access tokens
+
+Every SDK connector requires a non-empty scoped bearer token. There is no
+deployment-wide service-token fallback. Create a token from an owner credential,
+then store the returned bearer value in your local credential store. Verglas
+returns that value only once.
+
+```ts
+import { connect, connectAccess } from "@verglas/sdk";
+
+const access = connectAccess({
+  endpoint: "http://127.0.0.1:8345",
+  token: process.env.VERGLAS_OWNER_TOKEN!,
+});
+
+const localCli = await access.createToken({
+  name: "Local analytics script",
+  audience: "data-plane",
+  expires_in_seconds: 60 * 60 * 24 * 30,
+  grants: [{ resource_id: "database/analytics", actions: ["discover", "query"] }],
+});
+
+// Save localCli.token in a mode-0600 credentials file. It cannot be read again.
+const analytics = connect({
+  endpoint: "http://127.0.0.1:8334",
+  token: localCli.token,
+});
+const result = await analytics.query("analytics", "SELECT * FROM sales LIMIT 10");
+```
+
+The token creates a child process principal. The access service delegates only
+the requested resource actions that the owner already has, then evaluates the
+child principal on every request. Listing and revoking tokens returns public
+metadata only:
+
+```ts
+await access.listTokens();
+await access.revokeToken(localCli.id);
+```
+
+Use `access.authorize()` when a management surface needs to explain whether the
+presented token can perform a database, table, queue, Vessel, or Integration
+operation. The returned decision includes the matched grant and policy revision.
+
+For a direct connection to an authorized managed Postgres database, mint a
+separate short-lived database credential. This is not a tenant administrator
+password and it is returned only once. The access service caps its lifetime at
+15 minutes:
+
+```ts
+const direct = await access.createDatabaseToken({
+  database_id: "operations",
+  expires_in_seconds: 900,
+});
+
+// Pass direct.token to the database driver as its temporary credential.
+// Do not log it or write it to source control.
+console.log(new Date(direct.expires_at * 1000));
+```
+
 ## Reflected Integration namespaces
 
 An Integration publishes a reflection manifest instead of requiring a
@@ -398,14 +458,14 @@ or partitioning you need.
 
 ### Queues
 
-A worker may target a **queue** instead of a table. `client.queue(name)` returns a
-`Queue` with `enqueue(rows)`, `poll(group, { max })`, and `ack(group, position)`.
-Delivery is **at-least-once with consumer-side idempotency**: a record is durable
-before any consumer sees it, and a group's watermark advances only on an explicit
-`ack` after the consumer's downstream commit. A crash between `poll` and `ack`
-re-serves the same records, so a consumer that must not act twice dedupes on
-`QueueRecord.position`. `ack` is monotone — a regressing position is ignored.
-The self-hosted server backs the queue with a durable segment log.
+A worker may target an explicitly created **queue** instead of a table.
+`client.queue(name)` returns a `Queue` with `enqueue(messages)`,
+`poll(group, { owner, max, leaseSeconds })`, and `ack(group, receipt)`. Each queue
+owns a managed Verglas Neon database and an independently scalable queue
+container. Poll grants an exclusive expiring lease and returns a generation-fenced
+receipt. A crash before ack causes redelivery; a stale receipt cannot acknowledge
+a message reclaimed by another worker. Delivery is **at-least-once with
+consumer-side idempotency**.
 
 ### Graphs
 
@@ -565,7 +625,7 @@ The root exports exactly two layers; internals live behind subpaths.
   - `Table`: `snapshot()`, `scan(opts?)`, `delta(since, opts?)`,
     `append(rows, opts?)`, `addIndex(field, opts?)`, `listIndexes()`,
     `searchIndex(field, vector, opts?)`
-  - `Queue`: `enqueue(rows)`, `poll(group, opts?)`, `ack(group, position)`
+  - `Queue`: `enqueue(messages)`, `poll(group, { owner, max?, leaseSeconds })`, `ack(group, receipt)`
   - `Graph`: `create()`, `insertNodes()`, `insertEdges()`, `buildIndex()`,
     `show()`, `neighbors()`, `kHop()`, `paths()`
 - The worker contract: `defineWorker(def)`, `runWorker(worker, ctx, opts?)`; types

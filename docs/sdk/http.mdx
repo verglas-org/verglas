@@ -15,10 +15,10 @@ This page mirrors [`contracts/api-surface.json`](https://github.com/verglas-org/
 **ensure_table** — Iceberg REST `GET/POST …/v1/namespaces/{ns}/tables…` (not Verglas `/v1/tables`). TypeScript: `ensureTable`. Rust: `ensure_table`.
 
 <!-- op:query -->
-**query** — `POST /v1/query`. TypeScript JSON. Rust Arrow IPC stream.
+**query** — `POST /v1/databases/{database}/query`. TypeScript JSON. Rust Arrow IPC stream. The named database must be an active Lakehouse; Postgres SQL uses a separate runtime contract.
 
 <!-- op:append -->
-**append** — TypeScript/CLI: `POST /v1/ingest/{name}` (JSONL/files). Rust: `POST /v1/write/{name}` (Arrow IPC).
+**append** — TypeScript/CLI: `POST /v1/ingest/{name}` (JSONL/files). Rust: `POST /v1/databases/{database}/write/{name}` (Arrow IPC).
 
 <!-- op:ingest -->
 **ingest** — `POST /v1/ingest/{name}` file create/append (CLI). TypeScript append reuses this route.
@@ -35,7 +35,7 @@ This page mirrors [`contracts/api-surface.json`](https://github.com/verglas-org/
 **queue_enqueue** — `POST /v1/queues/{name}/enqueue`
 
 <!-- op:queue_poll -->
-**queue_poll** — `GET /v1/queues/{name}/poll`
+**queue_poll** — `POST /v1/queues/{name}/poll`
 
 <!-- op:queue_ack -->
 **queue_ack** — `POST /v1/queues/{name}/ack`

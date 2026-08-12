@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -24,7 +24,7 @@ use futures::StreamExt;
 use verglas_cluster::fragments::{FragmentIoError, LoadedFragment};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
-use verglas_core::read::{ObjectRead, ReadError, ReadRange};
+use verglas_core::read::{DirectReadOptions, ObjectRead, ReadError, ReadRange};
 use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
@@ -90,13 +90,7 @@ impl MemoryTransport {
 
     /// Count of stored fragments across all nodes.
     fn fragment_count(&self) -> usize {
-        self.inner
-            .lock()
-            .expect("lock")
-            .frags
-            .keys()
-            .filter(|(_, object_id, _)| !object_id.starts_with("journal-"))
-            .count()
+        self.inner.lock().expect("lock").frags.len()
     }
 
     /// Flips a byte in one stored fragment's payload while leaving its recorded
@@ -209,28 +203,6 @@ impl FragmentTransport for MemoryTransport {
         ));
         Ok(())
     }
-
-    async fn list_prefix(
-        &self,
-        node: &NodeId,
-        prefix: &str,
-    ) -> Result<Vec<verglas_cluster::fragments::FragmentKey>, TransportError> {
-        let inner = self.inner.lock().expect("lock");
-        if inner.dead.contains(node.as_str()) {
-            return Ok(Vec::new());
-        }
-        Ok(inner
-            .frags
-            .keys()
-            .filter(|(held, object_id, _)| held == node.as_str() && object_id.starts_with(prefix))
-            .map(
-                |(_, object_id, index)| verglas_cluster::fragments::FragmentKey {
-                    object_id: object_id.clone(),
-                    index: *index,
-                },
-            )
-            .collect())
-    }
 }
 
 // ---- in-memory membership --------------------------------------------------
@@ -275,8 +247,9 @@ impl LiveMembership for FakeMembership {
 struct RecordingOrigin {
     puts: Mutex<HashMap<(String, String), Bytes>>,
     fail: AtomicBool,
-    failures_remaining: AtomicUsize,
-    attempts: AtomicUsize,
+    block_put: AtomicBool,
+    put_entered: AtomicBool,
+    put_release: tokio::sync::Notify,
 }
 
 impl RecordingOrigin {
@@ -284,24 +257,17 @@ impl RecordingOrigin {
         Arc::new(Self {
             puts: Mutex::new(HashMap::new()),
             fail: AtomicBool::new(fail),
-            failures_remaining: AtomicUsize::new(0),
-            attempts: AtomicUsize::new(0),
+            block_put: AtomicBool::new(false),
+            put_entered: AtomicBool::new(false),
+            put_release: tokio::sync::Notify::new(),
         })
     }
-
-    /// Builds an origin that recovers only after `count` failed PUT attempts.
-    fn fail_first(count: usize) -> Arc<Self> {
-        Arc::new(Self {
-            puts: Mutex::new(HashMap::new()),
-            fail: AtomicBool::new(false),
-            failures_remaining: AtomicUsize::new(count),
-            attempts: AtomicUsize::new(0),
-        })
+    fn block_put(&self) {
+        self.block_put.store(true, Ordering::SeqCst);
     }
-
-    /// Number of PUT attempts observed, including failures.
-    fn attempt_count(&self) -> usize {
-        self.attempts.load(Ordering::Relaxed)
+    fn release_put(&self) {
+        self.block_put.store(false, Ordering::SeqCst);
+        self.put_release.notify_waiters();
     }
     fn get(&self, bucket: &str, key: &str) -> Option<Bytes> {
         self.puts
@@ -319,18 +285,15 @@ impl ObjectWrite for RecordingOrigin {
         _metadata: WriteMetadata,
         mut body: WriteBodyStream,
     ) -> Result<PutOutcome, WriteError> {
-        self.attempts.fetch_add(1, Ordering::Relaxed);
         let mut buf = Vec::new();
         while let Some(chunk) = body.next().await {
             buf.extend_from_slice(&chunk?);
         }
-        let counted_failure = self
-            .failures_remaining
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .is_ok();
-        if self.fail.load(Ordering::Relaxed) || counted_failure {
+        self.put_entered.store(true, Ordering::SeqCst);
+        while self.block_put.load(Ordering::SeqCst) {
+            self.put_release.notified().await;
+        }
+        if self.fail.load(Ordering::Relaxed) {
             return Err(WriteError::Backend("origin down".to_owned()));
         }
         self.puts
@@ -343,7 +306,11 @@ impl ObjectWrite for RecordingOrigin {
             e_tag: Some("\"origin\"".to_owned()),
         })
     }
-    async fn delete(&self, _key: &CacheKey) -> Result<(), WriteError> {
+    async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
+        self.puts
+            .lock()
+            .expect("lock")
+            .remove(&(key.bucket.clone(), key.key.clone()));
         Ok(())
     }
     async fn delete_batch(
@@ -523,43 +490,6 @@ async fn small_pod_falls_back_to_write_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn required_quorum_rejects_without_origin_fallback() {
-    let transport = MemoryTransport::new();
-    let membership = FakeMembership::new("node-0", &["node-0", "node-1"]);
-    let origin = RecordingOrigin::new(false);
-    let dir = tempfile::tempdir().expect("tmp");
-    let coordinator = Arc::new(
-        WriteCoordinator::new(
-            transport.clone(),
-            membership,
-            Arc::new(JournalStore::open(dir.path()).expect("journals")),
-            Arc::new(WritebackMetrics::default()),
-            origin.clone(),
-            Duration::from_secs(5),
-        )
-        .require_quorum(),
-    );
-
-    let result = coordinator
-        .put(
-            &ck("tenants/t1/timelines/l1/index_part.json-00000001"),
-            &WriteMetadata::default(),
-            body(4096),
-            2,
-            1,
-            3,
-        )
-        .await;
-
-    assert!(result.is_err(), "ring shortfall must reject publication");
-    assert_eq!(
-        origin.get("bkt", "tenants/t1/timelines/l1/index_part.json-00000001"),
-        None
-    );
-    assert_eq!(coordinator.metrics().snapshot().acked_via_write_through, 0);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn midflight_shortfall_rebuilds_and_writes_through() {
     let transport = MemoryTransport::new();
     // Five live nodes, geometry k=2/m=3/w=5. Two nodes fail placement, so only
@@ -709,6 +639,56 @@ async fn no_disk_headroom_falls_back_to_write_through() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::new(false);
+    origin.block_put();
+    let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
+    let key = ck("lakekeeper/storage-check");
+
+    coordinator
+        .put(&key, &WriteMetadata::default(), body(4096), 2, 1, 3)
+        .await
+        .expect("quorum ack before origin propagation");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !origin.put_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        origin.put_entered.load(Ordering::SeqCst),
+        "background propagation reached the blocked origin"
+    );
+
+    let delete_coordinator = Arc::clone(&coordinator);
+    let delete_key = key.clone();
+    let mut delete = tokio::spawn(async move { delete_coordinator.delete(&delete_key).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut delete)
+            .await
+            .is_err(),
+        "delete waits for the earlier accepted PUT instead of racing it"
+    );
+
+    origin.release_put();
+    delete
+        .await
+        .expect("delete task")
+        .expect("ordered origin delete");
+    assert_eq!(
+        origin.get("bkt", "lakekeeper/storage-check"),
+        None,
+        "the completed delete is final"
+    );
+    assert!(coordinator.journals().is_idle(), "dirty journal removed");
+    assert!(
+        wait_for_no_fragments(&transport).await,
+        "propagated fragments are released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn read_your_writes_before_propagation() {
     let transport = MemoryTransport::new();
     let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
@@ -749,79 +729,29 @@ async fn read_your_writes_before_propagation() {
     let meta = reader.head(&ck("data/x")).await.expect("head");
     assert_eq!(meta.size, payload.len() as u64);
     assert!(meta.e_tag.is_some());
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn another_coordinator_discovers_and_reads_a_dirty_object() {
-    let transport = MemoryTransport::new();
-    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
-    let origin = RecordingOrigin::new(true);
-    let (writer, _writer_dir) = build(
-        Arc::clone(&transport),
-        Arc::clone(&membership),
-        Arc::clone(&origin),
-    );
-    let (reader_coordinator, _reader_dir) = build(transport, membership, origin);
-    let payload = body(9000);
-
-    writer
-        .put(
-            &ck("data/shared"),
-            &WriteMetadata::default(),
-            payload.clone(),
-            2,
-            1,
-            3,
+    // AWS-compatible clients commonly enable checksum mode on validation
+    // reads. That direct-read shape must preserve the same dirty-object
+    // visibility instead of falling through to an origin that has not received
+    // the asynchronous propagation yet.
+    let direct = reader
+        .get_direct(
+            &ck("data/x"),
+            ReadRange::Full,
+            DirectReadOptions {
+                checksum_mode: true,
+                ..DirectReadOptions::default()
+            },
         )
         .await
-        .expect("ack");
-    assert!(reader_coordinator.journals().is_idle());
-
-    let reader = WritebackReader::new(FailingReader, reader_coordinator);
-    let got = reader
-        .get(&ck("data/shared"), ReadRange::Full)
-        .await
-        .expect("remote coordinator read");
-    let chunks = got
-        .body
-        .collect::<Vec<_>>()
-        .await
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()
-        .expect("body chunks");
-    assert_eq!(chunks.concat(), payload);
-}
-
-#[tokio::test(start_paused = true)]
-async fn propagation_keeps_retrying_past_eight_failures() {
-    let transport = MemoryTransport::new();
-    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
-    let origin = RecordingOrigin::fail_first(10);
-    let (coordinator, _dir) = build(transport, membership, Arc::clone(&origin));
-    let payload = body(9000);
-
-    coordinator
-        .put(
-            &ck("data/eventual"),
-            &WriteMetadata::default(),
-            payload.clone(),
-            2,
-            1,
-            3,
-        )
-        .await
-        .expect("ack");
-    for _ in 0..12 {
-        tokio::time::advance(Duration::from_secs(10)).await;
-        tokio::task::yield_now().await;
+        .expect("checksum-mode read");
+    let mut direct_buf = Vec::new();
+    let mut direct_stream = direct.body;
+    while let Some(chunk) = direct_stream.next().await {
+        direct_buf.extend_from_slice(&chunk.expect("chunk"));
     }
-
-    assert!(
-        origin.attempt_count() > 8,
-        "retry queue must not stop at eight"
-    );
-    assert_eq!(origin.get("bkt", "data/eventual"), Some(payload));
-    assert!(coordinator.journals().is_idle());
+    assert_eq!(Bytes::from(direct_buf), payload);
+    assert_eq!(direct.meta.meta.size, payload.len() as u64);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

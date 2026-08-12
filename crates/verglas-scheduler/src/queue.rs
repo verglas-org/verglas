@@ -8,6 +8,10 @@ use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::{Row, Transaction};
 use verglas_sdk::worker::CloudEvent;
 
+/// Two connections cover one claim transaction plus reconciliation without
+/// consuming the small tenant compute's client connection budget.
+const TENANT_POOL_MAX_CONNECTIONS: u32 = 2;
+
 /// A scheduler storage, encoding, or input error.
 #[derive(Debug, thiserror::Error)]
 pub enum SchedulerError {
@@ -17,6 +21,9 @@ pub enum SchedulerError {
     /// A durable scheduler value was not valid JSON.
     #[error("scheduler JSON: {0}")]
     Json(#[from] serde_json::Error),
+    /// A runtime secret could not be encrypted or authenticated.
+    #[error("scheduler secret: {0}")]
+    Secret(#[from] verglas_authz::SecretError),
     /// A queue or invocation field is invalid.
     #[error("invalid scheduler input: {0}")]
     Invalid(String),
@@ -102,6 +109,19 @@ pub struct Job {
     pub worker: String,
     pub event: CloudEvent,
     pub ready_at: DateTime<Utc>,
+}
+
+/// Bounded control-plane projection of one durable worker run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobSummary {
+    pub job_id: String,
+    pub worker: String,
+    pub state: String,
+    pub ready_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub rows_produced: Option<u64>,
+    pub error_message: Option<String>,
 }
 
 /// Result of an idempotent enqueue operation.
@@ -217,7 +237,7 @@ impl PgQueue {
         let queue = queue.into();
         validate_queue(&queue)?;
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(TENANT_POOL_MAX_CONNECTIONS)
             .connect(database_url)
             .await?;
         let result = PgQueue { pool, queue };
@@ -256,6 +276,45 @@ impl PgQueue {
     /// Starts a transaction used to atomically fence a claim or completion.
     async fn transaction(&self) -> Result<Transaction<'_, sqlx::Postgres>, SchedulerError> {
         Ok(self.pool.begin().await?)
+    }
+
+    /// Lists recent jobs for one worker with a bounded result size.
+    pub async fn worker_jobs(
+        &self,
+        worker: &str,
+        limit: u32,
+    ) -> Result<Vec<JobSummary>, SchedulerError> {
+        let rows = sqlx::query(
+            "SELECT j.id AS job_id,j.worker,j.state,j.ready_at,j.created_at,\
+             a.completed_at,a.completion FROM verglas_scheduler_jobs j LEFT JOIN LATERAL (\
+             SELECT completed_at,completion FROM verglas_scheduler_attempts \
+             WHERE queue=j.queue AND job_id=j.id ORDER BY generation DESC LIMIT 1) a ON true \
+             WHERE j.queue=$1 AND j.worker=$2 ORDER BY j.created_at DESC,j.id DESC LIMIT $3",
+        )
+        .bind(&self.queue)
+        .bind(worker)
+        .bind(i64::from(limit.clamp(1, 100)))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_job_summary).collect()
+    }
+
+    /// Returns one job by id within this scheduler queue.
+    pub async fn job(&self, job_id: &str) -> Result<Option<JobSummary>, SchedulerError> {
+        sqlx::query(
+            "SELECT j.id AS job_id,j.worker,j.state,j.ready_at,j.created_at,\
+             a.completed_at,a.completion FROM verglas_scheduler_jobs j LEFT JOIN LATERAL (\
+             SELECT completed_at,completion FROM verglas_scheduler_attempts \
+             WHERE queue=j.queue AND job_id=j.id ORDER BY generation DESC LIMIT 1) a ON true \
+             WHERE j.queue=$1 AND j.id=$2",
+        )
+        .bind(&self.queue)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .as_ref()
+        .map(row_job_summary)
+        .transpose()
     }
 }
 
@@ -461,7 +520,7 @@ impl RunQueue for PgQueue {
 }
 
 /// Validates the single-tenant queue name used in rows and logs.
-fn validate_queue(queue: &str) -> Result<(), SchedulerError> {
+pub(crate) fn validate_queue(queue: &str) -> Result<(), SchedulerError> {
     if queue.is_empty() || queue.contains('/') || queue == "." || queue == ".." {
         return Err(SchedulerError::Invalid(format!(
             "queue `{queue}` must be one non-empty component"
@@ -478,6 +537,29 @@ fn row_job(row: &PgRow) -> Result<Job, SchedulerError> {
         worker: row.try_get("worker")?,
         event: serde_json::from_value(row.try_get("event")?)?,
         ready_at: row.try_get("ready_at")?,
+    })
+}
+
+fn row_job_summary(row: &PgRow) -> Result<JobSummary, SchedulerError> {
+    let completion = row.try_get::<Option<serde_json::Value>, _>("completion")?;
+    let rows_produced = completion
+        .as_ref()
+        .and_then(|value| value.get("rows_produced"))
+        .and_then(serde_json::Value::as_u64);
+    let error_message = completion
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    Ok(JobSummary {
+        job_id: row.try_get("job_id")?,
+        worker: row.try_get("worker")?,
+        state: row.try_get("state")?,
+        ready_at: row.try_get("ready_at")?,
+        created_at: row.try_get("created_at")?,
+        completed_at: row.try_get("completed_at")?,
+        rows_produced,
+        error_message,
     })
 }
 

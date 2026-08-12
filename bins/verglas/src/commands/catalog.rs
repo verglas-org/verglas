@@ -43,7 +43,7 @@ impl CatalogClient {
     /// (`$VERGLAS_CONFIG` or `~/.verglas/config.toml`). A missing file, a missing
     /// `[catalog]` section, or an unresolvable bearer token each fails with a
     /// clear message rather than a silent no-auth request.
-    pub fn from_agent_config() -> Result<CatalogClient, Box<dyn Error>> {
+    pub fn from_agent_config(token: Option<&str>) -> Result<CatalogClient, Box<dyn Error>> {
         let path = config::user_config_path()
             .ok_or("no config file: set VERGLAS_CONFIG or HOME to locate ~/.verglas/config.toml")?;
         let text = std::fs::read_to_string(&path)
@@ -59,7 +59,11 @@ impl CatalogClient {
         let catalog = parsed
             .catalog
             .ok_or_else(|| format!("no [catalog] section in {}", path.display()))?;
-        Self::from_catalog(&catalog)
+        let mut client = Self::from_catalog(&catalog)?;
+        if let Some(token) = token {
+            client.bearer = Some(token.to_owned());
+        }
+        Ok(client)
     }
 
     /// Builds a client from a parsed `[catalog]` config.

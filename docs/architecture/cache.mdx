@@ -49,16 +49,6 @@ Cache budgets are ceilings. Startup rejects a configured NVMe capacity larger
 than the backing filesystem can hold. Scan-resistant admission prevents a
 one-touch scan from evicting frequently reused blocks.
 
-Iceberg ranges and Neon layer ranges use the same DRAM and NVMe admission
-ledger without static workload partitions. Repeated Neon `GetPage`
-reconstruction results use an exact tenant, timeline, relation, block, and LSN
-identity in the pageserver's shared page cache. This keeps a hot database page
-resident without confusing versions.
-
-Explicitly pinned Iceberg planning metadata uses its reserved metadata budget
-ahead of ordinary data heat. Dirty write-back fragments are protected
-separately by durability state and never depend on a heat score for retention.
-
 ## Cluster ownership
 
 A weighted rendezvous ring assigns every block to a live member. The same ring

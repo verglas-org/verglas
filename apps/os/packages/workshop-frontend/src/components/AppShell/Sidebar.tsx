@@ -1,4 +1,4 @@
-import { Link } from '@tanstack/react-router'
+import { Link } from "@tanstack/react-router";
 import {
   Browser,
   Compass,
@@ -10,17 +10,17 @@ import {
   PlugsConnected,
   SidebarSimple,
   SquaresFour,
-} from '@phosphor-icons/react'
-import { useSiteName } from '../../ServerConfigContext'
-import SiteLogo from '../SiteLogo'
-import { openCommandPalette } from './commandPaletteBus'
-import SidebarItem from './SidebarItem'
+} from "@phosphor-icons/react";
+import { useSiteName } from "../../ServerConfigContext";
+import SiteLogo from "../SiteLogo";
+import { openCommandPalette } from "./commandPaletteBus";
+import SidebarItem from "./SidebarItem";
 import {
   SidebarWorkspacesProvider,
   SidebarWorkspacesTools,
   SidebarWorkspacesLists,
-} from './SidebarWorkspaces'
-import SidebarUtilityStrip from './SidebarUtilityStrip'
+} from "./SidebarWorkspaces";
+import SidebarUtilityStrip from "./SidebarUtilityStrip";
 
 // The persistent left rail. Three pinned regions sandwich a single scrolling region of lists, so
 // the user can always reach Search, primary nav, and the bottom utility strip no matter how many
@@ -36,31 +36,39 @@ export default function Sidebar({
   collapsed,
   onToggleCollapsed,
 }: {
-  collapsed: boolean
-  onToggleCollapsed: () => void
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
 }) {
-  const siteName = useSiteName()
+  const siteName = useSiteName();
   return (
     <aside
       aria-label="Primary"
       className={[
         // Sidebar is the app chrome: a hair greyer than the (lighter) content canvas so the two
         // surfaces read as distinct without a heavy divider.
-        'flex h-screen flex-col border-r border-kumo-line bg-kumo-elevated',
-        collapsed ? 'w-[56px]' : 'w-[260px]',
-        'shrink-0 transition-[width] duration-200 ease-out',
-      ].join(' ')}
+        "flex h-screen flex-col border-r border-kumo-line bg-kumo-elevated",
+        collapsed ? "w-[56px]" : "w-[260px]",
+        "shrink-0 transition-[width] duration-200 ease-out",
+      ].join(" ")}
     >
       {/* Brand row */}
       <div
         className={[
-          'flex h-14 shrink-0 items-center border-b border-kumo-line',
-          collapsed ? 'justify-center px-1.5' : 'justify-between gap-2 px-3',
-        ].join(' ')}
+          "flex h-14 shrink-0 items-center border-b border-kumo-line",
+          collapsed ? "justify-center px-1.5" : "justify-between gap-2 px-3",
+        ].join(" ")}
       >
-        <Link to="/" aria-label={siteName} className="flex min-w-0 items-center gap-2">
+        <Link
+          to="/"
+          aria-label={siteName}
+          className="flex min-w-0 items-center gap-2"
+        >
           <SiteLogo size={20} className="shrink-0">
-            <Hexagon size={20} weight="bold" className="text-kumo-brand shrink-0" />
+            <Hexagon
+              size={20}
+              weight="bold"
+              className="text-kumo-brand shrink-0"
+            />
           </SiteLogo>
           {!collapsed && (
             <span className="truncate text-[14px] leading-5 font-semibold tracking-[-0.25px] text-kumo-default">
@@ -124,7 +132,7 @@ export default function Sidebar({
             />
             <SidebarItem
               to="/workflows"
-              label="Jobs"
+              label="Workers"
               icon={<FlowArrow size={14} weight="regular" />}
               collapsed={collapsed}
             />
@@ -142,7 +150,7 @@ export default function Sidebar({
             />
             <SidebarItem
               to="/data"
-              label="Lakehouse"
+              label="Databases"
               icon={<Database size={14} weight="regular" />}
               collapsed={collapsed}
             />
@@ -167,5 +175,5 @@ export default function Sidebar({
 
       <SidebarUtilityStrip collapsed={collapsed} />
     </aside>
-  )
+  );
 }

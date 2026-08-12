@@ -37,8 +37,25 @@
   added, with a socket-level regression test covering that launch race.
 - #58: Allowed the eight-argument `EcAppendLog::open` (node identity plus ring plane) and replaced test `unwrap`s with `expect` so clippy stays clean after the cache-metadata fleet fixes.
 
-- #74: Made pageserver feedback advance WAL retention only from the explicit
-  `vg_durable_lsn` watermark. Generic `ps_applylsn` no longer implies that
-  referenced layers and index metadata crossed the Verglas durability barrier.
 - #66: Documented Neon broker advertise reachability as Postgres compute over the tenant network rather than a microVM.
 - #84: Updated safekeeper cache identities to include the mandatory storage binding. Durable write tracking no longer aliases equal bucket and key names from different origins.
+- #84: Matched the published Verglas Neon walproposer's 8 MiB append contract and
+  made the durable storage binding an explicit safekeeper input. Large startup WAL
+  batches are accepted and WAL drains target the cache node's actual backend.
+- #87: Added optional foreground admission accounting to the Neon listener. Cache-node deployments now reject new safekeeper connections after a host fence and retain existing connections in the in-flight count until they close, while background WAL drain remains independent.
+- #87: Count safekeeper activity per accepted protocol message instead of per TCP connection. Idle and dead Neon sessions no longer prevent a fenced cache from scaling to zero, while every WAL mutation remains fenced through its durability acknowledgement.
+- #87: Release the `START_REPLICATION` command guard before entering the long-lived physical replication stream, then account only active WAL sends, feedback reads, and keepalives. An idle replication client no longer pins the cache awake, and the socket regression test now asserts the safekeeper plane returns to zero in-flight work while the connection remains open.
+- Fixed persistent-fragment exhaustion on sustained Neon WAL. Replicated
+  recovery manifests now alternate between two quorum-published slots instead
+  of leaking one full descriptor per revision. WAL admission that cannot find
+  quorum headroom synchronously streams the already-acked tail to object
+  storage, publishes the compact flushed state, evicts only then, and retries
+  placement. Upgrade recovery accepts legacy revision-keyed descriptors, and a
+  conservative local migration deletes only stale legacy descriptors whose
+  committed head names another revision. Bounded-store tests cover steady-state
+  commits, pressure offload/eviction, migration GC, and legacy recovery. Every
+  acknowledged append now wakes the S3 drain immediately; the one-second timer
+  remains only as retry insurance after origin failures.
+- #74: Made pageserver feedback advance retention only from the explicit
+  `vg_durable_lsn` watermark and accepted Neon's read-replica
+  `START_REPLICATION SLOT ... TIMELINE ...` command.

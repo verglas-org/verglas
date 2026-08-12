@@ -1,11 +1,13 @@
 spec_version = 1
 name = "market-data-ingest"
-exec = ["python3", "ingest.py"]
-cwd = "."
+runtime = "python"
+entrypoint = ["python", "ingest.py"]
 target_tables = ["market.ohlcv"]
 
 [files]
 "ingest.py" = "@file:ingest.py"
+"pyproject.toml" = "@file:pyproject.toml"
+"uv.lock" = "@file:uv.lock"
 
 [env]
 SYMBOL = "SPY"
@@ -27,5 +29,7 @@ source = "urn:rabbitmq:market-data"
 subject = "SPY"
 
 [resources]
-vcpus = 0.25
-mem_mib = 256
+vcpus = 1.0
+mem_mib = 1024
+pids = 128
+timeout_secs = 300

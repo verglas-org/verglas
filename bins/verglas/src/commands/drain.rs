@@ -27,6 +27,7 @@ pub enum DrainError {
 /// elapses, so `verglas status` will show it leave.
 pub async fn run(
     endpoint: &str,
+    token: Option<&str>,
     args: &DrainArgs,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -37,7 +38,7 @@ pub async fn run(
         None => None,
     };
 
-    let client = AdminClient::new(endpoint)?;
+    let client = AdminClient::new(endpoint, token)?;
     let ack = client.drain(&DrainRequest { timeout_secs }).await?;
 
     crate::output::emit(&ack, json, |ack| {

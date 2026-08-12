@@ -12,8 +12,8 @@ pub use repository::{
     DatabaseRecord, DatabaseRepository, PostgresDatabaseRepository, RepositoryError,
 };
 pub use service::{
-    DatabaseCreator, DatabaseService, DatabaseServiceError, ScopedSecretKind, ScopedSecretResolver,
-    SecretResolutionError,
+    DatabaseManager, DatabaseService, DatabaseServiceError, DatabaseView, ScopedSecretKind,
+    ScopedSecretResolver, SecretResolutionError,
 };
 
 /// JSON request accepted by the local database resource API.

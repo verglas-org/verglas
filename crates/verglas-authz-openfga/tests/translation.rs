@@ -71,3 +71,60 @@ async fn expands_grants_and_pins_check_model() {
     assert!(tuples.iter().any(|tuple| tuple["relation"] == "describe"));
     assert_eq!(captured[1].1["authorization_model_id"], "model-1");
 }
+
+#[tokio::test]
+async fn translates_connect_grants_and_checks_to_connect_relation() {
+    let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+    let app = Router::new()
+        .route(
+            "/stores/{store}/{operation}",
+            post(
+                |State(requests): State<CapturedRequests>,
+                 Path((_store, operation)): Path<(String, String)>,
+                 Json(body): Json<Value>| async move {
+                    requests
+                        .lock()
+                        .expect("request lock")
+                        .push((operation, body));
+                    Json(json!({"allowed": true}))
+                },
+            ),
+        )
+        .with_state(requests.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+
+    let engine = OpenFgaPolicyEngine::new(
+        OpenFgaConfig::new(endpoint, "store-1", "model-1", "secret").expect("config"),
+    )
+    .expect("engine");
+    engine
+        .write_grant(&Grant::new(
+            "grant-1",
+            "tenant-a",
+            "user-1",
+            "database-1",
+            BTreeSet::from([Action::Connect]),
+        ))
+        .await
+        .expect("write");
+    assert!(
+        engine
+            .check(&AccessCheck::new(
+                "tenant-a",
+                "user-1",
+                "database-1",
+                Action::Connect,
+            ))
+            .await
+            .expect("check")
+    );
+
+    let captured = requests.lock().expect("request lock");
+    let tuples = captured[0].1["writes"]["tuple_keys"]
+        .as_array()
+        .expect("tuples");
+    assert!(tuples.iter().any(|tuple| tuple["relation"] == "connect"));
+    assert_eq!(captured[1].1["tuple_key"]["relation"], "connect");
+}

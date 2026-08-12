@@ -17,6 +17,7 @@ arrow-schema.workspace = true
 # emit. Pinned to the workspace's Arrow major version.
 arrow-ipc = "57"
 async-trait.workspace = true
+async-stream = "0.3"
 bytes.workspace = true
 futures.workspace = true
 reqwest.workspace = true
@@ -24,12 +25,6 @@ serde = { workspace = true }
 serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["time"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = [
-    "connect",
-    "handshake",
-    "rustls-tls-webpki-roots",
-] }
-
 [dev-dependencies]
 axum.workspace = true
 futures.workspace = true

@@ -46,6 +46,32 @@ fn resolve_keypair(
 /// a separate crate from this library) can open the same connection without
 /// starting a server.
 pub fn connection_for(config: &QueryConfig) -> Result<Connection, String> {
+    let bearer_token = match std::env::var(verglas_core::RUN_BEARER_TOKEN_ENV) {
+        Ok(value) if value.is_empty() => {
+            return Err(format!(
+                "{} must not be empty when set",
+                verglas_core::RUN_BEARER_TOKEN_ENV
+            ));
+        }
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => {
+            return Err(format!(
+                "{} is required for every query run",
+                verglas_core::RUN_BEARER_TOKEN_ENV
+            ));
+        }
+        Err(std::env::VarError::NotUnicode(_)) => {
+            return Err(format!(
+                "{} must contain valid UTF-8",
+                verglas_core::RUN_BEARER_TOKEN_ENV
+            ));
+        }
+    };
+    connection_for_bearer(config, bearer_token)
+}
+
+/// Builds a connection using the explicitly inherited run bearer.
+fn connection_for_bearer(config: &QueryConfig, bearer_token: String) -> Result<Connection, String> {
     let (access_key_id, secret_access_key) = match resolve_keypair(
         &config.cache.credentials_file,
         &config.cache.credentials_profile,
@@ -55,7 +81,7 @@ pub fn connection_for(config: &QueryConfig) -> Result<Connection, String> {
     };
     Ok(Connection {
         catalog_uri: config.metadata.uri.clone(),
-        token: None,
+        token: Some(bearer_token),
         warehouse: None,
         s3_endpoint: Some(config.cache.s3_endpoint.clone()),
         region: config
@@ -77,7 +103,22 @@ pub async fn run(
     for_query: Option<String>,
     ports_file: Option<std::path::PathBuf>,
 ) -> Result<(), String> {
+    // Bind before catalog preparation so the parent can connect while this
+    // ephemeral worker loads Iceberg metadata. The accepted request remains
+    // queued by the listener until Axum starts serving below.
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.listen.admin_port))
+        .await
+        .map_err(|e| format!("cannot bind admin port {}: {e}", config.listen.admin_port))?;
+    let bound_addr = listener
+        .local_addr()
+        .map_err(|e| format!("cannot read bound admin address: {e}"))?;
+    tracing::info!(port = bound_addr.port(), "query worker listener bound");
+    if let Some(path) = &ports_file {
+        report_port(path, "admin", bound_addr);
+    }
+
     let connection = connection_for(config)?;
+    let generation_bearer = connection.token.clone();
     let catalog = catalog::open_catalog(&connection)
         .await
         .map_err(|e| format!("cannot open catalog: {e}"))?;
@@ -107,6 +148,7 @@ pub async fn run(
     let prepared_catalog = admin::PreparedQueryCatalog::open(
         catalog.clone(),
         Some(&config.metadata.uri),
+        generation_bearer,
         config.memory.limit_bytes,
         config.memory.spill_path.clone(),
     )
@@ -122,16 +164,7 @@ pub async fn run(
     };
 
     let app = admin::router(state.clone());
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.listen.admin_port))
-        .await
-        .map_err(|e| format!("cannot bind admin port {}: {e}", config.listen.admin_port))?;
-    let bound_addr = listener
-        .local_addr()
-        .map_err(|e| format!("cannot read bound admin address: {e}"))?;
     tracing::info!(port = bound_addr.port(), "serving");
-    if let Some(path) = &ports_file {
-        report_port(path, "admin", bound_addr);
-    }
 
     let idle_watch = tokio::spawn(idle_shutdown_watch(last_activity));
 
@@ -227,5 +260,96 @@ pub fn time_travel_from_flags(
     match (table, reference) {
         (Some(table), Some(reference)) => Some(TimeTravel { table, reference }),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use axum::Json;
+    use axum::extract::State;
+    use axum::http::{HeaderMap, StatusCode, Uri, header};
+    use axum::routing::get;
+    use serde_json::json;
+
+    /// Returns a minimal token-free role configuration for connection tests.
+    fn config(metadata_uri: &str) -> QueryConfig {
+        QueryConfig::from_toml_str(&format!(
+            "[cache]\ns3_endpoint = \"http://127.0.0.1:8333\"\n\n\
+             [metadata]\nuri = \"{metadata_uri}\"\n"
+        ))
+        .expect("query config")
+    }
+
+    /// The inherited run bearer becomes catalog client authority without entering role config.
+    #[test]
+    fn scoped_bearer_is_applied_only_to_the_connection() {
+        let config = config("http://127.0.0.1:8334/v1/databases/analytics/catalog");
+        let serialized = toml::to_string(&config).expect("serialize config");
+        let token = "scoped-token-that-must-not-persist";
+
+        let connection =
+            connection_for_bearer(&config, token.to_owned()).expect("scoped connection");
+
+        assert_eq!(connection.token.as_deref(), Some(token));
+        assert!(!serialized.contains(token));
+        assert!(!config.summary().contains(token));
+    }
+
+    /// A real REST-catalog bootstrap carries the inherited bearer to the protected gateway.
+    #[tokio::test]
+    async fn scoped_bearer_authorizes_catalog_bootstrap() {
+        let authorized = Arc::new(AtomicBool::new(false));
+        let authorized_handler =
+            |State(authorized): State<Arc<AtomicBool>>, headers: HeaderMap, uri: Uri| async move {
+                if headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    != Some("Bearer scoped-query-token")
+                {
+                    return (StatusCode::UNAUTHORIZED, Json(json!({})));
+                }
+                authorized.store(true, Ordering::SeqCst);
+                let body = if uri.path().ends_with("/config") {
+                    json!({"defaults": {}, "overrides": {}})
+                } else {
+                    json!({"namespaces": []})
+                };
+                (StatusCode::OK, Json(body))
+            };
+        let app = axum::Router::new()
+            .route(
+                "/v1/databases/analytics/catalog/v1/config",
+                get(authorized_handler),
+            )
+            .route(
+                "/v1/databases/analytics/catalog/v1/namespaces",
+                get(authorized_handler),
+            )
+            .with_state(authorized.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind catalog fixture");
+        let address = listener.local_addr().expect("catalog address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve catalog fixture");
+        });
+        let config = config(&format!("http://{address}/v1/databases/analytics/catalog"));
+        let connection = connection_for_bearer(&config, "scoped-query-token".to_owned())
+            .expect("scoped connection");
+
+        let catalog = verglas_iceberg::catalog::open_catalog(&connection)
+            .await
+            .expect("authorized catalog bootstrap");
+        catalog
+            .list_namespaces(None)
+            .await
+            .expect("authorized namespace discovery");
+
+        assert!(authorized.load(Ordering::SeqCst));
     }
 }

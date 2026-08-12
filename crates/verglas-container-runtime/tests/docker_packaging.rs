@@ -60,14 +60,18 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert_eq!(
         services,
         [
-            "verglas-secret-key-init:",
             "verglas-server:",
             "verglas-access:",
             "verglas-scheduler:",
-            "verglas-workers-postgres:",
-            "verglas-postgres-init:",
+            "verglas-neon-bootstrap:",
+            "verglas-queue-image:",
             "verglas-openfga-migrate:",
             "verglas-openfga:",
+            "verglas-lakekeeper-migrate:",
+            "verglas-lakekeeper:",
+            "verglas-cache-node-0:",
+            "verglas-cache-node-1:",
+            "verglas-cache-node-2:",
             "verglas-container-runtime:",
             "verglas-agent-runtime:",
             "verglas-os:",
@@ -76,7 +80,17 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(!compose.contains("profiles:"));
     assert_eq!(compose.matches("/var/run/docker.sock").count(), 2);
     assert!(compose.contains("verglas-runtime-state:/var/lib/verglas-container-runtime"));
+    assert!(compose.contains("verglas-access-neon-credentials:/var/run/verglas/neon:ro"));
+    assert!(compose.contains(
+        "VERGLAS_MANAGED_POSTGRES_TLS_CERTIFICATE_FILE: /var/lib/verglas-container-runtime/postgres-proxy/tls.crt"
+    ));
     assert!(compose.contains("name: verglas-runtime"));
+    assert!(
+        compose.contains("x-runtime-networks: &runtime-networks")
+            && compose.contains("runtime:\n    name: verglas-runtime")
+            && compose.matches("networks: *runtime-networks").count() >= 12,
+        "control-plane and cache services must join the explicit runtime network"
+    );
     assert!(
         compose.contains("VERGLAS_CONTAINER_RUNTIME_URL: http://verglas-container-runtime:8360")
     );
@@ -84,5 +98,6 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(compose.contains("target: verglas-os"));
     assert!(compose.contains("target: verglas-agent-runtime"));
     assert!(compose.contains("VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390"));
+    assert!(compose.contains("VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454"));
     assert!(compose.contains("127.0.0.1:8787:8787"));
 }

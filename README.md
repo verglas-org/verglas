@@ -43,29 +43,44 @@ repository test tooling).
 
 ### Self-host (Docker)
 
-The Docker application boots without a process-global object store or catalog.
-Provider credentials and database bindings are created through the access API,
-so adding a database never requires editing Compose or restarting the cache.
+The Docker application is configured entirely by Compose environment values.
+Export your R2 bucket and S3 credentials. Generate the tenant encryption,
+token-signing, and identity-assertion keys once, retain them with the
+deployment's secrets, and name the email address that becomes the initial
+tenant owner. This one-time bootstrap creates an ordinary owner principal; it
+does not create an administrative bearer-token bypass.
 
 ```sh
+export VERGLAS_SECRET_ENCRYPTION_KEY="$(openssl rand -hex 32)"
+export VERGLAS_TOKEN_SIGNING_KEY="$(openssl rand -base64 32)"
+export VERGLAS_TARGET_JWT_SIGNING_KEY="$(openssl rand -base64 32)"
+export VERGLAS_IDENTITY_ASSERTION_KEY="$(openssl rand -hex 32)"
+export VERGLAS_INITIAL_OWNER_EMAIL=you@example.com
 docker compose up -d --build
 ```
 
-Point the CLI at the container's API:
+Open Verglas OS at `http://127.0.0.1:8787`, create or sign in to the account
+whose email matches the initial owner, and create a scoped access token in
+**Profile → Access tokens**. The token is shown once. Store it in your local
+credential file, then point the CLI at the container's APIs:
 
 ```sh
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
 export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
-export VERGLAS_TOKEN=verglas-local-access
+export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
 verglas status
 ```
 
-Verglas OS is available at `http://127.0.0.1:8787`. It is a community and
-development application in the Compose stack, not a dependency of the
-`verglas` server or CLI binaries and not a new CLI command.
+The CLI can later mint a narrower replacement with `verglas token create`; it
+writes the resulting token to its owner-only local credentials file.
 
-The [self-hosted guide](docs/get-started/self-host.mdx) covers bringing up the
-stack and adding managed or customer-owned database resources.
+Verglas OS is a community and development application in the Compose stack,
+not a dependency of the `verglas` server or CLI binaries and not a new CLI
+command.
+
+The [self-hosted guide](docs/get-started/self-host.mdx) covers R2 and Data
+Catalog setup, every required environment variable, the complete Compose file,
+and creating the first table.
 
 ### Prometheus metrics
 
@@ -111,28 +126,25 @@ Database creation resolves the most-specific authorized secret scope once and
 stores its stable resource ID. Rotating that secret updates the same resource;
 creating a later overlapping secret cannot silently rebind the database.
 
-## Iceberg tables and catalog watchers
+## Iceberg tables: managed Lakekeeper catalogs
 
-Verglas works as a plain cache with no catalog. Point it at your Iceberg REST
-catalog and it also watches for table commits, so it can pre-warm table metadata
-and hot data and carry cache heat across compaction automatically — planning
-reads hit warm statistics, and a rewrite does not force queries to re-earn the
-cache from the origin.
-
-Each lakehouse database owns its catalog binding. Managed databases use the
-tenant Lakekeeper deployment; external databases resolve an authorized
-`iceberg-rest` secret. The corresponding watcher is attached to that database,
-not to process-global environment variables.
+The Docker application starts one tenant Lakekeeper service. Each managed
+Lakehouse database receives its own warehouse and object prefix; Verglas routes
+catalog requests by database name instead of keeping a process-global catalog.
+Customer-operated catalogs are explicit database bindings with scoped secrets,
+not server-wide environment values.
 
 ## Workers and containers
 
-Compose bootstraps `verglas-server`, the local container runtime, the durable
-worker scheduler and its Postgres queue, and Verglas OS. The runtime manager
+Compose bootstraps `verglas-server`, Lakekeeper, the three-member cache and WAL
+ring, the local container runtime, the durable worker scheduler and its Postgres
+queue, and Verglas OS. The runtime manager
 owns dynamically added Vessels, database components, external brokers, and
 other optional applications. A portable worker contains its bounded command,
 bundled files, target table, and cron, HTTP, or CloudEvent triggers.
 
 ```sh
+export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d --build
 verglas workers create \
   --file examples/workers/market-data-ingest/worker.toml

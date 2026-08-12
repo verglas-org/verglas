@@ -64,17 +64,21 @@ impl<W: ObjectWrite> ObjectWrite for WritebackWriter<W> {
             .await
     }
 
-    /// Delegates DELETE to the origin.
+    /// Orders DELETE after any earlier quorum-acked PUT for the same key.
     async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
-        self.origin.delete(key).await
+        self.coordinator.delete(key).await
     }
 
-    /// Delegates batch DELETE to the origin.
+    /// Applies the same per-key ordering to every batch DELETE member.
     async fn delete_batch(
         &self,
         keys: &[CacheKey],
     ) -> Result<Vec<Result<(), WriteError>>, WriteError> {
-        self.origin.delete_batch(keys).await
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.coordinator.delete(key).await);
+        }
+        Ok(results)
     }
 
     /// Delegates CopyObject to the origin.

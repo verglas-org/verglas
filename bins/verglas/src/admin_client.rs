@@ -6,6 +6,7 @@
 //! live here.
 
 use reqwest::StatusCode;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
 use thiserror::Error;
 use verglas_core::admin::{DRAIN_PATH, DrainAck, DrainRequest, VERSION_PATH, VersionInfo};
 
@@ -14,6 +15,7 @@ use verglas_core::admin::{DRAIN_PATH, DrainAck, DrainRequest, VERSION_PATH, Vers
 pub struct AdminClient {
     base_url: reqwest::Url,
     http: reqwest::Client,
+    bearer: Option<HeaderValue>,
 }
 
 /// Errors surfaced while calling the admin API.
@@ -45,12 +47,22 @@ pub enum AdminClientError {
 
 impl AdminClient {
     /// Builds a client targeting `endpoint`.
-    pub fn new(endpoint: &str) -> Result<Self, AdminClientError> {
+    pub fn new(endpoint: &str, token: Option<&str>) -> Result<Self, AdminClientError> {
         let base_url = reqwest::Url::parse(endpoint)
             .map_err(|error| AdminClientError::InvalidEndpoint(error.to_string()))?;
         let http = reqwest::Client::new();
 
-        Ok(Self { base_url, http })
+        let bearer = token
+            .map(|token| HeaderValue::from_str(&format!("Bearer {token}")))
+            .transpose()
+            .map_err(|error| {
+                AdminClientError::InvalidEndpoint(format!("invalid bearer token: {error}"))
+            })?;
+        Ok(Self {
+            base_url,
+            http,
+            bearer,
+        })
     }
 
     /// Fetches server version metadata from `GET /admin/version`.
@@ -81,8 +93,7 @@ impl AdminClient {
             ))
         })?;
         let response = self
-            .http
-            .post(url)
+            .authorize(self.http.post(url))
             .json(body)
             .send()
             .await
@@ -111,8 +122,7 @@ impl AdminClient {
             ))
         })?;
         let response = self
-            .http
-            .get(url)
+            .authorize(self.http.get(url))
             .send()
             .await
             .map_err(AdminClientError::RequestFailed)?;
@@ -126,5 +136,13 @@ impl AdminClient {
             .json::<T>()
             .await
             .map_err(|source| AdminClientError::DecodeFailed { path, source })
+    }
+
+    /// Adds the configured bearer token to an administrative request.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match &self.bearer {
+            Some(token) => request.header(AUTHORIZATION, token.clone()),
+            None => request,
+        }
     }
 }

@@ -9,12 +9,15 @@ use serde_json::Value;
 use crate::cli::{VesselAddArgs, VesselCommand};
 
 const RUNTIME_URL_ENV: &str = "VERGLAS_CONTAINER_RUNTIME_URL";
-const RUNTIME_TOKEN_ENV: &str = "VERGLAS_CONTAINER_RUNTIME_TOKEN";
 const DEFAULT_RUNTIME_URL: &str = "http://127.0.0.1:8360";
 
 /// Executes one local Vessel command.
-pub async fn run(command: VesselCommand, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let client = RuntimeClient::from_environment()?;
+pub async fn run(
+    command: VesselCommand,
+    token: Option<&str>,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = RuntimeClient::from_environment(token)?;
     match command {
         VesselCommand::Add(args) => add(&client, &args, json).await,
         VesselCommand::List => {
@@ -147,12 +150,14 @@ struct RuntimeClient {
 }
 
 impl RuntimeClient {
-    /// Builds a client from the dedicated runtime endpoint and bearer token.
-    fn from_environment() -> Result<Self, Box<dyn std::error::Error>> {
+    /// Builds a client from the runtime endpoint and the CLI's scoped bearer token.
+    fn from_environment(token: Option<&str>) -> Result<Self, Box<dyn std::error::Error>> {
         let endpoint =
             std::env::var(RUNTIME_URL_ENV).unwrap_or_else(|_| DEFAULT_RUNTIME_URL.to_owned());
-        let token = std::env::var(RUNTIME_TOKEN_ENV)
-            .map_err(|_| format!("{RUNTIME_TOKEN_ENV} is required for Vessel operations"))?;
+        let token = token
+            .filter(|token| !token.trim().is_empty())
+            .ok_or("a scoped bearer credential is required for Vessel operations")?
+            .to_owned();
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_owned(),
             token,

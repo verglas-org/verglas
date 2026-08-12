@@ -65,7 +65,6 @@ async fn kv_handle_is_a_thin_raw_byte_client() {
     let client = Client::connect(
         ConnectOptions::new(endpoint.clone())
             .with_query_uri(endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("scoped"),
     )
@@ -103,8 +102,7 @@ async fn kv_handle_is_a_thin_raw_byte_client() {
     assert_eq!(page.next_cursor.as_deref(), Some("opaque"));
 }
 
-/// A client authenticates once, discovers the real catalog plus the server's S3
-/// cache endpoint, and keeps the two data-plane destinations separate.
+/// A client authenticates once and discovers the query and S3 cache endpoints.
 #[tokio::test]
 async fn connect_separates_catalog_from_server_cache() {
     let query_uri = "http://127.0.0.1:8334";
@@ -136,7 +134,6 @@ async fn connect_separates_catalog_from_server_cache() {
     let client = Client::connect(ConnectOptions::new(endpoint).with_token("scoped-access-token"))
         .await
         .expect("connect client");
-    assert_eq!(client.catalog_uri(), "https://catalog.example.test");
     assert_eq!(client.query_uri(), query_uri);
     assert_eq!(client.s3_endpoint(), Some("http://127.0.0.1:8333"));
 }
@@ -147,14 +144,12 @@ async fn container_environment_shape_connects_without_admin_service() {
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
             .with_query_uri("http://verglas:8334")
-            .with_catalog_uri("https://catalog.example.test")
-            .with_warehouse("s3://warehouse/tenant")
             .with_s3_endpoint("http://verglas:8333")
             .with_token("catalog-token"),
     )
     .await
     .expect("connect without admin service");
-    assert_eq!(client.catalog_uri(), "https://catalog.example.test");
+    assert_eq!(client.query_uri(), "http://verglas:8334");
     assert_eq!(client.s3_endpoint(), Some("http://verglas:8333"));
 }
 
@@ -169,8 +164,8 @@ struct Captured {
 async fn query_and_append_use_server_execution_roles() {
     let captured = Captured::default();
     let app = Router::new()
-        .route("/v1/write/{name}", post(write_arrow))
-        .route("/v1/query", post(query_arrow))
+        .route("/v1/databases/analytics/write/{name}", post(write_arrow))
+        .route("/v1/databases/analytics/query", post(query_arrow))
         .with_state(captured.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -181,7 +176,6 @@ async fn query_and_append_use_server_execution_roles() {
     let client = Client::connect(
         ConnectOptions::new(endpoint.clone())
             .with_query_uri(endpoint)
-            .with_catalog_uri("http://127.0.0.1:1")
             .with_s3_endpoint("http://127.0.0.1:8333")
             .with_token("sdk-token"),
     )
@@ -191,7 +185,8 @@ async fn query_and_append_use_server_execution_roles() {
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
         .expect("batch");
-    let append = client
+    let database = client.database("analytics").expect("database handle");
+    let append = database
         .append_stream(
             "sdk.events",
             stream::iter(vec![Ok::<_, ClientError>(batch.clone())]),
@@ -201,7 +196,7 @@ async fn query_and_append_use_server_execution_roles() {
         .expect("append");
     assert_eq!(append.rows_committed, 2);
 
-    let mut query = client
+    let mut query = database
         .query_stream("select id from sdk.events")
         .await
         .expect("query");
@@ -211,6 +206,32 @@ async fn query_and_append_use_server_execution_roles() {
         captured.paths.lock().expect("paths").as_slice(),
         ["write:sdk.events", "query"]
     );
+}
+
+/// Query routing refuses names that cannot identify a registered database.
+#[tokio::test]
+async fn database_handle_rejects_invalid_names() {
+    let client = Client::connect(
+        ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://127.0.0.1:1")
+            .with_s3_endpoint("http://127.0.0.1:8333"),
+    )
+    .await
+    .expect("client");
+
+    for database in [
+        "",
+        "9analytics",
+        "-analytics",
+        "analytics/team",
+        "analytics.db",
+    ] {
+        let result = client.database(database);
+        assert!(
+            matches!(result, Err(ClientError::Configuration(message)) if message.contains("database name")),
+            "{database:?} must be rejected"
+        );
+    }
 }
 
 #[derive(Clone, Default)]
@@ -223,23 +244,31 @@ struct CatalogState {
 async fn ensure_table_uses_catalog_rest_without_server_table_routes() {
     let state = CatalogState::default();
     let app = Router::new()
-        .route("/v1/config", get(|| async { Json(json!({})) }))
         .route(
-            "/v1/namespaces",
+            "/v1/databases/analytics/catalog/v1/config",
+            get(|| async { Json(json!({})) }),
+        )
+        .route(
+            "/v1/databases/analytics/catalog/v1/namespaces",
             post(|| async { (axum::http::StatusCode::OK, Json(json!({}))) }),
         )
-        .route("/v1/namespaces/sdk/tables/events", get(load_catalog_table))
-        .route("/v1/namespaces/sdk/tables", post(create_catalog_table))
+        .route(
+            "/v1/databases/analytics/catalog/v1/namespaces/sdk/tables/events",
+            get(load_catalog_table),
+        )
+        .route(
+            "/v1/databases/analytics/catalog/v1/namespaces/sdk/tables",
+            post(create_catalog_table),
+        )
         .with_state(state.clone());
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind catalog");
-    let catalog_uri = format!("http://{}", listener.local_addr().expect("catalog address"));
+    let endpoint = format!("http://{}", listener.local_addr().expect("catalog address"));
     tokio::spawn(async move { axum::serve(listener, app).await.expect("catalog server") });
     let client = Client::connect(
         ConnectOptions::new("http://127.0.0.1:1")
-            .with_query_uri("http://127.0.0.1:1")
-            .with_catalog_uri(catalog_uri)
+            .with_query_uri(endpoint)
             .with_s3_endpoint("http://127.0.0.1:8333"),
     )
     .await
@@ -248,8 +277,9 @@ async fn ensure_table_uses_catalog_rest_without_server_table_routes() {
         schema: vec![verglas_sdk::ColumnSpec::required("id", "int64")],
         partitions: vec![verglas_sdk::PartitionSpec::identity("id")],
     };
+    let database = client.database("analytics").expect("database handle");
     assert_eq!(
-        client
+        database
             .ensure_table("sdk.events", &definition)
             .await
             .expect("create"),
@@ -257,7 +287,7 @@ async fn ensure_table_uses_catalog_rest_without_server_table_routes() {
     );
     assert!(state.created.load(Ordering::SeqCst));
     assert_eq!(
-        client
+        database
             .ensure_table("sdk.events", &definition)
             .await
             .expect("existing"),

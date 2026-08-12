@@ -1,22 +1,39 @@
 import { DurableObject, RpcStub, RpcTarget } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
 import type {
-  AnthropicMessagesCompat, Api, AssistantMessageEventStream, Context, Model, ModelCost,
-  OpenAICompletionsCompat, ProviderHeaders, SimpleStreamOptions, StreamFunction,
+  AnthropicMessagesCompat,
+  Api,
+  AssistantMessageEventStream,
+  Context,
+  Model,
+  ModelCost,
+  OpenAICompletionsCompat,
+  ProviderHeaders,
+  SimpleStreamOptions,
+  StreamFunction,
 } from "@earendil-works/pi-ai";
 import { stream as anthropicMessagesStream } from "@earendil-works/pi-ai/api/anthropic-messages";
 import { stream as googleGenerativeAiStream } from "@earendil-works/pi-ai/api/google-generative-ai";
 import { stream as openaiCompletionsStream } from "@earendil-works/pi-ai/api/openai-completions";
 import { stream as openaiResponsesStream } from "@earendil-works/pi-ai/api/openai-responses";
+import { stream as piMessagesStream } from "@earendil-works/pi-ai/api/pi-messages";
 import { ANTHROPIC_MODELS } from "@earendil-works/pi-ai/providers/anthropic.models";
 import { CLOUDFLARE_WORKERS_AI_MODELS } from "@earendil-works/pi-ai/providers/cloudflare-workers-ai.models";
 import { GOOGLE_MODELS } from "@earendil-works/pi-ai/providers/google.models";
 import { OPENAI_MODELS } from "@earendil-works/pi-ai/providers/openai.models";
-import { ApprovalQueue, Gatekeeper, ResourceDescription } from '@verglas/workshop-shared/gatekeeper';
+import {
+  ApprovalQueue,
+  Gatekeeper,
+  ResourceDescription,
+} from "@verglas/workshop-shared/gatekeeper";
 import { LanguageModelBinding } from "./ai-model-binding";
 import AI_MODEL_BINDING_TYPES from "./ai-model-binding.txt";
-import { AiChatAuthorInfo, AiModelConfig, SUGGESTED_MODELS, WORKERS_AI_OUTPUT_LIMIT }
-  from "@verglas/workshop-shared/api";
+import {
+  AiChatAuthorInfo,
+  AiModelConfig,
+  SUGGESTED_MODELS,
+  WORKERS_AI_OUTPUT_LIMIT,
+} from "@verglas/workshop-shared/api";
 import { completeText } from "./ai-invoke.js";
 import { bridgePdfAttachments } from "./chat-attachment-pdf.js";
 
@@ -56,8 +73,11 @@ export type ModelHandle = {
   // Streams a response. Merges the handle's routing/auth and per-API options into whatever
   // per-call options the caller (e.g. the agent loop) passes. Assignable to pi-agent-core's
   // StreamFn (the extra ModelStreamOptions knobs are optional).
-  stream: (model: Model<Api>, context: Context, options?: ModelStreamOptions)
-      => AssistantMessageEventStream;
+  stream: (
+    model: Model<Api>,
+    context: Context,
+    options?: ModelStreamOptions,
+  ) => AssistantMessageEventStream;
 
   // Status of the most recent HTTP response observed by `stream`. Reset at
   // the start of every request and set from pi's onResponse callback (which fires only once a
@@ -70,44 +90,83 @@ export type ModelHandle = {
 // The pi API implementations we route through, keyed by `Model.api`. Import per-module (never
 // `providers/all`, which drags ~30 providers into the bundle).
 const API_STREAMS: Record<string, StreamFunction<Api, SimpleStreamOptions>> = {
-  "anthropic-messages": anthropicMessagesStream as StreamFunction<Api, SimpleStreamOptions>,
-  "openai-responses": openaiResponsesStream as StreamFunction<Api, SimpleStreamOptions>,
-  "openai-completions": openaiCompletionsStream as StreamFunction<Api, SimpleStreamOptions>,
-  "google-generative-ai": googleGenerativeAiStream as StreamFunction<Api, SimpleStreamOptions>,
+  "anthropic-messages": anthropicMessagesStream as StreamFunction<
+    Api,
+    SimpleStreamOptions
+  >,
+  "openai-responses": openaiResponsesStream as StreamFunction<
+    Api,
+    SimpleStreamOptions
+  >,
+  "openai-completions": openaiCompletionsStream as StreamFunction<
+    Api,
+    SimpleStreamOptions
+  >,
+  "google-generative-ai": googleGenerativeAiStream as StreamFunction<
+    Api,
+    SimpleStreamOptions
+  >,
+  "pi-messages": piMessagesStream as StreamFunction<Api, SimpleStreamOptions>,
 };
 
-const ZERO_COST: ModelCost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+const ZERO_COST: ModelCost = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+};
 
 // Consult pi's builtin catalog for cost/compat metadata of a known model id. Unknown models are
 // fine (synthesized with zero cost). Import per-provider, not providers/all.
-function catalogModel(provider: AiModelConfig["provider"], modelId: string): Model<Api> | undefined {
+function catalogModel(
+  provider: AiModelConfig["provider"],
+  modelId: string,
+): Model<Api> | undefined {
   switch (provider) {
-    case "anthropic": return (ANTHROPIC_MODELS as Record<string, Model<Api>>)[modelId];
-    case "openai": return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
-    case "google": return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
-    case "cloudflare": return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[modelId];
-    case "ollama": case "local-runtime": return undefined;
-    default: return undefined;
+    case "anthropic":
+      return (ANTHROPIC_MODELS as Record<string, Model<Api>>)[modelId];
+    case "openai":
+      return (OPENAI_MODELS as Record<string, Model<Api>>)[modelId];
+    case "google":
+      return (GOOGLE_MODELS as Record<string, Model<Api>>)[modelId];
+    case "cloudflare":
+      return (CLOUDFLARE_WORKERS_AI_MODELS as Record<string, Model<Api>>)[
+        modelId
+      ];
+    case "ollama":
+    case "local-runtime":
+      return undefined;
+    default:
+      return undefined;
   }
 }
 
 // Token limits for a synthesized model. SUGGESTED_MODELS remains authoritative (compaction
 // budgets in agent-compaction.ts are computed from it and must not change); pi's catalog fills
 // gaps for models we don't list, and unknown models get conservative defaults.
-function modelTokenWindow(config: AiModelConfig, catalog: Model<Api> | undefined)
-    : { contextWindow: number, maxTokens: number } {
+function modelTokenWindow(
+  config: AiModelConfig,
+  catalog: Model<Api> | undefined,
+): { contextWindow: number; maxTokens: number } {
   const suggested = SUGGESTED_MODELS[config.provider]?.[config.model];
   return {
-    contextWindow: suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
-    maxTokens: suggested?.outputLimit ??
-        (config.provider === "cloudflare" ? WORKERS_AI_OUTPUT_LIMIT : undefined) ??
-        catalog?.maxTokens ?? 4096,
+    contextWindow:
+      suggested?.contextWindow ?? catalog?.contextWindow ?? 128_000,
+    maxTokens:
+      suggested?.outputLimit ??
+      (config.provider === "cloudflare"
+        ? WORKERS_AI_OUTPUT_LIMIT
+        : undefined) ??
+      catalog?.maxTokens ??
+      4096,
   };
 }
 
 // Compat flags for a Workers AI model reached over its OpenAI-compatible REST endpoint. Matches
 // pi's own generated Workers AI catalog entries.
-function workersAiCompat(catalog: Model<Api> | undefined): OpenAICompletionsCompat {
+function workersAiCompat(
+  catalog: Model<Api> | undefined,
+): OpenAICompletionsCompat {
   return {
     supportsStore: false,
     supportsDeveloperRole: false,
@@ -142,11 +201,16 @@ function makeHandle(args: HandleArgs): ModelHandle {
   //   content, which -- with pi's unconditional `store: false` -- preserves the old stateless
   //   ZDR behavior with reasoning carried between tool steps.
   // - Everything else: provider defaults.
-  const anthropicCompat = args.model.compat as AnthropicMessagesCompat | undefined;
+  const anthropicCompat = args.model.compat as
+    AnthropicMessagesCompat | undefined;
   const apiExtras: Record<string, unknown> =
-      args.model.api === "anthropic-messages"
-          ? (anthropicCompat?.forceAdaptiveThinking === true ? { thinkingEnabled: true } : {}) :
-      args.model.api === "openai-responses" ? { reasoningEffort: "medium" } : {};
+    args.model.api === "anthropic-messages"
+      ? anthropicCompat?.forceAdaptiveThinking === true
+        ? { thinkingEnabled: true }
+        : {}
+      : args.model.api === "openai-responses"
+        ? { reasoningEffort: "medium" }
+        : {};
 
   const handle: ModelHandle = {
     model: args.model,
@@ -164,8 +228,10 @@ function makeHandle(args: HandleArgs): ModelHandle {
         // off, e.g. claude-fable-5); for OpenAI Responses, passing no reasoningEffort makes pi
         // disable reasoning.
         ...(thinking
-            ? apiExtras
-            : args.model.api === "anthropic-messages" ? { thinkingEnabled: false } : {}),
+          ? apiExtras
+          : args.model.api === "anthropic-messages"
+            ? { thinkingEnabled: false }
+            : {}),
         ...options,
         ...(args.apiKey !== undefined ? { apiKey: args.apiKey } : {}),
         ...(Object.keys(headers).length > 0 ? { headers } : {}),
@@ -181,7 +247,10 @@ function makeHandle(args: HandleArgs): ModelHandle {
         // document blocks (no-op for payloads without one; see chat-attachment-pdf.ts).
         onPayload: async (payload, payloadModel) => {
           const replaced = await options.onPayload?.(payload, payloadModel);
-          return bridgePdfAttachments(args.model.api, replaced ?? payload) ?? replaced;
+          return (
+            bridgePdfAttachments(args.model.api, replaced ?? payload) ??
+            replaced
+          );
         },
       };
       return streamFn(model, context, merged);
@@ -191,15 +260,22 @@ function makeHandle(args: HandleArgs): ModelHandle {
 }
 
 /** Resolve a model using its saved provider credential or the deployment-owned native runtime. */
-export function getModel(env: Cloudflare.Env, config: AiModelConfig,
-                         _initiator: AiChatAuthorInfo,
-                         options: ModelRoutingOptions = {}): ModelHandle {
-  return getModelDirect(env, config, options.sessionAffinity);
+export function getModel(
+  env: Cloudflare.Env,
+  config: AiModelConfig,
+  initiator: AiChatAuthorInfo,
+  options: ModelRoutingOptions = {},
+): ModelHandle {
+  return getModelDirect(env, config, initiator, options.sessionAffinity);
 }
 
 // Direct provider access using the credentials in the model config itself.
 function getModelDirect(
-    env: Cloudflare.Env, config: AiModelConfig, sessionAffinity?: string): ModelHandle {
+  env: Cloudflare.Env,
+  config: AiModelConfig,
+  initiator: AiChatAuthorInfo,
+  sessionAffinity?: string,
+): ModelHandle {
   const catalog = catalogModel(config.provider, config.model);
   const window = modelTokenWindow(config, catalog);
   switch (config.provider) {
@@ -228,8 +304,9 @@ function getModelDirect(
       // model config. (The REST endpoint is account-scoped, hence the extra accountId field.)
       if (!config.accountId || !config.apiToken) {
         throw new Error(
-            "This Workers AI model has no Cloudflare credentials. Re-add it with your " +
-            "Cloudflare account ID and an API token that permits Workers AI.");
+          "This Workers AI model has no Cloudflare credentials. Re-add it with your " +
+            "Cloudflare account ID and an API token that permits Workers AI.",
+        );
       }
       return makeHandle({
         model: {
@@ -255,7 +332,8 @@ function getModelDirect(
           name: catalog?.name ?? config.model,
           api: "google-generative-ai",
           provider: "google",
-          baseUrl: config.apiUrl ?? "https://generativelanguage.googleapis.com/v1beta",
+          baseUrl:
+            config.apiUrl ?? "https://generativelanguage.googleapis.com/v1beta",
           reasoning: catalog?.reasoning ?? true,
           input: catalog?.input ?? ["text", "image"],
           cost: catalog?.cost ?? ZERO_COST,
@@ -281,31 +359,41 @@ function getModelDirect(
           api: "openai-completions",
           provider: "ollama",
           baseUrl: `${(config.apiUrl ?? "http://localhost:11434")
-              .replace(/\/+$/, "").replace(/\/(api|v1)$/, "")}/v1`,
+            .replace(/\/+$/, "")
+            .replace(/\/(api|v1)$/, "")}/v1`,
           reasoning: true,
           input: ["text", "image"],
           cost: ZERO_COST,
           ...window,
         },
         ...(config.apiToken === ""
-            ? { apiKey: "unused", headers: { Authorization: null } }
-            : { apiKey: config.apiToken }),
+          ? { apiKey: "unused", headers: { Authorization: null } }
+          : { apiKey: config.apiToken }),
         sessionAffinity,
       });
     case "local-runtime": {
       const endpoint = config.apiUrl || env.LOCAL_MODEL_RUNTIME_URL?.trim();
       const token = env.LOCAL_MODEL_RUNTIME_TOKEN?.trim();
       if (!endpoint || !token) {
-        throw new Error("The native model runtime adapter is not configured.");
+        throw new Error("The Pi model runtime is not configured.");
       }
       const baseUrl = endpoint.replace(/\/+$/, "").replace(/\/v1$/, "");
+      const runtime =
+        config.runtime ??
+        (config.model === "claude-code" ? "claude-code" : "codex");
+      const piProvider =
+        runtime === "codex"
+          ? "openai-codex"
+          : runtime === "claude-code"
+            ? "anthropic"
+            : "github-copilot";
       return makeHandle({
         model: {
           id: config.model,
           name: config.model,
-          api: "openai-completions",
-          provider: "local-runtime",
-          baseUrl: `${baseUrl}/v1`,
+          api: "pi-messages",
+          provider: piProvider,
+          baseUrl,
           reasoning: true,
           input: ["text", "image"],
           cost: ZERO_COST,
@@ -313,9 +401,8 @@ function getModelDirect(
         },
         apiKey: token,
         headers: {
-          ...(sessionAffinity ? { "x-runtime-session-key": `workshop:${sessionAffinity}` } : {}),
-          ...(config.runtime ? { "x-model-runtime": config.runtime } : {}),
-          ...(config.apiToken ? { "x-provider-api-key": config.apiToken } : {}),
+          "x-verglas-credential-scope": config.credentialScope ?? initiator.id,
+          "x-model-runtime": runtime,
         },
         sessionAffinity,
       });
@@ -347,15 +434,16 @@ function getModelDirect(
 // =======================================================================================
 
 export type LanguageModelGatekeeperProps = {
-  displayName: string,
-  config: AiModelConfig,
-  initiator: AiChatAuthorInfo,
-  metadata?: GatewayMetadataContext,
+  displayName: string;
+  config: AiModelConfig;
+  initiator: AiChatAuthorInfo;
+  metadata?: GatewayMetadataContext;
 };
 
 export class LanguageModelGatekeeper
-    extends DurableObject<Cloudflare.Env, LanguageModelGatekeeperProps>
-    implements Gatekeeper<LanguageModelBinding> {
+  extends DurableObject<Cloudflare.Env, LanguageModelGatekeeperProps>
+  implements Gatekeeper<LanguageModelBinding>
+{
   async describe(): Promise<ResourceDescription> {
     let modelConfig = this.ctx.props.config;
     let displayName = this.ctx.props.displayName;
@@ -381,22 +469,31 @@ export class LanguageModelGatekeeper
     return [];
   }
 
-  async startSession(approvalQueue: RpcStub<ApprovalQueue>)
-      : Promise<LanguageModelBinding> {
-    let model = getModel(this.env, this.ctx.props.config, this.ctx.props.initiator, {
-      metadata: this.ctx.props.metadata,
-    });
+  async startSession(
+    approvalQueue: RpcStub<ApprovalQueue>,
+  ): Promise<LanguageModelBinding> {
+    let model = getModel(
+      this.env,
+      this.ctx.props.config,
+      this.ctx.props.initiator,
+      {
+        metadata: this.ctx.props.metadata,
+      },
+    );
     return new LanguageModelBindingImpl(model);
   }
 
   applyAction(action: number): Promise<void> {
     throw new Error("This gatekeeper implements no actions.");
   }
-  rejectAction(action: number): Promise<void | {restart?: boolean}> {
+  rejectAction(action: number): Promise<void | { restart?: boolean }> {
     throw new Error("This gatekeeper implements no actions.");
   }
-  revertAction(action: number):
-      Promise<void | {message?: string, canRetry?: boolean, restart?: boolean}> {
+  revertAction(action: number): Promise<void | {
+    message?: string;
+    canRetry?: boolean;
+    restart?: boolean;
+  }> {
     throw new Error("This gatekeeper implements no actions.");
   }
 
@@ -411,12 +508,18 @@ export class LanguageModelGatekeeper
 }
 
 @validateRpc()
-class LanguageModelBindingImpl extends RpcTarget implements LanguageModelBinding {
+class LanguageModelBindingImpl
+  extends RpcTarget
+  implements LanguageModelBinding
+{
   constructor(private model: ModelHandle) {
     super();
   }
 
-  async run(options: {prompt: string, systemPrompt?: string}): Promise<string> {
+  async run(options: {
+    prompt: string;
+    systemPrompt?: string;
+  }): Promise<string> {
     // TODO: Should we be calling authorizeObservation() here? It's not really observing anything,
     //   but you might want the audit logs?
     // TODO: Account LLM costs back to the calling workspace.

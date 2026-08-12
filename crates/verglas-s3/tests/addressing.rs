@@ -90,7 +90,6 @@ async fn serve(domain: Option<&str>) -> (RecordingReader, String) {
         Arc::new(NoopInvalidation),
         None,
         None,
-        None,
         domain,
         None,
     );

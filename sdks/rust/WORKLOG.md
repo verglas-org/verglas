@@ -90,3 +90,22 @@
 - #67: Added first-class `Client::queue`, `Client::graph`, and `Client::table` handles matching the TypeScript SDK surface for queue enqueue/poll/ack, graph lifecycle and traversal, and table vector-index declare/list/search. Queue wire types live in `queue.rs`; graph and vector routes reuse the existing wire modules.
 - #66: Neutralized MemoryGrantHost docs (no Firecracker) and replaced *.verglas.dev catalog fixtures in client_data_plane tests with example.test hostnames.
 - #66: Rewrote unreachable-server and follow-trigger docs for self-hosted servers only (no cloud node / cloud lakehouse contrast).
+- #84: Made `Client::query_stream` require a database name and send Arrow SQL
+  requests only to that database's `/v1/databases/{database}/query` route. The
+  SDK no longer exposes the removed singleton query endpoint.
+
+- #access-tokens: Added typed create, list, and revoke calls for scoped access
+  tokens. The SDK sends the caller's bearer credential to every lifecycle route
+  and returns the plaintext value only from the creation response.
+
+- #database-tokens: Added the typed Postgres connection-token exchange. A
+  caller presents its normal scoped bearer to request a short-lived Neon JWT
+  for one database, which the database proxy accepts as `PGPASSWORD`.
+
+- #97: Added `Client::database` as the required boundary for Rust catalog,
+  query, write, graph, and vector operations. Removed singleton catalog
+  discovery and the dead catalog WebSocket client so every supported data
+  operation names its database in the route.
+- #107: Replaced watermark queue calls with PostgreSQL-backed fenced delivery receipts and routed queue handles through the access endpoint. Enqueue, poll, and ack now speak only the standalone queue-container contract.
+- #20: Added topic-aware queue messages and reconnecting push subscriptions. Database handles now expose one table subscription stream plus fenced acknowledgement, while the SDK owns NDJSON framing and transport reconnection without a polling fallback.
+- #20: Added an opt-in deployment test that proves an acknowledged Iceberg append wakes one durable table subscription and remains queryable afterward.

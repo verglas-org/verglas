@@ -42,9 +42,9 @@ boot. The runtime still owns dynamically added application services; its locally
 `verglas/verglas-container-runtime:local` image also carries `verglas-scheduler` for explicit
 container declarations. A child receives neither the Docker socket nor Docker environment.
 Database declarations consume the separately published
-`ghcr.io/verglas-org/verglas-neon-storage:latest` and
-`ghcr.io/verglas-org/verglas-neon-compute-v16:latest` images. Neon remains multiple declared
-services (broker, pageserver, and compute), not a hidden single Postgres container.
+`ghcr.io/verglas-org/neon-storage` and `ghcr.io/verglas-org/neon-compute-v16` images, pinned to an
+immutable source revision by the access service. Neon remains multiple declared services (broker,
+pageserver, compute, and authenticated proxy), not a hidden single Postgres container.
 
 ## Reflected Integration namespaces
 

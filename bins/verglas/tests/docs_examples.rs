@@ -56,16 +56,24 @@ fn self_hosted_compose_is_complete_and_runnable() {
     for required in [
         "verglas-server:",
         "verglas-container-runtime:",
-        "VERGLAS_ACCESS_SERVICE_TOKEN:",
+        "verglas-lakekeeper:",
+        "verglas-cache-node-0:",
+        "VERGLAS_BACKEND_BUCKET:",
+        "VERGLAS_BACKEND_ENDPOINT:",
+        "VERGLAS_ACCESS_URI:",
+        "VERGLAS_MANAGED_CATALOG_URI:",
+        "VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS:",
+        "VERGLAS_S3_ACCESS_KEY_ID:",
+        "VERGLAS_S3_SECRET_ACCESS_KEY:",
         "VERGLAS_SCHEDULER_URL:",
-        "verglas-cache:/var/lib/verglas",
+        "VERGLAS_CACHE_HOST_DIR:-verglas-cache",
         "nofile:",
         "soft: 8192",
         "hard: 8192",
         "/var/run/docker.sock:/var/run/docker.sock",
         "verglas-runtime-state:/var/lib/verglas-container-runtime",
         "name: verglas-runtime",
-        "io.verglas.managed: \"true\"",
+        "external: true",
         "verglas-cache:",
         "verglas-runtime-state:",
     ] {
@@ -82,16 +90,16 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("rill:"),
         "bootstrap Compose must not directly own rill:"
     );
-    for forbidden in [
-        "R2_",
-        "VERGLAS_BACKEND_",
-        "VERGLAS_CATALOG_",
-        "AWS_ACCESS_KEY_ID",
+    assert!(
+        !compose.contains("pg-ring:"),
+        "cache nodes must not consume a redundant fourth Coolify network"
+    );
+    for peer in [
+        "cache-0=verglas-cache-node-0:8336",
+        "cache-1=verglas-cache-node-1:8336",
+        "cache-2=verglas-cache-node-2:8336",
     ] {
-        assert!(
-            !compose.contains(forbidden),
-            "bootstrap Compose must not contain static provider configuration {forbidden}"
-        );
+        assert!(compose.contains(peer), "cache ring is missing peer {peer}");
     }
 }
 

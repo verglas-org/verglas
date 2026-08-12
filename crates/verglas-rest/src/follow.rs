@@ -208,7 +208,7 @@ impl FollowManager {
 /// A follow worker's target: `Some(Some(path))` tails a file, `Some(None)` wraps
 /// the worker's command, `None` means the worker has no follow trigger.
 fn follow_target(worker: &WorkerRow) -> Option<Option<String>> {
-    parse_triggers(worker)
+    parse_triggers(&worker.name, &worker.triggers)
         .ok()?
         .into_iter()
         .find_map(|t| match t {

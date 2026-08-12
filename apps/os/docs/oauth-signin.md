@@ -6,11 +6,11 @@ sign-in and (when the user later connects it) its capabilities, so there's only 
 provider — no separate "login" vs. "gatekeeper" apps.
 
 It's an optional, **additive** feature: for each allowlisted, auth-capable gatekeeper a "Continue
-with …" button appears **alongside** the normal username/password form. Off by default — with an
-empty allowlist the Workshop behaves as before (username/password, or Cloudflare Access).
+with …" button appears **alongside** the normal email/password form. Off by default — with an
+empty allowlist the Workshop behaves as before (email/password, or Cloudflare Access).
 
 The deployment opts gatekeepers into sign-in via the `AUTH_GATEKEEPERS` allowlist (comma-separated
-vendor ids). Set `DISABLE_PASSWORD_AUTH=true` to hide username/password and offer gatekeeper sign-in
+vendor ids). Set `DISABLE_PASSWORD_AUTH=true` to hide email/password and offer gatekeeper sign-in
 only (ignored unless the allowlist is non-empty, to avoid locking everyone out).
 
 ## Identity: keyed by verified email
@@ -57,7 +57,7 @@ persists the connection.
 PUBLIC_BASE_URL=https://your-host
 AUTH_GATEKEEPERS=cloudflare,google,github   # which gatekeepers may sign users in (order = button order)
 
-# Optional: gatekeeper sign-in only (hide username/password).
+# Optional: gatekeeper sign-in only (hide email/password).
 DISABLE_PASSWORD_AUTH=true
 ```
 

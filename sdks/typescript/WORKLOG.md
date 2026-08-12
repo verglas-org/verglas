@@ -1,5 +1,13 @@
 # Worklog
 
+- feat: Moved worker list/get/register/state/run methods from the data-server admin client to the
+  scheduler control client, matching the scheduler-owned Postgres registry and authenticated
+  execution control plane.
+
+- Database queries now require an explicit database name and use `POST /v1/databases/{database}/query`; the TypeScript SDK and admin control client both validate and URL-encode that scope.
+- #81: Added typed JSON POST and DELETE helpers to the official admin control client so
+  catalog-backed management surfaces can mutate Iceberg namespaces and tables without
+  reimplementing authenticated HTTP transport.
 - #43: Runtime callbacks now receive the connected namespace-aware SDK as both `ctx.verglas` and `this.verglas`; the legacy `ctx.client` property remains the same instance during migration.
 - #91: Updated SDK endpoint documentation to call the local process
   `verglas-server`. Client wire behavior is unchanged.
@@ -12,3 +20,11 @@
 - #66: Rewrote endpoint-run and README host-entry docs for the local worker harness against http://127.0.0.1:8334; kept VERGLAS_CLOUD_EVENT as the CloudEvents env binding.
 - #66: Removed local-vs-cloud endpoint product wording from README and SDK comments; renamed test fixtures `t.verglas.cloud` → `t.example.test` and `cloud.job_runs` → `demo.job_runs`.
 - #75: Added typed clients for worker administration, scheduler secrets and job history, and local Vessel runtime operations. Verglas OS can now use the canonical TypeScript SDK from the monorepo instead of carrying a generated private copy.
+
+- #52: Added typed runtime Vessel stop and resume controls. The SDK calls the runtime manager's persisted lifecycle routes instead of exposing generic Docker operations to product UIs.
+- #84: Added a typed access-service client with create, list, get, and delete methods for dynamic tenant databases. The public database union matches the managed and scoped create declarations and omits internal tenant and secret resource identifiers.
+- #84: Required every SDK SQL query to name its tenant database and routed it through `/v1/databases/{database}/query`. The typed client and control client also pass the optional table time-travel pin without retaining the removed singleton query route.
+- RBAC tokens now use the mandatory control-plane bearer credential. The SDK can mint, list, revoke, and explain scoped child-principal tokens through the access service, and every control connector rejects an empty token instead of silently sending an administrator fallback.
+- Added the one-time direct Postgres database-credential call. It is separately scoped to one database and returns only its bearer value and expiry, so SDK users do not need a reusable tenant database password.
+- #107: Replaced the local watermark queue API with PostgreSQL-backed exclusive leases and fenced receipts. Queue handles use the access endpoint and cannot implicitly create queue storage.
+- #20: Added topic-aware queue messages and an async push subscription generator with reconnect. Queue delivery types now preserve the matching topic and polling callers must select exact topics.

@@ -9,12 +9,28 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 use verglas_api::table::CommitResponse;
-use verglas_write_node::admin::{AppState, BatchCommitter, router};
+use verglas_write_node::admin::{AppState, BatchCommitter, CommitPublisher, router};
 
 #[derive(Default)]
 struct FakeCommitter {
     calls: Mutex<Vec<(String, usize, Option<String>)>>,
     ingests: Mutex<Vec<IngestCall>>,
+}
+
+#[derive(Default)]
+struct FakePublisher {
+    commits: Mutex<Vec<(String, String)>>,
+}
+
+#[async_trait]
+impl CommitPublisher for FakePublisher {
+    async fn publish(&self, table: &str, snapshot_id: &str) -> Result<(), String> {
+        self.commits
+            .lock()
+            .expect("published commits")
+            .push((table.to_owned(), snapshot_id.to_owned()));
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -73,7 +89,10 @@ impl BatchCommitter for FakeCommitter {
 #[tokio::test]
 async fn source_file_ingest_is_dispatched_to_the_writer() {
     let committer = Arc::new(FakeCommitter::default());
-    let app = router(AppState::new(committer.clone()));
+    let app = router(AppState::new(
+        committer.clone(),
+        Arc::new(FakePublisher::default()),
+    ));
     let response = app
         .oneshot(
             Request::post("/v1/ingest/sdk.events?mode=create&format=csv&partition_by=day")
@@ -101,7 +120,8 @@ async fn source_file_ingest_is_dispatched_to_the_writer() {
 #[tokio::test]
 async fn arrow_write_is_decoded_and_committed_once() {
     let committer = Arc::new(FakeCommitter::default());
-    let app = router(AppState::new(committer.clone()));
+    let publisher = Arc::new(FakePublisher::default());
+    let app = router(AppState::new(committer.clone(), publisher.clone()));
     let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
     let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int64Array::from(vec![1, 2]))])
         .expect("batch");
@@ -131,5 +151,13 @@ async fn arrow_write_is_decoded_and_committed_once() {
     assert_eq!(
         committer.calls.lock().expect("calls").as_slice(),
         &[("sdk.events".to_owned(), 2, Some("run-1:0".to_owned()))]
+    );
+    assert_eq!(
+        publisher
+            .commits
+            .lock()
+            .expect("published commits")
+            .as_slice(),
+        &[("sdk.events".to_owned(), "10".to_owned())]
     );
 }

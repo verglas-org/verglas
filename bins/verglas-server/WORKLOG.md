@@ -1,5 +1,11 @@
 # verglasd worklog
 
+- #RBAC: Passed `VERGLAS_INITIAL_OWNER_EMAIL` to the local Verglas OS service.
+  Its development gateway derives the Workshop `ADMINS` binding from this
+  value, so the first UI administrator and tenant-policy owner are the same
+  principal instead of silently falling back to `dev@example.com`. Added Docker
+  packaging coverage for the invariant.
+
 - #43: Wired the optional local container-runtime namespace gateway into the primary admin endpoint through paired URL and bearer-token configuration.
 - #385: Added content-negotiated Arrow IPC query streaming, Arrow IPC table
   commits, and exact table-definition inspection to the daemon data plane. A
@@ -609,9 +615,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #50: Reduced the local Compose bootstrap to the server and trusted Docker
   runtime manager; optional scheduler, database, and analytics services
   are now dynamic managed containers.
-- #74: Wired the prefix-filtered fragment identity callback into the shared peer
-  server. This keeps the full server's fragment RPC surface aligned with the
-  cache-node implementation.
 - chore: Removed deployment-watermark comments from the sys registry wiring. Server no longer exposes /v1/watermark.
 - #66: Removed verglas login product wording from optional control-plane node-report comments and tests; self-host privacy invariant unchanged.
 - #66: Removed cloud lakehouse / fleet product wording from catalog watcher and cache-instance commit-seam comments.
@@ -621,7 +624,25 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #84: Wired the server's built-in managed lakehouse binding explicitly through
   backend construction, S3 routing, table mapping, warming, and lifecycle
   coordination; server integration fixtures now declare the same binding.
-- #84: Removed the Compose-only singleton backend and catalog from environment-mode startup. The server now boots an empty dynamic provider registry while file-configured third-party deployments retain an explicit static binding and startup probe.
-- #84: Removed the fixed development secret-encryption key from Compose. A
-  one-shot initializer now generates it with OS randomness, restricts it to the
-  non-root access service, and persists it in a named volume across restarts.
+- #84: Replaced the OSS environment-mode singleton catalog with an access-service inventory synchronizer and database-scoped Lakekeeper gateway routes. Runtime snapshots refresh atomically and fail closed on unresolved external-catalog bindings.
+- #84: Bound the on-demand query worker to the live database registry and render one metadata config per Lakehouse. The server exposes no singleton SQL route or catalog fallback.
+- #84: Updated the self-hosted packaging contract for scoped authorization:
+  Compose supplies the server's read-only inventory credential file instead of
+  a deployment-wide access token, requires the initial-owner and token-signing
+  configuration needed by the tenant access service, including a separate
+  Ed25519 target-JWT signing seed, and does not inject a static data token into
+  Verglas OS.
+- #81: Wrapped both server data-plane entry points with access-service bearer authorization and removed the S3 access-key-to-KV-tenant bypass. Background database discovery now reloads a scoped service-principal credential from `VERGLAS_ACCESS_TOKEN_FILE`; the deployment-wide access service token is no longer accepted.
+- #81: The on-demand write launcher now renders one database-scoped, bearer-free
+  role config and passes the authorized caller token only through the short-lived
+  child environment. It refuses databases absent from the live Lakehouse registry.
+- #107: Removed all queue directories and queue data-plane routes from `verglas-server`. Queue lifecycle and traffic now terminate at Access and the independently provisioned queue container.
+- #109: Updated Docker application coverage to accept the configurable local cache bind mount while preserving the named-volume default.
+- #109: Updated the process-level KV durability test to provide the mandatory access authority instead of relying on the removed unauthenticated local data-plane path.
+- #84: Updated the self-hosted packaging contract to pin the native multi-platform Verglas Neon images used by managed Postgres. The contract still rejects source-build and unpublished image fallbacks.
+- #109: Declare the Docker API runtime network as an external platform resource so hosting transforms preserve it. Supply Access with its required admin API endpoint in the self-hosted stack.
+- #109: Start Lakekeeper after the Access listener binds instead of waiting for Access readiness. Access deliberately keeps readiness closed until its Lakekeeper-backed database recovery completes, so waiting for health created a startup cycle.
+- #109: Route scheduled worker writes through the authenticated Access database ingress. Sending workers to the cache admin listener allowed empty runs but rejected every run that produced rows.
+- #109: Kept database gateway lookup compatible with the merged immutable database-name contract.
+  The consolidated server now passes the resolved name directly and remains clean under clippy.
+- #20: Required the configured Access edge for isolated write workers so acknowledged Iceberg snapshots publish durable table events before the write response succeeds.

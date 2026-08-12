@@ -62,16 +62,20 @@ impl WriteConfig {
     fn validate(&self) -> Result<(), String> {
         validate_http_url("cache.s3_endpoint", &self.cache.s3_endpoint)?;
         validate_http_url("catalog.uri", &self.catalog.uri)?;
-        for (field, path) in [
-            (
-                "cache.credentials_file",
-                self.cache.credentials_file.as_deref(),
-            ),
-            (
-                "catalog.credentials_file",
-                self.catalog.credentials_file.as_deref(),
-            ),
-        ] {
+        if self.catalog.credentials_file.is_some()
+            || self.catalog.bearer_token.is_some()
+            || self.catalog.sigv4_region.is_some()
+            || self.catalog.sigv4_signing_name.is_some()
+        {
+            return Err(
+                "catalog credentials are inherited only through the ephemeral run environment"
+                    .to_owned(),
+            );
+        }
+        for (field, path) in [(
+            "cache.credentials_file",
+            self.cache.credentials_file.as_deref(),
+        )] {
             if let Some(path) = path
                 && !Path::new(path).is_file()
             {
@@ -92,5 +96,29 @@ fn validate_http_url(field: &str, value: &str) -> Result<(), String> {
         Err(format!(
             "{field} `{value}` must start with http:// or https://"
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WriteConfig;
+
+    /// A persisted role config cannot carry a caller credential.
+    #[test]
+    fn rejects_serialized_catalog_bearer() {
+        let dir = tempfile::tempdir().expect("config dir");
+        let path = dir.path().join("write.toml");
+        std::fs::write(
+            &path,
+            "[cache]\ns3_endpoint = \"http://127.0.0.1:8333\"\n\n\
+             [catalog]\nuri = \"http://127.0.0.1:8334/v1/databases/analytics/catalog\"\n\
+             bearer_token = \"persisted-caller-secret\"\n",
+        )
+        .expect("write config");
+
+        let error = WriteConfig::load(&path).expect_err("persisted bearer must fail");
+
+        assert!(error.contains("inherited only through the ephemeral run environment"));
+        assert!(!error.contains("persisted-caller-secret"));
     }
 }

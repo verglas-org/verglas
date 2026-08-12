@@ -16,6 +16,7 @@
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
+use verglas_core::activity::{ActivityPlane, ActivityTracker};
 
 use crate::blockdev::DeviceRegistry;
 
@@ -91,11 +92,20 @@ const EXPORT_FLAGS: u16 = NBD_FLAG_HAS_FLAGS | NBD_FLAG_SEND_FLUSH | NBD_FLAG_SE
 
 /// Serves NBD connections on `listener` until the process ends. Each connection
 /// is handled on its own task; a handler error tears down only that connection.
-pub async fn serve(listener: TcpListener, registry: DeviceRegistry) -> std::io::Result<()> {
+pub async fn serve(
+    listener: TcpListener,
+    registry: DeviceRegistry,
+    activity: ActivityTracker,
+) -> std::io::Result<()> {
     loop {
         let (socket, peer) = listener.accept().await?;
+        let Ok(activity_guard) = activity.try_begin(ActivityPlane::Nbd) else {
+            drop(socket);
+            continue;
+        };
         let registry = registry.clone();
         tokio::spawn(async move {
+            let _activity_guard = activity_guard;
             // TCP_NODELAY: NBD replies are small and latency-sensitive.
             let _ = socket.set_nodelay(true);
             if let Err(error) = handle_connection(socket, registry).await {
@@ -346,6 +356,25 @@ mod tests {
 
     use super::*;
     use crate::blockdev::DeviceRegistry;
+
+    /// A fenced node closes a newly accepted socket before the NBD handshake
+    /// and does not report it as accepted foreground work.
+    #[tokio::test]
+    async fn admission_fence_rejects_new_nbd_connections() {
+        let (registry, _dir) = ensured_registry("fenced", 4096).await;
+        let activity = ActivityTracker::new();
+        let _generation = activity.fence();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+        let task = tokio::spawn(serve(listener, registry, activity.clone()));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        let error = client.read_u8().await.expect_err("connection closes");
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(activity.snapshot().accepted, 0);
+        assert!(activity.snapshot().idle);
+        task.abort();
+    }
 
     /// A registry over an in-memory object backend, with `device_id` ensured at
     /// `size`. The temp dir is returned so it outlives the test.

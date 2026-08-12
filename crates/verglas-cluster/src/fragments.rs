@@ -237,7 +237,12 @@ impl LocalFragmentStore {
         if existing > 0 {
             self.used.fetch_sub(existing, Ordering::AcqRel);
         }
-        self.reserve(len)?;
+        if let Err(error) = self.reserve(len) {
+            // The old file is still live: a refused larger replacement must
+            // restore its charge before returning.
+            self.used.fetch_add(existing, Ordering::AcqRel);
+            return Err(error);
+        }
         let path = self.fragment_path(&record.key);
         // Persist `payload || CRC32C(payload)` so a later load can detect a
         // bit-flip and treat the fragment as an erasure (#220). The budget is
@@ -246,8 +251,10 @@ impl LocalFragmentStore {
             Ok(()) => Ok(()),
             Err(error) => {
                 // The write failed: undo the reservation so a transient IO error
-                // does not permanently shrink the budget.
+                // does not permanently shrink the budget, then restore the
+                // charge for the old file that the atomic rename preserved.
                 self.used.fetch_sub(len, Ordering::AcqRel);
+                self.used.fetch_add(existing, Ordering::AcqRel);
                 Err(error)
             }
         }
@@ -982,6 +989,40 @@ mod tests {
         store.store_fragment(&record("a", 0, 80)).expect("store");
         assert!(store.has_headroom(20));
         assert!(!store.has_headroom(21));
+    }
+
+    /// A refused replacement leaves both the old durable bytes and their
+    /// budget charge intact. Stable safekeeper state slots rely on replacement
+    /// never making a failed larger revision look like free capacity.
+    #[test]
+    fn refused_replacement_preserves_the_live_fragment_and_accounting() {
+        let store = LocalFragmentStore::with_budget(scratch("replacement-refusal"), 100);
+        let key = FragmentKey {
+            object_id: "state-slot".to_owned(),
+            index: 0,
+        };
+        store
+            .store_fragment(&FragmentRecord::new(
+                key.clone(),
+                Bytes::from(vec![7_u8; 80]),
+            ))
+            .expect("initial state");
+        let error = store
+            .store_fragment(&FragmentRecord::new(
+                key.clone(),
+                Bytes::from(vec![9_u8; 101]),
+            ))
+            .expect_err("larger replacement exceeds ceiling");
+        assert!(matches!(error, FragmentIoError::Full { .. }));
+        assert_eq!(store.used_bytes(), 80);
+        assert_eq!(
+            store
+                .load_fragment(&key)
+                .expect("load")
+                .expect("old state")
+                .bytes,
+            Bytes::from(vec![7_u8; 80])
+        );
     }
 
     /// Reopening a store rebuilds the used-byte count from the fragments left on

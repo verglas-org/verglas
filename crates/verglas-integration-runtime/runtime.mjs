@@ -132,7 +132,7 @@ function context(config, signal) {
       const response = await fetch(`${dataEndpoint}/v1/queues/${encodeURIComponent(queue)}/enqueue`, {
         method: "POST",
         headers: {authorization: `Bearer ${dataToken}`, "content-type": "application/json"},
-        body: JSON.stringify({rows}),
+        body: JSON.stringify({messages: rows}),
       });
       if (!response.ok) throw new Error(`Verglas queue enqueue failed: HTTP ${response.status}`);
       return await response.json();

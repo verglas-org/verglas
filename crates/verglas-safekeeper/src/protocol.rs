@@ -14,9 +14,7 @@ pub const PROTOCOL_VERSION: u32 = 3;
 pub const NEON_PROTOCOL_SOURCE: &str =
     "https://github.com/neondatabase/neon/tree/8f60b04da47ffefe0e52bda2440134b42874eb75";
 
-/// Maximum WAL payload accepted from the Verglas Neon fork. The compute uses
-/// 8 MiB frames to amortize the safekeeper's quorum and fsync boundary; keep
-/// this wire guard in lockstep with `walproposer.h::MAX_SEND_SIZE`.
+/// Maximum WAL payload emitted by the published Verglas Neon walproposer.
 const MAX_SEND_SIZE: usize = 8 * 1024 * 1024;
 
 /// One safekeeper member as represented in Neon's membership configuration.
@@ -521,10 +519,23 @@ fn parse_start_replication(command: &str) -> Result<SafekeeperCommand, ProtocolE
     let start_lsn = parse_lsn(
         next.ok_or_else(|| ProtocolError::Invalid("missing replication LSN".to_owned()))?,
     )?;
-    if fields.next().is_some() {
-        return Err(ProtocolError::Invalid(format!(
-            "malformed command {command}"
-        )));
+    if let Some(field) = fields.next() {
+        if field != "TIMELINE" {
+            return Err(ProtocolError::Invalid(format!(
+                "malformed command {command}"
+            )));
+        }
+        let timeline = fields
+            .next()
+            .ok_or_else(|| ProtocolError::Invalid("missing replication timeline".to_owned()))?;
+        timeline.parse::<u32>().map_err(|_| {
+            ProtocolError::Invalid(format!("invalid replication timeline {timeline}"))
+        })?;
+        if fields.next().is_some() {
+            return Err(ProtocolError::Invalid(format!(
+                "malformed command {command}"
+            )));
+        }
     }
     let term = command
         .split_once("term='")

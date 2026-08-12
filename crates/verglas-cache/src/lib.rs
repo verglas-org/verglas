@@ -21,6 +21,7 @@ mod demotion;
 pub mod engine;
 pub mod entry;
 mod foyer_metrics;
+mod materialized;
 mod meta_store;
 pub mod writeback_codec;
 
@@ -31,6 +32,7 @@ pub use engine::{
     BlockDemoter, CachePurger, DemoteReceipt, DemoteRequest, EngineError, HardEviction,
     HybridCacheEngine,
 };
+pub use materialized::{MaterializedPageError, MaterializedPageKey, POSTGRES_PAGE_BYTES};
 pub use writeback_codec::{
     CodecError, Encoded, Fragment, Geometry, MAX_STRIPE_CHUNK, StripeEncoder, encode, reassemble,
 };

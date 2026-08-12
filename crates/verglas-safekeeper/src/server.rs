@@ -11,13 +11,13 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+use verglas_core::activity::{ActivityGuard, ActivityPlane, ActivityRejected, ActivityTracker};
 use verglas_core::read::ObjectRead;
 use verglas_core::write::ObjectWrite;
 
 use crate::broker::proto::{
     SafekeeperTimelineInfo, TenantTimelineId, broker_service_client::BrokerServiceClient,
 };
-use crate::log::SEGMENT_TARGET;
 use crate::protocol::{
     AcceptorGreeting, AcceptorMessage, AppendResponse, Membership, ProposerMessage, ProtocolError,
     SafekeeperCommand, TermSwitch, VoteResponse, parse_command, parse_proposer, serialize_acceptor,
@@ -33,14 +33,15 @@ const PG_PROTOCOL_V3: u32 = 196_608;
 /// with the startup packet; tenant network isolation is the transport boundary.
 const PG_SSL_REQUEST: u32 = 80_877_103;
 /// Maximum bytes returned in one physical replication `XLogData` frame.
-// Match the append-log's immutable segment size. Flushed WAL reads fetch one
-// complete origin object, so a smaller replication frame would redownload the
-// same object for every slice during pageserver catch-up.
-const REPLICATION_CHUNK: u64 = SEGMENT_TARGET;
+const REPLICATION_CHUNK: u64 = 128 * 1024;
 /// Delay between attempts to drain committed EC WAL into object storage.
 const WAL_DRAIN_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
 const BROKER_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// A snapshotted/paused replication client retains its TCP connection but no
+/// longer drains the receive buffer. Never let a keepalive or WAL response hold
+/// a safekeeper activity guard forever and make the cache impossible to fence.
+const REPLICATION_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct BrokerConfig {
@@ -92,6 +93,8 @@ pub struct SafekeeperServer<S> {
     node_id: u64,
     /// Origin store used after WAL segments drain from EC fragments.
     origin: Arc<S>,
+    /// Backend binding used for durable WAL objects.
+    storage_binding_id: String,
     /// Origin bucket containing WAL objects.
     bucket: String,
     /// Tenant-scoped prefix before tenant/timeline ids.
@@ -110,6 +113,8 @@ pub struct SafekeeperServer<S> {
     /// receiver discovery. Connections retry forever because the broker lives
     /// in the dependent Postgres VM and may start after the cache.
     broker: Option<BrokerConfig>,
+    /// Optional cache-node foreground admission fence.
+    activity: Option<ActivityTracker>,
 }
 
 impl<S> SafekeeperServer<S>
@@ -121,6 +126,7 @@ where
     pub fn new(
         node_id: u64,
         origin: Arc<S>,
+        storage_binding_id: impl Into<String>,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
         transport: Arc<dyn FragmentTransport>,
@@ -131,6 +137,7 @@ where
         Arc::new(Self {
             node_id,
             origin,
+            storage_binding_id: storage_binding_id.into(),
             bucket: bucket.into(),
             prefix: prefix.into(),
             transport,
@@ -139,7 +146,17 @@ where
             geometry,
             timelines: Mutex::new(HashMap::new()),
             broker: None,
+            activity: None,
         })
+    }
+
+    /// Attaches the host-managed foreground admission fence.
+    #[must_use]
+    pub fn with_activity_tracker(mut self: Arc<Self>, activity: ActivityTracker) -> Arc<Self> {
+        Arc::get_mut(&mut self)
+            .expect("with_activity_tracker must be called before cloning the server")
+            .activity = Some(activity);
+        self
     }
 
     /// Publishes every opened timeline to Neon's storage broker. The advertised
@@ -176,6 +193,13 @@ where
                 }
             });
         }
+    }
+
+    /// Admits one decoded safekeeper protocol message under the cache stop fence.
+    /// Idle TCP sessions do not hold the fence; only work that can mutate or serve
+    /// timeline state contributes to the in-flight count.
+    fn begin_activity(&self) -> Result<Option<ActivityGuard>, ActivityRejected> {
+        begin_safekeeper_activity(&self.activity)
     }
 
     async fn publish_broker(self: Arc<Self>, config: BrokerConfig) {
@@ -243,6 +267,7 @@ where
         );
         let log = Arc::new(EcAppendLog::open(
             self.node_id,
+            self.storage_binding_id.clone(),
             Arc::clone(&self.origin),
             self.bucket.clone(),
             prefix,
@@ -277,6 +302,9 @@ where
             let Some((tag, payload)) = read_frontend(&mut stream).await? else {
                 return Ok(());
             };
+            let Ok(activity_guard) = self.begin_activity() else {
+                return Ok(());
+            };
             match tag {
                 b'Q' => {
                     let query = payload_cstr(&payload, "query")?;
@@ -299,6 +327,7 @@ where
                             allow_timeline_creation: _,
                         } => {
                             write_copy_both(&mut stream).await?;
+                            drop(activity_guard);
                             return self
                                 .receive_wal(&mut stream, startup_key, protocol_version)
                                 .await;
@@ -320,7 +349,14 @@ where
                                 )));
                             }
                             write_copy_both(&mut stream).await?;
-                            return send_wal(&mut stream, timeline, start_lsn).await;
+                            drop(activity_guard);
+                            return send_wal(
+                                &mut stream,
+                                timeline,
+                                start_lsn,
+                                self.activity.clone(),
+                            )
+                            .await;
                         }
                         SafekeeperCommand::IdentifySystem => {
                             let key = startup_key.clone().ok_or_else(|| {
@@ -363,6 +399,9 @@ where
         let mut membership: Option<Membership> = None;
         loop {
             let Some((tag, payload)) = read_frontend(stream).await? else {
+                return Ok(());
+            };
+            let Ok(_activity_guard) = self.begin_activity() else {
                 return Ok(());
             };
             match tag {
@@ -452,14 +491,11 @@ where
                                 append.generation
                             )));
                         }
+                        timeline
+                            .append(Epoch(append.term), append.begin_lsn, append.wal)
+                            .await?;
                         let state = timeline
-                            .append_with_watermarks(
-                                Epoch(append.term),
-                                append.begin_lsn,
-                                append.wal,
-                                append.commit_lsn,
-                                append.truncate_lsn,
-                            )
+                            .record_watermarks(append.commit_lsn, append.truncate_lsn)
                             .await?;
                         write_copy_data(
                             stream,
@@ -498,7 +534,10 @@ where
         let mut interval = tokio::time::interval(WAL_DRAIN_INTERVAL);
         interval.tick().await;
         loop {
-            interval.tick().await;
+            tokio::select! {
+                _ = interval.tick() => {}
+                _ = timeline.wait_for_flush_request() => {}
+            }
             match timeline.flush().await {
                 Ok(flushed) => {
                     let state = timeline.safekeeper_state().await;
@@ -707,12 +746,23 @@ async fn write_copy_data(stream: &mut TcpStream, payload: Bytes) -> Result<(), S
     write_backend(stream, b'd', &payload).await
 }
 
+async fn write_replication_data(stream: &mut TcpStream, payload: Bytes) -> Result<(), ServerError> {
+    tokio::time::timeout(REPLICATION_WRITE_TIMEOUT, write_copy_data(stream, payload))
+        .await
+        .map_err(|_| {
+            ServerError::Connection(
+                "replication client stopped draining safekeeper responses".to_owned(),
+            )
+        })?
+}
+
 /// Streams WAL from the EC/origin log using PostgreSQL physical replication
 /// `XLogData` frames, then stays attached for future appends and feedback.
 async fn send_wal<S>(
     stream: &mut TcpStream,
     timeline: Arc<EcAppendLog<S>>,
     mut position: Lsn,
+    activity: Option<ActivityTracker>,
 ) -> Result<(), ServerError>
 where
     S: ObjectRead + ObjectWrite + 'static,
@@ -720,6 +770,9 @@ where
     loop {
         let tail = timeline.tail();
         if position.0 < tail.0 {
+            let Ok(_activity_guard) = begin_safekeeper_activity(&activity) else {
+                return Ok(());
+            };
             let end = Lsn((position.0 + REPLICATION_CHUNK).min(tail.0));
             let wal = timeline.read(position, end).await?;
             let mut payload = BytesMut::with_capacity(25 + wal.len());
@@ -728,7 +781,7 @@ where
             payload.put_u64(tail.0);
             payload.put_i64(0);
             payload.put_slice(&wal);
-            write_copy_data(stream, payload.freeze()).await?;
+            write_replication_data(stream, payload.freeze()).await?;
             position = end;
             continue;
         }
@@ -736,6 +789,9 @@ where
         match tokio::time::timeout(Duration::from_secs(1), read_frontend(stream)).await {
             Ok(Ok(Some((b'X' | b'c', _)))) | Ok(Ok(None)) => return Ok(()),
             Ok(Ok(Some((b'd', feedback)))) => {
+                let Ok(_activity_guard) = begin_safekeeper_activity(&activity) else {
+                    return Ok(());
+                };
                 if let Some(remote_consistent_lsn) = parse_pageserver_feedback(&feedback)? {
                     timeline
                         .record_remote_consistent_lsn(remote_consistent_lsn)
@@ -745,20 +801,31 @@ where
             Ok(Ok(Some((_tag, _feedback)))) => {}
             Ok(Err(error)) => return Err(error),
             Err(_) => {
+                let Ok(_activity_guard) = begin_safekeeper_activity(&activity) else {
+                    return Ok(());
+                };
                 let mut keepalive = BytesMut::with_capacity(18);
                 keepalive.put_u8(b'k');
                 keepalive.put_u64(timeline.tail().0);
                 keepalive.put_i64(0);
                 keepalive.put_u8(0);
-                write_copy_data(stream, keepalive.freeze()).await?;
+                write_replication_data(stream, keepalive.freeze()).await?;
             }
         }
     }
 }
 
-/// Parses the pageserver's extensible `z` feedback frame and returns the
-/// explicit Verglas ring-durable checkpoint. Generic apply progress does not
-/// prove that the layer set and its publishing index crossed the ring barrier.
+fn begin_safekeeper_activity(
+    activity: &Option<ActivityTracker>,
+) -> Result<Option<ActivityGuard>, ActivityRejected> {
+    activity
+        .as_ref()
+        .map(|activity| activity.try_begin(ActivityPlane::Safekeeper))
+        .transpose()
+}
+
+/// Parses the pageserver's extensible `z` feedback frame and returns its
+/// remotely durable apply LSN. Unknown fields remain forward-compatible.
 fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError> {
     if payload.first() != Some(&b'z') {
         return Ok(None);
@@ -775,7 +842,7 @@ fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError
         ));
     }
     let count = fields.get_u8();
-    let mut ring_durable_lsn = None;
+    let mut remote_consistent_lsn = None;
     for _ in 0..count {
         let key = take_cstr(&mut fields, "pageserver feedback key")?;
         if fields.remaining() < 4 {
@@ -790,16 +857,16 @@ fn parse_pageserver_feedback(payload: &Bytes) -> Result<Option<Lsn>, ServerError
             ));
         }
         let mut value = fields.split_to(len);
-        if key == "vg_durable_lsn" {
+        if key == "ps_applylsn" {
             if len != 8 {
                 return Err(ServerError::Connection(
-                    "invalid vg_durable_lsn length".to_owned(),
+                    "invalid ps_applylsn length".to_owned(),
                 ));
             }
-            ring_durable_lsn = Some(Lsn(value.get_u64()));
+            remote_consistent_lsn = Some(Lsn(value.get_u64()));
         }
     }
-    Ok(ring_durable_lsn.filter(|lsn| *lsn != Lsn(0)))
+    Ok(remote_consistent_lsn.filter(|lsn| *lsn != Lsn(0)))
 }
 
 /// Sends Neon's `IDENTIFY_SYSTEM` row followed by ReadyForQuery.
@@ -970,29 +1037,12 @@ mod tests {
     }
 
     #[test]
-    fn parses_ring_durable_lsn_from_neon_feedback() {
+    fn parses_remote_consistent_lsn_from_neon_feedback() {
         let mut fields = BytesMut::new();
-        fields.put_u8(1);
-        fields.put_slice(b"vg_durable_lsn\0");
+        fields.put_u8(2);
+        fields.put_slice(b"ps_writelsn\0");
         fields.put_u32(8);
-        fields.put_u64(0x5000);
-
-        let mut frame = BytesMut::new();
-        frame.put_u8(b'z');
-        frame.put_u64(fields.len() as u64);
-        frame.extend_from_slice(&fields);
-        assert_eq!(
-            parse_pageserver_feedback(&frame.freeze()).expect("valid pageserver feedback"),
-            Some(Lsn(0x5000))
-        );
-    }
-
-    /// A generic apply watermark does not prove that every published layer is
-    /// durable on the Verglas ring, so it cannot release retained WAL.
-    #[test]
-    fn apply_lsn_does_not_advance_ring_durability() {
-        let mut fields = BytesMut::new();
-        fields.put_u8(1);
+        fields.put_u64(0x7000);
         fields.put_slice(b"ps_applylsn\0");
         fields.put_u32(8);
         fields.put_u64(0x5000);
@@ -1003,7 +1053,7 @@ mod tests {
         frame.extend_from_slice(&fields);
         assert_eq!(
             parse_pageserver_feedback(&frame.freeze()).expect("valid pageserver feedback"),
-            None
+            Some(Lsn(0x5000))
         );
     }
 }

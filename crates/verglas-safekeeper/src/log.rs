@@ -10,6 +10,7 @@
 //! placement so an ack is only ever handed out after its manifest record is
 //! fsynced — the durability point.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,11 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use futures::stream::FuturesUnordered;
 use sha2::{Digest, Sha256};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use verglas_cache::writeback_codec::{Encoded, Fragment, Geometry, encode, reassemble};
-use verglas_cluster::fragments::{FragmentKey, FragmentRecord};
+use verglas_cluster::fragments::{FragmentKey, FragmentRecord, LocalFragmentStore};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
 use verglas_core::read::{ObjectRead, ReadRange};
@@ -38,7 +38,7 @@ use crate::manifest::{
 /// Seal a segment and start a new one once the open one reaches this many bytes.
 /// A fixed flush-granularity constant, not a tuning knob: the whole tuning
 /// surface is the erasure geometry (see the crate contract, §7).
-pub(crate) const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
+const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
 
 /// Fragment index reserved for full-copy state descriptors. EC data fragments
 /// occupy the small `0..k+m` range, so this cannot collide with WAL data.
@@ -48,6 +48,59 @@ const STATE_DESCRIPTOR_INDEX: usize = usize::MAX - 1;
 /// state descriptor.
 const STATE_HEAD_INDEX: usize = usize::MAX;
 
+/// Removes stale descriptors written by the former one-object-per-revision
+/// protocol from one local fragment store. The descriptor named by each legacy
+/// head is retained; missing or malformed heads retain everything. This makes
+/// an upgrade recover disk space without ever guessing which state was
+/// committed.
+pub fn reclaim_legacy_state_descriptors(store: &LocalFragmentStore) -> Result<usize, AppendError> {
+    let keys = store.list_fragment_keys();
+    let mut heads = HashMap::new();
+    for key in &keys {
+        let Some(prefix) = key.object_id.strip_suffix("/head") else {
+            continue;
+        };
+        if key.index != STATE_HEAD_INDEX {
+            continue;
+        }
+        let Some(head) = store
+            .load_fragment(key)
+            .map_err(|error| AppendError::Manifest(format!("load legacy state head: {error}")))?
+        else {
+            continue;
+        };
+        if !head.is_healthy() || head.bytes.len() != 8 {
+            continue;
+        }
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&head.bytes);
+        heads.insert(prefix.to_owned(), u64::from_be_bytes(raw));
+    }
+
+    let mut reclaimed = 0;
+    for key in keys {
+        if key.index != STATE_DESCRIPTOR_INDEX {
+            continue;
+        }
+        let Some((prefix, revision)) = key.object_id.rsplit_once("/state/") else {
+            continue;
+        };
+        let Ok(revision) = revision.parse::<u64>() else {
+            continue;
+        };
+        if heads
+            .get(prefix)
+            .is_some_and(|current| *current != revision)
+        {
+            store.delete_fragment(&key).map_err(|error| {
+                AppendError::Manifest(format!("delete stale state descriptor: {error}"))
+            })?;
+            reclaimed += 1;
+        }
+    }
+    Ok(reclaimed)
+}
+
 /// The erasure-coded quorum append log. `S` is the S3 origin, used for the flush
 /// write and for reading already-flushed ranges back; it is never on the append
 /// (commit) path.
@@ -56,6 +109,8 @@ pub struct EcAppendLog<S> {
     /// Safekeepers advance and flush independently, so their replicated state
     /// keys must not collide even though they receive the same WAL stream.
     node_id: u64,
+    /// Backend binding used for durable WAL objects.
+    storage_binding_id: String,
     /// The S3 origin: flush target and flushed-range read source.
     store: Arc<S>,
     /// The bucket flushed segment objects live in.
@@ -81,12 +136,8 @@ pub struct EcAppendLog<S> {
     flushed: AtomicU64,
     /// Mirror of the writer epoch.
     epoch: AtomicU64,
-    /// Highest commit watermark supplied with an append but not yet folded
-    /// into that append's durable manifest revision.
-    pending_commit: AtomicU64,
-    /// Highest truncate watermark supplied with an append but not yet folded
-    /// into that append's durable manifest revision.
-    pending_truncate: AtomicU64,
+    /// Wakes the origin drain immediately after a newly acknowledged append.
+    flush_requested: Notify,
 }
 
 impl<S> EcAppendLog<S>
@@ -102,6 +153,7 @@ where
     #[allow(clippy::too_many_arguments)]
     pub fn open(
         node_id: u64,
+        storage_binding_id: impl Into<String>,
         store: Arc<S>,
         bucket: impl Into<String>,
         prefix: impl Into<String>,
@@ -130,6 +182,7 @@ where
         let epoch = AtomicU64::new(manifest.epoch.0);
         Ok(Self {
             node_id,
+            storage_binding_id: storage_binding_id.into(),
             store,
             bucket: bucket.into(),
             prefix: prefix.into(),
@@ -141,29 +194,14 @@ where
             tail,
             flushed,
             epoch,
-            pending_commit: AtomicU64::new(0),
-            pending_truncate: AtomicU64::new(0),
+            flush_requested: Notify::new(),
         })
     }
 
-    /// Appends WAL and records the watermarks carried by the same proposer
-    /// frame in one replicated manifest revision. Persisting them in two
-    /// revisions doubles the quorum network and fsync round trips on the hot
-    /// path, while providing no additional durability boundary.
-    pub async fn append_with_watermarks(
-        &self,
-        epoch: Epoch,
-        begin_lsn: Lsn,
-        records: Bytes,
-        commit_lsn: Lsn,
-        truncate_lsn: Lsn,
-    ) -> Result<SafekeeperState, AppendError> {
-        self.pending_commit
-            .fetch_max(commit_lsn.0, Ordering::Relaxed);
-        self.pending_truncate
-            .fetch_max(truncate_lsn.0, Ordering::Relaxed);
-        <Self as AppendLog>::append(self, epoch, begin_lsn, records).await?;
-        Ok(self.safekeeper_state().await)
+    /// Waits until an acknowledged append asks the background origin drain to
+    /// run. `Notify` coalesces bursts: one wake drains the whole open tail.
+    pub async fn wait_for_flush_request(&self) {
+        self.flush_requested.notified().await;
     }
 
     /// The geometry this append uses: the degenerate single-node code for a
@@ -229,8 +267,16 @@ where
         format!("sk/{:x}", digest.finalize())
     }
 
-    /// Object id holding a full immutable copy of one manifest revision.
+    /// Object id holding one of two alternating manifest slots. The current
+    /// head always points at the slot containing its exact revision; writing
+    /// the other slot first and publishing the head second preserves the
+    /// commit order while bounding replicated metadata to two objects.
     fn state_object_id(&self, revision: u64) -> String {
+        format!("{}/state/slot-{}", self.state_prefix(), revision % 2)
+    }
+
+    /// Object id used before descriptors were changed to two bounded slots.
+    fn legacy_state_object_id(&self, revision: u64) -> String {
         format!("{}/state/{revision:020}", self.state_prefix())
     }
 
@@ -239,9 +285,11 @@ where
         format!("{}/head", self.state_prefix())
     }
 
-    /// Replicates an immutable manifest revision and then publishes its head.
-    /// A revision is published only after its full descriptor reaches `w`
-    /// distinct nodes.
+    /// Replicates a manifest into the inactive slot and then publishes its
+    /// head. A revision is published only after its full descriptor reaches
+    /// `w` distinct nodes. Alternating slots are essential: overwriting the
+    /// descriptor named by the current head before the new revision reaches a
+    /// quorum would make the last acknowledged state unrecoverable.
     async fn replicate_state(&self, manifest: &Manifest) -> Result<(), AppendError> {
         let live = self.membership.live_nodes();
         let geometry = self.effective_geometry();
@@ -253,21 +301,10 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
-        let mut descriptor_writes = live
-            .iter()
-            .cloned()
-            .map(|node| {
-                let record = descriptor_record.clone();
-                async move {
-                    let result = self.transport.place(&node, record).await;
-                    (node, result)
-                }
-            })
-            .collect::<FuturesUnordered<_>>();
         let mut descriptor_nodes = Vec::new();
-        while let Some((node, result)) = descriptor_writes.next().await {
-            match result {
-                Ok(()) => descriptor_nodes.push(node),
+        for node in &live {
+            match self.transport.place(node, descriptor_record.clone()).await {
+                Ok(()) => descriptor_nodes.push(node.clone()),
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
                     revision = manifest.revision,
@@ -290,20 +327,9 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
-        let mut head_writes = descriptor_nodes
-            .iter()
-            .cloned()
-            .map(|node| {
-                let record = head_record.clone();
-                async move {
-                    let result = self.transport.place(&node, record).await;
-                    (node, result)
-                }
-            })
-            .collect::<FuturesUnordered<_>>();
         let mut heads = 0;
-        while let Some((node, result)) = head_writes.next().await {
-            match result {
+        for node in &descriptor_nodes {
+            match self.transport.place(node, head_record.clone()).await {
                 Ok(()) => heads += 1,
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
@@ -347,17 +373,25 @@ where
         let Some(revision) = latest else {
             return Ok(false);
         };
-        let descriptor_key = FragmentKey {
-            object_id: self.state_object_id(revision),
-            index: STATE_DESCRIPTOR_INDEX,
-        };
         let mut candidates: std::collections::HashMap<Vec<u8>, usize> =
             std::collections::HashMap::new();
-        for node in &live {
-            if let Ok(Some(descriptor)) = self.transport.load(node, &descriptor_key).await
-                && descriptor.is_healthy()
-            {
-                *candidates.entry(descriptor.bytes.to_vec()).or_default() += 1;
+        for object_id in [
+            self.state_object_id(revision),
+            self.legacy_state_object_id(revision),
+        ] {
+            let descriptor_key = FragmentKey {
+                object_id,
+                index: STATE_DESCRIPTOR_INDEX,
+            };
+            for node in &live {
+                if let Ok(Some(descriptor)) = self.transport.load(node, &descriptor_key).await
+                    && descriptor.is_healthy()
+                {
+                    *candidates.entry(descriptor.bytes.to_vec()).or_default() += 1;
+                }
+            }
+            if !candidates.is_empty() {
+                break;
             }
         }
         let bytes = candidates
@@ -585,28 +619,17 @@ where
             }
         }
 
-        let mut fragment_writes = encoded
-            .fragments
-            .iter()
-            .enumerate()
-            .zip(nodes)
-            .map(|((index, fragment), node)| {
-                let record = FragmentRecord::new(
-                    FragmentKey {
-                        object_id: object_id.to_owned(),
-                        index,
-                    },
-                    fragment.bytes.clone(),
-                );
-                async move {
-                    let result = self.transport.place(&node, record).await;
-                    (index, node, result)
-                }
-            })
-            .collect::<FuturesUnordered<_>>();
         let mut placements = Vec::new();
-        while let Some((index, node, result)) = fragment_writes.next().await {
-            match result {
+        for (index, fragment) in encoded.fragments.iter().enumerate() {
+            let Some(node) = nodes.get(index) else { break };
+            let record = FragmentRecord::new(
+                FragmentKey {
+                    object_id: object_id.to_owned(),
+                    index,
+                },
+                fragment.bytes.clone(),
+            );
+            match self.transport.place(node, record).await {
                 Ok(()) => placements.push(Placement {
                     index,
                     node: node.as_str().to_owned(),
@@ -620,7 +643,6 @@ where
                 ),
             }
         }
-        placements.sort_unstable_by_key(|placement| placement.index);
 
         if placements.len() < w {
             self.drop_fragments(object_id, &placements).await;
@@ -703,7 +725,7 @@ where
             .clone()
             .ok_or_else(|| AppendError::Origin("flushed segment has no S3 key".to_owned()))?;
         let key = CacheKey {
-            storage_binding_id: "default".to_owned(),
+            storage_binding_id: self.storage_binding_id.clone(),
             bucket: self.bucket.clone(),
             key: s3_key,
         };
@@ -718,6 +740,49 @@ where
             buf.extend_from_slice(&chunk.map_err(|e| AppendError::Origin(e.to_string()))?);
         }
         Ok(Bytes::from(buf))
+    }
+
+    /// Streams every open segment to object storage and reclaims its EC
+    /// fragments. Callers hold the append mutex, so the manifest cannot change
+    /// between reassembly, publication of the flushed state, and eviction.
+    async fn flush_manifest(&self, manifest: &mut Manifest) -> Result<Lsn, AppendError> {
+        let mut i = 0;
+        while i < manifest.segments.len() {
+            if manifest.segments[i].state != SegmentState::Open {
+                i += 1;
+                continue;
+            }
+            let segment = manifest.segments[i].clone();
+            let bytes = self.reassemble_segment(&segment).await?;
+            let s3_key = self.segment_key(&segment);
+            let key = CacheKey {
+                storage_binding_id: self.storage_binding_id.clone(),
+                bucket: self.bucket.clone(),
+                key: s3_key.clone(),
+            };
+            self.store
+                .put(&key, WriteMetadata::default(), once_body(bytes))
+                .await
+                .map_err(|e| AppendError::Origin(e.to_string()))?;
+
+            manifest.segments[i].state = SegmentState::Flushed;
+            manifest.segments[i].s3_key = Some(s3_key);
+            manifest.segments[i].appends.clear();
+            manifest.flushed_through = segment.end;
+            manifest.revision = manifest.revision.saturating_add(1);
+            self.replicate_state(manifest).await?;
+            self.manifest_store.persist(manifest)?;
+            self.flushed.store(segment.end.0, Ordering::Relaxed);
+
+            // The object-store write and the compacted recovery descriptor are
+            // both durable. Only now may pressure reclaim the EC fragments.
+            for entry in &segment.appends {
+                self.drop_fragments(entry.object_id(), &entry.placements)
+                    .await;
+            }
+            i += 1;
+        }
+        Ok(manifest.flushed_through)
     }
 
     /// Reads a live range using one already-locked manifest snapshot. Keeping
@@ -773,7 +838,7 @@ where
 /// rendezvous machinery the cache ring and the write-back placement use.
 fn placement_order(seed: &str, live: &[NodeId]) -> Vec<NodeId> {
     let key = CacheKey {
-        storage_binding_id: "default".to_owned(),
+        storage_binding_id: "safekeeper-placement".to_owned(),
         bucket: "safekeeper".to_owned(),
         key: seed.to_owned(),
     };
@@ -836,8 +901,6 @@ where
                     begin: begin_lsn,
                     bytes: records.len(),
                 })?);
-        let pending_commit = self.pending_commit.load(Ordering::Relaxed);
-        let pending_truncate = self.pending_truncate.load(Ordering::Relaxed);
         let fresh = manifest.segments.is_empty()
             && manifest.base == Lsn(0)
             && manifest.tail == Lsn(0)
@@ -873,25 +936,6 @@ where
             }
         }
         if end_lsn.0 <= durable_tail.0 {
-            let commit_lsn = pending_commit.min(manifest.tail.0);
-            let truncate_lsn = pending_truncate.min(manifest.tail.0);
-            if commit_lsn > manifest.commit_lsn.0 || truncate_lsn > manifest.truncate_lsn.0 {
-                manifest.commit_lsn = Lsn(manifest.commit_lsn.0.max(commit_lsn));
-                manifest.truncate_lsn = Lsn(manifest.truncate_lsn.0.max(truncate_lsn));
-                manifest.revision = manifest.revision.saturating_add(1);
-                self.replicate_state(&manifest).await?;
-                self.manifest_store.persist(&manifest)?;
-            }
-            let _ =
-                self.pending_commit
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        (current <= pending_commit).then_some(0)
-                    });
-            let _ = self.pending_truncate.fetch_update(
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-                |current| (current <= pending_truncate).then_some(0),
-            );
             return Ok(Appended {
                 start: begin_lsn,
                 end: end_lsn,
@@ -903,6 +947,38 @@ where
         let start = durable_tail;
         let end = end_lsn;
 
+        let geometry = self.effective_geometry();
+        let live = self.membership.live_nodes();
+        let encoded = match encode(geometry.k, geometry.m, &suffix) {
+            Ok(encoded) => encoded,
+            Err(error) => return Err(AppendError::Codec(error.to_string())),
+        };
+        let probe = encoded
+            .fragments
+            .first()
+            .map_or(0, |fragment| fragment.bytes.len() as u64);
+        let holders_with_room = futures::future::join_all(
+            live.iter()
+                .map(|node| self.transport.has_headroom(node, probe)),
+        )
+        .await
+        .into_iter()
+        .filter(|has_room| *has_room)
+        .count();
+        if holders_with_room < geometry.w
+            && manifest
+                .segments
+                .iter()
+                .any(|segment| segment.state == SegmentState::Open && !segment.appends.is_empty())
+        {
+            tracing::warn!(
+                needed = geometry.w,
+                available = holders_with_room,
+                "WAL admission is reclaiming object-store-durable fragments"
+            );
+            self.flush_manifest(&mut manifest).await?;
+        }
+
         let previous = manifest.clone();
         let idx = ensure_tail_segment(&mut manifest, start);
         let (segment_id, seq) = {
@@ -910,16 +986,6 @@ where
             (seg.id, seg.appends.len() as u64)
         };
         let object_id = format!("{}/w/{segment_id:016x}/{seq:016x}", self.state_prefix());
-
-        let geometry = self.effective_geometry();
-        let live = self.membership.live_nodes();
-        let encoded = match encode(geometry.k, geometry.m, &suffix) {
-            Ok(encoded) => encoded,
-            Err(error) => {
-                *manifest = previous.clone();
-                return Err(AppendError::Codec(error.to_string()));
-            }
-        };
         let placements = match self.place(&object_id, &encoded, geometry.w, &live).await {
             Ok(placements) => placements,
             Err(error) => {
@@ -949,14 +1015,6 @@ where
             manifest.flushed_through = begin_lsn;
         }
         manifest.tail = end;
-        manifest.commit_lsn = Lsn(manifest
-            .commit_lsn
-            .0
-            .max(pending_commit.min(manifest.tail.0)));
-        manifest.truncate_lsn = Lsn(manifest
-            .truncate_lsn
-            .0
-            .max(pending_truncate.min(manifest.tail.0)));
         manifest.revision = manifest.revision.saturating_add(1);
 
         if let Err(error) = self.replicate_state(&manifest).await {
@@ -978,16 +1036,7 @@ where
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
-        let _ = self
-            .pending_commit
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current <= pending_commit).then_some(0)
-            });
-        let _ =
-            self.pending_truncate
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    (current <= pending_truncate).then_some(0)
-                });
+        self.flush_requested.notify_one();
 
         Ok(Appended {
             start: begin_lsn,
@@ -996,78 +1045,13 @@ where
     }
 
     async fn read(&self, from: Lsn, to: Lsn) -> Result<Bytes, AppendError> {
-        // Replication reads can block on an origin GET while recovering a
-        // flushed segment. Keep that I/O outside the timeline serialization
-        // lock so a compute proposer can still complete its greeting and append
-        // new WAL while a pageserver is catching up from older WAL.
-        let manifest = self.state.lock().await.clone();
+        let manifest = self.state.lock().await;
         self.read_manifest(&manifest, from, to).await
     }
 
     async fn flush(&self) -> Result<Lsn, AppendError> {
-        // Snapshot one segment under the serialization lock, then release the
-        // lock before reconstructing it and performing the potentially slow R2
-        // PUT. Holding this lock across object storage used to stop every WAL
-        // append for the duration of each upload, limiting synchronous commit
-        // throughput to roughly one segment per R2 round trip.
-        let segment = {
-            let manifest = self.state.lock().await;
-            manifest
-                .segments
-                .iter()
-                .find(|segment| segment.state == SegmentState::Open)
-                .cloned()
-        };
-        let Some(segment) = segment else {
-            return Ok(self.flushed_through());
-        };
-
-        let bytes = self.reassemble_segment(&segment).await?;
-        let s3_key = self.segment_key(&segment);
-        let key = CacheKey {
-            storage_binding_id: "default".to_owned(),
-            bucket: self.bucket.clone(),
-            key: s3_key.clone(),
-        };
-        self.store
-            .put(&key, WriteMetadata::default(), once_body(bytes))
-            .await
-            .map_err(|e| AppendError::Origin(e.to_string()))?;
-
         let mut manifest = self.state.lock().await;
-        let Some(i) = manifest
-            .segments
-            .iter()
-            .position(|current| current.id == segment.id)
-        else {
-            return Ok(manifest.flushed_through);
-        };
-        // The open tail may have grown while its snapshot uploaded. That upload
-        // is not a complete segment and therefore cannot advance durability;
-        // leave the fragment-backed tail intact and retry a fresh snapshot on a
-        // later drain tick. Most importantly, appends never waited for the PUT.
-        if manifest.segments[i] != segment {
-            return Ok(manifest.flushed_through);
-        }
-
-        manifest.segments[i].state = SegmentState::Flushed;
-        manifest.segments[i].s3_key = Some(s3_key);
-        // Origin now owns the complete segment. Recovery and reads need only its
-        // LSN range and object key; retain the snapshot below only long enough to
-        // delete its fragment placements after the manifest commit.
-        manifest.segments[i].appends.clear();
-        manifest.flushed_through = segment.end;
-        manifest.revision = manifest.revision.saturating_add(1);
-        self.replicate_state(&manifest).await?;
-        self.manifest_store.persist(&manifest)?;
-        self.flushed.store(segment.end.0, Ordering::Relaxed);
-        drop(manifest);
-
-        for entry in &segment.appends {
-            self.drop_fragments(entry.object_id(), &entry.placements)
-                .await;
-        }
-        Ok(segment.end)
+        self.flush_manifest(&mut manifest).await
     }
 
     async fn truncate(&self, up_to: Lsn) -> Result<(), AppendError> {
@@ -1090,7 +1074,7 @@ where
             if segment.end.0 <= up_to.0 {
                 if let Some(k) = &segment.s3_key {
                     deletes.push(CacheKey {
-                        storage_binding_id: "default".to_owned(),
+                        storage_binding_id: self.storage_binding_id.clone(),
                         bucket: self.bucket.clone(),
                         key: k.clone(),
                     });
