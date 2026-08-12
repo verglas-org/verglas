@@ -28,3 +28,12 @@
   five isolated repetitions records direct, cold, warm, and fresh-process cache
   legs, plus cache occupancy, immutable-data configuration, cgroups, spill,
   R2 operations, result hashes, and direct-origin write readback.
+- #126: Corrected the QuackStore comparison to use the extension's global
+  cache settings and a persistent cache file rather than a directory. Every
+  workload now stops its primary QuackStore process before a fresh process
+  reopens that same file, and the report records each handoff with file and
+  process evidence.
+- #126: Retained each complete live-R2 repetition as a numbered JSON artifact
+  and embedded its raw evidence in the final summary. The contract now rejects
+  missing raw reports, cache-file paths, overlapping QuackStore processes, and
+  missing logical or physical cache-size evidence.

@@ -18,7 +18,7 @@ class BenchmarkContractTest(unittest.TestCase):
 
     def valid_report(self):
         """Return the smallest report satisfying every evidence gate."""
-        return {
+        report = {
             "dataset": {
                 "format": "parquet",
                 "storage": "s3-compatible",
@@ -47,6 +47,23 @@ class BenchmarkContractTest(unittest.TestCase):
                     "verglas_shared": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
                     "verglas": {"cpus": 1.0, "memory_bytes": 256 * 1024 * 1024},
                 },
+                "quackstore_processes": {
+                    workload: {
+                        "primary": {
+                            "container_id": f"{workload}-primary",
+                            "image_id": "sha256:quackstore",
+                            "started_at_ns": 10,
+                            "stopped_at_ns": 20,
+                        },
+                        "shared": {
+                            "container_id": f"{workload}-shared",
+                            "image_id": "sha256:quackstore",
+                            "started_at_ns": 30,
+                            "stopped_at_ns": 40,
+                        },
+                    }
+                    for workload in benchmark.WORKLOADS
+                },
             },
             "object_store": {"request_count": 10, "request_log_sha256": "1" * 64},
             "cache_stats": {
@@ -57,8 +74,11 @@ class BenchmarkContractTest(unittest.TestCase):
                 },
                 "quackstore": {
                     "capacity_bytes": 256 * 1024**2,
+                    "logical_capacity_bytes": 256 * 1024**2,
+                    "actual_file_bytes": 256 * 1024**2,
+                    "allocated_bytes": 256 * 1024**2,
                     "occupancy_bytes": 1,
-                    "cache_path": "/external/quackstore",
+                    "cache_path": "/external/quackstore/cache.bin",
                     "data_mutable": False,
                 },
                 "storage": {"verglas_device": "external-disk", "quackstore_device": "external-disk"},
@@ -75,9 +95,16 @@ class BenchmarkContractTest(unittest.TestCase):
                 leg: {"origin_bytes": 1, "readback_sha256": "b" * 64}
                 for leg in ("direct", "through_verglas")
             },
-            "repetitions": [{"number": number} for number in range(1, 6)],
+            "repetitions": [],
             "cache_resets": {"quackstore": len(benchmark.WORKLOADS), "verglas": len(benchmark.WORKLOADS)},
         }
+        raw_report = copy.deepcopy(report)
+        raw_report.pop("repetitions")
+        report["repetitions"] = [
+            {"number": number, "raw_report": copy.deepcopy(raw_report)}
+            for number in range(1, 6)
+        ]
+        return report
 
     def test_valid_report_requires_real_out_of_core_evidence(self):
         """A complete report passes all frozen evidence checks."""
@@ -175,13 +202,42 @@ class BenchmarkContractTest(unittest.TestCase):
 
     def test_quackstore_uses_its_persistent_cache_protocol(self):
         """QuackStore must use its real community extension and immutable URI form."""
-        settings = benchmark.quackstore_settings("/external/quackstore")
+        cache_file = benchmark.quackstore_cache_file(pathlib.Path("/external/quackstore"))
+        settings = benchmark.quackstore_settings(str(cache_file))
         self.assertEqual(settings["cache_size"], benchmark.DEFAULT_CACHE_CAPACITY_BYTES)
         self.assertFalse(settings["data_mutable"])
+        self.assertEqual(cache_file, pathlib.Path("/external/quackstore/cache.bin"))
+        self.assertEqual(
+            benchmark.quackstore_setting_statements(settings),
+            (
+                "SET GLOBAL quackstore_cache_enabled = true",
+                "SET GLOBAL quackstore_cache_path = '/external/quackstore/cache.bin'",
+                f"SET GLOBAL quackstore_cache_size = {benchmark.DEFAULT_CACHE_CAPACITY_BYTES}",
+                "SET GLOBAL quackstore_data_mutable = false",
+            ),
+        )
         self.assertEqual(
             benchmark.quackstore_location("verglas-benchmark"),
             "quackstore://s3://verglas-benchmark/issue-126/data/*.parquet",
         )
+
+    def test_quackstore_evidence_records_logical_and_physical_cache_bytes(self):
+        """The report distinguishes QuackStore's configured budget from its cache file allocation."""
+        with tempfile.TemporaryDirectory() as directory:
+            cache_file = benchmark.quackstore_cache_file(pathlib.Path(directory))
+            cache_file.write_bytes(b"x" * 8192)
+            evidence = benchmark.quackstore_cache_evidence(cache_file)
+        self.assertEqual(evidence["cache_path"], str(cache_file))
+        self.assertEqual(evidence["logical_capacity_bytes"], benchmark.DEFAULT_CACHE_CAPACITY_BYTES)
+        self.assertEqual(evidence["actual_file_bytes"], 8192)
+        self.assertGreaterEqual(evidence["allocated_bytes"], 8192)
+
+    def test_report_requires_full_raw_repetition_reports(self):
+        """A repetition hash alone cannot preserve the evidence needed to audit all five runs."""
+        report = self.valid_report()
+        report["repetitions"] = [{"number": number, "report_sha256": "a" * 64} for number in range(1, 6)]
+        with self.assertRaisesRegex(ValueError, "raw report"):
+            benchmark.validate_report(report)
 
     def test_report_requires_five_independent_repetitions(self):
         """One fortuitous cache run cannot stand in for the five-run protocol."""
@@ -210,6 +266,21 @@ class BenchmarkContractTest(unittest.TestCase):
         report = self.valid_report()
         report["cache_resets"]["quackstore"] -= 1
         with self.assertRaisesRegex(ValueError, "reset"):
+            benchmark.validate_report(report)
+
+    def test_report_rejects_overlapping_quackstore_cache_processes(self):
+        """The persistent-cache handoff must stop its primary before the fresh reader starts."""
+        report = self.valid_report()
+        process = report["runtime"]["quackstore_processes"]["scan_aggregate"]
+        process["primary"]["stopped_at_ns"] = process["shared"]["started_at_ns"] + 1
+        with self.assertRaisesRegex(ValueError, "before fresh shared"):
+            benchmark.validate_report(report)
+
+    def test_report_requires_a_quackstore_cache_file_not_a_directory(self):
+        """A directory path is not a QuackStore cache-file configuration."""
+        report = self.valid_report()
+        report["cache_stats"]["quackstore"]["cache_path"] = "/external/quackstore"
+        with self.assertRaisesRegex(ValueError, "cache file"):
             benchmark.validate_report(report)
 
 

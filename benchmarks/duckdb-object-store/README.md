@@ -66,13 +66,18 @@ legs: direct R2; QuackStore cold, warm, and a newly started Quack process that
 reuses its persistent cache; then Verglas cold, warm, and a newly started Quack
 process that reuses Verglas. QuackStore is installed in the measured server
 with `INSTALL quackstore FROM community; LOAD quackstore`, reads the immutable
-`quackstore://s3://...` data URI, uses `quackstore_data_mutable = false`, and is
-cleared through `quackstore_clear_cache()` before every cold leg. Both cache
-directories are bind-mounted from the external benchmark disk and are assigned
-an exact 256 MiB logical cache budget. The report rejects a run without
-observed nonzero occupancy for both caches, live R2 operation evidence,
-container/image provenance, cgroup limits, spill, result equivalence, and
-direct-R2 readback of writes.
+`quackstore://s3://...` data URI, and uses the extension's documented global
+immutable-cache settings. Its exact 256 MiB logical budget is stored in
+`/quackstore-cache/cache.bin` on the external benchmark disk. For each
+workload, the primary QuackStore process clears that file, runs cold and warm,
+stops, and only then does a fresh process reopen the same file for the shared
+warm leg. The report records logical capacity, file length, allocated bytes,
+and the non-overlapping container identities for every handoff. It writes five
+numbered full raw reports beside the requested summary artifact, and the
+summary retains each report's digest and raw evidence. The report rejects a
+run without observed nonzero occupancy for both caches, live R2 operation
+evidence, container/image provenance, cgroup limits, spill, result
+equivalence, and direct-R2 readback of writes.
 
 ## What the number means
 
