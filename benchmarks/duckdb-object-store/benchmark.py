@@ -59,7 +59,7 @@ WORKLOADS = {
     "scan_aggregate": "SELECT count(*), sum(id), sum(metric), min(payload) FROM benchmark_data",
     "external_sort": (
         "SELECT count(*), sum(id), sum(sort_position) FROM "
-        "(SELECT id, row_number() OVER (ORDER BY payload) sort_position FROM benchmark_data)"
+        "(SELECT id, row_number() OVER (ORDER BY metric) sort_position FROM benchmark_data)"
     ),
     "spill_join": (
         "SELECT count(*), sum(a.metric + b.metric) FROM benchmark_data a "

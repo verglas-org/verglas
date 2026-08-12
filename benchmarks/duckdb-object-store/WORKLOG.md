@@ -47,3 +47,7 @@
   299.0 of 305.1 MiB. The 1,501,993,637-byte measured dataset remains larger
   than four times the 352,000,000-byte operator budget, and spill evidence is
   still mandatory.
+- #126: Changed the external-sort key from the wide payload string to the
+  numeric metric after the 352 MB live-R2 retry also exhausted the string
+  buffer. The workload remains a full global `row_number()` sort, and the
+  benchmark continues to reject any run without observed spill.

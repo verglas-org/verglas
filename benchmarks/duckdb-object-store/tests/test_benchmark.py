@@ -147,6 +147,13 @@ class BenchmarkContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "must match"):
             benchmark.validate_report(report)
 
+    def test_external_sort_is_a_full_numeric_row_number_sort(self):
+        """The spill workload avoids payload-string buffering while retaining a global window sort."""
+        external_sort = benchmark.WORKLOADS["external_sort"]
+        self.assertIn("row_number() OVER (ORDER BY metric)", external_sort)
+        self.assertIn("SELECT count(*), sum(id), sum(sort_position)", external_sort)
+        self.assertNotIn("ORDER BY payload", external_sort)
+
     def test_spill_and_origin_traffic_must_be_observed(self):
         """Declared limits without observed spill or storage traffic are not evidence."""
         report = self.valid_report()

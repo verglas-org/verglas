@@ -30,7 +30,10 @@ Quack process against the shared warm cache. The run is invalid unless it sees
 DuckDB spill files, MinIO requests, identical result hashes, and direct-origin
 readback of Parquet written both directly and through Verglas.
 
-The workloads cover a full scan/aggregate, an external sort, and a hash join.
+The workloads cover a full scan/aggregate, a full `row_number()` external sort
+on the numeric `metric` key, and a hash join. The numeric key avoids the
+extension's payload-string buffering path while preserving a global sort that
+the evaluator must prove spilled to disk.
 MinIO's admin trace is hashed into the report. Container IDs, immutable image
 IDs, and Docker's applied CPU/RAM limits are recorded rather than inferred.
 
