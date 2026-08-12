@@ -34,7 +34,7 @@ PREFIX = "issue-126"
 R2_BUCKET = "verglas-duckdb-bench-20260812"
 # DuckDB interprets MB as decimal units. Keep the report's byte gate derived
 # from the setting sent to every measured server.
-ENGINE_MEMORY = "320MB"
+ENGINE_MEMORY = "352MB"
 ENGINE_MEMORY_BYTES = int(ENGINE_MEMORY.removesuffix("MB")) * 1_000_000
 ROWS = 40_000_000
 QUACK_CONTAINER_MEMORY_BYTES = 2 * 1024**3
@@ -179,7 +179,7 @@ def validate_report(report: dict, *, require_repetitions: bool = True) -> None:
     if operator is None:
         raise ValueError("DuckDB operator configuration is missing")
     if operator.get("memory_limit") != ENGINE_MEMORY or operator.get("memory_limit_bytes") != ENGINE_MEMORY_BYTES:
-        raise ValueError("DuckDB operator memory limit must be exactly 320 MB")
+        raise ValueError("DuckDB operator memory limit must be exactly 352 MB")
     if operator.get("threads") != 1 or operator.get("read_legs") != list(required_legs):
         raise ValueError("DuckDB operator configuration must apply uniformly to every read leg")
     if dataset["worker_memory_bytes"] != ENGINE_MEMORY_BYTES:

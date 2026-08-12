@@ -123,11 +123,11 @@ class BenchmarkContractTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "larger than 4x"):
             benchmark.validate_report(report)
 
-    def test_report_requires_the_uniform_320_mb_duckdb_operator_limit(self):
+    def test_report_requires_the_uniform_352_mb_duckdb_operator_limit(self):
         """Every measured server must use the fixed operator limit that leaves QuackStore headroom."""
         report = self.valid_report()
-        report["runtime"]["duckdb_operator"]["memory_limit_bytes"] = 256 * 1_000_000
-        with self.assertRaisesRegex(ValueError, "320 MB"):
+        report["runtime"]["duckdb_operator"]["memory_limit_bytes"] = 320 * 1_000_000
+        with self.assertRaisesRegex(ValueError, "352 MB"):
             benchmark.validate_report(report)
 
         report = self.valid_report()

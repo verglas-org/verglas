@@ -42,3 +42,8 @@
   not. The report now records and validates the exact limit and one-thread
   configuration for every measured read leg; the data-size and spill gates are
   unchanged.
+- #126: Raised the same uniform DuckDB operator limit to 352 MB after the
+  320 MB live-R2 retry again exhausted QuackStore's external sort allocator at
+  299.0 of 305.1 MiB. The 1,501,993,637-byte measured dataset remains larger
+  than four times the 352,000,000-byte operator budget, and spill evidence is
+  still mandatory.

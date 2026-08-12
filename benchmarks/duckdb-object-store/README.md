@@ -19,10 +19,10 @@ The report records the capacity and cache counters returned by the running
 Verglas server; the profile label is never inferred from the requested value.
 
 The default dataset uses 40 million rows and is valid only when its measured
-Parquet footprint is larger than four times DuckDB's 320 MB operator-memory
+Parquet footprint is larger than four times DuckDB's 352 MB operator-memory
 limit. The servers run with one CPU and a 2 GiB container ceiling; the larger
 process ceiling leaves room for Quack and HTTP buffers without weakening the
-320 MB DuckDB allocator limit that leaves QuackStore enough allocator headroom
+352 MB DuckDB allocator limit that leaves QuackStore enough allocator headroom
 while still forcing disk spill. Verglas runs with one
 CPU, 256 MiB RAM, 80 MiB DRAM cache, and a 256 MiB disk
 cache. Every workload runs direct, Verglas cold, Verglas warm, and from a second
@@ -59,7 +59,7 @@ does not place the live secret in container arguments or the report. The R2
 endpoint uses TLS and region `auto`. Dataset generation has a 512 MiB DuckDB
 allocator and a 1 GiB setup container because remote multipart upload has a
 larger buffering requirement. That setup is not timed. All measured Quack
-servers remain single-CPU with a 320 MB DuckDB allocator and 2 GiB process
+servers remain single-CPU with a 352 MB DuckDB allocator and 2 GiB process
 ceiling.
 
 The live profile runs five isolated repetitions. Each repetition measures seven
