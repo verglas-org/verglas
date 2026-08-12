@@ -37,3 +37,8 @@
   and embedded its raw evidence in the final summary. The contract now rejects
   missing raw reports, cache-file paths, overlapping QuackStore processes, and
   missing logical or physical cache-size evidence.
+- #126: Raised the uniform DuckDB operator limit from 256 MB to 320 MB after
+  QuackStore's external sort exhausted its allocator while the direct leg did
+  not. The report now records and validates the exact limit and one-thread
+  configuration for every measured read leg; the data-size and spill gates are
+  unchanged.

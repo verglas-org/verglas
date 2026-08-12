@@ -32,8 +32,10 @@ NETWORK = "verglas-duckdb-object-store-bench"
 BUCKET = "verglas-benchmark"
 PREFIX = "issue-126"
 R2_BUCKET = "verglas-duckdb-bench-20260812"
-ENGINE_MEMORY_BYTES = 256 * 1024 * 1024
-ENGINE_MEMORY = "256MB"
+# DuckDB interprets MB as decimal units. Keep the report's byte gate derived
+# from the setting sent to every measured server.
+ENGINE_MEMORY = "320MB"
+ENGINE_MEMORY_BYTES = int(ENGINE_MEMORY.removesuffix("MB")) * 1_000_000
 ROWS = 40_000_000
 QUACK_CONTAINER_MEMORY_BYTES = 2 * 1024**3
 DEFAULT_CACHE_CAPACITY_BYTES = 256 * 1024**2
@@ -72,6 +74,16 @@ def quackstore_settings(cache_path: str) -> dict[str, str | int | bool]:
         "cache_path": cache_path,
         "cache_size": DEFAULT_CACHE_CAPACITY_BYTES,
         "data_mutable": False,
+    }
+
+
+def duckdb_operator_evidence(read_legs: tuple[str, ...]) -> dict[str, str | int | list[str]]:
+    """Record the exact bounded DuckDB configuration shared by every measured read leg."""
+    return {
+        "memory_limit": ENGINE_MEMORY,
+        "memory_limit_bytes": ENGINE_MEMORY_BYTES,
+        "threads": 1,
+        "read_legs": list(read_legs),
     }
 
 
@@ -159,7 +171,19 @@ def validate_report(report: dict, *, require_repetitions: bool = True) -> None:
     if dataset["object_count"] < 1:
         raise ValueError("dataset must contain durable objects")
 
+    if not report.get("cache_stats"):
+        raise ValueError("cache stats are missing")
     quackstore_comparison = "quackstore" in report.get("cache_stats", {})
+    required_legs = LEGS if quackstore_comparison else LEGACY_LEGS
+    operator = report["runtime"].get("duckdb_operator")
+    if operator is None:
+        raise ValueError("DuckDB operator configuration is missing")
+    if operator.get("memory_limit") != ENGINE_MEMORY or operator.get("memory_limit_bytes") != ENGINE_MEMORY_BYTES:
+        raise ValueError("DuckDB operator memory limit must be exactly 320 MB")
+    if operator.get("threads") != 1 or operator.get("read_legs") != list(required_legs):
+        raise ValueError("DuckDB operator configuration must apply uniformly to every read leg")
+    if dataset["worker_memory_bytes"] != ENGINE_MEMORY_BYTES:
+        raise ValueError("dataset worker memory must match the DuckDB operator memory limit")
     required_services = {
         "verglas",
         "quack_direct",
@@ -254,7 +278,6 @@ def validate_report(report: dict, *, require_repetitions: bool = True) -> None:
         raise ValueError("spill was not observed")
 
     for workload, legs in report["workloads"].items():
-        required_legs = LEGS if quackstore_comparison else LEGACY_LEGS
         if set(legs) != set(required_legs):
             raise ValueError(f"read legs missing for {workload}")
         digests = {legs[leg]["result_digest"] for leg in required_legs}
@@ -787,7 +810,8 @@ def local_smoke(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> N
             "dataset": {"format": "parquet", "storage": "s3-compatible", "worker_memory_bytes": ENGINE_MEMORY_BYTES, **inventory["dataset"]},
             "runtime": {"services": services, "limits": {
                 "quack_direct": cgroup(names[2]), "quack_cached": cgroup(names[3]),
-                "quack_shared": cgroup(names[4]), "verglas": cgroup(names[1])}},
+                "quack_shared": cgroup(names[4]), "verglas": cgroup(names[1])},
+                "duckdb_operator": duckdb_operator_evidence(LEGACY_LEGS)},
             "object_store": {"request_count": len(request_lines), "request_log_sha256": hashlib.sha256(trace.encode()).hexdigest()},
             "cache_stats": fetch_json("http://127.0.0.1:18434/admin/stats"),
             "workloads": workloads,
@@ -1029,6 +1053,7 @@ def live_r2_once(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> 
             "runtime": {
                 "services": service_evidence,
                 "quackstore_processes": quackstore_processes,
+                "duckdb_operator": duckdb_operator_evidence(LEGS),
                 "external_origin": {
                     "provider": "cloudflare-r2", "bucket": R2_BUCKET,
                     "endpoint": settings["endpoint"],

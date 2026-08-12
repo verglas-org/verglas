@@ -22,11 +22,17 @@ class BenchmarkContractTest(unittest.TestCase):
             "dataset": {
                 "format": "parquet",
                 "storage": "s3-compatible",
-                "bytes": 600 * 1024 * 1024,
-                "worker_memory_bytes": 128 * 1024 * 1024,
+                "bytes": 1_500_000_000,
+                "worker_memory_bytes": benchmark.ENGINE_MEMORY_BYTES,
                 "object_count": 8,
             },
             "runtime": {
+                "duckdb_operator": {
+                    "memory_limit": benchmark.ENGINE_MEMORY,
+                    "memory_limit_bytes": benchmark.ENGINE_MEMORY_BYTES,
+                    "threads": 1,
+                    "read_legs": list(benchmark.LEGS),
+                },
                 "services": {
                     name: {"container_id": name * 2, "image_id": "sha256:" + name}
                     for name in (
@@ -115,6 +121,30 @@ class BenchmarkContractTest(unittest.TestCase):
         report = self.valid_report()
         report["dataset"]["bytes"] = 4 * report["dataset"]["worker_memory_bytes"]
         with self.assertRaisesRegex(ValueError, "larger than 4x"):
+            benchmark.validate_report(report)
+
+    def test_report_requires_the_uniform_320_mb_duckdb_operator_limit(self):
+        """Every measured server must use the fixed operator limit that leaves QuackStore headroom."""
+        report = self.valid_report()
+        report["runtime"]["duckdb_operator"]["memory_limit_bytes"] = 256 * 1_000_000
+        with self.assertRaisesRegex(ValueError, "320 MB"):
+            benchmark.validate_report(report)
+
+        report = self.valid_report()
+        del report["runtime"]["duckdb_operator"]
+        with self.assertRaisesRegex(ValueError, "DuckDB operator"):
+            benchmark.validate_report(report)
+
+        report = self.valid_report()
+        report["runtime"]["duckdb_operator"]["read_legs"] = list(benchmark.LEGACY_LEGS)
+        with self.assertRaisesRegex(ValueError, "uniformly"):
+            benchmark.validate_report(report)
+
+    def test_dataset_gate_uses_the_reported_operator_limit(self):
+        """The out-of-core size proof cannot be decoupled from the measured server setting."""
+        report = self.valid_report()
+        report["dataset"]["worker_memory_bytes"] = 256 * 1_000_000
+        with self.assertRaisesRegex(ValueError, "must match"):
             benchmark.validate_report(report)
 
     def test_spill_and_origin_traffic_must_be_observed(self):
