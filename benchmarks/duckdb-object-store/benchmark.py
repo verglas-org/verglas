@@ -30,7 +30,8 @@ BUCKET = "verglas-benchmark"
 PREFIX = "issue-126"
 ENGINE_MEMORY_BYTES = 256 * 1024 * 1024
 ENGINE_MEMORY = "256MB"
-ROWS = 20_000_000
+ROWS = 40_000_000
+QUACK_CONTAINER_MEMORY_BYTES = 2 * 1024**3
 QUACK_TOKEN = "benchmark-only-token"
 ORIGIN_KEY = "minio-benchmark"
 ORIGIN_SECRET = "minio-benchmark-secret"
@@ -106,6 +107,8 @@ def validate_report(report: dict) -> None:
             raise ValueError(f"runtime limit missing for {name}")
         if limits[name].get("cpus") != 1.0:
             raise ValueError(f"{name} must run with one CPU")
+        if limits[name].get("memory_bytes") != QUACK_CONTAINER_MEMORY_BYTES:
+            raise ValueError(f"{name} must run with a 2 GiB container memory ceiling")
 
     traffic = report["object_store"]
     if traffic["request_count"] < 1 or len(traffic["request_log_sha256"]) != 64:
@@ -425,7 +428,7 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
         for name, endpoint, key, secret in server_specs:
             containers.append(start_container(
                 name, IMAGE, ["python", "/bench/benchmark.py", "serve", "--endpoint", endpoint, "--access-key", key, "--secret", secret, "--bucket", BUCKET],
-                cpus="1", memory="768m", extra=["-v", f"{spill_dirs[name]}:/spill"],
+                cpus="1", memory="2g", extra=["-v", f"{spill_dirs[name]}:/spill"],
             ))
             wait_quack(name)
 

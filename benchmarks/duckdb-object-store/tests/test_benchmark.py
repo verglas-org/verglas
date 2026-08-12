@@ -37,9 +37,9 @@ class BenchmarkContractTest(unittest.TestCase):
                     )
                 },
                 "limits": {
-                    "quack_direct": {"cpus": 1.0, "memory_bytes": 128 * 1024 * 1024},
-                    "quack_cached": {"cpus": 1.0, "memory_bytes": 128 * 1024 * 1024},
-                    "quack_shared": {"cpus": 1.0, "memory_bytes": 128 * 1024 * 1024},
+                    "quack_direct": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
+                    "quack_cached": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
+                    "quack_shared": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
                     "verglas": {"cpus": 1.0, "memory_bytes": 256 * 1024 * 1024},
                 },
             },
@@ -97,6 +97,13 @@ class BenchmarkContractTest(unittest.TestCase):
         report = self.valid_report()
         report["runtime"]["limits"]["quack_shared"]["cpus"] = 2.0
         with self.assertRaisesRegex(ValueError, "one CPU"):
+            benchmark.validate_report(report)
+
+    def test_every_quack_process_has_the_same_two_gib_container_ceiling(self):
+        """A leg cannot gain an unreported RAM advantage outside DuckDB's allocator."""
+        report = self.valid_report()
+        report["runtime"]["limits"]["quack_cached"]["memory_bytes"] = 3 * 1024**3
+        with self.assertRaisesRegex(ValueError, "2 GiB"):
             benchmark.validate_report(report)
 
     def test_r2_requires_all_three_s3_credential_parts(self):

@@ -11,3 +11,7 @@
   servers, including the shared-warm reader. This prevents a report from
   presenting a shared-cache result without proving that the third engine was
   held to the same CPU ceiling.
+- #126: Increased the generated dataset to 40 million rows after the measured
+  20-million-row Parquet footprint failed the one-GiB eligibility gate. Quack
+  now has a fixed two-GiB process ceiling while DuckDB remains capped at 256
+  MiB, separating server overhead from the operator limit that forces spill.

@@ -14,9 +14,12 @@ reuse the shared Verglas cache.
 benchmarks/duckdb-object-store/run.sh --output /tmp/duckdb-object-store.json
 ```
 
-The default dataset is deliberately larger than four times DuckDB's 256 MiB
-operator-memory limit. The servers run with one CPU and 768 MiB container RAM;
-Verglas runs with one CPU, 256 MiB RAM, 80 MiB DRAM cache, and a 256 MiB disk
+The default dataset uses 40 million rows and is valid only when its measured
+Parquet footprint is larger than four times DuckDB's 256 MiB operator-memory
+limit. The servers run with one CPU and a 2 GiB container ceiling; the larger
+process ceiling leaves room for Quack and HTTP buffers without weakening the
+256 MiB DuckDB allocator limit that forces disk spill. Verglas runs with one
+CPU, 256 MiB RAM, 80 MiB DRAM cache, and a 256 MiB disk
 cache. Every workload runs direct, Verglas cold, Verglas warm, and from a second
 Quack process against the shared warm cache. The run is invalid unless it sees
 DuckDB spill files, MinIO requests, identical result hashes, and direct-origin
