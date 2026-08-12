@@ -19,3 +19,7 @@
   carry the running server's cache configuration and counters. This lets
   constrained and NVMe-resident results be distinguished using observed
   evidence rather than a handwritten profile label.
+- #126: Added the live Cloudflare R2 profile with TLS, mounted credentials,
+  external-origin provenance, and request counts from R2's GraphQL operations
+  dataset. The same bounded Quack topology now runs against durable R2 directly
+  and through Verglas, and both write paths are hashed after direct R2 readback.

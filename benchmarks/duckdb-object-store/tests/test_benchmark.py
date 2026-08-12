@@ -1,6 +1,7 @@
 """Acceptance tests for the durable, out-of-core DuckDB benchmark."""
 
 import importlib.util
+import copy
 import pathlib
 import tempfile
 import unittest
@@ -116,6 +117,33 @@ class BenchmarkContractTest(unittest.TestCase):
         report["runtime"]["limits"]["quack_cached"]["memory_bytes"] = 3 * 1024**3
         with self.assertRaisesRegex(ValueError, "2 GiB"):
             benchmark.validate_report(report)
+
+    def test_r2_origin_uses_external_provenance_instead_of_a_fake_container(self):
+        """A live R2 report identifies the remote origin and still passes every gate."""
+        report = copy.deepcopy(self.valid_report())
+        del report["runtime"]["services"]["minio"]
+        report["runtime"]["external_origin"] = {
+            "provider": "cloudflare-r2",
+            "bucket": "verglas-duckdb-bench-20260812",
+            "endpoint": "example.r2.cloudflarestorage.com",
+        }
+        report["object_store"]["evidence_source"] = "cloudflare-r2-graphql"
+        benchmark.validate_report(report)
+
+    def test_report_rejects_an_origin_without_container_or_external_provenance(self):
+        """Storage timing is invalid when the measured origin cannot be identified."""
+        report = copy.deepcopy(self.valid_report())
+        del report["runtime"]["services"]["minio"]
+        with self.assertRaisesRegex(ValueError, "origin provenance"):
+            benchmark.validate_report(report)
+
+    def test_r2_endpoint_enables_tls_and_auto_region(self):
+        """R2 must not inherit the local MinIO endpoint's insecure transport settings."""
+        settings = benchmark.r2_endpoint_settings("0123456789abcdef")
+        self.assertEqual(settings["endpoint"], "0123456789abcdef.r2.cloudflarestorage.com")
+        self.assertEqual(settings["endpoint_url"], "https://0123456789abcdef.r2.cloudflarestorage.com")
+        self.assertEqual(settings["region"], "auto")
+        self.assertTrue(settings["use_ssl"])
 
     def test_r2_requires_all_three_s3_credential_parts(self):
         """A token value alone is never guessed into an R2 credential pair."""

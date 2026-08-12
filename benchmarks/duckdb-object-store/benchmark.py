@@ -9,6 +9,8 @@ dataset, serves Quack, and executes the measured requests.
 from __future__ import annotations
 
 import argparse
+import configparser
+import datetime
 import hashlib
 import json
 import os
@@ -28,6 +30,7 @@ VERGLAS_IMAGE = os.environ.get("VERGLAS_BENCH_IMAGE", "verglas/verglas-server:lo
 NETWORK = "verglas-duckdb-object-store-bench"
 BUCKET = "verglas-benchmark"
 PREFIX = "issue-126"
+R2_BUCKET = "verglas-duckdb-bench-20260812"
 ENGINE_MEMORY_BYTES = 256 * 1024 * 1024
 ENGINE_MEMORY = "256MB"
 ROWS = 40_000_000
@@ -75,6 +78,17 @@ def r2_credentials(environment: dict[str, str]) -> dict[str, str]:
     return {name: environment[name] for name in required}
 
 
+def r2_endpoint_settings(account_id: str) -> dict[str, str | bool]:
+    """Return the TLS and region settings required by Cloudflare R2's S3 API."""
+    endpoint = f"{account_id}.r2.cloudflarestorage.com"
+    return {
+        "endpoint": endpoint,
+        "endpoint_url": f"https://{endpoint}",
+        "region": "auto",
+        "use_ssl": True,
+    }
+
+
 def validate_report(report: dict) -> None:
     """Reject a report unless it proves a durable, out-of-core comparison."""
     dataset = report["dataset"]
@@ -85,13 +99,7 @@ def validate_report(report: dict) -> None:
     if dataset["object_count"] < 1:
         raise ValueError("dataset must contain durable objects")
 
-    required_services = {
-        "minio",
-        "verglas",
-        "quack_direct",
-        "quack_cached",
-        "quack_shared",
-    }
+    required_services = {"verglas", "quack_direct", "quack_cached", "quack_shared"}
     services = report["runtime"]["services"]
     missing_services = required_services.difference(services)
     if missing_services:
@@ -102,6 +110,16 @@ def validate_report(report: dict) -> None:
     for name in required_services:
         if not services[name].get("container_id") or not services[name].get("image_id"):
             raise ValueError(f"runtime provenance missing for {name}")
+    local_origin = services.get("minio")
+    external_origin = report["runtime"].get("external_origin")
+    if not local_origin and not external_origin:
+        raise ValueError("origin provenance is missing")
+    if local_origin and (
+        not local_origin.get("container_id") or not local_origin.get("image_id")
+    ):
+        raise ValueError("runtime provenance missing for minio")
+    if external_origin and external_origin.get("provider") != "cloudflare-r2":
+        raise ValueError("external origin provenance must identify Cloudflare R2")
     limits = report["runtime"]["limits"]
     for name in ("quack_direct", "quack_cached", "quack_shared"):
         if name not in limits:
@@ -145,6 +163,8 @@ def duckdb_connection(
     *,
     register_data: bool = True,
     memory_limit: str = ENGINE_MEMORY,
+    region: str = "us-east-1",
+    use_ssl: bool = False,
 ):
     """Create a bounded DuckDB connection pointed at exactly one S3 endpoint."""
     import duckdb
@@ -157,8 +177,8 @@ def duckdb_connection(
     connection.execute("SET temp_directory='/spill'")
     connection.execute(f"SET s3_endpoint='{endpoint}'")
     connection.execute("SET s3_url_style='path'")
-    connection.execute("SET s3_use_ssl=false")
-    connection.execute("SET s3_region='us-east-1'")
+    connection.execute(f"SET s3_use_ssl={'true' if use_ssl else 'false'}")
+    connection.execute(f"SET s3_region='{region}'")
     connection.execute(f"SET s3_access_key_id='{access_key}'")
     connection.execute(f"SET s3_secret_access_key='{secret}'")
     escaped_endpoint = endpoint.replace("'", "''")
@@ -167,8 +187,9 @@ def duckdb_connection(
     connection.execute(
         "CREATE OR REPLACE PERSISTENT SECRET benchmark_s3 ("
         "TYPE s3, PROVIDER config, "
-        f"KEY_ID '{escaped_key}', SECRET '{escaped_secret}', REGION 'us-east-1', "
-        f"ENDPOINT '{escaped_endpoint}', URL_STYLE 'path', USE_SSL false)"
+        f"KEY_ID '{escaped_key}', SECRET '{escaped_secret}', REGION '{region}', "
+        f"ENDPOINT '{escaped_endpoint}', URL_STYLE 'path', "
+        f"USE_SSL {'true' if use_ssl else 'false'})"
     )
     if register_data:
         location = f"s3://{bucket}/{PREFIX}/data/*.parquet"
@@ -178,10 +199,26 @@ def duckdb_connection(
     return connection
 
 
-def seed(endpoint: str, access_key: str, secret: str, bucket: str, rows: int) -> None:
+def seed(
+    endpoint: str,
+    access_key: str,
+    secret: str,
+    bucket: str,
+    rows: int,
+    *,
+    region: str = "us-east-1",
+    use_ssl: bool = False,
+) -> None:
     """Stream an incompressible partitioned Parquet dataset to the origin."""
     connection = duckdb_connection(
-        endpoint, access_key, secret, bucket, register_data=False, memory_limit="256MB"
+        endpoint,
+        access_key,
+        secret,
+        bucket,
+        register_data=False,
+        memory_limit="512MB",
+        region=region,
+        use_ssl=use_ssl,
     )
     file_count = 4
     chunk_rows = (rows + file_count - 1) // file_count
@@ -200,9 +237,19 @@ def seed(endpoint: str, access_key: str, secret: str, bucket: str, rows: int) ->
     connection.close()
 
 
-def serve_quack(endpoint: str, access_key: str, secret: str, bucket: str) -> None:
+def serve_quack(
+    endpoint: str,
+    access_key: str,
+    secret: str,
+    bucket: str,
+    *,
+    region: str = "us-east-1",
+    use_ssl: bool = False,
+) -> None:
     """Expose one configured DuckDB instance through the real Quack extension."""
-    connection = duckdb_connection(endpoint, access_key, secret, bucket)
+    connection = duckdb_connection(
+        endpoint, access_key, secret, bucket, region=region, use_ssl=use_ssl
+    )
     connection.execute("INSTALL quack; LOAD quack")
     connection.execute(
         "CALL quack_serve('quack:0.0.0.0:9000', token = ?, "
@@ -233,10 +280,26 @@ def query(host: str, sql: str) -> dict:
     }
 
 
-def write_probe(endpoint: str, access_key: str, secret: str, bucket: str, leg: str) -> None:
+def write_probe(
+    endpoint: str,
+    access_key: str,
+    secret: str,
+    bucket: str,
+    leg: str,
+    *,
+    region: str = "us-east-1",
+    use_ssl: bool = False,
+) -> None:
     """Write a Parquet object through one benchmark leg."""
     connection = duckdb_connection(
-        endpoint, access_key, secret, bucket, register_data=False, memory_limit="256MB"
+        endpoint,
+        access_key,
+        secret,
+        bucket,
+        register_data=False,
+        memory_limit="256MB",
+        region=region,
+        use_ssl=use_ssl,
     )
     destination = f"s3://{bucket}/{PREFIX}/writes/{leg}.parquet"
     connection.execute(
@@ -246,7 +309,14 @@ def write_probe(endpoint: str, access_key: str, secret: str, bucket: str, leg: s
     connection.close()
 
 
-def origin_inventory(endpoint_url: str, access_key: str, secret: str, bucket: str) -> dict:
+def origin_inventory(
+    endpoint_url: str,
+    access_key: str,
+    secret: str,
+    bucket: str,
+    *,
+    region: str = "us-east-1",
+) -> dict:
     """List dataset objects and hash write probes read directly from the origin."""
     import boto3
 
@@ -255,7 +325,7 @@ def origin_inventory(endpoint_url: str, access_key: str, secret: str, bucket: st
         endpoint_url=endpoint_url,
         aws_access_key_id=access_key,
         aws_secret_access_key=secret,
-        region_name="us-east-1",
+        region_name=region,
     )
     paginator = client.get_paginator("list_objects_v2")
     objects = [item for page in paginator.paginate(Bucket=bucket, Prefix=f"{PREFIX}/data/") for item in page.get("Contents", [])]
@@ -301,6 +371,74 @@ def fetch_json(url: str) -> dict:
         return json.load(response)
 
 
+def r2_operation_evidence(
+    api_token: str,
+    account_id: str,
+    bucket: str,
+    started_at: str,
+    ended_at: str,
+) -> dict:
+    """Query Cloudflare's R2 operations dataset for this benchmark window."""
+    query_text = """
+    query R2Ops($accountTag: string!, $startDate: Time, $endDate: Time, $bucketName: string) {
+      viewer {
+        accounts(filter: { accountTag: $accountTag }) {
+          r2OperationsAdaptiveGroups(
+            limit: 10000
+            filter: {
+              datetime_geq: $startDate
+              datetime_leq: $endDate
+              bucketName: $bucketName
+            }
+          ) {
+            sum { requests }
+            dimensions { actionType }
+          }
+        }
+      }
+    }
+    """
+    payload = json.dumps(
+        {
+            "query": query_text,
+            "variables": {
+                "accountTag": account_id,
+                "startDate": started_at,
+                "endDate": ended_at,
+                "bucketName": bucket,
+            },
+        }
+    ).encode()
+    request = urllib.request.Request(
+        "https://api.cloudflare.com/client/v4/graphql",
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        raw = response.read()
+    document = json.loads(raw)
+    if document.get("errors"):
+        messages = "; ".join(error.get("message", "unknown") for error in document["errors"])
+        raise RuntimeError(f"R2 analytics query failed: {messages}")
+    accounts = document["data"]["viewer"]["accounts"]
+    groups = accounts[0]["r2OperationsAdaptiveGroups"] if accounts else []
+    requests = sum(group.get("sum", {}).get("requests", 0) for group in groups)
+    return {
+        "request_count": requests,
+        "request_log_sha256": hashlib.sha256(raw).hexdigest(),
+        "evidence_source": "cloudflare-r2-graphql",
+        "window": {"started_at": started_at, "ended_at": ended_at},
+        "operations": {
+            group.get("dimensions", {}).get("actionType", "unknown"): group.get("sum", {}).get("requests", 0)
+            for group in groups
+        },
+    }
+
+
 def wait_container(name: str, needle: str, timeout: float = 45.0) -> None:
     """Wait until a service log contains its readiness marker."""
     deadline = time.monotonic() + timeout
@@ -336,11 +474,17 @@ def start_container(name: str, image: str, command: list[str], *, cpus: str, mem
     return docker(*arguments).stdout.strip()
 
 
-def client(command: list[str]) -> dict:
+def client(
+    command: list[str], *, extra: list[str] | None = None, memory: str = "512m"
+) -> dict:
     """Run one bounded benchmark worker and parse its sole JSON result."""
+    arguments = [
+        "run", "--rm", "--network", NETWORK, "--cpus", "1", "--memory", memory
+    ]
+    arguments.extend(extra or [])
+    arguments.extend([IMAGE, "python", "/bench/benchmark.py", *command])
     output = docker(
-        "run", "--rm", "--network", NETWORK, "--cpus", "1", "--memory", "512m",
-        IMAGE, "python", "/bench/benchmark.py", *command,
+        *arguments,
     ).stdout
     return json.loads(output)
 
@@ -490,22 +634,207 @@ def local_smoke(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> N
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
+    """Run the complete comparison against the isolated durable R2 bucket."""
+    credentials = r2_credentials(os.environ)
+    api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
+    if not api_token:
+        raise ValueError("live R2 evidence requires CLOUDFLARE_API_TOKEN")
+    account_id = credentials["R2_ACCOUNT_ID"]
+    settings = r2_endpoint_settings(account_id)
+    names = ["vg-bench-verglas", "vg-bench-direct", "vg-bench-cached", "vg-bench-shared"]
+    external_root = pathlib.Path(
+        os.environ.get("VERGLAS_BENCH_ROOT", "/Volumes/data_cache/verglas/rime-benchmarks")
+    )
+    scratch_parent = external_root if external_root.is_dir() else None
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="verglas-duckdb-r2-", dir=scratch_parent))
+    config = scratch / "verglas.toml"
+    origin_creds = scratch / "origin-creds"
+    endpoint_creds = scratch / "endpoint-creds"
+    cache_dir = scratch / "cache"
+    cache_dir.mkdir()
+    spill_dirs = {name: scratch / f"spill-{name}" for name in names[1:]}
+    for directory in spill_dirs.values():
+        directory.mkdir()
+    origin_creds.write_text(
+        "[default]\n"
+        f"aws_access_key_id={credentials['R2_ACCESS_KEY_ID']}\n"
+        f"aws_secret_access_key={credentials['R2_SECRET_ACCESS_KEY']}\n"
+    )
+    endpoint_creds.write_text(
+        f"[default]\naws_access_key_id={VERGLAS_KEY}\naws_secret_access_key={VERGLAS_SECRET}\n"
+    )
+    origin_creds.chmod(0o600)
+    endpoint_creds.chmod(0o600)
+    config.write_text(
+        "[listen]\ns3_port=8333\nadmin_port=8334\n"
+        f"[cache]\ndir='/cache'\ncapacity_bytes='{cache_capacity_bytes}B'\ndram_bytes='80MB'\n"
+        "[auth]\ncredentials_file='/config/endpoint-creds'\n"
+        f"[backend]\nprovider='s3'\nbucket='{R2_BUCKET}'\n"
+        f"endpoint='{settings['endpoint_url']}'\nregion='auto'\n"
+        "credentials_file='/config/origin-creds'\n"
+    )
+    worker_origin_mount = ["-v", f"{origin_creds}:/run/secrets/origin:ro"]
+    worker_endpoint_mount = ["-v", f"{endpoint_creds}:/run/secrets/endpoint:ro"]
+    started_at = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+    try:
+        subprocess.run(["docker", "network", "rm", NETWORK], capture_output=True)
+        docker("network", "create", NETWORK)
+        docker("build", "-t", IMAGE, "-f", str(HERE / "Dockerfile"), str(HERE.parents[1]), capture=False)
+        client(
+            [
+                "seed", "--endpoint", str(settings["endpoint"]),
+                "--credentials-file", "/run/secrets/origin", "--bucket", R2_BUCKET,
+                "--rows", str(rows), "--region", "auto", "--use-ssl",
+            ],
+            extra=worker_origin_mount,
+            memory="1g",
+        )
+        start_container(
+            names[0], VERGLAS_IMAGE, ["--config", "/config/verglas.toml"], cpus="1", memory="256m",
+            extra=[
+                "--entrypoint", "verglas-server", "-p", "18434:8334",
+                "-e", "VERGLAS_ADMIN_ADDR=0.0.0.0:8334", "-v", f"{scratch}:/config:ro",
+                "-v", f"{cache_dir}:/cache",
+            ],
+        )
+        wait_http("http://127.0.0.1:18434/admin/healthz")
+        server_specs = (
+            (
+                names[1], str(settings["endpoint"]), "/run/secrets/origin", "auto", True,
+                worker_origin_mount,
+            ),
+            (names[2], f"{names[0]}:8333", "/run/secrets/endpoint", "us-east-1", False, worker_endpoint_mount),
+            (names[3], f"{names[0]}:8333", "/run/secrets/endpoint", "us-east-1", False, worker_endpoint_mount),
+        )
+        for name, endpoint, credentials_file, region, use_ssl, mounts in server_specs:
+            command = [
+                "python", "/bench/benchmark.py", "serve", "--endpoint", endpoint,
+                "--credentials-file", credentials_file, "--bucket", R2_BUCKET,
+                "--region", region,
+            ]
+            if use_ssl:
+                command.append("--use-ssl")
+            start_container(
+                name, IMAGE, command, cpus="1", memory="2g",
+                extra=[*mounts, "-v", f"{spill_dirs[name]}:/spill"],
+            )
+            wait_quack(name)
+
+        workloads = {}
+        peak_spill = 0
+        for workload, sql in WORKLOADS.items():
+            purge_cache()
+            direct, direct_spill = measured_query(spill_dirs[names[1]], names[1], sql)
+            cold, cold_spill = measured_query(spill_dirs[names[2]], names[2], sql)
+            warm, warm_spill = measured_query(spill_dirs[names[2]], names[2], sql)
+            shared, shared_spill = measured_query(spill_dirs[names[3]], names[3], sql)
+            peak_spill = max(
+                peak_spill, direct_spill, cold_spill, warm_spill, shared_spill
+            )
+            workloads[workload] = dict(zip(LEGS, (direct, cold, warm, shared)))
+
+        client(
+            [
+                "write", "--endpoint", str(settings["endpoint"]),
+                "--credentials-file", "/run/secrets/origin", "--bucket", R2_BUCKET,
+                "--leg", "direct", "--region", "auto", "--use-ssl",
+            ],
+            extra=worker_origin_mount,
+        )
+        client(
+            [
+                "write", "--endpoint", f"{names[0]}:8333",
+                "--credentials-file", "/run/secrets/endpoint", "--bucket", R2_BUCKET,
+                "--leg", "through_verglas",
+            ],
+            extra=worker_endpoint_mount,
+        )
+        inventory = client(
+            [
+                "inventory", "--endpoint-url", str(settings["endpoint_url"]),
+                "--credentials-file", "/run/secrets/origin", "--bucket", R2_BUCKET,
+                "--region", "auto",
+            ],
+            extra=worker_origin_mount,
+        )
+        ended_at = datetime.datetime.now(datetime.UTC).isoformat().replace("+00:00", "Z")
+        object_store = r2_operation_evidence(
+            api_token, account_id, R2_BUCKET, started_at, ended_at
+        )
+        services = {
+            "verglas": provenance(names[0]),
+            "quack_direct": provenance(names[1]),
+            "quack_cached": provenance(names[2]),
+            "quack_shared": provenance(names[3]),
+        }
+        report = {
+            "comparison_scope": "same DuckDB 1.5.5 + Quack engine; direct R2 versus Verglas S3 cache backed by R2",
+            "dataset": {
+                "format": "parquet", "storage": "s3-compatible",
+                "worker_memory_bytes": ENGINE_MEMORY_BYTES, **inventory["dataset"],
+            },
+            "runtime": {
+                "services": services,
+                "external_origin": {
+                    "provider": "cloudflare-r2", "bucket": R2_BUCKET,
+                    "endpoint": settings["endpoint"],
+                },
+                "limits": {
+                    "quack_direct": cgroup(names[1]), "quack_cached": cgroup(names[2]),
+                    "quack_shared": cgroup(names[3]), "verglas": cgroup(names[0]),
+                },
+            },
+            "object_store": object_store,
+            "cache_stats": fetch_json("http://127.0.0.1:18434/admin/stats"),
+            "workloads": workloads,
+            "spill": {"observed": peak_spill > 0, "peak_bytes": peak_spill},
+            "durable_writes": inventory["writes"],
+        }
+        validate_report(report)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(json.dumps(report, indent=2) + "\n")
+    finally:
+        for name in reversed(names):
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True)
+        subprocess.run(["docker", "network", "rm", NETWORK], capture_output=True)
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def file_credentials(path: str | None, access_key: str | None, secret: str | None) -> tuple[str, str]:
+    """Resolve worker credentials from a mounted AWS file or explicit local-test arguments."""
+    if path:
+        parser = configparser.ConfigParser()
+        if not parser.read(path) or "default" not in parser:
+            raise ValueError(f"credentials file has no default profile: {path}")
+        return (
+            parser["default"]["aws_access_key_id"],
+            parser["default"]["aws_secret_access_key"],
+        )
+    if not access_key or not secret:
+        raise ValueError("worker requires --credentials-file or both --access-key and --secret")
+    return access_key, secret
+
+
 def main() -> None:
     """Dispatch coordinator and container worker commands."""
     parser = argparse.ArgumentParser()
     parser.add_argument("command", nargs="?", choices=("local-smoke", "seed", "serve", "query", "write", "inventory"))
-    parser.add_argument("--profile", choices=("local-smoke",))
+    parser.add_argument("--profile", choices=("local-smoke", "live-r2"))
     parser.add_argument("--output", type=pathlib.Path, default=HERE / "result.json")
     parser.add_argument("--endpoint")
     parser.add_argument("--endpoint-url")
     parser.add_argument("--access-key")
     parser.add_argument("--secret")
+    parser.add_argument("--credentials-file")
     parser.add_argument("--bucket", default=BUCKET)
     parser.add_argument("--rows", type=int, default=ROWS)
     parser.add_argument("--cache-capacity-bytes", type=int, default=DEFAULT_CACHE_CAPACITY_BYTES)
     parser.add_argument("--host")
     parser.add_argument("--sql")
     parser.add_argument("--leg")
+    parser.add_argument("--region", default="us-east-1")
+    parser.add_argument("--use-ssl", action="store_true")
     args = parser.parse_args()
     if args.profile:
         if args.command:
@@ -515,18 +844,39 @@ def main() -> None:
         parser.error("a command or --profile is required")
     if args.command == "local-smoke":
         local_smoke(args.output, args.rows, args.cache_capacity_bytes)
+    elif args.command == "live-r2":
+        live_r2(args.output, args.rows, args.cache_capacity_bytes)
     elif args.command == "seed":
-        seed(args.endpoint, args.access_key, args.secret, args.bucket, args.rows)
+        access_key, secret = file_credentials(args.credentials_file, args.access_key, args.secret)
+        seed(
+            args.endpoint, access_key, secret, args.bucket, args.rows,
+            region=args.region, use_ssl=args.use_ssl,
+        )
         print("{}")
     elif args.command == "serve":
-        serve_quack(args.endpoint, args.access_key, args.secret, args.bucket)
+        access_key, secret = file_credentials(args.credentials_file, args.access_key, args.secret)
+        serve_quack(
+            args.endpoint, access_key, secret, args.bucket,
+            region=args.region, use_ssl=args.use_ssl,
+        )
     elif args.command == "query":
         print(json.dumps(query(args.host, args.sql)))
     elif args.command == "write":
-        write_probe(args.endpoint, args.access_key, args.secret, args.bucket, args.leg)
+        access_key, secret = file_credentials(args.credentials_file, args.access_key, args.secret)
+        write_probe(
+            args.endpoint, access_key, secret, args.bucket, args.leg,
+            region=args.region, use_ssl=args.use_ssl,
+        )
         print("{}")
     else:
-        print(json.dumps(origin_inventory(args.endpoint_url, args.access_key, args.secret, args.bucket)))
+        access_key, secret = file_credentials(args.credentials_file, args.access_key, args.secret)
+        print(
+            json.dumps(
+                origin_inventory(
+                    args.endpoint_url, access_key, secret, args.bucket, region=args.region
+                )
+            )
+        )
 
 
 if __name__ == "__main__":
