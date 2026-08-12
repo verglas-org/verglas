@@ -30,7 +30,7 @@ async fn database_subscribe_pushes_commit_without_polling() {
                 "group":"live-deploy-1",
                 "owner":"rlean-1",
                 "tables":["rlean.custom_points"],
-                "max":256,
+                "max":1,
                 "leaseSeconds":60
             })
         );
@@ -78,7 +78,13 @@ async fn database_subscribe_pushes_commit_without_polling() {
     .expect("connect");
     let database = client.database("trading").expect("database");
     let mut events = database
-        .subscribe("live-deploy-1", "rlean-1", ["rlean.custom_points"], 60)
+        .subscribe(
+            "live-deploy-1",
+            "rlean-1",
+            ["rlean.custom_points"],
+            Some(1),
+            60,
+        )
         .expect("subscribe");
 
     assert!(matches!(
@@ -137,7 +143,13 @@ async fn database_subscribe_reconnects_after_transient_http_failure() {
     .expect("connect");
     let database = client.database("trading").expect("database");
     let mut events = database
-        .subscribe("live-deploy-1", "rlean-1", ["rlean.custom_points"], 60)
+        .subscribe(
+            "live-deploy-1",
+            "rlean-1",
+            ["rlean.custom_points"],
+            Some(1),
+            60,
+        )
         .expect("subscribe");
 
     let event = tokio::time::timeout(Duration::from_secs(2), events.next())

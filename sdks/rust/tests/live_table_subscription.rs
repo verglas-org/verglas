@@ -58,7 +58,7 @@ async fn iceberg_write_wakes_durable_subscription() {
     let group = format!("e2e-follow-{suffix}");
     let owner = format!("e2e-owner-{suffix}");
     let mut changes = database
-        .subscribe(&group, &owner, [table_name.as_str()], 60)
+        .subscribe(&group, &owner, [table_name.as_str()], Some(1), 60)
         .expect("subscribe");
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(10), changes.next())

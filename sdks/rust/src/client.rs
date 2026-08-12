@@ -918,11 +918,14 @@ impl Database {
     }
 
     /// Subscribes to exact table commits through one durable push stream.
+    ///
+    /// `max` limits the number of fenced deliveries that can be in flight.
     pub fn subscribe<I, T>(
         &self,
         group: &str,
         owner: &str,
         tables: I,
+        max: Option<usize>,
         lease_seconds: u64,
     ) -> Result<TableChangeStream, ClientError>
     where
@@ -955,7 +958,7 @@ impl Database {
                     "group": group,
                     "owner": owner,
                     "tables": tables,
-                    "max": 256,
+                    "max": max.unwrap_or(256),
                     "leaseSeconds": lease_seconds,
                 }));
                 let response = match database.client.send(request).await {
