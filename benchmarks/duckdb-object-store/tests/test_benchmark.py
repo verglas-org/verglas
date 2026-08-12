@@ -2,6 +2,7 @@
 
 import importlib.util
 import pathlib
+import tempfile
 import unittest
 
 
@@ -83,6 +84,13 @@ class BenchmarkContractTest(unittest.TestCase):
         """A token value alone is never guessed into an R2 credential pair."""
         with self.assertRaisesRegex(ValueError, "R2_ACCESS_KEY_ID"):
             benchmark.r2_credentials({"CLOUDFLARE_API_TOKEN": "secret"})
+
+    def test_spill_sampling_reads_the_host_mount_without_docker(self):
+        """Spill evidence comes from the bind mount, not transient docker exec calls."""
+        with tempfile.TemporaryDirectory() as directory:
+            spill = pathlib.Path(directory) / "duckdb.tmp"
+            spill.write_bytes(b"x" * 8192)
+            self.assertGreaterEqual(benchmark.spill_directory_bytes(pathlib.Path(directory)), 8192)
 
 
 if __name__ == "__main__":

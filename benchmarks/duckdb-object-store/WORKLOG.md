@@ -4,3 +4,6 @@
   object-store benchmark. It requires a dataset larger than operator memory,
   observed spill and origin traffic, cold/warm/shared-cache reads, bounded
   containers, result equivalence, and durable origin readback for both writes.
+- #126: Moved MinIO data, Verglas cache, and DuckDB spill onto the external
+  benchmark disk when available. Spill high-water sampling now reads the host
+  bind mount, so transient Docker control-plane failures cannot abort a query.

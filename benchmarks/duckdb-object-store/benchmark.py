@@ -312,14 +312,21 @@ def client(command: list[str]) -> dict:
     return json.loads(output)
 
 
-def spill_bytes(container: str) -> int:
-    """Return current DuckDB temporary-file bytes without trusting host mounts."""
-    output = docker("exec", container, "sh", "-c", "du -sk /spill 2>/dev/null | cut -f1 || true").stdout.strip()
-    return int(output or "0") * 1024
+def spill_directory_bytes(directory: pathlib.Path) -> int:
+    """Return allocated bytes under one host-side DuckDB spill bind mount."""
+    total = 0
+    for path in directory.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_blocks * 512
+        except FileNotFoundError:
+            # DuckDB removes partitions while the coordinator samples them.
+            continue
+    return total
 
 
-def measured_query(container: str, host: str, sql: str) -> tuple[dict, int]:
-    """Measure a Quack query while polling its server-side spill directory."""
+def measured_query(spill_directory: pathlib.Path, host: str, sql: str) -> tuple[dict, int]:
+    """Measure a Quack query while polling its host-side spill bind mount."""
     process = subprocess.Popen(
         ["docker", "run", "--rm", "--network", NETWORK, "--cpus", "1", "--memory", "512m", IMAGE,
          "python", "/bench/benchmark.py", "query", "--host", host, "--sql", sql],
@@ -327,7 +334,7 @@ def measured_query(container: str, host: str, sql: str) -> tuple[dict, int]:
     )
     peak = 0
     while process.poll() is None:
-        peak = max(peak, spill_bytes(container))
+        peak = max(peak, spill_directory_bytes(spill_directory))
         time.sleep(0.05)
     stdout, stderr = process.communicate()
     if process.returncode:
@@ -346,12 +353,20 @@ def purge_cache() -> None:
 def local_smoke(output: pathlib.Path, rows: int) -> None:
     """Run the complete MinIO-backed, cgroup-bounded comparison."""
     names = ["vg-bench-minio", "vg-bench-verglas", "vg-bench-direct", "vg-bench-cached", "vg-bench-shared", "vg-bench-trace"]
-    scratch = pathlib.Path(tempfile.mkdtemp(prefix="verglas-duckdb-object-store-"))
+    external_root = pathlib.Path(
+        os.environ.get("VERGLAS_BENCH_ROOT", "/Volumes/data_cache/verglas/rime-benchmarks")
+    )
+    scratch_parent = external_root if external_root.is_dir() else None
+    scratch = pathlib.Path(
+        tempfile.mkdtemp(prefix="verglas-duckdb-object-store-", dir=scratch_parent)
+    )
     config = scratch / "verglas.toml"
     origin_creds = scratch / "origin-creds"
     endpoint_creds = scratch / "endpoint-creds"
     cache_dir = scratch / "cache"
     cache_dir.mkdir()
+    origin_dir = scratch / "origin"
+    origin_dir.mkdir()
     spill_dirs = {name: scratch / f"spill-{name}" for name in names[2:5]}
     for directory in spill_dirs.values():
         directory.mkdir()
@@ -370,7 +385,7 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
         docker("network", "create", NETWORK)
         containers.append(start_container(
             names[0], "minio/minio:latest", ["server", "/data", "--console-address", ":9001"], cpus="1", memory="512m",
-            extra=["-e", f"MINIO_ROOT_USER={ORIGIN_KEY}", "-e", f"MINIO_ROOT_PASSWORD={ORIGIN_SECRET}"],
+            extra=["-e", f"MINIO_ROOT_USER={ORIGIN_KEY}", "-e", f"MINIO_ROOT_PASSWORD={ORIGIN_SECRET}", "-v", f"{origin_dir}:/data"],
         ))
         wait_container(names[0], "API:")
         docker("run", "--rm", "--network", NETWORK, "--entrypoint", "sh", "minio/mc:latest", "-c",
@@ -402,10 +417,10 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
         peak_spill = 0
         for workload, sql in WORKLOADS.items():
             purge_cache()
-            direct, spill = measured_query(names[2], names[2], sql)
-            cold, cold_spill = measured_query(names[3], names[3], sql)
-            warm, warm_spill = measured_query(names[3], names[3], sql)
-            shared, shared_spill = measured_query(names[4], names[4], sql)
+            direct, spill = measured_query(spill_dirs[names[2]], names[2], sql)
+            cold, cold_spill = measured_query(spill_dirs[names[3]], names[3], sql)
+            warm, warm_spill = measured_query(spill_dirs[names[3]], names[3], sql)
+            shared, shared_spill = measured_query(spill_dirs[names[4]], names[4], sql)
             peak_spill = max(peak_spill, spill, cold_spill, warm_spill, shared_spill)
             workloads[workload] = dict(zip(LEGS, (direct, cold, warm, shared)))
 
@@ -431,6 +446,7 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
             "durable_writes": inventory["writes"],
         }
         validate_report(report)
+        output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2) + "\n")
     finally:
         for name in reversed(names):
