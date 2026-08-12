@@ -92,3 +92,7 @@
   real Neon query-after-write, safekeeper publication, and quorum writes with a
   ring member stopped.
 - #133: Made the cache node the public engine container entrypoint and added optional Iceberg catalog rendering to its startup script. The engine-only Compose stack now launches only object storage and the cache role.
+- #109: Made configured ring membership fail closed while peer DNS is changing.
+  Startup now waits for every declared peer instead of silently forming a
+  smaller EC ring that can advertise health without the safekeeper PostgreSQL
+  depends on.

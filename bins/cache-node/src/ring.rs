@@ -146,7 +146,7 @@ pub async fn setup(
     activity: ActivityTracker,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
     let peers = match env_var("VERGLAS_RING_PEERS") {
-        Some(raw) => resolve_peers(&raw).await,
+        Some(raw) => resolve_peers_until_complete(&raw).await?,
         None => Vec::new(),
     };
     // A production cache ring needs at least three boxes; fewer is a
@@ -289,9 +289,43 @@ pub async fn setup(
     }))
 }
 
-/// Parses `VERGLAS_RING_PEERS` — `id=host:port` entries, comma-separated —
-/// skipping any malformed entry with a warning rather than failing startup.
-async fn resolve_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
+/// Waits for every declared peer to resolve during a bounded startup window.
+/// Fly process DNS briefly removes a name while a Machine is replaced; starting
+/// a smaller static ring in that window permanently changes EC geometry and can
+/// advertise a safekeeper that can never acknowledge the configured quorum.
+async fn resolve_peers_until_complete(
+    raw: &str,
+) -> Result<Vec<(NodeId, SocketAddr)>, std::io::Error> {
+    const ATTEMPTS: usize = 150;
+    const RETRY_DELAY: Duration = Duration::from_millis(200);
+
+    let mut last_error = None;
+    for attempt in 1..=ATTEMPTS {
+        match resolve_peers(raw).await {
+            Ok(peers) => return Ok(peers),
+            Err(error) => {
+                if attempt == 1 || attempt % 25 == 0 {
+                    eprintln!(
+                        "verglas-cache-node {VERSION} waiting for complete fragment ring (attempt {attempt}/{ATTEMPTS}): {error}"
+                    );
+                }
+                last_error = Some(error);
+                tokio::time::sleep(RETRY_DELAY).await;
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "VERGLAS_RING_PEERS contains no resolvable entries",
+        )
+    }))
+}
+
+/// Resolves every `id=host:port` entry in `VERGLAS_RING_PEERS` exactly once.
+/// A configured member is never silently discarded: static membership and EC
+/// geometry must be identical on every process in the ring.
+async fn resolve_peers(raw: &str) -> Result<Vec<(NodeId, SocketAddr)>, std::io::Error> {
     let mut peers = Vec::new();
     for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         match entry.split_once('=') {
@@ -309,10 +343,10 @@ async fn resolve_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
                                 .copied()
                         }
                         Err(error) => {
-                            eprintln!(
-                                "verglas-cache-node {VERSION} ignoring unresolvable ring peer `{entry}`: {error}"
-                            );
-                            None
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::AddrNotAvailable,
+                                format!("cannot resolve ring peer `{entry}`: {error}"),
+                            ));
                         }
                     },
                 };
@@ -320,12 +354,15 @@ async fn resolve_peers(raw: &str) -> Vec<(NodeId, SocketAddr)> {
                     peers.push((NodeId::new(id.trim()), addr));
                 }
             }
-            None => eprintln!(
-                "verglas-cache-node {VERSION} ignoring malformed ring peer `{entry}` (want id=host:port)"
-            ),
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("malformed ring peer `{entry}` (want id=host:port)"),
+                ));
+            }
         }
     }
-    peers
+    Ok(peers)
 }
 
 /// An environment variable, empty treated as absent.
@@ -494,12 +531,25 @@ mod tests {
 
     #[tokio::test]
     async fn ring_peers_accept_ip_addresses_and_dns_names() {
-        let peers = resolve_peers("cache-0=127.0.0.1:8336,cache-1=localhost:8337").await;
+        let peers = resolve_peers("cache-0=127.0.0.1:8336,cache-1=localhost:8337")
+            .await
+            .expect("complete ring resolves");
 
         assert_eq!(peers.len(), 2);
         assert_eq!(peers[0].0, NodeId::new("cache-0"));
         assert_eq!(peers[1].0, NodeId::new("cache-1"));
         assert_eq!(peers[1].1.port(), 8337);
+    }
+
+    #[tokio::test]
+    async fn ring_peers_reject_an_incomplete_topology() {
+        let error = resolve_peers(
+            "cache-0=127.0.0.1:8336,cache-1=missing.invalid:8336,cache-2=127.0.0.1:8338",
+        )
+        .await
+        .expect_err("an unresolved declared member must not be discarded");
+
+        assert!(error.to_string().contains("cache-1"), "error={error}");
     }
 
     #[tokio::test]
