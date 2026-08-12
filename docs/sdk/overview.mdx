@@ -4,7 +4,7 @@ description: "Choose the TypeScript or Rust SDK and understand the shared data-p
 icon: "braces"
 ---
 
-The Verglas SDKs expose the same endpoint contract against a local self-hosted server. A worker receives a connected client. A standalone application connects with an endpoint and bearer token.
+The Verglas SDKs expose the same endpoint contract against a local self-hosted server. A worker receives a connected client. A standalone application or a Vessel connects with an endpoint and bearer token scoped to the data it needs.
 
 <Warning>
 The SDK packages are private workspace packages in the current prototype. Install them from this repository until published packages become available.
@@ -82,3 +82,8 @@ export VERGLAS_TOKEN=replace-with-a-scoped-token
 ```
 
 A worker runtime receives a scoped data-plane token for its table grants.
+
+Follow [Get your first result](/docs/get-started/first-table) before adapting a
+client to `analytics` and `market.ohlcv`. The SDK does not create a second data
+format: reads and writes remain ordinary Iceberg operations through the
+configured catalog and S3 cache path.

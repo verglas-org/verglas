@@ -1,0 +1,71 @@
+---
+title: "Vessels"
+description: "Run a long-lived Integration or Application service in the local Verglas runtime."
+icon: "container-storage"
+---
+
+A Vessel is a long-lived HTTP service reconciled by the local Docker runtime.
+Use an **Integration** for an API connection to an external application; use an
+**Application** for a service over Verglas data or integrations. Unlike a
+[worker](/docs/workers/overview), a Vessel is not one event dispatch and does
+not receive worker triggers.
+
+Vessels are part of the self-hosted Docker stack. The runtime owns the
+container it creates; it does not give a Vessel the Docker socket or a control
+plane credential. A Vessel's data access is governed by its declared runtime
+configuration and grants, not by the `role` label alone.
+
+## Add an Integration Vessel
+
+Start with [the self-hosted stack](/docs/get-started/self-host). Create
+`market-connector.yaml`, replacing `YOUR_IMAGE` with an image you built or can
+pull that listens on the declared port and implements its own `/health` route:
+
+```yaml market-connector.yaml
+name: market-connector
+role: integration
+image: YOUR_IMAGE
+http:
+  port: 8371
+  healthPath: /health
+```
+
+Apply it:
+
+```bash
+verglas vessel add --file ./market-connector.yaml
+verglas vessel get market-connector
+```
+
+Expected result: `get` reports the desired Vessel and its observed state. A
+ready state means the runtime's configured health path answered; it does not
+prove that an external provider accepted the Vessel's credentials or that it
+has written `market.ohlcv`.
+
+Call a private HTTP route through the runtime proxy when your service exposes
+one:
+
+```bash
+verglas vessel curl market-connector /health
+```
+
+## Add an Application Vessel
+
+An Application is declared the same way, with `role: application`. It can
+serve an API or UI over the data produced by the Integration and the
+`market.ohlcv` worker. The CLI's `vessel query` command posts JSON to a
+Vessel-owned `/v1/query` route; it is not a SQL query against the `analytics`
+lakehouse.
+
+```bash
+verglas vessel list
+verglas vessel remove market-connector
+```
+
+Removing a Vessel removes its runtime-owned container. It does not delete
+`market.ohlcv`, change its Iceberg snapshot, or remove external resources the
+service created.
+
+For HTTP and table clients inside your own service, use the
+[SDK overview](/docs/sdk/overview). For the runtime and execution boundary,
+see [Execution model](/docs/architecture/execution).

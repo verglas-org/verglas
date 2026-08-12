@@ -1,60 +1,71 @@
 ---
 title: "Verglas documentation"
-description: "Run Iceberg-aware data workloads on your own infrastructure."
+description: "Build an Iceberg data journey on infrastructure you control."
 icon: "snowflake"
 ---
 
-Verglas is an Iceberg-aware object cache with local workers, vessels, and query surfaces. Self-host the server, point engines at its S3 endpoint, and run workloads against your catalog and object store.
+Verglas is an Iceberg-aware cache and local data platform. It keeps ordinary
+Iceberg tables in your catalog and object store, then puts a bounded DRAM/NVMe
+cache, query API, workers, long-running services, dashboards, and SDKs on the
+path your data already takes.
 
 <Warning>
-Verglas is a pre-release prototype. Commands, configuration keys, wire formats, and on-disk layouts can change between commits.
+Verglas is a pre-release prototype. The open-source distribution is
+self-hosted today; there is no hosted Verglas onboarding or managed cloud
+service to sign up for. Commands, configuration, and on-disk layouts can
+change between commits.
 </Warning>
 
-## Choose a workflow
+## One useful journey
 
-<CardGroup cols={2}>
-  <Card title="Self-host Verglas" icon="server" href="/docs/get-started/self-host">
-    Run the cache server with Docker and point an S3-compatible query engine at it.
-  </Card>
-  <Card title="Create your first table" icon="table" href="/docs/get-started/first-table">
-    Ingest a file, query it, and inspect snapshot history through the CLI.
-  </Card>
-</CardGroup>
-
-## What you can run
-
-Verglas exposes two local compute shapes:
-
-- A **worker** handles one scheduled or event-driven dispatch. Workers hold no durable process state between runs.
-- A **vessel** (Application or Integration) runs as a long-lived service under the local Docker runtime manager.
-
-Both use ordinary Iceberg tables. Turning Verglas off leaves those tables readable through their original catalog and object store.
-
-## What the cache changes
-
-Query engines change their S3 endpoint to Verglas. The self-hosted REST service may also expose a shallow cached catalog path for engines that want one address for both interfaces. The configured upstream catalog remains authoritative.
+Start a self-hosted stack, create the `analytics` lakehouse, and load
+`market.ohlcv`. Query it twice: the result remains an ordinary Iceberg query,
+while the second read can reuse cache-pathed metadata and object bytes. Then
+use that same table as the handoff between a scheduled worker, an optional
+Integration or Application Vessel, a Rill dashboard, and an SDK client.
 
 ```mermaid
 flowchart LR
-    A["Query engine or worker"] -->|"S3 reads and writes"| B["Verglas cache endpoint"]
-    B -->|"cache miss or write-back"| C["Customer object store"]
-    A -->|"catalog requests"| D["Authoritative Iceberg catalog"]
-    B -->|"private commit observation"| D
+  D["analytics database"] --> T["market.ohlcv Iceberg table"]
+  W["Worker"] --> T
+  T --> Q["Query or SDK"]
+  T --> R["Rill dashboard"]
+  V["Integration / Application Vessel"] --> T
+  Q --> C["Verglas cache"] --> O["Your object store"]
+  R --> C
+  V --> C
+  W --> C
 ```
 
-<Note>
-The self-hosted catalog path caches successful reads and writes mutations
-through. It does not implement catalog semantics or become the catalog system
-of record.
-</Note>
+The cache is not a second database. Your catalog remains authoritative, and
+turning Verglas off leaves the table readable from its original catalog and
+bucket—just without the local cache path.
 
-## Next steps
+## Start here
 
 <CardGroup cols={2}>
-  <Card title="Learn the worker model" icon="workflow" href="/docs/workers/overview">
-    Understand triggers, logical intervals, outputs, and idempotent commits.
+  <Card title="Self-host the stack" icon="server" href="/docs/get-started/self-host">
+    Connect Cloudflare R2, Lakekeeper, the cache ring, and local runtime.
   </Card>
-  <Card title="Explore the SDKs" icon="braces" href="/docs/sdk/overview">
-    Read and write tables, follow commits, use queues, traverse graphs, and search vector indexes.
+  <Card title="Get a first result" icon="table" href="/docs/get-started/first-table">
+    Create `analytics`, write `market.ohlcv`, query it, and observe cache activity.
   </Card>
 </CardGroup>
+
+## Continue the same table
+
+<CardGroup cols={3}>
+  <Card title="Automate ingestion" icon="workflow" href="/docs/workers/overview">
+    Reuse `market.ohlcv` from manual, HTTP, cron, or CloudEvents dispatch.
+  </Card>
+  <Card title="Run a service" icon="container-storage" href="/docs/platform/vessels">
+    Connect an Integration or Application Vessel to the same local runtime.
+  </Card>
+  <Card title="Explore it in Rill" icon="chart-line" href="/docs/analytics/rill">
+    Generate an optional Explore dashboard over the table.
+  </Card>
+</CardGroup>
+
+For application code, begin with the [SDK overview](/docs/sdk/overview). For
+cache behavior, limits, and failure semantics, read the
+[architecture overview](/docs/architecture/overview).

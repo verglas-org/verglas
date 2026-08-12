@@ -1,84 +1,99 @@
 ---
-title: "Create your first table"
-description: "Create an Iceberg table, append rows, and query it through Verglas."
+title: "Get your first result"
+description: "Create analytics, write market.ohlcv, and query the Iceberg table through Verglas."
 icon: "table"
 ---
 
-This guide continues from [Self-host Verglas](/docs/get-started/self-host). It
-creates an Iceberg table of daily market bars. The example uses SPY as data;
-the table and commands are reusable for any symbol.
+This guide continues from [Self-host Verglas](/docs/get-started/self-host).
+You will create the managed `analytics` lakehouse, put two daily bars in
+`market.ohlcv`, and run a query twice. That table is the running example for
+the worker, Vessel, dashboard, and SDK guides.
 
 ## Before you begin
 
-Confirm that the server is ready and that this terminal points at it:
+Confirm that the stack is ready, then point the CLI at it. Use the scoped token
+created during self-hosting; the database operations need the matching grants.
 
 ```bash
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334
+export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
+export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
 verglas status
 ```
 
-## Create the seed file
+## Create the database
 
-Create `market-bars.jsonl`. Each line is one JSON object. The first write gives
-Iceberg the table schema.
+```bash
+verglas db create analytics --type lakehouse
+```
+
+Verglas creates an `analytics` warehouse in the tenant Lakekeeper catalog.
+The deployment R2 bucket remains the durable store; this is a logical
+lakehouse, not a new object-store credential or a private copy of your data.
+
+## Create the table
+
+Create `market-bars.jsonl`. The first write establishes the Iceberg schema.
 
 ```json market-bars.jsonl
 {"symbol":"SPY","timestamp":"2026-08-03T20:00:00Z","open":631.20,"high":633.91,"low":629.88,"close":632.08,"volume":71345000}
 ```
 
-## Create the table
-
-Create `market.ohlcv` from the seed file:
-
 ```bash
 verglas table create market.ohlcv ./market-bars.jsonl
 ```
 
-Expected output includes the table name and one committed row. Verglas writes
-ordinary Iceberg metadata and Parquet files to the deployment's R2 bucket, then
-commits the new metadata location through the tenant Lakekeeper catalog.
+Expected result: the CLI reports `market.ohlcv` and one committed row. Verglas
+writes ordinary Iceberg metadata and Parquet to R2, then commits the metadata
+location through Lakekeeper.
 
-## Append another row
-
-Create `more-market-bars.jsonl`:
+## Add one more day
 
 ```json more-market-bars.jsonl
 {"symbol":"SPY","timestamp":"2026-08-04T20:00:00Z","open":632.44,"high":635.12,"low":630.77,"close":634.89,"volume":68112000}
 ```
 
-Append it:
-
 ```bash
 verglas table append market.ohlcv ./more-market-bars.jsonl
 ```
 
-## Query the table
+## Query, then repeat
 
-The query runs in the isolated query role and reads metadata and Parquet bytes
-through the Verglas cache endpoint:
+The isolated query role reads the catalog metadata and Parquet bytes through
+the Verglas S3 cache endpoint.
 
 ```bash
-verglas query \
-  analytics \
+verglas query analytics \
   'SELECT symbol, timestamp, close, volume
    FROM market.ohlcv
    ORDER BY timestamp'
 ```
 
-You should see both rows. Run the same query again, then inspect cache activity:
+Expected result: two SPY rows, ordered from August 3 to August 4. Run the same
+query again, then inspect activity:
 
 ```bash
 verglas table metrics
 ```
 
-## Continue building
+The repeated query is the cache observation, not a benchmark. A small table or
+a cold/restarted cache may still show passthrough reads or no visible hit; the
+result bytes must be the same either way. Cache hits require catalog-backed
+Parquet reads, and the cache never replaces the catalog or R2 as authority.
 
-<CardGroup cols={2}>
-  <Card title="Run the ingestion as a worker" icon="workflow" href="/docs/workers/overview">
-    Package the same market-data write once, then invoke it manually, by HTTP,
-    on cron, or from a CloudEvent.
+## Keep building with market.ohlcv
+
+<CardGroup cols={3}>
+  <Card title="Run the worker" icon="workflow" href="/docs/workers/overview">
+    Append daily bars from one reusable worker through manual, HTTP, cron, or CloudEvents dispatch.
+  </Card>
+  <Card title="Attach a Vessel" icon="container-storage" href="/docs/platform/vessels">
+    Run a long-lived Integration or Application service beside the table.
   </Card>
   <Card title="Create a dashboard" icon="chart-line" href="/docs/analytics/rill">
-    Start Rill and create an Explore dashboard from `market.ohlcv`.
+    Generate a Rill Explore dashboard from the same Iceberg table.
   </Card>
 </CardGroup>
+
+The [SDK overview](/docs/sdk/overview) shows how standalone TypeScript and Rust
+clients use the query, write, and S3 endpoints without changing the table.
