@@ -9,6 +9,7 @@ pub mod kv;
 pub mod query;
 pub mod queue;
 pub mod secret;
+pub mod skill;
 pub mod status;
 pub mod table;
 pub mod table_metrics;

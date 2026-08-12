@@ -766,3 +766,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #109: Added portable `scratch_target` declarations. The CLI carries only the container path, while the trusted runtime owns the backing host location.
 - #109: Updated the documented self-hosted Compose contract to require the external runtime network preserved by deployment platforms.
 - #109: Routed cache-ring peers over runtime-network service aliases and removed the redundant fixed-IP network so Coolify preserves compute-to-safekeeper DNS.
+- #112: Added `verglas skill install rime` as the release-owned distribution path for RIME across Pi, Codex, and Claude. The CLI embeds the complete skill artifact, replaces only its managed directory, and performs installation before any credential resolution so this initial packaging does not require login.
+- #112: Expanded the installer from a Markdown-only copy into host-specific integration installation. Pi now receives its executable extension and worker, Codex receives its skill and Luna worker, and Claude receives a complete skills-directory plugin with its isolated Sonnet worker; reinstalling replaces only RIME-owned paths.

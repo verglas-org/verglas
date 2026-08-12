@@ -9,7 +9,9 @@
 //! duplicated `table` must not reappear in `--help`, so nothing creeps back
 //! silently. The `memory` and `skills` verbs are gone: durable agent memory is
 //! not part of this product. OS service lifecycle (`init`/`start`/`stop`/
-//! `restart`/`logs`/`dev`) is gone — the server runs in Docker. Removed
+//! `restart`/`logs`/`dev`) is gone — the server runs in Docker. The singular
+//! `skill` installer distributes release-embedded development skills and is
+//! unrelated to the deleted memory system. Removed
 //! hosted control-plane verbs (`login`, `containers`, `volumes`, `secrets`) are
 //! gone (#66). Issue #84 adds singular local `db` and `secret` resource APIs.
 
@@ -18,7 +20,7 @@ use std::process::Command;
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// local `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 14] = [
+const SURVIVING_COMMANDS: [&str; 15] = [
     "drain",
     "status",
     "table",
@@ -33,6 +35,7 @@ const SURVIVING_COMMANDS: [&str; 14] = [
     "queue",
     "secret",
     "token",
+    "skill",
 ];
 
 /// Commands removed from the CLI: `--help` must not name them.
@@ -162,6 +165,17 @@ fn memory_and_skills_subcommands_are_unknown() {
             args.join(" ")
         );
     }
+}
+
+#[test]
+fn skill_help_exposes_only_install() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["skill", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success(), "skill help must render");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert_eq!(help_command_names(&stdout), ["install", "help"]);
 }
 
 #[test]

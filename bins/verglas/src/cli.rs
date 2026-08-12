@@ -104,6 +104,48 @@ pub enum Command {
     /// Mint, inspect, and revoke scoped access tokens.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Install release-matched Verglas agent skills into supported coding agents.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+}
+
+/// Agent skill distribution operations.
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Install one skill embedded in this Verglas CLI release.
+    Install(SkillInstallArgs),
+}
+
+/// Arguments for installing a release-embedded agent skill.
+#[derive(Debug, Args)]
+pub struct SkillInstallArgs {
+    /// Skill bundled into this CLI release.
+    #[arg(value_enum)]
+    pub skill: BundledSkill,
+
+    /// Coding-agent installation target.
+    #[arg(long, value_enum, default_value_t = SkillTarget::All)]
+    pub target: SkillTarget,
+}
+
+/// Skills distributed as part of the Verglas CLI release.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum BundledSkill {
+    /// Parallel evaluated software-engineering search.
+    Rime,
+}
+
+/// Coding-agent layouts supported by the skill installer.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SkillTarget {
+    /// Pi's user-level skill directory.
+    Pi,
+    /// Codex's configured user-level skill directory.
+    Codex,
+    /// Claude Code's configured user-level skill directory.
+    Claude,
+    /// Every supported coding-agent layout.
+    All,
 }
 
 impl Cli {

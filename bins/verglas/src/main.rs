@@ -27,6 +27,9 @@ use cli::{Cli, Command};
 
 /// Runs the parsed CLI command against the configured admin endpoint.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if let Command::Skill(command) = &cli.command {
+        return commands::skill::run(command).map_err(Into::into);
+    }
     let token = cli.resolved_token()?;
     let credentials_path = cli.resolved_credentials_path()?;
     match cli.command {
@@ -83,6 +86,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
+        Command::Skill(_) => unreachable!("skill commands return before credential resolution"),
     }
 }
 

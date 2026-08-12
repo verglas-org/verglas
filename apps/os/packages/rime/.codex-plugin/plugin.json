@@ -1,0 +1,22 @@
+{
+  "name": "rime",
+  "version": "0.1.0",
+  "description": "Parallel evaluated exploration for clean, architecturally sound coding solutions",
+  "author": {
+    "name": "Verglas"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "RIME",
+    "shortDescription": "Explore clean coding solutions in parallel.",
+    "longDescription": "RIME reproduces a measurable coding objective, explores independent candidate solutions with a low-cost worker preference, rejects dead code, fallback paths, point fixes, and guessed semantics, then selects from evidence-backed results.",
+    "developerName": "Verglas",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Low-cost-preferred parallel exploration",
+      "Reproduction-first evaluation",
+      "Evidence-backed quality gates"
+    ],
+    "defaultPrompt": "Use RIME when low-cost-preferred, independently evaluated parallel exploration is worthwhile for this coding task."
+  }
+}

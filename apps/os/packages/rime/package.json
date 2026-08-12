@@ -1,0 +1,35 @@
+{
+  "name": "@verglas/rime",
+  "version": "0.1.0",
+  "description": "Low-cost-preferred parallel AIDE-style search for evaluated coding solutions",
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "files": [
+    ".claude-plugin",
+    ".codex-plugin",
+    "agents",
+    "extensions",
+    "host",
+    "skills",
+    "src"
+  ],
+  "keywords": [
+    "agent-skill",
+    "pi-package"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
