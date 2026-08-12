@@ -115,7 +115,7 @@ def sample_query(leg, cardinality, endpoint=None):
             # This is deliberately a genuine load/query attempt, not a local fallback.
             import duckdb
             extension = os.environ.get("VERGLAS_EXTENSION", "/artifacts/verglas.duckdb_extension")
-            connection = duckdb.connect(":memory:")
+            connection = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
             connection.execute("LOAD '" + extension.replace("'", "''") + "'")
             table = connection.sql(f"SELECT * FROM verglas_query('SELECT n, grp FROM benchmark_rows LIMIT {cardinality}')").arrow().read_all()
         elif leg == "quack":
@@ -175,7 +175,7 @@ def serve_arrow(port):
     server = http.server.ThreadingHTTPServer(("0.0.0.0", port), ArrowHandler)
     def payload_for(request):
         import re
-        match = re.search(r"(?:cardinality=|LIMIT\\s+)(\\d+)", request, re.I)
+        match = re.search(r"(?:cardinality=|LIMIT\s+)(\d+)", request, re.I)
         cardinality = int(match.group(1)) if match else 10_000
         batch = pa.record_batch([pa.array(range(cardinality), type=pa.int64()), pa.array(["even" if i % 2 == 0 else "odd" for i in range(cardinality)])], names=["n", "grp"])
         stream = io.BytesIO()
