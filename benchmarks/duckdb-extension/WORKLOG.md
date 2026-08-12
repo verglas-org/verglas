@@ -15,3 +15,5 @@
   imports, connections, and extension loading are excluded before warm-up.
   Results now stream bounded Arrow batches and record first-batch latency and
   received network bytes without materializing an unbounded result table.
+- #126: Removed host configure artifacts before compiling the benchmark image.
+  This keeps local extension build state from affecting the measured artifact.

@@ -4,7 +4,9 @@ FROM rust:1.96-bookworm AS extension-builder
 RUN apt-get update && apt-get install -y --no-install-recommends build-essential cmake git make python3 python3-venv && rm -rf /var/lib/apt/lists/*
 WORKDIR /source
 COPY extensions/verglas /source/extensions/verglas
-RUN test -f /source/extensions/verglas/extension-ci-tools/makefiles/c_api_extensions/base.Makefile && make -C /source/extensions/verglas EXTENSION_VERSION=benchmark-1.5.5 configure release
+RUN rm -rf /source/extensions/verglas/configure /source/extensions/verglas/.venv && \
+    test -f /source/extensions/verglas/extension-ci-tools/makefiles/c_api_extensions/base.Makefile && \
+    make -C /source/extensions/verglas EXTENSION_VERSION=benchmark-1.5.5 configure release
 
 FROM python:3.12-slim
 RUN pip install --no-cache-dir duckdb==1.5.5 pyarrow==19.0.1 numpy==2.2.3
