@@ -231,6 +231,8 @@ impl LocalFragmentStore {
     /// happens before the write, so the on-disk total never passes the budget.
     pub fn store_fragment(&self, record: &FragmentRecord) -> Result<(), FragmentIoError> {
         let len = record.bytes.len() as u64;
+        let path = self.fragment_path(&record.key);
+        self.ensure_fragment_parent(&path)?;
         // If this key already has bytes on disk (an idempotent re-place), free
         // its old charge first so a re-write of the same fragment is neutral.
         let existing = self.fragment_len(&record.key);
@@ -243,7 +245,6 @@ impl LocalFragmentStore {
             self.used.fetch_add(existing, Ordering::AcqRel);
             return Err(error);
         }
-        let path = self.fragment_path(&record.key);
         // Persist `payload || CRC32C(payload)` so a later load can detect a
         // bit-flip and treat the fragment as an erasure (#220). The budget is
         // charged for the payload only; the 4-byte trailer is fixed overhead.
@@ -273,9 +274,7 @@ impl LocalFragmentStore {
             .parent()
             .ok_or_else(|| FragmentIoError::io(format!("{} has no parent", path.display())))?
             .to_path_buf();
-        fs::create_dir_all(&parent).map_err(|error| {
-            FragmentIoError::io(format!("create fragment dir {}: {error}", parent.display()))
-        })?;
+        self.ensure_fragment_parent(&path)?;
         let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp.{}.{temp_id}", std::process::id()));
         let file = File::create(&tmp)
@@ -419,13 +418,45 @@ impl LocalFragmentStore {
 
     /// The directory holding one object's fragments.
     fn object_dir(&self, object_id: &str) -> PathBuf {
-        self.root.join("objects").join(hex_component(object_id))
+        const COMPONENT_LEN: usize = 120;
+        let encoded = hex_component(object_id);
+        let mut path = self.root.join("objects");
+        for start in (0..encoded.len()).step_by(COMPONENT_LEN) {
+            path.push(&encoded[start..encoded.len().min(start + COMPONENT_LEN)]);
+        }
+        path
     }
 
     /// The filesystem path for a fragment key.
     fn fragment_path(&self, key: &FragmentKey) -> PathBuf {
         self.object_dir(&key.object_id)
             .join(format!("fragment-{:05}.bin", key.index))
+    }
+
+    /// Creates a fragment's chunked object directory and fsyncs every directory
+    /// entry that was introduced. Long object identities span several bounded
+    /// path components, so syncing only the leaf would not make a new ancestor
+    /// survive a power loss.
+    fn ensure_fragment_parent(&self, path: &Path) -> Result<(), FragmentIoError> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| FragmentIoError::io(format!("{} has no parent", path.display())))?;
+        if parent.exists() {
+            return Ok(());
+        }
+        fs::create_dir_all(parent).map_err(|error| {
+            FragmentIoError::io(format!("create fragment dir {}: {error}", parent.display()))
+        })?;
+        let objects = self.root.join("objects");
+        let mut current = Some(parent);
+        while let Some(dir) = current {
+            if !dir.starts_with(&objects) {
+                break;
+            }
+            sync_dir(dir)?;
+            current = dir.parent();
+        }
+        Ok(())
     }
 }
 
@@ -594,44 +625,38 @@ fn split_trailer(path: &Path, mut raw: Vec<u8>) -> Result<LoadedFragment, Fragme
 }
 
 /// Walks `dir` (the store's `objects` root) and rebuilds the [`FragmentKey`] of
-/// every live `.bin` fragment: the object id from the hex-encoded subdirectory
-/// name, the index from the `fragment-NNNNN.bin` filename (#220).
+/// every live `.bin` fragment. A long encoded object id is split across bounded
+/// directory components; concatenating the relative components recovers the
+/// original encoded identity.
 fn list_fragment_keys(dir: &Path) -> Vec<FragmentKey> {
     let mut keys = Vec::new();
-    let Ok(objects) = fs::read_dir(dir) else {
-        return keys;
-    };
-    for object_entry in objects.flatten() {
-        let object_path = object_entry.path();
-        if !object_entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(object_id) = object_entry
-            .file_name()
-            .to_str()
-            .and_then(hex_component_decode)
-        else {
+    let mut pending = vec![(dir.to_path_buf(), String::new())];
+    while let Some((path, encoded_prefix)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(path) else {
             continue;
         };
-        let Ok(frags) = fs::read_dir(&object_path) else {
-            continue;
-        };
-        for frag in frags.flatten() {
-            let name = frag.file_name();
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if let Some(index) = name
+            if file_type.is_dir() {
+                if name.len().is_multiple_of(2) && name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    pending.push((entry.path(), format!("{encoded_prefix}{name}")));
+                }
+                continue;
+            }
+            let Some(index) = name
                 .strip_prefix("fragment-")
                 .and_then(|rest| rest.strip_suffix(".bin"))
                 .and_then(|digits| digits.parse::<usize>().ok())
-            {
-                keys.push(FragmentKey {
-                    object_id: object_id.clone(),
-                    index,
-                });
+            else {
+                continue;
+            };
+            if let Some(object_id) = hex_component_decode(&encoded_prefix) {
+                keys.push(FragmentKey { object_id, index });
             }
         }
     }
@@ -646,9 +671,6 @@ fn write_fsynced(path: &Path, bytes: &[u8], checksum: u32) -> Result<(), Fragmen
     let parent = path
         .parent()
         .ok_or_else(|| FragmentIoError::io(format!("{} has no parent", path.display())))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        FragmentIoError::io(format!("create fragment dir {}: {error}", parent.display()))
-    })?;
     let tmp = path.with_extension("tmp");
     {
         let mut file = File::create(&tmp)
@@ -750,6 +772,40 @@ mod tests {
             got.checksum,
             crate::fragments::fragment_checksum(&record.bytes)
         );
+    }
+
+    /// Self-describing safekeeper fragment identities can exceed one filesystem
+    /// component after path-safe encoding. They must still survive the complete
+    /// store/list/load/delete lifecycle used by replacement recovery.
+    #[test]
+    fn long_safekeeper_object_id_round_trips() {
+        let store = LocalFragmentStore::new(scratch("long-safekeeper-id"));
+        let object_id = format!(
+            "sk/{}/w/{}/{}/{}-{}-2-2-28-56-3",
+            "451b3a60fc59833c904b29b827ba9bdcb8fe476f511a5d68e963e6bf7c487718",
+            "0000000000000156",
+            "0000000000000000",
+            "0000000002d44c38",
+            "0000000002d44c70",
+        );
+        let key = FragmentKey {
+            object_id,
+            index: 2,
+        };
+        let record = FragmentRecord::new(key.clone(), Bytes::from_static(b"wal-fragment"));
+
+        store.store_fragment(&record).expect("store long key");
+        assert_eq!(store.list_fragment_keys(), vec![key.clone()]);
+        assert_eq!(
+            store
+                .load_fragment(&key)
+                .expect("load long key")
+                .expect("present")
+                .bytes,
+            record.bytes,
+        );
+        store.delete_fragment(&key).expect("delete long key");
+        assert!(store.load_fragment(&key).expect("load deleted").is_none());
     }
 
     /// A byte flipped on disk after the store makes the fragment fail

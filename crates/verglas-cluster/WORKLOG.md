@@ -104,3 +104,7 @@
   placement transport so WAL recovery can discover durable fragments on local
   and remote cache nodes without a separate metadata service.
   and placement RPCs for reconstructed Neon pages and ordinary cache blocks.
+- #127: Split path-safe fragment identities across bounded filesystem components.
+  Self-describing safekeeper WAL keys can no longer exceed Linux's per-component
+  filename limit, while recursive listing still reconstructs the exact identity
+  needed for replacement recovery.
