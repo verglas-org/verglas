@@ -66,6 +66,7 @@
           "docs/sdk/overview",
           "docs/sdk/http",
           "docs/sdk/cli",
+          "docs/sdk/duckdb",
           "docs/sdk/typescript",
           "docs/sdk/rust"
         ]

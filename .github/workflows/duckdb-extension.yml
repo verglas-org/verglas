@@ -1,0 +1,19 @@
+name: DuckDB extension
+
+on:
+  pull_request:
+    paths: ["extensions/verglas/**", ".github/workflows/duckdb-extension.yml"]
+  push:
+    branches: [main]
+    paths: ["extensions/verglas/**", ".github/workflows/duckdb-extension.yml"]
+  workflow_dispatch:
+
+jobs:
+  package:
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.5
+      ci_tools_version: v1.5-variegata
+      extension_name: verglas
+      extra_toolchains: rust;python3
+      exclude_archs: linux_amd64_musl
