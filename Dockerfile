@@ -151,6 +151,29 @@ USER verglas
 EXPOSE 5454 8333 8334 8335 8336
 ENTRYPOINT ["verglas-cache-node-start"]
 
+# Fly Machines consume OCI images as VM root filesystems. These role-specific
+# images use Fly's configured volume mount directly and do no guest-OS boot or
+# raw-device setup.
+FROM runtime AS verglas-fly-cache
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends util-linux \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/cache /run/verglas \
+    && chown -R verglas:verglas /data/cache /run/verglas
+COPY --from=build /tmp/verglas-build/verglas-cache-node /usr/local/bin/verglas-cache-node
+COPY --chmod=0755 deploy/fly/cache-entrypoint.sh /usr/local/bin/verglas-fly-cache-entrypoint
+EXPOSE 8333 8334 8336
+ENTRYPOINT ["/usr/local/bin/verglas-fly-cache-entrypoint"]
+
+FROM runtime AS verglas-fly-query
+RUN mkdir -p /run/verglas /tmp/verglas-query-spill \
+    && chown -R verglas:verglas /run/verglas /tmp/verglas-query-spill
+COPY --from=build /tmp/verglas-build/verglas-query /usr/local/bin/verglas-query
+COPY --chmod=0755 deploy/fly/query-entrypoint.sh /usr/local/bin/verglas-fly-query-entrypoint
+USER verglas
+EXPOSE 8335
+ENTRYPOINT ["/usr/local/bin/verglas-fly-query-entrypoint"]
+
 FROM runtime AS verglas-server
 COPY --from=build /tmp/verglas-build/verglas-server /usr/local/bin/verglas-server
 COPY --from=build /tmp/verglas-build/verglas-query /usr/local/bin/verglas-query

@@ -91,3 +91,6 @@
 - #74: Added a four-node shared-cache regression covering cross-node page heat,
   real Neon query-after-write, safekeeper publication, and quorum writes with a
   ring member stopped.
+- #111: Added a role-specific Fly Machines cache image that consumes a mounted
+  NVMe volume directly, keeps generated credentials on ephemeral runtime
+  storage, and drops privileges before starting the cache node.
