@@ -5,9 +5,9 @@ icon: "snowflake"
 ---
 
 Verglas is an Iceberg-aware cache and local data platform. It keeps ordinary
-Iceberg tables in your catalog and object store, then puts a bounded DRAM/NVMe
-cache, query API, workers, long-running services, dashboards, and SDKs on the
-path your data already takes.
+Iceberg tables in your catalog and object store, then adds a bounded DRAM/NVMe
+cache, query API, workers, long-running services, dashboards, and SDKs around
+the data journey you already own.
 
 <Warning>
 Verglas is a pre-release prototype. The open-source distribution is
@@ -33,9 +33,11 @@ flowchart LR
   V["Integration / Application Vessel"] --> T
   Q --> C["Verglas cache"] --> O["Your object store"]
   R --> C
-  V --> C
-  W --> C
 ```
+
+Workers and Vessels are optional runtime workloads. Their data connections and
+cache use come from their declared configuration and grants; this journey does
+not assume that every service request or worker run uses the cache path.
 
 The cache is not a second database. Your catalog remains authoritative, and
 turning Verglas off leaves the table readable from its original catalog and

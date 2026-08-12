@@ -15,7 +15,6 @@ The running application exposes:
 | `8333` | S3-compatible cache | Query engines and SDKs |
 | `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
 | `8360` | Local container runtime manager | Optional managed services |
-| `9009` | Rill | Optional analytics container |
 
 ## Before you begin
 
@@ -83,8 +82,8 @@ with R2 enabled.
   </Step>
 
   <Step title="Review the Compose bootstrap">
-    The repository's `docker-compose.yml` is the source of truth for the
-    complete OSS stack. It starts the data server, tenant Lakekeeper, the
+    The repository's `docker-compose.yml` is the source of truth for the base
+    OSS stack. It starts the data server, tenant Lakekeeper, the
     three-member cache and WAL ring, the scheduler and its Postgres queue, the
     trusted container-runtime manager, and Verglas OS. No profile or additional
     `verglas` command is required.
@@ -93,6 +92,11 @@ with R2 enabled.
     generated Vessels and other optional containers on the fixed
     `verglas-runtime` network. The OS is a community and development surface;
     the server and CLI remain usable independently of it.
+
+    Rill is not started by this Compose bootstrap and port `9009` is not part
+    of the base stack. If you need dashboards, declare Rill later through the
+    [Rill dashboards](/docs/analytics/rill) integration; that declaration gives
+    the local runtime its image, port, and S3 settings.
   </Step>
 
   <Step title="Start Verglas">
@@ -121,9 +125,12 @@ with R2 enabled.
     verglas status
     ```
 
-    `TOKEN_SHOWN_ONCE` is the token copied from the Access tokens page. After
-    creating a database, use `verglas token create` to mint a narrower
-    replacement; the CLI saves that token in its owner-only credential file.
+    `VERGLAS_ENDPOINT` names the server admin/query API on `8334`, while
+    `VERGLAS_ACCESS_ENDPOINT` names the tenant access/database API on `8345`.
+    `TOKEN_SHOWN_ONCE` is the access token copied from the Access tokens page;
+    save it now because the page does not show it again. After creating a
+    database, use `verglas token create` to mint a narrower replacement; the
+    CLI saves that token in its owner-only credential file.
 
     Open Verglas OS at `http://127.0.0.1:8787`.
 

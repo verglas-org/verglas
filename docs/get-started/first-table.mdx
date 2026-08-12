@@ -13,6 +13,10 @@ the worker, Vessel, dashboard, and SDK guides.
 
 Confirm that the stack is ready, then point the CLI at it. Use the scoped token
 created during self-hosting; the database operations need the matching grants.
+`VERGLAS_ENDPOINT` is the server admin/query API on port `8334`, and
+`VERGLAS_ACCESS_ENDPOINT` is the tenant access/database API on port `8345`.
+Replace `TOKEN_SHOWN_ONCE` with the token copied from the Access tokens page and
+save it before leaving that page: it is displayed only once.
 
 ```bash
 export VERGLAS_ENDPOINT=http://127.0.0.1:8334

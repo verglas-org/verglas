@@ -18,13 +18,14 @@ configuration and grants, not by the `role` label alone.
 ## Add an Integration Vessel
 
 Start with [the self-hosted stack](/docs/get-started/self-host). Create
-`market-connector.yaml`, replacing `YOUR_IMAGE` with an image you built or can
-pull that listens on the declared port and implements its own `/health` route:
+`market-connector.yaml`. This is the exact declaration shape exercised by the
+CLI contract test; use your own image only after it serves the declared health
+route:
 
 ```yaml market-connector.yaml
-name: market-connector
+name: demo
 role: integration
-image: YOUR_IMAGE
+image: verglas/integration-demo:local
 http:
   port: 8371
   healthPath: /health
@@ -34,7 +35,7 @@ Apply it:
 
 ```bash
 verglas vessel add --file ./market-connector.yaml
-verglas vessel get market-connector
+verglas vessel get demo
 ```
 
 Expected result: `get` reports the desired Vessel and its observed state. A
@@ -46,7 +47,7 @@ Call a private HTTP route through the runtime proxy when your service exposes
 one:
 
 ```bash
-verglas vessel curl market-connector /health
+verglas vessel curl demo /v1/viewer
 ```
 
 ## Add an Application Vessel
@@ -59,7 +60,7 @@ lakehouse.
 
 ```bash
 verglas vessel list
-verglas vessel remove market-connector
+verglas vessel remove demo
 ```
 
 Removing a Vessel removes its runtime-owned container. It does not delete
