@@ -33,26 +33,40 @@ class BenchmarkContractTest(unittest.TestCase):
                         "minio",
                         "verglas",
                         "quack_direct",
-                        "quack_cached",
-                        "quack_shared",
+                        "quackstore_cached",
+                        "quackstore_shared",
+                        "verglas_cached",
+                        "verglas_shared",
                     )
                 },
                 "limits": {
                     "quack_direct": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
-                    "quack_cached": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
-                    "quack_shared": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
+                    "quackstore_cached": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
+                    "quackstore_shared": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
+                    "verglas_cached": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
+                    "verglas_shared": {"cpus": 1.0, "memory_bytes": 2 * 1024**3},
                     "verglas": {"cpus": 1.0, "memory_bytes": 256 * 1024 * 1024},
                 },
             },
             "object_store": {"request_count": 10, "request_log_sha256": "1" * 64},
             "cache_stats": {
-                "cache": {"capacity_bytes": 256 * 1024**2, "dram_bytes": 80 * 1024**2},
-                "counters": {"backend_fills": 1, "disk_hits": 1},
+                "verglas": {
+                    "cache": {"capacity_bytes": 256 * 1024**2, "dram_bytes": 80 * 1024**2},
+                    "counters": {"backend_fills": 1, "disk_hits": 1},
+                    "occupancy_bytes": 1,
+                },
+                "quackstore": {
+                    "capacity_bytes": 256 * 1024**2,
+                    "occupancy_bytes": 1,
+                    "cache_path": "/external/quackstore",
+                    "data_mutable": False,
+                },
+                "storage": {"verglas_device": "external-disk", "quackstore_device": "external-disk"},
             },
             "workloads": {
                 name: {
                     leg: {"elapsed_ms": 1.0, "result_digest": "a" * 64}
-                    for leg in ("direct", "verglas_cold", "verglas_warm", "verglas_shared_warm")
+                    for leg in benchmark.LEGS
                 }
                 for name in ("scan_aggregate", "external_sort", "spill_join")
             },
@@ -61,6 +75,8 @@ class BenchmarkContractTest(unittest.TestCase):
                 leg: {"origin_bytes": 1, "readback_sha256": "b" * 64}
                 for leg in ("direct", "through_verglas")
             },
+            "repetitions": [{"number": number} for number in range(1, 6)],
+            "cache_resets": {"quackstore": len(benchmark.WORKLOADS), "verglas": len(benchmark.WORKLOADS)},
         }
 
     def test_valid_report_requires_real_out_of_core_evidence(self):
@@ -102,19 +118,19 @@ class BenchmarkContractTest(unittest.TestCase):
     def test_every_quack_process_must_have_provenance_and_one_cpu(self):
         """The shared-warm result is valid only when its server is bounded too."""
         report = self.valid_report()
-        del report["runtime"]["services"]["quack_shared"]
-        with self.assertRaisesRegex(ValueError, "quack_shared"):
+        del report["runtime"]["services"]["verglas_shared"]
+        with self.assertRaisesRegex(ValueError, "verglas_shared"):
             benchmark.validate_report(report)
 
         report = self.valid_report()
-        report["runtime"]["limits"]["quack_shared"]["cpus"] = 2.0
+        report["runtime"]["limits"]["quackstore_shared"]["cpus"] = 2.0
         with self.assertRaisesRegex(ValueError, "one CPU"):
             benchmark.validate_report(report)
 
     def test_every_quack_process_has_the_same_two_gib_container_ceiling(self):
         """A leg cannot gain an unreported RAM advantage outside DuckDB's allocator."""
         report = self.valid_report()
-        report["runtime"]["limits"]["quack_cached"]["memory_bytes"] = 3 * 1024**3
+        report["runtime"]["limits"]["quackstore_cached"]["memory_bytes"] = 3 * 1024**3
         with self.assertRaisesRegex(ValueError, "2 GiB"):
             benchmark.validate_report(report)
 
@@ -156,6 +172,45 @@ class BenchmarkContractTest(unittest.TestCase):
             spill = pathlib.Path(directory) / "duckdb.tmp"
             spill.write_bytes(b"x" * 8192)
             self.assertGreaterEqual(benchmark.spill_directory_bytes(pathlib.Path(directory)), 8192)
+
+    def test_quackstore_uses_its_persistent_cache_protocol(self):
+        """QuackStore must use its real community extension and immutable URI form."""
+        settings = benchmark.quackstore_settings("/external/quackstore")
+        self.assertEqual(settings["cache_size"], benchmark.DEFAULT_CACHE_CAPACITY_BYTES)
+        self.assertFalse(settings["data_mutable"])
+        self.assertEqual(
+            benchmark.quackstore_location("verglas-benchmark"),
+            "quackstore://s3://verglas-benchmark/issue-126/data/*.parquet",
+        )
+
+    def test_report_requires_five_independent_repetitions(self):
+        """One fortuitous cache run cannot stand in for the five-run protocol."""
+        report = self.valid_report()
+        report["repetitions"].pop()
+        with self.assertRaisesRegex(ValueError, "five independent repetitions"):
+            benchmark.validate_report(report)
+
+    def test_report_rejects_unequal_or_unobserved_cache_budget(self):
+        """Both persistent caches need exactly the same observed logical budget."""
+        report = self.valid_report()
+        report["cache_stats"]["quackstore"]["capacity_bytes"] -= 1
+        with self.assertRaisesRegex(ValueError, "256 MiB"):
+            benchmark.validate_report(report)
+        report = self.valid_report()
+        report["cache_stats"]["quackstore"]["occupancy_bytes"] = 0
+        with self.assertRaisesRegex(ValueError, "occupancy"):
+            benchmark.validate_report(report)
+
+    def test_report_requires_shared_external_disk_and_explicit_resets(self):
+        """Cache results are comparable only when both caches share storage and reset evidence."""
+        report = self.valid_report()
+        report["cache_stats"]["storage"]["quackstore_device"] = "other-disk"
+        with self.assertRaisesRegex(ValueError, "same external disk"):
+            benchmark.validate_report(report)
+        report = self.valid_report()
+        report["cache_resets"]["quackstore"] -= 1
+        with self.assertRaisesRegex(ValueError, "reset"):
+            benchmark.validate_report(report)
 
 
 if __name__ == "__main__":

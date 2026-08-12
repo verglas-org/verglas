@@ -61,6 +61,19 @@ larger buffering requirement. That setup is not timed. All measured Quack
 servers remain single-CPU with a 256 MiB DuckDB allocator and 2 GiB process
 ceiling.
 
+The live profile runs five isolated repetitions. Each repetition measures seven
+legs: direct R2; QuackStore cold, warm, and a newly started Quack process that
+reuses its persistent cache; then Verglas cold, warm, and a newly started Quack
+process that reuses Verglas. QuackStore is installed in the measured server
+with `INSTALL quackstore FROM community; LOAD quackstore`, reads the immutable
+`quackstore://s3://...` data URI, uses `quackstore_data_mutable = false`, and is
+cleared through `quackstore_clear_cache()` before every cold leg. Both cache
+directories are bind-mounted from the external benchmark disk and are assigned
+an exact 256 MiB logical cache budget. The report rejects a run without
+observed nonzero occupancy for both caches, live R2 operation evidence,
+container/image provenance, cgroup limits, spill, result equivalence, and
+direct-R2 readback of writes.
+
 ## What the number means
 
 This is the storage-path comparison: DuckDB 1.5.5 and Quack are identical on

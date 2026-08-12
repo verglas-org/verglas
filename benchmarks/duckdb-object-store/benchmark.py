@@ -41,7 +41,16 @@ ORIGIN_KEY = "minio-benchmark"
 ORIGIN_SECRET = "minio-benchmark-secret"
 VERGLAS_KEY = "verglas-benchmark"
 VERGLAS_SECRET = "verglas-benchmark-secret"
-LEGS = ("direct", "verglas_cold", "verglas_warm", "verglas_shared_warm")
+LEGS = (
+    "direct",
+    "quackstore_cold",
+    "quackstore_warm",
+    "quackstore_shared_warm",
+    "verglas_cold",
+    "verglas_warm",
+    "verglas_shared_warm",
+)
+LEGACY_LEGS = ("direct", "verglas_cold", "verglas_warm", "verglas_shared_warm")
 WORKLOADS = {
     "scan_aggregate": "SELECT count(*), sum(id), sum(metric), min(payload) FROM benchmark_data",
     "external_sort": (
@@ -53,6 +62,20 @@ WORKLOADS = {
         "JOIN benchmark_data b ON a.id = b.id"
     ),
 }
+
+
+def quackstore_settings(cache_path: str) -> dict[str, str | int | bool]:
+    """Return the fixed persistent QuackStore configuration for one measured server."""
+    return {
+        "cache_path": cache_path,
+        "cache_size": DEFAULT_CACHE_CAPACITY_BYTES,
+        "data_mutable": False,
+    }
+
+
+def quackstore_location(bucket: str) -> str:
+    """Return the immutable QuackStore URI for the benchmark's Parquet objects."""
+    return f"quackstore://s3://{bucket}/{PREFIX}/data/*.parquet"
 
 
 def run(command: list[str], *, capture: bool = True) -> subprocess.CompletedProcess[str]:
@@ -89,7 +112,7 @@ def r2_endpoint_settings(account_id: str) -> dict[str, str | bool]:
     }
 
 
-def validate_report(report: dict) -> None:
+def validate_report(report: dict, *, require_repetitions: bool = True) -> None:
     """Reject a report unless it proves a durable, out-of-core comparison."""
     dataset = report["dataset"]
     if dataset["format"] != "parquet" or dataset["storage"] != "s3-compatible":
@@ -99,7 +122,15 @@ def validate_report(report: dict) -> None:
     if dataset["object_count"] < 1:
         raise ValueError("dataset must contain durable objects")
 
-    required_services = {"verglas", "quack_direct", "quack_cached", "quack_shared"}
+    quackstore_comparison = "quackstore" in report.get("cache_stats", {})
+    required_services = {
+        "verglas",
+        "quack_direct",
+        "quackstore_cached",
+        "quackstore_shared",
+        "verglas_cached",
+        "verglas_shared",
+    } if quackstore_comparison else {"verglas", "quack_direct", "quack_cached", "quack_shared"}
     services = report["runtime"]["services"]
     missing_services = required_services.difference(services)
     if missing_services:
@@ -121,7 +152,7 @@ def validate_report(report: dict) -> None:
     if external_origin and external_origin.get("provider") != "cloudflare-r2":
         raise ValueError("external origin provenance must identify Cloudflare R2")
     limits = report["runtime"]["limits"]
-    for name in ("quack_direct", "quack_cached", "quack_shared"):
+    for name in required_services.difference({"verglas"}):
         if name not in limits:
             raise ValueError(f"runtime limit missing for {name}")
         if limits[name].get("cpus") != 1.0:
@@ -135,19 +166,47 @@ def validate_report(report: dict) -> None:
     cache_stats = report.get("cache_stats")
     if not cache_stats:
         raise ValueError("cache stats are missing")
-    if cache_stats.get("cache", {}).get("capacity_bytes", 0) < 1:
+    verglas_cache = cache_stats.get("verglas", cache_stats)
+    quackstore_cache = cache_stats.get("quackstore", {})
+    if quackstore_comparison:
+        if verglas_cache.get("cache", {}).get("capacity_bytes") != DEFAULT_CACHE_CAPACITY_BYTES:
+            raise ValueError("Verglas cache capacity must be exactly 256 MiB")
+        if quackstore_cache.get("capacity_bytes") != DEFAULT_CACHE_CAPACITY_BYTES:
+            raise ValueError("QuackStore cache capacity must be exactly 256 MiB")
+        if verglas_cache.get("occupancy_bytes", 0) < 1 or quackstore_cache.get("occupancy_bytes", 0) < 1:
+            raise ValueError("cache occupancy evidence is missing")
+        if quackstore_cache.get("data_mutable") is not False:
+            raise ValueError("QuackStore data must be explicitly immutable")
+        if not quackstore_cache.get("cache_path"):
+            raise ValueError("cache capacity evidence is missing")
+        storage = cache_stats.get("storage", {})
+        if not storage.get("verglas_device") or storage.get("verglas_device") != storage.get("quackstore_device"):
+            raise ValueError("persistent cache storage must use the same external disk class")
+    elif verglas_cache.get("cache", {}).get("capacity_bytes", 0) < 1:
         raise ValueError("cache capacity evidence is missing")
-    if "backend_fills" not in cache_stats.get("counters", {}):
+    if "backend_fills" not in verglas_cache.get("counters", {}):
         raise ValueError("cache counters are missing")
     if not report["spill"]["observed"] or report["spill"]["peak_bytes"] < 1:
         raise ValueError("spill was not observed")
 
     for workload, legs in report["workloads"].items():
-        if set(legs) != set(LEGS):
+        required_legs = LEGS if quackstore_comparison else LEGACY_LEGS
+        if set(legs) != set(required_legs):
             raise ValueError(f"read legs missing for {workload}")
-        digests = {legs[leg]["result_digest"] for leg in LEGS}
+        digests = {legs[leg]["result_digest"] for leg in required_legs}
         if len(digests) != 1:
             raise ValueError(f"result mismatch for {workload}")
+
+    repetitions = report.get("repetitions", [])
+    if quackstore_comparison and require_repetitions and (
+        len(repetitions) != 5 or {item.get("number") for item in repetitions} != set(range(1, 6))
+    ):
+        raise ValueError("report requires five independent repetitions")
+    if quackstore_comparison and report.get("cache_resets") != {
+        "quackstore": len(WORKLOADS),
+        "verglas": len(WORKLOADS),
+    }:
+        raise ValueError("explicit cache reset evidence is missing")
 
     writes = report["durable_writes"]
     for leg in ("direct", "through_verglas"):
@@ -165,6 +224,7 @@ def duckdb_connection(
     memory_limit: str = ENGINE_MEMORY,
     region: str = "us-east-1",
     use_ssl: bool = False,
+    quackstore_cache_path: str | None = None,
 ):
     """Create a bounded DuckDB connection pointed at exactly one S3 endpoint."""
     import duckdb
@@ -191,8 +251,19 @@ def duckdb_connection(
         f"ENDPOINT '{escaped_endpoint}', URL_STYLE 'path', "
         f"USE_SSL {'true' if use_ssl else 'false'})"
     )
+    if quackstore_cache_path:
+        settings = quackstore_settings(quackstore_cache_path)
+        connection.execute("INSTALL quackstore FROM community; LOAD quackstore")
+        connection.execute(f"SET quackstore_cache_enabled = true")
+        connection.execute(f"SET quackstore_cache_path = '{settings['cache_path']}'")
+        connection.execute(f"SET quackstore_cache_size = {settings['cache_size']}")
+        connection.execute("SET quackstore_data_mutable = false")
     if register_data:
-        location = f"s3://{bucket}/{PREFIX}/data/*.parquet"
+        location = (
+            quackstore_location(bucket)
+            if quackstore_cache_path
+            else f"s3://{bucket}/{PREFIX}/data/*.parquet"
+        )
         connection.execute(
             f"CREATE VIEW benchmark_data AS SELECT id, metric, payload FROM read_parquet('{location}')"
         )
@@ -245,10 +316,12 @@ def serve_quack(
     *,
     region: str = "us-east-1",
     use_ssl: bool = False,
+    quackstore_cache_path: str | None = None,
 ) -> None:
     """Expose one configured DuckDB instance through the real Quack extension."""
     connection = duckdb_connection(
-        endpoint, access_key, secret, bucket, region=region, use_ssl=use_ssl
+        endpoint, access_key, secret, bucket, region=region, use_ssl=use_ssl,
+        quackstore_cache_path=quackstore_cache_path,
     )
     connection.execute("INSTALL quack; LOAD quack")
     connection.execute(
@@ -502,6 +575,11 @@ def spill_directory_bytes(directory: pathlib.Path) -> int:
     return total
 
 
+def persistent_cache_bytes(directory: pathlib.Path) -> int:
+    """Return the occupied bytes of one persistent cache on the external disk."""
+    return spill_directory_bytes(directory)
+
+
 def measured_query(spill_directory: pathlib.Path, host: str, sql: str) -> tuple[dict, int]:
     """Measure a Quack query while polling its host-side spill bind mount."""
     process = subprocess.Popen(
@@ -525,6 +603,11 @@ def purge_cache() -> None:
     with urllib.request.urlopen(request, timeout=10) as response:
         if response.status >= 300:
             raise RuntimeError(f"cache purge failed: {response.status}")
+
+
+def clear_quackstore_cache(host: str) -> None:
+    """Clear QuackStore through its extension API before a measured cold leg."""
+    client(["query", "--host", host, "--sql", "SELECT * FROM quackstore_clear_cache()"])
 
 
 def local_smoke(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
@@ -634,15 +717,21 @@ def local_smoke(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> N
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
+def live_r2_once(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
     """Run the complete comparison against the isolated durable R2 bucket."""
+    if cache_capacity_bytes != DEFAULT_CACHE_CAPACITY_BYTES:
+        raise ValueError("the live R2 comparison requires an equal 256 MiB logical cache budget")
     credentials = r2_credentials(os.environ)
     api_token = os.environ.get("CLOUDFLARE_API_TOKEN")
     if not api_token:
         raise ValueError("live R2 evidence requires CLOUDFLARE_API_TOKEN")
     account_id = credentials["R2_ACCOUNT_ID"]
     settings = r2_endpoint_settings(account_id)
-    names = ["vg-bench-verglas", "vg-bench-direct", "vg-bench-cached", "vg-bench-shared"]
+    names = [
+        "vg-bench-verglas", "vg-bench-direct", "vg-bench-quackstore",
+        "vg-bench-quackstore-shared", "vg-bench-verglas-cached",
+        "vg-bench-verglas-shared",
+    ]
     external_root = pathlib.Path(
         os.environ.get("VERGLAS_BENCH_ROOT", "/Volumes/data_cache/verglas/rime-benchmarks")
     )
@@ -653,6 +742,8 @@ def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
     endpoint_creds = scratch / "endpoint-creds"
     cache_dir = scratch / "cache"
     cache_dir.mkdir()
+    quackstore_cache_dir = scratch / "quackstore-cache"
+    quackstore_cache_dir.mkdir()
     spill_dirs = {name: scratch / f"spill-{name}" for name in names[1:]}
     for directory in spill_dirs.values():
         directory.mkdir()
@@ -700,14 +791,13 @@ def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
         )
         wait_http("http://127.0.0.1:18434/admin/healthz")
         server_specs = (
-            (
-                names[1], str(settings["endpoint"]), "/run/secrets/origin", "auto", True,
-                worker_origin_mount,
-            ),
-            (names[2], f"{names[0]}:8333", "/run/secrets/endpoint", "us-east-1", False, worker_endpoint_mount),
-            (names[3], f"{names[0]}:8333", "/run/secrets/endpoint", "us-east-1", False, worker_endpoint_mount),
+            (names[1], str(settings["endpoint"]), "/run/secrets/origin", "auto", True, worker_origin_mount, None),
+            (names[2], str(settings["endpoint"]), "/run/secrets/origin", "auto", True, worker_origin_mount, "/quackstore-cache"),
+            (names[4], f"{names[0]}:8333", "/run/secrets/endpoint", "us-east-1", False, worker_endpoint_mount, None),
         )
-        for name, endpoint, credentials_file, region, use_ssl, mounts in server_specs:
+        service_evidence = {"verglas": provenance(names[0])}
+        service_limits = {"verglas": cgroup(names[0])}
+        for name, endpoint, credentials_file, region, use_ssl, mounts, quackstore_path in server_specs:
             command = [
                 "python", "/bench/benchmark.py", "serve", "--endpoint", endpoint,
                 "--credentials-file", credentials_file, "--bucket", R2_BUCKET,
@@ -715,24 +805,61 @@ def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
             ]
             if use_ssl:
                 command.append("--use-ssl")
+            if quackstore_path:
+                command.extend(["--quackstore-cache-path", quackstore_path])
             start_container(
                 name, IMAGE, command, cpus="1", memory="2g",
-                extra=[*mounts, "-v", f"{spill_dirs[name]}:/spill"],
+                extra=[*mounts, "-v", f"{spill_dirs[name]}:/spill", *(
+                    ["-v", f"{quackstore_cache_dir}:/quackstore-cache"] if quackstore_path else []
+                )],
             )
             wait_quack(name)
+            role = {names[1]: "quack_direct", names[2]: "quackstore_cached", names[4]: "verglas_cached"}[name]
+            service_evidence[role] = provenance(name)
+            service_limits[role] = cgroup(name)
 
         workloads = {}
         peak_spill = 0
         for workload, sql in WORKLOADS.items():
             purge_cache()
+            clear_quackstore_cache(names[2])
             direct, direct_spill = measured_query(spill_dirs[names[1]], names[1], sql)
-            cold, cold_spill = measured_query(spill_dirs[names[2]], names[2], sql)
-            warm, warm_spill = measured_query(spill_dirs[names[2]], names[2], sql)
-            shared, shared_spill = measured_query(spill_dirs[names[3]], names[3], sql)
-            peak_spill = max(
-                peak_spill, direct_spill, cold_spill, warm_spill, shared_spill
+            quackstore_cold, quackstore_cold_spill = measured_query(spill_dirs[names[2]], names[2], sql)
+            quackstore_warm, quackstore_warm_spill = measured_query(spill_dirs[names[2]], names[2], sql)
+            start_container(
+                names[3], IMAGE,
+                ["python", "/bench/benchmark.py", "serve", "--endpoint", str(settings["endpoint"]),
+                 "--credentials-file", "/run/secrets/origin", "--bucket", R2_BUCKET,
+                 "--region", "auto", "--use-ssl", "--quackstore-cache-path", "/quackstore-cache"],
+                cpus="1", memory="2g", extra=[*worker_origin_mount, "-v", f"{spill_dirs[names[3]]}:/spill", "-v", f"{quackstore_cache_dir}:/quackstore-cache"],
             )
-            workloads[workload] = dict(zip(LEGS, (direct, cold, warm, shared)))
+            wait_quack(names[3])
+            service_evidence["quackstore_shared"] = provenance(names[3])
+            service_limits["quackstore_shared"] = cgroup(names[3])
+            quackstore_shared, quackstore_shared_spill = measured_query(spill_dirs[names[3]], names[3], sql)
+            docker("rm", "-f", names[3])
+            verglas_cold, verglas_cold_spill = measured_query(spill_dirs[names[4]], names[4], sql)
+            verglas_warm, verglas_warm_spill = measured_query(spill_dirs[names[4]], names[4], sql)
+            start_container(
+                names[5], IMAGE,
+                ["python", "/bench/benchmark.py", "serve", "--endpoint", f"{names[0]}:8333",
+                 "--credentials-file", "/run/secrets/endpoint", "--bucket", R2_BUCKET],
+                cpus="1", memory="2g", extra=[*worker_endpoint_mount, "-v", f"{spill_dirs[names[5]]}:/spill"],
+            )
+            wait_quack(names[5])
+            service_evidence["verglas_shared"] = provenance(names[5])
+            service_limits["verglas_shared"] = cgroup(names[5])
+            verglas_shared, verglas_shared_spill = measured_query(spill_dirs[names[5]], names[5], sql)
+            docker("rm", "-f", names[5])
+            peak_spill = max(
+                peak_spill, direct_spill, quackstore_cold_spill, quackstore_warm_spill,
+                quackstore_shared_spill, verglas_cold_spill, verglas_warm_spill,
+                verglas_shared_spill,
+            )
+            workloads[workload] = dict(zip(LEGS, (
+                direct, quackstore_cold, quackstore_warm, quackstore_shared,
+                verglas_cold, verglas_warm, verglas_shared,
+            )))
 
         client(
             [
@@ -762,36 +889,41 @@ def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
         object_store = r2_operation_evidence(
             api_token, account_id, R2_BUCKET, started_at, ended_at
         )
-        services = {
-            "verglas": provenance(names[0]),
-            "quack_direct": provenance(names[1]),
-            "quack_cached": provenance(names[2]),
-            "quack_shared": provenance(names[3]),
-        }
+        verglas_stats = fetch_json("http://127.0.0.1:18434/admin/stats")
+        verglas_stats["occupancy_bytes"] = persistent_cache_bytes(cache_dir)
         report = {
-            "comparison_scope": "same DuckDB 1.5.5 + Quack engine; direct R2 versus Verglas S3 cache backed by R2",
+            "comparison_scope": "same DuckDB 1.5.5 + Quack engine; direct R2, QuackStore, and Verglas persistent caches",
             "dataset": {
                 "format": "parquet", "storage": "s3-compatible",
                 "worker_memory_bytes": ENGINE_MEMORY_BYTES, **inventory["dataset"],
             },
             "runtime": {
-                "services": services,
+                "services": service_evidence,
                 "external_origin": {
                     "provider": "cloudflare-r2", "bucket": R2_BUCKET,
                     "endpoint": settings["endpoint"],
                 },
-                "limits": {
-                    "quack_direct": cgroup(names[1]), "quack_cached": cgroup(names[2]),
-                    "quack_shared": cgroup(names[3]), "verglas": cgroup(names[0]),
-                },
+                "limits": service_limits,
             },
             "object_store": object_store,
-            "cache_stats": fetch_json("http://127.0.0.1:18434/admin/stats"),
+            "cache_stats": {
+                "verglas": verglas_stats,
+                "quackstore": {
+                    **quackstore_settings(str(quackstore_cache_dir)),
+                    "capacity_bytes": DEFAULT_CACHE_CAPACITY_BYTES,
+                    "occupancy_bytes": persistent_cache_bytes(quackstore_cache_dir),
+                },
+                "storage": {
+                    "verglas_device": str(cache_dir.stat().st_dev),
+                    "quackstore_device": str(quackstore_cache_dir.stat().st_dev),
+                },
+            },
             "workloads": workloads,
             "spill": {"observed": peak_spill > 0, "peak_bytes": peak_spill},
             "durable_writes": inventory["writes"],
+            "cache_resets": {"quackstore": len(WORKLOADS), "verglas": len(WORKLOADS)},
         }
-        validate_report(report)
+        validate_report(report, require_repetitions=False)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(report, indent=2) + "\n")
     finally:
@@ -799,6 +931,33 @@ def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
             subprocess.run(["docker", "rm", "-f", name], capture_output=True)
         subprocess.run(["docker", "network", "rm", NETWORK], capture_output=True)
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def live_r2(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
+    """Run five isolated R2 repetitions and publish their independently valid evidence."""
+    output.parent.mkdir(parents=True, exist_ok=True)
+    reports = []
+    with tempfile.TemporaryDirectory(prefix="verglas-duckdb-r2-reports-", dir=output.parent) as directory:
+        report_directory = pathlib.Path(directory)
+        for number in range(1, 6):
+            path = report_directory / f"repetition-{number}.json"
+            live_r2_once(path, rows, cache_capacity_bytes)
+            report = json.loads(path.read_text())
+            validate_report(report, require_repetitions=False)
+            reports.append(report)
+    final_report = reports[-1]
+    final_report["repetitions"] = [
+        {
+            "number": number,
+            "report_sha256": hashlib.sha256(
+                json.dumps(report, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
+            "workloads": report["workloads"],
+        }
+        for number, report in enumerate(reports, start=1)
+    ]
+    validate_report(final_report)
+    output.write_text(json.dumps(final_report, indent=2) + "\n")
 
 
 def file_credentials(path: str | None, access_key: str | None, secret: str | None) -> tuple[str, str]:
@@ -835,6 +994,7 @@ def main() -> None:
     parser.add_argument("--leg")
     parser.add_argument("--region", default="us-east-1")
     parser.add_argument("--use-ssl", action="store_true")
+    parser.add_argument("--quackstore-cache-path")
     args = parser.parse_args()
     if args.profile:
         if args.command:
@@ -858,6 +1018,7 @@ def main() -> None:
         serve_quack(
             args.endpoint, access_key, secret, args.bucket,
             region=args.region, use_ssl=args.use_ssl,
+            quackstore_cache_path=args.quackstore_cache_path,
         )
     elif args.command == "query":
         print(json.dumps(query(args.host, args.sql)))

@@ -23,3 +23,8 @@
   external-origin provenance, and request counts from R2's GraphQL operations
   dataset. The same bounded Quack topology now runs against durable R2 directly
   and through Verglas, and both write paths are hashed after direct R2 readback.
+- #126: Extended the live R2 benchmark to compare QuackStore's real persistent
+  block cache with Verglas under the same 256 MiB logical cache budget. Each of
+  five isolated repetitions records direct, cold, warm, and fresh-process cache
+  legs, plus cache occupancy, immutable-data configuration, cgroups, spill,
+  R2 operations, result hashes, and direct-origin write readback.
