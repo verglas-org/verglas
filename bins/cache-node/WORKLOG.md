@@ -96,3 +96,7 @@
   Startup now waits for every declared peer instead of silently forming a
   smaller EC ring that can advertise health without the safekeeper PostgreSQL
   depends on.
+- #127: Replaced ring-size-derived safekeeper geometry with mandatory explicit
+  `VERGLAS_SAFEKEEPER_EC_K/M/W` settings validated against the complete ring.
+  Managed four-node deployments can now declare `2/2/3`, while the OSS
+  three-node stack declares `2/1/3` rather than silently changing durability.

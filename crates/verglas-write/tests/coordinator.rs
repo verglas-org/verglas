@@ -191,6 +191,27 @@ impl FragmentTransport for MemoryTransport {
             }))
     }
 
+    async fn list(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<verglas_cluster::fragments::FragmentKey>, TransportError> {
+        let inner = self.inner.lock().expect("lock");
+        Ok(inner
+            .frags
+            .keys()
+            .filter(|(stored_node, object_id, _)| {
+                stored_node == node.as_str() && object_id.starts_with(prefix)
+            })
+            .map(
+                |(_, object_id, index)| verglas_cluster::fragments::FragmentKey {
+                    object_id: object_id.clone(),
+                    index: *index,
+                },
+            )
+            .collect())
+    }
+
     async fn delete(
         &self,
         node: &NodeId,

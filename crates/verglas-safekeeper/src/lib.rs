@@ -29,8 +29,9 @@
 //! bytes and returns only once
 //! those bytes are durable. "Durable" means: the bytes were erasure-coded into
 //! `k + m` fragments (any `k` reconstruct) and at least `w` of those fragments
-//! are fsynced on `w` distinct live nodes, and the append's manifest record is
-//! fsynced. The call blocks until that holds — it is synchronous. A Postgres
+//! are fsynced on `w` distinct live nodes. Every fragment's object identity
+//! carries the append's LSN range and codec geometry, so those same durable
+//! files are also the recovery journal. The call blocks until that holds. A Postgres
 //! commit therefore blocks precisely until its WAL is quorum-durable, never on
 //! an S3 round-trip. The return value is the half-open [`Appended`] range the
 //! bytes occupy.
@@ -68,7 +69,8 @@
 //! ## 4. Flush-to-S3 lifecycle
 //!
 //! Acked appends accumulate into **segments** — contiguous LSN runs. When a
-//! segment fills (or on an explicit [`AppendLog::flush`]) it is sealed, its
+//! segment reaches the PostgreSQL 16 MiB WAL size (or on an explicit
+//! [`AppendLog::flush`]) it is sealed, its
 //! bytes are reassembled in order into one object, and that object is written to
 //! S3. Only after S3 confirms the object durable does the log drop the segment's
 //! local fragments and advance [`AppendLog::flushed_through`]. The order is
@@ -112,13 +114,13 @@
 //!   flushing to S3 promptly.
 //! - **Single-node degenerate geometry.** A one-node deployment cannot form a
 //!   quorum. It runs `k = 1, m = 0, w = 1`: one fragment fsynced to local NVMe
-//!   plus the fsynced manifest record is the ack, no origin round-trip, async S3
+//!   is the ack, no origin round-trip, async S3
 //!   flush behind it. Durability is then "one local disk until the segment
 //!   flushes" — issue #286's shape, applied to the WAL. This is selected
 //!   automatically for a genuinely single-node deployment; it is not a knob.
-//! - **No configuration beyond the geometry.** `(k, m, w)` is the whole tuning
-//!   surface. There are no other knobs: segment size is a fixed flush-
-//!   granularity constant, not a parameter.
+//! - **Explicit geometry.** `(k, m, w)` is configured explicitly and must name
+//!   exactly the deployed cache-node count. Segment size remains a fixed
+//!   16 MiB flush granularity, matching PostgreSQL and Neon WAL backup.
 //!
 //! ## Where Neon consumes this
 //!

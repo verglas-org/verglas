@@ -65,8 +65,7 @@ type WritebackSlot = Arc<std::sync::OnceLock<Arc<WritebackMetrics>>>;
 /// Builds the all-object policy used by a tenant cache ring. Neon uploads both
 /// immutable layers and mutable publication metadata through ordinary PUTs, so
 /// every PUT must cross the same ring durability barrier.
-fn object_writeback_policy(nodes: usize) -> WritebackPolicy {
-    let layout = crate::safekeeper::geometry(nodes);
+fn object_writeback_policy(layout: verglas_safekeeper::AppendGeometry) -> WritebackPolicy {
     WritebackPolicy::new(vec![PrefixRule {
         prefix: String::new(),
         k: layout.k,
@@ -410,6 +409,7 @@ pub async fn run(
             bucket,
             config.cache.dir.clone(),
             Arc::clone(ring),
+            crate::safekeeper::geometry_from_env(ring.node_count())?,
         )),
         _ => {
             eprintln!(
@@ -631,8 +631,16 @@ pub async fn run(
     let safekeeper_activity = activity.clone();
     let safekeeper_fut = async move {
         match safekeeper_args {
-            Some((stores, bucket, cache_dir, ring)) => {
-                crate::safekeeper::serve(stores, bucket, cache_dir, ring, safekeeper_activity).await
+            Some((stores, bucket, cache_dir, ring, layout)) => {
+                crate::safekeeper::serve(
+                    stores,
+                    bucket,
+                    cache_dir,
+                    ring,
+                    layout,
+                    safekeeper_activity,
+                )
+                .await
             }
             None => {
                 std::future::pending::<()>().await;
@@ -706,7 +714,8 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let origin = Arc::new(PassthroughWrite::new(registry.clone()));
 
     let app = if let Some(ring) = object_ring {
-        let policy = Arc::new(object_writeback_policy(ring.node_count()));
+        let layout = crate::safekeeper::geometry_from_env(ring.node_count())?;
+        let policy = Arc::new(object_writeback_policy(layout));
         let (journal_store, migrated_journals) = JournalStore::open_for_binding(
             config.cache.dir.join("object-writeback"),
             MANAGED_STORAGE_BINDING_ID,
@@ -794,7 +803,8 @@ mod tests {
     /// same EC durability geometry as the embedded safekeeper.
     #[test]
     fn neon_object_writeback_covers_layers_and_index_publication() {
-        let policy = object_writeback_policy(3);
+        let policy =
+            object_writeback_policy(verglas_safekeeper::AppendGeometry { k: 2, m: 1, w: 3 });
         for key in [
             "tenants/t1/timelines/l1/000000000000000000000000000000000000-FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF-00000001",
             "tenants/t1/timelines/l1/index_part.json-00000001",

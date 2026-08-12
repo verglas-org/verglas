@@ -94,6 +94,19 @@ impl FragmentTransport for MemoryTransport {
                 checksum: *checksum,
             }))
     }
+    async fn list(&self, _node: &NodeId, prefix: &str) -> Result<Vec<FragmentKey>, TransportError> {
+        Ok(self
+            .frags
+            .lock()
+            .expect("lock")
+            .keys()
+            .filter(|(object_id, _)| object_id.starts_with(prefix))
+            .map(|(object_id, index)| FragmentKey {
+                object_id: object_id.clone(),
+                index: *index,
+            })
+            .collect())
+    }
     async fn delete(&self, _node: &NodeId, key: &FragmentKey) -> Result<(), TransportError> {
         self.frags
             .lock()
@@ -316,9 +329,14 @@ async fn single_node_recovers_the_tail_across_a_restart() {
         // crash: drop the log before any flush
     }
 
-    // Restart: reopen over the same local fragments and manifest.
+    // Restart: discover the self-describing fragment in the local store.
     let log = build(store, transport, dir.path());
-    assert_eq!(log.tail(), Lsn(5000), "manifest recovered the tail");
+    assert!(
+        log.recover_from_ring()
+            .await
+            .expect("recover local fragment")
+    );
+    assert_eq!(log.tail(), Lsn(5000), "fragment recovered the tail");
     let got = log
         .read(Lsn(0), Lsn(5000))
         .await

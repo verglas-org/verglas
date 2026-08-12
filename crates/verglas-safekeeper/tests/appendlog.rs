@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
@@ -99,6 +100,7 @@ struct TransportInner {
     dead: HashSet<String>,
     fail_place: HashSet<String>,
     budget_per_node: Option<u64>,
+    placement_delay: HashMap<String, Duration>,
 }
 
 struct MemoryTransport {
@@ -137,6 +139,16 @@ impl MemoryTransport {
             .insert(node.to_owned());
     }
 
+    /// Delays every durable placement sent to one node so quorum latency can
+    /// be tested independently from a non-quorum straggler.
+    fn delay_placement(&self, node: &str, delay: Duration) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .placement_delay
+            .insert(node.to_owned(), delay);
+    }
+
     fn wal_fragment_count(&self) -> usize {
         self.inner
             .lock()
@@ -145,6 +157,16 @@ impl MemoryTransport {
             .keys()
             .filter(|(_, _, index)| *index < 1024)
             .count()
+    }
+
+    /// Removes the replicated manifest slots and heads while retaining WAL
+    /// fragments, simulating loss of the old per-append metadata path.
+    fn delete_recovery_metadata(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .frags
+            .retain(|(_, _, index), _| *index < usize::MAX - 1);
     }
 }
 
@@ -168,6 +190,16 @@ impl FragmentTransport for MemoryTransport {
     }
 
     async fn place(&self, node: &NodeId, record: FragmentRecord) -> Result<(), TransportError> {
+        let delay = self
+            .inner
+            .lock()
+            .expect("lock")
+            .placement_delay
+            .get(node.as_str())
+            .copied();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
         let mut inner = self.inner.lock().expect("lock");
         let n = node.as_str();
         if inner.dead.contains(n) || inner.fail_place.contains(n) {
@@ -235,6 +267,24 @@ impl FragmentTransport for MemoryTransport {
                 bytes: bytes.clone(),
                 checksum: *checksum,
             }))
+    }
+
+    async fn list(&self, node: &NodeId, prefix: &str) -> Result<Vec<FragmentKey>, TransportError> {
+        let inner = self.inner.lock().expect("lock");
+        if inner.dead.contains(node.as_str()) {
+            return Ok(Vec::new());
+        }
+        Ok(inner
+            .frags
+            .keys()
+            .filter(|(stored_node, object_id, _)| {
+                stored_node == node.as_str() && object_id.starts_with(prefix)
+            })
+            .map(|(_, object_id, index)| FragmentKey {
+                object_id: object_id.clone(),
+                index: *index,
+            })
+            .collect())
     }
 
     async fn delete(&self, node: &NodeId, key: &FragmentKey) -> Result<(), TransportError> {
@@ -454,6 +504,10 @@ fn geom() -> AppendGeometry {
     AppendGeometry::new(2, 1, 3).expect("geometry")
 }
 
+fn four_node_geom() -> AppendGeometry {
+    AppendGeometry::new(2, 2, 3).expect("four-node geometry")
+}
+
 // ---- tests -----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -550,6 +604,83 @@ async fn append_acks_over_quorum_and_reads_back_the_tail() {
     );
 
     assert_eq!(log.flushed_through(), Lsn(0), "nothing flushed yet");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fourth_node_does_not_delay_a_three_of_four_durable_append() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let transport = MemoryTransport::new();
+    transport.delay_placement("n3", Duration::from_secs(2));
+    let log = build(
+        MemStore::new(),
+        transport,
+        FakeMembership::new("n0", &["n0", "n1", "n2", "n3"]),
+        dir.path(),
+        four_node_geom(),
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        log.append(Epoch(0), Lsn(0), bytes(4096)),
+    )
+    .await
+    .expect("the fourth node must remain outside the commit latency")
+    .expect("three durable fragments satisfy the configured quorum");
+
+    assert_eq!(result.end, Lsn(4096));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn normal_drain_waits_for_a_complete_sixteen_mib_wal_batch() {
+    const WAL_SEGMENT_BYTES: usize = 16 * 1024 * 1024;
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let log = build(
+        store.clone(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    log.append(Epoch(0), Lsn(0), bytes(4096))
+        .await
+        .expect("small append");
+    assert_eq!(
+        log.flush_complete_segments().await.expect("normal drain"),
+        Lsn(0),
+        "a partial WAL tail stays on the durable cache volumes"
+    );
+    assert_eq!(store.object_count(), 0, "no tiny R2 object was created");
+
+    let remaining = WAL_SEGMENT_BYTES - 4096;
+    log.append(Epoch(0), Lsn(4096), bytes(remaining))
+        .await
+        .expect("complete WAL batch");
+    assert_eq!(
+        log.flush_complete_segments().await.expect("normal drain"),
+        Lsn(WAL_SEGMENT_BYTES as u64),
+    );
+    assert_eq!(store.object_count(), 1, "one useful-sized R2 object");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn explicit_flush_drains_a_partial_wal_tail_for_lifecycle_checkpoint() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = MemStore::new();
+    let log = build(
+        store.clone(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+    log.append(Epoch(0), Lsn(0), bytes(4096))
+        .await
+        .expect("small append");
+
+    assert_eq!(log.flush().await.expect("forced drain"), Lsn(4096));
+    assert_eq!(store.object_count(), 1, "checkpoint persisted the tail");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -808,13 +939,25 @@ async fn repeated_commits_keep_writing_after_the_fragment_store_reaches_steady_s
 async fn write_pressure_offloads_and_evicts_the_acked_tail_before_rejecting_a_commit() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
-    let transport = MemoryTransport::with_budget_per_node(24 * 1024);
+    let transport = MemoryTransport::with_budget_per_node(12 * 1024);
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
-    let log = build(store.clone(), transport, membership, dir.path(), geom());
+    let log = build(
+        store.clone(),
+        transport.clone(),
+        membership,
+        dir.path(),
+        geom(),
+    );
 
-    let mut lsn = Lsn(0);
+    log.initialize_timeline(Lsn(0x1000))
+        .await
+        .expect("initialize timeline and first metadata slot");
+    log.configure_timeline(0, 41, 17, 16 * 1024 * 1024)
+        .await
+        .expect("configure timeline and second metadata slot");
+    let mut lsn = Lsn(0x1000);
     for commit in 0..24 {
-        log.append(Epoch(0), lsn, bytes(2048))
+        log.append(Epoch(1), lsn, bytes(2048))
             .await
             .unwrap_or_else(|error| panic!("pressure rejected commit {commit}: {error}"));
         lsn = log.tail();
@@ -825,7 +968,7 @@ async fn write_pressure_offloads_and_evicts_the_acked_tail_before_rejecting_a_co
         log.flushed_through().0 > 0,
         "pressure advanced the durable origin watermark"
     );
-    assert_eq!(log.tail(), Lsn(24 * 2048));
+    assert_eq!(log.tail(), Lsn(0x1000 + 24 * 2048));
 }
 
 #[test]
@@ -921,8 +1064,13 @@ async fn recovers_the_tail_from_fragments_after_a_node_loss() {
     transport.kill("n1");
     membership.drop_node("n1");
 
-    // Restart: reopen the log from the fsynced manifest over the same fragments.
+    // Restart: discover the self-describing durable fragments from the ring.
     let log = build(store, transport, membership, dir.path(), geom());
+    assert!(
+        log.recover_from_ring()
+            .await
+            .expect("recover durable fragments")
+    );
     assert_eq!(
         log.tail(),
         Lsn(9000),
@@ -976,6 +1124,51 @@ async fn replacement_coordinator_recovers_without_the_failed_nodes_manifest() {
             .read(Lsn(0x1000), replacement.tail())
             .await
             .expect("reassemble on replacement"),
+        payload
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replacement_recovers_acknowledged_wal_from_self_describing_fragments() {
+    let original_dir = tempfile::tempdir().expect("original tmp");
+    let replacement_dir = tempfile::tempdir().expect("replacement tmp");
+    let store = MemStore::new();
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("n0", &["n0", "n1", "n2", "n3"]);
+    let payload = bytes(9000);
+    {
+        let log = build(
+            store.clone(),
+            transport.clone(),
+            membership.clone(),
+            original_dir.path(),
+            four_node_geom(),
+        );
+        log.append(Epoch(0), Lsn(0x1000), payload.clone())
+            .await
+            .expect("quorum append");
+    }
+    transport.delete_recovery_metadata();
+
+    let replacement = build(
+        store,
+        transport,
+        membership,
+        replacement_dir.path(),
+        four_node_geom(),
+    );
+    assert!(
+        replacement
+            .recover_from_ring()
+            .await
+            .expect("recover directly from durable WAL fragments")
+    );
+    assert_eq!(replacement.tail(), Lsn(0x1000 + payload.len() as u64));
+    assert_eq!(
+        replacement
+            .read(Lsn(0x1000), replacement.tail())
+            .await
+            .expect("recovered WAL reads"),
         payload
     );
 }
@@ -1236,6 +1429,9 @@ async fn open_compacts_legacy_flushed_placements_before_serving() {
         log.append(Epoch(0), Lsn(0), bytes(4000))
             .await
             .expect("append");
+        log.fence(Epoch(1))
+            .await
+            .expect("checkpoint legacy-style manifest");
     }
 
     let path = dir.path().join("safekeeper/manifest.json");
@@ -1453,17 +1649,16 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
         "flush_lsn advances only after the EC append"
     );
 
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
-        while store.object_count() == 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-    })
-    .await
-    .expect("append notification streamed WAL without waiting for retry timer");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    assert_eq!(
+        store.object_count(),
+        0,
+        "a partial WAL segment is not uploaded as a tiny object"
+    );
     assert_eq!(
         transport.wal_fragment_count(),
-        0,
-        "EC fragments drop only after the object-store write"
+        3,
+        "the partial tail remains durable in the EC ring"
     );
 
     // The proposer may advance its truncate watermark before a cold pageserver

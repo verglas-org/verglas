@@ -35,6 +35,14 @@ use crate::manifest::{
     AppendEntry, Manifest, ManifestStore, Placement, SegmentEntry, SegmentState,
 };
 
+/// Metadata encoded into every WAL fragment object id. A durable fragment is
+/// therefore both data and its own recovery journal; a replacement coordinator
+/// does not need a separately fsynced manifest update for each append.
+struct WalFragmentIdentity {
+    segment_id: u64,
+    entry: AppendEntry,
+}
+
 /// Seal a segment and start a new one once the open one reaches this many bytes.
 /// A fixed flush-granularity constant, not a tuning knob: the whole tuning
 /// surface is the erasure geometry (see the crate contract, §7).
@@ -301,16 +309,32 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
-        let mut descriptor_nodes = Vec::new();
+        let mut descriptor_writes = futures::stream::FuturesUnordered::new();
         for node in &live {
-            match self.transport.place(node, descriptor_record.clone()).await {
-                Ok(()) => descriptor_nodes.push(node.clone()),
+            let transport = Arc::clone(&self.transport);
+            let node = node.clone();
+            let record = descriptor_record.clone();
+            descriptor_writes.push(tokio::spawn(async move {
+                let result = transport.place(&node, record).await;
+                (node, result)
+            }));
+        }
+        let mut descriptor_nodes = Vec::new();
+        while let Some(joined) = descriptor_writes.next().await {
+            let (node, result) = joined.map_err(|error| {
+                AppendError::Manifest(format!("descriptor placement task: {error}"))
+            })?;
+            match result {
+                Ok(()) => descriptor_nodes.push(node),
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
                     revision = manifest.revision,
                     %error,
                     "failed to replicate safekeeper descriptor"
                 ),
+            }
+            if descriptor_nodes.len() >= geometry.w {
+                break;
             }
         }
         if descriptor_nodes.len() < geometry.w {
@@ -327,9 +351,22 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
-        let mut heads = 0;
+        let mut head_writes = futures::stream::FuturesUnordered::new();
         for node in &descriptor_nodes {
-            match self.transport.place(node, head_record.clone()).await {
+            let transport = Arc::clone(&self.transport);
+            let node = node.clone();
+            let record = head_record.clone();
+            head_writes.push(tokio::spawn(async move {
+                let result = transport.place(&node, record).await;
+                (node, result)
+            }));
+        }
+        let mut heads = 0;
+        while let Some(joined) = head_writes.next().await {
+            let (node, result) = joined.map_err(|error| {
+                AppendError::Manifest(format!("state-head placement task: {error}"))
+            })?;
+            match result {
                 Ok(()) => heads += 1,
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
@@ -337,6 +374,9 @@ where
                     %error,
                     "failed to publish safekeeper state head"
                 ),
+            }
+            if heads >= geometry.w {
+                break;
             }
         }
         if heads < geometry.w {
@@ -370,59 +410,178 @@ where
                 latest = Some(latest.map_or(revision, |seen: u64| seen.max(revision)));
             }
         }
-        let Some(revision) = latest else {
-            return Ok(false);
-        };
-        let mut candidates: std::collections::HashMap<Vec<u8>, usize> =
-            std::collections::HashMap::new();
-        for object_id in [
-            self.state_object_id(revision),
-            self.legacy_state_object_id(revision),
-        ] {
-            let descriptor_key = FragmentKey {
-                object_id,
-                index: STATE_DESCRIPTOR_INDEX,
-            };
-            for node in &live {
-                if let Ok(Some(descriptor)) = self.transport.load(node, &descriptor_key).await
-                    && descriptor.is_healthy()
-                {
-                    *candidates.entry(descriptor.bytes.to_vec()).or_default() += 1;
+        let recovered_descriptor = if let Some(revision) = latest {
+            let mut candidates: std::collections::HashMap<Vec<u8>, usize> =
+                std::collections::HashMap::new();
+            for object_id in [
+                self.state_object_id(revision),
+                self.legacy_state_object_id(revision),
+            ] {
+                let descriptor_key = FragmentKey {
+                    object_id,
+                    index: STATE_DESCRIPTOR_INDEX,
+                };
+                for node in &live {
+                    if let Ok(Some(descriptor)) = self.transport.load(node, &descriptor_key).await
+                        && descriptor.is_healthy()
+                    {
+                        *candidates.entry(descriptor.bytes.to_vec()).or_default() += 1;
+                    }
+                }
+                if !candidates.is_empty() {
+                    break;
                 }
             }
-            if !candidates.is_empty() {
-                break;
-            }
-        }
-        let bytes = candidates
-            .into_iter()
-            .filter(|(_, count)| *count >= 1)
-            .map(|(bytes, _)| bytes)
-            .next()
-            .ok_or_else(|| {
+            let bytes = candidates.into_keys().next().ok_or_else(|| {
                 AppendError::Manifest(format!(
                     "state revision {revision} is unavailable on every live peer"
                 ))
             })?;
-        let recovered: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|error| AppendError::Manifest(format!("decode ring state: {error}")))?;
-        if recovered.revision != revision {
-            return Err(AppendError::Manifest(format!(
-                "state head {revision} points at revision {}",
-                recovered.revision
-            )));
-        }
-        let mut manifest = self.state.lock().await;
-        if recovered.revision <= manifest.revision {
+            let recovered: Manifest = serde_json::from_slice(&bytes)
+                .map_err(|error| AppendError::Manifest(format!("decode ring state: {error}")))?;
+            if recovered.revision != revision {
+                return Err(AppendError::Manifest(format!(
+                    "state head {revision} points at revision {}",
+                    recovered.revision
+                )));
+            }
+            Some(recovered)
+        } else {
+            None
+        };
+
+        let current = self.state.lock().await.clone();
+        let mut recovered = recovered_descriptor
+            .filter(|candidate| candidate.revision > current.revision)
+            .unwrap_or(current.clone());
+        let descriptor_changed = recovered != current;
+        let fragments_changed = self
+            .recover_acknowledged_fragments(&live, &mut recovered)
+            .await?;
+        if !descriptor_changed && !fragments_changed {
             return Ok(false);
+        }
+        if fragments_changed {
+            recovered.revision = recovered.revision.saturating_add(1);
         }
         self.manifest_store.persist(&recovered)?;
         self.tail.store(recovered.tail.0, Ordering::Relaxed);
         self.flushed
             .store(recovered.flushed_through.0, Ordering::Relaxed);
         self.epoch.store(recovered.epoch.0, Ordering::Relaxed);
-        *manifest = recovered;
+        *self.state.lock().await = recovered;
         Ok(true)
+    }
+
+    /// Discovers self-describing WAL fragments and appends only contiguous
+    /// entries that retain at least `k` verified placements. Neon distinguishes
+    /// durable flush WAL from the lower commit watermark, so recovering a
+    /// reconstructible but previously unacknowledged suffix is safe: a proposer
+    /// either repeats identical bytes or is rejected as divergent.
+    async fn recover_acknowledged_fragments(
+        &self,
+        live: &[NodeId],
+        manifest: &mut Manifest,
+    ) -> Result<bool, AppendError> {
+        let prefix = self.state_prefix();
+        let wal_prefix = format!("{prefix}/w/");
+        let listed = futures::future::join_all(live.iter().map(|node| {
+            let transport = Arc::clone(&self.transport);
+            let node = node.clone();
+            let wal_prefix = wal_prefix.clone();
+            async move {
+                let keys = transport.list(&node, &wal_prefix).await;
+                (node, keys)
+            }
+        }))
+        .await;
+        let mut discovered: HashMap<String, (WalFragmentIdentity, Vec<Placement>)> = HashMap::new();
+        for (node, keys) in listed {
+            let Ok(keys) = keys else { continue };
+            for key in keys {
+                let Some(identity) = parse_wal_fragment_object_id(&prefix, &key.object_id) else {
+                    continue;
+                };
+                if key.index >= identity.entry.k + identity.entry.m {
+                    continue;
+                }
+                let item = discovered
+                    .entry(key.object_id.clone())
+                    .or_insert_with(|| (identity, Vec::new()));
+                if !item
+                    .1
+                    .iter()
+                    .any(|placement| placement.node == node.as_str())
+                {
+                    item.1.push(Placement {
+                        index: key.index,
+                        node: node.as_str().to_owned(),
+                    });
+                }
+            }
+        }
+
+        let existing: std::collections::HashSet<String> = manifest
+            .segments
+            .iter()
+            .flat_map(|segment| segment.appends.iter().map(|entry| entry.object_id.clone()))
+            .collect();
+        let mut entries: Vec<(u64, AppendEntry)> = discovered
+            .into_values()
+            .filter_map(|(identity, placements)| {
+                if placements.len() < identity.entry.k
+                    || existing.contains(&identity.entry.object_id)
+                {
+                    return None;
+                }
+                let mut entry = identity.entry;
+                entry.placements = placements;
+                Some((identity.segment_id, entry))
+            })
+            .collect();
+        entries.sort_by_key(|(_, entry)| (entry.start, entry.seq));
+        if entries.is_empty() {
+            return Ok(false);
+        }
+
+        let mut changed = false;
+        let mut expected = manifest.tail;
+        if expected == Lsn(0) && manifest.segments.is_empty() {
+            expected = entries[0].1.start;
+            manifest.base = expected;
+            manifest.flushed_through = expected;
+        }
+        for (segment_id, entry) in entries {
+            if entry.end.0 <= manifest.flushed_through.0 || entry.start.0 < expected.0 {
+                continue;
+            }
+            if entry.start != expected {
+                break;
+            }
+            if let Some(segment) = manifest
+                .segments
+                .iter_mut()
+                .find(|segment| segment.id == segment_id && segment.state == SegmentState::Open)
+            {
+                segment.end = entry.end;
+                segment.appends.push(entry.clone());
+            } else {
+                manifest.segments.push(SegmentEntry {
+                    id: segment_id,
+                    start: entry.start,
+                    end: entry.end,
+                    state: SegmentState::Open,
+                    s3_key: None,
+                    appends: vec![entry.clone()],
+                });
+            }
+            manifest.next_segment_id = manifest.next_segment_id.max(segment_id.saturating_add(1));
+            manifest.tail = entry.end;
+            expected = entry.end;
+            changed = true;
+        }
+        manifest.segments.sort_by_key(|segment| segment.start);
+        Ok(changed)
     }
 
     /// Returns the persisted Neon acceptor state for greeting, voting, and WAL
@@ -552,8 +711,6 @@ where
             manifest.commit_lsn = Lsn(manifest.commit_lsn.0.max(commit_lsn.0));
             manifest.truncate_lsn = Lsn(manifest.truncate_lsn.0.max(truncate_lsn.0));
             manifest.revision = manifest.revision.saturating_add(1);
-            self.replicate_state(&manifest).await?;
-            self.manifest_store.persist(&manifest)?;
         }
         Ok(SafekeeperState {
             system_id: manifest.system_id,
@@ -605,9 +762,17 @@ where
             .first()
             .map_or(0, |f| f.bytes.len() as u64);
         let ordered = placement_order(object_id, live);
-        let mut nodes = Vec::with_capacity(ordered.len());
-        for node in ordered {
-            if self.transport.has_headroom(&node, probe).await {
+        let headroom = futures::future::join_all(ordered.into_iter().map(|node| {
+            let transport = Arc::clone(&self.transport);
+            async move {
+                let has_room = transport.has_headroom(&node, probe).await;
+                (node, has_room)
+            }
+        }))
+        .await;
+        let mut nodes = Vec::with_capacity(headroom.len());
+        for (node, has_room) in headroom {
+            if has_room {
                 nodes.push(node);
             } else {
                 tracing::warn!(
@@ -619,9 +784,14 @@ where
             }
         }
 
+        let mut writes = futures::stream::FuturesUnordered::new();
         let mut placements = Vec::new();
         for (index, fragment) in encoded.fragments.iter().enumerate() {
             let Some(node) = nodes.get(index) else { break };
+            let placement = Placement {
+                index,
+                node: node.as_str().to_owned(),
+            };
             let record = FragmentRecord::new(
                 FragmentKey {
                     object_id: object_id.to_owned(),
@@ -629,26 +799,44 @@ where
                 },
                 fragment.bytes.clone(),
             );
-            match self.transport.place(node, record).await {
-                Ok(()) => placements.push(Placement {
-                    index,
-                    node: node.as_str().to_owned(),
-                }),
+            placements.push(placement.clone());
+            let transport = Arc::clone(&self.transport);
+            let node = node.clone();
+            writes.push(tokio::spawn(async move {
+                let result = transport.place(&node, record).await;
+                (placement, result)
+            }));
+        }
+
+        let mut durable = 0;
+        while let Some(joined) = writes.next().await {
+            let (placement, result) = joined.map_err(|error| {
+                AppendError::Manifest(format!("WAL fragment placement task: {error}"))
+            })?;
+            match result {
+                Ok(()) => durable += 1,
                 Err(error) => tracing::warn!(
-                    node = node.as_str(),
-                    index,
+                    node = placement.node,
+                    index = placement.index,
                     %object_id,
                     %error,
                     "failed to place safekeeper WAL fragment"
                 ),
             }
+            if durable >= w {
+                // Dropping JoinHandles detaches the non-quorum writes. Their
+                // intended placements are already journaled, so a later flush
+                // deletes a successful straggler and treats a failed one as an
+                // ordinary erasure.
+                break;
+            }
         }
 
-        if placements.len() < w {
+        if durable < w {
             self.drop_fragments(object_id, &placements).await;
             return Err(AppendError::QuorumUnavailable {
                 needed: w,
-                placed: placements.len(),
+                placed: durable,
             });
         }
         Ok(placements)
@@ -745,10 +933,22 @@ where
     /// Streams every open segment to object storage and reclaims its EC
     /// fragments. Callers hold the append mutex, so the manifest cannot change
     /// between reassembly, publication of the flushed state, and eviction.
-    async fn flush_manifest(&self, manifest: &mut Manifest) -> Result<Lsn, AppendError> {
+    async fn flush_manifest(
+        &self,
+        manifest: &mut Manifest,
+        include_partial_tail: bool,
+    ) -> Result<Lsn, AppendError> {
         let mut i = 0;
         while i < manifest.segments.len() {
             if manifest.segments[i].state != SegmentState::Open {
+                i += 1;
+                continue;
+            }
+            let segment_bytes = manifest.segments[i]
+                .end
+                .0
+                .saturating_sub(manifest.segments[i].start.0);
+            if !include_partial_tail && segment_bytes < SEGMENT_TARGET {
                 i += 1;
                 continue;
             }
@@ -783,6 +983,14 @@ where
             i += 1;
         }
         Ok(manifest.flushed_through)
+    }
+
+    /// Drains only complete WAL batches to object storage. The partial tail
+    /// remains quorum-durable on cache volumes until it reaches 16 MiB or an
+    /// explicit lifecycle checkpoint calls [`AppendLog::flush`].
+    pub async fn flush_complete_segments(&self) -> Result<Lsn, AppendError> {
+        let mut manifest = self.state.lock().await;
+        self.flush_manifest(&mut manifest, false).await
     }
 
     /// Reads a live range using one already-locked manifest snapshot. Keeping
@@ -848,6 +1056,63 @@ fn placement_order(seed: &str, live: &[NodeId]) -> Vec<NodeId> {
         .collect();
     scored.sort_by(|(sa, na), (sb, nb)| sb.cmp(sa).then_with(|| na.as_str().cmp(nb.as_str())));
     scored.into_iter().map(|(_, n)| n).collect()
+}
+
+/// Builds the self-describing object id shared by all fragments of one append.
+#[allow(clippy::too_many_arguments)]
+fn wal_fragment_object_id(
+    prefix: &str,
+    segment_id: u64,
+    seq: u64,
+    start: Lsn,
+    end: Lsn,
+    geometry: AppendGeometry,
+    chunk: usize,
+    object_len: u64,
+) -> String {
+    format!(
+        "{prefix}/w/{segment_id:016x}/{seq:016x}/{:016x}-{:016x}-{}-{}-{chunk}-{object_len}-{}",
+        start.0, end.0, geometry.k, geometry.m, geometry.w,
+    )
+}
+
+/// Parses one self-describing WAL fragment object id. Unknown ids are ignored
+/// so state descriptors and pre-change WAL objects remain recoverable through
+/// their ordinary replicated manifests.
+fn parse_wal_fragment_object_id(prefix: &str, object_id: &str) -> Option<WalFragmentIdentity> {
+    let rest = object_id.strip_prefix(&format!("{prefix}/w/"))?;
+    let mut path = rest.split('/');
+    let segment_id = u64::from_str_radix(path.next()?, 16).ok()?;
+    let seq = u64::from_str_radix(path.next()?, 16).ok()?;
+    let fields = path.next()?;
+    if path.next().is_some() {
+        return None;
+    }
+    let mut fields = fields.split('-');
+    let start = Lsn(u64::from_str_radix(fields.next()?, 16).ok()?);
+    let end = Lsn(u64::from_str_radix(fields.next()?, 16).ok()?);
+    let k = fields.next()?.parse().ok()?;
+    let m = fields.next()?.parse().ok()?;
+    let chunk = fields.next()?.parse().ok()?;
+    let object_len = fields.next()?.parse().ok()?;
+    let required = fields.next()?.parse().ok()?;
+    if fields.next().is_some() || end.0 <= start.0 || AppendGeometry::new(k, m, required).is_err() {
+        return None;
+    }
+    Some(WalFragmentIdentity {
+        segment_id,
+        entry: AppendEntry {
+            object_id: object_id.to_owned(),
+            seq,
+            start,
+            end,
+            k,
+            m,
+            chunk,
+            object_len,
+            placements: Vec::new(),
+        },
+    })
 }
 
 /// Ensures the manifest has an open tail segment with room, creating a new one
@@ -976,7 +1241,7 @@ where
                 available = holders_with_room,
                 "WAL admission is reclaiming object-store-durable fragments"
             );
-            self.flush_manifest(&mut manifest).await?;
+            self.flush_manifest(&mut manifest, true).await?;
         }
 
         let previous = manifest.clone();
@@ -985,7 +1250,16 @@ where
             let seg = &manifest.segments[idx];
             (seg.id, seg.appends.len() as u64)
         };
-        let object_id = format!("{}/w/{segment_id:016x}/{seq:016x}", self.state_prefix());
+        let object_id = wal_fragment_object_id(
+            &self.state_prefix(),
+            segment_id,
+            seq,
+            start,
+            end,
+            geometry,
+            encoded.geometry.chunk,
+            encoded.object_len,
+        );
         let placements = match self.place(&object_id, &encoded, geometry.w, &live).await {
             Ok(placements) => placements,
             Err(error) => {
@@ -1017,26 +1291,20 @@ where
         manifest.tail = end;
         manifest.revision = manifest.revision.saturating_add(1);
 
-        if let Err(error) = self.replicate_state(&manifest).await {
-            *manifest = previous;
-            self.drop_fragments(&object_id, &placements).await;
-            return Err(error);
-        }
-
-        // The ring descriptor is the coordinator-replacement authority. Keep a
-        // local fsynced copy as the fast same-node restart path.
-        if let Err(error) = self.manifest_store.persist(&manifest) {
-            // The fragments are placed but the record is not durable — roll the
-            // append back so the tail never reflects an un-fsynced ack, and drop
-            // the orphaned fragments.
-            *manifest = previous;
-            self.drop_fragments(&object_id, &placements).await;
-            return Err(error);
-        }
+        // Each fsynced WAL fragment carries this entry's complete recovery
+        // identity in its object id. The quorum is therefore the journal; the
+        // full manifest is checkpointed on lifecycle and segment boundaries
+        // instead of adding two more distributed fsync rounds to every commit.
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
-        self.flush_requested.notify_one();
+        let completed_batch = manifest.segments.last().is_some_and(|segment| {
+            segment.state == SegmentState::Open
+                && segment.end.0.saturating_sub(segment.start.0) >= SEGMENT_TARGET
+        });
+        if completed_batch {
+            self.flush_requested.notify_one();
+        }
 
         Ok(Appended {
             start: begin_lsn,
@@ -1051,7 +1319,7 @@ where
 
     async fn flush(&self) -> Result<Lsn, AppendError> {
         let mut manifest = self.state.lock().await;
-        self.flush_manifest(&mut manifest).await
+        self.flush_manifest(&mut manifest, true).await
     }
 
     async fn truncate(&self, up_to: Lsn) -> Result<(), AppendError> {

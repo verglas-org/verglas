@@ -538,7 +538,7 @@ where
                 _ = interval.tick() => {}
                 _ = timeline.wait_for_flush_request() => {}
             }
-            match timeline.flush().await {
+            match timeline.flush_complete_segments().await {
                 Ok(flushed) => {
                     let state = timeline.safekeeper_state().await;
                     // A proposer peer horizon only says other safekeepers no

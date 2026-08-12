@@ -205,6 +205,9 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
             .env("VERGLAS_NODE_ID", format!("node-{index}"))
             .env("VERGLAS_RING_PEERS", &peers)
+            .env("VERGLAS_SAFEKEEPER_EC_K", "2")
+            .env("VERGLAS_SAFEKEEPER_EC_M", "1")
+            .env("VERGLAS_SAFEKEEPER_EC_W", "3")
             .env(
                 "VERGLAS_RING_ADDR",
                 format!("127.0.0.1:{}", ring_ports[index]),

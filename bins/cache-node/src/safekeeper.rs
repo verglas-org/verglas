@@ -137,19 +137,42 @@ impl ObjectWrite for Origin {
     }
 }
 
-/// Chooses an EC layout that uses the whole configured ring while retaining
-/// two parity fragments once at least four cache nodes exist.
-pub(crate) fn geometry(nodes: usize) -> AppendGeometry {
-    match nodes {
-        0 | 1 => AppendGeometry { k: 1, m: 0, w: 1 },
-        2 => AppendGeometry { k: 1, m: 1, w: 2 },
-        3 => AppendGeometry { k: 2, m: 1, w: 3 },
-        count => AppendGeometry {
-            k: count - 2,
-            m: 2,
-            w: count - 1,
-        },
+/// Validates an explicit WAL erasure geometry against the complete cache ring.
+/// Every configured node owns exactly one fragment; topology changes therefore
+/// require an intentional geometry update instead of silently changing parity.
+pub(crate) fn configured_geometry(
+    nodes: usize,
+    k: usize,
+    m: usize,
+    w: usize,
+) -> Result<AppendGeometry, String> {
+    let geometry = AppendGeometry::new(k, m, w).map_err(|error| error.to_string())?;
+    if geometry.total() != nodes {
+        return Err(format!(
+            "safekeeper EC k={k}, m={m} creates {} fragments for {nodes} cache nodes",
+            geometry.total()
+        ));
     }
+    Ok(geometry)
+}
+
+/// Reads one mandatory positive-or-zero integer from the process environment.
+fn geometry_env(name: &str) -> Result<usize, std::io::Error> {
+    let raw =
+        std::env::var(name).map_err(|_| std::io::Error::other(format!("{name} is required")))?;
+    raw.parse::<usize>()
+        .map_err(|error| std::io::Error::other(format!("invalid {name}={raw}: {error}")))
+}
+
+/// Loads and validates the mandatory process-level WAL EC configuration.
+pub(crate) fn geometry_from_env(nodes: usize) -> Result<AppendGeometry, std::io::Error> {
+    configured_geometry(
+        nodes,
+        geometry_env("VERGLAS_SAFEKEEPER_EC_K")?,
+        geometry_env("VERGLAS_SAFEKEEPER_EC_M")?,
+        geometry_env("VERGLAS_SAFEKEEPER_EC_W")?,
+    )
+    .map_err(std::io::Error::other)
 }
 
 /// Serves the Neon protocol from this cache-node process until its listener
@@ -159,13 +182,13 @@ pub async fn serve(
     bucket: String,
     cache_dir: std::path::PathBuf,
     ring: Arc<RingPlane>,
+    layout: AppendGeometry,
     activity: ActivityTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::var("VERGLAS_SAFEKEEPER_ADDR")
         .unwrap_or_else(|_| DEFAULT_SAFEKEEPER_ADDR.to_owned())
         .parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    let layout = geometry(ring.node_count());
     let mut server = SafekeeperServer::new(
         ring.safekeeper_id(),
         Arc::new(Origin::new(stores)),
@@ -200,12 +223,20 @@ pub async fn serve(
 mod tests {
     use super::*;
 
-    /// Geometry grows from replicated single-node mode to two-parity fleet EC.
+    /// Four-node geometry is explicit and must consume the configured ring.
     #[test]
-    fn geometry_tracks_ring_growth() {
-        assert_eq!(geometry(1), AppendGeometry { k: 1, m: 0, w: 1 });
-        assert_eq!(geometry(3), AppendGeometry { k: 2, m: 1, w: 3 });
-        assert_eq!(geometry(4), AppendGeometry { k: 2, m: 2, w: 3 });
-        assert_eq!(geometry(5), AppendGeometry { k: 3, m: 2, w: 4 });
+    fn configured_geometry_accepts_four_node_ec() {
+        assert_eq!(
+            configured_geometry(4, 2, 2, 3).expect("valid four-node geometry"),
+            AppendGeometry { k: 2, m: 2, w: 3 }
+        );
+    }
+
+    /// A geometry that silently leaves nodes unused or names absent nodes is a
+    /// deployment error rather than an implicit topology conversion.
+    #[test]
+    fn configured_geometry_rejects_ring_mismatch() {
+        let error = configured_geometry(4, 2, 1, 3).expect_err("three fragments for four nodes");
+        assert!(error.contains("4 cache nodes"), "{error}");
     }
 }

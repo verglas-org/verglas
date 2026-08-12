@@ -68,6 +68,11 @@ pub trait FragmentTransport: Send + Sync + 'static {
         key: &FragmentKey,
     ) -> Result<Option<LoadedFragment>, TransportError>;
 
+    /// Lists fragment keys on `node` whose object id begins with `prefix`.
+    /// Recovery uses this to discover self-describing durable WAL fragments
+    /// after loss of the original coordinator.
+    async fn list(&self, node: &NodeId, prefix: &str) -> Result<Vec<FragmentKey>, TransportError>;
+
     /// Deletes the fragment `key` from `node` (idempotent).
     async fn delete(&self, node: &NodeId, key: &FragmentKey) -> Result<(), TransportError>;
 }
@@ -150,6 +155,20 @@ impl FragmentTransport for PeerFragmentTransport {
             Ok(self.local.load_fragment(key)?)
         } else {
             Ok(self.client.get_fragment(node, key).await?)
+        }
+    }
+
+    /// Lists locally without a peer hop or through the authenticated peer RPC.
+    async fn list(&self, node: &NodeId, prefix: &str) -> Result<Vec<FragmentKey>, TransportError> {
+        if *node == self.self_id {
+            Ok(self
+                .local
+                .list_fragment_keys()
+                .into_iter()
+                .filter(|key| key.object_id.starts_with(prefix))
+                .collect())
+        } else {
+            Ok(self.client.list_fragments(node, prefix).await?)
         }
     }
 

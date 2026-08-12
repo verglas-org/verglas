@@ -59,3 +59,12 @@
 - #74: Made pageserver feedback advance retention only from the explicit
   `vg_durable_lsn` watermark and accepted Neon's read-replica
   `START_REPLICATION SLOT ... TIMELINE ...` command.
+- #127: Parallelized WAL fragment and checkpoint placement so a four-node
+  `k=2,m=2,w=3` ring acknowledges after three NVMe-durable completions without
+  waiting for the fourth. WAL fragment identities now carry their recovery
+  metadata, removing per-commit manifest replication while preserving
+  replacement-coordinator recovery from any reconstructible contiguous suffix.
+- #127: Matched Neon backup batching by draining complete 16 MiB WAL segments
+  during normal operation and retaining partial tails on persistent cache
+  volumes. Explicit lifecycle flush still checkpoints a partial tail to object
+  storage, and pressure may force a drain before rejecting new WAL.

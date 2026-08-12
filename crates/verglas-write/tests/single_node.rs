@@ -137,6 +137,21 @@ impl FragmentTransport for MemoryTransport {
             }))
     }
 
+    async fn list(&self, _node: &NodeId, prefix: &str) -> Result<Vec<FragmentKey>, TransportError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("lock")
+            .frags
+            .keys()
+            .filter(|(object_id, _)| object_id.starts_with(prefix))
+            .map(|(object_id, index)| FragmentKey {
+                object_id: object_id.clone(),
+                index: *index,
+            })
+            .collect())
+    }
+
     async fn delete(&self, _node: &NodeId, key: &FragmentKey) -> Result<(), TransportError> {
         self.inner
             .lock()

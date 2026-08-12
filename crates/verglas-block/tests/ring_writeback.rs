@@ -182,6 +182,18 @@ impl FragmentTransport for MemoryTransport {
         Ok(self.store(node.as_str()).load_fragment(key)?)
     }
 
+    async fn list(&self, node: &NodeId, prefix: &str) -> Result<Vec<FragmentKey>, TransportError> {
+        if self.is_dead(node.as_str()) {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .store(node.as_str())
+            .list_fragment_keys()
+            .into_iter()
+            .filter(|key| key.object_id.starts_with(prefix))
+            .collect())
+    }
+
     async fn delete(&self, node: &NodeId, key: &FragmentKey) -> Result<(), TransportError> {
         if self.is_dead(node.as_str()) {
             return Ok(());

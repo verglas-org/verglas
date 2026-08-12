@@ -1,19 +1,13 @@
-//! The durable append-log manifest: the fsynced record that makes an acked but
-//! not-yet-flushed append real, and that a restart rebuilds the tail from.
+//! The checkpointed append-log manifest for timeline identity, fencing,
+//! watermarks, and flushed object locations.
 //!
 //! One JSON file holds the whole log's state — the writer epoch, the ordered
 //! segments and their appends (with the exact fragment placements), and the
-//! flush and truncation watermarks. It is rewritten and fsynced before an append
-//! is acked, so a crash after ack replays it: the surviving fragments named in
-//! it reconstruct the tail, and the flushed-segment records point recovery at
-//! S3 for everything below the flush watermark.
-//!
-//! Rewriting the whole file per append is O(segments-in-flight); appends are
-//! serialized and flush drops the flushed segments' per-append placements, so
-//! the file stays small. The
-//! extension point for a higher append rate is a per-append journal file plus a
-//! small watermark manifest (the object write-back tier's shape) — noted, not
-//! built, per the prototype rules.
+//! flush and truncation watermarks. WAL fragment object identities carry their
+//! own LSN and codec metadata, so appends need no separate manifest fsync before
+//! acknowledgment. Recovery loads this checkpoint and then discovers any newer
+//! reconstructible fragment suffix from the ring. Segment flush and lifecycle
+//! operations compact and persist the complete state.
 
 use std::fs::{self, File};
 use std::io::Write;

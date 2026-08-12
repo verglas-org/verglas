@@ -100,4 +100,7 @@
   by the safekeeper's bounded manifest slots: failed metadata replacement can no
   longer make occupied NVMe appear free.
 - #74: Added prefix-filtered fragment discovery and authenticated owner fetch
+- #127: Exposed the existing prefix-filtered fragment listing through the shared
+  placement transport so WAL recovery can discover durable fragments on local
+  and remote cache nodes without a separate metadata service.
   and placement RPCs for reconstructed Neon pages and ordinary cache blocks.
