@@ -7,3 +7,7 @@
 - #126: Moved MinIO data, Verglas cache, and DuckDB spill onto the external
   benchmark disk when available. Spill high-water sampling now reads the host
   bind mount, so transient Docker control-plane failures cannot abort a query.
+- #126: Require provenance and a one-CPU cgroup record for all three Quack
+  servers, including the shared-warm reader. This prevents a report from
+  presenting a shared-cache result without proving that the third engine was
+  held to the same CPU ceiling.

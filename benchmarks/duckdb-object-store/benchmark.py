@@ -83,13 +83,29 @@ def validate_report(report: dict) -> None:
     if dataset["object_count"] < 1:
         raise ValueError("dataset must contain durable objects")
 
-    required_services = {"minio", "verglas", "quack_direct", "quack_cached"}
+    required_services = {
+        "minio",
+        "verglas",
+        "quack_direct",
+        "quack_cached",
+        "quack_shared",
+    }
     services = report["runtime"]["services"]
-    if not required_services.issubset(services):
-        raise ValueError("runtime service provenance is incomplete")
+    missing_services = required_services.difference(services)
+    if missing_services:
+        raise ValueError(
+            "runtime service provenance is incomplete: "
+            + ", ".join(sorted(missing_services))
+        )
     for name in required_services:
         if not services[name].get("container_id") or not services[name].get("image_id"):
             raise ValueError(f"runtime provenance missing for {name}")
+    limits = report["runtime"]["limits"]
+    for name in ("quack_direct", "quack_cached", "quack_shared"):
+        if name not in limits:
+            raise ValueError(f"runtime limit missing for {name}")
+        if limits[name].get("cpus") != 1.0:
+            raise ValueError(f"{name} must run with one CPU")
 
     traffic = report["object_store"]
     if traffic["request_count"] < 1 or len(traffic["request_log_sha256"]) != 64:
@@ -439,7 +455,8 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
             "comparison_scope": "same DuckDB 1.5.5 + Quack engine; direct object store versus Verglas S3 cache",
             "dataset": {"format": "parquet", "storage": "s3-compatible", "worker_memory_bytes": ENGINE_MEMORY_BYTES, **inventory["dataset"]},
             "runtime": {"services": services, "limits": {
-                "quack_direct": cgroup(names[2]), "quack_cached": cgroup(names[3]), "verglas": cgroup(names[1])}},
+                "quack_direct": cgroup(names[2]), "quack_cached": cgroup(names[3]),
+                "quack_shared": cgroup(names[4]), "verglas": cgroup(names[1])}},
             "object_store": {"request_count": len(request_lines), "request_log_sha256": hashlib.sha256(trace.encode()).hexdigest()},
             "workloads": workloads,
             "spill": {"observed": peak_spill > 0, "peak_bytes": peak_spill},

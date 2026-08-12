@@ -28,11 +28,18 @@ class BenchmarkContractTest(unittest.TestCase):
             "runtime": {
                 "services": {
                     name: {"container_id": name * 2, "image_id": "sha256:" + name}
-                    for name in ("minio", "verglas", "quack_direct", "quack_cached")
+                    for name in (
+                        "minio",
+                        "verglas",
+                        "quack_direct",
+                        "quack_cached",
+                        "quack_shared",
+                    )
                 },
                 "limits": {
                     "quack_direct": {"cpus": 1.0, "memory_bytes": 128 * 1024 * 1024},
                     "quack_cached": {"cpus": 1.0, "memory_bytes": 128 * 1024 * 1024},
+                    "quack_shared": {"cpus": 1.0, "memory_bytes": 128 * 1024 * 1024},
                     "verglas": {"cpus": 1.0, "memory_bytes": 256 * 1024 * 1024},
                 },
             },
@@ -78,6 +85,18 @@ class BenchmarkContractTest(unittest.TestCase):
         report = self.valid_report()
         report["workloads"]["spill_join"]["verglas_warm"]["result_digest"] = "c" * 64
         with self.assertRaisesRegex(ValueError, "result mismatch"):
+            benchmark.validate_report(report)
+
+    def test_every_quack_process_must_have_provenance_and_one_cpu(self):
+        """The shared-warm result is valid only when its server is bounded too."""
+        report = self.valid_report()
+        del report["runtime"]["services"]["quack_shared"]
+        with self.assertRaisesRegex(ValueError, "quack_shared"):
+            benchmark.validate_report(report)
+
+        report = self.valid_report()
+        report["runtime"]["limits"]["quack_shared"]["cpus"] = 2.0
+        with self.assertRaisesRegex(ValueError, "one CPU"):
             benchmark.validate_report(report)
 
     def test_r2_requires_all_three_s3_credential_parts(self):
