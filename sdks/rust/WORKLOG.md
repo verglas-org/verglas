@@ -1,7 +1,5 @@
 # verglas-sdk worklog
 
-- #1: Moved the Rust data-plane and worker SDK beside the unified CLI in the public client repository. The SDK remains source-compatible while shared wire and authorization contracts are pinned explicitly to the reviewed engine commit.
-
 - #81: Added a separately addressable access-service endpoint and typed principal, resource, grant, and policy-check APIs using scoped bearer credentials.
 - #43: Added the Rust half of the reflected Integration namespace contract. Clients can discover manifests, create a namespace handle, invoke bounded methods, and incrementally decode streaming methods through the same authenticated routes as the TypeScript SDK.
 
@@ -111,10 +109,6 @@
 - #107: Replaced watermark queue calls with PostgreSQL-backed fenced delivery receipts and routed queue handles through the access endpoint. Enqueue, poll, and ack now speak only the standalone queue-container contract.
 - #20: Added topic-aware queue messages and reconnecting push subscriptions. Database handles now expose one table subscription stream plus fenced acknowledgement, while the SDK owns NDJSON framing and transport reconnection without a polling fallback.
 - #20: Added an opt-in deployment test that proves an acknowledged Iceberg append wakes one durable table subscription and remains queryable afterward.
-- #2: Moved the public access request and response DTOs into the SDK so the
-  client no longer imports the private Cloud authorization implementation. The
-  wire shape remains exact while policy evaluation stays Cloud-owned.
-- Repository consolidation: Moved the Rust SDK back beside the engine and CLI so its public wire contracts are tested against the same workspace.
-- #67: Added direct SigV4 clients for every checked-in S3 Vectors and Graph REST-JSON operation. These clients use cache-listener service signatures instead of retired bearer routes.
-- #67: Removed the retired database query/write stream, graph handle, and table-index SDK APIs and their legacy DTO modules. The Rust SDK now exposes Iceberg catalog/table facilities, queues and KV, plus the typed cache-listener semantic clients without fallback routes.
-- #137: Aligned SigV4 canonical path/query handling with the cache listener and stopped serializing GET or DELETE request bodies. URI bindings preserve AWS-unreserved bytes, including hyphenated resource ARNs.
+- #128: Exposed the database table-subscription batch limit so consumers can
+  bound their in-flight fenced receipts. This prevents slow handlers from
+  receiving more commits than they can acknowledge within one lease.
