@@ -7,7 +7,8 @@ COPY extensions/verglas /source/extensions/verglas
 RUN test -f /source/extensions/verglas/extension-ci-tools/makefiles/c_api_extensions/base.Makefile && make -C /source/extensions/verglas EXTENSION_VERSION=benchmark-1.5.5 configure release
 
 FROM python:3.12-slim
-RUN pip install --no-cache-dir duckdb==1.5.5 pyarrow==19.0.1
+RUN pip install --no-cache-dir duckdb==1.5.5 pyarrow==19.0.1 numpy==2.2.3
+RUN python -c "import duckdb; connection = duckdb.connect(); connection.execute('INSTALL quack')"
 WORKDIR /bench
 COPY benchmarks/duckdb-extension/benchmark.py /bench/benchmark.py
 COPY --from=extension-builder /source/extensions/verglas/build/release/extension/verglas/verglas.duckdb_extension /artifacts/verglas.duckdb_extension

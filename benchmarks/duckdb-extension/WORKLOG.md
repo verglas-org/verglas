@@ -11,3 +11,7 @@
   100,000 rows. The benchmark now builds the Linux release extension in a
   separate Docker stage, uses real Quack serve/query over its isolated network,
   and refuses any failed or non-equivalent result.
+- #126: Moved query measurements into reusable prepared client sessions so
+  imports, connections, and extension loading are excluded before warm-up.
+  Results now stream bounded Arrow batches and record first-batch latency and
+  received network bytes without materializing an unbounded result table.

@@ -23,6 +23,7 @@ class BenchmarkContractTests(unittest.TestCase):
         samples = [
             {"elapsed_ms": value, "ttfr_ms": value / 2, "rows": 10,
              "cpu_seconds": 0.01, "peak_rss_mib": 12.0,
+             "network_receive_bytes": 100,
              "digest": "same", "schema": [["n", "BIGINT"]]}
             for value in (10, 20, 30, 40, 50)
         ]
@@ -31,6 +32,11 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertEqual(summary["p95_ms"], 50)
         self.assertEqual(len(summary["samples"]), 5)
         self.assertEqual(summary["digest"], "same")
+        self.assertEqual(summary["median_ttfr_ms"], 15)
+        self.assertEqual(summary["median_cpu_seconds_per_million_rows"], 1000)
+
+    def test_report_uses_prepared_query_sessions(self):
+        self.assertEqual(benchmark.PRIMARY_MEASUREMENT_MODE, "prepared_session")
 
     def test_report_refuses_a_failed_or_non_equivalent_mandatory_leg(self):
         good = {"rows": 1, "schema": [["n", "BIGINT"]], "digest": "x", "error": None}
