@@ -208,6 +208,58 @@ async fn query_and_append_use_server_execution_roles() {
     );
 }
 
+/// Logical writes cross the access boundary instead of bypassing authorization
+/// through the query node.
+#[tokio::test]
+async fn append_uses_the_access_endpoint() {
+    let captured = Captured::default();
+    let access_app = Router::new()
+        .route("/v1/databases/analytics/write/{name}", post(write_arrow))
+        .with_state(captured.clone());
+    let access_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind access endpoint");
+    let access_endpoint = format!(
+        "http://{}",
+        access_listener.local_addr().expect("access address")
+    );
+    tokio::spawn(async move {
+        axum::serve(access_listener, access_app)
+            .await
+            .expect("access server")
+    });
+
+    let client = Client::connect(
+        ConnectOptions::new("http://127.0.0.1:1")
+            .with_query_uri("http://127.0.0.1:2")
+            .with_access_uri(access_endpoint)
+            .with_s3_endpoint("http://127.0.0.1:3")
+            .with_token("sdk-token"),
+    )
+    .await
+    .expect("client");
+    let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+    let batch =
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1, 2]))]).expect("batch");
+
+    let result = client
+        .database("analytics")
+        .expect("database")
+        .append_stream(
+            "sdk.events",
+            stream::iter(vec![Ok::<_, ClientError>(batch)]),
+            "run-1",
+        )
+        .await
+        .expect("append through access");
+
+    assert_eq!(result.rows_committed, 2);
+    assert_eq!(
+        captured.paths.lock().expect("paths").as_slice(),
+        ["write:sdk.events"]
+    );
+}
+
 /// Query routing refuses names that cannot identify a registered database.
 #[tokio::test]
 async fn database_handle_rejects_invalid_names() {

@@ -708,7 +708,7 @@ impl Client {
         {
             let bytes = encode_batch(&batch)?;
             let commit_key = format!("{idempotency_key}:{}", result.commits);
-            let url = database_resource_url(&self.query_uri, database, "write", table, &[])?;
+            let url = database_resource_url(&self.access_uri, database, "write", table, &[])?;
             let request = self
                 .authorize(self.http.post(url))
                 .header(CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)

@@ -112,3 +112,5 @@
 - #128: Exposed the database table-subscription batch limit so consumers can
   bound their in-flight fenced receipts. This prevents slow handlers from
   receiving more commits than they can acknowledge within one lease.
+- #129: Routed logical table writes through the access endpoint. This keeps
+  write authorization on the same data-plane boundary as table subscriptions.
