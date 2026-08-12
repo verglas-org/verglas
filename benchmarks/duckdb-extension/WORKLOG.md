@@ -7,3 +7,7 @@
   It measures local DuckDB and raw HTTP Arrow with equivalent rows, while the
   real extension and Quack paths preserve measured unavailability instead of
   inventing fallback results.
+- #126: Made all four protocol legs mandatory and comparable at 1, 10,000, and
+  100,000 rows. The benchmark now builds the Linux release extension in a
+  separate Docker stage, uses real Quack serve/query over its isolated network,
+  and refuses any failed or non-equivalent result.

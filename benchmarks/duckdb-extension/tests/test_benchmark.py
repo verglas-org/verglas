@@ -32,6 +32,11 @@ class BenchmarkContractTests(unittest.TestCase):
         self.assertEqual(len(summary["samples"]), 5)
         self.assertEqual(summary["digest"], "same")
 
+    def test_report_refuses_a_failed_or_non_equivalent_mandatory_leg(self):
+        good = {"rows": 1, "schema": [["n", "BIGINT"]], "digest": "x", "error": None}
+        bad = {**good, "error": "extension did not load"}
+        self.assertRaises(RuntimeError, benchmark.require_equivalent, {"local_duckdb": good, "raw_arrow": good, "verglas_extension": bad, "quack": good})
+
 
 if __name__ == "__main__":
     unittest.main()

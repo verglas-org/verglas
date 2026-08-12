@@ -1,6 +1,9 @@
 .git
 .github
 benchmarks
+!benchmarks/
+!benchmarks/duckdb-extension/
+!benchmarks/duckdb-extension/benchmark.py
 tests
 target
 **/target
