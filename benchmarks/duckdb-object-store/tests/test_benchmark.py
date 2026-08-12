@@ -44,6 +44,10 @@ class BenchmarkContractTest(unittest.TestCase):
                 },
             },
             "object_store": {"request_count": 10, "request_log_sha256": "1" * 64},
+            "cache_stats": {
+                "cache": {"capacity_bytes": 256 * 1024**2, "dram_bytes": 80 * 1024**2},
+                "counters": {"backend_fills": 1, "disk_hits": 1},
+            },
             "workloads": {
                 name: {
                     leg: {"elapsed_ms": 1.0, "result_digest": "a" * 64}
@@ -78,6 +82,13 @@ class BenchmarkContractTest(unittest.TestCase):
         report = self.valid_report()
         report["object_store"]["request_count"] = 0
         with self.assertRaisesRegex(ValueError, "object-store"):
+            benchmark.validate_report(report)
+
+    def test_report_requires_actual_cache_capacity_and_counters(self):
+        """A warm-cache claim must carry the server's observed cache configuration."""
+        report = self.valid_report()
+        del report["cache_stats"]
+        with self.assertRaisesRegex((KeyError, ValueError), "cache"):
             benchmark.validate_report(report)
 
     def test_all_read_legs_must_have_equivalent_results(self):

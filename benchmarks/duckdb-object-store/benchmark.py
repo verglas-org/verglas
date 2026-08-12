@@ -32,6 +32,7 @@ ENGINE_MEMORY_BYTES = 256 * 1024 * 1024
 ENGINE_MEMORY = "256MB"
 ROWS = 40_000_000
 QUACK_CONTAINER_MEMORY_BYTES = 2 * 1024**3
+DEFAULT_CACHE_CAPACITY_BYTES = 256 * 1024**2
 QUACK_TOKEN = "benchmark-only-token"
 ORIGIN_KEY = "minio-benchmark"
 ORIGIN_SECRET = "minio-benchmark-secret"
@@ -113,6 +114,13 @@ def validate_report(report: dict) -> None:
     traffic = report["object_store"]
     if traffic["request_count"] < 1 or len(traffic["request_log_sha256"]) != 64:
         raise ValueError("object-store request evidence is missing")
+    cache_stats = report.get("cache_stats")
+    if not cache_stats:
+        raise ValueError("cache stats are missing")
+    if cache_stats.get("cache", {}).get("capacity_bytes", 0) < 1:
+        raise ValueError("cache capacity evidence is missing")
+    if "backend_fills" not in cache_stats.get("counters", {}):
+        raise ValueError("cache counters are missing")
     if not report["spill"]["observed"] or report["spill"]["peak_bytes"] < 1:
         raise ValueError("spill was not observed")
 
@@ -287,6 +295,12 @@ def wait_http(url: str, timeout: float = 45.0) -> None:
     raise RuntimeError(f"endpoint did not become ready: {url}")
 
 
+def fetch_json(url: str) -> dict:
+    """Fetch one JSON evidence document from a benchmark service."""
+    with urllib.request.urlopen(url, timeout=10) as response:
+        return json.load(response)
+
+
 def wait_container(name: str, needle: str, timeout: float = 45.0) -> None:
     """Wait until a service log contains its readiness marker."""
     deadline = time.monotonic() + timeout
@@ -369,7 +383,7 @@ def purge_cache() -> None:
             raise RuntimeError(f"cache purge failed: {response.status}")
 
 
-def local_smoke(output: pathlib.Path, rows: int) -> None:
+def local_smoke(output: pathlib.Path, rows: int, cache_capacity_bytes: int) -> None:
     """Run the complete MinIO-backed, cgroup-bounded comparison."""
     names = ["vg-bench-minio", "vg-bench-verglas", "vg-bench-direct", "vg-bench-cached", "vg-bench-shared", "vg-bench-trace"]
     external_root = pathlib.Path(
@@ -393,7 +407,7 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
     endpoint_creds.write_text(f"[default]\naws_access_key_id={VERGLAS_KEY}\naws_secret_access_key={VERGLAS_SECRET}\n")
     config.write_text(
         "[listen]\ns3_port=8333\nadmin_port=8334\n"
-        "[cache]\ndir='/cache'\ncapacity_bytes='256MB'\ndram_bytes='80MB'\n"
+        f"[cache]\ndir='/cache'\ncapacity_bytes='{cache_capacity_bytes}B'\ndram_bytes='80MB'\n"
         "[auth]\ncredentials_file='/config/endpoint-creds'\n"
         f"[backend]\nprovider='s3'\nbucket='{BUCKET}'\nendpoint='http://vg-bench-minio:9000'\n"
         "region='us-east-1'\nallow_http=true\ncredentials_file='/config/origin-creds'\n"
@@ -461,6 +475,7 @@ def local_smoke(output: pathlib.Path, rows: int) -> None:
                 "quack_direct": cgroup(names[2]), "quack_cached": cgroup(names[3]),
                 "quack_shared": cgroup(names[4]), "verglas": cgroup(names[1])}},
             "object_store": {"request_count": len(request_lines), "request_log_sha256": hashlib.sha256(trace.encode()).hexdigest()},
+            "cache_stats": fetch_json("http://127.0.0.1:18434/admin/stats"),
             "workloads": workloads,
             "spill": {"observed": peak_spill > 0, "peak_bytes": peak_spill},
             "durable_writes": inventory["writes"],
@@ -487,6 +502,7 @@ def main() -> None:
     parser.add_argument("--secret")
     parser.add_argument("--bucket", default=BUCKET)
     parser.add_argument("--rows", type=int, default=ROWS)
+    parser.add_argument("--cache-capacity-bytes", type=int, default=DEFAULT_CACHE_CAPACITY_BYTES)
     parser.add_argument("--host")
     parser.add_argument("--sql")
     parser.add_argument("--leg")
@@ -498,7 +514,7 @@ def main() -> None:
     if not args.command:
         parser.error("a command or --profile is required")
     if args.command == "local-smoke":
-        local_smoke(args.output, args.rows)
+        local_smoke(args.output, args.rows, args.cache_capacity_bytes)
     elif args.command == "seed":
         seed(args.endpoint, args.access_key, args.secret, args.bucket, args.rows)
         print("{}")

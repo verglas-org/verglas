@@ -15,3 +15,7 @@
   20-million-row Parquet footprint failed the one-GiB eligibility gate. Quack
   now has a fixed two-GiB process ceiling while DuckDB remains capped at 256
   MiB, separating server overhead from the operator limit that forces spill.
+- #126: Added an explicit byte-valued cache-capacity input and made the report
+  carry the running server's cache configuration and counters. This lets
+  constrained and NVMe-resident results be distinguished using observed
+  evidence rather than a handwritten profile label.

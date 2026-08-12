@@ -14,6 +14,10 @@ reuse the shared Verglas cache.
 benchmarks/duckdb-object-store/run.sh --output /tmp/duckdb-object-store.json
 ```
 
+Pass `--cache-capacity-bytes 2147483648` for a 2 GiB NVMe-resident profile.
+The report records the capacity and cache counters returned by the running
+Verglas server; the profile label is never inferred from the requested value.
+
 The default dataset uses 40 million rows and is valid only when its measured
 Parquet footprint is larger than four times DuckDB's 256 MiB operator-memory
 limit. The servers run with one CPU and a 2 GiB container ceiling; the larger
