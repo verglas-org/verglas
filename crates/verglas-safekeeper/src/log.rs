@@ -906,6 +906,31 @@ where
         Ok(Bytes::from(out))
     }
 
+    /// Reads only the append fragments that overlap the requested range.
+    /// Physical replication normally follows the open segment's tail; rebuilding
+    /// every earlier append for every 128 KiB frame turns that stream quadratic
+    /// and can leave pageserver minutes behind the acknowledged WAL position.
+    async fn read_open_segment_range(
+        &self,
+        segment: &SegmentEntry,
+        from: Lsn,
+        to: Lsn,
+    ) -> Result<Bytes, AppendError> {
+        let mut out = Vec::with_capacity((to.0.saturating_sub(from.0)) as usize);
+        for entry in &segment.appends {
+            if entry.end.0 <= from.0 || entry.start.0 >= to.0 {
+                continue;
+            }
+            let bytes = self.reassemble_append(entry).await?;
+            let lo = from.0.max(entry.start.0);
+            let hi = to.0.min(entry.end.0);
+            let start = (lo - entry.start.0) as usize;
+            let end = (hi - entry.start.0) as usize;
+            out.extend_from_slice(&bytes[start..end]);
+        }
+        Ok(Bytes::from(out))
+    }
+
     /// Reads a flushed segment's bytes back from its S3 object.
     async fn read_flushed_segment(&self, segment: &SegmentEntry) -> Result<Bytes, AppendError> {
         let s3_key = segment
@@ -1014,15 +1039,22 @@ where
             if segment.end.0 <= from.0 || segment.start.0 >= to.0 {
                 continue;
             }
-            let bytes = match segment.state {
-                SegmentState::Flushed => self.read_flushed_segment(segment).await?,
-                SegmentState::Open => self.reassemble_segment(segment).await?,
-            };
             let lo = from.0.max(segment.start.0);
             let hi = to.0.min(segment.end.0);
-            let start = (lo - segment.start.0) as usize;
-            let end = (hi - segment.start.0) as usize;
-            out.extend_from_slice(&bytes[start..end]);
+            match segment.state {
+                SegmentState::Flushed => {
+                    let bytes = self.read_flushed_segment(segment).await?;
+                    let start = (lo - segment.start.0) as usize;
+                    let end = (hi - segment.start.0) as usize;
+                    out.extend_from_slice(&bytes[start..end]);
+                }
+                SegmentState::Open => {
+                    let bytes = self
+                        .read_open_segment_range(segment, Lsn(lo), Lsn(hi))
+                        .await?;
+                    out.extend_from_slice(&bytes);
+                }
+            }
         }
         Ok(Bytes::from(out))
     }

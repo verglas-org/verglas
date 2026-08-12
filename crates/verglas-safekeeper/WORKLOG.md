@@ -68,3 +68,7 @@
   during normal operation and retaining partial tails on persistent cache
   volumes. Explicit lifecycle flush still checkpoints a partial tail to object
   storage, and pressure may force a drain before rejecting new WAL.
+- #127: Made physical replication reconstruct only WAL appends that overlap the
+  requested range. Tail-following pageservers no longer reread every fragment in
+  the open segment for each frame, which had made sustained writes quadratic and
+  left pageserver minutes behind the acknowledged safekeeper LSN.

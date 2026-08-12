@@ -101,6 +101,7 @@ struct TransportInner {
     fail_place: HashSet<String>,
     budget_per_node: Option<u64>,
     placement_delay: HashMap<String, Duration>,
+    loads: usize,
 }
 
 struct MemoryTransport {
@@ -157,6 +158,14 @@ impl MemoryTransport {
             .keys()
             .filter(|(_, _, index)| *index < 1024)
             .count()
+    }
+
+    fn reset_load_count(&self) {
+        self.inner.lock().expect("lock").loads = 0;
+    }
+
+    fn load_count(&self) -> usize {
+        self.inner.lock().expect("lock").loads
     }
 
     /// Removes the replicated manifest slots and heads while retaining WAL
@@ -255,7 +264,8 @@ impl FragmentTransport for MemoryTransport {
         node: &NodeId,
         key: &FragmentKey,
     ) -> Result<Option<LoadedFragment>, TransportError> {
-        let inner = self.inner.lock().expect("lock");
+        let mut inner = self.inner.lock().expect("lock");
+        inner.loads += 1;
         let n = node.as_str();
         if inner.dead.contains(n) {
             return Ok(None);
@@ -604,6 +614,40 @@ async fn append_acks_over_quorum_and_reads_back_the_tail() {
     );
 
     assert_eq!(log.flushed_through(), Lsn(0), "nothing flushed yet");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tail_range_reads_only_the_overlapping_open_append() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let transport = MemoryTransport::new();
+    let log = build(
+        MemStore::new(),
+        transport.clone(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    let mut tail = Lsn(0);
+    for _ in 0..128 {
+        tail = log
+            .append(Epoch(0), tail, Bytes::from_static(b"0123456789abcdef"))
+            .await
+            .expect("append")
+            .end;
+    }
+
+    transport.reset_load_count();
+    let got = log
+        .read(Lsn(tail.0 - 8), tail)
+        .await
+        .expect("read tail range");
+    assert_eq!(got, Bytes::from_static(b"89abcdef"));
+    assert_eq!(
+        transport.load_count(),
+        2,
+        "k=2 should load only the two fragments needed for the overlapping append"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
