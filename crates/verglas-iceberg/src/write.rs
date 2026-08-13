@@ -216,6 +216,18 @@ pub async fn create_table_with_partitions(
     schema: &SchemaRef,
     partitions: &[PartitionField],
 ) -> Result<CreateReport> {
+    create_table_with_partitions_and_properties(catalog, ident, schema, partitions, HashMap::new())
+        .await
+}
+
+/// Creates an empty explicit-schema table with properties committed atomically at creation.
+pub async fn create_table_with_partitions_and_properties(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    schema: &SchemaRef,
+    partitions: &[PartitionField],
+    properties: HashMap<String, String>,
+) -> Result<CreateReport> {
     let iceberg_schema = arrow_schema_to_schema_auto_assign_ids(schema)?;
     let partition_spec = if partitions.is_empty() {
         None
@@ -227,6 +239,7 @@ pub async fn create_table_with_partitions(
         .name(ident.name().to_owned())
         .schema(iceberg_schema)
         .partition_spec_opt(partition_spec)
+        .properties(properties)
         .build();
     let table = catalog.create_table(ident.namespace(), creation).await?;
     let schema = table

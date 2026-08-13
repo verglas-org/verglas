@@ -138,3 +138,6 @@
 - #137: Added committed-snapshot lineage row reads for append-only semantic
   tables. This resolves last-write-wins updates and tombstones by Iceberg commit
   order rather than mutable data-file path ordering.
+- #137: Added explicit-schema table creation with initial Iceberg properties.
+  Semantic resource adapters use this to atomically publish a table and its
+  durable control-plane definition, avoiding an orphaned table window.

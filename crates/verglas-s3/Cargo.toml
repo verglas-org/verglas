@@ -40,6 +40,7 @@ percent-encoding = "2.3.2"
 reqwest.workspace = true
 sha2 = "0.10.9"
 tokio.workspace = true
+tempfile.workspace = true
 urlencoding = "2.1.3"
 # Captures the request-completion events for the #61 trace-id test.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }

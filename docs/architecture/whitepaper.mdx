@@ -158,6 +158,9 @@ AWS S3 Vectors REST-JSON surface and Verglas Graph REST-JSON surface. They are
 adapters over customer-owned Iceberg node, edge, and vector tables; Puffin
 attachments are snapshot-bound acceleration only. There is no query-node,
 write-node, local vector bucket registry, or second graph database.
+Each vector bucket has a reserved Iceberg control table for its creation fields,
+encryption, tags, and policy; this avoids relying on optional catalog namespace
+mutation and keeps every control-plane read restart-safe.
 
 Verglas instead serializes each Vamana ANN index as a `verglas-vamana-v1` Puffin blob, writes the Puffin file through the source table's `FileIO`, and publishes it as the `StatisticsFile` of the exact Iceberg snapshot it reflects. The catalog therefore exposes the durable snapshot-to-index binding to every Iceberg client; clients that understand the blob type can use it, while other clients ignore it. Verglas fetches the attached Puffin file through its S3 endpoint and retains a decoded local copy for ANN serving, so customer object storage remains authoritative and local DRAM/NVMe remains disposable acceleration. A query never uses an index attached to a different snapshot.
 

@@ -173,6 +173,16 @@ pub async fn create_table(
     ident: &TableIdent,
     request: CreateTableRequest,
 ) -> Result<CreateTableResponse> {
+    create_table_with_properties(catalog, ident, request, HashMap::new()).await
+}
+
+/// Creates a table with immutable-at-create metadata properties for resource owners.
+pub async fn create_table_with_properties(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    request: CreateTableRequest,
+    properties: HashMap<String, String>,
+) -> Result<CreateTableResponse> {
     let table_name = ident_to_dotted(ident);
     let mut fields = Vec::with_capacity(request.schema.len());
     for column in &request.schema {
@@ -190,7 +200,14 @@ pub async fn create_table(
         });
     }
 
-    let report = write::create_table_with_partitions(catalog, ident, &schema, &partitions).await?;
+    let report = write::create_table_with_partitions_and_properties(
+        catalog,
+        ident,
+        &schema,
+        &partitions,
+        properties,
+    )
+    .await?;
     Ok(CreateTableResponse {
         table: report.table,
         columns: report.schema.into_iter().map(|f| f.name).collect(),

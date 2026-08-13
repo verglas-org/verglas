@@ -270,3 +270,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   graph and traversal shapes, and list pagination. Contract tests now validate
   every public operation and representative graph payloads before clients rely
   on generated bindings.
+- #137: Made S3 Vector bucket metadata durable in a reserved Iceberg control
+  table rather than mutable catalog namespace properties. Bucket/index creation
+  now persists exact encryption, tags, numeric timestamps, and index definitions;
+  filters, VectorData unions, result flags, and opaque list/query cursors are
+  validated at the adapter boundary, with reopen and commit-order tests.

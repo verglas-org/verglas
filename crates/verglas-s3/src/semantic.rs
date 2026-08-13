@@ -58,6 +58,15 @@ impl SemanticError {
             message: message.into(),
         }
     }
+
+    /// Builds a missing-resource response without inventing local state.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "NotFoundException",
+            message: message.into(),
+        }
+    }
 }
 
 /// Durable semantic implementation selected by the cache-node runtime.
@@ -406,40 +415,77 @@ impl IcebergCatalogSemanticStore {
         let mut input = normalize_vector_arn(input)?;
         input["operation"] = Value::String(operation.to_owned());
         if operation == "CreateVectorBucket" {
+            validate_resource_name(
+                required_string(&input, "vectorBucketName")?,
+                "vectorBucketName",
+            )?;
+            let encryption = encryption_configuration(input.get("encryptionConfiguration"))?;
+            let tags = tags_map(input.get("tags"))?;
             let namespace = bucket_namespace(&input)?;
             self.catalog
-                .create_namespace(
-                    &namespace,
-                    HashMap::from([
-                        ("verglas.s3vectors.kind".to_owned(), "bucket".to_owned()),
-                        (
-                            "verglas.s3vectors.created".to_owned(),
-                            now_millis().to_string(),
-                        ),
-                        ("verglas.s3vectors.policy".to_owned(), "null".to_owned()),
-                        ("verglas.s3vectors.tags".to_owned(), "{}".to_owned()),
-                    ]),
-                )
+                .create_namespace(&namespace, HashMap::new())
                 .await
                 .map_err(iceberg_error)?;
+            let control = bucket_control_ident(&input)?;
+            tables_api::create_table_with_properties(
+                self.catalog.as_ref(),
+                &control,
+                bucket_control_definition(),
+                HashMap::from([
+                    ("verglas.s3vectors.kind".to_owned(), "bucket".to_owned()),
+                    (
+                        "verglas.s3vectors.created".to_owned(),
+                        now_seconds().to_string(),
+                    ),
+                    (
+                        "verglas.s3vectors.tags".to_owned(),
+                        Value::Object(tags).to_string(),
+                    ),
+                    (
+                        "verglas.s3vectors.encryption".to_owned(),
+                        encryption.to_string(),
+                    ),
+                ]),
+            )
+            .await
+            .map_err(iceberg_error)?;
             return Ok(json!({"vectorBucketArn": bucket_arn(&input)?}));
         }
         if operation == "DeleteVectorBucket" {
+            let namespace = bucket_namespace(&input)?;
+            let tables = self
+                .catalog
+                .list_tables(&namespace)
+                .await
+                .map_err(iceberg_error)?;
+            if tables
+                .iter()
+                .any(|table| table.name() != BUCKET_CONTROL_TABLE)
+            {
+                return Err(SemanticError::validation(
+                    "vector bucket still contains indexes",
+                ));
+            }
             self.catalog
-                .drop_namespace(&bucket_namespace(&input)?)
+                .drop_table(&bucket_control_ident(&input)?)
+                .await
+                .map_err(iceberg_error)?;
+            self.catalog
+                .drop_namespace(&namespace)
                 .await
                 .map_err(iceberg_error)?;
             return Ok(json!({}));
         }
         if operation == "GetVectorBucket" {
-            let namespace = bucket_namespace(&input)?;
-            let state = self
-                .catalog
-                .get_namespace(&namespace)
-                .await
-                .map_err(iceberg_error)?;
+            let control = self.bucket_control(&input).await?;
+            let creation_time =
+                stored_number(control.metadata().properties(), "verglas.s3vectors.created")?;
+            let encryption = stored_json(
+                control.metadata().properties(),
+                "verglas.s3vectors.encryption",
+            )?;
             return Ok(
-                json!({"vectorBucket": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "vectorBucketArn": bucket_arn(&input)?, "creationTime": state.properties().get("verglas.s3vectors.created").cloned().unwrap_or_else(|| "0".to_owned())}}),
+                json!({"vectorBucket": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "vectorBucketArn": bucket_arn(&input)?, "creationTime": creation_time, "encryptionConfiguration": encryption}}),
             );
         }
         if operation == "ListVectorBuckets" {
@@ -450,12 +496,16 @@ impl IcebergCatalogSemanticStore {
                 .await
                 .map_err(iceberg_error)?
             {
-                let state = self
+                let control = match self
                     .catalog
-                    .get_namespace(&namespace)
+                    .load_table(&bucket_control_ident_from_namespace(&namespace)?)
                     .await
-                    .map_err(iceberg_error)?;
-                if state
+                {
+                    Ok(table) => table,
+                    Err(_) => continue,
+                };
+                if control
+                    .metadata()
                     .properties()
                     .get("verglas.s3vectors.kind")
                     .map(String::as_str)
@@ -466,7 +516,7 @@ impl IcebergCatalogSemanticStore {
                 let name = namespace.first().cloned().ok_or_else(|| {
                     SemanticError::validation("managed bucket namespace is empty")
                 })?;
-                buckets.push(json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": state.properties().get("verglas.s3vectors.created").cloned().ok_or_else(|| SemanticError::validation("bucket creation metadata is absent"))?}));
+                buckets.push(json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": stored_number(control.metadata().properties(), "verglas.s3vectors.created")?}));
             }
             if let Some(prefix) = input.get("prefix").and_then(Value::as_str) {
                 buckets.retain(|value| {
@@ -488,16 +538,11 @@ impl IcebergCatalogSemanticStore {
             operation,
             "PutVectorBucketPolicy" | "DeleteVectorBucketPolicy" | "GetVectorBucketPolicy"
         ) {
-            let namespace = bucket_namespace(&input)?;
-            let state = self
-                .catalog
-                .get_namespace(&namespace)
-                .await
-                .map_err(iceberg_error)?;
-            let mut properties = state.properties().clone();
+            let control = self.bucket_control(&input).await?;
+            let mut properties = control.metadata().properties().clone();
             if operation == "GetVectorBucketPolicy" {
                 return Ok(
-                    json!({"policy": properties.get("verglas.s3vectors.policy").cloned().ok_or_else(|| SemanticError::validation("vector bucket policy does not exist"))?}),
+                    json!({"policy": properties.get("verglas.s3vectors.policy").cloned().ok_or_else(|| SemanticError::not_found("vector bucket policy does not exist"))?}),
                 );
             }
             if operation == "PutVectorBucketPolicy" {
@@ -512,10 +557,7 @@ impl IcebergCatalogSemanticStore {
             } else {
                 properties.remove("verglas.s3vectors.policy");
             }
-            self.catalog
-                .update_namespace(&namespace, properties)
-                .await
-                .map_err(iceberg_error)?;
+            self.update_bucket_properties(&input, properties).await?;
             return Ok(json!({}));
         }
         if operation == "ListIndexes" {
@@ -529,6 +571,9 @@ impl IcebergCatalogSemanticStore {
                 .map_err(iceberg_error)?
             {
                 let name = ident.name().to_owned();
+                if name == BUCKET_CONTROL_TABLE {
+                    continue;
+                }
                 let table = self
                     .catalog
                     .load_table(&ident)
@@ -567,6 +612,13 @@ impl IcebergCatalogSemanticStore {
         let ident = vector_ident(&input)?;
         match operation {
             "CreateIndex" => {
+                validate_resource_name(required_string(&input, "indexName")?, "indexName")?;
+                validate_index_definition(&input)?;
+                let encryption = match input.get("encryptionConfiguration") {
+                    Some(value) => encryption_configuration(Some(value))?,
+                    None => self.bucket_encryption(&input).await?,
+                };
+                let tags = tags_map(input.get("tags"))?;
                 let definition = tables_api::CreateTableRequest {
                     schema: vec![
                         tables_api::ColumnSpec::required("key", "string"),
@@ -576,30 +628,21 @@ impl IcebergCatalogSemanticStore {
                     ],
                     partitions: Vec::new(),
                 };
-                tables_api::create_table(self.catalog.as_ref(), &ident, definition)
-                    .await
-                    .map_err(iceberg_error)?;
-                let table = self
-                    .catalog
-                    .load_table(&ident)
-                    .await
-                    .map_err(iceberg_error)?;
-                let metadata = json!({"creationTime": now_millis(), "dataType": required_string(&input, "dataType")?, "dimension": input.get("dimension").cloned().ok_or_else(|| SemanticError::validation("dimension is required"))?, "distanceMetric": required_string(&input, "distanceMetric")?, "metadataConfiguration": input.get("metadataConfiguration").cloned().unwrap_or(Value::Null), "encryptionConfiguration": input.get("encryptionConfiguration").cloned().unwrap_or(Value::Null)}).to_string();
-                self.catalog
-                    .update_table(TableCommit::from_parts(
-                        ident.clone(),
-                        vec![TableRequirement::UuidMatch {
-                            uuid: table.metadata().uuid(),
-                        }],
-                        vec![TableUpdate::SetProperties {
-                            updates: HashMap::from([(
-                                "verglas.s3vectors.index".to_owned(),
-                                metadata,
-                            )]),
-                        }],
-                    ))
-                    .await
-                    .map_err(iceberg_error)?;
+                let metadata = json!({"creationTime": now_seconds(), "dataType": required_string(&input, "dataType")?, "dimension": input.get("dimension").cloned().ok_or_else(|| SemanticError::validation("dimension is required"))?, "distanceMetric": required_string(&input, "distanceMetric")?, "metadataConfiguration": input.get("metadataConfiguration").cloned().unwrap_or(Value::Null), "encryptionConfiguration": encryption}).to_string();
+                tables_api::create_table_with_properties(
+                    self.catalog.as_ref(),
+                    &ident,
+                    definition,
+                    HashMap::from([
+                        ("verglas.s3vectors.index".to_owned(), metadata),
+                        (
+                            "verglas.s3vectors.tags".to_owned(),
+                            Value::Object(tags).to_string(),
+                        ),
+                    ]),
+                )
+                .await
+                .map_err(iceberg_error)?;
                 Ok(json!({"indexArn": vector_arn(&input)?}))
             }
             "DeleteIndex" => {
@@ -712,6 +755,10 @@ impl IcebergCatalogSemanticStore {
                     .map_err(iceberg_error)?;
                 let snapshot = table.metadata().current_snapshot_id();
                 let definition = self.index_definition(&ident).await?;
+                if let Some(filter) = input.get("filter") {
+                    validate_filter(filter)?;
+                    validate_filterable(filter, &non_filterable_keys(&definition)?)?;
+                }
                 let metric = match definition["distanceMetric"].as_str() {
                     Some("cosine") => Metric::Cosine,
                     Some("euclidean") => Metric::L2,
@@ -739,19 +786,17 @@ impl IcebergCatalogSemanticStore {
                     } else {
                         std::collections::HashMap::new()
                     };
-                    let vectors = attached
+                    let ranked = attached
                         .bridge
                         .query(&query, required_u32(&input, "topK")? as usize, 64)
                         .map_err(|error| SemanticError::unavailable(error.to_string()))?
                         .into_iter()
                         .map(|neighbor| {
                             let metadata = metadata.get(&neighbor.key).cloned().flatten();
-                            query_output(neighbor.key, neighbor.distance, metadata, &input)
+                            (neighbor.distance, neighbor.key, metadata)
                         })
                         .collect::<Vec<_>>();
-                    return Ok(
-                        json!({"distanceMetric": definition["distanceMetric"], "vectors": vectors}),
-                    );
+                    return query_response(&input, &definition, ranked);
                 }
                 let mut vectors = live_vectors(self.catalog.as_ref(), &ident).await?;
                 if let Some(filter) = input.get("filter") {
@@ -774,7 +819,7 @@ impl IcebergCatalogSemanticStore {
                             ),
                         )
                 });
-                let vectors = vectors
+                let ranked = vectors
                     .into_iter()
                     .take(required_u32(&input, "topK")? as usize)
                     .map(|vector| {
@@ -782,10 +827,10 @@ impl IcebergCatalogSemanticStore {
                             &metric.prepare(&vector.data),
                             &metric.prepare(&query),
                         );
-                        query_output(vector.key, distance, vector.metadata, &input)
+                        (distance, vector.key, vector.metadata)
                     })
                     .collect::<Vec<_>>();
-                Ok(json!({"distanceMetric": definition["distanceMetric"], "vectors": vectors}))
+                query_response(&input, &definition, ranked)
             }
             _ => Err(SemanticError::validation("unknown S3 Vectors operation")),
         }
@@ -835,9 +880,8 @@ impl IcebergCatalogSemanticStore {
                 "cosine queryVector must not be zero",
             ));
         }
-        let top_k = required_u32(input, "topK")?;
-        if top_k == 0 || top_k > 100 {
-            return Err(SemanticError::validation("topK must be 1..100"));
+        if required_u32(input, "topK")? == 0 {
+            return Err(SemanticError::validation("topK must be positive"));
         }
         Ok(())
     }
@@ -858,6 +902,15 @@ impl IcebergCatalogSemanticStore {
                 serde_json::from_str(text)
                     .map_err(|_| SemanticError::validation("index metadata is corrupt"))
             })
+    }
+
+    /// Loads the effective bucket encryption configuration from its namespace.
+    async fn bucket_encryption(&self, input: &Value) -> Result<Value, SemanticError> {
+        let control = self.bucket_control(input).await?;
+        stored_json(
+            control.metadata().properties(),
+            "verglas.s3vectors.encryption",
+        )
     }
 
     /// Rebuilds and attaches a lossless Vamana bridge to the exact committed snapshot.
@@ -956,13 +1009,8 @@ impl IcebergCatalogSemanticStore {
             }
             return Ok(json!({"tags": tags}));
         }
-        let namespace = bucket_namespace(input)?;
-        let state = self
-            .catalog
-            .get_namespace(&namespace)
-            .await
-            .map_err(iceberg_error)?;
-        let mut properties = state.properties().clone();
+        let control = self.bucket_control(input).await?;
+        let mut properties = control.metadata().properties().clone();
         let mut tags = properties
             .get(key)
             .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok())
@@ -970,12 +1018,44 @@ impl IcebergCatalogSemanticStore {
         mutate_tags(operation, input, &mut tags)?;
         if operation != "ListTagsForResource" {
             properties.insert(key.to_owned(), Value::Object(tags.clone()).to_string());
-            self.catalog
-                .update_namespace(&namespace, properties)
-                .await
-                .map_err(iceberg_error)?;
+            self.update_bucket_properties(input, properties).await?;
         }
         Ok(json!({"tags": tags}))
+    }
+
+    /// Loads the bucket control table that is authoritative for bucket metadata.
+    async fn bucket_control(&self, input: &Value) -> Result<iceberg::table::Table, SemanticError> {
+        self.catalog
+            .load_table(&bucket_control_ident(input)?)
+            .await
+            .map_err(iceberg_error)
+    }
+
+    /// CAS-updates durable bucket metadata without relying on catalog namespace mutation.
+    async fn update_bucket_properties(
+        &self,
+        input: &Value,
+        properties: HashMap<String, String>,
+    ) -> Result<(), SemanticError> {
+        let ident = bucket_control_ident(input)?;
+        let table = self
+            .catalog
+            .load_table(&ident)
+            .await
+            .map_err(iceberg_error)?;
+        self.catalog
+            .update_table(TableCommit::from_parts(
+                ident,
+                vec![TableRequirement::UuidMatch {
+                    uuid: table.metadata().uuid(),
+                }],
+                vec![TableUpdate::SetProperties {
+                    updates: properties,
+                }],
+            ))
+            .await
+            .map(|_| ())
+            .map_err(iceberg_error)
     }
 }
 
@@ -1036,11 +1116,8 @@ fn mutate_tags(
     tags: &mut serde_json::Map<String, Value>,
 ) -> Result<(), SemanticError> {
     if operation == "TagResource" {
-        for (name, value) in input
-            .get("tags")
-            .and_then(Value::as_object)
-            .ok_or_else(|| SemanticError::validation("tags is required"))?
-        {
+        let requested = tags_map(input.get("tags"))?;
+        for (name, value) in requested {
             tags.insert(name.clone(), value.clone());
         }
     }
@@ -1050,7 +1127,12 @@ fn mutate_tags(
             .and_then(Value::as_array)
             .ok_or_else(|| SemanticError::validation("tagKeys is required"))?
             .iter()
-            .filter_map(Value::as_str)
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or_else(|| SemanticError::validation("tagKeys must contain strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
         {
             tags.remove(name);
         }
@@ -1065,6 +1147,37 @@ fn bucket_namespace(input: &Value) -> Result<NamespaceIdent, SemanticError> {
     ))
 }
 
+/// Reserved table name used only for durable vector bucket control-plane state.
+const BUCKET_CONTROL_TABLE: &str = "_verglas_vector_bucket";
+
+/// Resolves the Iceberg table that stores bucket metadata, tags, and policy.
+fn bucket_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
+    parse_table_ident(&format!(
+        "{}.{}",
+        required_string(input, "vectorBucketName")?,
+        BUCKET_CONTROL_TABLE
+    ))
+    .map_err(iceberg_error)
+}
+
+/// Resolves a control table from a catalog namespace returned by list_namespaces.
+fn bucket_control_ident_from_namespace(
+    namespace: &NamespaceIdent,
+) -> Result<iceberg::TableIdent, SemanticError> {
+    let bucket = namespace
+        .first()
+        .ok_or_else(|| SemanticError::validation("managed bucket namespace is empty"))?;
+    parse_table_ident(&format!("{bucket}.{BUCKET_CONTROL_TABLE}")).map_err(iceberg_error)
+}
+
+/// Defines the empty durable control table schema kept apart from customer vectors.
+fn bucket_control_definition() -> tables_api::CreateTableRequest {
+    tables_api::CreateTableRequest {
+        schema: vec![tables_api::ColumnSpec::required("marker", "boolean")],
+        partitions: Vec::new(),
+    }
+}
+
 /// Builds the stable ARN for a bucket.
 fn bucket_arn(input: &Value) -> Result<String, SemanticError> {
     Ok(format!(
@@ -1074,14 +1187,125 @@ fn bucket_arn(input: &Value) -> Result<String, SemanticError> {
 }
 
 /// Returns a durable creation timestamp recorded with each catalog resource.
-fn now_millis() -> i64 {
+fn now_seconds() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
 }
 
-/// Names the catalog namespace property carrying one index's exact definition.
+/// Reads a JSON property that is required for a durable resource response.
+fn stored_json(properties: &HashMap<String, String>, key: &str) -> Result<Value, SemanticError> {
+    properties
+        .get(key)
+        .ok_or_else(|| SemanticError::validation(format!("resource metadata {key} is absent")))
+        .and_then(|text| {
+            serde_json::from_str(text).map_err(|_| {
+                SemanticError::validation(format!("resource metadata {key} is corrupt"))
+            })
+        })
+}
+
+/// Reads a numeric timestamp property without fabricating a missing value.
+fn stored_number(properties: &HashMap<String, String>, key: &str) -> Result<i64, SemanticError> {
+    properties
+        .get(key)
+        .and_then(|value| value.parse::<i64>().ok())
+        .ok_or_else(|| SemanticError::validation(format!("resource metadata {key} is absent")))
+}
+
+/// Validates an AWS bucket or index identifier before it becomes a catalog name.
+fn validate_resource_name(value: &str, field: &str) -> Result<(), SemanticError> {
+    if !(3..=63).contains(&value.len()) {
+        return Err(SemanticError::validation(format!(
+            "{field} must be 3..63 characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates the modeled index definition before the durable table is created.
+fn validate_index_definition(input: &Value) -> Result<(), SemanticError> {
+    if required_string(input, "dataType")? != "float32" {
+        return Err(SemanticError::validation("dataType must be float32"));
+    }
+    let dimension = required_u32(input, "dimension")?;
+    if dimension == 0 || dimension > 4096 {
+        return Err(SemanticError::validation("dimension must be 1..4096"));
+    }
+    match required_string(input, "distanceMetric")? {
+        "euclidean" | "cosine" => {}
+        _ => {
+            return Err(SemanticError::validation(
+                "distanceMetric must be euclidean or cosine",
+            ));
+        }
+    }
+    if let Some(configuration) = input.get("metadataConfiguration") {
+        let keys = configuration
+            .get("nonFilterableMetadataKeys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| SemanticError::validation("nonFilterableMetadataKeys is required"))?;
+        if keys.is_empty() || keys.len() > 10 {
+            return Err(SemanticError::validation(
+                "nonFilterableMetadataKeys must contain 1..10 keys",
+            ));
+        }
+        for key in keys {
+            let key = key.as_str().ok_or_else(|| {
+                SemanticError::validation("nonFilterableMetadataKeys must be strings")
+            })?;
+            if key.is_empty() || key.len() > 63 {
+                return Err(SemanticError::validation(
+                    "metadata key must be 1..63 characters",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validates and materializes effective resource encryption configuration.
+fn encryption_configuration(value: Option<&Value>) -> Result<Value, SemanticError> {
+    let value = value
+        .cloned()
+        .unwrap_or_else(|| json!({"sseType":"AES256"}));
+    let object = value
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("encryptionConfiguration must be an object"))?;
+    let sse = object
+        .get("sseType")
+        .and_then(Value::as_str)
+        .ok_or_else(|| SemanticError::validation("encryptionConfiguration.sseType is required"))?;
+    let has_kms = object.get("kmsKeyArn").is_some();
+    match (sse, has_kms) {
+        ("AES256", false) | ("aws:kms", true) => Ok(value),
+        ("AES256", true) => Err(SemanticError::validation("kmsKeyArn requires aws:kms")),
+        ("aws:kms", false) => Err(SemanticError::validation("aws:kms requires kmsKeyArn")),
+        _ => Err(SemanticError::validation(
+            "encryptionConfiguration.sseType is invalid",
+        )),
+    }
+}
+
+/// Validates a modeled tag map and returns its durable object representation.
+fn tags_map(value: Option<&Value>) -> Result<serde_json::Map<String, Value>, SemanticError> {
+    let tags = value
+        .cloned()
+        .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+    let object = tags
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("tags must be an object"))?;
+    for (key, value) in object {
+        if key.is_empty() || key.len() > 128 || value.as_str().is_none_or(|tag| tag.len() > 256) {
+            return Err(SemanticError::validation(
+                "tags contain an invalid key or value",
+            ));
+        }
+    }
+    Ok(object.clone())
+}
+
 /// Applies the AWS cursor/max-results contract to an already stably sorted list.
 fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>), SemanticError> {
     let binding = format!(
@@ -1129,7 +1353,7 @@ fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>
         .map(|last| {
             values
                 .iter()
-                .position(|value| listing_key(value) > last)
+                .position(|value| listing_key(input, value) > last)
                 .unwrap_or(values.len())
         })
         .unwrap_or(0);
@@ -1155,16 +1379,19 @@ fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>
         )));
     }
     let end = offset.saturating_add(limit).min(values.len());
-    let next = (end < values.len()).then(|| encode_cursor(&binding, listing_key(&values[end - 1])));
+    let next =
+        (end < values.len()).then(|| encode_cursor(&binding, listing_key(input, &values[end - 1])));
     Ok((values[offset..end].to_vec(), next))
 }
 
 /// Returns a stable key for an already sorted list response.
-fn listing_key(value: &Value) -> &str {
-    ["vectorBucketName", "indexName", "key"]
-        .into_iter()
-        .find_map(|field| value.get(field).and_then(Value::as_str))
-        .unwrap_or_default()
+fn listing_key<'a>(input: &Value, value: &'a Value) -> &'a str {
+    let field = match input.get("operation").and_then(Value::as_str) {
+        Some("ListVectorBuckets") => "vectorBucketName",
+        Some("ListIndexes") => "indexName",
+        _ => "key",
+    };
+    value.get(field).and_then(Value::as_str).unwrap_or_default()
 }
 
 /// Encodes a resource- and filter-bound last-key cursor.
@@ -1246,6 +1473,11 @@ fn vector_row(value: &Value, deleted: bool) -> Result<Value, SemanticError> {
 
 /// Parses the exact AWS VectorData union; only float32 is supported by this index.
 fn vector_data(value: &Value) -> Result<Vec<f32>, SemanticError> {
+    if value.as_object().is_none_or(|object| object.len() != 1) {
+        return Err(SemanticError::validation(
+            "VectorData must contain exactly one float32 variant",
+        ));
+    }
     let values = value
         .get("float32")
         .and_then(Value::as_array)
@@ -1292,6 +1524,209 @@ fn query_output(key: String, distance: f32, metadata: Option<Value>, input: &Val
         value["metadata"] = metadata.unwrap_or(Value::Null);
     }
     value
+}
+
+/// Pages a deterministically ranked query without exposing the ranking cursor.
+fn query_response(
+    input: &Value,
+    definition: &Value,
+    mut ranked: Vec<(f32, String, Option<Value>)>,
+) -> Result<Value, SemanticError> {
+    ranked.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let binding = format!(
+        "QueryVectors|{}|{}|{}|{}|{}|{}|{}",
+        input
+            .get("vectorBucketName")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        input
+            .get("indexName")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        input.get("queryVector").cloned().unwrap_or(Value::Null),
+        input.get("filter").cloned().unwrap_or(Value::Null),
+        required_u32(input, "topK")?,
+        input
+            .get("returnDistance")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        input
+            .get("returnMetadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    );
+    let last = input
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .map(|token| decode_cursor(token, &binding))
+        .transpose()?;
+    if let Some(last) = last {
+        let (distance, key) = decode_rank(&last)?;
+        ranked.retain(|candidate| {
+            candidate.0.total_cmp(&distance).is_gt()
+                || (candidate.0.total_cmp(&distance).is_eq() && candidate.1.as_str() > key)
+        });
+    }
+    let page_size = 100_usize;
+    let has_more = ranked.len() > page_size;
+    let page = ranked.into_iter().take(page_size).collect::<Vec<_>>();
+    let next_token = if has_more {
+        let (distance, key, _) = page
+            .last()
+            .ok_or_else(|| SemanticError::validation("query page is empty"))?;
+        Some(encode_cursor(&binding, &encode_rank(*distance, key)))
+    } else {
+        None
+    };
+    Ok(json!({
+        "distanceMetric": definition["distanceMetric"],
+        "vectors": page.into_iter().map(|(distance, key, metadata)| query_output(key, distance, metadata, input)).collect::<Vec<_>>(),
+        "nextToken": next_token,
+    }))
+}
+
+/// Encodes the unrendered rank and key that identify a query continuation.
+fn encode_rank(distance: f32, key: &str) -> String {
+    format!("{:08x}\n{key}", distance.to_bits())
+}
+
+/// Decodes a query rank continuation without accepting malformed cursors.
+fn decode_rank(value: &str) -> Result<(f32, &str), SemanticError> {
+    let (bits, key) = value
+        .split_once('\n')
+        .ok_or_else(|| SemanticError::validation("nextToken is invalid"))?;
+    let bits = u32::from_str_radix(bits, 16)
+        .map_err(|_| SemanticError::validation("nextToken is invalid"))?;
+    Ok((f32::from_bits(bits), key))
+}
+
+/// Extracts the configured metadata keys that cannot appear in a filter.
+fn non_filterable_keys(definition: &Value) -> Result<Vec<String>, SemanticError> {
+    let Some(configuration) = definition.get("metadataConfiguration") else {
+        return Ok(Vec::new());
+    };
+    if configuration.is_null() {
+        return Ok(Vec::new());
+    }
+    configuration
+        .get("nonFilterableMetadataKeys")
+        .and_then(Value::as_array)
+        .ok_or_else(|| SemanticError::validation("index metadataConfiguration is corrupt"))?
+        .iter()
+        .map(|key| {
+            key.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| SemanticError::validation("index metadataConfiguration is corrupt"))
+        })
+        .collect()
+}
+
+/// Rejects a query that references a key the index explicitly keeps non-filterable.
+fn validate_filterable(filter: &Value, prohibited: &[String]) -> Result<(), SemanticError> {
+    let object = filter
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("filter must be an object"))?;
+    for (field, predicate) in object {
+        if field == "$and" || field == "$or" {
+            for nested in predicate
+                .as_array()
+                .ok_or_else(|| SemanticError::validation("logical filter must be an array"))?
+            {
+                validate_filterable(nested, prohibited)?;
+            }
+        } else if !field.starts_with('$') && prohibited.iter().any(|key| key == field) {
+            return Err(SemanticError::validation(format!(
+                "metadata key {field} is not filterable"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validates the complete documented metadata filter grammar before scanning rows.
+fn validate_filter(filter: &Value) -> Result<(), SemanticError> {
+    let object = filter
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("filter must be an object"))?;
+    for (field, predicate) in object {
+        if field == "$and" || field == "$or" {
+            let values = predicate
+                .as_array()
+                .filter(|values| !values.is_empty())
+                .ok_or_else(|| {
+                    SemanticError::validation("logical filter must be a nonempty array")
+                })?;
+            for nested in values {
+                validate_filter(nested)?;
+            }
+            continue;
+        }
+        if field.starts_with('$') {
+            return Err(SemanticError::validation(
+                "unknown logical metadata filter operator",
+            ));
+        }
+        validate_field_predicate(predicate)?;
+    }
+    Ok(())
+}
+
+/// Validates one field predicate without relying on the presence of a matching row.
+fn validate_field_predicate(predicate: &Value) -> Result<(), SemanticError> {
+    let Some(operators) = predicate
+        .as_object()
+        .filter(|map| map.keys().any(|key| key.starts_with('$')))
+    else {
+        return primitive(predicate, "metadata equality value");
+    };
+    if operators.keys().any(|key| !key.starts_with('$')) {
+        return Err(SemanticError::validation(
+            "metadata predicate mixes operators and fields",
+        ));
+    }
+    for (operator, expected) in operators {
+        match operator.as_str() {
+            "$eq" | "$ne" => primitive(expected, "metadata comparison value")?,
+            "$gt" | "$gte" | "$lt" | "$lte" if expected.is_number() => {}
+            "$gt" | "$gte" | "$lt" | "$lte" => {
+                return Err(SemanticError::validation(
+                    "comparison value must be numeric",
+                ));
+            }
+            "$exists" if expected.is_boolean() => {}
+            "$exists" => return Err(SemanticError::validation("$exists must be boolean")),
+            "$in" | "$nin" => {
+                let values = expected
+                    .as_array()
+                    .filter(|values| !values.is_empty())
+                    .ok_or_else(|| SemanticError::validation("$in/$nin must be nonempty arrays"))?;
+                for value in values {
+                    primitive(value, "$in/$nin values")?;
+                }
+            }
+            _ => {
+                return Err(SemanticError::validation(
+                    "unknown metadata filter operator",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ensures a filter comparison value is one of the metadata primitive values.
+fn primitive(value: &Value, message: &str) -> Result<(), SemanticError> {
+    if value.is_string() || value.is_number() || value.is_boolean() || value.is_null() {
+        Ok(())
+    } else {
+        Err(SemanticError::validation(format!(
+            "{message} must be primitive"
+        )))
+    }
 }
 
 /// Evaluates the documented S3 Vectors metadata predicate subset against one row.
@@ -1352,9 +1787,9 @@ fn matches_field(value: Option<&Value>, predicate: &Value) -> Result<bool, Seman
                             .ok_or_else(|| SemanticError::validation("$exists must be boolean"))?
                 }
                 "$gt" | "$gte" | "$lt" | "$lte" => {
-                    let actual = value.and_then(Value::as_f64).ok_or_else(|| {
-                        SemanticError::validation("comparison metadata must be numeric")
-                    })?;
+                    let Some(actual) = value.and_then(Value::as_f64) else {
+                        return Ok(false);
+                    };
                     let expected = expected.as_f64().ok_or_else(|| {
                         SemanticError::validation("comparison value must be numeric")
                     })?;
@@ -1417,7 +1852,7 @@ impl LiveVector {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            output["data"] = json!(self.data);
+            output["data"] = json!({"float32": self.data});
         }
         if input
             .get("returnMetadata")
@@ -1627,5 +2062,39 @@ mod tests {
             matches_filter(Some(&metadata), &json!({"labels":{"$nin":["old"]}})).expect("filter")
         );
         assert!(matches_filter(Some(&metadata), &json!({"score":{"$wat":1}})).is_err());
+    }
+
+    /// Query cursors bind the ranked request and continue after an exact rank/key pair.
+    #[test]
+    fn query_cursor_paginates_ranked_results_without_distance_output() {
+        let input = json!({"vectorBucketName":"bucket-one","indexName":"index-one","queryVector":{"float32":[1.0]},"topK":101});
+        let ranked = (0..101)
+            .map(|value| (value as f32, format!("key-{value:03}"), None))
+            .collect();
+        let first = query_response(&input, &json!({"distanceMetric":"euclidean"}), ranked)
+            .expect("query page");
+        assert_eq!(first["vectors"].as_array().map(Vec::len), Some(100));
+        assert!(first["vectors"][0].get("distance").is_none());
+        let second = query_response(
+            &json!({"vectorBucketName":"bucket-one","indexName":"index-one","queryVector":{"float32":[1.0]},"topK":101,"nextToken":first["nextToken"]}),
+            &json!({"distanceMetric":"euclidean"}),
+            (0..101).map(|value| (value as f32, format!("key-{value:03}"), None)).collect(),
+        )
+        .expect("continuation");
+        assert_eq!(second["vectors"][0]["key"], "key-100");
+    }
+
+    /// A prohibited index key and malformed `$in` filter fail before any scan.
+    #[test]
+    fn filters_reject_non_filterable_and_nonprimitive_values() {
+        let definition = json!({"metadataConfiguration":{"nonFilterableMetadataKeys":["private"]}});
+        assert!(
+            validate_filterable(
+                &json!({"private":"x"}),
+                &non_filterable_keys(&definition).expect("keys")
+            )
+            .is_err()
+        );
+        assert!(validate_filter(&json!({"label":{"$in":[{"nested":true}]}})).is_err());
     }
 }
