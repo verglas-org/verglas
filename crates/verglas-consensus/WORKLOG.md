@@ -193,3 +193,7 @@
 - #135: Persist each committed WAL response boundary with its retry identity.
   Exact retries now return the original index and WAL end, while conflicting
   retry identities remain closed without exposing another command's result.
+- #135: Moved durable Raft log, state-machine, and snapshot image writes to
+  Tokio's blocking pool. Per-replica persistence ordering remains serialized,
+  and every OpenRaft callback still waits for the temp-file, rename, and
+  directory-fsync barrier before it reports success.

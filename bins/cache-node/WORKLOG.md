@@ -232,3 +232,7 @@
   frames, kills the exact first leader, and commits the same 8 MiB continuation
   through every survivor. It captures HTTP bodies and child diagnostics so a
   future failover rejection identifies the transport or consensus boundary.
+- #135: Moved ring-local fragment filesystem work onto Tokio's blocking pool.
+  Streaming uploads now relay a bounded number of body chunks to a worker that
+  owns append, fsync, rename, and directory fsync, and HTTP success still waits
+  until that worker reports the fragment durable.

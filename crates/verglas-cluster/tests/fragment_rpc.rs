@@ -9,18 +9,29 @@
 //! - an unreachable node is a placement error the coordinator counts against
 //!   quorum (never a silent success).
 
-use std::sync::Arc;
-use std::time::Duration;
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use verglas_cluster::StaticResolver;
 use verglas_cluster::fragments::{FragmentKey, FragmentRecord, LocalFragmentStore};
-use verglas_cluster::peer::{FragmentClient, FragmentHandlers, LocalBlockFn, PeerServer};
+use verglas_cluster::peer::{
+    FragmentClient, FragmentHandlers, LocalBlockFn, LocalBlockStoreFn, PeerServer,
+};
+use verglas_cluster::{OpenGroupFn, RaftRpcRegistry, StaticResolver};
 use verglas_core::node::NodeId;
 
 /// A block source that has nothing (fragment tests do not exercise blocks).
 fn empty_blocks() -> LocalBlockFn {
     Arc::new(|_bk| Box::pin(async move { None }))
+}
+
+/// A block-placement callback that refuses every request for tests that only
+/// exercise another internal peer route.
+fn reject_block_placement() -> LocalBlockStoreFn {
+    Arc::new(|_key, _bytes| Box::pin(async move { Ok(false) }))
 }
 
 /// Wires a `LocalFragmentStore` behind the fragment handler callbacks.
@@ -276,6 +287,96 @@ async fn fragment_read_times_out_before_the_durability_placement_budget() {
         matches!(result, Ok(Err(_))),
         "a stalled recovery read must fail within its short availability budget: {result:?}"
     );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// Raft vote RPCs use the peer runtime, not the public S3/WAL/NBD runtime.
+///
+/// The two public runtime workers block at the same time. A real authenticated
+/// vote route still reaches its group opener and returns its normal `404` for
+/// the deliberately unregistered group before either public worker wakes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_vote_remains_responsive_when_public_runtime_is_saturated() {
+    let registry = RaftRpcRegistry::new("peer-secret");
+    registry.register_target(42).await;
+    let opened = Arc::new(AtomicBool::new(false));
+    let observed = Arc::clone(&opened);
+    let opener: OpenGroupFn = Arc::new(move |_group| {
+        let observed = Arc::clone(&observed);
+        Box::pin(async move {
+            observed.store(true, Ordering::Release);
+            Ok(())
+        })
+    });
+    registry.set_opener(opener).await;
+
+    let directory = std::env::temp_dir().join(format!(
+        "verglas-peer-runtime-isolation-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    let server = PeerServer::bind_with_store_fragments_and_router(
+        "127.0.0.1:0".parse().expect("addr"),
+        Some("peer-secret".to_owned()),
+        empty_blocks(),
+        reject_block_placement(),
+        handlers_for(LocalFragmentStore::new(&directory)),
+        registry.router(),
+    )
+    .await
+    .expect("bind peer runtime");
+
+    let release = Arc::new(Barrier::new(3));
+    let blockers = (0..2)
+        .map(|_| {
+            let release = Arc::clone(&release);
+            tokio::spawn(async move {
+                release.wait();
+                std::thread::sleep(Duration::from_millis(300));
+            })
+        })
+        .collect::<Vec<_>>();
+    let address = server.local_addr();
+    let client_release = Arc::clone(&release);
+    let client = std::thread::spawn(move || -> std::io::Result<(Duration, String)> {
+        client_release.wait();
+        let started = Instant::now();
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.write_all(
+            format!(
+                "POST /consensus/v1/runtime-isolation/42/vote HTTP/1.1\r\nHost: {address}\r\nx-verglas-cluster-secret: peer-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok((started.elapsed(), response))
+    });
+    let response = tokio::task::spawn_blocking(move || client.join())
+        .await
+        .expect("join request thread")
+        .expect("request thread did not panic")
+        .expect("peer vote request");
+
+    assert!(
+        response.0 < Duration::from_millis(200),
+        "vote response waited for the public runtime: {:?}",
+        response.0
+    );
+    assert!(
+        response.1.starts_with("HTTP/1.1 404"),
+        "registered target with no opened Raft group returns 404: {}",
+        response.1
+    );
+    assert!(
+        opened.load(Ordering::Acquire),
+        "the vote route must run its registered group opener"
+    );
+    for blocker in blockers {
+        blocker.await.expect("public runtime blocker");
+    }
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(directory);
 }

@@ -18,7 +18,7 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::catalog::CatalogRecords;
 use crate::{AppliedOutcome, RaftCommand, RaftResponse, RequestId, VerglasRaftConfig};
@@ -28,6 +28,8 @@ use crate::{AppliedOutcome, RaftCommand, RaftResponse, RequestId, VerglasRaftCon
 pub struct PersistentLogStore {
     path: PathBuf,
     state: Arc<RwLock<LogData>>,
+    /// Dedicated ordered durability actor for this replica's Raft log images.
+    persistence: PersistenceActor,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -45,12 +47,19 @@ impl PersistentLogStore {
         Ok(Self {
             path,
             state: Arc::new(RwLock::new(state)),
+            persistence: PersistenceActor::new(),
         })
     }
 
-    /// Persists the small Raft metadata and log image atomically.
-    fn persist(&self, state: &LogData) -> std::io::Result<()> {
-        write_json(&self.path, state)
+    /// Queues an owned Raft log image behind every earlier mutation without
+    /// letting its fsync occupy an async runtime worker.
+    async fn enqueue_persist(
+        &self,
+        state: LogData,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.persistence
+            .enqueue_json(self.path.clone(), state)
+            .await
     }
 }
 
@@ -92,7 +101,11 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
     ) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
         state.committed = committed;
-        self.persist(&state)
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        let persisted = persisted.map_err(|error| StorageIOError::write_logs(&error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_logs(&error).into())
     }
 
@@ -103,7 +116,11 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
         state.vote = Some(*vote);
-        self.persist(&state)
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        let persisted = persisted.map_err(|error| StorageIOError::write_vote(&error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_vote(&error).into())
     }
 
@@ -123,11 +140,22 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
         for entry in entries {
             state.entries.insert(entry.log_id.index, entry);
         }
-        match self.persist(&state) {
-            Ok(()) => {
-                callback.log_io_completed(Ok(()));
-                Ok(())
-            }
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        match persisted {
+            Ok(completion) => match await_persisted(completion).await {
+                Ok(()) => {
+                    callback.log_io_completed(Ok(()));
+                    Ok(())
+                }
+                Err(error) => {
+                    callback.log_io_completed(Err(std::io::Error::new(
+                        error.kind(),
+                        error.to_string(),
+                    )));
+                    Err(StorageIOError::write_logs(&error).into())
+                }
+            },
             Err(error) => {
                 callback
                     .log_io_completed(Err(std::io::Error::new(error.kind(), error.to_string())));
@@ -139,7 +167,11 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
         state.entries.split_off(&log_id.index);
-        self.persist(&state)
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        let persisted = persisted.map_err(|error| StorageIOError::write_logs(&error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_logs(&error).into())
     }
 
@@ -147,7 +179,11 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
         let mut state = self.state.write().await;
         state.last_purged = Some(log_id);
         state.entries = state.entries.split_off(&(log_id.index + 1));
-        self.persist(&state)
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        let persisted = persisted.map_err(|error| StorageIOError::write_logs(&error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_logs(&error).into())
     }
 
@@ -162,6 +198,8 @@ pub struct PersistentStateMachine {
     path: PathBuf,
     snapshot_path: PathBuf,
     state: Arc<RwLock<StateMachineData>>,
+    /// Dedicated ordered durability actor for state and snapshot images.
+    persistence: PersistenceActor,
     snapshot_index: Arc<AtomicU64>,
     current_snapshot: Arc<RwLock<Option<StoredSnapshot>>>,
     payloads: Arc<RwLock<Option<Arc<dyn crate::PayloadStore>>>>,
@@ -227,15 +265,39 @@ impl PersistentStateMachine {
             path,
             snapshot_path,
             state: Arc::new(RwLock::new(state)),
+            persistence: PersistenceActor::new(),
             snapshot_index: Arc::new(AtomicU64::new(0)),
             current_snapshot: Arc::new(RwLock::new(current_snapshot)),
             payloads: Arc::new(RwLock::new(None)),
         })
     }
 
-    /// Persists one complete applied-state image atomically.
-    fn persist(&self, state: &StateMachineData) -> std::io::Result<()> {
-        write_json(&self.path, state)
+    /// Queues one state image in mutation order and returns the durable
+    /// acknowledgement receiver for its callback to await.
+    async fn enqueue_persist(
+        &self,
+        state: StateMachineData,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.persistence
+            .enqueue_json(self.path.clone(), state)
+            .await
+    }
+
+    /// Queues matching state and snapshot images as one ordered durability
+    /// operation, so an interrupted state write cannot publish a newer snapshot.
+    async fn enqueue_snapshot_persist(
+        &self,
+        state: StateMachineData,
+        snapshot: StoredSnapshot,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        let state_path = self.path.clone();
+        let snapshot_path = self.snapshot_path.clone();
+        self.persistence
+            .enqueue(move || {
+                write_json(&state_path, &state)?;
+                write_json(&snapshot_path, &Some(snapshot))
+            })
+            .await
     }
 
     /// Attaches the durable payload store before snapshot compaction can reclaim bodies.
@@ -662,7 +724,11 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                 }
             }
         }
-        self.persist(&state)
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        let persisted = persisted.map_err(|error| StorageIOError::write_state_machine(&error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         Ok(responses)
     }
@@ -691,16 +757,22 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                     StorageIOError::write_state_machine(&std::io::Error::other(error.to_string()))
                 })?;
         }
-        self.persist(&decoded)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: snapshot.get_ref().clone(),
         };
-        write_json(&self.snapshot_path, &Some(stored.clone()))
+        let mut state = self.state.write().await;
+        let persisted = self
+            .enqueue_snapshot_persist(decoded.clone(), stored.clone())
+            .await;
+        *state = decoded;
+        drop(state);
+        let persisted = persisted
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         *self.current_snapshot.write().await = Some(stored);
-        *self.state.write().await = decoded;
         Ok(())
     }
 
@@ -734,26 +806,29 @@ impl RaftSnapshotBuilder<VerglasRaftConfig> for PersistentStateMachine {
                 })?;
         }
         compact_checkpointed_catalog_history(&mut state);
-        self.persist(&state)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
-        let bytes = serde_json::to_vec(&*state)
+        let durable = state.clone();
+        let bytes = serde_json::to_vec(&durable)
             .map_err(|error| StorageIOError::read_state_machine(&error))?;
         let sequence = self.snapshot_index.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_id = state.last_applied.map_or_else(
+        let snapshot_id = durable.last_applied.map_or_else(
             || format!("empty-{sequence}"),
             |last| format!("{}-{}-{sequence}", last.leader_id, last.index),
         );
         let meta = SnapshotMeta {
-            last_log_id: state.last_applied,
-            last_membership: state.membership.clone(),
+            last_log_id: durable.last_applied,
+            last_membership: durable.membership.clone(),
             snapshot_id,
         };
-        drop(state);
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: bytes.clone(),
         };
-        write_json(&self.snapshot_path, &Some(stored.clone()))
+        let persisted = self.enqueue_snapshot_persist(durable, stored.clone()).await;
+        drop(state);
+        let persisted = persisted
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         *self.current_snapshot.write().await = Some(stored);
         Ok(Snapshot {
@@ -868,6 +943,82 @@ fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> std::io::Re
     }
 }
 
+/// Number of queued Raft image writes allowed per replica. This is a hard
+/// backpressure ceiling; a node never accumulates unbounded serialized state
+/// while its NVMe is slow.
+const PERSISTENCE_QUEUE_CAPACITY: usize = 16;
+
+/// One ordered write plus the acknowledgement its owning Raft callback awaits.
+struct PersistenceRequest {
+    /// Filesystem work that must reach a durable result before acknowledgement.
+    operation: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    /// Delivers the exact I/O outcome after the dedicated worker finishes.
+    completion: oneshot::Sender<std::io::Result<()>>,
+}
+
+/// Per-replica ordered filesystem actor. It runs on Tokio's blocking pool,
+/// keeping fsync out of Raft RPC workers while preserving mutation order.
+#[derive(Clone)]
+struct PersistenceActor {
+    /// Bounded queue shared by every clone of one persistent store.
+    sender: mpsc::Sender<PersistenceRequest>,
+}
+
+impl PersistenceActor {
+    /// Starts the dedicated actor for one replica's log, state, and snapshots.
+    fn new() -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<PersistenceRequest>(PERSISTENCE_QUEUE_CAPACITY);
+        tokio::task::spawn_blocking(move || {
+            while let Some(request) = receiver.blocking_recv() {
+                let result = (request.operation)();
+                let _ = request.completion.send(result);
+            }
+        });
+        Self { sender }
+    }
+
+    /// Enqueues arbitrary ordered filesystem work and returns its acknowledgement.
+    async fn enqueue<F>(
+        &self,
+        operation: F,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>>
+    where
+        F: FnOnce() -> std::io::Result<()> + Send + 'static,
+    {
+        let (completion, received) = oneshot::channel();
+        self.sender
+            .send(PersistenceRequest {
+                operation: Box::new(operation),
+                completion,
+            })
+            .await
+            .map_err(|_| std::io::Error::other("Raft persistence actor stopped"))?;
+        Ok(received)
+    }
+
+    /// Serializes and queues one owned JSON image on the dedicated actor.
+    async fn enqueue_json<T>(
+        &self,
+        path: PathBuf,
+        value: T,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>>
+    where
+        T: Serialize + Send + 'static,
+    {
+        self.enqueue(move || write_json(&path, &value)).await
+    }
+}
+
+/// Awaits the ordered actor acknowledgement and fails closed if the worker stops.
+async fn await_persisted(
+    completion: oneshot::Receiver<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    completion
+        .await
+        .map_err(|_| std::io::Error::other("Raft persistence actor stopped"))?
+}
+
 /// Serializes and atomically persists one JSON image.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)
@@ -891,4 +1042,69 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     fs::rename(&temporary, path)?;
     File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use super::{PersistenceActor, await_persisted};
+
+    /// A slow durable Raft image must not monopolize the runtime that receives
+    /// the next vote RPC.
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_raft_persistence_keeps_the_runtime_responsive() {
+        let (persistence_started, started) = tokio::sync::oneshot::channel();
+        let actor = PersistenceActor::new();
+        let persist = actor
+            .enqueue(move || {
+                let _ = persistence_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await;
+
+        started.await.expect("blocking persistence started");
+        let mut persist = persist.expect("enqueue persistence");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut persist)
+                .await
+                .is_err(),
+            "the Raft callback must wait for its durable image"
+        );
+        tokio::time::timeout(Duration::from_millis(50), tokio::task::yield_now())
+            .await
+            .expect("a vote RPC remains schedulable while the image fsyncs");
+        await_persisted(persist).await.expect("durable persistence");
+    }
+
+    /// Writes queued before and after a slow image remain in enqueue order, so
+    /// a later Raft callback can never overwrite its predecessor on disk.
+    #[tokio::test]
+    async fn persistence_actor_preserves_queued_image_order() {
+        let actor = PersistenceActor::new();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let first_writes = Arc::clone(&writes);
+        let first = actor
+            .enqueue(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                first_writes.lock().expect("writes lock").push(1_u8);
+                Ok(())
+            })
+            .await
+            .expect("queue first image");
+        let second_writes = Arc::clone(&writes);
+        let second = actor
+            .enqueue(move || {
+                second_writes.lock().expect("writes lock").push(2_u8);
+                Ok(())
+            })
+            .await
+            .expect("queue second image");
+
+        await_persisted(first).await.expect("first durable image");
+        await_persisted(second).await.expect("second durable image");
+        assert_eq!(*writes.lock().expect("writes lock"), vec![1, 2]);
+    }
 }

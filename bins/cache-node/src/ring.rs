@@ -725,7 +725,10 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
                 let _guard = activity
                     .try_begin(ActivityPlane::Fragment)
                     .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
-                store.store_fragment(&record)
+                await_fragment_store(tokio::task::spawn_blocking(move || {
+                    store.store_fragment(&record)
+                }))
+                .await
             })
         }),
         store_stream: Arc::new(move |key: FragmentKey, shards| {
@@ -735,7 +738,7 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
                 let _guard = activity
                     .try_begin(ActivityPlane::Fragment)
                     .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
-                stream_into_store(&store, &key, shards).await
+                stream_into_store(store, key, shards).await
             })
         }),
         load: Arc::new(move |key: FragmentKey| {
@@ -745,7 +748,10 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
                 let _guard = activity
                     .try_begin(ActivityPlane::Fragment)
                     .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
-                store.load_fragment(&key)
+                await_fragment_store(tokio::task::spawn_blocking(move || {
+                    store.load_fragment(&key)
+                }))
+                .await
             })
         }),
         delete: Arc::new(move |key: FragmentKey| {
@@ -755,7 +761,10 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
                 let _guard = activity
                     .try_begin(ActivityPlane::Fragment)
                     .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
-                store.delete_fragment(&key)
+                await_fragment_store(tokio::task::spawn_blocking(move || {
+                    store.delete_fragment(&key)
+                }))
+                .await
             })
         }),
         headroom: Arc::new(move |bytes: u64| {
@@ -775,11 +784,15 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
                 let Ok(_guard) = activity.try_begin(ActivityPlane::Fragment) else {
                     return Vec::new();
                 };
-                store
-                    .list_fragment_keys()
-                    .into_iter()
-                    .filter(|key| key.object_id.starts_with(&prefix))
-                    .collect()
+                tokio::task::spawn_blocking(move || {
+                    store
+                        .list_fragment_keys()
+                        .into_iter()
+                        .filter(|key| key.object_id.starts_with(&prefix))
+                        .collect()
+                })
+                .await
+                .unwrap_or_default()
             })
         }),
     }
@@ -789,16 +802,63 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
 /// budget refusal or IO error aborts the write (the temp file is cleaned on
 /// drop), so the peer answers 500 and the coordinator counts it against quorum.
 async fn stream_into_store(
-    store: &LocalFragmentStore,
-    key: &FragmentKey,
-    mut shards: FragmentShardStream,
+    store: LocalFragmentStore,
+    key: FragmentKey,
+    shards: FragmentShardStream,
 ) -> Result<(), FragmentIoError> {
+    stream_into_store_with_commit(store, key, shards, |writer| writer.commit()).await
+}
+
+/// Relays an asynchronous upload to a bounded channel while a blocking worker
+/// owns the fragment writer and its durability barrier. The HTTP handler awaits
+/// the worker, so it cannot acknowledge before the file and directory fsyncs.
+async fn stream_into_store_with_commit<F>(
+    store: LocalFragmentStore,
+    key: FragmentKey,
+    mut shards: FragmentShardStream,
+    commit: F,
+) -> Result<(), FragmentIoError>
+where
+    F: FnOnce(verglas_cluster::FragmentWriter) -> Result<(), FragmentIoError> + Send + 'static,
+{
     use futures::StreamExt;
-    let mut writer = store.open_fragment(key)?;
+    // This is deliberately small: it bounds per-upload heap use to a few
+    // stripes while the blocking worker is behind NVMe latency.
+    const FRAGMENT_UPLOAD_CHANNEL_CAPACITY: usize = 4;
+    let (sender, mut receiver) =
+        tokio::sync::mpsc::channel::<Bytes>(FRAGMENT_UPLOAD_CHANNEL_CAPACITY);
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut writer = store.open_fragment(&key)?;
+        while let Some(shard) = receiver.blocking_recv() {
+            writer.append(&shard)?;
+        }
+        commit(writer)
+    });
+
+    let mut upload_error = None;
     while let Some(shard) = shards.next().await {
-        writer.append(&shard)?;
+        if sender.send(shard).await.is_err() {
+            upload_error = Some(FragmentIoError::Io(
+                "fragment writer stopped before upload completed".to_owned(),
+            ));
+            break;
+        }
     }
-    writer.commit()
+    drop(sender);
+    let result = await_fragment_store(worker).await;
+    match upload_error {
+        Some(error) => Err(error),
+        None => result,
+    }
+}
+
+/// Converts a blocking fragment-store result back into the handler's error
+/// domain, including a worker panic or cancellation as a durable-write failure.
+async fn await_fragment_store<T: Send + 'static>(
+    task: tokio::task::JoinHandle<Result<T, FragmentIoError>>,
+) -> Result<T, FragmentIoError> {
+    task.await
+        .map_err(|error| FragmentIoError::Io(format!("fragment storage worker stopped: {error}")))?
 }
 
 /// Resolves a ring node id to its fragment-plane address from the static peer
@@ -859,6 +919,44 @@ impl LiveMembership for StaticMembership {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A slow fragment commit must not monopolize the async runtime that also
+    /// serves Raft votes and health checks.
+    #[tokio::test(flavor = "current_thread")]
+    async fn fragment_commit_leaves_the_runtime_responsive() {
+        let directory = tempfile::tempdir().expect("fragment directory");
+        let store = LocalFragmentStore::new(directory.path());
+        let key = FragmentKey {
+            object_id: "slow-durable-fragment".to_owned(),
+            index: 0,
+        };
+        let (commit_started, started) = tokio::sync::oneshot::channel();
+        let upload = tokio::spawn(stream_into_store_with_commit(
+            store,
+            key,
+            Box::pin(futures::stream::iter([bytes::Bytes::from_static(
+                b"fragment",
+            )])),
+            move |writer| {
+                let _ = commit_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                writer.commit()
+            },
+        ));
+
+        started.await.expect("blocking commit started");
+        assert!(
+            !upload.is_finished(),
+            "the HTTP upload must still wait for its durable commit"
+        );
+        tokio::time::timeout(Duration::from_millis(50), tokio::task::yield_now())
+            .await
+            .expect("a Raft vote or health handler remains schedulable");
+        upload
+            .await
+            .expect("upload task")
+            .expect("durable fragment commit");
+    }
 
     #[test]
     fn consensus_fragment_identity_separates_equal_bodies_from_distinct_requests() {

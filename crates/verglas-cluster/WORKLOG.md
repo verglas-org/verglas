@@ -149,3 +149,8 @@
 - #135: Bound the authenticated leader-command route explicitly for one
   JSON-expanded canonical 8 MiB WAL append. Non-leader ingresses can now
   forward the complete command without reopening an unbounded peer endpoint.
+
+- #135: Moved the internal peer listener onto an owned two-worker Tokio runtime
+  on its own OS thread. Raft and fragment RPCs now remain schedulable while the
+  public S3/WAL/NBD runtime is saturated, and shutdown drains then joins that
+  runtime so the peer listener does not outlive its cache node.

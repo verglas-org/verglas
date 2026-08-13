@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -55,7 +55,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
+use tokio::sync::oneshot;
 
 use verglas_core::BlockKey;
 use verglas_core::node::NodeId;
@@ -345,10 +345,14 @@ struct FragmentListRequest {
 }
 
 /// The peer-fetch server: listens on this node's advertised address and serves
-/// blocks from the local cache tiers only.
+/// blocks from the local cache tiers only. Its listener has a dedicated Tokio
+/// runtime so Raft vote and fragment RPCs remain schedulable while the public
+/// S3/WAL/NBD runtime is busy.
 pub struct PeerServer {
-    /// The serving task; aborted on [`PeerServer::shutdown`].
-    task: JoinHandle<()>,
+    /// The dedicated runtime thread serving all internal peer routes.
+    thread: std::thread::JoinHandle<()>,
+    /// Requests graceful listener shutdown before the owner joins `thread`.
+    shutdown: oneshot::Sender<()>,
     /// The address actually bound (a `:0` request resolves to a real port).
     local_addr: SocketAddr,
 }
@@ -429,7 +433,8 @@ impl PeerServer {
         fragments: Option<FragmentHandlers>,
         extra: Option<Router>,
     ) -> std::io::Result<Self> {
-        let listener = tokio::net::TcpListener::bind(addr).await?;
+        let listener = std::net::TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
         let local_addr = listener.local_addr()?;
         let mut app = Router::new().route(BLOCK_PATH, post(serve_block));
         if store.is_some() {
@@ -452,12 +457,65 @@ impl PeerServer {
         if let Some(extra) = extra {
             app = app.merge(extra);
         }
-        let task = tokio::spawn(async move {
-            // A serving error tears down only the peer surface; the ladder
-            // degrades to backend fills, so the server keeps serving.
-            let _ = axum::serve(listener, app).await;
-        });
-        Ok(Self { task, local_addr })
+        let (shutdown, stopping) = oneshot::channel();
+        let (ready, startup) = mpsc::sync_channel(1);
+        let thread = std::thread::Builder::new()
+            .name("verglas-peer-rpc".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                let listener = {
+                    let _entered = runtime.enter();
+                    match tokio::net::TcpListener::from_std(listener) {
+                        Ok(listener) => listener,
+                        Err(error) => {
+                            let _ = ready.send(Err(error.to_string()));
+                            return;
+                        }
+                    }
+                };
+                if ready.send(Ok(())).is_err() {
+                    return;
+                }
+                runtime.block_on(async move {
+                    // A serving error tears down only the peer surface. The
+                    // public cache endpoint still has its origin-safe path.
+                    let _ = axum::serve(listener, app)
+                        .with_graceful_shutdown(async move {
+                            let _ = stopping.await;
+                        })
+                        .await;
+                });
+            })
+            .map_err(|error| std::io::Error::other(format!("start peer runtime: {error}")))?;
+        match startup.recv() {
+            Ok(Ok(())) => Ok(Self {
+                thread,
+                shutdown,
+                local_addr,
+            }),
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                Err(std::io::Error::other(format!(
+                    "initialize peer runtime: {error}"
+                )))
+            }
+            Err(error) => {
+                let _ = thread.join();
+                Err(std::io::Error::other(format!(
+                    "peer runtime stopped during startup: {error}"
+                )))
+            }
+        }
     }
 
     /// The address the server is listening on.
@@ -465,10 +523,15 @@ impl PeerServer {
         self.local_addr
     }
 
-    /// Stops serving. In-flight requests are dropped; a peer that was mid-fetch
-    /// sees a transport error and degrades to a backend fill.
+    /// Stops serving after listener tasks drain, then joins the dedicated
+    /// runtime thread. In-flight peer requests finish or fail without blocking
+    /// the public cache runtime.
     pub async fn shutdown(self) {
-        self.task.abort();
+        let Self {
+            thread, shutdown, ..
+        } = self;
+        let _ = shutdown.send(());
+        let _ = tokio::task::spawn_blocking(move || thread.join()).await;
     }
 }
 

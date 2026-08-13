@@ -32,12 +32,60 @@ type Raft = openraft::Raft<VerglasRaftConfig>;
 type PlaneError = Box<dyn std::error::Error + Send + Sync>;
 /// Bounds one peer's group-open request so an unreachable voter cannot block a quorum.
 const GROUP_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Caps a client submission without undercutting the latest legal ranked
+/// election window after a leader loss.
+const GROUP_SUBMIT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Raft heartbeat interval for fsynced multi-megabyte WAL replication.
+const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 100;
+/// The first voter may start an election this long after heartbeats stop.
+const RAFT_ELECTION_FIRST_TIMEOUT_MS: u64 = 250;
+/// Each later stable voter receives a non-overlapping election window.
+const RAFT_ELECTION_RANK_STEP_MS: u64 = 300;
+/// Election window width. It stays smaller than the rank step so candidate
+/// campaigns never overlap in a healthy deployment.
+const RAFT_ELECTION_WINDOW_MS: u64 = 100;
 
 /// Maps a stable fragment holder identity to the corresponding Raft voter id.
 fn numeric_node_id(node: &str) -> u64 {
     node.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
         (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
+}
+
+/// Builds one node's fixed ranked election profile from its committed voters.
+///
+/// The peer-RPC boundary is where a future deployment may negotiate timing
+/// during version skew. This prototype has one fixed profile: every node sorts
+/// the same durable voter identities and gives its rank a distinct campaign
+/// slot after a leader loss.
+fn raft_config(voters: &[u64], local: u64) -> Result<openraft::Config, PlaneError> {
+    let mut ranks = voters.to_vec();
+    ranks.sort_unstable();
+    ranks.dedup();
+    if ranks.len() != voters.len() {
+        return Err("consensus voter configuration contains duplicate identities".into());
+    }
+    let rank = ranks
+        .binary_search(&local)
+        .map_err(|_| "local cache node is not a configured consensus voter")?;
+    let rank = u64::try_from(rank).map_err(|_| "consensus voter rank exceeds u64")?;
+    let offset = rank
+        .checked_mul(RAFT_ELECTION_RANK_STEP_MS)
+        .ok_or("consensus voter rank overflows election timing")?;
+    let minimum = RAFT_ELECTION_FIRST_TIMEOUT_MS
+        .checked_add(offset)
+        .ok_or("consensus election timing overflows")?;
+    let maximum = minimum
+        .checked_add(RAFT_ELECTION_WINDOW_MS)
+        .ok_or("consensus election timing overflows")?;
+    openraft::Config {
+        heartbeat_interval: RAFT_HEARTBEAT_INTERVAL_MS,
+        election_timeout_min: minimum,
+        election_timeout_max: maximum,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(Into::into)
 }
 
 /// Process-local registry for the many groups hosted on the cache fleet.
@@ -343,7 +391,7 @@ impl ConsensusPlane {
         request: GroupRequest,
     ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(GROUP_SUBMIT_TIMEOUT, async {
             loop {
                 if let Some(leader) = local.leader_id().await {
                     if leader == self.ring.safekeeper_id() {
@@ -397,13 +445,13 @@ impl ConsensusPlane {
         let payloads = Arc::new(DistributedPayloadStore::new(
             self.k,
             self.m,
-            voters,
+            voters.clone(),
             self.ring.consensus_payload_transport(),
         )?);
         state_machine.attach_payload_store(payloads.clone()).await?;
         let raft = Raft::new(
             self.ring.safekeeper_id(),
-            Arc::new(openraft::Config::default().validate()?),
+            Arc::new(raft_config(&voters, self.ring.safekeeper_id())?),
             self.network(group)?,
             log,
             state_machine.clone(),
@@ -520,5 +568,22 @@ fn validate_group(group: &str) -> Result<(), PlaneError> {
         Err("consensus group identity is empty or too long".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::raft_config;
+
+    /// Staggered election windows ensure only the earliest surviving voter
+    /// starts a replacement campaign after the leader is killed.
+    #[test]
+    fn raft_timing_uses_stable_sorted_voter_ranks() {
+        let voters = [44, 11, 33, 22];
+        let config = raft_config(&voters, 33).expect("valid Raft timing");
+
+        assert_eq!(config.heartbeat_interval, 100);
+        assert_eq!(config.election_timeout_min, 850);
+        assert_eq!(config.election_timeout_max, 950);
     }
 }
