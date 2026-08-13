@@ -168,28 +168,35 @@ impl PayloadStore for DistributedPayloadStore {
         configuration_generation: u64,
         mode: ReplicationMode,
         body: &[u8],
-        holders: &[u64],
+        candidates: &[u64],
     ) -> Result<StagedPayload, PayloadError> {
-        let certificate = PayloadCertificate::with_voters(
-            mode,
-            self.k,
-            self.m,
-            self.voters
-                .read()
-                .map_err(|_| PayloadError::Transport("payload voters are poisoned".to_owned()))?
-                .clone(),
-            holders.to_vec(),
-        )
-        .map_err(|error| PayloadError::InsufficientDurability {
-            required: error.required(),
-            durable: holders.iter().copied().collect::<BTreeSet<_>>().len(),
-        })?;
-        let hash: [u8; 32] = Sha256::digest(body).into();
         let voters = self
             .voters
             .read()
             .map_err(|_| PayloadError::Transport("payload voters are poisoned".to_owned()))?
             .clone();
+        // The current group configuration is the only authority that can name
+        // a staging target. Ingress may prefer recently reachable voters, but
+        // the remaining committed voters stay eligible: a stale caller cannot
+        // shrink a committed voter set and gossip cannot promote a non-voter
+        // into a certificate.
+        let mut ordered = Vec::with_capacity(voters.len());
+        for candidate in candidates {
+            if voters.contains(candidate) && !ordered.contains(candidate) {
+                ordered.push(*candidate);
+            }
+        }
+        for voter in &voters {
+            if !ordered.contains(voter) {
+                ordered.push(*voter);
+            }
+        }
+        let election_quorum = voters.len() / 2 + 1;
+        let required = match mode {
+            ReplicationMode::Coded => voters.len() - election_quorum + self.k,
+            ReplicationMode::Complete => election_quorum,
+        };
+        let hash: [u8; 32] = Sha256::digest(body).into();
         let representations = match mode {
             ReplicationMode::Coded => {
                 encode(self.k, self.m, body).map_err(|_| PayloadError::ReconstructionUnavailable)?
@@ -199,14 +206,16 @@ impl PayloadStore for DistributedPayloadStore {
                 .map(|_| Bytes::copy_from_slice(body))
                 .collect(),
         };
-        for voter in certificate.holders() {
+        let mut durable = Vec::with_capacity(required);
+        for voter in ordered {
             let slot = voters
                 .iter()
-                .position(|candidate| candidate == voter)
+                .position(|configured| configured == &voter)
                 .ok_or(PayloadError::UnknownHolder)?;
-            self.transport
+            let result = self
+                .transport
                 .store(
-                    *voter,
+                    voter,
                     PayloadRepresentation {
                         term: 0,
                         index: 0,
@@ -220,12 +229,32 @@ impl PayloadStore for DistributedPayloadStore {
                         bytes: representations[slot].clone(),
                     },
                 )
-                .await?;
+                .await;
+            if result.is_ok() {
+                durable.push(voter);
+                if durable.len() == required {
+                    let certificate = PayloadCertificate::with_voters(
+                        mode,
+                        self.k,
+                        self.m,
+                        voters.clone(),
+                        durable,
+                    )
+                    .map_err(|_| PayloadError::InsufficientDurability {
+                        required,
+                        durable: required,
+                    })?;
+                    return Ok(StagedPayload {
+                        hash,
+                        length: body.len() as u64,
+                        certificate,
+                    });
+                }
+            }
         }
-        Ok(StagedPayload {
-            hash,
-            length: body.len() as u64,
-            certificate,
+        Err(PayloadError::InsufficientDurability {
+            required,
+            durable: durable.len(),
         })
     }
 
@@ -468,6 +497,10 @@ pub trait PayloadStore: Send + Sync {
     /// Publishes the uniform committed voter allocation for subsequent staging.
     async fn set_voters(&self, voters: Vec<u64>) -> Result<(), PayloadError>;
     /// Stages representations before returning a certificate eligible for Raft.
+    ///
+    /// `candidates` is an ingress reachability hint only. Implementations must
+    /// derive every actual staging target and the certificate voter set from
+    /// committed group membership, never from gossip or an untrusted caller.
     async fn stage(
         &self,
         request: RequestId,
@@ -475,7 +508,7 @@ pub trait PayloadStore: Send + Sync {
         configuration_generation: u64,
         mode: ReplicationMode,
         body: &[u8],
-        holders: &[u64],
+        candidates: &[u64],
     ) -> Result<StagedPayload, PayloadError>;
 
     /// Reconstructs and verifies a committed logical body.

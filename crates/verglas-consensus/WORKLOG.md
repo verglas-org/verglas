@@ -43,6 +43,11 @@
   Coded and complete representations now yield a commit certificate only after
   the configured successor-quorum intersection is durably satisfied.
 
+- #135: Made durable payload staging continue through the full committed voter
+  allocation when an ingress-preferred holder is unavailable. The resulting
+  immutable certificate records only successful fsynced holders and still
+  requires the coded intersection threshold or a complete-entry majority.
+
 - #135: Moved exact retry identity and writer-epoch validation into the durable
   Raft state machine. Duplicate requests return their original index, while
   conflicting retries and stale writers apply as closed failures.

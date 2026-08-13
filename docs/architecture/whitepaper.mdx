@@ -295,6 +295,13 @@ The cache fleet hosts many independent Raft groups instead of one global log. A 
 
 Each group has a committed voter configuration. Reconfiguration uses joint consensus; gossip supplies reachability hints only. Terms, votes, log indexes, command kinds, payload lengths and hashes, coding geometry, storage mode, writer epoch, and idempotency identity are fully replicated. Large payloads may be stored as Reed–Solomon fragments, but agreement remains over the complete logical entry identified by its hash.
 
+At staging time an ingress may prefer voters it has recently reached, but the
+candidate pool is the complete committed voter configuration. A failed preferred
+holder therefore causes staging to try another committed voter; it never changes
+membership or treats gossip as a commit decision. The eventual header records
+the exact voters that fsynced the selected representations, making that durable
+certificate immutable after acknowledgement.
+
 Let `N` be the voter count, `q` the smallest legal future election quorum, `k` the number of fragments required to reconstruct a coded entry, and `w` the number of distinct voters that durably store fragments before acknowledgment. A coded entry is eligible to commit only when
 
 ```text

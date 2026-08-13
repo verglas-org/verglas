@@ -1,11 +1,112 @@
 //! Durable payload staging and reconstruction acceptance tests.
 
+use std::sync::{Arc, Mutex};
+
 use bytes::Bytes;
 use tempfile::TempDir;
 use verglas_consensus::{
-    FilePayloadReplica, PayloadSet, PayloadStore, ReconstructRequest, ReplicationMode, RequestId,
+    DistributedPayloadStore, FilePayloadReplica, PayloadError, PayloadRepresentation, PayloadSet,
+    PayloadStore, ReconstructRequest, ReplicationMode, RepresentationTransport, RequestId,
     SealRequest,
 };
+
+/// Transport whose first voter is unavailable while every later committed voter fsyncs writes.
+struct FirstVoterUnavailable {
+    /// Voters that reached durable storage, in attempt order.
+    stored: Mutex<Vec<u64>>,
+}
+
+impl FirstVoterUnavailable {
+    /// Builds the controlled transport.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            stored: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Returns the voters that accepted a durable representation.
+    fn stored(&self) -> Vec<u64> {
+        self.stored.lock().expect("stored voters lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RepresentationTransport for FirstVoterUnavailable {
+    /// Refuses voter one and durably accepts every other committed voter.
+    async fn store(
+        &self,
+        voter: u64,
+        _representation: PayloadRepresentation,
+    ) -> Result<(), PayloadError> {
+        if voter == 1 {
+            return Err(PayloadError::Transport(
+                "voter one is unavailable".to_owned(),
+            ));
+        }
+        self.stored.lock().expect("stored voters lock").push(voter);
+        Ok(())
+    }
+
+    /// This staging-only test never reconstructs a representation.
+    async fn load(
+        &self,
+        _voter: u64,
+        _hash: [u8; 32],
+        _group: &str,
+        _configuration_generation: u64,
+        _request: RequestId,
+    ) -> Result<Option<PayloadRepresentation>, PayloadError> {
+        Ok(None)
+    }
+
+    /// This staging-only test never reclaims a representation.
+    async fn delete(
+        &self,
+        _voter: u64,
+        _hash: [u8; 32],
+        _group: &str,
+        _configuration_generation: u64,
+        _request: RequestId,
+        _slot: usize,
+    ) -> Result<(), PayloadError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn staging_uses_reachable_committed_voters_after_a_prefix_voter_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let transport = FirstVoterUnavailable::new();
+    let payloads = DistributedPayloadStore::new(2, 2, vec![1, 2, 3, 4], transport.clone())?;
+
+    let coded = payloads
+        .stage(
+            RequestId::from_u128(91),
+            "timeline/available",
+            7,
+            ReplicationMode::Coded,
+            b"coded payload",
+            &[1, 2, 3],
+        )
+        .await?;
+    assert_eq!(coded.certificate().voters(), &[1, 2, 3, 4]);
+    assert_eq!(coded.certificate().holders(), &[2, 3, 4]);
+
+    let complete = payloads
+        .stage(
+            RequestId::from_u128(92),
+            "timeline/available",
+            7,
+            ReplicationMode::Complete,
+            b"complete payload",
+            &[1, 2, 3],
+        )
+        .await?;
+    assert_eq!(complete.certificate().voters(), &[1, 2, 3, 4]);
+    assert_eq!(complete.certificate().holders(), &[2, 3, 4]);
+    assert_eq!(transport.stored(), vec![2, 3, 4, 2, 3, 4]);
+    Ok(())
+}
 
 #[tokio::test]
 async fn coded_payload_is_fsynced_sealed_and_reconstructs() -> Result<(), Box<dyn std::error::Error>>
