@@ -46,6 +46,12 @@ impl<R, W: ObjectWrite> WritebackReader<R, W> {
         let object_id = states.find_dirty(&key.storage_binding_id, &key.bucket, &key.key)?;
         states.read(&object_id)
     }
+
+    fn tombstoned(&self, key: &CacheKey) -> bool {
+        self.coordinator
+            .states()
+            .is_tombstoned(&key.storage_binding_id, &key.bucket, &key.key)
+    }
 }
 
 impl<R, W> ObjectRead for WritebackReader<R, W>
@@ -56,6 +62,9 @@ where
     /// Serves a dirty object by reassembling the requested range from
     /// fragments; delegates otherwise.
     async fn get(&self, key: &CacheKey, range: ReadRange) -> Result<ObjectGet, ReadError> {
+        if self.tombstoned(key) {
+            return Err(ReadError::NoSuchKey);
+        }
         let Some(state) = self.dirty_state(key) else {
             return self.inner.get(key, range).await;
         };
@@ -83,6 +92,9 @@ where
 
     /// Reports dirty metadata before propagation; delegates otherwise.
     async fn head(&self, key: &CacheKey) -> Result<ObjectMeta, ReadError> {
+        if self.tombstoned(key) {
+            return Err(ReadError::NoSuchKey);
+        }
         match self.dirty_state(key) {
             Some(state) => Ok(meta_for(&state, state.object_len)),
             None => self.inner.head(key).await,
@@ -92,6 +104,9 @@ where
     /// Revalidates against the dirty state's synthetic ETag; delegates
     /// otherwise.
     async fn revalidate(&self, key: &CacheKey, etag: &str) -> Result<Revalidation, ReadError> {
+        if self.tombstoned(key) {
+            return Ok(Revalidation::Vanished);
+        }
         match self.dirty_state(key) {
             Some(state) => {
                 let meta = meta_for(&state, state.object_len);
@@ -118,6 +133,9 @@ where
         range: ReadRange,
         options: DirectReadOptions,
     ) -> Result<DirectGet, ReadError> {
+        if self.tombstoned(key) {
+            return Err(ReadError::NoSuchKey);
+        }
         let Some(state) = self.dirty_state(key) else {
             return self.inner.get_direct(key, range, options).await;
         };
@@ -147,6 +165,9 @@ where
         key: &CacheKey,
         options: DirectReadOptions,
     ) -> Result<DirectMeta, ReadError> {
+        if self.tombstoned(key) {
+            return Err(ReadError::NoSuchKey);
+        }
         let Some(state) = self.dirty_state(key) else {
             return self.inner.head_direct(key, options).await;
         };
@@ -163,6 +184,9 @@ where
         key: &CacheKey,
         request: AttributesRequest,
     ) -> Result<ObjectAttributes, ReadError> {
+        if self.tombstoned(key) {
+            return Err(ReadError::NoSuchKey);
+        }
         let Some(state) = self.dirty_state(key) else {
             return self.inner.object_attributes(key, request).await;
         };

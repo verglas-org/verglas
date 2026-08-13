@@ -30,7 +30,10 @@ use verglas_cluster::fragments::{FragmentKey, FragmentRecord};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
 use verglas_core::ring::rendezvous_hash;
-use verglas_core::write::{ObjectWrite, PutOutcome, WriteBodyStream, WriteError, WriteMetadata};
+use verglas_core::write::{
+    CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
+    PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
+};
 
 use crate::membership::LiveMembership;
 use crate::meta::{StoredMetadata, now_unix_ms};
@@ -206,6 +209,36 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         m: usize,
         w: usize,
     ) -> Result<PutOutcome, WriteError> {
+        self.put_stream_inner(key, metadata, body, k, m, w, true)
+            .await
+    }
+
+    /// Stores an internal multipart part through the exact same EC quorum
+    /// path as PUT, but deliberately never forwards that private part key to
+    /// the origin.  Its immutable part state is later consumed by complete.
+    async fn put_staged_stream(
+        self: &Arc<Self>,
+        key: &CacheKey,
+        metadata: &WriteMetadata,
+        body: WriteBodyStream,
+        k: usize,
+        m: usize,
+        w: usize,
+    ) -> Result<PutOutcome, WriteError> {
+        self.put_stream_inner(key, metadata, body, k, m, w, false)
+            .await
+    }
+
+    async fn put_stream_inner(
+        self: &Arc<Self>,
+        key: &CacheKey,
+        metadata: &WriteMetadata,
+        body: WriteBodyStream,
+        k: usize,
+        m: usize,
+        w: usize,
+        propagate: bool,
+    ) -> Result<PutOutcome, WriteError> {
         // Preserve completion order for operations on the same key. The guard
         // is moved into background propagation on a quorum ack; write-through
         // and failed writes release it when this function returns.
@@ -319,6 +352,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                 acked.into_receipts(),
                 done_rx,
                 key_guard,
+                propagate,
             )
             .await
         } else {
@@ -345,6 +379,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         acked: Vec<Placement>,
         rx: mpsc::UnboundedReceiver<(usize, NodeId, Result<(), crate::transport::TransportError>)>,
         key_guard: OwnedMutexGuard<()>,
+        propagate: bool,
     ) -> Result<PutOutcome, WriteError> {
         let state = TransactionRecord {
             object_id: object_id.to_owned(),
@@ -363,6 +398,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             placements: acked,
             w,
             revision: 0,
+            upload_id: None,
+            part_number: None,
+            multipart_manifest: false,
         };
         let replicas = state
             .placements
@@ -388,7 +426,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             let _key_guard = key_guard;
             let mut rx = rx;
             while rx.recv().await.is_some() {}
-            me.propagate_locked(object_id).await;
+            if propagate {
+                me.propagate_locked(object_id).await;
+            }
         });
 
         Ok(PutOutcome {
@@ -531,9 +571,401 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         lock
     }
 
-    /// Deletes an object after any earlier quorum-acked PUT for the same key.
-    /// The origin delete happens before the dirty state is discarded, so a
-    /// failed delete preserves the acknowledged object for retry/recovery.
+    /// Copies an EC-resident source into a new EC transaction.  We never use
+    /// the origin's CopyObject path: an acknowledged source is authoritative
+    /// in the fragment ring until its own release record is durable.
+    pub async fn copy_ec(
+        self: &Arc<Self>,
+        source: &CacheKey,
+        dest: &CacheKey,
+        metadata: Option<WriteMetadata>,
+        k: usize,
+        m: usize,
+        w: usize,
+    ) -> Result<CopyOutcome, WriteError> {
+        let source_id = self
+            .states
+            .find_dirty(&source.storage_binding_id, &source.bucket, &source.key)
+            .ok_or_else(|| WriteError::Unsupported("COPY source is not EC-resident".to_owned()))?;
+        let source_state = self.states.read(&source_id).ok_or(WriteError::NoSuchKey)?;
+        let bytes = self
+            .reassemble(&source_state)
+            .await
+            .map_err(|error| WriteError::Backend(error.to_string()))?;
+        let metadata = metadata.unwrap_or_else(|| WriteMetadata::from(&source_state.metadata));
+        if !metadata.checksum.is_empty() {
+            return Err(WriteError::Unsupported(
+                "COPY checksum verification is not available in EC write-back".to_owned(),
+            ));
+        }
+        let outcome = self.put(dest, &metadata, bytes, k, m, w).await?;
+        Ok(CopyOutcome {
+            e_tag: outcome.e_tag,
+            last_modified: Some(std::time::SystemTime::now()),
+        })
+    }
+
+    /// Creates a quorum-proven multipart manifest.  The generated upload id is
+    /// a ring transaction id, never an origin upload id.
+    pub async fn create_multipart_ec(
+        self: &Arc<Self>,
+        key: &CacheKey,
+        metadata: WriteMetadata,
+        k: usize,
+        m: usize,
+        w: usize,
+    ) -> Result<MultipartCreation, WriteError> {
+        if !metadata.checksum.is_empty() {
+            return Err(WriteError::Unsupported(
+                "multipart checksums are not supported by EC write-back".to_owned(),
+            ));
+        }
+        let _guard = self.key_lock(key).lock_owned().await;
+        let live = self.membership.live_nodes();
+        if self.membership.is_single_node() || live.len() < w {
+            return Err(quorum_shortfall(w, live.len()));
+        }
+        let object_id = self.new_object_id(key, 0);
+        let upload_id = format!("vg-{}", object_id);
+        let placements = placement_order(key, &object_id, &live)
+            .into_iter()
+            .take(w)
+            .enumerate()
+            .map(|(index, node)| Placement {
+                index,
+                node: node.as_str().to_owned(),
+            })
+            .collect::<Vec<_>>();
+        let state = TransactionRecord {
+            object_id,
+            storage_binding_id: key.storage_binding_id.clone(),
+            bucket: key.bucket.clone(),
+            key: key.key.clone(),
+            metadata: StoredMetadata::from(&metadata),
+            object_len: 0,
+            k,
+            m,
+            w,
+            chunk: MAX_STRIPE_CHUNK,
+            etag: String::new(),
+            created_ms: now_unix_ms(),
+            state: TransactionState::Dirty,
+            propagated_ms: None,
+            placements: placements.clone(),
+            revision: 0,
+            upload_id: Some(upload_id.clone()),
+            part_number: None,
+            multipart_manifest: true,
+        };
+        let replicas = placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()))
+            .collect::<Vec<_>>();
+        self.publish_state(state, &replicas)
+            .await
+            .map_err(|error| WriteError::Backend(format!("multipart state: {error}")))?;
+        Ok(MultipartCreation {
+            upload_id,
+            checksum_algorithm: None,
+            checksum_type: None,
+        })
+    }
+
+    /// Streams a part into a private EC object and then publishes a revision
+    /// attaching it to its quorum-proven upload manifest.
+    pub async fn upload_part_ec(
+        self: &Arc<Self>,
+        key: &CacheKey,
+        upload_id: &str,
+        part_number: u16,
+        checksum: WriteChecksum,
+        body: WriteBodyStream,
+        k: usize,
+        m: usize,
+        w: usize,
+    ) -> Result<PartUpload, WriteError> {
+        if !checksum.is_empty() {
+            return Err(WriteError::Unsupported(
+                "multipart part checksums are not supported by EC write-back".to_owned(),
+            ));
+        }
+        if part_number == 0 {
+            return Err(WriteError::InvalidPart(
+                "part number must be positive".to_owned(),
+            ));
+        }
+        self.states
+            .multipart_upload(&key.storage_binding_id, &key.bucket, &key.key, upload_id)
+            .ok_or(WriteError::NoSuchUpload)?;
+        let part_key = multipart_part_key(key, upload_id, part_number);
+        let outcome = self
+            .put_staged_stream(&part_key, &WriteMetadata::default(), body, k, m, w)
+            .await?;
+        let part_id = self
+            .states
+            .find_dirty(
+                &part_key.storage_binding_id,
+                &part_key.bucket,
+                &part_key.key,
+            )
+            .ok_or_else(|| {
+                WriteError::Backend("missing durable multipart part state".to_owned())
+            })?;
+        let state = self.states.read(&part_id).ok_or(WriteError::NoSuchUpload)?;
+        let revised = TransactionRecord {
+            upload_id: Some(upload_id.to_owned()),
+            part_number: Some(part_number),
+            revision: state.revision + 1,
+            ..state.clone()
+        };
+        let replicas = revised
+            .placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()))
+            .collect::<Vec<_>>();
+        self.publish_state(revised, &replicas)
+            .await
+            .map_err(|error| WriteError::Backend(format!("multipart part state: {error}")))?;
+        Ok(PartUpload {
+            e_tag: outcome
+                .e_tag
+                .unwrap_or_else(|| synthetic_object_etag(&part_id, state.object_len)),
+            checksums: Default::default(),
+        })
+    }
+
+    /// Lists only the recovered/quorum-proven part projection, never an origin
+    /// multipart session that may not exist yet.
+    pub fn list_parts_ec(
+        &self,
+        key: &CacheKey,
+        upload_id: &str,
+    ) -> Result<Vec<PartInfo>, WriteError> {
+        self.states
+            .multipart_upload(&key.storage_binding_id, &key.bucket, &key.key, upload_id)
+            .ok_or(WriteError::NoSuchUpload)?;
+        Ok(self
+            .states
+            .multipart_parts(upload_id)
+            .into_iter()
+            .map(|part| PartInfo {
+                part_number: part.part_number.expect("filtered multipart part"),
+                e_tag: Some(part.etag),
+                size: part.object_len,
+                last_modified: Some(std::time::UNIX_EPOCH + Duration::from_millis(part.created_ms)),
+            })
+            .collect())
+    }
+
+    /// Completes from the EC part records.  The final PUT is still streamed to
+    /// the coordinator; the origin only sees the final object during normal
+    /// background propagation.
+    pub async fn complete_multipart_ec(
+        self: &Arc<Self>,
+        key: &CacheKey,
+        upload_id: &str,
+        parts: Vec<CompletedPartRef>,
+        checksum: WriteChecksum,
+        k: usize,
+        m: usize,
+        w: usize,
+    ) -> Result<PutOutcome, WriteError> {
+        if !checksum.is_empty() {
+            return Err(WriteError::Unsupported(
+                "multipart object checksums are not supported by EC write-back".to_owned(),
+            ));
+        }
+        let manifest = self
+            .states
+            .multipart_upload(&key.storage_binding_id, &key.bucket, &key.key, upload_id)
+            .ok_or(WriteError::NoSuchUpload)?;
+        let available = self.states.multipart_parts(upload_id);
+        let mut selected = Vec::with_capacity(parts.len());
+        for requested in &parts {
+            let part = available
+                .iter()
+                .find(|part| {
+                    part.part_number == Some(requested.part_number) && part.etag == requested.e_tag
+                })
+                .ok_or_else(|| WriteError::InvalidPart(requested.part_number.to_string()))?;
+            if requested.checksums != Default::default() {
+                return Err(WriteError::Unsupported(
+                    "multipart manifest checksums are not supported by EC write-back".to_owned(),
+                ));
+            }
+            selected.push(part.clone());
+        }
+        // Reassemble and feed one selected part at a time.  In particular,
+        // completion never builds a Vec containing the whole multipart object.
+        let coordinator = Arc::clone(self);
+        let body = stream::iter(selected)
+            .then(move |part| {
+                let coordinator = Arc::clone(&coordinator);
+                async move {
+                    coordinator
+                        .reassemble(&part)
+                        .await
+                        .map_err(|error| WriteError::Backend(error.to_string()))
+                }
+            })
+            .boxed();
+        let outcome = self
+            .put_stream(key, &WriteMetadata::from(&manifest.metadata), body, k, m, w)
+            .await?;
+        self.release_multipart(&manifest, &available).await?;
+        Ok(outcome)
+    }
+
+    pub async fn abort_multipart_ec(
+        &self,
+        key: &CacheKey,
+        upload_id: &str,
+    ) -> Result<(), WriteError> {
+        let manifest = self
+            .states
+            .multipart_upload(&key.storage_binding_id, &key.bucket, &key.key, upload_id)
+            .ok_or(WriteError::NoSuchUpload)?;
+        let parts = self.states.multipart_parts(upload_id);
+        self.release_multipart(&manifest, &parts).await
+    }
+
+    async fn release_multipart(
+        &self,
+        manifest: &TransactionRecord,
+        parts: &[TransactionRecord],
+    ) -> Result<(), WriteError> {
+        for record in parts.iter().chain(std::iter::once(manifest)) {
+            let release = TransactionRecord {
+                state: TransactionState::Released,
+                propagated_ms: Some(now_unix_ms()),
+                revision: record.revision + 1,
+                ..record.clone()
+            };
+            let replicas = release
+                .placements
+                .iter()
+                .map(|p| NodeId::new(p.node.as_str()))
+                .collect::<Vec<_>>();
+            self.publish_state(release, &replicas)
+                .await
+                .map_err(|error| {
+                    WriteError::Backend(format!("multipart release state: {error}"))
+                })?;
+            self.spawn_object_cleanup(record.object_id.clone());
+        }
+        Ok(())
+    }
+
+    /// Publishes the delete transaction before acknowledging it, then lets a
+    /// retrying background task delete the origin object.  This is the inverse
+    /// of the old origin-first ordering: a crash after the client ACK now
+    /// recovers an absence, never a stale origin object.
+    pub async fn delete_ec(
+        self: &Arc<Self>,
+        key: &CacheKey,
+        k: usize,
+        m: usize,
+        w: usize,
+    ) -> Result<(), WriteError> {
+        let _guard = self.key_lock(key).lock_owned().await;
+        let state = if let Some(object_id) =
+            self.states
+                .find_dirty(&key.storage_binding_id, &key.bucket, &key.key)
+        {
+            self.states.read(&object_id).ok_or(WriteError::NoSuchKey)?
+        } else {
+            let live = self.membership.live_nodes();
+            if self.membership.is_single_node() || live.len() < w {
+                return Err(quorum_shortfall(w, live.len()));
+            }
+            let object_id = self.new_object_id(key, 0);
+            let placements = placement_order(key, &object_id, &live)
+                .into_iter()
+                .take(w)
+                .enumerate()
+                .map(|(index, node)| Placement {
+                    index,
+                    node: node.as_str().to_owned(),
+                })
+                .collect();
+            TransactionRecord {
+                object_id,
+                storage_binding_id: key.storage_binding_id.clone(),
+                bucket: key.bucket.clone(),
+                key: key.key.clone(),
+                metadata: StoredMetadata::default(),
+                object_len: 0,
+                k,
+                m,
+                w,
+                chunk: MAX_STRIPE_CHUNK,
+                etag: String::new(),
+                created_ms: now_unix_ms(),
+                state: TransactionState::Released,
+                propagated_ms: None,
+                placements,
+                revision: 0,
+                upload_id: None,
+                part_number: None,
+                multipart_manifest: false,
+            }
+        };
+        let tombstone = TransactionRecord {
+            state: TransactionState::Tombstone,
+            propagated_ms: None,
+            revision: state.revision + 1,
+            ..state.clone()
+        };
+        let replicas = tombstone
+            .placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()))
+            .collect::<Vec<_>>();
+        self.publish_state(tombstone.clone(), &replicas)
+            .await
+            .map_err(|error| WriteError::Backend(format!("write-back tombstone state: {error}")))?;
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            me.delete_tombstone(tombstone).await;
+        });
+        Ok(())
+    }
+
+    async fn delete_tombstone(self: Arc<Self>, tombstone: TransactionRecord) {
+        let key = CacheKey {
+            storage_binding_id: tombstone.storage_binding_id.clone(),
+            bucket: tombstone.bucket.clone(),
+            key: tombstone.key.clone(),
+        };
+        let mut backoff = PROPAGATION_BACKOFF;
+        loop {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            if self.origin.delete(&key).await.is_ok() {
+                let release = TransactionRecord {
+                    state: TransactionState::Released,
+                    propagated_ms: Some(now_unix_ms()),
+                    revision: tombstone.revision + 1,
+                    ..tombstone.clone()
+                };
+                let replicas = release
+                    .placements
+                    .iter()
+                    .map(|p| NodeId::new(p.node.as_str()))
+                    .collect::<Vec<_>>();
+                if self.publish_state(release, &replicas).await.is_ok() {
+                    self.spawn_object_cleanup(tombstone.object_id.clone());
+                    return;
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(10));
+        }
+    }
+
+    /// Backwards-compatible delete entry point used by coordinator tests. If
+    /// no policy geometry was supplied it derives the existing object's state.
     pub async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
         let _key_guard = self.key_lock(key).lock_owned().await;
         self.origin.delete(key).await?;
@@ -568,7 +1000,8 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                 };
                 let _ = self.transport.delete(&node, &fragment).await;
             }
-            self.delete_state_revisions(&state).await;
+            // State revisions are append-only recovery authority; never delete
+            // them as part of a best-effort cleanup.
         }
         Ok(())
     }
@@ -622,6 +1055,14 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         if state.state == TransactionState::Released {
             return Ok(());
         }
+        // Upload manifests and private part objects are EC-only bookkeeping.
+        // Only CompleteMultipartUpload creates the origin-visible final key.
+        if state.multipart_manifest
+            || state.part_number.is_some()
+            || state.state == TransactionState::Tombstone
+        {
+            return Ok(());
+        }
         let bytes = self.reassemble(&state).await?;
         let key = CacheKey {
             storage_binding_id: state.storage_binding_id.clone(),
@@ -655,28 +1096,11 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             };
             let _ = self.transport.delete(&node, &fkey).await;
         }
-        self.delete_state_revisions(&state).await;
+        // Keep immutable release records in the ring.  Recovery selects the
+        // highest revision, so retaining history is safe and a restart does
+        // not depend on a best-effort local deletion having completed.
         WritebackMetrics::bump(&self.metrics.propagated);
         Ok(())
-    }
-
-    /// Releases all immutable state revisions once a quorum-proven release has
-    /// been appended.  Deletion is best effort: an old record cannot make an
-    /// object live again because recovery selects the highest revision.
-    async fn delete_state_revisions(&self, state: &TransactionRecord) {
-        let replicas = state
-            .placements
-            .iter()
-            .map(|p| NodeId::new(p.node.as_str()));
-        for node in replicas {
-            for revision in 0..=state.revision + 1 {
-                let key = FragmentKey {
-                    object_id: format!("tx-state:{}:{revision}", state.object_id),
-                    index: 0,
-                };
-                let _ = self.transport.delete(&node, &key).await;
-            }
-        }
     }
 
     /// Reassembles the object bytes from any `k` surviving fragments named in
@@ -724,6 +1148,14 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let me = Arc::clone(self);
         tokio::spawn(async move {
             me.recover_transaction_states().await;
+            for object_id in me.states.tombstone_object_ids() {
+                if let Some(tombstone) = me.states.read(&object_id) {
+                    let me = Arc::clone(&me);
+                    tokio::spawn(async move {
+                        me.delete_tombstone(tombstone).await;
+                    });
+                }
+            }
             for object_id in me.states.dirty_object_ids() {
                 let me = Arc::clone(&me);
                 tokio::spawn(async move {
@@ -1102,4 +1534,14 @@ fn receiver_stream(rx: mpsc::Receiver<Bytes>) -> crate::transport::ShardStream {
 fn once_body(bytes: Bytes) -> verglas_core::write::WriteBodyStream {
     use futures::StreamExt;
     stream::once(async move { Ok(bytes) }).boxed()
+}
+
+/// Private logical key used for a multipart part.  It is never exposed to the
+/// origin and keeps normal object-key indexing separate from upload state.
+fn multipart_part_key(key: &CacheKey, upload_id: &str, part_number: u16) -> CacheKey {
+    CacheKey {
+        storage_binding_id: key.storage_binding_id.clone(),
+        bucket: key.bucket.clone(),
+        key: format!(".verglas-multipart/{upload_id}/{part_number}"),
+    }
 }
