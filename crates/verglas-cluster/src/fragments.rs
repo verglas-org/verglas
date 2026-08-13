@@ -1,1291 +1,955 @@
-//! Local fragment blob store for the write-back tier (#180).
+//! Durable, actor-owned fragment segments for the EC write plane (#127).
 //!
-//! A node persists erasure-coded fragments as self-describing append records in
-//! durable segments under its cache directory. The fragment files remain the
-//! read index while segment records are the crash journal and group-fdatasync
-//! boundary. This module owns only the on-disk store and
-//! the fragment identity types; the journal, quorum, placement, and origin
-//! propagation live in `verglas-write`, and the fragment transport lives in
-//! [`crate::peer`]. Returning `Ok` from [`LocalFragmentStore::store_fragment`]
-//! means the bytes are durable on this node's NVMe — that is the unit the
-//! write-back ack counts.
-//!
-//! ## Per-fragment integrity (#220)
-//!
-//! Every fragment file is written as `payload || CRC32C(payload)`: a fixed
-//! 4-byte little-endian trailer. Reed-Solomon is an *erasure* code, so a
-//! bit-flip in a fragment used for reconstruction produces silently wrong bytes.
-//! The trailer lets a load detect that flip and treat the fragment as an erasure
-//! instead of feeding corrupt data to the decoder. Loads return the payload plus
-//! the stored checksum so the caller can verify end-to-end; the scrubber uses
-//! [`LocalFragmentStore::verify_fragment`] to find corrupt fragments on a
-//! schedule and re-encode them before enough accumulate to cross `m`.
+//! A cache member has exactly one append actor.  It owns rolling preallocated
+//! segment files, coalesces queued requests into one `sync_data` barrier, and
+//! exposes only records from a checksummed committed prefix after restart.
+//! There is deliberately no per-fragment file, rename, directory sync, or
+//! second local journal in the acknowledgement path.
 
-use std::fs::{self, File};
-use std::io::Write;
+use std::collections::HashMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock, mpsc};
+use std::thread;
 
 use bytes::Bytes;
 
-/// Bytes of the CRC32C integrity trailer appended to every stored fragment file
-/// (#220). Little-endian `u32` over the fragment payload.
-const CHECKSUM_TRAILER_LEN: usize = 4;
-/// Fixed marker preceding every self-describing append record.
-const SEGMENT_MAGIC: [u8; 4] = *b"VGF1";
+/// Fixed marker for a self-describing fragment record.
+const RECORD_MAGIC: [u8; 4] = *b"VGF2";
+/// Fixed marker for a persisted group-commit boundary.
+const COMMIT_MAGIC: [u8; 4] = *b"VGC2";
+/// Segment allocation is outside a client commit barrier.
+const SEGMENT_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Makes in-flight paths unique when independent coordinators concurrently
-/// place the same logical fragment on this node.
-static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
-
-/// The per-fragment integrity checksum (CRC32C, Castagnoli) over a fragment's
-/// payload. Chosen for bit-flip detection on the storage path: hardware
-/// accelerated, the standard storage checksum, cheap on the write path. Not
-/// cryptographic — it defends against bit-rot, not a malicious rewrite (#220).
+/// Computes the Castagnoli checksum used to detect fragment corruption.
 pub fn fragment_checksum(bytes: &[u8]) -> u32 {
     crc32c::crc32c(bytes)
 }
 
-/// A fragment loaded from disk: its payload plus the checksum trailer stored
-/// with it (#220). The caller verifies `checksum` against `bytes` before using
-/// the fragment, so a corrupt fragment is caught end-to-end (on the storing node
-/// and again at reassembly).
+/// Bytes recovered from one durable fragment record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedFragment {
-    /// The fragment payload (without the trailer).
+    /// Fragment payload.
     pub bytes: Bytes,
-    /// The CRC32C read from the fragment's on-disk trailer.
+    /// Checksum persisted with `bytes`.
     pub checksum: u32,
 }
 
 impl LoadedFragment {
-    /// True when the payload still matches the stored checksum.
+    /// Returns whether the recovered payload still has its persisted checksum.
     pub fn is_healthy(&self) -> bool {
         fragment_checksum(&self.bytes) == self.checksum
     }
 }
 
-/// The health of a stored fragment as the scrubber sees it (#220).
+/// Integrity state visible to the scrubber.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FragmentHealth {
-    /// The fragment is present and its payload matches its checksum.
+    /// A record is present and valid.
     Healthy,
-    /// The fragment is present but its payload no longer matches its checksum
-    /// (bit-rot) — the scrubber re-encodes it from the survivors.
+    /// A record is present but invalid.
     Corrupt,
-    /// The fragment file is absent on this node.
+    /// No live record names this key.
     Missing,
 }
 
-/// Identifies one fragment: the object it belongs to and its index within the
-/// `k+m` fragment set.
+/// Stable identity of one EC fragment.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FragmentKey {
-    /// Stable per-object id assigned by the write coordinator.
+    /// Immutable transaction or object identity.
     pub object_id: String,
-    /// Zero-based fragment index (`0..k` data, `k..k+m` parity).
+    /// EC fragment index.
     pub index: usize,
 }
 
-/// A fragment's bytes plus its key and integrity checksum, the unit stored and
-/// moved over peer RPC. `checksum` is the CRC32C over `bytes` (#220), carried so
-/// a receiving node can persist the trailer and a reader can verify end-to-end.
+/// One self-describing record submitted to a cache member's append actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FragmentRecord {
-    /// The fragment's identity.
+    /// Record identity.
     pub key: FragmentKey,
-    /// The fragment payload (already erasure-padded by the codec).
+    /// Erasure-coded bytes.
     pub bytes: Bytes,
     /// CRC32C over `bytes`.
     pub checksum: u32,
 }
 
 impl FragmentRecord {
-    /// Builds a record for `key` over `bytes`, computing its CRC32C. The only
-    /// constructor, so `checksum` always describes `bytes` at creation time.
+    /// Builds an integrity-checked fragment record.
     pub fn new(key: FragmentKey, bytes: Bytes) -> Self {
-        let checksum = fragment_checksum(&bytes);
         Self {
             key,
+            checksum: fragment_checksum(&bytes),
             bytes,
-            checksum,
         }
     }
 }
 
-/// A fragment store or transport failure. A local IO error here fails the
-/// containing write-back placement; the write then degrades to write-through.
+/// A failure in the durable fragment plane.
 #[derive(Debug, thiserror::Error)]
 pub enum FragmentIoError {
-    /// A filesystem or encoding error touching a fragment.
+    /// A filesystem, actor, or malformed-record failure.
     #[error("fragment store: {0}")]
     Io(String),
-    /// The fragment sub-budget has no headroom for this fragment. This is a
-    /// hard-ceiling refusal, not an IO failure: the coordinator excludes a full
-    /// node from placement, and if fewer than `w` nodes have headroom the write
-    /// degrades to write-through. The ceiling is never exceeded.
+    /// Accepting a new live payload would exceed the hard NVMe budget.
     #[error("fragment store full: {needed} bytes needed, {available} available under the budget")]
     Full {
-        /// Bytes the refused fragment would add.
+        /// Requested payload bytes.
         needed: u64,
-        /// Bytes still free under the budget.
+        /// Available payload bytes.
         available: u64,
     },
 }
 
 impl FragmentIoError {
-    /// Builds an IO-flavored error from any displayable message. Keeps call
-    /// sites terse now that the type is an enum.
+    /// Makes an IO error without forcing call sites to allocate formatting glue.
     fn io(message: impl Into<String>) -> Self {
-        FragmentIoError::Io(message.into())
+        Self::Io(message.into())
     }
 }
 
-/// Filesystem-backed fragment store rooted under a node's cache directory.
-///
-/// The store enforces a byte budget as a hard ceiling: [`store_fragment`] first
-/// reserves the fragment's bytes against the budget and refuses with
-/// [`FragmentIoError::Full`] if that would exceed it, so total fragment bytes
-/// never pass the configured sub-budget. Deletes release bytes. The budget is a
-/// reservation gate on *new* writes; it never evicts a fragment already on disk,
-/// which is what keeps an un-propagated fragment (the only durable copy of acked
-/// data) safe until propagation deletes it explicitly.
-///
-/// The ceiling is **dynamic** (#223): a shared atomic the server's disk poll
-/// updates each tick to what the store holds plus the share of the one NVMe
-/// budget (`cache.capacity_bytes`) the block cache is not physically using —
-/// first come, first served, no carve and no fraction. Fragments are transient,
-/// so a write burst takes whatever budget reads are not using instead of
-/// degrading to write-through while the disk sits idle; when the budget or the
-/// disk is spent, the poll lowers the ceiling toward the bytes already stored,
-/// so new writes degrade to write-through but no stored fragment is dropped.
-/// Reading the ceiling is one relaxed atomic load, so it never blocks placement.
-///
-/// [`store_fragment`]: LocalFragmentStore::store_fragment
-#[derive(Debug, Clone)]
+/// Operation sent to the one durable append actor.
+enum Request {
+    /// Persist records and acknowledge them only after the batch sync succeeds.
+    Append {
+        /// Records belonging to one caller's durable request.
+        records: Vec<FragmentRecord>,
+        /// Synchronous receipt for that request.
+        reply: mpsc::Sender<Result<(), FragmentIoError>>,
+    },
+    /// Persist tombstones before forgetting records from the read index.
+    Delete {
+        /// Keys to remove.
+        keys: Vec<FragmentKey>,
+        /// Synchronous receipt for that request.
+        reply: mpsc::Sender<Result<(), FragmentIoError>>,
+    },
+}
+
+/// Filesystem-backed EC fragment log with a disposable in-memory read index.
+#[derive(Clone)]
 pub struct LocalFragmentStore {
-    /// Root holding all fragment blobs for this node.
+    /// Root directory containing append segments only.
     root: Arc<PathBuf>,
-    /// Live ceiling on total fragment bytes; `u64::MAX` means unbudgeted. Shared
-    /// so the server's disk poll can raise or lower it while placements run.
+    /// Dynamic payload ceiling shared with disk-budget accounting.
     ceiling: Arc<AtomicU64>,
-    /// Live fragment bytes on disk, charged on store and released on delete.
+    /// Bytes represented by live records in the index.
     used: Arc<AtomicU64>,
-    /// Serializes only the final replacement/accounting step. Uploads and
-    /// fsyncs remain concurrent, while two placements of one key cannot both
-    /// charge or release the previous live file.
-    commit_lock: Arc<Mutex<()>>,
-    /// The current append-only segment. One sync_data commits every record in a
-    /// submitted batch before any caller receives its durable watermark.
-    segment: Arc<Mutex<File>>,
+    /// Rebuilt read index; it is never an acknowledgement dependency.
+    index: Arc<RwLock<HashMap<FragmentKey, LoadedFragment>>>,
+    /// Serializes sending only; the actor serializes durable state itself.
+    sender: mpsc::SyncSender<Request>,
+}
+
+impl std::fmt::Debug for LocalFragmentStore {
+    /// Prints store state without exposing actor internals.
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalFragmentStore")
+            .field("root", &self.root)
+            .field("budget_bytes", &self.budget_bytes())
+            .field("used_bytes", &self.used_bytes())
+            .finish_non_exhaustive()
+    }
 }
 
 impl LocalFragmentStore {
-    /// Creates an unbudgeted store rooted at `<cache_dir>/writeback-fragments`.
-    /// Used by tests and the fragment RPC surface, which do not gate on budget.
+    /// Opens an unbounded durable fragment log below `cache_dir`.
     pub fn new(cache_dir: impl AsRef<Path>) -> Self {
         Self::with_dynamic_ceiling(cache_dir, Arc::new(AtomicU64::new(u64::MAX)))
     }
 
-    /// Creates a store with a fixed byte ceiling, rebuilding the used-byte count
-    /// from any fragments a previous run left on disk so the bound holds across a
-    /// restart. Convenience for tests and callers with a static bound.
+    /// Opens a durable fragment log with a fixed payload ceiling.
     pub fn with_budget(cache_dir: impl AsRef<Path>, budget: u64) -> Self {
         Self::with_dynamic_ceiling(cache_dir, Arc::new(AtomicU64::new(budget)))
     }
 
-    /// Creates a store whose ceiling is a shared atomic the server's disk poll
-    /// updates dynamically (#223), rebuilding the used-byte count from any
-    /// fragments a previous run left on disk so the bound holds across a restart.
+    /// Opens a durable fragment log using the caller-owned dynamic ceiling.
     pub fn with_dynamic_ceiling(cache_dir: impl AsRef<Path>, ceiling: Arc<AtomicU64>) -> Self {
         let root = cache_dir.as_ref().join("writeback-fragments");
-        let used = scan_used_bytes(&root);
-        let segment_dir = root.join("segments");
-        let segment = fs::create_dir_all(&segment_dir)
-            .and_then(|()| {
-                File::options()
-                    .create(true)
-                    .append(true)
-                    .open(segment_dir.join("open.log"))
+        let segments = root.join("segments");
+        fs::create_dir_all(&segments).unwrap_or_else(|error| {
+            panic!("create fragment segments {}: {error}", segments.display())
+        });
+        let recovered = scan_segments(&segments).unwrap_or_else(|error| {
+            panic!("scan fragment segments {}: {error}", segments.display())
+        });
+        let used = Arc::new(AtomicU64::new(index_bytes(&recovered.index)));
+        let index = Arc::new(RwLock::new(recovered.index.clone()));
+        let (sender, receiver) = mpsc::sync_channel(1024);
+        let actor_index = Arc::clone(&index);
+        let actor_used = Arc::clone(&used);
+        let store_ceiling = Arc::clone(&ceiling);
+        thread::Builder::new()
+            .name("verglas-fragment-append".to_owned())
+            .spawn(move || {
+                AppendActor::new(segments, recovered).run(
+                    receiver,
+                    actor_index,
+                    actor_used,
+                    ceiling,
+                )
             })
-            .unwrap_or_else(|error| panic!("open fragment append segment: {error}"));
+            .unwrap_or_else(|error| panic!("spawn fragment append actor: {error}"));
         Self {
             root: Arc::new(root),
-            ceiling,
-            used: Arc::new(AtomicU64::new(used)),
-            commit_lock: Arc::new(Mutex::new(())),
-            segment: Arc::new(Mutex::new(segment)),
+            ceiling: store_ceiling,
+            used,
+            index,
+            sender,
         }
     }
 
-    /// The root directory this store writes under.
+    /// Returns the durable-log root.
     pub fn root(&self) -> &Path {
         self.root.as_path()
     }
 
-    /// The current byte ceiling (`u64::MAX` when unbudgeted) — the live dynamic
-    /// bound.
+    /// Returns the current payload ceiling.
     pub fn budget_bytes(&self) -> u64 {
         self.ceiling.load(Ordering::Acquire)
     }
 
-    /// Live fragment bytes currently on disk.
+    /// Returns bytes named by live log records.
     pub fn used_bytes(&self) -> u64 {
         self.used.load(Ordering::Acquire)
     }
 
-    /// True when a write of `bytes` would still fit under the current ceiling.
-    /// Placement consults this to exclude a full node before attempting a write.
+    /// Returns whether one additional payload could be admitted.
     pub fn has_headroom(&self, bytes: u64) -> bool {
         self.used_bytes().saturating_add(bytes) <= self.budget_bytes()
     }
 
-    /// Persists and fsyncs one fragment. `Ok` means the bytes reached this
-    /// node's NVMe durably (file and directory both fsynced). Reserves the
-    /// fragment's bytes against the budget first and refuses with
-    /// [`FragmentIoError::Full`] if that would exceed the ceiling — the reserve
-    /// happens before the write, so the on-disk total never passes the budget.
+    /// Appends one record through the same group-commit actor used by peer RPC.
     pub fn store_fragment(&self, record: &FragmentRecord) -> Result<(), FragmentIoError> {
-        let len = record.bytes.len() as u64;
-        // If this key already has bytes on disk (an idempotent re-place), free
-        // its old charge first so a re-write of the same fragment is neutral.
-        let existing = self.fragment_len(&record.key);
-        if existing > 0 {
-            self.used.fetch_sub(existing, Ordering::AcqRel);
-        }
-        if let Err(error) = self.reserve(len) {
-            // The old file is still live: a refused larger replacement must
-            // restore its charge before returning.
-            self.used.fetch_add(existing, Ordering::AcqRel);
-            return Err(error);
-        }
-        let path = self.fragment_path(&record.key);
-        // Persist `payload || CRC32C(payload)` so a later load can detect a
-        // bit-flip and treat the fragment as an erasure (#220). The budget is
-        // charged for the payload only; the 4-byte trailer is fixed overhead.
-        match write_fsynced(&path, &record.bytes, record.checksum) {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                // The write failed: undo the reservation so a transient IO error
-                // does not permanently shrink the budget, then restore the
-                // charge for the old file that the atomic rename preserved.
-                self.used.fetch_sub(len, Ordering::AcqRel);
-                self.used.fetch_add(existing, Ordering::AcqRel);
-                Err(error)
-            }
-        }
+        self.append_batch(std::slice::from_ref(record))
     }
 
-    /// Appends a compatible durability batch to the current segment and issues
-    /// exactly one `fdatasync`-equivalent `sync_data` for the whole batch. The
-    /// segment records carry key, checksum, length, and payload, so they remain
-    /// intelligible after a writer process disappears; the indexed fragment
-    /// files are then updated for normal reads.
+    /// Queues compatible records and returns only after their common `fdatasync`.
     pub fn append_batch(&self, records: &[FragmentRecord]) -> Result<(), FragmentIoError> {
         if records.is_empty() {
             return Ok(());
         }
-        let mut encoded = Vec::new();
-        for record in records {
-            let object = record.key.object_id.as_bytes();
-            let object_len = u32::try_from(object.len())
-                .map_err(|_| FragmentIoError::io("fragment object id is too long"))?;
-            let payload_len = u64::try_from(record.bytes.len())
-                .map_err(|_| FragmentIoError::io("fragment payload is too large"))?;
-            encoded.extend_from_slice(&SEGMENT_MAGIC);
-            encoded.extend_from_slice(&object_len.to_le_bytes());
-            encoded.extend_from_slice(&(record.key.index as u64).to_le_bytes());
-            encoded.extend_from_slice(&payload_len.to_le_bytes());
-            encoded.extend_from_slice(&record.checksum.to_le_bytes());
-            encoded.extend_from_slice(object);
-            encoded.extend_from_slice(&record.bytes);
-        }
-        {
-            let mut segment = self
-                .segment
-                .lock()
-                .map_err(|_| FragmentIoError::io("fragment segment lock poisoned"))?;
-            segment.write_all(&encoded).map_err(|error| {
-                FragmentIoError::io(format!("append fragment segment: {error}"))
-            })?;
-            segment.sync_data().map_err(|error| {
-                FragmentIoError::io(format!("fdatasync fragment segment: {error}"))
-            })?;
-        }
-        for record in records {
-            self.store_fragment(record)?;
-        }
-        Ok(())
+        let (reply, receipt) = mpsc::channel();
+        self.sender
+            .send(Request::Append {
+                records: records.to_vec(),
+                reply,
+            })
+            .map_err(|_| FragmentIoError::io("fragment append actor stopped"))?;
+        receipt
+            .recv()
+            .map_err(|_| FragmentIoError::io("fragment append actor dropped receipt"))?
     }
 
-    /// Opens a streaming writer for one fragment: shards are appended to a temp
-    /// file as they arrive, and the fragment becomes live (rename + directory
-    /// fsync) only on [`FragmentWriter::commit`]. This is how the coordinator
-    /// streams a large fragment stripe by stripe without buffering it whole, so
-    /// DRAM stays at one stripe regardless of object size. Budget is reserved as
-    /// each shard is written and released if the writer is dropped without a
-    /// commit, so the hard ceiling holds even mid-stream.
+    /// Opens a bounded streaming accumulator that commits through the actor.
     pub fn open_fragment(&self, key: &FragmentKey) -> Result<FragmentWriter, FragmentIoError> {
-        let path = self.fragment_path(key);
-        let parent = path
-            .parent()
-            .ok_or_else(|| FragmentIoError::io(format!("{} has no parent", path.display())))?
-            .to_path_buf();
-        fs::create_dir_all(&parent).map_err(|error| {
-            FragmentIoError::io(format!("create fragment dir {}: {error}", parent.display()))
-        })?;
-        let temp_id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("tmp.{}.{temp_id}", std::process::id()));
-        let file = File::create(&tmp)
-            .map_err(|error| FragmentIoError::io(format!("create {}: {error}", tmp.display())))?;
         Ok(FragmentWriter {
             store: self.clone(),
-            file: Some(file),
-            tmp,
-            path,
-            parent,
-            written: 0,
-            hasher: crc32c::Crc32cHasher::default(),
+            key: key.clone(),
+            bytes: Vec::new(),
             committed: false,
         })
     }
 
-    /// Loads one fragment by key, returning `None` when this node lacks it. The
-    /// returned [`LoadedFragment`] carries the payload and the checksum read from
-    /// the on-disk trailer, so the caller verifies before use (#220). A file too
-    /// short to hold a trailer is a corrupt/partial write and is an IO error.
+    /// Loads a live record from the disposable index rebuilt by segment scan.
     pub fn load_fragment(
         &self,
         key: &FragmentKey,
     ) -> Result<Option<LoadedFragment>, FragmentIoError> {
-        let path = self.fragment_path(key);
-        match fs::read(&path) {
-            Ok(raw) => Ok(Some(split_trailer(&path, raw)?)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(FragmentIoError::io(format!(
-                "read fragment {}: {error}",
-                path.display()
-            ))),
-        }
+        self.index
+            .read()
+            .map_err(|_| FragmentIoError::io("fragment index lock poisoned"))
+            .map(|index| index.get(key).cloned())
     }
 
-    /// Verifies one stored fragment's integrity (#220): [`FragmentHealth::Healthy`]
-    /// when its payload matches its trailer, [`FragmentHealth::Corrupt`] when it
-    /// does not, [`FragmentHealth::Missing`] when the fragment is absent. The
-    /// scrubber calls this per fragment on a schedule.
+    /// Reports the checksum health of one live record.
     pub fn verify_fragment(&self, key: &FragmentKey) -> Result<FragmentHealth, FragmentIoError> {
-        match self.load_fragment(key)? {
-            None => Ok(FragmentHealth::Missing),
-            Some(loaded) if loaded.is_healthy() => Ok(FragmentHealth::Healthy),
-            Some(_) => Ok(FragmentHealth::Corrupt),
-        }
+        Ok(match self.load_fragment(key)? {
+            Some(fragment) if fragment.is_healthy() => FragmentHealth::Healthy,
+            Some(_) => FragmentHealth::Corrupt,
+            None => FragmentHealth::Missing,
+        })
     }
 
-    /// Lists the keys of every fragment this node currently stores, so the
-    /// scrubber can walk them (#220). Reads the object directory tree; a `.tmp`
-    /// (crashed write) is skipped because it is not a live fragment.
+    /// Lists live keys from the rebuilt read index.
     pub fn list_fragment_keys(&self) -> Vec<FragmentKey> {
-        list_fragment_keys(&self.root.join("objects"))
+        self.index
+            .read()
+            .map(|index| index.keys().cloned().collect())
+            .unwrap_or_default()
     }
 
-    /// Deletes one fragment if present, releasing its bytes back to the budget.
-    /// Missing is success (idempotent) — a repair or propagation cleanup may run
-    /// more than once.
+    /// Appends a durable tombstone before removing one key from the index.
     pub fn delete_fragment(&self, key: &FragmentKey) -> Result<(), FragmentIoError> {
-        let path = self.fragment_path(key);
-        let len = self.fragment_len(key);
-        match fs::remove_file(&path) {
-            Ok(()) => {
-                self.used.fetch_sub(len, Ordering::AcqRel);
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(FragmentIoError::io(format!(
-                "delete fragment {}: {error}",
-                path.display()
-            ))),
-        }
+        self.delete_keys(vec![key.clone()])
     }
 
-    /// Deletes every fragment stored for `object_id`, releasing their bytes back
-    /// to the budget (propagation cleanup). Missing is success.
+    /// Appends durable tombstones for every live fragment of one object.
     pub fn delete_object(&self, object_id: &str) -> Result<(), FragmentIoError> {
-        let dir = self.object_dir(object_id);
-        let freed = dir_bytes(&dir);
-        match fs::remove_dir_all(&dir) {
-            Ok(()) => {
-                self.used.fetch_sub(freed, Ordering::AcqRel);
-                Ok(())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(FragmentIoError::io(format!(
-                "delete object dir {}: {error}",
-                dir.display()
-            ))),
+        let keys = self
+            .index
+            .read()
+            .map_err(|_| FragmentIoError::io("fragment index lock poisoned"))?
+            .keys()
+            .filter(|key| key.object_id == object_id)
+            .cloned()
+            .collect();
+        self.delete_keys(keys)
+    }
+
+    /// Sends a durable tombstone batch to the append actor.
+    fn delete_keys(&self, keys: Vec<FragmentKey>) -> Result<(), FragmentIoError> {
+        if keys.is_empty() {
+            return Ok(());
         }
-    }
-
-    /// Charges `len` bytes against the current ceiling, refusing with
-    /// [`FragmentIoError::Full`] if it would exceed it. The check and the charge
-    /// are one compare-and-swap loop, so two concurrent writers can never both
-    /// slip past the ceiling. The ceiling is re-read each attempt, so a
-    /// concurrent poll that lowered it takes effect at once — but a lowered
-    /// ceiling only refuses *new* writes; bytes already charged stay put (an
-    /// acked fragment is never dropped by budget pressure).
-    fn reserve(&self, len: u64) -> Result<(), FragmentIoError> {
-        let mut used = self.used.load(Ordering::Acquire);
-        loop {
-            let ceiling = self.ceiling.load(Ordering::Acquire);
-            let next = used.saturating_add(len);
-            if next > ceiling {
-                return Err(FragmentIoError::Full {
-                    needed: len,
-                    available: ceiling.saturating_sub(used),
-                });
-            }
-            match self
-                .used
-                .compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire)
-            {
-                Ok(_) => return Ok(()),
-                Err(observed) => used = observed,
-            }
-        }
-    }
-
-    /// Releases `len` bytes back to the budget (used by [`FragmentWriter`] to
-    /// undo a partial stream that never commits).
-    fn release(&self, len: u64) {
-        if len > 0 {
-            self.used.fetch_sub(len, Ordering::AcqRel);
-        }
-    }
-
-    /// The payload byte length of a stored fragment (its on-disk size minus the
-    /// checksum trailer), or 0 if absent. The budget tracks payload bytes, so
-    /// the fixed trailer overhead never counts against the sub-budget (#220).
-    fn fragment_len(&self, key: &FragmentKey) -> u64 {
-        self.fragment_len_by_path(&self.fragment_path(key))
-    }
-
-    /// Payload length for an already-resolved fragment path.
-    fn fragment_len_by_path(&self, path: &Path) -> u64 {
-        fs::metadata(path)
-            .map(|m| payload_len(m.len()))
-            .unwrap_or(0)
-    }
-
-    /// The directory holding one object's fragments.
-    fn object_dir(&self, object_id: &str) -> PathBuf {
-        self.root.join("objects").join(hex_component(object_id))
-    }
-
-    /// The filesystem path for a fragment key.
-    fn fragment_path(&self, key: &FragmentKey) -> PathBuf {
-        self.object_dir(&key.object_id)
-            .join(format!("fragment-{:05}.bin", key.index))
+        let (reply, receipt) = mpsc::channel();
+        self.sender
+            .send(Request::Delete { keys, reply })
+            .map_err(|_| FragmentIoError::io("fragment append actor stopped"))?;
+        receipt
+            .recv()
+            .map_err(|_| FragmentIoError::io("fragment append actor dropped receipt"))?
     }
 }
 
-/// A streaming writer for one fragment (append shards, then commit).
-///
-/// Shards are appended to a temp file with [`FragmentWriter::append`], each
-/// append reserving its bytes against the store budget. [`FragmentWriter::commit`]
-/// fsyncs the file, renames it into place, and fsyncs the directory — only then
-/// is the fragment durable and live. Dropping the writer without committing
-/// releases the reserved bytes and removes the temp file, so a failed stream
-/// neither leaks budget nor leaves a live fragment.
+/// Streamed fragment builder; no temporary file or filesystem path exists.
 pub struct FragmentWriter {
-    /// The owning store (for budget reserve/release).
+    /// Actor-backed destination.
     store: LocalFragmentStore,
-    /// The open temp file; taken on commit.
-    file: Option<File>,
-    /// Temp path being written.
-    tmp: PathBuf,
-    /// Final fragment path.
-    path: PathBuf,
-    /// The fragment's parent directory (fsynced on commit).
-    parent: PathBuf,
-    /// Bytes reserved and written so far.
-    written: u64,
-    /// Running CRC32C over the appended payload; finalized into the trailer on
-    /// commit so the fragment carries its integrity check (#220).
-    hasher: crc32c::Crc32cHasher,
-    /// Set once committed, so `Drop` does not release/clean up.
+    /// Destination fragment identity.
+    key: FragmentKey,
+    /// Bounded caller-provided shards until commit.
+    bytes: Vec<u8>,
+    /// Prevents reuse after the one durable commit.
     committed: bool,
 }
 
 impl FragmentWriter {
-    /// Appends one shard, reserving its bytes against the budget first, and folds
-    /// it into the running checksum. Refuses with [`FragmentIoError::Full`] if the
-    /// ceiling would be crossed — the stream is abandoned and the partial
-    /// fragment never becomes live.
+    /// Adds one shard while respecting the current payload ceiling.
     pub fn append(&mut self, shard: &[u8]) -> Result<(), FragmentIoError> {
-        use std::hash::Hasher;
-        let len = shard.len() as u64;
-        self.store.reserve(len)?;
-        let Some(file) = self.file.as_mut() else {
-            self.store.release(len);
-            return Err(FragmentIoError::io("fragment writer already committed"));
-        };
-        match file.write_all(shard) {
-            Ok(()) => {
-                self.written += len;
-                self.hasher.write(shard);
-                Ok(())
-            }
-            Err(error) => {
-                self.store.release(len);
-                Err(FragmentIoError::io(format!(
-                    "append {}: {error}",
-                    self.tmp.display()
-                )))
-            }
+        let next = u64::try_from(self.bytes.len().saturating_add(shard.len()))
+            .map_err(|_| FragmentIoError::io("fragment stream is too large"))?;
+        if !self.store.has_headroom(next) {
+            return Err(FragmentIoError::Full {
+                needed: next,
+                available: self
+                    .store
+                    .budget_bytes()
+                    .saturating_sub(self.store.used_bytes()),
+            });
         }
+        self.bytes.extend_from_slice(shard);
+        Ok(())
     }
 
-    /// Writes the checksum trailer, fsyncs the fragment, renames it into place,
-    /// and fsyncs the directory, making the fragment durable and live. The
-    /// trailer is the CRC32C of everything appended, so a later load can detect a
-    /// bit-flip (#220). Consumes the writer.
+    /// Submits the concatenated shards to the append actor's group commit.
     pub fn commit(mut self) -> Result<(), FragmentIoError> {
-        use std::hash::Hasher;
-        let mut file = self
-            .file
-            .take()
-            .ok_or_else(|| FragmentIoError::io("fragment writer already committed"))?;
-        let checksum = self.hasher.finish() as u32;
-        file.write_all(&checksum.to_le_bytes()).map_err(|error| {
-            FragmentIoError::io(format!("write trailer {}: {error}", self.tmp.display()))
-        })?;
-        file.sync_all().map_err(|error| {
-            FragmentIoError::io(format!("fsync {}: {error}", self.tmp.display()))
-        })?;
-        drop(file);
-        let _commit = self
-            .store
-            .commit_lock
-            .lock()
-            .map_err(|_| FragmentIoError::io("fragment replacement lock poisoned"))?;
-        let replaced = self.store.fragment_len_by_path(&self.path);
-        fs::rename(&self.tmp, &self.path).map_err(|error| {
-            FragmentIoError::io(format!(
-                "rename {} to {}: {error}",
-                self.tmp.display(),
-                self.path.display()
-            ))
-        })?;
-        sync_dir(&self.parent)?;
-        self.store.used.fetch_sub(replaced, Ordering::AcqRel);
+        if self.committed {
+            return Err(FragmentIoError::io("fragment writer already committed"));
+        }
+        self.store.append_batch(&[FragmentRecord::new(
+            self.key.clone(),
+            Bytes::from(std::mem::take(&mut self.bytes)),
+        )])?;
         self.committed = true;
         Ok(())
     }
 }
 
-impl Drop for FragmentWriter {
-    /// Releases the reserved budget and removes the temp file if the stream was
-    /// never committed, so an abandoned write leaks neither budget nor a file.
-    fn drop(&mut self) {
-        if !self.committed {
-            self.store.release(self.written);
-            let _ = fs::remove_file(&self.tmp);
+/// Durable segment state reconstructed before the actor starts.
+struct Recovered {
+    /// Live records after applying only committed groups.
+    index: HashMap<FragmentKey, LoadedFragment>,
+    /// Last segment number, if any.
+    segment: Option<u64>,
+    /// Last durable group boundary in that segment.
+    position: u64,
+}
+
+/// The sole owner of segment files and group commit ordering.
+struct AppendActor {
+    /// Segment directory.
+    dir: PathBuf,
+    /// Current segment number.
+    number: u64,
+    /// Current durable append offset.
+    position: u64,
+    /// Open preallocated segment.
+    file: File,
+}
+
+impl AppendActor {
+    /// Opens the last recovered segment or allocates a first segment.
+    fn new(dir: PathBuf, recovered: Recovered) -> Self {
+        let number = recovered.segment.unwrap_or(0);
+        let (file, position) = open_segment(&dir, number, recovered.position)
+            .unwrap_or_else(|error| panic!("open fragment segment: {error}"));
+        Self {
+            dir,
+            number,
+            position,
+            file,
         }
     }
-}
 
-/// Sums the bytes of every fragment file under `root/objects`, ignoring the
-/// temp files a crash may have left. Used to rebuild the budget count on open.
-fn scan_used_bytes(root: &Path) -> u64 {
-    dir_bytes(&root.join("objects"))
-}
+    /// Runs until every sender is dropped, batching all currently queued calls.
+    fn run(
+        mut self,
+        receiver: mpsc::Receiver<Request>,
+        index: Arc<RwLock<HashMap<FragmentKey, LoadedFragment>>>,
+        used: Arc<AtomicU64>,
+        ceiling: Arc<AtomicU64>,
+    ) {
+        while let Ok(first) = receiver.recv() {
+            let mut requests = vec![first];
+            while let Ok(request) = receiver.try_recv() {
+                requests.push(request);
+            }
+            self.commit(requests, &index, &used, &ceiling);
+        }
+    }
 
-/// The payload byte count of a fragment file of on-disk size `file_len`: the
-/// file minus its fixed checksum trailer. A file too short to hold a trailer
-/// counts as zero payload (a crashed partial write).
-fn payload_len(file_len: u64) -> u64 {
-    file_len.saturating_sub(CHECKSUM_TRAILER_LEN as u64)
-}
-
-/// Sums the payload length of every `.bin` fragment file beneath `dir`
-/// (recursively over per-object subdirectories), excluding each file's checksum
-/// trailer so the budget tracks payload bytes (#220). A `.tmp` file (a crashed
-/// write) is not counted — it never became a live fragment.
-fn dir_bytes(dir: &Path) -> u64 {
-    let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(current) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&current) else {
-            continue;
+    /// Validates, writes, and syncs one compatible queue drain before replying.
+    fn commit(
+        &mut self,
+        requests: Vec<Request>,
+        index: &RwLock<HashMap<FragmentKey, LoadedFragment>>,
+        used: &AtomicU64,
+        ceiling: &AtomicU64,
+    ) {
+        let mut state = match index.write() {
+            Ok(state) => state,
+            Err(_) => {
+                for request in requests {
+                    reply_error(request, FragmentIoError::io("fragment index lock poisoned"));
+                }
+                return;
+            }
         };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata() else {
-                continue;
-            };
-            if meta.is_dir() {
-                stack.push(path);
-            } else if path.extension().and_then(|x| x.to_str()) == Some("bin") {
-                total += payload_len(meta.len());
+        let mut staged = state.clone();
+        let mut staged_used = index_bytes(&staged);
+        let mut accepted = Vec::new();
+        let mut bytes = Vec::new();
+        for request in requests {
+            match stage_request(
+                &request,
+                &mut staged,
+                &mut staged_used,
+                ceiling.load(Ordering::Acquire),
+                &mut bytes,
+            ) {
+                Ok(()) => accepted.push(request),
+                Err(error) => reply_error(request, error),
             }
         }
+        if accepted.is_empty() {
+            return;
+        }
+        let record_count = accepted
+            .iter()
+            .map(|request| match request {
+                Request::Append { records, .. } => records.len(),
+                Request::Delete { keys, .. } => keys.len(),
+            })
+            .sum();
+        let marker = commit_marker(&bytes, record_count);
+        bytes.extend_from_slice(&marker);
+        let result = self.write_group(&bytes);
+        if result.is_ok() {
+            *state = staged;
+            used.store(staged_used, Ordering::Release);
+        }
+        let failure = result.err().map(|error| error.to_string());
+        for request in accepted {
+            let receipt = match &failure {
+                Some(error) => Err(FragmentIoError::io(error.clone())),
+                None => Ok(()),
+            };
+            reply_result(request, receipt);
+        }
     }
-    total
+
+    /// Appends a full group then makes that exact group durable with one sync.
+    fn write_group(&mut self, bytes: &[u8]) -> Result<(), FragmentIoError> {
+        if self.position.saturating_add(bytes.len() as u64) > SEGMENT_BYTES && self.position > 0 {
+            self.number = self.number.saturating_add(1);
+            let (file, position) = open_segment(&self.dir, self.number, 0)?;
+            self.file = file;
+            self.position = position;
+        }
+        self.file
+            .seek(SeekFrom::Start(self.position))
+            .map_err(|error| FragmentIoError::io(format!("seek fragment segment: {error}")))?;
+        self.file
+            .write_all(bytes)
+            .map_err(|error| FragmentIoError::io(format!("append fragment segment: {error}")))?;
+        self.file
+            .sync_data()
+            .map_err(|error| FragmentIoError::io(format!("fdatasync fragment segment: {error}")))?;
+        self.position = self.position.saturating_add(bytes.len() as u64);
+        Ok(())
+    }
 }
 
-/// Splits a fragment file's raw bytes into its payload and the checksum trailer
-/// (#220). A file too short to hold the fixed trailer is a corrupt or partial
-/// write and is an IO error, never silently read as an empty fragment.
-fn split_trailer(path: &Path, mut raw: Vec<u8>) -> Result<LoadedFragment, FragmentIoError> {
-    if raw.len() < CHECKSUM_TRAILER_LEN {
-        return Err(FragmentIoError::io(format!(
-            "fragment {} is {} bytes, too short for a checksum trailer",
-            path.display(),
-            raw.len()
-        )));
+/// Applies one request to a prospective index and encodes its durable records.
+fn stage_request(
+    request: &Request,
+    index: &mut HashMap<FragmentKey, LoadedFragment>,
+    used: &mut u64,
+    ceiling: u64,
+    encoded: &mut Vec<u8>,
+) -> Result<(), FragmentIoError> {
+    match request {
+        Request::Append { records, .. } => {
+            let mut trial = index.clone();
+            let mut trial_used = *used;
+            let mut trial_encoded = Vec::new();
+            for record in records {
+                let old = trial.insert(
+                    record.key.clone(),
+                    LoadedFragment {
+                        bytes: record.bytes.clone(),
+                        checksum: record.checksum,
+                    },
+                );
+                trial_used = trial_used
+                    .saturating_sub(old.map_or(0, |fragment| fragment.bytes.len() as u64));
+                trial_used = trial_used.saturating_add(record.bytes.len() as u64);
+                if trial_used > ceiling {
+                    return Err(FragmentIoError::Full {
+                        needed: record.bytes.len() as u64,
+                        available: ceiling.saturating_sub(*used),
+                    });
+                }
+                trial_encoded.extend_from_slice(&encode_record(
+                    1,
+                    &record.key,
+                    record.checksum,
+                    &record.bytes,
+                )?);
+            }
+            *index = trial;
+            *used = trial_used;
+            encoded.extend_from_slice(&trial_encoded);
+            Ok(())
+        }
+        Request::Delete { keys, .. } => {
+            for key in keys {
+                if let Some(old) = index.remove(key) {
+                    *used = used.saturating_sub(old.bytes.len() as u64);
+                }
+                encoded.extend_from_slice(&encode_record(2, key, 0, &[])?);
+            }
+            Ok(())
+        }
     }
-    let trailer = raw.split_off(raw.len() - CHECKSUM_TRAILER_LEN);
-    let checksum = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
-    Ok(LoadedFragment {
-        bytes: Bytes::from(raw),
-        checksum,
+}
+
+/// Returns the durable group marker that lets recovery reject a torn tail.
+fn commit_marker(records: &[u8], request_count: usize) -> Vec<u8> {
+    let mut marker = Vec::with_capacity(12);
+    marker.extend_from_slice(&COMMIT_MAGIC);
+    marker.extend_from_slice(&(request_count as u32).to_le_bytes());
+    marker.extend_from_slice(&fragment_checksum(records).to_le_bytes());
+    marker
+}
+
+/// Encodes one complete checksummed log record.
+fn encode_record(
+    kind: u8,
+    key: &FragmentKey,
+    checksum: u32,
+    payload: &[u8],
+) -> Result<Vec<u8>, FragmentIoError> {
+    let name = key.object_id.as_bytes();
+    let name_len = u32::try_from(name.len())
+        .map_err(|_| FragmentIoError::io("fragment object id is too long"))?;
+    let index =
+        u64::try_from(key.index).map_err(|_| FragmentIoError::io("fragment index is too large"))?;
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| FragmentIoError::io("fragment payload is too large"))?;
+    let mut record = Vec::with_capacity(4 + 1 + 4 + 8 + 8 + 4 + name.len() + payload.len() + 4);
+    record.extend_from_slice(&RECORD_MAGIC);
+    record.push(kind);
+    record.extend_from_slice(&name_len.to_le_bytes());
+    record.extend_from_slice(&index.to_le_bytes());
+    record.extend_from_slice(&payload_len.to_le_bytes());
+    record.extend_from_slice(&checksum.to_le_bytes());
+    record.extend_from_slice(name);
+    record.extend_from_slice(payload);
+    record.extend_from_slice(&fragment_checksum(&record).to_le_bytes());
+    Ok(record)
+}
+
+/// Opens a preallocated segment at the requested committed offset.
+fn open_segment(dir: &Path, number: u64, position: u64) -> Result<(File, u64), FragmentIoError> {
+    let path = dir.join(format!("segment-{number:020}.log"));
+    let fresh = !path.exists();
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| FragmentIoError::io(format!("open {}: {error}", path.display())))?;
+    if fresh {
+        file.set_len(SEGMENT_BYTES).map_err(|error| {
+            FragmentIoError::io(format!("preallocate {}: {error}", path.display()))
+        })?;
+        file.sync_all().map_err(|error| {
+            FragmentIoError::io(format!("sync new segment {}: {error}", path.display()))
+        })?;
+    }
+    Ok((file, position))
+}
+
+/// Scans all segments in order and applies only records followed by valid commits.
+fn scan_segments(dir: &Path) -> Result<Recovered, FragmentIoError> {
+    let mut paths: Vec<_> = fs::read_dir(dir)
+        .map_err(|error| FragmentIoError::io(format!("list {}: {error}", dir.display())))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| segment_number(&entry.path()).map(|number| (number, entry.path())))
+        .collect();
+    paths.sort_by_key(|(number, _)| *number);
+    let mut index = HashMap::new();
+    let mut segment = None;
+    let mut position = 0;
+    for (number, path) in paths {
+        let (operations, durable) = scan_segment(&path)?;
+        for operation in operations {
+            apply_operation(&mut index, operation);
+        }
+        segment = Some(number);
+        position = durable;
+    }
+    Ok(Recovered {
+        index,
+        segment,
+        position,
     })
 }
 
-/// Walks `dir` (the store's `objects` root) and rebuilds the [`FragmentKey`] of
-/// every live `.bin` fragment: the object id from the hex-encoded subdirectory
-/// name, the index from the `fragment-NNNNN.bin` filename (#220).
-fn list_fragment_keys(dir: &Path) -> Vec<FragmentKey> {
-    let mut keys = Vec::new();
-    let Ok(objects) = fs::read_dir(dir) else {
-        return keys;
-    };
-    for object_entry in objects.flatten() {
-        let object_path = object_entry.path();
-        if !object_entry
-            .file_type()
-            .map(|t| t.is_dir())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-        let Some(object_id) = object_entry
-            .file_name()
-            .to_str()
-            .and_then(hex_component_decode)
-        else {
-            continue;
-        };
-        let Ok(frags) = fs::read_dir(&object_path) else {
-            continue;
-        };
-        for frag in frags.flatten() {
-            let name = frag.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some(index) = name
-                .strip_prefix("fragment-")
-                .and_then(|rest| rest.strip_suffix(".bin"))
-                .and_then(|digits| digits.parse::<usize>().ok())
-            {
-                keys.push(FragmentKey {
-                    object_id: object_id.clone(),
-                    index,
-                });
-            }
-        }
-    }
-    keys
+/// Extracts the numeric segment ordering key from one path.
+fn segment_number(path: &Path) -> Option<u64> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix("segment-")?
+        .strip_suffix(".log")?
+        .parse()
+        .ok()
 }
 
-/// Writes `bytes` to `path` durably with a trailing CRC32C, so a later load can
-/// detect a bit-flip (#220): write `payload || checksum` to a temp file, fsync
-/// it, rename into place, then fsync the directory so the rename survives a
-/// crash.
-fn write_fsynced(path: &Path, bytes: &[u8], checksum: u32) -> Result<(), FragmentIoError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| FragmentIoError::io(format!("{} has no parent", path.display())))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        FragmentIoError::io(format!("create fragment dir {}: {error}", parent.display()))
-    })?;
-    let tmp = path.with_extension("tmp");
-    {
-        let mut file = File::create(&tmp)
-            .map_err(|error| FragmentIoError::io(format!("create {}: {error}", tmp.display())))?;
-        file.write_all(bytes)
-            .map_err(|error| FragmentIoError::io(format!("write {}: {error}", tmp.display())))?;
-        file.write_all(&checksum.to_le_bytes()).map_err(|error| {
-            FragmentIoError::io(format!("write trailer {}: {error}", tmp.display()))
-        })?;
-        file.sync_all()
-            .map_err(|error| FragmentIoError::io(format!("fsync {}: {error}", tmp.display())))?;
-    }
-    fs::rename(&tmp, path).map_err(|error| {
-        FragmentIoError::io(format!(
-            "rename {} to {}: {error}",
-            tmp.display(),
-            path.display()
-        ))
-    })?;
-    sync_dir(parent)
+/// One recovered operation before it is applied to the volatile index.
+enum Operation {
+    /// Insert or replace one fragment.
+    Upsert(FragmentKey, LoadedFragment),
+    /// Remove one fragment.
+    Delete(FragmentKey),
 }
 
-/// Fsyncs a directory so a create or rename within it is durable.
-fn sync_dir(path: &Path) -> Result<(), FragmentIoError> {
+/// Scans one preallocated segment up through its final valid group marker.
+fn scan_segment(path: &Path) -> Result<(Vec<Operation>, u64), FragmentIoError> {
+    let mut bytes = Vec::new();
     File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| FragmentIoError::io(format!("fsync dir {}: {error}", path.display())))
+        .and_then(|mut file| file.read_to_end(&mut bytes))
+        .map_err(|error| FragmentIoError::io(format!("read {}: {error}", path.display())))?;
+    let mut offset = 0usize;
+    let mut durable = 0u64;
+    let mut committed = Vec::new();
+    let mut pending = Vec::new();
+    let mut group_bytes = Vec::new();
+    while offset + 4 <= bytes.len() {
+        let magic = &bytes[offset..offset + 4];
+        if magic == COMMIT_MAGIC {
+            if offset + 12 > bytes.len() {
+                break;
+            }
+            let count = u32::from_le_bytes(
+                bytes[offset + 4..offset + 8]
+                    .try_into()
+                    .map_err(|_| FragmentIoError::io("invalid commit count"))?,
+            ) as usize;
+            let checksum = u32::from_le_bytes(
+                bytes[offset + 8..offset + 12]
+                    .try_into()
+                    .map_err(|_| FragmentIoError::io("invalid commit checksum"))?,
+            );
+            if count != pending.len() || checksum != fragment_checksum(&group_bytes) {
+                break;
+            }
+            committed.append(&mut pending);
+            group_bytes.clear();
+            offset += 12;
+            durable = offset as u64;
+            continue;
+        }
+        if magic != RECORD_MAGIC {
+            break;
+        }
+        let Some((operation, end)) = decode_record(&bytes, offset)? else {
+            break;
+        };
+        group_bytes.extend_from_slice(&bytes[offset..end]);
+        pending.push(operation);
+        offset = end;
+    }
+    Ok((committed, durable))
 }
 
-/// Encodes an object id as a path-safe lowercase hex component so arbitrary
-/// key bytes never escape the store directory.
-fn hex_component(input: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(input.len() * 2);
-    for &byte in input.as_bytes() {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
+/// Decodes one complete record, returning `None` for a torn tail.
+fn decode_record(
+    bytes: &[u8],
+    offset: usize,
+) -> Result<Option<(Operation, usize)>, FragmentIoError> {
+    const HEADER: usize = 4 + 1 + 4 + 8 + 8 + 4;
+    if offset + HEADER + 4 > bytes.len() {
+        return Ok(None);
     }
-    out
-}
-
-/// Decodes a hex object-directory component back to the object id, or `None` if
-/// it is not valid hex. The inverse of [`hex_component`], used when the scrubber
-/// walks the store and rebuilds fragment keys from directory names (#220).
-fn hex_component_decode(input: &str) -> Option<String> {
-    if !input.len().is_multiple_of(2) {
-        return None;
-    }
-    let nibble = |b: u8| match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        _ => None,
+    let kind = bytes[offset + 4];
+    let name_len = u32::from_le_bytes(
+        bytes[offset + 5..offset + 9]
+            .try_into()
+            .map_err(|_| FragmentIoError::io("invalid name length"))?,
+    ) as usize;
+    let index = u64::from_le_bytes(
+        bytes[offset + 9..offset + 17]
+            .try_into()
+            .map_err(|_| FragmentIoError::io("invalid index"))?,
+    );
+    let payload_len = u64::from_le_bytes(
+        bytes[offset + 17..offset + 25]
+            .try_into()
+            .map_err(|_| FragmentIoError::io("invalid payload length"))?,
+    ) as usize;
+    let checksum = u32::from_le_bytes(
+        bytes[offset + 25..offset + 29]
+            .try_into()
+            .map_err(|_| FragmentIoError::io("invalid payload checksum"))?,
+    );
+    let end = offset
+        .checked_add(HEADER)
+        .and_then(|value| value.checked_add(name_len))
+        .and_then(|value| value.checked_add(payload_len))
+        .and_then(|value| value.checked_add(4));
+    let Some(end) = end.filter(|end| *end <= bytes.len()) else {
+        return Ok(None);
     };
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(input.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        let hi = nibble(pair[0])?;
-        let lo = nibble(pair[1])?;
-        out.push((hi << 4) | lo);
+    let stored = u32::from_le_bytes(
+        bytes[end - 4..end]
+            .try_into()
+            .map_err(|_| FragmentIoError::io("invalid record checksum"))?,
+    );
+    if stored != fragment_checksum(&bytes[offset..end - 4]) {
+        return Ok(None);
     }
-    String::from_utf8(out).ok()
+    let name_end = offset + HEADER + name_len;
+    let key = FragmentKey {
+        object_id: String::from_utf8(bytes[offset + HEADER..name_end].to_vec())
+            .map_err(|_| FragmentIoError::io("fragment object id is not utf-8"))?,
+        index: usize::try_from(index)
+            .map_err(|_| FragmentIoError::io("fragment index does not fit usize"))?,
+    };
+    let operation = match kind {
+        1 => Operation::Upsert(
+            key,
+            LoadedFragment {
+                bytes: Bytes::copy_from_slice(&bytes[name_end..end - 4]),
+                checksum,
+            },
+        ),
+        2 if payload_len == 0 => Operation::Delete(key),
+        _ => return Ok(None),
+    };
+    Ok(Some((operation, end)))
+}
+
+/// Applies a committed operation to the recovered or live read index.
+fn apply_operation(index: &mut HashMap<FragmentKey, LoadedFragment>, operation: Operation) {
+    match operation {
+        Operation::Upsert(key, value) => {
+            index.insert(key, value);
+        }
+        Operation::Delete(key) => {
+            index.remove(&key);
+        }
+    }
+}
+
+/// Totals payload bytes represented by an index.
+fn index_bytes(index: &HashMap<FragmentKey, LoadedFragment>) -> u64 {
+    index
+        .values()
+        .map(|fragment| fragment.bytes.len() as u64)
+        .sum()
+}
+
+/// Delivers the same result to either kind of request.
+fn reply_result(request: Request, result: Result<(), FragmentIoError>) {
+    match request {
+        Request::Append { reply, .. } | Request::Delete { reply, .. } => {
+            let _ = reply.send(result);
+        }
+    }
+}
+
+/// Delivers a cloned actor failure without retaining partial acknowledgement.
+fn reply_error(request: Request, error: FragmentIoError) {
+    reply_result(request, Err(error));
 }
 
 #[cfg(test)]
 mod tests {
+    //! Crash, batching, and recovery contracts for the durable append actor.
+
     use super::*;
+    use std::sync::atomic::AtomicU64;
 
-    /// A unique scratch directory per test.
-    fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("verglas-frag-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create scratch");
-        dir
+    /// Creates a unique test directory.
+    fn scratch(name: &str) -> Scratch {
+        let path = std::env::temp_dir().join(format!("verglas-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create scratch directory");
+        Scratch(path)
     }
 
-    /// A stored fragment reads back byte-identical, and its load carries the
-    /// checksum computed over the payload (#220).
-    #[test]
-    fn fragment_round_trips() {
-        let store = LocalFragmentStore::new(scratch("roundtrip"));
-        let record = FragmentRecord::new(
-            FragmentKey {
-                object_id: "bucket/key/etag".to_owned(),
-                index: 2,
-            },
-            Bytes::from_static(b"fragment-bytes"),
-        );
-        store.store_fragment(&record).expect("store");
-        let got = store
-            .load_fragment(&record.key)
-            .expect("load")
-            .expect("present");
-        assert_eq!(got.bytes, record.bytes);
-        assert_eq!(
-            got.checksum, record.checksum,
-            "checksum survives round-trip"
-        );
-        assert_eq!(
-            got.checksum,
-            crate::fragments::fragment_checksum(&record.bytes)
-        );
-    }
+    /// Temporary test directory removed when the test ends.
+    struct Scratch(PathBuf);
 
-    /// A durable batch writes self-describing segment records before exposing
-    /// either indexed fragment. This proves the record journal, rather than a
-    /// RAM receipt, is the local acknowledgement substrate.
-    #[test]
-    fn append_batch_persists_self_describing_records() {
-        let store = LocalFragmentStore::new(scratch("append-batch"));
-        let records = vec![
-            FragmentRecord::new(
-                FragmentKey {
-                    object_id: "txn-a".to_owned(),
-                    index: 0,
-                },
-                Bytes::from_static(b"first"),
-            ),
-            FragmentRecord::new(
-                FragmentKey {
-                    object_id: "txn-b".to_owned(),
-                    index: 1,
-                },
-                Bytes::from_static(b"second"),
-            ),
-        ];
-        store.append_batch(&records).expect("durable append batch");
-        let raw = std::fs::read(store.root().join("segments/open.log")).expect("segment");
-        assert_eq!(
-            raw.windows(SEGMENT_MAGIC.len())
-                .filter(|window| *window == SEGMENT_MAGIC)
-                .count(),
-            2
-        );
-        for record in &records {
-            assert_eq!(
-                store
-                    .load_fragment(&record.key)
-                    .expect("load")
-                    .expect("present")
-                    .bytes,
-                record.bytes
-            );
+    impl Scratch {
+        /// Returns the directory path.
+        fn path(&self) -> &Path {
+            &self.0
         }
     }
 
-    /// A byte flipped on disk after the store makes the fragment fail
-    /// verification: the trailer still describes the original bytes, so the
-    /// corruption is caught (#220).
-    #[test]
-    fn disk_bit_flip_is_detected_by_verify() {
-        let store = LocalFragmentStore::new(scratch("bitflip"));
-        let key = FragmentKey {
-            object_id: "obj".to_owned(),
-            index: 0,
-        };
-        store
-            .store_fragment(&FragmentRecord::new(
-                key.clone(),
-                Bytes::from(vec![7u8; 512]),
-            ))
-            .expect("store");
-        assert_eq!(
-            store.verify_fragment(&key).expect("verify"),
-            FragmentHealth::Healthy
-        );
-
-        // Flip one payload byte directly in the on-disk file.
-        let path = store.fragment_path(&key);
-        let mut raw = std::fs::read(&path).expect("read raw");
-        raw[10] ^= 0xff;
-        std::fs::write(&path, &raw).expect("rewrite corrupt");
-
-        // The load still returns the (now-corrupt) bytes plus the ORIGINAL
-        // trailer, so the mismatch is detectable, and verify reports Corrupt.
-        let loaded = store.load_fragment(&key).expect("load").expect("present");
-        assert_ne!(
-            fragment_checksum(&loaded.bytes),
-            loaded.checksum,
-            "loaded bytes no longer match the stored checksum"
-        );
-        assert_eq!(
-            store.verify_fragment(&key).expect("verify"),
-            FragmentHealth::Corrupt
-        );
-    }
-
-    /// The store lists the keys of every fragment it holds, so the scrubber can
-    /// walk them (#220).
-    #[test]
-    fn lists_stored_fragment_keys() {
-        let store = LocalFragmentStore::new(scratch("listkeys"));
-        for (object_id, index) in [("a", 0usize), ("a", 1), ("b", 0)] {
-            store
-                .store_fragment(&FragmentRecord::new(
-                    FragmentKey {
-                        object_id: object_id.to_owned(),
-                        index,
-                    },
-                    Bytes::from(vec![index as u8; 8]),
-                ))
-                .expect("store");
+    impl Drop for Scratch {
+        /// Removes only this test's unique scratch directory.
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
         }
-        let mut keys = store.list_fragment_keys();
-        keys.sort_by(|a, b| (a.object_id.as_str(), a.index).cmp(&(b.object_id.as_str(), b.index)));
-        assert_eq!(
-            keys,
-            vec![
-                FragmentKey {
-                    object_id: "a".to_owned(),
-                    index: 0
-                },
-                FragmentKey {
-                    object_id: "a".to_owned(),
-                    index: 1
-                },
-                FragmentKey {
-                    object_id: "b".to_owned(),
-                    index: 0
-                },
-            ]
-        );
     }
 
-    /// A streamed fragment computes its trailer over the concatenated shards, so
-    /// it verifies and loads back with the right checksum (#220).
-    #[test]
-    fn streamed_fragment_verifies() {
-        let store = LocalFragmentStore::new(scratch("stream-verify"));
-        let key = FragmentKey {
-            object_id: "obj".to_owned(),
-            index: 1,
-        };
-        let mut writer = store.open_fragment(&key).expect("open");
-        writer.append(b"hello ").expect("append 1");
-        writer.append(b"world").expect("append 2");
-        writer.commit().expect("commit");
-        let loaded = store.load_fragment(&key).expect("load").expect("present");
-        assert_eq!(loaded.bytes.as_ref(), b"hello world");
-        assert_eq!(loaded.checksum, fragment_checksum(b"hello world"));
-        assert_eq!(
-            store.verify_fragment(&key).expect("verify"),
-            FragmentHealth::Healthy
-        );
-    }
-
-    /// Overlapping idempotent placements use separate temporary files and the
-    /// final winner is charged exactly once.
-    #[test]
-    fn overlapping_streamed_replacements_do_not_collide_or_leak_budget() {
-        let store = LocalFragmentStore::with_budget(scratch("stream-overlap"), 1000);
-        let key = FragmentKey {
-            object_id: "same".to_owned(),
-            index: 1,
-        };
-        let mut first = store.open_fragment(&key).expect("open first");
-        let mut second = store.open_fragment(&key).expect("open second");
-        first.append(b"aaa").expect("append first");
-        second.append(b"bbbb").expect("append second");
-        first.commit().expect("commit first");
-        second.commit().expect("commit second");
-
-        assert_eq!(
-            store.used_bytes(),
-            4,
-            "only the live replacement is charged"
-        );
-        let loaded = store.load_fragment(&key).expect("load").expect("present");
-        assert_eq!(loaded.bytes.as_ref(), b"bbbb");
-    }
-
-    /// A missing fragment loads as `None`, and delete is idempotent.
-    #[test]
-    fn missing_fragment_is_none_and_delete_idempotent() {
-        let store = LocalFragmentStore::new(scratch("missing"));
-        let key = FragmentKey {
-            object_id: "obj".to_owned(),
-            index: 0,
-        };
-        assert!(store.load_fragment(&key).expect("load").is_none());
-        store.delete_fragment(&key).expect("delete missing is ok");
-    }
-
-    /// Deleting an object removes all of its fragments.
-    #[test]
-    fn delete_object_removes_all_fragments() {
-        let store = LocalFragmentStore::new(scratch("delobj"));
-        for index in 0..3 {
-            store
-                .store_fragment(&FragmentRecord::new(
-                    FragmentKey {
-                        object_id: "obj".to_owned(),
-                        index,
-                    },
-                    Bytes::from_static(b"x"),
-                ))
-                .expect("store");
-        }
-        store.delete_object("obj").expect("delete object");
-        assert!(
-            store
-                .load_fragment(&FragmentKey {
-                    object_id: "obj".to_owned(),
-                    index: 0,
-                })
-                .expect("load")
-                .is_none()
-        );
-    }
-
-    /// A record of the given size, unique per (object, index).
-    fn record(object_id: &str, index: usize, len: usize) -> FragmentRecord {
+    /// Builds a compact test record.
+    fn record(object: &str, index: usize, bytes: &'static [u8]) -> FragmentRecord {
         FragmentRecord::new(
             FragmentKey {
-                object_id: object_id.to_owned(),
+                object_id: object.to_owned(),
                 index,
             },
-            Bytes::from(vec![index as u8; len]),
+            Bytes::from_static(bytes),
         )
     }
 
-    /// A store with a byte budget refuses a fragment that would exceed the
-    /// ceiling and reports it as [`FragmentStoreFull`], not a silent success.
+    /// A group commit exposes every record after one durable receipt.
     #[test]
-    fn budget_refuses_over_ceiling() {
-        let store = LocalFragmentStore::with_budget(scratch("budget-refuse"), 100);
-        assert_eq!(store.budget_bytes(), 100);
-        assert_eq!(store.used_bytes(), 0);
-        // 60 bytes fits.
+    fn batch_is_recoverable_from_segments_without_fragment_files() {
+        let dir = scratch("fragment-batch");
+        let store = LocalFragmentStore::new(dir.path());
         store
-            .store_fragment(&record("a", 0, 60))
-            .expect("first fits");
-        assert_eq!(store.used_bytes(), 60);
-        // Another 60 would exceed 100; refused, and no bytes are charged.
-        let err = store
-            .store_fragment(&record("b", 0, 60))
-            .expect_err("over ceiling");
-        assert!(matches!(err, FragmentIoError::Full { .. }), "got {err:?}");
-        assert_eq!(store.used_bytes(), 60, "a refused write charges nothing");
-        // The refused fragment is not on disk.
-        assert!(
-            store
+            .append_batch(&[record("one", 0, b"alpha"), record("two", 1, b"beta")])
+            .expect("append");
+        drop(store);
+        let reopened = LocalFragmentStore::new(dir.path());
+        assert_eq!(
+            reopened
                 .load_fragment(&FragmentKey {
-                    object_id: "b".to_owned(),
-                    index: 0,
+                    object_id: "one".to_owned(),
+                    index: 0
+                })
+                .expect("load")
+                .expect("record")
+                .bytes,
+            Bytes::from_static(b"alpha")
+        );
+        assert!(
+            !dir.path().join("writeback-fragments/objects").exists(),
+            "segments are the only durable fragment representation"
+        );
+    }
+
+    /// A torn uncommitted suffix never appears after the durable-prefix scan.
+    #[test]
+    fn recovery_discards_torn_group_after_last_commit_marker() {
+        let dir = scratch("fragment-torn");
+        let store = LocalFragmentStore::new(dir.path());
+        store
+            .store_fragment(&record("safe", 0, b"durable"))
+            .expect("append");
+        let path = store
+            .root()
+            .join("segments/segment-00000000000000000000.log");
+        drop(store);
+        let mut file = OpenOptions::new().write(true).open(&path).expect("open");
+        let end = scan_segment(&path).expect("scan").1;
+        file.seek(SeekFrom::Start(end)).expect("seek");
+        file.write_all(
+            &encode_record(
+                1,
+                &FragmentKey {
+                    object_id: "torn".to_owned(),
+                    index: 1,
+                },
+                fragment_checksum(b"lost"),
+                b"lost",
+            )
+            .expect("encode"),
+        )
+        .expect("write torn");
+        let reopened = LocalFragmentStore::new(dir.path());
+        assert!(
+            reopened
+                .load_fragment(&FragmentKey {
+                    object_id: "safe".to_owned(),
+                    index: 0
+                })
+                .expect("load")
+                .is_some()
+        );
+        assert!(
+            reopened
+                .load_fragment(&FragmentKey {
+                    object_id: "torn".to_owned(),
+                    index: 1
                 })
                 .expect("load")
                 .is_none()
         );
     }
 
-    /// Deleting fragments releases their bytes back to the budget, so a later
-    /// write that would not have fit now fits.
+    /// Tombstones survive restart so cleaned fragments never reappear.
     #[test]
-    fn delete_releases_budget() {
-        let store = LocalFragmentStore::with_budget(scratch("budget-release"), 100);
-        store.store_fragment(&record("a", 0, 60)).expect("store a");
-        // b does not fit yet.
-        assert!(store.store_fragment(&record("b", 0, 60)).is_err());
-        // Free a; now b fits and used tracks it.
-        store
-            .delete_fragment(&FragmentKey {
-                object_id: "a".to_owned(),
-                index: 0,
-            })
-            .expect("delete a");
-        assert_eq!(store.used_bytes(), 0);
-        store
-            .store_fragment(&record("b", 0, 60))
-            .expect("store b now fits");
-        assert_eq!(store.used_bytes(), 60);
-    }
-
-    /// `has_headroom` answers whether a write of `n` bytes would fit under the
-    /// ceiling, so placement can exclude a full node before attempting a write.
-    #[test]
-    fn headroom_tracks_used_bytes() {
-        let store = LocalFragmentStore::with_budget(scratch("budget-headroom"), 100);
-        assert!(store.has_headroom(100));
-        assert!(!store.has_headroom(101));
-        store.store_fragment(&record("a", 0, 80)).expect("store");
-        assert!(store.has_headroom(20));
-        assert!(!store.has_headroom(21));
-    }
-
-    /// A refused replacement leaves both the old durable bytes and their
-    /// budget charge intact. Stable safekeeper state slots rely on replacement
-    /// never making a failed larger revision look like free capacity.
-    #[test]
-    fn refused_replacement_preserves_the_live_fragment_and_accounting() {
-        let store = LocalFragmentStore::with_budget(scratch("replacement-refusal"), 100);
+    fn durable_tombstone_prevents_resurrection() {
+        let dir = scratch("fragment-delete");
+        let store = LocalFragmentStore::new(dir.path());
         let key = FragmentKey {
-            object_id: "state-slot".to_owned(),
+            object_id: "gone".to_owned(),
             index: 0,
         };
         store
             .store_fragment(&FragmentRecord::new(
                 key.clone(),
-                Bytes::from(vec![7_u8; 80]),
+                Bytes::from_static(b"bytes"),
             ))
-            .expect("initial state");
-        let error = store
-            .store_fragment(&FragmentRecord::new(
-                key.clone(),
-                Bytes::from(vec![9_u8; 101]),
-            ))
-            .expect_err("larger replacement exceeds ceiling");
-        assert!(matches!(error, FragmentIoError::Full { .. }));
-        assert_eq!(store.used_bytes(), 80);
-        assert_eq!(
-            store
+            .expect("append");
+        store.delete_fragment(&key).expect("delete");
+        drop(store);
+        assert!(
+            LocalFragmentStore::new(dir.path())
                 .load_fragment(&key)
                 .expect("load")
-                .expect("old state")
-                .bytes,
-            Bytes::from(vec![7_u8; 80])
+                .is_none()
         );
     }
 
-    /// Reopening a store rebuilds the used-byte count from the fragments left on
-    /// disk, so the ceiling holds across a restart (crash recovery).
+    /// A current dynamic ceiling refuses records before any durable append.
     #[test]
-    fn reopen_rebuilds_used_bytes() {
-        let dir = scratch("budget-reopen");
-        {
-            let store = LocalFragmentStore::with_budget(&dir, 1000);
-            store.store_fragment(&record("a", 0, 60)).expect("store a");
-            store.store_fragment(&record("a", 1, 40)).expect("store a1");
-        }
-        let store = LocalFragmentStore::with_budget(&dir, 1000);
-        assert_eq!(store.used_bytes(), 100, "used rebuilt from disk on reopen");
-    }
-
-    /// A streamed fragment (appended shard by shard, then committed) reads back
-    /// as the concatenation of its shards and charges the budget once.
-    #[test]
-    fn streamed_fragment_round_trips_and_charges_budget() {
-        let store = LocalFragmentStore::with_budget(scratch("stream-commit"), 1000);
-        let key = FragmentKey {
-            object_id: "obj".to_owned(),
-            index: 3,
-        };
-        let mut writer = store.open_fragment(&key).expect("open");
-        writer.append(b"aaa").expect("append 1");
-        writer.append(b"bbbb").expect("append 2");
-        writer.commit().expect("commit");
-        assert_eq!(store.used_bytes(), 7);
-        let got = store.load_fragment(&key).expect("load").expect("present");
-        assert_eq!(got.bytes.as_ref(), b"aaabbbb");
-    }
-
-    /// A streaming write dropped before commit releases its reserved budget and
-    /// leaves no live fragment.
-    #[test]
-    fn dropped_stream_releases_budget() {
-        let store = LocalFragmentStore::with_budget(scratch("stream-drop"), 1000);
-        let key = FragmentKey {
-            object_id: "obj".to_owned(),
-            index: 0,
-        };
-        {
-            let mut writer = store.open_fragment(&key).expect("open");
-            writer.append(b"partial").expect("append");
-            assert_eq!(store.used_bytes(), 7, "reserved mid-stream");
-            // Drop without commit.
-        }
-        assert_eq!(store.used_bytes(), 0, "budget released on drop");
-        assert!(store.load_fragment(&key).expect("load").is_none());
-    }
-
-    /// A streaming write that would cross the ceiling is refused mid-stream and
-    /// never becomes live.
-    #[test]
-    fn streaming_write_honors_ceiling() {
-        let store = LocalFragmentStore::with_budget(scratch("stream-ceiling"), 10);
-        let key = FragmentKey {
-            object_id: "obj".to_owned(),
-            index: 0,
-        };
-        let mut writer = store.open_fragment(&key).expect("open");
-        writer.append(&[0u8; 6]).expect("first shard fits");
-        let err = writer
-            .append(&[0u8; 6])
-            .expect_err("second shard overflows");
-        assert!(matches!(err, FragmentIoError::Full { .. }));
-        drop(writer);
-        assert_eq!(store.used_bytes(), 0, "abandoned stream charges nothing");
-        assert!(store.load_fragment(&key).expect("load").is_none());
-    }
-
-    /// A stored (un-propagated) fragment is never dropped by budget pressure:
-    /// the budget refuses new writes but only an explicit delete frees a
-    /// fragment. This is the invariant that keeps the pod's only durable copy of
-    /// acked data safe until propagation deletes it.
-    #[test]
-    fn budget_never_evicts_a_stored_fragment() {
-        let store = LocalFragmentStore::with_budget(scratch("budget-noevict"), 100);
-        let pinned = FragmentKey {
-            object_id: "dirty".to_owned(),
-            index: 0,
-        };
-        store
-            .store_fragment(&FragmentRecord::new(
-                pinned.clone(),
-                Bytes::from(vec![7u8; 90]),
-            ))
-            .expect("store the dirty fragment");
-        // The store is now nearly full. Every further write is refused...
-        for i in 0..5 {
-            assert!(
-                store.store_fragment(&record("other", i, 90)).is_err(),
-                "further writes refused under pressure"
-            );
-        }
-        // ...but the pinned fragment is untouched and still reads back.
-        assert_eq!(store.used_bytes(), 90);
-        let got = store
-            .load_fragment(&pinned)
-            .expect("load")
-            .expect("present");
-        assert_eq!(
-            got.bytes.len(),
-            90,
-            "the dirty fragment survives disk pressure"
-        );
-        // Only an explicit delete (propagation cleanup) frees it.
-        store.delete_fragment(&pinned).expect("delete");
+    fn ceiling_is_a_hard_live_record_limit() {
+        let dir = scratch("fragment-budget");
+        let ceiling = Arc::new(AtomicU64::new(3));
+        let store = LocalFragmentStore::with_dynamic_ceiling(dir.path(), Arc::clone(&ceiling));
+        assert!(store.store_fragment(&record("no", 0, b"four")).is_err());
         assert_eq!(store.used_bytes(), 0);
-    }
-
-    /// The fragment store's ceiling is dynamic (#223): a shared atomic the
-    /// server's disk poll updates. A write burst is absorbed up to the current
-    /// ceiling (far past the retired flat 10% cap); raising the ceiling (free
-    /// NVMe appeared) lets the burst continue; lowering it below what is already
-    /// stored refuses new writes but never drops an acked fragment; and
-    /// propagation delete reclaims the space so it is never permanently consumed.
-    #[test]
-    fn dynamic_ceiling_flexes_and_reclaims() {
-        let ceiling = Arc::new(AtomicU64::new(1000));
-        let store =
-            LocalFragmentStore::with_dynamic_ceiling(scratch("dyn-ceiling"), Arc::clone(&ceiling));
-        // A burst up to the current ceiling is absorbed.
-        store.store_fragment(&record("a", 0, 900)).expect("fits");
-        assert!(
-            store.store_fragment(&record("b", 0, 200)).is_err(),
-            "past the current ceiling is refused"
-        );
-        // Free NVMe appeared: raise the ceiling and the burst continues.
-        ceiling.store(2000, Ordering::Release);
-        assert_eq!(store.budget_bytes(), 2000, "budget tracks the live ceiling");
-        store
-            .store_fragment(&record("b", 0, 200))
-            .expect("fits once the ceiling rises");
-        // The disk filled: the ceiling shrinks below what is stored. New writes
-        // are refused, but the stored (acked) fragments are kept.
-        ceiling.store(100, Ordering::Release);
-        assert!(
-            store.store_fragment(&record("c", 0, 50)).is_err(),
-            "no new writes under a shrunk ceiling"
-        );
-        assert_eq!(
-            store.used_bytes(),
-            1100,
-            "stored fragments survive a shrunk ceiling"
-        );
-        // Propagation cleanup reclaims the space.
-        store.delete_object("a").expect("propagated");
-        store.delete_object("b").expect("propagated");
-        assert_eq!(store.used_bytes(), 0, "reclaimed after propagation");
-    }
-
-    /// An unbudgeted store (the default) never refuses on budget grounds.
-    #[test]
-    fn unbudgeted_store_has_infinite_headroom() {
-        let store = LocalFragmentStore::new(scratch("budget-none"));
-        assert_eq!(store.budget_bytes(), u64::MAX);
-        assert!(store.has_headroom(u64::MAX));
-        store
-            .store_fragment(&record("a", 0, 1_000_000))
-            .expect("store");
     }
 }

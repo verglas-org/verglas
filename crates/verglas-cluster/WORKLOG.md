@@ -104,3 +104,7 @@
 - #127: Local fragments now write a self-describing append-segment record and
   call `sync_data` once for each supplied durable batch before updating the read
   index. Local transport and fragment RPC ingress use that batch boundary.
+- #127: Replaced per-fragment files with one actor-owned, preallocated segment
+  log per cache member. The actor group-commits queued records with one data
+  sync, and restart rebuilds the disposable read index only from checksummed
+  batches ending at a persisted commit marker, so a torn tail is never visible.
