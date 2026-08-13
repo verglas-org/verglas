@@ -95,6 +95,9 @@ async fn vector_state_survives_a_fresh_semantic_adapter() {
     let vector = call(&reopened, "GetVectors", json!({"vectorBucketName":"bucket-one","indexName":"index-one","keys":["exact/key Ω"],"returnData":true,"returnMetadata":true})).await;
     assert_eq!(vector["vectors"][0]["key"], "exact/key Ω");
     assert_eq!(vector["vectors"][0]["data"]["float32"], json!([1.0, 2.0]));
+    let query = call(&reopened, "QueryVectors", json!({"vectorBucketName":"bucket-one","indexName":"index-one","queryVector":{"float32":[1.0,2.0]},"topK":1,"returnDistance":true,"returnMetadata":true})).await;
+    assert_eq!(query["vectors"][0]["key"], "exact/key Ω");
+    assert!(query.get("nextToken").is_none());
 }
 
 /// Appended updates and tombstones resolve by committed order, including a write race.

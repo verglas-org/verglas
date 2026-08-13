@@ -275,3 +275,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   now persists exact encryption, tags, numeric timestamps, and index definitions;
   filters, VectorData unions, result flags, and opaque list/query cursors are
   validated at the adapter boundary, with reopen and commit-order tests.
+- #137: Enforced the Graph REST-JSON runtime contract at the Iceberg adapter.
+  Graph names, node/edge inputs, directions, filters, confidence, pagination,
+  and camel-case traversal outputs now validate and render at the protocol
+  boundary instead of exposing graph-engine serde shapes.

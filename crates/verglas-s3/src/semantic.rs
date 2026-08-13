@@ -15,8 +15,11 @@ use axum::{
     routing::{get, post},
 };
 use iceberg::{Catalog, NamespaceIdent, TableCommit, TableRequirement, TableUpdate};
-use serde_json::{Value, json};
-use verglas_graph::{Direction, Edge, Graph, Node, TraversalFilter};
+use serde_json::{Map, Value, json};
+use verglas_graph::{
+    Direction, Edge, Graph, Neighbor, Node, Path, Reached, Subgraph, TraversalFilter,
+    TripletReceipt,
+};
 use verglas_iceberg::{parse_table_ident, tables_api};
 use verglas_vector::{MaintenanceConfig, Metric, StringKeyIndex, VamanaParams};
 
@@ -288,10 +291,7 @@ impl IcebergCatalogSemanticStore {
 
     /// Opens the named graph directly from its Iceberg namespace.
     fn graph(&self, input: &Value) -> Result<Graph, SemanticError> {
-        let graph = input
-            .get("graphName")
-            .and_then(Value::as_str)
-            .ok_or_else(|| SemanticError::validation("graphName is required"))?;
+        let graph = required_bounded_string(input, "graphName", 1, 255)?;
         Graph::open(self.catalog.clone(), graph).map_err(graph_error)
     }
 }
@@ -311,16 +311,48 @@ impl SemanticApi for IcebergCatalogSemanticStore {
             unreachable!("semantic operation is vector or graph")
         };
         if operation == "ListGraphs" {
-            let graphs = self
+            let max_results = list_max_results(&input)?;
+            let next_token = optional_bounded_string(&input, "nextToken", 1, 2048)?;
+            let mut names = self
                 .catalog
                 .list_namespaces(None)
                 .await
                 .map_err(iceberg_error)?
                 .into_iter()
-                .filter_map(|namespace| namespace.first().cloned())
-                .map(|name| json!({"graphName": name}))
+                .filter_map(|namespace| {
+                    (namespace.len() == 1)
+                        .then(|| namespace.first().cloned())
+                        .flatten()
+                })
                 .collect::<Vec<_>>();
-            return Ok(json!({"graphs": graphs}));
+            names.sort();
+            names.dedup();
+            let names = names
+                .into_iter()
+                .filter(|name| {
+                    next_token
+                        .as_ref()
+                        .is_none_or(|token| name.as_str() > *token)
+                })
+                .collect::<Vec<_>>();
+            let more = names.len() > max_results;
+            let graphs = names
+                .into_iter()
+                .take(max_results)
+                .map(|graph_name| json!({"graphName":graph_name}))
+                .collect::<Vec<_>>();
+            let mut output = Map::from_iter([("graphs".to_owned(), Value::Array(graphs))]);
+            if more
+                && let Some(last) = output
+                    .get("graphs")
+                    .and_then(Value::as_array)
+                    .and_then(|values| values.last())
+                    .and_then(|value| value.get("graphName"))
+                    .cloned()
+            {
+                output.insert("nextToken".to_owned(), last);
+            }
+            return Ok(Value::Object(output));
         }
         let graph = self.graph(&input)?;
         match operation {
@@ -339,7 +371,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     .map_err(iceberg_error)?;
                 self.catalog
                     .drop_namespace(&NamespaceIdent::new(
-                        required_string(&input, "graphName")?.to_owned(),
+                        required_bounded_string(&input, "graphName", 1, 255)?.to_owned(),
                     ))
                     .await
                     .map_err(iceberg_error)?;
@@ -349,61 +381,66 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                 let rows = input
                     .get("nodes")
                     .and_then(Value::as_array)
-                    .ok_or_else(|| SemanticError::validation("nodes is required"))?;
+                    .ok_or_else(|| {
+                        SemanticError::validation("nodes is required and must be an array")
+                    })?;
                 let nodes = rows
                     .iter()
                     .map(node_from_json)
                     .collect::<Result<Vec<_>, _>>()?;
                 let snapshot = graph.insert_nodes(&nodes).await.map_err(graph_error)?;
-                Ok(json!({"snapshotId": snapshot}))
+                Ok(snapshot_output(snapshot))
             }
             "PutEdges" => {
                 let rows = input
                     .get("edges")
                     .and_then(Value::as_array)
-                    .ok_or_else(|| SemanticError::validation("edges is required"))?;
+                    .ok_or_else(|| {
+                        SemanticError::validation("edges is required and must be an array")
+                    })?;
                 let edges = rows
                     .iter()
                     .map(edge_from_json)
                     .collect::<Result<Vec<_>, _>>()?;
                 let snapshot = graph.insert_edges(&edges).await.map_err(graph_error)?;
-                Ok(json!({"snapshotId": snapshot}))
+                Ok(snapshot_output(snapshot))
             }
             "BuildGraphIndex" => {
                 Ok(json!({"index": graph.build_index(None).await.map_err(graph_error)?.is_some()}))
             }
             "GetNeighbors" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
-                let node = required_string(&input, "nodeId")?;
+                let node = required_bounded_string(&input, "nodeId", 1, 1024)?;
                 Ok(
-                    json!({"neighbors": reader.get_neighbors(node, direction(&input)?, &TraversalFilter::default())}),
+                    json!({"neighbors": reader.get_neighbors(node, direction(&input)?, &filter(&input)?).into_iter().map(neighbor_to_json).collect::<Vec<_>>() }),
                 )
             }
             "QueryKHop" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
-                let node = required_string(&input, "nodeId")?;
+                let node = required_bounded_string(&input, "nodeId", 1, 1024)?;
                 let hops = required_u32(&input, "k")?;
                 Ok(
-                    json!({"nodes": reader.k_hop(node, hops, direction(&input)?, &TraversalFilter::default())}),
+                    json!({"nodes": reader.k_hop(node, hops, direction(&input)?, &filter(&input)?).into_iter().map(reached_to_json).collect::<Vec<_>>() }),
                 )
             }
             "QueryNeighborhood" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
-                let node = required_string(&input, "nodeId")?;
+                let node = required_bounded_string(&input, "nodeId", 1, 1024)?;
                 let hops = required_u32(&input, "k")?;
                 Ok(
-                    json!({"neighborhood": reader.neighborhood(node, hops, direction(&input)?, &TraversalFilter::default())}),
+                    json!({"neighborhood": subgraph_to_json(reader.neighborhood(node, hops, direction(&input)?, &filter(&input)?))}),
                 )
             }
             "QueryPaths" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
                 Ok(
-                    json!({"paths": reader.paths(required_string(&input, "sourceId")?, required_string(&input, "targetId")?, required_u32(&input, "maxHops")?, direction(&input)?, &TraversalFilter::default())}),
+                    json!({"paths": reader.paths(required_bounded_string(&input, "sourceId", 1, 1024)?, required_bounded_string(&input, "targetId", 1, 1024)?, required_u32(&input, "maxHops")?, direction(&input)?, &filter(&input)?).into_iter().map(path_to_json).collect::<Vec<_>>() }),
                 )
             }
-            "GetGraph" => Ok(
-                json!({"graphName": required_string(&input, "graphName")?, "edgesSnapshotId": graph.current_edges_snapshot().await.map_err(graph_error)?}),
-            ),
+            "GetGraph" => Ok(graph_output(
+                required_bounded_string(&input, "graphName", 1, 255)?,
+                graph.current_edges_snapshot().await.map_err(graph_error)?,
+            )),
             _ => Err(SemanticError::validation("unknown graph operation")),
         }
     }
@@ -532,7 +569,12 @@ impl IcebergCatalogSemanticStore {
                     .to_owned()
             });
             let (vector_buckets, next_token) = page(&input, buckets)?;
-            return Ok(json!({"vectorBuckets": vector_buckets, "nextToken": next_token}));
+            let mut output =
+                Map::from_iter([("vectorBuckets".to_owned(), Value::Array(vector_buckets))]);
+            if let Some(next_token) = next_token {
+                output.insert("nextToken".to_owned(), json!(next_token));
+            }
+            return Ok(Value::Object(output));
         }
         if matches!(
             operation,
@@ -596,7 +638,11 @@ impl IcebergCatalogSemanticStore {
             }
             indexes.sort_by_key(|value| value["indexName"].as_str().unwrap_or_default().to_owned());
             let (indexes, next_token) = page(&input, indexes)?;
-            return Ok(json!({"indexes": indexes, "nextToken": next_token}));
+            let mut output = Map::from_iter([("indexes".to_owned(), Value::Array(indexes))]);
+            if let Some(next_token) = next_token {
+                output.insert("nextToken".to_owned(), json!(next_token));
+            }
+            return Ok(Value::Object(output));
         }
         if matches!(
             operation,
@@ -665,9 +711,30 @@ impl IcebergCatalogSemanticStore {
                     .ok_or_else(|| SemanticError::validation("index metadata is absent"))?;
                 let metadata: Value = serde_json::from_str(value)
                     .map_err(|_| SemanticError::validation("index metadata is corrupt"))?;
-                Ok(
-                    json!({"index": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "indexName": required_string(&input, "indexName")?, "indexArn": vector_arn(&input)?, "creationTime": metadata["creationTime"], "dataType": metadata["dataType"], "dimension": metadata["dimension"], "distanceMetric": metadata["distanceMetric"], "metadataConfiguration": metadata["metadataConfiguration"], "encryptionConfiguration": metadata["encryptionConfiguration"]}}),
-                )
+                let mut index = Map::from_iter([
+                    (
+                        "vectorBucketName".to_owned(),
+                        json!(required_string(&input, "vectorBucketName")?),
+                    ),
+                    (
+                        "indexName".to_owned(),
+                        json!(required_string(&input, "indexName")?),
+                    ),
+                    ("indexArn".to_owned(), json!(vector_arn(&input)?)),
+                    ("creationTime".to_owned(), metadata["creationTime"].clone()),
+                    ("dataType".to_owned(), metadata["dataType"].clone()),
+                    ("dimension".to_owned(), metadata["dimension"].clone()),
+                    (
+                        "distanceMetric".to_owned(),
+                        metadata["distanceMetric"].clone(),
+                    ),
+                ]);
+                for field in ["metadataConfiguration", "encryptionConfiguration"] {
+                    if let Some(value) = metadata.get(field).filter(|value| !value.is_null()) {
+                        index.insert(field.to_owned(), value.clone());
+                    }
+                }
+                Ok(json!({"index":index}))
             }
             "PutVectors" | "DeleteVectors" => {
                 let values = if operation == "PutVectors" {
@@ -740,7 +807,11 @@ impl IcebergCatalogSemanticStore {
                     ));
                 }
                 let (vectors, next_token) = page(&input, vectors)?;
-                Ok(json!({"vectors": vectors, "nextToken": next_token}))
+                let mut output = Map::from_iter([("vectors".to_owned(), Value::Array(vectors))]);
+                if let Some(next_token) = next_token {
+                    output.insert("nextToken".to_owned(), json!(next_token));
+                }
+                Ok(Value::Object(output))
             }
             "QueryVectors" => {
                 let query = input
@@ -1582,11 +1653,24 @@ fn query_response(
     } else {
         None
     };
-    Ok(json!({
-        "distanceMetric": definition["distanceMetric"],
-        "vectors": page.into_iter().map(|(distance, key, metadata)| query_output(key, distance, metadata, input)).collect::<Vec<_>>(),
-        "nextToken": next_token,
-    }))
+    let mut output = Map::from_iter([
+        (
+            "distanceMetric".to_owned(),
+            definition["distanceMetric"].clone(),
+        ),
+        (
+            "vectors".to_owned(),
+            Value::Array(
+                page.into_iter()
+                    .map(|(distance, key, metadata)| query_output(key, distance, metadata, input))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+    ]);
+    if let Some(next_token) = next_token {
+        output.insert("nextToken".to_owned(), json!(next_token));
+    }
+    Ok(Value::Object(output))
 }
 
 /// Encodes the unrendered rank and key that identify a query continuation.
@@ -1916,46 +2000,176 @@ fn iceberg_error(error: impl std::fmt::Display) -> SemanticError {
 
 /// Converts a REST-JSON node object to the graph engine's durable row model.
 fn node_from_json(value: &Value) -> Result<Node, SemanticError> {
-    let mut node = Node::new(required_string(value, "id")?);
-    node.labels = value
-        .get("labels")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default();
-    node.properties = value
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    let mut node = Node::new(required_bounded_string(value, "id", 1, 1024)?);
+    node.labels = optional_string_list(value, "labels", 1, 255)?;
+    node.properties = optional_properties(value)?;
     Ok(node)
 }
 
 /// Converts a REST-JSON edge object to the graph engine's append-only model.
 fn edge_from_json(value: &Value) -> Result<Edge, SemanticError> {
     let mut edge = Edge::new(
-        required_string(value, "sourceId")?,
-        required_string(value, "predicate")?,
-        required_string(value, "targetId")?,
-        required_string(value, "provenance")?,
+        required_bounded_string(value, "sourceId", 1, 1024)?,
+        required_bounded_string(value, "predicate", 1, 1024)?,
+        required_bounded_string(value, "targetId", 1, 1024)?,
+        required_bounded_string(value, "provenance", 1, 1024)?,
     );
-    if let Some(id) = value.get("edgeId").and_then(Value::as_str) {
+    if let Some(id) = optional_bounded_string(value, "edgeId", 1, 255)? {
         edge.edge_id = id.to_owned();
     }
-    if let Some(confidence) = value.get("confidence").and_then(Value::as_f64) {
+    if let Some(confidence) = optional_confidence(value, "confidence")? {
         edge.confidence = confidence;
     }
-    edge.properties = value
-        .get("properties")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
+    edge.properties = optional_properties(value)?;
     Ok(edge)
+}
+
+/// Builds a mutation output without serializing an absent snapshot as null.
+fn snapshot_output(snapshot: Option<i64>) -> Value {
+    let mut output = Map::new();
+    if let Some(snapshot) = snapshot {
+        output.insert("snapshotId".to_owned(), json!(snapshot));
+    }
+    Value::Object(output)
+}
+
+/// Builds a graph response without serializing an absent edge snapshot as null.
+fn graph_output(graph_name: &str, snapshot: Option<i64>) -> Value {
+    let mut output = Map::from_iter([("graphName".to_owned(), json!(graph_name))]);
+    if let Some(snapshot) = snapshot {
+        output.insert("edgesSnapshotId".to_owned(), json!(snapshot));
+    }
+    Value::Object(output)
+}
+
+/// Renders engine direction in the Graph REST-JSON enum spelling.
+fn direction_to_json(direction: Direction) -> &'static str {
+    match direction {
+        Direction::Out => "out",
+        Direction::In => "in",
+        Direction::Both => "both",
+    }
+}
+
+/// Renders a graph neighbor in the public camel-case response shape.
+fn neighbor_to_json(neighbor: Neighbor) -> Value {
+    json!({"nodeId":neighbor.node_id,"predicate":neighbor.predicate,"confidence":neighbor.confidence,"edgeId":neighbor.edge_id,"provenance":neighbor.provenance,"direction":direction_to_json(neighbor.direction)})
+}
+
+/// Renders a reached node in the public camel-case response shape.
+fn reached_to_json(reached: Reached) -> Value {
+    json!({"nodeId":reached.node_id,"hops":reached.hops,"pathConfidence":reached.path_confidence})
+}
+
+/// Renders one traversed edge receipt in the public camel-case response shape.
+fn triplet_receipt_to_json(receipt: TripletReceipt) -> Value {
+    json!({"sourceId":receipt.src_id,"predicate":receipt.predicate,"targetId":receipt.dst_id,"confidence":receipt.confidence,"edgeId":receipt.edge_id,"provenance":receipt.provenance})
+}
+
+/// Renders a traversal subgraph in the public REST-JSON response shape.
+fn subgraph_to_json(subgraph: Subgraph) -> Value {
+    json!({"nodes":subgraph.nodes.into_iter().map(reached_to_json).collect::<Vec<_>>(),"edges":subgraph.edges.into_iter().map(triplet_receipt_to_json).collect::<Vec<_>>()})
+}
+
+/// Renders a graph path in the public REST-JSON response shape.
+fn path_to_json(path: Path) -> Value {
+    json!({"nodes":path.nodes,"edges":path.edges.into_iter().map(triplet_receipt_to_json).collect::<Vec<_>>(),"confidence":path.confidence})
+}
+
+/// Validates a required bounded string supplied by the Graph protocol.
+fn required_bounded_string<'a>(
+    value: &'a Value,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<&'a str, SemanticError> {
+    let string = value.get(field).and_then(Value::as_str).ok_or_else(|| {
+        SemanticError::validation(format!("{field} is required and must be a string"))
+    })?;
+    validate_string(string, field, minimum, maximum)?;
+    Ok(string)
+}
+
+/// Validates an optional bounded string supplied by the Graph protocol.
+fn optional_bounded_string<'a>(
+    value: &'a Value,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Option<&'a str>, SemanticError> {
+    let Some(member) = value.get(field) else {
+        return Ok(None);
+    };
+    let string = member
+        .as_str()
+        .ok_or_else(|| SemanticError::validation(format!("{field} must be a string")))?;
+    validate_string(string, field, minimum, maximum)?;
+    Ok(Some(string))
+}
+
+/// Checks one Graph protocol string's inclusive bounds.
+fn validate_string(
+    string: &str,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<(), SemanticError> {
+    if !(minimum..=maximum).contains(&string.len()) {
+        return Err(SemanticError::validation(format!(
+            "{field} length must be between {minimum} and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+/// Parses an optional bounded label list from a Graph node.
+fn optional_string_list(
+    value: &Value,
+    field: &str,
+    minimum: usize,
+    maximum: usize,
+) -> Result<Vec<String>, SemanticError> {
+    let Some(member) = value.get(field) else {
+        return Ok(Vec::new());
+    };
+    member
+        .as_array()
+        .ok_or_else(|| SemanticError::validation(format!("{field} must be an array")))?
+        .iter()
+        .map(|item| {
+            let label = item.as_str().ok_or_else(|| {
+                SemanticError::validation(format!("{field} members must be strings"))
+            })?;
+            validate_string(label, field, minimum, maximum)?;
+            Ok(label.to_owned())
+        })
+        .collect()
+}
+
+/// Parses optional Graph properties without silently discarding an invalid object.
+fn optional_properties(value: &Value) -> Result<Map<String, Value>, SemanticError> {
+    let Some(member) = value.get("properties") else {
+        return Ok(Map::new());
+    };
+    let properties = member
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("properties must be an object"))?;
+    for key in properties.keys() {
+        validate_string(key, "properties key", 1, 255)?;
+    }
+    Ok(properties.clone())
+}
+
+/// Parses an optional closed-unit-interval Graph confidence.
+fn optional_confidence(value: &Value, field: &str) -> Result<Option<f64>, SemanticError> {
+    let Some(value) = value.get(field) else {
+        return Ok(None);
+    };
+    let confidence = value
+        .as_f64()
+        .filter(|number| number.is_finite() && (0.0..=1.0).contains(number))
+        .ok_or_else(|| SemanticError::validation(format!("{field} must be between 0 and 1")))?;
+    Ok(Some(confidence))
 }
 
 /// Reads one required string field from an operation input.
@@ -1989,6 +2203,48 @@ fn direction(input: &Value) -> Result<Direction, SemanticError> {
             "direction must be out, in, or both",
         )),
     }
+}
+
+/// Parses Graph traversal filters and rejects out-of-contract predicate values.
+fn filter(input: &Value) -> Result<TraversalFilter, SemanticError> {
+    let Some(value) = input.get("filter") else {
+        return Ok(TraversalFilter::default());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("filter must be an object"))?;
+    let predicate = match object.get("predicate") {
+        Some(value) => {
+            Some(required_bounded_string(&json!({"value":value}), "value", 1, 1024)?.to_owned())
+        }
+        None => None,
+    };
+    let min_confidence = match object.get("minConfidence") {
+        Some(value) => {
+            let number = value
+                .as_f64()
+                .filter(|number| number.is_finite() && (0.0..=1.0).contains(number))
+                .ok_or_else(|| SemanticError::validation("filter.minConfidence must be 0..1"))?;
+            Some(number)
+        }
+        None => None,
+    };
+    Ok(TraversalFilter {
+        predicate,
+        min_confidence,
+    })
+}
+
+/// Parses the bounded ListGraphs page size.
+fn list_max_results(input: &Value) -> Result<usize, SemanticError> {
+    let Some(value) = input.get("maxResults") else {
+        return Ok(1000);
+    };
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=1000).contains(value))
+        .ok_or_else(|| SemanticError::validation("maxResults must be an integer from 1 to 1000"))
 }
 
 /// Converts graph-engine errors to a safe REST-JSON service failure.
