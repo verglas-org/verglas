@@ -12,7 +12,7 @@ icon: "snowflake"
 
 Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
 
-We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible storage endpoint with compute and serves frequently accessed bytes from DRAM and NVMe. Independently deployed cache, query, and write roles communicate with an authoritative Iceberg REST catalog and object store; Verglas never becomes either system of record. Verglas keys cached blocks by storage binding and object version, yielding correctness properties that format-blind systems cannot achieve at any configuration. An erasure-coded, quorum-acknowledged write-back path stages writes durably in front of object storage, which remains the system of record. A hosted control plane may schedule these engine roles and the pipeline platform described in §7, but that orchestration is not part of the public storage engine.
+We propose Verglas, an Iceberg-aware data engine that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache, query, write, and consensus engine; the hosted control plane owns the authenticated Iceberg REST composition, provisioning, and pipeline platform that call those engine contracts.
 
 ---
 
@@ -20,9 +20,13 @@ We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible 
 
 This open-source repository is the Verglas data engine: the Iceberg-aware cache
 node (including WAL and virtual block devices) plus independently deployed
-query and write roles. The engine is a catalog **client**, not a catalog
-implementation: it connects to an Iceberg REST catalog and never stores
-authoritative catalog state.
+query and write roles. Cache nodes implement the coded Multi-Raft substrate and
+the typed warehouse and timeline state machines. They expose private engine
+contracts, not hosted identity, provisioning, or public catalog REST modules.
+The hosted Lakekeeper adapter translates authenticated Iceberg REST operations
+into the warehouse state-machine commands defined here. External-catalog
+databases bypass the managed warehouse state machine and retain the semantics
+of their configured catalog.
 
 The public CLI and SDKs live in `verglas-client`. Hosted access, scheduling,
 workers, databases, integrations, applications, and agent runtime services live
@@ -207,9 +211,9 @@ This architecture provides operational and analytical access under one platform,
 
 ## 3. Verglas Overview
 
-Verglas interposes a shared storage service between query engines and an existing object store. Engines continue to issue S3 requests, and Iceberg continues to define table state through its catalog and metadata files. The service changes neither the table format nor the query engine. It changes the location from which repeated reads are served and uses Iceberg metadata to prepare cache state before those reads occur.
+Verglas interposes a shared storage and consensus service between engines and object storage. Engines continue to issue S3 requests, and Iceberg remains the table format, but a managed deployment no longer requires a separate transactional database for catalog commits. The same cache nodes that hold hot bytes host many isolated coded Raft groups. These groups order the small mutable state that cannot be made safe by immutable object naming alone: Iceberg catalog transactions, Postgres writer ownership, WAL positions, archive checkpoints, and membership changes.
 
-The design separates a data path from a table-control path. The data path implements the S3 operations used to read and write objects. The control path has two consistency contracts. Eventual mode polls any Iceberg REST catalog. Strong mode accepts the transactional catalog's ordered pointer mutation, persists that compact record through the cache ring's erasure-coded quorum, and fences each catalog read until the local prepared view reaches the committed ring sequence. Both paths parse table metadata and schedule metadata warming and snapshot-driven prefetch. Clients still resolve namespaces, schemas, snapshots, and commits against the catalog system of record. The self-hosted REST composition may expose a shallow cached Iceberg REST proxy, but it implements no catalog mutation semantics and never becomes the catalog system of record. Logical SQL and table-write requests are dispatched to isolated `verglas-query` and `verglas-write` roles, whose object I/O returns through the S3 cache endpoint. This lets table-level information guide a byte-addressed cache without embedding query or write engines in the storage server.
+The design separates unordered immutable reads from ordered mutation streams. Cached immutable reads need no consensus and remain available from any valid copy. Managed catalog and WAL mutations enter the group leader through any ingress, become committed commands in one replicated log, and are applied deterministically. Large WAL or object payloads are erasure-coded across voters while their hashes, terms, indexes, lengths, coding geometry, modes, and request identities are fully replicated. External Iceberg catalogs remain available through database-scoped gateways in eventual mode, but managed catalogs are authoritative Verglas state machines and provide linearizable commits and reads. Logical SQL and table-write requests remain isolated roles whose object I/O returns through the shared S3 surface.
 
 ### 3.1 System boundary
 
@@ -221,12 +225,14 @@ The server runs as a container. Self-hosted deployments use the published Docker
 
 ### 3.2 Design requirements
 
-Four requirements constrain the design.
+Six requirements constrain the design.
 
-1. **Durable object storage.** Verglas does not replace Iceberg objects with a proprietary representation. Writes either reach object storage before acknowledgment or enter the erasure-coded buffer described in §6 and propagate asynchronously. Once buffered writes have drained, the complete table remains standard Iceberg in object storage and no Verglas-specific state is required to read it: switch Verglas off and the lakehouse still works, just slower.
+1. **Open durable output.** Verglas does not replace Iceberg objects with a proprietary table representation. Data, manifests, and metadata files drain to ordinary object storage. A deliberate detach first fences new mutations, archives committed WAL, exports and checkpoints the managed catalog, and then redirects clients; after that drain, the lakehouse remains standard Iceberg. Abruptly destroying a quorum while acknowledged state is not yet archived is data loss, not a supported turn-off path.
 2. **Version-specific reads.** Cached blocks are identified by object ETag, bucket, key, block geometry, and block index. A mutable read spanning multiple blocks commits to one ETag before streaming, so a response cannot combine cached bytes from one object version with origin bytes from another.
 3. **Shared acceleration.** Cache state belongs to the Verglas nodes rather than to a query-engine process. Any S3 client using the endpoint can reuse blocks populated by another client. Cluster ownership distributes the cache across nodes while preserving a backend path for every miss.
 4. **Bounded resource use.** DRAM, NVMe, metadata, and write-back fragment capacity are configured as ceilings. Admission and background warming operate within those budgets. Property tests exercise the DRAM and disk ceilings under randomized workloads.
+5. **One agreement boundary.** Acknowledgment of managed catalog or WAL state means that the command is durably committed by its coded Raft group. Verglas does not acknowledge from a process-local journal, delegate agreement to PostgreSQL, or run a second proposer quorum above the ring.
+6. **Linearizable multi-ingress operation.** Any ingress may accept a request, but only the current group leader orders it. Committed writer epochs fence stale Postgres computes, catalog compare-and-swap requirements execute in log order, and linearizable reads wait for a ReadIndex fence before observing state.
 
 ---
 
@@ -275,13 +281,29 @@ When ownership moves, a joining node requests blocks from its rendezvous predece
 
 ### 4.3 Failure behavior
 
-The read path does not require consensus. If a node disappears, gossip removes it from the live membership view and the ring reassigns its objects. Blocks unavailable from a peer are fetched from the origin. The consequence is lost cache warmth rather than lost table data.
+The immutable read-cache path does not require consensus. If a node disappears, gossip removes it from the cache placement view and the ring reassigns its objects. Blocks unavailable from a peer are fetched from the origin. The consequence is lost cache warmth rather than lost table data. Gossip never changes consensus membership and never decides whether a catalog or WAL command is committed.
 
 NVMe entries survive process restart and checksum-failed tail entries are discarded during recovery. A permanent node loss discards that node's cache contents. If all cache nodes are unavailable, clients must use the origin endpoint directly or through deployment-level failover; this transition is not performed by the server.
 
-Host-managed scale-to-zero uses an admission fence, not a ring drain. The host authenticates to the cache node's private quiescence API, atomically closes foreground admission across S3, attached block, fragment, and Neon safekeeper planes, then waits for the already-accepted count to reach zero before stopping the process. A generation lease prevents a stale failed-stop handler from reopening a newer fence. Retained NVMe is reattached on restart: the cache rebuilds its disk indexes without eagerly copying cached bytes into DRAM, and dirty fragment/WAL state resumes its ordinary replay and background propagation. Catalog polling, recovery, warming, and propagation do not pin the process awake; their durable inputs remain on NVMe or in the origin.
+Host-managed scale-to-zero fences foreground admission and transfers leadership before stopping a node. A node that is still a voter may stop only when the remaining live voters preserve a legal election quorum and every committed coded entry needed for recovery remains reconstructable. Scaling an entire authoritative ring to zero requires an explicit checkpoint: stop new mutations, wait for accepted requests, archive WAL and dirty objects, export a catalog checkpoint to object storage, commit the checkpoint watermarks, and only then stop the final quorum. Retained NVMe can shorten restart, but it is not used to excuse an uncommitted membership change or an unsafe stop.
 
-Write-back changes the failure model because acknowledged objects may not yet exist at the origin; §6 describes its protocol.
+Consensus-backed write-back changes the failure model because acknowledged catalog and WAL state may not yet exist at the origin; §6 describes its protocol.
+
+### 4.4 Coded Multi-Raft substrate
+
+The cache fleet hosts many independent Raft groups instead of one global log. A tenant-root group owns warehouse discovery and tenant-scoped allocation; each managed warehouse owns a catalog group; each Neon timeline owns a WAL group. Independent groups elect leaders and commit concurrently, so one busy timeline or catalog does not serialize unrelated tenants. Requests may arrive at any node and are forwarded to the known leader. A client retry carries the same request identity and never becomes a second command.
+
+Each group has a committed voter configuration. Reconfiguration uses joint consensus; gossip supplies reachability hints only. Terms, votes, log indexes, command kinds, payload lengths and hashes, coding geometry, storage mode, writer epoch, and idempotency identity are fully replicated. Large payloads may be stored as Reed–Solomon fragments, but agreement remains over the complete logical entry identified by its hash.
+
+Let `N` be the voter count, `q` the smallest legal future election quorum, `k` the number of fragments required to reconstruct a coded entry, and `w` the number of distinct voters that durably store fragments before acknowledgment. A coded entry is eligible to commit only when
+
+```text
+w + q - N >= k
+```
+
+so every legal future leader quorum intersects the durable write set in at least `k` fragments. This is the RS-Paxos quorum-intersection condition [32]. The usual Raft majority rule is also required. Configuration validation rejects a geometry that cannot satisfy both constraints. When a majority is available but the coded threshold is not, the leader may append a complete-entry representation to a majority. This CRaft-style fallback [33] preserves Raft liveness without relaxing safety; the chosen storage mode is part of the replicated entry header and cannot change locally after acknowledgment.
+
+A newly elected leader first reconstructs every committed coded entry needed by its state machine and completes Raft's log-matching repair before serving. It may fetch fragments from voters outside its election quorum, but it cannot expose state or acknowledge new entries until its committed prefix is complete. Linearizable reads use Raft ReadIndex (or an equivalent current-term quorum fence) and wait until the local applied index reaches the returned commit index. Session responses carry a commit-index watermark so a client routed to another ingress cannot move backward.
 
 ---
 
@@ -357,7 +379,7 @@ The planning walk of §1.2 is a serial dependency chain: its latency is depth ti
 
 **Isolation.** Metadata is admitted into a dedicated store rather than the data-block cache. A shared eviction policy cannot express that a manifest is worth more than a data block of equal recency — under LRU-family policies a large scan evicts both alike. A separate store encodes the priority structurally: no data workload, at any scan rate, can displace planning state. The store bypasses scan-resistant admission for the same reason; metadata objects are small and always on the critical path.
 
-**Commit-driven warming.** A demand cache faults metadata in one miss at a time, on the first query after every change. In eventual mode the table-control path polls the Iceberg REST catalog. In strong mode the catalog sends an ordered mutation naming the new immutable metadata location; Verglas EC-persists and applies that pointer before acknowledgment, invalidates prepared catalog responses, and makes lagging query nodes replay through the ring watermark before serving. The next fenced read loads the catalog's current response rather than attempting to re-fetch historical versions that an Iceberg REST catalog no longer exposes. On startup and after each observed commit, the control path walks the new metadata — table metadata file, current manifest list, manifests, and Parquet footers — through the normal cache interface into the metadata store. Catalog availability and mutation semantics remain the catalog service's responsibility. Footer warming uses a bounded suffix request, with a second request only when the footer exceeds the initial window. Warming concurrency and byte rate are bounded independently, and if a table's metadata footprint exceeds the configured budget the warmer stops admitting rather than thrashing the store.
+**Commit-driven warming.** A demand cache faults metadata in one miss at a time, on the first query after every change. A managed catalog commit is already an ordered warehouse-group command naming the new immutable metadata location. Applying that command atomically publishes the new catalog snapshot, invalidates prepared responses, emits the data-update event, and schedules the metadata walk. A lagging query node must reach the command's ReadIndex fence before serving a linearizable response. External catalogs use their database binding's polling or notification semantics and remain eventual unless that service independently guarantees more. On startup and after each observed commit, the control path walks the new table metadata, current manifest list, manifests, and Parquet footers through the normal cache interface. Footer warming uses a bounded suffix request, with a second request only when the footer exceeds the initial window. Warming concurrency and byte rate are bounded independently, and if a table's metadata footprint exceeds the configured budget the warmer stops admitting rather than thrashing the store.
 
 The combined effect is that the serial planning walk runs against local media for the first query after a deployment and the first query after every commit — the cases where a demand cache is coldest; §8.1 measures the resulting origin-request elimination.
 
@@ -385,70 +407,71 @@ LIST requests are forwarded to the origin. Requests that specify an S3 `versionI
 
 ---
 
-## 6. Erasure-Coded Write Path
+## 6. Consensus-Backed Erasure-Coded Writes
 
-Write-back acknowledges a PUT before the object reaches the origin, so the cluster must first make the object durable across nodes. The classical form of this guarantee is a write quorum over complete copies: a write is acknowledged once `W` of `N` replicas are durable, survives `W − 1` subsequent node failures, and costs `W` times the object's bytes in storage and replication traffic [24, 25].
+The write path combines Raft agreement and erasure-coded persistence instead of stacking a process-local coordinator above passive fragment holders. A leader proposes one logical command. Voters persist the fully replicated header and either one coded payload fragment or, in fallback mode, the complete payload. A follower acknowledges only after its entry metadata, payload representation, and containing directory are durable. The leader commits only after the normal Raft majority condition and the reconstructability condition in §4.4 both hold. There is no separate local journal whose acknowledgment can outrun group consensus.
 
-Erasure coding changes the unit the quorum counts. A Reed–Solomon code [26] transforms an object into `k` data fragments and `m` parity fragments such that any `k` of the `k + m` reconstruct the original exactly; each node stores a fragment of roughly `1/k` of the object rather than a copy of it. An acknowledgment threshold `w` over fragments then plays the same role a replica quorum plays over copies: once `w` distinct nodes have durably persisted their fragments, the object remains reconstructible after any `w − k` of them fail. The durability of a `w`-fragment quorum therefore matches a `(w − k + 1)`-copy replica quorum while writing `w/k` times the object instead of `w − k + 1` times — the standard argument for erasure coding over replication [27], applied in production storage systems at cloud scale [28]. For the staging buffer this economy matters twice: fragments compete for the same NVMe that serves reads, and encoding fans a single PUT's bytes across the pod's NICs instead of sending full copies to multiple nodes.
+### 6.1 Append and commit
 
-A write transaction against the buffer is therefore: encode, place fragments on distinct nodes, count durable fragment acknowledgments to `w`, journal, acknowledge. The remainder of this section describes that path and its failure handling.
-
-### 6.1 Quorum staging
-
-Encoding and placement stream one stripe at a time, bounding memory use independently of object size. Fragment capacity is reserved from each node's configured NVMe ceiling.
-
-The coordinator orders candidate nodes by rendezvous hash and places at most one fragment on each node. A fragment counts toward acknowledgment only after its file and parent directory have been synchronized to local storage. Once `w` distinct fragments have completed, the coordinator writes and synchronizes a journal containing the object identity, metadata, coding geometry, and observed placements. It then acknowledges the client and continues collecting successful stragglers. Configuration requires `k ≤ w ≤ k + m`; tolerating all `m` fragment losses requires acknowledging all `k + m` fragments.
-
-Figure 5 shows how the cluster builds the acknowledgment. The receiving node coordinates: it stream-encodes the body one stripe at a time and places each of the `k + m` fragments on a distinct node, chosen by rendezvous order over the object. A fragment counts toward the quorum only when its node reports the fragment file and its directory fsynced — a durability report, not a receipt. The coordinator counts these reports; at the `w`-th it fsyncs its journal (object identity, coding geometry, observed placements) and only then acknowledges the client. Enforcement is structural: there is no code path to an acknowledgment that does not pass through `w` counted fsyncs and a journal fsync, and if the count cannot reach `w` the write degrades as described in §6.2 rather than acknowledging early.
+Encoding streams one stripe at a time and reserves fragment capacity before accepting an unbounded body. The replicated header binds the term, index, group and configuration generation, command type, payload length, cryptographic hash, `k`, `m`, storage mode, and client request identity. Fragments are deterministically assigned to distinct voters for that configuration. A fragment received under another geometry, generation, term, index, or hash cannot satisfy the proposal.
 
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant C as Coordinator
-    participant NA as Node a
-    participant NB as Node b
-    participant NC as Node c
+    participant C as Client
+    participant I as Any ingress
+    participant L as Group leader
+    participant A as Voter A
+    participant B as Voter B
+    participant D as Voter C
     participant S3
 
-    Client->>C: Streaming PUT
-    Note over C: Encode stripe by stripe
-    Note over C: Three fragments with k = 2 and m = 1
-    C->>NA: Stream fragment 0
-    C->>NB: Stream fragment 1
-    C->>NC: Stream fragment 2
-    NA-->>C: File and directory fsynced
-    NB-->>C: File and directory fsynced
-    NC-->>C: File and directory fsynced
-    Note over C: Three durable fragments reached
-    Note over C: Journal fsynced
-    C-->>Client: ACK with ETag
-    Note over C,S3: Background propagation after ACK
-    C->>S3: PUT reassembled object
-    S3-->>C: 200
-    Note over C: Mark journal clean and release fragments
+    C->>I: Append(command, request ID)
+    I->>L: Route to current leader
+    L->>A: Header + fragment A
+    L->>B: Header + fragment B
+    L->>D: Header + fragment C
+    A-->>L: Durable term/index/hash
+    B-->>L: Durable term/index/hash
+    D-->>L: Durable term/index/hash
+    Note over L: Majority and w+q-N >= k
+    L->>A: Advance commit index
+    L->>B: Advance commit index
+    L-->>I: Committed index + result
+    I-->>C: ACK + session watermark
+    Note over L,S3: Asynchronous archive
 ```
 
-*Figure 5: The acknowledgment quorum for one write-back PUT with `k = 2, m = 1, w = 3`. Each fragment lands on a distinct node and reports durability only after fsync; the coordinator acknowledges only after counting `w` reports and fsyncing its own journal. Propagation to the origin runs after the acknowledgment; fragments are released only once the origin write succeeds.*
+*Figure 5: One coded Raft append. The ingress is only a router. The group leader orders the command, voters durably store mutually verifiable representations, and acknowledgment follows the group commit. S3 archival is not on the foreground path.*
 
-Concurrent writers need no consensus. Every PUT is an independent, immutable erasure-coded object under a pod-unique identifier: two writes to the same key share no fragments and no journal state, so the quorum counts the durability of one write rather than agreement among writers. Ordering between them is the contract the origin itself offers for concurrent PUTs — the last acknowledged write wins. A per-key dirty index points at the most recently acknowledged object, reads of the key serve that object, version-committed reads (§5.1) never interleave two versions, and propagation delivers to an origin whose own semantics for concurrent PUTs are also last-writer-wins. The quorum of this section is a durability quorum, not an agreement protocol; the coordination problem concurrent writers usually pose is dissolved by immutability, exactly as on the read path.
+The request identity makes retries exact. Repeating an identity with the same group, command, payload hash, and writer epoch returns the original result. Reusing it for different content fails closed. An ingress cannot manufacture success: client-visible success includes the committed group index and is produced only after the state machine applies the command.
 
-### 6.2 Degraded operation
+### 6.2 Degraded operation, repair, and archive
 
-Before consuming a request body, the coordinator checks live membership and fragment-store headroom. If fewer than `w` nodes are eligible, it streams the request directly to the origin. If placement falls below `w` after the body has been consumed but at least `k` fragments committed, the coordinator reconstructs the object and completes a synchronous origin write before acknowledging the client. Fewer than `k` committed fragments produce an explicit write failure.
+If the coded write threshold cannot be reached but a Raft majority remains, the leader proposes a complete-entry representation to that majority. This is a committed storage-mode decision, not an origin-write fallback. If no majority exists, no managed mutation is acknowledged. A partitioned minority may continue serving immutable origin-backed cache reads, but it refuses catalog writes, WAL writes, and linearizable reads.
 
-An acknowledged but unpropagated object is readable through the same S3 endpoint. GET and HEAD consult the dirty journal and reconstruct the requested object from its fragments. Background propagation uploads the object to the origin with bounded retries, marks the journal clean, and releases fragments only after the origin write succeeds. Dirty journals are replayed after restart.
+Each representation carries a checksum, and the replicated header carries the logical payload hash. Reconstruction verifies both before applying an entry. Corrupt or missing fragments are erasures. Repair runs from committed placement metadata, reconstructs only from verified fragments, and writes replacement fragments under the same logical entry hash. Compaction may rewrite the physical representation after a new safe representation is durable, but cannot change the logical log entry.
 
-The repair loop observes membership changes. If a journaled object loses a fragment node but retains at least `k` placements, the coordinator reconstructs the object, re-encodes the missing fragments, and places them on unused live nodes. Coordinator tests cover acknowledgment threshold, insufficient-node fallback, mid-stream shortfall, read-after-write, propagation, and node-loss repair. Journal tests verify that dirty state is recovered when the journal directory is reopened.
+Committed immutable object bodies, complete WAL segments, and catalog checkpoints drain to object storage in the background. An uploader first makes the object visible and verifies its identity, then proposes an `ArchiveCheckpoint` command. Only application of that committed command permits log truncation or release of the last reconstructable local representation. Origin failure therefore consumes the configured dirty-state budget and eventually applies backpressure; it never permits unsafe eviction or an acknowledgment from RAM.
 
-### 6.3 Fragment integrity and scrubbing
+### 6.3 Authoritative Iceberg catalog
 
-Each persisted fragment carries a CRC32C trailer computed as the fragment is streamed to disk. Reassembly and node-loss repair verify this checksum before passing a fragment to the Reed–Solomon decoder. A corrupt fragment is treated as an erasure and reconstructed from healthy fragments; if fewer than `k` verified fragments remain, reconstruction fails rather than returning unchecked bytes.
+Managed catalog state is partitioned into a tenant-root group and one group per warehouse. The root group owns warehouse identity and routing. A warehouse group owns namespaces, table registrations, current metadata locations, optimistic commit requirements, idempotency records, and its applied event stream. Hosted REST handlers authenticate and validate requests, translate each transaction into one typed deterministic engine command batch, and submit it through any cache ingress to the warehouse leader. All compare-and-swap requirements are evaluated at one applied log index, so concurrent commits have one serial order without PostgreSQL.
 
-A background scrubber periodically walks the fragments associated with dirty journals. It verifies each checksum and re-encodes missing or corrupt fragments while at least `k` healthy fragments remain. The scrubber yields between objects and reports the number of fragments examined, corrupt fragments found, and fragments repaired. Integration tests inject fragment corruption, verify byte-identical reconstruction, require failure when corruption exceeds the parity budget, and exercise repair by the scrubber.
+The hosted catalog module retains Lakekeeper's Iceberg REST surface, domain validation, authorization model, and useful event schemas, but replaces its SQL transaction backend with the public Verglas state-machine client. The hosted module lives in `verglas-cloud`; the command types, consensus implementation, and durable applied state live in this engine. SQL-shaped repository calls are not emulated over a key-value shim. Operations are expressed as typed deterministic commands and reads against an immutable applied snapshot. A committed catalog index is also the outbox sequence: data-update events derive from applied commands and consumers resume by index, eliminating a second transactional outbox database.
 
-Journals are synchronized on the coordinator's local storage and replay after process restart; journal records additionally replicate to the fragment nodes themselves, so an acknowledged object remains discoverable and recoverable even after permanent loss of the coordinator's storage.
+Catalog reads are either explicitly stale or linearizable. A linearizable read obtains a ReadIndex fence from the current leader and waits until the serving replica has applied that index. Commit responses include the warehouse index, and a later request carrying that watermark cannot be served from an older view. External catalog bindings keep their existing remote semantics and are never silently upgraded or downgraded to the managed path.
 
-The AWS evaluation (§8) reports acknowledgment latency across object sizes, encoding throughput and CPU cost, time to origin propagation, and recovery of acknowledged objects under fragment corruption, node loss, origin outage, and restart during propagation.
+### 6.4 Neon WAL groups
+
+Each Neon timeline is one consensus group. Its state machine owns the PostgreSQL term, writer epoch, WAL start and commit LSNs, append identities, archive checkpoint, and truncation boundary. `AcquireWriter` is a committed command that increments the epoch. Every `Append` carries that epoch, its exact start and end LSN, and a payload hash. The leader rejects stale epochs, gaps, overlaps with different bytes, and conflicting retries before acknowledgment. Consequently, multiple ingresses can accept connections without allowing multiple live writers to commit on one timeline.
+
+Verglas, not compute, runs election, quorum, donor selection, reconstruction, and commit advancement. The Neon fork replaces walproposer's safekeeper election/quorum state machine with a transport client for `OpenTimeline`, `AcquireWriter`, `Append`, `AppendAck`, `ReadWAL`, `ReleaseWriter`, and status operations. Compute may connect through several discovered ingresses and reconnect without changing the timeline's consensus identity. It does not count ingress connections as independent voters.
+
+Pageservers read the committed stream through any ingress. A read carries an LSN range and optional minimum committed index; the serving node waits for that fence, then serves bytes from its local fragment, peer reconstruction, or the object-resident archived prefix. It never exposes uncommitted WAL. Complete 16 MiB segments archive asynchronously; partial tails stay consensus-durable until an explicit checkpoint or lifecycle flush. Truncation advances only after the timeline group commits the verified S3 archive checkpoint.
+
+### 6.5 Safety evaluation
+
+Deterministic model tests enumerate elections, partitions, message reordering, duplicate requests, fragment loss, corrupt fragments, joint membership, and crashes between every persistence and acknowledgment boundary. Integration tests use several independent ingresses and kill leaders during concurrent WAL and catalog writes. Required assertions are: one committed value per group index; every committed coded entry reconstructable by every legal successor quorum; no stale writer acknowledgment; no catalog requirement evaluated against stale state; no linearizable read below its fence; and no truncation beyond a committed archive checkpoint. Performance measurements report foreground acknowledgment latency, encoded bytes per logical byte, recovery time, and throughput per independent group, but no performance result can override a safety failure.
 
 ---
 
@@ -467,7 +490,7 @@ Three doctrines run through the whole design and are stated once here:
 
 - **Engine/control separation.** Cache, query, and write roles are public and independently runnable. Hosted access, placement, worker scheduling, and container lifecycle live in `verglas-cloud`; they consume engine contracts without becoming storage-engine dependencies.
 - **Scale-to-zero by default.** Every workload idles to zero when unused. A worker holds nothing between runs; a stateless container scales horizontally up to the operator's allocation limit and back to zero; a stateful container scales vertically (cpu/ram) while staying a single instance, and snapshots to idle when quiet. The runtime monitors every active job and owns scaling decisions — the user declares the shape, not the schedule of scale.
-- **Sockets never pin compute.** Container edge sockets and the SDK's `follow` terminate on a hibernating edge object. Lakekeeper sends committed catalog mutations directly to the tenant cache ring over its private network. Worker scheduling accepts bounded events, including complete HTTP callbacks; it never owns a client connection.
+- **Sockets never pin compute.** Container edge sockets and the SDK's `follow` terminate on a hibernating edge object. Managed catalog events are derived from committed warehouse-group indexes rather than delivered by a separate database-backed service. Worker scheduling accepts bounded events, including complete HTTP callbacks; it never owns a client connection.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'Inter, ui-sans-serif, system-ui', 'primaryTextColor': '#0f172a', 'lineColor': '#64748b'}}}%%
@@ -508,13 +531,13 @@ Workers are ordinary code packaged as immutable OCI images. Python projects carr
 
 ### 7.3 Triggers and scheduling
 
-Triggers are deployment configuration, not runtime payload variants. One worker may declare any combination of **cron**, **webhook**, and **event** subscriptions, while every dispatch is one CloudEvents 1.0 envelope delivered to `ctx.trigger`. Manual requests, cron ticks, and complete inbound HTTP requests are CloudEvent producers. Lakekeeper emits Iceberg mutation events after successful commits. An event subscription matches exact `type` and optional `source` and `subject` attributes. The hosted control plane accepts structured CloudEvents and fans them out to matching subscriptions, so Kafka, RabbitMQ, and other transports connect through bridges without adding broker payloads to the scheduler. The scheduler stores bounded CloudEvents and never owns an HTTP or WebSocket connection.
+Triggers are deployment configuration, not runtime payload variants. One worker may declare any combination of **cron**, **webhook**, and **event** subscriptions, while every dispatch is one CloudEvents 1.0 envelope delivered to `ctx.trigger`. Manual requests, cron ticks, and complete inbound HTTP requests are CloudEvent producers. Applying a managed catalog commit emits its Iceberg mutation event with the committed warehouse index as its durable identity. An event subscription matches exact `type` and optional `source` and `subject` attributes. The hosted control plane accepts structured CloudEvents and fans them out to matching subscriptions, so Kafka, RabbitMQ, and other transports connect through bridges without adding broker payloads to the scheduler. The scheduler stores bounded CloudEvents and never owns an HTTP or WebSocket connection.
 
 Scheduling follows the Airflow model: a cron dispatch carries the run's **logical time** — a nominal `logicalDate` and the half-open interval `[intervalStart, intervalEnd)` the run is responsible for. A worker doing an incremental pull ranges its query over that interval; the logical interval is the *only* progress concept a worker sees. This makes **backfill a first-class scheduling feature rather than application code**: a cron trigger declares a `startDate` and a `catchup` policy — `sequential` (replay each past interval in order), `parallel` (fan the backlog out concurrently), or `none` (start live) — and the platform dispatches the historical intervals, each as an ordinary run with its own logical window, until the schedule catches up to now. Because each run is pinned to a bounded interval and commits idempotently, a backfill and a live run are the same code path over a different window.
 
 Scheduling is a separate stateless hosted service. Each deployment has one logical worker queue. Manual REST calls, complete HTTP callbacks, cron reconciliation, and catalog data-update subscriptions all materialize the same durable job shape in that queue. A deterministic trigger identity makes enqueue idempotent; lease generations fence competing or recovered consumers; a completion is accepted only for the live generation. The scheduler can therefore restart or migrate without a filesystem guard or process-local cursor. Postgres owns queue state. Public engine roles remain independently runnable and do not mount worker-trigger routes.
 
-The scheduler is a running queue consumer. Pushed worker events are persisted before the event API acknowledges them and are eligible to run immediately. Cron, retry, and lease deadlines use exact timers derived from durable queue state; there is no periodic queue poll and no separate wake endpoint. Lakekeeper can submit matching data-update events to the scheduler, which claims work and runs the local worker harness; cache invalidation is delivered independently and directly to the cache ring.
+The scheduler is a running queue consumer. Pushed worker events are persisted before the event API acknowledges them and are eligible to run immediately. Cron, retry, and lease deadlines use exact timers derived from durable queue state; there is no periodic queue poll and no separate wake endpoint. Managed catalog data-update events are consumed from the warehouse group's applied event stream; external catalogs enter through their configured gateway. Cache invalidation for managed tables occurs in the same state-machine apply that publishes the new pointer.
 
 There is no per-deployment watermark cell. Cross-run state a worker genuinely needs belongs in a table or KV the worker writes through the connected client; scheduling progress remains the platform's responsibility, expressed as logical time.
 
@@ -531,13 +554,13 @@ In both shapes the container runtime monitors the active job and owns the scalin
 
 A deployment declares the data it may touch: the tables and databases it is granted, per record. A grant is the access-control boundary: a worker or container sees only what its record lists. CloudEvent subscription attributes independently determine which events invoke a worker; receiving an event never expands its data grants. Grants are part of the one record (§7.1), so what a workload can reach is inspectable and auditable as a unit, not scattered across IAM policies and connection strings.
 
-Databases are explicit tenant resources. `verglas db create NAME --type postgres` declares an independent managed Verglas Neon database. `verglas db create NAME --type lakehouse` creates managed storage plus a warehouse in the tenant's managed Lakekeeper deployment. Supplying `--data-path s3://…` binds a scoped S3 secret while retaining managed Lakekeeper; supplying `--catalog https://… --warehouse NAME` additionally binds a scoped Iceberg REST secret and uses the external catalog. The stable secret resource IDs are stored on the database record, so later secrets with overlapping scopes cannot silently rebind an existing database; rotating a secret replaces its value under the same ID.
+Databases are explicit tenant resources. `verglas db create NAME --type postgres` declares an independent managed Verglas Neon database. `verglas db create NAME --type lakehouse` creates managed storage plus an authoritative warehouse group in the tenant's Verglas ring. Supplying `--data-path s3://…` binds a scoped S3 secret while retaining the managed Verglas catalog; supplying `--catalog https://… --warehouse NAME` instead creates an external-catalog binding. The stable secret resource IDs are stored on the database record, so later secrets with overlapping scopes cannot silently rebind an existing database; rotating a secret replaces its value under the same ID.
 
-There is one managed Lakekeeper deployment per tenant, not one process per database. Each managed lakehouse receives its own Lakekeeper warehouse and access resource while sharing the tenant's Lakekeeper, Neon dependency, private network, and scale-to-zero lifecycle. A physically dedicated catalog is an explicit isolation/pinning tier rather than the default consequence of creating a logical database. Postgres databases remain independent managed Neon resources and do not acquire catalog bindings.
+There is one logical managed catalog service per tenant, exposed by the hosted REST fleet, not one catalog process or PostgreSQL database per warehouse. Each REST replica may route to any cache ingress. Tenant-root state maps each lakehouse to an independent warehouse group, so warehouses share the cache fleet but not a consensus log. The hosted REST and domain layer is adapted from Lakekeeper, while persistence, transactions, events, and read fencing use public Verglas engine groups. A physically dedicated voter set is an explicit isolation tier rather than the default consequence of creating a logical database. Postgres databases remain independent Neon resources; their timelines use separate WAL groups.
 
 Secret material is entered through stdin or a hidden prompt with `verglas secret create`; values never appear in command arguments or database records. Encrypted, versioned secret values live beside the tenant authorization state in the `verglas_permissions` Postgres database, while OpenFGA controls `use_secret`. Database creation resolves the longest authorized matching scope once, stores the stable resource ID, and fails closed on missing, ambiguous, or unauthorized bindings.
 
-Each cache node may also embed the Postgres WAL ingress. Neon compute speaks its ordinary safekeeper protocol to one selected reachable cache node; that ingress preserves PostgreSQL LSNs and terms and acknowledges only after the new WAL is erasure-coded and fsynced across the configured Verglas ring. The four-node managed geometry is `k=2, m=2, w=3`; placements run concurrently and the fourth does not delay commit after three durable reports. The compute is not given the ring members as a Neon safekeeper quorum: one ingress coordinates the Verglas durability quorum, while service discovery may select any healthy ingress after a failure. Complete 16 MiB WAL batches drain to object storage in the background; partial tails remain on persistent cache volumes until completion or an explicit lifecycle checkpoint. Pageserver reads both the EC tail and the object-resident prefix through the same safekeeper protocol. Running the listener inside `verglas-cache-node` shares its NVMe fragment store, peer plane, failure detection, and fleet lifecycle without introducing another deployable instance.
+Each cache node embeds a Postgres WAL ingress and may lead or follow timeline groups. Neon compute discovers several ingresses and speaks the Verglas WAL protocol described in §6.4; any ingress routes the session to the timeline leader. For the four-node managed geometry, `N=4`, majority `q=3`, and `k=2` require `w>=3`, so `k=2,m=2,w=3` is valid and a delayed fourth fragment does not delay commit. If coded placement cannot reach three voters but a majority survives, the entry is stored complete on that majority. Complete 16 MiB segments drain to object storage in the background; partial tails remain consensus-durable until an explicit lifecycle checkpoint. Pageservers read the committed EC tail and object-resident prefix through any ingress. The listener shares the cache node's NVMe store and peer transport without confusing gossip membership with consensus membership.
 
 ### 7.6 Hosted placement, containers, and workers
 
@@ -545,7 +568,7 @@ The hosted scheduler owns durable triggers, jobs, and leases but never executes 
 
 ### 7.7 Cache-pathed I/O
 
-Local I/O routes through the server's own S3 surface — the cache. This is a wiring property, not a code dependency: the engine reads and writes through whatever storage endpoint it is given, and the server hands it its own. Two guarantees follow. First, residency: every read and write a workload makes populates the cache as a side effect, so the tables an operator's workloads touch are precisely the tables the cache keeps warm — the working set is defined by use rather than by prediction. Second, ownership: the §4 ring routes below the engine, so no user or harness code path can assume a key is locally owned, and workloads behave identically on one node or a pod. The turn-off invariant of §3 is preserved: output is ordinary committed Iceberg, and with Verglas removed the tables remain readable by any engine.
+Local I/O routes through the server's own S3 surface — the cache. This is a wiring property, not a code dependency: the engine reads and writes through whatever storage endpoint it is given, and the server hands it its own. Two guarantees follow. First, residency: every read and write a workload makes populates the cache as a side effect, so the tables an operator's workloads touch are precisely the tables the cache keeps warm. Second, ownership: the §4 ring routes below the engine, so no user or harness code path can assume a key is locally owned. A clean detach preserves portability by draining objects and exporting the catalog as described in §3.2; destroying the authoritative quorum before that fence is not equivalent to disabling a disposable read cache.
 
 ### 7.8 Queues
 
@@ -553,15 +576,15 @@ Some stages need decoupling that a table's commit cadence does not provide: a bu
 
 Messages receive monotonically increasing positions in PostgreSQL and carry an exact topic plus a producer-defined idempotency identity. A subscription claims exclusive, expiring leases for one consumer group and owner; separate groups receive independent copies while owners inside one group compete. Every delivery carries an opaque receipt containing its claim generation. Acknowledgement succeeds only for that exact live generation, so an expired worker cannot acknowledge a message after another worker has reclaimed it. PostgreSQL `LISTEN/NOTIFY` wakes long-lived subscriptions after commit, but durable rows, lease deadlines, and acknowledgements remain authoritative. The client never polls. Expiry re-delivers unacknowledged messages from an exact deadline timer. Delivery remains at-least-once with consumer-side idempotency, deliberately the same discipline as the commit path (§7.2), while database durability and scale-to-zero recovery use the same Neon, Verglas cache-ring, and object-storage path as §7.5.
 
-Acknowledged Iceberg writes publish their database, table, and snapshot identity to an explicitly configured queue before the write endpoint returns success. PostgreSQL commits wake subscribers in the same transaction that inserts the durable message. A failed Iceberg event publication makes the write request fail after the snapshot commit; retrying the write reuses both the snapshot idempotency key and the queue message identity, repairing delivery without duplicating table state or queue state.
+A managed Iceberg commit creates its database, table, snapshot, and warehouse-index event as part of applying the catalog command. An explicitly configured queue consumes that applied event idempotently and may wake PostgreSQL-backed subscribers, but queue delivery is not part of catalog atomicity. Consumers resume from the warehouse index, so retrying delivery cannot duplicate table state and does not require a cross-database transaction.
 
 ### 7.9 Sockets on hibernating edge objects
 
-A long-lived inbound socket must not pin a backend that is supposed to scale to zero. Verglas terminates client-facing sockets on a hibernating edge object. Catalog mutation delivery is not client traffic: Lakekeeper publishes each successful mutation directly to every member of the tenant cache ring. Worker scheduling accepts bounded HTTP callback events and does not retain the client connection.
+A long-lived inbound socket must not pin a backend that is supposed to scale to zero. Verglas terminates client-facing sockets on a hibernating edge object. Managed catalog mutation delivery is an applied-log subscription identified by warehouse index, not a client socket or a Lakekeeper outbox callback. Worker scheduling accepts bounded HTTP callback events and does not retain the client connection.
 
 ### 7.11 Layering
 
-Every database-scoped Iceberg REST catalog remains authoritative. A local Verglas server resolves `database_id → catalog_binding_id → gateway/watcher` and exposes that database's shallow cached proxy; the proxy implements no catalog semantics of its own. Managed bindings share the tenant Lakekeeper endpoint but use distinct warehouses. External bindings carry their own endpoint and stable secret ID. The engine's Iceberg REST client and metadata-warming trigger (§5) remain transport-agnostic. The hosted Lakekeeper integration calls that trigger directly after a successful mutation; third-party catalogs may continue to discover changes through polling and therefore provide eventual consistency only.
+The hosted control plane resolves `database_id → catalog_binding`. A managed binding routes REST operations through an engine ingress to `tenant root → warehouse group`; the ingress exposes the private state-machine contract, not the hosted Iceberg REST or identity surface. An external binding routes to a remote catalog gateway and carries its own endpoint and stable secret ID. The same query/write engine clients and metadata-warming code operate above both bindings, but their consistency contracts remain explicit: managed reads and commits are linearizable through Raft fences, while third-party catalogs retain their own polling, notification, and transaction behavior. No managed request falls back to an external catalog or PostgreSQL persistence.
 
 ---
 
@@ -611,7 +634,7 @@ ClickHouse is excluded from the table because the tested Iceberg path did not su
 
 The lakehouse settled where analytical data lives; it has not settled where hot bytes are served from or where its own transactional state runs. Today those gaps are filled by derived copies — OLAP stores, feature stores, vector databases, replicated Postgres — each with its own pipeline, freshness boundary, and failure modes, and by a managed database quietly required underneath every catalog.
 
-Verglas closes both gaps with one tier. Because it is built on Iceberg's contract rather than merely compatible with its files, its two central properties are structural: version-keyed blocks cannot serve stale bytes at any configuration, and catalog subscription warms metadata and data before queries ask. Engines adopt it by changing an endpoint; removing it leaves a standard Iceberg lakehouse, just slower.
+Verglas closes both gaps with one tier. Version-keyed blocks cannot serve bytes from the wrong immutable object version, while coded Multi-Raft gives managed catalog commits and Postgres WAL one agreement and persistence boundary across every ingress. Catalog application warms metadata before queries ask, and WAL is readable as soon as its append commits rather than after S3 archival. Engines adopt the managed service through standard Iceberg REST and the Verglas Neon protocol. A clean checkpoint-and-detach leaves standard Iceberg objects and an exported catalog for another service; an authoritative ring cannot be destroyed like a disposable cache while acknowledged state is still local.
 
 The platform layer applies the same discipline to data movement. A pipeline is a deployment record executed by a harness against the same commit contract everywhere; correctness rests on commit-before-acknowledgment and snapshot-recorded idempotency keys rather than on any property of the runtime that happens to host the job.
 
@@ -650,3 +673,5 @@ The platform layer applies the same discipline to data movement. A pipeline is a
 29. ClickHouse. [*ClickHouse Release 25.7 Call*](https://presentations.clickhouse.com/2025-release-25.7/).
 30. Apache Software Foundation. [*Kafka Connect*](https://kafka.apache.org/documentation/#connect).
 31. Tyler Akidau et al. [*MillWheel: Fault-Tolerant Stream Processing at Internet Scale*](https://doi.org/10.14778/2536222.2536229). PVLDB 6(11), 2013.
+32. Shuai Mu, Kang Chen, Yongwei Wu, and Weimin Zheng. [*When Paxos Meets Erasure Code: Reduce Network and Storage Cost in State Machine Replication*](https://doi.org/10.1145/2600212.2600218). HPDC 2014.
+33. Zizhong Wang et al. [*CRaft: An Erasure-coding-supported Version of Raft for Reducing Storage Cost and Network Cost*](https://www.usenix.org/conference/fast20/presentation/wang-zizhong). FAST 2020.
