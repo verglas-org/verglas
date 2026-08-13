@@ -101,6 +101,49 @@ fn write_config(root: &std::path::Path, index: usize, s3: u16, admin: u16) -> st
     config
 }
 
+/// Starts one cache node against its retained directory and captures diagnostics.
+fn spawn_node(
+    index: usize,
+    config: &std::path::Path,
+    peers: &str,
+    ring_port: u16,
+    safekeeper_port: u16,
+    stderr: &Arc<Mutex<Vec<String>>>,
+) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
+        .arg("--config")
+        .arg(config)
+        .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
+        .env("VERGLAS_NODE_ID", format!("node-{index}"))
+        .env("VERGLAS_RING_PEERS", peers)
+        .env("VERGLAS_SAFEKEEPER_EC_K", "2")
+        .env("VERGLAS_SAFEKEEPER_EC_M", "2")
+        .env("VERGLAS_SAFEKEEPER_EC_W", "3")
+        .env("VERGLAS_RING_ADDR", format!("127.0.0.1:{ring_port}"))
+        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
+        .env(
+            "VERGLAS_SAFEKEEPER_ADDR",
+            format!("127.0.0.1:{safekeeper_port}"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cache node");
+    let pipe = child.stderr.take().expect("piped stderr");
+    let sink = Arc::clone(stderr);
+    thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            let Ok(line) = line else {
+                return;
+            };
+            if let Ok(mut lines) = sink.lock() {
+                lines.push(line);
+            }
+        }
+    });
+    child
+}
+
 /// Submits one canonical WAL operation and decodes its complete response.
 async fn submit(addr: SocketAddr, request: WalRequest) -> Result<WalResponse, String> {
     let body = request.encode().expect("encode WAL request");
@@ -134,44 +177,19 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         .collect::<Vec<_>>()
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
     let mut children = Vec::new();
     for index in 0..4 {
-        let config = write_config(root.path(), index, free_port(), free_port());
-        let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
-            .arg("--config")
-            .arg(config)
-            .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
-            .env("VERGLAS_NODE_ID", format!("node-{index}"))
-            .env("VERGLAS_RING_PEERS", &peers)
-            .env("VERGLAS_SAFEKEEPER_EC_K", "2")
-            .env("VERGLAS_SAFEKEEPER_EC_M", "2")
-            .env("VERGLAS_SAFEKEEPER_EC_W", "3")
-            .env(
-                "VERGLAS_RING_ADDR",
-                format!("127.0.0.1:{}", ring_ports[index]),
-            )
-            .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
-            .env(
-                "VERGLAS_SAFEKEEPER_ADDR",
-                format!("127.0.0.1:{}", safekeeper_ports[index]),
-            )
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cache node");
-        let pipe = child.stderr.take().expect("piped stderr");
-        let sink = Arc::clone(&stderr);
-        thread::spawn(move || {
-            for line in BufReader::new(pipe).lines() {
-                let Ok(line) = line else {
-                    return;
-                };
-                if let Ok(mut lines) = sink.lock() {
-                    lines.push(line);
-                }
-            }
-        });
-        children.push(child);
+        children.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            &stderr,
+        ));
     }
     let mut fleet = Fleet { children, stderr };
     fleet.wait_for_safekeepers(4, Duration::from_secs(30));
@@ -276,14 +294,40 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     expected.extend_from_slice(second);
     assert_eq!(read, WalResponse::WalBytes { payload: expected });
 
+    fleet.children[3] = spawn_node(
+        3,
+        &configs[3],
+        &peers,
+        ring_ports[3],
+        safekeeper_ports[3],
+        &fleet.stderr,
+    );
+    fleet.wait_for_safekeepers(5, Duration::from_secs(30));
+
     fleet.children[2].kill().expect("stop third voter");
     fleet.children[2].wait().expect("reap third voter");
-    let minority = submit(
+    let recovered_payload = b"through-restarted-follower";
+    let recovered = submit(
         address,
         WalRequest::Append {
             request_id: (u128::from(writer_epoch) << 64) | u128::from(second_end),
             writer_epoch,
             start_lsn: second_end,
+            payload: recovered_payload.to_vec(),
+        },
+    )
+    .await
+    .expect("a restarted durable follower must reopen its group from Raft traffic");
+    assert!(matches!(recovered, WalResponse::Applied { .. }));
+
+    fleet.children[3].kill().expect("stop restarted fourth voter");
+    fleet.children[3].wait().expect("reap restarted fourth voter");
+    let minority = submit(
+        address,
+        WalRequest::Append {
+            request_id: (u128::from(writer_epoch) << 64) | u128::from(second_end + 1),
+            writer_epoch,
+            start_lsn: second_end + recovered_payload.len() as u64,
             payload: b"must-not-commit".to_vec(),
         },
     )
