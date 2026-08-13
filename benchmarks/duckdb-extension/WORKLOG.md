@@ -27,3 +27,4 @@
 - #126: Added failing tests for the repository-owned managed runner. They
   distinguish direct-R2 Quack from Quack loading the real Verglas extension and
   require every product path to execute the same out-of-core SQL semantics.
+- #126: Added the managed-Iceberg runner used by the full-stack benchmark. It creates a unique Iceberg v2 table through Lakekeeper, keeps Quack's direct R2 path separate from the Query worker and extension path, and streams typed Arrow evidence from real clients.
