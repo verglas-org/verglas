@@ -95,6 +95,11 @@ const FRAGMENT_HEADROOM_PATH: &str = "/peer/v0/fragment/headroom";
 /// Lists fragment keys whose object id begins with a requested prefix.
 const FRAGMENT_LIST_PATH: &str = "/peer/v0/fragment/list";
 
+/// The hard availability budget for one fragment recovery read. Placement keeps
+/// its longer durability budget, but a blackholed retained holder must not
+/// consume a catalog leader's request deadline.
+const FRAGMENT_RECOVERY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// Header carrying the byte count a headroom check asks about.
 const FRAGMENT_BYTES_HEADER: &str = "x-verglas-fragment-bytes";
 
@@ -1073,7 +1078,14 @@ impl FragmentClient {
             object_id: key.object_id.clone(),
             index: key.index,
         };
-        let builder = self.http.post(&url).json(&request);
+        // A fragment placement may wait for a peer fsync, but recovery only
+        // needs a reconstructable subset. Bound this one read independently so
+        // a dead certified holder cannot make a committed-prefix scan time out.
+        let builder = self
+            .http
+            .post(&url)
+            .timeout(FRAGMENT_RECOVERY_READ_TIMEOUT)
+            .json(&request);
         let response = self.authenticated(builder).send().await.map_err(|e| {
             FragmentRpcError::Unavailable {
                 node: node.clone(),

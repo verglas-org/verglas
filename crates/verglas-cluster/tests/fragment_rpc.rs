@@ -71,6 +71,14 @@ fn handlers_for(store: LocalFragmentStore) -> FragmentHandlers {
     }
 }
 
+/// Wires fragment handlers whose read never answers, simulating a peer that
+/// accepts a connection but has stopped making recovery progress.
+fn handlers_with_hanging_load(store: LocalFragmentStore) -> FragmentHandlers {
+    let mut handlers = handlers_for(store);
+    handlers.load = Arc::new(|_key| Box::pin(std::future::pending()));
+    handlers
+}
+
 /// Binds a fragment server over a fresh store, returning the server, a client
 /// pointed at it as `node`, and the backing store.
 async fn server_and_client(
@@ -229,4 +237,45 @@ async fn unreachable_node_is_a_placement_error() {
         )
         .await;
     assert!(result.is_err(), "an unreachable node is a placement error");
+}
+
+/// Recovery reads must not inherit the long durability-placement deadline.
+#[tokio::test]
+async fn fragment_read_times_out_before_the_durability_placement_budget() {
+    let node = NodeId::new("blackholed-peer");
+    let directory =
+        std::env::temp_dir().join(format!("verglas-fragrpc-blackhole-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let server = PeerServer::bind_with_fragments(
+        "127.0.0.1:0".parse().expect("addr"),
+        None,
+        empty_blocks(),
+        handlers_with_hanging_load(LocalFragmentStore::new(&directory)),
+    )
+    .await
+    .expect("bind blackholed fragment server");
+    let client = FragmentClient::new(
+        Arc::new(StaticResolver::with(node.clone(), server.local_addr())),
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(300),
+        client.get_fragment(
+            &node,
+            &FragmentKey {
+                object_id: "retained-catalog-header".to_owned(),
+                index: 0,
+            },
+        ),
+    )
+    .await;
+    assert!(
+        matches!(result, Ok(Err(_))),
+        "a stalled recovery read must fail within its short availability budget: {result:?}"
+    );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(directory);
 }

@@ -115,6 +115,7 @@
 - #135: Added authenticated HTTP/2 OpenRaft vote, append, and snapshot RPCs,
   keyed by both group and voter identity. One cache node can host many independent
   warehouse and timeline groups without one registration overwriting another.
+
 - #135: Allowed the cache peer listener to merge the authenticated consensus
   router with block and fragment routes. Raft reuses the existing multiplexed
   peer port instead of introducing another deployment endpoint.
@@ -139,3 +140,9 @@
   and snapshot traffic before looking up its in-memory replica. A restarted node
   now reloads retained durable groups lazily; unknown targets still return 404
   and unauthenticated traffic cannot invoke the opener.
+
+- #135: Gave fragment recovery reads their own short availability deadline while
+  preserving the longer fsync budget for fragment placement. A retained catalog
+  leader now treats a blackholed certified holder as unavailable quickly, so it
+  can verify the full committed prefix from surviving replicas before the
+  request deadline without skipping corruption checks.
