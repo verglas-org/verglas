@@ -20,8 +20,6 @@ members = [
     "crates/verglas-kv",
     "bins/cache-node",
     "crates/verglas-block",
-    "bins/query-node",
-    "bins/write-node",
 ]
 
 [workspace.package]

@@ -209,8 +209,11 @@
 - #135: Return HTTP 409 only for CRaft catalog CAS and request-identity
   conflicts. All other catalog submission failures are HTTP 503 so another
   ingress can preserve availability during leader or quorum disruption.
-
 - #135: Added a four-process native-catalog leader-loss regression with a
   realistic retained warehouse prefix. It proves a surviving ingress serves
   an immediate fenced read and mutation at three of four voters, while a
   two-voter catalog minority remains closed.
+- #137: Mounted the semantic REST-JSON dispatcher on the existing cache-node
+  S3 listener before the ordinary S3 fallback. When a catalog is configured it
+  opens the customer Iceberg catalog and routes Graph requests through it; no
+  query-node, write-node, or process-local graph registry remains.

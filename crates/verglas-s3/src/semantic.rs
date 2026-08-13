@@ -1,0 +1,685 @@
+//! Semantic REST-JSON dispatch on the cache node's S3 listener.
+//!
+//! This module owns only wire routing and error rendering. A [`SemanticApi`]
+//! implementation owns all meaning and must use Iceberg tables as its source of
+//! truth; Puffin is an optional, snapshot-bound acceleration artifact.
+
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{Method, StatusCode, Uri},
+    response::IntoResponse,
+    routing::{get, post},
+};
+use iceberg::Catalog;
+use serde_json::{Value, json};
+use verglas_graph::{Direction, Edge, Graph, Node, TraversalFilter};
+use verglas_iceberg::{parse_table_ident, tables_api};
+
+/// The operations in the checked-in AWS S3 Vectors and Verglas Graph contracts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticOperation {
+    /// An AWS S3 Vectors REST-JSON operation.
+    S3Vectors(&'static str),
+    /// A Verglas Graph REST-JSON operation.
+    Graph(&'static str),
+}
+
+/// Error returned by a semantic engine while serving a protocol operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticError {
+    /// HTTP status returned to the client.
+    pub status: StatusCode,
+    /// Stable REST-JSON error code.
+    pub code: &'static str,
+    /// Safe operator/client-facing explanation.
+    pub message: String,
+}
+
+impl SemanticError {
+    /// Builds a validation error without exposing internal state.
+    pub fn validation(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "ValidationException",
+            message: message.into(),
+        }
+    }
+
+    /// Builds an unavailable error for a node without a configured Iceberg catalog.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "ServiceUnavailableException",
+            message: message.into(),
+        }
+    }
+}
+
+/// Durable semantic implementation selected by the cache-node runtime.
+///
+/// Implementations must not keep bucket, index, vector, or graph membership in
+/// process memory. A restart must rehydrate solely from the customer-owned
+/// Iceberg snapshot and its Puffin attachments.
+#[async_trait]
+pub trait SemanticApi: Send + Sync + 'static {
+    /// Executes one exact REST-JSON operation and returns its response object.
+    async fn call(
+        &self,
+        operation: SemanticOperation,
+        input: Value,
+    ) -> Result<Value, SemanticError>;
+}
+
+/// Router state shared by all semantic endpoints.
+#[derive(Clone)]
+struct SemanticState {
+    /// The explicitly wired durable semantic implementation.
+    api: Arc<dyn SemanticApi>,
+}
+
+/// Builds the semantic routes that take precedence over the ordinary S3 fallback.
+///
+/// Every route is intentionally declared from the two checked-in contracts.
+/// This is an extension seam for future wire-format evolution; no negotiation
+/// or compatibility path exists in this prototype.
+pub fn router(api: Arc<dyn SemanticApi>) -> Router {
+    let state = SemanticState { api };
+    Router::new()
+        .route("/CreateIndex", post(dispatch_s3))
+        .route("/CreateVectorBucket", post(dispatch_s3))
+        .route("/DeleteIndex", post(dispatch_s3))
+        .route("/DeleteVectorBucket", post(dispatch_s3))
+        .route("/DeleteVectorBucketPolicy", post(dispatch_s3))
+        .route("/DeleteVectors", post(dispatch_s3))
+        .route("/GetIndex", post(dispatch_s3))
+        .route("/GetVectorBucket", post(dispatch_s3))
+        .route("/GetVectorBucketPolicy", post(dispatch_s3))
+        .route("/GetVectors", post(dispatch_s3))
+        .route("/ListIndexes", post(dispatch_s3))
+        .route("/ListVectorBuckets", post(dispatch_s3))
+        .route("/ListVectors", post(dispatch_s3))
+        .route("/PutVectorBucketPolicy", post(dispatch_s3))
+        .route("/PutVectors", post(dispatch_s3))
+        .route("/QueryVectors", post(dispatch_s3))
+        .route(
+            "/tags/{resourceArn}",
+            get(dispatch_s3).post(dispatch_s3).delete(dispatch_s3),
+        )
+        .route("/CreateGraph", post(dispatch_graph))
+        .route("/DeleteGraph", post(dispatch_graph))
+        .route("/GetGraph", post(dispatch_graph))
+        .route("/ListGraphs", post(dispatch_graph))
+        .route("/PutNodes", post(dispatch_graph))
+        .route("/PutEdges", post(dispatch_graph))
+        .route("/GetNeighbors", post(dispatch_graph))
+        .route("/QueryKHop", post(dispatch_graph))
+        .route("/QueryNeighborhood", post(dispatch_graph))
+        .route("/QueryPaths", post(dispatch_graph))
+        .route("/BuildGraphIndex", post(dispatch_graph))
+        .with_state(state)
+}
+
+/// Resolves and runs an AWS operation from its exact request URI.
+async fn dispatch_s3(
+    State(state): State<SemanticState>,
+    method: Method,
+    uri: Uri,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let Some(operation) = s3_operation(uri.path(), &method) else {
+        return not_found();
+    };
+    dispatch(
+        state,
+        operation,
+        body.map_or(Value::Object(Default::default()), |body| body.0),
+    )
+    .await
+}
+
+/// Resolves and runs a graph operation from its exact request URI.
+async fn dispatch_graph(
+    State(state): State<SemanticState>,
+    uri: Uri,
+    body: Option<Json<Value>>,
+) -> impl IntoResponse {
+    let Some(operation) = graph_operation(uri.path()) else {
+        return not_found();
+    };
+    dispatch(
+        state,
+        operation,
+        body.map_or(Value::Object(Default::default()), |body| body.0),
+    )
+    .await
+}
+
+/// Calls the durable adapter and maps its result to REST-JSON.
+async fn dispatch(
+    state: SemanticState,
+    operation: SemanticOperation,
+    body: Value,
+) -> axum::response::Response {
+    match state.api.call(operation, body).await {
+        Ok(output) => (StatusCode::OK, Json(output)).into_response(),
+        Err(error) => (
+            error.status,
+            Json(json!({"code": error.code, "message": error.message})),
+        )
+            .into_response(),
+    }
+}
+
+/// Returns the protocol's standard unknown-operation response.
+fn not_found() -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"code": "NotFoundException", "message": "unknown semantic operation"})),
+    )
+        .into_response()
+}
+
+/// Maps each exact S3 Vectors URI to its operation name.
+fn s3_operation(path: &str, method: &Method) -> Option<SemanticOperation> {
+    if path.starts_with("/tags/") {
+        return match *method {
+            Method::GET => Some(SemanticOperation::S3Vectors("ListTagsForResource")),
+            Method::POST => Some(SemanticOperation::S3Vectors("TagResource")),
+            Method::DELETE => Some(SemanticOperation::S3Vectors("UntagResource")),
+            _ => None,
+        };
+    }
+    const OPERATIONS: [&str; 16] = [
+        "CreateIndex",
+        "CreateVectorBucket",
+        "DeleteIndex",
+        "DeleteVectorBucket",
+        "DeleteVectorBucketPolicy",
+        "DeleteVectors",
+        "GetIndex",
+        "GetVectorBucket",
+        "GetVectorBucketPolicy",
+        "GetVectors",
+        "ListIndexes",
+        "ListVectorBuckets",
+        "ListVectors",
+        "PutVectorBucketPolicy",
+        "PutVectors",
+        "QueryVectors",
+    ];
+    let operation = path.strip_prefix('/')?;
+    OPERATIONS
+        .into_iter()
+        .find(|candidate| *candidate == operation)
+        .map(SemanticOperation::S3Vectors)
+}
+
+/// Maps each exact Graph URI to its operation name.
+fn graph_operation(path: &str) -> Option<SemanticOperation> {
+    const OPERATIONS: [&str; 11] = [
+        "CreateGraph",
+        "DeleteGraph",
+        "GetGraph",
+        "ListGraphs",
+        "PutNodes",
+        "PutEdges",
+        "GetNeighbors",
+        "QueryKHop",
+        "QueryNeighborhood",
+        "QueryPaths",
+        "BuildGraphIndex",
+    ];
+    let operation = path.strip_prefix('/')?;
+    OPERATIONS
+        .into_iter()
+        .find(|candidate| *candidate == operation)
+        .map(SemanticOperation::Graph)
+}
+
+/// A deliberately fail-closed implementation used until the cache node has a
+/// native Iceberg catalog runtime. It stores nothing and cannot fabricate data.
+pub struct UnavailableSemanticApi;
+
+#[async_trait]
+impl SemanticApi for UnavailableSemanticApi {
+    /// Rejects requests rather than constructing an authoritative local registry.
+    async fn call(
+        &self,
+        _operation: SemanticOperation,
+        _input: Value,
+    ) -> Result<Value, SemanticError> {
+        Err(SemanticError::unavailable(
+            "semantic APIs require a configured native Iceberg catalog",
+        ))
+    }
+}
+
+/// Iceberg-backed Graph adapter used by the cache-node runtime.
+///
+/// It has no registry: a graph name is an Iceberg namespace and [`Graph`] is
+/// reopened for every operation. Consequently the graph's node/edge tables and
+/// snapshot-bound Puffin attachment remain the only durable state.
+pub struct IcebergCatalogSemanticStore {
+    /// The catalog that owns all graph tables and Puffin statistics files.
+    catalog: Arc<dyn Catalog>,
+}
+
+impl IcebergCatalogSemanticStore {
+    /// Creates an adapter over one already-open Iceberg catalog.
+    pub fn new(catalog: Arc<dyn Catalog>) -> Self {
+        Self { catalog }
+    }
+
+    /// Opens the named graph directly from its Iceberg namespace.
+    fn graph(&self, input: &Value) -> Result<Graph, SemanticError> {
+        let graph = input
+            .get("graphName")
+            .and_then(Value::as_str)
+            .ok_or_else(|| SemanticError::validation("graphName is required"))?;
+        Graph::open(self.catalog.clone(), graph).map_err(graph_error)
+    }
+}
+
+#[async_trait]
+impl SemanticApi for IcebergCatalogSemanticStore {
+    /// Runs semantic operations against customer-owned Iceberg tables.
+    async fn call(
+        &self,
+        operation: SemanticOperation,
+        input: Value,
+    ) -> Result<Value, SemanticError> {
+        if let SemanticOperation::S3Vectors(operation) = operation {
+            return self.vector_call(operation, input).await;
+        }
+        let SemanticOperation::Graph(operation) = operation else {
+            unreachable!("semantic operation is vector or graph")
+        };
+        let graph = self.graph(&input)?;
+        match operation {
+            "CreateGraph" => {
+                graph.ensure_tables().await.map_err(graph_error)?;
+                Ok(json!({}))
+            }
+            "PutNodes" => {
+                let rows = input
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| SemanticError::validation("nodes is required"))?;
+                let nodes = rows
+                    .iter()
+                    .map(node_from_json)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let snapshot = graph.insert_nodes(&nodes).await.map_err(graph_error)?;
+                Ok(json!({"snapshotId": snapshot}))
+            }
+            "PutEdges" => {
+                let rows = input
+                    .get("edges")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| SemanticError::validation("edges is required"))?;
+                let edges = rows
+                    .iter()
+                    .map(edge_from_json)
+                    .collect::<Result<Vec<_>, _>>()?;
+                let snapshot = graph.insert_edges(&edges).await.map_err(graph_error)?;
+                Ok(json!({"snapshotId": snapshot}))
+            }
+            "BuildGraphIndex" => {
+                Ok(json!({"index": graph.build_index(None).await.map_err(graph_error)?.is_some()}))
+            }
+            "GetNeighbors" => {
+                let reader = graph.reader(None).await.map_err(graph_error)?;
+                let node = required_string(&input, "nodeId")?;
+                Ok(
+                    json!({"neighbors": reader.get_neighbors(node, direction(&input)?, &TraversalFilter::default())}),
+                )
+            }
+            "QueryKHop" => {
+                let reader = graph.reader(None).await.map_err(graph_error)?;
+                let node = required_string(&input, "nodeId")?;
+                let hops = required_u32(&input, "k")?;
+                Ok(
+                    json!({"nodes": reader.k_hop(node, hops, direction(&input)?, &TraversalFilter::default())}),
+                )
+            }
+            "QueryNeighborhood" => {
+                let reader = graph.reader(None).await.map_err(graph_error)?;
+                let node = required_string(&input, "nodeId")?;
+                let hops = required_u32(&input, "k")?;
+                Ok(
+                    json!({"neighborhood": reader.neighborhood(node, hops, direction(&input)?, &TraversalFilter::default())}),
+                )
+            }
+            "QueryPaths" => {
+                let reader = graph.reader(None).await.map_err(graph_error)?;
+                Ok(
+                    json!({"paths": reader.paths(required_string(&input, "sourceId")?, required_string(&input, "targetId")?, required_u32(&input, "maxHops")?, direction(&input)?, &TraversalFilter::default())}),
+                )
+            }
+            "GetGraph" => Ok(
+                json!({"graphName": required_string(&input, "graphName")?, "edgesSnapshotId": graph.current_edges_snapshot().await.map_err(graph_error)?}),
+            ),
+            "DeleteGraph" | "ListGraphs" => Err(SemanticError::unavailable(
+                "Iceberg catalog namespace deletion/listing is not exposed by this catalog adapter",
+            )),
+            _ => Err(SemanticError::validation("unknown graph operation")),
+        }
+    }
+}
+
+impl IcebergCatalogSemanticStore {
+    /// Executes the vector operations whose durable state is an Iceberg table.
+    async fn vector_call(&self, operation: &str, input: Value) -> Result<Value, SemanticError> {
+        let ident = vector_ident(&input)?;
+        match operation {
+            "CreateIndex" => {
+                let definition = tables_api::CreateTableRequest {
+                    schema: vec![
+                        tables_api::ColumnSpec::required("key", "string"),
+                        tables_api::ColumnSpec::nullable("data", "list<float32>"),
+                        tables_api::ColumnSpec::nullable("metadata", "string"),
+                        tables_api::ColumnSpec::required("deleted", "boolean"),
+                    ],
+                    partitions: Vec::new(),
+                };
+                tables_api::create_table(self.catalog.as_ref(), &ident, definition)
+                    .await
+                    .map_err(iceberg_error)?;
+                Ok(json!({"indexArn": vector_arn(&input)?}))
+            }
+            "PutVectors" | "DeleteVectors" => {
+                let values = if operation == "PutVectors" {
+                    input.get("vectors")
+                } else {
+                    input.get("keys")
+                }
+                .and_then(Value::as_array)
+                .ok_or_else(|| SemanticError::validation("vectors or keys is required"))?;
+                let rows = values
+                    .iter()
+                    .map(|value| vector_row(value, operation == "DeleteVectors"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                tables_api::commit(
+                    self.catalog.as_ref(),
+                    &ident,
+                    tables_api::CommitRequest {
+                        rows,
+                        idempotency_key: None,
+                    },
+                )
+                .await
+                .map_err(iceberg_error)?;
+                Ok(json!({}))
+            }
+            "GetVectors" => {
+                let wanted = input
+                    .get("keys")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| SemanticError::validation("keys is required"))?
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<std::collections::HashSet<_>>();
+                let vectors = live_vectors(self.catalog.as_ref(), &ident)
+                    .await?
+                    .into_iter()
+                    .filter(|vector| wanted.contains(vector.key.as_str()))
+                    .map(|vector| vector.output(&input))
+                    .collect::<Vec<_>>();
+                Ok(json!({"vectors": vectors}))
+            }
+            "ListVectors" => Ok(
+                json!({"vectors": live_vectors(self.catalog.as_ref(), &ident).await?.into_iter().map(|vector| vector.output(&input)).collect::<Vec<_>>() }),
+            ),
+            "QueryVectors" => {
+                let query = input
+                    .get("queryVector")
+                    .and_then(Value::as_array)
+                    .ok_or_else(|| SemanticError::validation("queryVector is required"))?
+                    .iter()
+                    .map(|value| {
+                        value.as_f64().map(|number| number as f32).ok_or_else(|| {
+                            SemanticError::validation("queryVector must contain numbers")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut vectors = live_vectors(self.catalog.as_ref(), &ident).await?;
+                vectors.retain(|vector| vector.data.len() == query.len());
+                vectors.sort_by(|left, right| {
+                    squared_distance(&left.data, &query)
+                        .total_cmp(&squared_distance(&right.data, &query))
+                });
+                let vectors = vectors.into_iter().take(required_u32(&input, "topK")? as usize).map(|vector| json!({"key": vector.key, "distance": squared_distance(&vector.data, &query), "metadata": vector.metadata})).collect::<Vec<_>>();
+                Ok(json!({"vectors": vectors}))
+            }
+            _ => Err(SemanticError::unavailable(
+                "vector bucket metadata, policies, and tags require native catalog properties",
+            )),
+        }
+    }
+}
+
+/// Resolves a vector bucket/index name to its customer-owned Iceberg table.
+fn vector_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
+    parse_table_ident(&format!(
+        "{}.{}",
+        required_string(input, "vectorBucketName")?,
+        required_string(input, "indexName")?
+    ))
+    .map_err(iceberg_error)
+}
+
+/// Builds the stable local ARN returned for a newly created vector index.
+fn vector_arn(input: &Value) -> Result<String, SemanticError> {
+    Ok(format!(
+        "arn:verglas:s3vectors:::{}:{}",
+        required_string(input, "vectorBucketName")?,
+        required_string(input, "indexName")?
+    ))
+}
+
+/// Converts an S3 Vector write/delete item into an append-only Iceberg row.
+fn vector_row(value: &Value, deleted: bool) -> Result<Value, SemanticError> {
+    let key = if deleted {
+        value
+            .as_str()
+            .ok_or_else(|| SemanticError::validation("key must be a string"))?
+    } else {
+        required_string(value, "key")?
+    };
+    let data = if deleted {
+        Value::Null
+    } else {
+        value
+            .get("data")
+            .cloned()
+            .ok_or_else(|| SemanticError::validation("vector data is required"))?
+    };
+    if !deleted
+        && !data
+            .as_array()
+            .is_some_and(|items| items.iter().all(Value::is_number))
+    {
+        return Err(SemanticError::validation(
+            "vector data must contain numbers",
+        ));
+    }
+    Ok(
+        json!({"key": key, "data": data, "metadata": if deleted { None } else { value.get("metadata").map(Value::to_string) }, "deleted": deleted}),
+    )
+}
+
+/// A source-table vector with its exact customer-provided key preserved.
+struct LiveVector {
+    key: String,
+    data: Vec<f32>,
+    metadata: Option<Value>,
+}
+
+impl LiveVector {
+    /// Renders Get/List output without exposing the implementation's scan state.
+    fn output(&self, input: &Value) -> Value {
+        let mut output = json!({"key": self.key});
+        if input
+            .get("returnData")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            output["data"] = json!(self.data);
+        }
+        if input
+            .get("returnMetadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            output["metadata"] = self.metadata.clone().unwrap_or(Value::Null);
+        }
+        output
+    }
+}
+
+/// Scans the current source snapshot; this is the correct, slower turn-off path.
+async fn live_vectors(
+    catalog: &dyn Catalog,
+    ident: &iceberg::TableIdent,
+) -> Result<Vec<LiveVector>, SemanticError> {
+    let rows = tables_api::rows(catalog, ident, None, None)
+        .await
+        .map_err(iceberg_error)?
+        .rows;
+    let mut current = std::collections::BTreeMap::new();
+    for row in rows {
+        let Some(key) = row.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        if row.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+            current.remove(key);
+            continue;
+        }
+        let data = row
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_f64)
+                    .map(|number| number as f32)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let metadata = row
+            .get("metadata")
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str(text).ok());
+        current.insert(
+            key.to_owned(),
+            LiveVector {
+                key: key.to_owned(),
+                data,
+                metadata,
+            },
+        );
+    }
+    Ok(current.into_values().collect())
+}
+
+/// Computes exact squared L2 distance for the no-Puffin query path.
+fn squared_distance(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(a, b)| {
+            let delta = a - b;
+            delta * delta
+        })
+        .sum()
+}
+
+/// Converts an Iceberg error to a safe service failure.
+fn iceberg_error(error: impl std::fmt::Display) -> SemanticError {
+    SemanticError::unavailable(error.to_string())
+}
+
+/// Converts a REST-JSON node object to the graph engine's durable row model.
+fn node_from_json(value: &Value) -> Result<Node, SemanticError> {
+    let mut node = Node::new(required_string(value, "id")?);
+    node.labels = value
+        .get("labels")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    node.properties = value
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Ok(node)
+}
+
+/// Converts a REST-JSON edge object to the graph engine's append-only model.
+fn edge_from_json(value: &Value) -> Result<Edge, SemanticError> {
+    let mut edge = Edge::new(
+        required_string(value, "sourceId")?,
+        required_string(value, "predicate")?,
+        required_string(value, "targetId")?,
+        required_string(value, "provenance")?,
+    );
+    if let Some(id) = value.get("edgeId").and_then(Value::as_str) {
+        edge.edge_id = id.to_owned();
+    }
+    if let Some(confidence) = value.get("confidence").and_then(Value::as_f64) {
+        edge.confidence = confidence;
+    }
+    edge.properties = value
+        .get("properties")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    Ok(edge)
+}
+
+/// Reads one required string field from an operation input.
+fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, SemanticError> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| SemanticError::validation(format!("{field} is required")))
+}
+
+/// Reads one required non-negative hop count from an operation input.
+fn required_u32(value: &Value, field: &str) -> Result<u32, SemanticError> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .ok_or_else(|| SemanticError::validation(format!("{field} is required")))
+}
+
+/// Parses the optional traversal direction, defaulting to outgoing edges.
+fn direction(input: &Value) -> Result<Direction, SemanticError> {
+    match input
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("out")
+    {
+        "out" => Ok(Direction::Out),
+        "in" => Ok(Direction::In),
+        "both" => Ok(Direction::Both),
+        _ => Err(SemanticError::validation(
+            "direction must be out, in, or both",
+        )),
+    }
+}
+
+/// Converts graph-engine errors to a safe REST-JSON service failure.
+fn graph_error(error: verglas_graph::GraphError) -> SemanticError {
+    SemanticError::unavailable(error.to_string())
+}

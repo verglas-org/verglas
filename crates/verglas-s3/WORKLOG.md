@@ -261,3 +261,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   cache access key as a user or tenant principal. Regression coverage proves a
   signed object GET still succeeds while a signed `/v1` path is rejected as an
   invalid S3 bucket.
+- #137: Added checked-in AWS S3 Vectors and Verglas Graph REST-JSON contracts
+  and dispatch them through the existing S3 listener. The Graph adapter opens
+  customer Iceberg tables per operation and uses Puffin only as its existing
+  snapshot-bound acceleration, never as a local authoritative registry.

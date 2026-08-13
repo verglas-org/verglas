@@ -1,0 +1,22 @@
+{
+  "version": "1.0",
+  "metadata": {
+    "apiVersion": "2026-08-13",
+    "protocol": "rest-json",
+    "serviceId": "VerglasGraphs",
+    "signingName": "verglasgraphs"
+  },
+  "operations": {
+    "CreateGraph": { "http": { "method": "POST", "requestUri": "/CreateGraph", "responseCode": 200 } },
+    "DeleteGraph": { "http": { "method": "POST", "requestUri": "/DeleteGraph", "responseCode": 200 } },
+    "GetGraph": { "http": { "method": "POST", "requestUri": "/GetGraph", "responseCode": 200 } },
+    "ListGraphs": { "http": { "method": "POST", "requestUri": "/ListGraphs", "responseCode": 200 } },
+    "PutNodes": { "http": { "method": "POST", "requestUri": "/PutNodes", "responseCode": 200 } },
+    "PutEdges": { "http": { "method": "POST", "requestUri": "/PutEdges", "responseCode": 200 } },
+    "GetNeighbors": { "http": { "method": "POST", "requestUri": "/GetNeighbors", "responseCode": 200 } },
+    "QueryKHop": { "http": { "method": "POST", "requestUri": "/QueryKHop", "responseCode": 200 } },
+    "QueryNeighborhood": { "http": { "method": "POST", "requestUri": "/QueryNeighborhood", "responseCode": 200 } },
+    "QueryPaths": { "http": { "method": "POST", "requestUri": "/QueryPaths", "responseCode": 200 } },
+    "BuildGraphIndex": { "http": { "method": "POST", "requestUri": "/BuildGraphIndex", "responseCode": 200 } }
+  }
+}

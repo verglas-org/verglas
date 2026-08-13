@@ -232,6 +232,10 @@ fn parse_data_type(type_name: &str, table: &str, column: &str) -> Result<DataTyp
         "utf8" | "string" => Ok(DataType::Utf8),
         "boolean" | "bool" => Ok(DataType::Boolean),
         "date32" | "date" => Ok(DataType::Date32),
+        "list<float32>" | "list<float>" => Ok(DataType::List(Arc::new(Field::new_list_field(
+            DataType::Float32,
+            true,
+        )))),
         other => Err(mismatch(format!(
             "`{other}` is not a supported column type"
         ))),

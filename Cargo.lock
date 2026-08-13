@@ -574,28 +574,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "async-stream"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b5a71a6f37880a80d1d7f19efd781e4b5de42c88f0722cc13bcb6cc2cfe8476"
-dependencies = [
- "async-stream-impl",
- "futures-core",
- "pin-project-lite",
-]
-
-[[package]]
-name = "async-stream-impl"
-version = "0.3.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7c24de15d275a1ecfd47a380fb4d5ec9bfe0933f309ed5e705b775596a3574d"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "async-trait"
 version = "0.1.89"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6816,9 +6794,12 @@ dependencies = [
  "verglas-cluster",
  "verglas-consensus",
  "verglas-core",
+ "verglas-graph",
+ "verglas-iceberg",
  "verglas-s3",
  "verglas-safekeeper",
  "verglas-tables",
+ "verglas-vector",
  "verglas-write",
 ]
 
@@ -6980,32 +6961,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "verglas-query"
-version = "0.1.1"
-dependencies = [
- "arrow-array 57.3.1",
- "arrow-ipc 57.3.1",
- "async-stream",
- "axum",
- "bytes",
- "futures",
- "iceberg",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "verglas-backend",
- "verglas-core",
- "verglas-iceberg",
-]
-
-[[package]]
 name = "verglas-s3"
 version = "0.1.1"
 dependencies = [
@@ -7018,11 +6973,13 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "http-body-util",
+ "iceberg",
  "md-5 0.11.0",
  "object_store 0.14.0",
  "percent-encoding",
  "reqwest 0.12.28",
  "s3s",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "sync_wrapper",
@@ -7034,6 +6991,9 @@ dependencies = [
  "urlencoding",
  "verglas-backend",
  "verglas-core",
+ "verglas-graph",
+ "verglas-iceberg",
+ "verglas-vector",
 ]
 
 [[package]]
@@ -7121,33 +7081,6 @@ dependencies = [
  "verglas-consensus",
  "verglas-core",
  "xxhash-rust",
-]
-
-[[package]]
-name = "verglas-write-node"
-version = "0.1.1"
-dependencies = [
- "arrow-array 57.3.1",
- "arrow-ipc 57.3.1",
- "arrow-schema 57.3.1",
- "async-trait",
- "axum",
- "bytes",
- "futures",
- "iceberg",
- "reqwest 0.12.28",
- "rustls",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "toml",
- "tower",
- "tracing",
- "verglas-api",
- "verglas-backend",
- "verglas-core",
- "verglas-iceberg",
 ]
 
 [[package]]

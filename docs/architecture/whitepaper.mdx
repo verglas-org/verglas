@@ -153,6 +153,12 @@ Verglas, and no dashboard registry is stored in customer tables.
 
 **Vector retrieval.** Embedding-based search conventionally requires a dedicated vector database that owns its index storage, consistency model, and operational lifecycle, an arrangement at odds with compute-disaggregated analytics, where executors are stateless and read all state from object storage [7]. The embeddings themselves typically originate in lakehouse tables and are copied out at index-build time.
 
+**S3 Vectors and Graph API.** The cache node's S3 listener also owns the exact
+AWS S3 Vectors REST-JSON surface and Verglas Graph REST-JSON surface. They are
+adapters over customer-owned Iceberg node, edge, and vector tables; Puffin
+attachments are snapshot-bound acceleration only. There is no query-node,
+write-node, local vector bucket registry, or second graph database.
+
 Verglas instead serializes each Vamana ANN index as a `verglas-vamana-v1` Puffin blob, writes the Puffin file through the source table's `FileIO`, and publishes it as the `StatisticsFile` of the exact Iceberg snapshot it reflects. The catalog therefore exposes the durable snapshot-to-index binding to every Iceberg client; clients that understand the blob type can use it, while other clients ignore it. Verglas fetches the attached Puffin file through its S3 endpoint and retains a decoded local copy for ANN serving, so customer object storage remains authoritative and local DRAM/NVMe remains disposable acceleration. A query never uses an index attached to a different snapshot.
 
 **ML training.** Training jobs repeatedly consume the same dataset across epochs and parameter-search experiments. Quiver reports that deep-learning jobs commonly run 50–100 epochs and that many concurrent jobs may read the same underlying dataset in different random orders, motivating distributed caches between cloud storage and GPU workers [8].

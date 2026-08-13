@@ -132,3 +132,6 @@
 - #133: Removed the stale reference to the extracted monolithic server from the
   streaming query contract. The engine query node is now the sole documented
   owner of that response path.
+- #137: Added the list-of-float32 table schema type used by the S3 Vectors
+  Iceberg source table. Vector keys, data, metadata, and tombstones stay in
+  customer rows, while a Puffin index remains a disposable acceleration.
