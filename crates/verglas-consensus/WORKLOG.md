@@ -197,3 +197,8 @@
   Tokio's blocking pool. Per-replica persistence ordering remains serialized,
   and every OpenRaft callback still waits for the temp-file, rename, and
   directory-fsync barrier before it reports success.
+
+- #135: Replaced the Raft log's whole-image JSON persistence with a compact
+  metadata file and checksummed append-only entry frames. Votes and commit state
+  now fsync independently of large log entries, while replay preserves append,
+  truncation, purge, and restart correctness without acknowledging before disk.
