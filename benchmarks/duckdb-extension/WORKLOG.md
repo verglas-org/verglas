@@ -24,3 +24,6 @@
   declared Docker services, reads effective cgroup-v2 limits from measured
   containers, and rejects any missing catalog, cache, origin-byte, snapshot, or
   result-identity proof instead of manufacturing a benchmark result.
+- #126: Added failing tests for the repository-owned managed runner. They
+  distinguish direct-R2 Quack from Quack loading the real Verglas extension and
+  require every product path to execute the same out-of-core SQL semantics.
