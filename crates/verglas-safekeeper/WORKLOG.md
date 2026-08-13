@@ -72,3 +72,7 @@
   A four-node append returns after `w` durable receipts while a delayed fourth
   data fragment continues in the background; flush persists a release record
   before fragment cleanup so a restart can finish that lifecycle safely.
+- #127: Replaced the WAL descriptor/head publication pair with one
+  quorum-appended state record in the same fragment segment protocol as WAL
+  data. Replacement ingresses recover the highest checksummed surviving state
+  record, so there is no pointer round trip or stale-descriptor reclamation.

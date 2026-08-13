@@ -139,7 +139,7 @@ pub mod protocol;
 pub mod server;
 
 pub use contract::{AppendError, AppendGeometry, AppendLog, Appended, Epoch, Lsn, SafekeeperState};
-pub use log::{EcAppendLog, reclaim_legacy_state_descriptors};
+pub use log::EcAppendLog;
 pub use server::{SafekeeperServer, ServerError};
 
 // Re-export the substrate pieces this crate reuses, so a consumer wires an

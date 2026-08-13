@@ -96,3 +96,6 @@
   nodes. The one-node server therefore uses synchronous origin durability.
 - #127: Fragment RPC ingress now appends through the local durable-batch store,
   preserving the same segment and fdatasync boundary as local placement.
+- #127: Removed cache-startup handling for retired safekeeper descriptor/head
+  files. The embedded Neon listener now recovers only the shared durable
+  state-record protocol carried by the fragment segment plane.

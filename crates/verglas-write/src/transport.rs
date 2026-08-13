@@ -118,6 +118,18 @@ pub trait FragmentTransport: Send + Sync + 'static {
 
     /// Deletes the fragment `key` from `node` (idempotent).
     async fn delete(&self, node: &NodeId, key: &FragmentKey) -> Result<(), TransportError>;
+
+    /// Lists durable record keys with `prefix` on `node`. Recovery uses this
+    /// private peer operation to discover immutable transaction records; an
+    /// implementation that cannot enumerate returns an empty list, never a
+    /// guessed key range.
+    async fn list_prefix(
+        &self,
+        _node: &NodeId,
+        _prefix: &str,
+    ) -> Result<Vec<FragmentKey>, TransportError> {
+        Ok(Vec::new())
+    }
 }
 
 /// The production transport: local store for this node, peer RPC for the rest.
@@ -209,6 +221,24 @@ impl FragmentTransport for PeerFragmentTransport {
         } else {
             self.client.delete_fragment(node, key).await?;
             Ok(())
+        }
+    }
+
+    /// Lists local segment-index keys or asks the private peer list RPC.
+    async fn list_prefix(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<FragmentKey>, TransportError> {
+        if *node == self.self_id {
+            Ok(self
+                .local
+                .list_fragment_keys()
+                .into_iter()
+                .filter(|key| key.object_id.starts_with(prefix))
+                .collect())
+        } else {
+            Ok(self.client.list_fragments(node, prefix).await?)
         }
     }
 }

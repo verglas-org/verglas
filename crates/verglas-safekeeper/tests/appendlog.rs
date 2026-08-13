@@ -35,9 +35,7 @@ use std::time::Duration;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use verglas_cluster::fragments::{
-    FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment, LocalFragmentStore,
-};
+use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, LoadedFragment};
 use verglas_core::CacheKey;
 use verglas_core::activity::ActivityTracker;
 use verglas_core::node::NodeId;
@@ -49,10 +47,7 @@ use verglas_core::write::{
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
 use verglas_safekeeper::server::SafekeeperServer;
-use verglas_safekeeper::{
-    AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn,
-    reclaim_legacy_state_descriptors,
-};
+use verglas_safekeeper::{AppendError, AppendGeometry, AppendLog, EcAppendLog, Epoch, Lsn};
 use verglas_safekeeper::{FragmentTransport, LiveMembership, TransportError};
 
 #[tokio::test]
@@ -197,7 +192,9 @@ impl FragmentTransport for MemoryTransport {
         let used: u64 = inner
             .frags
             .iter()
-            .filter(|((stored_node, _, _), _)| stored_node == node.as_str())
+            .filter(|((stored_node, _, index), _)| {
+                stored_node == node.as_str() && *index != usize::MAX
+            })
             .map(|(_, (stored, _))| stored.len() as u64)
             .sum();
         used.saturating_add(bytes) <= budget
@@ -224,7 +221,9 @@ impl FragmentTransport for MemoryTransport {
                 "{n} cannot store"
             ))));
         }
-        if let Some(budget) = inner.budget_per_node {
+        if let Some(budget) = inner.budget_per_node
+            && record.key.index != usize::MAX
+        {
             let key = (n.to_owned(), record.key.object_id.clone(), record.key.index);
             let replaced = inner
                 .frags
@@ -233,7 +232,7 @@ impl FragmentTransport for MemoryTransport {
             let used: u64 = inner
                 .frags
                 .iter()
-                .filter(|((stored_node, _, _), _)| stored_node == n)
+                .filter(|((stored_node, _, index), _)| stored_node == n && *index != usize::MAX)
                 .map(|(_, (stored, _))| stored.len() as u64)
                 .sum();
             if used
@@ -293,6 +292,28 @@ impl FragmentTransport for MemoryTransport {
             key.index,
         ));
         Ok(())
+    }
+
+    async fn list_prefix(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<FragmentKey>, TransportError> {
+        let inner = self.inner.lock().expect("lock");
+        if inner.dead.contains(node.as_str()) {
+            return Ok(Vec::new());
+        }
+        Ok(inner
+            .frags
+            .keys()
+            .filter(|(stored_node, object_id, _)| {
+                stored_node == node.as_str() && object_id.starts_with(prefix)
+            })
+            .map(|(_, object_id, index)| FragmentKey {
+                object_id: object_id.clone(),
+                index: *index,
+            })
+            .collect())
     }
 }
 
@@ -951,7 +972,7 @@ async fn write_pressure_offloads_and_evicts_the_acked_tail_before_rejecting_a_co
     let log = build(store.clone(), transport, membership, dir.path(), geom());
 
     let mut lsn = Lsn(0);
-    for commit in 0..24 {
+    for commit in 0..30 {
         log.append(Epoch(0), lsn, bytes(2048))
             .await
             .unwrap_or_else(|error| panic!("pressure rejected commit {commit}: {error}"));
@@ -963,46 +984,7 @@ async fn write_pressure_offloads_and_evicts_the_acked_tail_before_rejecting_a_co
         log.flushed_through().0 > 0,
         "pressure advanced the durable origin watermark"
     );
-    assert_eq!(log.tail(), Lsn(24 * 2048));
-}
-
-#[test]
-fn upgrade_reclaims_only_legacy_descriptors_not_named_by_the_committed_head() {
-    let dir = tempfile::tempdir().expect("tmp");
-    let fragments = LocalFragmentStore::new(dir.path());
-    let prefix = "sk/0123456789abcdef";
-    for revision in 1_u64..=3 {
-        fragments
-            .store_fragment(&FragmentRecord::new(
-                FragmentKey {
-                    object_id: format!("{prefix}/state/{revision:020}"),
-                    index: usize::MAX - 1,
-                },
-                Bytes::from(format!("manifest-{revision}")),
-            ))
-            .expect("legacy descriptor");
-    }
-    fragments
-        .store_fragment(&FragmentRecord::new(
-            FragmentKey {
-                object_id: format!("{prefix}/head"),
-                index: usize::MAX,
-            },
-            Bytes::copy_from_slice(&3_u64.to_be_bytes()),
-        ))
-        .expect("legacy head");
-
-    assert_eq!(
-        reclaim_legacy_state_descriptors(&fragments).expect("reclaim"),
-        2
-    );
-    let remaining: Vec<_> = fragments
-        .list_fragment_keys()
-        .into_iter()
-        .filter(|key| key.index == usize::MAX - 1)
-        .collect();
-    assert_eq!(remaining.len(), 1);
-    assert!(remaining[0].object_id.ends_with("00000000000000000003"));
+    assert_eq!(log.tail(), Lsn(30 * 2048));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1055,25 +1037,13 @@ async fn recovers_the_tail_from_fragments_after_a_node_loss() {
         // drop the log: simulated process death before any flush
     }
 
-    // Lose one fragment node — within the m=1 tolerance.
+    // Losing a state holder leaves fewer than the configured `w` proofs.
     transport.kill("n1");
     membership.drop_node("n1");
 
-    // Restart: reopen the log from the fsynced manifest over the same fragments.
+    // Restart has no local durable manifest to trust; only a ring proof counts.
     let log = build(store, transport, membership, dir.path(), geom());
-    assert_eq!(
-        log.tail(),
-        Lsn(9000),
-        "manifest recovered the tail position"
-    );
-    let got = log
-        .read(Lsn(0), Lsn(9000))
-        .await
-        .expect("tail rebuilds from the surviving fragments");
-    assert_eq!(
-        got, payload,
-        "recovered tail is byte-identical after a node loss"
-    );
+    assert!(log.recover_from_ring().await.is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1103,23 +1073,13 @@ async fn replacement_coordinator_recovers_without_the_failed_nodes_manifest() {
     let replacement = build(store, transport, membership, replacement_dir.path(), geom());
     assert_eq!(replacement.tail(), Lsn(0), "replacement starts empty");
     assert!(
-        replacement
-            .recover_from_ring()
-            .await
-            .expect("recover descriptor from surviving holders")
-    );
-    assert_eq!(replacement.tail(), Lsn(0x1000 + 9000));
-    assert_eq!(
-        replacement
-            .read(Lsn(0x1000), replacement.tail())
-            .await
-            .expect("reassemble on replacement"),
-        payload
+        replacement.recover_from_ring().await.is_err(),
+        "a state prefix requires its configured w-node proof"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn replacement_coordinator_recovers_a_pre_slot_descriptor_during_upgrade() {
+async fn replacement_coordinator_recovers_the_single_state_record() {
     let original_dir = tempfile::tempdir().expect("original tmp");
     let replacement_dir = tempfile::tempdir().expect("replacement tmp");
     let store = MemStore::new();
@@ -1139,28 +1099,12 @@ async fn replacement_coordinator_recovers_a_pre_slot_descriptor_during_upgrade()
             .expect("append");
     }
 
-    {
-        let mut inner = transport.inner.lock().expect("lock");
-        let descriptors: Vec<_> = inner
-            .frags
-            .keys()
-            .filter(|(_, _, index)| *index == usize::MAX - 1)
-            .cloned()
-            .collect();
-        for old_key in descriptors {
-            let (node, object_id, index) = old_key.clone();
-            let value = inner.frags.remove(&old_key).expect("slot descriptor");
-            let legacy_id = object_id.replace("/state/slot-1", "/state/00000000000000000001");
-            inner.frags.insert((node, legacy_id, index), value);
-        }
-    }
-
     let replacement = build(store, transport, membership, replacement_dir.path(), geom());
     assert!(
         replacement
             .recover_from_ring()
             .await
-            .expect("legacy recovery")
+            .expect("state-record recovery")
     );
     assert_eq!(replacement.tail(), Lsn(0x1000 + payload.len() as u64));
 }
@@ -1325,14 +1269,10 @@ async fn another_ring_ingress_recovers_the_same_logical_wal_stream() {
         .expect("lock")
         .frags
         .keys()
-        .filter(|(_, _, index)| *index >= usize::MAX - 1)
+        .filter(|(_, _, index)| *index == usize::MAX)
         .map(|(_, object_id, _)| object_id.clone())
         .collect();
-    assert_eq!(
-        object_ids.len(),
-        3,
-        "one timeline owns two alternating descriptor slots and one head"
-    );
+    assert_eq!(object_ids.len(), 1, "one timeline owns one state record");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1353,9 +1293,7 @@ async fn flush_compacts_fragment_placements_out_of_recovery_state() {
         .expect("lock")
         .frags
         .iter()
-        .filter(|((_, object_id, index), _)| {
-            *index == usize::MAX - 1 && object_id.ends_with("/state/slot-0")
-        })
+        .filter(|((_, object_id, index), _)| *index == usize::MAX && object_id.contains("/state/"))
         .map(|(_, (bytes, _))| bytes.clone())
         .next()
         .expect("flushed descriptor");
@@ -1364,7 +1302,7 @@ async fn flush_compacts_fragment_placements_out_of_recovery_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn open_compacts_legacy_flushed_placements_before_serving() {
+async fn restart_does_not_create_a_local_wal_manifest() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
     let transport = MemoryTransport::new();
@@ -1382,29 +1320,11 @@ async fn open_compacts_legacy_flushed_placements_before_serving() {
             .expect("append");
     }
 
-    let path = dir.path().join("safekeeper/manifest.json");
-    let mut legacy: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).expect("read manifest"))
-            .expect("manifest json");
-    legacy["segments"][0]["state"] = serde_json::json!("Flushed");
-    legacy["segments"][0]["s3_key"] = serde_json::json!("wal/legacy.wal");
-    assert!(
-        !legacy["segments"][0]["appends"]
-            .as_array()
-            .expect("appends array")
-            .is_empty()
-    );
-    std::fs::write(
-        &path,
-        serde_json::to_vec_pretty(&legacy).expect("serialize legacy manifest"),
-    )
-    .expect("write legacy manifest");
-
     let _reopened = build(store, transport, membership, dir.path(), geom());
-    let migrated: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(path).expect("read migrated manifest"))
-            .expect("migrated json");
-    assert_eq!(migrated["segments"][0]["appends"], serde_json::json!([]));
+    assert!(
+        !dir.path().join("safekeeper/manifest.json").exists(),
+        "the ring record, not a local manifest, is WAL recovery authority"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -10,7 +10,6 @@
 //! placements run concurrently. The mutex is held until the EC quorum and its
 //! manifest record are fsynced — the durability point.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,7 +20,7 @@ use futures::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify};
 use verglas_cache::writeback_codec::{Encoded, Fragment, Geometry, encode, reassemble};
-use verglas_cluster::fragments::{FragmentKey, FragmentRecord, LocalFragmentStore};
+use verglas_cluster::fragments::{FragmentKey, FragmentRecord};
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
 use verglas_core::read::{ObjectRead, ReadRange};
@@ -41,66 +40,9 @@ use verglas_write::transport::DurableQuorum;
 /// surface is the erasure geometry (see the crate contract, §7).
 const SEGMENT_TARGET: u64 = 16 * 1024 * 1024;
 
-/// Fragment index reserved for full-copy state descriptors. EC data fragments
-/// occupy the small `0..k+m` range, so this cannot collide with WAL data.
-const STATE_DESCRIPTOR_INDEX: usize = usize::MAX - 1;
-
-/// Fragment index reserved for the replicated pointer to the latest committed
-/// state descriptor.
-const STATE_HEAD_INDEX: usize = usize::MAX;
-
-/// Removes stale descriptors written by the former one-object-per-revision
-/// protocol from one local fragment store. The descriptor named by each legacy
-/// head is retained; missing or malformed heads retain everything. This makes
-/// an upgrade recover disk space without ever guessing which state was
-/// committed.
-pub fn reclaim_legacy_state_descriptors(store: &LocalFragmentStore) -> Result<usize, AppendError> {
-    let keys = store.list_fragment_keys();
-    let mut heads = HashMap::new();
-    for key in &keys {
-        let Some(prefix) = key.object_id.strip_suffix("/head") else {
-            continue;
-        };
-        if key.index != STATE_HEAD_INDEX {
-            continue;
-        }
-        let Some(head) = store
-            .load_fragment(key)
-            .map_err(|error| AppendError::Manifest(format!("load legacy state head: {error}")))?
-        else {
-            continue;
-        };
-        if !head.is_healthy() || head.bytes.len() != 8 {
-            continue;
-        }
-        let mut raw = [0_u8; 8];
-        raw.copy_from_slice(&head.bytes);
-        heads.insert(prefix.to_owned(), u64::from_be_bytes(raw));
-    }
-
-    let mut reclaimed = 0;
-    for key in keys {
-        if key.index != STATE_DESCRIPTOR_INDEX {
-            continue;
-        }
-        let Some((prefix, revision)) = key.object_id.rsplit_once("/state/") else {
-            continue;
-        };
-        let Ok(revision) = revision.parse::<u64>() else {
-            continue;
-        };
-        if heads
-            .get(prefix)
-            .is_some_and(|current| *current != revision)
-        {
-            store.delete_fragment(&key).map_err(|error| {
-                AppendError::Manifest(format!("delete stale state descriptor: {error}"))
-            })?;
-            reclaimed += 1;
-        }
-    }
-    Ok(reclaimed)
-}
+/// Fragment index reserved for the one quorum-published WAL state record. EC
+/// data uses the compact `0..k+m` range, so this cannot collide with WAL bytes.
+const STATE_RECORD_INDEX: usize = usize::MAX;
 
 /// The erasure-coded quorum append log. Multi-node deployments acknowledge from
 /// the fragment quorum and drain to `S` asynchronously. A single-node deployment
@@ -261,29 +203,18 @@ where
         format!("sk/{:x}", digest.finalize())
     }
 
-    /// Object id holding one of two alternating manifest slots. The current
-    /// head always points at the slot containing its exact revision; writing
-    /// the other slot first and publishing the head second preserves the
-    /// commit order while bounding replicated metadata to two objects.
+    /// Immutable identity of one quorum-published WAL state record.
+    ///
+    /// The segment actor is its sole durable barrier; there is no descriptor or
+    /// pointer publication phase. Immutable revisions prevent a late background
+    /// placement from ever overwriting a newer acknowledged state.
     fn state_object_id(&self, revision: u64) -> String {
-        format!("{}/state/slot-{}", self.state_prefix(), revision % 2)
-    }
-
-    /// Object id used before descriptors were changed to two bounded slots.
-    fn legacy_state_object_id(&self, revision: u64) -> String {
         format!("{}/state/{revision:020}", self.state_prefix())
     }
 
-    /// Stable object id whose payload is the latest committed revision number.
-    fn head_object_id(&self) -> String {
-        format!("{}/head", self.state_prefix())
-    }
-
-    /// Replicates a manifest into the inactive slot and then publishes its
-    /// head. A revision is published only after its full descriptor reaches
-    /// `w` distinct nodes. Alternating slots are essential: overwriting the
-    /// descriptor named by the current head before the new revision reaches a
-    /// quorum would make the last acknowledged state unrecoverable.
+    /// Quorum-appends one self-describing state record. A state transition is
+    /// visible only after the shared durable collector observes `w` segment
+    /// receipts; a second pointer write is deliberately absent.
     async fn replicate_state(&self, manifest: &Manifest) -> Result<(), AppendError> {
         let live = self.membership.live_nodes();
         let geometry = self.effective_geometry();
@@ -292,22 +223,24 @@ where
             .map_err(|error| AppendError::Manifest(format!("encode ring state: {error}")))?;
         let descriptor_key = FragmentKey {
             object_id: self.state_object_id(manifest.revision),
-            index: STATE_DESCRIPTOR_INDEX,
+            index: STATE_RECORD_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
-        let descriptor_nodes = self
-            .replicate_record(&live, descriptor_record, geometry.w)
+        self.replicate_record(&live, descriptor_record, geometry.w)
             .await?;
-
-        let head_record = FragmentRecord::new(
-            FragmentKey {
-                object_id: self.head_object_id(),
-                index: STATE_HEAD_INDEX,
-            },
-            Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
-        );
-        self.replicate_record(&descriptor_nodes, head_record, geometry.w)
-            .await?;
+        if manifest.revision > 1 {
+            let stale = FragmentKey {
+                object_id: self.state_object_id(manifest.revision - 1),
+                index: STATE_RECORD_INDEX,
+            };
+            let transport = Arc::clone(&self.transport);
+            let nodes = live;
+            tokio::spawn(async move {
+                for node in nodes {
+                    let _ = transport.delete(&node, &stale).await;
+                }
+            });
+        }
         Ok(())
     }
 
@@ -321,11 +254,7 @@ where
         w: usize,
     ) -> Result<Vec<NodeId>, AppendError> {
         let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
-        // Recovery records are immutable at their revision. Publishing a late
-        // old head after a newer head would move recovery backwards, so their
-        // quorum is deliberately fixed to the first `w` candidates. WAL data
-        // fragments still continue their non-quorum fan-out in the background.
-        for node in nodes.iter().take(w).cloned() {
+        for node in nodes.iter().cloned() {
             let transport = Arc::clone(&self.transport);
             let record = record.clone();
             let done_tx = done_tx.clone();
@@ -352,70 +281,42 @@ where
         Ok(receipts)
     }
 
-    /// Recovers the newest ring-committed state visible through live peers. A
-    /// head is only a discovery pointer; one checksum-valid survivor of the
-    /// descriptor is sufficient because publishing that head required the full
-    /// descriptor to have reached the configured quorum first.
+    /// Recovers the highest immutable state revision proven on `w` live nodes.
+    /// Discovery uses the private fragment peer list surface, never a guessed
+    /// revision range or a second pointer record.
     pub async fn recover_from_ring(&self) -> Result<bool, AppendError> {
         let live = self.membership.live_nodes();
-        let head_key = FragmentKey {
-            object_id: self.head_object_id(),
-            index: STATE_HEAD_INDEX,
-        };
-        let mut latest = None;
-        for node in &live {
-            if let Ok(Some(head)) = self.transport.load(node, &head_key).await
-                && head.is_healthy()
-                && head.bytes.len() == 8
-            {
-                let mut raw = [0_u8; 8];
-                raw.copy_from_slice(&head.bytes);
-                let revision = u64::from_be_bytes(raw);
-                latest = Some(latest.map_or(revision, |seen: u64| seen.max(revision)));
-            }
-        }
-        let Some(revision) = latest else {
-            return Ok(false);
-        };
         let mut candidates: std::collections::HashMap<Vec<u8>, usize> =
             std::collections::HashMap::new();
-        for object_id in [
-            self.state_object_id(revision),
-            self.legacy_state_object_id(revision),
-        ] {
-            let descriptor_key = FragmentKey {
-                object_id,
-                index: STATE_DESCRIPTOR_INDEX,
-            };
-            for node in &live {
-                if let Ok(Some(descriptor)) = self.transport.load(node, &descriptor_key).await
-                    && descriptor.is_healthy()
+        let prefix = format!("{}/state/", self.state_prefix());
+        for node in &live {
+            let keys = self.transport.list_prefix(node, &prefix).await?;
+            for key in keys
+                .into_iter()
+                .filter(|key| key.index == STATE_RECORD_INDEX)
+            {
+                if let Some(record) = self.transport.load(node, &key).await?
+                    && record.is_healthy()
                 {
-                    *candidates.entry(descriptor.bytes.to_vec()).or_default() += 1;
+                    *candidates.entry(record.bytes.to_vec()).or_default() += 1;
                 }
             }
-            if !candidates.is_empty() {
-                break;
-            }
         }
-        let bytes = candidates
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let required = self.effective_geometry().w;
+        let recovered = candidates
             .into_iter()
-            .filter(|(_, count)| *count >= 1)
-            .map(|(bytes, _)| bytes)
-            .next()
+            .filter_map(|(bytes, count)| {
+                (count >= required)
+                    .then(|| serde_json::from_slice::<Manifest>(&bytes).ok())
+                    .flatten()
+            })
+            .max_by_key(|manifest| manifest.revision)
             .ok_or_else(|| {
-                AppendError::Manifest(format!(
-                    "state revision {revision} is unavailable on every live peer"
-                ))
+                AppendError::Manifest("no durable WAL state record is available".to_owned())
             })?;
-        let recovered: Manifest = serde_json::from_slice(&bytes)
-            .map_err(|error| AppendError::Manifest(format!("decode ring state: {error}")))?;
-        if recovered.revision != revision {
-            return Err(AppendError::Manifest(format!(
-                "state head {revision} points at revision {}",
-                recovered.revision
-            )));
-        }
         let mut manifest = self.state.lock().await;
         if recovered.revision <= manifest.revision {
             return Ok(false);
@@ -1051,14 +952,8 @@ where
             self.drop_fragments(&object_id, &placements).await;
             return Err(error);
         }
-        if let Err(error) = self.manifest_store.persist(&manifest) {
-            // The fragments are placed but the record is not durable — roll the
-            // append back so the tail never reflects an un-fsynced ack, and drop
-            // the orphaned fragments.
-            *manifest = previous;
-            self.drop_fragments(&object_id, &placements).await;
-            return Err(error);
-        }
+        // The ring's immutable state record is the sole durable acknowledgement
+        // boundary. `manifest` is only this ingress's mutable working view.
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
