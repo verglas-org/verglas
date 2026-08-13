@@ -6794,12 +6794,10 @@ dependencies = [
  "verglas-cluster",
  "verglas-consensus",
  "verglas-core",
- "verglas-graph",
  "verglas-iceberg",
  "verglas-s3",
  "verglas-safekeeper",
  "verglas-tables",
- "verglas-vector",
  "verglas-write",
 ]
 

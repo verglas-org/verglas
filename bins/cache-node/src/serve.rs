@@ -757,14 +757,6 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     // restart: the adapter reopens graphs from Iceberg for each operation.
     let semantic_api: Arc<dyn verglas_s3::semantic::SemanticApi> = match config.catalog.as_ref() {
         Some(catalog) => {
-            // Keep the serving binary's dependency boundary explicit: the
-            // Iceberg adapter invokes `verglas_graph::Graph::open` and owns a
-            // `verglas_vector::VectorService` for snapshot-bound Vamana Puffin
-            // acceleration. Neither engine keeps authoritative local state.
-            let _semantic_engines = (
-                std::any::TypeId::of::<verglas_graph::Graph>(),
-                verglas_vector::VectorService::new(),
-            );
             let local_addr = s3_listener.local_addr()?;
             let connection = verglas_iceberg::Connection {
                 catalog_uri: catalog.uri.clone(),

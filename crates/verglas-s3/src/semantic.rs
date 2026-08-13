@@ -18,6 +18,7 @@ use iceberg::{Catalog, NamespaceIdent, TableCommit, TableRequirement, TableUpdat
 use serde_json::{Value, json};
 use verglas_graph::{Direction, Edge, Graph, Node, TraversalFilter};
 use verglas_iceberg::{parse_table_ident, tables_api};
+use verglas_vector::{MaintenanceConfig, Metric, StringKeyIndex, VamanaParams};
 
 /// The operations in the checked-in AWS S3 Vectors and Verglas Graph contracts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,6 +648,9 @@ impl IcebergCatalogSemanticStore {
                 )
                 .await
                 .map_err(iceberg_error)?;
+                if let Err(error) = self.attach_vector_bridge(&ident, &input).await {
+                    tracing::warn!(%error.message, "vector Puffin attachment failed after authoritative Iceberg commit; query will scan");
+                }
                 Ok(json!({}))
             }
             "GetVectors" => {
@@ -704,6 +708,29 @@ impl IcebergCatalogSemanticStore {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
+                let table = self
+                    .catalog
+                    .load_table(&ident)
+                    .await
+                    .map_err(iceberg_error)?;
+                let snapshot = table.metadata().current_snapshot_id();
+                if let Some(snapshot) = snapshot
+                    && let Some(attached) =
+                        verglas_vector::attachment::load_string_key_index_for_snapshot(
+                            &table, snapshot, "data",
+                        )
+                        .await
+                        .map_err(|error| SemanticError::unavailable(error.to_string()))?
+                {
+                    let vectors = attached
+                        .bridge
+                        .query(&query, required_u32(&input, "topK")? as usize, 64)
+                        .map_err(|error| SemanticError::unavailable(error.to_string()))?
+                        .into_iter()
+                        .map(|neighbor| json!({"key": neighbor.key, "distance": neighbor.distance}))
+                        .collect::<Vec<_>>();
+                    return Ok(json!({"vectors": vectors}));
+                }
                 let mut vectors = live_vectors(self.catalog.as_ref(), &ident).await?;
                 vectors.retain(|vector| vector.data.len() == query.len());
                 vectors.sort_by(|left, right| {
@@ -715,6 +742,61 @@ impl IcebergCatalogSemanticStore {
             }
             _ => Err(SemanticError::validation("unknown S3 Vectors operation")),
         }
+    }
+
+    /// Rebuilds and attaches a lossless Vamana bridge to the exact committed snapshot.
+    async fn attach_vector_bridge(
+        &self,
+        ident: &iceberg::TableIdent,
+        input: &Value,
+    ) -> Result<(), SemanticError> {
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(iceberg_error)?;
+        let Some(snapshot) = table.metadata().current_snapshot_id() else {
+            return Ok(());
+        };
+        let metadata = table
+            .metadata()
+            .properties()
+            .get("verglas.s3vectors.index")
+            .and_then(|text| serde_json::from_str::<Value>(text).ok())
+            .ok_or_else(|| SemanticError::validation("index metadata is absent"))?;
+        let dim = metadata
+            .get("dimension")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| SemanticError::validation("index dimension is invalid"))?;
+        let metric = match metadata.get("distanceMetric").and_then(Value::as_str) {
+            Some("cosine") => Metric::Cosine,
+            Some("euclidean") => Metric::L2,
+            _ => return Err(SemanticError::validation("index distanceMetric is invalid")),
+        };
+        let mut bridge = StringKeyIndex::new(metric, dim, VamanaParams::default(), 0)
+            .map_err(|error| SemanticError::unavailable(error.to_string()))?;
+        for vector in live_vectors(self.catalog.as_ref(), ident).await? {
+            if vector.data.len() == dim {
+                bridge
+                    .put(&vector.key, &vector.data)
+                    .map_err(|error| SemanticError::unavailable(error.to_string()))?;
+            }
+        }
+        bridge.index_mut().set_reflected_snapshot(snapshot);
+        let config = MaintenanceConfig::new("key", "data", metric);
+        verglas_vector::attachment::attach_string_key_index(
+            self.catalog.as_ref(),
+            &table,
+            snapshot,
+            &config,
+            bridge.index(),
+            bridge.keys(),
+        )
+        .await
+        .map_err(|error| SemanticError::unavailable(error.to_string()))?;
+        let _ = input;
+        Ok(())
     }
 
     /// Persists tags on the bucket namespace or the index table selected by ARN.
@@ -1091,10 +1173,9 @@ async fn live_vectors(
     catalog: &dyn Catalog,
     ident: &iceberg::TableIdent,
 ) -> Result<Vec<LiveVector>, SemanticError> {
-    let rows = tables_api::rows(catalog, ident, None, None)
+    let rows = tables_api::rows_in_commit_order(catalog, ident)
         .await
-        .map_err(iceberg_error)?
-        .rows;
+        .map_err(iceberg_error)?;
     let mut current = std::collections::BTreeMap::new();
     for row in rows {
         let Some(key) = row.get("key").and_then(Value::as_str) else {

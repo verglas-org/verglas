@@ -328,6 +328,45 @@ pub async fn rows(
     })
 }
 
+/// Returns every current-table row in committed snapshot order, oldest first.
+///
+/// Append-only semantic tables use this to resolve last-write-wins updates and
+/// tombstones without relying on file-path order. Each snapshot contributes
+/// only files introduced at that commit, so concurrent commits remain ordered
+/// by the catalog's committed parent lineage.
+pub async fn rows_in_commit_order(catalog: &dyn Catalog, ident: &TableIdent) -> Result<Vec<Value>> {
+    let table = catalog.load_table(ident).await?;
+    let mut lineage = Vec::new();
+    let mut cursor = table.metadata().current_snapshot_id();
+    while let Some(id) = cursor {
+        let snapshot = table
+            .metadata()
+            .snapshot_by_id(id)
+            .ok_or_else(|| AgentError::TableApi(format!("snapshot {id} is absent")))?;
+        lineage.push((id, snapshot.parent_snapshot_id()));
+        cursor = snapshot.parent_snapshot_id();
+    }
+    lineage.reverse();
+    let mut rows = Vec::new();
+    for (id, parent) in lineage {
+        let tasks = planned_files(&table, Some(id)).await?;
+        let parent_files = match parent {
+            Some(parent) => planned_files(&table, Some(parent))
+                .await?
+                .into_iter()
+                .map(|task| task.data_file_path)
+                .collect::<HashSet<_>>(),
+            None => HashSet::new(),
+        };
+        let added = tasks
+            .into_iter()
+            .filter(|task| !parent_files.contains(&task.data_file_path))
+            .collect();
+        rows.extend(read_tasks_to_json(&table, added).await?);
+    }
+    Ok(rows)
+}
+
 /// Returns the rows committed after the `since` watermark, plus the current tip.
 ///
 /// The write path only appends, so the delta is exactly the data files present

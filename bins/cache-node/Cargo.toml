@@ -25,8 +25,6 @@ verglas-backend.workspace = true
 verglas-catalog.workspace = true
 verglas-tables.workspace = true
 verglas-iceberg.workspace = true
-verglas-graph.workspace = true
-verglas-vector.workspace = true
 # The block-device tier (#382): the NBD server in this binary serves cache-served
 # virtual disks to attached NBD clients; verglas-block owns the durable chunk
 # store + manifest.
