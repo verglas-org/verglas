@@ -154,21 +154,11 @@ class ManagedConfig:
         )
 
     def iceberg_properties(self):
-        """Return the REST and direct S3 properties PyIceberg must use to write data."""
+        """Return the managed REST properties that vend the warehouse's storage access."""
         return {
             "uri": self.catalog_url,
             "token": self.catalog_token,
             "warehouse": self.warehouse,
-            # Lakekeeper is the catalog authority. The benchmark writes data
-            # with the explicitly supplied R2 credential; it must not request
-            # a different delegated credential while seeding its snapshot.
-            "header.X-Iceberg-Access-Delegation": "",
-            "s3.endpoint": self.r2_endpoint,
-            "s3.access-key-id": self.r2_access_key,
-            "s3.secret-access-key": self.r2_secret_key,
-            "s3.region": "auto",
-            "s3.path-style-access": "true",
-            "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
         }
 
 
