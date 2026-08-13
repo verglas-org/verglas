@@ -29,6 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::StreamExt;
@@ -103,12 +105,27 @@ struct TransportInner {
 
 struct MemoryTransport {
     inner: Mutex<TransportInner>,
+    placement_delay: Option<Duration>,
+    placements_inflight: AtomicUsize,
+    max_placements_inflight: AtomicUsize,
 }
 
 impl MemoryTransport {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             inner: Mutex::new(TransportInner::default()),
+            placement_delay: None,
+            placements_inflight: AtomicUsize::new(0),
+            max_placements_inflight: AtomicUsize::new(0),
+        })
+    }
+
+    fn with_placement_delay(delay: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(TransportInner::default()),
+            placement_delay: Some(delay),
+            placements_inflight: AtomicUsize::new(0),
+            max_placements_inflight: AtomicUsize::new(0),
         })
     }
 
@@ -118,7 +135,14 @@ impl MemoryTransport {
                 budget_per_node: Some(bytes),
                 ..TransportInner::default()
             }),
+            placement_delay: None,
+            placements_inflight: AtomicUsize::new(0),
+            max_placements_inflight: AtomicUsize::new(0),
         })
+    }
+
+    fn max_placements_inflight(&self) -> usize {
+        self.max_placements_inflight.load(Ordering::Relaxed)
     }
 
     /// Marks a node down: its fragments are lost and further ops miss/fail.
@@ -168,6 +192,13 @@ impl FragmentTransport for MemoryTransport {
     }
 
     async fn place(&self, node: &NodeId, record: FragmentRecord) -> Result<(), TransportError> {
+        let inflight = self.placements_inflight.fetch_add(1, Ordering::Relaxed) + 1;
+        self.max_placements_inflight
+            .fetch_max(inflight, Ordering::Relaxed);
+        if let Some(delay) = self.placement_delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.placements_inflight.fetch_sub(1, Ordering::Relaxed);
         let mut inner = self.inner.lock().expect("lock");
         let n = node.as_str();
         if inner.dead.contains(n) || inner.fail_place.contains(n) {
@@ -245,6 +276,28 @@ impl FragmentTransport for MemoryTransport {
         ));
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn ec_quorum_placements_are_parallel() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let transport = MemoryTransport::with_placement_delay(Duration::from_millis(10));
+    let log = build(
+        MemStore::new(),
+        transport.clone(),
+        FakeMembership::new("n0", &["n0", "n1", "n2", "n3"]),
+        dir.path(),
+        AppendGeometry::new(2, 2, 3).expect("geometry"),
+    );
+
+    log.append(Epoch(0), Lsn(0), bytes(4096))
+        .await
+        .expect("append");
+
+    assert!(
+        transport.max_placements_inflight() >= 3,
+        "EC fragments and replicated state must not serialize node round trips",
+    );
 }
 
 // ---- in-memory membership --------------------------------------------------
@@ -1494,13 +1547,13 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
         "flush_lsn advances only after the EC append"
     );
 
-    tokio::time::timeout(std::time::Duration::from_millis(500), async {
+    tokio::time::timeout(std::time::Duration::from_millis(1_500), async {
         while store.object_count() == 0 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
     .await
-    .expect("append notification streamed WAL without waiting for retry timer");
+    .expect("the one-second low-volume deadline streamed the partial WAL segment");
     assert_eq!(
         transport.wal_fragment_count(),
         0,

@@ -6,9 +6,9 @@
 //!
 //! Appends are serialized through one async mutex over the durable manifest:
 //! the log is single-writer by contract, and serializing is what makes the
-//! assigned LSN order the commit order. The mutex is held across fragment
-//! placement so an ack is only ever handed out after its manifest record is
-//! fsynced — the durability point.
+//! assigned LSN order the commit order. Within one append, independent node
+//! placements run concurrently. The mutex is held until the EC quorum and its
+//! manifest record are fsynced — the durability point.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -294,10 +294,18 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
+        let descriptor_results = futures::future::join_all(live.iter().cloned().map(|node| {
+            let record = descriptor_record.clone();
+            async move {
+                let result = self.transport.place(&node, record).await;
+                (node, result)
+            }
+        }))
+        .await;
         let mut descriptor_nodes = Vec::new();
-        for node in &live {
-            match self.transport.place(node, descriptor_record.clone()).await {
-                Ok(()) => descriptor_nodes.push(node.clone()),
+        for (node, result) in descriptor_results {
+            match result {
+                Ok(()) => descriptor_nodes.push(node),
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
                     revision = manifest.revision,
@@ -320,9 +328,18 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
+        let head_results =
+            futures::future::join_all(descriptor_nodes.iter().cloned().map(|node| {
+                let record = head_record.clone();
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (node, result)
+                }
+            }))
+            .await;
         let mut heads = 0;
-        for node in &descriptor_nodes {
-            match self.transport.place(node, head_record.clone()).await {
+        for (node, result) in head_results {
+            match result {
                 Ok(()) => heads += 1,
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
@@ -582,9 +599,9 @@ where
         self.manifest_store.persist(&manifest)
     }
 
-    /// Encodes `records` and places its fragments on distinct live nodes,
-    /// returning the placements once at least `w` are durable. Fewer than `w`
-    /// is not a durable ack: the partial placements are cleaned up and the
+    /// Encodes `records` and concurrently places its fragments on distinct live
+    /// nodes, returning the placements once at least `w` are durable. Fewer than
+    /// `w` is not a durable ack: the partial placements are cleaned up and the
     /// append fails, never a sub-quorum ack.
     async fn place(
         &self,
@@ -612,17 +629,28 @@ where
             }
         }
 
-        let mut placements = Vec::new();
-        for (index, fragment) in encoded.fragments.iter().enumerate() {
-            let Some(node) = nodes.get(index) else { break };
-            let record = FragmentRecord::new(
-                FragmentKey {
-                    object_id: object_id.to_owned(),
-                    index,
+        let placement_results =
+            futures::future::join_all(encoded.fragments.iter().zip(nodes.iter()).enumerate().map(
+                |(index, (fragment, node))| {
+                    let node = node.clone();
+                    let record = FragmentRecord::new(
+                        FragmentKey {
+                            object_id: object_id.to_owned(),
+                            index,
+                        },
+                        fragment.bytes.clone(),
+                    );
+                    async move {
+                        let result = self.transport.place(&node, record).await;
+                        (index, node, result)
+                    }
                 },
-                fragment.bytes.clone(),
-            );
-            match self.transport.place(node, record).await {
+            ))
+            .await;
+
+        let mut placements = Vec::new();
+        for (index, node, result) in placement_results {
+            match result {
                 Ok(()) => placements.push(Placement {
                     index,
                     node: node.as_str().to_owned(),
