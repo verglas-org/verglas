@@ -29,16 +29,26 @@ def _sql_string(value):
 
 def canonical_sql(workload):
     """Return the catalog-relative SQL shared by all product transports."""
+    table = ".".join((
+        os.environ.get("VERGLAS_BENCHMARK_NAMESPACE", TABLE.split(".")[0]),
+        os.environ.get("VERGLAS_BENCHMARK_TABLE", TABLE.split(".")[1]),
+    ))
     statements = {
-        "scan": f"SELECT id, category, payload FROM {TABLE} ORDER BY id",
+        "scan": (
+            f"SELECT count(*) AS rows, sum(value) AS total, "
+            f"sum(length(payload)) AS payload_bytes FROM {table}"
+        ),
         "selective_aggregate": (
             f"SELECT category, count(*) AS rows, sum(value) AS total "
-            f"FROM {TABLE} WHERE category BETWEEN 8 AND 15 GROUP BY category ORDER BY category"
+            f"FROM {table} WHERE category BETWEEN 8 AND 15 GROUP BY category ORDER BY category"
         ),
-        "external_sort": f"SELECT id, category, value FROM {TABLE} ORDER BY value DESC, id",
+        "external_sort": (
+            "SELECT sum(rn) AS row_number_sum FROM ("
+            f"SELECT row_number() OVER (ORDER BY value DESC, id) AS rn FROM {table})"
+        ),
         "spill_heavy_join": (
             f"SELECT l.category, count(*) AS rows, sum(l.value + r.value) AS total "
-            f"FROM {TABLE} l JOIN {TABLE} r ON l.id = r.id "
+            f"FROM {table} l JOIN {table} r ON l.id = r.id "
             "WHERE l.category < 32 GROUP BY l.category ORDER BY l.category"
         ),
     }
