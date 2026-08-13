@@ -14,7 +14,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use iceberg::Catalog;
+use iceberg::{Catalog, NamespaceIdent};
 use serde_json::{Value, json};
 use verglas_graph::{Direction, Edge, Graph, Node, TraversalFilter};
 use verglas_iceberg::{parse_table_ident, tables_api};
@@ -298,10 +298,39 @@ impl SemanticApi for IcebergCatalogSemanticStore {
         let SemanticOperation::Graph(operation) = operation else {
             unreachable!("semantic operation is vector or graph")
         };
+        if operation == "ListGraphs" {
+            let graphs = self
+                .catalog
+                .list_namespaces(None)
+                .await
+                .map_err(iceberg_error)?
+                .into_iter()
+                .filter_map(|namespace| namespace.first().cloned())
+                .map(|name| json!({"graphName": name}))
+                .collect::<Vec<_>>();
+            return Ok(json!({"graphs": graphs}));
+        }
         let graph = self.graph(&input)?;
         match operation {
             "CreateGraph" => {
                 graph.ensure_tables().await.map_err(graph_error)?;
+                Ok(json!({}))
+            }
+            "DeleteGraph" => {
+                self.catalog
+                    .drop_table(graph.nodes_ident())
+                    .await
+                    .map_err(graph_error)?;
+                self.catalog
+                    .drop_table(graph.edges_ident())
+                    .await
+                    .map_err(graph_error)?;
+                self.catalog
+                    .drop_namespace(&NamespaceIdent::new(
+                        required_string(&input, "graphName")?.to_owned(),
+                    ))
+                    .await
+                    .map_err(iceberg_error)?;
                 Ok(json!({}))
             }
             "PutNodes" => {
@@ -363,9 +392,6 @@ impl SemanticApi for IcebergCatalogSemanticStore {
             "GetGraph" => Ok(
                 json!({"graphName": required_string(&input, "graphName")?, "edgesSnapshotId": graph.current_edges_snapshot().await.map_err(graph_error)?}),
             ),
-            "DeleteGraph" | "ListGraphs" => Err(SemanticError::unavailable(
-                "Iceberg catalog namespace deletion/listing is not exposed by this catalog adapter",
-            )),
             _ => Err(SemanticError::validation("unknown graph operation")),
         }
     }
