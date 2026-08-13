@@ -1,0 +1,19 @@
+[package]
+name = "verglas-instance"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+verglas-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name = "lakekeeper-bin"
+resolver = "2"
+version = { workspace = true }
+edition = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+rust-version = { workspace = true }
+license = "Apache-2.0 AND FSL-1.1-ALv2"
+description = """
+This is Lakekeeper, a catalog for Iceberg tables.
+"""
+
+[[bin]]
+name = "lakekeeper"
+path = "src/main.rs"
+
+[features]
+default = []
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "^4.5", features = ["derive"] }
+lakekeeper = { path = "../lakekeeper", features = ["s3-signer", "router"] }
+lakekeeper-authz-verglas = { path = "../authz-verglas" }
+lakekeeper-storage-verglas = { path = "../lakekeeper-storage-verglas" }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

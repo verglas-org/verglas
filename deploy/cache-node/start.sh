@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+umask 077
+mkdir -p /var/lib/verglas/cache
+printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+  "$VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID" \
+  "$VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY" \
+  > /var/lib/verglas/backend-credentials
+printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+  "$VERGLAS_S3_ACCESS_KEY_ID" \
+  "$VERGLAS_S3_SECRET_ACCESS_KEY" \
+  > /var/lib/verglas/endpoint-credentials
+printf '%s\n' \
+  '[listen]' \
+  's3_port = 8333' \
+  'admin_port = 8334' \
+  '' \
+  '[cache]' \
+  'dir = "/var/lib/verglas/cache"' \
+  "capacity_bytes = \"${VERGLAS_CACHE_CAPACITY:-1GB}\"" \
+  "dram_bytes = \"${VERGLAS_CACHE_DRAM:-256MB}\"" \
+  '' \
+  '[auth]' \
+  'credentials_file = "/var/lib/verglas/endpoint-credentials"' \
+  '' \
+  '[backend]' \
+  'provider = "s3"' \
+  "bucket = \"$VERGLAS_MANAGED_STORAGE_BUCKET\"" \
+  "endpoint = \"$VERGLAS_MANAGED_STORAGE_ENDPOINT\"" \
+  "region = \"$VERGLAS_MANAGED_STORAGE_REGION\"" \
+  "allow_http = ${VERGLAS_MANAGED_STORAGE_ALLOW_HTTP:-false}" \
+  'credentials_file = "/var/lib/verglas/backend-credentials"' \
+  > /var/lib/verglas/config.toml
+
+if [ -n "${VERGLAS_CATALOG_URI:-}" ]; then
+  printf '%s\n' \
+    '' \
+    '[catalog]' \
+    "uri = \"$VERGLAS_CATALOG_URI\"" \
+    >> /var/lib/verglas/config.toml
+  if [ -n "${VERGLAS_CATALOG_WAREHOUSE:-}" ]; then
+    printf 'warehouse = "%s"\n' "$VERGLAS_CATALOG_WAREHOUSE" \
+      >> /var/lib/verglas/config.toml
+  fi
+fi
+
+exec verglas-cache-node --config /var/lib/verglas/config.toml

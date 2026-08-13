@@ -1,0 +1,3 @@
+[submodule "extensions/verglas/extension-ci-tools"]
+	path = extensions/verglas/extension-ci-tools
+	url = https://github.com/duckdb/extension-ci-tools.git

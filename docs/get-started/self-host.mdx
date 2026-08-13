@@ -1,0 +1,45 @@
+---
+title: "Self-host the engine"
+description: "Start a local cache node without a hosted control plane."
+icon: "server"
+---
+
+The checked-in Compose file starts MinIO and one `verglas-cache-node`.
+
+```bash
+git clone https://github.com/verglas-org/verglas.git
+cd verglas
+docker compose up --detach --build
+```
+
+The cache endpoint is `http://127.0.0.1:8333`; its development credentials are
+`verglas-local` and `verglas-local-secret`. Health and metrics are exposed on
+port `8334`.
+
+```bash
+until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 1; done
+
+AWS_ACCESS_KEY_ID=verglas-local \
+AWS_SECRET_ACCESS_KEY=verglas-local-secret \
+AWS_DEFAULT_REGION=us-east-1 \
+aws --endpoint-url http://127.0.0.1:8333 s3 ls
+```
+
+## Enable Iceberg-aware caching
+
+An S3 endpoint alone provides correct pass-through behavior. Catalog watching,
+metadata warming, and table-aware admission require an authoritative Iceberg
+REST catalog.
+
+```bash
+export VERGLAS_CATALOG_URI=https://catalog.example.com
+export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
+docker compose up --detach --build
+```
+
+The local stack does not create access, scheduler, database, worker,
+integration, application, or agent services. Those are hosted control-plane
+responsibilities in `verglas-cloud`.
+
+Stop the local engine with `docker compose down`. Add `--volumes` only when you
+intend to delete the local cache and MinIO data.

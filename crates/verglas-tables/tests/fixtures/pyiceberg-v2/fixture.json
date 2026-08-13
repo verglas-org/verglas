@@ -1,0 +1,18 @@
+{
+  "pyiceberg_version": "0.8.1",
+  "pyarrow_version": "18.1.0",
+  "bucket": "lake",
+  "table_location": "s3://lake/warehouse/db/events",
+  "metadata_key": "warehouse/db/events/metadata/00002-91193721-bf94-4f8e-ab1d-878f0e930b18.metadata.json",
+  "current_snapshot_id": 3722410885969766955,
+  "snapshot_ids": [
+    3722410885969766955,
+    8835672860161737842
+  ],
+  "data_file_keys": [
+    "warehouse/db/events/data/category=a/00000-0-648b56f6-33a3-44a2-a346-18aeb807a036.parquet",
+    "warehouse/db/events/data/category=b/00000-0-71e9dc37-2a28-4353-a8c1-941399f77b96.parquet",
+    "warehouse/db/events/data/category=b/00000-1-648b56f6-33a3-44a2-a346-18aeb807a036.parquet",
+    "warehouse/db/events/data/category=c/00000-1-71e9dc37-2a28-4353-a8c1-941399f77b96.parquet"
+  ]
+}

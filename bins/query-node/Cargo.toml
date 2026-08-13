@@ -1,0 +1,68 @@
+[package]
+name = "verglas-query"
+description = "The standalone Verglas query role: stateless SQL over Iceberg tables, reading data only through a configured cache S3 endpoint. No cache storage, no source/sink/jobs code, no catalog write path — a query worker, launched on demand and killed after use."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[lib]
+name = "verglas_query"
+path = "src/lib.rs"
+
+[[bin]]
+name = "verglas-query"
+path = "src/main.rs"
+
+[dependencies]
+# The query path, and nothing off it. No verglas-cache/verglas-s3 (no cache
+# tier, no S3 frontend — this binary is a client of a cache node, never a
+# cache itself), no verglas-cluster/writeback/tables/platform (no ring, no
+# write-back, no mapper, no jobs/worker executor). verglas-core is reused only
+# for its `[log]`/`[catalog]` config shapes, the same ones verglas-cache-node's schema
+# uses, so a fleet image renders one familiar TOML dialect for every role.
+verglas-core.workspace = true
+verglas-iceberg.workspace = true
+# `iceberg::Catalog` is the trait object type this binary's app state and
+# sizing helpers hold — verglas-iceberg is the pure-client engine, this crate
+# still needs the trait itself in scope.
+iceberg.workspace = true
+# Reads the AWS-INI credentials file for the SigV4 keypair this binary signs
+# cache-endpoint requests with — the one small utility function cache-node
+# also pulls this crate in for.
+verglas-backend.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["signal", "macros", "rt-multi-thread", "time"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml.workspace = true
+futures.workspace = true
+bytes.workspace = true
+reqwest.workspace = true
+arrow-ipc = "57"
+# `/v1/query` streams its response body one chunk per Arrow `RecordBatch` as
+# DataFusion produces them (never collects the whole result first, so peak
+# memory tracks the query's operator working set, not the result size).
+# async-stream is the standard, minimal way to write that generator without
+# hand-rolling a `Stream` impl.
+async-stream = "0.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.3"
+# Pin the process rustls CryptoProvider so an https cache endpoint resolves
+# TLS through a chosen provider rather than panicking when the dep graph
+# carries more than one.
+rustls = "0.23"
+
+[dev-dependencies]
+arrow-array.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true
+
+# Ship this binary in the cargo-dist release archives, like the other role
+# binaries.
+[package.metadata.dist]
+dist = true

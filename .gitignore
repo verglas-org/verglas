@@ -1,0 +1,47 @@
+# Rust build artifacts
+/target/
+# Cross-compile / alternate CARGO_TARGET_DIR checkouts (e.g. linux-amd64 from macOS)
+/target-*/
+**/*.rs.bk
+
+# Coverage / profiling artifacts
+*.profraw
+*.profdata
+perf.data*
+flamegraph.svg
+dhat-heap.json
+
+# Local configuration & secrets — verglas.example.toml is the committed reference
+/verglas.toml
+*.local.toml
+.env
+.env.*
+
+# Scratch space
+/scratch/
+/tmp/
+/release-out/
+
+# Claude Code / agent local worktrees
+.claude/worktrees/
+
+# TypeScript SDK (sdks/typescript) build/deps
+node_modules/
+sdks/**/dist/
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Note: Cargo.lock is deliberately COMMITTED (binary-producing workspace —
+# the lockfile is the dependency-reproducibility guarantee). Resolve lockfile
+# merge conflicts by taking main's version and running `cargo check`:
+#   git checkout origin/main -- Cargo.lock && cargo check --workspace
+
+# Python
+__pycache__/
+*.py[cod]

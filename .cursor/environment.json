@@ -1,0 +1,26 @@
+{
+  "name": "Verglas",
+  "install": "bash scripts/cloud/install.sh",
+  "start": "bash scripts/cloud/start.sh",
+  "ports": [
+    {
+      "name": "S3 endpoint",
+      "port": 8333
+    },
+    {
+      "name": "Admin API",
+      "port": 8334
+    },
+    {
+      "name": "MinIO origin",
+      "port": 9000
+    }
+  ],
+  "terminals": [
+    {
+      "name": "verglas-cache-node",
+      "description": "Follows the cache-node log started by scripts/cloud/start.sh (S3 :8333, admin :8334).",
+      "command": "tail -n +1 -F /tmp/verglas-dev/verglas-cache-node.log"
+    }
+  ]
+}

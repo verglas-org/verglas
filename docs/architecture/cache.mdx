@@ -1,0 +1,72 @@
+---
+title: "Cache design"
+description: "Follow a read through DRAM, NVMe, peers, and the origin object store."
+icon: "memory"
+---
+
+Verglas exposes an S3-compatible endpoint. A client changes its S3 endpoint;
+its bucket names and object keys do not change.
+
+## Read path
+
+```mermaid
+flowchart LR
+    Q["GET object range"] --> D{"DRAM hit?"}
+    D -->|yes| A["Return bytes"]
+    D -->|no| N{"NVMe hit?"}
+    N -->|yes| A
+    N -->|no| P{"Peer owns block?"}
+    P -->|yes| A
+    P -->|no| O["Read origin"]
+    O --> C["Admit under budget"]
+    C --> A
+```
+
+The hot path does not aggregate statistics or coordinate cluster state. It
+records bounded observations and lets background tasks update admission,
+warming, and telemetry.
+
+## Cache identity
+
+An object path is mutable; an object generation is not. Verglas keys a cached
+block by:
+
+```text
+provider + bucket + object key + object version + aligned byte range
+```
+
+When Iceberg publishes a new metadata file or replaces a Parquet object, the
+new generation cannot collide with old cached bytes. This is the correctness
+property that a path-only HTTP cache cannot provide.
+
+## DRAM and NVMe
+
+DRAM serves the smallest latency-sensitive working set. NVMe carries the larger
+resident set. Both are accelerators: losing either tier never loses the source
+table.
+
+Cache budgets are ceilings. Startup rejects a configured NVMe capacity larger
+than the backing filesystem can hold. Scan-resistant admission prevents a
+one-touch scan from evicting frequently reused blocks.
+
+## Cluster ownership
+
+A weighted rendezvous ring assigns every block to a live member. The same ring
+interface is used with one node, where that node owns all keys. Reads never
+assume that the process receiving the request owns the requested block.
+
+When membership changes, only keys whose winning owner changed move. During a
+failure, a request can fetch from another peer or the origin. Slow recovery is
+acceptable; returning an incorrect block is not.
+
+## Background work
+
+Background tasks operate under explicit limits:
+
+| Task | Limit |
+| --- | --- |
+| Origin fills | Maximum concurrent requests and retry circuit breaker. |
+| Metadata warming | Concurrent requests and byte-rate budget. |
+| Prefetch | Bounded queue, concurrency, and organic-read yield threshold. |
+| Eviction | Fixed DRAM and NVMe capacity. |
+| Telemetry | Bounded per-core tapes folded off the request path. |

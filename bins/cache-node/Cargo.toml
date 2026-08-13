@@ -1,0 +1,84 @@
+[package]
+name = "verglas-cache-node"
+description = "The standalone Verglas cache serving server: config + SigV4 S3 frontend + foyer cache tiers + origin read/write-through, and nothing else."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "verglas-cache-node"
+path = "src/main.rs"
+
+[dependencies]
+# The cache serving path, and nothing off it. No verglas-cluster (single-node
+# rendezvous ring of one owns every key). The write crate supplies the EC
+# catalog/object writeback journal used by strong-consistency cache nodes.
+# There is still no platform/memory/query engine in this image.
+verglas-core.workspace = true
+verglas-cache.workspace = true
+verglas-s3.workspace = true
+verglas-backend.workspace = true
+# Cache nodes own the tenant catalog response cache and watcher. Query workers
+# consume the local gateway and never receive upstream Lakekeeper credentials.
+verglas-catalog.workspace = true
+verglas-tables.workspace = true
+# The block-device tier (#382): the NBD server in this binary serves cache-served
+# virtual disks to attached NBD clients; verglas-block owns the durable chunk
+# store + manifest.
+verglas-block.workspace = true
+# The block FLUSH write-back plane erasure-codes a device flush across the
+# ring and acks on a quorum. It reuses the object tier's fragment store and peer
+# RPC (verglas-cluster) — this binary wires the block ring peers to them and
+# serves the fragment endpoints peers place shards through. The embedded
+# safekeeper shares this transport; the object serving path stays a deliberate
+# cluster-of-one.
+verglas-cluster.workspace = true
+verglas-consensus.workspace = true
+# The Neon-compatible WAL listener is embedded in this process and places WAL
+# fragments through the same ring transport as block FLUSH.
+verglas-safekeeper.workspace = true
+verglas-write.workspace = true
+axum.workspace = true
+futures.workspace = true
+# The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.
+tokio = { workspace = true, features = ["io-util"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+bytes.workspace = true
+tracing = "0.1.44"
+# Same `[log]` subscriber shape as verglas-cache-node (json for pipelines, pretty for dev),
+# minus the runtime reload handle the cache node has no admin route for.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
+tracing-appender = "0.2.3"
+thiserror.workspace = true
+async-trait.workspace = true
+hex.workspace = true
+sha2.workspace = true
+openraft.workspace = true
+reqwest.workspace = true
+object_store.workspace = true
+# Pin the process rustls CryptoProvider so an https origin (R2/S3) resolves TLS
+# through a chosen provider rather than panicking when the dep graph carries more
+# than one. Ring matches what reqwest's rustls-tls pulls in.
+rustls = "0.23"
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+reqwest.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+tower = { version = "0.5.3", features = ["util"] }
+# Block-device tests: an in-memory object backend, and the NBD protocol test
+# client drives the listener over a real loopback socket.
+
+[lints]
+workspace = true
+
+# Ship this binary in the cargo-dist release archives (workspace packages set
+# `publish = false` for the crates.io ban), like the other bins.
+[package.metadata.dist]
+dist = true

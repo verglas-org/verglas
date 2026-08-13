@@ -1,0 +1,170 @@
+[workspace]
+resolver = "2"
+exclude = ["crates/verglas-catalog-service"]
+members = [
+    "crates/verglas-backend",
+    "crates/verglas-core",
+    "crates/verglas-cluster",
+    "crates/verglas-cache",
+    "crates/verglas-instance",
+    "crates/verglas-s3",
+    "crates/verglas-catalog",
+    "crates/verglas-tables",
+    "crates/verglas-write",
+    "crates/verglas-consensus",
+    "crates/verglas-safekeeper",
+    "crates/verglas-iceberg",
+    "crates/verglas-graph",
+    "crates/verglas-api",
+    "crates/verglas-vector",
+    "crates/verglas-kv",
+    "bins/cache-node",
+    "crates/verglas-block",
+    "bins/query-node",
+    "bins/write-node",
+]
+
+[workspace.package]
+# RELEASE POLICY: bump this before every release tag; tags are immutable and
+# are never deleted or re-pointed once pushed (the tag/version pair names the
+# artifacts forever). The tag must match this version (cargo-dist enforces it).
+version = "0.1.1"
+edition = "2024"
+repository = "https://github.com/verglas-org/verglas"
+homepage = "https://github.com/verglas-org/verglas"
+publish = false
+
+[workspace.dependencies]
+verglas-core = { path = "crates/verglas-core" }
+verglas-backend = { path = "crates/verglas-backend" }
+verglas-cluster = { path = "crates/verglas-cluster" }
+verglas-cache = { path = "crates/verglas-cache" }
+verglas-instance = { path = "crates/verglas-instance" }
+verglas-s3 = { path = "crates/verglas-s3" }
+verglas-catalog = { path = "crates/verglas-catalog" }
+verglas-tables = { path = "crates/verglas-tables" }
+verglas-write = { path = "crates/verglas-write" }
+verglas-consensus = { path = "crates/verglas-consensus" }
+verglas-safekeeper = { path = "crates/verglas-safekeeper" }
+verglas-iceberg = { path = "crates/verglas-iceberg" }
+verglas-graph = { path = "crates/verglas-graph" }
+verglas-api = { path = "crates/verglas-api" }
+verglas-vector = { path = "crates/verglas-vector" }
+verglas-kv = { path = "crates/verglas-kv" }
+verglas-block = { path = "crates/verglas-block" }
+tonic = "0.13.1"
+prost = "0.13.5"
+# Iceberg read/write and DataFusion integration shared by engine roles.
+iceberg = "0.9.1"
+iceberg-catalog-rest = "0.9.1"
+iceberg-datafusion = "0.9.1"
+# S3/fs/memory storage backends for Iceberg FileIO. RestCatalog requires an
+# explicit StorageFactory; the S3 one routes data-file writes and reads through
+# the configured cache endpoint.
+iceberg-storage-opendal = "0.9.1"
+datafusion = "52.2"
+# Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
+arrow-array = "57"
+arrow-schema = "57"
+arrow-csv = "57"
+arrow-json = "57"
+arrow-cast = "57"
+parquet = "57"
+uuid = { version = "1.18", features = ["v4"] }
+axum = "0.8.8"
+bytes = "1.12.0"
+async-trait = "0.1.89"
+foyer = "0.22.3"
+# foyer's metrics registry trait (`mixtrics::RegistryOps`). foyer does not
+# re-export it, so verglas names it directly to install a registry that reads
+# foyer's `storage_queue_buffer_overflow` counter (#278). Pinned to the same
+# version foyer 0.22.3 depends on so the trait objects are compatible.
+mixtrics = "0.2.5"
+futures = "0.3.31"
+libc = "0.2.180"
+object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
+s3s = "0.14.1"
+sync_wrapper = { version = "1.0.2", features = ["futures"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "blocking", "stream", "http2"] }
+# AWS SigV4 request signing for AWS-backed Iceberg REST catalogs (S3 Tables,
+# Glue) — the watcher signs its own reqwest requests, no signing proxy (#236).
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-runtime = "1"
+aws-sigv4 = "1"
+aws-smithy-runtime-api = "1"
+serde = { version = "1.0.228", features = ["derive", "rc"] }
+serde_json = "1.0.149"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+serde_yaml = "0.9.34"
+# SHA-256 content addressing for the block-device chunk store (verglas-block,
+# #382): identical 2 MiB chunks hash to one key so they dedup across devices and
+# versions. `hex` renders the digest as the backend object key.
+sha2 = "0.10.9"
+hex = "0.4.3"
+# Tagged (de)serialization for iceberg's `Storage`/`StorageFactory` traits, which
+# require `#[typetag::serde]` on every implementation.
+typetag = "0.2.22"
+# JSON Schema derived from the config structs' doc comments: the single source
+# that feeds rustdoc, the generated config.toml, and a config reference page.
+schemars = "1.0.4"
+tempfile = "3.20.0"
+thiserror = "2.0.18"
+ts-rs = { version = "11.1.0", features = ["serde-compat"] }
+chrono = "0.4.44"
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+toml = "1.1.2"
+xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
+# CRC32C (Castagnoli) for per-fragment integrity in the write-back tier (#220):
+# hardware-accelerated (SSE4.2/ARM CRC) with a software fallback, the standard
+# storage bit-flip detector, cheap on the fragment write path.
+crc32c = "0.6.8"
+# SIMD Reed-Solomon (Leopard, O(n log n)) for the write-back erasure codec (#180).
+reed-solomon-simd = "3.1.0"
+# Classic GF(2^8) Reed-Solomon, kept only for the codec throughput comparison
+# benchmark (#180) that justifies the SIMD choice; not used on any serving path.
+reed-solomon-erasure = "6.0.0"
+openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
+# Prometheus exposition (#46): a Registry + TextEncoder for the /metrics endpoint.
+# The `process` feature is off — node-level process stats come from node-exporter,
+# not this in-process registry (see verglas-core::metrics).
+prometheus = { version = "0.14.0", default-features = false }
+bollard = "0.21.0"
+
+[workspace.lints.clippy]
+# CI will run clippy with `-D warnings` (see `just lint`), turning these into errors.
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unwrap_used = "warn"
+
+# VERGLAS PATCH: iceberg 0.9.1 from verglas-org/iceberg-rust (branch
+# verglas/v0.9.1) with one added public constructor, `TableCommit::from_parts`.
+# Upstream 0.9.1 gates `TableCommit` construction to the transaction action set
+# (fast-append + property updates, no overwrite or delete), so REPLACE /
+# RemoveSnapshots commits cannot be built through the public API. Compaction
+# and post-compact snapshot expiry need that escape hatch. Pin a SHA — never a
+# floating branch tip. Patch inventory:
+# https://github.com/verglas-org/iceberg-rust/blob/verglas/v0.9.1/VERGLAS.md
+[patch.crates-io]
+iceberg = { git = "https://github.com/verglas-org/iceberg-rust", rev = "a40f92680e7528b15033d7168ecdc8731e3ca2b9" }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
+
+# Smallest-footprint profile for the standalone fleet cache image
+# (bins/cache-node). The cache VM targets a 256 MB box, so its binary is built
+# with fat LTO, a single codegen unit, size-optimized codegen, symbols stripped,
+# and panic=abort (no unwinder — a cache node that panics should die and be
+# restarted by the guest init, not unwind). Build with:
+#   cargo build --profile min-size -p verglas-cache-node
+[profile.min-size]
+inherits = "release"
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

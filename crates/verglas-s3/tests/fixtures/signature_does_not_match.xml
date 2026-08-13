@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Error>
+  <Code>SignatureDoesNotMatch</Code>
+  <Message>The request signature we calculated does not match the signature you provided. Check your key and signing method.</Message>
+  <AWSAccessKeyId>AKIAIOSFODNN7EXAMPLE</AWSAccessKeyId>
+  <RequestId>0A49CEB7F6BF9415</RequestId>
+  <HostId>MsS3PFXbdCDIpBamcM1BTMoHcG69eGUqE53SW2xfQkFV/2BP1Art/I+b0aOKbIZcoFfoeGoZY7hID110vIGgCs22z35m1oh</HostId>
+</Error>

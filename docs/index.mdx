@@ -1,0 +1,28 @@
+---
+title: "Verglas engine documentation"
+description: "Run the Iceberg-aware storage engine on your infrastructure."
+icon: "snowflake"
+---
+
+Verglas is an Iceberg-aware object cache and storage engine. Query engines use
+its S3 endpoint while the customer's object store and Iceberg catalog remain
+authoritative.
+
+<Warning>
+Verglas is a pre-release prototype. Configuration, wire formats, and on-disk
+layouts may change between commits.
+</Warning>
+
+<CardGroup cols={2}>
+  <Card title="Self-host the engine" icon="server" href="/docs/get-started/self-host">
+    Start MinIO and a cache node, then point an S3-compatible client at it.
+  </Card>
+  <Card title="Understand the architecture" icon="compass-drafting" href="/docs/architecture/overview">
+    Follow reads, writes, catalog events, query roles, and ring ownership.
+  </Card>
+</CardGroup>
+
+The CLI and SDK documentation lives with
+[verglas-client](https://github.com/verglas-org/verglas-client). Hosted access,
+scheduling, databases, integrations, applications, workers, and agents live in
+the private `verglas-cloud` repository.

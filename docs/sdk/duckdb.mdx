@@ -1,0 +1,122 @@
+---
+title: "DuckDB extension"
+description: "Query Verglas SQL, graph, and vector routes from DuckDB."
+---
+
+The Verglas extension lets DuckDB stay DuckDB while a remote Verglas query
+worker does the lakehouse work. SQL goes to the database-scoped query API. Its
+Arrow stream comes back as an ordinary DuckDB relation, ready to join with a
+local CSV, Parquet file, or dataframe.
+
+<Note>
+The extension is not in DuckDB's community repository yet. During development,
+build and load the local artifact as shown below. The release workflow is
+prepared to produce DuckDB 1.5.5 binaries for a custom repository.
+</Note>
+
+## Build and connect
+
+Clone submodules because DuckDB's official extension tooling is one of them:
+
+```bash
+git clone --recurse-submodules https://github.com/verglas-org/verglas.git
+cd verglas/extensions/verglas
+make configure debug
+```
+
+Keep connection details outside SQL. Every function reads the same three
+environment variables, and a missing value stops the request before any network
+call:
+
+```bash
+export VERGLAS_ENDPOINT="https://api.example.verglas.dev"
+export VERGLAS_DATABASE="analytics"
+export VERGLAS_TOKEN="replace-with-a-short-lived-token"
+
+duckdb -unsigned
+```
+
+Then load the development artifact and ask for a first result:
+
+```sql
+LOAD 'build/debug/verglas.duckdb_extension';
+
+SELECT *
+FROM verglas_query('
+  SELECT symbol, avg(price) AS average_price
+  FROM market.ohlcv
+  GROUP BY symbol
+  ORDER BY average_price DESC
+');
+```
+
+The SQL string is passed verbatim to Verglas's DataFusion query worker. The
+extension does not rewrite DuckDB SQL or retry through a local engine. Arrow IPC
+is decoded incrementally, and each call produces at most one DuckDB vector.
+
+## Graph and vector queries
+
+Graph traversals are relations too:
+
+```sql
+SELECT node_id, predicate, confidence
+FROM verglas_graph_neighbors('knowledge', 'account:42', 'out')
+ORDER BY confidence DESC;
+
+SELECT nodes, edges_json, confidence
+FROM verglas_graph_paths(
+  'knowledge', 'account:42', 'company:7', 3, 'out'
+);
+```
+
+Vector search accepts a native `FLOAT[]`. Choose `table` or `graph` explicitly;
+the extension uses the corresponding index-search API and never substitutes a
+brute-force scan:
+
+```sql
+SELECT id, distance
+FROM verglas_vector_search(
+  'table', 'documents', 'embedding',
+  [0.12::FLOAT, -0.08::FLOAT, 0.44::FLOAT], 10
+)
+ORDER BY distance;
+```
+
+The available table functions are:
+
+| Function | Result |
+| --- | --- |
+| `verglas_query(sql)` | The remote Arrow schema and rows |
+| `verglas_graph_neighbors(namespace, start, direction)` | Neighbor edges plus backend and snapshot |
+| `verglas_graph_k_hop(namespace, start, k, direction)` | Reached nodes, hop counts, and path confidence |
+| `verglas_graph_paths(namespace, start, destination, max_hops, direction)` | Ordered node lists, edge JSON, and confidence |
+| `verglas_vector_search(kind, resource, field, vector, k)` | Index ids, distances, and source |
+
+## Install from a release repository
+
+DuckDB extensions are specific to both a DuckDB version and a platform. The
+release job therefore produces a matrix rather than one universal binary. Once
+the custom repository is published, installation becomes:
+
+```sql
+INSTALL verglas FROM 'https://extensions.verglas.dev';
+LOAD verglas;
+```
+
+Until Verglas is signed through DuckDB's community process, clients must opt in
+to trusted unsigned extensions (`duckdb -unsigned`, or
+`allow_unsigned_extensions` in an embedded client). Production distribution
+should publish the exact DuckDB repository layout:
+
+```text
+https://extensions.verglas.dev/
+└── v1.5.5/
+    ├── linux_amd64/verglas.duckdb_extension.gz
+    ├── linux_arm64/verglas.duckdb_extension.gz
+    ├── osx_amd64/verglas.duckdb_extension.gz
+    ├── osx_arm64/verglas.duckdb_extension.gz
+    └── windows_amd64/verglas.duckdb_extension.gz
+```
+
+Remote failures preserve the HTTP status and a bounded response excerpt. Tokens
+are never SQL arguments, result values, or part of those diagnostics.

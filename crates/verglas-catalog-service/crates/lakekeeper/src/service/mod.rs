@@ -1,0 +1,64 @@
+pub mod admission;
+pub mod authn;
+pub mod authz;
+pub(crate) mod cache_metrics;
+pub(crate) mod cache_ttl;
+mod catalog_store;
+pub mod contract_verification;
+pub mod endpoint_statistics;
+pub mod events;
+pub mod health;
+pub mod idempotency;
+pub mod maintenance;
+pub mod secrets;
+pub mod storage;
+pub mod task_configs;
+pub mod tasks;
+pub use admission::{AdmissionGate, AdmissionGates, AdmissionRejection};
+pub use authn::{Actor, UserId};
+pub use catalog_store::*;
+pub use endpoint_statistics::EndpointStatisticsTrackerTx;
+mod post_migration_hooks;
+#[allow(unused_imports)]
+pub use identifier::tabular::{TabularId, TabularIdentBorrowed, TabularIdentOwned};
+pub use lakekeeper_io::Location;
+pub use secrets::{SecretId, SecretStore};
+use tasks::RegisteredTaskQueues;
+
+use self::authz::Authorizer;
+pub use crate::api::{ErrorModel, IcebergErrorResponse};
+use crate::{
+    api::{
+        ThreadSafe as ServiceState,
+        management::v1::server::{BuildInfo, LicenseStatus},
+    },
+    service::{contract_verification::ContractVerifiers, events::EventDispatcher},
+};
+
+mod identifier;
+
+pub use identifier::{generic::*, project::*, role::*};
+pub use post_migration_hooks::run_post_migration_hooks;
+#[cfg(any(test, all(feature = "test-utils", feature = "sqlx-postgres")))]
+pub use post_migration_hooks::upsert_system_roles_in_all_projects;
+
+// ---------------- State ----------------
+#[derive(Clone, Debug)]
+pub struct State<A: Authorizer + Clone, C: CatalogStore, S: SecretStore> {
+    pub authz: A,
+    pub catalog: C::State,
+    pub secrets: S,
+    pub contract_verifiers: ContractVerifiers,
+    pub events: EventDispatcher,
+    pub registered_task_queues: RegisteredTaskQueues,
+    pub license_status: &'static LicenseStatus,
+    pub build_info: &'static BuildInfo,
+}
+
+impl<A: Authorizer + Clone, C: CatalogStore, S: SecretStore> ServiceState for State<A, C, S> {}
+
+impl<A: Authorizer + Clone, C: CatalogStore, S: SecretStore> State<A, C, S> {
+    pub fn server_id(&self) -> ServerId {
+        self.authz.server_id()
+    }
+}

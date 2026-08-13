@@ -1,0 +1,194 @@
+# cache-node worklog
+
+- fleet cache image: New standalone cache serving daemon `verglas-cache-node`.
+  It is the CACHE-relevant subset of `verglasd`: config load (reusing
+  `verglas-core`'s schema and validation verbatim), the SigV4 S3 frontend
+  (`verglas-s3` `router_with_passthrough`), the foyer cache tiers over a
+  single-node rendezvous ring (`verglas-cache` `HybridCacheEngine` with
+  `NoopPeerFetch` + `RendezvousRing::single`), the origin backend with the
+  startup probe and read-through/write-through (`verglas-backend`), the
+  disk-full admission guardrail (#96), and a four-endpoint admin surface
+  (`/admin/healthz`, `/admin/version`, `/admin/stats`, `/metrics`) matching the
+  fleet health-check and metrics-scrape contracts. Deliberately excludes the
+  cluster ring/gossip/peers, the write-back tier (the fleet cache image never
+  enables it and it needs the excluded peer transport), the catalog watcher and
+  table lifecycle, and every DataFusion/platform/harness/memory surface — the
+  cache VM does exactly one job. Accepts the exact config the fleet cache image
+  boot script renders (`fleet/images/boot/cache-boot.sh`), so the image swaps
+  binaries without a boot-script change. Auth/logging/`background_fill_limit`
+  helpers are copied from `bins/verglasd` (each noted in-place) rather than
+  shared, to keep this crate independent of the daemon.
+
+- #382: Added the block-device tier. New `nbd` module serves attached
+  `verglas-block` devices to the Linux kernel NBD client over a single fixed
+  newstyle listener on port 8335 (export name = device id; READ/WRITE/FLUSH/
+  TRIM/DISC, with FLUSH and clean DISC forcing the durability barrier + manifest
+  commit). New `blockdev` module holds the device registry over one chunk store
+  and the `POST /blocks/ensure` control route (merged into the admin surface) the
+  host agent calls before attaching. `serve::run` builds the chunk store over the
+  single configured backend bucket, binds the NBD listener, and joins it with the
+  admin and S3 planes. `vhost-user-blk` is noted as the extension point.
+
+- #382: Wired the block-flush write-back ring (`ring.rs`). When VERGLAS_RING_PEERS
+  names a ring (id=host:port entries) and VERGLAS_NODE_ID is this box, the node
+  builds the flush plane over the device registry's chunk store, serves the
+  fragment RPC endpoints peers place shards through on VERGLAS_RING_ADDR
+  (default :8336, no new authz — VXLAN isolation like the NBD plane), and runs the
+  drain-takeover loop. With no ring configured the block tier stays single-node and
+  FLUSH is the synchronous R2 barrier, unchanged. The object serve path is still a
+  peerless cluster-of-one; only the block tier reaches verglas-cluster's fragment
+  store and peer RPC. `DeviceRegistry` gained an optional ring plane it attaches
+  once at startup; ensure/get route flushes through it when present.
+- #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.
+- #91: Renamed the full local process from `verglasd` to `verglas-server` in
+  cache-node parity documentation. The comparison now names the foreground
+  server binary used by self-hosted deployments.
+- #13: Embedded `verglas-safekeeper` in the cache-node process. The Neon
+  PostgreSQL listener shares the existing fragment transport, membership,
+  local NVMe fragment store, and peer RPC listener with block FLUSH; it is not
+  another daemon or deployment. Three-node rings use `k=2,m=1,w=3`; four and
+  larger nodes retain two parity fragments and acknowledge after `n-1`
+  placements. Added a process-level test that launches three real cache-node
+  binaries, pushes WAL through one ingress, observes the EC quorum ack, and
+  reads the exact bytes back with physical replication.
+- #58: Added the cache-owned Iceberg REST gateway and catalog watcher used by local query workers. Watcher refreshes and query reads share the same bounded response cache, so ephemeral query processes never own upstream credentials or catalog state.
+
+- #58: Cache-node catalog watching uses `PollingWatcher` only. Dropped `VERGLAS_CATALOG_FEED_*` and the websocket upgrade attempt against the catalog origin.
+
+- #58: Hardened the embedded safekeeper process test: wait for all three children to log listen readiness, capture stderr, and retry the Postgres startup handshake so CI does not flake on early connect.
+
+- #74: Routed pageserver layer and index PUTs through the shared EC fragment
+  ring. The S3 endpoint now acknowledges a ring-backed PUT after quorum fsync,
+  keeps dirty fragments outside cache eviction, propagates to the origin in the
+  background, and exposes write-back counters. The disk monitor gives ordinary
+  cache blocks and durability fragments one physical NVMe ceiling without
+  evicting acknowledged dirty data.
+- #74: Made origin probing asynchronous so a cache node recovers and serves
+  dirty ring data during an origin outage. The fragment server now exposes the
+  journal-manifest discovery callback used by cross-node dirty reads.
+- #66: Rewrote block-device and NBD docs for attached NBD clients instead of microVMs, and dropped cloud-fleet wording from the package description.
+- #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.
+- #84: Wired the cache node's built-in managed lakehouse binding explicitly
+  through backend construction, block-device store lookup, and the S3 router.
+- #82: Added explicit eventual polling and strong quorum-backed catalog runtimes. Strong mode requires the three-node fragment ring, verifies ordered Lakekeeper events, catches query reads up to the EC tail, and returns applied event proofs without a polling fallback.
+- #84: Added the cache-node Docker target and rendered local startup contract used by the three-member OSS fragment ring. The ring exposes one selected embedded safekeeper for managed Neon while retaining erasure-coded WAL durability across all three cache volumes.
+- #84: Passed the cache node's managed backend binding into its embedded
+   safekeeper so completed WAL segments drain to the configured object store.
+- #87: Added the authenticated host-agent quiescence API and wired one atomic admission fence across S3/catalog HTTP, NBD connections, fragment RPC operations, and embedded safekeeper connections. The fence rejects new work, reports already-accepted work until it drains, and can be reopened only with its current generation; background recovery and propagation do not create a ring-drain requirement.
+- #109: Kept the stacked cache-node base compatible with the current Rust lint gate by boxing large response/catalog values and grouping the S3 server inputs in one explicit context.
+- #109: Resolved DNS names in `VERGLAS_RING_PEERS` at startup. Containerized
+  cache peers can now use stable Compose service names while the fragment RPC
+  client retains its concrete socket-address contract.
+- Reclaim stale revision-keyed safekeeper recovery descriptors when the shared
+  fragment ring starts. The committed legacy head remains pinned, malformed or
+  missing heads cause no deletion, and the new two-slot safekeeper protocol no
+  longer grows this metadata without bound.
+- #74: Exposed exact reconstructed-page GET/PUT routes on the admin listener,
+  backed by the same hybrid engine and recovery gate as Iceberg data.
+- #74: Extended rendezvous ownership and cache peer transport to reconstructed
+  Neon pages and ordinary object blocks, allowing any ingress node to fetch from
+  the owner and retain a local hot replica.
+- #74: Added a four-node shared-cache regression covering cross-node page heat,
+  real Neon query-after-write, safekeeper publication, and quorum writes with a
+  ring member stopped.
+- #133: Made the cache node the public engine container entrypoint and added optional Iceberg catalog rendering to its startup script. The engine-only Compose stack now launches only object storage and the cache role.
+- #109: Made configured ring membership fail closed while peer DNS is changing.
+  Startup now waits for every declared peer instead of silently forming a
+  smaller EC ring that can advertise health without the safekeeper PostgreSQL
+  depends on.
+- #127: Replaced ring-size-derived safekeeper geometry with mandatory explicit
+  `VERGLAS_SAFEKEEPER_EC_K/M/W` settings validated against the complete ring.
+  Managed four-node deployments can now declare `2/2/3`, while the OSS
+  three-node stack declares `2/1/3` rather than silently changing durability.
+- #135: Served group-keyed Raft RPCs on the existing cache peer listener and
+  derived an explicit numeric voter address map from the configured ring. Gossip
+  remains outside consensus membership and cannot reconfigure a group.
+- #135: Adapted consensus coded representations to the existing fsynced fragment
+  RPC and store. Successful remote placement now supplies the durability proof
+  used before Raft header submission, with checksummed reconstruction reads.
+- #135: Added the cache-node Multi-Raft registry. Dynamic groups open persistent
+  replicas on every explicit voter and initialize through one deterministic
+  bootstrap voter before catalog or WAL commands can be accepted.
+- #135: Added any-ingress typed command routing to the leader reported by the
+  local Raft replica. Forwarded commands execute only on the actual leader and
+  preserve their exact request identity across leadership changes.
+- #135: Replaced the cache node's live Neon Vote/Elected safekeeper listener with
+  the Verglas WAL protocol. Every ingress provisions a timeline group and routes
+  writer, append, read, release, and checkpoint commands through Raft.
+- #135: Added CRaft complete-entry fallback to the live WAL ingress. When coded
+  staging cannot reach its intersection threshold, the same exact append is
+  retried as a full copy on a regular majority without changing Raft safety.
+- #135: Added the native managed-catalog ingress beside the WAL protocol. Typed
+  Lakekeeper transactions and fenced namespace/table reads route to independent
+  warehouse groups on the same Multi-Raft and payload substrate.
+- #135: Switched the live Neon ingress to the canonical binary WAL protocol and
+  removed client-submitted archive checkpoints. The cache node now decodes
+  complete frames strictly and returns only consensus-applied binary results.
+
+- #135: Removed the cache-node's legacy catalog EC log and its strong admin
+  proxy. External REST catalogs are explicitly eventual; managed warehouse
+  catalog mutations and reads use their native ConsensusPlane group only.
+
+- #135: Attached each cache-node group's distributed durable payload store to
+  its state machine before Raft can build snapshots. Catalog checkpoint
+  compaction now reclaims only the already-checkpointed ring fragments, and a
+  failed peer deletion leaves authoritative metadata available for retry.
+- #135: Wired immutable S3 write-back publication to per-object groups on the
+  same Multi-Raft plane. A coded fragment set is no longer acknowledged until
+  its deterministic placement certificate is committed by consensus.
+- #135: Added the fenced binary WAL-status response used by pageservers to read
+  exact committed ranges through any ingress without safekeeper discovery.
+
+- #135: Native catalog requests now require explicit tenant and warehouse path
+  identities. The ingress first registers and resolves the tenant-root route,
+  then submits only to that tenant-scoped warehouse group.
+- #135: Routed OpenTimeline through the timeline Multi-Raft group before writer acquisition. Cache ingresses now establish a real PostgreSQL starting LSN as committed state.
+- #135: Wired the segment archiver into successful WAL appends using an explicitly configured archive bucket. Complete segment boundaries upload and verify content-addressed objects in the background, then commit their checkpoint through the timeline group without delaying foreground acknowledgement.
+- #135: Restricted complete-entry WAL fallback to failures that prove coded
+  durability is unavailable. Semantic conflicts and Raft failures now fail closed
+  instead of being retried under a different storage mode.
+
+- #135: Routed typed hosted-catalog record reads and listings through warehouse
+  consensus groups. The cache-node ingress now exposes one read authority for
+  Lakekeeper domain state and Iceberg metadata pointers.
+
+- #135: Added explicit prospective-voter peer-address registration at the ring
+  boundary. Membership lifecycle code can resolve a learner's authenticated
+  Raft endpoint without treating ordinary read-ring gossip as consensus authority.
+
+- #135: Added leader-only voter replacement sequencing: register a precise peer
+  address, provision and catch up the learner, repair committed payloads, then
+  commit OpenRaft's joint and uniform voter transition.
+
+- #135: Mounted authenticated administrative voter replacement. Host agents now
+  submit an explicit remove/add/address request; the node validates its durable
+  voter set and invokes the repair-first CRaft transition with no catalog path.
+
+- #135: Made authoritative stop prove local voter relinquishment after draining.
+  A host can only receive stop success once this process is absent from every
+  committed hosted-group voter set; archive completion alone is insufficient.
+
+- #135: Added route coverage for authenticated membership replacement. The test
+  proves unauthenticated and malformed transitions are rejected, while a valid
+  request invokes exactly one injected lifecycle operation.
+
+- #135: Registered prospective voters in the shared payload peer map before
+  learner catch-up, then publish new representation slots only after uniform
+  membership commits. Candidate fragment traffic now uses the stable node ID
+  carried and verified by the lifecycle request.
+
+- #135: Refresh the open group's payload allocation after uniform membership
+  commits. New WAL and catalog entries now stage against the committed voter
+  ordering rather than the process's original static ring snapshot.
+
+- #135: Forward membership replacement from a non-leader ingress to its
+  observed leader, and refuse the operation while no leader is known. Lifecycle
+  reconfiguration no longer has a local no-leader execution path.
+- #135: Made ring representation identities include both the content hash and
+  exact request identity, and persisted the hash inside the representation
+  frame. Repeated empty or equal bodies can no longer overwrite unrelated
+  committed allocations before a recovery fence.
+- #135: Added group and configuration generation to fragment object identity.
+  Membership repair stages into a separate namespace, so candidate fragments
+  cannot overwrite the currently committed source allocation before Raft
+  publishes the replacement certificate.
