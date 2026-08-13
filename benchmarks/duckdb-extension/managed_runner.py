@@ -85,6 +85,13 @@ def product_sql(path, workload):
     raise ValueError(f"unknown product path {path!r}")
 
 
+def measured_sql(path, workload):
+    """Select the SQL visible to the declared product's remote Quack server."""
+    if path not in ("quack_direct", "quack_verglas_extension"):
+        raise ValueError(f"{path!r} is not a Quack product path")
+    return product_sql(path, workload)
+
+
 def validate_bootstrap(rows, worker_memory_mib, catalog_engine):
     """Reject a bootstrap that cannot exercise managed, out-of-core Iceberg I/O."""
     if catalog_engine != "verglas-lakekeeper":
@@ -293,7 +300,11 @@ def main(argv=None):
     serve_ext = sub.add_parser("serve-extension-quack")
     serve_ext.add_argument("--extension", default="/artifacts/verglas.duckdb_extension")
     measure = sub.add_parser("measure")
-    measure.add_argument("--path", choices=("query-worker", "quack"), required=True)
+    measure.add_argument(
+        "--path",
+        choices=("verglas_query_worker", "quack_direct", "quack_verglas_extension"),
+        required=True,
+    )
     measure.add_argument("--workload", choices=WORKLOADS, required=True)
     measure.add_argument("--repetitions", type=int, default=5)
     measure.add_argument("--warmups", type=int, default=1)
@@ -308,8 +319,8 @@ def main(argv=None):
     else:
         if args.repetitions != 5 or args.warmups != 1:
             raise ValueError("full-stack evidence requires exactly one warmup and five repetitions")
-        sql = canonical_sql(args.workload)
-        if args.path == "query-worker":
+        sql = product_sql(args.path, args.workload)
+        if args.path == "verglas_query_worker":
             required = ("VERGLAS_ENDPOINT", "VERGLAS_DATABASE", "VERGLAS_TOKEN")
             if any(not os.environ.get(name) for name in required):
                 raise RuntimeError("Query worker measurement requires VERGLAS_ENDPOINT, VERGLAS_DATABASE, and VERGLAS_TOKEN")

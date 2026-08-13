@@ -33,6 +33,13 @@ class ManagedRunnerTests(unittest.TestCase):
         query = RUNNER.product_sql("quack_verglas_extension", "scan")
         self.assertIn("verglas_query(", query)
 
+    def test_quack_measurement_selects_the_declared_product_transport(self):
+        """Do not accidentally run direct SQL against the extension-only server."""
+        self.assertEqual(RUNNER.measured_sql("quack_direct", "scan"),
+                         RUNNER.canonical_sql("scan"))
+        self.assertIn("verglas_query(",
+                      RUNNER.measured_sql("quack_verglas_extension", "scan"))
+
     def test_product_workloads_are_same_semantics_for_all_paths(self):
         """Change only the transport wrapper around each canonical workload."""
         for workload in RUNNER.WORKLOADS:

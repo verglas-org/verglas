@@ -28,3 +28,6 @@
   distinguish direct-R2 Quack from Quack loading the real Verglas extension and
   require every product path to execute the same out-of-core SQL semantics.
 - #126: Added the managed-Iceberg runner used by the full-stack benchmark. It creates a unique Iceberg v2 table through Lakekeeper, keeps Quack's direct R2 path separate from the Query worker and extension path, and streams typed Arrow evidence from real clients.
+- #126: Added a regression contract that keeps the two Quack transports
+  distinct. The extension-hosting server must receive `verglas_query(...)`,
+  while direct Quack receives the canonical Iceberg SQL unchanged.
