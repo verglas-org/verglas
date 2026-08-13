@@ -265,3 +265,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   and dispatch them through the existing S3 listener. The Graph adapter opens
   customer Iceberg tables per operation and uses Puffin only as its existing
   snapshot-bound acceleration, never as a local authoritative registry.
+- #258: Expanded the Verglas Graph REST-JSON model from route names into a
+  botocore-style contract with operation input/output/error bindings, typed
+  graph and traversal shapes, and list pagination. Contract tests now validate
+  every public operation and representative graph payloads before clients rely
+  on generated bindings.
