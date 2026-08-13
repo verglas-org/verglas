@@ -19,10 +19,18 @@ use verglas_database::DatabaseServiceError;
 
 use crate::database_runtime::ManagedPostgresRuntime;
 
+#[cfg(target_arch = "aarch64")]
 const STORAGE_IMAGE: &str =
-    "ghcr.io/verglas-org/neon-storage:bc9110da9698a05559fcbf557dcbf427891ab61d";
+    "ghcr.io/verglas-org/neon-storage:bc9110da9698a05559fcbf557dcbf427891ab61d-arm64";
+#[cfg(target_arch = "x86_64")]
+const STORAGE_IMAGE: &str =
+    "ghcr.io/verglas-org/neon-storage:bc9110da9698a05559fcbf557dcbf427891ab61d-amd64";
+#[cfg(target_arch = "aarch64")]
 const COMPUTE_IMAGE: &str =
-    "ghcr.io/verglas-org/neon-compute-v16:bc9110da9698a05559fcbf557dcbf427891ab61d";
+    "ghcr.io/verglas-org/neon-compute-v16:bc9110da9698a05559fcbf557dcbf427891ab61d-arm64";
+#[cfg(target_arch = "x86_64")]
+const COMPUTE_IMAGE: &str =
+    "ghcr.io/verglas-org/neon-compute-v16:bc9110da9698a05559fcbf557dcbf427891ab61d-amd64";
 const COMPUTE_PORT: u16 = 55_433;
 pub(crate) const PROXY_PORT: u16 = 5_432;
 const PROXY_HTTP_PORT: u16 = 7_001;
@@ -829,7 +837,7 @@ mod tests {
 
     use super::{ManagedPostgresConfig, ManagedPostgresProvisioner, tenant_is_active};
 
-    /// Pins multi-platform component images and lets Docker select the host architecture.
+    /// Pins the published image matching the access service architecture.
     #[test]
     fn managed_postgres_uses_native_published_images() {
         let provisioner = ManagedPostgresProvisioner::new(ManagedPostgresConfig::fixture())
@@ -842,6 +850,16 @@ mod tests {
         assert_eq!(plan.containers[1].image, super::STORAGE_IMAGE);
         assert_eq!(plan.containers[2].image, super::COMPUTE_IMAGE);
         assert_eq!(plan.containers[3].image, super::STORAGE_IMAGE);
+        let suffix = if cfg!(target_arch = "aarch64") {
+            "-arm64"
+        } else {
+            "-amd64"
+        };
+        assert!(
+            plan.containers
+                .iter()
+                .all(|container| container.image.ends_with(suffix))
+        );
         assert!(
             plan.containers
                 .iter()
