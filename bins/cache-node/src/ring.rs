@@ -1,7 +1,7 @@
 //! Shared fragment-ring wiring for block FLUSH and Neon WAL (#13/#382).
 //!
 //! The cache node's read ownership is a deliberate cluster-of-one (see
-//! [`crate::serve`]), but object PUT, block FLUSH, and the embedded safekeeper
+//! [`crate::serve`]), but object PUT, block FLUSH, and the dedicated EC keeper
 //! write over the fleet ring. This module constructs their one shared transport,
 //! membership view, fragment store, and listener. It:
 //!
@@ -19,8 +19,8 @@
 //! - runs the takeover pass that completes a drain a crashed originator left
 //!   behind.
 //!
-//! With one configured node, this module supplies the embedded safekeeper's
-//! local staging transport but leaves the block tier on its synchronous origin
+//! With one configured node, this module supplies the dedicated keeper's remote
+//! fragment target but leaves the block tier on its synchronous origin
 //! barrier. Three or more nodes also enable erasure-coded block write-back.
 
 use std::collections::HashMap;
@@ -104,16 +104,6 @@ impl RingPlane {
         Arc::clone(&self.membership)
     }
 
-    /// Returns a deterministic Neon numeric id derived from the fleet node id.
-    pub fn safekeeper_id(&self) -> u64 {
-        self.self_id
-            .as_str()
-            .bytes()
-            .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
-            })
-    }
-
     /// Returns the current number of configured live fragment holders.
     pub fn node_count(&self) -> usize {
         self.membership.live_nodes().len()
@@ -133,8 +123,8 @@ impl RingPlane {
 
 /// Wires the block-flush write-back plane onto `registry` from the environment,
 /// or returns `None` when no node membership is configured. One member leaves
-/// the block tier on the synchronous origin barrier while still providing the
-/// embedded safekeeper transport. Called once at startup, before serving.
+/// the block tier on the synchronous origin barrier while still exposing a
+/// private fragment target to the dedicated keeper. Called once at startup.
 ///
 /// `secret` is the shared cluster secret to honour on the fragment plane, if the
 /// env sets one; v1 requires none (VXLAN isolation, mirroring the NBD plane).

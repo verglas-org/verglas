@@ -1,5 +1,8 @@
 # verglas-safekeeper worklog
 
+- #durable-ec: Documented the dedicated `verglas-ec-keeper` hosting contract;
+  physical protocol and EC/WAL semantics are unchanged.
+
 - #372: New crate. Pinned the append-log contract (the substrate<->pageserver
   boundary for pg-engine) as the crate-root doc plus the `AppendLog` trait, and
   built the EC quorum-append WAL buffer (`EcAppendLog`) against it. Reuses the

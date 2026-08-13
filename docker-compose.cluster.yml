@@ -12,11 +12,6 @@ x-cluster-cache-environment: &cluster-cache-environment
   VERGLAS_RING_ADDR: 0.0.0.0:8336
   VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336,cache-1=verglas-cache-node-1:8336,cache-2=verglas-cache-node-2:8336
   VERGLAS_CLUSTER_SECRET: ${VERGLAS_CLUSTER_SECRET:-verglas-local-ring}
-  VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:5454
-  VERGLAS_SAFEKEEPER_EC_K: "2"
-  VERGLAS_SAFEKEEPER_EC_M: "1"
-  VERGLAS_SAFEKEEPER_EC_W: "3"
-  VERGLAS_SAFEKEEPER_BROKER_ENDPOINT: http://verglas-neon-broker:50051
   VERGLAS_MANAGED_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
   VERGLAS_MANAGED_STORAGE_ENDPOINT: ${R2_ENDPOINT:?Set R2_ENDPOINT}
   VERGLAS_MANAGED_STORAGE_REGION: auto
@@ -32,28 +27,27 @@ services:
     environment:
       VERGLAS_MANAGED_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333
       VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333
-      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-safekeeper-pool:5454
+      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-ec-keeper:5454
     depends_on:
       verglas-ring-proxy:
         condition: service_healthy
-      verglas-safekeeper-pool:
+      verglas-ec-keeper:
         condition: service_healthy
 
   verglas-neon-bootstrap:
     environment:
       VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333
-      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-safekeeper-pool:5454
+      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-ec-keeper:5454
     depends_on:
       verglas-ring-proxy:
         condition: service_healthy
-      verglas-safekeeper-pool:
+      verglas-ec-keeper:
         condition: service_healthy
 
   verglas-cache-node-0:
     environment:
       <<: *cluster-cache-environment
       VERGLAS_NODE_ID: cache-0
-      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-0:5454
 
   verglas-cache-node-1:
     build:
@@ -63,7 +57,6 @@ services:
     environment:
       <<: *cluster-cache-environment
       VERGLAS_NODE_ID: cache-1
-      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-1:5454
     volumes:
       - verglas-pg-cache-1:/var/lib/verglas
     networks:
@@ -84,7 +77,6 @@ services:
     environment:
       <<: *cluster-cache-environment
       VERGLAS_NODE_ID: cache-2
-      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-2:5454
     volumes:
       - verglas-pg-cache-2:/var/lib/verglas
     networks:
@@ -122,17 +114,11 @@ services:
       retries: 30
     restart: unless-stopped
 
-  verglas-safekeeper-pool:
-    build:
-      context: .
-      target: verglas-safekeeper-pool
-    image: verglas/verglas-safekeeper-pool:local
+  verglas-ec-keeper:
     environment:
-      VERGLAS_RING_SAFEKEEPER_LISTEN: 0.0.0.0:5454
-      VERGLAS_RING_SAFEKEEPER_ENDPOINTS: verglas-cache-node-0:5454,verglas-cache-node-1:5454,verglas-cache-node-2:5454
-    networks:
-      - default
-      - runtime
+      VERGLAS_EC_KEEPER_EC_K: "2"
+      VERGLAS_EC_KEEPER_EC_M: "1"
+      VERGLAS_EC_KEEPER_EC_W: "3"
     depends_on:
       verglas-cache-node-0:
         condition: service_healthy

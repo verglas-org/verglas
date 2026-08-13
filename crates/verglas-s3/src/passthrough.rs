@@ -1988,6 +1988,100 @@ impl ObjectList for PassthroughList {
     }
 }
 
+/// Canonical direct-origin adapter for components (such as the WAL keeper)
+/// that need both sides of the object contract without owning an S3 frontend.
+pub struct PassthroughOrigin {
+    read: PassthroughRead,
+    write: PassthroughWrite,
+}
+
+impl PassthroughOrigin {
+    /// Builds the paired origin adapter over one configured backend registry.
+    pub fn new(stores: Arc<dyn BackendStores>) -> Self {
+        Self {
+            read: PassthroughRead::new(Arc::clone(&stores)),
+            write: PassthroughWrite::new(stores),
+        }
+    }
+}
+
+impl ObjectRead for PassthroughOrigin {
+    async fn get(&self, key: &CacheKey, range: ReadRange) -> Result<ObjectGet, ReadError> {
+        self.read.get(key, range).await
+    }
+    async fn head(&self, key: &CacheKey) -> Result<ObjectMeta, ReadError> {
+        self.read.head(key).await
+    }
+}
+
+impl ObjectWrite for PassthroughOrigin {
+    async fn put(
+        &self,
+        key: &CacheKey,
+        metadata: WriteMetadata,
+        body: WriteBodyStream,
+    ) -> Result<PutOutcome, WriteError> {
+        self.write.put(key, metadata, body).await
+    }
+    async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
+        self.write.delete(key).await
+    }
+    async fn delete_batch(
+        &self,
+        keys: &[CacheKey],
+    ) -> Result<Vec<Result<(), WriteError>>, WriteError> {
+        self.write.delete_batch(keys).await
+    }
+    async fn copy(
+        &self,
+        source: &CacheKey,
+        dest: &CacheKey,
+        metadata: Option<WriteMetadata>,
+    ) -> Result<CopyOutcome, WriteError> {
+        self.write.copy(source, dest, metadata).await
+    }
+    async fn create_multipart(
+        &self,
+        key: &CacheKey,
+        metadata: WriteMetadata,
+    ) -> Result<MultipartCreation, WriteError> {
+        self.write.create_multipart(key, metadata).await
+    }
+    async fn upload_part(
+        &self,
+        key: &CacheKey,
+        upload_id: &str,
+        part_number: u16,
+        checksum: WriteChecksum,
+        body: WriteBodyStream,
+    ) -> Result<PartUpload, WriteError> {
+        self.write
+            .upload_part(key, upload_id, part_number, checksum, body)
+            .await
+    }
+    async fn complete_multipart(
+        &self,
+        key: &CacheKey,
+        upload_id: &str,
+        parts: Vec<CompletedPartRef>,
+        object_checksum: WriteChecksum,
+    ) -> Result<PutOutcome, WriteError> {
+        self.write
+            .complete_multipart(key, upload_id, parts, object_checksum)
+            .await
+    }
+    async fn abort_multipart(&self, key: &CacheKey, upload_id: &str) -> Result<(), WriteError> {
+        self.write.abort_multipart(key, upload_id).await
+    }
+    async fn list_parts(
+        &self,
+        key: &CacheKey,
+        upload_id: &str,
+    ) -> Result<Vec<PartInfo>, WriteError> {
+        self.write.list_parts(key, upload_id).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

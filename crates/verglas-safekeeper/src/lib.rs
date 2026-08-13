@@ -2,14 +2,14 @@
 //!
 //! # The append-log contract
 //!
-//! This crate is the safekeeper component embedded in `verglas-cache-node`.
-//! Neon compute connects through a workload-local pool to any cache node using
-//! the ordinary safekeeper PostgreSQL protocol. The protocol adapter translates WAL pushes
+//! This crate is served by the workload-local `verglas-ec-keeper` process.
+//! Neon compute connects to that dedicated endpoint using the ordinary
+//! safekeeper PostgreSQL protocol. The protocol adapter translates WAL pushes
 //! into the [`AppendLog`] contract, and [`EcAppendLog`] commits the new bytes to
 //! the same fragment ring and NVMe substrate the cache node already operates.
 //! There is no second safekeeper deployment or Neon durability quorum: the
-//! active Verglas ingress coordinates one EC quorum append, and another ingress
-//! recovers the same logical stream from ring-replicated state after failure.
+//! active Verglas keeper coordinates one EC quorum append and recovers the same
+//! logical stream from cache-ring fragments after failure.
 //!
 //! The one primitive Postgres needs that a read cache does not provide is a
 //! *durable commit*: a WAL record must be safe before it reaches S3. Everything

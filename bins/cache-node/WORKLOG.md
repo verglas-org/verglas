@@ -1,5 +1,9 @@
 # cache-node worklog
 
+- #durable-ec: Removed the embedded Neon listener. Cache nodes now expose only
+  private fragment RPC/read service; `verglas-ec-keeper` owns keeper TCP
+  sessions and reaches the ring remotely.
+
 - fleet cache image: New standalone cache serving daemon `verglas-cache-node`.
   It is the CACHE-relevant subset of `verglasd`: config load (reusing
   `verglas-core`'s schema and validation verbatim), the SigV4 S3 frontend

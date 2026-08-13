@@ -19,9 +19,9 @@
 //! - **Block-device write-back**: the block tier (#382) is the exception that
 //!   reaches the ring. With at least three members, a device FLUSH is
 //!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
-//!   background); see [`crate::ring`]. The embedded safekeeper shares that same
-//!   fragment store and peer RPC. One member keeps object PUT, block FLUSH, and
-//!   WAL on synchronous origin barriers while still hosting the safekeeper.
+//!   background); see [`crate::ring`]. The separate `verglas-ec-keeper` reaches
+//!   the same private fragment RPC plane. Public mutations never address a cache
+//!   node directly.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,12 +66,17 @@ type WritebackSlot = Arc<std::sync::OnceLock<Arc<WritebackMetrics>>>;
 /// immutable layers and mutable publication metadata through ordinary PUTs, so
 /// every PUT must cross the same ring durability barrier.
 fn object_writeback_policy(nodes: usize) -> WritebackPolicy {
-    let layout = crate::safekeeper::geometry(nodes);
+    let (k, m, w) = match nodes {
+        0 | 1 => (1, 0, 1),
+        2 => (1, 1, 2),
+        3 => (2, 1, 3),
+        count => (count - 2, 2, count - 1),
+    };
     WritebackPolicy::new(vec![PrefixRule {
         prefix: String::new(),
-        k: layout.k,
-        m: layout.m,
-        w: layout.w,
+        k,
+        m,
+        w,
     }])
 }
 
@@ -401,24 +406,7 @@ pub async fn run(
         }
     };
 
-    // The Neon listener is another data plane of this same process. It is
-    // present whenever this node belongs to the fragment ring and shares that
-    // ring's transport/listener/store with block FLUSH.
     let object_ring = ring_plane.clone();
-    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane.as_ref()) {
-        (Some(bucket), Some(ring)) => Some((
-            Arc::clone(&registry),
-            bucket,
-            config.cache.dir.clone(),
-            Arc::clone(ring),
-        )),
-        _ => {
-            eprintln!(
-                "verglas-cache-node {VERSION} embedded safekeeper disabled: this node is not a configured fragment-ring member"
-            );
-            None
-        }
-    };
 
     // Catalog consistency is explicit. Eventual mode polls any Iceberg REST
     // catalog. Strong mode has no polling path: it requires the fragment ring,
@@ -629,23 +617,7 @@ pub async fn run(
         }
     };
 
-    // The embedded PostgreSQL/Neon WAL plane. As with an absent NBD listener,
-    // a node outside the fragment ring waits forever instead of inventing a
-    // separate durability mode.
-    let safekeeper_activity = activity.clone();
-    let safekeeper_fut = async move {
-        match safekeeper_args {
-            Some((stores, bucket, cache_dir, ring)) => {
-                crate::safekeeper::serve(stores, bucket, cache_dir, ring, safekeeper_activity).await
-            }
-            None => {
-                std::future::pending::<()>().await;
-                Ok(())
-            }
-        }
-    };
-
-    tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut).map(|_| ())
+    tokio::try_join!(admin_fut, data_plane, nbd_fut).map(|_| ())
 }
 
 /// Probes the origin until it is reachable, then keeps checking after failures.
@@ -785,7 +757,7 @@ mod tests {
     use verglas_core::admin::{HEALTHZ_PATH, METRICS_PATH, STATS_PATH};
 
     /// Every object uploaded through a ring-backed tenant cache receives the
-    /// same EC durability geometry as the embedded safekeeper.
+    /// same EC durability geometry as the dedicated keeper.
     #[test]
     fn neon_object_writeback_covers_layers_and_index_publication() {
         let policy = object_writeback_policy(3);

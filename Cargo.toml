@@ -32,6 +32,7 @@ members = [
     "crates/verglas-database",
     "crates/verglas-queue",
     "bins/cache-node",
+    "bins/ec-keeper",
     "bins/access-node",
     "crates/verglas-block",
     "crates/verglas-pgcdc",

@@ -1,4 +1,7 @@
 # Worklog
+
+- #durable-ec: Packaging contracts now build and test the standalone
+  `verglas-ec-keeper` image instead of the retired safekeeper TCP pool.
 - #84: Pinned the complete stack to immutable published Verglas Neon
   storage/proxy and compute images. The runtime consumes only its isolated
   Neon policy-token volume; access mounts runtime state read-only solely to

@@ -136,8 +136,8 @@ not server-wide environment values.
 
 ## Workers and containers
 
-Compose bootstraps `verglas-server`, Lakekeeper, one write-through cache and WAL
-node, the local container runtime, the durable worker scheduler and its Postgres
+Compose bootstraps `verglas-server`, Lakekeeper, one private fragment/read cache,
+the dedicated EC WAL keeper, the local container runtime, the durable worker scheduler and its Postgres
 queue, and Verglas OS. The runtime manager
 owns dynamically added Vessels, database components, external brokers, and
 other optional applications. A portable worker contains its bounded command,
@@ -150,7 +150,7 @@ verglas workers create \
   --file examples/workers/market-data-ingest/worker.toml
 ```
 
-The default stack is standalone. Its single cache and WAL node acknowledges
+The default stack is standalone. Its dedicated keeper acknowledges WAL
 only after the origin accepts each write. Use the cluster override when the
 deployment has three independent cache failure domains:
 
@@ -161,10 +161,10 @@ docker compose \
   up -d --build
 ```
 
-The cluster override gives PostgreSQL pageserver and Lakekeeper one HTTP pool
-over all cache nodes. It gives Neon compute one logical safekeeper pool. Cache
-nodes retain the EC quorum: the pool selects an ingress but never represents a
-second durability quorum.
+The cluster override gives PostgreSQL pageserver and Lakekeeper one HTTP router
+over all cache nodes. Neon compute connects only to `verglas-ec-keeper`, which
+holds long-lived wire sessions and coordinates the cache nodes' EC fragment
+quorum; cache nodes never expose a safekeeper listener.
 
 The [Workers guide](docs/workers/overview.mdx) shows the complete program and
 manifest before running it manually, through an HTTP callback, on cron, and

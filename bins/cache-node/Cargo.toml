@@ -1,6 +1,6 @@
 [package]
 name = "verglas-cache-node"
-description = "The standalone Verglas cache serving server: config + SigV4 S3 frontend + foyer cache tiers + origin read/write-through, and nothing else."
+description = "The standalone Verglas cache serving server: private fragment RPC and read cache tiers."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -32,12 +32,8 @@ verglas-block.workspace = true
 # ring and acks on a quorum. It reuses the object tier's fragment store and peer
 # RPC (verglas-cluster) — this binary wires the block ring peers to them and
 # serves the fragment endpoints peers place shards through. The embedded
-# safekeeper shares this transport; the object serving path stays a deliberate
-# cluster-of-one.
+# The keeper is a separate workload and reaches this private fragment RPC plane.
 verglas-cluster.workspace = true
-# The Neon-compatible WAL listener is embedded in this process and places WAL
-# fragments through the same ring transport as block FLUSH.
-verglas-safekeeper.workspace = true
 verglas-write.workspace = true
 axum.workspace = true
 futures.workspace = true

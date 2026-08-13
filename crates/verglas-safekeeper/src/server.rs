@@ -87,7 +87,7 @@ pub enum ServerError {
     Connection(String),
 }
 
-/// One cache-node safekeeper service, shared by every accepted connection.
+/// One dedicated keeper service, shared by every accepted connection.
 pub struct SafekeeperServer<S> {
     /// Numeric identity returned in acceptor greetings.
     node_id: u64,

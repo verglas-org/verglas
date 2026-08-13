@@ -20,7 +20,7 @@ pub mod passthrough_route;
 pub mod preconditions;
 
 pub use frontend::{VerglasS3, router, router_with_passthrough};
-pub use passthrough::{PassthroughList, PassthroughRead, PassthroughWrite};
+pub use passthrough::{PassthroughList, PassthroughOrigin, PassthroughRead, PassthroughWrite};
 pub use passthrough_route::BucketConfigPassthrough;
 pub use verglas_backend::{BackendRegistry, BackendStore, BackendStores, MultipartObjectStore};
 pub use verglas_core::CacheKey;
