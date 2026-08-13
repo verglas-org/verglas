@@ -274,12 +274,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     .expect("read committed WAL through another live ingress");
     let mut expected = wal.to_vec();
     expected.extend_from_slice(second);
-    assert_eq!(
-        read,
-        WalResponse::WalBytes {
-            payload: expected
-        }
-    );
+    assert_eq!(read, WalResponse::WalBytes { payload: expected });
 
     fleet.children[2].kill().expect("stop third voter");
     fleet.children[2].wait().expect("reap third voter");
