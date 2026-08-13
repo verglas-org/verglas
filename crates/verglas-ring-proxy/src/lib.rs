@@ -1,7 +1,10 @@
 //! Pools workload traffic across every endpoint in one dedicated cache ring.
 
 use std::collections::HashSet;
+use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
@@ -11,6 +14,7 @@ use axum::routing::any;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 /// A stable object-to-ingress assignment over every member of one cache ring.
 ///
@@ -151,4 +155,96 @@ enum GatewayError {
     /// The selected cache ingress could not complete the HTTP exchange.
     #[error("cache-ring S3 request failed: {0}")]
     Upstream(#[from] reqwest::Error),
+}
+
+/// Maximum time spent proving one private cache endpoint reachable before the
+/// next ring member is tried. Stable Fly private addresses normally connect in
+/// under a millisecond; this bound keeps one stopped member off the cold path.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(50);
+
+/// Rotating endpoint state for one logical safekeeper transport.
+struct TcpEndpointPool {
+    /// Every safekeeper ingress assigned to the database timeline.
+    endpoints: Arc<Vec<String>>,
+    /// Starting member for the next client session.
+    next: AtomicUsize,
+}
+
+impl TcpEndpointPool {
+    /// Builds a non-empty pool of safekeeper socket addresses.
+    fn new(endpoints: Vec<String>) -> io::Result<Self> {
+        if endpoints.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the safekeeper endpoint pool is empty",
+            ));
+        }
+        let unique = endpoints.iter().collect::<HashSet<_>>();
+        if unique.len() != endpoints.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the safekeeper endpoint pool contains a duplicate",
+            ));
+        }
+        Ok(Self {
+            endpoints: Arc::new(endpoints),
+            next: AtomicUsize::new(0),
+        })
+    }
+
+    /// Connects one client session to one active ingress, rotating its first choice.
+    async fn connect(&self) -> io::Result<tokio::net::TcpStream> {
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % self.endpoints.len();
+        let mut last_error = None;
+        for offset in 0..self.endpoints.len() {
+            let endpoint = &self.endpoints[(start + offset) % self.endpoints.len()];
+            match tokio::time::timeout(
+                TCP_CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect(endpoint),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => return Ok(stream),
+                Ok(Err(error)) => last_error = Some(error),
+                Err(_) => {
+                    last_error = Some(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("safekeeper connect to {endpoint} timed out"),
+                    ));
+                }
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotConnected,
+                "no safekeeper endpoint is reachable",
+            )
+        }))
+    }
+}
+
+/// Serves one logical Neon safekeeper address over all assigned cache endpoints.
+///
+/// Each Neon TCP session is attached to exactly one ingress, so endpoint count
+/// never becomes an additional WAL durability quorum. New and reconnected
+/// sessions rotate their first choice and skip endpoints that do not connect
+/// within the private-network deadline.
+pub async fn serve_tcp_pool(
+    listener: tokio::net::TcpListener,
+    endpoints: Vec<String>,
+) -> io::Result<()> {
+    let pool = Arc::new(TcpEndpointPool::new(endpoints)?);
+    loop {
+        let (mut client, _) = listener.accept().await?;
+        let pool = Arc::clone(&pool);
+        tokio::spawn(async move {
+            let Ok(mut upstream) = pool.connect().await else {
+                let _ = client.shutdown().await;
+                return;
+            };
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+            let _ = client.shutdown().await;
+            let _ = upstream.shutdown().await;
+        });
+    }
 }
