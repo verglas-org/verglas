@@ -16,7 +16,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use iceberg::{Catalog, NamespaceIdent, TableCommit, TableRequirement, TableUpdate};
+use iceberg::{Catalog, NamespaceIdent};
 use serde_json::{Map, Value, json};
 use verglas_graph::{
     Direction, Edge, Graph, Neighbor, Node, Path, Reached, Subgraph, TraversalFilter,
@@ -853,10 +853,6 @@ impl IcebergCatalogSemanticStore {
                         now_seconds().to_string(),
                     ),
                     (
-                        "verglas.s3vectors.tags".to_owned(),
-                        Value::Object(tags).to_string(),
-                    ),
-                    (
                         "verglas.s3vectors.encryption".to_owned(),
                         encryption.to_string(),
                     ),
@@ -864,6 +860,7 @@ impl IcebergCatalogSemanticStore {
             )
             .await
             .map_err(iceberg_error)?;
+            self.append_tag_events(&control, &tags, &[]).await?;
             return Ok(json!({"vectorBucketArn": bucket_arn(&input)?}));
         }
         if operation == "DeleteVectorBucket" {
@@ -958,26 +955,34 @@ impl IcebergCatalogSemanticStore {
             operation,
             "PutVectorBucketPolicy" | "DeleteVectorBucketPolicy" | "GetVectorBucketPolicy"
         ) {
-            let control = self.bucket_control(&input).await?;
-            let mut properties = control.metadata().properties().clone();
             if operation == "GetVectorBucketPolicy" {
                 return Ok(
-                    json!({"policy": properties.get("verglas.s3vectors.policy").cloned().ok_or_else(|| SemanticError::not_found("vector bucket policy does not exist"))?}),
+                    json!({"policy": self.control_state(&bucket_control_ident(&input)?, "policy").await?.ok_or_else(|| SemanticError::not_found("vector bucket policy does not exist"))?}),
                 );
             }
             if operation == "PutVectorBucketPolicy" {
-                properties.insert(
-                    "verglas.s3vectors.policy".to_owned(),
-                    input
-                        .get("policy")
-                        .and_then(Value::as_str)
-                        .ok_or_else(|| SemanticError::validation("policy is required"))?
-                        .to_owned(),
-                );
+                self.append_control_event(
+                    &bucket_control_ident(&input)?,
+                    "policy",
+                    Value::String(
+                        input
+                            .get("policy")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| SemanticError::validation("policy is required"))?
+                            .to_owned(),
+                    ),
+                    false,
+                )
+                .await?;
             } else {
-                properties.remove("verglas.s3vectors.policy");
+                self.append_control_event(
+                    &bucket_control_ident(&input)?,
+                    "policy",
+                    Value::Null,
+                    true,
+                )
+                .await?;
             }
-            self.update_bucket_properties(&input, properties).await?;
             return Ok(json!({}));
         }
         if operation == "ListIndexes" {
@@ -991,7 +996,7 @@ impl IcebergCatalogSemanticStore {
                 .map_err(iceberg_error)?
             {
                 let name = ident.name().to_owned();
-                if name == BUCKET_CONTROL_TABLE {
+                if name.starts_with("_verglas_vector_") {
                     continue;
                 }
                 let table = self
@@ -1057,19 +1062,30 @@ impl IcebergCatalogSemanticStore {
                     self.catalog.as_ref(),
                     &ident,
                     definition,
-                    HashMap::from([
-                        ("verglas.s3vectors.index".to_owned(), metadata),
-                        (
-                            "verglas.s3vectors.tags".to_owned(),
-                            Value::Object(tags).to_string(),
-                        ),
-                    ]),
+                    HashMap::from([("verglas.s3vectors.index".to_owned(), metadata)]),
                 )
                 .await
                 .map_err(iceberg_error)?;
+                let tag_control = index_control_ident(&input)?;
+                tables_api::create_table_with_properties(
+                    self.catalog.as_ref(),
+                    &tag_control,
+                    bucket_control_definition(),
+                    HashMap::from([(
+                        "verglas.s3vectors.kind".to_owned(),
+                        "index-control".to_owned(),
+                    )]),
+                )
+                .await
+                .map_err(iceberg_error)?;
+                self.append_tag_events(&tag_control, &tags, &[]).await?;
                 Ok(json!({"indexArn": vector_arn(&input)?}))
             }
             "DeleteIndex" => {
+                self.catalog
+                    .drop_table(&index_control_ident(&input)?)
+                    .await
+                    .map_err(iceberg_error)?;
                 self.catalog
                     .drop_table(&ident)
                     .await
@@ -1425,49 +1441,32 @@ impl IcebergCatalogSemanticStore {
         ident: Option<&iceberg::TableIdent>,
     ) -> Result<Value, SemanticError> {
         let _resource = required_string(input, "resourceArn")?;
-        let key = "verglas.s3vectors.tags";
-        if let Some(ident) = ident {
-            let table = self
-                .catalog
-                .load_table(ident)
-                .await
-                .map_err(iceberg_error)?;
-            let mut tags = table
-                .metadata()
-                .properties()
-                .get(key)
-                .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok())
-                .unwrap_or_default();
+        if ident.is_some() {
+            let control = index_control_ident(input)?;
+            let mut tags = self.control_tags(&control).await?;
+            let before = tags.clone();
             mutate_tags(operation, input, &mut tags)?;
             if operation != "ListTagsForResource" {
-                self.catalog
-                    .update_table(TableCommit::from_parts(
-                        ident.clone(),
-                        vec![TableRequirement::UuidMatch {
-                            uuid: table.metadata().uuid(),
-                        }],
-                        vec![TableUpdate::SetProperties {
-                            updates: HashMap::from([(
-                                key.to_owned(),
-                                Value::Object(tags.clone()).to_string(),
-                            )]),
-                        }],
-                    ))
-                    .await
-                    .map_err(iceberg_error)?;
+                let removed = before
+                    .keys()
+                    .filter(|key| !tags.contains_key(*key))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.append_tag_events(&control, &tags, &removed).await?;
             }
             return Ok(json!({"tags": tags}));
         }
-        let control = self.bucket_control(input).await?;
-        let mut properties = control.metadata().properties().clone();
-        let mut tags = properties
-            .get(key)
-            .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok())
-            .unwrap_or_default();
+        let control = bucket_control_ident(input)?;
+        let mut tags = self.control_tags(&control).await?;
+        let before = tags.clone();
         mutate_tags(operation, input, &mut tags)?;
         if operation != "ListTagsForResource" {
-            properties.insert(key.to_owned(), Value::Object(tags.clone()).to_string());
-            self.update_bucket_properties(input, properties).await?;
+            let removed = before
+                .keys()
+                .filter(|key| !tags.contains_key(*key))
+                .cloned()
+                .collect::<Vec<_>>();
+            self.append_tag_events(&control, &tags, &removed).await?;
         }
         Ok(json!({"tags": tags}))
     }
@@ -1480,31 +1479,108 @@ impl IcebergCatalogSemanticStore {
             .map_err(iceberg_error)
     }
 
-    /// CAS-updates durable bucket metadata without relying on catalog namespace mutation.
-    async fn update_bucket_properties(
+    /// Appends one control event, preserving every concurrent mutation in Iceberg order.
+    async fn append_control_event(
         &self,
-        input: &Value,
-        properties: HashMap<String, String>,
+        ident: &iceberg::TableIdent,
+        key: &str,
+        value: Value,
+        deleted: bool,
     ) -> Result<(), SemanticError> {
-        let ident = bucket_control_ident(input)?;
-        let table = self
-            .catalog
-            .load_table(&ident)
+        tables_api::commit(
+            self.catalog.as_ref(),
+            ident,
+            tables_api::CommitRequest {
+                rows: vec![json!({"key":key,"value":value.to_string(),"deleted":deleted})],
+                idempotency_key: None,
+            },
+        )
+        .await
+        .map_err(iceberg_error)?;
+        Ok(())
+    }
+
+    /// Resolves one control key from its append-only snapshot lineage.
+    async fn control_state(
+        &self,
+        ident: &iceberg::TableIdent,
+        wanted: &str,
+    ) -> Result<Option<Value>, SemanticError> {
+        let rows = tables_api::rows_in_commit_order(self.catalog.as_ref(), ident)
             .await
             .map_err(iceberg_error)?;
-        self.catalog
-            .update_table(TableCommit::from_parts(
-                ident,
-                vec![TableRequirement::UuidMatch {
-                    uuid: table.metadata().uuid(),
-                }],
-                vec![TableUpdate::SetProperties {
-                    updates: properties,
-                }],
-            ))
+        let mut result = None;
+        for row in rows {
+            if row.get("key").and_then(Value::as_str) == Some(wanted) {
+                result = if row.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+                    None
+                } else {
+                    row.get("value")
+                        .and_then(Value::as_str)
+                        .and_then(|text| serde_json::from_str(text).ok())
+                };
+            }
+        }
+        Ok(result)
+    }
+
+    /// Resolves every independently appended tag mutation from a control table.
+    async fn control_tags(
+        &self,
+        ident: &iceberg::TableIdent,
+    ) -> Result<serde_json::Map<String, Value>, SemanticError> {
+        let rows = tables_api::rows_in_commit_order(self.catalog.as_ref(), ident)
             .await
-            .map(|_| ())
-            .map_err(iceberg_error)
+            .map_err(iceberg_error)?;
+        let mut tags = serde_json::Map::new();
+        for row in rows {
+            let Some(key) = row
+                .get("key")
+                .and_then(Value::as_str)
+                .and_then(|key| key.strip_prefix("tag:"))
+            else {
+                continue;
+            };
+            if row.get("deleted").and_then(Value::as_bool).unwrap_or(false) {
+                tags.remove(key);
+            } else if let Some(value) = row
+                .get("value")
+                .and_then(Value::as_str)
+                .and_then(|value| serde_json::from_str(value).ok())
+            {
+                tags.insert(key.to_owned(), value);
+            }
+        }
+        Ok(tags)
+    }
+
+    /// Appends independent key-level tag events so concurrent writers compose.
+    async fn append_tag_events(
+        &self,
+        ident: &iceberg::TableIdent,
+        tags: &serde_json::Map<String, Value>,
+        removed: &[String],
+    ) -> Result<(), SemanticError> {
+        let mut rows = tags.iter().map(|(key, value)| json!({"key":format!("tag:{key}"),"value":value.to_string(),"deleted":false})).collect::<Vec<_>>();
+        rows.extend(
+            removed
+                .iter()
+                .map(|key| json!({"key":format!("tag:{key}"),"value":"null","deleted":true})),
+        );
+        if rows.is_empty() {
+            return Ok(());
+        }
+        tables_api::commit(
+            self.catalog.as_ref(),
+            ident,
+            tables_api::CommitRequest {
+                rows,
+                idempotency_key: None,
+            },
+        )
+        .await
+        .map_err(iceberg_error)?;
+        Ok(())
     }
 }
 
@@ -1768,12 +1844,26 @@ fn bucket_namespace(input: &Value) -> Result<NamespaceIdent, SemanticError> {
 /// Reserved table name used only for durable vector bucket control-plane state.
 const BUCKET_CONTROL_TABLE: &str = "_verglas_vector_bucket";
 
+/// Prefix reserved for auxiliary append-only resource control tables.
+const INDEX_CONTROL_PREFIX: &str = "_verglas_vector_index_";
+
 /// Resolves the Iceberg table that stores bucket metadata, tags, and policy.
 fn bucket_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
     parse_table_ident(&format!(
         "{}.{}",
         required_string(input, "vectorBucketName")?,
         BUCKET_CONTROL_TABLE
+    ))
+    .map_err(iceberg_error)
+}
+
+/// Resolves the sibling control table that carries mutable index tags.
+fn index_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
+    parse_table_ident(&format!(
+        "{}.{}{}",
+        required_string(input, "vectorBucketName")?,
+        INDEX_CONTROL_PREFIX,
+        required_string(input, "indexName")?
     ))
     .map_err(iceberg_error)
 }
@@ -1791,7 +1881,11 @@ fn bucket_control_ident_from_namespace(
 /// Defines the empty durable control table schema kept apart from customer vectors.
 fn bucket_control_definition() -> tables_api::CreateTableRequest {
     tables_api::CreateTableRequest {
-        schema: vec![tables_api::ColumnSpec::required("marker", "boolean")],
+        schema: vec![
+            tables_api::ColumnSpec::required("key", "string"),
+            tables_api::ColumnSpec::required("value", "string"),
+            tables_api::ColumnSpec::required("deleted", "boolean"),
+        ],
         partitions: Vec::new(),
     }
 }

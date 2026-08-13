@@ -287,3 +287,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   members before resolving an Iceberg resource. The adapter also maps catalog
   not-found, conflict, invalid-data, and unexpected failures to REST-JSON
   status codes instead of reporting every catalog error as unavailable.
+- #137: Replaced mutable bucket and index tag/policy properties with append-only
+  Iceberg control events. State is resolved from snapshot lineage, so concurrent
+  tag writers compose and a fresh semantic adapter observes the same result.

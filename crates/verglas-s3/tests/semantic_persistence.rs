@@ -149,3 +149,45 @@ async fn vector_update_delete_order_remains_correct_after_concurrent_calls() {
         json!([3.0, 3.0])
     );
 }
+
+/// Concurrent tag events retain both updates and a later untag wins after reopening.
+#[tokio::test]
+async fn control_tags_are_append_only_across_concurrent_mutations_and_reopen() {
+    let catalog = catalog().await;
+    let store = Arc::new(IcebergCatalogSemanticStore::new(catalog.clone()));
+    call(
+        &store,
+        "CreateVectorBucket",
+        json!({"vectorBucketName":"bucket-three"}),
+    )
+    .await;
+    let arn = "arn:aws:s3vectors:us-east-1:000000000000:bucket/bucket-three";
+    let first = store.clone();
+    let second = store.clone();
+    let (one, two) = tokio::join!(
+        call(
+            &first,
+            "TagResource",
+            json!({"resourceArn":arn,"tags":{"one":"1"}})
+        ),
+        call(
+            &second,
+            "TagResource",
+            json!({"resourceArn":arn,"tags":{"two":"2"}})
+        ),
+    );
+    let _ = (one, two);
+    let reopened = IcebergCatalogSemanticStore::new(catalog);
+    let tags = call(&reopened, "ListTagsForResource", json!({"resourceArn":arn})).await;
+    assert_eq!(tags["tags"]["one"], "1");
+    assert_eq!(tags["tags"]["two"], "2");
+    call(
+        &reopened,
+        "UntagResource",
+        json!({"resourceArn":arn,"tagKeys":["one"]}),
+    )
+    .await;
+    let after = call(&reopened, "ListTagsForResource", json!({"resourceArn":arn})).await;
+    assert!(after["tags"].get("one").is_none());
+    assert_eq!(after["tags"]["two"], "2");
+}
