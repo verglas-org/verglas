@@ -37,16 +37,19 @@ type PlaneError = Box<dyn std::error::Error + Send + Sync>;
 const GROUP_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Caps a client submission without undercutting the latest legal ranked
 /// election window after a leader loss.
-const GROUP_SUBMIT_TIMEOUT: Duration = Duration::from_secs(8);
+const GROUP_SUBMIT_TIMEOUT: Duration = Duration::from_secs(25);
 /// Raft heartbeat interval for fsynced multi-megabyte WAL replication.
-const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 100;
+///
+/// This leaves room for compact Raft metadata fsync under canonical 8 MiB WAL
+/// traffic without treating an overloaded live voter as dead.
+const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 250;
 /// The first voter may start an election this long after heartbeats stop.
-const RAFT_ELECTION_FIRST_TIMEOUT_MS: u64 = 250;
+const RAFT_ELECTION_FIRST_TIMEOUT_MS: u64 = 2_500;
 /// Each later stable voter receives a non-overlapping election window.
-const RAFT_ELECTION_RANK_STEP_MS: u64 = 300;
+const RAFT_ELECTION_RANK_STEP_MS: u64 = 2_500;
 /// Election window width. It stays smaller than the rank step so candidate
 /// campaigns never overlap in a healthy deployment.
-const RAFT_ELECTION_WINDOW_MS: u64 = 100;
+const RAFT_ELECTION_WINDOW_MS: u64 = 500;
 
 /// Maps a stable fragment holder identity to the corresponding Raft voter id.
 fn numeric_node_id(node: &str) -> u64 {
@@ -745,9 +748,9 @@ mod tests {
         let voters = [44, 11, 33, 22];
         let config = raft_config(&voters, 33).expect("valid Raft timing");
 
-        assert_eq!(config.heartbeat_interval, 100);
-        assert_eq!(config.election_timeout_min, 850);
-        assert_eq!(config.election_timeout_max, 950);
+        assert_eq!(config.heartbeat_interval, 250);
+        assert_eq!(config.election_timeout_min, 7_500);
+        assert_eq!(config.election_timeout_max, 8_000);
     }
 
     /// A vote remains serviceable while every public-runtime worker is blocked.

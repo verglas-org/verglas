@@ -241,3 +241,7 @@
   when peer HTTP opens a retained group, and teardown stops every core before
   joining the runtime thread; a saturated-public-runtime real-vote regression
   protects that scheduling boundary.
+- #135: Extended ranked election windows around one canonical 8 MiB durable
+  append. The 250 ms heartbeat, 2.5–3.0 s first window, and 2.5 s rank spacing
+  leave compact vote metadata time to fsync before a live follower is treated as
+  failed; client submission remains bounded at 25 seconds and still fails closed.
