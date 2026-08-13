@@ -1,0 +1,113 @@
+# Frozen local topology for the SF10 durability acceptance protocol.
+# Every data and metadata S3 operation enters through a Verglas cache ingress.
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: server /data --address :9000
+    environment:
+      MINIO_ROOT_USER: ${TPCH_DURABILITY_S3_ACCESS_KEY:?set an ephemeral benchmark access key}
+      MINIO_ROOT_PASSWORD: ${TPCH_DURABILITY_S3_SECRET_KEY:?set an ephemeral benchmark secret key}
+    ports: ["19000:9000"]
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio: { condition: service_healthy }
+    environment:
+      TPCH_DURABILITY_S3_ACCESS_KEY: ${TPCH_DURABILITY_S3_ACCESS_KEY:?set an ephemeral benchmark access key}
+      TPCH_DURABILITY_S3_SECRET_KEY: ${TPCH_DURABILITY_S3_SECRET_KEY:?set an ephemeral benchmark secret key}
+    entrypoint: ["/bin/sh", "-ec"]
+    command: >-
+      mc alias set origin http://minio:9000 "$${TPCH_DURABILITY_S3_ACCESS_KEY}" "$${TPCH_DURABILITY_S3_SECRET_KEY}" &&
+      mc mb --ignore-existing origin/verglas
+
+  cache-0: &cache
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: verglas-cache-node
+    depends_on:
+      minio-init: { condition: service_completed_successfully }
+    environment: &cache_environment
+      VERGLAS_NODE_ID: cache-0
+      VERGLAS_RING_PEERS: cache-0=cache-0:8336,cache-1=cache-1:8336,cache-2=cache-2:8336,cache-3=cache-3:8336
+      VERGLAS_RING_ADDR: 0.0.0.0:8336
+      VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:5454
+      VERGLAS_SAFEKEEPER_EC_K: "2"
+      VERGLAS_SAFEKEEPER_EC_M: "2"
+      VERGLAS_SAFEKEEPER_EC_W: "3"
+      VERGLAS_CLUSTER_SECRET: ${TPCH_DURABILITY_CLUSTER_SECRET:?set an ephemeral benchmark cluster secret}
+      VERGLAS_MANAGED_STORAGE_BUCKET: verglas
+      VERGLAS_MANAGED_STORAGE_ENDPOINT: http://minio:9000
+      VERGLAS_MANAGED_STORAGE_REGION: us-east-1
+      VERGLAS_MANAGED_STORAGE_ALLOW_HTTP: "true"
+      VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID: ${TPCH_DURABILITY_S3_ACCESS_KEY:?set an ephemeral benchmark access key}
+      VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY: ${TPCH_DURABILITY_S3_SECRET_KEY:?set an ephemeral benchmark secret key}
+      VERGLAS_S3_ACCESS_KEY_ID: ${TPCH_DURABILITY_S3_ACCESS_KEY:?set an ephemeral benchmark access key}
+      VERGLAS_S3_SECRET_ACCESS_KEY: ${TPCH_DURABILITY_S3_SECRET_KEY:?set an ephemeral benchmark secret key}
+      VERGLAS_CACHE_CAPACITY: 40GB
+      VERGLAS_CACHE_DRAM: 2GB
+    volumes: ["cache-0:/var/lib/verglas"]
+    ports: ["18333:8333", "18334:8334", "15454:5454"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8334/admin/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+
+  cache-1:
+    <<: *cache
+    environment:
+      <<: *cache_environment
+      VERGLAS_NODE_ID: cache-1
+    volumes: ["cache-1:/var/lib/verglas"]
+    ports: ["18343:8333", "18344:8334", "15464:5454"]
+
+  cache-2:
+    <<: *cache
+    environment:
+      <<: *cache_environment
+      VERGLAS_NODE_ID: cache-2
+    volumes: ["cache-2:/var/lib/verglas"]
+    ports: ["18353:8333", "18354:8334", "15474:5454"]
+
+  cache-3:
+    <<: *cache
+    environment:
+      <<: *cache_environment
+      VERGLAS_NODE_ID: cache-3
+    volumes: ["cache-3:/var/lib/verglas"]
+    ports: ["18363:8333", "18364:8334", "15484:5454"]
+
+  lakekeeper:
+    build:
+      context: ../..
+      dockerfile: benchmarks/tpch-durability/Dockerfile.catalog
+    depends_on:
+      cache-0: { condition: service_healthy }
+      cache-1: { condition: service_healthy }
+      cache-2: { condition: service_healthy }
+      cache-3: { condition: service_healthy }
+    environment:
+      AWS_ACCESS_KEY_ID: ${TPCH_DURABILITY_S3_ACCESS_KEY:?set an ephemeral benchmark access key}
+      AWS_SECRET_ACCESS_KEY: ${TPCH_DURABILITY_S3_SECRET_KEY:?set an ephemeral benchmark secret key}
+      AWS_REGION: us-east-1
+      LAKEKEEPER__LISTEN_PORT: "8181"
+      VERGLAS_CATALOG_ENDPOINTS: http://cache-0:5454,http://cache-1:5454,http://cache-2:5454,http://cache-3:5454
+      VERGLAS_CATALOG_TENANT: durability
+      VERGLAS_CATALOG_WAREHOUSE: durability
+      VERGLAS_METADATA_S3_PROFILE: >-
+        {"type":"s3","bucket":"verglas","key-prefix":"warehouse","region":"us-east-1","endpoint":"http://cache-0:8333","path-style-access":true}
+    command: ["serve-craft", "--endpoints", "http://cache-0:5454,http://cache-1:5454,http://cache-2:5454,http://cache-3:5454", "--tenant", "durability", "--warehouse", "durability", "--metadata-s3-profile", "{\"type\":\"s3\",\"bucket\":\"verglas\",\"key-prefix\":\"warehouse\",\"region\":\"us-east-1\",\"endpoint\":\"http://cache-0:8333\",\"path-style-access\":true}"]
+    ports: ["18181:8181"]
+
+volumes:
+  cache-0: {}
+  cache-1: {}
+  cache-2: {}
+  cache-3: {}
