@@ -110,9 +110,9 @@ def validate_bootstrap(rows, worker_memory_mib, catalog_engine):
         raise ValueError("bootstrap requires the managed Verglas Lakekeeper catalog")
     if rows <= 0 or worker_memory_mib <= 0:
         raise ValueError("rows and worker memory must be positive")
-    # Each row contains three i64 values plus an Arrow string payload.  This is
-    # conservative and keeps the requested data set above the evaluator floor.
-    if rows * 40 < 4 * worker_memory_mib * 1024 * 1024:
+    # The two independent SHA-256 payload halves contain 64 bytes of entropy;
+    # physical compressed bytes are checked again after the catalog commit.
+    if rows * 64 < 4 * worker_memory_mib * 1024 * 1024:
         raise ValueError("dataset must exceed four times the worker memory ceiling")
 
 
