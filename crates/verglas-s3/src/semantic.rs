@@ -888,17 +888,35 @@ fn now_millis() -> i64 {
 /// Names the catalog namespace property carrying one index's exact definition.
 /// Applies the AWS cursor/max-results contract to an already stably sorted list.
 fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>), SemanticError> {
-    let offset = match input.get("nextToken").and_then(Value::as_str) {
-        Some(token) => token
-            .parse::<usize>()
-            .map_err(|_| SemanticError::validation("nextToken is invalid"))?,
-        None => 0,
-    };
-    if offset > values.len() {
-        return Err(SemanticError::validation(
-            "nextToken is outside this listing",
-        ));
-    }
+    let binding = format!(
+        "{}|{}|{}",
+        input
+            .get("vectorBucketName")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        input
+            .get("indexName")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        input
+            .get("prefix")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    );
+    let last = input
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .map(|token| decode_cursor(token, &binding))
+        .transpose()?;
+    let offset = last
+        .as_deref()
+        .map(|last| {
+            values
+                .iter()
+                .position(|value| listing_key(value) > last)
+                .unwrap_or(values.len())
+        })
+        .unwrap_or(0);
     let limit = input
         .get("maxResults")
         .and_then(Value::as_u64)
@@ -908,10 +926,43 @@ fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>
         .transpose()?
         .unwrap_or(500);
     let end = offset.saturating_add(limit).min(values.len());
-    Ok((
-        values[offset..end].to_vec(),
-        (end < values.len()).then(|| end.to_string()),
-    ))
+    let next = (end < values.len()).then(|| encode_cursor(&binding, listing_key(&values[end - 1])));
+    Ok((values[offset..end].to_vec(), next))
+}
+
+/// Returns a stable key for an already sorted list response.
+fn listing_key(value: &Value) -> &str {
+    ["vectorBucketName", "indexName", "key"]
+        .into_iter()
+        .find_map(|field| value.get(field).and_then(Value::as_str))
+        .unwrap_or_default()
+}
+
+/// Encodes a resource- and filter-bound last-key cursor.
+fn encode_cursor(binding: &str, last: &str) -> String {
+    base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        format!("v1\n{binding}\n{last}"),
+    )
+}
+
+/// Rejects cursors reused with a different resource or filter.
+fn decode_cursor(token: &str, binding: &str) -> Result<String, SemanticError> {
+    let text = String::from_utf8(
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, token)
+            .map_err(|_| SemanticError::validation("nextToken is invalid"))?,
+    )
+    .map_err(|_| SemanticError::validation("nextToken is invalid"))?;
+    let mut parts = text.splitn(3, '\n');
+    if parts.next() != Some("v1") || parts.next() != Some(binding) {
+        return Err(SemanticError::validation(
+            "nextToken does not match this listing",
+        ));
+    }
+    parts
+        .next()
+        .map(str::to_owned)
+        .ok_or_else(|| SemanticError::validation("nextToken is invalid"))
 }
 
 /// Assigns a key to a deterministic list segment without process-random hashing.
