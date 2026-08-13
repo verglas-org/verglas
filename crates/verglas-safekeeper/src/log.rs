@@ -105,7 +105,7 @@ where
         // Older builds retained per-append fragment placements even after the
         // complete segment was durable in origin and those fragments had been
         // deleted. Compact that legacy state before serving so the first new
-        // descriptor does not republish an unbounded historical payload.
+        // state record does not republish an unbounded historical payload.
         let mut compacted = false;
         for segment in &mut manifest.segments {
             if segment.state == SegmentState::Flushed && !segment.appends.is_empty() {
@@ -218,15 +218,15 @@ where
     async fn replicate_state(&self, manifest: &Manifest) -> Result<(), AppendError> {
         let live = self.membership.live_nodes();
         let geometry = self.effective_geometry();
-        let descriptor = serde_json::to_vec(manifest)
+        let state_bytes = serde_json::to_vec(manifest)
             .map(Bytes::from)
             .map_err(|error| AppendError::Manifest(format!("encode ring state: {error}")))?;
-        let descriptor_key = FragmentKey {
+        let state_key = FragmentKey {
             object_id: self.state_object_id(manifest.revision),
             index: STATE_RECORD_INDEX,
         };
-        let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
-        self.replicate_record(&live, descriptor_record, geometry.w)
+        let state_record = FragmentRecord::new(state_key, state_bytes);
+        self.replicate_record(&live, state_record, geometry.w)
             .await?;
         if manifest.revision > 1 {
             let stale = FragmentKey {

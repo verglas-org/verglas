@@ -1287,7 +1287,7 @@ async fn flush_compacts_fragment_placements_out_of_recovery_state() {
         .expect("append");
     log.flush().await.expect("flush");
 
-    let descriptor = transport
+    let state_record = transport
         .inner
         .lock()
         .expect("lock")
@@ -1296,8 +1296,8 @@ async fn flush_compacts_fragment_placements_out_of_recovery_state() {
         .filter(|((_, object_id, index), _)| *index == usize::MAX && object_id.contains("/state/"))
         .map(|(_, (bytes, _))| bytes.clone())
         .next()
-        .expect("flushed descriptor");
-    let manifest: serde_json::Value = serde_json::from_slice(&descriptor).expect("manifest json");
+        .expect("flushed state record");
+    let manifest: serde_json::Value = serde_json::from_slice(&state_record).expect("state json");
     assert_eq!(manifest["segments"][0]["appends"], serde_json::json!([]));
 }
 
