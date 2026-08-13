@@ -57,6 +57,34 @@ const MODE_QUORUM: u8 = 1;
 /// Last write acked via write-through fallback.
 const MODE_WRITE_THROUGH: u8 = 2;
 
+/// Policy-resolved fragment geometry, passed as one value through internal EC
+/// mutation flows so their durability parameters cannot be mixed up.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EcWriteGeometry {
+    pub(crate) k: usize,
+    pub(crate) m: usize,
+    pub(crate) w: usize,
+}
+
+/// One client part upload after routing has selected its EC geometry.
+pub(crate) struct MultipartPartRequest<'a> {
+    pub(crate) key: &'a CacheKey,
+    pub(crate) upload_id: &'a str,
+    pub(crate) part_number: u16,
+    pub(crate) checksum: WriteChecksum,
+    pub(crate) body: WriteBodyStream,
+    pub(crate) geometry: EcWriteGeometry,
+}
+
+/// One complete request after policy routing has selected the EC geometry.
+pub(crate) struct MultipartCompleteRequest<'a> {
+    pub(crate) key: &'a CacheKey,
+    pub(crate) upload_id: &'a str,
+    pub(crate) parts: Vec<CompletedPartRef>,
+    pub(crate) checksum: WriteChecksum,
+    pub(crate) geometry: EcWriteGeometry,
+}
+
 /// A coordinator-level error (propagation, repair, reassembly).
 #[derive(Debug, thiserror::Error)]
 pub enum WritebackError {
@@ -198,7 +226,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     ///
     /// The write-back size limit is NVMe headroom, not DRAM: a candidate node is
     /// excluded when its fragment store cannot hold the fragment, and if fewer
-    /// than `w` nodes have headroom the write degrades to write-through before
+    /// than `w` nodes have headroom the write is rejected before
     /// the body is consumed. `k`/`m`/`w` are the resolved geometry.
     pub async fn put_stream(
         self: &Arc<Self>,
@@ -209,7 +237,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         m: usize,
         w: usize,
     ) -> Result<PutOutcome, WriteError> {
-        self.put_stream_inner(key, metadata, body, k, m, w, true)
+        self.put_stream_inner(key, metadata, body, EcWriteGeometry { k, m, w }, true)
             .await
     }
 
@@ -221,11 +249,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         key: &CacheKey,
         metadata: &WriteMetadata,
         body: WriteBodyStream,
-        k: usize,
-        m: usize,
-        w: usize,
+        geometry: EcWriteGeometry,
     ) -> Result<PutOutcome, WriteError> {
-        self.put_stream_inner(key, metadata, body, k, m, w, false)
+        self.put_stream_inner(key, metadata, body, geometry, false)
             .await
     }
 
@@ -234,11 +260,10 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         key: &CacheKey,
         metadata: &WriteMetadata,
         body: WriteBodyStream,
-        k: usize,
-        m: usize,
-        w: usize,
+        write_geometry: EcWriteGeometry,
         propagate: bool,
     ) -> Result<PutOutcome, WriteError> {
+        let EcWriteGeometry { k, m, w } = write_geometry;
         // Preserve completion order for operations on the same key. The guard
         // is moved into background propagation on a quorum ack; write-through
         // and failed writes release it when this function returns.
@@ -441,8 +466,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         })
     }
 
-    /// Replicates one immutable self-describing state record through the same
-    /// append/fdatasync protocol as data fragments.  The volatile index is only
+    /// Replicates one immutable self-describing state record through the shared
+    /// fragment-log `append_batch`/fdatasync protocol used by the EC keeper.
+    /// The volatile index is only
     /// updated after `w` distinct state replicas report durable receipt.
     async fn publish_state(
         &self,
@@ -673,17 +699,18 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
 
     /// Streams a part into a private EC object and then publishes a revision
     /// attaching it to its quorum-proven upload manifest.
-    pub async fn upload_part_ec(
+    pub(crate) async fn upload_part_ec(
         self: &Arc<Self>,
-        key: &CacheKey,
-        upload_id: &str,
-        part_number: u16,
-        checksum: WriteChecksum,
-        body: WriteBodyStream,
-        k: usize,
-        m: usize,
-        w: usize,
+        request: MultipartPartRequest<'_>,
     ) -> Result<PartUpload, WriteError> {
+        let MultipartPartRequest {
+            key,
+            upload_id,
+            part_number,
+            checksum,
+            body,
+            geometry,
+        } = request;
         if !checksum.is_empty() {
             return Err(WriteError::Unsupported(
                 "multipart part checksums are not supported by EC write-back".to_owned(),
@@ -699,7 +726,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             .ok_or(WriteError::NoSuchUpload)?;
         let part_key = multipart_part_key(key, upload_id, part_number);
         let outcome = self
-            .put_staged_stream(&part_key, &WriteMetadata::default(), body, k, m, w)
+            .put_staged_stream(&part_key, &WriteMetadata::default(), body, geometry)
             .await?;
         let part_id = self
             .states
@@ -760,16 +787,17 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     /// Completes from the EC part records.  The final PUT is still streamed to
     /// the coordinator; the origin only sees the final object during normal
     /// background propagation.
-    pub async fn complete_multipart_ec(
+    pub(crate) async fn complete_multipart_ec(
         self: &Arc<Self>,
-        key: &CacheKey,
-        upload_id: &str,
-        parts: Vec<CompletedPartRef>,
-        checksum: WriteChecksum,
-        k: usize,
-        m: usize,
-        w: usize,
+        request: MultipartCompleteRequest<'_>,
     ) -> Result<PutOutcome, WriteError> {
+        let MultipartCompleteRequest {
+            key,
+            upload_id,
+            parts,
+            checksum,
+            geometry,
+        } = request;
         if !checksum.is_empty() {
             return Err(WriteError::Unsupported(
                 "multipart object checksums are not supported by EC write-back".to_owned(),
@@ -810,7 +838,14 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             })
             .boxed();
         let outcome = self
-            .put_stream(key, &WriteMetadata::from(&manifest.metadata), body, k, m, w)
+            .put_stream(
+                key,
+                &WriteMetadata::from(&manifest.metadata),
+                body,
+                geometry.k,
+                geometry.m,
+                geometry.w,
+            )
             .await?;
         self.release_multipart(&manifest, &available).await?;
         Ok(outcome)

@@ -12,7 +12,9 @@ use verglas_core::write::{
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
 
-use crate::coordinator::WriteCoordinator;
+use crate::coordinator::{
+    EcWriteGeometry, MultipartCompleteRequest, MultipartPartRequest, WriteCoordinator,
+};
 use crate::policy::WritebackPolicy;
 
 pub struct WritebackWriter<W: ObjectWrite> {
@@ -114,7 +116,14 @@ impl<W: ObjectWrite> ObjectWrite for WritebackWriter<W> {
     ) -> Result<PartUpload, WriteError> {
         let (k, m, w) = self.geometry(key)?;
         self.coordinator
-            .upload_part_ec(key, upload_id, part_number, checksum, body, k, m, w)
+            .upload_part_ec(MultipartPartRequest {
+                key,
+                upload_id,
+                part_number,
+                checksum,
+                body,
+                geometry: EcWriteGeometry { k, m, w },
+            })
             .await
     }
 
@@ -127,7 +136,13 @@ impl<W: ObjectWrite> ObjectWrite for WritebackWriter<W> {
     ) -> Result<PutOutcome, WriteError> {
         let (k, m, w) = self.geometry(key)?;
         self.coordinator
-            .complete_multipart_ec(key, upload_id, parts, object_checksum, k, m, w)
+            .complete_multipart_ec(MultipartCompleteRequest {
+                key,
+                upload_id,
+                parts,
+                checksum: object_checksum,
+                geometry: EcWriteGeometry { k, m, w },
+            })
             .await
     }
 

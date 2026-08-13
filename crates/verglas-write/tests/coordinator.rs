@@ -219,14 +219,15 @@ impl FragmentTransport for MemoryTransport {
         Ok(inner
             .frags
             .keys()
-            .filter_map(|(owner, object_id, index)| {
-                (owner == node.as_str() && object_id.starts_with(prefix)).then(|| {
-                    verglas_cluster::fragments::FragmentKey {
-                        object_id: object_id.clone(),
-                        index: *index,
-                    }
-                })
+            .filter(|(owner, object_id, _)| {
+                *owner == node.as_str() && object_id.starts_with(prefix)
             })
+            .map(
+                |(_, object_id, index)| verglas_cluster::fragments::FragmentKey {
+                    object_id: object_id.clone(),
+                    index: *index,
+                },
+            )
             .collect())
     }
 }
@@ -1207,7 +1208,7 @@ async fn unpropagated_fragments_survive_disk_pressure() {
     transport.fill_disk("node-0");
     transport.fill_disk("node-1");
     transport.fill_disk("node-2");
-    // A second write is refused write-back and degrades to write-through, but
+    // A second write is refused by the EC quorum boundary, but
     // the first object's fragments are untouched.
     assert_eq!(
         transport.fragment_count(),

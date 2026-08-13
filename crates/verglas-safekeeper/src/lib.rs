@@ -1,5 +1,9 @@
 //! Neon-compatible safekeeper storage on the Verglas EC ring (#13).
 //!
+//! The keeper and object write-back coordinator share the ring FragmentLog
+//! append_batch durability substrate; each publishes its own immutable state
+//! records only after that common protocol reaches its `w`-member quorum.
+//!
 //! # The append-log contract
 //!
 //! This crate is served by the workload-local `verglas-ec-keeper` process.

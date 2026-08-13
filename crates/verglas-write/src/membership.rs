@@ -4,7 +4,7 @@
 //! nodes?" per write against the current gossip view, not against config. This
 //! trait is that view; [`AgentMembership`] reads it from the cluster agent's
 //! failure detector, and [`SingleNodeMembership`] is the no-cluster server
-//! (always one node, so write-back always degrades to write-through).
+//! (always one node, so write-back is origin-durable).
 
 use std::sync::Arc;
 

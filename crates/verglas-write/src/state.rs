@@ -118,10 +118,10 @@ impl StateIndex {
             && state.part_number.is_none()
         {
             self.insert_index(&state);
-        } else if state.state == TransactionState::Tombstone {
-            if let Ok(mut tombstones) = self.tombstones.write() {
-                tombstones.insert(state.index_key(), state.object_id.clone());
-            }
+        } else if state.state == TransactionState::Tombstone
+            && let Ok(mut tombstones) = self.tombstones.write()
+        {
+            tombstones.insert(state.index_key(), state.object_id.clone());
         }
     }
 
@@ -231,12 +231,12 @@ impl StateIndex {
                 self.dirty_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
-        if state.state == TransactionState::Tombstone {
-            if let Ok(mut tombstones) = self.tombstones.write() {
-                let key = state.index_key();
-                if tombstones.get(&key) == Some(&state.object_id) {
-                    tombstones.remove(&key);
-                }
+        if state.state == TransactionState::Tombstone
+            && let Ok(mut tombstones) = self.tombstones.write()
+        {
+            let key = state.index_key();
+            if tombstones.get(&key) == Some(&state.object_id) {
+                tombstones.remove(&key);
             }
         }
     }
