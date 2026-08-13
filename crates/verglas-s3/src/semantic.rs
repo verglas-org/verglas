@@ -634,6 +634,13 @@ impl IcebergCatalogSemanticStore {
                 }
                 .and_then(Value::as_array)
                 .ok_or_else(|| SemanticError::validation("vectors or keys is required"))?;
+                if operation == "PutVectors" {
+                    for value in values {
+                        let _ = vector_data(value.get("data").ok_or_else(|| {
+                            SemanticError::validation("vector data is required")
+                        })?)?;
+                    }
+                }
                 let rows = values
                     .iter()
                     .map(|value| vector_row(value, operation == "DeleteVectors"))
@@ -699,15 +706,8 @@ impl IcebergCatalogSemanticStore {
             "QueryVectors" => {
                 let query = input
                     .get("queryVector")
-                    .and_then(Value::as_array)
-                    .ok_or_else(|| SemanticError::validation("queryVector is required"))?
-                    .iter()
-                    .map(|value| {
-                        value.as_f64().map(|number| number as f32).ok_or_else(|| {
-                            SemanticError::validation("queryVector must contain numbers")
-                        })
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                    .ok_or_else(|| SemanticError::validation("queryVector is required"))
+                    .and_then(vector_data)?;
                 let table = self
                     .catalog
                     .load_table(&ident)
@@ -729,7 +729,7 @@ impl IcebergCatalogSemanticStore {
                         .into_iter()
                         .map(|neighbor| json!({"key": neighbor.key, "distance": neighbor.distance}))
                         .collect::<Vec<_>>();
-                    return Ok(json!({"vectors": vectors}));
+                    return Ok(json!({"distanceMetric":"euclidean", "vectors": vectors}));
                 }
                 let mut vectors = live_vectors(self.catalog.as_ref(), &ident).await?;
                 vectors.retain(|vector| vector.data.len() == query.len());
@@ -738,7 +738,7 @@ impl IcebergCatalogSemanticStore {
                         .total_cmp(&squared_distance(&right.data, &query))
                 });
                 let vectors = vectors.into_iter().take(required_u32(&input, "topK")? as usize).map(|vector| json!({"key": vector.key, "distance": squared_distance(&vector.data, &query), "metadata": vector.metadata})).collect::<Vec<_>>();
-                Ok(json!({"vectors": vectors}))
+                Ok(json!({"distanceMetric":"euclidean", "vectors": vectors}))
             }
             _ => Err(SemanticError::validation("unknown S3 Vectors operation")),
         }
@@ -1122,21 +1122,33 @@ fn vector_row(value: &Value, deleted: bool) -> Result<Value, SemanticError> {
     } else {
         value
             .get("data")
-            .cloned()
-            .ok_or_else(|| SemanticError::validation("vector data is required"))?
+            .ok_or_else(|| SemanticError::validation("vector data is required"))
+            .and_then(vector_data)
+            .map(|values| json!(values))?
     };
-    if !deleted
-        && !data
-            .as_array()
-            .is_some_and(|items| items.iter().all(Value::is_number))
-    {
-        return Err(SemanticError::validation(
-            "vector data must contain numbers",
-        ));
-    }
     Ok(
         json!({"key": key, "data": data, "metadata": if deleted { None } else { value.get("metadata").map(Value::to_string) }, "deleted": deleted}),
     )
+}
+
+/// Parses the exact AWS VectorData union; only float32 is supported by this index.
+fn vector_data(value: &Value) -> Result<Vec<f32>, SemanticError> {
+    let values = value
+        .get("float32")
+        .and_then(Value::as_array)
+        .ok_or_else(|| SemanticError::validation("VectorData must be an object with float32"))?;
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|number| number as f32)
+                .filter(|number| number.is_finite())
+                .ok_or_else(|| {
+                    SemanticError::validation("VectorData.float32 must contain finite numbers")
+                })
+        })
+        .collect()
 }
 
 /// A source-table vector with its exact customer-provided key preserved.
@@ -1340,5 +1352,16 @@ mod tests {
         let error = page(&json!({"operation":"ListIndexes", "vectorBucketName":"other", "maxResults":1, "nextToken":token}), vec![]).expect_err("binding mismatch");
         assert_eq!(error.code, "ValidationException");
         assert!(page(&json!({"operation":"ListVectors", "maxResults":0}), vec![]).is_err());
+    }
+
+    /// Only the AWS-modelled float32 union variant enters the vector engine.
+    #[test]
+    fn vector_data_requires_the_float32_union() {
+        assert_eq!(
+            vector_data(&json!({"float32":[1.0, 2.0]})).expect("union"),
+            vec![1.0, 2.0]
+        );
+        assert!(vector_data(&json!([1.0, 2.0])).is_err());
+        assert!(vector_data(&json!({"float32":["bad"]})).is_err());
     }
 }
