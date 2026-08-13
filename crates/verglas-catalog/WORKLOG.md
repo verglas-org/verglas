@@ -15,3 +15,6 @@
 - #135: Exposed the immutable warehouse route bound to a managed catalog
   client. The hosted Iceberg config service uses this exact route as the
   standard REST prefix instead of trusting a caller-provided warehouse string.
+- #135: Made managed-catalog HTTP 409 a typed final conflict instead of an
+  ingress retry signal. HTTP 503 remains retryable across explicit ingresses,
+  preserving leader-availability failover without retrying failed CAS writes.

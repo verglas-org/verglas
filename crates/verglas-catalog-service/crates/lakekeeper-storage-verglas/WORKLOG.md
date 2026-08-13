@@ -14,3 +14,7 @@
   explicit location while immutable metadata still receives the exact durable root.
 - #135: Marked the Verglas-authored CRaft storage adapter as FSL-1.1-ALv2.
   The imported Lakekeeper crates retain their existing Apache 2.0 license.
+- #135: Added a durable idempotency record to the same CRaft batch as hosted
+  table and transaction commits. The record binds the operation and canonical
+  input fingerprint to the original result, so restart or alternate-ingress
+  retries replay exactly while mismatched key reuse returns a conflict.

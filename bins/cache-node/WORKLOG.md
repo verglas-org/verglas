@@ -202,3 +202,6 @@
 - #135: Register this cache node's Raft voter identity before serving peer RPCs.
   Authenticated replication can now lazily reopen a retained durable timeline
   or warehouse group after restart, while unknown numeric targets remain closed.
+- #135: Return HTTP 409 only for CRaft catalog CAS and request-identity
+  conflicts. All other catalog submission failures are HTTP 503 so another
+  ingress can preserve availability during leader or quorum disruption.

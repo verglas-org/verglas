@@ -25,13 +25,15 @@ use lakekeeper::api::{
         views::{LoadViewRequest, ViewParameters, ViewService},
     },
 };
-use serde_json::to_string;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, to_string};
 use uuid::Uuid;
 use verglas_consensus::CatalogEntity;
 
 use crate::{
     VerglasCatalog, VerglasCatalogError,
     domain::{NamespaceDocument, TableDocument, ViewDocument},
+    idempotency::HostedIdempotency,
 };
 
 #[async_trait]
@@ -76,12 +78,32 @@ fn durable_id(kind: &str, identity: &str) -> String {
 
 /// Converts durable transport failures into the standard Iceberg error model.
 fn storage_error(error: VerglasCatalogError) -> IcebergErrorResponse {
+    if error.is_conflict() {
+        return ErrorModel::conflict(
+            format!("CRaft catalog conflict: {error}"),
+            "CatalogConflict",
+            Some(Box::new(error)),
+        )
+        .into();
+    }
     ErrorModel::service_unavailable(
         format!("CRaft catalog is unavailable: {error}"),
         "CatalogUnavailable",
         Some(Box::new(error)),
     )
     .into()
+}
+
+/// The complete durable result required to replay a table commit after failover or restart.
+#[derive(Deserialize, Serialize)]
+struct CommitTableResult {
+    metadata_location: String,
+}
+
+/// The complete durable result of a multi-table commit, even though Iceberg returns no body.
+#[derive(Deserialize, Serialize)]
+struct CommitTransactionResult {
+    metadata_locations: Vec<String>,
 }
 
 /// Requires a routed warehouse prefix for a hosted Iceberg endpoint.
@@ -576,6 +598,48 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
         metadata: RequestMetadata,
     ) -> Result<CommitTableResponse> {
         let prefix = required_prefix(parameters.prefix)?;
+        let idempotency = metadata
+            .idempotency_key()
+            .copied()
+            .map(|key| {
+                HostedIdempotency::new(
+                    key,
+                    "commit_table",
+                    &json!({"table": &parameters.table, "request": &request}),
+                    &CommitTableResult {
+                        metadata_location: String::new(),
+                    },
+                )
+            })
+            .transpose()
+            .map_err(storage_error)?;
+        if let Some(idempotency) = &idempotency {
+            // This linearizable read only short-circuits a finalized result. The
+            // ensuing write still carries RecordAbsent in the same CRaft batch.
+            if let Some(result) = idempotency
+                .replay::<CommitTableResult>(&state.v1_state)
+                .await
+                .map_err(storage_error)?
+            {
+                let table_metadata = state
+                    .v1_state
+                    .metadata()
+                    .load_table(&result.metadata_location)
+                    .await
+                    .map_err(|error| {
+                        ErrorModel::failed_dependency(
+                            error.message.clone(),
+                            "MetadataVerificationFailed",
+                            Some(Box::new(error)),
+                        )
+                    })?;
+                return Ok(CommitTableResponse {
+                    metadata_location: result.metadata_location,
+                    metadata: table_metadata,
+                    config: None,
+                });
+            }
+        }
         let (key, mut document) =
             table_document(&state.v1_state, &prefix, &parameters.table).await?;
         let expected = to_string(&document).map_err(|error| {
@@ -589,7 +653,10 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
             .v1_state
             .metadata()
             .commit_table(
-                metadata.request_id().as_u128(),
+                idempotency.as_ref().map_or_else(
+                    || metadata.request_id().as_u128(),
+                    HostedIdempotency::request_id,
+                ),
                 &document.metadata_location,
                 &request,
             )
@@ -602,7 +669,26 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
                 )
             })?;
         document.metadata_location = metadata_location.clone();
-        let mut transaction = state.v1_state.transaction(metadata.request_id().as_u128());
+        let result = CommitTableResult {
+            metadata_location: metadata_location.clone(),
+        };
+        let idempotency = metadata
+            .idempotency_key()
+            .copied()
+            .map(|key| {
+                HostedIdempotency::new(
+                    key,
+                    "commit_table",
+                    &json!({"table": &parameters.table, "request": &request}),
+                    &result,
+                )
+            })
+            .transpose()
+            .map_err(storage_error)?;
+        let mut transaction = state.v1_state.transaction(idempotency.as_ref().map_or_else(
+            || metadata.request_id().as_u128(),
+            HostedIdempotency::request_id,
+        ));
         transaction.require_document(CatalogEntity::Table, key.clone(), expected);
         transaction.put(
             CatalogEntity::Table,
@@ -615,7 +701,44 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
                 )
             })?,
         );
-        transaction.commit().await.map_err(storage_error)?;
+        if let Some(idempotency) = &idempotency {
+            idempotency
+                .attach(&mut transaction)
+                .map_err(storage_error)?;
+        }
+        match transaction.commit().await {
+            Ok(()) => {}
+            Err(error) if error.is_conflict() => {
+                let replayed = match &idempotency {
+                    Some(idempotency) => idempotency
+                        .replay::<CommitTableResult>(&state.v1_state)
+                        .await
+                        .map_err(storage_error)?,
+                    None => None,
+                };
+                let Some(replayed) = replayed else {
+                    return Err(storage_error(error));
+                };
+                let table_metadata = state
+                    .v1_state
+                    .metadata()
+                    .load_table(&replayed.metadata_location)
+                    .await
+                    .map_err(|metadata_error| {
+                        ErrorModel::failed_dependency(
+                            metadata_error.message.clone(),
+                            "MetadataVerificationFailed",
+                            Some(Box::new(metadata_error)),
+                        )
+                    })?;
+                return Ok(CommitTableResponse {
+                    metadata_location: replayed.metadata_location,
+                    metadata: table_metadata,
+                    config: None,
+                });
+            }
+            Err(error) => return Err(storage_error(error)),
+        }
         Ok(CommitTableResponse {
             metadata_location,
             metadata: table_metadata,
@@ -706,6 +829,34 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
         metadata: RequestMetadata,
     ) -> Result<()> {
         let prefix = required_prefix(prefix)?;
+        let idempotency_input = json!({"prefix": prefix.as_str(), "request": &request});
+        let idempotency = metadata
+            .idempotency_key()
+            .copied()
+            .map(|key| {
+                HostedIdempotency::new(
+                    key,
+                    "commit_transaction",
+                    &idempotency_input,
+                    &CommitTransactionResult {
+                        metadata_locations: Vec::new(),
+                    },
+                )
+            })
+            .transpose()
+            .map_err(storage_error)?;
+        if let Some(idempotency) = &idempotency {
+            // This only reads a finalized record; RecordAbsent below remains the
+            // authoritative protection against concurrent same-key submissions.
+            if idempotency
+                .replay::<CommitTransactionResult>(&state.v1_state)
+                .await
+                .map_err(storage_error)?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
         let mut records = Vec::with_capacity(request.table_changes.len());
         let mut metadata_changes = Vec::with_capacity(request.table_changes.len());
         for change in request.table_changes {
@@ -723,7 +874,13 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
         let published = state
             .v1_state
             .metadata()
-            .commit_tables(metadata.request_id().as_u128(), &metadata_changes)
+            .commit_tables(
+                idempotency.as_ref().map_or_else(
+                    || metadata.request_id().as_u128(),
+                    HostedIdempotency::request_id,
+                ),
+                &metadata_changes,
+            )
             .await
             .map_err(|error| {
                 ErrorModel::failed_dependency(
@@ -740,7 +897,24 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
             )
             .into());
         }
-        let mut transaction = state.v1_state.transaction(metadata.request_id().as_u128());
+        let result = CommitTransactionResult {
+            metadata_locations: published
+                .iter()
+                .map(|(metadata_location, _)| metadata_location.clone())
+                .collect(),
+        };
+        let idempotency = metadata
+            .idempotency_key()
+            .copied()
+            .map(|key| {
+                HostedIdempotency::new(key, "commit_transaction", &idempotency_input, &result)
+            })
+            .transpose()
+            .map_err(storage_error)?;
+        let mut transaction = state.v1_state.transaction(idempotency.as_ref().map_or_else(
+            || metadata.request_id().as_u128(),
+            HostedIdempotency::request_id,
+        ));
         for ((key, mut document), (metadata_location, _)) in records.into_iter().zip(published) {
             let expected = to_string(&document).map_err(|error| {
                 ErrorModel::internal(
@@ -763,7 +937,29 @@ impl TablesService<VerglasCatalog> for VerglasCatalog {
                 })?,
             );
         }
-        transaction.commit().await.map_err(storage_error)
+        if let Some(idempotency) = &idempotency {
+            idempotency
+                .attach(&mut transaction)
+                .map_err(storage_error)?;
+        }
+        match transaction.commit().await {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_conflict() => {
+                let replayed = match &idempotency {
+                    Some(idempotency) => idempotency
+                        .replay::<CommitTransactionResult>(&state.v1_state)
+                        .await
+                        .map_err(storage_error)?,
+                    None => None,
+                };
+                if replayed.is_some() {
+                    Ok(())
+                } else {
+                    Err(storage_error(error))
+                }
+            }
+            Err(error) => Err(storage_error(error)),
+        }
     }
 }
 

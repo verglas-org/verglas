@@ -67,6 +67,81 @@ mod tests {
 
     use super::VerglasTransaction;
     use crate::{ImmutableMetadataStore, MetadataStoreError, VerglasCatalog, VerglasCatalogError};
+    use verglas_consensus::{CatalogAction, CatalogEntity, CatalogRequirement};
+
+    /// One idempotency key always maps to the same CRaft request identity, even when the payload differs.
+    #[test]
+    fn idempotency_key_has_a_deterministic_craft_request_identity() {
+        let key = lakekeeper::service::idempotency::IdempotencyKey::parse(
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .expect("valid key");
+        let first = crate::idempotency::HostedIdempotency::new(
+            key,
+            "commit_table",
+            &serde_json::json!({"snapshot": 1}),
+            &serde_json::json!({"metadata_location": "s3://one"}),
+        )
+        .expect("first identity");
+        let second = crate::idempotency::HostedIdempotency::new(
+            key,
+            "commit_table",
+            &serde_json::json!({"snapshot": 2}),
+            &serde_json::json!({"metadata_location": "s3://two"}),
+        )
+        .expect("second identity");
+        assert_eq!(first.request_id(), second.request_id());
+        assert_ne!(first.fingerprint(), second.fingerprint());
+    }
+
+    /// An idempotency result is part of the same atomic transaction as the hosted mutation.
+    #[test]
+    fn idempotency_record_is_staged_with_the_hosted_transaction() {
+        let catalog = VerglasCatalog::with_ingresses(
+            ["http://127.0.0.1:1".to_owned()],
+            "tenant",
+            "warehouse",
+            UnusedMetadataStore,
+        )
+        .expect("one ingress is valid");
+        let key = lakekeeper::service::idempotency::IdempotencyKey::parse(
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .expect("valid key");
+        let identity = crate::idempotency::HostedIdempotency::new(
+            key,
+            "commit_transaction",
+            &serde_json::json!({"tables": ["analytics.events"]}),
+            &serde_json::json!({"metadata_locations": ["s3://warehouse/metadata.json"]}),
+        )
+        .expect("identity");
+        let mut transaction = VerglasTransaction::new(catalog, identity.request_id());
+        transaction.put(
+            CatalogEntity::Table,
+            "warehouse:analytics.events".to_owned(),
+            r#"{"metadata_location":"s3://warehouse/metadata.json"}"#.to_owned(),
+        );
+        identity
+            .attach(&mut transaction)
+            .expect("serializable record");
+        assert!(matches!(
+            transaction.requirements.last(),
+            Some(CatalogRequirement::RecordAbsent {
+                entity: CatalogEntity::Idempotency,
+                ..
+            })
+        ));
+        let Some(CatalogAction::PutRecord {
+            entity: CatalogEntity::Idempotency,
+            document,
+            ..
+        }) = transaction.actions.last()
+        else {
+            panic!("idempotency record must be part of the transaction");
+        };
+        assert!(document.contains("commit_transaction"));
+        assert!(document.contains("metadata_locations"));
+    }
 
     /// A metadata authority that proves a transaction can fail before object access.
     struct UnusedMetadataStore;

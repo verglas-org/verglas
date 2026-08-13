@@ -19,7 +19,7 @@ use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 use verglas_backend::MultipartObjectStore;
 use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
-use verglas_consensus::{GroupRequest, GroupResponse, ReplicationMode};
+use verglas_consensus::{GroupError, GroupRequest, GroupResponse, ReplicationMode};
 use verglas_core::activity::ActivityTracker;
 use verglas_safekeeper::{
     AppendGeometry, ArchiveError, ArchiveObject, ArchiveTimeline, ImmutableSegmentStore,
@@ -290,7 +290,7 @@ async fn catalog_request(
             },
         )
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(catalog_submission_error)?;
     if root_response != GroupResponse::WarehouseGroup(Some(warehouse_group.clone())) {
         return Err((
             StatusCode::CONFLICT,
@@ -301,7 +301,7 @@ async fn catalog_request(
         .consensus
         .submit(&warehouse_group, command)
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(catalog_submission_error)?;
     let response = match response {
         GroupResponse::Applied(response) => ManagedCatalogResponse::Applied(response),
         GroupResponse::CatalogTable(table) => ManagedCatalogResponse::Table(table),
@@ -337,6 +337,17 @@ async fn catalog_request(
         }
     };
     Ok(Json(response))
+}
+
+/// Preserves availability failover while making authoritative catalog conflicts final HTTP 409 responses.
+fn catalog_submission_error(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> (StatusCode, String) {
+    let status = match error.downcast_ref::<GroupError>() {
+        Some(GroupError::CatalogConflict | GroupError::ConflictingRetry) => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, error.to_string())
 }
 
 /// Converts one transport request into the universal timeline-group command.

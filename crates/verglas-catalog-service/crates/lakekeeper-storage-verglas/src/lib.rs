@@ -12,6 +12,7 @@ use verglas_consensus::{CatalogAction, CatalogBatch, CatalogEntity, CatalogRequi
 pub mod authorized;
 pub mod domain;
 mod hosted;
+pub(crate) mod idempotency;
 pub mod metadata_store;
 mod transaction;
 
@@ -318,9 +319,23 @@ pub enum VerglasCatalogError {
     /// The request could not form a valid deterministic catalog transaction.
     #[error("invalid consensus catalog transaction")]
     InvalidBatch,
+    /// CRaft rejected an optimistic requirement or an idempotency key was reused with different input.
+    #[error("catalog mutation conflicts with durable state")]
+    IdempotencyConflict,
     /// The ingress returned a response for another catalog operation.
     #[error("unexpected consensus catalog response")]
     WrongResponse,
+}
+
+impl VerglasCatalogError {
+    /// Returns whether the error is a final typed conflict rather than an unavailable ingress.
+    pub(crate) fn is_conflict(&self) -> bool {
+        matches!(
+            self,
+            Self::Client(verglas_catalog::ManagedCatalogError::Conflict)
+                | Self::IdempotencyConflict
+        )
+    }
 }
 
 #[cfg(test)]
