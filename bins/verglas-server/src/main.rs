@@ -1182,7 +1182,7 @@ mod tls;
 /// Assembles the write-back tier (#180): the fragment transport (local store +
 /// peer RPC), the live-membership view, the quorum coordinator over the origin
 /// writer, and the reader/writer wrappers. Spawns the node-loss repair loop when
-/// clustered. Replays any dirty journal from a previous run.
+/// clustered. Replays any dirty state from a previous run.
 #[allow(clippy::too_many_arguments)]
 fn build_writeback_tier(
     config: &verglas_core::config::Config,
@@ -1198,7 +1198,7 @@ fn build_writeback_tier(
 > {
     let wb = &config.cache.writeback;
     let policy = Arc::new(build_writeback_policy(wb));
-    let journals = Arc::new(verglas_write::JournalStore::open(&config.cache.dir)?);
+    let states = Arc::new(verglas_write::StateIndex::new());
     let fragment_client = build_fragment_client(config, agent.as_ref());
     let transport = Arc::new(PeerFragmentTransport::new(
         node_id.clone(),
@@ -1213,7 +1213,7 @@ fn build_writeback_tier(
     let coordinator = WriteCoordinator::new(
         transport,
         membership.clone(),
-        journals,
+        states,
         metrics,
         Arc::clone(&origin),
         std::time::Duration::from_millis(wb.ack_deadline_ms),

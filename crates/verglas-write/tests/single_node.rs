@@ -1,7 +1,7 @@
 //! Standalone write-through durability contract tests.
 //!
 //! One cache node is not a quorum. These tests prove that it never acknowledges
-//! local fragment or journal state and returns success only after the origin
+//! local fragment or state state and returns success only after the origin
 //! accepts the complete object.
 
 use std::collections::HashMap;
@@ -20,8 +20,8 @@ use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
+use verglas_write::StateIndex;
 use verglas_write::coordinator::WriteCoordinator;
-use verglas_write::journal::JournalStore;
 use verglas_write::membership::SingleNodeMembership;
 use verglas_write::metrics::WritebackMetrics;
 use verglas_write::transport::{FragmentTransport, TransportError};
@@ -247,11 +247,11 @@ fn body(len: usize) -> Bytes {
     Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<u8>>())
 }
 
-/// A single-node coordinator over the given transport, journal dir, and origin.
+/// A single-node coordinator over the given transport, state dir, and origin.
 /// The configured pod geometry is intentionally irrelevant in standalone mode.
 fn single_node_coordinator(
     transport: Arc<MemoryTransport>,
-    journals: Arc<JournalStore>,
+    states: Arc<StateIndex>,
     origin: Arc<GatedOrigin>,
     metrics: Arc<WritebackMetrics>,
 ) -> Arc<WriteCoordinator<GatedOrigin>> {
@@ -259,7 +259,7 @@ fn single_node_coordinator(
     Arc::new(WriteCoordinator::new(
         transport,
         membership,
-        journals,
+        states,
         metrics,
         origin,
         Duration::from_secs(2),
@@ -275,14 +275,14 @@ const POD_W: usize = 5;
 /// Standalone writes never acknowledge local cache state as durable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_node_requires_origin_durability_before_ack() {
-    let dir = TempDir::new().expect("tmp");
+    let _dir = TempDir::new().expect("tmp");
     let transport = MemoryTransport::new();
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
+    let states = Arc::new(StateIndex::new());
     let origin = GatedOrigin::new(true); // origin down for the whole test
     let metrics = Arc::new(WritebackMetrics::default());
     let coord = single_node_coordinator(
         Arc::clone(&transport),
-        Arc::clone(&journals),
+        Arc::clone(&states),
         Arc::clone(&origin),
         Arc::clone(&metrics),
     );
@@ -303,7 +303,7 @@ async fn single_node_requires_origin_durability_before_ack() {
     // Local cache state is never the standalone durability authority.
     assert_eq!(transport.fragment_count(), 0, "no local fragment is acked");
     assert!(
-        journals.find_dirty("default", "bkt", "data/f1").is_none(),
+        states.find_dirty("default", "bkt", "data/f1").is_none(),
         "a failed origin write leaves no dirty write-back record"
     );
     let snap = metrics.snapshot();
@@ -315,15 +315,15 @@ async fn single_node_requires_origin_durability_before_ack() {
 /// never a silent drop and never an ack it cannot back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_buffer_rejects_when_origin_down_never_silent_drop() {
-    let dir = TempDir::new().expect("tmp");
+    let _dir = TempDir::new().expect("tmp");
     let transport = MemoryTransport::new();
     transport.set_no_headroom(true); // buffer full
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
+    let states = Arc::new(StateIndex::new());
     let origin = GatedOrigin::new(true); // origin also down
     let metrics = Arc::new(WritebackMetrics::default());
     let coord = single_node_coordinator(
         Arc::clone(&transport),
-        Arc::clone(&journals),
+        Arc::clone(&states),
         Arc::clone(&origin),
         Arc::clone(&metrics),
     );
@@ -344,7 +344,7 @@ async fn full_buffer_rejects_when_origin_down_never_silent_drop() {
         "clear error: {err:?}"
     );
     assert!(
-        journals.is_idle(),
+        states.is_idle(),
         "nothing acked, nothing buffered — no silent drop"
     );
     assert_eq!(transport.fragment_count(), 0);
@@ -353,15 +353,15 @@ async fn full_buffer_rejects_when_origin_down_never_silent_drop() {
 /// Local headroom does not affect standalone origin write-through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standalone_writes_through_when_origin_is_available() {
-    let dir = TempDir::new().expect("tmp");
+    let _dir = TempDir::new().expect("tmp");
     let transport = MemoryTransport::new();
     transport.set_no_headroom(true);
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
+    let states = Arc::new(StateIndex::new());
     let origin = GatedOrigin::new(false); // origin up
     let metrics = Arc::new(WritebackMetrics::default());
     let coord = single_node_coordinator(
         Arc::clone(&transport),
-        Arc::clone(&journals),
+        Arc::clone(&states),
         Arc::clone(&origin),
         Arc::clone(&metrics),
     );
@@ -387,6 +387,6 @@ async fn standalone_writes_through_when_origin_is_available() {
         snap.acked_via_write_through, 1,
         "standalone ACK follows synchronous write-through"
     );
-    assert!(journals.is_idle(), "write-through leaves nothing buffered");
+    assert!(states.is_idle(), "write-through leaves nothing buffered");
     assert_eq!(transport.fragment_count(), 0, "no EC state was created");
 }

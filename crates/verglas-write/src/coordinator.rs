@@ -32,10 +32,10 @@ use verglas_core::node::NodeId;
 use verglas_core::ring::rendezvous_hash;
 use verglas_core::write::{ObjectWrite, PutOutcome, WriteBodyStream, WriteError, WriteMetadata};
 
-use crate::journal::{Journal, JournalState, JournalStore, Placement};
 use crate::membership::LiveMembership;
 use crate::meta::{StoredMetadata, now_unix_ms};
 use crate::metrics::WritebackMetrics;
+use crate::state::{Placement, StateIndex, TransactionRecord, TransactionState};
 use crate::transport::{DurableQuorum, FragmentTransport};
 
 /// Base backoff between propagation retries.
@@ -44,7 +44,7 @@ const PROPAGATION_BACKOFF: Duration = Duration::from_millis(200);
 /// Upper bound on fragment indices swept when cleaning up an abandoned object.
 /// No configured geometry places more than this many fragments (k + m), so
 /// deleting `0..this` on every live node removes every fragment an object could
-/// have. A generous fixed bound keeps cleanup independent of the journal.
+/// have. A generous fixed bound keeps cleanup independent of the state.
 const MAX_FRAGMENTS_PER_OBJECT: usize = 256;
 
 /// How the last write was acked, for transition counting.
@@ -60,18 +60,12 @@ pub enum WritebackError {
     /// A fragment could not be reassembled (fewer than `k` survive).
     #[error("reassembly failed: {0}")]
     Reassembly(String),
-    /// The journal store failed.
-    #[error(transparent)]
-    Journal(#[from] crate::journal::JournalError),
     /// The fragment transport failed.
     #[error(transparent)]
     Transport(#[from] crate::transport::TransportError),
     /// The codec rejected an encode or geometry.
     #[error("codec: {0}")]
     Codec(String),
-    /// A durable journal is missing origin-routing identity.
-    #[error("invalid journal: {0}")]
-    InvalidJournal(String),
 }
 
 /// What one scrub pass saw and fixed (#220): fragments verified, found corrupt,
@@ -105,8 +99,8 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     transport: Arc<dyn FragmentTransport>,
     /// Live pod view for placement and quorum.
     membership: Arc<dyn LiveMembership>,
-    /// Journal store and dirty index.
-    journals: Arc<JournalStore>,
+    /// TransactionRecord store and dirty index.
+    states: Arc<StateIndex>,
     /// Write-back counters.
     metrics: Arc<WritebackMetrics>,
     /// Direct-to-origin writer for propagation and true standalone write-through.
@@ -125,7 +119,7 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     key_locks: Mutex<HashMap<CacheKey, Weak<AsyncMutex<()>>>>,
     /// Set by [`shutdown`](Self::shutdown): background propagation retry loops
     /// exit at their next wake instead of acting on a coordinator whose owner
-    /// is gone. The journals stay dirty for the next run's recovery replay.
+    /// is gone. The states stay dirty for the next run's recovery replay.
     shutdown: AtomicBool,
 }
 
@@ -134,7 +128,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     pub fn new(
         transport: Arc<dyn FragmentTransport>,
         membership: Arc<dyn LiveMembership>,
-        journals: Arc<JournalStore>,
+        states: Arc<StateIndex>,
         metrics: Arc<WritebackMetrics>,
         origin: Arc<W>,
         ack_deadline: Duration,
@@ -143,7 +137,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         Self {
             transport,
             membership,
-            journals,
+            states,
             metrics,
             origin,
             self_id,
@@ -156,7 +150,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     }
 
     /// Stops background propagation: every in-flight retry loop exits at its
-    /// next wake, leaving still-dirty journals for the next run's recovery
+    /// next wake, leaving still-dirty states for the next run's recovery
     /// replay (exactly what they are for). For server shutdown, and for tests
     /// that simulate process death — a dropped coordinator does not cancel its
     /// spawned tasks (they hold their own `Arc<Self>`), so without this a
@@ -166,9 +160,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         self.shutdown.store(true, Ordering::SeqCst);
     }
 
-    /// The journal store (for the reader wrapper).
-    pub fn journals(&self) -> &Arc<JournalStore> {
-        &self.journals
+    /// The state store (for the reader wrapper).
+    pub fn states(&self) -> &Arc<StateIndex> {
+        &self.states
     }
 
     /// The counters (for admin export and tests).
@@ -320,6 +314,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                 &object_id,
                 &etag,
                 geometry,
+                w,
                 object_len,
                 acked.into_receipts(),
                 done_rx,
@@ -334,8 +329,8 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         }
     }
 
-    /// Records the dirty journal for the reached quorum (with the exact acked
-    /// placements), acks the client, then drains stragglers into the journal
+    /// Records the dirty state for the reached quorum (with the exact acked
+    /// placements), acks the client, then drains stragglers into the state
     /// and starts propagation. The streaming path's ack.
     #[allow(clippy::too_many_arguments)]
     async fn finish_stream_ack(
@@ -345,12 +340,13 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         object_id: &str,
         etag: &str,
         geometry: Geometry,
+        w: usize,
         object_len: u64,
         acked: Vec<Placement>,
         rx: mpsc::UnboundedReceiver<(usize, NodeId, Result<(), crate::transport::TransportError>)>,
         key_guard: OwnedMutexGuard<()>,
     ) -> Result<PutOutcome, WriteError> {
-        let journal = Journal {
+        let state = TransactionRecord {
             object_id: object_id.to_owned(),
             storage_binding_id: key.storage_binding_id.clone(),
             bucket: key.bucket.clone(),
@@ -362,18 +358,25 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             chunk: geometry.chunk,
             etag: etag.to_owned(),
             created_ms: now_unix_ms(),
-            state: JournalState::Dirty,
+            state: TransactionState::Dirty,
             propagated_ms: None,
             placements: acked,
+            w,
+            revision: 0,
         };
-        self.journals
-            .put(&journal)
-            .map_err(|e| WriteError::Backend(format!("write-back journal: {e}")))?;
+        let replicas = state
+            .placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()))
+            .collect::<Vec<_>>();
+        self.publish_state(state, &replicas)
+            .await
+            .map_err(|e| WriteError::Backend(format!("write-back state: {e}")))?;
 
         WritebackMetrics::bump(&self.metrics.acked_via_quorum);
         self.record_mode(MODE_QUORUM);
 
-        // Merge each straggler placement into the current journal (never a bulk
+        // Merge each straggler placement into the current state (never a bulk
         // overwrite, so a concurrent repair is not clobbered), then propagate.
         let me = Arc::clone(self);
         let object_id = object_id.to_owned();
@@ -384,17 +387,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             // successful DELETE final rather than vulnerable to resurrection.
             let _key_guard = key_guard;
             let mut rx = rx;
-            while let Some((index, node, result)) = rx.recv().await {
-                if result.is_ok() {
-                    let _ = me.journals.add_placement(
-                        &object_id,
-                        Placement {
-                            index,
-                            node: node.as_str().to_owned(),
-                        },
-                    );
-                }
-            }
+            while rx.recv().await.is_some() {}
             me.propagate_locked(object_id).await;
         });
 
@@ -406,6 +399,42 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             checksums: Default::default(),
             version_id: None,
         })
+    }
+
+    /// Replicates one immutable self-describing state record through the same
+    /// append/fdatasync protocol as data fragments.  The volatile index is only
+    /// updated after `w` distinct state replicas report durable receipt.
+    async fn publish_state(
+        &self,
+        state: TransactionRecord,
+        replicas: &[NodeId],
+    ) -> Result<(), WritebackError> {
+        let bytes = Bytes::from(
+            serde_json::to_vec(&state)
+                .map_err(|e| WritebackError::Codec(format!("encode state: {e}")))?,
+        );
+        let key = FragmentKey {
+            object_id: format!("tx-state:{}:{}", state.object_id, state.revision),
+            index: 0,
+        };
+        let attempts = replicas.iter().cloned().map(|node| {
+            let transport = Arc::clone(&self.transport);
+            let record = FragmentRecord::new(key.clone(), bytes.clone());
+            async move { transport.place(&node, record).await.map(|_| node) }
+        });
+        let mut quorum = DurableQuorum::new(state.w);
+        for receipt in futures::future::join_all(attempts).await {
+            quorum.record(receipt);
+        }
+        if !quorum.reached() {
+            return Err(WritebackError::Reassembly(format!(
+                "state requires {} durable replicas; only {} available",
+                state.w,
+                quorum.len()
+            )));
+        }
+        self.states.install(state);
+        Ok(())
     }
 
     /// Drains a placement-result channel, ignoring the outcomes. Used to let the
@@ -503,49 +532,58 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     }
 
     /// Deletes an object after any earlier quorum-acked PUT for the same key.
-    /// The origin delete happens before the dirty journal is discarded, so a
+    /// The origin delete happens before the dirty state is discarded, so a
     /// failed delete preserves the acknowledged object for retry/recovery.
     pub async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
         let _key_guard = self.key_lock(key).lock_owned().await;
         self.origin.delete(key).await?;
 
         let Some(object_id) =
-            self.journals
+            self.states
                 .find_dirty(&key.storage_binding_id, &key.bucket, &key.key)
         else {
             return Ok(());
         };
-        let journal = self
-            .journals
-            .read(&object_id)
-            .map_err(|error| WriteError::Backend(format!("write-back journal: {error}")))?;
-        self.journals
-            .delete(&object_id)
-            .map_err(|error| WriteError::Backend(format!("write-back journal: {error}")))?;
-        if let Some(journal) = journal {
-            for placement in journal.placements {
-                let node = NodeId::new(placement.node);
+        let state = self.states.read(&object_id);
+        if let Some(state) = state {
+            let replicas = state
+                .placements
+                .iter()
+                .map(|p| NodeId::new(p.node.as_str()))
+                .collect::<Vec<_>>();
+            let release = TransactionRecord {
+                state: TransactionState::Released,
+                propagated_ms: Some(now_unix_ms()),
+                revision: state.revision + 1,
+                ..state.clone()
+            };
+            self.publish_state(release, &replicas)
+                .await
+                .map_err(|e| WriteError::Backend(format!("write-back release state: {e}")))?;
+            for placement in &state.placements {
+                let node = NodeId::new(placement.node.as_str());
                 let fragment = FragmentKey {
                     object_id: object_id.clone(),
                     index: placement.index,
                 };
                 let _ = self.transport.delete(&node, &fragment).await;
             }
+            self.delete_state_revisions(&state).await;
         }
         Ok(())
     }
 
     /// Propagates one object to the origin until it succeeds or shutdown starts.
-    /// The dirty journal and EC fragments remain durable throughout an origin
+    /// The dirty state and EC fragments remain durable throughout an origin
     /// outage; recovery does not require a process restart.
     pub async fn propagate(self: Arc<Self>, object_id: String) {
-        let Some(journal) = self.journals.read(&object_id).ok().flatten() else {
+        let Some(state) = self.states.read(&object_id) else {
             return;
         };
         let key = CacheKey {
-            storage_binding_id: journal.storage_binding_id,
-            bucket: journal.bucket,
-            key: journal.key,
+            storage_binding_id: state.storage_binding_id,
+            bucket: state.bucket,
+            key: state.key,
         };
         let _key_guard = self.key_lock(&key).lock_owned().await;
         self.propagate_locked(object_id).await;
@@ -576,35 +614,40 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     }
 
     /// Reassembles one dirty object, uploads it to the origin, marks the
-    /// journal clean, and frees the fragments.
+    /// state clean, and frees the fragments.
     async fn propagate_once(&self, object_id: &str) -> Result<(), WritebackError> {
-        let Some(journal) = self.journals.read(object_id)? else {
+        let Some(state) = self.states.read(object_id) else {
             return Ok(());
         };
-        if journal.state == JournalState::Clean {
+        if state.state == TransactionState::Released {
             return Ok(());
         }
-        let bytes = self.reassemble(&journal).await?;
-        if journal.storage_binding_id.is_empty() {
-            return Err(WritebackError::InvalidJournal(format!(
-                "{} has no storage binding; run the explicit journal migration",
-                journal.object_id
-            )));
-        }
+        let bytes = self.reassemble(&state).await?;
         let key = CacheKey {
-            storage_binding_id: journal.storage_binding_id.clone(),
-            bucket: journal.bucket.clone(),
-            key: journal.key.clone(),
+            storage_binding_id: state.storage_binding_id.clone(),
+            bucket: state.bucket.clone(),
+            key: state.key.clone(),
         };
-        let metadata = WriteMetadata::from(&journal.metadata);
+        let metadata = WriteMetadata::from(&state.metadata);
         self.origin
             .put(&key, metadata, once_body(bytes))
             .await
             .map_err(|e| WritebackError::Reassembly(format!("origin put: {e}")))?;
-        self.journals.mark_clean(object_id)?;
+        let replicas = state
+            .placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()))
+            .collect::<Vec<_>>();
+        let release = TransactionRecord {
+            state: TransactionState::Released,
+            propagated_ms: Some(now_unix_ms()),
+            revision: state.revision + 1,
+            ..state.clone()
+        };
+        self.publish_state(release, &replicas).await?;
         // Free the fragments; they were the pod's only copy and the origin now
         // has the object. Best-effort — a leftover fragment is harmless.
-        for placement in &journal.placements {
+        for placement in &state.placements {
             let node = NodeId::new(placement.node.as_str());
             let fkey = FragmentKey {
                 object_id: object_id.to_owned(),
@@ -612,28 +655,47 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             };
             let _ = self.transport.delete(&node, &fkey).await;
         }
-        let _ = self.journals.delete(object_id);
+        self.delete_state_revisions(&state).await;
         WritebackMetrics::bump(&self.metrics.propagated);
         Ok(())
     }
 
+    /// Releases all immutable state revisions once a quorum-proven release has
+    /// been appended.  Deletion is best effort: an old record cannot make an
+    /// object live again because recovery selects the highest revision.
+    async fn delete_state_revisions(&self, state: &TransactionRecord) {
+        let replicas = state
+            .placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()));
+        for node in replicas {
+            for revision in 0..=state.revision + 1 {
+                let key = FragmentKey {
+                    object_id: format!("tx-state:{}:{revision}", state.object_id),
+                    index: 0,
+                };
+                let _ = self.transport.delete(&node, &key).await;
+            }
+        }
+    }
+
     /// Reassembles the object bytes from any `k` surviving fragments named in
-    /// the journal.
-    pub async fn reassemble(&self, journal: &Journal) -> Result<Bytes, WritebackError> {
+    /// the state.
+    pub async fn reassemble(&self, state: &TransactionRecord) -> Result<Bytes, WritebackError> {
         let geometry = Geometry {
-            k: journal.k,
-            m: journal.m,
-            chunk: journal.chunk,
+            k: state.k,
+            m: state.m,
+            chunk: state.chunk,
         };
         // Load fragments, carrying each one's stored checksum into the codec
         // `Fragment` so reassembly verifies it before use (#220). A corrupt
         // fragment is dropped by the codec (treated as an erasure), so we keep
         // loading past `k` until `k` *verified* fragments are in hand.
         let mut fragments = Vec::new();
-        for placement in &journal.placements {
+        for placement in &state.placements {
             let node = NodeId::new(placement.node.as_str());
             let fkey = FragmentKey {
-                object_id: journal.object_id.clone(),
+                object_id: state.object_id.clone(),
                 index: placement.index,
             };
             if let Ok(Some(loaded)) = self.transport.load(&node, &fkey).await {
@@ -648,22 +710,62 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                     fragments.push(fragment);
                 }
             }
-            if fragments.len() >= journal.k {
+            if fragments.len() >= state.k {
                 break;
             }
         }
-        reassemble(geometry, journal.object_len, &fragments)
+        reassemble(geometry, state.object_len, &fragments)
             .map_err(|e| WritebackError::Reassembly(e.to_string()))
     }
 
-    /// Replays every dirty journal on startup: rebuild placement and finish the
+    /// Replays every dirty state on startup: rebuild placement and finish the
     /// origin upload the crashed run did not.
     pub fn resume_propagation(self: &Arc<Self>) {
-        for object_id in self.journals.dirty_object_ids() {
-            let me = Arc::clone(self);
-            tokio::spawn(async move {
-                me.propagate(object_id).await;
-            });
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            me.recover_transaction_states().await;
+            for object_id in me.states.dirty_object_ids() {
+                let me = Arc::clone(&me);
+                tokio::spawn(async move {
+                    me.propagate(object_id).await;
+                });
+            }
+        });
+    }
+
+    /// Rebuilds the disposable local projection by scanning immutable state
+    /// records from every live fragment member.  A record is accepted only when
+    /// byte-identical copies are visible on at least its recorded `w` members.
+    async fn recover_transaction_states(&self) {
+        let live = self.membership.live_nodes();
+        let mut copies: HashMap<(String, u64), Vec<TransactionRecord>> = HashMap::new();
+        for node in &live {
+            let Ok(keys) = self.transport.list_prefix(node, "tx-state:").await else {
+                continue;
+            };
+            for key in keys {
+                let Ok(Some(loaded)) = self.transport.load(node, &key).await else {
+                    continue;
+                };
+                if !loaded.is_healthy() {
+                    continue;
+                }
+                let Ok(state) = serde_json::from_slice::<TransactionRecord>(&loaded.bytes) else {
+                    continue;
+                };
+                copies
+                    .entry((state.object_id.clone(), state.revision))
+                    .or_default()
+                    .push(state);
+            }
+        }
+        for (_, records) in copies {
+            let Some(state) = records.first().cloned() else {
+                continue;
+            };
+            if records.len() >= state.w && records.iter().all(|other| other == &state) {
+                self.states.install(state);
+            }
         }
     }
 
@@ -681,18 +783,18 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     pub async fn repair_once(&self) -> Result<u64, WritebackError> {
         let live: HashSet<NodeId> = self.membership.live_nodes().into_iter().collect();
         let mut repaired = 0u64;
-        for object_id in self.journals.dirty_object_ids() {
-            let Some(journal) = self.journals.read(&object_id)? else {
+        for object_id in self.states.dirty_object_ids() {
+            let Some(state) = self.states.read(&object_id) else {
                 continue;
             };
-            let object = self.repair_object(&object_id, &journal, &live).await?;
+            let object = self.repair_object(&object_id, &state, &live).await?;
             repaired += object.repaired;
         }
         WritebackMetrics::add(&self.metrics.fragments_repaired, repaired);
         Ok(repaired)
     }
 
-    /// One full scrub pass over the dirty journals (#220): verify every stored
+    /// One full scrub pass over the dirty states (#220): verify every stored
     /// fragment's checksum and re-encode any that are corrupt or missing before
     /// the object drops below `k`. This is the durability follow-on to the
     /// per-fragment integrity check — repair fires only on a membership change,
@@ -712,11 +814,11 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     pub async fn scrub_once(&self) -> Result<ScrubReport, WritebackError> {
         let live: HashSet<NodeId> = self.membership.live_nodes().into_iter().collect();
         let mut report = ScrubReport::default();
-        for object_id in self.journals.dirty_object_ids() {
-            let Some(journal) = self.journals.read(&object_id)? else {
+        for object_id in self.states.dirty_object_ids() {
+            let Some(state) = self.states.read(&object_id) else {
                 continue;
             };
-            let object = self.repair_object(&object_id, &journal, &live).await?;
+            let object = self.repair_object(&object_id, &state, &live).await?;
             report.scrubbed += object.scrubbed;
             report.corrupt += object.corrupt;
             report.repaired += object.repaired;
@@ -741,7 +843,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     async fn repair_object(
         &self,
         object_id: &str,
-        journal: &Journal,
+        state: &TransactionRecord,
         live: &HashSet<NodeId>,
     ) -> Result<ObjectRepair, WritebackError> {
         let mut stats = ObjectRepair::default();
@@ -749,7 +851,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         // checksum) and indices needing repair (dead node OR corrupt).
         let mut healthy: Vec<Placement> = Vec::new();
         let mut to_repair: HashSet<usize> = HashSet::new();
-        for placement in &journal.placements {
+        for placement in &state.placements {
             let node = NodeId::new(placement.node.as_str());
             if !live.contains(&node) {
                 to_repair.insert(placement.index);
@@ -779,35 +881,35 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         if to_repair.is_empty() {
             return Ok(stats);
         }
-        if healthy.len() < journal.k {
+        if healthy.len() < state.k {
             // Fewer than k healthy fragments: loss/corruption beyond the codec's
-            // tolerance. Skip and leave the journal for an operator/alert; do not
+            // tolerance. Skip and leave the state for an operator/alert; do not
             // crash, never rebuild garbage.
             eprintln!(
                 "writeback: cannot repair {object_id}: {} of k={} fragments healthy",
                 healthy.len(),
-                journal.k
+                state.k
             );
             return Ok(stats);
         }
 
         // Reassemble from the healthy fragments (verified inside), then re-encode
-        // with the journal's exact geometry.
-        let healthy_journal = Journal {
+        // with the state's exact geometry.
+        let healthy_state = TransactionRecord {
             placements: healthy.clone(),
-            ..journal.clone()
+            ..state.clone()
         };
-        let bytes = self.reassemble(&healthy_journal).await?;
-        let encoded = encode_with_geometry_chunk(journal.k, journal.m, journal.chunk, &bytes)
+        let bytes = self.reassemble(&healthy_state).await?;
+        let encoded = encode_with_geometry_chunk(state.k, state.m, state.chunk, &bytes)
             .map_err(WritebackError::Codec)?;
 
         // Candidate nodes: live, not already holding a healthy fragment.
         let occupied: HashSet<String> = healthy.iter().map(|p| p.node.clone()).collect();
         let mut candidates: Vec<NodeId> = placement_order(
             &CacheKey {
-                storage_binding_id: journal.storage_binding_id.clone(),
-                bucket: journal.bucket.clone(),
-                key: journal.key.clone(),
+                storage_binding_id: state.storage_binding_id.clone(),
+                bucket: state.bucket.clone(),
+                key: state.key.clone(),
             },
             object_id,
             &live.iter().cloned().collect::<Vec<_>>(),
@@ -842,7 +944,17 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             });
             stats.repaired += 1;
         }
-        self.journals.update_placements(object_id, placements)?;
+        let revised = TransactionRecord {
+            placements,
+            revision: state.revision + 1,
+            ..state.clone()
+        };
+        let replicas = revised
+            .placements
+            .iter()
+            .map(|p| NodeId::new(p.node.as_str()))
+            .collect::<Vec<_>>();
+        self.publish_state(revised, &replicas).await?;
         Ok(stats)
     }
 
@@ -964,7 +1076,7 @@ fn synthetic_object_etag(object_id: &str, object_len: u64) -> String {
     format!("\"{:032x}\"", xxhash_rust::xxh3::xxh3_128(&buf))
 }
 
-/// Encodes `body` with a fixed geometry chunk (repair must match the journal's
+/// Encodes `body` with a fixed geometry chunk (repair must match the state's
 /// exact chunk so the re-encoded fragments align with the surviving ones).
 fn encode_with_geometry_chunk(
     k: usize,

@@ -38,7 +38,7 @@ use verglas_core::node::NodeId;
 use verglas_core::ring::RendezvousRing;
 use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
 use verglas_write::{
-    JournalStore, PrefixRule, WriteCoordinator, WritebackMetrics, WritebackPolicy, WritebackTier,
+    PrefixRule, StateIndex, WriteCoordinator, WritebackMetrics, WritebackPolicy, WritebackTier,
 };
 
 use crate::VERSION;
@@ -711,23 +711,16 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
 
     let app = if let Some(ring) = object_ring.filter(|ring| ring.node_count() >= 3) {
         let policy = Arc::new(object_writeback_policy(ring.node_count()));
-        let (journal_store, migrated_journals) = JournalStore::open_for_binding(
-            config.cache.dir.join("object-writeback"),
-            MANAGED_STORAGE_BINDING_ID,
-        )?;
-        if migrated_journals > 0 {
-            eprintln!(
-                "verglas-cache-node {VERSION} migrated {migrated_journals} legacy writeback journals to storage binding {MANAGED_STORAGE_BINDING_ID}"
-            );
-        }
-        let journals = Arc::new(journal_store);
+        // Fragment-log transaction records are authoritative; this is only a
+        // volatile projection rebuilt from quorum-proven records.
+        let states = Arc::new(StateIndex::new());
         let metrics = Arc::new(WritebackMetrics::default());
         let _ = writeback_slot.set(Arc::clone(&metrics));
         let membership = ring.membership();
         let coordinator = Arc::new(WriteCoordinator::new(
             ring.transport(),
             Arc::clone(&membership),
-            journals,
+            states,
             metrics,
             Arc::clone(&origin),
             std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),

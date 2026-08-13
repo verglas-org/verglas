@@ -3,7 +3,7 @@
 //! exercised without a network or a live origin:
 //!
 //! - quorum ack accounting: an eligible write acks over `w` distinct nodes and
-//!   is counted as a quorum ack, with a dirty journal and placed fragments;
+//!   is counted as a quorum ack, with a dirty state and placed fragments;
 //! - configured-ring refusal: a live view that cannot support `w`, a mid-flight
 //!   shortfall, or exhausted fragment headroom fails without bypassing EC to the
 //!   origin;
@@ -29,8 +29,8 @@ use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
+use verglas_write::StateIndex;
 use verglas_write::coordinator::WriteCoordinator;
-use verglas_write::journal::JournalStore;
 use verglas_write::membership::LiveMembership;
 use verglas_write::metrics::WritebackMetrics;
 use verglas_write::reader::WritebackReader;
@@ -90,7 +90,13 @@ impl MemoryTransport {
 
     /// Count of stored fragments across all nodes.
     fn fragment_count(&self) -> usize {
-        self.inner.lock().expect("lock").frags.len()
+        self.inner
+            .lock()
+            .expect("lock")
+            .frags
+            .keys()
+            .filter(|(_, object_id, _)| !object_id.starts_with("tx-state:"))
+            .count()
     }
 
     /// Flips a byte in one stored fragment's payload while leaving its recorded
@@ -202,6 +208,26 @@ impl FragmentTransport for MemoryTransport {
             key.index,
         ));
         Ok(())
+    }
+
+    async fn list_prefix(
+        &self,
+        node: &NodeId,
+        prefix: &str,
+    ) -> Result<Vec<verglas_cluster::fragments::FragmentKey>, TransportError> {
+        let inner = self.inner.lock().expect("lock");
+        Ok(inner
+            .frags
+            .keys()
+            .filter_map(|(owner, object_id, index)| {
+                (owner == node.as_str() && object_id.starts_with(prefix)).then(|| {
+                    verglas_cluster::fragments::FragmentKey {
+                        object_id: object_id.clone(),
+                        index: *index,
+                    }
+                })
+            })
+            .collect())
     }
 }
 
@@ -386,12 +412,12 @@ fn build(
     origin: Arc<RecordingOrigin>,
 ) -> (Arc<WriteCoordinator<RecordingOrigin>>, tempfile::TempDir) {
     let dir = tempfile::tempdir().expect("tmp");
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("journals"));
+    let states = Arc::new(StateIndex::new());
     let metrics = Arc::new(WritebackMetrics::default());
     let coordinator = Arc::new(WriteCoordinator::new(
         transport,
         membership,
-        journals,
+        states,
         metrics,
         origin,
         Duration::from_secs(5),
@@ -451,15 +477,62 @@ async fn quorum_ack_places_w_fragments_and_counts_it() {
     let m = coordinator.metrics().snapshot();
     assert_eq!(m.acked_via_quorum, 1, "one quorum ack");
     assert_eq!(m.acked_via_write_through, 0, "no fallback");
-    // Three distinct fragments landed, and a dirty journal exists.
+    // Three distinct fragments landed, and a dirty state exists.
     assert_eq!(transport.fragment_count(), 3);
-    assert!(!coordinator.journals().is_idle(), "object is dirty");
+    assert!(!coordinator.states().is_idle(), "object is dirty");
     assert!(
         coordinator
-            .journals()
+            .states()
             .find_dirty("default", "bkt", "data/x")
             .is_some()
     );
+}
+
+/// The writer-local dirty index is deliberately disposable: a replacement
+/// coordinator discovers the immutable `tx-state:` records from the fragment
+/// ring and reconstructs read-your-writes before it attempts propagation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_rebuilds_dirty_index_from_quorum_state_records() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::new(true);
+    let (first, _dir) = build(
+        transport.clone(),
+        Arc::clone(&membership),
+        Arc::clone(&origin),
+    );
+    first
+        .put(
+            &ck("data/recover"),
+            &WriteMetadata::default(),
+            body(4096),
+            2,
+            1,
+            3,
+        )
+        .await
+        .expect("quorum ack");
+    first.shutdown();
+    let replacement = Arc::new(WriteCoordinator::new(
+        transport,
+        membership,
+        Arc::new(StateIndex::new()),
+        Arc::new(WritebackMetrics::default()),
+        origin,
+        Duration::from_millis(100),
+    ));
+    replacement.resume_propagation();
+    for _ in 0..20 {
+        if replacement
+            .states()
+            .find_dirty("default", "bkt", "data/recover")
+            .is_some()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("replacement did not recover quorum-proven state");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -487,7 +560,7 @@ async fn configured_ring_with_too_few_nodes_never_bypasses_ec() {
     assert_eq!(m.acked_via_write_through, 0, "no origin bypass");
     assert_eq!(m.acked_via_quorum, 0, "not a quorum ack");
     assert_eq!(transport.fragment_count(), 0, "no fragments placed");
-    assert!(coordinator.journals().is_idle(), "no dirty journal");
+    assert!(coordinator.states().is_idle(), "no dirty state");
     assert_eq!(origin.get("bkt", "data/x"), None, "origin was untouched");
 }
 
@@ -523,7 +596,7 @@ async fn midflight_shortfall_never_bypasses_ec() {
     assert_eq!(m.acked_via_write_through, 0, "no origin bypass");
     assert_eq!(m.acked_via_quorum, 0, "not a quorum ack");
     assert_eq!(origin.get("bkt", "data/x"), None, "origin was untouched");
-    assert!(coordinator.journals().is_idle(), "no dirty journal left");
+    assert!(coordinator.states().is_idle(), "no dirty state left");
     // Cleanup is async; wait on the condition, not the clock.
     assert!(
         wait_for_no_fragments(&transport).await,
@@ -591,16 +664,12 @@ async fn full_node_is_excluded_from_placement() {
     assert_eq!(transport.fragment_count(), 3, "three fragments placed");
     // No fragment landed on the full node.
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
+    let state = coordinator.states().read(&object_id).expect("some");
     assert!(
-        journal.placements.iter().all(|p| p.node != "node-1"),
+        state.placements.iter().all(|p| p.node != "node-1"),
         "the full node holds no fragment"
     );
 }
@@ -633,7 +702,7 @@ async fn configured_ring_without_headroom_never_bypasses_ec() {
     assert_eq!(m.acked_via_write_through, 0, "no origin bypass");
     assert_eq!(m.acked_via_quorum, 0, "not a quorum ack");
     assert_eq!(transport.fragment_count(), 0, "no fragments placed");
-    assert!(coordinator.journals().is_idle(), "no dirty journal");
+    assert!(coordinator.states().is_idle(), "no dirty state");
     assert_eq!(origin.get("bkt", "data/x"), None, "origin was untouched");
 }
 
@@ -680,7 +749,7 @@ async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
         None,
         "the completed delete is final"
     );
-    assert!(coordinator.journals().is_idle(), "dirty journal removed");
+    assert!(coordinator.states().is_idle(), "dirty state removed");
     assert!(
         wait_for_no_fragments(&transport).await,
         "propagated fragments are released"
@@ -776,7 +845,7 @@ async fn corrupt_fragment_reassembles_byte_identical() {
         .await
         .expect("ack");
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
 
@@ -786,12 +855,8 @@ async fn corrupt_fragment_reassembles_byte_identical() {
         "a data fragment was placed and corrupted"
     );
 
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
-    let rebuilt = coordinator.reassemble(&journal).await.expect("reassemble");
+    let state = coordinator.states().read(&object_id).expect("some");
+    let rebuilt = coordinator.reassemble(&state).await.expect("reassemble");
     assert_eq!(
         rebuilt, payload,
         "the corrupt fragment is erased; output is byte-identical"
@@ -821,7 +886,7 @@ async fn more_than_m_corrupt_fails_loudly() {
         .await
         .expect("ack");
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
 
@@ -829,13 +894,9 @@ async fn more_than_m_corrupt_fails_loudly() {
     assert!(transport.corrupt_fragment(&object_id, 0));
     assert!(transport.corrupt_fragment(&object_id, 1));
 
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
+    let state = coordinator.states().read(&object_id).expect("some");
     let err = coordinator
-        .reassemble(&journal)
+        .reassemble(&state)
         .await
         .expect_err("more than m corrupt cannot rebuild");
     assert!(
@@ -867,17 +928,13 @@ async fn repair_verifies_and_re_encodes_a_corrupt_survivor() {
         .await
         .expect("ack");
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
+    let state = coordinator.states().read(&object_id).expect("some");
     // Corrupt one placed fragment; every node stays live, so this is a pure
     // bit-rot repair (not a node-loss repair).
-    let victim = journal.placements[0].index;
+    let victim = state.placements[0].index;
     assert!(transport.corrupt_fragment(&object_id, victim));
 
     // repair_once is what the loop calls on an epoch change; call it directly.
@@ -888,12 +945,8 @@ async fn repair_verifies_and_re_encodes_a_corrupt_survivor() {
     );
 
     // After repair every fragment verifies and the object reassembles exactly.
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
-    let rebuilt = coordinator.reassemble(&journal).await.expect("reassemble");
+    let state = coordinator.states().read(&object_id).expect("some");
+    let rebuilt = coordinator.reassemble(&state).await.expect("reassemble");
     assert_eq!(rebuilt, payload, "repaired object is byte-identical");
 }
 
@@ -920,7 +973,7 @@ async fn scrubber_repairs_a_corrupt_fragment_and_counts_it() {
         .await
         .expect("ack");
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
 
@@ -938,12 +991,8 @@ async fn scrubber_repairs_a_corrupt_fragment_and_counts_it() {
     assert_eq!(m.fragments_repaired, 1);
 
     // A later read now has a full, verified set and reassembles byte-identically.
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
-    let rebuilt = coordinator.reassemble(&journal).await.expect("reassemble");
+    let state = coordinator.states().read(&object_id).expect("some");
+    let rebuilt = coordinator.reassemble(&state).await.expect("reassemble");
     assert_eq!(rebuilt, payload, "post-scrub read is byte-identical");
 }
 
@@ -994,16 +1043,12 @@ async fn node_loss_triggers_repair_from_survivors() {
         .await
         .expect("ack");
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("dirty");
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
+    let state = coordinator.states().read(&object_id).expect("some");
     // Pick a node that actually holds a fragment and kill it.
-    let victim = journal.placements[0].node.clone();
+    let victim = state.placements[0].node.clone();
     transport.kill(&victim);
     membership.drop_node(&victim);
 
@@ -1012,18 +1057,14 @@ async fn node_loss_triggers_repair_from_survivors() {
 
     // After repair every placement is on a live node and the object still
     // reassembles byte-identically.
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
+    let state = coordinator.states().read(&object_id).expect("some");
     let live: HashSet<String> = membership
         .live_nodes()
         .into_iter()
         .map(|n| n.as_str().to_owned())
         .collect();
-    assert!(journal.placements.iter().all(|p| live.contains(&p.node)));
-    let rebuilt = coordinator.reassemble(&journal).await.expect("reassemble");
+    assert!(state.placements.iter().all(|p| live.contains(&p.node)));
+    let rebuilt = coordinator.reassemble(&state).await.expect("reassemble");
     assert_eq!(rebuilt, payload);
 }
 
@@ -1059,8 +1100,8 @@ async fn acked_object_propagates_and_frees_fragments() {
     assert!(propagated, "object propagated to origin");
     assert_eq!(origin.get("bkt", "data/x"), Some(payload));
     assert!(
-        coordinator.journals().is_idle(),
-        "journal cleaned after propagation"
+        coordinator.states().is_idle(),
+        "state cleaned after propagation"
     );
     assert_eq!(
         transport.fragment_count(),
@@ -1099,7 +1140,7 @@ async fn propagation_keeps_retrying_until_origin_recovers() {
 
     assert_eq!(origin.get("bkt", "data/recover"), Some(payload));
     assert_eq!(coordinator.metrics().snapshot().propagated, 1);
-    assert!(coordinator.journals().is_idle());
+    assert!(coordinator.states().is_idle());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1129,16 +1170,12 @@ async fn streamed_large_object_acks_over_quorum_and_reassembles() {
 
     // The object reassembles byte-identically from its fragments.
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/big")
         .expect("dirty");
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
-    assert_eq!(journal.object_len, payload.len() as u64);
-    let rebuilt = coordinator.reassemble(&journal).await.expect("reassemble");
+    let state = coordinator.states().read(&object_id).expect("some");
+    assert_eq!(state.object_len, payload.len() as u64);
+    let rebuilt = coordinator.reassemble(&state).await.expect("reassemble");
     assert_eq!(rebuilt, payload, "streamed object reassembles exactly");
 }
 
@@ -1180,15 +1217,11 @@ async fn unpropagated_fragments_survive_disk_pressure() {
 
     // The dirty object still reassembles byte-identically from its fragments.
     let object_id = coordinator
-        .journals()
+        .states()
         .find_dirty("default", "bkt", "data/x")
         .expect("still dirty");
-    let journal = coordinator
-        .journals()
-        .read(&object_id)
-        .expect("read")
-        .expect("some");
-    let rebuilt = coordinator.reassemble(&journal).await.expect("reassemble");
+    let state = coordinator.states().read(&object_id).expect("some");
+    let rebuilt = coordinator.reassemble(&state).await.expect("reassemble");
     assert_eq!(rebuilt, payload, "object reassembles after disk pressure");
 }
 

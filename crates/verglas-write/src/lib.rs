@@ -10,21 +10,19 @@
 //! fragment-holding nodes within that window is data loss. This is a durability
 //! contract change and is therefore opt-in per prefix and off by default.
 //!
-//! ## Enforced write-through fallback
+//! ## Configured-ring shortfall
 //!
 //! Write-back acks over a quorum only when the live gossip view can place `w`
-//! fragments on distinct live nodes. A single node, a pod smaller than `w`, or
-//! a membership degraded below `w` makes the write fall back to a synchronous
-//! write-through to the origin — today's durable-ack behavior. Write-through is
-//! full durability, so the invariant "acked = durable at the origin OR durable
-//! on a quorum of distinct nodes" holds in every membership state. It is never a
-//! sub-quorum ack and never a rejected write for cluster size.
+//! fragments on distinct live nodes. A configured ring below `w` rejects the
+//! write before consuming its body; it never bypasses the EC contract through
+//! the origin. A genuine single-node deployment remains explicitly
+//! write-through, because it has no configured fragment quorum.
 //!
 //! ## Turn-off semantics
 //!
 //! "Verglas off" for a write-back prefix means flush-then-stop: drain the dirty
-//! journals to the origin, then stop. A crash mid-window is replayed on the next
-//! start from the fsynced journals and fragments. If more than `n - k` fragment
+//! states to the origin, then stop. A crash mid-window is replayed on the next
+//! start by scanning quorum-proven immutable state records and fragments. If more than `n - k` fragment
 //! nodes are also lost before propagation, the unpropagated writes in that
 //! window are lost — the stated cost of the contract.
 //!
@@ -33,13 +31,13 @@
 //! A commit that references a data file must not be published before that file
 //! is durable at the origin. With write-back, "durable at the origin" is the
 //! propagation point, not the ack. The safe rule is **flush-before-commit**:
-//! wait for the referenced objects to propagate (journal clean) before writing
+//! wait for the referenced objects to propagate (a release record) before writing
 //! the Iceberg commit. Read-your-writes covers intra-pod readers in the
 //! meantime; a direct-to-origin reader does not see the object until it
 //! propagates (the lag is bounded and observable via the counters).
 //!
-//! [`CommitBarrier`] (and [`JournalBarrier`], its implementation over the shared
-//! journal) is that rule made into a primitive the commit path calls: it awaits
+//! [`CommitBarrier`] (and [`TransactionRecordBarrier`], its implementation over the shared
+//! state) is that rule made into a primitive the commit path calls: it awaits
 //! the referenced data files' propagation before the commit is forwarded, or
 //! refuses the commit with a clear error when propagation cannot complete
 //! (#286). It sits on the commit path, never the ack or serve hot path.
@@ -53,22 +51,22 @@
 pub mod barrier;
 pub mod catalog_log;
 pub mod coordinator;
-pub mod journal;
 pub mod membership;
 pub mod meta;
 pub mod metrics;
 pub mod policy;
 pub mod reader;
+pub mod state;
 pub mod transport;
 pub mod writer;
 
-pub use barrier::{BarrierError, BarrierOutcome, CommitBarrier, JournalBarrier};
+pub use barrier::{BarrierError, BarrierOutcome, CommitBarrier, TransactionRecordBarrier};
 pub use coordinator::{ScrubReport, WriteCoordinator, WritebackError};
-pub use journal::{Journal, JournalState, JournalStore, Placement};
 pub use membership::{AgentMembership, LiveMembership, SingleNodeMembership};
 pub use metrics::{WritebackMetrics, WritebackMetricsSnapshot};
 pub use policy::{PrefixRule, WritebackPolicy};
 pub use reader::WritebackReader;
+pub use state::{Placement, StateIndex, TransactionRecord, TransactionState};
 pub use transport::{FragmentTransport, PeerFragmentTransport, TransportError};
 pub use writer::WritebackWriter;
 
@@ -98,7 +96,7 @@ where
     W: ObjectWrite,
 {
     /// Assembles the tier from its coordinator, the inner read path, the origin
-    /// writer, and the opt-in policy. Resumes any dirty journal propagation left
+    /// writer, and the opt-in policy. Resumes any dirty state propagation left
     /// by a previous run. There is no buffer cap: the coordinator streams every
     /// eligible write and gates on NVMe headroom, not object size.
     pub fn new(

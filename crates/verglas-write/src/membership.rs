@@ -78,7 +78,7 @@ impl LiveMembership for AgentMembership {
 /// deployment can never reach a fragment quorum of `w > 1`, so instead of the
 /// synchronous write-through fallback it fast-acks from local durability (#286):
 /// write-back degenerates to `k=1, m=0, w=1` — the single object fragment is
-/// fsynced to local NVMe and, with the fsynced journal, is the ack; propagation
+/// fsynced to local NVMe and, with the fsynced state, is the ack; propagation
 /// to the origin then runs in the background exactly as §6 specifies. The
 /// deployment story may put the buffer directory on a replicated block volume,
 /// but the server does not know or care — durability here is "one local disk

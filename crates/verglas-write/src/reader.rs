@@ -19,7 +19,7 @@ use verglas_core::read::{
 use verglas_core::write::ObjectWrite;
 
 use crate::coordinator::WriteCoordinator;
-use crate::journal::Journal;
+use crate::state::TransactionRecord;
 use std::sync::Arc;
 
 /// Wraps an inner read path and serves dirty (unpropagated) objects from
@@ -37,14 +37,14 @@ impl<R, W: ObjectWrite> WritebackReader<R, W> {
         Self { inner, coordinator }
     }
 
-    /// Looks up the dirty journal for `key`, or `None`. Cheap when idle.
-    fn dirty_journal(&self, key: &CacheKey) -> Option<Journal> {
-        let journals = self.coordinator.journals();
-        if journals.is_idle() {
+    /// Looks up the dirty state for `key`, or `None`. Cheap when idle.
+    fn dirty_state(&self, key: &CacheKey) -> Option<TransactionRecord> {
+        let states = self.coordinator.states();
+        if states.is_idle() {
             return None;
         }
-        let object_id = journals.find_dirty(&key.storage_binding_id, &key.bucket, &key.key)?;
-        journals.read(&object_id).ok().flatten()
+        let object_id = states.find_dirty(&key.storage_binding_id, &key.bucket, &key.key)?;
+        states.read(&object_id)
     }
 }
 
@@ -56,12 +56,12 @@ where
     /// Serves a dirty object by reassembling the requested range from
     /// fragments; delegates otherwise.
     async fn get(&self, key: &CacheKey, range: ReadRange) -> Result<ObjectGet, ReadError> {
-        let Some(journal) = self.dirty_journal(key) else {
+        let Some(state) = self.dirty_state(key) else {
             return self.inner.get(key, range).await;
         };
         let bytes = self
             .coordinator
-            .reassemble(&journal)
+            .reassemble(&state)
             .await
             .map_err(|e| ReadError::Backend(e.to_string()))?;
         let served = resolve_range(range, bytes.len() as u64)?;
@@ -74,7 +74,7 @@ where
         // a warm serve for the request-duration histogram (#46).
         served_from.set(ServedTier::Dram);
         Ok(ObjectGet {
-            meta: meta_for(&journal, bytes.len() as u64),
+            meta: meta_for(&state, bytes.len() as u64),
             range: served,
             body: once_body(bytes.slice(start..end)),
             served_from,
@@ -83,18 +83,18 @@ where
 
     /// Reports dirty metadata before propagation; delegates otherwise.
     async fn head(&self, key: &CacheKey) -> Result<ObjectMeta, ReadError> {
-        match self.dirty_journal(key) {
-            Some(journal) => Ok(meta_for(&journal, journal.object_len)),
+        match self.dirty_state(key) {
+            Some(state) => Ok(meta_for(&state, state.object_len)),
             None => self.inner.head(key).await,
         }
     }
 
-    /// Revalidates against the dirty journal's synthetic ETag; delegates
+    /// Revalidates against the dirty state's synthetic ETag; delegates
     /// otherwise.
     async fn revalidate(&self, key: &CacheKey, etag: &str) -> Result<Revalidation, ReadError> {
-        match self.dirty_journal(key) {
-            Some(journal) => {
-                let meta = meta_for(&journal, journal.object_len);
+        match self.dirty_state(key) {
+            Some(state) => {
+                let meta = meta_for(&state, state.object_len);
                 if meta.e_tag.as_deref() == Some(etag) {
                     Ok(Revalidation::Unchanged)
                 } else {
@@ -118,7 +118,7 @@ where
         range: ReadRange,
         options: DirectReadOptions,
     ) -> Result<DirectGet, ReadError> {
-        let Some(journal) = self.dirty_journal(key) else {
+        let Some(state) = self.dirty_state(key) else {
             return self.inner.get_direct(key, range, options).await;
         };
         if options.version_id.is_some() || options.part_number.is_some() {
@@ -126,7 +126,7 @@ where
         }
         let bytes = self
             .coordinator
-            .reassemble(&journal)
+            .reassemble(&state)
             .await
             .map_err(|error| ReadError::Backend(error.to_string()))?;
         let served = resolve_range(range, bytes.len() as u64)?;
@@ -135,7 +135,7 @@ where
         let end = usize::try_from(served.end)
             .map_err(|_| ReadError::Backend("range end overflow".to_owned()))?;
         Ok(DirectGet {
-            meta: dirty_direct_meta(&journal),
+            meta: dirty_direct_meta(&state),
             range: served,
             body: once_body(bytes.slice(start..end)),
         })
@@ -147,13 +147,13 @@ where
         key: &CacheKey,
         options: DirectReadOptions,
     ) -> Result<DirectMeta, ReadError> {
-        let Some(journal) = self.dirty_journal(key) else {
+        let Some(state) = self.dirty_state(key) else {
             return self.inner.head_direct(key, options).await;
         };
         if options.version_id.is_some() || options.part_number.is_some() {
             return self.inner.head_direct(key, options).await;
         }
-        Ok(dirty_direct_meta(&journal))
+        Ok(dirty_direct_meta(&state))
     }
 
     /// Reports the currently acknowledged dirty object instead of consulting
@@ -163,13 +163,13 @@ where
         key: &CacheKey,
         request: AttributesRequest,
     ) -> Result<ObjectAttributes, ReadError> {
-        let Some(journal) = self.dirty_journal(key) else {
+        let Some(state) = self.dirty_state(key) else {
             return self.inner.object_attributes(key, request).await;
         };
         if request.version_id.is_some() {
             return self.inner.object_attributes(key, request).await;
         }
-        let meta = meta_for(&journal, journal.object_len);
+        let meta = meta_for(&state, state.object_len);
         Ok(ObjectAttributes {
             e_tag: meta.e_tag,
             object_size: Some(meta.size),
@@ -183,9 +183,9 @@ where
 }
 
 /// Builds the direct-read envelope for a quorum-acked dirty object.
-fn dirty_direct_meta(journal: &Journal) -> DirectMeta {
+fn dirty_direct_meta(state: &TransactionRecord) -> DirectMeta {
     DirectMeta {
-        meta: meta_for(journal, journal.object_len),
+        meta: meta_for(state, state.object_len),
         version_id: None,
         parts_count: None,
         checksums: Checksums::default(),
@@ -193,10 +193,10 @@ fn dirty_direct_meta(journal: &Journal) -> DirectMeta {
 }
 
 /// Builds the object metadata a dirty read reports.
-fn meta_for(journal: &Journal, size: u64) -> ObjectMeta {
-    journal
+fn meta_for(state: &TransactionRecord, size: u64) -> ObjectMeta {
+    state
         .metadata
-        .to_object_meta(size, journal.etag.clone(), journal.created_ms)
+        .to_object_meta(size, state.etag.clone(), state.created_ms)
 }
 
 /// Resolves an HTTP byte range against a known object size.

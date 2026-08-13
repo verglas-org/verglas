@@ -1,7 +1,7 @@
-//! Serde-able copy of write metadata for the journal (#180).
+//! Serde-able copy of write metadata for the state (#180).
 //!
-//! `verglas_core::write::WriteMetadata` is not serde-able, so the journal keeps
-//! its own mirror and converts both ways. The journal must round-trip the PUT
+//! `verglas_core::write::WriteMetadata` is not serde-able, so the state keeps
+//! its own mirror and converts both ways. The state must round-trip the PUT
 //! metadata so a read-your-writes GET and the eventual origin propagation both
 //! report and store exactly what the client sent.
 
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use verglas_core::read::ObjectMeta;
 use verglas_core::write::WriteMetadata;
 
-/// The subset of write metadata the journal persists. Mirrors
+/// The subset of write metadata the state persists. Mirrors
 /// [`WriteMetadata`] field-for-field.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredMetadata {

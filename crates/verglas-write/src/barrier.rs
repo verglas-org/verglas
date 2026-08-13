@@ -4,7 +4,7 @@
 //! ## Why a barrier exists
 //!
 //! Write-back acks a data-file PUT once it is durable on the buffer (a fragment
-//! quorum in the §6 EC path, or one local-NVMe fragment plus the journal in the
+//! quorum in the §6 EC path, or one local-NVMe fragment plus the state in the
 //! single-node path), and propagates it to the origin in the background. Iceberg
 //! data files are invisible until a commit references them, so fast-acking the
 //! data files is safe on its own. What is *not* safe is publishing the commit —
@@ -21,14 +21,14 @@
 //!
 //! ## One abstraction over both durability backends
 //!
-//! The durability state the barrier reads is the write-back journal: an acked
+//! The durability state the barrier reads is the write-back state: an acked
 //! object is `Dirty` until its background propagation to the origin succeeds,
-//! then `Clean`. Both durability backends record their acks in the *same*
-//! [`JournalStore`] — the §6 EC quorum and the #286 single-node local fsync
-//! differ only in how a fragment becomes durable, not in how propagation is
-//! tracked. So a single barrier over the journal serves both backends, and
+//! then a replicated `Released` revision removes it from the projection. The
+//! [`StateIndex`] is a disposable local projection reconstructed from fragment
+//! logs; it is never an acknowledgement dependency. So a single barrier over
+//! the recovered state serves both backends, and
 //! [`CommitBarrier`] is the interface a future backend that tracked durability
-//! differently would implement instead of [`JournalBarrier`].
+//! differently would implement instead of [`TransactionRecordBarrier`].
 //!
 //! ## The transport-level-only retry rule
 //!
@@ -45,9 +45,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use verglas_core::CacheKey;
 
-use crate::journal::JournalStore;
+use crate::state::StateIndex;
 
-/// How often the barrier re-checks the journal while waiting. Small enough that
+/// How often the barrier re-checks the state while waiting. Small enough that
 /// the barrier adds only a short tail once propagation completes, large enough
 /// that a long wait is not a busy-loop. Not a tuning knob: it is a poll cadence,
 /// invisible to configuration.
@@ -87,8 +87,8 @@ pub struct BarrierOutcome {
 ///
 /// Implementations block until the referenced write-back objects are durable at
 /// the origin, or fail with [`BarrierError`] when that cannot be reached in the
-/// bounded wait. [`JournalBarrier`] is the implementation over the shared
-/// write-back journal; both durability backends feed that journal, so it serves
+/// bounded wait. [`TransactionRecordBarrier`] is the implementation over the shared
+/// write-back state; both durability backends feed that state, so it serves
 /// both (see the module docs).
 #[async_trait]
 pub trait CommitBarrier: Send + Sync {
@@ -113,24 +113,24 @@ pub trait CommitBarrier: Send + Sync {
     async fn await_all_dirty(&self, deadline: Duration) -> Result<BarrierOutcome, BarrierError>;
 }
 
-/// The commit barrier over the write-back journal.
+/// The commit barrier over the write-back state.
 ///
-/// Holds a share of the same [`JournalStore`] the coordinator acks and
-/// propagates against. Reading it is cheap: [`JournalStore::is_idle`] is a
+/// Holds a share of the same [`StateIndex`] the coordinator acks and
+/// propagates against. Reading it is cheap: [`StateIndex::is_idle`] is a
 /// single relaxed atomic load when nothing is dirty, so a barrier crossing on an
 /// idle buffer takes the fast path with no lock — the common case, and never on
 /// a serve or ack hot path (the barrier is on the commit path only).
-pub struct JournalBarrier {
-    /// The shared dirty journal both durability backends record against.
-    journals: Arc<JournalStore>,
+pub struct TransactionRecordBarrier {
+    /// The shared dirty state both durability backends record against.
+    states: Arc<StateIndex>,
 }
 
-impl JournalBarrier {
-    /// Builds a barrier over the coordinator's journal store. Pass
-    /// [`crate::WriteCoordinator::journals`]`().clone()` so the barrier reads the
+impl TransactionRecordBarrier {
+    /// Builds a barrier over the coordinator's state store. Pass
+    /// [`crate::WriteCoordinator::states`]`().clone()` so the barrier reads the
     /// exact dirty state the ack and propagation paths write.
-    pub fn new(journals: Arc<JournalStore>) -> Self {
-        Self { journals }
+    pub fn new(states: Arc<StateIndex>) -> Self {
+        Self { states }
     }
 
     /// Objects among `referenced` that are still dirty right now.
@@ -138,7 +138,7 @@ impl JournalBarrier {
         referenced
             .iter()
             .filter(|k| {
-                self.journals
+                self.states
                     .find_dirty(&k.storage_binding_id, &k.bucket, &k.key)
                     .is_some()
             })
@@ -147,7 +147,7 @@ impl JournalBarrier {
 }
 
 #[async_trait]
-impl CommitBarrier for JournalBarrier {
+impl CommitBarrier for TransactionRecordBarrier {
     async fn await_referenced(
         &self,
         referenced: &[CacheKey],
@@ -172,14 +172,14 @@ impl CommitBarrier for JournalBarrier {
 
     async fn await_all_dirty(&self, deadline: Duration) -> Result<BarrierOutcome, BarrierError> {
         let start = Instant::now();
-        let awaited = self.journals.dirty_object_ids().len();
+        let awaited = self.states.dirty_object_ids().len();
         loop {
-            if self.journals.is_idle() {
+            if self.states.is_idle() {
                 return Ok(BarrierOutcome { awaited });
             }
             if start.elapsed() >= deadline {
                 return Err(BarrierError::Timeout {
-                    pending: self.journals.dirty_object_ids().len(),
+                    pending: self.states.dirty_object_ids().len(),
                     waited_ms: start.elapsed().as_millis() as u64,
                 });
             }

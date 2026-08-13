@@ -653,3 +653,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #130: Passed cache coordinates to embedded query and writer dispatchers as endpoint lists. The one-node self-hosted server remains a one-member ring without retaining a separate selected-endpoint code path.
 - #127: Server-side fragment RPC placement now enters the durable append-batch
   store before it reports a local fragment durable.
+- #180: Removed the writer-local write-back journal from the acknowledgement
+  path. Object transaction state is now an immutable self-describing fragment
+  record replicated to the same `w` members as object data; startup rebuilds a
+  disposable index by scanning those records, and propagation appends a release
+  revision before reclaiming data and state fragments.

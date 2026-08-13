@@ -99,3 +99,5 @@
 - #127: Removed cache-startup handling for retired safekeeper descriptor/head
   files. The embedded Neon listener now recovers only the shared durable
   state-record protocol carried by the fragment segment plane.
+- #180: Object write-back uses the same fragment-segment state-record protocol:
+  no cache-node-local journal is opened or fsynced for a client acknowledgement.

@@ -48,19 +48,19 @@
   error (backpressure, never a silent drop); with the origin up it backpressures
   through a synchronous write-through.
 - #286: The commit barrier (barrier.rs). CommitBarrier is the durability gate a
-  table commit crosses before it may publish; JournalBarrier implements it over
-  the shared JournalStore. Because BOTH durability backends — the §6 EC quorum
-  and the #286 single-node local fsync — record their acks and propagation in the
-  same journal (Dirty until the origin write succeeds, then Clean), one barrier
-  over the journal serves both; CommitBarrier is the seam a future backend that
+  table commit crosses before it may publish; TransactionRecordBarrier reads the
+  recovered state projection. Quorum state is immutable in fragment segments
+  (Dirty until a replicated Released revision), so the local StateIndex is only
+  a disposable accelerator. One barrier over that projection serves both;
+  CommitBarrier is the seam a future backend that
   tracked durability differently would implement. `await_referenced` waits on
   exactly the data files a commit names; `await_all_dirty` is the conservative
   superset the loopback catalog POST path uses without parsing manifests. The
   bounded wait governs how long a COMMIT blocks, never the in-flight S3
   propagation — a timed-out commit is refused with a clear error while the
   buffered data stays put and keeps retrying (transport-level-only, no wall-clock
-  abandonment). Recovery-gates-serving falls out of the shared journal:
-  JournalStore::open rebuilds the dirty index from the fsynced journals at boot,
+  abandonment). Recovery-gates-serving falls out of the shared segment protocol:
+  fragment-prefix discovery rebuilds the dirty index from w-proven state records at boot,
   so a commit issued right after restart is gated on the recovered segment's
   replay to the origin. Wiring into the daemon's `/catalog` commit route is a
   documented seam in `bins/verglasd/src/admin.rs::catalog_request` (the tier is
