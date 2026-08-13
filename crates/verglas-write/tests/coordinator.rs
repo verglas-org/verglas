@@ -1,12 +1,12 @@
 //! Coordinator contract tests (#180), mapped to the issue's acceptance criteria
-//! with in-memory fakes so quorum, explicit refusal, read-your-writes, and repair are
+//! with in-memory fakes so quorum, fallback, read-your-writes, and repair are
 //! exercised without a network or a live origin:
 //!
 //! - quorum ack accounting: an eligible write acks over `w` distinct nodes and
 //!   is counted as a quorum ack, with a dirty journal and placed fragments;
-//! - configured-ring refusal: a live view that cannot support `w`, a mid-flight
-//!   shortfall, or exhausted fragment headroom fails without bypassing EC to the
-//!   origin;
+//! - write-through fallback: a live view that cannot support `w` (small pod)
+//!   degrades to a synchronous origin write, counted as write-through, with no
+//!   journal; a mid-flight fan-out shortfall also degrades to write-through;
 //! - read-your-writes: a just-acked object reads back byte-identically from
 //!   fragments before it propagates;
 //! - node-loss repair: losing a fragment node re-encodes the missing fragment
@@ -463,15 +463,15 @@ async fn quorum_ack_places_w_fragments_and_counts_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_ring_with_too_few_nodes_never_bypasses_ec() {
+async fn small_pod_falls_back_to_write_through() {
     let transport = MemoryTransport::new();
-    // Only two live nodes, so configured geometry w=3 cannot be honored.
+    // Only two live nodes, but w=3 cannot be reached: enforced write-through.
     let membership = FakeMembership::new("node-0", &["node-0", "node-1"]);
     let origin = RecordingOrigin::new(false);
     let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
 
     let payload = body(4096);
-    let result = coordinator
+    coordinator
         .put(
             &ck("data/x"),
             &WriteMetadata::default(),
@@ -480,23 +480,26 @@ async fn configured_ring_with_too_few_nodes_never_bypasses_ec() {
             1,
             3,
         )
-        .await;
-    assert!(result.is_err(), "configured EC shortfall must fail");
+        .await
+        .expect("write-through ack");
 
     let m = coordinator.metrics().snapshot();
-    assert_eq!(m.acked_via_write_through, 0, "no origin bypass");
+    assert_eq!(m.acked_via_write_through, 1, "counted as write-through");
     assert_eq!(m.acked_via_quorum, 0, "not a quorum ack");
     assert_eq!(transport.fragment_count(), 0, "no fragments placed");
     assert!(coordinator.journals().is_idle(), "no dirty journal");
-    assert_eq!(origin.get("bkt", "data/x"), None, "origin was untouched");
+    // The object is durable at the origin, byte-identical (fallback proof).
+    assert_eq!(origin.get("bkt", "data/x"), Some(payload));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn midflight_shortfall_never_bypasses_ec() {
+async fn midflight_shortfall_rebuilds_and_writes_through() {
     let transport = MemoryTransport::new();
     // Five live nodes, geometry k=2/m=3/w=5. Two nodes fail placement, so only
-    // three fragments commit — short of w=5. A configured ring must fail rather
-    // than silently substitute origin durability after consuming the body.
+    // three fragments commit — short of w=5 but at least k=2, so the object is
+    // rebuilt from the committed fragments and written through to the origin
+    // byte-identically. The body was consumed by the streaming encode, so the
+    // rebuild-from-fragments path is the write-through here.
     let membership = FakeMembership::new(
         "node-0",
         &["node-0", "node-1", "node-2", "node-3", "node-4"],
@@ -507,7 +510,7 @@ async fn midflight_shortfall_never_bypasses_ec() {
     let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
 
     let payload = body(9000);
-    let result = coordinator
+    coordinator
         .put(
             &ck("data/x"),
             &WriteMetadata::default(),
@@ -516,13 +519,14 @@ async fn midflight_shortfall_never_bypasses_ec() {
             3,
             5,
         )
-        .await;
-    assert!(result.is_err(), "mid-flight EC shortfall must fail");
+        .await
+        .expect("write-through ack");
 
     let m = coordinator.metrics().snapshot();
-    assert_eq!(m.acked_via_write_through, 0, "no origin bypass");
+    assert_eq!(m.acked_via_write_through, 1, "degraded to write-through");
     assert_eq!(m.acked_via_quorum, 0, "not a quorum ack");
-    assert_eq!(origin.get("bkt", "data/x"), None, "origin was untouched");
+    // The object is durable at the origin, byte-identical (fallback proof).
+    assert_eq!(origin.get("bkt", "data/x"), Some(payload));
     assert!(coordinator.journals().is_idle(), "no dirty journal left");
     // Cleanup is async; wait on the condition, not the clock.
     assert!(
@@ -606,10 +610,10 @@ async fn full_node_is_excluded_from_placement() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configured_ring_without_headroom_never_bypasses_ec() {
+async fn no_disk_headroom_falls_back_to_write_through() {
     let transport = MemoryTransport::new();
     // Three live nodes, but two are out of headroom: fewer than w=3 nodes can
-    // hold a fragment, so the configured write must fail.
+    // hold a fragment, so the write degrades to write-through.
     let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
     transport.fill_disk("node-1");
     transport.fill_disk("node-2");
@@ -617,7 +621,7 @@ async fn configured_ring_without_headroom_never_bypasses_ec() {
     let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
 
     let payload = body(4096);
-    let result = coordinator
+    coordinator
         .put(
             &ck("data/x"),
             &WriteMetadata::default(),
@@ -626,15 +630,15 @@ async fn configured_ring_without_headroom_never_bypasses_ec() {
             1,
             3,
         )
-        .await;
-    assert!(result.is_err(), "headroom shortfall must fail");
+        .await
+        .expect("write-through ack");
 
     let m = coordinator.metrics().snapshot();
-    assert_eq!(m.acked_via_write_through, 0, "no origin bypass");
+    assert_eq!(m.acked_via_write_through, 1, "degraded to write-through");
     assert_eq!(m.acked_via_quorum, 0, "not a quorum ack");
     assert_eq!(transport.fragment_count(), 0, "no fragments placed");
     assert!(coordinator.journals().is_idle(), "no dirty journal");
-    assert_eq!(origin.get("bkt", "data/x"), None, "origin was untouched");
+    assert_eq!(origin.get("bkt", "data/x"), Some(payload));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

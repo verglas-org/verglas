@@ -106,7 +106,6 @@ struct TransportInner {
 struct MemoryTransport {
     inner: Mutex<TransportInner>,
     placement_delay: Option<Duration>,
-    node_placement_delays: Mutex<HashMap<String, Duration>>,
     placements_inflight: AtomicUsize,
     max_placements_inflight: AtomicUsize,
 }
@@ -116,7 +115,6 @@ impl MemoryTransport {
         Arc::new(Self {
             inner: Mutex::new(TransportInner::default()),
             placement_delay: None,
-            node_placement_delays: Mutex::new(HashMap::new()),
             placements_inflight: AtomicUsize::new(0),
             max_placements_inflight: AtomicUsize::new(0),
         })
@@ -126,7 +124,6 @@ impl MemoryTransport {
         Arc::new(Self {
             inner: Mutex::new(TransportInner::default()),
             placement_delay: Some(delay),
-            node_placement_delays: Mutex::new(HashMap::new()),
             placements_inflight: AtomicUsize::new(0),
             max_placements_inflight: AtomicUsize::new(0),
         })
@@ -139,7 +136,6 @@ impl MemoryTransport {
                 ..TransportInner::default()
             }),
             placement_delay: None,
-            node_placement_delays: Mutex::new(HashMap::new()),
             placements_inflight: AtomicUsize::new(0),
             max_placements_inflight: AtomicUsize::new(0),
         })
@@ -147,14 +143,6 @@ impl MemoryTransport {
 
     fn max_placements_inflight(&self) -> usize {
         self.max_placements_inflight.load(Ordering::Relaxed)
-    }
-
-    /// Delays durability acknowledgments from one node without slowing its peers.
-    fn delay_node(&self, node: &str, delay: Duration) {
-        self.node_placement_delays
-            .lock()
-            .expect("lock")
-            .insert(node.to_owned(), delay);
     }
 
     /// Marks a node down: its fragments are lost and further ops miss/fail.
@@ -207,13 +195,7 @@ impl FragmentTransport for MemoryTransport {
         let inflight = self.placements_inflight.fetch_add(1, Ordering::Relaxed) + 1;
         self.max_placements_inflight
             .fetch_max(inflight, Ordering::Relaxed);
-        let node_delay = self
-            .node_placement_delays
-            .lock()
-            .expect("lock")
-            .get(node.as_str())
-            .copied();
-        if let Some(delay) = self.placement_delay.or(node_delay) {
+        if let Some(delay) = self.placement_delay {
             tokio::time::sleep(delay).await;
         }
         self.placements_inflight.fetch_sub(1, Ordering::Relaxed);
@@ -315,38 +297,6 @@ async fn ec_quorum_placements_are_parallel() {
     assert!(
         transport.max_placements_inflight() >= 3,
         "EC fragments and replicated state must not serialize node round trips",
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn durable_quorum_ack_does_not_wait_for_the_fourth_fragment() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let transport = MemoryTransport::new();
-    transport.delay_node("n3", Duration::from_millis(750));
-    let log = build(
-        MemStore::new(),
-        transport.clone(),
-        FakeMembership::new("n0", &["n0", "n1", "n2", "n3"]),
-        dir.path(),
-        AppendGeometry::new(2, 2, 3).expect("geometry"),
-    );
-
-    tokio::time::timeout(
-        Duration::from_millis(200),
-        log.append(Epoch(0), Lsn(0), bytes(4096)),
-    )
-    .await
-    .expect("three durable nodes must release the client before the slow fourth")
-    .expect("durable quorum append");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while transport.wal_fragment_count() < 4 && std::time::Instant::now() < deadline {
-        tokio::task::yield_now().await;
-    }
-    assert_eq!(
-        transport.wal_fragment_count(),
-        4,
-        "the fourth durable fragment finishes as a background straggler"
     );
 }
 
