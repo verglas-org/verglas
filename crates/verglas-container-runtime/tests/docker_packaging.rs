@@ -102,3 +102,56 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(!compose.contains("verglas-cache-node-2:"));
     assert!(compose.contains("127.0.0.1:8787:8787"));
 }
+
+#[test]
+fn dockerfile_packages_the_cluster_endpoint_pools() {
+    let dockerfile =
+        std::fs::read_to_string(repository_file("Dockerfile")).expect("read repository Dockerfile");
+
+    assert!(dockerfile.contains("-p verglas-ring-proxy"));
+    assert!(
+        dockerfile
+            .contains("/tmp/verglas-build/verglas-ring-proxy /usr/local/bin/verglas-ring-proxy")
+    );
+    assert!(dockerfile.contains(
+        "/tmp/verglas-build/verglas-safekeeper-pool /usr/local/bin/verglas-safekeeper-pool"
+    ));
+    assert!(dockerfile.contains("FROM runtime AS verglas-ring-proxy"));
+    assert!(dockerfile.contains("ENTRYPOINT [\"verglas-ring-proxy\"]"));
+    assert!(dockerfile.contains("FROM runtime AS verglas-safekeeper-pool"));
+    assert!(dockerfile.contains("ENTRYPOINT [\"verglas-safekeeper-pool\"]"));
+}
+
+#[test]
+fn standalone_and_cluster_compose_select_distinct_durability_topologies() {
+    let standalone = std::fs::read_to_string(repository_file("docker-compose.yml"))
+        .expect("read standalone Compose file");
+    let cluster = std::fs::read_to_string(repository_file("docker-compose.cluster.yml"))
+        .expect("read cluster Compose override");
+
+    assert!(
+        standalone.contains(
+            "VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-cache-node-0:8333"
+        )
+    );
+    assert!(standalone.contains("VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454"));
+    assert!(!standalone.contains("verglas-ring-proxy:"));
+    assert!(!standalone.contains("verglas-safekeeper-pool:"));
+
+    assert!(cluster.contains("verglas-ring-proxy:"));
+    assert!(cluster.contains("verglas-safekeeper-pool:"));
+    assert!(
+        cluster
+            .contains("VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333")
+    );
+    assert!(cluster.contains("VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-safekeeper-pool:5454"));
+    assert!(cluster.contains(
+        "VERGLAS_RING_S3_ENDPOINTS: http://verglas-cache-node-0:8333,http://verglas-cache-node-1:8333,http://verglas-cache-node-2:8333"
+    ));
+    assert!(cluster.contains(
+        "VERGLAS_RING_SAFEKEEPER_ENDPOINTS: verglas-cache-node-0:5454,verglas-cache-node-1:5454,verglas-cache-node-2:5454"
+    ));
+    assert!(cluster.contains(
+        "VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336,cache-1=verglas-cache-node-1:8336,cache-2=verglas-cache-node-2:8336"
+    ));
+}

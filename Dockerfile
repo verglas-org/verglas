@@ -20,6 +20,7 @@ RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registr
     -p verglas-scheduler-bin \
     -p verglas-container-runtime \
     -p verglas-cache-node \
+    -p verglas-ring-proxy \
     -p verglas-query \
     -p verglas-write-node \
     && mkdir -p /tmp/verglas-build \
@@ -29,6 +30,8 @@ RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registr
     && cp /src/target/release/verglas-scheduler /tmp/verglas-build/ \
     && cp /src/target/release/verglas-container-runtime /tmp/verglas-build/ \
     && cp /src/target/release/verglas-cache-node /tmp/verglas-build/ \
+    && cp /src/target/release/verglas-ring-proxy /tmp/verglas-build/ \
+    && cp /src/target/release/verglas-safekeeper-pool /tmp/verglas-build/ \
     && cp /src/target/release/verglas-neon-bootstrap /tmp/verglas-build/ \
     && cp /src/target/release/verglas-query /tmp/verglas-build/ \
     && cp /src/target/release/verglas-write /tmp/verglas-build/
@@ -150,6 +153,24 @@ RUN chmod 0755 /usr/local/bin/verglas-cache-node-start
 USER verglas
 EXPOSE 5454 8333 8334 8335 8336
 ENTRYPOINT ["verglas-cache-node-start"]
+
+FROM runtime AS verglas-ring-proxy
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /tmp/verglas-build/verglas-ring-proxy /usr/local/bin/verglas-ring-proxy
+USER verglas
+EXPOSE 8333
+ENTRYPOINT ["verglas-ring-proxy"]
+
+FROM runtime AS verglas-safekeeper-pool
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=build /tmp/verglas-build/verglas-safekeeper-pool /usr/local/bin/verglas-safekeeper-pool
+USER verglas
+EXPOSE 5454
+ENTRYPOINT ["verglas-safekeeper-pool"]
 
 FROM runtime AS verglas-server
 COPY --from=build /tmp/verglas-build/verglas-server /usr/local/bin/verglas-server

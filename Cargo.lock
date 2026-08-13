@@ -7816,6 +7816,7 @@ dependencies = [
  "typetag",
  "uuid",
  "verglas-api",
+ "verglas-ring-proxy",
 ]
 
 [[package]]
@@ -7980,6 +7981,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
+ "toml",
  "tower",
  "tracing",
  "tracing-appender",
@@ -8000,6 +8002,24 @@ dependencies = [
  "verglas-scheduler",
  "verglas-sdk",
  "verglas-vector",
+]
+
+[[package]]
+name = "verglas-ring-proxy"
+version = "0.1.1"
+dependencies = [
+ "axum",
+ "bytes",
+ "http 1.4.2",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.12.28",
+ "serde",
+ "sha2 0.10.9",
+ "thiserror",
+ "tokio",
+ "tower",
 ]
 
 [[package]]

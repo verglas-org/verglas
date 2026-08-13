@@ -788,7 +788,7 @@ fn internal_connection(
         catalog_uri: format!("{scheme}://127.0.0.1:{admin_port}/catalog"),
         token: catalog.resolve_bearer_token()?,
         warehouse: catalog.warehouse.clone(),
-        s3_endpoint: Some(format!("{scheme}://127.0.0.1:{s3_port}")),
+        s3_endpoints: vec![format!("{scheme}://127.0.0.1:{s3_port}")],
         region: config
             .backend
             .region
@@ -828,7 +828,7 @@ fn build_query_worker_dispatcher(
             std::path::PathBuf::from(&query_worker.binary),
             verglas_server::query_worker::QueryWorkerRuntimeConfig {
                 config_dir: dir.join("databases"),
-                cache_s3_endpoint: format!("{scheme}://127.0.0.1:{resolved_s3_port}"),
+                cache_s3_endpoints: vec![format!("{scheme}://127.0.0.1:{resolved_s3_port}")],
                 region: config
                     .backend
                     .region
@@ -878,7 +878,7 @@ fn build_write_worker_dispatcher(
             std::path::PathBuf::from(&write_worker.binary),
             verglas_server::write_worker::WriteWorkerRuntimeConfig {
                 config_dir: dir.join("databases"),
-                cache_s3_endpoint: format!("{scheme}://127.0.0.1:{resolved_s3_port}"),
+                cache_s3_endpoints: vec![format!("{scheme}://127.0.0.1:{resolved_s3_port}")],
                 region: config
                     .backend
                     .region
@@ -1209,15 +1209,20 @@ fn build_writeback_tier(
         Some(agent) => Arc::new(AgentMembership::new(agent.clone())),
         None => Arc::new(SingleNodeMembership::new(node_id)),
     };
-    let coordinator = Arc::new(WriteCoordinator::new(
+    let single_node = membership.is_single_node();
+    let coordinator = WriteCoordinator::new(
         transport,
         membership.clone(),
         journals,
         metrics,
         Arc::clone(&origin),
         std::time::Duration::from_millis(wb.ack_deadline_ms),
-    ));
-    let single_node = membership.is_single_node();
+    );
+    let coordinator = Arc::new(if single_node {
+        coordinator
+    } else {
+        coordinator.require_quorum()
+    });
     // Repair only makes progress when membership can change; a single-node
     // server never opens the window.
     if agent.is_some() {
@@ -1227,21 +1232,21 @@ fn build_writeback_tier(
             std::time::Duration::from_secs(2),
         );
     }
-    // The scrubber runs regardless of cluster mode: silent bit-rot has no
-    // membership event, so even a single node must scrub its fragments to catch
+    // Only clustered writes create fragments. Their scrubber catches silent
     // corruption before it accumulates past `m` (#220).
-    let _scrub = verglas_write::spawn_scrub_loop(
-        Arc::clone(&coordinator),
-        std::time::Duration::from_secs(wb.scrub_interval_secs),
-    );
+    if !single_node {
+        let _scrub = verglas_write::spawn_scrub_loop(
+            Arc::clone(&coordinator),
+            std::time::Duration::from_secs(wb.scrub_interval_secs),
+        );
+    }
     if single_node {
         eprintln!(
-            "verglas-server {VERSION} write-back tier enabled (single-node, ack_deadline={}ms) — opt-in per prefix; PUTs fast-ack from local durability (degenerate k=1 m=0 w=1) and propagate to the origin in the background; a commit awaits its data files' propagation via the barrier",
-            wb.ack_deadline_ms
+            "verglas-server {VERSION} write tier enabled (standalone) — opted-in PUTs write through to the origin before ACK",
         );
     } else {
         eprintln!(
-            "verglas-server {VERSION} write-back tier enabled (k={} m={} w={}, ack_deadline={}ms) — opt-in per prefix, degrades to write-through below quorum (#180)",
+            "verglas-server {VERSION} write-back tier enabled (k={} m={} w={}, ack_deadline={}ms) — opted-in PUTs require the configured EC quorum before ACK",
             wb.k, wb.m, wb.w, wb.ack_deadline_ms
         );
     }

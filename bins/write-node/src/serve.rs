@@ -161,7 +161,7 @@ fn connection_for_bearer(
         catalog_uri: config.catalog.uri.clone(),
         token: Some(caller_bearer),
         warehouse: config.catalog.warehouse.clone(),
-        s3_endpoint: Some(config.cache.s3_endpoint.clone()),
+        s3_endpoints: config.cache.s3_endpoints.clone(),
         region: config
             .cache
             .region
@@ -314,7 +314,7 @@ mod tests {
         WriteConfig {
             listen: crate::config::Listen { admin_port: 0 },
             cache: crate::config::CacheEndpoint {
-                s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                s3_endpoints: vec!["http://127.0.0.1:8333".to_owned()],
                 ..crate::config::CacheEndpoint::default()
             },
             catalog: verglas_core::config::Catalog {

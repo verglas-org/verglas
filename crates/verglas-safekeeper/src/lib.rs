@@ -3,12 +3,13 @@
 //! # The append-log contract
 //!
 //! This crate is the safekeeper component embedded in `verglas-cache-node`.
-//! Neon compute connects to one selected cache node using the ordinary
-//! safekeeper PostgreSQL protocol. The protocol adapter translates WAL pushes
+//! Neon compute connects through a workload-local pool to any cache node using
+//! the ordinary safekeeper PostgreSQL protocol. The protocol adapter translates WAL pushes
 //! into the [`AppendLog`] contract, and [`EcAppendLog`] commits the new bytes to
 //! the same fragment ring and NVMe substrate the cache node already operates.
 //! There is no second safekeeper deployment or Neon durability quorum: the
-//! selected Verglas ingress coordinates one EC quorum append.
+//! active Verglas ingress coordinates one EC quorum append, and another ingress
+//! recovers the same logical stream from ring-replicated state after failure.
 //!
 //! The one primitive Postgres needs that a read cache does not provide is a
 //! *durable commit*: a WAL record must be safe before it reaches S3. Everything
@@ -68,7 +69,8 @@
 //! ## 4. Flush-to-S3 lifecycle
 //!
 //! Acked appends accumulate into **segments** — contiguous LSN runs. When a
-//! segment fills (or on an explicit [`AppendLog::flush`]) it is sealed, its
+//! 16 MiB PostgreSQL WAL segment fills, a one-second low-volume deadline expires,
+//! or an explicit [`AppendLog::flush`] runs, it is sealed, its
 //! bytes are reassembled in order into one object, and that object is written to
 //! S3. Only after S3 confirms the object durable does the log drop the segment's
 //! local fragments and advance [`AppendLog::flushed_through`]. The order is

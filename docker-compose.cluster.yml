@@ -1,0 +1,152 @@
+# Cluster override for the open-source stack.
+#
+# Start it with both files so PostgreSQL pages, Iceberg objects, and WAL use
+# workload-local pools while cache nodes retain the EC durability quorum:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cluster.yml up -d --build
+
+x-cluster-cache-environment: &cluster-cache-environment
+  VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
+  VERGLAS_S3_ADDR: 0.0.0.0:8333
+  VERGLAS_BLOCK_ADDR: 0.0.0.0:8335
+  VERGLAS_RING_ADDR: 0.0.0.0:8336
+  VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336,cache-1=verglas-cache-node-1:8336,cache-2=verglas-cache-node-2:8336
+  VERGLAS_CLUSTER_SECRET: ${VERGLAS_CLUSTER_SECRET:-verglas-local-ring}
+  VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:5454
+  VERGLAS_SAFEKEEPER_EC_K: "2"
+  VERGLAS_SAFEKEEPER_EC_M: "1"
+  VERGLAS_SAFEKEEPER_EC_W: "3"
+  VERGLAS_SAFEKEEPER_BROKER_ENDPOINT: http://verglas-neon-broker:50051
+  VERGLAS_MANAGED_STORAGE_BUCKET: ${R2_BUCKET:?Set R2_BUCKET}
+  VERGLAS_MANAGED_STORAGE_ENDPOINT: ${R2_ENDPOINT:?Set R2_ENDPOINT}
+  VERGLAS_MANAGED_STORAGE_REGION: auto
+  VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:?Set R2_ACCESS_KEY_ID}
+  VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:?Set R2_SECRET_ACCESS_KEY}
+  VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
+  VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?Set VERGLAS_S3_SECRET_ACCESS_KEY}
+  VERGLAS_CACHE_CAPACITY: ${VERGLAS_POSTGRES_CACHE_CAPACITY:-1GB}
+  VERGLAS_CACHE_DRAM: ${VERGLAS_POSTGRES_CACHE_DRAM:-256MB}
+
+services:
+  verglas-access:
+    environment:
+      VERGLAS_MANAGED_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333
+      VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333
+      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-safekeeper-pool:5454
+    depends_on:
+      verglas-ring-proxy:
+        condition: service_healthy
+      verglas-safekeeper-pool:
+        condition: service_healthy
+
+  verglas-neon-bootstrap:
+    environment:
+      VERGLAS_MANAGED_POSTGRES_STORAGE_ENDPOINT: http://verglas-ring-proxy:8333
+      VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-safekeeper-pool:5454
+    depends_on:
+      verglas-ring-proxy:
+        condition: service_healthy
+      verglas-safekeeper-pool:
+        condition: service_healthy
+
+  verglas-cache-node-0:
+    environment:
+      <<: *cluster-cache-environment
+      VERGLAS_NODE_ID: cache-0
+      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-0:5454
+
+  verglas-cache-node-1:
+    build:
+      context: .
+      target: verglas-cache-node
+    image: verglas/verglas-cache-node:local
+    environment:
+      <<: *cluster-cache-environment
+      VERGLAS_NODE_ID: cache-1
+      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-1:5454
+    volumes:
+      - verglas-pg-cache-1:/var/lib/verglas
+    networks:
+      - default
+      - runtime
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  verglas-cache-node-2:
+    build:
+      context: .
+      target: verglas-cache-node
+    image: verglas/verglas-cache-node:local
+    environment:
+      <<: *cluster-cache-environment
+      VERGLAS_NODE_ID: cache-2
+      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-2:5454
+    volumes:
+      - verglas-pg-cache-2:/var/lib/verglas
+    networks:
+      - default
+      - runtime
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  verglas-ring-proxy:
+    build:
+      context: .
+      target: verglas-ring-proxy
+    image: verglas/verglas-ring-proxy:local
+    environment:
+      VERGLAS_RING_S3_LISTEN: 0.0.0.0:8333
+      VERGLAS_RING_S3_ENDPOINTS: http://verglas-cache-node-0:8333,http://verglas-cache-node-1:8333,http://verglas-cache-node-2:8333
+    networks:
+      - default
+      - runtime
+    depends_on:
+      verglas-cache-node-0:
+        condition: service_healthy
+      verglas-cache-node-1:
+        condition: service_healthy
+      verglas-cache-node-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--output", "/dev/null", "http://127.0.0.1:8333/"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  verglas-safekeeper-pool:
+    build:
+      context: .
+      target: verglas-safekeeper-pool
+    image: verglas/verglas-safekeeper-pool:local
+    environment:
+      VERGLAS_RING_SAFEKEEPER_LISTEN: 0.0.0.0:5454
+      VERGLAS_RING_SAFEKEEPER_ENDPOINTS: verglas-cache-node-0:5454,verglas-cache-node-1:5454,verglas-cache-node-2:5454
+    networks:
+      - default
+      - runtime
+    depends_on:
+      verglas-cache-node-0:
+        condition: service_healthy
+      verglas-cache-node-1:
+        condition: service_healthy
+      verglas-cache-node-2:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "5454"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+volumes:
+  verglas-pg-cache-1:
+  verglas-pg-cache-2:

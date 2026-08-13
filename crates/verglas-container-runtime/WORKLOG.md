@@ -57,3 +57,7 @@
   consistent and preserves DNS reachability from runtime-created containers.
 - #111: Updated the OSS packaging contract to require exactly one cache-node
   service instead of a three-process write-back topology.
+- #130: Packaged separate HTTP and safekeeper endpoint-pool images and added a
+  three-node Compose override. Standalone PostgreSQL uses its one cache node
+  directly; clustered PostgreSQL sends S3 traffic through the HTTP pool and WAL
+  through the logical safekeeper pool while the cache ring owns EC durability.

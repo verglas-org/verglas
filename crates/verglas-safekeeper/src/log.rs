@@ -6,9 +6,9 @@
 //!
 //! Appends are serialized through one async mutex over the durable manifest:
 //! the log is single-writer by contract, and serializing is what makes the
-//! assigned LSN order the commit order. The mutex is held across fragment
-//! placement so an ack is only ever handed out after its manifest record is
-//! fsynced — the durability point.
+//! assigned LSN order the commit order. Within one append, independent node
+//! placements run concurrently. The mutex is held until the EC quorum and its
+//! manifest record are fsynced — the durability point.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -105,10 +105,6 @@ pub fn reclaim_legacy_state_descriptors(store: &LocalFragmentStore) -> Result<us
 /// the fragment quorum and drain to `S` asynchronously. A single-node deployment
 /// has no independent quorum, so it flushes to `S` before acknowledging.
 pub struct EcAppendLog<S> {
-    /// Stable identity of the safekeeper whose state this log represents.
-    /// Safekeepers advance and flush independently, so their replicated state
-    /// keys must not collide even though they receive the same WAL stream.
-    node_id: u64,
     /// Backend binding used for durable WAL objects.
     storage_binding_id: String,
     /// The S3 origin: flush target and flushed-range read source.
@@ -136,7 +132,8 @@ pub struct EcAppendLog<S> {
     flushed: AtomicU64,
     /// Mirror of the writer epoch.
     epoch: AtomicU64,
-    /// Wakes the origin drain immediately after a newly acknowledged append.
+    /// Wakes the origin drain after the open WAL segment reaches its useful
+    /// offload size. The server timer bounds low-volume tail latency.
     flush_requested: Notify,
 }
 
@@ -152,7 +149,6 @@ where
     // Bundling would only rename the same eight inputs.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        node_id: u64,
         storage_binding_id: impl Into<String>,
         store: Arc<S>,
         bucket: impl Into<String>,
@@ -181,7 +177,6 @@ where
         let flushed = AtomicU64::new(manifest.flushed_through.0);
         let epoch = AtomicU64::new(manifest.epoch.0);
         Ok(Self {
-            node_id,
             storage_binding_id: storage_binding_id.into(),
             store,
             bucket: bucket.into(),
@@ -262,8 +257,6 @@ where
         digest.update(self.bucket.as_bytes());
         digest.update([0]);
         digest.update(self.prefix.trim_matches('/').as_bytes());
-        digest.update([0]);
-        digest.update(self.node_id.to_be_bytes());
         format!("sk/{:x}", digest.finalize())
     }
 
@@ -301,10 +294,18 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
+        let descriptor_results = futures::future::join_all(live.iter().cloned().map(|node| {
+            let record = descriptor_record.clone();
+            async move {
+                let result = self.transport.place(&node, record).await;
+                (node, result)
+            }
+        }))
+        .await;
         let mut descriptor_nodes = Vec::new();
-        for node in &live {
-            match self.transport.place(node, descriptor_record.clone()).await {
-                Ok(()) => descriptor_nodes.push(node.clone()),
+        for (node, result) in descriptor_results {
+            match result {
+                Ok(()) => descriptor_nodes.push(node),
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
                     revision = manifest.revision,
@@ -327,9 +328,18 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
+        let head_results =
+            futures::future::join_all(descriptor_nodes.iter().cloned().map(|node| {
+                let record = head_record.clone();
+                async move {
+                    let result = self.transport.place(&node, record).await;
+                    (node, result)
+                }
+            }))
+            .await;
         let mut heads = 0;
-        for node in &descriptor_nodes {
-            match self.transport.place(node, head_record.clone()).await {
+        for (node, result) in head_results {
+            match result {
                 Ok(()) => heads += 1,
                 Err(error) => tracing::warn!(
                     node = node.as_str(),
@@ -589,9 +599,9 @@ where
         self.manifest_store.persist(&manifest)
     }
 
-    /// Encodes `records` and places its fragments on distinct live nodes,
-    /// returning the placements once at least `w` are durable. Fewer than `w`
-    /// is not a durable ack: the partial placements are cleaned up and the
+    /// Encodes `records` and concurrently places its fragments on distinct live
+    /// nodes, returning the placements once at least `w` are durable. Fewer than
+    /// `w` is not a durable ack: the partial placements are cleaned up and the
     /// append fails, never a sub-quorum ack.
     async fn place(
         &self,
@@ -619,17 +629,28 @@ where
             }
         }
 
-        let mut placements = Vec::new();
-        for (index, fragment) in encoded.fragments.iter().enumerate() {
-            let Some(node) = nodes.get(index) else { break };
-            let record = FragmentRecord::new(
-                FragmentKey {
-                    object_id: object_id.to_owned(),
-                    index,
+        let placement_results =
+            futures::future::join_all(encoded.fragments.iter().zip(nodes.iter()).enumerate().map(
+                |(index, (fragment, node))| {
+                    let node = node.clone();
+                    let record = FragmentRecord::new(
+                        FragmentKey {
+                            object_id: object_id.to_owned(),
+                            index,
+                        },
+                        fragment.bytes.clone(),
+                    );
+                    async move {
+                        let result = self.transport.place(&node, record).await;
+                        (index, node, result)
+                    }
                 },
-                fragment.bytes.clone(),
-            );
-            match self.transport.place(node, record).await {
+            ))
+            .await;
+
+        let mut placements = Vec::new();
+        for (index, node, result) in placement_results {
+            match result {
                 Ok(()) => placements.push(Placement {
                     index,
                     node: node.as_str().to_owned(),
@@ -1009,11 +1030,12 @@ where
             object_len: encoded.object_len,
             placements: placements.clone(),
         };
-        {
+        let segment_reached_target = {
             let seg = &mut manifest.segments[idx];
             seg.appends.push(entry);
             seg.end = end;
-        }
+            seg.end.0.saturating_sub(seg.start.0) >= SEGMENT_TARGET
+        };
         if fresh {
             manifest.base = begin_lsn;
             manifest.flushed_through = begin_lsn;
@@ -1042,7 +1064,7 @@ where
             .store(manifest.flushed_through.0, Ordering::Relaxed);
         if write_through {
             self.flush_manifest(&mut manifest).await?;
-        } else {
+        } else if segment_reached_target {
             self.flush_requested.notify_one();
         }
 

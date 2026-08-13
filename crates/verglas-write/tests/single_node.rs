@@ -1,26 +1,8 @@
-//! Single-node write-back + commit barrier contract tests (#286).
+//! Standalone write-through durability contract tests.
 //!
-//! These map to the issue's acceptance criteria, with in-memory fakes so the
-//! fast-ack path, backpressure, the commit barrier's ordering, and
-//! recovery-gates-serving are exercised without a network or a live origin. The
-//! real crash-durability evidence (kill -9 the server between ack and flush,
-//! restart, segment reaches S3) lives in `tests/writeback-recovery/run.sh`.
-//!
-//! - `single_node_fast_acks_from_local_durability`: a one-node deployment acks a
-//!   PUT with the origin unreachable — durability is the local buffer, not an
-//!   origin round-trip (ack-implies-durable, local half).
-//! - `full_buffer_rejects_when_origin_down_never_silent_drop` /
-//!   `full_buffer_backpressures_through_origin_when_up`: at capacity the write
-//!   backpressures — write-through to the origin when it is up, a clear error
-//!   when it is down — never a silent drop.
-//! - `commit_barrier_waits_for_referenced_propagation`: a commit awaits its
-//!   referenced data file's propagation and proceeds only after it lands
-//!   (barrier ordering).
-//! - `commit_barrier_refuses_when_origin_unreachable`: with the origin down the
-//!   barrier times out with a clear error, the commit is refused, and the
-//!   buffered data stays put with its propagation still in flight.
-//! - `recovery_gates_serving_on_replay`: after a restart that recovers a dirty
-//!   journal, a commit is gated on the replay of that segment to the origin.
+//! One cache node is not a quorum. These tests prove that it never acknowledges
+//! local fragment or journal state and returns success only after the origin
+//! accepts the complete object.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -38,7 +20,6 @@ use verglas_core::write::{
     CompletedPartRef, CopyOutcome, MultipartCreation, ObjectWrite, PartInfo, PartUpload,
     PutOutcome, WriteBodyStream, WriteChecksum, WriteError, WriteMetadata,
 };
-use verglas_write::barrier::{BarrierError, CommitBarrier, JournalBarrier};
 use verglas_write::coordinator::WriteCoordinator;
 use verglas_write::journal::JournalStore;
 use verglas_write::membership::SingleNodeMembership;
@@ -161,9 +142,6 @@ impl GatedOrigin {
             puts: Mutex::new(HashMap::new()),
         })
     }
-    fn release(&self) {
-        self.blocked.store(false, Ordering::SeqCst);
-    }
     fn get(&self, bucket: &str, key: &str) -> Option<Bytes> {
         self.puts
             .lock()
@@ -270,8 +248,7 @@ fn body(len: usize) -> Bytes {
 }
 
 /// A single-node coordinator over the given transport, journal dir, and origin.
-/// The configured pod geometry (k=4,m=2,w=5) is what a clustered deployment
-/// would use; the single-node path degenerates it to (1,0,1) internally.
+/// The configured pod geometry is intentionally irrelevant in standalone mode.
 fn single_node_coordinator(
     transport: Arc<MemoryTransport>,
     journals: Arc<JournalStore>,
@@ -295,11 +272,9 @@ const POD_W: usize = 5;
 
 // ---- tests -----------------------------------------------------------------
 
-/// A one-node deployment acks a PUT while the origin is unreachable: the ack is
-/// the local fragment + journal fsync, not an origin round-trip. The object is
-/// left dirty (buffered) for background propagation.
+/// Standalone writes never acknowledge local cache state as durable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_node_fast_acks_from_local_durability() {
+async fn single_node_requires_origin_durability_before_ack() {
     let dir = TempDir::new().expect("tmp");
     let transport = MemoryTransport::new();
     let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
@@ -312,7 +287,7 @@ async fn single_node_fast_acks_from_local_durability() {
         Arc::clone(&metrics),
     );
 
-    let out = coord
+    let error = coord
         .put(
             &ck("data/f1"),
             &WriteMetadata::default(),
@@ -322,29 +297,18 @@ async fn single_node_fast_acks_from_local_durability() {
             POD_W,
         )
         .await
-        .expect("single-node PUT acks locally even with the origin down");
-    assert!(
-        out.e_tag.is_some(),
-        "the local ack carries a synthetic etag"
-    );
+        .expect_err("standalone PUT must fail while the origin is unavailable");
+    assert!(matches!(error, WriteError::Backend(_)), "{error:?}");
 
-    // Durable locally: one fragment placed, and the object is dirty (buffered).
-    assert_eq!(
-        transport.fragment_count(),
-        1,
-        "one local fragment (k=1,m=0)"
-    );
+    // Local cache state is never the standalone durability authority.
+    assert_eq!(transport.fragment_count(), 0, "no local fragment is acked");
     assert!(
-        journals.find_dirty("default", "bkt", "data/f1").is_some(),
-        "acked-but-unpropagated object is dirty in the journal"
+        journals.find_dirty("default", "bkt", "data/f1").is_none(),
+        "a failed origin write leaves no dirty write-back record"
     );
-    // Counted as a durable ack, not a write-through: no origin round-trip.
     let snap = metrics.snapshot();
-    assert_eq!(snap.acked_via_quorum, 1, "local-durability ack");
-    assert_eq!(
-        snap.acked_via_write_through, 0,
-        "no origin write on the ack path"
-    );
+    assert_eq!(snap.acked_via_quorum, 0, "no local quorum exists");
+    assert_eq!(snap.acked_via_write_through, 1, "origin path attempted");
 }
 
 /// At capacity with the origin down, the write is refused with a clear error —
@@ -386,10 +350,9 @@ async fn full_buffer_rejects_when_origin_down_never_silent_drop() {
     assert_eq!(transport.fragment_count(), 0);
 }
 
-/// At capacity with the origin up, the write backpressures through a synchronous
-/// write-through to the origin rather than fast-acking locally.
+/// Local headroom does not affect standalone origin write-through.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn full_buffer_backpressures_through_origin_when_up() {
+async fn standalone_writes_through_when_origin_is_available() {
     let dir = TempDir::new().expect("tmp");
     let transport = MemoryTransport::new();
     transport.set_no_headroom(true);
@@ -422,193 +385,8 @@ async fn full_buffer_backpressures_through_origin_when_up() {
     let snap = metrics.snapshot();
     assert_eq!(
         snap.acked_via_write_through, 1,
-        "backpressure = synchronous write-through"
+        "standalone ACK follows synchronous write-through"
     );
     assert!(journals.is_idle(), "write-through leaves nothing buffered");
-}
-
-/// A commit awaits its referenced data file's propagation: it does not proceed
-/// while the file is still buffered, and returns once the origin has it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_barrier_waits_for_referenced_propagation() {
-    let dir = TempDir::new().expect("tmp");
-    let transport = MemoryTransport::new();
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
-    let origin = GatedOrigin::new(true); // hold propagation
-    let metrics = Arc::new(WritebackMetrics::default());
-    let coord = single_node_coordinator(
-        Arc::clone(&transport),
-        Arc::clone(&journals),
-        Arc::clone(&origin),
-        Arc::clone(&metrics),
-    );
-
-    coord
-        .put(
-            &ck("data/f1"),
-            &WriteMetadata::default(),
-            body(2048),
-            POD_K,
-            POD_M,
-            POD_W,
-        )
-        .await
-        .expect("fast-ack");
-    assert!(
-        journals.find_dirty("default", "bkt", "data/f1").is_some(),
-        "buffered, not yet at origin"
-    );
-
-    let barrier = JournalBarrier::new(Arc::clone(&journals));
-    // The commit blocks while the file is dirty...
-    let quick = barrier
-        .await_referenced(&[ck("data/f1")], Duration::from_millis(80))
-        .await;
-    assert!(
-        matches!(quick, Err(BarrierError::Timeout { .. })),
-        "blocks while buffered"
-    );
-
-    // ...release the origin; the background propagation lands the file...
-    origin.release();
-    // ...and now the barrier crosses, only after the referenced file is durable.
-    let crossed = barrier
-        .await_referenced(&[ck("data/f1")], Duration::from_secs(5))
-        .await
-        .expect("barrier crosses once the referenced file reaches the origin");
-    assert_eq!(crossed.awaited, 1, "it waited on the one referenced file");
-    assert_eq!(
-        origin.get("bkt", "data/f1"),
-        Some(body(2048)),
-        "file is at the origin"
-    );
-    assert!(journals.is_idle(), "propagation marked it clean");
-}
-
-/// With the origin unreachable, the commit barrier times out with a clear error,
-/// the commit is refused, and the buffered data stays put — its propagation is
-/// never abandoned on the wall clock (transport-level-only retry).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn commit_barrier_refuses_when_origin_unreachable() {
-    let dir = TempDir::new().expect("tmp");
-    let transport = MemoryTransport::new();
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
-    let origin = GatedOrigin::new(true); // never released
-    let metrics = Arc::new(WritebackMetrics::default());
-    let coord = single_node_coordinator(
-        Arc::clone(&transport),
-        Arc::clone(&journals),
-        Arc::clone(&origin),
-        Arc::clone(&metrics),
-    );
-
-    coord
-        .put(
-            &ck("data/f1"),
-            &WriteMetadata::default(),
-            body(1024),
-            POD_K,
-            POD_M,
-            POD_W,
-        )
-        .await
-        .expect("fast-ack");
-
-    let barrier = JournalBarrier::new(Arc::clone(&journals));
-    let err = barrier
-        .await_all_dirty(Duration::from_millis(150))
-        .await
-        .expect_err("origin down: the commit is refused");
-    match err {
-        BarrierError::Timeout { pending, .. } => assert_eq!(pending, 1),
-    }
-    // The data is still buffered and dirty: nothing was dropped or abandoned.
-    assert!(
-        journals.find_dirty("default", "bkt", "data/f1").is_some(),
-        "data safe, still in flight"
-    );
-    assert!(
-        origin.get("bkt", "data/f1").is_none(),
-        "never published to a down origin"
-    );
-}
-
-/// After a restart that recovers a dirty journal from disk, a commit is gated on
-/// the replay of that recovered segment to the origin: the barrier does not
-/// cross until recovery propagation lands the file.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn recovery_gates_serving_on_replay() {
-    let dir = TempDir::new().expect("tmp");
-    let transport = MemoryTransport::new(); // fragments persist across the "crash"
-    let origin = GatedOrigin::new(true); // origin down through the crash
-    let metrics = Arc::new(WritebackMetrics::default());
-
-    // Phase 1: ack a write, then "crash" before propagation (drop the coordinator
-    // without ever releasing the origin). The journal is fsynced to `dir`.
-    {
-        let journals = Arc::new(JournalStore::open(dir.path()).expect("open"));
-        let coord = single_node_coordinator(
-            Arc::clone(&transport),
-            Arc::clone(&journals),
-            Arc::clone(&origin),
-            Arc::clone(&metrics),
-        );
-        coord
-            .put(
-                &ck("data/f1"),
-                &WriteMetadata::default(),
-                body(4096),
-                POD_K,
-                POD_M,
-                POD_W,
-            )
-            .await
-            .expect("fast-ack");
-        assert!(journals.find_dirty("default", "bkt", "data/f1").is_some());
-        // Process death: dropping the coordinator does NOT cancel its spawned
-        // propagation task (it holds its own Arc), so without shutdown() the
-        // "crashed" run's retry loop would keep running and race the phase-2
-        // recovery replay — whichever won, the loser's JournalStore kept a
-        // stale dirty index and the barrier below timed out flakily.
-        coord.shutdown();
-    }
-
-    // Phase 2: restart. Reopening the journal store rebuilds the dirty index from
-    // disk — this is boot recovery, and serving of commits is gated on it.
-    let journals = Arc::new(JournalStore::open(dir.path()).expect("reopen"));
-    assert!(
-        journals.find_dirty("default", "bkt", "data/f1").is_some(),
-        "recovery rebuilt the dirty segment from the fsynced journal"
-    );
-    let coord = single_node_coordinator(
-        Arc::clone(&transport),
-        Arc::clone(&journals),
-        Arc::clone(&origin),
-        Arc::clone(&metrics),
-    );
-    coord.resume_propagation(); // recovery replay begins (blocked on the down origin)
-
-    let barrier = JournalBarrier::new(Arc::clone(&journals));
-    // A commit issued right after restart is gated: the recovered segment is not
-    // at the origin yet.
-    assert!(
-        barrier
-            .await_all_dirty(Duration::from_millis(80))
-            .await
-            .is_err(),
-        "commit gated on recovery replay"
-    );
-
-    // Recovery completes once the origin returns; the barrier then crosses.
-    origin.release();
-    barrier
-        .await_all_dirty(Duration::from_secs(5))
-        .await
-        .expect("barrier crosses once recovery replays the segment to the origin");
-    assert_eq!(
-        origin.get("bkt", "data/f1"),
-        Some(body(4096)),
-        "the recovered segment reached the origin"
-    );
-    assert!(journals.is_idle());
+    assert_eq!(transport.fragment_count(), 0, "no EC state was created");
 }

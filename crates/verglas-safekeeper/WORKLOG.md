@@ -63,3 +63,8 @@
   A one-node safekeeper now flushes and reclaims each staged WAL append before
   acknowledgement; multi-node EC deployments retain quorum acknowledgement and
   asynchronous origin drain.
+- #130: Made recovery state identify the database timeline rather than the ingress node, so another cache member can resume the same WAL stream without duplicating the EC durability quorum. Background origin drain now accumulates the two 8 MiB Neon frames in a 16 MiB PostgreSQL WAL segment, while the one-second timer and explicit flush bound low-volume and pause latency.
+- #130: Parallelized each append's independent EC fragment writes and both
+  phases of quorum state publication across the ring. The acknowledgement still
+  waits for the configured durable quorum, but no longer serializes one
+  NVMe/network round trip per cache member.

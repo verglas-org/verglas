@@ -150,6 +150,22 @@ verglas workers create \
   --file examples/workers/market-data-ingest/worker.toml
 ```
 
+The default stack is standalone. Its single cache and WAL node acknowledges
+only after the origin accepts each write. Use the cluster override when the
+deployment has three independent cache failure domains:
+
+```sh
+docker compose \
+  -f docker-compose.yml \
+  -f docker-compose.cluster.yml \
+  up -d --build
+```
+
+The cluster override gives PostgreSQL pageserver and Lakekeeper one HTTP pool
+over all cache nodes. It gives Neon compute one logical safekeeper pool. Cache
+nodes retain the EC quorum: the pool selects an ingress but never represents a
+second durability quorum.
+
 The [Workers guide](docs/workers/overview.mdx) shows the complete program and
 manifest before running it manually, through an HTTP callback, on cron, and
 from a RabbitMQ CloudEvent.

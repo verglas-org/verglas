@@ -2891,7 +2891,7 @@ mod tests {
             std::path::PathBuf::from("/binary/that/must/not/be/spawned"),
             crate::query_worker::QueryWorkerRuntimeConfig {
                 config_dir: dir.join("databases"),
-                cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                cache_s3_endpoints: vec!["http://127.0.0.1:8333".to_owned()],
                 region: "auto".to_owned(),
                 credentials_file: dir.join("credentials"),
                 admin_origin: "http://127.0.0.1:8334".to_owned(),

@@ -51,7 +51,7 @@ use crate::sizing;
 pub struct AppState {
     /// The Iceberg catalog, opened once at startup against the configured
     /// cache-owned `[metadata]` endpoint and reading data only through the configured
-    /// `[cache].s3_endpoint`.
+    /// `[cache].s3_endpoints`.
     pub catalog: Arc<dyn Catalog>,
     /// Long-lived DataFusion catalog session, replaced only when the cache
     /// watcher exposes a new prepared-catalog generation.

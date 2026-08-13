@@ -28,8 +28,8 @@ pub struct WriteWorkerDispatcher {
 pub struct WriteWorkerRuntimeConfig {
     /// Directory that receives database-specific TOML files.
     pub config_dir: PathBuf,
-    /// Cache-routed S3 endpoint used for every object write.
-    pub cache_s3_endpoint: String,
+    /// Cache-routed S3 endpoints used for every object write.
+    pub cache_s3_endpoints: Vec<String>,
     /// Region passed to the S3 client.
     pub region: String,
     /// Restricted credentials file for the cache S3 endpoint.
@@ -48,9 +48,9 @@ impl WriteWorkerRuntimeConfig {
         let config_path = self.config_dir.join(format!("{}.toml", database.as_str()));
         let rendered = format!(
             "[listen]\nadmin_port = 0\n\n\
-             [cache]\ns3_endpoint = \"{}\"\nregion = \"{}\"\ncredentials_file = \"{}\"\n\n\
+             [cache]\ns3_endpoints = {}\nregion = \"{}\"\ncredentials_file = \"{}\"\n\n\
              [catalog]\nuri = \"{}/v1/databases/{}/catalog\"\n",
-            self.cache_s3_endpoint,
+            toml_string_array(&self.cache_s3_endpoints),
             self.region,
             self.credentials_file.display(),
             self.admin_origin.trim_end_matches('/'),
@@ -60,6 +60,11 @@ impl WriteWorkerRuntimeConfig {
             .map_err(|error| format!("write write role config: {error}"))?;
         Ok(config_path)
     }
+}
+
+/// Renders endpoint values as a valid TOML string array.
+fn toml_string_array(values: &[String]) -> String {
+    toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect()).to_string()
 }
 
 impl WriteWorkerDispatcher {
@@ -222,7 +227,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("config dir");
         let runtime = WriteWorkerRuntimeConfig {
             config_dir: dir.path().to_owned(),
-            cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+            cache_s3_endpoints: vec!["http://127.0.0.1:8333".to_owned()],
             region: "auto".to_owned(),
             credentials_file: dir.path().join("credentials"),
             admin_origin: "http://127.0.0.1:8334".to_owned(),
@@ -245,7 +250,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("config dir");
         let declaration = WriteWorkerRuntimeConfig {
             config_dir: dir.path().to_owned(),
-            cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+            cache_s3_endpoints: vec!["http://127.0.0.1:8333".to_owned()],
             region: "auto".to_owned(),
             credentials_file: dir.path().join("credentials"),
             admin_origin: "http://127.0.0.1:8334".to_owned(),
@@ -267,7 +272,7 @@ mod tests {
             PathBuf::from("verglas-write"),
             WriteWorkerRuntimeConfig {
                 config_dir: dir.path().to_owned(),
-                cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                cache_s3_endpoints: vec!["http://127.0.0.1:8333".to_owned()],
                 region: "auto".to_owned(),
                 credentials_file: dir.path().join("credentials"),
                 admin_origin: "http://127.0.0.1:8334".to_owned(),
@@ -306,7 +311,7 @@ mod tests {
             PathBuf::from("/binary/that/must/not/be/spawned"),
             WriteWorkerRuntimeConfig {
                 config_dir: dir.path().to_owned(),
-                cache_s3_endpoint: "http://127.0.0.1:8333".to_owned(),
+                cache_s3_endpoints: vec!["http://127.0.0.1:8333".to_owned()],
                 region: "auto".to_owned(),
                 credentials_file: dir.path().join("credentials"),
                 admin_origin: "http://127.0.0.1:8334".to_owned(),

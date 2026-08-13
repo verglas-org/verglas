@@ -129,3 +129,4 @@
 
 - #66: Rewrote fixed-memory query comments and the compaction e2e header so they no longer mention microVMs or Verglas Cloud.
 - #66: Rewrote engine/connection docs so endpoints are self-host or direct object storage, without a cloud-committer contrast.
+- #130: Moved cache-ring endpoint selection below Iceberg FileIO and retained fixed 8 MiB multipart parts. Reads and every object class written by Iceberg now use stable per-object placement across all assigned cache endpoints, while multipart operations remain on one member.

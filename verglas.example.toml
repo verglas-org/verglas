@@ -109,10 +109,9 @@ binary = "/usr/local/bin/verglas-write"
 # background. This is a DURABILITY CONTRACT CHANGE: during the lag between ack
 # and origin upload the pod is the only copy of the object (as fragments), so
 # losing more than `m` fragment nodes in that window is data loss. That is why it
-# is opt-in per prefix. When the live pod cannot place `w` fragments (single
-# node, small or degraded pod), the write falls back to synchronous
-# write-through to the origin — today's durable-ack behavior — so a write is
-# never acked sub-quorum and never rejected for cluster size. Iceberg ordering:
+# is opt-in per prefix. A standalone node always writes synchronously through
+# to the origin. A configured cluster never acknowledges below its EC quorum;
+# a quorum shortfall rejects the write. Iceberg ordering:
 # wait for referenced data files to propagate (journal clean) before writing the
 # commit (flush-before-commit).
 [cache.writeback]
@@ -121,20 +120,11 @@ k = 4                     # data fragments
 m = 2                     # parity fragments
 w = 5                     # fragments durable on distinct live nodes to ack;
                           # k <= w <= k+m. Post-ack node-loss tolerance is w-k.
-ack_deadline_ms = 2000    # gather w durable fragments within this, else write-through
-# k/m/w are the pod geometry for a multi-node deployment. A SINGLE-NODE
-# deployment (no [cluster]) cannot form a fragment quorum, so with write-back
-# enabled it fast-acks from LOCAL durability instead: the coding degenerates to
-# k=1, m=0, w=1 — one fragment fsynced to local NVMe plus the fsynced journal is
-# the ack, no origin round-trip on the write path, then background propagation to
-# the origin exactly as the pod path does. This needs no configuration; k/m/w
-# above are simply ignored on one node. Loss semantics, stated plainly: the
-# durability of an acknowledged-but-unpropagated single-node write is one local
-# disk until propagation completes — a dead disk before propagation loses those
-# uncommitted files. COMMITTED table state is never affected: the commit barrier
-# orders propagation before a table publishes, so the catalog never points at
-# files missing from the origin. (The deployment story may put the buffer
-# directory on a replicated block volume; the server neither knows nor relies on it.)
+ack_deadline_ms = 2000    # gather w durable fragments within this, else reject
+# k/m/w are the pod geometry for a multi-node deployment. A single-node
+# deployment cannot form a fragment quorum and therefore uses synchronous
+# origin write-through. The local cache is populated only after the origin
+# accepts the write.
 # There is no fragment size setting (#223): fragments share the one NVMe budget
 # (cache.capacity_bytes) with the read cache, first come, first served.
 # Fragments are transient — held only until the object propagates to the

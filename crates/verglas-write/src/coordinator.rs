@@ -230,20 +230,13 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         // and failed writes release it when this function returns.
         let key_guard = self.key_lock(key).lock_owned().await;
         let live = self.membership.live_nodes();
-        // Single-node write-back (#286): a one-node deployment can never form a
-        // fragment quorum, but it can fast-ack from local durability. Degenerate
-        // the coding to k=1, m=0, w=1 — one fragment fsynced to local NVMe plus
-        // the fsynced journal is the ack, no origin round-trip on the write path,
-        // and background propagation runs exactly as the §6 quorum path does.
-        // This is chosen only for a genuine one-node deployment; a multi-node pod
-        // degraded to one live member keeps the safe write-through fallback below,
-        // so §6 quorum behavior is untouched (the branch is never taken there).
-        // No new configuration: write-back enabled + single-node membership picks
-        // this mode. If the local buffer is full the headroom check below still
-        // degrades to write-through (backpressure), never a silent drop.
-        let (k, m, w) = if self.membership.is_single_node() {
-            (1, 0, 1)
-        } else if live.len() < w {
+        // One cache node is one failure domain, not a durability quorum. A
+        // standalone deployment therefore acknowledges only after the origin
+        // accepts the complete write and never creates dirty EC state.
+        if self.membership.is_single_node() {
+            return self.write_through_stream(key, metadata, body).await;
+        }
+        let (k, m, w) = if live.len() < w {
             // Enforced fallback: the live view cannot place `w` distinct
             // fragments. Decided before the body is consumed, so write-through
             // re-streams it.

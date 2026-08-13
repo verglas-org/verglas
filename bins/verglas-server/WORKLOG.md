@@ -605,6 +605,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Docker previously granted it 1,048,576, so a future socket or cache leak could
   exhaust the host file table instead of failing inside the container.
 - #18: Added an explicit environment-configured startup mode for the Docker image. The Compose application now supplies cache, R2, catalog, endpoint-auth, and execution-role settings directly and no longer copies or mounts a server TOML or credentials directory.
+- #111: Made deployment topology select one unambiguous write contract. A
+  standalone server writes through to origin before ACK; a clustered server
+  requires its configured EC fragment quorum and never acknowledges a
+  sub-quorum write.
 - #16: Wired the optional Rill analytics runtime into the on-prem REST composition from validated server configuration. Rill receives the resolved Verglas S3 credentials only over the private deployment network, while deployments without analytics keep the dashboard routes absent. The admin integration-test startup window now covers a cold instrumented cache boot instead of failing at five seconds.
 - #18: Added Postgres and its health gate to the optional Workers Compose profile so the documented scheduler starts as a complete application. The base storage, catalog, query, and analytics paths remain independent of that profile.
 - #29: Opened the persistent KV engine automatically beneath every server's existing cache directory and exposed it through both authenticated serving boundaries. The engine requires no KV configuration, survives process termination, and remains independent from object-cache purge and eviction.
@@ -646,3 +650,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #109: Kept database gateway lookup compatible with the merged immutable database-name contract.
   The consolidated server now passes the resolved name directly and remains clean under clippy.
 - #20: Required the configured Access edge for isolated write workers so acknowledged Iceberg snapshots publish durable table events before the write response succeeds.
+- #130: Passed cache coordinates to embedded query and writer dispatchers as endpoint lists. The one-node self-hosted server remains a one-member ring without retaining a separate selected-endpoint code path.
