@@ -88,3 +88,21 @@ async fn unknown_semantic_uri_is_not_dispatched() {
         .expect("route response");
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+/// Tag-resource paths percent-decode the exact AWS ARN before dispatch.
+#[tokio::test]
+async fn tag_route_decodes_an_aws_shaped_resource_arn() {
+    let api = Arc::new(RecordingApi(Mutex::new(Vec::new())));
+    let app = router(api);
+    let arn =
+        "arn%3Aaws%3As3vectors%3Aus-east-1%3A000000000000%3Abucket%2Fdocs%2Findex%2Fembeddings";
+    let response = app
+        .oneshot(
+            Request::get(format!("/tags/{arn}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("route response");
+    assert_eq!(response.status(), StatusCode::OK);
+}

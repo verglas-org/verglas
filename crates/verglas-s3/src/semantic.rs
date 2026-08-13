@@ -135,7 +135,10 @@ async fn dispatch_s3(
     };
     let mut input = body.map_or(Value::Object(Default::default()), |body| body.0);
     if let Some(resource) = uri.path().strip_prefix("/tags/") {
-        input["resourceArn"] = Value::String(resource.to_owned());
+        let Ok(resource) = percent_encoding::percent_decode_str(resource).decode_utf8() else {
+            return not_found();
+        };
+        input["resourceArn"] = Value::String(resource.into_owned());
     }
     dispatch(state, operation, input).await
 }
@@ -434,7 +437,7 @@ impl IcebergCatalogSemanticStore {
             );
         }
         if operation == "ListVectorBuckets" {
-            let buckets = self.catalog.list_namespaces(None).await.map_err(iceberg_error)?.into_iter().filter_map(|namespace| namespace.first().cloned()).map(|name| json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:verglas:s3vectors:::{name}"), "creationTime": "0"})).collect::<Vec<_>>();
+            let buckets = self.catalog.list_namespaces(None).await.map_err(iceberg_error)?.into_iter().filter_map(|namespace| namespace.first().cloned()).map(|name| json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": "0"})).collect::<Vec<_>>();
             return Ok(json!({"vectorBuckets": buckets}));
         }
         if matches!(
@@ -474,7 +477,7 @@ impl IcebergCatalogSemanticStore {
         if operation == "ListIndexes" {
             let namespace = bucket_namespace(&input)?;
             let bucket = required_string(&input, "vectorBucketName")?;
-            let indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().map(|table| json!({"vectorBucketName": bucket, "indexName": table.name(), "indexArn": format!("arn:verglas:s3vectors:::{bucket}:{}", table.name()), "creationTime": "0"})).collect::<Vec<_>>();
+            let indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().map(|table| json!({"vectorBucketName": bucket, "indexName": table.name(), "indexArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{bucket}/index/{}", table.name()), "creationTime": "0"})).collect::<Vec<_>>();
             return Ok(json!({"indexes": indexes}));
         }
         if matches!(
@@ -665,12 +668,31 @@ fn normalize_vector_arn(mut input: Value) -> Result<Value, SemanticError> {
 
 /// Parses local S3 Vector bucket and index ARNs without guessing other ARN forms.
 fn arn_parts(arn: &str) -> Result<Option<(String, Option<String>)>, SemanticError> {
-    let Some(rest) = arn.strip_prefix("arn:verglas:s3vectors:::") else {
+    let mut parts = arn.splitn(6, ':');
+    if parts.next() != Some("arn")
+        || parts.next() != Some("aws")
+        || parts.next() != Some("s3vectors")
+    {
         return Ok(None);
     };
-    let (bucket, index) = match rest.split_once(':') {
+    let _region = parts
+        .next()
+        .ok_or_else(|| SemanticError::validation("invalid S3 Vectors ARN"))?;
+    let account = parts
+        .next()
+        .ok_or_else(|| SemanticError::validation("invalid S3 Vectors ARN"))?;
+    let resource = parts
+        .next()
+        .ok_or_else(|| SemanticError::validation("invalid S3 Vectors ARN"))?;
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(SemanticError::validation("invalid S3 Vectors ARN account"));
+    }
+    let Some(resource) = resource.strip_prefix("bucket/") else {
+        return Err(SemanticError::validation("invalid S3 Vectors ARN resource"));
+    };
+    let (bucket, index) = match resource.split_once("/index/") {
         Some((bucket, index)) => (bucket, Some(index)),
-        None => (rest, None),
+        None => (resource, None),
     };
     if bucket.is_empty() || index.is_some_and(str::is_empty) {
         return Err(SemanticError::validation("invalid S3 Vectors ARN"));
@@ -717,7 +739,7 @@ fn bucket_namespace(input: &Value) -> Result<NamespaceIdent, SemanticError> {
 /// Builds the stable ARN for a bucket.
 fn bucket_arn(input: &Value) -> Result<String, SemanticError> {
     Ok(format!(
-        "arn:verglas:s3vectors:::{}",
+        "arn:aws:s3vectors:us-east-1:000000000000:bucket/{}",
         required_string(input, "vectorBucketName")?
     ))
 }
@@ -735,7 +757,7 @@ fn vector_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
 /// Builds the stable local ARN returned for a newly created vector index.
 fn vector_arn(input: &Value) -> Result<String, SemanticError> {
     Ok(format!(
-        "arn:verglas:s3vectors:::{}:{}",
+        "arn:aws:s3vectors:us-east-1:000000000000:bucket/{}/index/{}",
         required_string(input, "vectorBucketName")?,
         required_string(input, "indexName")?
     ))
