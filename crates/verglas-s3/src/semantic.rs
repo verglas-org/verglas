@@ -441,8 +441,39 @@ impl IcebergCatalogSemanticStore {
             );
         }
         if operation == "ListVectorBuckets" {
-            let buckets = self.catalog.list_namespaces(None).await.map_err(iceberg_error)?.into_iter().filter_map(|namespace| namespace.first().cloned()).map(|name| json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": "0"})).collect::<Vec<_>>();
-            return Ok(json!({"vectorBuckets": buckets}));
+            let mut buckets = Vec::new();
+            for namespace in self
+                .catalog
+                .list_namespaces(None)
+                .await
+                .map_err(iceberg_error)?
+            {
+                let state = self
+                    .catalog
+                    .get_namespace(&namespace)
+                    .await
+                    .map_err(iceberg_error)?;
+                if state
+                    .properties()
+                    .get("verglas.s3vectors.kind")
+                    .map(String::as_str)
+                    != Some("bucket")
+                {
+                    continue;
+                }
+                let name = namespace.first().cloned().ok_or_else(|| {
+                    SemanticError::validation("managed bucket namespace is empty")
+                })?;
+                buckets.push(json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": state.properties().get("verglas.s3vectors.created").cloned().ok_or_else(|| SemanticError::validation("bucket creation metadata is absent"))?}));
+            }
+            buckets.sort_by_key(|value| {
+                value["vectorBucketName"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned()
+            });
+            let (vector_buckets, next_token) = page(&input, buckets)?;
+            return Ok(json!({"vectorBuckets": vector_buckets, "nextToken": next_token}));
         }
         if matches!(
             operation,
@@ -465,9 +496,9 @@ impl IcebergCatalogSemanticStore {
                     "verglas.s3vectors.policy".to_owned(),
                     input
                         .get("policy")
-                        .cloned()
+                        .and_then(Value::as_str)
                         .ok_or_else(|| SemanticError::validation("policy is required"))?
-                        .to_string(),
+                        .to_owned(),
                 );
             } else {
                 properties.remove("verglas.s3vectors.policy");
@@ -481,8 +512,22 @@ impl IcebergCatalogSemanticStore {
         if operation == "ListIndexes" {
             let namespace = bucket_namespace(&input)?;
             let bucket = required_string(&input, "vectorBucketName")?;
-            let indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().map(|table| json!({"vectorBucketName": bucket, "indexName": table.name(), "indexArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{bucket}/index/{}", table.name()), "creationTime": "0"})).collect::<Vec<_>>();
-            return Ok(json!({"indexes": indexes}));
+            let state = self
+                .catalog
+                .get_namespace(&namespace)
+                .await
+                .map_err(iceberg_error)?;
+            let mut indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().filter_map(|table| { let name = table.name().to_owned(); state.properties().get(&index_metadata_key(&name)).and_then(|metadata| serde_json::from_str::<Value>(metadata).ok()).map(|metadata| json!({"vectorBucketName": bucket, "indexName": name, "indexArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{bucket}/index/{name}"), "creationTime": metadata["creationTime"]})) }).collect::<Vec<_>>();
+            if let Some(prefix) = input.get("prefix").and_then(Value::as_str) {
+                indexes.retain(|value| {
+                    value["indexName"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with(prefix))
+                });
+            }
+            indexes.sort_by_key(|value| value["indexName"].as_str().unwrap_or_default().to_owned());
+            let (indexes, next_token) = page(&input, indexes)?;
+            return Ok(json!({"indexes": indexes, "nextToken": next_token}));
         }
         if matches!(
             operation,
@@ -587,9 +632,15 @@ impl IcebergCatalogSemanticStore {
                     .collect::<Vec<_>>();
                 Ok(json!({"vectors": vectors}))
             }
-            "ListVectors" => Ok(
-                json!({"vectors": live_vectors(self.catalog.as_ref(), &ident).await?.into_iter().map(|vector| vector.output(&input)).collect::<Vec<_>>() }),
-            ),
+            "ListVectors" => {
+                let vectors = live_vectors(self.catalog.as_ref(), &ident)
+                    .await?
+                    .into_iter()
+                    .map(|vector| vector.output(&input))
+                    .collect::<Vec<_>>();
+                let (vectors, next_token) = page(&input, vectors)?;
+                Ok(json!({"vectors": vectors, "nextToken": next_token}))
+            }
             "QueryVectors" => {
                 let query = input
                     .get("queryVector")
@@ -787,6 +838,34 @@ fn now_millis() -> i64 {
 /// Names the catalog namespace property carrying one index's exact definition.
 fn index_metadata_key(index: &str) -> String {
     format!("verglas.s3vectors.index.{index}")
+}
+
+/// Applies the AWS cursor/max-results contract to an already stably sorted list.
+fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>), SemanticError> {
+    let offset = match input.get("nextToken").and_then(Value::as_str) {
+        Some(token) => token
+            .parse::<usize>()
+            .map_err(|_| SemanticError::validation("nextToken is invalid"))?,
+        None => 0,
+    };
+    if offset > values.len() {
+        return Err(SemanticError::validation(
+            "nextToken is outside this listing",
+        ));
+    }
+    let limit = input
+        .get("maxResults")
+        .and_then(Value::as_u64)
+        .map(|value| {
+            usize::try_from(value).map_err(|_| SemanticError::validation("maxResults is too large"))
+        })
+        .transpose()?
+        .unwrap_or(500);
+    let end = offset.saturating_add(limit).min(values.len());
+    Ok((
+        values[offset..end].to_vec(),
+        (end < values.len()).then(|| end.to_string()),
+    ))
 }
 
 /// Resolves a vector bucket/index name to its customer-owned Iceberg table.
