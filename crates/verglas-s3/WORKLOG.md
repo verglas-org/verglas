@@ -283,3 +283,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   verifier accepts only `s3vectors` and `verglasgraphs`, binds body, headers,
   URI/query canonicalization, and a fifteen-minute clock window before the
   Iceberg adapter sees a request.
+- #137: Enforced exact name-or-ARN selectors and rejected unknown scalar input
+  members before resolving an Iceberg resource. The adapter also maps catalog
+  not-found, conflict, invalid-data, and unexpected failures to REST-JSON
+  status codes instead of reporting every catalog error as unavailable.

@@ -826,6 +826,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
 impl IcebergCatalogSemanticStore {
     /// Executes the vector operations whose durable state is an Iceberg table.
     async fn vector_call(&self, operation: &str, input: Value) -> Result<Value, SemanticError> {
+        validate_vector_input(operation, &input)?;
         let mut input = normalize_vector_arn(input)?;
         input["operation"] = Value::String(operation.to_owned());
         if operation == "CreateVectorBucket" {
@@ -1521,6 +1522,175 @@ fn normalize_vector_arn(mut input: Value) -> Result<Value, SemanticError> {
         }
     }
     Ok(input)
+}
+
+/// Enforces the model's name-or-ARN selector and scalar-member invariants.
+fn validate_vector_input(operation: &str, input: &Value) -> Result<(), SemanticError> {
+    let object = input
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("request must be a JSON object"))?;
+    let allowed: &[&str] = match operation {
+        "CreateVectorBucket" => &["vectorBucketName", "encryptionConfiguration", "tags"],
+        "ListVectorBuckets" => &["maxResults", "nextToken", "prefix"],
+        "CreateIndex" => &[
+            "vectorBucketName",
+            "vectorBucketArn",
+            "indexName",
+            "dataType",
+            "dimension",
+            "distanceMetric",
+            "metadataConfiguration",
+            "encryptionConfiguration",
+            "tags",
+        ],
+        "ListIndexes" => &[
+            "vectorBucketName",
+            "vectorBucketArn",
+            "maxResults",
+            "nextToken",
+            "prefix",
+        ],
+        "TagResource" => &["resourceArn", "tags"],
+        "UntagResource" => &["resourceArn", "tagKeys"],
+        "ListTagsForResource" => &["resourceArn"],
+        "DeleteVectorBucket"
+        | "GetVectorBucket"
+        | "PutVectorBucketPolicy"
+        | "GetVectorBucketPolicy"
+        | "DeleteVectorBucketPolicy" => &["vectorBucketName", "vectorBucketArn", "policy"],
+        "DeleteIndex" | "GetIndex" | "DeleteVectors" | "GetVectors" | "PutVectors"
+        | "ListVectors" | "QueryVectors" => &[
+            "vectorBucketName",
+            "indexName",
+            "indexArn",
+            "keys",
+            "vectors",
+            "returnData",
+            "returnMetadata",
+            "maxResults",
+            "nextToken",
+            "segmentCount",
+            "segmentIndex",
+            "topK",
+            "queryVector",
+            "filter",
+            "returnDistance",
+        ],
+        _ => return Err(SemanticError::validation("unknown S3 Vectors operation")),
+    };
+    if object.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err(SemanticError::validation(
+            "request contains an unknown member",
+        ));
+    }
+    match operation {
+        "CreateVectorBucket" => required_name(input, "vectorBucketName")?,
+        "ListVectorBuckets" => {}
+        "CreateIndex" | "ListIndexes" => bucket_selector(input)?,
+        "TagResource" | "UntagResource" | "ListTagsForResource" => {
+            required_string(input, "resourceArn")?;
+        }
+        "DeleteVectorBucket"
+        | "GetVectorBucket"
+        | "PutVectorBucketPolicy"
+        | "GetVectorBucketPolicy"
+        | "DeleteVectorBucketPolicy" => bucket_selector(input)?,
+        _ => index_selector(input)?,
+    }
+    for field in ["returnData", "returnMetadata", "returnDistance"] {
+        if let Some(value) = input.get(field)
+            && !value.is_boolean()
+        {
+            return Err(SemanticError::validation(format!(
+                "{field} must be boolean"
+            )));
+        }
+    }
+    if let Some(prefix) = input.get("prefix") {
+        bounded_string(prefix, "prefix", 0, 63)?;
+    }
+    if let Some(token) = input.get("nextToken") {
+        bounded_string(token, "nextToken", 1, 4096)?;
+    }
+    if let Some(policy) = input.get("policy")
+        && !policy.is_string()
+    {
+        return Err(SemanticError::validation("policy must be a string"));
+    }
+    Ok(())
+}
+
+/// Requires exactly one bucket selector, not a conflicting name and ARN pair.
+fn bucket_selector(input: &Value) -> Result<(), SemanticError> {
+    match (input.get("vectorBucketName"), input.get("vectorBucketArn")) {
+        (Some(name), None) => bounded_string(name, "vectorBucketName", 3, 63),
+        (None, Some(arn)) => {
+            required_arn(arn, "vectorBucketArn")?;
+            Ok(())
+        }
+        _ => Err(SemanticError::validation(
+            "provide exactly one of vectorBucketName or vectorBucketArn",
+        )),
+    }
+}
+
+/// Requires exactly one index selector: an ARN or the complete name pair.
+fn index_selector(input: &Value) -> Result<(), SemanticError> {
+    match (
+        input.get("indexArn"),
+        input.get("vectorBucketName"),
+        input.get("indexName"),
+    ) {
+        (Some(arn), None, None) => {
+            required_arn(arn, "indexArn")?;
+            Ok(())
+        }
+        (None, Some(bucket), Some(index)) => {
+            bounded_string(bucket, "vectorBucketName", 3, 63)?;
+            bounded_string(index, "indexName", 3, 63)
+        }
+        _ => Err(SemanticError::validation(
+            "provide indexArn or both vectorBucketName and indexName",
+        )),
+    }
+}
+
+/// Validates a required resource name using its modeled string bounds.
+fn required_name(input: &Value, field: &str) -> Result<(), SemanticError> {
+    bounded_string(
+        input
+            .get(field)
+            .ok_or_else(|| SemanticError::validation(format!("{field} is required")))?,
+        field,
+        3,
+        63,
+    )
+}
+
+/// Validates a string member against inclusive model bounds.
+fn bounded_string(value: &Value, field: &str, min: usize, max: usize) -> Result<(), SemanticError> {
+    let value = value
+        .as_str()
+        .ok_or_else(|| SemanticError::validation(format!("{field} must be a string")))?;
+    if !(min..=max).contains(&value.len()) {
+        return Err(SemanticError::validation(format!(
+            "{field} length must be {min}..{max}"
+        )));
+    }
+    Ok(())
+}
+
+/// Validates an ARN-shaped selector before the ARN parser maps it to table names.
+fn required_arn(value: &Value, field: &str) -> Result<(), SemanticError> {
+    let arn = value
+        .as_str()
+        .ok_or_else(|| SemanticError::validation(format!("{field} must be a string")))?;
+    if arn.is_empty() || arn.len() > 2048 {
+        return Err(SemanticError::validation(format!(
+            "{field} length is invalid"
+        )));
+    }
+    Ok(())
 }
 
 /// Parses local S3 Vector bucket and index ARNs without guessing other ARN forms.
@@ -2372,7 +2542,31 @@ async fn live_vectors(
 
 /// Converts an Iceberg error to a safe service failure.
 fn iceberg_error(error: impl std::fmt::Display) -> SemanticError {
-    SemanticError::unavailable(error.to_string())
+    let message = error.to_string();
+    let (status, code) =
+        if message.starts_with("TableNotFound") || message.starts_with("NamespaceNotFound") {
+            (StatusCode::NOT_FOUND, "NotFoundException")
+        } else if message.starts_with("TableAlreadyExists")
+            || message.starts_with("NamespaceAlreadyExists")
+            || message.starts_with("CatalogCommitConflicts")
+            || message.starts_with("PreconditionFailed")
+        {
+            (StatusCode::CONFLICT, "ConflictException")
+        } else if message.starts_with("DataInvalid") {
+            (StatusCode::BAD_REQUEST, "ValidationException")
+        } else if message.starts_with("Unexpected") {
+            (StatusCode::INTERNAL_SERVER_ERROR, "InternalServerException")
+        } else {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailableException",
+            )
+        };
+    SemanticError {
+        status,
+        code,
+        message,
+    }
 }
 
 /// Converts a REST-JSON node object to the graph engine's durable row model.
@@ -2729,5 +2923,19 @@ mod tests {
             .is_err()
         );
         assert!(validate_filter(&json!({"label":{"$in":[{"nested":true}]}})).is_err());
+    }
+
+    /// AWS selectors reject ambiguity rather than letting a name silently override an ARN.
+    #[test]
+    fn vector_selectors_require_exactly_one_modelled_form() {
+        assert!(validate_vector_input("GetIndex", &json!({"indexArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/bucket-one/index/index-one","indexName":"index-one","vectorBucketName":"bucket-one"})).is_err());
+        assert!(validate_vector_input("GetVectorBucket", &json!({"vectorBucketName":"bucket-one","vectorBucketArn":"arn:aws:s3vectors:us-east-1:000000000000:bucket/bucket-one"})).is_err());
+        assert!(
+            validate_vector_input(
+                "GetIndex",
+                &json!({"vectorBucketName":"bucket-one","indexName":"index-one","unknown":true})
+            )
+            .is_err()
+        );
     }
 }
