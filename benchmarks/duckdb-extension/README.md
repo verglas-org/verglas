@@ -46,3 +46,16 @@ cold, warm, and fresh-process shared-warm latency can attribute an improvement
 to the cache. Every process is cgroup bounded, every result is tied to the same
 snapshot and manifest list, and missing catalog, extension, warming, cache, or
 resource-limit evidence invalidates the report.
+
+Run the full-stack evaluator with an explicit environment manifest:
+
+```sh
+python3 iceberg_full_stack.py --manifest full-stack.json --output iceberg-report.json
+```
+
+There are intentionally no endpoint or engine defaults. The manifest supplies
+the real managed-Lakekeeper bootstrap command, all Docker services, and an
+evidence-producing command for every product and cache-control leg. The
+coordinator starts those services with one equal cgroup budget, reads the
+effective cgroup-v2 values from each measured container, preserves each
+command's observed JSON, and tears down only its own containers and network.

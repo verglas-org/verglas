@@ -20,3 +20,7 @@
 - #126: Added the failing evidence contract for the real Iceberg full-stack
   comparison. It requires catalog-committed Iceberg data, the three requested
   product paths, equal cgroup budgets, and same-engine cold/warm cache controls.
+- #126: Added the Iceberg full-stack orchestrator. It controls only explicitly
+  declared Docker services, reads effective cgroup-v2 limits from measured
+  containers, and rejects any missing catalog, cache, origin-byte, snapshot, or
+  result-identity proof instead of manufacturing a benchmark result.
