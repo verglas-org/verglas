@@ -14,7 +14,7 @@ use axum::{
     response::IntoResponse,
     routing::{get, post},
 };
-use iceberg::{Catalog, NamespaceIdent};
+use iceberg::{Catalog, NamespaceIdent, TableCommit, TableRequirement, TableUpdate};
 use serde_json::{Value, json};
 use verglas_graph::{Direction, Edge, Graph, Node, TraversalFilter};
 use verglas_iceberg::{parse_table_ident, tables_api};
@@ -133,12 +133,11 @@ async fn dispatch_s3(
     let Some(operation) = s3_operation(uri.path(), &method) else {
         return not_found();
     };
-    dispatch(
-        state,
-        operation,
-        body.map_or(Value::Object(Default::default()), |body| body.0),
-    )
-    .await
+    let mut input = body.map_or(Value::Object(Default::default()), |body| body.0);
+    if let Some(resource) = uri.path().strip_prefix("/tags/") {
+        input["resourceArn"] = Value::String(resource.to_owned());
+    }
+    dispatch(state, operation, input).await
 }
 
 /// Resolves and runs a graph operation from its exact request URI.
@@ -400,6 +399,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
 impl IcebergCatalogSemanticStore {
     /// Executes the vector operations whose durable state is an Iceberg table.
     async fn vector_call(&self, operation: &str, input: Value) -> Result<Value, SemanticError> {
+        let input = normalize_vector_arn(input)?;
         if operation == "CreateVectorBucket" {
             let namespace = bucket_namespace(&input)?;
             self.catalog
@@ -476,6 +476,17 @@ impl IcebergCatalogSemanticStore {
             let bucket = required_string(&input, "vectorBucketName")?;
             let indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().map(|table| json!({"vectorBucketName": bucket, "indexName": table.name(), "indexArn": format!("arn:verglas:s3vectors:::{bucket}:{}", table.name()), "creationTime": "0"})).collect::<Vec<_>>();
             return Ok(json!({"indexes": indexes}));
+        }
+        if matches!(
+            operation,
+            "TagResource" | "UntagResource" | "ListTagsForResource"
+        ) {
+            let ident = input
+                .get("indexName")
+                .is_some()
+                .then(|| vector_ident(&input))
+                .transpose()?;
+            return self.tags_call(operation, &input, ident.as_ref()).await;
         }
         let ident = vector_ident(&input)?;
         match operation {
@@ -568,10 +579,132 @@ impl IcebergCatalogSemanticStore {
                 let vectors = vectors.into_iter().take(required_u32(&input, "topK")? as usize).map(|vector| json!({"key": vector.key, "distance": squared_distance(&vector.data, &query), "metadata": vector.metadata})).collect::<Vec<_>>();
                 Ok(json!({"vectors": vectors}))
             }
-            "TagResource" | "UntagResource" | "ListTagsForResource" => Ok(json!({"tags": {}})),
             _ => Err(SemanticError::validation("unknown S3 Vectors operation")),
         }
     }
+
+    /// Persists tags on the bucket namespace or the index table selected by ARN.
+    async fn tags_call(
+        &self,
+        operation: &str,
+        input: &Value,
+        ident: Option<&iceberg::TableIdent>,
+    ) -> Result<Value, SemanticError> {
+        let _resource = required_string(input, "resourceArn")?;
+        let key = "verglas.s3vectors.tags";
+        if let Some(ident) = ident {
+            let table = self
+                .catalog
+                .load_table(ident)
+                .await
+                .map_err(iceberg_error)?;
+            let mut tags = table
+                .metadata()
+                .properties()
+                .get(key)
+                .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok())
+                .unwrap_or_default();
+            mutate_tags(operation, input, &mut tags)?;
+            if operation != "ListTagsForResource" {
+                self.catalog
+                    .update_table(TableCommit::from_parts(
+                        ident.clone(),
+                        vec![TableRequirement::UuidMatch {
+                            uuid: table.metadata().uuid(),
+                        }],
+                        vec![TableUpdate::SetProperties {
+                            updates: HashMap::from([(
+                                key.to_owned(),
+                                Value::Object(tags.clone()).to_string(),
+                            )]),
+                        }],
+                    ))
+                    .await
+                    .map_err(iceberg_error)?;
+            }
+            return Ok(json!({"tags": tags}));
+        }
+        let namespace = bucket_namespace(input)?;
+        let state = self
+            .catalog
+            .get_namespace(&namespace)
+            .await
+            .map_err(iceberg_error)?;
+        let mut properties = state.properties().clone();
+        let mut tags = properties
+            .get(key)
+            .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(text).ok())
+            .unwrap_or_default();
+        mutate_tags(operation, input, &mut tags)?;
+        if operation != "ListTagsForResource" {
+            properties.insert(key.to_owned(), Value::Object(tags.clone()).to_string());
+            self.catalog
+                .update_namespace(&namespace, properties)
+                .await
+                .map_err(iceberg_error)?;
+        }
+        Ok(json!({"tags": tags}))
+    }
+}
+
+/// Normalizes modeled ARN selectors to the name fields the Iceberg adapter owns.
+fn normalize_vector_arn(mut input: Value) -> Result<Value, SemanticError> {
+    for field in ["vectorBucketArn", "indexArn", "resourceArn"] {
+        let Some(arn) = input.get(field).and_then(Value::as_str).map(str::to_owned) else {
+            continue;
+        };
+        if let Some((bucket, index)) = arn_parts(&arn)? {
+            input["vectorBucketName"] = Value::String(bucket);
+            if let Some(index) = index {
+                input["indexName"] = Value::String(index);
+            }
+        }
+    }
+    Ok(input)
+}
+
+/// Parses local S3 Vector bucket and index ARNs without guessing other ARN forms.
+fn arn_parts(arn: &str) -> Result<Option<(String, Option<String>)>, SemanticError> {
+    let Some(rest) = arn.strip_prefix("arn:verglas:s3vectors:::") else {
+        return Ok(None);
+    };
+    let (bucket, index) = match rest.split_once(':') {
+        Some((bucket, index)) => (bucket, Some(index)),
+        None => (rest, None),
+    };
+    if bucket.is_empty() || index.is_some_and(str::is_empty) {
+        return Err(SemanticError::validation("invalid S3 Vectors ARN"));
+    }
+    Ok(Some((bucket.to_owned(), index.map(str::to_owned))))
+}
+
+/// Applies one tag mutation to an authoritative JSON property map.
+fn mutate_tags(
+    operation: &str,
+    input: &Value,
+    tags: &mut serde_json::Map<String, Value>,
+) -> Result<(), SemanticError> {
+    if operation == "TagResource" {
+        for (name, value) in input
+            .get("tags")
+            .and_then(Value::as_object)
+            .ok_or_else(|| SemanticError::validation("tags is required"))?
+        {
+            tags.insert(name.clone(), value.clone());
+        }
+    }
+    if operation == "UntagResource" {
+        for name in input
+            .get("tagKeys")
+            .and_then(Value::as_array)
+            .ok_or_else(|| SemanticError::validation("tagKeys is required"))?
+            .iter()
+            .filter_map(Value::as_str)
+        {
+            tags.remove(name);
+        }
+    }
+    Ok(())
 }
 
 /// Resolves a bucket name to the customer-owned Iceberg namespace.
