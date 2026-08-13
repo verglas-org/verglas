@@ -186,10 +186,10 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
     identifier = (config.namespace, config.table)
     catalog.create_namespace_if_not_exists(config.namespace)
     schema = Schema(
-        NestedField(1, "id", LongType(), required=True),
-        NestedField(2, "category", LongType(), required=True),
-        NestedField(3, "value", LongType(), required=True),
-        NestedField(4, "payload", StringType(), required=True),
+        NestedField(1, "id", LongType(), required=False),
+        NestedField(2, "category", LongType(), required=False),
+        NestedField(3, "value", LongType(), required=False),
+        NestedField(4, "payload", StringType(), required=False),
     )
     # A run name must be unique. Reusing a table would silently retain an old
     # snapshot and make the cache comparison non-reproducible.
