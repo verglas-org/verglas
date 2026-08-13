@@ -292,16 +292,20 @@ impl ConsensusPlane {
         Ok(plane)
     }
 
-    /// Provisions a group on a Raft quorum and returns this ingress's local handle.
+    /// Returns an initialized local group or provisions a Raft quorum on first use.
     ///
-    /// Opening is concurrent and bounded per voter.  A down voter is left for a
-    /// later provisioning request, while a minority fails before any bootstrap
-    /// attempt can form a group without a Raft majority.
+    /// An initialized local replica skips fleet provisioning entirely. First
+    /// creation opens voters concurrently and bounded per peer; a down voter is
+    /// left for a later request, while a minority fails before bootstrap can
+    /// form a group without a Raft majority.
     pub async fn ensure_group(
         self: &Arc<Self>,
         group: &str,
     ) -> Result<Arc<ConsensusGroup>, PlaneError> {
         validate_group(group)?;
+        if let Some(local) = self.initialized_local_group(group).await {
+            return Ok(local);
+        }
         let network = self.network(group)?;
         let voters = self.ring.consensus_voters();
         if voters.is_empty() {
@@ -315,6 +319,16 @@ impl ConsensusPlane {
             .ok_or("no voter opened the consensus group")?;
         network.bootstrap_group(bootstrap).await?;
         self.open_local(group).await
+    }
+
+    /// Returns this ingress's initialized replica without creating local state.
+    async fn initialized_local_group(&self, group: &str) -> Option<Arc<ConsensusGroup>> {
+        let (group, state_machine) = {
+            let groups = self.groups.lock().await;
+            let local = groups.get(group)?;
+            (Arc::clone(&local.group), local.state_machine.clone())
+        };
+        state_machine.is_initialized().await.then_some(group)
     }
 
     /// Routes a typed request from any ingress to the currently observed leader.

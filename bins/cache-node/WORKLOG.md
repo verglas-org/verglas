@@ -196,4 +196,6 @@
   concurrently with a hard per-peer deadline. It now proceeds only after a
   Raft majority opens successfully and bootstraps through the lowest successful
   voter, so one unavailable nonleader does not block the four-voter `2/2/3`
-  geometry while a two-voter minority still fails closed.
+  geometry while a two-voter minority still fails closed. Once an ingress has
+  an initialized local replica, normal WAL and catalog requests skip group
+  provisioning and rely on the committed Raft quorum directly.
