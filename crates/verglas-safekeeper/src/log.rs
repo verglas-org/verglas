@@ -34,6 +34,7 @@ use crate::contract::{
 use crate::manifest::{
     AppendEntry, Manifest, ManifestStore, Placement, SegmentEntry, SegmentState,
 };
+use verglas_write::transport::DurableQuorum;
 
 /// Seal a segment and start a new one once the open one reaches this many bytes.
 /// A fixed flush-granularity constant, not a tuning knob: the whole tuning
@@ -294,32 +295,9 @@ where
             index: STATE_DESCRIPTOR_INDEX,
         };
         let descriptor_record = FragmentRecord::new(descriptor_key, descriptor);
-        let descriptor_results = futures::future::join_all(live.iter().cloned().map(|node| {
-            let record = descriptor_record.clone();
-            async move {
-                let result = self.transport.place(&node, record).await;
-                (node, result)
-            }
-        }))
-        .await;
-        let mut descriptor_nodes = Vec::new();
-        for (node, result) in descriptor_results {
-            match result {
-                Ok(()) => descriptor_nodes.push(node),
-                Err(error) => tracing::warn!(
-                    node = node.as_str(),
-                    revision = manifest.revision,
-                    %error,
-                    "failed to replicate safekeeper descriptor"
-                ),
-            }
-        }
-        if descriptor_nodes.len() < geometry.w {
-            return Err(AppendError::QuorumUnavailable {
-                needed: geometry.w,
-                placed: descriptor_nodes.len(),
-            });
-        }
+        let descriptor_nodes = self
+            .replicate_record(&live, descriptor_record, geometry.w)
+            .await?;
 
         let head_record = FragmentRecord::new(
             FragmentKey {
@@ -328,34 +306,50 @@ where
             },
             Bytes::copy_from_slice(&manifest.revision.to_be_bytes()),
         );
-        let head_results =
-            futures::future::join_all(descriptor_nodes.iter().cloned().map(|node| {
-                let record = head_record.clone();
-                async move {
-                    let result = self.transport.place(&node, record).await;
-                    (node, result)
-                }
-            }))
-            .await;
-        let mut heads = 0;
-        for (node, result) in head_results {
-            match result {
-                Ok(()) => heads += 1,
-                Err(error) => tracing::warn!(
-                    node = node.as_str(),
-                    revision = manifest.revision,
-                    %error,
-                    "failed to publish safekeeper state head"
-                ),
-            }
-        }
-        if heads < geometry.w {
-            return Err(AppendError::QuorumUnavailable {
-                needed: geometry.w,
-                placed: heads,
+        self.replicate_record(&descriptor_nodes, head_record, geometry.w)
+            .await?;
+        Ok(())
+    }
+
+    /// Places one self-describing durable record on every candidate concurrently
+    /// and returns immediately after `w` fdatasync acknowledgements. The tasks
+    /// for non-quorum peers keep running after the caller receives its watermark.
+    async fn replicate_record(
+        &self,
+        nodes: &[NodeId],
+        record: FragmentRecord,
+        w: usize,
+    ) -> Result<Vec<NodeId>, AppendError> {
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Recovery records are immutable at their revision. Publishing a late
+        // old head after a newer head would move recovery backwards, so their
+        // quorum is deliberately fixed to the first `w` candidates. WAL data
+        // fragments still continue their non-quorum fan-out in the background.
+        for node in nodes.iter().take(w).cloned() {
+            let transport = Arc::clone(&self.transport);
+            let record = record.clone();
+            let done_tx = done_tx.clone();
+            tokio::spawn(async move {
+                let result = transport.place(&node, record).await;
+                let _ = done_tx.send((node, result));
             });
         }
-        Ok(())
+        drop(done_tx);
+        let mut collector = DurableQuorum::new(w);
+        while !collector.reached() {
+            let Some((node, result)) = done_rx.recv().await else {
+                break;
+            };
+            let _ = collector.record(result.map(|()| node));
+        }
+        let receipts = collector.into_receipts();
+        if receipts.len() < w {
+            return Err(AppendError::QuorumUnavailable {
+                needed: w,
+                placed: receipts.len(),
+            });
+        }
+        Ok(receipts)
     }
 
     /// Recovers the newest ring-committed state visible through live peers. A
@@ -629,42 +623,36 @@ where
             }
         }
 
-        let placement_results =
-            futures::future::join_all(encoded.fragments.iter().zip(nodes.iter()).enumerate().map(
-                |(index, (fragment, node))| {
-                    let node = node.clone();
-                    let record = FragmentRecord::new(
-                        FragmentKey {
-                            object_id: object_id.to_owned(),
-                            index,
-                        },
-                        fragment.bytes.clone(),
-                    );
-                    async move {
-                        let result = self.transport.place(&node, record).await;
-                        (index, node, result)
-                    }
+        let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel();
+        for (index, (fragment, node)) in encoded.fragments.iter().zip(nodes.iter()).enumerate() {
+            let transport = Arc::clone(&self.transport);
+            let node = node.clone();
+            let record = FragmentRecord::new(
+                FragmentKey {
+                    object_id: object_id.to_owned(),
+                    index,
                 },
-            ))
-            .await;
-
-        let mut placements = Vec::new();
-        for (index, node, result) in placement_results {
-            match result {
-                Ok(()) => placements.push(Placement {
-                    index,
-                    node: node.as_str().to_owned(),
-                }),
-                Err(error) => tracing::warn!(
-                    node = node.as_str(),
-                    index,
-                    %object_id,
-                    %error,
-                    "failed to place safekeeper WAL fragment"
-                ),
-            }
+                fragment.bytes.clone(),
+            );
+            let done_tx = done_tx.clone();
+            tokio::spawn(async move {
+                let result = transport.place(&node, record).await;
+                let _ = done_tx.send((index, node, result));
+            });
         }
+        drop(done_tx);
 
+        let mut collector = DurableQuorum::new(w);
+        while !collector.reached() {
+            let Some((index, node, result)) = done_rx.recv().await else {
+                break;
+            };
+            let _ = collector.record(result.map(|()| Placement {
+                index,
+                node: node.as_str().to_owned(),
+            }));
+        }
+        let placements = collector.into_receipts();
         if placements.len() < w {
             self.drop_fragments(object_id, &placements).await;
             return Err(AppendError::QuorumUnavailable {
@@ -786,21 +774,33 @@ where
                 .await
                 .map_err(|e| AppendError::Origin(e.to_string()))?;
 
+            // This persisted transition is the durable release record: it
+            // proves the object-store copy exists while retaining the exact
+            // fragment placements a restart must reclaim if this process dies
+            // between origin durability and local cleanup.
             manifest.segments[i].state = SegmentState::Flushed;
             manifest.segments[i].s3_key = Some(s3_key);
-            manifest.segments[i].appends.clear();
             manifest.flushed_through = segment.end;
             manifest.revision = manifest.revision.saturating_add(1);
             self.replicate_state(manifest).await?;
             self.manifest_store.persist(manifest)?;
             self.flushed.store(segment.end.0, Ordering::Relaxed);
 
-            // The object-store write and the compacted recovery descriptor are
-            // both durable. Only now may pressure reclaim the EC fragments.
+            // The origin object and release record are durable. Only now may
+            // pressure reclaim EC fragments.
             for entry in &segment.appends {
                 self.drop_fragments(entry.object_id(), &entry.placements)
                     .await;
             }
+            // Cleanup completed. Compact the retained release placements; a
+            // later restart needs only the S3 range, not its former fragments.
+            manifest.segments[i].appends.clear();
+            // Reuse the release revision's inactive slot. No logical state
+            // changed after the durable release; only its completed cleanup is
+            // compacted, so publishing a new head would add another metadata
+            // barrier for no recovery value.
+            self.replicate_state(manifest).await?;
+            self.manifest_store.persist(manifest)?;
             i += 1;
         }
         Ok(manifest.flushed_through)
@@ -1043,14 +1043,14 @@ where
         manifest.tail = end;
         manifest.revision = manifest.revision.saturating_add(1);
 
+        // The recovery record uses the same durable-quorum collector as the
+        // data fragments. It therefore cannot make a delayed non-quorum peer
+        // delay PostgreSQL after the batch watermark reaches `w` nodes.
         if let Err(error) = self.replicate_state(&manifest).await {
             *manifest = previous;
             self.drop_fragments(&object_id, &placements).await;
             return Err(error);
         }
-
-        // The ring descriptor is the coordinator-replacement authority. Keep a
-        // local fsynced copy as the fast same-node restart path.
         if let Err(error) = self.manifest_store.persist(&manifest) {
             // The fragments are placed but the record is not durable — roll the
             // append back so the tail never reflects an un-fsynced ack, and drop

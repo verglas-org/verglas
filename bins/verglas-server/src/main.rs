@@ -1218,11 +1218,7 @@ fn build_writeback_tier(
         Arc::clone(&origin),
         std::time::Duration::from_millis(wb.ack_deadline_ms),
     );
-    let coordinator = Arc::new(if single_node {
-        coordinator
-    } else {
-        coordinator.require_quorum()
-    });
+    let coordinator = Arc::new(coordinator);
     // Repair only makes progress when membership can change; a single-node
     // server never opens the window.
     if agent.is_some() {
@@ -2025,7 +2021,7 @@ fn fragment_handlers(store: LocalFragmentStore) -> FragmentHandlers {
     FragmentHandlers {
         store: Arc::new(move |record: FragmentRecord| {
             let store = store_put.clone();
-            Box::pin(async move { store.store_fragment(&record) })
+            Box::pin(async move { store.append_batch(&[record]) })
         }),
         store_stream: Arc::new(move |key: FragmentKey, shards| {
             let store = store_stream.clone();

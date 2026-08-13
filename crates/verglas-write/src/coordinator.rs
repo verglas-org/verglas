@@ -36,7 +36,7 @@ use crate::journal::{Journal, JournalState, JournalStore, Placement};
 use crate::membership::LiveMembership;
 use crate::meta::{StoredMetadata, now_unix_ms};
 use crate::metrics::WritebackMetrics;
-use crate::transport::FragmentTransport;
+use crate::transport::{DurableQuorum, FragmentTransport};
 
 /// Base backoff between propagation retries.
 const PROPAGATION_BACKOFF: Duration = Duration::from_millis(200);
@@ -109,14 +109,12 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     journals: Arc<JournalStore>,
     /// Write-back counters.
     metrics: Arc<WritebackMetrics>,
-    /// Direct-to-origin writer for propagation and write-through fallback.
+    /// Direct-to-origin writer for propagation and true standalone write-through.
     origin: Arc<W>,
     /// This node's id.
     self_id: NodeId,
-    /// Deadline to gather `w` durable fragments before falling back.
+    /// Deadline to gather `w` durable fragments before refusing the write.
     ack_deadline: Duration,
-    /// Reject a shortfall instead of silently changing durability to origin.
-    require_quorum: bool,
     /// Last ack mode, for counting write-back <-> write-through transitions.
     last_mode: AtomicU8,
     /// Per-write counter feeding object-id uniqueness.
@@ -150,18 +148,11 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             origin,
             self_id,
             ack_deadline,
-            require_quorum: false,
             last_mode: AtomicU8::new(MODE_UNSET),
             object_counter: AtomicU64::new(0),
             key_locks: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
         }
-    }
-
-    /// Requires eligible writes to acknowledge only from the fragment quorum.
-    pub fn require_quorum(mut self) -> Self {
-        self.require_quorum = true;
-        self
     }
 
     /// Stops background propagation: every in-flight retry loop exits at its
@@ -232,17 +223,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         if self.membership.is_single_node() {
             return self.write_through_stream(key, metadata, body).await;
         }
-        let (k, m, w) = if live.len() < w {
-            // Enforced fallback: the live view cannot place `w` distinct
-            // fragments. Decided before the body is consumed, so write-through
-            // re-streams it.
-            if self.require_quorum {
-                return Err(quorum_shortfall(w, live.len()));
-            }
-            return self.write_through_stream(key, metadata, body).await;
-        } else {
-            (k, m, w)
-        };
+        if live.len() < w {
+            return Err(quorum_shortfall(w, live.len()));
+        }
 
         let object_id = self.new_object_id(key, 0);
         // Placement nodes, ordered by rendezvous, narrowed to those with room
@@ -256,10 +239,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             .nodes_with_headroom(ordered, MAX_STRIPE_CHUNK as u64)
             .await;
         if nodes.len() < w {
-            if self.require_quorum {
-                return Err(quorum_shortfall(w, nodes.len()));
-            }
-            return self.write_through_stream(key, metadata, body).await;
+            return Err(quorum_shortfall(w, nodes.len()));
         }
 
         // Stream-encode the body into per-fragment placement tasks. Each fragment
@@ -315,43 +295,42 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
 
         // Gather committed fragments until `w` land or the deadline passes.
         let deadline = tokio::time::Instant::now() + self.ack_deadline;
-        let mut acked: Vec<Placement> = Vec::new();
+        let mut acked = DurableQuorum::new(w);
         loop {
-            if acked.len() >= w {
+            if acked.reached() {
                 break;
             }
             match tokio::time::timeout_at(deadline, done_rx.recv()).await {
-                Ok(Some((index, node, Ok(())))) => acked.push(Placement {
-                    index,
-                    node: node.as_str().to_owned(),
-                }),
-                Ok(Some((_, _, Err(_)))) => {}
+                Ok(Some((index, node, result))) => {
+                    let _ = acked.record(result.map(|()| Placement {
+                        index,
+                        node: node.as_str().to_owned(),
+                    }));
+                }
                 Ok(None) => break,
                 Err(_) => break,
             }
         }
 
         let etag = synthetic_object_etag(&object_id, object_len);
-        if acked.len() >= w {
+        if acked.reached() {
             self.finish_stream_ack(
-                key, metadata, &object_id, &etag, geometry, object_len, acked, done_rx, key_guard,
+                key,
+                metadata,
+                &object_id,
+                &etag,
+                geometry,
+                object_len,
+                acked.into_receipts(),
+                done_rx,
+                key_guard,
             )
             .await
         } else {
-            if self.require_quorum {
-                self.drain_placements(&mut done_rx).await;
-                self.spawn_object_cleanup(object_id);
-                return Err(quorum_shortfall(w, acked.len()));
-            }
-            // Fewer than `w` fragments committed. The body is already consumed,
-            // so write-through re-streams from the committed fragments: any `k`
-            // reconstruct the object, which is then uploaded to the origin. If
-            // fewer than `k` committed, the object cannot be rebuilt and the
-            // write fails cleanly (never a sub-quorum ack, never wrong bytes).
-            self.stream_shortfall_fallback(
-                key, metadata, &object_id, geometry, object_len, acked, done_rx,
-            )
-            .await
+            let placed = acked.len();
+            self.drain_placements(&mut done_rx).await;
+            self.spawn_object_cleanup(object_id);
+            Err(quorum_shortfall(w, placed))
         }
     }
 
@@ -427,76 +406,6 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             checksums: Default::default(),
             version_id: None,
         })
-    }
-
-    /// Fewer than `w` fragments committed on the streaming path. The client body
-    /// is already consumed, so rebuild the object from the committed fragments
-    /// (any `k` reconstruct) and write it through to the origin, then delete the
-    /// fragments. Counts as a write-through. If fewer than `k` fragments
-    /// committed the object cannot be rebuilt: the write fails cleanly — never a
-    /// sub-quorum ack, never wrong bytes.
-    #[allow(clippy::too_many_arguments)]
-    async fn stream_shortfall_fallback(
-        self: &Arc<Self>,
-        key: &CacheKey,
-        metadata: &WriteMetadata,
-        object_id: &str,
-        geometry: Geometry,
-        object_len: u64,
-        mut acked: Vec<Placement>,
-        mut rx: mpsc::UnboundedReceiver<(
-            usize,
-            NodeId,
-            Result<(), crate::transport::TransportError>,
-        )>,
-    ) -> Result<PutOutcome, WriteError> {
-        // Collect any late commits so we have the best chance of `k` fragments.
-        while let Ok((index, node, result)) = rx.try_recv() {
-            if result.is_ok() {
-                acked.push(Placement {
-                    index,
-                    node: node.as_str().to_owned(),
-                });
-            }
-        }
-        if acked.len() < geometry.k {
-            self.spawn_object_cleanup(object_id.to_owned());
-            return Err(WriteError::Backend(format!(
-                "write-back could not place k={} fragments ({} committed); write not durable",
-                geometry.k,
-                acked.len()
-            )));
-        }
-        // Rebuild from the committed fragments and upload to the origin.
-        let journal = Journal {
-            object_id: object_id.to_owned(),
-            storage_binding_id: key.storage_binding_id.clone(),
-            bucket: key.bucket.clone(),
-            key: key.key.clone(),
-            metadata: StoredMetadata::from(metadata),
-            object_len,
-            k: geometry.k,
-            m: geometry.m,
-            chunk: geometry.chunk,
-            etag: String::new(),
-            created_ms: now_unix_ms(),
-            state: JournalState::Dirty,
-            propagated_ms: None,
-            placements: acked,
-        };
-        let bytes = self
-            .reassemble(&journal)
-            .await
-            .map_err(|e| WriteError::Backend(format!("write-back shortfall rebuild: {e}")))?;
-        WritebackMetrics::bump(&self.metrics.acked_via_write_through);
-        self.record_mode(MODE_WRITE_THROUGH);
-        let outcome = self
-            .origin
-            .put(key, metadata.clone(), once_body(bytes))
-            .await?;
-        // The origin has the object now; drop the fragments.
-        self.spawn_object_cleanup(object_id.to_owned());
-        Ok(outcome)
     }
 
     /// Drains a placement-result channel, ignoring the outcomes. Used to let the

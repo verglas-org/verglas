@@ -1,7 +1,9 @@
 //! Local fragment blob store for the write-back tier (#180).
 //!
-//! A node persists erasure-coded fragments it is assigned as fsynced files
-//! under its cache directory. This module owns only the on-disk blob store and
+//! A node persists erasure-coded fragments as self-describing append records in
+//! durable segments under its cache directory. The fragment files remain the
+//! read index while segment records are the crash journal and group-fdatasync
+//! boundary. This module owns only the on-disk store and
 //! the fragment identity types; the journal, quorum, placement, and origin
 //! propagation live in `verglas-write`, and the fragment transport lives in
 //! [`crate::peer`]. Returning `Ok` from [`LocalFragmentStore::store_fragment`]
@@ -30,6 +32,8 @@ use bytes::Bytes;
 /// Bytes of the CRC32C integrity trailer appended to every stored fragment file
 /// (#220). Little-endian `u32` over the fragment payload.
 const CHECKSUM_TRAILER_LEN: usize = 4;
+/// Fixed marker preceding every self-describing append record.
+const SEGMENT_MAGIC: [u8; 4] = *b"VGF1";
 
 /// Makes in-flight paths unique when independent coordinators concurrently
 /// place the same logical fragment on this node.
@@ -172,6 +176,9 @@ pub struct LocalFragmentStore {
     /// fsyncs remain concurrent, while two placements of one key cannot both
     /// charge or release the previous live file.
     commit_lock: Arc<Mutex<()>>,
+    /// The current append-only segment. One sync_data commits every record in a
+    /// submitted batch before any caller receives its durable watermark.
+    segment: Arc<Mutex<File>>,
 }
 
 impl LocalFragmentStore {
@@ -194,11 +201,21 @@ impl LocalFragmentStore {
     pub fn with_dynamic_ceiling(cache_dir: impl AsRef<Path>, ceiling: Arc<AtomicU64>) -> Self {
         let root = cache_dir.as_ref().join("writeback-fragments");
         let used = scan_used_bytes(&root);
+        let segment_dir = root.join("segments");
+        let segment = fs::create_dir_all(&segment_dir)
+            .and_then(|()| {
+                File::options()
+                    .create(true)
+                    .append(true)
+                    .open(segment_dir.join("open.log"))
+            })
+            .unwrap_or_else(|error| panic!("open fragment append segment: {error}"));
         Self {
             root: Arc::new(root),
             ceiling,
             used: Arc::new(AtomicU64::new(used)),
             commit_lock: Arc::new(Mutex::new(())),
+            segment: Arc::new(Mutex::new(segment)),
         }
     }
 
@@ -258,6 +275,48 @@ impl LocalFragmentStore {
                 Err(error)
             }
         }
+    }
+
+    /// Appends a compatible durability batch to the current segment and issues
+    /// exactly one `fdatasync`-equivalent `sync_data` for the whole batch. The
+    /// segment records carry key, checksum, length, and payload, so they remain
+    /// intelligible after a writer process disappears; the indexed fragment
+    /// files are then updated for normal reads.
+    pub fn append_batch(&self, records: &[FragmentRecord]) -> Result<(), FragmentIoError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let mut encoded = Vec::new();
+        for record in records {
+            let object = record.key.object_id.as_bytes();
+            let object_len = u32::try_from(object.len())
+                .map_err(|_| FragmentIoError::io("fragment object id is too long"))?;
+            let payload_len = u64::try_from(record.bytes.len())
+                .map_err(|_| FragmentIoError::io("fragment payload is too large"))?;
+            encoded.extend_from_slice(&SEGMENT_MAGIC);
+            encoded.extend_from_slice(&object_len.to_le_bytes());
+            encoded.extend_from_slice(&(record.key.index as u64).to_le_bytes());
+            encoded.extend_from_slice(&payload_len.to_le_bytes());
+            encoded.extend_from_slice(&record.checksum.to_le_bytes());
+            encoded.extend_from_slice(object);
+            encoded.extend_from_slice(&record.bytes);
+        }
+        {
+            let mut segment = self
+                .segment
+                .lock()
+                .map_err(|_| FragmentIoError::io("fragment segment lock poisoned"))?;
+            segment.write_all(&encoded).map_err(|error| {
+                FragmentIoError::io(format!("append fragment segment: {error}"))
+            })?;
+            segment.sync_data().map_err(|error| {
+                FragmentIoError::io(format!("fdatasync fragment segment: {error}"))
+            })?;
+        }
+        for record in records {
+            self.store_fragment(record)?;
+        }
+        Ok(())
     }
 
     /// Opens a streaming writer for one fragment: shards are appended to a temp
@@ -750,6 +809,48 @@ mod tests {
             got.checksum,
             crate::fragments::fragment_checksum(&record.bytes)
         );
+    }
+
+    /// A durable batch writes self-describing segment records before exposing
+    /// either indexed fragment. This proves the record journal, rather than a
+    /// RAM receipt, is the local acknowledgement substrate.
+    #[test]
+    fn append_batch_persists_self_describing_records() {
+        let store = LocalFragmentStore::new(scratch("append-batch"));
+        let records = vec![
+            FragmentRecord::new(
+                FragmentKey {
+                    object_id: "txn-a".to_owned(),
+                    index: 0,
+                },
+                Bytes::from_static(b"first"),
+            ),
+            FragmentRecord::new(
+                FragmentKey {
+                    object_id: "txn-b".to_owned(),
+                    index: 1,
+                },
+                Bytes::from_static(b"second"),
+            ),
+        ];
+        store.append_batch(&records).expect("durable append batch");
+        let raw = std::fs::read(store.root().join("segments/open.log")).expect("segment");
+        assert_eq!(
+            raw.windows(SEGMENT_MAGIC.len())
+                .filter(|window| *window == SEGMENT_MAGIC)
+                .count(),
+            2
+        );
+        for record in &records {
+            assert_eq!(
+                store
+                    .load_fragment(&record.key)
+                    .expect("load")
+                    .expect("present")
+                    .bytes,
+                record.bytes
+            );
+        }
     }
 
     /// A byte flipped on disk after the store makes the fragment fail

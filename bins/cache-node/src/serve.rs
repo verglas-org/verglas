@@ -724,17 +724,14 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
         let metrics = Arc::new(WritebackMetrics::default());
         let _ = writeback_slot.set(Arc::clone(&metrics));
         let membership = ring.membership();
-        let coordinator = Arc::new(
-            WriteCoordinator::new(
-                ring.transport(),
-                Arc::clone(&membership),
-                journals,
-                metrics,
-                Arc::clone(&origin),
-                std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
-            )
-            .require_quorum(),
-        );
+        let coordinator = Arc::new(WriteCoordinator::new(
+            ring.transport(),
+            Arc::clone(&membership),
+            journals,
+            metrics,
+            Arc::clone(&origin),
+            std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
+        ));
         let _repair = verglas_write::spawn_repair_loop(
             Arc::clone(&coordinator),
             membership,

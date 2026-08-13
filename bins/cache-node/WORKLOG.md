@@ -94,3 +94,5 @@
 - #111: Allowed a one-member fragment plane for the embedded safekeeper while
   restricting object, block, and strong-catalog write-back to three or more
   nodes. The one-node server therefore uses synchronous origin durability.
+- #127: Fragment RPC ingress now appends through the local durable-batch store,
+  preserving the same segment and fdatasync boundary as local placement.

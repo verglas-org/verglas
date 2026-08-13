@@ -101,3 +101,6 @@
   longer make occupied NVMe appear free.
 - #74: Added prefix-filtered fragment discovery and authenticated owner fetch
   and placement RPCs for reconstructed Neon pages and ordinary cache blocks.
+- #127: Local fragments now write a self-describing append-segment record and
+  call `sync_data` once for each supplied durable batch before updating the read
+  index. Local transport and fragment RPC ingress use that batch boundary.

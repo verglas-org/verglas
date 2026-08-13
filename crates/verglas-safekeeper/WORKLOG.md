@@ -68,3 +68,7 @@
   phases of quorum state publication across the ring. The acknowledgement still
   waits for the configured durable quorum, but no longer serializes one
   NVMe/network round trip per cache member.
+- #127: WAL data and recovery records now use the shared durable quorum collector.
+  A four-node append returns after `w` durable receipts while a delayed fourth
+  data fragment continues in the background; flush persists a release record
+  before fragment cleanup so a restart can finish that lifecycle safely.

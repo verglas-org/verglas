@@ -18,6 +18,54 @@ use verglas_core::node::NodeId;
 /// one stripe's chunk for that fragment; concatenated they are the fragment.
 pub type ShardStream = BoxStream<'static, Bytes>;
 
+/// Counts completed durable append receipts for one batch. Both the object
+/// writer and WAL keeper use it, so RAM delivery cannot be mistaken for a
+/// durable quorum acknowledgement.
+pub struct DurableQuorum<T> {
+    /// Required distinct durable watermarks.
+    required: usize,
+    /// Successful fdatasync-backed receipts seen so far.
+    receipts: Vec<T>,
+}
+
+impl<T> DurableQuorum<T> {
+    /// Starts collecting the required durable receipts for an append batch.
+    pub fn new(required: usize) -> Self {
+        Self {
+            required,
+            receipts: Vec::with_capacity(required),
+        }
+    }
+
+    /// Records one completed append, ignoring failures, and reports quorum.
+    pub fn record<E>(&mut self, result: Result<T, E>) -> bool {
+        if let Ok(receipt) = result {
+            self.receipts.push(receipt);
+        }
+        self.reached()
+    }
+
+    /// Returns whether this batch has its configured durable quorum.
+    pub fn reached(&self) -> bool {
+        self.receipts.len() >= self.required
+    }
+
+    /// Returns the number of durable receipts observed before the deadline.
+    pub fn len(&self) -> usize {
+        self.receipts.len()
+    }
+
+    /// Returns whether no durable receipt has completed for this batch yet.
+    pub fn is_empty(&self) -> bool {
+        self.receipts.is_empty()
+    }
+
+    /// Consumes the collector and yields exactly its durable receipts.
+    pub fn into_receipts(self) -> Vec<T> {
+        self.receipts
+    }
+}
+
 /// A fragment transport failure. Any error here counts against quorum; it never
 /// silently succeeds.
 #[derive(Debug, thiserror::Error)]
@@ -110,7 +158,7 @@ impl FragmentTransport for PeerFragmentTransport {
     /// Stores locally when `node` is self, otherwise over peer RPC.
     async fn place(&self, node: &NodeId, record: FragmentRecord) -> Result<(), TransportError> {
         if *node == self.self_id {
-            self.local.store_fragment(&record)?;
+            self.local.append_batch(&[record])?;
             Ok(())
         } else {
             self.client.put_fragment(node, record).await?;

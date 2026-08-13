@@ -1604,11 +1604,13 @@ async fn neon_wal_push_is_acked_and_served_back_over_physical_replication() {
     })
     .await
     .expect("the one-second low-volume deadline streamed the partial WAL segment");
-    assert_eq!(
-        transport.wal_fragment_count(),
-        0,
-        "EC fragments drop only after the object-store write"
-    );
+    tokio::time::timeout(std::time::Duration::from_millis(1_500), async {
+        while transport.wal_fragment_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the durable release record reclaims EC fragments after origin durability");
 
     // The proposer may advance its truncate watermark before a cold pageserver
     // has consumed the retained WAL. Object-store drain must not make that WAL

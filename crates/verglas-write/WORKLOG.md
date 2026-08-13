@@ -91,3 +91,7 @@
   shutdown. A temporary object-store outage no longer strands acknowledged data
   until the cache process restarts; a paused-time regression test covers recovery
   after the former eight-attempt limit.
+- #127: Configured EC rings now refuse a quorum or headroom shortfall without
+  touching origin; only an actual standalone no-ring deployment writes through.
+  WAL and object paths share `DurableQuorum`, which counts only completed durable
+  append receipts and releases the client while non-quorum fragment work continues.

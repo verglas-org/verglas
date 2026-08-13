@@ -362,7 +362,7 @@ fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> Fr
                 let _guard = activity
                     .try_begin(ActivityPlane::Fragment)
                     .map_err(|_| FragmentIoError::Io("cache node is fenced".to_owned()))?;
-                store.store_fragment(&record)
+                store.append_batch(&[record])
             })
         }),
         store_stream: Arc::new(move |key: FragmentKey, shards| {
