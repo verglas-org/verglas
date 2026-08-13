@@ -38,10 +38,6 @@ use crate::meta::{StoredMetadata, now_unix_ms};
 use crate::metrics::WritebackMetrics;
 use crate::transport::FragmentTransport;
 
-/// Default background propagation retry attempts before giving up for this
-/// process run (a later run replays the still-dirty journal).
-const PROPAGATION_ATTEMPTS: u32 = 8;
-
 /// Base backoff between propagation retries.
 const PROPAGATION_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -404,8 +400,8 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let object_id = object_id.to_owned();
         tokio::spawn(async move {
             // Keep the key serialized from the start of the accepted PUT until
-            // every straggler is recorded and propagation has finished (or its
-            // bounded retries are exhausted). This is what makes a subsequent
+            // every straggler is recorded and propagation has finished. This is
+            // what makes a subsequent
             // successful DELETE final rather than vulnerable to resurrection.
             let _key_guard = key_guard;
             let mut rx = rx;
@@ -597,8 +593,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         lock
     }
 
-    /// Deletes an object after any earlier quorum-acked PUT for the same key
-    /// has either reached the origin or exhausted its propagation attempts.
+    /// Deletes an object after any earlier quorum-acked PUT for the same key.
     /// The origin delete happens before the dirty journal is discarded, so a
     /// failed delete preserves the acknowledged object for retry/recovery.
     pub async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
@@ -631,8 +626,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         Ok(())
     }
 
-    /// Propagates one object to the origin with bounded retries. A still-dirty
-    /// journal after all attempts is left for a later run to replay.
+    /// Propagates one object to the origin until it succeeds or shutdown starts.
+    /// The dirty journal and EC fragments remain durable throughout an origin
+    /// outage; recovery does not require a process restart.
     pub async fn propagate(self: Arc<Self>, object_id: String) {
         let Some(journal) = self.journals.read(&object_id).ok().flatten() else {
             return;
@@ -649,17 +645,19 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     /// Propagates while the caller owns the per-key operation lock.
     async fn propagate_locked(&self, object_id: String) {
         let mut backoff = PROPAGATION_BACKOFF;
-        for attempt in 0..PROPAGATION_ATTEMPTS {
+        let mut attempt = 0u64;
+        loop {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
+            attempt = attempt.saturating_add(1);
             match self.propagate_once(&object_id).await {
                 Ok(()) => return,
                 Err(error) => {
                     WritebackMetrics::bump(&self.metrics.propagation_failures);
                     eprintln!(
                         "writeback: propagation of {object_id} attempt {} failed: {error}",
-                        attempt + 1
+                        attempt
                     );
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(10));

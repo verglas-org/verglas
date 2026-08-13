@@ -435,9 +435,9 @@ Concurrent writers need no consensus. Every PUT is an independent, immutable era
 
 ### 6.2 Degraded operation
 
-Before consuming a request body, the coordinator checks live membership and fragment-store headroom. If fewer than `w` nodes are eligible, it streams the request directly to the origin. If placement falls below `w` after the body has been consumed but at least `k` fragments committed, the coordinator reconstructs the object and completes a synchronous origin write before acknowledging the client. Fewer than `k` committed fragments produce an explicit write failure.
+Before consuming a request body, the coordinator checks live membership and fragment-store headroom. A standalone deployment streams the request directly to the origin and acknowledges only after that write succeeds. A configured cluster requires `w` eligible nodes and returns an explicit write failure when it cannot meet that EC quorum; it does not bypass cluster durability through an origin fallback.
 
-An acknowledged but unpropagated object is readable through the same S3 endpoint. GET and HEAD consult the dirty journal and reconstruct the requested object from its fragments. Background propagation uploads the object to the origin with bounded retries, marks the journal clean, and releases fragments only after the origin write succeeds. Dirty journals are replayed after restart.
+An acknowledged but unpropagated object is readable through the same S3 endpoint. GET and HEAD consult the dirty journal and reconstruct the requested object from its fragments. Background propagation uploads the object to the origin with capped exponential backoff and keeps retrying until it succeeds or the process shuts down. It marks the journal clean and releases fragments only after the origin write succeeds. Dirty journals are replayed after restart.
 
 The repair loop observes membership changes. If a journaled object loses a fragment node but retains at least `k` placements, the coordinator reconstructs the object, re-encodes the missing fragments, and places them on unused live nodes. Coordinator tests cover acknowledgment threshold, insufficient-node fallback, mid-stream shortfall, read-after-write, propagation, and node-loss repair. Journal tests verify that dirty state is recovered when the journal directory is reopened.
 

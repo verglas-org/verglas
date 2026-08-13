@@ -40,13 +40,15 @@ completing stale work.
 
 ## Degraded operation
 
-If the cluster cannot meet its staging quorum, Verglas writes through to the
-origin before acknowledging. This increases latency but preserves correctness.
-It never acknowledges an object that exists only in volatile memory.
+A standalone deployment writes through to the origin before acknowledging. A
+configured cluster acknowledges only after its EC staging quorum succeeds and
+rejects the write when it cannot meet that quorum. Neither topology acknowledges
+an object that exists only in volatile memory.
 
 ## Repair and scrubbing
 
-Background propagation reconstructs complete objects and uploads them to the
-origin. Scrubbing verifies fragment checksums and repairs damaged fragments
+Background propagation reconstructs complete objects and retries the origin
+upload with capped backoff until it succeeds or the process shuts down. Scrubbing
+verifies fragment checksums and repairs damaged fragments
 while enough independent fragments remain. Both operate under hard bandwidth
 and concurrency limits so cache recovery cannot consume the host.

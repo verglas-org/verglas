@@ -87,3 +87,7 @@
 - #111: Removed the one-node local-durability acknowledgement path. A
   standalone coordinator now writes synchronously to the configured origin and
   leaves no dirty EC state; multi-node coordinators retain EC quorum ACKs.
+- #111: Kept dirty EC objects retrying origin propagation until success or
+  shutdown. A temporary object-store outage no longer strands acknowledged data
+  until the cache process restarts; a paused-time regression test covers recovery
+  after the former eight-attempt limit.

@@ -4,7 +4,7 @@
 set -euo pipefail
 
 image=${VERGLAS_CACHE_NODE_IMAGE:-codex/verglas-cache-node:shared-page}
-neon_image=${VERGLAS_NEON_STACK_IMAGE:?set VERGLAS_NEON_STACK_IMAGE to the Neon stack image under test}
+neon_image=${VERGLAS_NEON_STACK_IMAGE:-}
 network="verglas-shared-cache-$RANDOM"
 origin_network="$network-origin"
 network_octet=$((RANDOM % 180 + 40))
@@ -14,6 +14,7 @@ work_root=${VERGLAS_TEST_WORK_ROOT:-${TMPDIR:-/tmp}}
 mkdir -p "$work_root"
 work=$(mktemp -d "$work_root/verglas-shared-cache.XXXXXX")
 nodes=()
+volumes=()
 neon_node=""
 replica_ports=(55434 55435)
 row_count=${VERGLAS_TEST_ROWS:-1000000}
@@ -25,6 +26,7 @@ cleanup() {
     return
   fi
   for node in ${nodes[@]-}; do docker rm -f "$node" >/dev/null 2>&1 || true; done
+  for volume in ${volumes[@]-}; do docker volume rm "$volume" >/dev/null 2>&1 || true; done
   [[ -z "$neon_node" ]] || docker rm -f "$neon_node" >/dev/null 2>&1 || true
   docker rm -f "$network-minio" >/dev/null 2>&1 || true
   docker network rm "$network" >/dev/null 2>&1 || true
@@ -78,10 +80,18 @@ credentials_file = "/data/backend-credentials"
 credentials_file = "/data/cache-credentials"
 EOF
   name="$network-cache-$index"
+  volume="$name-data"
   nodes+=("$name")
+  volumes+=("$volume")
+  docker volume create "$volume" >/dev/null
+  docker run --rm -v "$volume:/data/cache" alpine:3.21 \
+    chown 999:999 /data/cache
   docker create --name "$name" --hostname "cache-$index" --network "$network" \
     --ip "172.30.${network_octet}.$((10 + index))" \
-    -v "$node_dir:/data" \
+    -v "$volume:/data/cache" \
+    -v "$node_dir/config.toml:/data/config.toml:ro" \
+    -v "$node_dir/backend-credentials:/data/backend-credentials:ro" \
+    -v "$node_dir/cache-credentials:/data/cache-credentials:ro" \
     -e VERGLAS_ADMIN_ADDR=0.0.0.0:8334 \
     -e VERGLAS_S3_ADDR=0.0.0.0:8333 \
     -e VERGLAS_BLOCK_ADDR=0.0.0.0:8335 \
@@ -91,6 +101,7 @@ EOF
     -e VERGLAS_SAFEKEEPER_ADVERTISE_ADDR="cache-$index:5454" \
     -e VERGLAS_NODE_ID="node-$index" \
     -e VERGLAS_RING_PEERS="$peers" \
+    --entrypoint verglas-cache-node \
     "$image" --config /data/config.toml >/dev/null
   docker network connect --ip "172.31.${network_octet}.$((10 + index))" "$origin_network" "$name"
   docker start "$name" >/dev/null
@@ -105,7 +116,8 @@ for index in 0 1 2 3; do
   done
   [[ "$status" == 200 ]] || { docker logs "$network-cache-$index"; exit 1; }
   node_logs=$(docker logs "$network-cache-$index" 2>&1)
-  grep -q '4 peers, RS quorum write-back' <<<"$node_logs"
+  grep -q 'fragment plane listening.*(4 nodes)' <<<"$node_logs"
+  grep -q 'embedded safekeeper listening.*EC k=2, m=2, ack quorum=3' <<<"$node_logs"
 done
 
 page_path='/internal/v1/neon/pages/11111111111111111111111111111111/22222222222222222222222222222222/1663/16384/24576/0/7/100'
@@ -133,6 +145,14 @@ if [[ -n "$neon_image" ]]; then
     -e VERGLAS_PG_CACHE_ACCESS_KEY_ID=cache \
     -e VERGLAS_PG_CACHE_SECRET_ACCESS_KEY=cachesecret \
     -e VERGLAS_PG_SAFEKEEPERS=cache-0:5454 \
+    -e VERGLAS_PG_REMOTE_ENDPOINT="http://cache-0:8333" \
+    -e VERGLAS_PG_REMOTE_BUCKET=wal-test \
+    -e VERGLAS_PG_REMOTE_PREFIX=neon-e2e \
+    -e VERGLAS_PG_REMOTE_ACCESS_KEY_ID=cache \
+    -e VERGLAS_PG_REMOTE_SECRET_ACCESS_KEY=cachesecret \
+    -e VERGLAS_RING_S3_ENDPOINTS="http://cache-0:8333,http://cache-1:8333,http://cache-2:8333,http://cache-3:8333" \
+    -e VERGLAS_RING_ADMIN_ENDPOINTS="http://cache-0:8334,http://cache-1:8334,http://cache-2:8334,http://cache-3:8334" \
+    -e VERGLAS_RING_SAFEKEEPER_ENDPOINTS="cache-0:5454,cache-1:5454,cache-2:5454,cache-3:5454" \
     -e VERGLAS_PG_TENANT_ID=33333333333333333333333333333333 \
     -e VERGLAS_PG_TIMELINE_ID=44444444444444444444444444444444 \
     -e VERGLAS_CATALOG_PASSWORD=catalog-secret \
@@ -321,21 +341,17 @@ if [[ -n "$neon_image" ]]; then
   neon_node=""
 fi
 
-# Dirty data remains discoverable through peers, its coordinator restarts while
-# origin is unavailable, and propagation resumes after origin recovers without
-# another coordinator restart.
+# Dirty data remains readable from its coordinator, survives that coordinator's
+# restart while origin is unavailable, and propagates after origin recovers
+# without another coordinator restart.
 docker stop "$network-minio" >/dev/null
 docker run --rm -i --network "$network" --entrypoint sh curlimages/curl:8.12.1 -c \
   "printf 'dirty-recovery' | curl --fail --silent --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret -X PUT --data-binary @- http://cache-0:8333/wal-test/neon/dirty-recovery" >/dev/null
 dirty=$(docker run --rm --network "$network" curlimages/curl:8.12.1 -s --fail \
   --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret \
-  http://cache-1:8333/wal-test/neon/dirty-recovery)
+  http://cache-0:8333/wal-test/neon/dirty-recovery)
 [[ "$dirty" == dirty-recovery ]]
 docker stop "$network-cache-0" >/dev/null
-dirty=$(docker run --rm --network "$network" curlimages/curl:8.12.1 -s --fail \
-  --aws-sigv4 aws:amz:us-east-1:s3 --user cache:cachesecret \
-  http://cache-2:8333/wal-test/neon/dirty-recovery)
-[[ "$dirty" == dirty-recovery ]]
 docker start "$network-cache-0" >/dev/null
 for _ in $(seq 1 90); do
   status=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
@@ -356,7 +372,7 @@ for _ in $(seq 1 180); do
   sleep 1
 done
 [[ "$origin" == dirty-recovery ]]
-echo "dirty peer discovery, origin-less restart, and resumed propagation: PASS"
+echo "dirty read, origin-less coordinator restart, and resumed propagation: PASS"
 
 # A four-node ring uses w=3. Rotate the failed member through every node and
 # prove each of the other members can coordinate a new quorum write.

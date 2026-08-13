@@ -269,6 +269,9 @@ impl RecordingOrigin {
         self.block_put.store(false, Ordering::SeqCst);
         self.put_release.notify_waiters();
     }
+    fn recover(&self) {
+        self.fail.store(false, Ordering::SeqCst);
+    }
     fn get(&self, bucket: &str, key: &str) -> Option<Bytes> {
         self.puts
             .lock()
@@ -1068,6 +1071,39 @@ async fn acked_object_propagates_and_frees_fragments() {
         0,
         "fragments freed after propagation"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn propagation_keeps_retrying_until_origin_recovers() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::new(true);
+    let (coordinator, _dir) = build(transport, membership, origin.clone());
+    let payload = body(9000);
+
+    coordinator
+        .put(
+            &ck("data/recover"),
+            &WriteMetadata::default(),
+            payload.clone(),
+            2,
+            1,
+            3,
+        )
+        .await
+        .expect("quorum ack");
+
+    while coordinator.metrics().snapshot().propagation_failures < 8 {
+        tokio::time::advance(Duration::from_secs(11)).await;
+        tokio::task::yield_now().await;
+    }
+    origin.recover();
+    tokio::time::advance(Duration::from_secs(11)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(origin.get("bkt", "data/recover"), Some(payload));
+    assert_eq!(coordinator.metrics().snapshot().propagated, 1);
+    assert!(coordinator.journals().is_idle());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -44,17 +44,11 @@
 //! refuses the commit with a clear error when propagation cannot complete
 //! (#286). It sits on the commit path, never the ack or serve hot path.
 //!
-//! ## Single-node write-back (#286)
+//! ## Single-node write-through
 //!
-//! A one-node deployment ([`SingleNodeMembership`]) cannot form a fragment
-//! quorum, but it can still fast-ack from local durability. Write-back
-//! degenerates to `k=1, m=0, w=1`: the single object fragment is fsynced to
-//! local NVMe and, with the fsynced journal, is the ack — no origin round-trip
-//! on the write path — and propagation to the origin runs in the background
-//! exactly as the §6 quorum path does. There is no new configuration: write-back
-//! enabled plus single-node membership selects this mode. Its loss semantics are
-//! the ones stated above (one local disk until propagation), and the commit
-//! barrier keeps published tables consistent regardless.
+//! A one-node deployment ([`SingleNodeMembership`]) cannot form a durability
+//! quorum. It therefore writes synchronously to the origin and acknowledges only
+//! after the origin accepts the complete object. It creates no dirty EC state.
 
 pub mod barrier;
 pub mod catalog_log;
