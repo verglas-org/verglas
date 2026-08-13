@@ -409,7 +409,11 @@ impl IcebergCatalogSemanticStore {
                 .create_namespace(
                     &namespace,
                     HashMap::from([
-                        ("verglas.s3vectors.created".to_owned(), "0".to_owned()),
+                        ("verglas.s3vectors.kind".to_owned(), "bucket".to_owned()),
+                        (
+                            "verglas.s3vectors.created".to_owned(),
+                            now_millis().to_string(),
+                        ),
                         ("verglas.s3vectors.policy".to_owned(), "null".to_owned()),
                         ("verglas.s3vectors.tags".to_owned(), "{}".to_owned()),
                     ]),
@@ -453,7 +457,7 @@ impl IcebergCatalogSemanticStore {
             let mut properties = state.properties().clone();
             if operation == "GetVectorBucketPolicy" {
                 return Ok(
-                    json!({"policy": serde_json::from_str::<Value>(properties.get("verglas.s3vectors.policy").map(String::as_str).unwrap_or("null")).unwrap_or(Value::Null)}),
+                    json!({"policy": properties.get("verglas.s3vectors.policy").cloned().ok_or_else(|| SemanticError::validation("vector bucket policy does not exist"))?}),
                 );
             }
             if operation == "PutVectorBucketPolicy" {
@@ -506,6 +510,18 @@ impl IcebergCatalogSemanticStore {
                 tables_api::create_table(self.catalog.as_ref(), &ident, definition)
                     .await
                     .map_err(iceberg_error)?;
+                let namespace = bucket_namespace(&input)?;
+                let state = self
+                    .catalog
+                    .get_namespace(&namespace)
+                    .await
+                    .map_err(iceberg_error)?;
+                let mut properties = state.properties().clone();
+                properties.insert(index_metadata_key(required_string(&input, "indexName")?), json!({"creationTime": now_millis(), "dataType": required_string(&input, "dataType")?, "dimension": input.get("dimension").cloned().ok_or_else(|| SemanticError::validation("dimension is required"))?, "distanceMetric": required_string(&input, "distanceMetric")?, "metadataConfiguration": input.get("metadataConfiguration").cloned().unwrap_or(Value::Null), "encryptionConfiguration": input.get("encryptionConfiguration").cloned().unwrap_or(Value::Null)}).to_string());
+                self.catalog
+                    .update_namespace(&namespace, properties)
+                    .await
+                    .map_err(iceberg_error)?;
                 Ok(json!({"indexArn": vector_arn(&input)?}))
             }
             "DeleteIndex" => {
@@ -515,9 +531,22 @@ impl IcebergCatalogSemanticStore {
                     .map_err(iceberg_error)?;
                 Ok(json!({}))
             }
-            "GetIndex" => Ok(
-                json!({"index": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "indexName": required_string(&input, "indexName")?, "indexArn": vector_arn(&input)?, "creationTime": "0", "dataType": "float32", "dimension": input.get("dimension").cloned().unwrap_or(json!(0)), "distanceMetric": input.get("distanceMetric").cloned().unwrap_or(json!("euclidean"))}}),
-            ),
+            "GetIndex" => {
+                let state = self
+                    .catalog
+                    .get_namespace(&bucket_namespace(&input)?)
+                    .await
+                    .map_err(iceberg_error)?;
+                let value = state
+                    .properties()
+                    .get(&index_metadata_key(required_string(&input, "indexName")?))
+                    .ok_or_else(|| SemanticError::validation("index metadata is absent"))?;
+                let metadata: Value = serde_json::from_str(value)
+                    .map_err(|_| SemanticError::validation("index metadata is corrupt"))?;
+                Ok(
+                    json!({"index": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "indexName": required_string(&input, "indexName")?, "indexArn": vector_arn(&input)?, "creationTime": metadata["creationTime"], "dataType": metadata["dataType"], "dimension": metadata["dimension"], "distanceMetric": metadata["distanceMetric"], "metadataConfiguration": metadata["metadataConfiguration"], "encryptionConfiguration": metadata["encryptionConfiguration"]}}),
+                )
+            }
             "PutVectors" | "DeleteVectors" => {
                 let values = if operation == "PutVectors" {
                     input.get("vectors")
@@ -742,6 +771,22 @@ fn bucket_arn(input: &Value) -> Result<String, SemanticError> {
         "arn:aws:s3vectors:us-east-1:000000000000:bucket/{}",
         required_string(input, "vectorBucketName")?
     ))
+}
+
+/// Returns a durable creation timestamp recorded with each catalog resource.
+fn now_millis() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(duration) => match i64::try_from(duration.as_millis()) {
+            Ok(value) => value,
+            Err(_) => i64::MAX,
+        },
+        Err(_) => 0,
+    }
+}
+
+/// Names the catalog namespace property carrying one index's exact definition.
+fn index_metadata_key(index: &str) -> String {
+    format!("verglas.s3vectors.index.{index}")
 }
 
 /// Resolves a vector bucket/index name to its customer-owned Iceberg table.
