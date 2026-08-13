@@ -180,3 +180,9 @@
   absent certified holders, then require one valid complete copy or `k` valid
   coded shards. Returned representations still require their exact committed
   allocation identity, so a mismatched peer response fails closed.
+
+- #135: Validated certified payload holders in parallel and retained committed
+  prefixes with a bounded sixteen-entry concurrency during leader readiness.
+  Every completed holder response is still identity-checked before service, so
+  a dead former leader no longer makes catalog recovery exceed its request
+  deadline without weakening corruption checks or resource ceilings.

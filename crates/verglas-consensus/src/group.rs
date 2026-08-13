@@ -10,6 +10,7 @@ use std::sync::{
 };
 
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -751,48 +752,75 @@ impl ConsensusGroup {
 
     /// Verifies every committed representation before this replica serves authority.
     async fn verify_committed_prefix(&self) -> Result<(), GroupError> {
-        for (index, header) in self.state_machine.committed_headers().await {
-            let (certificate, configuration_generation, log_id) =
-                if let Some(repair) = self.state_machine.repair_allocation(index).await {
-                    (
-                        repair.certificate,
-                        repair.configuration_generation,
-                        repair.log_id,
-                    )
-                } else {
-                    (
-                        header.certificate().clone(),
-                        header.configuration_generation(),
-                        self.state_machine
-                            .committed_log_id(index)
-                            .await
-                            .ok_or(GroupError::NotCommitted(index))?,
-                    )
-                };
-            self.payloads
-                .seal(crate::SealRequest {
-                    hash: header.payload_hash(),
-                    group: header.group(),
-                    configuration_generation,
-                    request: header.request(),
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: &certificate,
-                })
-                .await?;
-            self.payloads
-                .reconstruct(crate::ReconstructRequest {
-                    hash: header.payload_hash(),
-                    group: header.group(),
-                    configuration_generation,
-                    request: header.request(),
-                    length: header.payload_len(),
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: &certificate,
-                })
-                .await?;
+        // Prefix entries are independent immutable allocations. Validate them
+        // concurrently so one failed former holder adds one transport timeout,
+        // not one timeout per retained catalog command. Await every task before
+        // admitting the read, so a completed corrupt response cannot be hidden
+        // by another valid entry.
+        let verified = stream::iter(
+            self.state_machine
+                .committed_headers()
+                .await
+                .into_iter()
+                .map(|(index, header)| async move {
+                    self.verify_committed_header(index, &header).await
+                }),
+        )
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+        for result in verified {
+            result?;
         }
+        Ok(())
+    }
+
+    /// Seals and reconstructs one exact committed header before authoritative service.
+    async fn verify_committed_header(
+        &self,
+        index: u64,
+        header: &EntryHeader,
+    ) -> Result<(), GroupError> {
+        let (certificate, configuration_generation, log_id) =
+            if let Some(repair) = self.state_machine.repair_allocation(index).await {
+                (
+                    repair.certificate,
+                    repair.configuration_generation,
+                    repair.log_id,
+                )
+            } else {
+                (
+                    header.certificate().clone(),
+                    header.configuration_generation(),
+                    self.state_machine
+                        .committed_log_id(index)
+                        .await
+                        .ok_or(GroupError::NotCommitted(index))?,
+                )
+            };
+        self.payloads
+            .seal(crate::SealRequest {
+                hash: header.payload_hash(),
+                group: header.group(),
+                configuration_generation,
+                request: header.request(),
+                term: log_id.leader_id.term,
+                index: log_id.index,
+                certificate: &certificate,
+            })
+            .await?;
+        self.payloads
+            .reconstruct(crate::ReconstructRequest {
+                hash: header.payload_hash(),
+                group: header.group(),
+                configuration_generation,
+                request: header.request(),
+                length: header.payload_len(),
+                term: log_id.leader_id.term,
+                index: log_id.index,
+                certificate: &certificate,
+            })
+            .await?;
         Ok(())
     }
 

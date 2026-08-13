@@ -8,10 +8,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
+use verglas_consensus::{CatalogAction, CatalogBatch};
 use verglas_safekeeper::{WalRequest, WalResponse};
 
 const TENANT: &str = "0123456789abcdef0123456789abcdef";
 const TIMELINE: &str = "fedcba9876543210fedcba9876543210";
+const CATALOG_TENANT: &str = "tenant-tpch";
+const WAREHOUSE: &str = "tpch";
 
 /// Kills child cache nodes even when an assertion fails.
 struct Fleet {
@@ -162,6 +166,32 @@ async fn submit(addr: SocketAddr, request: WalRequest) -> Result<WalResponse, St
     }
     WalResponse::decode(&response.bytes().await.expect("WAL response body"))
         .map_err(|error| error.to_string())
+}
+
+/// Submits one typed native-catalog request and decodes its linearizable response.
+async fn submit_catalog(
+    addr: SocketAddr,
+    request: ManagedCatalogRequest,
+) -> Result<ManagedCatalogResponse, String> {
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!(
+            "http://{addr}/catalog/v1/{CATALOG_TENANT}/{WAREHOUSE}"
+        ))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "catalog operation failed with {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+    response.json().await.map_err(|error| error.to_string())
 }
 
 /// Four real cache nodes preserve writes with one voter down and refuse two failures.
@@ -365,4 +395,140 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     )
     .await;
     assert!(minority.is_err(), "two live voters must fail closed");
+}
+
+/// Four native-catalog ingresses retain linearizable availability after their elected leader dies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    for index in 0..4 {
+        children.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            &stderr,
+        ));
+    }
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let leader = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
+    let namespace = CatalogBatch::new(
+        vec![],
+        vec![CatalogAction::CreateNamespace {
+            namespace: "analytics".to_owned(),
+        }],
+    )
+    .expect("namespace batch");
+    assert!(matches!(
+        submit_catalog(
+            leader,
+            ManagedCatalogRequest::Commit {
+                request_id: 1,
+                batch: namespace,
+            },
+        )
+        .await
+        .expect("commit catalog namespace through four voters"),
+        ManagedCatalogResponse::Applied(_)
+    ));
+
+    // The dead-leader case must validate a realistic retained catalog prefix,
+    // rather than only the one registration command in the tenant-root group.
+    for revision in 0..106_u128 {
+        let batch = CatalogBatch::new(
+            vec![],
+            vec![CatalogAction::PutTable {
+                table: "analytics.lineitem".to_owned(),
+                metadata_location: format!("s3://warehouse/lineitem/v{revision}.metadata.json"),
+            }],
+        )
+        .expect("table batch");
+        assert!(matches!(
+            submit_catalog(
+                leader,
+                ManagedCatalogRequest::Commit {
+                    request_id: revision + 2,
+                    batch,
+                },
+            )
+            .await
+            .expect("commit retained catalog prefix"),
+            ManagedCatalogResponse::Applied(_)
+        ));
+    }
+
+    fleet.children[0]
+        .kill()
+        .expect("stop elected catalog leader");
+    fleet.children[0]
+        .wait()
+        .expect("reap elected catalog leader");
+    let survivor = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[1]));
+    assert_eq!(
+        submit_catalog(survivor, ManagedCatalogRequest::Namespaces)
+            .await
+            .expect("survivor serves an immediate linearizable catalog read"),
+        ManagedCatalogResponse::Namespaces(vec!["analytics".to_owned()])
+    );
+    let mutation = CatalogBatch::new(
+        vec![],
+        vec![CatalogAction::PutTable {
+            table: "analytics.lineitem".to_owned(),
+            metadata_location: "s3://warehouse/lineitem/after-leader-loss.metadata.json".to_owned(),
+        }],
+    )
+    .expect("post-loss table batch");
+    assert!(matches!(
+        submit_catalog(
+            survivor,
+            ManagedCatalogRequest::Commit {
+                request_id: 10_000,
+                batch: mutation,
+            },
+        )
+        .await
+        .expect("three live voters commit after catalog-leader loss"),
+        ManagedCatalogResponse::Applied(_)
+    ));
+
+    fleet.children[3]
+        .kill()
+        .expect("stop a second catalog voter");
+    fleet.children[3].wait().expect("reap second catalog voter");
+    let minority = CatalogBatch::new(
+        vec![],
+        vec![CatalogAction::PutTable {
+            table: "analytics.lineitem".to_owned(),
+            metadata_location: "s3://warehouse/lineitem/must-not-commit.metadata.json".to_owned(),
+        }],
+    )
+    .expect("minority table batch");
+    assert!(
+        submit_catalog(
+            survivor,
+            ManagedCatalogRequest::Commit {
+                request_id: 10_001,
+                batch: minority,
+            },
+        )
+        .await
+        .is_err(),
+        "two live voters must reject a catalog mutation"
+    );
 }

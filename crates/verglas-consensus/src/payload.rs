@@ -13,6 +13,7 @@ use std::{
 
 use bytes::Bytes;
 use crc32c::crc32c;
+use futures::future::join_all;
 use sha2::{Digest, Sha256};
 
 use crate::{PayloadCertificate, ReplicationMode, RequestId, decode, encode};
@@ -269,13 +270,24 @@ impl PayloadStore for DistributedPayloadStore {
             index,
             certificate,
         } = read;
+        // Start every certified peer load together. Recovery must wait for all
+        // returned representations before accepting a body: returning after a
+        // first complete copy would hide a corrupt response from another peer.
+        let loaded = join_all(certificate.holders().iter().copied().map(|voter| {
+            let transport = Arc::clone(&self.transport);
+            async move {
+                (
+                    voter,
+                    transport
+                        .load(voter, hash, group, configuration_generation, request)
+                        .await,
+                )
+            }
+        }))
+        .await;
         let mut records = Vec::new();
-        for voter in certificate.holders() {
-            let record = match self
-                .transport
-                .load(*voter, hash, group, configuration_generation, request)
-                .await
-            {
+        for (voter, result) in loaded {
+            let record = match result {
                 Ok(Some(record)) => record,
                 // A committed certificate can outlive an individual peer. The
                 // remaining holders are sufficient when they meet the mode's
@@ -288,7 +300,7 @@ impl PayloadStore for DistributedPayloadStore {
             let expected_slot = certificate
                 .voters()
                 .iter()
-                .position(|candidate| candidate == voter)
+                .position(|candidate| *candidate == voter)
                 .ok_or(PayloadError::UnknownHolder)?;
             if record.group != group
                 || record.configuration_generation != configuration_generation
@@ -441,13 +453,25 @@ impl PayloadStore for DistributedPayloadStore {
         if term == 0 || index == 0 {
             return Err(PayloadError::CorruptRepresentation);
         }
+        // Load all holders before writing a seal. This retains the corruption
+        // check for every response that completed, while an unavailable former
+        // leader no longer serializes recovery of a long committed prefix.
+        let loaded = join_all(certificate.holders().iter().copied().map(|voter| {
+            let transport = Arc::clone(&self.transport);
+            async move {
+                (
+                    voter,
+                    transport
+                        .load(voter, hash, group, configuration_generation, request)
+                        .await,
+                )
+            }
+        }))
+        .await;
         let mut sealed = 0;
-        for voter in certificate.holders() {
-            let mut record = match self
-                .transport
-                .load(*voter, hash, group, configuration_generation, request)
-                .await
-            {
+        let mut pending = Vec::new();
+        for (voter, result) in loaded {
+            let mut record = match result {
                 Ok(Some(record)) => record,
                 Ok(None) | Err(PayloadError::Transport(_)) => continue,
                 Err(error) => return Err(error),
@@ -455,7 +479,7 @@ impl PayloadStore for DistributedPayloadStore {
             let expected_slot = certificate
                 .voters()
                 .iter()
-                .position(|candidate| candidate == voter)
+                .position(|candidate| *candidate == voter)
                 .ok_or(PayloadError::UnknownHolder)?;
             if record.request != request
                 || record.group != group
@@ -473,7 +497,15 @@ impl PayloadStore for DistributedPayloadStore {
             }
             record.term = term;
             record.index = index;
-            match self.transport.store(*voter, record).await {
+            pending.push((voter, record));
+        }
+        let stored = join_all(pending.into_iter().map(|(voter, record)| {
+            let transport = Arc::clone(&self.transport);
+            async move { transport.store(voter, record).await }
+        }))
+        .await;
+        for result in stored {
+            match result {
                 Ok(()) => sealed += 1,
                 Err(PayloadError::Transport(_)) => continue,
                 Err(error) => return Err(error),

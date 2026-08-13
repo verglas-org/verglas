@@ -209,3 +209,8 @@
 - #135: Return HTTP 409 only for CRaft catalog CAS and request-identity
   conflicts. All other catalog submission failures are HTTP 503 so another
   ingress can preserve availability during leader or quorum disruption.
+
+- #135: Added a four-process native-catalog leader-loss regression with a
+  realistic retained warehouse prefix. It proves a surviving ingress serves
+  an immediate fenced read and mutation at three of four voters, while a
+  two-voter catalog minority remains closed.
