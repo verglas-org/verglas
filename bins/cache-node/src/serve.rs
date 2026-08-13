@@ -441,6 +441,7 @@ pub async fn run(
     let object_consensus = safekeeper_args
         .as_ref()
         .map(|(_, _, consensus, _, _)| Arc::clone(consensus));
+    let shutdown_consensus = object_consensus.clone();
 
     // An external Iceberg REST endpoint is always an explicitly eventual
     // source. Managed catalog transactions use the native warehouse endpoint
@@ -693,7 +694,14 @@ pub async fn run(
         }
     };
 
-    tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut).map(|_| ())
+    let result = tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut);
+    if let Some(consensus) = shutdown_consensus {
+        consensus
+            .shutdown()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    result.map(|_| ())
 }
 
 /// Probes the origin until it is reachable, then keeps checking after failures.

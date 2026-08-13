@@ -236,3 +236,8 @@
   Streaming uploads now relay a bounded number of body chunks to a worker that
   owns append, fsync, rename, and directory fsync, and HTTP success still waits
   until that worker reports the fragment durable.
+- #135: Put each OpenRaft core and its replication timers on a cache-node-owned
+  current-thread Tokio runtime. Group creation now dispatches to that runtime even
+  when peer HTTP opens a retained group, and teardown stops every core before
+  joining the runtime thread; a saturated-public-runtime real-vote regression
+  protects that scheduling boundary.

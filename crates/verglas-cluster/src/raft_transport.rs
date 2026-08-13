@@ -11,7 +11,7 @@ use axum::{
 };
 use openraft::{
     BasicNode,
-    error::{InstallSnapshotError, NetworkError, RPCError},
+    error::{InstallSnapshotError, NetworkError, RPCError, Unreachable},
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -38,6 +38,33 @@ const GROUP_COMMAND_BODY_LIMIT_BYTES: usize = 34 * 1024 * 1024;
 type Raft = openraft::Raft<VerglasRaftConfig>;
 type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError<u64, E>;
 type Net<T, E = openraft::error::Infallible> = Result<T, RPCError<u64, BasicNode, RaftError<E>>>;
+/// Distinguishes a peer that is down from a transient transport error.
+///
+/// OpenRaft retries [`Unreachable`] peers through its 500ms backoff rather
+/// than immediately resubmitting an HTTP connection refusal in a tight loop.
+enum RaftTransportError {
+    Unreachable(Unreachable),
+    Network(NetworkError),
+}
+
+impl RaftTransportError {
+    /// Converts this transport error into the generic OpenRaft RPC error type.
+    fn into_rpc<E: std::error::Error>(self) -> RPCError<u64, BasicNode, RaftError<E>> {
+        match self {
+            Self::Unreachable(error) => RPCError::Unreachable(error),
+            Self::Network(error) => RPCError::Network(error),
+        }
+    }
+}
+
+/// Marks connection establishment failures as backoff-worthy peer unavailability.
+fn classify_peer_error(error: reqwest::Error) -> RaftTransportError {
+    if error.is_connect() {
+        RaftTransportError::Unreachable(Unreachable::new(&error))
+    } else {
+        RaftTransportError::Network(NetworkError::new(&error))
+    }
+}
 /// Installs one group locally before its first OpenRaft RPC arrives.
 pub type OpenGroupFn =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
@@ -493,17 +520,17 @@ pub struct RaftHttpNetwork<R> {
     secret: Arc<str>,
 }
 impl<R: RaftAddressResolver> RaftHttpNetwork<R> {
-    /// Sends one JSON RPC and fail-closes transport and HTTP failures as network errors.
+    /// Sends one JSON RPC and makes refused peer connections use Raft backoff.
     async fn call<Req: serde::Serialize + ?Sized, Resp: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         request: &Req,
-    ) -> Result<Resp, NetworkError> {
+    ) -> Result<Resp, RaftTransportError> {
         let address = self.resolver.resolve(self.target).ok_or_else(|| {
-            NetworkError::new(&io::Error::new(
+            RaftTransportError::Unreachable(Unreachable::new(&io::Error::new(
                 io::ErrorKind::NotFound,
                 "unknown raft voter",
-            ))
+            )))
         })?;
         let response = self
             .client
@@ -519,13 +546,16 @@ impl<R: RaftAddressResolver> RaftHttpNetwork<R> {
             .json(request)
             .send()
             .await
-            .map_err(|e| NetworkError::new(&e))?;
+            .map_err(classify_peer_error)?;
         if !response.status().is_success() {
-            return Err(NetworkError::new(&io::Error::other(
-                "raft peer rejected RPC",
+            return Err(RaftTransportError::Network(NetworkError::new(
+                &io::Error::other("raft peer rejected RPC"),
             )));
         }
-        response.json().await.map_err(|e| NetworkError::new(&e))
+        response
+            .json()
+            .await
+            .map_err(|error| RaftTransportError::Network(NetworkError::new(&error)))
     }
 }
 impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<R> {
@@ -537,7 +567,7 @@ impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<
     ) -> Net<AppendEntriesResponse<u64>> {
         self.call("append", &request)
             .await
-            .map_err(RPCError::Network)
+            .map_err(RaftTransportError::into_rpc)
     }
     /// Sends InstallSnapshot.
     async fn install_snapshot(
@@ -547,17 +577,20 @@ impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<
     ) -> Net<InstallSnapshotResponse<u64>, InstallSnapshotError> {
         self.call("snapshot", &request)
             .await
-            .map_err(RPCError::Network)
+            .map_err(RaftTransportError::into_rpc)
     }
     /// Sends Vote.
     async fn vote(&mut self, request: VoteRequest<u64>, _: RPCOption) -> Net<VoteResponse<u64>> {
-        self.call("vote", &request).await.map_err(RPCError::Network)
+        self.call("vote", &request)
+            .await
+            .map_err(RaftTransportError::into_rpc)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::Vote;
 
     const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
 
@@ -608,6 +641,29 @@ mod tests {
             .expect("forwarded lifecycle request");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         server.abort();
+    }
+
+    /// A refused peer connection is classified as unreachable so Raft backs off before retrying.
+    #[tokio::test]
+    async fn refused_peer_vote_uses_unreachable_backoff() {
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve unavailable peer address")
+            .local_addr()
+            .expect("unavailable peer address");
+        let network = RaftHttpNetwork {
+            target: 7,
+            group: Arc::from("warehouse/a"),
+            resolver: StaticRaftAddressResolver::new(BTreeMap::from([(7, address)])),
+            client: Client::builder()
+                .http2_prior_knowledge()
+                .build()
+                .expect("HTTP client"),
+            secret: Arc::from("secret"),
+        };
+        let result = network
+            .call::<_, VoteResponse<u64>>("vote", &VoteRequest::new(Vote::new(1, 1), None))
+            .await;
+        assert!(matches!(result, Err(RaftTransportError::Unreachable(_))));
     }
 
     /// The authenticated forwarding route admits one canonical large WAL command.

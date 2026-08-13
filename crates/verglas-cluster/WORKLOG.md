@@ -1,5 +1,10 @@
 # verglas-cluster worklog
 
+- #135: Classified refused consensus-peer HTTP connections as OpenRaft
+  `Unreachable` instead of immediately retriable network errors. Replication
+  now uses OpenRaft's bounded 500ms peer backoff after a node is killed, so a
+  retained group cannot burn CPU in a connection-refusal retry storm.
+
 - #135: Added authenticated HTTP/2 OpenRaft vote, append, and snapshot routes,
   plus a numeric-voter network factory. Requests only reach registered local
   Raft instances and unresolved or rejected peers fail closed.

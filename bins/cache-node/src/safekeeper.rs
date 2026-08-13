@@ -249,8 +249,15 @@ pub async fn serve(
         layout.m,
         layout.w,
     );
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Waits for process termination before closing the public WAL ingress.
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Routes catalog work through its tenant root before the warehouse group.

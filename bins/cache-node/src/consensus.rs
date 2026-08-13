@@ -6,9 +6,11 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    future::Future,
     net::SocketAddr,
     path::PathBuf,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex, mpsc},
+    thread,
     time::Duration,
 };
 
@@ -16,6 +18,7 @@ use futures::future::join_all;
 use openraft::BasicNode;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use verglas_cluster::{
     BootstrapGroupFn, GroupCommandFn, MembershipReplace, MembershipReplaceFn, OpenGroupFn,
     RaftHttpTransport,
@@ -88,13 +91,126 @@ fn raft_config(voters: &[u64], local: u64) -> Result<openraft::Config, PlaneErro
     .map_err(Into::into)
 }
 
+/// Owns the one-thread Tokio scheduler on which OpenRaft creates its core and replication tasks.
+///
+/// OpenRaft uses the currently entered Tokio runtime in [`Raft::new`].  The
+/// public HTTP runtime must therefore never create a Raft instance: a slow
+/// public request must not postpone vote processing, heartbeats, or replication.
+struct ConsensusRuntime {
+    handle: tokio::runtime::Handle,
+    shutdown: StdMutex<Option<oneshot::Sender<()>>>,
+    thread: StdMutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl ConsensusRuntime {
+    /// Starts an owned multi-worker runtime and waits until it can accept group creation.
+    fn start() -> Result<Arc<Self>, PlaneError> {
+        let (ready, started) = mpsc::sync_channel(1);
+        let (shutdown, stopping) = oneshot::channel();
+        let thread = thread::Builder::new()
+            .name("verglas-consensus".to_owned())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        let _ = ready.send(Err(error.to_string()));
+                        return;
+                    }
+                };
+                if ready.send(Ok(runtime.handle().clone())).is_err() {
+                    return;
+                }
+                runtime.block_on(async move {
+                    let _ = stopping.await;
+                });
+            })
+            .map_err(|error| format!("start consensus runtime: {error}"))?;
+        let handle = match started.recv() {
+            Ok(Ok(handle)) => handle,
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                return Err(format!("initialize consensus runtime: {error}").into());
+            }
+            Err(error) => {
+                let _ = thread.join();
+                return Err(format!("consensus runtime stopped during startup: {error}").into());
+            }
+        };
+        Ok(Arc::new(Self {
+            handle,
+            shutdown: StdMutex::new(Some(shutdown)),
+            thread: StdMutex::new(Some(thread)),
+        }))
+    }
+
+    /// Runs work on the owned scheduler and returns task or runtime failures to the caller.
+    async fn run<T, F>(&self, work: F) -> Result<T, PlaneError>
+    where
+        T: Send + 'static,
+        F: Future<Output = Result<T, PlaneError>> + Send + 'static,
+    {
+        self.handle
+            .spawn(work)
+            .await
+            .map_err(|error| format!("consensus runtime task stopped: {error}"))?
+    }
+
+    /// Stops the scheduler after its Raft cores have been shut down.
+    async fn shutdown(&self) -> Result<(), PlaneError> {
+        if let Some(shutdown) = self
+            .shutdown
+            .lock()
+            .map_err(|_| "consensus runtime shutdown lock is poisoned")?
+            .take()
+        {
+            let _ = shutdown.send(());
+        }
+        let thread = self
+            .thread
+            .lock()
+            .map_err(|_| "consensus runtime thread lock is poisoned")?
+            .take();
+        if let Some(thread) = thread {
+            tokio::task::spawn_blocking(move || thread.join())
+                .await
+                .map_err(|error| format!("join consensus runtime task: {error}"))?
+                .map_err(|_| "consensus runtime thread panicked")?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ConsensusRuntime {
+    /// Releases the runtime thread if startup later fails before normal shutdown.
+    fn drop(&mut self) {
+        if let Ok(shutdown) = self.shutdown.get_mut()
+            && let Some(shutdown) = shutdown.take()
+        {
+            let _ = shutdown.send(());
+        }
+        if let Ok(thread) = self.thread.get_mut()
+            && let Some(thread) = thread.take()
+        {
+            let _ = thread::Builder::new()
+                .name("verglas-consensus-join".to_owned())
+                .spawn(move || {
+                    let _ = thread.join();
+                });
+        }
+    }
+}
+
 /// Process-local registry for the many groups hosted on the cache fleet.
 pub struct ConsensusPlane {
     root: PathBuf,
     ring: Arc<RingPlane>,
     k: usize,
     m: usize,
-    groups: Mutex<BTreeMap<String, LocalGroup>>,
+    runtime: Arc<ConsensusRuntime>,
+    groups: Arc<Mutex<BTreeMap<String, LocalGroup>>>,
 }
 
 /// Commits staged immutable-object certificates through per-object Raft groups.
@@ -272,7 +388,8 @@ impl ConsensusPlane {
             ring,
             k,
             m,
-            groups: Mutex::new(BTreeMap::new()),
+            runtime: ConsensusRuntime::start()?,
+            groups: Arc::new(Mutex::new(BTreeMap::new())),
         });
         plane
             .ring
@@ -423,43 +540,88 @@ impl ConsensusPlane {
         self.groups.lock().await.keys().cloned().collect()
     }
 
+    /// Shuts down every hosted Raft core before stopping its private scheduler.
+    ///
+    /// Call this during cache-node teardown.  The public runtime can await the
+    /// handles across runtimes, while the OpenRaft core itself remains owned by
+    /// the consensus scheduler until its shutdown completes.
+    pub async fn shutdown(&self) -> Result<(), PlaneError> {
+        let rafts = self
+            .groups
+            .lock()
+            .await
+            .values()
+            .map(|local| local.raft.clone())
+            .collect::<Vec<_>>();
+        self.runtime
+            .run(async move {
+                for raft in rafts {
+                    raft.shutdown().await?;
+                }
+                Ok(())
+            })
+            .await?;
+        self.runtime.shutdown().await
+    }
+
     /// Opens one persistent local replica idempotently without initializing it.
     async fn open_local(&self, group: &str) -> Result<Arc<ConsensusGroup>, PlaneError> {
+        let root = self.root.clone();
+        let ring = Arc::clone(&self.ring);
+        let groups = Arc::clone(&self.groups);
+        let k = self.k;
+        let m = self.m;
+        let group = group.to_owned();
+        self.runtime
+            .run(async move {
+                Self::open_local_on_consensus_runtime(root, ring, k, m, groups, &group).await
+            })
+            .await
+    }
+
+    /// Opens one persistent local replica while the consensus scheduler is entered.
+    async fn open_local_on_consensus_runtime(
+        root: PathBuf,
+        ring: Arc<RingPlane>,
+        k: usize,
+        m: usize,
+        groups: Arc<Mutex<BTreeMap<String, LocalGroup>>>,
+        group: &str,
+    ) -> Result<Arc<ConsensusGroup>, PlaneError> {
         validate_group(group)?;
-        let mut groups = self.groups.lock().await;
+        let mut groups = groups.lock().await;
         if let Some(local) = groups.get(group) {
             return Ok(Arc::clone(&local.group));
         }
-        let directory = self
-            .root
-            .join(hex::encode(Sha256::digest(group.as_bytes())));
+        let directory = root.join(hex::encode(Sha256::digest(group.as_bytes())));
         std::fs::create_dir_all(&directory)?;
         let log = PersistentLogStore::open(directory.join("raft-log.json")).await?;
         let state_machine = PersistentStateMachine::open(directory.join("state.json")).await?;
         let committed_voters = state_machine.committed_voters().await;
-        let voters = if committed_voters.len() == self.k + self.m {
+        let voters = if committed_voters.len() == k + m {
             committed_voters.into_iter().collect()
         } else {
-            self.ring.consensus_voters()
+            ring.consensus_voters()
         };
         let payloads = Arc::new(DistributedPayloadStore::new(
-            self.k,
-            self.m,
+            k,
+            m,
             voters.clone(),
-            self.ring.consensus_payload_transport(),
+            ring.consensus_payload_transport(),
         )?);
         state_machine.attach_payload_store(payloads.clone()).await?;
+        let network =
+            RaftHttpTransport::new(group, ring.raft_addresses(), ring.raft_secret().to_owned())?;
         let raft = Raft::new(
-            self.ring.safekeeper_id(),
-            Arc::new(raft_config(&voters, self.ring.safekeeper_id())?),
-            self.network(group)?,
+            ring.safekeeper_id(),
+            Arc::new(raft_config(&voters, ring.safekeeper_id())?),
+            network,
             log,
             state_machine.clone(),
         )
         .await?;
-        self.ring
-            .raft_registry()
-            .register(group, self.ring.safekeeper_id(), raft.clone())
+        ring.raft_registry()
+            .register(group, ring.safekeeper_id(), raft.clone())
             .await;
         let generation = state_machine.membership_generation().await.max(1);
         let consensus = Arc::new(ConsensusGroup::new(
@@ -573,7 +735,8 @@ fn validate_group(group: &str) -> Result<(), PlaneError> {
 
 #[cfg(test)]
 mod tests {
-    use super::raft_config;
+    use super::*;
+    use openraft::{Vote, raft::VoteRequest};
 
     /// Staggered election windows ensure only the earliest surviving voter
     /// starts a replacement campaign after the leader is killed.
@@ -585,5 +748,87 @@ mod tests {
         assert_eq!(config.heartbeat_interval, 100);
         assert_eq!(config.election_timeout_min, 850);
         assert_eq!(config.election_timeout_max, 950);
+    }
+
+    /// A vote remains serviceable while every public-runtime worker is blocked.
+    ///
+    /// This is intentionally a real OpenRaft vote, not a scheduler-only probe:
+    /// [`Raft::new`] must run while the private scheduler is entered, otherwise
+    /// its core task inherits the saturated public runtime and this deadline
+    /// expires.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_vote_survives_public_runtime_saturation() {
+        let directory = tempfile::tempdir().expect("temporary consensus state");
+        let runtime = ConsensusRuntime::start().expect("start consensus runtime");
+        let log = PersistentLogStore::open(directory.path().join("raft-log.json"))
+            .await
+            .expect("open durable log");
+        let state = PersistentStateMachine::open(directory.path().join("state.json"))
+            .await
+            .expect("open durable state machine");
+        let raft = runtime
+            .run(async move {
+                Raft::new(
+                    1,
+                    Arc::new(openraft::Config::default().validate()?),
+                    RaftHttpTransport::new(
+                        "runtime-isolation",
+                        verglas_cluster::StaticRaftAddressResolver::default(),
+                        "test-secret",
+                    )?,
+                    log,
+                    state,
+                )
+                .await
+                .map_err(Into::into)
+            })
+            .await
+            .expect("create Raft on the consensus runtime");
+
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let entered = entered.clone();
+            tokio::spawn(async move {
+                entered.send(()).expect("report public worker saturation");
+                std::thread::sleep(Duration::from_millis(300));
+            });
+        }
+        drop(entered);
+        entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("first public worker blocked");
+        entered_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("second public worker blocked");
+
+        let (vote_tx, vote_rx) = std::sync::mpsc::sync_channel(1);
+        let vote_raft = raft.clone();
+        std::thread::spawn(move || {
+            let vote_runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("start vote caller runtime");
+            let result = vote_runtime.block_on(async move {
+                vote_raft
+                    .vote(VoteRequest::new(Vote::new(1, 2), None))
+                    .await
+            });
+            let _ = vote_tx.send(result);
+        });
+        let response = vote_rx
+            .recv_timeout(Duration::from_millis(150))
+            .expect("private Raft core answers during public saturation")
+            .expect("real Raft vote succeeds");
+        assert!(response.vote_granted);
+
+        let shutdown_raft = raft.clone();
+        runtime
+            .run(async move {
+                shutdown_raft.shutdown().await?;
+                Ok(())
+            })
+            .await
+            .expect("stop private Raft core");
+        runtime.shutdown().await.expect("stop consensus runtime");
     }
 }
