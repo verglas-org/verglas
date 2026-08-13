@@ -91,6 +91,28 @@ class ReportGates(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     BENCHMARK.validate_report(report)
 
+    def test_sql_checksum_is_invariant_to_legal_tie_order(self) -> None:
+        """Rows with an unspecified tie order produce one canonical digest."""
+
+        class Cursor:
+            def __init__(self, rows: list[tuple[int, str]]) -> None:
+                self.description = [("id",), ("value",)]
+                self.rows = rows
+
+            def execute(self, _query: str) -> "Cursor":
+                return self
+
+            def fetchmany(self, _size: int) -> list[tuple[int, str]]:
+                rows, self.rows = self.rows, []
+                return rows
+
+        first = Cursor([(2, "same"), (1, "same")])
+        second = Cursor([(1, "same"), (2, "same")])
+        self.assertEqual(
+            BENCHMARK.sql_checksum(first, "select"),
+            BENCHMARK.sql_checksum(second, "select"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

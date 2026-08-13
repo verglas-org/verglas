@@ -2,7 +2,11 @@
 FROM rust:1.96.1-bookworm AS build
 WORKDIR /src
 COPY . .
-RUN cargo build --release --manifest-path crates/verglas-catalog-service/Cargo.toml -p lakekeeper-bin
+WORKDIR /src/crates/verglas-catalog-service
+# Cargo discovers the vendored workspace's `.cargo/config.toml` from this
+# directory. That config enables the tracing cfg required by Lakekeeper's
+# structured `valuable` fields.
+RUN cargo build --release -p lakekeeper-bin
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*

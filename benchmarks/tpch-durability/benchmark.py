@@ -231,18 +231,30 @@ def sha256_file(path: pathlib.Path) -> str:
 
 
 def sql_checksum(connection: Any, query: str) -> str:
-    """Hash a DuckDB result in the database's deterministic textual row order."""
+    """Hash a DuckDB result as a canonical multiset of typed textual rows.
+
+    TPC-H queries may order by a non-unique expression. Engines may therefore
+    return tied rows in different legal orders, which must not masquerade as a
+    data mismatch.
+    """
     cursor = connection.execute(query)
     digest = hashlib.sha256()
     names = [description[0] for description in cursor.description]
     digest.update(json.dumps(names, separators=(",", ":")).encode())
+    rows: list[bytes] = []
     while True:
-        rows = cursor.fetchmany(16_384)
-        if not rows:
+        batch = cursor.fetchmany(16_384)
+        if not batch:
             break
-        for row in rows:
-            digest.update(json.dumps(row, separators=(",", ":"), default=str).encode())
-            digest.update(b"\n")
+        rows.extend(
+            hashlib.sha256(
+                json.dumps(row, separators=(",", ":"), default=str).encode()
+            ).digest()
+            for row in batch
+        )
+    rows.sort()
+    for row_digest in rows:
+        digest.update(row_digest)
     return digest.hexdigest()
 
 

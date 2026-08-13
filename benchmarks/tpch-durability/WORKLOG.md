@@ -9,3 +9,4 @@
   `WalRequest` and `WalResponse` codec. The fault protocol kills a declared
   leader during a 256 MiB append stream, verifies reads before and after restart,
   and waits for checkpoint-gated archival of all complete WAL segments.
+- #135: Corrected the catalog image build to run from the vendored Lakekeeper workspace so its required Cargo cfg is active. Canonical query checksums now ignore legal tie-order differences while retaining every result row.
