@@ -1,6 +1,9 @@
 //! Durable payload staging and reconstruction acceptance tests.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
 use tempfile::TempDir;
@@ -73,6 +76,121 @@ impl RepresentationTransport for FirstVoterUnavailable {
     }
 }
 
+/// Transport that retains successful stores while selected voters are unreachable.
+struct SelectivelyUnavailableTransport {
+    /// Persisted representations indexed by their configured voter.
+    records: Mutex<BTreeMap<u64, PayloadRepresentation>>,
+    /// Voters that currently fail peer operations.
+    unavailable: Mutex<BTreeSet<u64>>,
+}
+
+impl SelectivelyUnavailableTransport {
+    /// Builds an initially reachable in-memory peer transport.
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            records: Mutex::new(BTreeMap::new()),
+            unavailable: Mutex::new(BTreeSet::new()),
+        })
+    }
+
+    /// Makes one holder unreachable after its representation has been sealed.
+    fn make_unavailable(&self, voter: u64) {
+        self.unavailable
+            .lock()
+            .expect("unavailable voters lock")
+            .insert(voter);
+    }
+
+    /// Rewrites one stored seal to exercise reconstruction identity validation.
+    fn corrupt_term(&self, voter: u64) {
+        let mut records = self.records.lock().expect("stored representations lock");
+        let record = records
+            .get_mut(&voter)
+            .expect("stored representation for committed voter");
+        record.term += 1;
+    }
+
+    /// Returns whether a peer operation can currently reach this voter.
+    fn reachable(&self, voter: u64) -> bool {
+        !self
+            .unavailable
+            .lock()
+            .expect("unavailable voters lock")
+            .contains(&voter)
+    }
+}
+
+#[async_trait::async_trait]
+impl RepresentationTransport for SelectivelyUnavailableTransport {
+    /// Stores a representation while the voter remains reachable.
+    async fn store(
+        &self,
+        voter: u64,
+        representation: PayloadRepresentation,
+    ) -> Result<(), PayloadError> {
+        if !self.reachable(voter) {
+            return Err(PayloadError::Transport("voter is unavailable".to_owned()));
+        }
+        self.records
+            .lock()
+            .expect("stored representations lock")
+            .insert(voter, representation);
+        Ok(())
+    }
+
+    /// Loads the requested representation while the voter remains reachable.
+    async fn load(
+        &self,
+        voter: u64,
+        hash: [u8; 32],
+        group: &str,
+        configuration_generation: u64,
+        request: RequestId,
+    ) -> Result<Option<PayloadRepresentation>, PayloadError> {
+        if !self.reachable(voter) {
+            return Err(PayloadError::Transport("voter is unavailable".to_owned()));
+        }
+        Ok(self
+            .records
+            .lock()
+            .expect("stored representations lock")
+            .get(&voter)
+            .filter(|record| {
+                record.hash == hash
+                    && record.group == group
+                    && record.configuration_generation == configuration_generation
+                    && record.request == request
+            })
+            .cloned())
+    }
+
+    /// Deletes a matching representation while the voter remains reachable.
+    async fn delete(
+        &self,
+        voter: u64,
+        hash: [u8; 32],
+        group: &str,
+        configuration_generation: u64,
+        request: RequestId,
+        slot: usize,
+    ) -> Result<(), PayloadError> {
+        if !self.reachable(voter) {
+            return Err(PayloadError::Transport("voter is unavailable".to_owned()));
+        }
+        let mut records = self.records.lock().expect("stored representations lock");
+        if records.get(&voter).is_some_and(|record| {
+            record.hash == hash
+                && record.group == group
+                && record.configuration_generation == configuration_generation
+                && record.request == request
+                && record.slot == slot
+        }) {
+            records.remove(&voter);
+        }
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn staging_uses_reachable_committed_voters_after_a_prefix_voter_fails()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -105,6 +223,120 @@ async fn staging_uses_reachable_committed_voters_after_a_prefix_voter_fails()
     assert_eq!(complete.certificate().voters(), &[1, 2, 3, 4]);
     assert_eq!(complete.certificate().holders(), &[2, 3, 4]);
     assert_eq!(transport.stored(), vec![2, 3, 4, 2, 3, 4]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn distributed_reconstruction_uses_remaining_certified_holders_when_one_is_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (mode, body) in [
+        (
+            ReplicationMode::Coded,
+            Bytes::from_static(b"coded quorum payload"),
+        ),
+        (
+            ReplicationMode::Complete,
+            Bytes::from_static(b"complete quorum payload"),
+        ),
+    ] {
+        let transport = SelectivelyUnavailableTransport::new();
+        let payloads = DistributedPayloadStore::new(2, 2, vec![1, 2, 3, 4], transport.clone())?;
+        let request = RequestId::from_u128(match mode {
+            ReplicationMode::Coded => 93,
+            ReplicationMode::Complete => 94,
+        });
+        let staged = payloads
+            .stage(request, "timeline/quorum", 7, mode, &body, &[1, 2, 3, 4])
+            .await?;
+        payloads
+            .seal(SealRequest {
+                hash: staged.hash(),
+                group: "timeline/quorum",
+                configuration_generation: 7,
+                request,
+                term: 3,
+                index: 11,
+                certificate: staged.certificate(),
+            })
+            .await?;
+
+        transport.make_unavailable(staged.certificate().holders()[0]);
+        payloads
+            .seal(SealRequest {
+                hash: staged.hash(),
+                group: "timeline/quorum",
+                configuration_generation: 7,
+                request,
+                term: 3,
+                index: 11,
+                certificate: staged.certificate(),
+            })
+            .await?;
+
+        assert_eq!(
+            payloads
+                .reconstruct(ReconstructRequest {
+                    hash: staged.hash(),
+                    group: "timeline/quorum",
+                    configuration_generation: 7,
+                    request,
+                    length: body.len() as u64,
+                    term: 3,
+                    index: 11,
+                    certificate: staged.certificate(),
+                })
+                .await?,
+            body
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn distributed_reconstruction_rejects_a_returned_mismatched_representation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let transport = SelectivelyUnavailableTransport::new();
+    let payloads = DistributedPayloadStore::new(2, 2, vec![1, 2, 3, 4], transport.clone())?;
+    let request = RequestId::from_u128(95);
+    let body = Bytes::from_static(b"identity validation payload");
+    let staged = payloads
+        .stage(
+            request,
+            "timeline/identity",
+            7,
+            ReplicationMode::Coded,
+            &body,
+            &[1, 2, 3, 4],
+        )
+        .await?;
+    payloads
+        .seal(SealRequest {
+            hash: staged.hash(),
+            group: "timeline/identity",
+            configuration_generation: 7,
+            request,
+            term: 3,
+            index: 12,
+            certificate: staged.certificate(),
+        })
+        .await?;
+    transport.corrupt_term(staged.certificate().holders()[0]);
+
+    assert!(matches!(
+        payloads
+            .reconstruct(ReconstructRequest {
+                hash: staged.hash(),
+                group: "timeline/identity",
+                configuration_generation: 7,
+                request,
+                length: body.len() as u64,
+                term: 3,
+                index: 12,
+                certificate: staged.certificate(),
+            })
+            .await,
+        Err(PayloadError::CorruptRepresentation)
+    ));
     Ok(())
 }
 

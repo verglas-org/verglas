@@ -112,6 +112,10 @@
 - #135: Added any-ingress typed command routing to the leader reported by the
   local Raft replica. Forwarded commands execute only on the actual leader and
   preserve their exact request identity across leadership changes.
+- #135: Kept any-ingress routing within its existing leader-observation deadline
+  when a just-observed leader dies before receiving a command. The ingress now
+  retries the unchanged typed request only after re-observing Raft, so leader
+  loss does not become a false client conflict or alter request identity.
 - #135: Replaced the cache node's live Neon Vote/Elected safekeeper listener with
   the Verglas WAL protocol. Every ingress provisions a timeline group and routes
   writer, append, read, release, and checkpoint commands through Raft.

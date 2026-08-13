@@ -175,3 +175,8 @@
 - #135: Replaced compound hosted-record map keys with a typed collection of
   entity-keyed record maps. This keeps catalog record lookups and deterministic
   ordering intact while making every persisted state-machine image valid JSON.
+
+- #135: Made distributed payload reconstruction continue past unavailable and
+  absent certified holders, then require one valid complete copy or `k` valid
+  coded shards. Returned representations still require their exact committed
+  allocation identity, so a mismatched peer response fails closed.

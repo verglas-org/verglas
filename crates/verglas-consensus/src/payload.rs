@@ -271,30 +271,45 @@ impl PayloadStore for DistributedPayloadStore {
         } = read;
         let mut records = Vec::new();
         for voter in certificate.holders() {
-            if let Some(record) = self
+            let record = match self
                 .transport
                 .load(*voter, hash, group, configuration_generation, request)
-                .await?
+                .await
             {
-                let expected_slot = certificate
-                    .voters()
-                    .iter()
-                    .position(|candidate| candidate == voter)
-                    .ok_or(PayloadError::UnknownHolder)?;
-                if record.group != group
-                    || record.configuration_generation != configuration_generation
-                    || record.mode != certificate.mode()
-                    || record.hash != hash
-                    || record.request != request
-                    || record.length as u64 != length
-                    || record.slot != expected_slot
-                    || record.term != term
-                    || record.index != index
-                {
-                    return Err(PayloadError::CorruptRepresentation);
-                }
-                records.push(record);
+                Ok(Some(record)) => record,
+                // A committed certificate can outlive an individual peer. The
+                // remaining holders are sufficient when they meet the mode's
+                // reconstruction threshold; a future wire protocol may add
+                // finer-grained peer error classes here without changing that
+                // invariant.
+                Ok(None) | Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let expected_slot = certificate
+                .voters()
+                .iter()
+                .position(|candidate| candidate == voter)
+                .ok_or(PayloadError::UnknownHolder)?;
+            if record.group != group
+                || record.configuration_generation != configuration_generation
+                || record.mode != certificate.mode()
+                || record.hash != hash
+                || record.request != request
+                || record.length as u64 != length
+                || record.slot != expected_slot
+                || record.term != term
+                || record.index != index
+            {
+                return Err(PayloadError::CorruptRepresentation);
             }
+            records.push(record);
+        }
+        let required = match certificate.mode() {
+            ReplicationMode::Complete => 1,
+            ReplicationMode::Coded => certificate.k(),
+        };
+        if records.len() < required {
+            return Err(PayloadError::ReconstructionUnavailable);
         }
         let first = records
             .first()
@@ -426,25 +441,50 @@ impl PayloadStore for DistributedPayloadStore {
         if term == 0 || index == 0 {
             return Err(PayloadError::CorruptRepresentation);
         }
+        let mut sealed = 0;
         for voter in certificate.holders() {
-            let mut record = self
+            let mut record = match self
                 .transport
                 .load(*voter, hash, group, configuration_generation, request)
-                .await?
-                .ok_or(PayloadError::ReconstructionUnavailable)?;
+                .await
+            {
+                Ok(Some(record)) => record,
+                Ok(None) | Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let expected_slot = certificate
+                .voters()
+                .iter()
+                .position(|candidate| candidate == voter)
+                .ok_or(PayloadError::UnknownHolder)?;
             if record.request != request
                 || record.group != group
                 || record.configuration_generation != configuration_generation
+                || record.mode != certificate.mode()
+                || record.hash != hash
+                || record.slot != expected_slot
                 || (record.term != 0 && (record.term != term || record.index != index))
             {
                 return Err(PayloadError::CorruptRepresentation);
             }
             if record.term == term && record.index == index {
+                sealed += 1;
                 continue;
             }
             record.term = term;
             record.index = index;
-            self.transport.store(*voter, record).await?;
+            match self.transport.store(*voter, record).await {
+                Ok(()) => sealed += 1,
+                Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let required = match certificate.mode() {
+            ReplicationMode::Complete => 1,
+            ReplicationMode::Coded => certificate.k(),
+        };
+        if sealed < required {
+            return Err(PayloadError::ReconstructionUnavailable);
         }
         Ok(())
     }

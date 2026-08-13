@@ -21,8 +21,8 @@ use verglas_cluster::{
     RaftHttpTransport,
 };
 use verglas_consensus::{
-    ConsensusGroup, DistributedPayloadStore, GroupRequest, GroupResponse, PersistentLogStore,
-    PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
+    ConsensusGroup, DistributedPayloadStore, GroupError, GroupRequest, GroupResponse,
+    PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
 use verglas_write::{ConsensusCommitter, ObjectCommit, StagedObject};
 
@@ -343,21 +343,28 @@ impl ConsensusPlane {
         request: GroupRequest,
     ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
-        let leader = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if let Some(leader) = local.leader_id().await {
-                    break leader;
+                    if leader == self.ring.safekeeper_id() {
+                        match local.execute(request.clone()).await {
+                            Ok(response) => return Ok(response),
+                            Err(GroupError::Raft(_)) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    let encoded = serde_json::to_vec(&request)?;
+                    if let Ok(response) = self.network(group)?.command(leader, encoded).await {
+                        return serde_json::from_slice(&response).map_err(Into::into);
+                    }
                 }
+                // A leader may die after this replica observes it but before the
+                // command reaches it. Re-observe Raft instead of treating that
+                // transport race as a client-visible command rejection.
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         })
-        .await?;
-        if leader == self.ring.safekeeper_id() {
-            return Ok(local.execute(request).await?);
-        }
-        let encoded = serde_json::to_vec(&request)?;
-        let response = self.network(group)?.command(leader, encoded).await?;
-        Ok(serde_json::from_slice(&response)?)
+        .await?
     }
 
     /// Returns the locally opened authoritative group names in deterministic order.
@@ -451,11 +458,11 @@ impl ConsensusPlane {
             .open_local(group)
             .await
             .map_err(|error| error.to_string())?;
+        let request: GroupRequest =
+            serde_json::from_slice(body).map_err(|error| error.to_string())?;
         if local.leader_id().await != Some(self.ring.safekeeper_id()) {
             return Err("forwarded command reached a non-leader".to_owned());
         }
-        let request: GroupRequest =
-            serde_json::from_slice(body).map_err(|error| error.to_string())?;
         let response = local
             .execute(request)
             .await
