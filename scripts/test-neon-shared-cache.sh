@@ -16,8 +16,9 @@ work=$(mktemp -d "$work_root/verglas-shared-cache.XXXXXX")
 nodes=()
 volumes=()
 neon_node=""
-replica_ports=(55434 55435)
+replica_ports=(56434 56435)
 row_count=${VERGLAS_TEST_ROWS:-1000000}
+run_replicas=${VERGLAS_TEST_REPLICAS:-1}
 
 cleanup() {
   status=$?
@@ -175,6 +176,7 @@ if [[ -n "$neon_image" ]]; then
     'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -c \
     "CREATE TABLE heat_test(id bigint PRIMARY KEY, payload text); INSERT INTO heat_test SELECT i, repeat(md5(i::text), 8) FROM generate_series(1,$row_count) AS i; CHECKPOINT; SELECT count(*) FROM heat_test;" >/dev/null
 
+  if [[ "$run_replicas" == 1 ]]; then
   # Start two independent read-only computes against the same pageserver,
   # timeline, and Verglas safekeeper. These are real Neon Replica computes,
   # not extra client connections to the primary Postgres process.
@@ -252,7 +254,7 @@ if [[ -n "$neon_image" ]]; then
       sleep 1
     done
     if [[ "$ready" != true ]]; then
-      docker exec "$neon_node" sh -c "tail -n 120 /run/neon/replica-$((replica_port - 55434)).log 2>/dev/null || true" >&2
+      docker exec "$neon_node" sh -c "tail -n 120 /run/neon/replica-$((replica_port - 56434)).log 2>/dev/null || true" >&2
       docker logs "$neon_node" >&2
       exit 1
     fi
@@ -286,7 +288,7 @@ if [[ -n "$neon_image" ]]; then
       docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
         "postgresql://cloud_admin@127.0.0.1:$replica_port/postgres" -x -c \
         'SELECT pg_is_in_recovery(), pg_last_wal_receive_lsn(), pg_last_wal_replay_lsn(), pg_last_xact_replay_timestamp()' >&2 || true
-      docker exec "$neon_node" sh -c "tail -n 160 /run/neon/replica-$((replica_port - 55434)).log" >&2 || true
+      docker exec "$neon_node" sh -c "tail -n 160 /run/neon/replica-$((replica_port - 56434)).log" >&2 || true
       docker logs --tail 160 "$network-cache-0" >&2 || true
       exit 1
     fi
@@ -333,6 +335,24 @@ if [[ -n "$neon_image" ]]; then
   tiers=$(python3 -c 'import json,sys; c=json.load(sys.stdin)["counters"]; print("dram=%d disk=%d peer=%d" % (c["dram_hits"],c["disk_hits"],c["peer_hits"]))' <<<"$final_stats")
   echo "Neon query-after-write and reconstructed-page reuse: PASS ($before_hits -> $after_hits total hits; $tiers)"
   echo "two Neon read mirrors and eight concurrent query clients: PASS"
+  else
+    count=$(docker exec -e PGPASSWORD=cloud_admin "$neon_node" /usr/local/bin/psql \
+      'postgresql://cloud_admin@127.0.0.1:55433/postgres' -v ON_ERROR_STOP=1 -tAc \
+      'SELECT count(*) FROM heat_test')
+    [[ "$count" == "$row_count" ]]
+    pool_stats=""
+    for index in 0 1 2 3; do
+      pool_stats+=$(docker run --rm --network "$network" curlimages/curl:8.12.1 \
+        -s "http://cache-$index:8334/admin/stats")$'\n'
+    done
+    python3 -c '
+import json,sys
+stats=[json.loads(line)["writeback"] for line in sys.stdin if line.strip()]
+assert sum(item["acked_via_quorum"] for item in stats) >= 1, stats
+assert sum(item["acked_via_write_through"] for item in stats) == 0, stats
+' <<<"$pool_stats"
+    echo "Neon primary SQL, pooled S3 quorum writes, and pooled WAL ingress: PASS"
+  fi
 
   # The remaining storage failure tests deliberately stop cache-0. Tear down
   # Neon first so its fixed test endpoint does not turn a cache-node test into
