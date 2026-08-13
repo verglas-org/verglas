@@ -40,6 +40,7 @@ pub mod arrow;
 pub mod attachment;
 pub mod codec;
 pub mod error;
+pub mod key_map;
 pub mod maintenance;
 pub mod metric;
 pub mod puffin;
@@ -48,9 +49,10 @@ pub mod vamana;
 
 pub use codec::BLOB_TYPE;
 pub use error::{Result, VectorError};
+pub use key_map::StringKeyMap;
 pub use maintenance::{IdEncoding, MaintenanceConfig, uuid_hash_id};
 pub use metric::Metric;
-pub use service::IndexKey;
+pub use service::{IndexKey, StringKeyIndex, StringKeyNeighbor};
 pub use vamana::{DEFAULT_ALPHA, DEFAULT_L, DEFAULT_R, Neighbor, VamanaIndex, VamanaParams};
 
 /// Brute-force k-nearest search over `(id, vector)` rows under `metric` — the

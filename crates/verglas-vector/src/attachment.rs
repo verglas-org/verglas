@@ -18,6 +18,7 @@ use crate::BLOB_TYPE;
 use crate::error::{Result, VectorError};
 use crate::maintenance::{IdEncoding, MaintenanceConfig};
 use crate::vamana::{VamanaIndex, VamanaParams};
+use crate::{StringKeyIndex, StringKeyMap};
 
 const FIELD_PROPERTY: &str = "verglas.vector.field";
 const ID_FIELD_PROPERTY: &str = "verglas.vector.id-field";
@@ -27,6 +28,8 @@ const DIM_PROPERTY: &str = "verglas.vector.dim";
 const R_PROPERTY: &str = "verglas.vector.r";
 const L_PROPERTY: &str = "verglas.vector.l";
 const ALPHA_PROPERTY: &str = "verglas.vector.alpha";
+/// A sibling Puffin blob containing exact string-key to Vamana-id mappings.
+pub const STRING_KEY_MAP_BLOB_TYPE: &str = "verglas-vamana-string-key-map-v1";
 
 const COMMIT_ATTEMPTS: u32 = 8;
 
@@ -39,6 +42,15 @@ pub struct AttachedIndex {
     pub config: MaintenanceConfig,
 }
 
+/// A decoded Vamana index plus the lossless caller-key map paired with it.
+#[derive(Debug)]
+pub struct AttachedStringKeyIndex {
+    /// The index and exact-key bridge ready for semantic serving.
+    pub bridge: StringKeyIndex,
+    /// The source-column and construction configuration stored with the index.
+    pub config: MaintenanceConfig,
+}
+
 /// Writes `index` into the table's metadata area and attaches the resulting
 /// Puffin statistics file to `snapshot`. Existing blobs for other index fields
 /// on the same snapshot are preserved in the replacement statistics file.
@@ -48,6 +60,32 @@ pub async fn attach_index(
     snapshot: i64,
     config: &MaintenanceConfig,
     index: &VamanaIndex,
+) -> Result<String> {
+    attach_with_optional_key_map(catalog, table, snapshot, config, index, None).await
+}
+
+/// Writes an ANN graph and its exact arbitrary-string key map into one
+/// snapshot-bound statistics file. The map is durable Iceberg/Puffin state,
+/// not a process-local resource registry.
+pub async fn attach_string_key_index(
+    catalog: &dyn Catalog,
+    table: &Table,
+    snapshot: i64,
+    config: &MaintenanceConfig,
+    index: &VamanaIndex,
+    keys: &StringKeyMap,
+) -> Result<String> {
+    attach_with_optional_key_map(catalog, table, snapshot, config, index, Some(keys)).await
+}
+
+/// Performs the common attachment write with an optional lossless key-map blob.
+async fn attach_with_optional_key_map(
+    catalog: &dyn Catalog,
+    table: &Table,
+    snapshot: i64,
+    config: &MaintenanceConfig,
+    index: &VamanaIndex,
+    keys: Option<&StringKeyMap>,
 ) -> Result<String> {
     let sequence_number = table
         .metadata()
@@ -68,7 +106,8 @@ pub async fn attach_index(
         let reader = PuffinReader::new(input);
         let metadata = reader.file_metadata().await?.blobs().to_vec();
         for blob_metadata in &metadata {
-            let same_vector_field = blob_metadata.blob_type() == BLOB_TYPE
+            let same_vector_field = (blob_metadata.blob_type() == BLOB_TYPE
+                || blob_metadata.blob_type() == STRING_KEY_MAP_BLOB_TYPE)
                 && blob_metadata
                     .properties()
                     .get(FIELD_PROPERTY)
@@ -90,6 +129,20 @@ pub async fn attach_index(
         .properties(properties)
         .build();
     writer.add(blob, CompressionCodec::Zstd).await?;
+    if let Some(keys) = keys {
+        let key_blob = Blob::builder()
+            .r#type(STRING_KEY_MAP_BLOB_TYPE.to_owned())
+            .fields(Vec::new())
+            .snapshot_id(snapshot)
+            .sequence_number(sequence_number)
+            .data(keys.encode()?)
+            .properties(HashMap::from([(
+                FIELD_PROPERTY.to_owned(),
+                config.vec_field.clone(),
+            )]))
+            .build();
+        writer.add(key_blob, CompressionCodec::Zstd).await?;
+    }
     writer.close().await?;
 
     let (file_size, footer_size, blob_metadata) = inspect_file(table, &path).await?;
@@ -103,6 +156,49 @@ pub async fn attach_index(
     };
     commit_statistics(catalog, table, statistics).await?;
     Ok(path)
+}
+
+/// Loads the exact-key bridge paired with a Vamana index at `snapshot`.
+/// Missing either sibling is an error because serving opaque ids would violate
+/// the S3 Vectors caller-key contract.
+pub async fn load_string_key_index_for_snapshot(
+    table: &Table,
+    snapshot: i64,
+    field: &str,
+) -> Result<Option<AttachedStringKeyIndex>> {
+    let Some(attached) = load_index_for_snapshot(table, snapshot, field).await? else {
+        return Ok(None);
+    };
+    let statistics = table
+        .metadata()
+        .statistics_for_snapshot(snapshot)
+        .ok_or_else(|| {
+            VectorError::CorruptBlob(format!("missing statistics for Vamana snapshot {snapshot}"))
+        })?;
+    let reader = PuffinReader::new(table.file_io().new_input(&statistics.statistics_path)?);
+    let metadata = reader.file_metadata().await?.blobs().to_vec();
+    let map_metadata = metadata
+        .iter()
+        .find(|blob| {
+            blob.blob_type() == STRING_KEY_MAP_BLOB_TYPE
+                && blob
+                    .properties()
+                    .get(FIELD_PROPERTY)
+                    .is_some_and(|stored| stored == field)
+        })
+        .ok_or_else(|| {
+            VectorError::CorruptBlob(format!("missing string-key map for Vamana field {field}"))
+        })?;
+    if map_metadata.snapshot_id() != snapshot {
+        return Err(VectorError::CorruptBlob(
+            "string-key map attached to a different snapshot".to_owned(),
+        ));
+    }
+    let keys = StringKeyMap::decode(reader.blob(map_metadata).await?.data())?;
+    Ok(Some(AttachedStringKeyIndex {
+        bridge: StringKeyIndex::from_parts(attached.index, keys)?,
+        config: attached.config,
+    }))
 }
 
 /// Loads the Vamana index for `field` attached to exactly `snapshot`.
