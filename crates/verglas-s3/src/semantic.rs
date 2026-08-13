@@ -726,12 +726,28 @@ impl IcebergCatalogSemanticStore {
                         .await
                         .map_err(|error| SemanticError::unavailable(error.to_string()))?
                 {
+                    let metadata = if input
+                        .get("returnMetadata")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        live_vectors(self.catalog.as_ref(), &ident)
+                            .await?
+                            .into_iter()
+                            .map(|vector| (vector.key, vector.metadata))
+                            .collect::<std::collections::HashMap<_, _>>()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
                     let vectors = attached
                         .bridge
                         .query(&query, required_u32(&input, "topK")? as usize, 64)
                         .map_err(|error| SemanticError::unavailable(error.to_string()))?
                         .into_iter()
-                        .map(|neighbor| query_output(neighbor.key, neighbor.distance, None, &input))
+                        .map(|neighbor| {
+                            let metadata = metadata.get(&neighbor.key).cloned().flatten();
+                            query_output(neighbor.key, neighbor.distance, metadata, &input)
+                        })
                         .collect::<Vec<_>>();
                     return Ok(
                         json!({"distanceMetric": definition["distanceMetric"], "vectors": vectors}),
@@ -1060,10 +1076,7 @@ fn bucket_arn(input: &Value) -> Result<String, SemanticError> {
 /// Returns a durable creation timestamp recorded with each catalog resource.
 fn now_millis() -> i64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(duration) => match i64::try_from(duration.as_millis()) {
-            Ok(value) => value,
-            Err(_) => i64::MAX,
-        },
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
     }
 }
@@ -1309,6 +1322,11 @@ fn matches_filter(metadata: Option<&Value>, filter: &Value) -> Result<bool, Sema
             }
             continue;
         }
+        if field.starts_with('$') {
+            return Err(SemanticError::validation(
+                "unknown logical metadata filter operator",
+            ));
+        }
         let value = metadata.get(field);
         if !matches_field(value, predicate)? {
             return Ok(false);
@@ -1454,17 +1472,6 @@ async fn live_vectors(
         );
     }
     Ok(current.into_values().collect())
-}
-
-/// Computes exact squared L2 distance for the no-Puffin query path.
-fn squared_distance(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| {
-            let delta = a - b;
-            delta * delta
-        })
-        .sum()
 }
 
 /// Converts an Iceberg error to a safe service failure.
