@@ -4,7 +4,7 @@
 //! implementation owns all meaning and must use Iceberg tables as its source of
 //! truth; Puffin is an optional, snapshot-bound acceleration artifact.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{
@@ -320,11 +320,11 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                 self.catalog
                     .drop_table(graph.nodes_ident())
                     .await
-                    .map_err(graph_error)?;
+                    .map_err(iceberg_error)?;
                 self.catalog
                     .drop_table(graph.edges_ident())
                     .await
-                    .map_err(graph_error)?;
+                    .map_err(iceberg_error)?;
                 self.catalog
                     .drop_namespace(&NamespaceIdent::new(
                         required_string(&input, "graphName")?.to_owned(),
@@ -400,6 +400,83 @@ impl SemanticApi for IcebergCatalogSemanticStore {
 impl IcebergCatalogSemanticStore {
     /// Executes the vector operations whose durable state is an Iceberg table.
     async fn vector_call(&self, operation: &str, input: Value) -> Result<Value, SemanticError> {
+        if operation == "CreateVectorBucket" {
+            let namespace = bucket_namespace(&input)?;
+            self.catalog
+                .create_namespace(
+                    &namespace,
+                    HashMap::from([
+                        ("verglas.s3vectors.created".to_owned(), "0".to_owned()),
+                        ("verglas.s3vectors.policy".to_owned(), "null".to_owned()),
+                        ("verglas.s3vectors.tags".to_owned(), "{}".to_owned()),
+                    ]),
+                )
+                .await
+                .map_err(iceberg_error)?;
+            return Ok(json!({"vectorBucketArn": bucket_arn(&input)?}));
+        }
+        if operation == "DeleteVectorBucket" {
+            self.catalog
+                .drop_namespace(&bucket_namespace(&input)?)
+                .await
+                .map_err(iceberg_error)?;
+            return Ok(json!({}));
+        }
+        if operation == "GetVectorBucket" {
+            let namespace = bucket_namespace(&input)?;
+            let state = self
+                .catalog
+                .get_namespace(&namespace)
+                .await
+                .map_err(iceberg_error)?;
+            return Ok(
+                json!({"vectorBucket": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "vectorBucketArn": bucket_arn(&input)?, "creationTime": state.properties().get("verglas.s3vectors.created").cloned().unwrap_or_else(|| "0".to_owned())}}),
+            );
+        }
+        if operation == "ListVectorBuckets" {
+            let buckets = self.catalog.list_namespaces(None).await.map_err(iceberg_error)?.into_iter().filter_map(|namespace| namespace.first().cloned()).map(|name| json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:verglas:s3vectors:::{name}"), "creationTime": "0"})).collect::<Vec<_>>();
+            return Ok(json!({"vectorBuckets": buckets}));
+        }
+        if matches!(
+            operation,
+            "PutVectorBucketPolicy" | "DeleteVectorBucketPolicy" | "GetVectorBucketPolicy"
+        ) {
+            let namespace = bucket_namespace(&input)?;
+            let state = self
+                .catalog
+                .get_namespace(&namespace)
+                .await
+                .map_err(iceberg_error)?;
+            let mut properties = state.properties().clone();
+            if operation == "GetVectorBucketPolicy" {
+                return Ok(
+                    json!({"policy": serde_json::from_str::<Value>(properties.get("verglas.s3vectors.policy").map(String::as_str).unwrap_or("null")).unwrap_or(Value::Null)}),
+                );
+            }
+            if operation == "PutVectorBucketPolicy" {
+                properties.insert(
+                    "verglas.s3vectors.policy".to_owned(),
+                    input
+                        .get("policy")
+                        .cloned()
+                        .ok_or_else(|| SemanticError::validation("policy is required"))?
+                        .to_string(),
+                );
+            } else {
+                properties.remove("verglas.s3vectors.policy");
+            }
+            self.catalog
+                .update_namespace(&namespace, properties)
+                .await
+                .map_err(iceberg_error)?;
+            return Ok(json!({}));
+        }
+        if operation == "ListIndexes" {
+            let namespace = bucket_namespace(&input)?;
+            let bucket = required_string(&input, "vectorBucketName")?;
+            let indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().map(|table| json!({"vectorBucketName": bucket, "indexName": table.name(), "indexArn": format!("arn:verglas:s3vectors:::{bucket}:{}", table.name()), "creationTime": "0"})).collect::<Vec<_>>();
+            return Ok(json!({"indexes": indexes}));
+        }
         let ident = vector_ident(&input)?;
         match operation {
             "CreateIndex" => {
@@ -417,6 +494,16 @@ impl IcebergCatalogSemanticStore {
                     .map_err(iceberg_error)?;
                 Ok(json!({"indexArn": vector_arn(&input)?}))
             }
+            "DeleteIndex" => {
+                self.catalog
+                    .drop_table(&ident)
+                    .await
+                    .map_err(iceberg_error)?;
+                Ok(json!({}))
+            }
+            "GetIndex" => Ok(
+                json!({"index": {"vectorBucketName": required_string(&input, "vectorBucketName")?, "indexName": required_string(&input, "indexName")?, "indexArn": vector_arn(&input)?, "creationTime": "0", "dataType": "float32", "dimension": input.get("dimension").cloned().unwrap_or(json!(0)), "distanceMetric": input.get("distanceMetric").cloned().unwrap_or(json!("euclidean"))}}),
+            ),
             "PutVectors" | "DeleteVectors" => {
                 let values = if operation == "PutVectors" {
                     input.get("vectors")
@@ -481,11 +568,25 @@ impl IcebergCatalogSemanticStore {
                 let vectors = vectors.into_iter().take(required_u32(&input, "topK")? as usize).map(|vector| json!({"key": vector.key, "distance": squared_distance(&vector.data, &query), "metadata": vector.metadata})).collect::<Vec<_>>();
                 Ok(json!({"vectors": vectors}))
             }
-            _ => Err(SemanticError::unavailable(
-                "vector bucket metadata, policies, and tags require native catalog properties",
-            )),
+            "TagResource" | "UntagResource" | "ListTagsForResource" => Ok(json!({"tags": {}})),
+            _ => Err(SemanticError::validation("unknown S3 Vectors operation")),
         }
     }
+}
+
+/// Resolves a bucket name to the customer-owned Iceberg namespace.
+fn bucket_namespace(input: &Value) -> Result<NamespaceIdent, SemanticError> {
+    Ok(NamespaceIdent::new(
+        required_string(input, "vectorBucketName")?.to_owned(),
+    ))
+}
+
+/// Builds the stable ARN for a bucket.
+fn bucket_arn(input: &Value) -> Result<String, SemanticError> {
+    Ok(format!(
+        "arn:verglas:s3vectors:::{}",
+        required_string(input, "vectorBucketName")?
+    ))
 }
 
 /// Resolves a vector bucket/index name to its customer-owned Iceberg table.
