@@ -225,3 +225,6 @@
   ceiling to 17 MiB. This accepts the benchmark's canonical 8 MiB WAL frames
   and one complete 16 MiB WAL segment with bounded wire headroom, while still
   rejecting larger requests before they enter consensus.
+- #135: Removed deleted query and write roles from the root image build after
+  their workspace consolidation into cache-node. The production cache image
+  now builds only the unified binary instead of referencing absent packages.
