@@ -20,6 +20,7 @@ class ManagedRunnerTests(unittest.TestCase):
         """Configure direct Quack with Lakekeeper metadata and direct R2 data I/O."""
         sql = "\n".join(RUNNER.direct_quack_setup("token", "access", "secret"))
         self.assertIn("TYPE ICEBERG", sql)
+        self.assertIn("ENDPOINT ", sql)
         self.assertIn("ACCESS_DELEGATION_MODE 'none'", sql)
         self.assertIn("r2.cloudflarestorage.com", sql)
         self.assertNotIn("verglas-cache", sql)
@@ -57,6 +58,8 @@ class ManagedRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             RUNNER.validate_bootstrap(rows=1000, worker_memory_mib=512,
                                       catalog_engine="verglas-lakekeeper")
+        with self.assertRaises(ValueError):
+            RUNNER.validate_dataset_bytes(2 * 1024**3 - 1, worker_memory_mib=512)
 
 
 if __name__ == "__main__":

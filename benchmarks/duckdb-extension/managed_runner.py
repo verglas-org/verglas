@@ -52,14 +52,16 @@ def direct_quack_setup(catalog_token, r2_access_key, r2_secret_key):
     """Configure Quack's DuckDB with managed metadata and direct R2 reads only."""
     catalog_url = os.environ.get("VERGLAS_CATALOG_URL", "https://catalog.invalid/v1/databases/analytics/catalog")
     r2_endpoint = os.environ.get("R2_ENDPOINT", "https://r2.cloudflarestorage.com")
+    warehouse = os.environ.get("VERGLAS_WAREHOUSE", "benchmark")
     return (
         "INSTALL quack",
         "LOAD quack",
         "CREATE OR REPLACE SECRET benchmark_r2 ("
         "TYPE S3, PROVIDER CONFIG, KEY_ID " + _sql_string(r2_access_key) + ", SECRET " + _sql_string(r2_secret_key)
         + ", REGION 'auto', ENDPOINT " + _sql_string(r2_endpoint.removeprefix("https://")) + ")",
-        "ATTACH " + _sql_string(catalog_url) + " AS managed (TYPE ICEBERG, "
-        "TOKEN " + _sql_string(catalog_token) + ", ACCESS_DELEGATION_MODE 'none')",
+        "ATTACH " + _sql_string(warehouse) + " AS managed (TYPE ICEBERG, "
+        "ENDPOINT " + _sql_string(catalog_url) + ", TOKEN "
+        + _sql_string(catalog_token) + ", ACCESS_DELEGATION_MODE 'none')",
         "USE managed",
     )
 
@@ -102,6 +104,12 @@ def validate_bootstrap(rows, worker_memory_mib, catalog_engine):
     # conservative and keeps the requested data set above the evaluator floor.
     if rows * 40 < 4 * worker_memory_mib * 1024 * 1024:
         raise ValueError("dataset must exceed four times the worker memory ceiling")
+
+
+def validate_dataset_bytes(data_bytes, worker_memory_mib):
+    """Require the committed compressed files themselves to be out of core."""
+    if data_bytes < 4 * worker_memory_mib * 1024 * 1024:
+        raise ValueError("compressed Iceberg data must exceed four worker-memory budgets")
 
 
 @dataclass(frozen=True)
@@ -184,7 +192,11 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
             "id": ids,
             "category": pa.array((number % 64 for number in range(offset, stop)), type=pa.int64()),
             "value": values,
-            "payload": pa.array((f"event-{number:016d}-" + "x" * 48 for number in range(offset, stop))),
+            "payload": pa.array((
+                hashlib.sha256(str(number).encode()).hexdigest()
+                + hashlib.sha256(f"payload:{number}".encode()).hexdigest()
+                for number in range(offset, stop)
+            )),
         })
         table.append(data)
     table = catalog.load_table(identifier)
@@ -197,6 +209,7 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
     data_bytes = sum(task.file.file_size_in_bytes for task in files)
     if data_bytes <= 0:
         raise RuntimeError("managed Iceberg snapshot contains no data files")
+    validate_dataset_bytes(data_bytes, worker_memory_mib)
     return {
         "format": "iceberg-v2", "catalog_engine": "verglas-lakekeeper",
         "catalog_commit_observed": True, "snapshot_id": str(snapshot.snapshot_id),

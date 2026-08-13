@@ -31,3 +31,6 @@
 - #126: Added a regression contract that keeps the two Quack transports
   distinct. The extension-hosting server must receive `verglas_query(...)`,
   while direct Quack receives the canonical Iceberg SQL unchanged.
+- #126: Added failing gates for the direct catalog endpoint and the physical
+  compressed Iceberg footprint. A row estimate cannot substitute for proving
+  the committed data files exceed four worker-memory budgets.
