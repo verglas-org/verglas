@@ -254,6 +254,34 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     assert_eq!(committed_end, end);
     assert!(append_index > acquire_index);
 
+    fleet.children[0].kill().expect("stop elected leader");
+    fleet.children[0].wait().expect("reap elected leader");
+    let immediate = submit(
+        SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[1])),
+        WalRequest::ReadWal {
+            from: start,
+            to: end,
+            minimum_index: append_index,
+        },
+    )
+    .await
+    .expect("a live ingress must ride out election and serve immediately after leader loss");
+    assert_eq!(
+        immediate,
+        WalResponse::WalBytes {
+            payload: wal.to_vec(),
+        }
+    );
+    fleet.children[0] = spawn_node(
+        0,
+        &configs[0],
+        &peers,
+        ring_ports[0],
+        safekeeper_ports[0],
+        &fleet.stderr,
+    );
+    fleet.wait_for_safekeepers(5, Duration::from_secs(30));
+
     fleet.children[3].kill().expect("stop fourth voter");
     fleet.children[3].wait().expect("reap fourth voter");
     let second = b"-while-one-voter-is-down";
