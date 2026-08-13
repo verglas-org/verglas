@@ -4,13 +4,15 @@
 //! implementation owns all meaning and must use Iceberg tables as its source of
 //! truth; Puffin is an optional, snapshot-bound acceleration artifact.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
-    http::{Method, StatusCode, Uri},
+    http::{HeaderMap, Method, Request, StatusCode, Uri},
+    middleware::Next,
     response::IntoResponse,
     routing::{get, post},
 };
@@ -42,6 +44,26 @@ pub struct SemanticError {
     /// Safe operator/client-facing explanation.
     pub message: String,
 }
+
+/// Static credential material used by the semantic SigV4 verifier.
+#[derive(Clone)]
+pub struct SemanticCredentials {
+    access_key_id: Arc<str>,
+    secret_access_key: Arc<str>,
+}
+
+impl SemanticCredentials {
+    /// Constructs verifier credentials from the cache-node S3 keypair.
+    pub fn new(access_key_id: String, secret_access_key: String) -> Self {
+        Self {
+            access_key_id: Arc::from(access_key_id),
+            secret_access_key: Arc::from(secret_access_key),
+        }
+    }
+}
+
+/// Maximum accepted client/server timestamp difference for semantic SigV4.
+const MAX_SIGV4_CLOCK_SKEW: Duration = Duration::from_secs(15 * 60);
 
 impl SemanticError {
     /// Builds a validation error without exposing internal state.
@@ -136,6 +158,32 @@ pub fn router(api: Arc<dyn SemanticApi>) -> Router {
         .with_state(state)
 }
 
+/// Builds semantic routes protected by header-signed AWS SigV4 requests.
+pub fn router_with_sigv4(api: Arc<dyn SemanticApi>, credentials: SemanticCredentials) -> Router {
+    router(api).layer(axum::middleware::from_fn_with_state(
+        credentials,
+        semantic_sigv4,
+    ))
+}
+
+/// Buffers the bounded JSON request once, verifies it, then restores it for dispatch.
+async fn semantic_sigv4(
+    State(credentials): State<SemanticCredentials>,
+    request: Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    let (parts, body) = request.into_parts();
+    let bytes = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
+        Ok(bytes) => bytes,
+        Err(error) => return semantic_error(SemanticError::validation(error.to_string())),
+    };
+    if let Err(error) = verify_sigv4(&parts, &bytes, &credentials) {
+        return semantic_error(error);
+    }
+    next.run(Request::from_parts(parts, Body::from(bytes)))
+        .await
+}
+
 /// Resolves and runs an AWS operation from its exact request URI.
 async fn dispatch_s3(
     State(state): State<SemanticState>,
@@ -152,6 +200,27 @@ async fn dispatch_s3(
             return not_found();
         };
         input["resourceArn"] = Value::String(resource.into_owned());
+    }
+    if matches!(operation, SemanticOperation::S3Vectors("UntagResource")) {
+        let keys = uri
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|item| {
+                item.split_once('=')
+                    .filter(|(name, _)| *name == "tagKeys")
+                    .map(|(_, value)| {
+                        percent_encoding::percent_decode_str(value)
+                            .decode_utf8()
+                            .ok()
+                            .map(|value| Value::String(value.into_owned()))
+                    })
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(keys) = keys else {
+            return semantic_error(SemanticError::validation("tagKeys query is invalid"));
+        };
+        input["tagKeys"] = Value::Array(keys);
     }
     dispatch(state, operation, input).await
 }
@@ -181,21 +250,22 @@ async fn dispatch(
 ) -> axum::response::Response {
     match state.api.call(operation, body).await {
         Ok(output) => (StatusCode::OK, Json(output)).into_response(),
-        Err(error) => (
-            error.status,
-            Json(json!({"code": error.code, "message": error.message})),
-        )
-            .into_response(),
+        Err(error) => semantic_error(error),
     }
 }
 
 /// Returns the protocol's standard unknown-operation response.
 fn not_found() -> axum::response::Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({"code": "NotFoundException", "message": "unknown semantic operation"})),
-    )
-        .into_response()
+    semantic_error(SemanticError::not_found("unknown semantic operation"))
+}
+
+/// Renders protocol errors with the REST-JSON code field expected by AWS clients.
+fn semantic_error(error: SemanticError) -> axum::response::Response {
+    let mut response = (error.status, Json(json!({"message": error.message}))).into_response();
+    if let Ok(value) = axum::http::HeaderValue::from_str(error.code) {
+        response.headers_mut().insert("x-amzn-errortype", value);
+    }
+    response
 }
 
 /// Maps each exact S3 Vectors URI to its operation name.
@@ -253,6 +323,313 @@ fn graph_operation(path: &str) -> Option<SemanticOperation> {
         .into_iter()
         .find(|candidate| *candidate == operation)
         .map(SemanticOperation::Graph)
+}
+
+/// Verifies the complete header-signed AWS4 request for this semantic operation.
+fn verify_sigv4(
+    parts: &axum::http::request::Parts,
+    body: &[u8],
+    credentials: &SemanticCredentials,
+) -> Result<(), SemanticError> {
+    let fields = parse_authorization(header(&parts.headers, "authorization")?)?;
+    let (access_key, date, region, service) = parse_credential(fields.credential)?;
+    if access_key != credentials.access_key_id.as_ref() {
+        return Err(auth_error("InvalidAccessKeyId", "unknown access key"));
+    }
+    let expected_service = if is_graph_operation(parts.uri.path()) {
+        "verglasgraphs"
+    } else {
+        "s3vectors"
+    };
+    if service != expected_service {
+        return Err(auth_error(
+            "SignatureDoesNotMatch",
+            "unexpected SigV4 signing service",
+        ));
+    }
+    let amz_date = header(&parts.headers, "x-amz-date")?;
+    if !valid_amz_date(amz_date, date) {
+        return Err(auth_error(
+            "SignatureDoesNotMatch",
+            "credential date does not match x-amz-date",
+        ));
+    }
+    if !within_clock_skew(amz_date) {
+        return Err(auth_error(
+            "RequestTimeTooSkewed",
+            "x-amz-date is outside the accepted clock skew",
+        ));
+    }
+    let supplied_hash = header(&parts.headers, "x-amz-content-sha256")?;
+    if supplied_hash != sha256_hex(body) {
+        return Err(auth_error(
+            "SignatureDoesNotMatch",
+            "payload hash does not match request body",
+        ));
+    }
+    let headers = canonical_headers(&parts.headers, fields.signed_headers)?;
+    let canonical = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        parts.method,
+        canonical_uri(parts.uri.path()),
+        canonical_query(parts.uri.query().unwrap_or_default()),
+        headers,
+        fields.signed_headers,
+        supplied_hash
+    );
+    let scope = format!("{date}/{region}/{service}/aws4_request");
+    let signed = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+        sha256_hex(canonical.as_bytes())
+    );
+    let expected = signature(
+        credentials.secret_access_key.as_ref(),
+        date,
+        region,
+        service,
+        &signed,
+    );
+    if !constant_time_eq(expected.as_bytes(), fields.signature.as_bytes()) {
+        return Err(auth_error("SignatureDoesNotMatch", "signature mismatch"));
+    }
+    Ok(())
+}
+
+/// Parsed fields from one strict AWS4 authorization header.
+struct AuthorizationFields<'a> {
+    credential: &'a str,
+    signed_headers: &'a str,
+    signature: &'a str,
+}
+
+/// Parses the strict AWS4-HMAC-SHA256 Authorization grammar.
+fn parse_authorization(value: &str) -> Result<AuthorizationFields<'_>, SemanticError> {
+    let payload = value.strip_prefix("AWS4-HMAC-SHA256 ").ok_or_else(|| {
+        auth_error(
+            "SignatureDoesNotMatch",
+            "unsupported authorization algorithm",
+        )
+    })?;
+    let mut credential = None;
+    let mut signed_headers = None;
+    let mut signature = None;
+    for field in payload.split(',').map(str::trim) {
+        let (name, value) = field
+            .split_once('=')
+            .ok_or_else(|| auth_error("SignatureDoesNotMatch", "malformed authorization header"))?;
+        match name {
+            "Credential" => credential = Some(value),
+            "SignedHeaders" => signed_headers = Some(value),
+            "Signature" => signature = Some(value),
+            _ => {
+                return Err(auth_error(
+                    "SignatureDoesNotMatch",
+                    "unknown authorization field",
+                ));
+            }
+        }
+    }
+    Ok(AuthorizationFields {
+        credential: credential
+            .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing Credential"))?,
+        signed_headers: signed_headers
+            .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing SignedHeaders"))?,
+        signature: signature
+            .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing Signature"))?,
+    })
+}
+
+/// Splits an AWS4 credential scope and rejects extensions.
+fn parse_credential(value: &str) -> Result<(&str, &str, &str, &str), SemanticError> {
+    let mut parts = value.split('/');
+    let access = parts
+        .next()
+        .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing access key"))?;
+    let date = parts
+        .next()
+        .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing signing date"))?;
+    let region = parts
+        .next()
+        .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing signing region"))?;
+    let service = parts
+        .next()
+        .ok_or_else(|| auth_error("SignatureDoesNotMatch", "missing signing service"))?;
+    if parts.next() != Some("aws4_request") || parts.next().is_some() {
+        return Err(auth_error(
+            "SignatureDoesNotMatch",
+            "invalid credential scope",
+        ));
+    }
+    Ok((access, date, region, service))
+}
+
+/// Builds canonical header lines in SignedHeaders order and requires core headers.
+fn canonical_headers(headers: &HeaderMap, signed: &str) -> Result<String, SemanticError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut output = String::new();
+    for name in signed.split(';') {
+        if name.is_empty() || name != name.to_ascii_lowercase() || !names.insert(name) {
+            return Err(auth_error("SignatureDoesNotMatch", "invalid SignedHeaders"));
+        }
+        let values = headers.get_all(name);
+        if values.iter().next().is_none() {
+            return Err(auth_error(
+                "SignatureDoesNotMatch",
+                "signed header missing from request",
+            ));
+        }
+        let text = values
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .map(normalize_header)
+                    .map_err(|_| auth_error("SignatureDoesNotMatch", "non-text signed header"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        output.push_str(name);
+        output.push(':');
+        output.push_str(&text);
+        output.push('\n');
+    }
+    for required in ["host", "x-amz-date", "x-amz-content-sha256"] {
+        if !names.contains(required) {
+            return Err(auth_error(
+                "SignatureDoesNotMatch",
+                "required header is not signed",
+            ));
+        }
+    }
+    Ok(output)
+}
+
+/// Collapses linear whitespace in a canonical header value.
+fn normalize_header(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Reads a required textual SigV4 header.
+fn header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, SemanticError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| auth_error("SignatureDoesNotMatch", "required SigV4 header missing"))
+}
+
+/// Checks that a timestamp matches its scope date and AWS basic format.
+fn valid_amz_date(value: &str, date: &str) -> bool {
+    value.len() == 16
+        && value.ends_with('Z')
+        && value.get(..8) == Some(date)
+        && value
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                8 => *byte == b'T',
+                15 => *byte == b'Z',
+                _ => byte.is_ascii_digit(),
+            })
+}
+
+/// Rejects correctly shaped dates outside the hard clock skew window.
+fn within_clock_skew(value: &str) -> bool {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y%m%dT%H%M%SZ").is_ok_and(|time| {
+        chrono::Utc::now()
+            .signed_duration_since(time.and_utc())
+            .num_seconds()
+            .unsigned_abs()
+            <= MAX_SIGV4_CLOCK_SKEW.as_secs()
+    })
+}
+
+/// Canonicalizes a URI path by decoding transport escapes then AWS-encoding components.
+fn canonical_uri(path: &str) -> String {
+    (if path.is_empty() { "/" } else { path })
+        .split('/')
+        .map(canonical_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Identifies Graph paths to bind their distinct signing name.
+fn is_graph_operation(path: &str) -> bool {
+    graph_operation(path).is_some()
+}
+
+/// Canonicalizes sorted encoded query key/value pairs for SigV4.
+fn canonical_query(query: &str) -> String {
+    let mut pairs = query
+        .split('&')
+        .filter(|piece| !piece.is_empty())
+        .map(|piece| match piece.split_once('=') {
+            Some((key, value)) => (canonical_component(key), canonical_component(value)),
+            None => (canonical_component(piece), String::new()),
+        })
+        .collect::<Vec<_>>();
+    pairs.sort_unstable();
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// AWS-encodes a URI/query component after decoding original escaped octets.
+fn canonical_component(value: &str) -> String {
+    percent_encoding::percent_decode_str(value)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .fold(String::new(), |mut output, byte| {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+                output.push(char::from(byte));
+            } else {
+                output.push_str(&format!("%{byte:02X}"));
+            }
+            output
+        })
+}
+
+/// Hashes bytes as a lower-case SHA-256 hexadecimal digest.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// Derives the AWS4 signing key and signs one canonical string.
+fn signature(secret: &str, date: &str, region: &str, service: &str, string: &str) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    fn sign(key: &[u8], bytes: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("SHA256 supports HMAC");
+        mac.update(bytes);
+        mac.finalize().into_bytes().to_vec()
+    }
+    let date_key = sign(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let region_key = sign(&date_key, region.as_bytes());
+    let service_key = sign(&region_key, service.as_bytes());
+    let key = sign(&service_key, b"aws4_request");
+    hex::encode(sign(&key, string.as_bytes()))
+}
+
+/// Compares signature bytes without early exit.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+}
+
+/// Constructs a SigV4 authentication error response.
+fn auth_error(code: &'static str, message: impl Into<String>) -> SemanticError {
+    SemanticError {
+        status: StatusCode::FORBIDDEN,
+        code,
+        message: message.into(),
+    }
 }
 
 /// A deliberately fail-closed implementation used until the cache node has a

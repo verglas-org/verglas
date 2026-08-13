@@ -755,30 +755,33 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     // Semantic state is opened from the same customer catalog and routes table
     // FileIO back through this listener. No process-local registry survives
     // restart: the adapter reopens graphs from Iceberg for each operation.
-    let semantic_api: Arc<dyn verglas_s3::semantic::SemanticApi> = match config.catalog.as_ref() {
-        Some(catalog) => {
-            let local_addr = s3_listener.local_addr()?;
-            let connection = verglas_iceberg::Connection {
-                catalog_uri: catalog.uri.clone(),
-                token: catalog
-                    .resolve_bearer_token()
-                    .map_err(std::io::Error::other)?,
-                warehouse: catalog.warehouse.clone(),
-                s3_endpoint: Some(format!("http://{local_addr}")),
-                region: config
-                    .backend
-                    .region
-                    .clone()
-                    .unwrap_or_else(|| "us-east-1".to_owned()),
-                access_key_id: Some(credentials.0.clone()),
-                secret_access_key: Some(credentials.1.clone()),
-            };
-            Arc::new(verglas_s3::semantic::IcebergCatalogSemanticStore::new(
-                verglas_iceberg::catalog::open_catalog(&connection).await?,
-            ))
-        }
-        None => Arc::new(verglas_s3::semantic::UnavailableSemanticApi),
-    };
+    let semantic_api: Option<Arc<dyn verglas_s3::semantic::SemanticApi>> =
+        match config.catalog.as_ref() {
+            Some(catalog) => {
+                let local_addr = s3_listener.local_addr()?;
+                let connection = verglas_iceberg::Connection {
+                    catalog_uri: catalog.uri.clone(),
+                    token: catalog
+                        .resolve_bearer_token()
+                        .map_err(std::io::Error::other)?,
+                    warehouse: catalog.warehouse.clone(),
+                    s3_endpoint: Some(format!("http://{local_addr}")),
+                    region: config
+                        .backend
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| "us-east-1".to_owned()),
+                    access_key_id: Some(credentials.0.clone()),
+                    secret_access_key: Some(credentials.1.clone()),
+                };
+                Some(Arc::new(
+                    verglas_s3::semantic::IcebergCatalogSemanticStore::new(
+                        verglas_iceberg::catalog::open_catalog(&connection).await?,
+                    ),
+                ))
+            }
+            None => None,
+        };
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
     let lister: Arc<dyn verglas_core::list::ObjectList> =
@@ -831,7 +834,7 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             tier.writer,
             lister,
             invalidation,
-            Some(credentials),
+            Some(credentials.clone()),
             Some(registry as Arc<dyn verglas_backend::BackendStores>),
             config.listen.domain.as_deref(),
             Some(node_metrics),
@@ -843,15 +846,25 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             PassthroughWrite::new(registry.clone()),
             lister,
             invalidation,
-            Some(credentials),
+            Some(credentials.clone()),
             Some(registry as Arc<dyn verglas_backend::BackendStores>),
             config.listen.domain.as_deref(),
             Some(node_metrics),
         )
     };
-    // Semantic REST-JSON operations share this listener. They precede s3s's
-    // fallback service and fail closed rather than create a local registry.
-    let app = verglas_s3::semantic::router(semantic_api).merge(app);
+    // Semantic routes exist only with a configured customer catalog and use the
+    // same configured keypair as S3 objects for their distinct SigV4 services.
+    let app = match semantic_api {
+        Some(api) => verglas_s3::semantic::router_with_sigv4(
+            api,
+            verglas_s3::semantic::SemanticCredentials::new(
+                credentials.0.clone(),
+                credentials.1.clone(),
+            ),
+        )
+        .merge(app),
+        None => app,
+    };
     let app = admin::track_http(app, activity, ActivityPlane::Http);
 
     let local_addr = s3_listener.local_addr()?;

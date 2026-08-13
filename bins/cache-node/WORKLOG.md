@@ -217,3 +217,6 @@
   S3 listener before the ordinary S3 fallback. When a catalog is configured it
   opens the customer Iceberg catalog and routes Graph requests through it; no
   query-node, write-node, or process-local graph registry remains.
+- #137: Mount semantic routes only when a customer Iceberg catalog is present.
+  They now reuse the configured cache credentials with the semantic SigV4
+  verifier, so unsigned REST-JSON calls never reach the durable adapter.

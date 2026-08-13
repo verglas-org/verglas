@@ -279,3 +279,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Graph names, node/edge inputs, directions, filters, confidence, pagination,
   and camel-case traversal outputs now validate and render at the protocol
   boundary instead of exposing graph-engine serde shapes.
+- #137: Added strict header-signed SigV4 verification to semantic routes. The
+  verifier accepts only `s3vectors` and `verglasgraphs`, binds body, headers,
+  URI/query canonicalization, and a fifteen-minute clock window before the
+  Iceberg adapter sees a request.
