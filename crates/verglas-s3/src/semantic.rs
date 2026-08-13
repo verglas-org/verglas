@@ -635,11 +635,7 @@ impl IcebergCatalogSemanticStore {
                 .and_then(Value::as_array)
                 .ok_or_else(|| SemanticError::validation("vectors or keys is required"))?;
                 if operation == "PutVectors" {
-                    for value in values {
-                        let _ = vector_data(value.get("data").ok_or_else(|| {
-                            SemanticError::validation("vector data is required")
-                        })?)?;
-                    }
+                    self.validate_vectors(values, &ident).await?;
                 }
                 let rows = values
                     .iter()
@@ -708,13 +704,21 @@ impl IcebergCatalogSemanticStore {
                     .get("queryVector")
                     .ok_or_else(|| SemanticError::validation("queryVector is required"))
                     .and_then(vector_data)?;
+                self.validate_query(&query, &ident, &input).await?;
                 let table = self
                     .catalog
                     .load_table(&ident)
                     .await
                     .map_err(iceberg_error)?;
                 let snapshot = table.metadata().current_snapshot_id();
-                if let Some(snapshot) = snapshot
+                let definition = self.index_definition(&ident).await?;
+                let metric = match definition["distanceMetric"].as_str() {
+                    Some("cosine") => Metric::Cosine,
+                    Some("euclidean") => Metric::L2,
+                    _ => return Err(SemanticError::validation("index distanceMetric is invalid")),
+                };
+                if input.get("filter").is_none()
+                    && let Some(snapshot) = snapshot
                     && let Some(attached) =
                         verglas_vector::attachment::load_string_key_index_for_snapshot(
                             &table, snapshot, "data",
@@ -727,21 +731,117 @@ impl IcebergCatalogSemanticStore {
                         .query(&query, required_u32(&input, "topK")? as usize, 64)
                         .map_err(|error| SemanticError::unavailable(error.to_string()))?
                         .into_iter()
-                        .map(|neighbor| json!({"key": neighbor.key, "distance": neighbor.distance}))
+                        .map(|neighbor| query_output(neighbor.key, neighbor.distance, None, &input))
                         .collect::<Vec<_>>();
-                    return Ok(json!({"distanceMetric":"euclidean", "vectors": vectors}));
+                    return Ok(
+                        json!({"distanceMetric": definition["distanceMetric"], "vectors": vectors}),
+                    );
                 }
                 let mut vectors = live_vectors(self.catalog.as_ref(), &ident).await?;
+                if let Some(filter) = input.get("filter") {
+                    let mut filtered = Vec::new();
+                    for vector in vectors {
+                        if matches_filter(vector.metadata.as_ref(), filter)? {
+                            filtered.push(vector);
+                        }
+                    }
+                    vectors = filtered;
+                }
                 vectors.retain(|vector| vector.data.len() == query.len());
                 vectors.sort_by(|left, right| {
-                    squared_distance(&left.data, &query)
-                        .total_cmp(&squared_distance(&right.data, &query))
+                    metric
+                        .report_distance(&metric.prepare(&left.data), &metric.prepare(&query))
+                        .total_cmp(
+                            &metric.report_distance(
+                                &metric.prepare(&right.data),
+                                &metric.prepare(&query),
+                            ),
+                        )
                 });
-                let vectors = vectors.into_iter().take(required_u32(&input, "topK")? as usize).map(|vector| json!({"key": vector.key, "distance": squared_distance(&vector.data, &query), "metadata": vector.metadata})).collect::<Vec<_>>();
-                Ok(json!({"distanceMetric":"euclidean", "vectors": vectors}))
+                let vectors = vectors
+                    .into_iter()
+                    .take(required_u32(&input, "topK")? as usize)
+                    .map(|vector| {
+                        let distance = metric.report_distance(
+                            &metric.prepare(&vector.data),
+                            &metric.prepare(&query),
+                        );
+                        query_output(vector.key, distance, vector.metadata, &input)
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({"distanceMetric": definition["distanceMetric"], "vectors": vectors}))
             }
             _ => Err(SemanticError::validation("unknown S3 Vectors operation")),
         }
+    }
+
+    /// Enforces index dimensionality and metric domain before durable append.
+    async fn validate_vectors(
+        &self,
+        values: &[Value],
+        ident: &iceberg::TableIdent,
+    ) -> Result<(), SemanticError> {
+        let metadata = self.index_definition(ident).await?;
+        let dim = dimension(&metadata)?;
+        let cosine = metadata["distanceMetric"].as_str() == Some("cosine");
+        for value in values {
+            let vector = vector_data(
+                value
+                    .get("data")
+                    .ok_or_else(|| SemanticError::validation("vector data is required"))?,
+            )?;
+            if vector.len() != dim || cosine && !vector.iter().any(|value| *value != 0.0) {
+                return Err(SemanticError::validation(
+                    "vector does not satisfy index dimension or cosine domain",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforces query dimensionality and top-K bounds from the persisted definition.
+    async fn validate_query(
+        &self,
+        query: &[f32],
+        ident: &iceberg::TableIdent,
+        input: &Value,
+    ) -> Result<(), SemanticError> {
+        let metadata = self.index_definition(ident).await?;
+        if query.len() != dimension(&metadata)? {
+            return Err(SemanticError::validation(
+                "queryVector dimension does not match index",
+            ));
+        }
+        if metadata["distanceMetric"].as_str() == Some("cosine")
+            && !query.iter().any(|value| *value != 0.0)
+        {
+            return Err(SemanticError::validation(
+                "cosine queryVector must not be zero",
+            ));
+        }
+        let top_k = required_u32(input, "topK")?;
+        if top_k == 0 || top_k > 100 {
+            return Err(SemanticError::validation("topK must be 1..100"));
+        }
+        Ok(())
+    }
+
+    /// Loads the authoritative per-index definition from the table metadata.
+    async fn index_definition(&self, ident: &iceberg::TableIdent) -> Result<Value, SemanticError> {
+        let table = self
+            .catalog
+            .load_table(ident)
+            .await
+            .map_err(iceberg_error)?;
+        table
+            .metadata()
+            .properties()
+            .get("verglas.s3vectors.index")
+            .ok_or_else(|| SemanticError::validation("index metadata is absent"))
+            .and_then(|text| {
+                serde_json::from_str(text)
+                    .map_err(|_| SemanticError::validation("index metadata is corrupt"))
+            })
     }
 
     /// Rebuilds and attaches a lossless Vamana bridge to the exact committed snapshot.
@@ -1142,13 +1242,145 @@ fn vector_data(value: &Value) -> Result<Vec<f32>, SemanticError> {
         .map(|value| {
             value
                 .as_f64()
-                .map(|number| number as f32)
-                .filter(|number| number.is_finite())
+                .and_then(|number| {
+                    let cast = number as f32;
+                    cast.is_finite().then_some(cast)
+                })
                 .ok_or_else(|| {
                     SemanticError::validation("VectorData.float32 must contain finite numbers")
                 })
         })
         .collect()
+}
+
+/// Extracts the required fixed vector dimension from an index definition.
+fn dimension(definition: &Value) -> Result<usize, SemanticError> {
+    definition["dimension"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| SemanticError::validation("index dimension is invalid"))
+}
+
+/// Renders one QueryVectors result while honoring optional result fields.
+fn query_output(key: String, distance: f32, metadata: Option<Value>, input: &Value) -> Value {
+    let mut value = json!({"key": key});
+    if input
+        .get("returnDistance")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        value["distance"] = json!(distance);
+    }
+    if input
+        .get("returnMetadata")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        value["metadata"] = metadata.unwrap_or(Value::Null);
+    }
+    value
+}
+
+/// Evaluates the documented S3 Vectors metadata predicate subset against one row.
+fn matches_filter(metadata: Option<&Value>, filter: &Value) -> Result<bool, SemanticError> {
+    let metadata = metadata
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let object = filter
+        .as_object()
+        .ok_or_else(|| SemanticError::validation("filter must be an object"))?;
+    for (field, predicate) in object {
+        if field == "$and" || field == "$or" {
+            let list = predicate
+                .as_array()
+                .filter(|list| !list.is_empty())
+                .ok_or_else(|| {
+                    SemanticError::validation("logical filter must be a nonempty array")
+                })?;
+            let matches = list
+                .iter()
+                .map(|item| matches_filter(Some(&Value::Object(metadata.clone())), item))
+                .collect::<Result<Vec<_>, _>>()?;
+            if (field == "$and" && !matches.iter().all(|value| *value))
+                || (field == "$or" && !matches.iter().any(|value| *value))
+            {
+                return Ok(false);
+            }
+            continue;
+        }
+        let value = metadata.get(field);
+        if !matches_field(value, predicate)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Evaluates all operators on one metadata field as an AND expression.
+fn matches_field(value: Option<&Value>, predicate: &Value) -> Result<bool, SemanticError> {
+    let operators = predicate
+        .as_object()
+        .filter(|object| object.keys().any(|key| key.starts_with('$')));
+    if let Some(operators) = operators {
+        for (operator, expected) in operators {
+            let result = match operator.as_str() {
+                "$eq" => value.is_some_and(|actual| equal_metadata(actual, expected)),
+                "$ne" => !value.is_some_and(|actual| equal_metadata(actual, expected)),
+                "$exists" => {
+                    value.is_some()
+                        == expected
+                            .as_bool()
+                            .ok_or_else(|| SemanticError::validation("$exists must be boolean"))?
+                }
+                "$gt" | "$gte" | "$lt" | "$lte" => {
+                    let actual = value.and_then(Value::as_f64).ok_or_else(|| {
+                        SemanticError::validation("comparison metadata must be numeric")
+                    })?;
+                    let expected = expected.as_f64().ok_or_else(|| {
+                        SemanticError::validation("comparison value must be numeric")
+                    })?;
+                    match operator.as_str() {
+                        "$gt" => actual > expected,
+                        "$gte" => actual >= expected,
+                        "$lt" => actual < expected,
+                        _ => actual <= expected,
+                    }
+                }
+                "$in" | "$nin" => {
+                    let choices = expected
+                        .as_array()
+                        .filter(|choices| !choices.is_empty())
+                        .ok_or_else(|| {
+                            SemanticError::validation("$in/$nin must be nonempty arrays")
+                        })?;
+                    let found = value.is_some_and(|actual| {
+                        choices.iter().any(|choice| equal_metadata(actual, choice))
+                    });
+                    if operator == "$in" { found } else { !found }
+                }
+                _ => {
+                    return Err(SemanticError::validation(
+                        "unknown metadata filter operator",
+                    ));
+                }
+            };
+            if !result {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    } else {
+        Ok(value.is_some_and(|actual| equal_metadata(actual, predicate)))
+    }
+}
+
+/// Compares metadata scalars and treats arrays as membership sets for equality.
+fn equal_metadata(actual: &Value, expected: &Value) -> bool {
+    actual == expected
+        || actual
+            .as_array()
+            .is_some_and(|values| values.contains(expected))
 }
 
 /// A source-table vector with its exact customer-provided key preserved.
@@ -1363,5 +1595,30 @@ mod tests {
         );
         assert!(vector_data(&json!([1.0, 2.0])).is_err());
         assert!(vector_data(&json!({"float32":["bad"]})).is_err());
+    }
+
+    /// Metadata predicates compose comparison, membership, and logical operators.
+    #[test]
+    fn metadata_filters_follow_the_documented_operator_rules() {
+        let metadata = json!({"score": 9, "labels": ["hot", "new"], "name":"ice"});
+        assert!(
+            matches_filter(
+                Some(&metadata),
+                &json!({"score":{"$gte":8}, "labels":"hot"})
+            )
+            .expect("filter")
+        );
+        assert!(
+            matches_filter(
+                Some(&metadata),
+                &json!({"$or":[{"name":"no"},{"score":{"$gt":8}}]})
+            )
+            .expect("filter")
+        );
+        assert!(!matches_filter(Some(&metadata), &json!({"score":{"$lt":8}})).expect("filter"));
+        assert!(
+            matches_filter(Some(&metadata), &json!({"labels":{"$nin":["old"]}})).expect("filter")
+        );
+        assert!(matches_filter(Some(&metadata), &json!({"score":{"$wat":1}})).is_err());
     }
 }
