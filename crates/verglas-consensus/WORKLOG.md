@@ -186,3 +186,10 @@
   Every completed holder response is still identity-checked before service, so
   a dead former leader no longer makes catalog recovery exceed its request
   deadline without weakening corruption checks or resource ceilings.
+- #135: Stage every committed voter concurrently and acknowledge only after
+  the existing coded or complete durability threshold fsyncs. This keeps the
+  committed configuration and certificate unchanged while a dead preferred
+  holder can no longer exhaust the foreground command deadline.
+- #135: Persist each committed WAL response boundary with its retry identity.
+  Exact retries now return the original index and WAL end, while conflicting
+  retry identities remain closed without exposing another command's result.

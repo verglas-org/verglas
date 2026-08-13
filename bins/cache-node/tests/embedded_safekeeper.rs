@@ -517,6 +517,138 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
     assert_eq!(rejected.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A large WAL tail continues through every surviving ingress after its first leader dies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_wal_append_continues_after_exact_leader_death() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let children = (0..4)
+        .map(|index| {
+            spawn_node(
+                index,
+                &configs[index],
+                &peers,
+                ring_ports[index],
+                safekeeper_ports[index],
+                &stderr,
+            )
+        })
+        .collect();
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let leader = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
+    let start = match submit(
+        leader,
+        WalRequest::OpenTimeline {
+            request_id: 300,
+            start_lsn: 0,
+        },
+    )
+    .await
+    .expect("open timeline through node zero")
+    {
+        WalResponse::Applied {
+            wal_end: Some(start),
+            ..
+        } => start,
+        other => panic!("unexpected timeline-open response: {other:?}"),
+    };
+    let writer_epoch = match submit(
+        leader,
+        WalRequest::AcquireWriter {
+            request_id: 301,
+            writer: "large-failover-compute".to_owned(),
+        },
+    )
+    .await
+    .expect("acquire writer through node zero")
+    {
+        WalResponse::Applied {
+            writer_epoch: Some(writer_epoch),
+            ..
+        } => writer_epoch,
+        other => panic!("unexpected writer-acquire response: {other:?}"),
+    };
+
+    let mut end = start;
+    for sequence in 0..4_u128 {
+        let payload = vec![sequence as u8; CANONICAL_WAL_APPEND_BYTES];
+        let response = submit_wal_http(
+            leader,
+            WalRequest::Append {
+                request_id: 0x1350_3000 + sequence,
+                writer_epoch,
+                start_lsn: end,
+                payload,
+            },
+        )
+        .await
+        .expect("submit retained large WAL frame through node zero");
+        assert!(
+            response.status().is_success(),
+            "retained large WAL frame {sequence} must commit; status={}; stderr:\n{}",
+            response.status(),
+            fleet.stderr_snapshot(),
+        );
+        let response = WalResponse::decode(&response.bytes().await.expect("append response body"))
+            .expect("decode retained large WAL append response");
+        end = match response {
+            WalResponse::Applied {
+                wal_end: Some(committed_end),
+                ..
+            } => committed_end,
+            other => panic!("unexpected retained large WAL response: {other:?}"),
+        };
+    }
+
+    fleet.children[0]
+        .kill()
+        .expect("stop exact node-zero leader after retained large tail");
+    fleet.children[0]
+        .wait()
+        .expect("reap exact node-zero leader");
+
+    let continuation = vec![4_u8; CANONICAL_WAL_APPEND_BYTES];
+    for (index, port) in safekeeper_ports.iter().enumerate().skip(1) {
+        let response = submit_wal_http(
+            SocketAddr::from(([127, 0, 0, 1], *port)),
+            WalRequest::Append {
+                request_id: 0x1350_3004,
+                writer_epoch,
+                start_lsn: end,
+                payload: continuation.clone(),
+            },
+        )
+        .await
+        .expect("submit large WAL continuation through surviving ingress");
+        let status = response.status();
+        let body = response.bytes().await.expect("continuation response body");
+        assert!(
+            status.is_success(),
+            "surviving ingress node {index} rejected the large WAL continuation with {status}: {}; stderr:\n{}",
+            String::from_utf8_lossy(&body),
+            fleet.stderr_snapshot(),
+        );
+        let response = WalResponse::decode(&body).expect("decode continuation response");
+        assert!(
+            matches!(response, WalResponse::Applied { wal_end: Some(committed_end), .. } if committed_end == end + CANONICAL_WAL_APPEND_BYTES as u64),
+            "surviving ingress node {index} returned an unexpected continuation response: {response:?}",
+        );
+    }
+}
+
 /// Four native-catalog ingresses retain linearizable availability after their elected leader dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {

@@ -146,3 +146,6 @@
   leader now treats a blackholed certified holder as unavailable quickly, so it
   can verify the full committed prefix from surviving replicas before the
   request deadline without skipping corruption checks.
+- #135: Bound the authenticated leader-command route explicitly for one
+  JSON-expanded canonical 8 MiB WAL append. Non-leader ingresses can now
+  forward the complete command without reopening an unbounded peer endpoint.

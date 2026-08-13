@@ -5,7 +5,7 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::post,
 };
@@ -33,6 +33,8 @@ use verglas_consensus::VerglasRaftConfig;
 
 /// Authenticates internal consensus traffic.
 const SECRET_HEADER: &str = "x-verglas-cluster-secret";
+/// One canonical 8 MiB WAL frame encoded as JSON byte values plus its command envelope.
+const GROUP_COMMAND_BODY_LIMIT_BYTES: usize = 34 * 1024 * 1024;
 type Raft = openraft::Raft<VerglasRaftConfig>;
 type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError<u64, E>;
 type Net<T, E = openraft::error::Infallible> = Result<T, RPCError<u64, BasicNode, RaftError<E>>>;
@@ -128,7 +130,10 @@ impl RaftRpcRegistry {
             .route("/consensus/v1/{group}/{target}/vote", post(vote))
             .route("/consensus/v1/{group}/open", post(open_group))
             .route("/consensus/v1/{group}/bootstrap", post(bootstrap_group))
-            .route("/consensus/v1/{group}/command", post(group_command))
+            .route(
+                "/consensus/v1/{group}/command",
+                post(group_command).layer(DefaultBodyLimit::max(GROUP_COMMAND_BODY_LIMIT_BYTES)),
+            )
             .route("/consensus/v1/membership/replace", post(membership_replace))
             .with_state(self.clone())
     }
@@ -554,6 +559,8 @@ impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<
 mod tests {
     use super::*;
 
+    const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
+
     #[tokio::test]
     async fn authenticated_membership_transport_reaches_registered_callback() {
         let registry = RaftRpcRegistry::new("secret");
@@ -600,6 +607,60 @@ mod tests {
             .await
             .expect("forwarded lifecycle request");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    /// The authenticated forwarding route admits one canonical large WAL command.
+    #[tokio::test]
+    async fn authenticated_command_route_accepts_a_canonical_large_wal_append() {
+        let registry = RaftRpcRegistry::new("secret");
+        registry
+            .set_commander(Arc::new(|group, body| {
+                Box::pin(async move {
+                    let command: verglas_consensus::GroupRequest =
+                        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+                    if group != "timeline/a"
+                        || !matches!(command, verglas_consensus::GroupRequest::AppendWal { .. })
+                    {
+                        return Err("wrong forwarded command".to_owned());
+                    }
+                    Ok(Vec::new())
+                })
+            }))
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, registry.router())
+                .await
+                .expect("server");
+        });
+        let body = serde_json::to_vec(&verglas_consensus::GroupRequest::AppendWal {
+            request_id: 1,
+            writer_epoch: 1,
+            start_lsn: 0,
+            payload: vec![u8::MAX; CANONICAL_WAL_APPEND_BYTES],
+            holders: vec![1, 2, 3],
+            mode: verglas_consensus::ReplicationMode::Coded,
+        })
+        .expect("encode canonical large command");
+        assert!(body.len() < GROUP_COMMAND_BODY_LIMIT_BYTES);
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/consensus/v1/timeline%2Fa/command"
+            ))
+            .header(SECRET_HEADER, "secret")
+            .body(body)
+            .send()
+            .await
+            .expect("send canonical large command");
+        assert!(
+            response.status().is_success(),
+            "status={}",
+            response.status()
+        );
         server.abort();
     }
 }

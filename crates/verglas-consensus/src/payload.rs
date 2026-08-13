@@ -13,7 +13,7 @@ use std::{
 
 use bytes::Bytes;
 use crc32c::crc32c;
-use futures::future::join_all;
+use futures::{StreamExt, future::join_all, stream};
 use sha2::{Digest, Sha256};
 
 use crate::{PayloadCertificate, ReplicationMode, RequestId, decode, encode};
@@ -207,30 +207,38 @@ impl PayloadStore for DistributedPayloadStore {
                 .map(|_| Bytes::copy_from_slice(body))
                 .collect(),
         };
-        let mut durable = Vec::with_capacity(required);
-        for voter in ordered {
+        // Every committed voter is a staging candidate. Start the fixed set
+        // together so a dead preferred holder cannot consume the command
+        // deadline before the surviving safe quorum fsyncs its fragments.
+        let mut staging = stream::iter(ordered.into_iter().map(|voter| {
             let slot = voters
                 .iter()
                 .position(|configured| configured == &voter)
-                .ok_or(PayloadError::UnknownHolder)?;
-            let result = self
-                .transport
-                .store(
-                    voter,
-                    PayloadRepresentation {
-                        term: 0,
-                        index: 0,
-                        group: group.to_owned(),
-                        configuration_generation,
-                        mode,
-                        hash,
-                        request,
-                        length: body.len(),
-                        slot,
-                        bytes: representations[slot].clone(),
-                    },
-                )
-                .await;
+                .ok_or(PayloadError::UnknownHolder);
+            let transport = Arc::clone(&self.transport);
+            let representation = slot.map(|slot| PayloadRepresentation {
+                term: 0,
+                index: 0,
+                group: group.to_owned(),
+                configuration_generation,
+                mode,
+                hash,
+                request,
+                length: body.len(),
+                slot,
+                bytes: representations[slot].clone(),
+            });
+            async move {
+                let result = match representation {
+                    Ok(representation) => transport.store(voter, representation).await,
+                    Err(error) => Err(error),
+                };
+                (voter, result)
+            }
+        }))
+        .buffer_unordered(voters.len());
+        let mut durable = Vec::with_capacity(required);
+        while let Some((voter, result)) = staging.next().await {
             if result.is_ok() {
                 durable.push(voter);
                 if durable.len() == required {

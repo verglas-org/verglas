@@ -228,3 +228,7 @@
 - #135: Removed deleted query and write roles from the root image build after
   their workspace consolidation into cache-node. The production cache image
   now builds only the unified binary instead of referencing absent packages.
+- #135: Added a real four-process WAL regression that retains four 8 MiB
+  frames, kills the exact first leader, and commits the same 8 MiB continuation
+  through every survivor. It captures HTTP bodies and child diagnostics so a
+  future failover rejection identifies the transport or consensus boundary.

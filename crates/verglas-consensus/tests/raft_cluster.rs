@@ -391,6 +391,19 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         .await
         .expect("contiguous WAL append");
     assert_eq!(wal.wal_end, Some(0x1003));
+    let retried_wal = leader_group
+        .append_wal(
+            RequestId::from_u128(52),
+            1,
+            0x1000,
+            Bytes::from_static(b"wal"),
+            &[1, 2, 3, 4, 5],
+        )
+        .await
+        .expect("exact WAL retry returns its original result");
+    assert_eq!(retried_wal.outcome, AppliedOutcome::Duplicate);
+    assert_eq!(retried_wal.index, wal.index);
+    assert_eq!(retried_wal.wal_end, wal.wal_end);
     assert_eq!(
         leader_group
             .open_timeline(RequestId::from_u128(62), 0x1000, &[1, 2, 3])

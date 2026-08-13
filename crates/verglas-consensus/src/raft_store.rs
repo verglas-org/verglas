@@ -194,6 +194,9 @@ struct AppliedIdentity {
     kind: crate::CommandKind,
     hash: [u8; 32],
     writer_epoch: Option<u64>,
+    wal_end: Option<u64>,
+    archive_lsn: Option<u64>,
+    catalog_changed: bool,
 }
 
 /// Latest committed replacement allocation and the Raft identity that sealed it.
@@ -429,9 +432,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             } else {
                                 AppliedOutcome::ConflictingRetry
                             },
-                            wal_end: None,
-                            archive_lsn: None,
-                            catalog_changed: false,
+                            wal_end: same.then_some(previous.wal_end).flatten(),
+                            archive_lsn: same.then_some(previous.archive_lsn).flatten(),
+                            catalog_changed: same && previous.catalog_changed,
                         });
                         continue;
                     }
@@ -597,6 +600,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             kind: header.kind(),
                             hash: header.payload_hash(),
                             writer_epoch,
+                            wal_end,
+                            archive_lsn,
+                            catalog_changed,
                         },
                     );
                     state.committed.insert(entry.log_id.index, header);
