@@ -19,7 +19,7 @@ x-pg-cache-environment: &pg-cache-environment
   VERGLAS_S3_ADDR: 0.0.0.0:8333
   VERGLAS_BLOCK_ADDR: 0.0.0.0:8335
   VERGLAS_RING_ADDR: 0.0.0.0:8336
-  VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336,cache-1=verglas-cache-node-1:8336,cache-2=verglas-cache-node-2:8336
+  VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336
   VERGLAS_CLUSTER_SECRET: ${VERGLAS_CLUSTER_SECRET:-verglas-local-ring}
   VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:5454
   VERGLAS_SAFEKEEPER_BROKER_ENDPOINT: http://verglas-neon-broker:50051
@@ -156,10 +156,6 @@ services:
         condition: service_healthy
       verglas-cache-node-0:
         condition: service_healthy
-      verglas-cache-node-1:
-        condition: service_healthy
-      verglas-cache-node-2:
-        condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8345/healthz"]
       interval: 2s
@@ -222,10 +218,6 @@ services:
       verglas-container-runtime:
         condition: service_healthy
       verglas-cache-node-0:
-        condition: service_healthy
-      verglas-cache-node-1:
-        condition: service_healthy
-      verglas-cache-node-2:
         condition: service_healthy
     restart: "no"
 
@@ -327,44 +319,6 @@ services:
       VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-0:5454
     volumes:
       - verglas-pg-cache-0:/var/lib/verglas
-    networks: *runtime-networks
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
-    restart: unless-stopped
-
-  verglas-cache-node-1:
-    build:
-      context: .
-      target: verglas-cache-node
-    image: verglas/verglas-cache-node:local
-    environment:
-      <<: *pg-cache-environment
-      VERGLAS_NODE_ID: cache-1
-      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-1:5454
-    volumes:
-      - verglas-pg-cache-1:/var/lib/verglas
-    networks: *runtime-networks
-    healthcheck:
-      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
-      interval: 2s
-      timeout: 5s
-      retries: 30
-    restart: unless-stopped
-
-  verglas-cache-node-2:
-    build:
-      context: .
-      target: verglas-cache-node
-    image: verglas/verglas-cache-node:local
-    environment:
-      <<: *pg-cache-environment
-      VERGLAS_NODE_ID: cache-2
-      VERGLAS_SAFEKEEPER_ADVERTISE_ADDR: verglas-cache-node-2:5454
-    volumes:
-      - verglas-pg-cache-2:/var/lib/verglas
     networks: *runtime-networks
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8334/admin/healthz"]
@@ -485,8 +439,6 @@ volumes:
   verglas-access-lakekeeper-credentials:
   verglas-access-neon-credentials:
   verglas-pg-cache-0:
-  verglas-pg-cache-1:
-  verglas-pg-cache-2:
 
 networks:
   runtime:

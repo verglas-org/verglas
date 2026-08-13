@@ -91,3 +91,6 @@
 - #74: Added a four-node shared-cache regression covering cross-node page heat,
   real Neon query-after-write, safekeeper publication, and quorum writes with a
   ring member stopped.
+- #111: Allowed a one-member fragment plane for the embedded safekeeper while
+  restricting object, block, and strong-catalog write-back to three or more
+  nodes. The one-node server therefore uses synchronous origin durability.

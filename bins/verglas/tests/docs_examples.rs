@@ -94,13 +94,9 @@ fn self_hosted_compose_is_complete_and_runnable() {
         !compose.contains("pg-ring:"),
         "cache nodes must not consume a redundant fourth Coolify network"
     );
-    for peer in [
-        "cache-0=verglas-cache-node-0:8336",
-        "cache-1=verglas-cache-node-1:8336",
-        "cache-2=verglas-cache-node-2:8336",
-    ] {
-        assert!(compose.contains(peer), "cache ring is missing peer {peer}");
-    }
+    assert!(compose.contains("VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336"));
+    assert!(!compose.contains("verglas-cache-node-1:"));
+    assert!(!compose.contains("verglas-cache-node-2:"));
 }
 
 #[test]

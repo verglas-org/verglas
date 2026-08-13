@@ -242,7 +242,7 @@ async fn serve(app: axum::Router) -> String {
 /// and a real passthrough writer over the same in-memory backend, so a write
 /// genuinely lands in the store the cache reads through. Returns the base URL
 /// and a handle to the store for direct out-of-band seeding.
-async fn serve_model() -> (String, Arc<InMemory>) {
+async fn serve_model() -> (String, Arc<InMemory>, ModelCache) {
     let store = Arc::new(InMemory::new());
     let model = ModelCache::new(store.clone());
     let base = serve(verglas_s3::router(
@@ -254,11 +254,11 @@ async fn serve_model() -> (String, Arc<InMemory>) {
             BUCKET,
             store.clone(),
         ))),
-        Arc::new(model),
+        Arc::new(model.clone()),
         None,
     ))
     .await;
-    (base, store)
+    (base, store, model)
 }
 
 /// The mutating op under test. Every variant makes the same key hold `new`
@@ -432,6 +432,36 @@ async fn observe(client: &reqwest::Client, base: &str, key: &str) -> Observation
     Observation { status, body }
 }
 
+/// Successful object-producing writes allocate the committed version into the
+/// read cache before the client receives its acknowledgement. This keeps the
+/// common write-then-query path local for atomic PUTs, copies, and completed
+/// multipart uploads instead of forcing the first query to refill from origin.
+#[tokio::test]
+async fn successful_writes_leave_the_new_version_resident() {
+    let (base, _store, cache) = serve_model().await;
+    let client = reqwest::Client::new();
+
+    for (index, op) in [WriteOp::Put, WriteOp::Copy, WriteOp::Multipart]
+        .into_iter()
+        .enumerate()
+    {
+        let key = format!("resident/{index}.bin");
+        let source = format!("resident/{index}.src");
+        let expected = payload(70 + index as u64, 32_000 + index as u64);
+        apply_write(&client, &base, op, &key, &source, expected.clone()).await;
+
+        let cache_key = CacheKey {
+            storage_binding_id: "default".to_owned(),
+            bucket: BUCKET.to_owned(),
+            key: key.clone(),
+        };
+        let resident = cache
+            .lookup(&cache_key)
+            .unwrap_or_else(|| panic!("{op:?} acknowledged without cache residency"));
+        assert_eq!(resident.bytes, expected, "{op:?} cached different bytes");
+    }
+}
+
 /// The property (#24), covering every op type: for a key already warm in the
 /// cache with `old` bytes, a durable write that replaces it must be invalidated
 /// before it is acked, so the **first read issued after the ack never returns
@@ -445,7 +475,7 @@ async fn observe(client: &reqwest::Client, base: &str, key: &str) -> Observation
 /// the post-ack read would return `old`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_post_ack_read_returns_pre_write_bytes_across_op_types() {
-    let (base, _store) = serve_model().await;
+    let (base, _store, _cache) = serve_model().await;
     let client = reqwest::Client::new();
 
     for scenario in 0..64u64 {
@@ -535,7 +565,7 @@ async fn no_post_ack_read_returns_pre_write_bytes_across_op_types() {
 /// rather than one write at a time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_load_never_exposes_stale_post_ack_reads() {
-    let (base, _store) = serve_model().await;
+    let (base, _store, _cache) = serve_model().await;
     let client = reqwest::Client::new();
     let key = "hot/contended.bin";
 

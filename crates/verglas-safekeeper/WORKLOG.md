@@ -59,3 +59,7 @@
 - #74: Made pageserver feedback advance retention only from the explicit
   `vg_durable_lsn` watermark and accepted Neon's read-replica
   `START_REPLICATION SLOT ... TIMELINE ...` command.
+- #111: Made the single-node append geometry write through to object storage.
+  A one-node safekeeper now flushes and reclaims each staged WAL append before
+  acknowledgement; multi-node EC deployments retain quorum acknowledgement and
+  asynchronous origin drain.

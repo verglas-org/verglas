@@ -766,3 +766,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #109: Added portable `scratch_target` declarations. The CLI carries only the container path, while the trusted runtime owns the backing host location.
 - #109: Updated the documented self-hosted Compose contract to require the external runtime network preserved by deployment platforms.
 - #109: Routed cache-ring peers over runtime-network service aliases and removed the redundant fixed-IP network so Coolify preserves compute-to-safekeeper DNS.
+- #111: Updated the documented self-hosted Compose contract to require one
+  write-through cache node and reject the removed replica services.

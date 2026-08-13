@@ -15,12 +15,12 @@ fn dockerfile_builds_the_runtime_manager() {
     assert!(dockerfile.contains("-p verglas-container-runtime"));
     assert!(dockerfile.contains("AS verglas-container-runtime"));
     assert!(dockerfile.contains(
-        "/src/target/release/verglas-container-runtime /usr/local/bin/verglas-container-runtime"
+        "/tmp/verglas-build/verglas-container-runtime /usr/local/bin/verglas-container-runtime"
     ));
     assert!(dockerfile.contains("FROM runtime AS verglas-container-runtime"));
     assert!(
         dockerfile
-            .contains("/src/target/release/verglas-scheduler /usr/local/bin/verglas-scheduler")
+            .contains("/tmp/verglas-build/verglas-scheduler /usr/local/bin/verglas-scheduler")
     );
     assert!(!dockerfile.contains("FROM verglas-gadget-runtime AS verglas-container-runtime"));
     assert!(!dockerfile.contains("verglas-gadget-runtime"));
@@ -70,8 +70,6 @@ fn compose_bootstraps_the_complete_oss_stack() {
             "verglas-lakekeeper-migrate:",
             "verglas-lakekeeper:",
             "verglas-cache-node-0:",
-            "verglas-cache-node-1:",
-            "verglas-cache-node-2:",
             "verglas-container-runtime:",
             "verglas-agent-runtime:",
             "verglas-os:",
@@ -99,5 +97,8 @@ fn compose_bootstraps_the_complete_oss_stack() {
     assert!(compose.contains("target: verglas-agent-runtime"));
     assert!(compose.contains("VERGLAS_AGENT_RUNTIME_URL: http://verglas-agent-runtime:8390"));
     assert!(compose.contains("VERGLAS_MANAGED_POSTGRES_SAFEKEEPERS: verglas-cache-node-0:5454"));
+    assert!(compose.contains("VERGLAS_RING_PEERS: cache-0=verglas-cache-node-0:8336"));
+    assert!(!compose.contains("verglas-cache-node-1:"));
+    assert!(!compose.contains("verglas-cache-node-2:"));
     assert!(compose.contains("127.0.0.1:8787:8787"));
 }

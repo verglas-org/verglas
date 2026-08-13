@@ -261,3 +261,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   cache access key as a user or tenant principal. Regression coverage proves a
   signed object GET still succeeds while a signed `/v1` path is rejected as an
   invalid S3 bucket.
+- #111: Replaced invalidation-only write acknowledgements with write allocation.
+  PUT, copy, and multipart completion now fence stale mappings and stream the
+  durable object through the bounded read path before acknowledging the client.

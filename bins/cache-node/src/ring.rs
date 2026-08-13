@@ -19,10 +19,9 @@
 //! - runs the takeover pass that completes a drain a crashed originator left
 //!   behind.
 //!
-//! With no ring configured (`VERGLAS_RING_PEERS` unset or naming fewer than three
-//! nodes) this module does nothing and the block tier stays single-node: FLUSH is
-//! the synchronous R2 barrier, byte-identical to before the write-back plane
-//! existed. That is topology-driven, not a config knob.
+//! With one configured node, this module supplies the embedded safekeeper's
+//! local staging transport but leaves the block tier on its synchronous origin
+//! barrier. Three or more nodes also enable erasure-coded block write-back.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -133,8 +132,9 @@ impl RingPlane {
 }
 
 /// Wires the block-flush write-back plane onto `registry` from the environment,
-/// or returns `None` for a single-node deployment (no ring peers), leaving the
-/// block tier on the synchronous barrier. Called once at startup, before serving.
+/// or returns `None` when no node membership is configured. One member leaves
+/// the block tier on the synchronous origin barrier while still providing the
+/// embedded safekeeper transport. Called once at startup, before serving.
 ///
 /// `secret` is the shared cluster secret to honour on the fragment plane, if the
 /// env sets one; v1 requires none (VXLAN isolation, mirroring the NBD plane).
@@ -149,11 +149,9 @@ pub async fn setup(
         Some(raw) => resolve_peers(&raw).await,
         None => Vec::new(),
     };
-    // A production cache ring needs at least three boxes; fewer is a
-    // single-node deployment and the block tier stays on the synchronous barrier.
-    if peers.len() < 3 {
+    if peers.is_empty() {
         eprintln!(
-            "verglas-cache-node {VERSION} fragment ring disabled: at least three VERGLAS_RING_PEERS are required"
+            "verglas-cache-node {VERSION} fragment plane disabled: VERGLAS_RING_PEERS is empty"
         );
         return Ok(None);
     }
@@ -219,13 +217,18 @@ pub async fn setup(
     });
 
     // The plane MUST code over the same chunk store the registry stages into.
-    let ring = RingWriteback::new(
-        Arc::clone(&transport),
-        Arc::clone(&membership),
-        local.clone(),
-        registry.chunk_store(),
-    );
-    registry.attach_ring(Arc::clone(&ring));
+    let block_ring = if peers.len() >= 3 {
+        let ring = RingWriteback::new(
+            Arc::clone(&transport),
+            Arc::clone(&membership),
+            local.clone(),
+            registry.chunk_store(),
+        );
+        registry.attach_ring(Arc::clone(&ring));
+        Some(ring)
+    } else {
+        None
+    };
 
     // Serve both the clean read-cache owner protocol and the durable fragment
     // protocol on the ring listener. The deferred slot returns a clean miss or
@@ -262,7 +265,7 @@ pub async fn setup(
     )
     .await?;
     eprintln!(
-        "verglas-cache-node {VERSION} block-ring fragment plane listening on http://{} ({} peers, RS quorum write-back)",
+        "verglas-cache-node {VERSION} fragment plane listening on http://{} ({} nodes)",
         peer_server.local_addr(),
         peers.len()
     );
@@ -272,7 +275,9 @@ pub async fn setup(
         let mut ticker = tokio::time::interval(TAKEOVER_INTERVAL);
         loop {
             ticker.tick().await;
-            ring.run_takeover_pass().await;
+            if let Some(ring) = &block_ring {
+                ring.run_takeover_pass().await;
+            }
         }
     });
 

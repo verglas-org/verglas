@@ -101,9 +101,9 @@ pub fn reclaim_legacy_state_descriptors(store: &LocalFragmentStore) -> Result<us
     Ok(reclaimed)
 }
 
-/// The erasure-coded quorum append log. `S` is the S3 origin, used for the flush
-/// write and for reading already-flushed ranges back; it is never on the append
-/// (commit) path.
+/// The erasure-coded quorum append log. Multi-node deployments acknowledge from
+/// the fragment quorum and drain to `S` asynchronously. A single-node deployment
+/// has no independent quorum, so it flushes to `S` before acknowledging.
 pub struct EcAppendLog<S> {
     /// Stable identity of the safekeeper whose state this log represents.
     /// Safekeepers advance and flush independently, so their replicated state
@@ -887,6 +887,8 @@ where
         records: Bytes,
     ) -> Result<Appended, AppendError> {
         let mut manifest = self.state.lock().await;
+        let geometry = self.effective_geometry();
+        let write_through = geometry.k == 1 && geometry.m == 0 && geometry.w == 1;
         if epoch != manifest.epoch {
             return Err(AppendError::Fenced {
                 current: manifest.epoch,
@@ -936,6 +938,9 @@ where
             }
         }
         if end_lsn.0 <= durable_tail.0 {
+            if write_through {
+                self.flush_manifest(&mut manifest).await?;
+            }
             return Ok(Appended {
                 start: begin_lsn,
                 end: end_lsn,
@@ -947,7 +952,6 @@ where
         let start = durable_tail;
         let end = end_lsn;
 
-        let geometry = self.effective_geometry();
         let live = self.membership.live_nodes();
         let encoded = match encode(geometry.k, geometry.m, &suffix) {
             Ok(encoded) => encoded,
@@ -1036,7 +1040,11 @@ where
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
-        self.flush_requested.notify_one();
+        if write_through {
+            self.flush_manifest(&mut manifest).await?;
+        } else {
+            self.flush_requested.notify_one();
+        }
 
         Ok(Appended {
             start: begin_lsn,

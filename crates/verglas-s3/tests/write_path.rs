@@ -1,7 +1,7 @@
 //! Integration tests for the S3 write path (issue #9): put/delete/copy and
 //! multipart round trips over the passthrough, S3 error XML for the write
 //! surface, the #21 ordering invariant (backend-durable before ack,
-//! invalidation before ack, nothing on failure), and bounded-memory
+//! cache replacement before ack, nothing on failure), and bounded-memory
 //! streaming for large PUT bodies — all against `object_store`'s in-memory
 //! backend (or a synthetic writer), no network.
 
@@ -14,6 +14,7 @@ use futures::StreamExt;
 use object_store::memory::InMemory;
 use object_store::{ObjectStoreExt, PutPayload, path::Path};
 use verglas_core::CacheKey;
+use verglas_core::read::{ObjectGet, ObjectMeta, ObjectRead, ReadError, ReadRange, TierCell};
 use verglas_s3::{
     BackendStore, CompletedPartRef, CopyOutcome, Invalidation, MultipartCreation, NoopInvalidation,
     ObjectWrite, PartInfo, PartUpload, PassthroughList, PassthroughRead, PassthroughWrite,
@@ -815,6 +816,47 @@ impl ObjectWrite for CountingWrite {
 /// Chunk size the synthetic client body yields.
 const SYNTH_CHUNK: u64 = 1024 * 1024;
 
+/// Synthetic durable object exposed after [`CountingWrite`] completes. It
+/// streams the write-allocation read without retaining the 64 MiB payload.
+struct CountingRead {
+    size: u64,
+}
+
+impl ObjectRead for CountingRead {
+    async fn get(&self, _key: &CacheKey, range: ReadRange) -> Result<ObjectGet, ReadError> {
+        if range != ReadRange::Full {
+            return Err(ReadError::InvalidRange);
+        }
+        let size = self.size;
+        let body = futures::stream::unfold(0u64, move |offset| async move {
+            if offset >= size {
+                return None;
+            }
+            let len = SYNTH_CHUNK.min(size - offset);
+            Some((Ok(pattern(offset, len)), offset + len))
+        })
+        .boxed();
+        Ok(ObjectGet {
+            meta: ObjectMeta {
+                size,
+                e_tag: Some("\"counting\"".to_owned()),
+                ..ObjectMeta::default()
+            },
+            range: 0..size,
+            body,
+            served_from: TierCell::new(),
+        })
+    }
+
+    async fn head(&self, _key: &CacheKey) -> Result<ObjectMeta, ReadError> {
+        Ok(ObjectMeta {
+            size: self.size,
+            e_tag: Some("\"counting\"".to_owned()),
+            ..ObjectMeta::default()
+        })
+    }
+}
+
 /// Bounded-memory proof for PUT, the reverse of the read path's test: a
 /// 64 MiB body is produced lazily on the client side (counting every byte
 /// generated) and consumed chunk by chunk at the interface; the producer may
@@ -833,11 +875,7 @@ async fn streaming_put_body_stays_bounded_ahead_of_the_writer() {
     let max_lead = Arc::new(AtomicU64::new(0));
     let base = serve(verglas_s3::router(
         "default",
-        PassthroughRead::new(BackendStore::single(
-            "default",
-            BUCKET,
-            Arc::new(InMemory::new()),
-        )),
+        CountingRead { size: SIZE },
         CountingWrite {
             produced: Arc::clone(&produced),
             consumed: Arc::clone(&consumed),

@@ -136,8 +136,8 @@ not server-wide environment values.
 
 ## Workers and containers
 
-Compose bootstraps `verglas-server`, Lakekeeper, the three-member cache and WAL
-ring, the local container runtime, the durable worker scheduler and its Postgres
+Compose bootstraps `verglas-server`, Lakekeeper, one write-through cache and WAL
+node, the local container runtime, the durable worker scheduler and its Postgres
 queue, and Verglas OS. The runtime manager
 owns dynamically added Vessels, database components, external brokers, and
 other optional applications. A portable worker contains its bounded command,

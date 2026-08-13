@@ -1,6 +1,6 @@
 //! The cache serving path: build the origin backend, probe it, build the hybrid
 //! cache engine over a single-node rendezvous ring, run the disk-full guardrail
-//! poll, and serve the SigV4 S3 endpoint with read-through and ring write-back.
+//! poll, and serve the SigV4 S3 endpoint with read-through and write allocation.
 //!
 //! This is the CACHE-relevant subset of `bins/verglas-server/src/main.rs::serve`,
 //! reproduced without gossip, table lifecycle, or any admin surface beyond
@@ -13,15 +13,15 @@
 //!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
 //!   dependency (gossip, peer RPC, fragment store).
 //! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
-//! - **Object write-back**: a configured fragment ring stages every S3 PUT as
+//! - **Object write-back**: a fragment ring of at least three nodes stages every S3 PUT as
 //!   erasure-coded, fsynced fragments before acknowledgement. Dirty fragments
 //!   remain outside normal cache eviction while origin propagation runs.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
-//!   reaches the ring. When `VERGLAS_RING_PEERS` names a ring, a device FLUSH is
+//!   reaches the ring. With at least three members, a device FLUSH is
 //!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
 //!   background); see [`crate::ring`]. The embedded safekeeper shares that same
-//!   fragment store and peer RPC. With no ring configured, object PUT and block
-//!   FLUSH retain the synchronous origin barrier and no safekeeper starts.
+//!   fragment store and peer RPC. One member keeps object PUT, block FLUSH, and
+//!   WAL on synchronous origin barriers while still hosting the safekeeper.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -363,7 +363,8 @@ pub async fn run(
     // through. A glob-only/bucketless config (dev) has no single bucket to root
     // chunks in, so the block tier is off there.
     // The ring flush plane, held for the process lifetime when the node is on a
-    // ring (fragment peer server + takeover loop). `None` on a single-node node.
+    // fragment plane (peer server + takeover loop). A one-node plane supports
+    // the write-through safekeeper but does not enable write-back.
     let mut ring_plane = None;
     let block_registry = match config.backend.bucket.as_deref() {
         Some(bucket) => {
@@ -452,9 +453,12 @@ pub async fn run(
                         .filter(|value| !value.is_empty()),
                 },
                 CatalogConsistency::Strong => {
-                    let ring = ring_plane.as_ref().ok_or(
-                        "catalog.consistency=strong requires a configured three-node VERGLAS_RING_PEERS ring",
-                    )?;
+                    let ring = ring_plane
+                        .as_ref()
+                        .filter(|ring| ring.node_count() >= 3)
+                        .ok_or(
+                            "catalog.consistency=strong requires a configured three-node VERGLAS_RING_PEERS ring",
+                        )?;
                     let token = std::env::var("VERGLAS_CATALOG_EVENT_TOKEN")
                         .ok()
                         .filter(|value| !value.is_empty())
@@ -705,7 +709,7 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let bucket_set = registry.bucket_set();
     let origin = Arc::new(PassthroughWrite::new(registry.clone()));
 
-    let app = if let Some(ring) = object_ring {
+    let app = if let Some(ring) = object_ring.filter(|ring| ring.node_count() >= 3) {
         let policy = Arc::new(object_writeback_policy(ring.node_count()));
         let (journal_store, migrated_journals) = JournalStore::open_for_binding(
             config.cache.dir.join("object-writeback"),

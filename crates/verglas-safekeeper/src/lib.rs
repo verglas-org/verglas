@@ -111,11 +111,10 @@
 //!   window is data loss — the disclosed, bounded cost of the buffer, closed by
 //!   flushing to S3 promptly.
 //! - **Single-node degenerate geometry.** A one-node deployment cannot form a
-//!   quorum. It runs `k = 1, m = 0, w = 1`: one fragment fsynced to local NVMe
-//!   plus the fsynced manifest record is the ack, no origin round-trip, async S3
-//!   flush behind it. Durability is then "one local disk until the segment
-//!   flushes" — issue #286's shape, applied to the WAL. This is selected
-//!   automatically for a genuinely single-node deployment; it is not a knob.
+//!   quorum. It uses `k = 1, m = 0, w = 1` only to stage an append, then flushes
+//!   the WAL segment to S3 and reclaims the fragment before acknowledgement.
+//!   This write-through behavior is selected automatically for a genuinely
+//!   single-node deployment; it is not a knob.
 //! - **No configuration beyond the geometry.** `(k, m, w)` is the whole tuning
 //!   surface. There are no other knobs: segment size is a fixed flush-
 //!   granularity constant, not a parameter.

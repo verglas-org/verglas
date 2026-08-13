@@ -55,3 +55,5 @@
 - #109: Applied the shared runtime-network declaration to cache peers as well as
   control-plane services. This keeps deployment-platform Compose transforms
   consistent and preserves DNS reachability from runtime-created containers.
+- #111: Updated the OSS packaging contract to require exactly one cache-node
+  service instead of a three-process write-back topology.

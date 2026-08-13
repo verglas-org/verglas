@@ -5,7 +5,7 @@
 //! an axum router the server can bind to `listen.s3_port`. s3s owns request
 //! parsing, error XML rendering, and status codes; this module owns the
 //! mapping between S3 semantics and the interfaces — including the write path's
-//! ordering invariant: backend durable, then invalidation, then (and only
+//! ordering invariant: backend durable, then cache replacement, then (and only
 //! then) the client ack.
 
 use std::str::FromStr;
@@ -54,9 +54,8 @@ use verglas_core::write::{
 
 /// The S3 front-end: a thin protocol adapter over an [`ObjectRead`] source
 /// and an [`ObjectWrite`] sink. Today both are the passthrough; issue #12
-/// swaps a cache in for reads without this type changing, while writes stay
-/// passthrough (read-through-only rule) and only ever touch the cache via
-/// the [`Invalidation`] hook.
+/// swaps a cache in for reads without this type changing. Writes reach their
+/// durability target first, then replace the cached object before acknowledgement.
 pub struct VerglasS3<R, W> {
     /// Immutable storage binding assigned to this database endpoint.
     storage_binding_id: String,
@@ -145,6 +144,24 @@ impl<R: ObjectRead, W: ObjectWrite> VerglasS3<R, W> {
                 format!("cache invalidation failed: {message}"),
             )
         })
+    }
+
+    /// Replaces one durable object in the read cache before acknowledging its
+    /// write. Invalidation fences stale concurrent fills; fully draining the
+    /// ordinary read path then admits the new mapping and bytes without
+    /// buffering the object in this protocol layer.
+    async fn commit_written_object(&self, key: &CacheKey) -> S3Result<()> {
+        self.invalidate(std::slice::from_ref(key)).await?;
+        let mut body = self
+            .reader
+            .get(key, ReadRange::Full)
+            .await
+            .map_err(to_s3_error)?
+            .body;
+        while let Some(chunk) = body.next().await {
+            chunk.map_err(to_s3_error)?;
+        }
+        Ok(())
     }
 }
 
@@ -905,7 +922,8 @@ fn strip_aws_chunked(encoding: Option<String>) -> Option<String> {
 //   1. stream the client's bytes to the backend;
 //   2. the backend confirms the write durable (the interface call returns `Ok` —
 //      the `ObjectWrite` contract);
-//   3. invalidate the affected logical keys;
+//   3. invalidate the affected logical key and stream the durable bytes through
+//      the read path so the new value is resident;
 //   4. only then ack the client (return `Ok`, which s3s renders as 2xx).
 //
 // Crash/failure windows and why each is safe:
@@ -915,14 +933,14 @@ fn strip_aws_chunked(encoding: Option<String>) -> Option<String> {
 //     got no ack (it must retry); the cache was either already invalidated
 //     or is covered by the mutable-key TTL backstop (#14) — the same
 //     argument that covers writes going direct to S3 behind our back;
-//   - invalidation failing after 2: the request errors (no ack), landing in
+//   - cache replacement failing after 2: the request errors (no ack), landing in
 //     the previous window.
 //
-// Never invalidate before the backend confirms (a concurrent read could
+// Never replace before the backend confirms (a concurrent read could
 // re-fill the cache from pre-write backend state and then receive the ack's
-// bytes late), and never ack before invalidation completes (a post-ack read
-// could hit a stale entry). No write is ever admitted into the cache here —
-// the cache fills on the read path only (issue #9's read-through-only rule).
+// bytes late), and never ack before replacement completes (a post-ack read
+// could hit a stale entry). Writes reuse the bounded streaming read path, so
+// large objects do not need a second whole-object buffer here.
 #[async_trait::async_trait]
 impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
     /// GetObject: full and ranged reads. A request with any `Range` header
@@ -1340,14 +1358,14 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
             .put(&key, metadata, body)
             .await
             .map_err(to_s3_write_error)?;
-        // 3: invalidate; 4: ack. On a failed PUT we never reach here: S3
+        // 3: replace the cached value; 4: ack. On a failed PUT we never reach here: S3
         // PUTs are atomic, so a failure leaves the backend (and any cache
         // entry) on the old bytes — nothing to invalidate, no ack. The
         // backend now holds the new bytes, so invalidate before the digest
         // verdict too: a BadDigest still changed backend state, and cached
         // state must not lag it (the bytes are the client's real body, never
         // corrupt — Verglas only reports that the *claimed* digest was wrong).
-        self.invalidate(std::slice::from_ref(&key)).await?;
+        self.commit_written_object(&key).await?;
         if let (Some(expected), Some(hasher)) = (expected_md5, hasher) {
             use md5::Digest;
             let digest = hasher
@@ -1512,7 +1530,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
             .copy(&source, &dest, metadata)
             .await
             .map_err(to_s3_write_error)?;
-        self.invalidate(std::slice::from_ref(&dest)).await?;
+        self.commit_written_object(&dest).await?;
         Ok(S3Response::new(CopyObjectOutput {
             copy_object_result: Some(CopyObjectResult {
                 e_tag: outcome.e_tag.map(to_etag),
@@ -1672,7 +1690,7 @@ impl<R: ObjectRead, W: ObjectWrite> S3 for VerglasS3<R, W> {
             .complete_multipart(&key, &input.upload_id, parts, object_checksum)
             .await
             .map_err(to_s3_write_error)?;
-        self.invalidate(std::slice::from_ref(&key)).await?;
+        self.commit_written_object(&key).await?;
         let mut output = CompleteMultipartUploadOutput {
             bucket: Some(input.bucket),
             key: Some(input.key),
@@ -1953,7 +1971,7 @@ async fn handle_http_error(_error: s3s::HttpError) -> axum::http::StatusCode {
 
 /// Builds the complete S3 endpoint as an axum router, path-style only: s3s
 /// service over the given [`ObjectRead`] source and [`ObjectWrite`] sink (writes
-/// fire `invalidation` before acking). When `credentials` is `Some`, every
+/// replace their read-cache entry before acking). When `credentials` is `Some`, every
 /// request must carry a valid SigV4 signature (header or presigned query string)
 /// matching one of the configured static keys; unsigned requests get
 /// `AccessDenied`. With `None`, auth is disabled (unit tests only).

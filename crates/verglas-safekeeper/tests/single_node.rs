@@ -1,13 +1,12 @@
 //! Single-node degenerate-geometry tests for the append log (#372 step 2, the
 //! free/single-box case built on #286's shape). A one-node deployment runs
-//! `k=1, m=0, w=1`: one fragment fsynced to local NVMe plus the fsynced manifest
-//! record is the ack, no origin round-trip, async S3 flush behind it.
+//! `k=1, m=0, w=1`: one local fragment stages each append, but the S3 origin
+//! must confirm the WAL object before the client receives an acknowledgement.
 //!
-//! - `single_node_fast_acks_with_the_origin_absent`: an append acks and reads
-//!   back from the one local fragment while nothing is in S3 (local durability).
+//! - `single_node_acks_only_after_origin_durability`: an append reaches S3 and
+//!   evicts its staging fragment before acknowledgement.
 //! - `single_node_recovers_the_tail_across_a_restart`: after a crash the tail
-//!   rebuilds from the local fragment (no redundancy, so the fragment must
-//!   survive — it does, on durable local storage).
+//!   rebuilds from the S3-durable segment and local manifest.
 //! - `single_node_flush_then_recover_from_s3`: after a flush the fragment is
 //!   dropped and the log recovers wholly from S3.
 
@@ -274,7 +273,7 @@ fn build(
 // ---- tests -----------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn single_node_fast_acks_with_the_origin_absent() {
+async fn single_node_acks_only_after_origin_durability() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
     let transport = MemoryTransport::new();
@@ -284,19 +283,23 @@ async fn single_node_fast_acks_with_the_origin_absent() {
     let r = log
         .append(Epoch(0), Lsn(0), payload.clone())
         .await
-        .expect("single-node append acks from local durability, origin untouched");
+        .expect("single-node append acks after origin durability");
     assert_eq!(r.start, Lsn(0));
     assert_eq!(r.end, Lsn(4096));
 
-    // One fragment (k=1, m=0), nothing in S3.
-    assert_eq!(transport.wal_fragment_count(), 1, "one local fragment");
     assert_eq!(
-        store.object_count(),
-        0,
-        "no origin round-trip on the ack path"
+        log.flushed_through(),
+        log.tail(),
+        "origin is current at ack"
     );
+    assert_eq!(
+        transport.wal_fragment_count(),
+        0,
+        "staging fragment is evicted after the origin confirms"
+    );
+    assert_eq!(store.object_count(), 1, "one WAL object is durable in S3");
 
-    // Reads back from the one local fragment.
+    // Reads back from S3 after the staging fragment has been reclaimed.
     let got = log.read(Lsn(0), Lsn(4096)).await.expect("read tail");
     assert_eq!(got, payload);
 }
@@ -305,7 +308,7 @@ async fn single_node_fast_acks_with_the_origin_absent() {
 async fn single_node_recovers_the_tail_across_a_restart() {
     let dir = tempfile::tempdir().expect("tmp");
     let store = MemStore::new();
-    let transport = MemoryTransport::new(); // durable local store, survives the crash
+    let transport = MemoryTransport::new();
 
     let payload = bytes(5000);
     {
@@ -313,7 +316,7 @@ async fn single_node_recovers_the_tail_across_a_restart() {
         log.append(Epoch(0), Lsn(0), payload.clone())
             .await
             .expect("append");
-        // crash: drop the log before any flush
+        // crash: the acknowledged append is already durable in S3
     }
 
     // Restart: reopen over the same local fragments and manifest.
@@ -322,7 +325,7 @@ async fn single_node_recovers_the_tail_across_a_restart() {
     let got = log
         .read(Lsn(0), Lsn(5000))
         .await
-        .expect("tail rebuilds from the local fragment");
+        .expect("tail rebuilds from the S3 segment");
     assert_eq!(got, payload, "recovered tail is byte-identical");
 }
 
