@@ -68,12 +68,18 @@ aws --endpoint-url "$MINIO" s3api put-object \
   --bucket "$BUCKET" --key "$KEY" --body "$BODY" >/dev/null
 
 # ---- server (system under test) over TLS ---------------------------------- #
-echo "[server] building verglas-server" >&2
-( cd "$REPO" && cargo build -q -p verglas-server )
-VGD="$REPO/target/debug/verglas-server"
+echo "[server] building verglas-cache-node" >&2
+( cd "$REPO" && cargo build -q -p verglas-cache-node )
+VGD="$REPO/target/debug/verglas-cache-node"
 
 CACHE_DIR="$WORK/cache"; mkdir -p "$CACHE_DIR"
-cat > "$WORK/verglas-server.toml" <<TOML
+cat > "$WORK/endpoint-credentials" <<CREDS
+[default]
+aws_access_key_id = $DEV_AK
+aws_secret_access_key = $DEV_SK
+CREDS
+chmod 600 "$WORK/endpoint-credentials"
+cat > "$WORK/verglas-cache-node.toml" <<TOML
 [listen]
 s3_port = $S3_PORT
 admin_port = $ADMIN_PORT
@@ -90,22 +96,27 @@ dir = "$CACHE_DIR"
 capacity_bytes = "1GB"
 dram_bytes = "256MB"
 
+[backend]
+bucket = "$BUCKET"
+endpoint = "$MINIO"
+region = "$REGION"
+allow_http = true
+
 [auth]
-access_key_id = "$DEV_AK"
-secret_access_key = "$DEV_SK"
+credentials_file = "$WORK/endpoint-credentials"
 TOML
 
-echo "[server] starting verglas-server (TLS) -> MinIO" >&2
+echo "[server] starting verglas-cache-node (TLS) -> MinIO" >&2
 AWS_ENDPOINT="$MINIO" \
 AWS_ACCESS_KEY_ID="$ORIGIN_AK" AWS_SECRET_ACCESS_KEY="$ORIGIN_SK" \
 AWS_REGION="$REGION" AWS_ALLOW_HTTP=true \
 VERGLAS_S3_ADDR="127.0.0.1:$S3_PORT" VERGLAS_ADMIN_ADDR="127.0.0.1:$ADMIN_PORT" \
-  "$VGD" --config "$WORK/verglas-server.toml" &
+  "$VGD" --config "$WORK/verglas-cache-node.toml" &
 VGD_PID=$!
 
 for _ in $(seq 1 100); do
   curl -sf "http://127.0.0.1:$ADMIN_PORT/admin/healthz" >/dev/null && break
-  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglas-server died on startup" >&2; exit 1; }
+  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglas-cache-node died on startup" >&2; exit 1; }
   sleep 0.1
 done
 

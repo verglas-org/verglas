@@ -2,7 +2,7 @@
 //! against the currently held grant.
 //!
 //! This is the query role's use of the framework-level grant contract
-//! (`verglas_sdk::grant`): the estimate is the *primary* sizing mechanism (a
+//! (`verglas_core::grant`): the estimate is the *primary* sizing mechanism (a
 //! request made before or at launch, from a real query shape and real table
 //! stats), and growth is the escape hatch for when the estimate falls short —
 //! not the other way around.
@@ -10,8 +10,8 @@
 use std::sync::Arc;
 
 use iceberg::Catalog;
+use verglas_core::grant::{MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 use verglas_iceberg::TimeTravel;
-use verglas_sdk::grant::{MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 
 /// The floor this binary will not usefully run below — its own runtime
 /// baseline. Matches the estimator's own fixed base-overhead term
@@ -78,7 +78,7 @@ pub async fn ensure_covers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use verglas_sdk::grant::LocalGrantHost;
+    use verglas_core::grant::LocalGrantHost;
 
     /// A need already covered by the current grant is a no-op — no grow call
     /// changes the bytes held.

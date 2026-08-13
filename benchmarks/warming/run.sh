@@ -2,7 +2,7 @@
 # Eager-warming live demonstration (issue #168).
 #
 # Proves that a WATCHED Iceberg table's COLD planning walk collapses toward a
-# WARM one because verglas-server warmed the table's metadata into #50's pinned store
+# WARM one because verglas-cache-node warmed the table's metadata into #50's pinned store
 # BEFORE any client asked — driven by the real `[catalog]` REST watcher (#47) +
 # warming coordinator (#168), not a benchmark shortcut.
 #
@@ -45,9 +45,9 @@ VG_SECRET="${WARMING_VG_SECRET:-demosecret}"
 VG_DRAM="${WARMING_VG_DRAM:-1GB}"
 VG_DISK="${WARMING_VG_DISK:-8GB}"
 POLL_SECS="${WARMING_POLL_SECS:-2}"
-VERGLAS_SERVER_BIN="${VERGLAS_SERVER_BIN:-$HERE/../../target/release/verglas-server}"
+VERGLAS_CACHE_NODE_BIN="${VERGLAS_CACHE_NODE_BIN:-$HERE/../../target/release/verglas-cache-node}"
 
-# Polaris on the host (published ports so verglas-server + the driver reach it).
+# Polaris on the host (published ports so verglas-cache-node + the driver reach it).
 POLARIS_PORT="${WARMING_POLARIS_PORT:-8181}"
 POLARIS_MGMT_PORT="${WARMING_POLARIS_MGMT_PORT:-8182}"
 POLARIS_CONTAINER="verglas-warming-polaris"
@@ -55,7 +55,7 @@ CATALOG_URI="http://127.0.0.1:${POLARIS_PORT}/api/catalog"
 MGMT_URI="http://127.0.0.1:${POLARIS_PORT}"
 
 VG_CACHE_ROOT="${WARMING_VG_CACHE_ROOT:-/tmp/vg-warming-cache}"
-VG_LOG="$HERE/verglas-server.log"
+VG_LOG="$HERE/verglas-cache-node.log"
 VG_PID=""
 
 PHASE="all"
@@ -69,7 +69,7 @@ Phases:
   --seed-only     start Polaris, bootstrap the catalog, seed the tables, stop
   --measure-only  measure A/B/C x RUNS against an already-seeded catalog + report
   --report        re-render results/report.md from results/walks.jsonl
-  --teardown      kill verglas-server, drop tables/catalog, prefix-scoped S3 delete,
+  --teardown      kill verglas-cache-node, drop tables/catalog, prefix-scoped S3 delete,
                   stop the Polaris container
 
 Options (also env; see README):
@@ -208,13 +208,20 @@ stop_polaris() {
 }
 
 # --------------------------------------------------------------------------- #
-# verglas-server (host) — dedicated ports, explicit PID kill on teardown (#170)
+# verglas-cache-node (host) — dedicated ports, explicit PID kill on teardown (#170)
 # --------------------------------------------------------------------------- #
 
 # $1=warming(on|off)  $2=cache-dir  $3=bearer-token(may be empty for off)
-write_verglas-server_config() {
+write_cache_node_config() {
   local warming="$1" cache_dir="$2" token="$3"
-  local cfg="$HERE/verglas-server.toml"
+  local cfg="$HERE/verglas-cache-node.toml"
+  printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
+    "$VG_KEY" "$VG_SECRET" > "$cache_dir/endpoint-credentials"
+  chmod 600 "$cache_dir/endpoint-credentials"
+  if [[ "$warming" == "on" ]]; then
+    printf '%s' "$token" > "$cache_dir/catalog-token"
+    chmod 600 "$cache_dir/catalog-token"
+  fi
   {
     echo "[listen]"
     echo "s3_port = $VG_PORT"
@@ -225,47 +232,50 @@ write_verglas-server_config() {
     echo "dram_bytes = \"$VG_DRAM\""
     echo "[cache.warming]"
     echo "enabled = $([[ "$warming" == "on" ]] && echo true || echo false)"
+    echo "[backend]"
+    echo "bucket = \"$BUCKET\""
+    echo "endpoint = \"$AWS_ENDPOINT\""
+    echo "region = \"$AWS_REGION\""
     echo "[auth]"
-    echo "access_key_id = \"$VG_KEY\""
-    echo "secret_access_key = \"$VG_SECRET\""
+    echo "credentials_file = \"$cache_dir/endpoint-credentials\""
     if [[ "$warming" == "on" ]]; then
       echo "[catalog]"
       echo "uri = \"$CATALOG_URI\""
       echo "poll_interval_secs = $POLL_SECS"
       echo "warehouse = \"$CATALOG\""
-      echo "bearer_token = \"$token\""
+      echo "credentials_file = \"$cache_dir/catalog-token\""
     fi
   } > "$cfg"
   echo "$cfg"
 }
 
-start_verglas-server() {
+start_cache_node() {
   # $1=warming(on|off)  $2=cache-dir  $3=bearer-token
-  [[ -x "$VERGLAS_SERVER_BIN" ]] || { echo "error: verglas-server not found at $VERGLAS_SERVER_BIN; run: cargo build --release -p verglas -p verglas-server" >&2; exit 2; }
-  stop_verglas-server
+  [[ -x "$VERGLAS_CACHE_NODE_BIN" ]] || { echo "error: verglas-cache-node not found at $VERGLAS_CACHE_NODE_BIN; run: cargo build --release -p verglas-cache-node" >&2; exit 2; }
+  stop_cache_node
   check_port_free "$VG_PORT"; check_port_free "$VG_ADMIN_PORT"
   rm -rf "$2"; mkdir -p "$2"
-  local cfg; cfg="$(write_verglas-server_config "$1" "$2" "$3")"
+  local cfg; cfg="$(write_cache_node_config "$1" "$2" "$3")"
   : > "$VG_LOG"
-  "$VERGLAS_SERVER_BIN" --config "$cfg" >"$VG_LOG" 2>&1 &
+  "$VERGLAS_CACHE_NODE_BIN" --config "$cfg" >"$VG_LOG" 2>&1 &
   VG_PID=$!
-  # Detach from job control so the eventual kill in stop_verglas-server does not print
+  # Detach from job control so the eventual kill in stop_cache_node does not print
   # a "Terminated" notice to the run transcript.
   disown "$VG_PID" 2>/dev/null || true
   for _ in $(seq 1 100); do
     if curl -sf "http://127.0.0.1:${VG_ADMIN_PORT}/admin/healthz" >/dev/null 2>&1; then
-      echo "[verglas-server] ready (warming=$1, pid $VG_PID)" >&2; return 0
+      echo "[verglas-cache-node] ready (warming=$1, pid $VG_PID)" >&2; return 0
     fi
     if ! kill -0 "$VG_PID" 2>/dev/null; then
-      echo "error: verglas-server exited during startup; see $VG_LOG" >&2; cat "$VG_LOG" >&2; exit 1
+      echo "error: verglas-cache-node exited during startup; see $VG_LOG" >&2; cat "$VG_LOG" >&2; exit 1
     fi
     sleep 0.2
   done
-  echo "error: verglas-server admin never became healthy" >&2; cat "$VG_LOG" >&2; exit 1
+  echo "error: verglas-cache-node admin never became healthy" >&2; cat "$VG_LOG" >&2; exit 1
 }
 
-stop_verglas-server() {
-  # #170: verglas-server children can survive the parent's SIGTERM, so kill every PID
+stop_cache_node() {
+  # #170: verglas-cache-node children can survive the parent's SIGTERM, so kill every PID
   # holding our S3/admin port plus the parent, escalating until the port frees.
   local attempt sig p pids
   [[ -n "$VG_PID" ]] && kill "$VG_PID" 2>/dev/null || true
@@ -336,7 +346,7 @@ do_measure() {
   start_polaris
   mkdir -p "$RESULTS_DIR"; : > "$RESULTS"
   local n; n="$(num_tables)"
-  trap 'stop_verglas-server' EXIT
+  trap 'stop_cache_node' EXIT
   for run in $(seq 1 "$RUNS"); do
     echo "" >&2; echo "===== run $run/$RUNS =====" >&2
 
@@ -346,18 +356,18 @@ do_measure() {
     #     commit is fired — this is the pure onboarding path (a commit-driven
     #     re-warm exercises the same warmer; see the #168 integration tests). ---
     local token; token="$(polaris_token)"
-    start_verglas-server on "$VG_CACHE_ROOT/b-$run" "$token"
+    start_cache_node on "$VG_CACHE_ROOT/b-$run" "$token"
     echo "[B] server started; waiting for the startup warming pass" >&2
     wait_for_warming "$n"
     PY walk "${common_args[@]}" "${walk_args[@]}" --config B --run "$run"
-    stop_verglas-server
+    stop_cache_node
 
     # --- Config A (cold baseline) + C (warm floor): warming OFF, fresh cache.
     #     First walk is genuine cold; the immediate re-run is the warm floor. ---
-    start_verglas-server off "$VG_CACHE_ROOT/a-$run" ""
+    start_cache_node off "$VG_CACHE_ROOT/a-$run" ""
     PY walk "${common_args[@]}" "${walk_args[@]}" --config A --run "$run"
     PY walk "${common_args[@]}" "${walk_args[@]}" --config C --run "$run"
-    stop_verglas-server
+    stop_cache_node
   done
   trap - EXIT
   do_report
@@ -372,7 +382,7 @@ do_report() {
 
 do_teardown() {
   need_origin_env; guard_prefix; setup_venv
-  stop_verglas-server
+  stop_cache_node
   start_polaris
   PY teardown "${common_args[@]}" --origin-endpoint "$AWS_ENDPOINT" --origin-region "$REGION" >/dev/null 2>&1 || true
   echo "[teardown] deleting s3://${BUCKET}/${PREFIX}/ (prefix-scoped)" >&2

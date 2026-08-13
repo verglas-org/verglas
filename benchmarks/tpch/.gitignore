@@ -1,4 +1,0 @@
-# Local venv and generated artifacts — never committed.
-.venv/
-catalog.db
-*.db

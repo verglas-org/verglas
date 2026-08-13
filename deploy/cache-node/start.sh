@@ -33,4 +33,16 @@ printf '%s\n' \
   'credentials_file = "/var/lib/verglas/backend-credentials"' \
   > /var/lib/verglas/config.toml
 
+if [ -n "${VERGLAS_CATALOG_URI:-}" ]; then
+  printf '%s\n' \
+    '' \
+    '[catalog]' \
+    "uri = \"$VERGLAS_CATALOG_URI\"" \
+    >> /var/lib/verglas/config.toml
+  if [ -n "${VERGLAS_CATALOG_WAREHOUSE:-}" ]; then
+    printf 'warehouse = "%s"\n' "$VERGLAS_CATALOG_WAREHOUSE" \
+      >> /var/lib/verglas/config.toml
+  fi
+fi
+
 exec verglas-cache-node --config /var/lib/verglas/config.toml

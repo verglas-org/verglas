@@ -9,3 +9,4 @@
   Iceberg implementation.
 - #91: Updated API ownership documentation to call the foreground process the
   server. Wire behavior is unchanged by the executable rename.
+- #133: Clarified that this leaf crate is the public wire boundary between independently versioned clients and the engine. No client implementation remains in the engine workspace.

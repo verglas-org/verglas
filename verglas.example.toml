@@ -1,16 +1,16 @@
-# verglas.example.toml — annotated reference configuration for `verglas-server`.
+# verglas.example.toml — annotated reference configuration for `verglas-cache-node`.
 #
-# Copy, edit, and pass with `verglas-server --config /etc/verglas/verglas.toml`.
-# The file is validated at startup: a bad config makes the server exit
+# Copy, edit, and pass with `verglas-cache-node --config /etc/verglas/verglas.toml`.
+# The file is validated at startup: a bad config makes the cache node exit
 # non-zero with a message naming the exact field, and unknown fields are
 # rejected so typos fail fast instead of silently taking defaults.
 #
-# Every field is optional and shown here with its default value.
+# Required origin and cache fields are populated; optional fields show defaults.
 
 [listen]
 # Port of the S3 endpoint engines point at.
 s3_port = 8333
-# Port of the loopback admin API the `verglas` CLI talks to.
+# Port of the private health, metrics, and cache-local catalog API.
 admin_port = 8334
 
 # Virtual-hosted-style addressing (#11). Set the endpoint's base domain to accept
@@ -25,18 +25,18 @@ admin_port = 8334
 
 # TLS termination for the S3 endpoint (#11). Absent means plain HTTP — for local
 # dev on localhost only. The production deployment puts an L4 NLB (TCP
-# passthrough) in front of the servers, so TLS terminates HERE, at the server:
+# passthrough) in front of the cache nodes, so TLS terminates HERE, at the cache node:
 # the NLB never sees plaintext and SigV4's signed Host header survives intact.
 #
 # Point cert_path at the PEM certificate chain (leaf first) and key_path at the
-# PEM private key. The server reloads both on SIGHUP without dropping live
+# PEM private key. The cache node reloads both on SIGHUP without dropping live
 # connections, so a production cert rotation causes zero failed requests: rotate
-# the files on disk, then `kill -HUP <verglas-server-pid>`.
+# the files on disk, then `kill -HUP <verglas-cache-node-pid>`.
 #[listen.tls]
 #cert_path = "/etc/verglas/tls/fullchain.pem"
 #key_path = "/etc/verglas/tls/privkey.pem"
 
-# Structured logging (#61). The server installs one `tracing` subscriber from
+# Structured logging (#61). The cache node installs one `tracing` subscriber from
 # this section.
 [log]
 # Output format. `json` emits one JSON object per line for log pipelines
@@ -45,13 +45,12 @@ admin_port = 8334
 format = "json"
 # Default verbosity filter, in RUST_LOG syntax (e.g. `info`, or a per-target
 # filter like `verglas_cache=debug,info`). `RUST_LOG` in the environment
-# overrides this at startup; `POST /admin/log {"level": "..."}` hot-reloads it
-# at runtime without a restart.
+# overrides this at startup.
 level = "info"
 
 [cache]
 # Directory holding cached data. Must already exist and be writable by the
-# server user.
+# cache-node user.
 dir = "/var/lib/verglas"
 # Size ceilings. Byte fields take human-size strings — suffixes B/KB/MB/GB/TB
 # (binary multiples) — or a bare number of bytes.
@@ -79,7 +78,7 @@ mutable_mapping_ttl_secs = 5
 enabled = true            # false = admit every fetched block (debugging only)
 frequency_threshold = 2   # admit on the second sighting (1 = admit everything)
 
-# Snapshot-driven prefetch (#51). On a compaction (`replace`) commit the server
+# Snapshot-driven prefetch (#51). On a compaction (`replace`) commit the cache node
 # prefetches the rewritten files' hot column chunks — scored against a heat
 # ledger fed from the request path — so the cache hit rate recovers before
 # queries re-earn it from the origin. Prefetch shares the warming byte budget and
@@ -93,14 +92,6 @@ max_queue = 65536         # queued fills before the lowest-priority are dropped
 heat_epoch_secs = 300     # heat-ledger EWMA epoch (5 minutes)
 heat_table_cap = 65536    # bounded heat entries per table
 heat_channel_capacity = 16384 # drop-on-full request-path sample channel depth
-
-# SQL and logical writes execute in isolated role processes. The server only
-# dispatches bounded requests; it contains no embedded query or table writer.
-[query_worker]
-binary = "/usr/local/bin/verglas-query"
-
-[write_worker]
-binary = "/usr/local/bin/verglas-write"
 
 # Erasure-coded NVMe write-back tier (#180). OFF by default and disabled here.
 # When enabled, a PUT to an opted-in key prefix is acked once `w` Reed-Solomon
@@ -134,7 +125,7 @@ ack_deadline_ms = 2000    # gather w durable fragments within this, else write-t
 # uncommitted files. COMMITTED table state is never affected: the commit barrier
 # orders propagation before a table publishes, so the catalog never points at
 # files missing from the origin. (The deployment story may put the buffer
-# directory on a replicated block volume; the server neither knows nor relies on it.)
+# directory on a replicated block volume; the cache node neither knows nor relies on it.)
 # There is no fragment size setting (#223): fragments share the one NVMe budget
 # (cache.capacity_bytes) with the read cache, first come, first served.
 # Fragments are transient — held only until the object propagates to the
@@ -156,9 +147,9 @@ ack_deadline_ms = 2000    # gather w durable fragments within this, else write-t
 # w = 9
 
 [backend]
-# The buckets this server serves. It serves a SET: the single `bucket` below
+# The buckets this node serves. It serves a SET: the single `bucket` below
 # and/or the `bucket_globs` patterns. At least one of the two is REQUIRED — the
-# server refuses to start without a bucket set. A request whose bucket is in the
+# node refuses to start without a bucket set. A request whose bucket is in the
 # set is served; any other bucket returns NoSuchBucket. On a cache miss a served
 # bucket is read through to its origin using the node's credential chain (the
 # ambient AWS role/keys, or the credentials file below); one credential set
@@ -195,12 +186,12 @@ min_samples = 20          # outcomes needed before the rate is trusted
 cooldown_ms = 5000        # open duration before probing
 half_open_max_probes = 3  # probe successes required to close again
 
-# Static access keys engines present to the server's S3 endpoint. Optional:
-# if the whole [auth] table is absent, the server generates a keypair at
+# Static access keys engines present to the cache node's S3 endpoint. Optional:
+# if the whole [auth] table is absent, the cache node generates a keypair at
 # startup and prints it once.
 #[auth]
-#access_key_id = "dev"
-#secret_access_key = "change-me"
+#credentials_file = "/etc/verglas/endpoint-credentials"
+#credentials_profile = "default"
 
 # Iceberg REST catalog to watch for table commits. Optional: if the whole
 # [catalog] table is absent, the Iceberg-awareness layer is off. Filters
@@ -222,7 +213,7 @@ half_open_max_probes = 3  # probe successes required to close again
 #warehouse = "lake"              # multi-warehouse catalogs; S3 Tables: the table-bucket ARN
 
 # Gossip cluster membership (#27) and the weighted rendezvous ring (#28).
-# Optional: if the whole [cluster] table is absent the server is a
+# Optional: if the whole [cluster] table is absent the cache node is a
 # cluster-of-one — no gossip runs, the ring has one member, and behaviour is
 # identical to a single-node deployment. When present, the node joins the pod
 # over `chitchat` gossip and takes a weighted share of the keyspace.

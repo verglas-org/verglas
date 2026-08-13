@@ -77,17 +77,16 @@ environment is defined by `.cursor/environment.json` (repo-file managed), which
 runs two scripts:
 
 - `scripts/cloud/install.sh` (install step): installs dev tooling (`just`, `jq`,
-  MinIO `minio`+`mc`, AWS CLI, Bun 1.3.8), runs `cargo fetch --locked`, pre-builds
-  `verglas-server` + `verglas`, and `npm ci`s the TypeScript SDK. Every step is
-  guarded, so re-runs are no-ops.
+  MinIO `minio`+`mc`, and AWS CLI), runs `cargo fetch --locked`, and pre-builds
+  `verglas-cache-node`. Every step is guarded, so re-runs are no-ops.
 - `scripts/cloud/start.sh` (start step, runs on every boot): brings up a local
-  MinIO origin on `:9000` and `verglas-server` (S3 `:8333`, admin `:8334`) using
+  MinIO origin on `:9000` and `verglas-cache-node` (S3 `:8333`, admin `:8334`) using
   `deploy/dev/verglas.dev.toml`, creates the `my-bucket` origin bucket, and is
   idempotent (skips a service already listening on its port). After binding the
   admin port it waits for `/admin/healthz` before declaring ready. So a fresh VM
   comes up ready to serve an S3 PUT/GET through the cache with no manual steps.
   Its output goes to `/tmp/cursor/start-user/start-user.log`; the running stack
-  logs to `/tmp/verglas-dev/{verglas-server,minio}.log`.
+  logs to `/tmp/verglas-dev/{verglas-cache-node,minio}.log`.
 
 Standard commands live in the `justfile` and `README.md`; use them
 (`just build`/`just test`/`just lint`, or the underlying `cargo` commands). The
@@ -112,30 +111,25 @@ Rust workspace facts:
   services (see the standing test policy at the top of `.github/workflows/ci.yml`).
   Anything needing a real service is behind `#[ignore]`.
 
-Running `verglas-server` locally (non-obvious gotchas):
+Running `verglas-cache-node` locally (non-obvious gotchas):
 
 - There is **no in-memory/filesystem origin exposed by the binary**. `[backend]`
   requires a bucket set and a reachable S3-compatible origin, so a live server
   needs one. MinIO is preinstalled (`minio`, `mc`) — run it as a single binary
   (no Docker): `minio server /tmp/verglas-origin --address 127.0.0.1:9000`. The
-  fully dependency-free exercise of the read/write/list path is instead
-  `cargo test -p verglas-server --test s3_smoke` (in-process mock origin).
-- A **config-less** `cargo run --bin verglas-server` (a.k.a. `just run-dev`)
-  brings up **only the admin API** — no S3 endpoint, no cache. Pass
-  `--config <file>` to serve S3.
+  fully dependency-free exercises live in the cache-node and S3 crate tests.
+- The cache node requires `--config <file>` because an origin and cache
+  directory are part of its serving contract. `just run-dev` uses the checked-in
+  MinIO development config.
 - **Two distinct credential sets:** `[auth].credentials_file` is what engines
   present to Verglas on the S3 port; the origin credentials come from the AWS
   env chain or `[backend].credentials_file`. Don't conflate them. With no
-  `[auth]`, the server prints an ephemeral keypair at startup.
+  `[auth]`, the node prints an ephemeral keypair at startup.
 - An `http://` origin needs `backend.allow_http = true` (or `AWS_ALLOW_HTTP=true`).
-- `cache.dir` must exist, be writable, and be exclusive to one server.
+- `cache.dir` must exist, be writable, and be exclusive to one node.
 - **Cache acceleration is Iceberg/Parquet-aware.** Without a `[catalog]` and real
   Parquet data files, reads are served `tier="passthrough"` (correct read-through:
   right bytes, just not locally accelerated), so `verglas_cache_hits_total` stays
   0. Non-zero hits require standing up an Iceberg REST catalog + Parquet objects.
-  The `verglas` CLI has no raw object put/get — use an S3 client (`aws`, DuckDB)
-  for object I/O on port 8333; the CLI drives the admin/table/catalog verbs on 8334.
-
-TypeScript SDK (`sdks/typescript`): `npm run typecheck` + `npm test` (vitest,
-mock endpoint, no server needed). Bun 1.3.8 is preinstalled for the parity/
-trajectory checks (`node scripts/check-api-surface.mjs`, `bash scripts/check-cli-thin.sh`).
+  Use an S3 client (`aws`, DuckDB) for object I/O on port 8333. The CLI and SDKs
+  are developed in `verglas-client`, not this repository.

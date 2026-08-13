@@ -2,14 +2,14 @@
 //! cache engine over a single-node rendezvous ring, run the disk-full guardrail
 //! poll, and serve the SigV4 S3 endpoint with read-through and ring write-back.
 //!
-//! This is the CACHE-relevant subset of `bins/verglas-server/src/main.rs::serve`,
+//! This is the CACHE-relevant subset of `bins/cache-node/src/main.rs::serve`,
 //! reproduced without gossip, table lifecycle, or any admin surface beyond
 //! health/stats/metrics. Ring members provide the shared durability plane.
 //!
 //! ## Read ownership and write durability
 //!
 //! - **Ring**: a [`RendezvousRing::single`] node owns every key, so the read
-//!   path never consults a peer. This is byte-identical ownership to a verglas-server
+//!   path never consults a peer. This is byte-identical ownership to a verglas-cache-node
 //!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
 //!   dependency (gossip, peer RPC, fragment store).
 //! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
@@ -44,7 +44,7 @@ use verglas_write::{
 use crate::VERSION;
 use crate::admin;
 
-/// The node id the single-node cache uses. Matches verglas-server's cluster-of-one id
+/// The node id the single-node cache uses. Matches verglas-cache-node's cluster-of-one id
 /// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
 /// Storage binding for the built-in managed lakehouse database.
@@ -78,7 +78,7 @@ fn object_writeback_policy(nodes: usize) -> WritebackPolicy {
 /// Whether the operator has opted out of the backend startup probe via
 /// `VERGLAS_DEV_ALLOW_MISSING_ORIGIN`. Truthy values are `1`/`true`
 /// (case-insensitive). A dev/test escape hatch — same name and semantics as
-/// verglas-server so the two binaries behave identically.
+/// verglas-cache-node so the two binaries behave identically.
 fn dev_allow_missing_origin() -> bool {
     std::env::var("VERGLAS_DEV_ALLOW_MISSING_ORIGIN")
         .map(|value| {
@@ -89,7 +89,7 @@ fn dev_allow_missing_origin() -> bool {
 }
 
 /// Reserves one quarter of configured origin concurrency for repeated aligned
-/// cache tails, leaving the rest for user reads. Copied from verglas-server so the
+/// cache tails, leaving the rest for user reads. Copied from verglas-cache-node so the
 /// overfetch behaviour matches.
 fn background_fill_limit(max_concurrent_requests: usize) -> usize {
     max_concurrent_requests / 4
@@ -160,7 +160,7 @@ fn stats_source(
 
 /// Builds the `GET /metrics` source: renders the Prometheus exposition on each
 /// scrape from the shared request registry plus the engine and backend counters
-/// read at scrape time. The CACHE-relevant subset of verglas-server's `metrics_source`
+/// read at scrape time. The CACHE-relevant subset of verglas-cache-node's `metrics_source`
 /// (no per-table telemetry).
 fn metrics_source(
     config: &Config,
@@ -250,7 +250,7 @@ fn spawn_disk_monitor(
     let capacity = config.cache.capacity_bytes.0;
     // Keep a headroom reserve so admission stops before the disk is truly spent;
     // the gap to `high_water` is the hysteresis band. Floored at 64 MiB so a tiny
-    // test budget still leaves a sane reserve. Same shape as verglas-server's poll.
+    // test budget still leaves a sane reserve. Same shape as verglas-cache-node's poll.
     let low_water = (capacity / 16).max(64 * 1024 * 1024);
     let high_water = low_water.saturating_mul(2);
     let params = DiskParams {
@@ -293,7 +293,7 @@ fn spawn_disk_monitor(
 
 /// Builds the cache engine and runs the admin and S3 listeners together.
 ///
-/// Ordering mirrors verglas-server's serve-gating (#16): the admin listener binds
+/// Ordering mirrors verglas-cache-node's serve-gating (#16): the admin listener binds
 /// first reporting `starting`, then the backend is probed and the engine
 /// recovers its on-disk tiers, then the stats/metrics slots are filled and the
 /// health gate flips to `ready`, then the S3 endpoint serves. Either listener

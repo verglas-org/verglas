@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::Mutex;
+use verglas_core::grant::{MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 use verglas_iceberg::{Connection, TimeTravel, catalog};
-use verglas_sdk::grant::{MemoryGrant, MemoryGrantHost};
 
 use crate::admin::{self, AppState};
 use crate::config::QueryConfig;
@@ -133,7 +133,7 @@ pub async fn run(
                 }
             }),
         None => grant_host
-            .request(verglas_sdk::grant::MemoryGrantRequest::new(
+            .request(MemoryGrantRequest::new(
                 sizing::MINIMUM_GRANT_BYTES,
                 sizing::MINIMUM_GRANT_BYTES,
             ))
@@ -218,9 +218,9 @@ async fn idle_shutdown_watch(last_activity: Arc<AtomicU64>) {
     }
 }
 
-/// Appends `<role> <ip:port>` to the ports file a parent (`bins/verglas-server`'s
+/// Appends `<role> <ip:port>` to the ports file a parent (`bins/cache-node`'s
 /// query-worker dispatcher, or a test) named with `--ports-file`, matching the
-/// exact convention `verglas-server --ports-file` uses (issue #194) so a poller
+/// exact convention `verglas-cache-node --ports-file` uses (issue #194) so a poller
 /// written against one works against both. Best-effort: a write failure is
 /// logged and swallowed — it never fails startup, since serving does not
 /// depend on the parent learning the port.

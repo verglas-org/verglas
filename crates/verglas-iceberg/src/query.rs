@@ -438,7 +438,7 @@ fn batches_to_rows(
 /// Serializes one [`arrow_array::RecordBatch`] to the *inner* bytes of a JSON
 /// row-object array — `{"a":1,"b":2},{"c":3,"d":4}`, with no enclosing `[`/`]`
 /// — plus its row count. A streaming caller ([`crate::estimate`] does not use
-/// this; the HTTP layer in `bins/query-node`/`bins/verglas-server` does) splices
+/// this; the HTTP layer in `bins/query-node` does) splices
 /// this between its own `[`/`]` as batches arrive, one call per batch, so
 /// nothing beyond one batch is ever held in memory building the response body.
 /// An empty batch returns empty bytes and `0`, never a bare `[]`.

@@ -428,3 +428,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #87: Added atomic foreground activity accounting across HTTP, NBD, fragment, and safekeeper planes. A generation-fenced admission lease makes a zero in-flight report safe for a host stop decision while retaining per-plane diagnostics.
 - #74: Extended the cache peer contract with rendezvous-owner placement for
   materialized blocks, reporting admission separately from transport failure.
+- #133: Moved the memory-grant contract into the engine core so query roles no longer depend on the extracted client SDK. Standalone and hosted launchers now share an engine-owned sizing boundary.

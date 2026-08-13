@@ -1,177 +1,45 @@
 ---
-title: "Self-host Verglas"
-description: "Start the complete OSS stack with Cloudflare R2 and tenant-managed Lakekeeper."
+title: "Self-host the engine"
+description: "Start a local cache node without a hosted control plane."
 icon: "server"
 ---
 
-This guide starts one Verglas tenant backed by Cloudflare R2. R2 stores durable
-Iceberg objects. The Compose stack runs Lakekeeper as the tenant's managed
-Iceberg REST catalog. You do not create or mount a server `config.toml`.
-
-The running application exposes:
-
-| Port | Service | Used by |
-| --- | --- | --- |
-| `8333` | S3-compatible cache | Query engines and SDKs |
-| `8334` | Query, write, catalog, and admin API | The `verglas` CLI and SDKs |
-| `8360` | Local container runtime manager | Optional managed services |
-| `9009` | Rill | Optional analytics container |
-
-## Before you begin
-
-Install [Docker Desktop](https://docs.docker.com/desktop/) or Docker Engine
-with Compose, Git, and the Rust toolchain. You also need a Cloudflare account
-with R2 enabled.
-
-<Steps>
-  <Step title="Create an R2 bucket">
-    Follow Cloudflare's [R2 S3 setup](https://developers.cloudflare.com/r2/get-started/s3/)
-    to create a bucket. This guide calls it `verglas-demo`.
-
-    Record the S3 endpoint. It has this shape:
-
-    ```text
-    S3 endpoint: https://ACCOUNT_ID.r2.cloudflarestorage.com
-    ```
-  </Step>
-
-  <Step title="Create read-write R2 credentials">
-    In **R2 → Overview → Manage API Tokens**, create an **Admin Read & Write**
-    token scoped to the bucket. See Cloudflare's [R2 authentication guide](https://developers.cloudflare.com/r2/api/tokens/).
-
-    Record both S3 values shown once at creation:
-
-    - Access Key ID, used for S3 requests.
-    - Secret Access Key, used for S3 requests.
-
-    <Warning>
-    Cloudflare does not show the secret access key again. Do not commit any of
-    these values.
-    </Warning>
-  </Step>
-
-  <Step title="Clone Verglas and install the CLI">
-    ```bash
-    git clone https://github.com/verglas-org/verglas.git
-    cd verglas
-    cargo install --path bins/verglas --locked --force
-    verglas --version
-    ```
-  </Step>
-
-  <Step title="Export the deployment values">
-    Replace the placeholders with the values from Cloudflare. The last command
-    creates a separate credential for clients of your Verglas S3 endpoint.
-
-    ```bash
-    export R2_BUCKET=verglas-demo
-    export R2_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
-    export R2_ACCESS_KEY_ID=YOUR_R2_ACCESS_KEY_ID
-    export R2_SECRET_ACCESS_KEY=YOUR_R2_SECRET_ACCESS_KEY
-    export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
-    export VERGLAS_S3_SECRET_ACCESS_KEY=$(openssl rand -hex 32)
-    export VERGLAS_SECRET_ENCRYPTION_KEY=$(openssl rand -hex 32)
-    export VERGLAS_TOKEN_SIGNING_KEY=$(openssl rand -base64 32)
-    export VERGLAS_TARGET_JWT_SIGNING_KEY=$(openssl rand -base64 32)
-    export VERGLAS_IDENTITY_ASSERTION_KEY=$(openssl rand -hex 32)
-    export VERGLAS_INITIAL_OWNER_EMAIL=you@example.com
-    ```
-
-    Keep this terminal open. Compose substitutes these values when it creates
-    the containers.
-
-  </Step>
-
-  <Step title="Review the Compose bootstrap">
-    The repository's `docker-compose.yml` is the source of truth for the
-    complete OSS stack. It starts the data server, tenant Lakekeeper, the
-    three-member cache and WAL ring, the scheduler and its Postgres queue, the
-    trusted container-runtime manager, and Verglas OS. No profile or additional
-    `verglas` command is required.
-
-    Only the runtime manager receives the Docker socket. It owns dynamically
-    generated Vessels and other optional containers on the fixed
-    `verglas-runtime` network. The OS is a community and development surface;
-    the server and CLI remain usable independently of it.
-  </Step>
-
-  <Step title="Start Verglas">
-    Set the local Docker control-plane token, then build and start the stack.
-    `VERGLAS_INITIAL_OWNER_EMAIL` is consumed only to create the first owner
-    principal. The signing keys must remain stable for the lifetime of the
-    tenant because they protect token verification and signed login assertions.
-
-    ```bash
-    export VERGLAS_CONTAINER_RUNTIME_TOKEN="$(openssl rand -hex 32)"
-    docker compose up --detach --build
-    ```
-
-    Wait until the health endpoint reports `ready`. Open Verglas OS and create
-    or sign in to the account whose email matches
-    `VERGLAS_INITIAL_OWNER_EMAIL`. In **Profile → Access tokens**, create a
-    token with the minimum database and action grants needed by the CLI, and
-    save the value displayed once to the local credentials file. Then connect
-    the CLI:
-
-    ```bash
-    until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 2; done
-    export VERGLAS_ENDPOINT=http://127.0.0.1:8334
-    export VERGLAS_ACCESS_ENDPOINT=http://127.0.0.1:8345
-    export VERGLAS_TOKEN=TOKEN_SHOWN_ONCE
-    verglas status
-    ```
-
-    `TOKEN_SHOWN_ONCE` is the token copied from the Access tokens page. After
-    creating a database, use `verglas token create` to mint a narrower
-    replacement; the CLI saves that token in its owner-only credential file.
-
-    Open Verglas OS at `http://127.0.0.1:8787`.
-
-    Confirm that the runtime manager can reach Docker:
-
-    ```bash
-    curl -i http://127.0.0.1:8360/health
-    docker compose logs -f verglas-container-runtime
-    ```
-
-    Pass the same `VERGLAS_CONTAINER_RUNTIME_TOKEN` to the local Verglas control
-    plane. Do not use the Compose file's development default on a shared machine.
-
-    The access service writes separate short-lived workload credentials to
-    separate private Compose volumes. `verglas-server` mounts only its inventory
-    token file read-only. Lakekeeper mounts only its catalog-policy credential,
-    and the trusted container runtime mounts only the Neon proxy-policy
-    credential so it can inject the file into a managed Postgres proxy. Do not
-    copy any of these files to a shell, an Application, a Vessel, or a source
-    repository.
-
-    Compose uses pinned, immutable Verglas Neon storage/proxy and compute
-    images. It never uses a mutable `latest` image. Each managed Postgres proxy
-    validates its caller's short-lived database JWT against the tenant access
-    service.
-
-    If startup fails, read the server log:
-
-    ```bash
-    docker compose logs verglas-server
-    ```
-  </Step>
-</Steps>
-
-## Next: create your first table
-
-The server is connected to R2 and tenant Lakekeeper. Continue with
-[Create your first table](/docs/get-started/first-table) to write rows, run a
-query, and confirm that the resulting Iceberg table is visible through the
-catalog.
-
-## Stop the cluster
+The checked-in Compose file starts MinIO and one `verglas-cache-node`.
 
 ```bash
-docker compose down
+git clone https://github.com/verglas-org/verglas.git
+cd verglas
+docker compose up --detach --build
 ```
 
-This stops the Compose services. Dynamically managed containers retain
-their declared state and are reconciled when the manager starts again. The
-named volumes retain the local cache and runtime desired-state document. Add
-`--volumes` only when you intentionally want to delete both.
+The cache endpoint is `http://127.0.0.1:8333`; its development credentials are
+`verglas-local` and `verglas-local-secret`. Health and metrics are exposed on
+port `8334`.
+
+```bash
+until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 1; done
+
+AWS_ACCESS_KEY_ID=verglas-local \
+AWS_SECRET_ACCESS_KEY=verglas-local-secret \
+AWS_DEFAULT_REGION=us-east-1 \
+aws --endpoint-url http://127.0.0.1:8333 s3 ls
+```
+
+## Enable Iceberg-aware caching
+
+An S3 endpoint alone provides correct pass-through behavior. Catalog watching,
+metadata warming, and table-aware admission require an authoritative Iceberg
+REST catalog.
+
+```bash
+export VERGLAS_CATALOG_URI=https://catalog.example.com
+export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
+docker compose up --detach --build
+```
+
+The local stack does not create access, scheduler, database, worker,
+integration, application, or agent services. Those are hosted control-plane
+responsibilities in `verglas-cloud`.
+
+Stop the local engine with `docker compose down`. Add `--volumes` only when you
+intend to delete the local cache and MinIO data.

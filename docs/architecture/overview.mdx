@@ -1,71 +1,57 @@
 ---
 title: "Architecture overview"
-description: "Understand the Verglas system boundary, deployment shapes, and invariants."
+description: "Understand the public engine boundary and its independently deployed roles."
 icon: "compass-drafting"
 ---
 
-Verglas is an Iceberg-aware S3 cache placed between compute and object storage.
-Query engines, SDK workers, and analytics tools read object bytes through
-Verglas. The Iceberg catalog and customer bucket remain authoritative.
+Verglas sits between compute and object storage. The object store and Iceberg
+catalog remain authoritative; turning Verglas off makes reads slower, not
+incorrect or unavailable.
 
 ```mermaid
 flowchart LR
-    C["CLI, SDKs, query engines"] --> R["Query and write API"]
-    C --> S["Verglas S3 endpoint"]
-    R --> S
-    R --> I["Iceberg REST catalog"]
-    S --> O["Object storage"]
-    I --> O
+    E["Query engine"] -->|"S3"| C["verglas-cache-node"]
+    Q["verglas-query"] -->|"S3"| C
+    W["verglas-write"] -->|"S3"| C
+    Q --> I["Iceberg REST catalog"]
+    W --> I
+    C -->|"watch commits"| I
+    C --> O["Object storage"]
 ```
 
-## Product boundary
+## Repository boundary
 
-The open-source Docker application composes independently testable crates into
-one self-hosted service:
-
-| Surface | Responsibility |
+| Repository | Responsibility |
 | --- | --- |
-| S3 | Serve cached ranges and forward misses and writes to object storage. |
-| Catalog | Cache shallow Iceberg REST metadata reads and pass mutations to the configured catalog. |
-| Query | Run bounded SQL in the isolated query role. |
-| Write | Commit logical table writes in the isolated write role. |
-| Scheduler | Persist and execute worker events when the optional Workers profile is running. |
-| Analytics | Manage Rill resources when the optional Analytics profile is running. |
+| `verglas` | Public cache, storage, query, and write engine roles. |
+| `verglas-client` | Public CLI, Rust SDK, and TypeScript SDK. |
+| `verglas-cloud` | Hosted access, scheduler, workers, databases, integrations, applications, and agent runtime. |
+| `verglas-app` | Private cloud console and workspace client. |
+| `rime` | Public parallel software-engineering plugin. |
 
-Self-hosted installs typically run the REST composition in one container.
-Operators may also run the same crates as separate roles so cache, query,
-write, catalog, and scheduling scale independently.
+The engine does not import a hosted control-plane package. Hosted services run
+the same public role binaries and interact through explicit network and process
+contracts.
 
-## Design requirements
+## Engine roles
 
-<CardGroup cols={2}>
-  <Card title="Turn-off test" icon="power-off">
-    Removing Verglas leaves ordinary Iceberg tables in the original catalog and
-    bucket. Workloads become slower, not unavailable.
-  </Card>
-  <Card title="Correct bytes" icon="shield-check">
-    Cache identity includes object version. A stale path cannot return bytes
-    from a different object generation.
-  </Card>
-  <Card title="Hard budgets" icon="gauge">
-    DRAM, NVMe, CPU, request concurrency, and background work are bounded
-    operator inputs.
-  </Card>
-  <Card title="No local ownership assumptions" icon="share-nodes">
-    Every cache operation resolves ownership through the ring, including a
-    single-node deployment.
-  </Card>
-</CardGroup>
+| Role | Responsibility |
+| --- | --- |
+| Cache | Serve S3 ranges, route ownership, warm Iceberg metadata, and read or write through to object storage. |
+| Query | Execute bounded SQL against a catalog while reading data only through the cache endpoint. |
+| Write | Commit isolated logical table writes through the cache and authoritative catalog. |
 
-## Read the architecture by concern
+## Standing requirements
 
-- [Cache design](/docs/architecture/cache) covers the read path, tiers, ring,
-  and failure behavior.
-- [Iceberg awareness](/docs/architecture/iceberg) separates catalog metadata
-  from object reads and explains warming, graphs, and vector indexes.
-- [Write path](/docs/architecture/writes) explains staging, quorum, and
-  propagation to object storage.
-- [Execution model](/docs/architecture/execution) explains isolated roles,
-  workers, scheduling, and containers.
-- [Benchmarks](/docs/architecture/benchmarks) records the current measured
-  results and their limits.
+- Turning Verglas off leaves customer data readable through its original
+  catalog and bucket.
+- Object version participates in cache identity, so stale paths cannot return
+  bytes from another generation.
+- DRAM, NVMe, CPU, concurrency, and background work obey hard ceilings.
+- Every operation resolves ownership through the ring, including a one-node
+  deployment.
+
+Continue with [cache design](/docs/architecture/cache),
+[Iceberg awareness](/docs/architecture/iceberg),
+[write path](/docs/architecture/writes), and
+[engine roles](/docs/architecture/execution).

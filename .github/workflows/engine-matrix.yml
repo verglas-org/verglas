@@ -57,10 +57,8 @@ jobs:
           java-version: "21"
           cache: gradle
 
-      # Only the two binaries the harness drives — keeps the build well under
-      # the ~5-minute PR-time budget.
-      - name: Build server + CLI
-        run: cargo build -p verglas-server -p verglas
+      - name: Build cache node
+        run: cargo build -p verglas-cache-node
 
       # Compile the plain-Java iceberg-core fixture builder into one runnable jar
       # (no Spark). Runs once; the matrix reuses it for the avro and mixed variants.
@@ -81,9 +79,19 @@ jobs:
             "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && \
              mc mb --ignore-existing local/verglas-test"
 
-      - name: Start Verglas server against MinIO
+      - name: Start Verglas cache node against MinIO
         run: |
           mkdir -p "$RUNNER_TEMP/vg-cache"
+          cat > "$RUNNER_TEMP/backend-credentials" <<EOF
+          [default]
+          aws_access_key_id = minioadmin
+          aws_secret_access_key = minioadmin
+          EOF
+          cat > "$RUNNER_TEMP/endpoint-credentials" <<EOF
+          [default]
+          aws_access_key_id = matrixdev
+          aws_secret_access_key = matrixdevsecret
+          EOF
           cat > "$RUNNER_TEMP/verglas-matrix.toml" <<EOF
           [listen]
           s3_port = 8333
@@ -94,17 +102,23 @@ jobs:
           capacity_bytes = "2GB"
           dram_bytes = "512MB"
 
+          [backend]
+          bucket = "verglas-test"
+          endpoint = "http://127.0.0.1:9000"
+          region = "us-east-1"
+          allow_http = true
+          credentials_file = "$RUNNER_TEMP/backend-credentials"
+
           [auth]
-          access_key_id = "matrixdev"
-          secret_access_key = "matrixdevsecret"
+          credentials_file = "$RUNNER_TEMP/endpoint-credentials"
           EOF
-          ./target/debug/verglas-server --config "$RUNNER_TEMP/verglas-matrix.toml" \
-            > "$RUNNER_TEMP/verglas-server.log" 2>&1 &
+          ./target/debug/verglas-cache-node --config "$RUNNER_TEMP/verglas-matrix.toml" \
+            > "$RUNNER_TEMP/verglas-cache-node.log" 2>&1 &
           for _ in $(seq 1 30); do
             curl -sf http://127.0.0.1:8334/admin/healthz && break
             sleep 1
           done
-          echo "server log:"; cat "$RUNNER_TEMP/verglas-server.log"
+          echo "cache-node log:"; cat "$RUNNER_TEMP/verglas-cache-node.log"
 
       # Guard the comparator itself: a tripwire that can't trip is worthless.
       - name: Comparator selftest
@@ -117,6 +131,6 @@ jobs:
             --access-key-id matrixdev \
             --secret-key matrixdevsecret
 
-      - name: Server log on failure
+      - name: Cache-node log on failure
         if: failure()
-        run: cat "$RUNNER_TEMP/verglas-server.log" || true
+        run: cat "$RUNNER_TEMP/verglas-cache-node.log" || true

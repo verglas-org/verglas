@@ -2,7 +2,7 @@
 # Ceph s3-tests conformance harness for Verglas (issue #22).
 #
 # One entrypoint. Brings up MinIO (origin) via docker compose, builds and runs
-# verglas-server pointed at it, then runs the pinned ceph/s3-tests suite against the
+# verglas-cache-node pointed at it, then runs the pinned ceph/s3-tests suite against the
 # VERGLAS endpoint with the dev credentials. The pass/skip surface is defined by
 # markers-exclude.txt (feature groups) + skip-list.txt (per-test residue) — the
 # documented compatibility contract. See README.md.
@@ -23,7 +23,7 @@ S3TESTS_COMMIT="5522d1c351f75bc00ae0f64f742f3f095f5939d9"
 
 # ---- defaults (override via flags/env) ------------------------------------ #
 MODE="full"                        # full | smoke | list
-PROFILE="release"                  # release | debug (cargo profile for verglas-server)
+PROFILE="release"                  # release | debug (cargo profile for verglas-cache-node)
 KEEP=""                            # --keep leaves MinIO + server up for inspection
 S3_PORT="${VG_S3_PORT:-8433}"
 ADMIN_PORT="${VG_ADMIN_PORT:-8434}"
@@ -42,9 +42,9 @@ Usage: run.sh [options] [-- <extra pytest args>]
                  markers excluded, per-test skip-list applied (default).
   --smoke        run only the fast PR-path subset (smoke-list.txt).
   --list         collect-only: print what WOULD run, then exit (no server).
-  --debug        build verglas-server with the debug profile (faster compile).
-  --keep         leave MinIO + verglas-server running after the suite (for debugging).
-  --s3-port N    verglas-server S3 port (default 8433).
+  --debug        build verglas-cache-node with the debug profile (faster compile).
+  --keep         leave MinIO + verglas-cache-node running after the suite (for debugging).
+  --s3-port N    verglas-cache-node S3 port (default 8433).
   --minio-port N host port MinIO is published on (default 9100).
   -h|--help      this help.
 
@@ -122,7 +122,7 @@ cleanup() {
   if [[ -z "$KEEP" ]]; then
     VG_MINIO_PORT="$MINIO_PORT" "${COMPOSE[@]}" down -v >/dev/null 2>&1 || true
   else
-    echo "[keep] MinIO + verglas-server left running (S3 http://127.0.0.1:${S3_PORT})" >&2
+    echo "[keep] MinIO + verglas-cache-node left running (S3 http://127.0.0.1:${S3_PORT})" >&2
   fi
 }
 trap cleanup EXIT
@@ -131,14 +131,20 @@ echo "[origin] starting MinIO on :$MINIO_PORT" >&2
 VG_MINIO_PORT="$MINIO_PORT" VG_ORIGIN_ACCESS_KEY="$ORIGIN_AK" VG_ORIGIN_SECRET_KEY="$ORIGIN_SK" \
   "${COMPOSE[@]}" up -d --wait
 
-# Build verglas-server from this repo and run it as the system under test.
-echo "[server] building verglas-server ($PROFILE)" >&2
+# Build verglas-cache-node from this repo and run it as the system under test.
+echo "[server] building verglas-cache-node ($PROFILE)" >&2
 BUILD_FLAGS=(); [[ "$PROFILE" == "release" ]] && BUILD_FLAGS=(--release)
-( cd "$REPO" && cargo build -q -p verglas-server ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} )
-VGD="$REPO/target/$PROFILE/verglas-server"
+( cd "$REPO" && cargo build -q -p verglas-cache-node ${BUILD_FLAGS[@]+"${BUILD_FLAGS[@]}"} )
+VGD="$REPO/target/$PROFILE/verglas-cache-node"
 
 CACHE_DIR="$WORK/cache"; mkdir -p "$CACHE_DIR"
-cat > "$WORK/verglas-server.toml" <<TOML
+cat > "$WORK/endpoint-credentials" <<CREDS
+[default]
+aws_access_key_id = $DEV_AK
+aws_secret_access_key = $DEV_SK
+CREDS
+chmod 600 "$WORK/endpoint-credentials"
+cat > "$WORK/verglas-cache-node.toml" <<TOML
 [listen]
 s3_port = $S3_PORT
 admin_port = $ADMIN_PORT
@@ -148,23 +154,28 @@ dir = "$CACHE_DIR"
 capacity_bytes = "2GB"
 dram_bytes = "512MB"
 
+[backend]
+bucket_globs = ["*"]
+endpoint = "http://127.0.0.1:${MINIO_PORT}"
+region = "us-east-1"
+allow_http = true
+
 [auth]
-access_key_id = "$DEV_AK"
-secret_access_key = "$DEV_SK"
+credentials_file = "$WORK/endpoint-credentials"
 TOML
 
-echo "[server] starting verglas-server → MinIO" >&2
+echo "[server] starting verglas-cache-node → MinIO" >&2
 AWS_ENDPOINT="http://127.0.0.1:${MINIO_PORT}" \
 AWS_ACCESS_KEY_ID="$ORIGIN_AK" AWS_SECRET_ACCESS_KEY="$ORIGIN_SK" \
 AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
 VERGLAS_S3_ADDR="127.0.0.1:${S3_PORT}" VERGLAS_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
-  "$VGD" --config "$WORK/verglas-server.toml" &
+  "$VGD" --config "$WORK/verglas-cache-node.toml" &
 VGD_PID=$!
 disown "$VGD_PID" 2>/dev/null || true   # keep job control quiet when we kill it
 
 for _ in $(seq 1 100); do
   curl -sf "http://127.0.0.1:${ADMIN_PORT}/admin/healthz" >/dev/null && break
-  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglas-server died on startup" >&2; exit 1; }
+  kill -0 "$VGD_PID" 2>/dev/null || { echo "verglas-cache-node died on startup" >&2; exit 1; }
   sleep 0.1
 done
 

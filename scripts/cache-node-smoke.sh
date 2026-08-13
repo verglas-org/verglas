@@ -6,8 +6,7 @@
 # a few hundred write/read operations through the cache's SigV4 S3 surface with
 # the AWS CLI, verifies bytes round-trip through the cache (read-through fill on
 # miss, write-through to origin), and records the server's resident memory (RSS)
-# while serving. Prints the stripped binary size next to verglas-server's for the
-# 256 MB-VM footprint comparison.
+# while serving and prints its stripped binary size.
 #
 # Runs anywhere with bash + minio + mc + aws + a release build. RSS is read via
 # `ps -o rss=` (KB), which works on both Linux and macOS; the fleet's real number
@@ -25,7 +24,6 @@ here="$(cd "$(dirname "$0")" && pwd)"
 repo="$(cd "${here}/.." && pwd)"
 
 BIN="${repo}/target/release/verglas-cache-node"
-VERGLAS_SERVER_BIN="${repo}/target/release/verglas-server"
 OPS="${OPS:-300}"
 S3_PORT="${S3_PORT:-18333}"
 ADMIN_PORT="${ADMIN_PORT:-18334}"
@@ -144,8 +142,7 @@ export AWS_EC2_METADATA_DISABLED="true"
 # cache models as a straight-to-origin direct read (a version/part/checksum view
 # the block cache does not model) — bytes are correct but nothing is cached.
 # `when_required` drops the default checksum handshake so GETs take the cacheable
-# read-through path and actually exercise the tiers. verglas-server behaves identically
-# under either setting; this only changes what the smoke measures.
+# read-through path and actually exercise the tiers.
 export AWS_REQUEST_CHECKSUM_CALCULATION="when_required"
 export AWS_RESPONSE_CHECKSUM_VALIDATION="when_required"
 ENDPOINT="http://127.0.0.1:${S3_PORT}"
@@ -213,7 +210,6 @@ echo "healthz:               ready (200) after serve-gating"
 echo "metrics content-type:  ${metrics_ct}"
 echo "resident memory (RSS): ${rss_mb} MB (${rss_kb} KB) serving warm"
 echo "cache-node binary:     $(strip_size "${BIN}")  [stripped]"
-echo "verglas-server binary:       $(strip_size "${VERGLAS_SERVER_BIN}")  [stripped, for comparison]"
 echo "======================================================"
 
 # Fail the smoke if any read came back wrong bytes — wrong is never acceptable.

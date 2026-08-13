@@ -16,11 +16,11 @@
 //!   foreground activity diagnostics, atomic admission close, and
 //!   generation-checked reopen after a failed stop.
 //!
-//! Everything else verglas-server's admin router carries (purge, members, drain, the
+//! Everything else verglas-cache-node's admin router carries (purge, members, drain, the
 //! table/graph/vector/platform/recall verb families) is deliberately absent:
 //! the cache node proxies prepared catalog reads but owns no catalog semantics,
 //! surfaces have nothing to answer. The `Health` gate and the deferred stats/
-//! metrics slots mirror verglas-server's serve-gating shape (origin: `bins/verglas-server/src/admin.rs`).
+//! metrics slots mirror verglas-cache-node's serve-gating shape (origin: `bins/cache-node/src/admin.rs`).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -357,7 +357,7 @@ async fn healthz(State(health): State<Health>) -> Response {
 /// Assembles the admin router. `version` names this binary in `/admin/version`;
 /// the two slots are filled by the serve path the instant recovery completes, so
 /// `/admin/stats` and `/metrics` answer 503 (not 404) until then, exactly like
-/// verglas-server's deferred routes.
+/// verglas-cache-node's deferred routes.
 pub fn router(
     version: &'static str,
     health: Health,

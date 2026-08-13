@@ -15,16 +15,16 @@ lint:
 
 # Run the cache server locally.
 run-dev:
-    cargo run --bin verglas-server
+    cargo run --bin verglas-cache-node -- --config deploy/dev/verglas.dev.toml
 
-# Ceph s3-tests conformance: full suite against verglas-server over MinIO (issue #22).
+# Ceph s3-tests conformance: full suite against verglas-cache-node over MinIO.
 # Pass extra flags through, e.g. `just s3-tests --smoke` or `just s3-tests --debug`.
 s3-tests *ARGS:
     ./tests/s3-conformance/run.sh {{ARGS}}
 
 # `cargo install` compiles in release by default; --force replaces an earlier
-# install. Installs into ~/.cargo/bin, which is on PATH.
-# Production self-host runs verglas-server via Docker (see docker-compose.yml).
+# install. Installs the public engine roles into ~/.cargo/bin.
 install:
-    cargo install --path bins/verglas --locked --force
-    cargo install --path bins/verglas-server --locked --force
+    cargo install --path bins/cache-node --locked --force
+    cargo install --path bins/query-node --locked --force
+    cargo install --path bins/write-node --locked --force

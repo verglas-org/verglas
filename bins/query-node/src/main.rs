@@ -4,11 +4,10 @@
 //! DataFusion engine), reading every table's data through a configured cache
 //! S3 endpoint — never a direct object-store path. There is no cache tier, no
 //! S3 frontend, no source/sink/jobs code, and no catalog write path in this
-//! binary; the embedded copy in `verglas-server` stays the fallback for a server
-//! with no query worker configured.
+//! binary.
 //!
-//! This binary is meant to be launched on demand — by the workers/jobs
-//! framework's executor, or directly for local use — and killed after use: it
+//! This binary is meant to be launched on demand by an external orchestrator,
+//! or directly for local use, and killed after use: it
 //! self-exits after an idle period with no request, and shuts down cleanly on
 //! SIGTERM or SIGINT either way. Its memory need is *predicted*, not just
 //! grown reactively: given the SQL it's about to serve (`--for-query`), it
@@ -16,7 +15,7 @@
 //! statistics before requesting its initial grant (`sizing::request_for_query`),
 //! then grows that grant, grow-only, if a later request needs more
 //! (`sizing::ensure_covers`). The grant request/grow/release calls go through
-//! `verglas_sdk::grant::MemoryGrantHost` — the same framework-level contract
+//! `verglas_core::grant::MemoryGrantHost` — the engine-level contract
 //! every worker kind gets, not something query-specific. Standalone/dev runs
 //! with no host agent attached use `LocalGrantHost`, which grants whatever is
 //! asked and enforces nothing.
@@ -34,7 +33,7 @@
 
 use std::sync::Arc;
 
-use verglas_sdk::grant::{LocalGrantHost, MemoryGrantHost};
+use verglas_core::grant::{LocalGrantHost, MemoryGrantHost};
 
 use verglas_query::VERSION;
 use verglas_query::config::QueryConfig;
@@ -86,7 +85,7 @@ fn parse_args() -> Result<Invocation, String> {
         match arg.as_str() {
             "--config" => config_path = Some(require_value(&mut iter, "--config")?),
             "--for-query" => for_query = Some(require_value(&mut iter, "--for-query")?),
-            // Same convention `verglas-server --ports-file` uses (issue #194): bind
+            // Same convention `verglas-cache-node --ports-file` uses (issue #194): bind
             // an ephemeral port, then append `<role> <ip:port>` lines so a
             // parent that spawned this worker learns the real port without a
             // probe-then-bind race.

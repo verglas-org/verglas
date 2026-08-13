@@ -68,7 +68,7 @@ aws_access_key_id = $DEV_AK
 aws_secret_access_key = $DEV_SK
 CREDS
   chmod 600 "$WORK/endpoint-creds"
-  cat > "$WORK/verglas-server.toml" <<TOML
+  cat > "$WORK/verglas-cache-node.toml" <<TOML
 [listen]
 s3_port = $S3_PORT
 admin_port = $ADMIN_PORT
@@ -95,17 +95,17 @@ start_server() {
   AWS_ACCESS_KEY_ID="$ORIGIN_AK" AWS_SECRET_ACCESS_KEY="$ORIGIN_SK" \
   AWS_REGION=us-east-1 AWS_ALLOW_HTTP=true AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
   VERGLAS_S3_ADDR="127.0.0.1:${S3_PORT}" VERGLAS_ADMIN_ADDR="127.0.0.1:${ADMIN_PORT}" \
-    "$VGD" --config "$WORK/verglas-server.toml" >"$WORK/vgd.log" 2>&1 &
+    "$VGD" --config "$WORK/verglas-cache-node.toml" >"$WORK/vgd.log" 2>&1 &
   VGD_PID=$!
   disown "$VGD_PID" 2>/dev/null || true   # keep job control quiet when we kill it
   wait_for "http://127.0.0.1:${ADMIN_PORT}/admin/healthz" 150 \
-    || { log "verglas-server did not become healthy"; cat "$WORK/vgd.log" >&2; exit 1; }
+    || { log "verglas-cache-node did not become healthy"; cat "$WORK/vgd.log" >&2; exit 1; }
 }
 
 # ---- build ---------------------------------------------------------------- #
-log "building verglas-server"
-( cd "$REPO" && cargo build -q -p verglas-server )
-VGD="$REPO/target/debug/verglas-server"
+log "building verglas-cache-node"
+( cd "$REPO" && cargo build -q -p verglas-cache-node )
+VGD="$REPO/target/debug/verglas-cache-node"
 
 # ---- origin up, bucket created -------------------------------------------- #
 log "starting MinIO ($CONTAINER) on :$MINIO_PORT"
@@ -120,7 +120,7 @@ WANT="$(shasum -a 256 "$OBJ" | awk '{print $1}')"
 log "object sha256=$WANT"
 
 # ---- server up ------------------------------------------------------------ #
-log "starting verglas-server (single-node write-back)"
+log "starting verglas-cache-node (single-node write-back)"
 write_config
 start_server
 grep -q "single-node" "$WORK/vgd.log" && log "server reports single-node write-back mode"
@@ -143,7 +143,7 @@ DIRTY="$(grep -rl '"Dirty"' "$CACHE_DIR"/writeback-journals/ 2>/dev/null | head 
 log "dirty journal on disk: $(basename "$DIRTY")"
 
 # ---- kill -9 the server between the ack and the S3 flush ------------------- #
-log "kill -9 verglas-server (PID $VGD_PID) — crash between ack and flush"
+log "kill -9 verglas-cache-node (PID $VGD_PID) — crash between ack and flush"
 kill -9 "$VGD_PID"; wait "$VGD_PID" 2>/dev/null || true; VGD_PID=""
 
 # ---- origin returns; prove the object was NEVER flushed pre-crash ---------- #
@@ -157,7 +157,7 @@ fi
 log "confirmed: object is ABSENT from S3 immediately after the crash"
 
 # ---- restart the server: boot recovery must replay the segment to S3 ------- #
-log "restarting verglas-server — boot recovery replays the unflushed segment"
+log "restarting verglas-cache-node — boot recovery replays the unflushed segment"
 start_server
 
 log "waiting for the recovered segment to reach S3 (direct MinIO read, no Verglas)"

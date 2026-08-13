@@ -1350,28 +1350,3 @@ fn catalog_sigv4_and_bearer_token_are_mutually_exclusive() {
         "error names the conflict, got: {err}"
     );
 }
-
-#[test]
-fn rill_analytics_parses_only_with_a_catalog() {
-    let toml = format!(
-        "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n\
-         [backend]\nbucket = \"b\"\n\
-         [catalog]\nuri = \"https://catalog.example.com\"\n\
-         [analytics.rill]\nuri = \"http://rill:9009\"\n\
-         browser_uri = \"http://127.0.0.1:9009\"\n\
-         s3_uri = \"http://verglas-server:8333\"\n",
-        scratch_dir("rill-analytics").display()
-    );
-    let config = Config::from_toml_str(&toml).expect("Rill config parses");
-    config.validate().expect("Rill config validates");
-    let rill = &config.analytics.expect("analytics").rill;
-    assert_eq!(rill.instance_id, "default");
-    assert_eq!(rill.uri, "http://rill:9009");
-
-    let without_catalog = toml.replace("[catalog]\nuri = \"https://catalog.example.com\"\n", "");
-    let config = Config::from_toml_str(&without_catalog).expect("schema parses");
-    let error = config
-        .validate()
-        .expect_err("analytics without a catalog is rejected");
-    assert!(error.to_string().contains("analytics.rill"));
-}

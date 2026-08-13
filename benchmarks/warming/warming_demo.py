@@ -10,7 +10,7 @@ coordinator (#168) — the exact production path — not a benchmark shortcut.
 
 The plumbing this closes: ``benchmarks/tpch`` seeds through a *local SQLite*
 catalog, which the REST watcher cannot see, so it never exercises warming. Here
-an **Apache Polaris** container is the REST catalog verglas-server watches; the table
+an **Apache Polaris** container is the REST catalog verglas-cache-node watches; the table
 is seeded *through Polaris* (pyiceberg as the client) with its data on the same
 origin S3 the server fills from, so a commit the watcher observes drives a real
 warming walk.
@@ -82,7 +82,7 @@ def polaris_token(catalog_uri: str) -> str:
     """Fetch a Polaris OAuth2 client-credentials token for the root principal.
 
     pyiceberg's own token exchange asks for a scope Polaris rejects, so the
-    token is minted here and handed to pyiceberg (and to verglas-server) as a ready
+    token is minted here and handed to pyiceberg (and to verglas-cache-node) as a ready
     bearer credential. Tokens are short-lived; a demo run finishes well inside
     the lifetime, and each server start re-mints one.
     """

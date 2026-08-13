@@ -14,6 +14,7 @@ pub mod config;
 pub mod config_template;
 pub mod disk;
 pub mod glob;
+pub mod grant;
 pub mod list;
 pub mod medium;
 pub mod metrics;

@@ -12,24 +12,23 @@ icon: "snowflake"
 
 Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
 
-We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible storage endpoint with compute and serves frequently accessed bytes from DRAM and NVMe. In a self-hosted deployment, one REST composition exposes the cache S3 endpoint, query/write API, and database-scoped shallow Iceberg REST proxies; each proxy caches successful metadata reads, observes changes, and writes mutations through to that database's bound catalog. Verglas never becomes the catalog system of record. Verglas keys cached blocks by storage binding and object version, yielding correctness properties that format-blind systems cannot achieve at any configuration. An erasure-coded, quorum-acknowledged write-back path stages writes durably in front of object storage, which remains the system of record. Above the cache, Verglas runs a pipeline platform (§7). A deployment is one record — kind, triggers, and placement — carrying user code written against one SDK; pipeline I/O is routed through the shared tenant cache, so the working set of all databases and workloads competes in one heat budget.
+We propose Verglas, an Iceberg-aware local tier that colocates an S3-compatible storage endpoint with compute and serves frequently accessed bytes from DRAM and NVMe. Independently deployed cache, query, and write roles communicate with an authoritative Iceberg REST catalog and object store; Verglas never becomes either system of record. Verglas keys cached blocks by storage binding and object version, yielding correctness properties that format-blind systems cannot achieve at any configuration. An erasure-coded, quorum-acknowledged write-back path stages writes durably in front of object storage, which remains the system of record. A hosted control plane may schedule these engine roles and the pipeline platform described in §7, but that orchestration is not part of the public storage engine.
 
 ---
 
 ## Repository scope
 
-This open-source repository is the self-hosted Verglas stack: the Iceberg-aware
-cache server (including WAL and virtual block devices), the query and write
-roles, Docker vessel runtimes, the local worker scheduler, and the SDKs that
-talk to them — `/v1/databases/{database}/query`, graph traversal, vector
-search, and table scans. SQL workers receive only the selected database's
-catalog configuration; there is no process-global query catalog.
-The server is a catalog **client**, not a catalog implementation: it connects
-to the configured Iceberg REST catalog and never stores authoritative catalog
-state. The on-prem `verglas-rest` composition may expose a shallow cached proxy
-at `/catalog`.
+This open-source repository is the Verglas data engine: the Iceberg-aware cache
+node (including WAL and virtual block devices) plus independently deployed
+query and write roles. The engine is a catalog **client**, not a catalog
+implementation: it connects to an Iceberg REST catalog and never stores
+authoritative catalog state.
 
-External proprietary services are out of this repository.
+The public CLI and SDKs live in `verglas-client`. Hosted access, scheduling,
+workers, databases, integrations, applications, and agent runtime services live
+in the private `verglas-cloud` repository. The private `verglas-app` repository
+contains only the cloud console and workspace client. `rime` is a separate
+public plugin. CI rejects copies of those products in this repository.
 
 ---
 
@@ -136,8 +135,8 @@ Lakehouse deployments serve heterogeneous consumers, and for many of them the la
 
 **Interactive analytics.** Dashboards and user-facing analytics require low query latency over recent data. Real-time OLAP systems meet this requirement by continuously ingesting source data into indexed, column-oriented storage designed for high query concurrency. Pinot, for example, combines near-real-time stream ingestion with tens of thousands of analytical queries per second [5]. Freshness therefore depends on the progress and correctness of a separate ingestion path.
 
-The on-prem composition may attach Rill Developer as an optional analytics
-service. `verglas-rest` resolves a selected table through the configured Iceberg
+The hosted platform may attach Rill Developer as an optional analytics
+service. Its control plane resolves a selected table through the configured Iceberg
 catalog, then manages the corresponding Rill model, metrics view, and Explore
 resource through Rill's runtime API. Rill currently discovers Iceberg through a
 direct metadata location rather than an Iceberg REST catalog, so Verglas supplies
@@ -258,7 +257,7 @@ sequenceDiagram
 
 ### 4.1 Cache node
 
-A cache node is one `verglas-server` process. Process startup and listener ownership remain in that binary; `verglas-rest` owns the on-prem HTTP composition. Its S3 front end validates SigV4 requests and maps supported operations onto separate read and write interfaces, while its execution listener exposes query/write and the shallow catalog proxy. The backend layer applies concurrency limits, retry policy, and circuit breaking before issuing origin requests. The cache engine and Iceberg layer sit between these interfaces.
+A cache node is one `verglas-cache-node` process. Its S3 front end validates SigV4 requests and maps supported operations onto separate read and write interfaces. Its private admin listener exposes health, metrics, and cache-local catalog access for engine roles. Query and write execute in their own processes. The backend layer applies concurrency limits, retry policy, and circuit breaking before issuing origin requests. The cache engine and Iceberg layer sit between these interfaces.
 
 The data cache divides objects into configurable 1–8 MiB blocks (2 MiB by default) and stores them in a hybrid DRAM and NVMe cache. The default follows a local Iceberg TPC-DS SF1000 measurement: DuckDB's 1–2 MiB Parquet ranges made 8 MiB fills fetch 70.67 GB from S3 to serve 12.61 GB, while 2 MiB blocks fetched 33.29 GB and cut cold wall time from 658.142 s to 329.440 s. Block geometry is part of the block identity, so a divergent peer configuration is a miss rather than a wrong-offset serve. Changing the configured geometry is a pre-release flag day and requires an empty cache directory; Verglas deliberately has no on-disk compatibility layer. A separate hybrid store holds metadata files and bounded Parquet footer suffixes. Separating the stores prevents a data scan from consuming the capacity reserved for planning metadata. Both stores recover their NVMe indexes after restart; a recovery test reopened a 256 MiB cache containing 32 blocks in approximately 11 ms.
 
@@ -455,13 +454,18 @@ The AWS evaluation (§8) reports acknowledgment latency across object sizes, enc
 
 ## 7. The Agent-Data Platform
 
+This section specifies hosted platform behavior implemented in
+`verglas-cloud`. It explains the engine contracts that platform consumes; it
+does not place scheduler, access, worker, database, application, integration,
+or agent-runtime source in this repository.
+
 The preceding sections argued that derived read copies — OLAP stores, feature stores, caches — should collapse into one Iceberg-native tier. The same argument applies to the compute that feeds and serves them. A production estate around a lakehouse accumulates ingestion scripts, transformation jobs, delivery servers, and the long-running services that answer for the data, each with its own scheduler, offset store, retry logic, scaling policy, and logging; each is a copy of the same operational machinery, differing only in the few lines that move or serve the data. Verglas runs that machinery once, as a platform over the cache, and reduces each program to the few lines that differ. The design is shaped by one further observation: the code that differs is now routinely written by coding agents. The platform therefore fixes hard contracts around small user programs — the shape a framework must take when its programs are generated rather than hand-maintained, since a generated program can be regenerated against a stable contract but cannot be trusted to re-implement scheduling, scaling, or exactly-once bookkeeping correctly each time.
 
 The user-facing compute primitives are two: the **worker** and the **container**. A worker is a stateless handler invoked once per trigger event; it reads and writes tables through the client and returns. A container is a user image the platform runs as a service — stateless and scaled horizontally, or stateful and scaled vertically while kept to a single instance. Tables (§§1–6), queues (§7.8), and serverless Postgres (§7.5) are the data the two operate over. The guiding property is one line: **a datalake that scales from zero to infinity with complete control over your stack** — every workload idles to nothing when unused, grows to the tenant's allocation when loaded, and is defined by the tenant, not chosen from a fixed menu.
 
 Three doctrines run through the whole design and are stated once here:
 
-- **Local-first.** Everything runs on the open-source self-hosted stack — workers, Docker vessels, tables, the whole stack on one machine or a small pod. A deployment is one record the local scheduler and container runtime reconcile; there is no second plane to push onto.
+- **Engine/control separation.** Cache, query, and write roles are public and independently runnable. Hosted access, placement, worker scheduling, and container lifecycle live in `verglas-cloud`; they consume engine contracts without becoming storage-engine dependencies.
 - **Scale-to-zero by default.** Every workload idles to zero when unused. A worker holds nothing between runs; a stateless container scales horizontally up to the operator's allocation limit and back to zero; a stateful container scales vertically (cpu/ram) while staying a single instance, and snapshots to idle when quiet. The runtime monitors every active job and owns scaling decisions — the user declares the shape, not the schedule of scale.
 - **Sockets never pin compute.** Container edge sockets and the SDK's `follow` terminate on a hibernating edge object. Lakekeeper sends committed catalog mutations directly to the tenant cache ring over its private network. Worker scheduling accepts bounded events, including complete HTTP callbacks; it never owns a client connection.
 
@@ -504,11 +508,11 @@ Workers are ordinary code packaged as immutable OCI images. Python projects carr
 
 ### 7.3 Triggers and scheduling
 
-Triggers are deployment configuration, not runtime payload variants. One worker may declare any combination of **cron**, **webhook**, and **event** subscriptions, while every dispatch is one CloudEvents 1.0 envelope delivered to `ctx.trigger`. Manual requests, cron ticks, and complete inbound HTTP requests are CloudEvent producers. Lakekeeper emits Iceberg mutation events after successful commits. An event subscription matches exact `type` and optional `source` and `subject` attributes. The on-prem REST composition accepts structured CloudEvents and fans them out to matching subscriptions, so Kafka, RabbitMQ, and other transports connect through bridges without adding broker payloads to the scheduler. The scheduler stores bounded CloudEvents and never owns an HTTP or WebSocket connection.
+Triggers are deployment configuration, not runtime payload variants. One worker may declare any combination of **cron**, **webhook**, and **event** subscriptions, while every dispatch is one CloudEvents 1.0 envelope delivered to `ctx.trigger`. Manual requests, cron ticks, and complete inbound HTTP requests are CloudEvent producers. Lakekeeper emits Iceberg mutation events after successful commits. An event subscription matches exact `type` and optional `source` and `subject` attributes. The hosted control plane accepts structured CloudEvents and fans them out to matching subscriptions, so Kafka, RabbitMQ, and other transports connect through bridges without adding broker payloads to the scheduler. The scheduler stores bounded CloudEvents and never owns an HTTP or WebSocket connection.
 
 Scheduling follows the Airflow model: a cron dispatch carries the run's **logical time** — a nominal `logicalDate` and the half-open interval `[intervalStart, intervalEnd)` the run is responsible for. A worker doing an incremental pull ranges its query over that interval; the logical interval is the *only* progress concept a worker sees. This makes **backfill a first-class scheduling feature rather than application code**: a cron trigger declares a `startDate` and a `catchup` policy — `sequential` (replay each past interval in order), `parallel` (fan the backlog out concurrently), or `none` (start live) — and the platform dispatches the historical intervals, each as an ordinary run with its own logical window, until the schedule catches up to now. Because each run is pinned to a bounded interval and commits idempotently, a backfill and a live run are the same code path over a different window.
 
-Scheduling is a separate stateless service. Each deployment has one logical worker queue. Manual REST calls, complete HTTP callbacks, cron reconciliation, and catalog data-update subscriptions all materialize the same durable job shape in that queue. A deterministic trigger identity makes enqueue idempotent; lease generations fence competing or recovered consumers; a completion is accepted only for the live generation. The scheduler can therefore restart or migrate without a filesystem guard or process-local cursor. Postgres owns queue state: an operator supplies a Postgres URL to the optional scheduler container. If the scheduler is not configured, Verglas serves storage, catalog, and query normally and does not mount worker-trigger routes.
+Scheduling is a separate stateless hosted service. Each deployment has one logical worker queue. Manual REST calls, complete HTTP callbacks, cron reconciliation, and catalog data-update subscriptions all materialize the same durable job shape in that queue. A deterministic trigger identity makes enqueue idempotent; lease generations fence competing or recovered consumers; a completion is accepted only for the live generation. The scheduler can therefore restart or migrate without a filesystem guard or process-local cursor. Postgres owns queue state. Public engine roles remain independently runnable and do not mount worker-trigger routes.
 
 The scheduler is a running queue consumer. Pushed worker events are persisted before the event API acknowledges them and are eligible to run immediately. Cron, retry, and lease deadlines use exact timers derived from durable queue state; there is no periodic queue poll and no separate wake endpoint. Lakekeeper can submit matching data-update events to the scheduler, which claims work and runs the local worker harness; cache invalidation is delivered independently and directly to the cache ring.
 
@@ -533,11 +537,11 @@ There is one managed Lakekeeper deployment per tenant, not one process per datab
 
 Secret material is entered through stdin or a hidden prompt with `verglas secret create`; values never appear in command arguments or database records. Encrypted, versioned secret values live beside the tenant authorization state in the `verglas_permissions` Postgres database, while OpenFGA controls `use_secret`. Database creation resolves the longest authorized matching scope once, stores the stable resource ID, and fails closed on missing, ambiguous, or unauthorized bindings.
 
-Each cache node may also embed the Postgres WAL ingress. Neon compute speaks its ordinary safekeeper protocol to one selected reachable cache node; that ingress preserves PostgreSQL LSNs and terms and acknowledges only after the new WAL is erasure-coded and fsynced across the Verglas ring. The compute is not given the ring members as a Neon safekeeper quorum: one ingress coordinates the Verglas durability quorum, while service discovery may select any healthy ingress after a failure. Committed WAL drains to object storage in the background, and pageserver reads both the EC tail and the object-resident prefix through the same safekeeper protocol. Running the listener inside `verglas-cache-node` shares its NVMe fragment store, peer plane, failure detection, and scheduler lifecycle without introducing another deployable instance.
+Each cache node may also embed the Postgres WAL ingress. Neon compute speaks its ordinary safekeeper protocol to one selected reachable cache node; that ingress preserves PostgreSQL LSNs and terms and acknowledges only after the new WAL is erasure-coded and fsynced across the Verglas ring. The compute is not given the ring members as a Neon safekeeper quorum: one ingress coordinates the Verglas durability quorum, while service discovery may select any healthy ingress after a failure. Committed WAL drains to object storage in the background, and pageserver reads both the EC tail and the object-resident prefix through the same safekeeper protocol. Running the listener inside `verglas-cache-node` shares its NVMe fragment store, peer plane, failure detection, and fleet lifecycle without introducing another deployable instance.
 
-### 7.6 Placement: local server, vessels, and workers
+### 7.6 Hosted placement, containers, and workers
 
-The standalone scheduler owns durable triggers, jobs, and leases but never executes tenant code. It builds locked worker projects through `verglas-container-runtime`, stores the resulting immutable image identity, resolves secret references immediately before a run, and submits each claimed job to the runtime. The runtime creates, limits, observes, and removes the ephemeral Docker container. The engine's storage endpoint points at the server's own cache surface. The commit and read contract between user code and the platform is one HTTP surface — commit, snapshot, rows, delta — served by the local server from the engine library. Because idempotency lives in snapshot summaries (§7.2), a worker or container observes identical semantics whether invoked by cron, HTTP, or a CloudEvent producer.
+The hosted scheduler owns durable triggers, jobs, and leases but never executes tenant code. It builds locked worker projects through the cloud container runtime, stores the resulting immutable image identity, resolves secret references immediately before a run, and submits each claimed job to the runtime. The runtime creates, limits, observes, and removes the ephemeral container. Workload storage points at the tenant's cache surface. Because idempotency lives in snapshot summaries (§7.2), a worker or container observes identical semantics whether invoked by cron, HTTP, or a CloudEvent producer.
 
 ### 7.7 Cache-pathed I/O
 

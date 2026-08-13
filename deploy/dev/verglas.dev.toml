@@ -1,4 +1,4 @@
-# Verglas server config for the Cursor Cloud dev environment.
+# Verglas cache-node config for the Cursor Cloud dev environment.
 #
 # Booted by scripts/cloud/start.sh against a local MinIO origin on 127.0.0.1:9000.
 # This is a development-only config: the origin and engine credentials are the
@@ -17,7 +17,7 @@ format = "pretty"
 level = "info"
 
 [cache]
-# start.sh creates this directory; it must be writable and exclusive to one server.
+# start.sh creates this directory; it must be writable and exclusive to one node.
 dir = "/tmp/verglas-dev/cache"
 capacity_bytes = "1GB"
 dram_bytes = "256MB"

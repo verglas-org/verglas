@@ -3,7 +3,7 @@
 //! a real Iceberg table (an in-process `MemoryCatalog` over a local-filesystem
 //! warehouse, built the same way `crates/verglas-iceberg/tests/table_verbs.rs`
 //! builds its fixtures) — the same real-router-over-real-HTTP technique
-//! `bins/verglas-server/tests` already uses to test its own admin routes without
+//! `bins/cache-node/tests` already uses to test its own admin routes without
 //! spawning a subprocess.
 //!
 //! # What this does and does not cover
@@ -17,19 +17,14 @@
 //! completes, because `/v1/query` streams its response instead of collecting
 //! the whole result first.
 //!
-//! It does **not** spawn `verglas-server` and `verglas-query` as two separate OS
+//! It does **not** spawn `verglas-cache-node` and `verglas-query` as separate OS
 //! processes talking over a real Iceberg REST catalog. That would need a real
 //! REST catalog *service* reachable over HTTP: `verglas_iceberg::catalog::open_catalog`
-//! (used by both the server's embedded path and this binary) only builds a
+//! only builds a
 //! REST catalog client — there is no in-repo REST catalog *server* to point it
 //! at. Issue #294 ("CI: add an Iceberg REST catalog service for true
 //! end-to-end verb tests") tracks exactly this gap and is still open; standing
-//! one up is out of scope for this PR. The server-side dispatch wiring
-//! (`bins/verglas-server/src/query_worker.rs`, `admin::query_sql`'s dispatch-then-
-//! fallback) is covered instead by `verglas-server`'s existing in-process router
-//! tests (`bins/verglas-server/tests/admin.rs`, `query_route_*`), which pass
-//! unchanged with the dispatcher wired in as `None` — proving the embedded
-//! fallback path the dispatch code always has to degrade to correctly.
+//! one up is outside these package-local tests.
 //!
 //! Format coverage: fixtures here are Parquet, matching the scope of
 //! `crates/verglas-iceberg/tests/table_verbs.rs` (this repo's Rust write path,
@@ -50,9 +45,9 @@ use futures::StreamExt;
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::{Catalog, CatalogBuilder};
 use tokio::sync::Mutex;
+use verglas_core::grant::{LocalGrantHost, MemoryGrant};
 use verglas_iceberg::{QueryReport, parse_table_ident, write};
 use verglas_query::admin::{self, AppState};
-use verglas_sdk::grant::{LocalGrantHost, MemoryGrant};
 
 /// Builds an in-process memory catalog over a fresh temp warehouse path, and a
 /// table with `rows` wide-ish CSV rows in it — enough real bytes on disk that

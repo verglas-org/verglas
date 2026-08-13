@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "bins/verglas-server",
-    "bins/verglas",
     "crates/verglas-backend",
     "crates/verglas-core",
     "crates/verglas-cluster",
@@ -10,39 +8,18 @@ members = [
     "crates/verglas-instance",
     "crates/verglas-s3",
     "crates/verglas-catalog",
-    "crates/verglas-rest",
     "crates/verglas-tables",
     "crates/verglas-write",
     "crates/verglas-safekeeper",
     "crates/verglas-iceberg",
     "crates/verglas-graph",
-    "crates/verglas-platform",
     "crates/verglas-api",
-    "crates/verglas-authz",
-    "crates/verglas-authz-openfga",
-    "crates/verglas-authz-postgres",
-    "sdks/rust",
-    "crates/verglas-harness",
     "crates/verglas-vector",
     "crates/verglas-kv",
-    "crates/verglas-scheduler",
-    "crates/verglas-vessel-contract",
-    "crates/verglas-container-runtime",
-    "crates/verglas-database",
-    "crates/verglas-queue",
     "bins/cache-node",
-    "bins/access-node",
     "crates/verglas-block",
-    "crates/verglas-pgcdc",
-    "bins/verglas-pgcdc",
     "bins/query-node",
     "bins/write-node",
-    "bins/scheduler",
-    "bins/queue-service",
-]
-# Language SDKs live under sdks/. The TypeScript package is not a Cargo crate.
-exclude = [
-    "sdks/typescript",
 ]
 
 [workspace.package]
@@ -63,43 +40,27 @@ verglas-cache = { path = "crates/verglas-cache" }
 verglas-instance = { path = "crates/verglas-instance" }
 verglas-s3 = { path = "crates/verglas-s3" }
 verglas-catalog = { path = "crates/verglas-catalog" }
-verglas-rest = { path = "crates/verglas-rest" }
 verglas-tables = { path = "crates/verglas-tables" }
 verglas-write = { path = "crates/verglas-write" }
 verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }
-verglas-platform = { path = "crates/verglas-platform" }
 verglas-api = { path = "crates/verglas-api" }
-verglas-authz = { path = "crates/verglas-authz" }
-verglas-authz-openfga = { path = "crates/verglas-authz-openfga" }
-verglas-authz-postgres = { path = "crates/verglas-authz-postgres" }
-verglas-sdk = { path = "sdks/rust" }
-verglas-harness = { path = "crates/verglas-harness" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
-verglas-scheduler = { path = "crates/verglas-scheduler" }
-verglas-vessel-contract = { path = "crates/verglas-vessel-contract" }
-verglas-container-runtime = { path = "crates/verglas-container-runtime" }
-verglas-database = { path = "crates/verglas-database" }
-verglas-queue = { path = "crates/verglas-queue" }
 verglas-block = { path = "crates/verglas-block" }
-verglas-pgcdc = { path = "crates/verglas-pgcdc" }
 tonic = "0.13.1"
 prost = "0.13.5"
-# Client-side Iceberg read/write for the agent-facing CLI verbs (#287). The
-# write path (create/append/commit) and the embedded query engine are new; they
-# speak to any Iceberg REST catalog, including the server's loopback gateway.
+# Iceberg read/write and DataFusion integration shared by engine roles.
 iceberg = "0.9.1"
 iceberg-catalog-rest = "0.9.1"
 iceberg-datafusion = "0.9.1"
 # S3/fs/memory storage backends for Iceberg FileIO. RestCatalog requires an
 # explicit StorageFactory; the S3 one routes data-file writes and reads through
-# the configured (server) S3 endpoint.
+# the configured cache endpoint.
 iceberg-storage-opendal = "0.9.1"
 datafusion = "52.2"
-# Arrow at the major version iceberg 0.9 / datafusion 52 build against; the CSV
-# and JSON readers drive schema inference for `verglas table create`.
+# Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "57"
 arrow-schema = "57"
 arrow-csv = "57"
@@ -109,7 +70,6 @@ parquet = "57"
 uuid = { version = "1.18", features = ["v4"] }
 axum = "0.8.8"
 bytes = "1.12.0"
-clap = { version = "4.5.53", features = ["derive", "env"] }
 async-trait = "0.1.89"
 foyer = "0.22.3"
 # foyer's metrics registry trait (`mixtrics::RegistryOps`). foyer does not

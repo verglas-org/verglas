@@ -2,7 +2,7 @@
 # Cursor Cloud environment start step.
 #
 # Launched detached on every VM boot. Brings up the local dev stack so the box is
-# ready to serve: a MinIO origin on :9000 and verglas-server (S3 :8333, admin
+# ready to serve: a MinIO origin on :9000 and verglas-cache-node (S3 :8333, admin
 # :8334) reading through to it. Idempotent — if a service is already listening on
 # its port, it is left alone, so re-running is safe.
 set -euo pipefail
@@ -13,7 +13,7 @@ cd "$REPO"
 RUNTIME_DIR="/tmp/verglas-dev"
 CONFIG="$REPO/deploy/dev/verglas.dev.toml"
 MINIO_LOG="$RUNTIME_DIR/minio.log"
-SERVER_LOG="$RUNTIME_DIR/verglas-server.log"
+CACHE_LOG="$RUNTIME_DIR/verglas-cache-node.log"
 MINIO_DATA="$RUNTIME_DIR/origin"
 BUCKET="my-bucket"
 
@@ -59,12 +59,12 @@ wait_for_healthz() {
   local i
   for i in $(seq 1 60); do
     if curl -fsS "http://127.0.0.1:8334/admin/healthz" >/dev/null 2>&1; then
-      echo "  verglas-server healthz ready"
+      echo "  verglas-cache-node healthz ready"
       return 0
     fi
     sleep 0.5
   done
-  echo "  ERROR: verglas-server /admin/healthz did not become ready in time" >&2
+  echo "  ERROR: verglas-cache-node /admin/healthz did not become ready in time" >&2
   return 1
 }
 
@@ -83,19 +83,19 @@ mc alias set localminio http://127.0.0.1:9000 minioadmin minioadmin >/dev/null 2
 mc mb -p "localminio/$BUCKET" >/dev/null 2>&1 || true
 echo "  bucket ready: $BUCKET"
 
-echo "== verglas dev env start: verglas-server (S3 :8333, admin :8334) =="
+echo "== verglas dev env start: verglas-cache-node (S3 :8333, admin :8334) =="
 if port_open 8334; then
-  echo "  verglas-server already running, leaving it alone"
+  echo "  verglas-cache-node already running, leaving it alone"
 else
-  SERVER_BIN="$REPO/target/debug/verglas-server"
-  if [ ! -x "$SERVER_BIN" ]; then
-    echo "  server binary missing, building it"
-    cargo build -p verglas-server
+  CACHE_BIN="$REPO/target/debug/verglas-cache-node"
+  if [ ! -x "$CACHE_BIN" ]; then
+    echo "  cache binary missing, building it"
+    cargo build -p verglas-cache-node
   fi
   # Origin credentials come from the config's backend.credentials_file; allow_http
   # is set in the config. AWS_ALLOW_HTTP is a belt-and-braces echo of that.
-  AWS_ALLOW_HTTP=true nohup "$SERVER_BIN" --config "$CONFIG" > "$SERVER_LOG" 2>&1 &
-  wait_for_port 8334 verglas-server
+  AWS_ALLOW_HTTP=true nohup "$CACHE_BIN" --config "$CONFIG" > "$CACHE_LOG" 2>&1 &
+  wait_for_port 8334 verglas-cache-node
   wait_for_healthz
 fi
 
@@ -103,4 +103,4 @@ echo "== verglas dev env start: ready =="
 echo "  S3 endpoint:   http://127.0.0.1:8333  (engine keypair: engine-ak / engine-secret)"
 echo "  admin API:     http://127.0.0.1:8334  (VERGLAS_ENDPOINT)"
 echo "  MinIO origin:  http://127.0.0.1:9000  (minioadmin / minioadmin)"
-echo "  logs:          $SERVER_LOG , $MINIO_LOG"
+echo "  logs:          $CACHE_LOG , $MINIO_LOG"

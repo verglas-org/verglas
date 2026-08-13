@@ -1,60 +1,28 @@
 ---
-title: "Verglas documentation"
-description: "Run Iceberg-aware data workloads on your own infrastructure."
+title: "Verglas engine documentation"
+description: "Run the Iceberg-aware storage engine on your infrastructure."
 icon: "snowflake"
 ---
 
-Verglas is an Iceberg-aware object cache with local workers, vessels, and query surfaces. Self-host the server, point engines at its S3 endpoint, and run workloads against your catalog and object store.
+Verglas is an Iceberg-aware object cache and storage engine. Query engines use
+its S3 endpoint while the customer's object store and Iceberg catalog remain
+authoritative.
 
 <Warning>
-Verglas is a pre-release prototype. Commands, configuration keys, wire formats, and on-disk layouts can change between commits.
+Verglas is a pre-release prototype. Configuration, wire formats, and on-disk
+layouts may change between commits.
 </Warning>
 
-## Choose a workflow
-
 <CardGroup cols={2}>
-  <Card title="Self-host Verglas" icon="server" href="/docs/get-started/self-host">
-    Run the cache server with Docker and point an S3-compatible query engine at it.
+  <Card title="Self-host the engine" icon="server" href="/docs/get-started/self-host">
+    Start MinIO and a cache node, then point an S3-compatible client at it.
   </Card>
-  <Card title="Create your first table" icon="table" href="/docs/get-started/first-table">
-    Ingest a file, query it, and inspect snapshot history through the CLI.
+  <Card title="Understand the architecture" icon="compass-drafting" href="/docs/architecture/overview">
+    Follow reads, writes, catalog events, query roles, and ring ownership.
   </Card>
 </CardGroup>
 
-## What you can run
-
-Verglas exposes two local compute shapes:
-
-- A **worker** handles one scheduled or event-driven dispatch. Workers hold no durable process state between runs.
-- A **vessel** (Application or Integration) runs as a long-lived service under the local Docker runtime manager.
-
-Both use ordinary Iceberg tables. Turning Verglas off leaves those tables readable through their original catalog and object store.
-
-## What the cache changes
-
-Query engines change their S3 endpoint to Verglas. The self-hosted REST service may also expose a shallow cached catalog path for engines that want one address for both interfaces. The configured upstream catalog remains authoritative.
-
-```mermaid
-flowchart LR
-    A["Query engine or worker"] -->|"S3 reads and writes"| B["Verglas cache endpoint"]
-    B -->|"cache miss or write-back"| C["Customer object store"]
-    A -->|"catalog requests"| D["Authoritative Iceberg catalog"]
-    B -->|"private commit observation"| D
-```
-
-<Note>
-The self-hosted catalog path caches successful reads and writes mutations
-through. It does not implement catalog semantics or become the catalog system
-of record.
-</Note>
-
-## Next steps
-
-<CardGroup cols={2}>
-  <Card title="Learn the worker model" icon="workflow" href="/docs/workers/overview">
-    Understand triggers, logical intervals, outputs, and idempotent commits.
-  </Card>
-  <Card title="Explore the SDKs" icon="braces" href="/docs/sdk/overview">
-    Read and write tables, follow commits, use queues, traverse graphs, and search vector indexes.
-  </Card>
-</CardGroup>
+The CLI and SDK documentation lives with
+[verglas-client](https://github.com/verglas-org/verglas-client). Hosted access,
+scheduling, databases, integrations, applications, workers, and agents live in
+the private `verglas-cloud` repository.

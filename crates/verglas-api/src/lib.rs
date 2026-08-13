@@ -2,8 +2,8 @@
 //!
 //! This crate contains only serializable request and response shapes. It has no
 //! HTTP client, storage engine, Iceberg, DataFusion, or server behavior, so both
-//! `verglas-sdk` and `verglas-iceberg` can depend on the same contract without
-//! either architectural layer depending on the other.
+//! the public client packages and `verglas-iceberg` can consume the same
+//! contract without either architectural layer depending on the other.
 
 pub mod report;
 pub mod table;

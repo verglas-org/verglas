@@ -14,7 +14,7 @@ coordinator (#51) repairs the cache — no benchmark shortcut. The heat that
 decides *which* chunks to prefetch is earned by the steady read load that runs
 before the compaction.
 
-Reuses ``benchmarks/warming/warming_demo.py`` for all Polaris/verglas-server/counter
+Reuses ``benchmarks/warming/warming_demo.py`` for all Polaris/verglas-cache-node/counter
 plumbing (catalog bootstrap, REST catalog open, origin/Verglas S3 profiles,
 ``/admin/stats`` reading), so both demos share one machinery.
 
@@ -48,7 +48,7 @@ from typing import Optional
 import pyarrow as pa
 import requests
 
-# Reuse the warming demo's proven Polaris/verglas-server/counter helpers.
+# Reuse the warming demo's proven Polaris/verglas-cache-node/counter helpers.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "warming"))
 import warming_demo as w  # noqa: E402
 

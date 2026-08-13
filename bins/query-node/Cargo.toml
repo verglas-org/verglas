@@ -20,11 +20,10 @@ path = "src/main.rs"
 # tier, no S3 frontend — this binary is a client of a cache node, never a
 # cache itself), no verglas-cluster/writeback/tables/platform (no ring, no
 # write-back, no mapper, no jobs/worker executor). verglas-core is reused only
-# for its `[log]`/`[catalog]` config shapes, the same ones verglas-server's schema
+# for its `[log]`/`[catalog]` config shapes, the same ones verglas-cache-node's schema
 # uses, so a fleet image renders one familiar TOML dialect for every role.
 verglas-core.workspace = true
 verglas-iceberg.workspace = true
-verglas-sdk.workspace = true
 # `iceberg::Catalog` is the trait object type this binary's app state and
 # sizing helpers hold — verglas-iceberg is the pure-client engine, this crate
 # still needs the trait itself in scope.

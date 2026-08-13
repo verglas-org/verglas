@@ -47,7 +47,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 bytes.workspace = true
 tracing = "0.1.44"
-# Same `[log]` subscriber shape as verglas-server (json for pipelines, pretty for dev),
+# Same `[log]` subscriber shape as verglas-cache-node (json for pipelines, pretty for dev),
 # minus the runtime reload handle the cache node has no admin route for.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2.3"

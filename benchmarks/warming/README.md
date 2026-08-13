@@ -11,25 +11,25 @@ Every benchmark under `benchmarks/` follows the same shape: a folder, one
 
 ## The plumbing this closes
 
-Server warming is driven by the **`[catalog]` REST watcher**: verglas-server polls an
+Server warming is driven by the **`[catalog]` REST watcher**: verglas-cache-node polls an
 Iceberg REST catalog, and when a table's pointer swings (onboarding or a commit)
 the coordinator walks that snapshot's `metadata.json` → manifest list →
 manifests → Parquet footers through the cache, pinning them. `benchmarks/tpch`
 seeds through a **local SQLite catalog**, which the REST watcher cannot see — so
 it never exercises warming.
 
-This demo stands up an **Apache Polaris** container as the REST catalog verglas-server
+This demo stands up an **Apache Polaris** container as the REST catalog verglas-cache-node
 watches (same pinned digest as `benchmarks/polaris`), seeds a TPC-H table
 _through Polaris_ with its data on the same origin S3 the server fills from, and
-configures verglas-server with `[catalog] uri` → Polaris and `[cache.warming] enabled
+configures verglas-cache-node with `[catalog] uri` → Polaris and `[cache.warming] enabled
 = true`. A commit the watcher observes then drives a real warming walk, and a
 scripted client planning walk through the Verglas endpoint measures the payoff.
 
 ```
  warming_demo.py (host) ──seed (pyiceberg REST)─────────▶ Polaris (:8181) ──▶ origin S3 (OCI)
-                        ──planning walk (Verglas S3)───▶ verglas-server (:8555) ──▶ origin S3 (OCI)
+                        ──planning walk (Verglas S3)───▶ verglas-cache-node (:8555) ──▶ origin S3 (OCI)
                                                              ▲
- verglas-server  ──[catalog] watch (REST poll)──▶ Polaris ; on a pointer swing the
+ verglas-cache-node  ──[catalog] watch (REST poll)──▶ Polaris ; on a pointer swing the
            warming coordinator walks metadata+footers through its own cache,
            pinning them in #50's metadata store BEFORE the client walks.
 ```
@@ -107,8 +107,8 @@ Mechanism (first run of each config):
 - An **S3-compatible origin** reachable via the standard `AWS_*` environment
   (`AWS_ENDPOINT`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`).
   The bucket must exist; path-style addressing throughout.
-- Built server binaries: `cargo build --release -p verglas -p verglas-server` →
-  `target/release/verglas-server`.
+- Built server binaries: `cargo build --release -p verglas-cache-node` →
+  `target/release/verglas-cache-node`.
 - **aws CLI** (teardown only), **jq**, **lsof**, and **python3.13**.
 
 ## Pinned versions
@@ -134,14 +134,14 @@ Mechanism (first run of each config):
 | Cache-medium note | — | `WARMING_CACHE_NOTE` | (generic) |
 
 Polaris publishes `8181` (REST) and `8182` (management) on the host so both
-verglas-server and the driver reach it. The **prefix must be non-empty** — the guard
+verglas-cache-node and the driver reach it. The **prefix must be non-empty** — the guard
 refuses the bucket root.
 
 ## Copy-paste invocation
 
 ```bash
 # 0. Build the server binaries (once).
-cargo build --release -p verglas -p verglas-server
+cargo build --release -p verglas-cache-node
 
 # 1. Load origin creds (used by Polaris's FileIO and by Verglas's backend).
 cp /path/to/.env benchmarks/warming/.env      # never committed; guarded in run.sh
@@ -157,7 +157,7 @@ benchmarks/warming/run.sh --seed-only
 benchmarks/warming/run.sh --measure-only     # re-render is automatic
 benchmarks/warming/run.sh --report
 
-# 3. Teardown: kill verglas-server, drop catalog/tables, prefix-scoped S3 delete,
+# 3. Teardown: kill verglas-cache-node, drop catalog/tables, prefix-scoped S3 delete,
 #    stop the Polaris container.
 benchmarks/warming/run.sh --teardown
 ```
@@ -170,19 +170,19 @@ gitignored).
 
 - **Dedicated ports.** Verglas S3 on `--vg-port` (default 8555), admin on N+1;
   Polaris on 8181/8182. `run.sh` guards each port with `lsof` before binding.
-- **Explicit PID kill (#170).** `stop_verglas-server` kills every PID holding the S3
+- **Explicit PID kill (#170).** `stop_verglas-cache-node` kills every PID holding the S3
   or admin port plus the parent, escalating `TERM`→`KILL` until the port frees,
   so nothing is orphaned between configs or after `--teardown`. Even if #190's
-  supervisor is absent, teardown leaves no verglas-server behind.
+  supervisor is absent, teardown leaves no verglas-cache-node behind.
 - **`.env` is gitignored and never logged.** The driver reads origin secrets
   only from the process environment/flags and never prints them; the generated
-  `verglas-server.toml` (which carries a short-lived Polaris bearer token) is
+  `verglas-cache-node.toml` (which carries a short-lived Polaris bearer token) is
   gitignored.
 
 ## A bug this demo caught (fixed in #177)
 
 The first working version of this demo could only trigger warming with a
-commit: a table that **already existed** in the catalog when verglas-server started
+commit: a table that **already existed** in the catalog when verglas-cache-node started
 was never warmed on startup. Root cause: the coordinator's initial `warm_all`
 raced the watcher's first poll — it enumerated a still-empty watched set, and
 the seeding poll deliberately emits no events, so the pre-existing table waited
@@ -194,7 +194,7 @@ exactly this once-broken path.
 
 ## Files
 
-- `run.sh` — the single entrypoint (venv, Polaris lifecycle, verglas-server lifecycle
+- `run.sh` — the single entrypoint (venv, Polaris lifecycle, verglas-cache-node lifecycle
   with port guards + explicit PID kill, seed, per-config measurement, report,
   prefix-scoped teardown, guards).
 - `warming_demo.py` — the driver (Polaris bootstrap/seed, the planning walk +

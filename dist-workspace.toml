@@ -4,7 +4,7 @@ members = ["cargo:."]
 # Config for 'dist' (cargo-dist): the cross-platform prebuilt-binary release
 # pipeline. `git tag vX.Y.Z && git push --tags` triggers .github/workflows/
 # release.yml, which builds every target below, assembles one archive per
-# platform (verglas + verglas-server), generates the installers, and publishes a
+# engine roles, generates the installers, and publishes a
 # GitHub Release with checksums. No crates.io publishing: the workspace patches
 # iceberg from the verglas-org/iceberg-rust fork ([patch.crates-io]), so
 # distribution is GitHub Releases only.

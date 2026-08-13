@@ -335,7 +335,7 @@ fn env_var(name: &str) -> Option<String> {
 
 /// Wires the local fragment store behind the peer server's fragment handlers, so
 /// a peer coordinator can place, load, delete, and headroom-check block-flush
-/// shards on this node. Mirrors verglas-server's object-tier `fragment_handlers`.
+/// shards on this node. Mirrors verglas-cache-node's object-tier `fragment_handlers`.
 fn fragment_handlers(store: LocalFragmentStore, activity: ActivityTracker) -> FragmentHandlers {
     let store_put = store.clone();
     let store_stream = store.clone();

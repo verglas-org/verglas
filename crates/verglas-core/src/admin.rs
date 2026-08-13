@@ -156,16 +156,6 @@ pub struct PurgeReport {
     pub reclaimable_bytes: u64,
 }
 
-impl VersionInfo {
-    /// Builds the version payload served by `verglas-server`.
-    pub fn for_server(version: &str) -> Self {
-        Self {
-            name: "verglas-server".to_owned(),
-            version: version.to_owned(),
-        }
-    }
-}
-
 impl HealthzInfo {
     /// The ready response: recovery is complete, warm reads are being served.
     pub fn ok() -> Self {

@@ -105,11 +105,10 @@ Run through each engine, on each leg:
   builds the fixture builder jar via `fixture-jvm/gradlew shadowJar` on first use
   (or use the committed Gradle wrapper directly). Not needed for `--variant
   parquet` or `--selftest`.
-- A **built server**: `cargo build -p verglas-server -p verglas` →
-  `target/debug/{verglas-server,verglas}` (release works too).
+- A built cache node: `cargo build -p verglas-cache-node`.
 - A running **MinIO** (or any S3-compatible origin) with the target bucket
   created, reachable via the standard `AWS_*` environment.
-- A **`verglas-server`** started against that origin with static `[auth]` keys (see
+- A **`verglas-cache-node`** started against that origin with static `[auth]` keys (see
   below). Path-style S3 addressing throughout.
 
 ## Inputs
@@ -132,8 +131,8 @@ the server's static dev keys.
 ## Copy-paste invocation (local)
 
 ```bash
-# 1. Build the server (once).
-cargo build -p verglas-server -p verglas
+# 1. Build the cache node (once).
+cargo build -p verglas-cache-node
 
 # 2. Start MinIO and create the bucket.
 docker run -d --name minio -p 9000:9000 \
@@ -143,7 +142,17 @@ docker run --rm --network host --entrypoint /bin/sh minio/mc -c \
   "mc alias set local http://127.0.0.1:9000 minioadmin minioadmin && \
    mc mb --ignore-existing local/verglas-test"
 
-# 3. Start the server against MinIO with static keys (leave it running).
+# 3. Start the cache node against MinIO with static keys (leave it running).
+cat > /tmp/vg-origin-credentials <<'EOF'
+[default]
+aws_access_key_id = minioadmin
+aws_secret_access_key = minioadmin
+EOF
+cat > /tmp/vg-endpoint-credentials <<'EOF'
+[default]
+aws_access_key_id = matrixdev
+aws_secret_access_key = matrixdevsecret
+EOF
 cat > /tmp/vg-matrix.toml <<'EOF'
 [listen]
 s3_port = 8333
@@ -152,15 +161,17 @@ admin_port = 8334
 dir = "/tmp/vg-matrix-cache"
 capacity_bytes = "2GB"
 dram_bytes = "512MB"
+[backend]
+bucket = "verglas-test"
+endpoint = "http://127.0.0.1:9000"
+region = "us-east-1"
+allow_http = true
+credentials_file = "/tmp/vg-origin-credentials"
 [auth]
-access_key_id = "matrixdev"
-secret_access_key = "matrixdevsecret"
+credentials_file = "/tmp/vg-endpoint-credentials"
 EOF
 mkdir -p /tmp/vg-matrix-cache
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
-AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
-AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
-  ./target/debug/verglas-server --config /tmp/vg-matrix.toml &
+./target/debug/verglas-cache-node --config /tmp/vg-matrix.toml &
 
 # 4. Run the matrix (fixture then diff). Origin creds come from AWS_*.
 export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
@@ -174,48 +185,6 @@ tests/engine-matrix/run.sh --fixture-only   # build the fixture, stop
 tests/engine-matrix/run.sh --matrix-only ...# diff only (fixture must exist)
 tests/engine-matrix/run.sh --selftest       # comparator selftest, no MinIO
 ```
-
-## Running against node 0 of a 3-node pod (issue #160)
-
-The matrix (and the conformance smoke and tpch bench) are the standing
-cluster-correctness harness: point them at **node 0** of a local pod and every
-leg still diffs byte-for-byte, now with keys routed across three nodes through
-the ring. `verglas dev --nodes 3` boots the pod — three `verglas-server` children on
-consecutive port blocks, each with its own cache dir and its own
-`--dram`/`--cache-size` budgets, wired into one gossip pod seeded at node 0. The
-**dev keys are shared across the pod**, so a client that talks to node 0 (S3
-`--port`, the base) authenticates against any node.
-
-```bash
-# 1. Build both binaries and start MinIO + the bucket (steps 1–2 above).
-
-# 2. Boot a 3-node pod against MinIO. Node 0's S3 endpoint is the base --port
-#    (8333); admin is 8334; gossip 8335; peer 8336. Node 1 starts at 8337, etc.
-#    Copy the printed dev keys from the banner (shared across all three nodes).
-mkdir -p /tmp/vg-pod
-AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1 \
-AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true \
-AWS_VIRTUAL_HOSTED_STYLE_REQUEST=false \
-  ./target/debug/verglas dev --nodes 3 --port 8333 \
-    --cache-dir /tmp/vg-pod --dram 80MB --cache-size 122MB &
-# → banner prints node 0..2 endpoints and one shared "dev keys:" pair.
-
-# 3. Run the matrix against NODE 0 (the ring routes keys to the owning node;
-#    a remote-owned key degrades to a local backend fill until #29's peer
-#    transport lands — never an error, never wrong bytes).
-export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
-       AWS_REGION=us-east-1 AWS_ENDPOINT=http://127.0.0.1:9000
-tests/engine-matrix/run.sh \
-  --endpoint http://127.0.0.1:8333 \
-  --access-key-id <banner-key-id> --secret-key <banner-secret>
-```
-
-The same node-0 endpoint + shared keys drive the conformance smoke
-(`tests/s3-conformance/run.sh --smoke`) and the tpch benchmark
-(`benchmarks/tpch/run.sh`) against the pod. Because the budgets
-are per node, `--dram 80MB --cache-size 122MB` is the realistic memory-
-constrained shape (3×80 MiB DRAM), the profile peer fetches are measured against
-as #29 lands.
 
 ## Proving the tripwire fires
 

@@ -8,11 +8,11 @@
 //! of those, and a config knob for a feature that does not exist is worse
 //! than no knob at all.
 //!
-//! `[cache]` here is a different (and much smaller) thing than `verglas-server`'s
+//! `[cache]` here is a different (and much smaller) thing than `verglas-cache-node`'s
 //! `[cache]` section: it is not a cache tier, it is the single S3 endpoint
 //! this binary is allowed to read table data through. There is no direct
 //! object-store path anywhere in this binary (the platform rule: cache-or-503
-//! applies to every role, not just verglas-server) — `[cache]` is that endpoint and
+//! applies to every role, not just verglas-cache-node) — `[cache]` is that endpoint and
 //! nothing else.
 
 use std::path::Path;
@@ -30,7 +30,7 @@ pub struct QueryConfig {
     #[serde(default)]
     pub listen: Listen,
     /// Structured-logging output format and default verbosity — the same
-    /// `[log]` shape `verglas-server` uses.
+    /// `[log]` shape `verglas-cache-node` uses.
     #[serde(default)]
     pub log: Log,
     /// Memory-grant behavior. Fixed-memory deployments can skip the redundant
@@ -83,7 +83,7 @@ pub struct Listen {
 }
 
 impl Default for Listen {
-    /// One above `verglas-server`/`verglas-cache-node`'s default admin port (8334),
+    /// One above `verglas-cache-node`'s default admin port (8334),
     /// so all three can run side by side on one dev host without a port
     /// clash.
     fn default() -> Self {
@@ -96,7 +96,7 @@ impl Default for Listen {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheEndpoint {
-    /// Base URL of the cache node's S3 surface (a `verglas-server` or
+    /// Base URL of the cache node's S3 surface (a `verglas-cache-node` or
     /// `verglas-cache-node` instance). Required: without it there is nowhere
     /// to read table data from, and this binary never falls back to a direct
     /// object-store path.

@@ -18,9 +18,9 @@
   ],
   "terminals": [
     {
-      "name": "verglas-server",
-      "description": "Follows the verglas-server log started by scripts/cloud/start.sh (S3 :8333, admin :8334).",
-      "command": "tail -n +1 -F /tmp/verglas-dev/verglas-server.log"
+      "name": "verglas-cache-node",
+      "description": "Follows the cache-node log started by scripts/cloud/start.sh (S3 :8333, admin :8334).",
+      "command": "tail -n +1 -F /tmp/verglas-dev/verglas-cache-node.log"
     }
   ]
 }

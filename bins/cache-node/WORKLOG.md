@@ -91,3 +91,4 @@
 - #74: Added a four-node shared-cache regression covering cross-node page heat,
   real Neon query-after-write, safekeeper publication, and quorum writes with a
   ring member stopped.
+- #133: Made the cache node the public engine container entrypoint and added optional Iceberg catalog rendering to its startup script. The engine-only Compose stack now launches only object storage and the cache role.

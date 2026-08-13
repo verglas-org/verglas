@@ -129,3 +129,6 @@
 
 - #66: Rewrote fixed-memory query comments and the compaction e2e header so they no longer mention microVMs or Verglas Cloud.
 - #66: Rewrote engine/connection docs so endpoints are self-host or direct object storage, without a cloud-committer contrast.
+- #133: Removed the stale reference to the extracted monolithic server from the
+  streaming query contract. The engine query node is now the sole documented
+  owner of that response path.

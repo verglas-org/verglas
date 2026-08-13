@@ -54,12 +54,7 @@ fi
 echo "== verglas dev env install: rust deps + build =="
 # rustup installs the pinned toolchain (rust-toolchain.toml) on first use.
 cargo fetch --locked
-# Pre-build the two binaries the start step runs, so boot is fast.
-cargo build -p verglas-server -p verglas
-
-echo "== verglas dev env install: typescript sdk =="
-if [ -f sdks/typescript/package-lock.json ]; then
-  npm --prefix sdks/typescript ci
-fi
+# Pre-build the engine role the start step runs, so boot is fast.
+cargo build -p verglas-cache-node
 
 echo "== verglas dev env install: done =="

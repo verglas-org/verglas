@@ -60,7 +60,10 @@ fn local_access_without_a_catalog_or_keys_still_decodes() {
 
 #[test]
 fn version_info_round_trips_through_json() {
-    let info = VersionInfo::for_server("0.1.0-test");
+    let info = VersionInfo {
+        name: "verglas-cache-node".to_owned(),
+        version: "0.1.0-test".to_owned(),
+    };
     let encoded = serde_json::to_string(&info).expect("encode");
     let decoded: VersionInfo = serde_json::from_str(&encoded).expect("decode");
 

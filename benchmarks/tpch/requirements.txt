@@ -1,7 +1,0 @@
-# Pinned dependencies for the TPC-H-over-Iceberg benchmark (issue #136).
-# Versions verified against Python 3.13 on macOS/arm64. duckdb ships the
-# `tpch` (dbgen + canonical query set) and `iceberg` extensions; pyiceberg
-# writes the tables (Parquet only) via a local SQLite catalog.
-duckdb==1.1.3
-pyiceberg[sql-sqlite,pyarrow]==0.8.1
-pyarrow==18.1.0

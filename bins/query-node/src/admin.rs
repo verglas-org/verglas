@@ -7,9 +7,8 @@
 //! result first (see that function's doc comment). This handler writes one
 //! JSON chunk per batch as it arrives — `{"columns":[...],"rows":[` first,
 //! then each batch's rows, then `],"row_count":N}` once the stream is
-//! exhausted — so the *shape* on the wire is exactly the same
-//! `{columns, rows, row_count}` object `verglas-server`'s embedded `/v1/query`
-//! returns in one shot, byte-for-byte reconstructable by any client that
+//! exhausted — so the wire remains one reconstructable
+//! `{columns, rows, row_count}` object for any client that
 //! reads to EOF and parses the whole body as JSON, but nothing on the server
 //! side ever holds the whole result in memory to produce it. Peak worker
 //! memory during a query therefore tracks its operator working set (a join's
@@ -18,10 +17,7 @@
 //! one TCP write behaves identically to a buffered response; the point is
 //! that nothing *requires* full materialization for a large one.
 //!
-//! The request wire shape (`{sql, at: {reference, table}}`) is byte-for-byte
-//! the same as `verglas-server`'s embedded `/v1/query`, so a client (or the
-//! server's own dispatcher, streaming this response straight through to its
-//! own caller) does not need to know which of the two is answering.
+//! The request wire shape is `{sql, at: {reference, table}}`.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -39,8 +35,8 @@ use futures::StreamExt;
 use iceberg::Catalog;
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
+use verglas_core::grant::{MemoryGrant, MemoryGrantHost};
 use verglas_iceberg::AgentError;
-use verglas_sdk::grant::{MemoryGrant, MemoryGrantHost};
 
 use crate::sizing;
 
@@ -246,7 +242,7 @@ async fn healthz() -> &'static str {
 }
 
 /// The body of `POST /v1/query` and `POST /v1/query/estimate`: identical to
-/// `verglas-server`'s embedded `/v1/query` request shape.
+/// `verglas-cache-node`'s embedded `/v1/query` request shape.
 #[derive(Debug, Deserialize)]
 struct QueryRequest {
     /// The SQL to run (or, for `/estimate`, to plan without running).

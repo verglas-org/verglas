@@ -59,21 +59,6 @@ pub struct Config {
     /// Iceberg REST catalog to track for table commits. Unset leaves Iceberg
     /// awareness off.
     pub catalog: Option<Catalog>,
-    /// The standalone query role this server can dispatch `POST /v1/query` to
-    /// instead of running it embedded (a `verglas-query` worker, launched on
-    /// demand and killed after use). Unset keeps every query embedded —
-    /// nothing about an existing deployment changes, and a dispatch failure
-    /// for any reason still falls back to the embedded path. Everything the
-    /// worker needs beyond this binary path (the cache S3 endpoint, the
-    /// catalog URI, the signing keypair) the server derives from its own
-    /// loopback surface and its own resolved auth — the same values the
-    /// embedded path already uses.
-    pub query_worker: Option<QueryWorker>,
-    /// Isolated logical table writer launched by the server for Arrow commits.
-    pub write_worker: Option<WriteWorker>,
-    /// Optional self-hosted analytics services (Rill and related roles).
-    #[serde(default)]
-    pub analytics: Option<Analytics>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
 }
@@ -1132,109 +1117,6 @@ fn default_poll_interval_secs() -> u64 {
     30
 }
 
-/// The standalone query worker a server can dispatch to (see [`Config::query_worker`]).
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct QueryWorker {
-    /// Path to the `verglas-query` binary this server spawns on demand.
-    pub binary: String,
-}
-
-/// The standalone logical write worker a server dispatches Arrow commits to.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct WriteWorker {
-    /// Path to the `verglas-write` binary spawned on demand.
-    pub binary: String,
-}
-
-/// Optional analytics services composed by the on-prem REST process.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Analytics {
-    /// Rill Developer runtime reachable over the private deployment network.
-    pub rill: Rill,
-}
-
-/// Network contract for an on-prem Rill Developer runtime.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Rill {
-    /// Internal base URI used by `verglas-rest` to manage Rill project files.
-    pub uri: String,
-    /// Rill runtime instance receiving project-file requests.
-    #[serde(default = "default_rill_instance_id")]
-    pub instance_id: String,
-    /// Browser-facing URI returned by dashboard commands.
-    pub browser_uri: String,
-    /// S3 URI Rill uses from inside the deployment network to reach Verglas.
-    pub s3_uri: String,
-}
-
-/// Rill Developer's local runtime instance name.
-fn default_rill_instance_id() -> String {
-    "default".to_owned()
-}
-
-impl Rill {
-    /// Rejects malformed network addresses and instance identifiers at startup.
-    fn validate(&self) -> Result<(), ConfigError> {
-        for (field, value) in [
-            ("analytics.rill.uri", self.uri.as_str()),
-            ("analytics.rill.browser_uri", self.browser_uri.as_str()),
-            ("analytics.rill.s3_uri", self.s3_uri.as_str()),
-        ] {
-            if !(value.starts_with("http://") || value.starts_with("https://")) {
-                return Err(ConfigError::Invalid(
-                    field,
-                    "must be an http:// or https:// URI".to_owned(),
-                ));
-            }
-        }
-        if self.instance_id.is_empty()
-            || !self
-                .instance_id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-        {
-            return Err(ConfigError::Invalid(
-                "analytics.rill.instance_id",
-                "must contain only ASCII letters, digits, `_`, or `-`".to_owned(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl WriteWorker {
-    /// Validates the configured role binary before the first write request.
-    fn validate(&self) -> Result<(), ConfigError> {
-        if !Path::new(&self.binary).is_file() {
-            return Err(ConfigError::Invalid(
-                "write_worker.binary",
-                format!("{} does not exist or is not a readable file", self.binary),
-            ));
-        }
-        Ok(())
-    }
-}
-
-impl QueryWorker {
-    /// The binary exists as a readable file. Failing here first turns a
-    /// typo'd path into an actionable startup error instead of a dispatch
-    /// failure discovered on the first query (which falls back to the
-    /// embedded path silently, so a broken path would otherwise go unnoticed).
-    fn validate(&self) -> Result<(), ConfigError> {
-        if !Path::new(&self.binary).is_file() {
-            return Err(ConfigError::Invalid(
-                "query_worker.binary",
-                format!("{} does not exist or is not a readable file", self.binary),
-            ));
-        }
-        Ok(())
-    }
-}
-
 /// Gossip cluster membership and ring participation (#27/#28).
 ///
 /// A node advertises its identity and capacity over `chitchat` gossip and
@@ -1492,7 +1374,7 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 }
 
 impl Config {
-    /// Reads, parses, and validates a config file — the one call `verglas-server`
+    /// Reads, parses, and validates a config file — the one call `verglas-cache-node`
     /// startup makes. Any error is ready to print and exit on.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text =
@@ -1592,21 +1474,6 @@ impl Config {
         if let Some(catalog) = &self.catalog {
             catalog.validate()?;
         }
-        if let Some(query_worker) = &self.query_worker {
-            query_worker.validate()?;
-        }
-        if let Some(write_worker) = &self.write_worker {
-            write_worker.validate()?;
-        }
-        if let Some(analytics) = &self.analytics {
-            if self.catalog.is_none() {
-                return Err(ConfigError::Invalid(
-                    "analytics.rill",
-                    "requires a configured [catalog] so tables can be resolved".to_owned(),
-                ));
-            }
-            analytics.rill.validate()?;
-        }
         if let Some(cluster) = &self.cluster {
             cluster.validate()?;
         }
@@ -1641,7 +1508,7 @@ impl Config {
     /// One-line startup summary so operators can eyeball what loaded.
     pub fn summary(&self) -> String {
         format!(
-            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} cluster={} query_worker={} write_worker={} analytics={}",
+            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} cluster={}",
             self.listen.s3_port,
             self.listen.admin_port,
             if self.listen.tls.is_some() {
@@ -1666,15 +1533,6 @@ impl Config {
             },
             self.catalog.as_ref().map_or("off", |c| c.uri.as_str()),
             self.cluster.as_ref().map_or("off", |c| c.pod_id.as_str()),
-            self.query_worker
-                .as_ref()
-                .map_or("off", |q| q.binary.as_str()),
-            self.write_worker
-                .as_ref()
-                .map_or("off", |w| w.binary.as_str()),
-            self.analytics
-                .as_ref()
-                .map_or("off", |a| a.rill.uri.as_str()),
         )
     }
 }
