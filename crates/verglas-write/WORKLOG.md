@@ -95,3 +95,10 @@
   touching origin; only an actual standalone no-ring deployment writes through.
   WAL and object paths share `DurableQuorum`, which counts only completed durable
   append receipts and releases the client while non-quorum fragment work continues.
+- #127: Removed the coordinator-local JSON journal as write authority. Immutable
+  self-describing transaction revisions are appended through the fragment log
+  and accepted only after byte-identical records are durable on `w` members;
+  restart rebuilds the disposable read/repair index from those records. PUT,
+  COPY, DELETE, and multipart create/part/complete/abort now enter this writer
+  protocol. Tombstones hide deleted objects before background origin deletion,
+  and configured rings contain no direct-origin mutation fallback.
