@@ -1,6 +1,6 @@
 //! Crash-safe OpenRaft log and state-machine storage.
 //!
-//! Every mutating storage callback persists an atomic image before returning.
+//! Every metadata mutation and log-flush callback waits for its own durable write.
 //! OpenRaft remains the sole owner of votes, log matching, commit indexes, and membership.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,8 +29,10 @@ pub struct PersistentLogStore {
     path: PathBuf,
     entries_path: PathBuf,
     state: Arc<RwLock<LogStateData>>,
-    /// Dedicated ordered durability actor for this replica's compact metadata and log records.
-    persistence: PersistenceActor,
+    /// Ordered durability actor for compact term, vote, and committed metadata.
+    metadata_persistence: PersistenceActor,
+    /// Ordered durability actor for append-only Raft entry frames.
+    entries_persistence: PersistenceActor,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -79,7 +81,8 @@ impl PersistentLogStore {
                 metadata,
                 entries: recovered.entries,
             })),
-            persistence: PersistenceActor::new(),
+            metadata_persistence: PersistenceActor::new(),
+            entries_persistence: PersistenceActor::new(),
         })
     }
 
@@ -89,7 +92,7 @@ impl PersistentLogStore {
         &self,
         state: LogData,
     ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
-        self.persistence
+        self.metadata_persistence
             .enqueue_json(self.path.clone(), state)
             .await
     }
@@ -99,9 +102,45 @@ impl PersistentLogStore {
         &self,
         record: LogRecord,
     ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
-        self.persistence
+        self.entries_persistence
             .enqueue_log_record(self.entries_path.clone(), record)
             .await
+    }
+
+    /// Adds entries to the visible in-memory log and dispatches their ordered durable frame.
+    async fn dispatch_append(
+        &self,
+        entries: Vec<Entry<VerglasRaftConfig>>,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        let mut state = self.state.write().await;
+        let previous: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.log_id.index,
+                    state.entries.get(&entry.log_id.index).cloned(),
+                )
+            })
+            .collect();
+        for entry in &entries {
+            state.entries.insert(entry.log_id.index, entry.clone());
+        }
+        match self
+            .entries_persistence
+            .try_enqueue_log_record(self.entries_path.clone(), LogRecord::Append(entries))
+        {
+            Ok(completion) => Ok(completion),
+            Err(error) => {
+                for (index, prior) in previous {
+                    if let Some(prior) = prior {
+                        state.entries.insert(index, prior);
+                    } else {
+                        state.entries.remove(&index);
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -182,28 +221,20 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
     where
         I: IntoIterator<Item = Entry<VerglasRaftConfig>> + Send,
     {
-        let mut state = self.state.write().await;
         let entries: Vec<_> = entries.into_iter().collect();
-        let persisted = self
-            .enqueue_record(LogRecord::Append(entries.clone()))
-            .await;
-        match persisted {
-            Ok(completion) => match await_persisted(completion).await {
-                Ok(()) => {
-                    for entry in entries {
-                        state.entries.insert(entry.log_id.index, entry);
+        match self.dispatch_append(entries).await {
+            Ok(completion) => {
+                tokio::spawn(async move {
+                    match await_persisted(completion).await {
+                        Ok(()) => callback.log_io_completed(Ok(())),
+                        Err(error) => callback.log_io_completed(Err(std::io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        ))),
                     }
-                    callback.log_io_completed(Ok(()));
-                    Ok(())
-                }
-                Err(error) => {
-                    callback.log_io_completed(Err(std::io::Error::new(
-                        error.kind(),
-                        error.to_string(),
-                    )));
-                    Err(StorageIOError::write_logs(&error).into())
-                }
-            },
+                });
+                Ok(())
+            }
             Err(error) => {
                 callback
                     .log_io_completed(Err(std::io::Error::new(error.kind(), error.to_string())));
@@ -1049,6 +1080,31 @@ impl PersistenceActor {
         Ok(received)
     }
 
+    /// Schedules one operation without waiting behind a saturated durable queue.
+    fn try_enqueue<F>(
+        &self,
+        operation: F,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>>
+    where
+        F: FnOnce() -> std::io::Result<()> + Send + 'static,
+    {
+        let (completion, received) = oneshot::channel();
+        self.sender
+            .try_send(PersistenceRequest {
+                operation: Box::new(operation),
+                completion,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    std::io::Error::other("Raft entry persistence queue is full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    std::io::Error::other("Raft persistence actor stopped")
+                }
+            })?;
+        Ok(received)
+    }
+
     /// Serializes and queues one owned JSON image on the dedicated actor.
     async fn enqueue_json<T>(
         &self,
@@ -1069,6 +1125,15 @@ impl PersistenceActor {
     ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
         self.enqueue(move || append_log_record(&path, &record))
             .await
+    }
+
+    /// Schedules one framed append-only log record without delaying the Raft core.
+    fn try_enqueue_log_record(
+        &self,
+        path: PathBuf,
+        record: LogRecord,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.try_enqueue(move || append_log_record(&path, &record))
     }
 }
 
@@ -1376,6 +1441,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3]
         );
+    }
+
+    /// A delayed entry fsync must never queue a RequestVote durability barrier behind it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_entry_frame_does_not_delay_vote_metadata() {
+        let root = TempDir::new().expect("temporary replica root");
+        let mut store = PersistentLogStore::open(root.path().join("raft-log.json"))
+            .await
+            .expect("open log store");
+        let (persistence_started, started) = tokio::sync::oneshot::channel();
+        let delayed = store
+            .entries_persistence
+            .enqueue(move || {
+                let _ = persistence_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await
+            .expect("queue delayed entry frame");
+        started.await.expect("entry persistence started");
+
+        tokio::time::timeout(Duration::from_millis(50), store.save_vote(&Vote::new(2, 2)))
+            .await
+            .expect("vote metadata bypasses the delayed entry actor")
+            .expect("durable vote");
+        await_persisted(delayed)
+            .await
+            .expect("delayed entry frame completes");
+    }
+
+    /// Entry dispatch returns before fsync, while its completion remains fenced by the frame write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_dispatch_returns_before_its_fsync_completes() {
+        let root = TempDir::new().expect("temporary replica root");
+        let store = PersistentLogStore::open(root.path().join("raft-log.json"))
+            .await
+            .expect("open log store");
+        let (persistence_started, started) = tokio::sync::oneshot::channel();
+        let delayed = store
+            .entries_persistence
+            .enqueue(move || {
+                let _ = persistence_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await
+            .expect("queue delayed entry frame");
+        started.await.expect("entry persistence started");
+
+        let mut completion = tokio::time::timeout(
+            Duration::from_millis(50),
+            store.dispatch_append(vec![large_entry(1)]),
+        )
+        .await
+        .expect("append dispatch returns without waiting for fsync")
+        .expect("append frame is queued");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut completion)
+                .await
+                .is_err(),
+            "the callback completion cannot precede its frame fsync"
+        );
+        await_persisted(delayed)
+            .await
+            .expect("delayed entry frame completes");
+        await_persisted(completion)
+            .await
+            .expect("append frame completion follows fsync");
     }
 
     /// A slow durable Raft image must not monopolize the runtime that receives

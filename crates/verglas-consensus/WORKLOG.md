@@ -202,3 +202,7 @@
   metadata file and checksummed append-only entry frames. Votes and commit state
   now fsync independently of large log entries, while replay preserves append,
   truncation, purge, and restart correctness without acknowledging before disk.
+
+- #135: Split compact Raft metadata and entry-frame durability into independent
+  ordered actors. Entry dispatch returns to OpenRaft immediately and reports its
+  flush callback only after fsync, so a large append cannot delay a vote grant.
