@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::Response,
     routing::post,
@@ -31,6 +31,13 @@ use crate::{VERSION, consensus::ConsensusPlane, ring::RingPlane};
 /// Default HTTP/2 address for the Verglas Neon WAL protocol.
 const DEFAULT_SAFEKEEPER_ADDR: &str = "0.0.0.0:5454";
 const WAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Hard ingress budget: one complete 16 MiB WAL segment and bounded frame headroom.
+///
+/// The public benchmark appends 8 MiB frames, while archive scheduling operates on
+/// complete 16 MiB segments. This prevents the HTTP extractor from retaining an
+/// unbounded request and leaves room for the canonical wire envelope and catalog
+/// command metadata.
+const INGRESS_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
 #[derive(Clone)]
 struct WalIngress {
@@ -233,6 +240,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/wal/v1/{tenant}/{timeline}", post(wal_request))
         .route("/catalog/v1/{tenant}/{warehouse}", post(catalog_request))
+        .layer(DefaultBodyLimit::max(INGRESS_BODY_LIMIT_BYTES))
         .with_state(state);
     eprintln!(
         "verglas-cache-node {VERSION} Verglas Neon WAL ingress listening on http://{} (EC k={}, m={}, coded threshold={})",

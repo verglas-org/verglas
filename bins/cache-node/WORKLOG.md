@@ -98,6 +98,7 @@
   depends on.
 - #127: Replaced ring-size-derived safekeeper geometry with mandatory explicit
   `VERGLAS_SAFEKEEPER_EC_K/M/W` settings validated against the complete ring.
+
   Managed four-node deployments can now declare `2/2/3`, while the OSS
   three-node stack declares `2/1/3` rather than silently changing durability.
 - #135: Served group-keyed Raft RPCs on the existing cache peer listener and
@@ -220,3 +221,7 @@
 - #137: Mount semantic routes only when a customer Iceberg catalog is present.
   They now reuse the configured cache credentials with the semantic SigV4
   verifier, so unsigned REST-JSON calls never reach the durable adapter.
+- #135: Raised the embedded WAL/catalog router's explicit Axum request-body
+  ceiling to 17 MiB. This accepts the benchmark's canonical 8 MiB WAL frames
+  and one complete 16 MiB WAL segment with bounded wire headroom, while still
+  rejecting larger requests before they enter consensus.

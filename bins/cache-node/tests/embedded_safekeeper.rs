@@ -16,6 +16,8 @@ const TENANT: &str = "0123456789abcdef0123456789abcdef";
 const TIMELINE: &str = "fedcba9876543210fedcba9876543210";
 const CATALOG_TENANT: &str = "tenant-tpch";
 const WAREHOUSE: &str = "tpch";
+const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
+const WAL_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
 /// Kills child cache nodes even when an assertion fails.
 struct Fleet {
@@ -165,6 +167,24 @@ async fn submit(addr: SocketAddr, request: WalRequest) -> Result<WalResponse, St
         return Err(format!("WAL operation failed with {}", response.status()));
     }
     WalResponse::decode(&response.bytes().await.expect("WAL response body"))
+        .map_err(|error| error.to_string())
+}
+
+/// Sends one complete canonical WAL request and leaves its HTTP status visible.
+async fn submit_wal_http(
+    addr: SocketAddr,
+    request: WalRequest,
+) -> Result<reqwest::Response, String> {
+    let body = request.encode().expect("encode WAL request");
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!("http://{addr}/wal/v1/{TENANT}/{TIMELINE}"))
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await
         .map_err(|error| error.to_string())
 }
 
@@ -395,6 +415,106 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     )
     .await;
     assert!(minority.is_err(), "two live voters must fail closed");
+}
+
+/// The public WAL listener accepts benchmark-sized appends but retains a hard body ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodies() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let children = (0..4)
+        .map(|index| {
+            spawn_node(
+                index,
+                &configs[index],
+                &peers,
+                ring_ports[index],
+                safekeeper_ports[index],
+                &stderr,
+            )
+        })
+        .collect();
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let address = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
+    let opened = submit(
+        address,
+        WalRequest::OpenTimeline {
+            request_id: 200,
+            start_lsn: 0,
+        },
+    )
+    .await
+    .expect("open timeline");
+    let start = match opened {
+        WalResponse::Applied {
+            wal_end: Some(start),
+            ..
+        } => start,
+        other => panic!("unexpected timeline-open response: {other:?}"),
+    };
+    let acquired = submit(
+        address,
+        WalRequest::AcquireWriter {
+            request_id: 201,
+            writer: "body-limit-compute".to_owned(),
+        },
+    )
+    .await
+    .expect("acquire writer");
+    let writer_epoch = match acquired {
+        WalResponse::Applied {
+            writer_epoch: Some(writer_epoch),
+            ..
+        } => writer_epoch,
+        other => panic!("unexpected writer-acquire response: {other:?}"),
+    };
+    let payload = vec![0xa5; CANONICAL_WAL_APPEND_BYTES];
+    let appended = submit_wal_http(
+        address,
+        WalRequest::Append {
+            request_id: 202,
+            writer_epoch,
+            start_lsn: start,
+            payload: payload.clone(),
+        },
+    )
+    .await
+    .expect("submit benchmark-sized WAL append");
+    assert!(
+        appended.status().is_success(),
+        "canonical append reaches WAL handler"
+    );
+    let response = WalResponse::decode(&appended.bytes().await.expect("append response body"))
+        .expect("decode append response");
+    assert!(
+        matches!(response, WalResponse::Applied { wal_end: Some(end), .. } if end == payload.len() as u64)
+    );
+
+    let rejected = submit_wal_http(
+        address,
+        WalRequest::Append {
+            request_id: 203,
+            writer_epoch,
+            start_lsn: start + payload.len() as u64,
+            payload: vec![0; WAL_BODY_LIMIT_BYTES],
+        },
+    )
+    .await
+    .expect("submit over-limit WAL append");
+    assert_eq!(rejected.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
 }
 
 /// Four native-catalog ingresses retain linearizable availability after their elected leader dies.
