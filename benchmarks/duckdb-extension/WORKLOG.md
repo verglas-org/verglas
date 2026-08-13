@@ -17,3 +17,6 @@
   received network bytes without materializing an unbounded result table.
 - #126: Removed host configure artifacts before compiling the benchmark image.
   This keeps local extension build state from affecting the measured artifact.
+- #126: Added the failing evidence contract for the real Iceberg full-stack
+  comparison. It requires catalog-committed Iceberg data, the three requested
+  product paths, equal cgroup budgets, and same-engine cold/warm cache controls.

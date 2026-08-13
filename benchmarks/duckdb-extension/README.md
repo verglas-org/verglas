@@ -29,3 +29,20 @@ The `full_stack` report section is deliberately marked `protocol-only`. A
 Verglas Query deployment, catalog, object store, and cache topology must be
 supplied before cold, warm, and shared-warm cache results can be measured. The
 harness never substitutes the synthetic Arrow endpoint for that evidence.
+
+## Iceberg full-stack comparison
+
+`iceberg_full_stack.py` is the evidence-producing benchmark for the product
+comparison. It requires one immutable Iceberg v2 snapshot committed through the
+Verglas-managed Lakekeeper catalog and runs five measured repetitions after one
+warm-up through exactly three user-visible paths: Quack without Verglas, the
+Verglas Query worker API, and Quack loading `verglas_query` and traversing the
+same Query worker.
+
+The benchmark also runs same-engine cache controls through QuackStore and the
+Verglas S3 endpoint. Those controls are not additional product claims; they
+hold the DuckDB/Quack execution engine constant so origin-byte reduction and
+cold, warm, and fresh-process shared-warm latency can attribute an improvement
+to the cache. Every process is cgroup bounded, every result is tied to the same
+snapshot and manifest list, and missing catalog, extension, warming, cache, or
+resource-limit evidence invalidates the report.
