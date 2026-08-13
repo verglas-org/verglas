@@ -402,7 +402,8 @@ impl SemanticApi for IcebergCatalogSemanticStore {
 impl IcebergCatalogSemanticStore {
     /// Executes the vector operations whose durable state is an Iceberg table.
     async fn vector_call(&self, operation: &str, input: Value) -> Result<Value, SemanticError> {
-        let input = normalize_vector_arn(input)?;
+        let mut input = normalize_vector_arn(input)?;
+        input["operation"] = Value::String(operation.to_owned());
         if operation == "CreateVectorBucket" {
             let namespace = bucket_namespace(&input)?;
             self.catalog
@@ -674,9 +675,9 @@ impl IcebergCatalogSemanticStore {
                     input.get("segmentCount").and_then(Value::as_u64),
                     input.get("segmentIndex").and_then(Value::as_u64),
                 ) {
-                    if count == 0 || index >= count {
+                    if count == 0 || count > 16 || index >= count || index > 15 {
                         return Err(SemanticError::validation(
-                            "segmentIndex must be less than segmentCount",
+                            "segmentCount must be 1..16 and segmentIndex less than it",
                         ));
                     }
                     vectors.retain(|value| {
@@ -889,7 +890,11 @@ fn now_millis() -> i64 {
 /// Applies the AWS cursor/max-results contract to an already stably sorted list.
 fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>), SemanticError> {
     let binding = format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}",
+        input
+            .get("operation")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
         input
             .get("vectorBucketName")
             .and_then(Value::as_str)
@@ -901,7 +906,23 @@ fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>
         input
             .get("prefix")
             .and_then(Value::as_str)
-            .unwrap_or_default()
+            .unwrap_or_default(),
+        input
+            .get("segmentCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        input
+            .get("segmentIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or_default(),
+        input
+            .get("returnData")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        input
+            .get("returnMetadata")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     );
     let last = input
         .get("nextToken")
@@ -925,6 +946,19 @@ fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>
         })
         .transpose()?
         .unwrap_or(500);
+    if limit == 0 {
+        return Err(SemanticError::validation("maxResults must be positive"));
+    }
+    let maximum = if input.get("operation").and_then(Value::as_str) == Some("ListVectors") {
+        1000
+    } else {
+        500
+    };
+    if limit > maximum {
+        return Err(SemanticError::validation(format!(
+            "maxResults must not exceed {maximum}"
+        )));
+    }
     let end = offset.saturating_add(limit).min(values.len());
     let next = (end < values.len()).then(|| encode_cursor(&binding, listing_key(&values[end - 1])));
     Ok((values[offset..end].to_vec(), next))
@@ -942,7 +976,7 @@ fn listing_key(value: &Value) -> &str {
 fn encode_cursor(binding: &str, last: &str) -> String {
     base64::Engine::encode(
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        format!("v1\n{binding}\n{last}"),
+        format!("{binding}\n{last}"),
     )
 }
 
@@ -953,8 +987,8 @@ fn decode_cursor(token: &str, binding: &str) -> Result<String, SemanticError> {
             .map_err(|_| SemanticError::validation("nextToken is invalid"))?,
     )
     .map_err(|_| SemanticError::validation("nextToken is invalid"))?;
-    let mut parts = text.splitn(3, '\n');
-    if parts.next() != Some("v1") || parts.next() != Some(binding) {
+    let mut parts = text.splitn(2, '\n');
+    if parts.next() != Some(binding) {
         return Err(SemanticError::validation(
             "nextToken does not match this listing",
         ));
@@ -1193,4 +1227,37 @@ fn direction(input: &Value) -> Result<Direction, SemanticError> {
 /// Converts graph-engine errors to a safe REST-JSON service failure.
 fn graph_error(error: verglas_graph::GraphError) -> SemanticError {
     SemanticError::unavailable(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A cursor advances by key, so inserting an earlier key cannot duplicate a page.
+    #[test]
+    fn cursor_is_bound_and_advances_by_last_key() {
+        let input = json!({"operation":"ListVectors", "vectorBucketName":"b", "indexName":"i", "maxResults":1});
+        let first = vec![json!({"key":"b"}), json!({"key":"d"})];
+        let (page_one, token) = page(&input, first).expect("page");
+        assert_eq!(page_one[0]["key"], "b");
+        let mut second_input = input.clone();
+        second_input["nextToken"] = json!(token.expect("token"));
+        let second = vec![json!({"key":"a"}), json!({"key":"b"}), json!({"key":"d"})];
+        let (page_two, _) = page(&second_input, second).expect("page");
+        assert_eq!(page_two[0]["key"], "d");
+    }
+
+    /// A cursor cannot be replayed with another list resource or filter.
+    #[test]
+    fn cursor_rejects_a_different_binding_and_zero_limit() {
+        let input = json!({"operation":"ListIndexes", "vectorBucketName":"b", "maxResults":1});
+        let (_, token) = page(
+            &input,
+            vec![json!({"indexName":"a"}), json!({"indexName":"b"})],
+        )
+        .expect("page");
+        let error = page(&json!({"operation":"ListIndexes", "vectorBucketName":"other", "maxResults":1, "nextToken":token}), vec![]).expect_err("binding mismatch");
+        assert_eq!(error.code, "ValidationException");
+        assert!(page(&json!({"operation":"ListVectors", "maxResults":0}), vec![]).is_err());
+    }
 }
