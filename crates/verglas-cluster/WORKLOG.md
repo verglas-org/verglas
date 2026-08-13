@@ -135,3 +135,7 @@
 - #135: Made the explicit Raft peer registry safely extensible for a prospective
   voter address. Learner admission can now bind its exact peer endpoint before
   replication starts, while unknown identities still fail closed.
+- #135: Reopen a configured local Raft voter from authenticated vote, append,
+  and snapshot traffic before looking up its in-memory replica. A restarted node
+  now reloads retained durable groups lazily; unknown targets still return 404
+  and unauthenticated traffic cannot invoke the opener.

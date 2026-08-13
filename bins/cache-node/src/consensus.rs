@@ -226,6 +226,11 @@ impl ConsensusPlane {
             m,
             groups: Mutex::new(BTreeMap::new()),
         });
+        plane
+            .ring
+            .raft_registry()
+            .register_target(plane.ring.safekeeper_id())
+            .await;
         let open_plane = Arc::clone(&plane);
         let opener: OpenGroupFn = Arc::new(move |group| {
             let plane = Arc::clone(&open_plane);

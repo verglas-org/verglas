@@ -21,7 +21,7 @@ use openraft::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io,
     net::SocketAddr,
@@ -67,6 +67,7 @@ pub type MembershipReplaceFn = Arc<
 #[derive(Clone)]
 pub struct RaftRpcRegistry {
     groups: Arc<RwLock<BTreeMap<(String, u64), Raft>>>,
+    targets: Arc<RwLock<BTreeSet<u64>>>,
     secret: Arc<str>,
     opener: Arc<RwLock<Option<OpenGroupFn>>>,
     bootstrapper: Arc<RwLock<Option<BootstrapGroupFn>>>,
@@ -79,6 +80,7 @@ impl RaftRpcRegistry {
     pub fn new(secret: impl Into<String>) -> Self {
         Self {
             groups: Arc::new(RwLock::new(BTreeMap::new())),
+            targets: Arc::new(RwLock::new(BTreeSet::new())),
             secret: Arc::from(secret.into()),
             opener: Arc::new(RwLock::new(None)),
             bootstrapper: Arc::new(RwLock::new(None)),
@@ -88,10 +90,19 @@ impl RaftRpcRegistry {
     }
     /// Adds a locally served Raft voter.
     pub async fn register(&self, group: impl Into<String>, node_id: u64, raft: Raft) {
+        self.register_target(node_id).await;
         self.groups
             .write()
             .await
             .insert((group.into(), node_id), raft);
+    }
+    /// Registers a local Raft voter identity before its durable groups reopen.
+    ///
+    /// Peer RPCs for an unregistered identity return `404` without invoking the
+    /// group opener, so an authenticated peer cannot create state for another
+    /// voter by choosing its numeric target.
+    pub async fn register_target(&self, node_id: u64) {
+        self.targets.write().await.insert(node_id);
     }
     /// Installs the process callback that creates persistent local group state.
     pub async fn set_opener(&self, opener: OpenGroupFn) {
@@ -121,7 +132,11 @@ impl RaftRpcRegistry {
             .route("/consensus/v1/membership/replace", post(membership_replace))
             .with_state(self.clone())
     }
-    /// Authenticates then resolves exactly one local voter.
+    /// Authenticates, reopens, then resolves exactly one configured local voter.
+    ///
+    /// Reopening is idempotent and happens before the in-memory lookup so a
+    /// node that retained durable Raft state across restart can receive normal
+    /// replication traffic without a separate recovery control request.
     async fn target(
         &self,
         headers: &HeaderMap,
@@ -131,6 +146,18 @@ impl RaftRpcRegistry {
         if headers.get(SECRET_HEADER).and_then(|v| v.to_str().ok()) != Some(&self.secret) {
             return Err(StatusCode::FORBIDDEN);
         }
+        if !self.targets.read().await.contains(&target) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let opener = self
+            .opener
+            .read()
+            .await
+            .clone()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        opener(group.to_owned())
+            .await
+            .map_err(|_| StatusCode::CONFLICT)?;
         self.groups
             .read()
             .await

@@ -199,3 +199,6 @@
   geometry while a two-voter minority still fails closed. Once an ingress has
   an initialized local replica, normal WAL and catalog requests skip group
   provisioning and rely on the committed Raft quorum directly.
+- #135: Register this cache node's Raft voter identity before serving peer RPCs.
+  Authenticated replication can now lazily reopen a retained durable timeline
+  or warehouse group after restart, while unknown numeric targets remain closed.
