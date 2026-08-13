@@ -134,6 +134,10 @@ class ManagedConfig:
             "uri": self.catalog_url,
             "token": self.catalog_token,
             "warehouse": self.warehouse,
+            # Lakekeeper is the catalog authority. The benchmark writes data
+            # with the explicitly supplied R2 credential; it must not request
+            # a different delegated credential while seeding its snapshot.
+            "header.X-Iceberg-Access-Delegation": "",
             "s3.endpoint": self.r2_endpoint,
             "s3.access-key-id": self.r2_access_key,
             "s3.secret-access-key": self.r2_secret_key,
@@ -149,11 +153,11 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
     if batch_rows <= 0:
         raise ValueError("batch_rows must be positive")
     import pyarrow as pa
-    from pyiceberg.catalog import load_catalog
+    from pyiceberg.catalog.rest import RestCatalog
     from pyiceberg.schema import Schema
     from pyiceberg.types import LongType, NestedField, StringType
 
-    catalog = load_catalog("verglas", **config.iceberg_properties())
+    catalog = RestCatalog("verglas", **config.iceberg_properties())
     identifier = (config.namespace, config.table)
     catalog.create_namespace_if_not_exists(config.namespace)
     schema = Schema(
@@ -180,7 +184,8 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
     snapshot = table.current_snapshot()
     if snapshot is None or not snapshot.manifest_list:
         raise RuntimeError("Lakekeeper committed no current Iceberg snapshot")
-    manifest_bytes = table.io.read(snapshot.manifest_list)
+    with table.io.new_input(snapshot.manifest_list).open() as manifest:
+        manifest_bytes = manifest.read()
     files = list(table.scan().plan_files())
     data_bytes = sum(task.file.file_size_in_bytes for task in files)
     if data_bytes <= 0:
