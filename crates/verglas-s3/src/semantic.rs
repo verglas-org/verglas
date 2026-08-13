@@ -466,6 +466,13 @@ impl IcebergCatalogSemanticStore {
                 })?;
                 buckets.push(json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": state.properties().get("verglas.s3vectors.created").cloned().ok_or_else(|| SemanticError::validation("bucket creation metadata is absent"))?}));
             }
+            if let Some(prefix) = input.get("prefix").and_then(Value::as_str) {
+                buckets.retain(|value| {
+                    value["vectorBucketName"]
+                        .as_str()
+                        .is_some_and(|name| name.starts_with(prefix))
+                });
+            }
             buckets.sort_by_key(|value| {
                 value["vectorBucketName"]
                     .as_str()
@@ -512,12 +519,27 @@ impl IcebergCatalogSemanticStore {
         if operation == "ListIndexes" {
             let namespace = bucket_namespace(&input)?;
             let bucket = required_string(&input, "vectorBucketName")?;
-            let state = self
+            let mut indexes = Vec::new();
+            for ident in self
                 .catalog
-                .get_namespace(&namespace)
+                .list_tables(&namespace)
                 .await
-                .map_err(iceberg_error)?;
-            let mut indexes = self.catalog.list_tables(&namespace).await.map_err(iceberg_error)?.into_iter().filter_map(|table| { let name = table.name().to_owned(); state.properties().get(&index_metadata_key(&name)).and_then(|metadata| serde_json::from_str::<Value>(metadata).ok()).map(|metadata| json!({"vectorBucketName": bucket, "indexName": name, "indexArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{bucket}/index/{name}"), "creationTime": metadata["creationTime"]})) }).collect::<Vec<_>>();
+                .map_err(iceberg_error)?
+            {
+                let name = ident.name().to_owned();
+                let table = self
+                    .catalog
+                    .load_table(&ident)
+                    .await
+                    .map_err(iceberg_error)?;
+                let Some(text) = table.metadata().properties().get("verglas.s3vectors.index")
+                else {
+                    continue;
+                };
+                let metadata: Value = serde_json::from_str(text)
+                    .map_err(|_| SemanticError::validation("index metadata is corrupt"))?;
+                indexes.push(json!({"vectorBucketName": bucket, "indexName": name, "indexArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{bucket}/index/{name}"), "creationTime": metadata["creationTime"]}));
+            }
             if let Some(prefix) = input.get("prefix").and_then(Value::as_str) {
                 indexes.retain(|value| {
                     value["indexName"]
@@ -555,16 +577,25 @@ impl IcebergCatalogSemanticStore {
                 tables_api::create_table(self.catalog.as_ref(), &ident, definition)
                     .await
                     .map_err(iceberg_error)?;
-                let namespace = bucket_namespace(&input)?;
-                let state = self
+                let table = self
                     .catalog
-                    .get_namespace(&namespace)
+                    .load_table(&ident)
                     .await
                     .map_err(iceberg_error)?;
-                let mut properties = state.properties().clone();
-                properties.insert(index_metadata_key(required_string(&input, "indexName")?), json!({"creationTime": now_millis(), "dataType": required_string(&input, "dataType")?, "dimension": input.get("dimension").cloned().ok_or_else(|| SemanticError::validation("dimension is required"))?, "distanceMetric": required_string(&input, "distanceMetric")?, "metadataConfiguration": input.get("metadataConfiguration").cloned().unwrap_or(Value::Null), "encryptionConfiguration": input.get("encryptionConfiguration").cloned().unwrap_or(Value::Null)}).to_string());
+                let metadata = json!({"creationTime": now_millis(), "dataType": required_string(&input, "dataType")?, "dimension": input.get("dimension").cloned().ok_or_else(|| SemanticError::validation("dimension is required"))?, "distanceMetric": required_string(&input, "distanceMetric")?, "metadataConfiguration": input.get("metadataConfiguration").cloned().unwrap_or(Value::Null), "encryptionConfiguration": input.get("encryptionConfiguration").cloned().unwrap_or(Value::Null)}).to_string();
                 self.catalog
-                    .update_namespace(&namespace, properties)
+                    .update_table(TableCommit::from_parts(
+                        ident.clone(),
+                        vec![TableRequirement::UuidMatch {
+                            uuid: table.metadata().uuid(),
+                        }],
+                        vec![TableUpdate::SetProperties {
+                            updates: HashMap::from([(
+                                "verglas.s3vectors.index".to_owned(),
+                                metadata,
+                            )]),
+                        }],
+                    ))
                     .await
                     .map_err(iceberg_error)?;
                 Ok(json!({"indexArn": vector_arn(&input)?}))
@@ -577,14 +608,15 @@ impl IcebergCatalogSemanticStore {
                 Ok(json!({}))
             }
             "GetIndex" => {
-                let state = self
+                let table = self
                     .catalog
-                    .get_namespace(&bucket_namespace(&input)?)
+                    .load_table(&ident)
                     .await
                     .map_err(iceberg_error)?;
-                let value = state
+                let value = table
+                    .metadata()
                     .properties()
-                    .get(&index_metadata_key(required_string(&input, "indexName")?))
+                    .get("verglas.s3vectors.index")
                     .ok_or_else(|| SemanticError::validation("index metadata is absent"))?;
                 let metadata: Value = serde_json::from_str(value)
                     .map_err(|_| SemanticError::validation("index metadata is corrupt"))?;
@@ -633,11 +665,29 @@ impl IcebergCatalogSemanticStore {
                 Ok(json!({"vectors": vectors}))
             }
             "ListVectors" => {
-                let vectors = live_vectors(self.catalog.as_ref(), &ident)
+                let mut vectors = live_vectors(self.catalog.as_ref(), &ident)
                     .await?
                     .into_iter()
                     .map(|vector| vector.output(&input))
                     .collect::<Vec<_>>();
+                if let (Some(count), Some(index)) = (
+                    input.get("segmentCount").and_then(Value::as_u64),
+                    input.get("segmentIndex").and_then(Value::as_u64),
+                ) {
+                    if count == 0 || index >= count {
+                        return Err(SemanticError::validation(
+                            "segmentIndex must be less than segmentCount",
+                        ));
+                    }
+                    vectors.retain(|value| {
+                        stable_segment(value["key"].as_str().unwrap_or_default(), count) == index
+                    });
+                } else if input.get("segmentCount").is_some() || input.get("segmentIndex").is_some()
+                {
+                    return Err(SemanticError::validation(
+                        "segmentCount and segmentIndex must be provided together",
+                    ));
+                }
                 let (vectors, next_token) = page(&input, vectors)?;
                 Ok(json!({"vectors": vectors, "nextToken": next_token}))
             }
@@ -836,10 +886,6 @@ fn now_millis() -> i64 {
 }
 
 /// Names the catalog namespace property carrying one index's exact definition.
-fn index_metadata_key(index: &str) -> String {
-    format!("verglas.s3vectors.index.{index}")
-}
-
 /// Applies the AWS cursor/max-results contract to an already stably sorted list.
 fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>), SemanticError> {
     let offset = match input.get("nextToken").and_then(Value::as_str) {
@@ -866,6 +912,14 @@ fn page(input: &Value, values: Vec<Value>) -> Result<(Vec<Value>, Option<String>
         values[offset..end].to_vec(),
         (end < values.len()).then(|| end.to_string()),
     ))
+}
+
+/// Assigns a key to a deterministic list segment without process-random hashing.
+fn stable_segment(key: &str, count: u64) -> u64 {
+    key.bytes().fold(0_u64, |hash, byte| {
+        hash.wrapping_mul(1099511628211)
+            .wrapping_add(u64::from(byte))
+    }) % count
 }
 
 /// Resolves a vector bucket/index name to its customer-owned Iceberg table.
