@@ -1,5 +1,5 @@
-//! Process-level proof that three cache-node binaries form the fragment ring
-//! used by the embedded Neon safekeeper.
+//! Process-level proof that cache-node binaries form the fragment ring used by
+//! the embedded Neon safekeeper and retain one-node-failure availability.
 
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
@@ -102,26 +102,31 @@ fn write_config(root: &std::path::Path, index: usize, s3: u16, admin: u16) -> st
 }
 
 /// Submits one canonical WAL operation and decodes its complete response.
-async fn submit(addr: SocketAddr, request: WalRequest) -> WalResponse {
+async fn submit(addr: SocketAddr, request: WalRequest) -> Result<WalResponse, String> {
     let body = request.encode().expect("encode WAL request");
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?
         .post(format!("http://{addr}/wal/v1/{TENANT}/{TIMELINE}"))
         .header("content-type", "application/octet-stream")
         .body(body)
         .send()
         .await
-        .expect("submit WAL operation");
-    assert!(response.status().is_success(), "{}", response.status());
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("WAL operation failed with {}", response.status()));
+    }
     WalResponse::decode(&response.bytes().await.expect("WAL response body"))
-        .expect("decode WAL response")
+        .map_err(|error| error.to_string())
 }
 
-/// Three real cache-node processes quorum-ack WAL and serve it back unchanged.
+/// Four real cache nodes preserve writes with one voter down and refuse two failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cache_node_embeds_the_ring_backed_safekeeper() {
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port()];
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -130,7 +135,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let mut children = Vec::new();
-    for index in 0..3 {
+    for index in 0..4 {
         let config = write_config(root.path(), index, free_port(), free_port());
         let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
             .arg("--config")
@@ -139,7 +144,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             .env("VERGLAS_NODE_ID", format!("node-{index}"))
             .env("VERGLAS_RING_PEERS", &peers)
             .env("VERGLAS_SAFEKEEPER_EC_K", "2")
-            .env("VERGLAS_SAFEKEEPER_EC_M", "1")
+            .env("VERGLAS_SAFEKEEPER_EC_M", "2")
             .env("VERGLAS_SAFEKEEPER_EC_W", "3")
             .env(
                 "VERGLAS_RING_ADDR",
@@ -169,7 +174,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         children.push(child);
     }
     let mut fleet = Fleet { children, stderr };
-    fleet.wait_for_safekeepers(3, Duration::from_secs(30));
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
 
     let address = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
     let opened = submit(
@@ -179,7 +184,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             start_lsn: 0x16_b6ff_f000,
         },
     )
-    .await;
+    .await
+    .expect("open timeline through four-voter quorum");
     let WalResponse::Applied {
         wal_end: Some(opened_lsn),
         ..
@@ -195,7 +201,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             writer: "integration-compute".to_owned(),
         },
     )
-    .await;
+    .await
+    .expect("acquire writer through four-voter quorum");
     let WalResponse::Applied {
         index: acquire_index,
         writer_epoch: Some(writer_epoch),
@@ -216,7 +223,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             payload: wal.to_vec(),
         },
     )
-    .await;
+    .await
+    .expect("append through four-voter quorum");
     let WalResponse::Applied {
         index: append_index,
         wal_end: Some(committed_end),
@@ -228,19 +236,62 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     assert_eq!(committed_end, end);
     assert!(append_index > acquire_index);
 
+    fleet.children[3].kill().expect("stop fourth voter");
+    fleet.children[3].wait().expect("reap fourth voter");
+    let second = b"-while-one-voter-is-down";
+    let second_end = end + second.len() as u64;
+    let appended = submit(
+        address,
+        WalRequest::Append {
+            request_id: (u128::from(writer_epoch) << 64) | u128::from(end),
+            writer_epoch,
+            start_lsn: end,
+            payload: second.to_vec(),
+        },
+    )
+    .await
+    .expect("three live voters must commit without waiting for the fourth");
+    let WalResponse::Applied {
+        index: second_index,
+        wal_end: Some(committed_end),
+        ..
+    } = appended
+    else {
+        panic!("unexpected one-down append response: {appended:?}");
+    };
+    assert_eq!(committed_end, second_end);
+    assert!(second_index > append_index);
+
     let read = submit(
         SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[1])),
         WalRequest::ReadWal {
             from: start,
-            to: end,
-            minimum_index: append_index,
+            to: second_end,
+            minimum_index: second_index,
         },
     )
-    .await;
+    .await
+    .expect("read committed WAL through another live ingress");
+    let mut expected = wal.to_vec();
+    expected.extend_from_slice(second);
     assert_eq!(
         read,
         WalResponse::WalBytes {
-            payload: wal.to_vec()
+            payload: expected
         }
     );
+
+    fleet.children[2].kill().expect("stop third voter");
+    fleet.children[2].wait().expect("reap third voter");
+    let minority = submit(
+        address,
+        WalRequest::Append {
+            request_id: (u128::from(writer_epoch) << 64) | u128::from(second_end),
+            writer_epoch,
+            start_lsn: second_end,
+            payload: b"must-not-commit".to_vec(),
+        },
+    )
+    .await;
+    assert!(minority.is_err(), "two live voters must fail closed");
 }
