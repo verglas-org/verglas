@@ -1,16 +1,18 @@
 //! Multi-Raft group lifecycle hosted by one cache-node process.
 //!
-//! Group creation opens durable local state on every explicit voter, then asks
-//! the deterministic smallest voter to initialize Raft exactly once. The ring's
-//! gossip membership never changes these voter sets.
+//! Group creation opens durable local state concurrently on explicit voters,
+//! requires a Raft quorum, then asks the smallest successful voter to initialize
+//! Raft exactly once. The ring's gossip membership never changes these voter sets.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
+use futures::future::join_all;
 use openraft::BasicNode;
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -28,6 +30,8 @@ use crate::ring::RingPlane;
 
 type Raft = openraft::Raft<VerglasRaftConfig>;
 type PlaneError = Box<dyn std::error::Error + Send + Sync>;
+/// Bounds one peer's group-open request so an unreachable voter cannot block a quorum.
+const GROUP_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maps a stable fragment holder identity to the corresponding Raft voter id.
 fn numeric_node_id(node: &str) -> u64 {
@@ -288,22 +292,27 @@ impl ConsensusPlane {
         Ok(plane)
     }
 
-    /// Provisions a group on every voter and returns this ingress's local handle.
+    /// Provisions a group on a Raft quorum and returns this ingress's local handle.
+    ///
+    /// Opening is concurrent and bounded per voter.  A down voter is left for a
+    /// later provisioning request, while a minority fails before any bootstrap
+    /// attempt can form a group without a Raft majority.
     pub async fn ensure_group(
         self: &Arc<Self>,
         group: &str,
     ) -> Result<Arc<ConsensusGroup>, PlaneError> {
         validate_group(group)?;
         let network = self.network(group)?;
-        for voter in self.ring.consensus_voters() {
-            network.open_group(voter).await?;
+        let voters = self.ring.consensus_voters();
+        if voters.is_empty() {
+            return Err("consensus group has no voters".into());
         }
-        let bootstrap = self
-            .ring
-            .consensus_voters()
-            .into_iter()
-            .min()
-            .ok_or("consensus group has no voters")?;
+        let opened = open_voters(&network, voters).await?;
+        let bootstrap = opened
+            .iter()
+            .next()
+            .copied()
+            .ok_or("no voter opened the consensus group")?;
         network.bootstrap_group(bootstrap).await?;
         self.open_local(group).await
     }
@@ -448,6 +457,38 @@ impl ConsensusPlane {
     }
 }
 
+/// Opens every configured voter concurrently and returns the successful Raft quorum.
+///
+/// Each request has an independent hard deadline.  The selected bootstrap is
+/// the lowest successful voter, making initialization deterministic without
+/// making it depend on a specific unavailable node.
+async fn open_voters(
+    network: &RaftHttpTransport<verglas_cluster::StaticRaftAddressResolver>,
+    voters: Vec<u64>,
+) -> Result<BTreeSet<u64>, PlaneError> {
+    let quorum = voters.len() / 2 + 1;
+    let openings = voters.into_iter().map(|voter| async move {
+        (
+            voter,
+            tokio::time::timeout(GROUP_OPEN_TIMEOUT, network.open_group(voter)).await,
+        )
+    });
+    let opened = join_all(openings)
+        .await
+        .into_iter()
+        .filter_map(|(voter, result)| result.ok().and_then(Result::ok).map(|()| voter))
+        .collect::<BTreeSet<_>>();
+    if opened.len() < quorum {
+        return Err(format!(
+            "opened {} consensus voters, but a Raft quorum of {quorum} is required",
+            opened.len()
+        )
+        .into());
+    }
+    Ok(opened)
+}
+
+/// Rejects invalid dynamic group identities before they reach persistent storage.
 fn validate_group(group: &str) -> Result<(), PlaneError> {
     if group.is_empty() || group.len() > 512 {
         Err("consensus group identity is empty or too long".into())

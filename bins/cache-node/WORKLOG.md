@@ -192,3 +192,8 @@
   Membership repair stages into a separate namespace, so candidate fragments
   cannot overwrite the currently committed source allocation before Raft
   publishes the replacement certificate.
+- #135: Made dynamic consensus-group provisioning open all configured voters
+  concurrently with a hard per-peer deadline. It now proceeds only after a
+  Raft majority opens successfully and bootstraps through the lowest successful
+  voter, so one unavailable nonleader does not block the four-voter `2/2/3`
+  geometry while a two-voter minority still fails closed.
