@@ -445,7 +445,7 @@ fn build(
     geometry: AppendGeometry,
 ) -> EcAppendLog<MemStore> {
     EcAppendLog::open(
-        0, "default", store, "wal-bkt", "wal", transport, membership, dir, geometry,
+        "default", store, "wal-bkt", "wal", transport, membership, dir, geometry,
     )
     .expect("open append log")
 }
@@ -550,6 +550,41 @@ async fn append_acks_over_quorum_and_reads_back_the_tail() {
     );
 
     assert_eq!(log.flushed_through(), Lsn(0), "nothing flushed yet");
+}
+
+#[tokio::test]
+async fn origin_drain_waits_for_a_useful_wal_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let log = build(
+        MemStore::new(),
+        MemoryTransport::new(),
+        FakeMembership::new("n0", &["n0", "n1", "n2"]),
+        dir.path(),
+        geom(),
+    );
+
+    log.append(Epoch(0), Lsn(0), bytes(8 * 1024 * 1024))
+        .await
+        .expect("first Neon-sized WAL frame");
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            log.wait_for_flush_request(),
+        )
+        .await
+        .is_err(),
+        "a partial PostgreSQL WAL segment must wait for the timed drain",
+    );
+
+    log.append(Epoch(0), Lsn(8 * 1024 * 1024), bytes(8 * 1024 * 1024))
+        .await
+        .expect("second Neon-sized WAL frame");
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        log.wait_for_flush_request(),
+    )
+    .await
+    .expect("a full PostgreSQL WAL segment wakes the origin drain");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1135,14 +1170,13 @@ async fn truncate_beyond_the_flush_watermark_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn independent_safekeepers_publish_disjoint_recovery_state() {
+async fn another_ring_ingress_recovers_the_same_logical_wal_stream() {
     let first_dir = tempfile::tempdir().expect("first tmp");
     let second_dir = tempfile::tempdir().expect("second tmp");
     let store = MemStore::new();
     let transport = MemoryTransport::new();
     let membership = FakeMembership::new("n0", &["n0", "n1", "n2"]);
     let first = EcAppendLog::open(
-        1,
         "default",
         store.clone(),
         "wal-bkt",
@@ -1154,7 +1188,6 @@ async fn independent_safekeepers_publish_disjoint_recovery_state() {
     )
     .expect("open first safekeeper");
     let second = EcAppendLog::open(
-        2,
         "default",
         store,
         "wal-bkt",
@@ -1170,10 +1203,18 @@ async fn independent_safekeepers_publish_disjoint_recovery_state() {
         .initialize_timeline(Lsn(0x1000))
         .await
         .expect("initialize first");
-    second
-        .initialize_timeline(Lsn(0x1000))
+    first
+        .append(Epoch(1), Lsn(0x1000), bytes(4096))
         .await
-        .expect("initialize second");
+        .expect("append through first ingress");
+    assert!(
+        second
+            .recover_from_ring()
+            .await
+            .expect("recover through second ingress"),
+        "another ingress must discover the ring-committed timeline state"
+    );
+    assert_eq!(second.tail(), first.tail());
 
     let object_ids: HashSet<String> = transport
         .inner
@@ -1186,8 +1227,8 @@ async fn independent_safekeepers_publish_disjoint_recovery_state() {
         .collect();
     assert_eq!(
         object_ids.len(),
-        4,
-        "each safekeeper owns a distinct descriptor and head key"
+        3,
+        "one timeline owns two alternating descriptor slots and one head"
     );
 }
 

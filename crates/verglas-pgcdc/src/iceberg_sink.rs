@@ -67,7 +67,7 @@ impl SinkConfig {
             catalog_uri: self.catalog_uri.clone(),
             token: self.token.clone(),
             warehouse: self.warehouse.clone(),
-            s3_endpoint: self.s3_endpoint.clone(),
+            s3_endpoints: self.s3_endpoint.iter().cloned().collect(),
             region: self.region.clone(),
             access_key_id: self.access_key_id.clone(),
             secret_access_key: self.secret_access_key.clone(),
@@ -235,7 +235,7 @@ mod tests {
             secret_access_key: Some("secret".to_owned()),
         };
         let conn = cfg.connection();
-        assert_eq!(conn.s3_endpoint.as_deref(), Some("https://cache.internal"));
+        assert_eq!(conn.s3_endpoints, vec!["https://cache.internal"]);
         assert_eq!(conn.catalog_uri, "https://catalog.example");
     }
 }

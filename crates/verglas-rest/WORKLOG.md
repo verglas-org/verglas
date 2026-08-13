@@ -45,3 +45,4 @@
 - #81: Kept authorization registration after durable database creation so the resource uses the
   immutable database ID. A failed database create now leaves no authorization resource to remove.
 - #20: Added streaming queue subscription proxying and authorized subscribe operations as queue queries. Proxy responses now preserve upstream content types and bodies without buffering long-lived delivery streams.
+- #130: Rendered the complete cache-ring endpoint list into every isolated query and writer configuration. Workload FileIO can now distribute reads and Iceberg writes without a distinguished cache node.

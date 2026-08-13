@@ -25,6 +25,7 @@ use iceberg::io::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 use serde::{Deserialize, Serialize};
+use verglas_ring_proxy::EndpointPool;
 
 /// Fixed multipart part size: 8 MiB. Comfortably above S3's 5 MiB minimum for
 /// non-final parts and a clean power-of-two boundary. Every non-final part is
@@ -38,12 +39,18 @@ pub const PART_SIZE: usize = 8 * 1024 * 1024;
 pub struct FixedPartStorageFactory {
     /// The wrapped OpenDAL factory that builds the real S3 operator.
     inner: OpenDalStorageFactory,
+    /// Every S3 ingress assigned to this database or lakehouse.
+    endpoints: Vec<String>,
 }
 
 impl FixedPartStorageFactory {
-    /// Wraps `inner` so the storage it builds slices writes to [`PART_SIZE`].
-    pub fn new(inner: OpenDalStorageFactory) -> Self {
-        Self { inner }
+    /// Wraps every ring endpoint built by `inner` so object placement and fixed
+    /// multipart sizing apply below Iceberg FileIO.
+    pub fn new(inner: OpenDalStorageFactory, endpoints: Vec<String>) -> Result<Self> {
+        if !endpoints.is_empty() {
+            validate_endpoint_pool(&endpoints)?;
+        }
+        Ok(Self { inner, endpoints })
     }
 }
 
@@ -52,8 +59,117 @@ impl StorageFactory for FixedPartStorageFactory {
     /// Builds the inner OpenDAL storage and wraps it so multipart parts are
     /// fixed size.
     fn build(&self, config: &StorageConfig) -> Result<Arc<dyn Storage>> {
-        let inner = self.inner.build(config)?;
+        if self.endpoints.is_empty() {
+            let inner = self.inner.build(config)?;
+            return Ok(Arc::new(FixedPartStorage { inner }));
+        }
+        let mut members = Vec::with_capacity(self.endpoints.len());
+        for endpoint in &self.endpoints {
+            let mut props = config.props().clone();
+            props.insert(iceberg::io::S3_ENDPOINT.to_owned(), endpoint.clone());
+            members.push(self.inner.build(&StorageConfig::from_props(props))?);
+        }
+        let inner = Arc::new(RingStorage::new(self.endpoints.clone(), members)?);
         Ok(Arc::new(FixedPartStorage { inner }))
+    }
+}
+
+/// Validates that a workload has a complete, unambiguous endpoint pool.
+fn validate_endpoint_pool(endpoints: &[String]) -> Result<()> {
+    EndpointPool::new(endpoints.to_vec())
+        .map(|_| ())
+        .map_err(|error| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                format!("invalid S3 endpoint pool: {error}"),
+            )
+        })
+}
+
+/// Iceberg storage that assigns every operation for one object to one cache ingress.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RingStorage {
+    /// Stable placement policy shared by reads, writes, and multipart writers.
+    pool: EndpointPool,
+    /// Storage clients in the same order as the pool endpoints.
+    members: Vec<Arc<dyn Storage>>,
+}
+
+impl RingStorage {
+    /// Builds a storage pool with exactly one client per endpoint.
+    fn new(endpoints: Vec<String>, members: Vec<Arc<dyn Storage>>) -> Result<Self> {
+        if endpoints.len() != members.len() {
+            return Err(iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                "the S3 endpoint and storage-client counts differ",
+            ));
+        }
+        let pool = EndpointPool::new(endpoints).map_err(|error| {
+            iceberg::Error::new(
+                iceberg::ErrorKind::DataInvalid,
+                format!("invalid S3 endpoint pool: {error}"),
+            )
+        })?;
+        Ok(Self { pool, members })
+    }
+
+    /// Returns the one storage client assigned to `path`.
+    fn member(&self, path: &str) -> &Arc<dyn Storage> {
+        &self.members[self.pool.index_for_path(path)]
+    }
+}
+
+#[async_trait]
+#[typetag::serde(name = "RingStorage")]
+impl Storage for RingStorage {
+    /// Checks existence through the object's assigned ingress.
+    async fn exists(&self, path: &str) -> Result<bool> {
+        self.member(path).exists(path).await
+    }
+
+    /// Loads metadata through the object's assigned ingress.
+    async fn metadata(&self, path: &str) -> Result<FileMetadata> {
+        self.member(path).metadata(path).await
+    }
+
+    /// Reads the whole object through its assigned ingress.
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        self.member(path).read(path).await
+    }
+
+    /// Opens a range reader through the object's assigned ingress.
+    async fn reader(&self, path: &str) -> Result<Box<dyn FileRead>> {
+        self.member(path).reader(path).await
+    }
+
+    /// Writes a one-shot object through its assigned ingress.
+    async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
+        self.member(path).write(path, bs).await
+    }
+
+    /// Opens a multipart writer on one ingress for the complete object lifetime.
+    async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
+        self.member(path).writer(path).await
+    }
+
+    /// Deletes an object through the same ingress used by reads and writes.
+    async fn delete(&self, path: &str) -> Result<()> {
+        self.member(path).delete(path).await
+    }
+
+    /// Deletes a prefix through its stable assigned ingress.
+    async fn delete_prefix(&self, path: &str) -> Result<()> {
+        self.member(path).delete_prefix(path).await
+    }
+
+    /// Creates an input handle bound to the object's assigned ingress.
+    fn new_input(&self, path: &str) -> Result<InputFile> {
+        self.member(path).new_input(path)
+    }
+
+    /// Creates an output handle bound to the object's assigned ingress.
+    fn new_output(&self, path: &str) -> Result<OutputFile> {
+        self.member(path).new_output(path)
     }
 }
 
@@ -175,6 +291,7 @@ impl FileWrite for FixedPartWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iceberg::io::MemoryStorage;
     use std::sync::Mutex;
 
     /// A [`FileWrite`] that records the size of every forwarded write so a test
@@ -275,5 +392,60 @@ mod tests {
         let part_size = 1024;
         let sizes = forwarded_part_sizes(part_size, &[200, 300]).await;
         assert_eq!(sizes, vec![500], "got {sizes:?}");
+    }
+
+    /// Every Iceberg object class is readable through the same ring member that
+    /// accepted its write before any catalog pointer is involved.
+    #[tokio::test]
+    async fn ring_storage_covers_all_iceberg_file_io_objects() {
+        let endpoints = (0..4)
+            .map(|member| format!("http://cache-{member}:8333"))
+            .collect::<Vec<_>>();
+        let concrete = (0..4)
+            .map(|_| Arc::new(MemoryStorage::new()))
+            .collect::<Vec<_>>();
+        let members = concrete
+            .iter()
+            .cloned()
+            .map(|storage| storage as Arc<dyn Storage>)
+            .collect();
+        let ring = RingStorage::new(endpoints, members).expect("ring storage");
+        let object_kinds = [
+            "data",
+            "delete",
+            "manifest",
+            "manifest-list",
+            "metadata-json",
+            "puffin",
+        ];
+
+        for object in 0..256 {
+            let kind = object_kinds[object % object_kinds.len()];
+            let path = format!("memory:///warehouse/db/table/{kind}/object-{object:04}.bin");
+            let value = Bytes::from(format!("value-{object}"));
+            ring.write(&path, value.clone()).await.expect("ring write");
+            assert_eq!(ring.read(&path).await.expect("ring read"), value);
+
+            let owners =
+                futures::future::join_all(concrete.iter().map(|storage| storage.exists(&path)))
+                    .await
+                    .into_iter()
+                    .filter(|exists| matches!(exists, Ok(true)))
+                    .count();
+            assert_eq!(owners, 1, "one ingress owns {path}");
+        }
+
+        let used = futures::future::join_all(concrete.iter().map(|storage| async move {
+            for object in 0..256 {
+                let kind = object_kinds[object % object_kinds.len()];
+                let path = format!("memory:///warehouse/db/table/{kind}/object-{object:04}.bin");
+                if storage.exists(&path).await.unwrap_or(false) {
+                    return true;
+                }
+            }
+            false
+        }))
+        .await;
+        assert!(used.into_iter().all(|member| member));
     }
 }

@@ -57,10 +57,10 @@ async fn compaction_e2e_against_catalog_service() {
         catalog_uri: env_or("VG_COMPACTION_CATALOG_URI", "http://127.0.0.1:18799"),
         token: None, // dev-auth bypass (CATALOG_DEV_TENANT) — no bearer needed.
         warehouse: Some(env_or("VG_COMPACTION_WAREHOUSE", "warehouse")),
-        s3_endpoint: Some(env_or(
+        s3_endpoints: vec![env_or(
             "VG_COMPACTION_S3_ENDPOINT",
             "http://127.0.0.1:19010",
-        )),
+        )],
         region: env_or("VG_COMPACTION_REGION", "us-east-1"),
         access_key_id: Some(env_or("VG_COMPACTION_ACCESS_KEY_ID", "minioadmin")),
         secret_access_key: Some(env_or("VG_COMPACTION_SECRET_ACCESS_KEY", "minioadmin")),

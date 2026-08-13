@@ -19,9 +19,9 @@ pub struct Connection {
     pub token: Option<String>,
     /// Optional catalog warehouse identifier.
     pub warehouse: Option<String>,
-    /// S3 data endpoint URL, when one is known. Data files and queries are
-    /// routed through it so a server in the path gives cache residency.
-    pub s3_endpoint: Option<String>,
+    /// S3 data endpoints assigned to this workload's cache ring. A direct
+    /// object-store connection uses an empty list and its provider defaults.
+    pub s3_endpoints: Vec<String>,
     /// SigV4 signing region.
     pub region: String,
     /// Endpoint access key id, when known.

@@ -105,10 +105,6 @@ pub fn reclaim_legacy_state_descriptors(store: &LocalFragmentStore) -> Result<us
 /// write and for reading already-flushed ranges back; it is never on the append
 /// (commit) path.
 pub struct EcAppendLog<S> {
-    /// Stable identity of the safekeeper whose state this log represents.
-    /// Safekeepers advance and flush independently, so their replicated state
-    /// keys must not collide even though they receive the same WAL stream.
-    node_id: u64,
     /// Backend binding used for durable WAL objects.
     storage_binding_id: String,
     /// The S3 origin: flush target and flushed-range read source.
@@ -136,7 +132,8 @@ pub struct EcAppendLog<S> {
     flushed: AtomicU64,
     /// Mirror of the writer epoch.
     epoch: AtomicU64,
-    /// Wakes the origin drain immediately after a newly acknowledged append.
+    /// Wakes the origin drain after the open WAL segment reaches its useful
+    /// offload size. The server timer bounds low-volume tail latency.
     flush_requested: Notify,
 }
 
@@ -152,7 +149,6 @@ where
     // Bundling would only rename the same eight inputs.
     #[allow(clippy::too_many_arguments)]
     pub fn open(
-        node_id: u64,
         storage_binding_id: impl Into<String>,
         store: Arc<S>,
         bucket: impl Into<String>,
@@ -181,7 +177,6 @@ where
         let flushed = AtomicU64::new(manifest.flushed_through.0);
         let epoch = AtomicU64::new(manifest.epoch.0);
         Ok(Self {
-            node_id,
             storage_binding_id: storage_binding_id.into(),
             store,
             bucket: bucket.into(),
@@ -262,8 +257,6 @@ where
         digest.update(self.bucket.as_bytes());
         digest.update([0]);
         digest.update(self.prefix.trim_matches('/').as_bytes());
-        digest.update([0]);
-        digest.update(self.node_id.to_be_bytes());
         format!("sk/{:x}", digest.finalize())
     }
 
@@ -1005,11 +998,12 @@ where
             object_len: encoded.object_len,
             placements: placements.clone(),
         };
-        {
+        let segment_reached_target = {
             let seg = &mut manifest.segments[idx];
             seg.appends.push(entry);
             seg.end = end;
-        }
+            seg.end.0.saturating_sub(seg.start.0) >= SEGMENT_TARGET
+        };
         if fresh {
             manifest.base = begin_lsn;
             manifest.flushed_through = begin_lsn;
@@ -1036,7 +1030,9 @@ where
         self.tail.store(end.0, Ordering::Relaxed);
         self.flushed
             .store(manifest.flushed_through.0, Ordering::Relaxed);
-        self.flush_requested.notify_one();
+        if segment_reached_target {
+            self.flush_requested.notify_one();
+        }
 
         Ok(Appended {
             start: begin_lsn,

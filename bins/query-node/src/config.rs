@@ -91,16 +91,15 @@ impl Default for Listen {
     }
 }
 
-/// The cache S3 endpoint this binary reads table data through, and the SigV4
+/// The cache S3 endpoints this binary reads table data through, and the SigV4
 /// keypair it signs those reads with.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheEndpoint {
-    /// Base URL of the cache node's S3 surface (a `verglas-server` or
-    /// `verglas-cache-node` instance). Required: without it there is nowhere
+    /// Base URLs of every cache node's S3 surface. Required: without them there is nowhere
     /// to read table data from, and this binary never falls back to a direct
     /// object-store path.
-    pub s3_endpoint: String,
+    pub s3_endpoints: Vec<String>,
     /// Signing region. Unset defaults to `us-east-1`, matching the cache
     /// endpoint's own default.
     pub region: Option<String>,
@@ -139,8 +138,10 @@ impl QueryConfig {
     /// reads and queries against. Never includes credentials.
     pub fn summary(&self) -> String {
         format!(
-            "admin_port={} cache={} metadata={}",
-            self.listen.admin_port, self.cache.s3_endpoint, self.metadata.uri
+            "admin_port={} caches={} metadata={}",
+            self.listen.admin_port,
+            self.cache.s3_endpoints.join(","),
+            self.metadata.uri
         )
     }
 
@@ -161,16 +162,15 @@ impl QueryConfig {
                 path.display()
             ));
         }
-        if self.cache.s3_endpoint.is_empty() {
-            return Err("cache.s3_endpoint is required".to_owned());
+        if self.cache.s3_endpoints.is_empty() {
+            return Err("cache.s3_endpoints is required".to_owned());
         }
-        if !self.cache.s3_endpoint.starts_with("http://")
-            && !self.cache.s3_endpoint.starts_with("https://")
-        {
-            return Err(format!(
-                "cache.s3_endpoint `{}` must start with http:// or https://",
-                self.cache.s3_endpoint
-            ));
+        for endpoint in &self.cache.s3_endpoints {
+            if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                return Err(format!(
+                    "cache.s3_endpoints entry `{endpoint}` must start with http:// or https://"
+                ));
+            }
         }
         if !self.metadata.uri.starts_with("http://") && !self.metadata.uri.starts_with("https://") {
             return Err(format!(
@@ -202,7 +202,7 @@ mod tests {
             admin_port = 9000
 
             [cache]
-            s3_endpoint = "http://127.0.0.1:8333"
+            s3_endpoints = ["http://127.0.0.1:8333"]
 
             [metadata]
             uri = "http://127.0.0.1:8334/catalog"
@@ -210,7 +210,7 @@ mod tests {
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         config.validate().expect("valid");
         assert_eq!(config.listen.admin_port, 9000);
-        assert_eq!(config.cache.s3_endpoint, "http://127.0.0.1:8333");
+        assert_eq!(config.cache.s3_endpoints, ["http://127.0.0.1:8333"]);
         assert_eq!(config.metadata.uri, "http://127.0.0.1:8334/catalog");
     }
 
@@ -220,7 +220,7 @@ mod tests {
     fn defaults_the_admin_port() {
         let toml = r#"
             [cache]
-            s3_endpoint = "http://127.0.0.1:8333"
+            s3_endpoints = ["http://127.0.0.1:8333"]
 
             [metadata]
             uri = "http://127.0.0.1:8334/catalog"
@@ -241,7 +241,7 @@ mod tests {
             spill_path = "/tmp"
 
             [cache]
-            s3_endpoint = "http://127.0.0.1:8333"
+            s3_endpoints = ["http://127.0.0.1:8333"]
 
             [metadata]
             uri = "http://127.0.0.1:8334/catalog"
@@ -258,14 +258,14 @@ mod tests {
     fn rejects_a_non_http_cache_endpoint() {
         let toml = r#"
             [cache]
-            s3_endpoint = "127.0.0.1:8333"
+            s3_endpoints = ["127.0.0.1:8333"]
 
             [metadata]
             uri = "http://127.0.0.1:8334/catalog"
         "#;
         let config = QueryConfig::from_toml_str(toml).expect("parses");
         let err = config.validate().expect_err("rejected");
-        assert!(err.contains("cache.s3_endpoint"), "{err}");
+        assert!(err.contains("cache.s3_endpoints"), "{err}");
     }
 
     /// A credentials file that does not exist is rejected at validation, not
@@ -274,7 +274,7 @@ mod tests {
     fn rejects_a_missing_credentials_file() {
         let toml = r#"
             [cache]
-            s3_endpoint = "http://127.0.0.1:8333"
+            s3_endpoints = ["http://127.0.0.1:8333"]
             credentials_file = "/nonexistent/creds"
 
             [metadata]
@@ -290,7 +290,7 @@ mod tests {
     fn rejects_unknown_fields() {
         let toml = r#"
             [cache]
-            s3_endpoint = "http://127.0.0.1:8333"
+            s3_endpoints = ["http://127.0.0.1:8333"]
             bogus = true
 
             [catalog]
@@ -305,7 +305,7 @@ mod tests {
     fn rejects_direct_catalog_configuration() {
         let toml = r#"
             [cache]
-            s3_endpoint = "http://127.0.0.1:8333"
+            s3_endpoints = ["http://127.0.0.1:8333"]
 
             [metadata]
             uri = "http://127.0.0.1:8334/catalog"

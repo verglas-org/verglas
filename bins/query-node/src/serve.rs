@@ -83,7 +83,7 @@ fn connection_for_bearer(config: &QueryConfig, bearer_token: String) -> Result<C
         catalog_uri: config.metadata.uri.clone(),
         token: Some(bearer_token),
         warehouse: None,
-        s3_endpoint: Some(config.cache.s3_endpoint.clone()),
+        s3_endpoints: config.cache.s3_endpoints.clone(),
         region: config
             .cache
             .region
@@ -277,7 +277,7 @@ mod tests {
     /// Returns a minimal token-free role configuration for connection tests.
     fn config(metadata_uri: &str) -> QueryConfig {
         QueryConfig::from_toml_str(&format!(
-            "[cache]\ns3_endpoint = \"http://127.0.0.1:8333\"\n\n\
+            "[cache]\ns3_endpoints = [\"http://127.0.0.1:8333\"]\n\n\
              [metadata]\nuri = \"{metadata_uri}\"\n"
         ))
         .expect("query config")

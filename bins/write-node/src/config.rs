@@ -37,8 +37,8 @@ impl Default for Listen {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct CacheEndpoint {
-    /// Verglas S3 endpoint. There is no direct-origin fallback.
-    pub s3_endpoint: String,
+    /// Every Verglas S3 endpoint in the workload's ring. There is no direct-origin fallback.
+    pub s3_endpoints: Vec<String>,
     /// SigV4 signing region.
     pub region: Option<String>,
     /// AWS-INI keypair accepted by the cache endpoint.
@@ -60,7 +60,12 @@ impl WriteConfig {
 
     /// Validates endpoints and named credentials files before startup.
     fn validate(&self) -> Result<(), String> {
-        validate_http_url("cache.s3_endpoint", &self.cache.s3_endpoint)?;
+        if self.cache.s3_endpoints.is_empty() {
+            return Err("cache.s3_endpoints is required".to_owned());
+        }
+        for endpoint in &self.cache.s3_endpoints {
+            validate_http_url("cache.s3_endpoints", endpoint)?;
+        }
         validate_http_url("catalog.uri", &self.catalog.uri)?;
         if self.catalog.credentials_file.is_some()
             || self.catalog.bearer_token.is_some()
@@ -110,7 +115,7 @@ mod tests {
         let path = dir.path().join("write.toml");
         std::fs::write(
             &path,
-            "[cache]\ns3_endpoint = \"http://127.0.0.1:8333\"\n\n\
+            "[cache]\ns3_endpoints = [\"http://127.0.0.1:8333\"]\n\n\
              [catalog]\nuri = \"http://127.0.0.1:8334/v1/databases/analytics/catalog\"\n\
              bearer_token = \"persisted-caller-secret\"\n",
         )

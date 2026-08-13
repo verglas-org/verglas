@@ -646,3 +646,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #109: Kept database gateway lookup compatible with the merged immutable database-name contract.
   The consolidated server now passes the resolved name directly and remains clean under clippy.
 - #20: Required the configured Access edge for isolated write workers so acknowledged Iceberg snapshots publish durable table events before the write response succeeds.
+- #130: Passed cache coordinates to embedded query and writer dispatchers as endpoint lists. The one-node self-hosted server remains a one-member ring without retaining a separate selected-endpoint code path.

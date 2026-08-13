@@ -788,7 +788,7 @@ fn internal_connection(
         catalog_uri: format!("{scheme}://127.0.0.1:{admin_port}/catalog"),
         token: catalog.resolve_bearer_token()?,
         warehouse: catalog.warehouse.clone(),
-        s3_endpoint: Some(format!("{scheme}://127.0.0.1:{s3_port}")),
+        s3_endpoints: vec![format!("{scheme}://127.0.0.1:{s3_port}")],
         region: config
             .backend
             .region
@@ -828,7 +828,7 @@ fn build_query_worker_dispatcher(
             std::path::PathBuf::from(&query_worker.binary),
             verglas_server::query_worker::QueryWorkerRuntimeConfig {
                 config_dir: dir.join("databases"),
-                cache_s3_endpoint: format!("{scheme}://127.0.0.1:{resolved_s3_port}"),
+                cache_s3_endpoints: vec![format!("{scheme}://127.0.0.1:{resolved_s3_port}")],
                 region: config
                     .backend
                     .region
@@ -878,7 +878,7 @@ fn build_write_worker_dispatcher(
             std::path::PathBuf::from(&write_worker.binary),
             verglas_server::write_worker::WriteWorkerRuntimeConfig {
                 config_dir: dir.join("databases"),
-                cache_s3_endpoint: format!("{scheme}://127.0.0.1:{resolved_s3_port}"),
+                cache_s3_endpoints: vec![format!("{scheme}://127.0.0.1:{resolved_s3_port}")],
                 region: config
                     .backend
                     .region
