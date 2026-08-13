@@ -320,8 +320,12 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     .expect("a restarted durable follower must reopen its group from Raft traffic");
     assert!(matches!(recovered, WalResponse::Applied { .. }));
 
-    fleet.children[3].kill().expect("stop restarted fourth voter");
-    fleet.children[3].wait().expect("reap restarted fourth voter");
+    fleet.children[3]
+        .kill()
+        .expect("stop restarted fourth voter");
+    fleet.children[3]
+        .wait()
+        .expect("reap restarted fourth voter");
     let minority = submit(
         address,
         WalRequest::Append {
