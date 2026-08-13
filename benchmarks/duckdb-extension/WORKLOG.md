@@ -34,3 +34,7 @@
 - #126: Added failing gates for the direct catalog endpoint and the physical
   compressed Iceberg footprint. A row estimate cannot substitute for proving
   the committed data files exceed four worker-memory budgets.
+- #126: Made the managed benchmark bind its catalog-created tables to the
+  database's explicit R2 FileIO and compare typed row results independently of
+  Arrow batch boundaries. Direct and extension Quack servers now share fixed
+  operator limits, persistent protocol sessions, and a stable metadata snapshot.

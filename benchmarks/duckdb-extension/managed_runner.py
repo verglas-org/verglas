@@ -7,7 +7,6 @@ REST catalog, then each command talks to the endpoint named in its environment.
 """
 import argparse
 import hashlib
-import io
 import json
 import os
 import pathlib
@@ -27,27 +26,30 @@ def _sql_string(value):
     return "'" + value.replace("'", "''") + "'"
 
 
-def canonical_sql(workload):
+def canonical_sql(workload, catalog=None):
     """Return the catalog-relative SQL shared by all product transports."""
-    table = ".".join((
+    parts = [
         os.environ.get("VERGLAS_BENCHMARK_NAMESPACE", TABLE.split(".")[0]),
         os.environ.get("VERGLAS_BENCHMARK_TABLE", TABLE.split(".")[1]),
-    ))
+    ]
+    if catalog is not None:
+        parts.insert(0, catalog)
+    table = ".".join(parts)
     statements = {
         "scan": (
-            f"SELECT count(*) AS rows, sum(value) AS total, "
-            f"sum(length(payload)) AS payload_bytes FROM {table}"
+            f"SELECT count(*) AS rows, CAST(sum(value) AS BIGINT) AS total, "
+            f"CAST(sum(length(payload)) AS BIGINT) AS payload_bytes FROM {table}"
         ),
         "selective_aggregate": (
-            f"SELECT category, count(*) AS rows, sum(value) AS total "
+            f"SELECT category, count(*) AS rows, CAST(sum(value) AS BIGINT) AS total "
             f"FROM {table} WHERE category BETWEEN 8 AND 15 GROUP BY category ORDER BY category"
         ),
         "external_sort": (
-            "SELECT sum(rn) AS row_number_sum FROM ("
+            "SELECT CAST(sum(rn) AS BIGINT) AS row_number_sum FROM ("
             f"SELECT row_number() OVER (ORDER BY value DESC, id) AS rn FROM {table})"
         ),
         "spill_heavy_join": (
-            f"SELECT l.category, count(*) AS rows, sum(l.value + r.value) AS total "
+            f"SELECT l.category, count(*) AS rows, CAST(sum(l.value + r.value) AS BIGINT) AS total "
             f"FROM {table} l JOIN {table} r ON l.id = r.id "
             "WHERE l.category < 32 GROUP BY l.category ORDER BY l.category"
         ),
@@ -68,11 +70,12 @@ def direct_quack_setup(catalog_token, r2_access_key, r2_secret_key):
         "LOAD quack",
         "CREATE OR REPLACE SECRET benchmark_r2 ("
         "TYPE S3, PROVIDER CONFIG, KEY_ID " + _sql_string(r2_access_key) + ", SECRET " + _sql_string(r2_secret_key)
-        + ", REGION 'auto', ENDPOINT " + _sql_string(r2_endpoint.removeprefix("https://")) + ")",
+        + ", REGION 'auto', ENDPOINT " + _sql_string(r2_endpoint.removeprefix("https://"))
+        + ", URL_STYLE 'path', USE_SSL true)",
         "ATTACH " + _sql_string(warehouse) + " AS managed (TYPE ICEBERG, "
         "ENDPOINT " + _sql_string(catalog_url) + ", TOKEN "
         + _sql_string(catalog_token) + ", ACCESS_DELEGATION_MODE 'none')",
-        "USE managed",
+        "USE managed.benchmark",
     )
 
 
@@ -90,7 +93,9 @@ def extension_quack_setup(extension_path):
 def product_sql(path, workload):
     """Wrap canonical SQL only when the real Quack extension transport requires it."""
     sql = canonical_sql(workload)
-    if path in ("quack_direct", "verglas_query_worker"):
+    if path == "quack_direct":
+        return sql
+    if path == "verglas_query_worker":
         return sql
     if path == "quack_verglas_extension":
         return "SELECT * FROM verglas_query(" + _sql_string(sql) + ")"
@@ -154,12 +159,38 @@ class ManagedConfig:
         )
 
     def iceberg_properties(self):
-        """Return the managed REST properties that vend the warehouse's storage access."""
+        """Return managed REST commits plus the database's explicit R2 write binding."""
         return {
             "uri": self.catalog_url,
             "token": self.catalog_token,
             "warehouse": self.warehouse,
+            # R2 cannot mint STS credentials. Lakekeeper remains the metadata
+            # commit authority while the benchmark signs data and manifest I/O
+            # with the storage binding attached to the managed database.
+            "header.X-Iceberg-Access-Delegation": "",
+            "s3.endpoint": self.r2_endpoint,
+            "s3.access-key-id": self.r2_access_key,
+            "s3.secret-access-key": self.r2_secret_key,
+            "s3.region": "auto",
+            "s3.path-style-access": "true",
+            "py-io-impl": "pyiceberg.io.pyarrow.PyArrowFileIO",
         }
+
+    def storage_properties(self):
+        """Return only the explicit signed R2 FileIO properties."""
+        return {
+            "s3.endpoint": self.r2_endpoint,
+            "s3.access-key-id": self.r2_access_key,
+            "s3.secret-access-key": self.r2_secret_key,
+            "s3.region": "auto",
+            "s3.path-style-access": "true",
+        }
+
+
+def bind_explicit_storage_io(table, file_io_factory, properties):
+    """Replace REST-vended remote signing with the database's fixed R2 binding."""
+    table.io = file_io_factory(properties)
+    return table
 
 
 def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_000):
@@ -169,6 +200,7 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
         raise ValueError("batch_rows must be positive")
     import pyarrow as pa
     from pyiceberg.catalog.rest import RestCatalog
+    from pyiceberg.io.pyarrow import PyArrowFileIO
     from pyiceberg.schema import Schema
     from pyiceberg.types import LongType, NestedField, StringType
 
@@ -183,7 +215,11 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
     )
     # A run name must be unique. Reusing a table would silently retain an old
     # snapshot and make the cache comparison non-reproducible.
-    table = catalog.create_table(identifier, schema=schema, properties={"format-version": "2"})
+    table = bind_explicit_storage_io(
+        catalog.create_table(identifier, schema=schema, properties={"format-version": "2"}),
+        PyArrowFileIO,
+        config.storage_properties(),
+    )
     for offset in range(0, rows, batch_rows):
         stop = min(rows, offset + batch_rows)
         ids = pa.array(range(offset, stop), type=pa.int64())
@@ -199,7 +235,9 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
             )),
         })
         table.append(data)
-    table = catalog.load_table(identifier)
+    table = bind_explicit_storage_io(
+        catalog.load_table(identifier), PyArrowFileIO, config.storage_properties()
+    )
     snapshot = table.current_snapshot()
     if snapshot is None or not snapshot.manifest_list:
         raise RuntimeError("Lakekeeper committed no current Iceberg snapshot")
@@ -221,18 +259,16 @@ def bootstrap_managed_table(config, rows, worker_memory_mib, batch_rows=1_000_00
 
 
 def _arrow_identity(reader, started):
-    """Stream Arrow batches, hashing the typed IPC bytes rather than parsed text values."""
-    import pyarrow.ipc as ipc
+    """Stream Arrow batches into a batch-boundary-independent typed row digest."""
     rows, ttfr = 0, None
     schema = [[field.name, str(field.type).upper()] for field in reader.schema]
     digest = hashlib.sha256(json.dumps(schema, separators=(",", ":")).encode())
     for batch in reader:
         if batch.num_rows and ttfr is None:
             ttfr = (time.perf_counter_ns() - started) / 1_000_000
-        encoded = io.BytesIO()
-        with ipc.new_stream(encoded, batch.schema) as writer:
-            writer.write_batch(batch)
-        digest.update(encoded.getvalue())
+        for row in batch.to_pylist():
+            digest.update(json.dumps(row, sort_keys=True, separators=(",", ":"), default=str).encode())
+            digest.update(b"\n")
         rows += batch.num_rows
     return rows, schema, digest.hexdigest(), ttfr if ttfr is not None else 0.0
 
@@ -264,27 +300,66 @@ def measure_query_worker(endpoint, database, token, sql, repetitions, warmups):
     return [_measure(request) for _ in range(repetitions)]
 
 
+def quack_client_setup(host, token):
+    """Attach one persistent Quack catalog for all warm-up and measured requests."""
+    return (
+        "ATTACH " + _sql_string("quack:" + host + ":9000")
+        + " AS benchmark_remote (TOKEN " + _sql_string(token)
+        + ", DISABLE_SSL true)",
+    )
+
+
+def direct_snapshot_view_setup(namespace, table, metadata_location):
+    """Expose one immutable catalog snapshot in Quack's local catalog."""
+    for identifier in (namespace, table):
+        if not identifier.replace("_", "").isalnum() or identifier[0].isdigit():
+            raise ValueError("benchmark identifiers must contain only letters, digits, and underscores")
+    if not metadata_location.startswith("s3://"):
+        raise ValueError("benchmark metadata location must be an absolute S3 URI")
+    return (
+        "USE memory.main",
+        "CREATE SCHEMA " + namespace,
+        "CREATE VIEW " + namespace + "." + table + " AS SELECT * FROM iceberg_scan("
+        + _sql_string(metadata_location) + ")",
+        "DETACH managed",
+    )
+
+
 def measure_quack(host, sql, repetitions, warmups):
-    """Call a Quack server over Quack protocol; no HTTP or local SQL substitute exists."""
+    """Call a Quack server over one persistent protocol connection."""
     import duckdb
     connection = duckdb.connect(":memory:")
     connection.execute("INSTALL quack")
     connection.execute("LOAD quack")
+    for statement in quack_client_setup(host, "benchmark-token"):
+        connection.execute(statement)
     def request():
         return connection.execute(
-            "FROM quack_query(?, ?, token = 'benchmark-token', disable_ssl = true)",
-            ["quack:" + host + ":9000", sql],
+            "FROM quack_query_by_name('benchmark_remote', ?)",
+            [sql],
         ).fetch_record_batch(65_536)
     for _ in range(warmups):
         _measure(request)
     return [_measure(request) for _ in range(repetitions)]
 
 
+def apply_duckdb_limits(connection):
+    """Apply the Query Worker's one-thread, 512 MiB operator budget to DuckDB."""
+    connection.execute("SET threads = 1")
+    connection.execute("SET memory_limit = '512 MiB'")
+
+
 def serve_direct_quack(config):
     """Expose direct-R2 Iceberg DuckDB through Quack after its catalog is attached."""
     import duckdb
     connection = duckdb.connect(":memory:")
+    apply_duckdb_limits(connection)
     for statement in direct_quack_setup(config.catalog_token, config.r2_access_key, config.r2_secret_key):
+        connection.execute(statement)
+    metadata_location = os.environ.get("VERGLAS_ICEBERG_METADATA_LOCATION")
+    if not metadata_location:
+        raise RuntimeError("direct Quack requires VERGLAS_ICEBERG_METADATA_LOCATION")
+    for statement in direct_snapshot_view_setup(config.namespace, config.table, metadata_location):
         connection.execute(statement)
     connection.execute("CALL quack_serve('quack:0.0.0.0:9000', token = 'benchmark-token', allow_other_hostname = true, disable_ssl = true)")
     while True:
@@ -295,6 +370,7 @@ def serve_extension_quack(extension):
     """Expose the loaded Verglas extension through Quack with no direct catalog attachment."""
     import duckdb
     connection = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    apply_duckdb_limits(connection)
     for statement in extension_quack_setup(extension):
         connection.execute(statement)
     while True:
