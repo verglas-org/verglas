@@ -18,3 +18,6 @@
   table and transaction commits. The record binds the operation and canonical
   input fingerprint to the original result, so restart or alternate-ingress
   retries replay exactly while mismatched key reuse returns a conflict.
+- #135: Return the conventional Iceberg `CommitFailedException` for optimistic
+  catalog conflicts and a distinct 409 for mismatched idempotency-key reuse.
+  Added direct receipt-matching and public error-boundary regression tests.

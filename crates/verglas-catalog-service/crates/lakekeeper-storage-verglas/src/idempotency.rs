@@ -85,7 +85,7 @@ impl HostedIdempotency {
         Ok(())
     }
 
-    /// Resolves a final result only after a CRaft conflict, never before the mutation attempt.
+    /// Resolves a finalized result before a retry or after a racing CRaft conflict.
     pub(crate) async fn replay<R: DeserializeOwned>(
         &self,
         catalog: &VerglasCatalog,
@@ -98,12 +98,17 @@ impl HostedIdempotency {
         };
         // A different operation or input fingerprint under the same key conflicts;
         // it must never be treated as a successful replay.
-        if record.operation != self.operation || record.fingerprint != self.fingerprint {
+        if !self.matches(&record) {
             return Err(VerglasCatalogError::IdempotencyConflict);
         }
         serde_json::from_str(&record.result)
             .map(Some)
             .map_err(VerglasCatalogError::Decode)
+    }
+
+    /// Returns whether a durable receipt belongs to this exact operation and input.
+    fn matches(&self, record: &IdempotencyRecord) -> bool {
+        record.operation == self.operation && record.fingerprint == self.fingerprint
     }
 
     /// Returns the typed stable record identity owned by the warehouse group.
@@ -138,5 +143,43 @@ fn canonical_value(value: serde_json::Value) -> serde_json::Value {
                 .collect(),
         ),
         scalar => scalar,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for durable retry identity matching.
+
+    use lakekeeper::service::idempotency::IdempotencyKey;
+    use serde_json::json;
+
+    use super::{HostedIdempotency, IdempotencyRecord};
+
+    /// Reuse of one key for another operation or input never replays success.
+    #[test]
+    fn changed_operation_or_input_does_not_match_a_receipt() {
+        let key = IdempotencyKey::parse("550e8400-e29b-41d4-a716-446655440000").expect("valid key");
+        let original = HostedIdempotency::new(
+            key,
+            "commit_table",
+            &json!({"snapshot": 1}),
+            &json!({"metadata_location": "s3://metadata/one.json"}),
+        )
+        .expect("original identity");
+        let record = IdempotencyRecord {
+            operation: original.operation.clone(),
+            fingerprint: original.fingerprint.clone(),
+            result: original.result.clone(),
+        };
+        let changed_operation =
+            HostedIdempotency::new(key, "commit_transaction", &json!({"snapshot": 1}), &())
+                .expect("changed operation");
+        let changed_input =
+            HostedIdempotency::new(key, "commit_table", &json!({"snapshot": 2}), &())
+                .expect("changed input");
+
+        assert!(original.matches(&record));
+        assert!(!changed_operation.matches(&record));
+        assert!(!changed_input.matches(&record));
     }
 }

@@ -78,20 +78,28 @@ fn durable_id(kind: &str, identity: &str) -> String {
 
 /// Converts durable transport failures into the standard Iceberg error model.
 fn storage_error(error: VerglasCatalogError) -> IcebergErrorResponse {
-    if error.is_conflict() {
-        return ErrorModel::conflict(
-            format!("CRaft catalog conflict: {error}"),
-            "CatalogConflict",
+    match error {
+        VerglasCatalogError::Client(verglas_catalog::ManagedCatalogError::Conflict) => {
+            ErrorModel::conflict(
+                "catalog transaction conflicts with current state",
+                "CommitFailedException",
+                None,
+            )
+            .into()
+        }
+        VerglasCatalogError::IdempotencyConflict => ErrorModel::conflict(
+            "idempotency key is bound to a different catalog mutation",
+            "IdempotencyConflict",
+            None,
+        )
+        .into(),
+        error => ErrorModel::service_unavailable(
+            format!("CRaft catalog is unavailable: {error}"),
+            "CatalogUnavailable",
             Some(Box::new(error)),
         )
-        .into();
+        .into(),
     }
-    ErrorModel::service_unavailable(
-        format!("CRaft catalog is unavailable: {error}"),
-        "CatalogUnavailable",
-        Some(Box::new(error)),
-    )
-    .into()
 }
 
 /// The complete durable result required to replay a table commit after failover or restart.
@@ -1221,7 +1229,8 @@ mod tests {
 
     use lakekeeper::api::iceberg::v1::{NamespaceIdent, Prefix};
 
-    use super::namespace_key;
+    use super::{namespace_key, storage_error};
+    use crate::VerglasCatalogError;
 
     /// Namespace keys include the routed warehouse and every namespace level.
     #[test]
@@ -1267,5 +1276,23 @@ mod tests {
             super::hosted_defaults("warehouse-a").get("prefix"),
             Some(&"warehouse-a".to_owned())
         );
+    }
+
+    /// Optimistic catalog failures use the standard Iceberg commit-conflict response.
+    #[test]
+    fn catalog_conflict_maps_to_commit_failed_response() {
+        let response = storage_error(VerglasCatalogError::Client(
+            verglas_catalog::ManagedCatalogError::Conflict,
+        ));
+        assert_eq!(response.error.code, 409);
+        assert_eq!(response.error.r#type, "CommitFailedException");
+    }
+
+    /// Reusing an idempotency key for different input is also a final HTTP 409.
+    #[test]
+    fn idempotency_conflict_maps_to_conflict_response() {
+        let response = storage_error(VerglasCatalogError::IdempotencyConflict);
+        assert_eq!(response.error.code, 409);
+        assert_eq!(response.error.r#type, "IdempotencyConflict");
     }
 }

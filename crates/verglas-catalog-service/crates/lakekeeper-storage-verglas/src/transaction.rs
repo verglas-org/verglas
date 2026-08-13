@@ -65,9 +65,10 @@ impl VerglasTransaction {
 mod tests {
     //! Tests for local transaction validation before any consensus request.
 
+    use verglas_consensus::{CatalogAction, CatalogEntity, CatalogRequirement};
+
     use super::VerglasTransaction;
     use crate::{ImmutableMetadataStore, MetadataStoreError, VerglasCatalog, VerglasCatalogError};
-    use verglas_consensus::{CatalogAction, CatalogEntity, CatalogRequirement};
 
     /// One idempotency key always maps to the same CRaft request identity, even when the payload differs.
     #[test]
