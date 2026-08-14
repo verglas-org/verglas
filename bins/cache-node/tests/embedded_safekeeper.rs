@@ -19,6 +19,10 @@ const WAREHOUSE: &str = "tpch";
 const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
 const WAL_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
+/// Process-level fleets release reserved ports before their children bind them.
+/// Keep the four fleet tests from racing each other for those ports.
+static FLEET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Kills child cache nodes even when an assertion fails.
 struct Fleet {
     /// Spawned cache-node processes.
@@ -255,6 +259,7 @@ async fn submit_catalog(
 /// Four real cache nodes preserve writes with one voter down and refuse two failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cache_node_embeds_the_ring_backed_safekeeper() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
     let ring_ports = [free_port(), free_port(), free_port(), free_port()];
     let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
@@ -461,6 +466,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
 /// The public WAL listener accepts benchmark-sized appends but retains a hard body ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodies() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
     let ring_ports = [free_port(), free_port(), free_port(), free_port()];
     let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
@@ -564,6 +570,7 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
 /// A large WAL tail continues through every surviving ingress after its first leader dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_wal_append_continues_after_exact_leader_death() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
     let ring_ports = [free_port(), free_port(), free_port(), free_port()];
     let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
@@ -699,6 +706,7 @@ async fn large_wal_append_continues_after_exact_leader_death() {
 /// Four native-catalog ingresses retain linearizable availability after their elected leader dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
     let ring_ports = [free_port(), free_port(), free_port(), free_port()];
     let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
