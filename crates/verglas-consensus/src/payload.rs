@@ -540,16 +540,31 @@ impl PayloadStore for DistributedPayloadStore {
             index,
             certificate,
         } = release;
-        for voter in certificate.holders() {
-            let slot = certificate
-                .voters()
-                .iter()
-                .position(|candidate| candidate == voter)
-                .ok_or(PayloadError::UnknownHolder)?;
-            let record = self
-                .transport
-                .load(*voter, hash, group, configuration_generation, request)
-                .await?;
+        let loaded = join_all(certificate.holders().iter().copied().map(|voter| {
+            let transport = Arc::clone(&self.transport);
+            async move {
+                let slot = certificate
+                    .voters()
+                    .iter()
+                    .position(|candidate| *candidate == voter)
+                    .ok_or(PayloadError::UnknownHolder)?;
+                let record = transport
+                    .load(voter, hash, group, configuration_generation, request)
+                    .await?;
+                Ok::<_, PayloadError>((voter, slot, record))
+            }
+        }))
+        .await;
+        for result in loaded {
+            // Release runs only after a durable checkpoint has replaced the
+            // cached payload as authority. An unavailable former holder may
+            // retain garbage until it returns; every reachable copy must still
+            // match the exact committed identity before any deletion begins.
+            let (_voter, slot, record) = match result {
+                Ok(loaded) => loaded,
+                Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            };
             if record.is_some_and(|record| {
                 record.group != group
                     || record.configuration_generation != configuration_generation
@@ -563,9 +578,30 @@ impl PayloadStore for DistributedPayloadStore {
             }) {
                 return Err(PayloadError::CorruptRepresentation);
             }
-            self.transport
-                .delete(*voter, hash, group, configuration_generation, request, slot)
-                .await?;
+        }
+        // A peer can fsync a concurrent stage request after the leader has
+        // already formed its minimum certificate. The request identity and
+        // configured slot make deletion safe on every voter, and doing so is
+        // required to reclaim those successful-but-uncertified races.
+        let deleted = join_all(certificate.voters().iter().copied().enumerate().map(
+            |(slot, voter)| {
+                let transport = Arc::clone(&self.transport);
+                async move {
+                    transport
+                        .delete(voter, hash, group, configuration_generation, request, slot)
+                        .await
+                }
+            },
+        ))
+        .await;
+        for result in deleted {
+            // Reclamation cannot make a committed archive unavailable merely
+            // because one old cache holder is down. A later compaction pass
+            // may remove its idempotently addressed fragment after recovery.
+            match result {
+                Ok(()) | Err(PayloadError::Transport(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

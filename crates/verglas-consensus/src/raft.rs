@@ -266,6 +266,18 @@ impl EntryHeader {
         Ok(self)
     }
 
+    /// Binds this timeline group to one non-empty WAL archive bucket.
+    pub fn with_wal_archive_bucket(mut self, bucket: String) -> Result<Self, CertificateError> {
+        if self.kind != CommandKind::WalArchiveBinding
+            || self.payload_len != bucket.len() as u64
+            || bucket.is_empty()
+        {
+            return Err(CertificateError { required: 1 });
+        }
+        self.metadata = EntryMetadata::WalArchiveBinding { bucket };
+        Ok(self)
+    }
+
     /// Binds a verified object-store WAL archive watermark.
     pub fn with_archive_segment(
         mut self,
@@ -369,6 +381,8 @@ pub enum EntryMetadata {
         /// First byte accepted by the timeline WAL stream.
         start: u64,
     },
+    /// Immutable object-store bucket assigned to this timeline's WAL archive.
+    WalArchiveBinding { bucket: String },
     /// Exact half-open WAL byte range.
     Wal {
         /// First appended LSN.
@@ -403,6 +417,8 @@ pub enum RaftCommand {
         configuration_generation: u64,
         certificate: PayloadCertificate,
     },
+    /// Prunes WAL allocation metadata only after its object-store checkpoint is committed.
+    ReleaseWal { through_lsn: u64 },
 }
 
 /// Deterministic state-machine response returned after an entry applies.

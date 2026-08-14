@@ -75,6 +75,8 @@ impl RequestId {
 pub enum CommandKind {
     /// Establishes the immutable initial PostgreSQL WAL position.
     TimelineOpen,
+    /// Binds one timeline to its immutable object-store archive bucket.
+    WalArchiveBinding,
     /// Catalog mutation.
     Catalog,
     /// Tenant-root warehouse registration.

@@ -20,7 +20,7 @@ use verglas_consensus::{
     AppliedOutcome, CatalogAction, CatalogBatch, CatalogEntity, CatalogRequirement, CommandKind,
     ConsensusGroup, EntryHeader, FilePayloadReplica, GroupRequest, GroupResponse,
     PayloadCertificate, PayloadSet, PayloadStore, PersistentLogStore, PersistentStateMachine,
-    RaftCommand, ReleaseRequest, ReplicationMode, RequestId, SealRequest, VerglasRaftConfig,
+    RaftCommand, ReplicationMode, RequestId, SealRequest, VerglasRaftConfig,
 };
 
 type Raft = openraft::Raft<VerglasRaftConfig>;
@@ -264,6 +264,10 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         .collect::<Result<Vec<_>, _>>()
         .expect("payload replicas");
     let payloads = Arc::new(PayloadSet::new(3, 2, payload_replicas).expect("payload set"));
+    state_machines[&replacement]
+        .attach_payload_store(payloads.clone())
+        .await
+        .expect("attach payload store");
     let leader_group = ConsensusGroup::new(
         "warehouse/a",
         1,
@@ -369,6 +373,14 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         catalog_body
     );
 
+    leader_group
+        .bind_wal_archive(
+            RequestId::from_u128(60),
+            "verglas/wal/archive".to_owned(),
+            &[1, 2, 3],
+        )
+        .await
+        .expect("bind the timeline archive before opening WAL");
     let opened = leader_group
         .open_timeline(RequestId::from_u128(61), 0x1000, &[1, 2, 3])
         .await
@@ -460,27 +472,13 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         .await
         .expect("archive checkpoint");
     assert_eq!(checkpoint.archive_lsn, Some(0x1003));
-    let wal_header = state_machines[&replacement]
-        .committed_header(wal.index)
-        .await
-        .expect("committed WAL header");
-    let wal_log_id = state_machines[&replacement]
-        .committed_log_id(wal.index)
-        .await
-        .expect("committed WAL log identity");
-    payloads
-        .release(ReleaseRequest {
-            hash: wal_header.payload_hash(),
-            group: wal_header.group(),
-            configuration_generation: wal_header.configuration_generation(),
-            request: wal_header.request(),
-            length: wal_header.payload_len(),
-            term: wal_log_id.leader_id.term,
-            index: wal_log_id.index,
-            certificate: wal_header.certificate(),
-        })
-        .await
-        .expect("release checkpoint-covered local WAL allocation");
+    assert!(
+        state_machines[&replacement]
+            .committed_header(wal.index)
+            .await
+            .is_none(),
+        "the archive checkpoint must prune its released WAL header"
+    );
     let GroupResponse::ArchivedWalReadPlan(plan) = leader_group
         .execute(GroupRequest::ReadWal {
             from: 0x1000,
@@ -515,28 +513,6 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
     };
     assert_eq!(archive_state.checkpointed_end(), 0x1003);
     assert_eq!(archive_state.committed_end(), 0x101a);
-    let restored_wal = payloads
-        .stage_local(
-            RequestId::from_u128(52),
-            "warehouse/a",
-            1,
-            ReplicationMode::Coded,
-            b"wal",
-            &[1, 2, 3, 4, 5],
-        )
-        .expect("restage WAL allocation for unrelated catalog-read coverage");
-    payloads
-        .seal(SealRequest {
-            hash: restored_wal.hash(),
-            group: "warehouse/a",
-            configuration_generation: 1,
-            request: RequestId::from_u128(52),
-            term: wal_log_id.leader_id.term,
-            index: wal_log_id.index,
-            certificate: restored_wal.certificate(),
-        })
-        .await
-        .expect("reseal restored WAL allocation");
     leader_group
         .release_writer(RequestId::from_u128(57), 1, &[1, 2, 3])
         .await

@@ -374,27 +374,40 @@ fn backend_bucket_is_required_and_gates_validation() {
 }
 
 #[test]
-fn wal_archive_requires_an_explicitly_served_bucket() {
+fn catalog_archive_has_its_own_explicit_target_and_reserved_prefix() {
     let config = Config::from_toml_str(&format!(
-        "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket = \"table-data\"\n[wal_archive]\nbucket = \"unserved-archive\"\n",
-        scratch_dir("wal-archive-unserved").display()
+        "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket = \"catalog-archive\"\n[catalog_archive]\nbucket = \"catalog-archive\"\n",
+        scratch_dir("catalog-archive-prefix").display()
     ))
-    .expect("archive config parses");
-    let error = config
-        .validate()
-        .expect_err("an archive bucket outside the authorized set must fail");
-    assert!(error.to_string().contains("wal_archive.bucket"));
+    .expect("catalog archive config parses");
+    config.validate().expect("catalog archive config validates");
+    assert_eq!(
+        config.catalog_archive.expect("catalog archive").prefix,
+        "_verglas/catalog"
+    );
 }
 
 #[test]
-fn wal_archive_defaults_to_the_reserved_prefix() {
+fn catalog_archive_requires_an_explicitly_served_bucket() {
     let config = Config::from_toml_str(&format!(
-        "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket = \"archive\"\n[wal_archive]\nbucket = \"archive\"\n",
-        scratch_dir("wal-archive-prefix").display()
+        "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket = \"table-data\"\n[catalog_archive]\nbucket = \"unserved-archive\"\n",
+        scratch_dir("catalog-archive-unserved").display()
     ))
-    .expect("archive config parses");
-    config.validate().expect("archive config validates");
-    assert_eq!(config.wal_archive.expect("archive").prefix, "_verglas/wal");
+    .expect("catalog archive config parses");
+    let error = config
+        .validate()
+        .expect_err("an archive bucket outside the authorized set must fail");
+    assert!(error.to_string().contains("catalog_archive.bucket"));
+}
+
+#[test]
+fn global_wal_archive_config_is_rejected() {
+    let error = Config::from_toml_str(&format!(
+        "[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n[backend]\nbucket = \"tenant-bucket\"\n[wal_archive]\nbucket = \"shared-wal\"\n",
+        scratch_dir("global-wal-archive").display()
+    ))
+    .expect_err("a process-global WAL archive would defeat per-database isolation");
+    assert!(error.to_string().contains("wal_archive"));
 }
 
 #[test]

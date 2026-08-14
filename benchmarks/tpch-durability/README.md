@@ -22,13 +22,22 @@ Rust package pinned to the workspace's `verglas-safekeeper` crate. It imports
 `WalRequest` and `WalResponse` and therefore uses the canonical strict wire
 codec rather than copying the binary frame parser.
 
-Set three fresh, local-only values before running. They are intentionally not
-stored in this repository and must not be production credentials.
+Set fresh local credentials and the real tenant-local access-service inputs
+before running. The access service must mint the caller session and the
+Lakekeeper workload credential; the benchmark does not substitute an allow-all
+authorization fixture.
 
 ```sh
 export TPCH_DURABILITY_S3_ACCESS_KEY='local-run-access-key'
 export TPCH_DURABILITY_S3_SECRET_KEY='replace-with-a-fresh-local-value'
 export TPCH_DURABILITY_CLUSTER_SECRET='replace-with-a-fresh-local-value'
+export TPCH_DURABILITY_CATALOG_EVENT_TOKEN='replace-with-a-fresh-local-value'
+export TPCH_DURABILITY_CACHE_IMAGE='codex/verglas-cache-node:current'
+export TPCH_DURABILITY_LAKEKEEPER_IMAGE='codex/verglas-lakekeeper:current'
+export TPCH_DURABILITY_ACCESS_ENDPOINT='http://host.docker.internal:8345/'
+export TPCH_DURABILITY_TENANT_ID='local'
+export TPCH_DURABILITY_LAKEKEEPER_POLICY_TOKEN_FILE='/absolute/path/verglas-lakekeeper.token'
+export TPCH_DURABILITY_CALLER_TOKEN='session-minted-for-the-data-plane-audience'
 python3 -m pip install -r benchmarks/tpch-durability/requirements.txt
 ```
 

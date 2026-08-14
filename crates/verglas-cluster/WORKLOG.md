@@ -159,3 +159,7 @@
   on its own OS thread. Raft and fragment RPCs now remain schedulable while the
   public S3/WAL/NBD runtime is saturated, and shutdown drains then joins that
   runtime so the peer listener does not outlive its cache node.
+- #135: Increased the bounded fragment recovery deadline to accommodate
+  multi-megabyte shards served by CPU-throttled peers. A delayed-peer regression
+  keeps healthy durable fragments available while blackholed reads still fail
+  before the longer placement budget.

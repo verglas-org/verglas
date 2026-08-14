@@ -98,7 +98,7 @@ fn write_config(root: &std::path::Path, index: usize, s3: u16, admin: u16) -> st
     .expect("credentials");
     let config = node.join("config.toml");
     let body = format!(
-        "[listen]\ns3_port = {s3}\nadmin_port = {admin}\n\n[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\ndram_bytes = \"80MB\"\n\n[backend]\nbucket = \"wal-test\"\nendpoint = \"http://127.0.0.1:9\"\nallow_http = true\nregion = \"us-east-1\"\ncredentials_file = \"{}\"\n\n[wal_archive]\nbucket = \"wal-test\"\nprefix = \"_verglas/test-wal\"\n\n[auth]\ncredentials_file = \"{}\"\n",
+        "[listen]\ns3_port = {s3}\nadmin_port = {admin}\n\n[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\ndram_bytes = \"80MB\"\n\n[backend]\nbucket = \"wal-test\"\nbucket_globs = [\"catalog-test\"]\nendpoint = \"http://127.0.0.1:9\"\nallow_http = true\nregion = \"us-east-1\"\ncredentials_file = \"{}\"\n\n[catalog_archive]\nbucket = \"catalog-test\"\nprefix = \"_verglas/test-catalog\"\n\n[auth]\ncredentials_file = \"{}\"\n",
         node.display(),
         credentials.display(),
         credentials.display(),
@@ -121,6 +121,7 @@ fn spawn_node(
         .arg(config)
         .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
         .env("VERGLAS_NODE_ID", format!("node-{index}"))
+        .env("VERGLAS_CATALOG_EVENT_TOKEN", "embedded-control-token")
         .env("VERGLAS_RING_PEERS", peers)
         .env("VERGLAS_SAFEKEEPER_EC_K", "2")
         .env("VERGLAS_SAFEKEEPER_EC_M", "2")
@@ -168,6 +169,40 @@ async fn submit(addr: SocketAddr, request: WalRequest) -> Result<WalResponse, St
     }
     WalResponse::decode(&response.bytes().await.expect("WAL response body"))
         .map_err(|error| error.to_string())
+}
+
+/// Reads the admin port rendered into one cache-node test config.
+fn admin_port(config: &std::path::Path) -> u16 {
+    std::fs::read_to_string(config)
+        .expect("read node config")
+        .lines()
+        .find_map(|line| line.strip_prefix("admin_port = "))
+        .and_then(|raw| raw.parse().ok())
+        .expect("admin port in node config")
+}
+
+/// Commits the test timeline's required per-database WAL archive binding.
+async fn bind_timeline(addr: SocketAddr) -> Result<(), String> {
+    let response = reqwest::Client::new()
+        .post(format!("http://{addr}/admin/neon/timeline-bindings"))
+        .bearer_auth("embedded-control-token")
+        .json(&serde_json::json!({
+            "tenant_id": TENANT,
+            "timeline_id": TIMELINE,
+            "bucket": "wal-test",
+        }))
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT {
+        Ok(())
+    } else {
+        Err(format!(
+            "bind timeline failed with {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ))
+    }
 }
 
 /// Sends one complete canonical WAL request and leaves its HTTP status visible.
@@ -246,6 +281,9 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     }
     let mut fleet = Fleet { children, stderr };
     fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+    bind_timeline(SocketAddr::from(([127, 0, 0, 1], admin_port(&configs[0]))))
+        .await
+        .expect("bind timeline archive bucket");
 
     let address = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
     let opened = submit(
@@ -450,6 +488,9 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
         .collect();
     let mut fleet = Fleet { children, stderr };
     fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+    bind_timeline(SocketAddr::from(([127, 0, 0, 1], admin_port(&configs[0]))))
+        .await
+        .expect("bind timeline archive bucket");
 
     let address = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
     let opened = submit(
@@ -550,6 +591,9 @@ async fn large_wal_append_continues_after_exact_leader_death() {
         .collect();
     let mut fleet = Fleet { children, stderr };
     fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+    bind_timeline(SocketAddr::from(([127, 0, 0, 1], admin_port(&configs[0]))))
+        .await
+        .expect("bind timeline archive bucket");
 
     let leader = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
     let start = match submit(

@@ -122,6 +122,20 @@ impl ConsensusGroup {
     /// Executes one universal catalog or WAL operation through this group.
     pub async fn execute(&self, request: GroupRequest) -> Result<GroupResponse, GroupError> {
         match request {
+            GroupRequest::BindWalArchive {
+                request_id,
+                bucket,
+                holders,
+            } => Ok(GroupResponse::Applied(
+                self.bind_wal_archive(RequestId::from_u128(request_id), bucket, &holders)
+                    .await?,
+            )),
+            GroupRequest::WalArchiveBinding => {
+                self.read_fence().await?;
+                Ok(GroupResponse::WalArchiveBinding(
+                    self.state_machine.wal_archive_bucket().await,
+                ))
+            }
             GroupRequest::OpenTimeline {
                 request_id,
                 start_lsn,
@@ -332,6 +346,31 @@ impl ConsensusGroup {
         .await
     }
 
+    /// Commits the one immutable archive bucket used by this timeline group.
+    pub async fn bind_wal_archive(
+        &self,
+        request: RequestId,
+        bucket: String,
+        holders: &[u64],
+    ) -> Result<RaftResponse, GroupError> {
+        self.commit_header(
+            request,
+            CommandKind::WalArchiveBinding,
+            ReplicationMode::Complete,
+            Bytes::copy_from_slice(bucket.as_bytes()),
+            None,
+            holders,
+            |header| header.with_wal_archive_bucket(bucket),
+        )
+        .await
+    }
+
+    /// Reads the committed archive bucket after a current-term quorum fence.
+    pub async fn wal_archive_binding(&self) -> Result<Option<String>, GroupError> {
+        self.read_fence().await?;
+        Ok(self.state_machine.wal_archive_bucket().await)
+    }
+
     /// Commits the next exclusive writer epoch for one Neon timeline group.
     pub async fn acquire_writer(
         &self,
@@ -430,16 +469,27 @@ impl ConsensusGroup {
         if segment.end_lsn() != end_lsn {
             return Err(GroupError::InvalidArchiveCheckpoint);
         }
-        self.commit_header(
-            request,
-            CommandKind::ArchiveCheckpoint,
-            ReplicationMode::Complete,
-            Bytes::copy_from_slice(object.as_bytes()),
-            None,
-            holders,
-            |header| header.with_archive_segment(segment),
-        )
-        .await
+        let response = self
+            .commit_header(
+                request,
+                CommandKind::ArchiveCheckpoint,
+                ReplicationMode::Complete,
+                Bytes::copy_from_slice(object.as_bytes()),
+                None,
+                holders,
+                |header| header.with_archive_segment(segment),
+            )
+            .await?;
+        self.state_machine
+            .release_checkpointed_wal_payloads()
+            .await?;
+        self.raft
+            .client_write(crate::RaftCommand::ReleaseWal {
+                through_lsn: end_lsn,
+            })
+            .await
+            .map_err(|error| GroupError::Raft(error.to_string()))?;
+        Ok(response)
     }
 
     /// Returns a current-term fenced WAL archive state for background release decisions.
@@ -473,10 +523,11 @@ impl ConsensusGroup {
     ) -> Result<GroupResponse, GroupError> {
         match self.read_wal(from, to, minimum_index).await {
             Ok(bytes) => Ok(GroupResponse::Bytes(bytes.to_vec())),
-            Err(GroupError::Payload(PayloadError::ReconstructionUnavailable)) => {
+            Err(error @ GroupError::Payload(PayloadError::ReconstructionUnavailable))
+            | Err(error @ GroupError::WalOutOfRange) => {
                 let (_, checkpointed_end) = self.state_machine.wal_archive_state().await;
                 if from >= checkpointed_end {
-                    return Err(GroupError::Payload(PayloadError::ReconstructionUnavailable));
+                    return Err(error);
                 }
                 Ok(GroupResponse::ArchivedWalReadPlan(
                     self.wal_read_plan(from, to, minimum_index).await?,
@@ -1046,6 +1097,14 @@ impl ConsensusGroup {
 /// Universal command envelope routed through any cache ingress.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GroupRequest {
+    /// Binds a timeline group to its immutable WAL archive bucket before writes.
+    BindWalArchive {
+        request_id: u128,
+        bucket: String,
+        holders: Vec<u64>,
+    },
+    /// Reads the linearizable archive bucket binding for this timeline group.
+    WalArchiveBinding,
     /// Establishes the immutable first PostgreSQL WAL position for a timeline.
     OpenTimeline {
         request_id: u128,
@@ -1135,6 +1194,8 @@ pub enum GroupRequest {
 /// Universal response produced only by an applied state machine or read fence.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum GroupResponse {
+    /// The immutable WAL archive bucket bound to this timeline, if provisioned.
+    WalArchiveBinding(Option<String>),
     /// One state transition applied through Raft.
     Applied(RaftResponse),
     /// One committed WAL range.

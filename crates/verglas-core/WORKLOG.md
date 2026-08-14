@@ -76,6 +76,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   ceilings plus the live read-path counters and DRAM-tier usage, so bench reports
   can stamp tier context on every number and the nvme/constrained profiles can
   prove disk-serving and eviction from real counters.
+
 - #27/#28: evolved the `Ring` trait so a live gossip-backed ring can implement
   it — `members()` now returns an owned `Vec<NodeId>` snapshot (a ring whose
   membership swaps atomically has no stable slice to borrow) and a new
@@ -430,3 +431,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   materialized blocks, reporting admission separately from transport failure.
 - #133: Moved the memory-grant contract into the engine core so query roles no longer depend on the extracted client SDK. Standalone and hosted launchers now share an engine-owned sizing boundary.
 - #135: Added an explicit WAL archive bucket and reserved object prefix to cache-node configuration. Ring deployments must opt into the storage namespace they authorize for background timeline archival rather than writing into table paths implicitly.
+- #135: Added the explicit `[catalog_archive]` config target alongside
+  `[wal_archive]`. It validates against the served bucket set and defaults to a
+  distinct reserved prefix, so cloud provisioning can bind catalog checkpoints
+  to the tenant catalog bucket.
+- #135: Removed the process-global WAL archive target. Each Neon timeline now
+  receives its immutable bucket binding through the consensus-backed admin
+  contract, while `[catalog_archive]` remains the fixed catalog checkpoint target.

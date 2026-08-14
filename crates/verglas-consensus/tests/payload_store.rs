@@ -9,8 +9,8 @@ use bytes::Bytes;
 use tempfile::TempDir;
 use verglas_consensus::{
     DistributedPayloadStore, FilePayloadReplica, PayloadError, PayloadRepresentation, PayloadSet,
-    PayloadStore, ReconstructRequest, ReplicationMode, RepresentationTransport, RequestId,
-    SealRequest,
+    PayloadStore, ReconstructRequest, ReleaseRequest, ReplicationMode, RepresentationTransport,
+    RequestId, SealRequest,
 };
 
 /// Transport whose first voter is unavailable while every later committed voter fsyncs writes.
@@ -82,6 +82,8 @@ struct SelectivelyUnavailableTransport {
     records: Mutex<BTreeMap<u64, PayloadRepresentation>>,
     /// Voters that currently fail peer operations.
     unavailable: Mutex<BTreeSet<u64>>,
+    /// Controlled per-holder delete latency for release concurrency tests.
+    delete_delay: Mutex<std::time::Duration>,
 }
 
 impl SelectivelyUnavailableTransport {
@@ -90,6 +92,7 @@ impl SelectivelyUnavailableTransport {
         Arc::new(Self {
             records: Mutex::new(BTreeMap::new()),
             unavailable: Mutex::new(BTreeSet::new()),
+            delete_delay: Mutex::new(std::time::Duration::ZERO),
         })
     }
 
@@ -99,6 +102,21 @@ impl SelectivelyUnavailableTransport {
             .lock()
             .expect("unavailable voters lock")
             .insert(voter);
+    }
+
+    /// Delays every holder delete by the same deterministic interval.
+    fn set_delete_delay(&self, delay: std::time::Duration) {
+        *self.delete_delay.lock().expect("delete delay lock") = delay;
+    }
+
+    /// Returns every voter that currently retains this test's representation.
+    fn stored_voters(&self) -> BTreeSet<u64> {
+        self.records
+            .lock()
+            .expect("stored representations lock")
+            .keys()
+            .copied()
+            .collect()
     }
 
     /// Rewrites one stored seal to exercise reconstruction identity validation.
@@ -135,6 +153,8 @@ impl RepresentationTransport for SelectivelyUnavailableTransport {
             .lock()
             .expect("stored representations lock")
             .insert(voter, representation);
+        // Model an RPC whose peer has fsynced before its response is observed.
+        tokio::task::yield_now().await;
         Ok(())
     }
 
@@ -174,6 +194,8 @@ impl RepresentationTransport for SelectivelyUnavailableTransport {
         request: RequestId,
         slot: usize,
     ) -> Result<(), PayloadError> {
+        let delay = *self.delete_delay.lock().expect("delete delay lock");
+        tokio::time::sleep(delay).await;
         if !self.reachable(voter) {
             return Err(PayloadError::Transport("voter is unavailable".to_owned()));
         }
@@ -189,6 +211,155 @@ impl RepresentationTransport for SelectivelyUnavailableTransport {
         }
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn release_validates_then_deletes_certified_holders_concurrently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let transport = SelectivelyUnavailableTransport::new();
+    let payloads = DistributedPayloadStore::new(2, 2, vec![1, 2, 3, 4], transport.clone())?;
+    let request = RequestId::from_u128(190);
+    let staged = payloads
+        .stage(
+            request,
+            "timeline/release",
+            7,
+            ReplicationMode::Coded,
+            b"release concurrently",
+            &[1, 2, 3, 4],
+        )
+        .await?;
+    payloads
+        .seal(SealRequest {
+            hash: staged.hash(),
+            group: "timeline/release",
+            configuration_generation: 7,
+            request,
+            term: 3,
+            index: 11,
+            certificate: staged.certificate(),
+        })
+        .await?;
+    transport.set_delete_delay(std::time::Duration::from_millis(100));
+    tokio::time::timeout(
+        std::time::Duration::from_millis(180),
+        payloads.release(ReleaseRequest {
+            hash: staged.hash(),
+            group: "timeline/release",
+            configuration_generation: 7,
+            request,
+            length: staged.length(),
+            term: 3,
+            index: 11,
+            certificate: staged.certificate(),
+        }),
+    )
+    .await
+    .map_err(|_| "certified holder deletes ran serially")??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn checkpoint_release_tolerates_an_unavailable_former_holder()
+-> Result<(), Box<dyn std::error::Error>> {
+    let transport = SelectivelyUnavailableTransport::new();
+    let payloads = DistributedPayloadStore::new(2, 2, vec![1, 2, 3, 4], transport.clone())?;
+    let request = RequestId::from_u128(192);
+    let staged = payloads
+        .stage(
+            request,
+            "timeline/checkpoint-release",
+            7,
+            ReplicationMode::Coded,
+            b"checkpointed WAL no longer depends on cached fragments",
+            &[1, 2, 3, 4],
+        )
+        .await?;
+    payloads
+        .seal(SealRequest {
+            hash: staged.hash(),
+            group: "timeline/checkpoint-release",
+            configuration_generation: 7,
+            request,
+            term: 3,
+            index: 13,
+            certificate: staged.certificate(),
+        })
+        .await?;
+
+    let unavailable = *staged
+        .certificate()
+        .holders()
+        .first()
+        .ok_or("coded certificate must contain a holder")?;
+    transport.make_unavailable(unavailable);
+    payloads
+        .release(ReleaseRequest {
+            hash: staged.hash(),
+            group: "timeline/checkpoint-release",
+            configuration_generation: 7,
+            request,
+            length: staged.length(),
+            term: 3,
+            index: 13,
+            certificate: staged.certificate(),
+        })
+        .await?;
+
+    assert_eq!(
+        transport.stored_voters(),
+        BTreeSet::from([unavailable]),
+        "reachable cached copies must be reclaimed without making a dead peer block archival"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn release_reclaims_successful_noncertificate_stage_races()
+-> Result<(), Box<dyn std::error::Error>> {
+    let transport = SelectivelyUnavailableTransport::new();
+    let payloads = DistributedPayloadStore::new(2, 2, vec![1, 2, 3, 4], transport.clone())?;
+    let request = RequestId::from_u128(191);
+    let staged = payloads
+        .stage(
+            request,
+            "timeline/orphan-race",
+            7,
+            ReplicationMode::Coded,
+            b"all four stores can finish before the first three replies are certified",
+            &[1, 2, 3, 4],
+        )
+        .await?;
+    assert_eq!(staged.certificate().holders().len(), 3);
+    assert_eq!(transport.stored_voters(), BTreeSet::from([1, 2, 3, 4]));
+    payloads
+        .seal(SealRequest {
+            hash: staged.hash(),
+            group: "timeline/orphan-race",
+            configuration_generation: 7,
+            request,
+            term: 3,
+            index: 12,
+            certificate: staged.certificate(),
+        })
+        .await?;
+    payloads
+        .release(ReleaseRequest {
+            hash: staged.hash(),
+            group: "timeline/orphan-race",
+            configuration_generation: 7,
+            request,
+            length: staged.length(),
+            term: 3,
+            index: 12,
+            certificate: staged.certificate(),
+        })
+        .await?;
+    assert!(
+        transport.stored_voters().is_empty(),
+        "checkpoint release must reclaim successful stage races outside the certificate"
+    );
+    Ok(())
 }
 
 #[tokio::test]

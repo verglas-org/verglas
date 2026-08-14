@@ -26,6 +26,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use sha2::{Digest, Sha256};
 use verglas_backend::{BackendStore, BackendStores};
 use verglas_block::{ObjectBackend, ObjectStoreBackend};
 use verglas_cache::HybridCacheEngine;
@@ -48,7 +49,7 @@ use crate::admin;
 /// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
 /// Storage binding for the built-in managed lakehouse database.
-const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
+pub(crate) const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
 
 /// The default NBD listen port for the block-device tier (#382). An attach
 /// client connects a kernel NBD client here; the export name selects the
@@ -414,22 +415,24 @@ pub async fn run(
             )
             .await
             .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let archive = config.wal_archive.as_ref().ok_or_else(|| {
+            let catalog_archive = config.catalog_archive.as_ref().ok_or_else(|| {
                 std::io::Error::other(
-                    "wal_archive is required when the authoritative cache ring is enabled",
+                    "catalog_archive is required when the authoritative cache ring is enabled",
                 )
             })?;
-            let archive_store = registry.store_for(DEFAULT_STORAGE_BINDING_ID, &archive.bucket)?;
-            let archive_store: Arc<dyn verglas_safekeeper::ImmutableSegmentStore> =
-                Arc::new(crate::safekeeper::ObjectArchiveStore::new(archive_store));
+            let catalog_store =
+                registry.store_for(DEFAULT_STORAGE_BINDING_ID, &catalog_archive.bucket)?;
+            let catalog_store: Arc<dyn verglas_safekeeper::ImmutableSegmentStore> =
+                Arc::new(crate::safekeeper::ObjectArchiveStore::new(catalog_store));
+            let archives = crate::safekeeper::AuthoritativeArchives {
+                wal_registry: Arc::clone(&registry),
+                catalog: crate::safekeeper::CatalogArchiveDestination::new(
+                    catalog_store,
+                    catalog_archive.prefix.clone(),
+                ),
+            };
             let _ = bucket;
-            Some((
-                Arc::clone(ring),
-                layout,
-                consensus,
-                archive_store,
-                archive.prefix.clone(),
-            ))
+            Some((Arc::clone(ring), layout, consensus, archives))
         }
         _ => {
             eprintln!(
@@ -440,7 +443,7 @@ pub async fn run(
     };
     let object_consensus = safekeeper_args
         .as_ref()
-        .map(|(_, _, consensus, _, _)| Arc::clone(consensus));
+        .map(|(_, _, consensus, _)| Arc::clone(consensus));
     let shutdown_consensus = object_consensus.clone();
 
     // An external Iceberg REST endpoint is always an explicitly eventual
@@ -480,10 +483,9 @@ pub async fn run(
     );
     let authoritative_stop = safekeeper_args
         .as_ref()
-        .map(|(ring, _, consensus, store, prefix)| {
+        .map(|(ring, _, consensus, archives)| {
             let consensus = Arc::clone(consensus);
-            let store = Arc::clone(store);
-            let prefix = prefix.clone();
+            let archives = archives.clone();
             let holders = ring
                 .consensus_voters()
                 .into_iter()
@@ -491,15 +493,13 @@ pub async fn run(
                 .collect::<Vec<_>>();
             let stop: admin::AuthoritativeStop = Arc::new(move || {
                 let consensus = Arc::clone(&consensus);
-                let store = Arc::clone(&store);
-                let prefix = prefix.clone();
+                let archives = archives.clone();
                 let holders = holders.clone();
                 let future: futures::future::BoxFuture<'static, Result<(), String>> =
                     Box::pin(async move {
                         crate::safekeeper::drain_authoritative_groups(
                             Arc::clone(&consensus),
-                            store,
-                            prefix,
+                            archives,
                             holders,
                         )
                         .await?;
@@ -513,7 +513,7 @@ pub async fn run(
             stop
         });
     if let Some(quiescence) = quiescence {
-        if let Some((ring, _, consensus, _, _)) = safekeeper_args.as_ref() {
+        if let Some((ring, _, consensus, _)) = safekeeper_args.as_ref() {
             let consensus = Arc::clone(consensus);
             let ring = Arc::clone(ring);
             let replace: admin::MembershipReplace = Arc::new(move |request| {
@@ -546,6 +546,66 @@ pub async fn run(
             admin_app = admin_app.merge(admin::membership_router(quiescence.clone(), replace));
         }
         admin_app = admin_app.merge(admin::quiescence_router(quiescence, authoritative_stop));
+    }
+    if let (Some((ring, _, consensus, archives)), Ok(token)) = (
+        safekeeper_args.as_ref(),
+        std::env::var("VERGLAS_CATALOG_EVENT_TOKEN"),
+    ) && !token.is_empty()
+    {
+        let consensus = Arc::clone(consensus);
+        let registry = Arc::clone(&archives.wal_registry);
+        let holders = ring
+            .consensus_voters()
+            .into_iter()
+            .take(ring.consensus_voters().len() / 2 + 1)
+            .collect::<Vec<_>>();
+        let bind: admin::NeonTimelineBinding = Arc::new(move |request| {
+            let consensus = Arc::clone(&consensus);
+            let registry = Arc::clone(&registry);
+            let holders = holders.clone();
+            Box::pin(async move {
+                registry
+                    .store_for(DEFAULT_STORAGE_BINDING_ID, &request.bucket)
+                    .map_err(|error| error.to_string())?;
+                let group = format!("timeline/{}/{}", request.tenant_id, request.timeline_id);
+                let digest = Sha256::digest(
+                    format!(
+                        "wal-archive-binding\0{}\0{}\0{}",
+                        request.tenant_id, request.timeline_id, request.bucket
+                    )
+                    .as_bytes(),
+                );
+                let request_id = u128::from_be_bytes(
+                    digest[..16]
+                        .try_into()
+                        .map_err(|_| "WAL archive binding identity malformed".to_owned())?,
+                );
+                match consensus
+                    .submit(
+                        &group,
+                        verglas_consensus::GroupRequest::BindWalArchive {
+                            request_id,
+                            bucket: request.bucket,
+                            holders,
+                        },
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    verglas_consensus::GroupResponse::Applied(response)
+                        if matches!(
+                            response.outcome,
+                            verglas_consensus::AppliedOutcome::Committed
+                                | verglas_consensus::AppliedOutcome::Duplicate
+                        ) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err("timeline WAL archive binding was not committed".to_owned()),
+                }
+            })
+        });
+        admin_app = admin_app.merge(admin::neon_timeline_binding_router(token, bind));
     }
     admin_app = admin_app.merge(admin::track_http(
         crate::page_cache::router(Arc::clone(&page_cache_slot)),
@@ -676,16 +736,9 @@ pub async fn run(
     let safekeeper_activity = activity.clone();
     let safekeeper_fut = async move {
         match safekeeper_args {
-            Some((ring, layout, consensus, archive_store, archive_prefix)) => {
-                crate::safekeeper::serve(
-                    ring,
-                    layout,
-                    consensus,
-                    archive_store,
-                    archive_prefix,
-                    safekeeper_activity,
-                )
-                .await
+            Some((ring, layout, consensus, archives)) => {
+                crate::safekeeper::serve(ring, layout, consensus, archives, safekeeper_activity)
+                    .await
             }
             None => {
                 std::future::pending::<()>().await;

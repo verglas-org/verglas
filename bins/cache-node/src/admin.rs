@@ -95,6 +95,8 @@ pub const CATALOG_EVENTS_PATH: &str = "/admin/catalog/events";
 pub const AUTHORITATIVE_STOP_PATH: &str = "/admin/lifecycle/authoritative-stop";
 /// Authenticated authoritative-voter replacement endpoint.
 pub const MEMBERSHIP_REPLACE_PATH: &str = "/admin/lifecycle/membership/replace";
+/// Authenticated control-plane binding from a Neon timeline to its WAL bucket.
+pub const NEON_TIMELINE_BINDINGS_PATH: &str = "/admin/neon/timeline-bindings";
 
 /// One explicit authoritative-voter replacement request.
 #[derive(Deserialize)]
@@ -104,6 +106,17 @@ pub struct MembershipReplaceRequest {
     pub add: u64,
     pub node_id: String,
     pub address: std::net::SocketAddr,
+}
+
+/// One immutable durable-object binding requested before a Neon timeline opens.
+#[derive(Deserialize)]
+pub struct NeonTimelineBindingRequest {
+    /// Tenant component of the consensus timeline group identity.
+    pub tenant_id: String,
+    /// Timeline component of the consensus timeline group identity.
+    pub timeline_id: String,
+    /// Tigris bucket authorized for only this timeline's WAL archive objects.
+    pub bucket: String,
 }
 
 #[derive(Clone)]
@@ -165,6 +178,52 @@ pub type AuthoritativeStop = Arc<dyn Fn() -> BoxFuture<'static, Result<(), Strin
 /// Async replacement supplied by the consensus lifecycle owner.
 pub type MembershipReplace =
     Arc<dyn Fn(MembershipReplaceRequest) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+/// Binds a consensus timeline to its immutable WAL archive bucket.
+pub type NeonTimelineBinding =
+    Arc<dyn Fn(NeonTimelineBindingRequest) -> BoxFuture<'static, Result<(), String>> + Send + Sync>;
+
+#[derive(Clone)]
+struct NeonTimelineBindingState {
+    token: Arc<str>,
+    bind: NeonTimelineBinding,
+}
+
+/// Mounts the bearer-authenticated durable WAL binding control surface.
+pub fn neon_timeline_binding_router(token: String, bind: NeonTimelineBinding) -> Router {
+    Router::new()
+        .route(NEON_TIMELINE_BINDINGS_PATH, post(bind_neon_timeline))
+        .with_state(NeonTimelineBindingState {
+            token: Arc::from(token),
+            bind,
+        })
+}
+
+/// Validates and commits one durable archive binding before Neon ingress starts.
+async fn bind_neon_timeline(
+    State(state): State<NeonTimelineBindingState>,
+    headers: HeaderMap,
+    Json(request): Json<NeonTimelineBindingRequest>,
+) -> Response {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if !constant_time_eq(presented, state.token.as_ref()) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    if request.tenant_id.is_empty() || request.timeline_id.is_empty() || request.bucket.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            "tenant_id, timeline_id, and bucket are required",
+        )
+            .into_response();
+    }
+    match (state.bind)(request).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::CONFLICT, error).into_response(),
+    }
+}
 
 /// Mounts authenticated consensus membership replacement without a catalog fallback.
 pub fn membership_router(quiescence: Quiescence, replace: MembershipReplace) -> Router {
@@ -595,6 +654,70 @@ mod tests {
             .expect("response");
         assert_eq!(accepted.status(), StatusCode::NO_CONTENT);
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    /// Timeline archive binding accepts only the configured control-plane bearer.
+    #[tokio::test]
+    async fn neon_timeline_binding_uses_bearer_and_returns_conflicts() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called = Arc::clone(&calls);
+        let bind: NeonTimelineBinding = Arc::new(move |request| {
+            let called = Arc::clone(&called);
+            Box::pin(async move {
+                called.fetch_add(1, Ordering::Relaxed);
+                if request.bucket == "other-bucket" {
+                    Err("timeline already uses its first bucket".to_owned())
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        let app = neon_timeline_binding_router("control-secret".to_owned(), bind);
+        let request =
+            r#"{"tenant_id":"tenant-a","timeline_id":"timeline-a","bucket":"tenant-a-db"}"#;
+        let denied = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(NEON_TIMELINE_BINDINGS_PATH)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let bound = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(NEON_TIMELINE_BINDINGS_PATH)
+                    .header(header::AUTHORIZATION, "Bearer control-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(bound.status(), StatusCode::NO_CONTENT);
+        let conflicting = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(NEON_TIMELINE_BINDINGS_PATH)
+                    .header(header::AUTHORIZATION, "Bearer control-secret")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"tenant_id":"tenant-a","timeline_id":"timeline-a","bucket":"other-bucket"}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(conflicting.status(), StatusCode::CONFLICT);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 
     /// The scale-to-zero status is fail-closed and discloses activity only to
