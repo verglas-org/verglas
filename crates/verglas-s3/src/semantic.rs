@@ -122,6 +122,11 @@ struct SemanticState {
 /// This is an extension seam for future wire-format evolution; no negotiation
 /// or compatibility path exists in this prototype.
 pub fn router(api: Arc<dyn SemanticApi>) -> Router {
+    semantic_router(api).merge(documentation_router())
+}
+
+/// Builds only semantic operations so authentication can exclude public docs.
+fn semantic_router(api: Arc<dyn SemanticApi>) -> Router {
     let state = SemanticState { api };
     Router::new()
         .route("/CreateIndex", post(dispatch_s3))
@@ -158,12 +163,37 @@ pub fn router(api: Arc<dyn SemanticApi>) -> Router {
         .with_state(state)
 }
 
+/// Serves the checked-in S3 listener contract without exposing a second API family.
+async fn s3_openapi() -> impl IntoResponse {
+    (
+        [("content-type", "application/json")],
+        include_str!("../../../contracts/s3-openapi.json"),
+    )
+}
+
+/// Directs browsers to the listener OpenAPI document for interactive inspection.
+async fn s3_swagger() -> impl IntoResponse {
+    (
+        [("content-type", "text/html; charset=utf-8")],
+        "<!doctype html><title>Verglas S3 API</title><p>Open <a href=\"/api-docs/s3/openapi.json\">the S3 listener OpenAPI document</a>.</p>",
+    )
+}
+
 /// Builds semantic routes protected by header-signed AWS SigV4 requests.
 pub fn router_with_sigv4(api: Arc<dyn SemanticApi>, credentials: SemanticCredentials) -> Router {
-    router(api).layer(axum::middleware::from_fn_with_state(
-        credentials,
-        semantic_sigv4,
-    ))
+    documentation_router().merge(
+        semantic_router(api).layer(axum::middleware::from_fn_with_state(
+            credentials,
+            semantic_sigv4,
+        )),
+    )
+}
+
+/// Builds unauthenticated API-documentation routes for the public listener.
+fn documentation_router() -> Router {
+    Router::new()
+        .route("/api-docs/s3/openapi.json", get(s3_openapi))
+        .route("/swagger-ui", get(s3_swagger))
 }
 
 /// Buffers the bounded JSON request once, verifies it, then restores it for dispatch.

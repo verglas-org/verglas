@@ -1,23 +1,16 @@
 ---
 title: "Engine roles"
-description: "Deploy cache, query, and write independently."
+description: "Deploy the cache node with optional catalog observation and WAL durability."
 icon: "server"
 ---
 
-Verglas exposes three process boundaries rather than one server that embeds
-unrelated platform behavior.
+Verglas exposes the cache node as its public engine process. Its reusable
+components remain libraries, not separately deployed query or write products.
 
-`verglas-cache-node` owns the S3 protocol, cache tiers, catalog observation,
-ring traffic, block devices, and WAL ingress. It never schedules user code or
-provides tenant authentication.
+`verglas-cache-node` owns the S3 protocol, S3 Vectors and Graph REST-JSON
+surfaces, cache tiers, catalog observation, ring traffic, block devices, and
+WAL ingress. It never schedules user code or provides hosted tenant control.
 
-`verglas-query` is stateless. It receives an Iceberg catalog URI and a Verglas
-S3 endpoint, estimates its working set, acquires a memory budget, streams Arrow
-IPC results, and exits without retaining tenant state.
-
-`verglas-write` owns the isolated table-write path. It stages data, commits
-through the authoritative catalog, and leaves cache observation and warming to
-cache nodes.
-
-Hosted launchers in `verglas-cloud` decide when and where these public roles
-run. That orchestration is deliberately outside the engine repository.
+Iceberg engines use the catalog REST endpoint and the cache-node S3 listener.
+The `verglas-writeback` library retains the erasure-coded write-back protocol;
+it is linked into engine components rather than published as a node product.

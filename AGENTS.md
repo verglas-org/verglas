@@ -132,4 +132,4 @@ Running `verglas-cache-node` locally (non-obvious gotchas):
   right bytes, just not locally accelerated), so `verglas_cache_hits_total` stays
   0. Non-zero hits require standing up an Iceberg REST catalog + Parquet objects.
   Use an S3 client (`aws`, DuckDB) for object I/O on port 8333. The CLI and SDKs
-  are developed in `verglas-client`, not this repository.
+  are developed in this repository under `cli/` and `sdks/`.

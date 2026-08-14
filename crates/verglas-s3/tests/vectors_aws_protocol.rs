@@ -68,6 +68,24 @@ async fn semantic_sigv4_requires_a_valid_vectors_signature() {
     );
 }
 
+/// Public listener documentation is inspectable without semantic credentials.
+#[tokio::test]
+async fn semantic_openapi_is_not_behind_sigv4() {
+    let app = router_with_sigv4(
+        Arc::new(RecordingApi(Mutex::new(Vec::new()))),
+        SemanticCredentials::new("key".to_owned(), "secret".to_owned()),
+    );
+    let response = app
+        .oneshot(
+            Request::get("/api-docs/s3/openapi.json")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 /// Stale or wrong-service signatures are rejected before semantic dispatch.
 #[tokio::test]
 async fn semantic_sigv4_rejects_stale_and_wrong_service_requests() {

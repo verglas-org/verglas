@@ -40,7 +40,7 @@ verglas-consensus.workspace = true
 # The Neon-compatible WAL listener is embedded in this process and places WAL
 # fragments through the same ring transport as block FLUSH.
 verglas-safekeeper.workspace = true
-verglas-write.workspace = true
+verglas-writeback.workspace = true
 axum.workspace = true
 futures.workspace = true
 # The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.

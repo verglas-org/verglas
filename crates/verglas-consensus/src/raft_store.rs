@@ -430,6 +430,36 @@ impl PersistentStateMachine {
         (state.wal_end, state.archive_lsn)
     }
 
+    /// Returns ordered checkpoint identities that exactly cover the archived WAL prefix.
+    pub async fn archived_wal_segments(
+        &self,
+        through_lsn: u64,
+    ) -> Result<Vec<crate::WalArchiveSegment>, crate::PayloadError> {
+        let state = self.state.read().await;
+        if through_lsn != state.archive_lsn {
+            return Err(crate::PayloadError::CorruptRepresentation);
+        }
+        let mut cursor = None;
+        let mut segments = Vec::new();
+        for header in state.committed.values() {
+            let crate::EntryMetadata::Archive { segment } = header.metadata() else {
+                continue;
+            };
+            if let Some(previous_end) = cursor
+                && segment.start_lsn() != previous_end
+            {
+                return Err(crate::PayloadError::CorruptRepresentation);
+            }
+            cursor = Some(segment.end_lsn());
+            segments.push(segment.clone());
+        }
+        if cursor.is_none() || cursor == Some(through_lsn) {
+            Ok(segments)
+        } else {
+            Err(crate::PayloadError::CorruptRepresentation)
+        }
+    }
+
     /// Returns the applied metadata pointer for one catalog table.
     pub async fn catalog_table(&self, table: &str) -> Option<String> {
         self.state.read().await.tables.get(table).cloned()
@@ -652,8 +682,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             state.wal_end = end;
                             wal_end = Some(end);
                         }
-                        crate::EntryMetadata::Archive { end }
-                            if end < state.archive_lsn || end > state.wal_end =>
+                        crate::EntryMetadata::Archive { segment }
+                            if segment.start_lsn() != state.archive_lsn
+                                || segment.end_lsn() > state.wal_end =>
                         {
                             responses.push(RaftResponse {
                                 index: entry.log_id.index,
@@ -665,9 +696,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             });
                             continue;
                         }
-                        crate::EntryMetadata::Archive { end } => {
-                            state.archive_lsn = end;
-                            archive_lsn = Some(end);
+                        crate::EntryMetadata::Archive { segment } => {
+                            state.archive_lsn = segment.end_lsn();
+                            archive_lsn = Some(segment.end_lsn());
                         }
                         crate::EntryMetadata::Catalog { batch } => {
                             let mut namespaces = state.namespaces.clone();

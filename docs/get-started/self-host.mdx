@@ -1,22 +1,36 @@
 ---
-title: "Self-host the engine"
-description: "Start a local cache node without a hosted control plane."
+title: "Self-host Verglas"
+description: "Run Verglas against your own S3 origin or as an edge for Verglas Cloud."
 icon: "server"
 ---
 
-The checked-in Compose file starts MinIO and one `verglas-cache-node`.
+The open-source container runs one `verglas-cache-node`. It does not include a
+catalog or cloud control plane. Every deployment needs an S3-compatible origin;
+an Iceberg catalog is optional.
+
+## Standalone cache
+
+In this topology Verglas sits in front of your S3 bucket. Reads fill the local
+cache. PUT, COPY, multipart completion, and DELETE write through to the
+configured S3 origin, so the single node is not the only copy of an
+acknowledged object.
 
 ```bash
-git clone https://github.com/verglas-org/verglas.git
-cd verglas
-docker compose up --detach --build
+export VERGLAS_STORAGE_BUCKET=my-data
+export VERGLAS_STORAGE_ENDPOINT=https://s3.us-west-2.amazonaws.com
+export VERGLAS_STORAGE_REGION=us-west-2
+export VERGLAS_STORAGE_ACCESS_KEY_ID=...
+export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
+export VERGLAS_S3_ACCESS_KEY_ID=verglas-client
+export VERGLAS_S3_SECRET_ACCESS_KEY=...
+docker compose up --detach --build cache
 ```
 
-The cache endpoint is `http://127.0.0.1:8333`; its development credentials are
-`verglas-local` and `verglas-local-secret`. Health and metrics are exposed on
-port `8334`.
+The checked-in Compose defaults demonstrate the same layout with MinIO. The S3
+listener is `http://127.0.0.1:8333`; health and metrics are on port `8334`.
 
 ```bash
+docker compose up --detach --build
 until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 1; done
 
 AWS_ACCESS_KEY_ID=verglas-local \
@@ -25,21 +39,60 @@ AWS_DEFAULT_REGION=us-east-1 \
 aws --endpoint-url http://127.0.0.1:8333 s3 ls
 ```
 
-## Enable Iceberg-aware caching
+### Choose a catalog
 
-An S3 endpoint alone provides correct pass-through behavior. Catalog watching,
-metadata warming, and table-aware admission require an authoritative Iceberg
-REST catalog.
+Without a catalog, ordinary S3 operations remain correct but Verglas cannot
+classify Iceberg metadata or warm a table after a commit. Configure any
+compatible Iceberg REST catalog with:
 
 ```bash
-export VERGLAS_CATALOG_URI=https://catalog.example.com
+export VERGLAS_CATALOG_URI=https://catalog.example.com/catalog
 export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
-docker compose up --detach --build
+docker compose up --detach --build cache
 ```
 
-The local stack does not create access, scheduler, database, worker,
-integration, application, or agent services. Those are hosted control-plane
-responsibilities in `verglas-cloud`.
+For the best managed experience, point these values at Verglas Catalog. The
+cloud service adds warehouse provisioning, scoped credential vending,
+compaction and snapshot-maintenance scheduling, push notifications to the
+Verglas cache fleet, and event delivery for workers. The cloud-owned Lakekeeper
+service runs `serve-craft`: its catalog commits are linearized and durably
+replicated by the managed Verglas CRaft ring rather than a Lakekeeper Postgres
+database. Losing a minority of that ring does not make the catalog unavailable;
+losing quorum refuses writes instead of accepting unsafe catalog state.
+
+Verglas also works with other catalog authorities. Apache Polaris, Lakekeeper,
+Nessie, and another Iceberg REST catalog can be configured directly. AWS Glue
+and S3 Tables remain valid authorities for the Iceberg clients; connect them to
+the cache watcher through an Iceberg REST bridge until a native watcher is
+available. With a third-party catalog, use that catalog's notification
+integration when it has one; otherwise Verglas observes changes by polling and
+warming may lag a commit. Verglas does not replace or mirror the catalog's
+transaction state.
+
+## Edge cache
+
+A self-hosted node can instead cache the managed Verglas S3 endpoint close to
+your applications. In this topology the node's origin is already a durable
+Verglas Cloud cache backed by managed object storage, and both layers observe
+the same managed catalog.
+
+```bash
+export VERGLAS_STORAGE_BUCKET=my-managed-bucket
+export VERGLAS_STORAGE_ENDPOINT=https://s3.my-region.verglas.example
+export VERGLAS_STORAGE_REGION=us-west-2
+export VERGLAS_STORAGE_ACCESS_KEY_ID=...
+export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
+export VERGLAS_CATALOG_URI=https://catalog.my-region.verglas.example/catalog
+export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
+export VERGLAS_S3_ACCESS_KEY_ID=edge-client
+export VERGLAS_S3_SECRET_ACCESS_KEY=...
+docker compose up --detach --build cache
+```
+
+Applications use the edge node's S3 listener. Misses and write-throughs go to
+the managed S3 endpoint, not directly to the backing cloud bucket. This keeps
+the edge disposable while preserving the cloud durability and catalog push
+path.
 
 Stop the local engine with `docker compose down`. Add `--volumes` only when you
-intend to delete the local cache and MinIO data.
+intend to delete its local cache and the demonstration MinIO data.

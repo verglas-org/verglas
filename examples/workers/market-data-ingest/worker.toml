@@ -1,0 +1,35 @@
+spec_version = 1
+name = "market-data-ingest"
+runtime = "python"
+entrypoint = ["python", "ingest.py"]
+target_tables = ["market.ohlcv"]
+
+[files]
+"ingest.py" = "@file:ingest.py"
+"pyproject.toml" = "@file:pyproject.toml"
+"uv.lock" = "@file:uv.lock"
+
+[env]
+SYMBOL = "SPY"
+
+[[triggers]]
+type = "webhook"
+path = "/market-data/daily-bars"
+
+[[triggers]]
+type = "cron"
+cron = "0 22 * * 1-5"
+start_date = "2025-08-04T00:00:00Z"
+catchup = "sequential"
+
+[[triggers]]
+type = "event"
+event_type = "com.yahoo.finance.quote"
+source = "urn:rabbitmq:market-data"
+subject = "SPY"
+
+[resources]
+vcpus = 1.0
+mem_mib = 1024
+pids = 128
+timeout_secs = 300

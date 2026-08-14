@@ -27,7 +27,7 @@ use verglas_consensus::{
     ConsensusGroup, DistributedPayloadStore, GroupError, GroupRequest, GroupResponse,
     PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
-use verglas_write::{ConsensusCommitter, ObjectCommit, StagedObject};
+use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
 
 use crate::ring::RingPlane;
 

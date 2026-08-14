@@ -245,3 +245,10 @@
   append. The 250 ms heartbeat, 2.5–3.0 s first window, and 2.5 s rank spacing
   leave compact vote metadata time to fsync before a live follower is treated as
   failed; client submission remains bounded at 25 seconds and still fails closed.
+- #137: Renamed the embedded erasure-coded durability dependency to verglas-writeback. The cache node retains its write-back and repair behavior without presenting a separate write product.
+- #135: Composed checkpointed WAL reads from hash-verified archive objects and
+  the retained coded tail under one consensus fence. Aborted peer uploads now
+  fail without committing a partial fragment, preserving quorum availability.
+- #135: Aligned the process-level catalog failover regression with the bounded
+  30-second consensus recovery window. Retained-prefix verification still must
+  complete before an immediate linearizable read can succeed.

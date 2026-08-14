@@ -822,34 +822,62 @@ where
     F: FnOnce(verglas_cluster::FragmentWriter) -> Result<(), FragmentIoError> + Send + 'static,
 {
     use futures::StreamExt;
+    /// Distinguishes a verified end of an HTTP body from a dropped relay.
+    enum UploadMessage {
+        /// Carries one received body shard to the blocking writer.
+        Shard(Bytes),
+        /// Permits the blocking writer to make the completed fragment live.
+        Complete,
+        /// Stops the blocking writer and discards its temporary fragment.
+        Abort(FragmentIoError),
+    }
+
     // This is deliberately small: it bounds per-upload heap use to a few
     // stripes while the blocking worker is behind NVMe latency.
     const FRAGMENT_UPLOAD_CHANNEL_CAPACITY: usize = 4;
     let (sender, mut receiver) =
-        tokio::sync::mpsc::channel::<Bytes>(FRAGMENT_UPLOAD_CHANNEL_CAPACITY);
+        tokio::sync::mpsc::channel::<UploadMessage>(FRAGMENT_UPLOAD_CHANNEL_CAPACITY);
     let worker = tokio::task::spawn_blocking(move || {
         let mut writer = store.open_fragment(&key)?;
-        while let Some(shard) = receiver.blocking_recv() {
-            writer.append(&shard)?;
+        loop {
+            match receiver.blocking_recv() {
+                Some(UploadMessage::Shard(shard)) => writer.append(&shard)?,
+                Some(UploadMessage::Complete) => return commit(writer),
+                Some(UploadMessage::Abort(error)) => return Err(error),
+                None => {
+                    return Err(FragmentIoError::Io(
+                        "fragment upload relay stopped before a complete body".to_owned(),
+                    ));
+                }
+            }
         }
-        commit(writer)
     });
 
-    let mut upload_error = None;
     while let Some(shard) = shards.next().await {
-        if sender.send(shard).await.is_err() {
-            upload_error = Some(FragmentIoError::Io(
-                "fragment writer stopped before upload completed".to_owned(),
-            ));
-            break;
+        match shard {
+            Ok(shard) => {
+                if sender.send(UploadMessage::Shard(shard)).await.is_err() {
+                    return Err(FragmentIoError::Io(
+                        "fragment writer stopped before upload completed".to_owned(),
+                    ));
+                }
+            }
+            Err(error) => {
+                if sender.send(UploadMessage::Abort(error)).await.is_err() {
+                    return Err(FragmentIoError::Io(
+                        "fragment writer stopped before upload completed".to_owned(),
+                    ));
+                }
+                return await_fragment_store(worker).await;
+            }
         }
     }
-    drop(sender);
-    let result = await_fragment_store(worker).await;
-    match upload_error {
-        Some(error) => Err(error),
-        None => result,
+    if sender.send(UploadMessage::Complete).await.is_err() {
+        return Err(FragmentIoError::Io(
+            "fragment writer stopped before upload completed".to_owned(),
+        ));
     }
+    await_fragment_store(worker).await
 }
 
 /// Converts a blocking fragment-store result back into the handler's error
@@ -934,9 +962,9 @@ mod tests {
         let upload = tokio::spawn(stream_into_store_with_commit(
             store,
             key,
-            Box::pin(futures::stream::iter([bytes::Bytes::from_static(
+            Box::pin(futures::stream::iter([Ok(bytes::Bytes::from_static(
                 b"fragment",
-            )])),
+            ))])),
             move |writer| {
                 let _ = commit_started.send(());
                 std::thread::sleep(Duration::from_millis(200));
@@ -956,6 +984,49 @@ mod tests {
             .await
             .expect("upload task")
             .expect("durable fragment commit");
+    }
+
+    /// Cancelling a body relay after one received shard must drop its temporary
+    /// writer instead of turning the relay's closed channel into a commit.
+    #[tokio::test]
+    async fn cancelled_fragment_stream_discards_its_partial_writer() {
+        use futures::StreamExt;
+
+        let directory = tempfile::tempdir().expect("fragment directory");
+        let store = LocalFragmentStore::new(directory.path());
+        let key = FragmentKey {
+            object_id: "cancelled-fragment-stream".to_owned(),
+            index: 0,
+        };
+        let upload = tokio::spawn(stream_into_store(
+            store.clone(),
+            key.clone(),
+            Box::pin(
+                futures::stream::iter([Ok(bytes::Bytes::from_static(b"partial"))])
+                    .chain(futures::stream::pending()),
+            ),
+        ));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        upload.abort();
+        let _ = upload.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if store.used_bytes() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("cancelled relay releases its fragment reservation");
+        assert!(
+            store
+                .load_fragment(&key)
+                .expect("inspect fragment")
+                .is_none(),
+            "a cancelled relay must not publish a partial fragment"
+        );
     }
 
     #[test]

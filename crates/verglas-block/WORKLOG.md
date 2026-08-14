@@ -42,3 +42,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #127: Updated the block-ring transport test double for the shared fragment
   prefix-discovery contract introduced by safekeeper recovery. Block durability
   behavior is unchanged.
+- #137: Updated block flush integration to the renamed verglas-writeback library. The fragment transport and quorum behavior are unchanged.

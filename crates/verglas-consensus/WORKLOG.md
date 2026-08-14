@@ -206,3 +206,18 @@
 - #135: Split compact Raft metadata and entry-frame durability into independent
   ordered actors. Entry dispatch returns to OpenRaft immediately and reports its
   flush callback only after fsync, so a large append cannot delay a vote grant.
+
+- #135: Made committed archive checkpoints carry the exact canonical WAL range,
+  immutable object key, and SHA-256 identity. A current-term WAL read plan now
+  exports those ordered checkpoint records and refuses a gap, overlap, or
+  identity mismatch before an archived prefix can be served.
+
+- #135: Kept normal ReadWal on its established direct reconstruction path. Only
+  a checkpoint-covered range whose local reconstruction is unavailable returns
+  an archive composition response; every other read error remains final and the
+  archived object identities still require exact verification by the ingress.
+
+- #135: Made automatic WAL archive-boundary reads fence only the replicated WAL
+  metadata. A verified checkpoint may release its own local payload allocation,
+  so the scheduler now continues to archive later complete segments after a
+  former certified holder or released archived prefix is unavailable.

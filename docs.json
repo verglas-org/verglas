@@ -66,9 +66,9 @@
           "docs/sdk/overview",
           "docs/sdk/http",
           "docs/sdk/cli",
-          "docs/sdk/duckdb",
           "docs/sdk/typescript",
-          "docs/sdk/rust"
+          "docs/sdk/rust",
+          "docs/reference/semantic-api"
         ]
       }
     ]
@@ -96,6 +96,6 @@
     "eyebrows": "breadcrumbs"
   },
   "api": {
-    "openapi": "contracts/openapi.json"
+    "openapi": "contracts/s3-openapi.json"
   }
 }

@@ -10,7 +10,7 @@
 //!   quorum (never a silent success).
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant};
@@ -53,6 +53,7 @@ fn handlers_for(store: LocalFragmentStore) -> FragmentHandlers {
                 use futures::StreamExt;
                 let mut writer = s.open_fragment(&key)?;
                 while let Some(shard) = shards.next().await {
+                    let shard = shard?;
                     writer.append(&shard)?;
                 }
                 writer.commit()
@@ -287,6 +288,96 @@ async fn fragment_read_times_out_before_the_durability_placement_budget() {
         matches!(result, Ok(Err(_))),
         "a stalled recovery read must fail within its short availability budget: {result:?}"
     );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// A disconnected fragment sender is an upload failure, never a clean end of
+/// stream. The peer runtime must discard the partial file and keep a live vote
+/// route responsive after the cancelled upload is reaped.
+#[tokio::test]
+async fn cancelled_fragment_upload_never_commits_and_does_not_block_a_vote() {
+    let registry = RaftRpcRegistry::new("peer-secret");
+    registry.register_target(42).await;
+    registry
+        .set_opener(Arc::new(|_group| Box::pin(async move { Ok(()) })))
+        .await;
+    let directory = std::env::temp_dir().join(format!(
+        "verglas-fragrpc-cancelled-upload-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&directory);
+    let store = LocalFragmentStore::new(&directory);
+    let server = PeerServer::bind_with_store_fragments_and_router(
+        "127.0.0.1:0".parse().expect("addr"),
+        Some("peer-secret".to_owned()),
+        empty_blocks(),
+        reject_block_placement(),
+        handlers_for(store.clone()),
+        registry.router(),
+    )
+    .await
+    .expect("bind peer runtime");
+    let address = server.local_addr();
+    let upload_response = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.write_all(
+            format!(
+                "POST /peer/v0/fragment HTTP/1.1\r\nHost: {address}\r\nx-verglas-cluster-secret: peer-secret\r\nx-verglas-fragment-object: cancelled-upload\r\nx-verglas-fragment-index: 0\r\nContent-Length: 8\r\nConnection: close\r\n\r\ncut"
+            )
+            .as_bytes(),
+        )?;
+        stream.shutdown(Shutdown::Write)?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok(response)
+    })
+    .await
+    .expect("join upload task")
+    .expect("send partial upload");
+    assert!(
+        upload_response.starts_with("HTTP/1.1 500"),
+        "cancelled upload must fail instead of acknowledging a truncated fragment: {upload_response}"
+    );
+    let key = FragmentKey {
+        object_id: "cancelled-upload".to_owned(),
+        index: 0,
+    };
+    assert!(
+        store
+            .load_fragment(&key)
+            .expect("inspect fragment")
+            .is_none(),
+        "a cancelled upload must leave no live fragment"
+    );
+
+    let vote = tokio::task::spawn_blocking(move || -> std::io::Result<(Duration, String)> {
+        let started = Instant::now();
+        let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(1))?;
+        stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+        stream.write_all(
+            format!(
+                "POST /consensus/v1/cancelled-upload/42/vote HTTP/1.1\r\nHost: {address}\r\nx-verglas-cluster-secret: peer-secret\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )?;
+        let mut response = String::new();
+        stream.read_to_string(&mut response)?;
+        Ok((started.elapsed(), response))
+    })
+    .await
+    .expect("join vote task")
+    .expect("vote request");
+    assert!(
+        vote.0 < Duration::from_millis(200),
+        "vote was delayed: {vote:?}"
+    );
+    assert!(
+        vote.1.starts_with("HTTP/1.1 404"),
+        "unexpected vote route: {vote:?}"
+    );
+
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(directory);
 }

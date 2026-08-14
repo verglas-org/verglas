@@ -194,7 +194,10 @@ async fn submit_catalog(
     request: ManagedCatalogRequest,
 ) -> Result<ManagedCatalogResponse, String> {
     let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        // Leader recovery verifies the retained catalog prefix before serving
+        // authority. Match the process-level 30-second consensus bound rather
+        // than imposing the old single-election five-second client deadline.
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|error| error.to_string())?
         .post(format!(

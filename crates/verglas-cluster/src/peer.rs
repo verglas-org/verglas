@@ -282,7 +282,11 @@ pub type FragmentListFn =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Vec<FragmentKey>> + Send>> + Send + Sync>;
 
 /// A stream of a fragment's shard chunks in stripe order (#180).
-pub type FragmentShardStream = Pin<Box<dyn futures::Stream<Item = Bytes> + Send>>;
+///
+/// Transport failures remain items in the stream so an interrupted request can
+/// abort its temporary fragment instead of being mistaken for a complete body.
+pub type FragmentShardStream =
+    Pin<Box<dyn futures::Stream<Item = Result<Bytes, FragmentIoError>> + Send>>;
 
 /// Stores one fragment by streaming its shards into the local store, so the
 /// receiving node holds one stripe at a time rather than the whole fragment
@@ -665,14 +669,15 @@ async fn store_fragment(
         object_id: object_id.to_owned(),
         index,
     };
-    // Turn the request body into a stream of `Bytes` chunks. A transport error
-    // mid-stream ends the stream; the store then sees a short fragment and the
-    // commit still fsyncs what arrived — but the coordinator only counts a `200`
-    // as durable, so a truncated upload that errors the connection never acks.
+    // Preserve a transport error as a stream item. Dropping it would make a
+    // cancelled HTTP/2 sender look like a clean EOF and could commit a partial
+    // fragment while its failed body future keeps waking the peer runtime.
     use futures::StreamExt;
     let shards = body
         .into_data_stream()
-        .filter_map(|chunk| async move { chunk.ok() })
+        .map(|chunk| {
+            chunk.map_err(|error| FragmentIoError::Io(format!("fragment request body: {error}")))
+        })
         .boxed();
     match (handlers.store_stream)(key, shards).await {
         Ok(()) => StatusCode::OK.into_response(),

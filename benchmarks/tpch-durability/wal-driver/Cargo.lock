@@ -1949,6 +1949,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "crc32c",
+ "futures",
  "hex",
  "openraft",
  "reed-solomon-simd",

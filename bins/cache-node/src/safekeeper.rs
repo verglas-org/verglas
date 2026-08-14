@@ -23,7 +23,7 @@ use verglas_consensus::{GroupError, GroupRequest, GroupResponse, ReplicationMode
 use verglas_core::activity::ActivityTracker;
 use verglas_safekeeper::{
     AppendGeometry, ArchiveError, ArchiveObject, ArchiveTimeline, ImmutableSegmentStore,
-    SegmentArchiver, SegmentRelease, WalRequest, WalResponse,
+    SegmentArchiver, SegmentRelease, WalRequest, WalResponse, read_archived_wal_prefix,
 };
 
 use crate::{VERSION, consensus::ConsensusPlane, ring::RingPlane};
@@ -80,23 +80,19 @@ impl ImmutableSegmentStore for ObjectArchiveStore {
     }
 
     async fn verify(&self, object: &ArchiveObject) -> Result<(), ArchiveError> {
+        let bytes = self.read(object).await?;
+        object.verify_bytes(&bytes)
+    }
+
+    async fn read(&self, object: &ArchiveObject) -> Result<Bytes, ArchiveError> {
         let path = object_store::path::Path::from(object.key.as_str());
-        let bytes = self
-            .store
+        self.store
             .get(&path)
             .await
             .map_err(|error| ArchiveError::ObjectStore(error.to_string()))?
             .bytes()
             .await
-            .map_err(|error| ArchiveError::ObjectStore(error.to_string()))?;
-        if bytes.len() as u64 != object.length
-            || <[u8; 32]>::from(Sha256::digest(&bytes)) != object.hash
-        {
-            return Err(ArchiveError::ObjectStore(
-                "visible archive object has the wrong identity".to_owned(),
-            ));
-        }
-        Ok(())
+            .map_err(|error| ArchiveError::ObjectStore(error.to_string()))
     }
 }
 
@@ -350,6 +346,12 @@ async fn catalog_request(
                 "wrong group response".to_owned(),
             ));
         }
+        GroupResponse::ArchivedWalReadPlan(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "wrong group response".to_owned(),
+            ));
+        }
     };
     Ok(Json(response))
 }
@@ -374,6 +376,14 @@ async fn wal_request(
     let request =
         WalRequest::decode(&body).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let group = format!("timeline/{tenant}/{timeline}");
+    if let WalRequest::ReadWal {
+        from,
+        to,
+        minimum_index,
+    } = request
+    {
+        return composed_wal_read(&state, &group, from, to, minimum_index).await;
+    }
     if let WalRequest::Append {
         request_id,
         writer_epoch,
@@ -478,6 +488,53 @@ async fn wal_request(
         _ => {}
     }
     response_binary(response)
+}
+
+/// Serves a baseline retained read or composes its archived prefix and retained tail.
+async fn composed_wal_read(
+    state: &WalIngress,
+    group: &str,
+    from: u64,
+    to: u64,
+    minimum_index: u64,
+) -> Result<Response, (StatusCode, String)> {
+    let response = state
+        .consensus
+        .submit(
+            group,
+            GroupRequest::ReadWal {
+                from,
+                to,
+                minimum_index,
+            },
+        )
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    let plan = match response {
+        GroupResponse::Bytes(bytes) => return response_binary(GroupResponse::Bytes(bytes)),
+        GroupResponse::ArchivedWalReadPlan(plan) => plan,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WAL read returned the wrong response".to_owned(),
+            ));
+        }
+    };
+    let archived_end = to.min(plan.checkpointed_end());
+    let mut output = Vec::with_capacity((to - from) as usize);
+    if from < archived_end {
+        let prefix = read_archived_wal_prefix(
+            state.archive_store.as_ref(),
+            plan.archived_segments(),
+            from,
+            archived_end,
+        )
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        output.extend_from_slice(&prefix);
+    }
+    output.extend_from_slice(plan.retained_tail());
+    response_binary(GroupResponse::Bytes(output))
 }
 
 /// Archives every newly complete PostgreSQL segment without delaying append acknowledgement.
@@ -718,7 +775,8 @@ fn response_binary(response: GroupResponse) -> Result<Response, (StatusCode, Str
         | GroupResponse::CatalogRecord(_)
         | GroupResponse::CatalogRecords(_)
         | GroupResponse::CatalogExport(_)
-        | GroupResponse::WarehouseGroup(_) => {
+        | GroupResponse::WarehouseGroup(_)
+        | GroupResponse::ArchivedWalReadPlan(_) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "wrong group response".to_owned(),

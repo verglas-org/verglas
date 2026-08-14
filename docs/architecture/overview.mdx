@@ -11,10 +11,7 @@ incorrect or unavailable.
 ```mermaid
 flowchart LR
     E["Query engine"] -->|"S3"| C["verglas-cache-node"]
-    Q["verglas-query"] -->|"S3"| C
-    W["verglas-write"] -->|"S3"| C
-    Q --> I["Iceberg REST catalog"]
-    W --> I
+    E --> I["Iceberg REST catalog"]
     C -->|"watch commits"| I
     C --> O["Object storage"]
 ```
@@ -23,23 +20,21 @@ flowchart LR
 
 | Repository | Responsibility |
 | --- | --- |
-| `verglas` | Public cache, storage, query, and write engine roles. |
-| `verglas-client` | Public CLI, Rust SDK, and TypeScript SDK. |
+| `verglas` | Public cache and storage engine, CLI, SDKs, documentation, and RIME package. |
 | `verglas-cloud` | Hosted access, scheduler, workers, databases, integrations, applications, and agent runtime. |
 | `verglas-app` | Private cloud console and workspace client. |
-| `rime` | Public parallel software-engineering plugin. |
 
 The engine does not import a hosted control-plane package. Hosted services run
 the same public role binaries and interact through explicit network and process
 contracts.
 
-## Engine roles
+## Engine and client roles
 
 | Role | Responsibility |
 | --- | --- |
 | Cache | Serve S3 ranges, route ownership, warm Iceberg metadata, and read or write through to object storage. |
-| Query | Execute bounded SQL against a catalog while reading data only through the cache endpoint. |
-| Write | Commit isolated logical table writes through the cache and authoritative catalog. |
+| CLI and SDKs | Use the public S3, catalog, vector, graph, and administrative contracts. |
+| RIME | Package the evaluated parallel software-engineering skill installed by the CLI. |
 
 ## Standing requirements
 

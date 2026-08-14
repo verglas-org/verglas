@@ -290,3 +290,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #137: Replaced mutable bucket and index tag/policy properties with append-only
   Iceberg control events. State is resolved from snapshot lineage, so concurrent
   tag writers compose and a fresh semantic adapter observes the same result.
+- #67: Exposed the checked-in S3 listener OpenAPI document and Swagger entry point alongside semantic routes. This keeps the listener contract inspectable without adding another serving API.

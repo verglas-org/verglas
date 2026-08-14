@@ -1,5 +1,7 @@
 # Rust build artifacts
 /target/
+# Standalone benchmark and example crates may build outside the root workspace.
+**/target/
 # Cross-compile / alternate CARGO_TARGET_DIR checkouts (e.g. linux-amd64 from macOS)
 /target-*/
 **/*.rs.bk

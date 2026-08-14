@@ -55,5 +55,5 @@ pub use store::{ChunkStore, StoreError};
 // append log (#372) are built on — this crate adds the block flush write-back
 // over them, it re-implements no codec, store, or transport.
 pub use verglas_cluster::fragments::LocalFragmentStore;
-pub use verglas_write::membership::{AgentMembership, LiveMembership, SingleNodeMembership};
-pub use verglas_write::transport::{FragmentTransport, PeerFragmentTransport, TransportError};
+pub use verglas_writeback::membership::{AgentMembership, LiveMembership, SingleNodeMembership};
+pub use verglas_writeback::transport::{FragmentTransport, PeerFragmentTransport, TransportError};
