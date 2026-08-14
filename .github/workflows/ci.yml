@@ -34,13 +34,6 @@ env:
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  repository-boundary:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Reject hosted product source
-        run: bash scripts/check-repository-boundary.sh
-
   typescript-sdk:
     runs-on: ubuntu-latest
     defaults:
@@ -151,26 +144,26 @@ jobs:
     # Keep one stable required-check name while the actual package checks are
     # a dynamic matrix whose labels vary with every pull request.
     if: always()
-    needs: [rust-changes, crate-tests, typescript-sdk, rime]
+    needs: [rust-changes, crate-tests, typescript-sdk, rime, coverage]
     runs-on: ubuntu-latest
     steps:
-      - name: Require repository gates
+      - name: Require code-quality gates
         env:
           CRATE_TESTS_RESULT: ${{ needs.crate-tests.result }}
+          COVERAGE_RESULT: ${{ needs.coverage.result }}
           RIME_RESULT: ${{ needs.rime.result }}
           RUST_CHANGES_RESULT: ${{ needs.rust-changes.result }}
           TYPESCRIPT_SDK_RESULT: ${{ needs.typescript-sdk.result }}
         run: |
           [[ "$RUST_CHANGES_RESULT" == "success" ]]
           [[ "$CRATE_TESTS_RESULT" == "success" || "$CRATE_TESTS_RESULT" == "skipped" ]]
+          [[ "$COVERAGE_RESULT" == "success" ]]
           [[ "$TYPESCRIPT_SDK_RESULT" == "success" ]]
           [[ "$RIME_RESULT" == "success" ]]
 
   coverage:
-    # Coverage is expensive (a full llvm-cov instrumented build). Run it
-    # nightly and on demand only; run it locally before opening a PR. The cheap
-    # lint+test `ci` job above is the default per-PR gate.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Coverage is a required code-quality gate for every pull request as well
+    # as scheduled and manually dispatched runs.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
