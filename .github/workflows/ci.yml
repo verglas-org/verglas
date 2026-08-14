@@ -40,8 +40,8 @@ jobs:
       run:
         working-directory: sdks/typescript
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -56,8 +56,8 @@ jobs:
       run:
         working-directory: rime
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
       - run: npm test
@@ -69,7 +69,7 @@ jobs:
       has-packages: ${{ steps.packages.outputs.has-packages }}
       packages: ${{ steps.packages.outputs.packages }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Package selection compares the pull request head with its merge
           # base. Both histories must be present for that comparison.
@@ -79,6 +79,19 @@ jobs:
       # so CI always matches dev machines exactly.
       - name: Install pinned toolchain
         run: rustup show
+
+      # Populate one lockfile-keyed Cargo registry cache before the package
+      # matrix fans out, instead of downloading the same archives in every job.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-registry
+          add-job-id-key: false
+          add-rust-environment-hash-key: false
+          cache-targets: false
+          cache-bin: false
+
+      - name: Fetch Cargo dependencies
+        run: cargo fetch --locked
 
       - name: Format
         run: cargo fmt --all --check
@@ -121,10 +134,18 @@ jobs:
       RUSTC_WRAPPER: sccache
       SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
         run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-registry
+          add-job-id-key: false
+          add-rust-environment-hash-key: false
+          cache-targets: false
+          cache-bin: false
 
       - name: Restore compiler cache
         uses: mozilla-actions/sccache-action@v0.0.11
@@ -164,14 +185,29 @@ jobs:
   coverage:
     # Coverage is a required code-quality gate for every pull request as well
     # as scheduled and manually dispatched runs.
+    needs: rust-changes
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install pinned toolchain
         run: rustup show && rustup component add llvm-tools-preview
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cargo-registry
+          add-job-id-key: false
+          add-rust-environment-hash-key: false
+          cache-targets: false
+          cache-bin: false
+
+      # llvm-cov intentionally cleans target/ to avoid stale coverage data, so
+      # cache compiler outputs rather than a target directory it will delete.
+      - uses: mozilla-actions/sccache-action@v0.0.11
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 

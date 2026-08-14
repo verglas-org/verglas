@@ -16,17 +16,9 @@ async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 object_store.workspace = true
-reqwest.workspace = true
 # Decompress gzip-encoded catalog responses (some managed REST catalogs return
 # Content-Encoding: gzip) so every local client receives plain JSON (#307/#310).
 flate2 = "1.1"
-# SigV4 signing for AWS-backed Iceberg REST catalogs (S3 Tables/Glue) (#236):
-# the watcher signs its own reqwest requests directly (no signing proxy).
-aws-config.workspace = true
-aws-credential-types.workspace = true
-aws-runtime.workspace = true
-aws-sigv4.workspace = true
-aws-smithy-runtime-api.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

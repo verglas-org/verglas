@@ -53,7 +53,6 @@ tracing = "0.1.44"
 # minus the runtime reload handle the cache node has no admin route for.
 tracing-subscriber = { version = "0.3.23", default-features = false, features = ["env-filter", "fmt", "json"] }
 tracing-appender = "0.2.3"
-thiserror.workspace = true
 async-trait.workspace = true
 hex.workspace = true
 sha2.workspace = true
@@ -67,12 +66,8 @@ tempfile.workspace = true
 # than one. Ring matches what reqwest's rustls-tls pulls in.
 rustls = "0.23"
 
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
 [dev-dependencies]
 reqwest.workspace = true
-toml.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
 # Block-device tests: an in-memory object backend, and the NBD protocol test
 # client drives the listener over a real loopback socket.
