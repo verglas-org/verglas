@@ -605,6 +605,13 @@ pub async fn run(
                     .store_for(DEFAULT_STORAGE_BINDING_ID, &request.bucket)
                     .map_err(|error| error.to_string())?;
                 let group = format!("timeline/{}/{}", request.tenant_id, request.timeline_id);
+                if consensus
+                    .resolve_committed_wal_binding(&group, &request.bucket)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    return Ok(());
+                }
                 let digest = Sha256::digest(
                     format!(
                         "wal-archive-binding\0{}\0{}\0{}",

@@ -278,3 +278,11 @@
   discovery in the cache process. Tables, Graphs, and Vectors open Iceberg only
   through the loopback catalog gateway, so provider bearer and SigV4 authority
   stays inside this process while all table FileIO re-enters its local S3 cache.
+- #135: Invalidated a restored local committed-leader vote before reopening its
+  Raft group. A restarted leader now runs a fresh election and reconstructs its
+  replication workers instead of accepting commands that can never commit.
+  Exact immutable WAL-binding replays also return from locally applied
+  committed state without appending a redundant Raft command.
+- #135: Canonicalized consensus voter and fragment-slot ordering by numeric
+  voter identity. A restarted group now seals and reconstructs payloads from
+  the same slots used before and after Raft restores its sorted voter set.
