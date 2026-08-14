@@ -60,6 +60,8 @@ sha2.workspace = true
 openraft.workspace = true
 reqwest.workspace = true
 object_store.workspace = true
+iceberg.workspace = true
+tempfile.workspace = true
 # Pin the process rustls CryptoProvider so an https origin (R2/S3) resolves TLS
 # through a chosen provider rather than panicking when the dep graph carries more
 # than one. Ring matches what reqwest's rustls-tls pulls in.
@@ -70,7 +72,6 @@ libc.workspace = true
 
 [dev-dependencies]
 reqwest.workspace = true
-tempfile.workspace = true
 toml.workspace = true
 tower = { version = "0.5.3", features = ["util"] }
 # Block-device tests: an in-memory object backend, and the NBD protocol test

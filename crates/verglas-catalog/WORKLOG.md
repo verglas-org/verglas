@@ -18,3 +18,8 @@
 - #135: Made managed-catalog HTTP 409 a typed final conflict instead of an
   ingress retry signal. HTTP 503 remains retryable across explicit ingresses,
   preserving leader-availability failover without retrying failed CAS writes.
+- #96: Made the self-hosted catalog gateway a prefix-free façade for SDK
+  callers while preserving already-prefixed Iceberg requests. The gateway now
+  resolves a provider's warehouse prefix once and adds it exactly once, so R2
+  Data Catalog and Amazon S3 Tables work without exposing provider routing to
+  local Tables, Graphs, or Vectors clients.

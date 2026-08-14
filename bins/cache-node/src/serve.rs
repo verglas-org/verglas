@@ -347,15 +347,18 @@ pub async fn run(
     let admin_addr = std::env::var("VERGLAS_ADMIN_ADDR")
         .unwrap_or_else(|_| format!("127.0.0.1:{}", config.listen.admin_port));
     let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+    let admin_bound_addr = admin_listener.local_addr()?;
+    let catalog_gateway_addr = loopback_addr(admin_bound_addr);
     eprintln!(
         "verglas-cache-node {VERSION} admin API listening on http://{}",
-        admin_listener.local_addr()?
+        admin_bound_addr
     );
 
     // Pre-bind the S3 listener too, so its port is owned before serving.
     let s3_addr = std::env::var("VERGLAS_S3_ADDR")
         .unwrap_or_else(|_| format!("0.0.0.0:{}", config.listen.s3_port));
     let s3_listener = tokio::net::TcpListener::bind(&s3_addr).await?;
+    let s3_gateway_addr = loopback_addr(s3_listener.local_addr()?);
 
     // Block-device tier (#382): the durable chunk store + attached-device
     // registry, the block-control route on the admin surface, and the NBD
@@ -481,6 +484,40 @@ pub async fn run(
         stats_slot.clone(),
         metrics_slot.clone(),
     );
+    if let Some(catalog) = config.catalog.as_ref() {
+        let connection = semantic_connection(
+            catalog,
+            catalog_gateway_addr,
+            s3_gateway_addr,
+            &credentials,
+            config.backend.region.as_deref(),
+        );
+        let public_admin_uri = std::env::var("VERGLAS_PUBLIC_ADMIN_URI")
+            .unwrap_or_else(|_| format!("http://{catalog_gateway_addr}"));
+        let public_s3_endpoint = std::env::var("VERGLAS_PUBLIC_S3_ENDPOINT")
+            .unwrap_or_else(|_| format!("http://{s3_gateway_addr}"));
+        let access = verglas_core::admin::LocalAccess {
+            s3_endpoint: public_s3_endpoint,
+            query_uri: public_admin_uri.clone(),
+            catalog_uri: Some(format!(
+                "{}/catalog",
+                public_admin_uri.trim_end_matches('/')
+            )),
+            warehouse: catalog.warehouse.clone(),
+            region: config
+                .backend
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_owned()),
+            bucket: config.backend.bucket.clone(),
+            access_key_id: Some(credentials.0.clone()),
+        };
+        admin_app = admin_app
+            .merge(admin::access_router(access))
+            .merge(crate::tables_api::router(
+                crate::tables_api::TableState::new(connection),
+            ));
+    }
     let authoritative_stop = safekeeper_args
         .as_ref()
         .map(|(ring, _, consensus, archives)| {
@@ -702,6 +739,7 @@ pub async fn run(
         serve_s3(S3Serve {
             config,
             s3_listener,
+            catalog_gateway_addr,
             credentials,
             engine,
             registry,
@@ -789,6 +827,10 @@ fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()
 struct S3Serve<'a> {
     config: &'a Config,
     s3_listener: tokio::net::TcpListener,
+    /// Loopback address of this process's catalog gateway. Semantic operations
+    /// must use it so the cache node, rather than a client library, owns bearer
+    /// and SigV4 catalog authentication.
+    catalog_gateway_addr: std::net::SocketAddr,
     credentials: (String, String),
     engine: CacheEngine,
     registry: Arc<BackendStore>,
@@ -805,6 +847,7 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let S3Serve {
         config,
         s3_listener,
+        catalog_gateway_addr,
         credentials,
         engine,
         registry,
@@ -819,22 +862,14 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let semantic_api: Option<Arc<dyn verglas_s3::semantic::SemanticApi>> =
         match config.catalog.as_ref() {
             Some(catalog) => {
-                let local_addr = s3_listener.local_addr()?;
-                let connection = verglas_iceberg::Connection {
-                    catalog_uri: catalog.uri.clone(),
-                    token: catalog
-                        .resolve_bearer_token()
-                        .map_err(std::io::Error::other)?,
-                    warehouse: catalog.warehouse.clone(),
-                    s3_endpoint: Some(format!("http://{local_addr}")),
-                    region: config
-                        .backend
-                        .region
-                        .clone()
-                        .unwrap_or_else(|| "us-east-1".to_owned()),
-                    access_key_id: Some(credentials.0.clone()),
-                    secret_access_key: Some(credentials.1.clone()),
-                };
+                let local_addr = loopback_addr(s3_listener.local_addr()?);
+                let connection = semantic_connection(
+                    catalog,
+                    catalog_gateway_addr,
+                    local_addr,
+                    &credentials,
+                    config.backend.region.as_deref(),
+                );
                 Some(Arc::new(
                     verglas_s3::semantic::IcebergCatalogSemanticStore::new(
                         verglas_iceberg::catalog::open_catalog(&connection).await?,
@@ -938,6 +973,39 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// Replaces an unspecified bind address with loopback for internal clients.
+/// A listener commonly binds `0.0.0.0`, but dialing that wildcard address is
+/// invalid; every in-process catalog and semantic request is loopback-only.
+fn loopback_addr(address: std::net::SocketAddr) -> std::net::SocketAddr {
+    if address.ip().is_unspecified() {
+        std::net::SocketAddr::from(([127, 0, 0, 1], address.port()))
+    } else {
+        address
+    }
+}
+
+/// Builds the local semantic Iceberg connection.  The local catalog gateway
+/// owns upstream credential selection and request signing; semantic code never
+/// opens the provider catalog directly.  Data-file IO still enters the local
+/// S3 listener, preserving cache residency for Tables, Graphs, and Vectors.
+fn semantic_connection(
+    catalog: &verglas_core::config::Catalog,
+    catalog_gateway_addr: std::net::SocketAddr,
+    s3_addr: std::net::SocketAddr,
+    credentials: &(String, String),
+    backend_region: Option<&str>,
+) -> verglas_iceberg::Connection {
+    verglas_iceberg::Connection {
+        catalog_uri: format!("http://{catalog_gateway_addr}/catalog"),
+        token: None,
+        warehouse: catalog.warehouse.clone(),
+        s3_endpoint: Some(format!("http://{s3_addr}")),
+        region: backend_region.unwrap_or("us-east-1").to_owned(),
+        access_key_id: Some(credentials.0.clone()),
+        secret_access_key: Some(credentials.1.clone()),
+    }
+}
+
 /// Waits for Ctrl-C before tearing down a listener.
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
@@ -948,6 +1016,48 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::routing::get;
+
+    /// Semantic operations use the cache process's catalog gateway rather than
+    /// bypassing its provider authentication with a direct upstream request.
+    #[test]
+    fn semantic_connection_uses_loopback_catalog_gateway() {
+        let catalog = verglas_core::config::Catalog {
+            uri: "https://provider.invalid/iceberg".to_owned(),
+            consistency: verglas_core::config::CatalogConsistency::Eventual,
+            poll_interval_secs: 30,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            credentials_file: Some("/private/provider-token".to_owned()),
+            credentials_profile: None,
+            bearer_token: None,
+            sigv4_region: Some("us-west-2".to_owned()),
+            sigv4_signing_name: Some("s3tables".to_owned()),
+            warehouse: Some("arn:aws:s3tables:us-west-2:123:bucket/example".to_owned()),
+        };
+
+        let connection = semantic_connection(
+            &catalog,
+            "127.0.0.1:8334".parse().expect("admin address"),
+            "127.0.0.1:8333".parse().expect("s3 address"),
+            &("VGLOCAL".to_owned(), "local-secret".to_owned()),
+            Some("us-west-2"),
+        );
+
+        assert_eq!(connection.catalog_uri, "http://127.0.0.1:8334/catalog");
+        assert_eq!(connection.token, None);
+        assert_eq!(
+            connection.s3_endpoint.as_deref(),
+            Some("http://127.0.0.1:8333")
+        );
+        assert_eq!(
+            connection.warehouse.as_deref(),
+            Some("arn:aws:s3tables:us-west-2:123:bucket/example")
+        );
+        assert_eq!(
+            loopback_addr("0.0.0.0:8334".parse().expect("wildcard address")),
+            "127.0.0.1:8334".parse().expect("loopback address")
+        );
+    }
     use std::sync::atomic::AtomicUsize;
     use verglas_core::admin::{HEALTHZ_PATH, METRICS_PATH, STATS_PATH};
 

@@ -269,3 +269,12 @@
   storage binding and bucket instead of creating one Raft group per object.
   A failed voter no longer creates an unbounded heartbeat storm that starves a
   concurrently active WAL timeline after a large Iceberg ingest.
+- #20 #96: Replaced the bundled local object-store Compose topology with one
+  disposable cache process and three provider profiles: Verglas Cloud,
+  Cloudflare R2 Data Catalog, and Amazon S3 Tables. Provider catalog credentials
+  are rendered into owner-only files; external catalog changes reconcile by poll
+  while Cloud can additionally wake reconciliation through its event hint.
+- #20 #96: Restored the local SDK Table read/append surface and `/admin/access`
+  discovery in the cache process. Tables, Graphs, and Vectors open Iceberg only
+  through the loopback catalog gateway, so provider bearer and SigV4 authority
+  stays inside this process while all table FileIO re-enters its local S3 cache.

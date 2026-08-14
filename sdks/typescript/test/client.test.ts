@@ -43,7 +43,7 @@ describe("createTable contract", () => {
       (r) => r.method === "POST" && r.path === "/v1/namespaces/rlean/tables",
     );
     expect(post).toBeTruthy();
-    expect(post!.body).toMatchObject({ name: "custom_points" });
+    expect(post!.body).toMatchObject({ name: "custom_points", "stage-create": false });
   });
 
   it("requires a name and a non-empty schema", async () => {

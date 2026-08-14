@@ -22,6 +22,7 @@ mod page_cache;
 mod ring;
 mod safekeeper;
 mod serve;
+mod tables_api;
 
 /// The server version, from the package manifest. Reported by `/admin/version`
 /// and stamped on operator log lines.
