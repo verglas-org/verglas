@@ -144,16 +144,13 @@ todo = "warn"
 unimplemented = "warn"
 unwrap_used = "warn"
 
-# VERGLAS PATCH: iceberg 0.9.1 from verglas-org/iceberg-rust (branch
-# verglas/v0.9.1) with one added public constructor, `TableCommit::from_parts`.
-# Upstream 0.9.1 gates `TableCommit` construction to the transaction action set
-# (fast-append + property updates, no overwrite or delete), so REPLACE /
-# RemoveSnapshots commits cannot be built through the public API. Compaction
-# and post-compact snapshot expiry need that escape hatch. Pin a SHA — never a
-# floating branch tip. Patch inventory:
-# https://github.com/verglas-org/iceberg-rust/blob/verglas/v0.9.1/VERGLAS.md
+# VERGLAS PATCH: Iceberg 0.9.1 with one public `TableCommit::from_parts`
+# constructor. Upstream restricts construction to transaction actions, which
+# cannot express the replace and snapshot-expiry commits used by compaction.
+# Keep the exact source in-tree so public CI and self-hosted builds never depend
+# on credentials for a private fork. See vendor/iceberg/VERGLAS.md.
 [patch.crates-io]
-iceberg = { git = "https://github.com/verglas-org/iceberg-rust", rev = "a40f92680e7528b15033d7168ecdc8731e3ca2b9" }
+iceberg = { path = "vendor/iceberg" }
 
 # The profile that 'dist' will build with
 [profile.dist]

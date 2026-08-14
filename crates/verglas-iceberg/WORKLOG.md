@@ -116,7 +116,7 @@
   owns construction and aggregation behavior without depending on the client
   SDK.
 
-- #393: Switched from in-tree `vendor/iceberg` to the pinned `verglas-org/iceberg-rust` fork (`verglas/v0.9.1` @ a40f9268) for `TableCommit::from_parts`. Same patch, maintained out of tree; drop when upstream exposes overwrite/replace commits.
+- CI: Restored the exact Iceberg 0.9.1 constructor patch under `vendor/iceberg` so public CI and self-hosted builds do not require credentials for the unavailable private fork. Drop the patch when upstream exposes overwrite/replace commits.
 
 - #393: Removed platform `_LOGS` run logging and day-partition retention from Verglas. Catalog-side lakekeeping owns telemetry write/TTL; this crate keeps only the compact-adjacent APIs (snapshot expiry where applicable). Harness no longer writes `verglas_logs.<name>_LOGS`; verglasd no longer runs the hourly prune loop.
 
