@@ -866,6 +866,16 @@ mod tests {
     /// expires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_vote_survives_public_runtime_saturation() {
+        struct SaturationRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+        impl Drop for SaturationRelease {
+            fn drop(&mut self) {
+                let (released, wake) = &*self.0;
+                *released.lock().expect("lock saturation release") = true;
+                wake.notify_all();
+            }
+        }
+
         let directory = tempfile::tempdir().expect("temporary consensus state");
         let runtime = ConsensusRuntime::start().expect("start consensus runtime");
         let log = PersistentLogStore::open(directory.path().join("raft-log.json"))
@@ -894,11 +904,20 @@ mod tests {
             .expect("create Raft on the consensus runtime");
 
         let (entered, entered_rx) = std::sync::mpsc::channel();
+        let release = SaturationRelease(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
         for _ in 0..2 {
             let entered = entered.clone();
+            let release = Arc::clone(&release.0);
             tokio::spawn(async move {
                 entered.send(()).expect("report public worker saturation");
-                std::thread::sleep(Duration::from_millis(300));
+                let (released, wake) = &*release;
+                let mut released = released.lock().expect("lock saturation release");
+                while !*released {
+                    released = wake.wait(released).expect("wait for saturation release");
+                }
             });
         }
         drop(entered);
@@ -924,10 +943,11 @@ mod tests {
             let _ = vote_tx.send(result);
         });
         let response = vote_rx
-            .recv_timeout(Duration::from_millis(150))
+            .recv_timeout(Duration::from_secs(2))
             .expect("private Raft core answers during public saturation")
             .expect("real Raft vote succeeds");
         assert!(response.vote_granted);
+        drop(release);
 
         let shutdown_raft = raft.clone();
         runtime

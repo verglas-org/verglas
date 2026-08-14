@@ -43,6 +43,7 @@ sdks/**/dist/
 # the lockfile is the dependency-reproducibility guarantee). Resolve lockfile
 # merge conflicts by taking main's version and running `cargo check`:
 #   git checkout origin/main -- Cargo.lock && cargo check --workspace
+/vendor/iceberg/Cargo.lock
 
 # Python
 __pycache__/
