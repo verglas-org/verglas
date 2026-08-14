@@ -81,13 +81,32 @@ impl Fleet {
     }
 }
 
-/// Reserves and releases a loopback port for a child listener.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve port")
-        .local_addr()
-        .expect("reserved address")
-        .port()
+/// Unique loopback ports consumed by one four-node process fleet.
+struct FleetPorts {
+    ring: [u16; 4],
+    safekeeper: [u16; 4],
+    block: [u16; 4],
+    s3: [u16; 4],
+    admin: [u16; 4],
+}
+
+/// Reserves every fleet port at once so the OS cannot return one port twice.
+fn reserve_fleet_ports() -> FleetPorts {
+    let reservations: [TcpListener; 20] =
+        std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").expect("reserve fleet port"));
+    let ports: [u16; 20] = std::array::from_fn(|index| {
+        reservations[index]
+            .local_addr()
+            .expect("reserved fleet address")
+            .port()
+    });
+    FleetPorts {
+        ring: ports[0..4].try_into().expect("four ring ports"),
+        safekeeper: ports[4..8].try_into().expect("four safekeeper ports"),
+        block: ports[8..12].try_into().expect("four block ports"),
+        s3: ports[12..16].try_into().expect("four S3 ports"),
+        admin: ports[16..20].try_into().expect("four admin ports"),
+    }
 }
 
 /// Writes the minimal cache-node config used by one child.
@@ -118,6 +137,7 @@ fn spawn_node(
     peers: &str,
     ring_port: u16,
     safekeeper_port: u16,
+    block_port: u16,
     stderr: &Arc<Mutex<Vec<String>>>,
 ) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
@@ -131,7 +151,7 @@ fn spawn_node(
         .env("VERGLAS_SAFEKEEPER_EC_M", "2")
         .env("VERGLAS_SAFEKEEPER_EC_W", "3")
         .env("VERGLAS_RING_ADDR", format!("127.0.0.1:{ring_port}"))
-        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
+        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{block_port}"))
         .env(
             "VERGLAS_SAFEKEEPER_ADDR",
             format!("127.0.0.1:{safekeeper_port}"),
@@ -261,8 +281,9 @@ async fn submit_catalog(
 async fn cache_node_embeds_the_ring_backed_safekeeper() {
     let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -271,7 +292,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let mut children = Vec::new();
     for index in 0..4 {
@@ -281,6 +302,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             &peers,
             ring_ports[index],
             safekeeper_ports[index],
+            ports.block[index],
             &stderr,
         ));
     }
@@ -374,6 +396,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         &peers,
         ring_ports[0],
         safekeeper_ports[0],
+        ports.block[0],
         &fleet.stderr,
     );
     fleet.wait_for_safekeepers(5, Duration::from_secs(30));
@@ -424,6 +447,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         &peers,
         ring_ports[3],
         safekeeper_ports[3],
+        ports.block[3],
         &fleet.stderr,
     );
     fleet.wait_for_safekeepers(5, Duration::from_secs(30));
@@ -468,8 +492,9 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
 async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodies() {
     let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -478,7 +503,7 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let children = (0..4)
         .map(|index| {
@@ -488,6 +513,7 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
                 &peers,
                 ring_ports[index],
                 safekeeper_ports[index],
+                ports.block[index],
                 &stderr,
             )
         })
@@ -572,8 +598,9 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
 async fn large_wal_append_continues_after_exact_leader_death() {
     let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -582,7 +609,7 @@ async fn large_wal_append_continues_after_exact_leader_death() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let children = (0..4)
         .map(|index| {
@@ -592,6 +619,7 @@ async fn large_wal_append_continues_after_exact_leader_death() {
                 &peers,
                 ring_ports[index],
                 safekeeper_ports[index],
+                ports.block[index],
                 &stderr,
             )
         })
@@ -708,8 +736,9 @@ async fn large_wal_append_continues_after_exact_leader_death() {
 async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
     let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -718,7 +747,7 @@ async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let mut children = Vec::new();
     for index in 0..4 {
@@ -728,6 +757,7 @@ async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
             &peers,
             ring_ports[index],
             safekeeper_ports[index],
+            ports.block[index],
             &stderr,
         ));
     }
