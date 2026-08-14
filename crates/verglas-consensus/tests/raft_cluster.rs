@@ -18,9 +18,9 @@ use tempfile::TempDir;
 use tokio::sync::RwLock;
 use verglas_consensus::{
     AppliedOutcome, CatalogAction, CatalogBatch, CatalogEntity, CatalogRequirement, CommandKind,
-    ConsensusGroup, EntryHeader, FilePayloadReplica, PayloadCertificate, PayloadSet, PayloadStore,
-    PersistentLogStore, PersistentStateMachine, RaftCommand, ReplicationMode, RequestId,
-    SealRequest, VerglasRaftConfig,
+    ConsensusGroup, EntryHeader, FilePayloadReplica, GroupRequest, GroupResponse,
+    PayloadCertificate, PayloadSet, PayloadStore, PersistentLogStore, PersistentStateMachine,
+    RaftCommand, ReleaseRequest, ReplicationMode, RequestId, SealRequest, VerglasRaftConfig,
 };
 
 type Raft = openraft::Raft<VerglasRaftConfig>;
@@ -391,6 +391,19 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         .await
         .expect("contiguous WAL append");
     assert_eq!(wal.wal_end, Some(0x1003));
+    let retried_wal = leader_group
+        .append_wal(
+            RequestId::from_u128(52),
+            1,
+            0x1000,
+            Bytes::from_static(b"wal"),
+            &[1, 2, 3, 4, 5],
+        )
+        .await
+        .expect("exact WAL retry returns its original result");
+    assert_eq!(retried_wal.outcome, AppliedOutcome::Duplicate);
+    assert_eq!(retried_wal.index, wal.index);
+    assert_eq!(retried_wal.wal_end, wal.wal_end);
     assert_eq!(
         leader_group
             .open_timeline(RequestId::from_u128(62), 0x1000, &[1, 2, 3])
@@ -412,6 +425,18 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
             .expect("committed WAL read"),
         Bytes::from_static(b"wal")
     );
+    let GroupResponse::Bytes(bytes) = leader_group
+        .execute(GroupRequest::ReadWal {
+            from: 0x1000,
+            to: 0x1003,
+            minimum_index: wal.index,
+        })
+        .await
+        .expect("unarchived ReadWal uses the baseline byte response")
+    else {
+        panic!("expected WAL bytes");
+    };
+    assert_eq!(bytes, b"wal");
     assert!(
         leader_group
             .append_wal(
@@ -424,16 +449,94 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
             .await
             .is_err()
     );
+    let archive_key = format!(
+        "s3://wal/{:016x}-{:016x}-{}",
+        0x1000,
+        0x1003,
+        hex::encode(sha2::Sha256::digest(b"wal")),
+    );
     let checkpoint = leader_group
-        .archive_checkpoint(
-            RequestId::from_u128(54),
-            0x1003,
-            "s3://wal/segment-0",
-            &[1, 2, 3],
-        )
+        .archive_checkpoint(RequestId::from_u128(54), 0x1003, &archive_key, &[1, 2, 3])
         .await
         .expect("archive checkpoint");
     assert_eq!(checkpoint.archive_lsn, Some(0x1003));
+    let wal_header = state_machines[&replacement]
+        .committed_header(wal.index)
+        .await
+        .expect("committed WAL header");
+    let wal_log_id = state_machines[&replacement]
+        .committed_log_id(wal.index)
+        .await
+        .expect("committed WAL log identity");
+    payloads
+        .release(ReleaseRequest {
+            hash: wal_header.payload_hash(),
+            group: wal_header.group(),
+            configuration_generation: wal_header.configuration_generation(),
+            request: wal_header.request(),
+            length: wal_header.payload_len(),
+            term: wal_log_id.leader_id.term,
+            index: wal_log_id.index,
+            certificate: wal_header.certificate(),
+        })
+        .await
+        .expect("release checkpoint-covered local WAL allocation");
+    let GroupResponse::ArchivedWalReadPlan(plan) = leader_group
+        .execute(GroupRequest::ReadWal {
+            from: 0x1000,
+            to: 0x1003,
+            minimum_index: checkpoint.index,
+        })
+        .await
+        .expect("archived crossing read returns one object plan")
+    else {
+        panic!("expected archived WAL read plan");
+    };
+    assert_eq!(plan.archived_segments().len(), 1);
+    assert_eq!(plan.retained_tail(), b"");
+    let continued_wal = leader_group
+        .append_wal(
+            RequestId::from_u128(154),
+            1,
+            0x1003,
+            Bytes::from_static(b"continued after archive"),
+            &[1, 2, 3, 4, 5],
+        )
+        .await
+        .expect("continue WAL after the certified archived prefix is released");
+    let GroupResponse::WalState(archive_state) = leader_group
+        .execute(GroupRequest::WalState {
+            minimum_index: continued_wal.index,
+        })
+        .await
+        .expect("automatic archive boundary advances after checkpointed payload release")
+    else {
+        panic!("expected WAL archive state");
+    };
+    assert_eq!(archive_state.checkpointed_end(), 0x1003);
+    assert_eq!(archive_state.committed_end(), 0x101a);
+    let restored_wal = payloads
+        .stage_local(
+            RequestId::from_u128(52),
+            "warehouse/a",
+            1,
+            ReplicationMode::Coded,
+            b"wal",
+            &[1, 2, 3, 4, 5],
+        )
+        .expect("restage WAL allocation for unrelated catalog-read coverage");
+    payloads
+        .seal(SealRequest {
+            hash: restored_wal.hash(),
+            group: "warehouse/a",
+            configuration_generation: 1,
+            request: RequestId::from_u128(52),
+            term: wal_log_id.leader_id.term,
+            index: wal_log_id.index,
+            certificate: restored_wal.certificate(),
+        })
+        .await
+        .expect("reseal restored WAL allocation");
     leader_group
         .release_writer(RequestId::from_u128(57), 1, &[1, 2, 3])
         .await

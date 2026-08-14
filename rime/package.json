@@ -1,0 +1,50 @@
+{
+  "name": "@verglas/rime",
+  "version": "0.1.0",
+  "description": "Low-cost-preferred parallel AIDE-style search for evaluated coding solutions",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/verglas-org/verglas.git",
+    "directory": "rime"
+  },
+  "homepage": "https://github.com/verglas-org/verglas/tree/main/rime#readme",
+  "bugs": {
+    "url": "https://github.com/verglas-org/verglas/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "type": "module",
+  "exports": "./src/index.mjs",
+  "files": [
+    ".claude-plugin",
+    ".codex-plugin",
+    "agents",
+    "extensions",
+    "host",
+    "skills",
+    "src"
+  ],
+  "keywords": [
+    "aide",
+    "agent-skill",
+    "coding-agent",
+    "pi-package"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

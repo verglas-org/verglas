@@ -173,6 +173,16 @@ pub async fn create_table(
     ident: &TableIdent,
     request: CreateTableRequest,
 ) -> Result<CreateTableResponse> {
+    create_table_with_properties(catalog, ident, request, HashMap::new()).await
+}
+
+/// Creates a table with immutable-at-create metadata properties for resource owners.
+pub async fn create_table_with_properties(
+    catalog: &dyn Catalog,
+    ident: &TableIdent,
+    request: CreateTableRequest,
+    properties: HashMap<String, String>,
+) -> Result<CreateTableResponse> {
     let table_name = ident_to_dotted(ident);
     let mut fields = Vec::with_capacity(request.schema.len());
     for column in &request.schema {
@@ -190,7 +200,14 @@ pub async fn create_table(
         });
     }
 
-    let report = write::create_table_with_partitions(catalog, ident, &schema, &partitions).await?;
+    let report = write::create_table_with_partitions_and_properties(
+        catalog,
+        ident,
+        &schema,
+        &partitions,
+        properties,
+    )
+    .await?;
     Ok(CreateTableResponse {
         table: report.table,
         columns: report.schema.into_iter().map(|f| f.name).collect(),
@@ -232,6 +249,10 @@ fn parse_data_type(type_name: &str, table: &str, column: &str) -> Result<DataTyp
         "utf8" | "string" => Ok(DataType::Utf8),
         "boolean" | "bool" => Ok(DataType::Boolean),
         "date32" | "date" => Ok(DataType::Date32),
+        "list<float32>" | "list<float>" => Ok(DataType::List(Arc::new(Field::new_list_field(
+            DataType::Float32,
+            true,
+        )))),
         other => Err(mismatch(format!(
             "`{other}` is not a supported column type"
         ))),
@@ -322,6 +343,45 @@ pub async fn rows(
         rows: page,
         next_cursor,
     })
+}
+
+/// Returns every current-table row in committed snapshot order, oldest first.
+///
+/// Append-only semantic tables use this to resolve last-write-wins updates and
+/// tombstones without relying on file-path order. Each snapshot contributes
+/// only files introduced at that commit, so concurrent commits remain ordered
+/// by the catalog's committed parent lineage.
+pub async fn rows_in_commit_order(catalog: &dyn Catalog, ident: &TableIdent) -> Result<Vec<Value>> {
+    let table = catalog.load_table(ident).await?;
+    let mut lineage = Vec::new();
+    let mut cursor = table.metadata().current_snapshot_id();
+    while let Some(id) = cursor {
+        let snapshot = table
+            .metadata()
+            .snapshot_by_id(id)
+            .ok_or_else(|| AgentError::TableApi(format!("snapshot {id} is absent")))?;
+        lineage.push((id, snapshot.parent_snapshot_id()));
+        cursor = snapshot.parent_snapshot_id();
+    }
+    lineage.reverse();
+    let mut rows = Vec::new();
+    for (id, parent) in lineage {
+        let tasks = planned_files(&table, Some(id)).await?;
+        let parent_files = match parent {
+            Some(parent) => planned_files(&table, Some(parent))
+                .await?
+                .into_iter()
+                .map(|task| task.data_file_path)
+                .collect::<HashSet<_>>(),
+            None => HashSet::new(),
+        };
+        let added = tasks
+            .into_iter()
+            .filter(|task| !parent_files.contains(&task.data_file_path))
+            .collect();
+        rows.extend(read_tasks_to_json(&table, added).await?);
+    }
+    Ok(rows)
 }
 
 /// Returns the rows committed after the `since` watermark, plus the current tip.

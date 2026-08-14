@@ -90,7 +90,7 @@ use verglas_cluster::fragments::{FragmentKey, FragmentRecord, LocalFragmentStore
 use verglas_core::CacheKey;
 use verglas_core::node::NodeId;
 use verglas_core::ring::rendezvous_hash;
-use verglas_write::{FragmentTransport, LiveMembership};
+use verglas_writeback::{FragmentTransport, LiveMembership};
 
 use crate::backend::BackendError;
 use crate::chunk::ChunkHash;

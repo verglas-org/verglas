@@ -1,7 +1,9 @@
 [workspace]
 resolver = "2"
-exclude = ["crates/verglas-catalog-service"]
+exclude = ["sdks/typescript"]
 members = [
+    "cli",
+    "sdks/rust",
     "crates/verglas-backend",
     "crates/verglas-core",
     "crates/verglas-cluster",
@@ -10,7 +12,7 @@ members = [
     "crates/verglas-s3",
     "crates/verglas-catalog",
     "crates/verglas-tables",
-    "crates/verglas-write",
+    "crates/verglas-writeback",
     "crates/verglas-consensus",
     "crates/verglas-safekeeper",
     "crates/verglas-iceberg",
@@ -20,8 +22,6 @@ members = [
     "crates/verglas-kv",
     "bins/cache-node",
     "crates/verglas-block",
-    "bins/query-node",
-    "bins/write-node",
 ]
 
 [workspace.package]
@@ -43,7 +43,7 @@ verglas-instance = { path = "crates/verglas-instance" }
 verglas-s3 = { path = "crates/verglas-s3" }
 verglas-catalog = { path = "crates/verglas-catalog" }
 verglas-tables = { path = "crates/verglas-tables" }
-verglas-write = { path = "crates/verglas-write" }
+verglas-writeback = { path = "crates/verglas-writeback" }
 verglas-consensus = { path = "crates/verglas-consensus" }
 verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
@@ -52,6 +52,7 @@ verglas-api = { path = "crates/verglas-api" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-block = { path = "crates/verglas-block" }
+verglas-sdk = { path = "sdks/rust" }
 tonic = "0.13.1"
 prost = "0.13.5"
 # Iceberg read/write and DataFusion integration shared by engine roles.
@@ -65,6 +66,8 @@ iceberg-storage-opendal = "0.9.1"
 datafusion = "52.2"
 # Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "57"
+arrow-buffer = "57"
+arrow-ipc = "57"
 arrow-schema = "57"
 arrow-csv = "57"
 arrow-json = "57"
@@ -74,6 +77,7 @@ uuid = { version = "1.18", features = ["v4"] }
 axum = "0.8.8"
 bytes = "1.12.0"
 async-trait = "0.1.89"
+async-stream = "0.3"
 foyer = "0.22.3"
 # foyer's metrics registry trait (`mixtrics::RegistryOps`). foyer does not
 # re-export it, so verglas names it directly to install a registry that reads
@@ -130,6 +134,7 @@ openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
 # not this in-process registry (see verglas-core::metrics).
 prometheus = { version = "0.14.0", default-features = false }
 bollard = "0.21.0"
+clap = { version = "4.5.60", features = ["derive", "env"] }
 
 [workspace.lints.clippy]
 # CI will run clippy with `-D warnings` (see `just lint`), turning these into errors.

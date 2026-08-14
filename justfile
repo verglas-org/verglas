@@ -23,8 +23,7 @@ s3-tests *ARGS:
     ./tests/s3-conformance/run.sh {{ARGS}}
 
 # `cargo install` compiles in release by default; --force replaces an earlier
-# install. Installs the public engine roles into ~/.cargo/bin.
+# install. Installs the public server and CLI into ~/.cargo/bin.
 install:
     cargo install --path bins/cache-node --locked --force
-    cargo install --path bins/query-node --locked --force
-    cargo install --path bins/write-node --locked --force
+    cargo install --path cli --locked --force

@@ -5,13 +5,13 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderMap, StatusCode},
     routing::post,
 };
 use openraft::{
     BasicNode,
-    error::{InstallSnapshotError, NetworkError, RPCError},
+    error::{InstallSnapshotError, NetworkError, RPCError, Unreachable},
     network::{RPCOption, RaftNetwork, RaftNetworkFactory},
     raft::{
         AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest,
@@ -21,7 +21,7 @@ use openraft::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     io,
     net::SocketAddr,
@@ -33,9 +33,38 @@ use verglas_consensus::VerglasRaftConfig;
 
 /// Authenticates internal consensus traffic.
 const SECRET_HEADER: &str = "x-verglas-cluster-secret";
+/// One canonical 8 MiB WAL frame encoded as JSON byte values plus its command envelope.
+const GROUP_COMMAND_BODY_LIMIT_BYTES: usize = 34 * 1024 * 1024;
 type Raft = openraft::Raft<VerglasRaftConfig>;
 type RaftError<E = openraft::error::Infallible> = openraft::error::RaftError<u64, E>;
 type Net<T, E = openraft::error::Infallible> = Result<T, RPCError<u64, BasicNode, RaftError<E>>>;
+/// Distinguishes a peer that is down from a transient transport error.
+///
+/// OpenRaft retries [`Unreachable`] peers through its 500ms backoff rather
+/// than immediately resubmitting an HTTP connection refusal in a tight loop.
+enum RaftTransportError {
+    Unreachable(Unreachable),
+    Network(NetworkError),
+}
+
+impl RaftTransportError {
+    /// Converts this transport error into the generic OpenRaft RPC error type.
+    fn into_rpc<E: std::error::Error>(self) -> RPCError<u64, BasicNode, RaftError<E>> {
+        match self {
+            Self::Unreachable(error) => RPCError::Unreachable(error),
+            Self::Network(error) => RPCError::Network(error),
+        }
+    }
+}
+
+/// Marks connection establishment failures as backoff-worthy peer unavailability.
+fn classify_peer_error(error: reqwest::Error) -> RaftTransportError {
+    if error.is_connect() {
+        RaftTransportError::Unreachable(Unreachable::new(&error))
+    } else {
+        RaftTransportError::Network(NetworkError::new(&error))
+    }
+}
 /// Installs one group locally before its first OpenRaft RPC arrives.
 pub type OpenGroupFn =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
@@ -67,6 +96,7 @@ pub type MembershipReplaceFn = Arc<
 #[derive(Clone)]
 pub struct RaftRpcRegistry {
     groups: Arc<RwLock<BTreeMap<(String, u64), Raft>>>,
+    targets: Arc<RwLock<BTreeSet<u64>>>,
     secret: Arc<str>,
     opener: Arc<RwLock<Option<OpenGroupFn>>>,
     bootstrapper: Arc<RwLock<Option<BootstrapGroupFn>>>,
@@ -79,6 +109,7 @@ impl RaftRpcRegistry {
     pub fn new(secret: impl Into<String>) -> Self {
         Self {
             groups: Arc::new(RwLock::new(BTreeMap::new())),
+            targets: Arc::new(RwLock::new(BTreeSet::new())),
             secret: Arc::from(secret.into()),
             opener: Arc::new(RwLock::new(None)),
             bootstrapper: Arc::new(RwLock::new(None)),
@@ -88,10 +119,19 @@ impl RaftRpcRegistry {
     }
     /// Adds a locally served Raft voter.
     pub async fn register(&self, group: impl Into<String>, node_id: u64, raft: Raft) {
+        self.register_target(node_id).await;
         self.groups
             .write()
             .await
             .insert((group.into(), node_id), raft);
+    }
+    /// Registers a local Raft voter identity before its durable groups reopen.
+    ///
+    /// Peer RPCs for an unregistered identity return `404` without invoking the
+    /// group opener, so an authenticated peer cannot create state for another
+    /// voter by choosing its numeric target.
+    pub async fn register_target(&self, node_id: u64) {
+        self.targets.write().await.insert(node_id);
     }
     /// Installs the process callback that creates persistent local group state.
     pub async fn set_opener(&self, opener: OpenGroupFn) {
@@ -117,11 +157,18 @@ impl RaftRpcRegistry {
             .route("/consensus/v1/{group}/{target}/vote", post(vote))
             .route("/consensus/v1/{group}/open", post(open_group))
             .route("/consensus/v1/{group}/bootstrap", post(bootstrap_group))
-            .route("/consensus/v1/{group}/command", post(group_command))
+            .route(
+                "/consensus/v1/{group}/command",
+                post(group_command).layer(DefaultBodyLimit::max(GROUP_COMMAND_BODY_LIMIT_BYTES)),
+            )
             .route("/consensus/v1/membership/replace", post(membership_replace))
             .with_state(self.clone())
     }
-    /// Authenticates then resolves exactly one local voter.
+    /// Authenticates, reopens, then resolves exactly one configured local voter.
+    ///
+    /// Reopening is idempotent and happens before the in-memory lookup so a
+    /// node that retained durable Raft state across restart can receive normal
+    /// replication traffic without a separate recovery control request.
     async fn target(
         &self,
         headers: &HeaderMap,
@@ -131,6 +178,18 @@ impl RaftRpcRegistry {
         if headers.get(SECRET_HEADER).and_then(|v| v.to_str().ok()) != Some(&self.secret) {
             return Err(StatusCode::FORBIDDEN);
         }
+        if !self.targets.read().await.contains(&target) {
+            return Err(StatusCode::NOT_FOUND);
+        }
+        let opener = self
+            .opener
+            .read()
+            .await
+            .clone()
+            .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        opener(group.to_owned())
+            .await
+            .map_err(|_| StatusCode::CONFLICT)?;
         self.groups
             .read()
             .await
@@ -461,17 +520,17 @@ pub struct RaftHttpNetwork<R> {
     secret: Arc<str>,
 }
 impl<R: RaftAddressResolver> RaftHttpNetwork<R> {
-    /// Sends one JSON RPC and fail-closes transport and HTTP failures as network errors.
+    /// Sends one JSON RPC and makes refused peer connections use Raft backoff.
     async fn call<Req: serde::Serialize + ?Sized, Resp: serde::de::DeserializeOwned>(
         &self,
         method: &str,
         request: &Req,
-    ) -> Result<Resp, NetworkError> {
+    ) -> Result<Resp, RaftTransportError> {
         let address = self.resolver.resolve(self.target).ok_or_else(|| {
-            NetworkError::new(&io::Error::new(
+            RaftTransportError::Unreachable(Unreachable::new(&io::Error::new(
                 io::ErrorKind::NotFound,
                 "unknown raft voter",
-            ))
+            )))
         })?;
         let response = self
             .client
@@ -487,13 +546,16 @@ impl<R: RaftAddressResolver> RaftHttpNetwork<R> {
             .json(request)
             .send()
             .await
-            .map_err(|e| NetworkError::new(&e))?;
+            .map_err(classify_peer_error)?;
         if !response.status().is_success() {
-            return Err(NetworkError::new(&io::Error::other(
-                "raft peer rejected RPC",
+            return Err(RaftTransportError::Network(NetworkError::new(
+                &io::Error::other("raft peer rejected RPC"),
             )));
         }
-        response.json().await.map_err(|e| NetworkError::new(&e))
+        response
+            .json()
+            .await
+            .map_err(|error| RaftTransportError::Network(NetworkError::new(&error)))
     }
 }
 impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<R> {
@@ -505,7 +567,7 @@ impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<
     ) -> Net<AppendEntriesResponse<u64>> {
         self.call("append", &request)
             .await
-            .map_err(RPCError::Network)
+            .map_err(RaftTransportError::into_rpc)
     }
     /// Sends InstallSnapshot.
     async fn install_snapshot(
@@ -515,17 +577,22 @@ impl<R: RaftAddressResolver> RaftNetwork<VerglasRaftConfig> for RaftHttpNetwork<
     ) -> Net<InstallSnapshotResponse<u64>, InstallSnapshotError> {
         self.call("snapshot", &request)
             .await
-            .map_err(RPCError::Network)
+            .map_err(RaftTransportError::into_rpc)
     }
     /// Sends Vote.
     async fn vote(&mut self, request: VoteRequest<u64>, _: RPCOption) -> Net<VoteResponse<u64>> {
-        self.call("vote", &request).await.map_err(RPCError::Network)
+        self.call("vote", &request)
+            .await
+            .map_err(RaftTransportError::into_rpc)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openraft::Vote;
+
+    const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
 
     #[tokio::test]
     async fn authenticated_membership_transport_reaches_registered_callback() {
@@ -573,6 +640,83 @@ mod tests {
             .await
             .expect("forwarded lifecycle request");
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    /// A refused peer connection is classified as unreachable so Raft backs off before retrying.
+    #[tokio::test]
+    async fn refused_peer_vote_uses_unreachable_backoff() {
+        let address = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("reserve unavailable peer address")
+            .local_addr()
+            .expect("unavailable peer address");
+        let network = RaftHttpNetwork {
+            target: 7,
+            group: Arc::from("warehouse/a"),
+            resolver: StaticRaftAddressResolver::new(BTreeMap::from([(7, address)])),
+            client: Client::builder()
+                .http2_prior_knowledge()
+                .build()
+                .expect("HTTP client"),
+            secret: Arc::from("secret"),
+        };
+        let result = network
+            .call::<_, VoteResponse<u64>>("vote", &VoteRequest::new(Vote::new(1, 1), None))
+            .await;
+        assert!(matches!(result, Err(RaftTransportError::Unreachable(_))));
+    }
+
+    /// The authenticated forwarding route admits one canonical large WAL command.
+    #[tokio::test]
+    async fn authenticated_command_route_accepts_a_canonical_large_wal_append() {
+        let registry = RaftRpcRegistry::new("secret");
+        registry
+            .set_commander(Arc::new(|group, body| {
+                Box::pin(async move {
+                    let command: verglas_consensus::GroupRequest =
+                        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+                    if group != "timeline/a"
+                        || !matches!(command, verglas_consensus::GroupRequest::AppendWal { .. })
+                    {
+                        return Err("wrong forwarded command".to_owned());
+                    }
+                    Ok(Vec::new())
+                })
+            }))
+            .await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, registry.router())
+                .await
+                .expect("server");
+        });
+        let body = serde_json::to_vec(&verglas_consensus::GroupRequest::AppendWal {
+            request_id: 1,
+            writer_epoch: 1,
+            start_lsn: 0,
+            payload: vec![u8::MAX; CANONICAL_WAL_APPEND_BYTES],
+            holders: vec![1, 2, 3],
+            mode: verglas_consensus::ReplicationMode::Coded,
+        })
+        .expect("encode canonical large command");
+        assert!(body.len() < GROUP_COMMAND_BODY_LIMIT_BYTES);
+        let response = reqwest::Client::new()
+            .post(format!(
+                "http://{address}/consensus/v1/timeline%2Fa/command"
+            ))
+            .header(SECRET_HEADER, "secret")
+            .body(body)
+            .send()
+            .await
+            .expect("send canonical large command");
+        assert!(
+            response.status().is_success(),
+            "status={}",
+            response.status()
+        );
         server.abort();
     }
 }

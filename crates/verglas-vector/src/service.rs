@@ -11,11 +11,110 @@ use std::sync::{Arc, Mutex};
 
 use iceberg::{Catalog, TableIdent};
 
+use crate::StringKeyMap;
 use crate::attachment::{list_indexes_for_snapshot, load_index_for_snapshot};
 use crate::error::{Result, VectorError};
 use crate::maintenance::{MaintenanceConfig, MaintenanceReport, run_maintenance};
 use crate::metric::Metric;
 use crate::vamana::{Neighbor, VamanaIndex};
+
+/// An ANN result whose caller key was recovered from the durable key map.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StringKeyNeighbor {
+    /// The exact string key supplied when the vector was written.
+    pub key: String,
+    /// The Vamana-computed distance.
+    pub distance: f32,
+}
+
+/// A mutable vector index plus its collision-free caller-key bridge.
+///
+/// This is a construction/serving value only. Persist it with
+/// [`crate::attachment::attach_string_key_index`] before acknowledging a
+/// semantic write; reopening reads the bridge from that snapshot attachment.
+#[derive(Debug, Clone)]
+pub struct StringKeyIndex {
+    /// The compact ANN graph.
+    index: VamanaIndex,
+    /// Exact key recovery data paired with the graph in Puffin.
+    keys: StringKeyMap,
+}
+
+impl StringKeyIndex {
+    /// Creates an empty bridge with a deterministic Vamana construction seed.
+    pub fn new(metric: Metric, dim: usize, params: crate::VamanaParams, seed: u64) -> Result<Self> {
+        Ok(Self {
+            index: VamanaIndex::new(metric, dim, params, seed)?,
+            keys: StringKeyMap::default(),
+        })
+    }
+
+    /// Reconstructs an index from a snapshot-bound ANN graph and key map.
+    pub fn from_parts(index: VamanaIndex, keys: StringKeyMap) -> Result<Self> {
+        for id in index.live_ids() {
+            if keys.key_for(id).is_none() {
+                return Err(crate::VectorError::CorruptBlob(
+                    "live Vamana id has no string-key mapping".to_owned(),
+                ));
+            }
+        }
+        Ok(Self { index, keys })
+    }
+
+    /// Inserts or updates `key` without hashing it; the same exact key retains its id.
+    pub fn put(&mut self, key: &str, vector: &[f32]) -> Result<()> {
+        let id = self.keys.id_for_put(key)?;
+        self.index.insert(id, vector)
+    }
+
+    /// Deletes `key` from both the ANN graph and durable key map.
+    pub fn delete(&mut self, key: &str) -> bool {
+        let Some(id) = self.keys.id_for(key) else {
+            return false;
+        };
+        if !self.index.delete(id) {
+            return false;
+        }
+        let removed = self.keys.remove(key);
+        debug_assert_eq!(removed, Some(id));
+        true
+    }
+
+    /// Queries the ANN graph and maps every returned id back to its exact key.
+    pub fn query(&self, vector: &[f32], k: usize, l: usize) -> Result<Vec<StringKeyNeighbor>> {
+        self.index
+            .search(vector, k, l)?
+            .into_iter()
+            .map(|neighbor| {
+                let key = self.keys.key_for(neighbor.id).ok_or_else(|| {
+                    crate::VectorError::CorruptBlob(format!(
+                        "Vamana id {} has no string-key mapping",
+                        neighbor.id
+                    ))
+                })?;
+                Ok(StringKeyNeighbor {
+                    key: key.to_owned(),
+                    distance: neighbor.distance,
+                })
+            })
+            .collect()
+    }
+
+    /// Returns the ANN index to attach to an Iceberg snapshot.
+    pub fn index(&self) -> &VamanaIndex {
+        &self.index
+    }
+
+    /// Returns mutable ANN state so a semantic store can set its committed snapshot.
+    pub fn index_mut(&mut self) -> &mut VamanaIndex {
+        &mut self.index
+    }
+
+    /// Returns the lossless key map to attach alongside the ANN graph.
+    pub fn keys(&self) -> &StringKeyMap {
+        &self.keys
+    }
+}
 
 /// The logical identity of a vector index.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

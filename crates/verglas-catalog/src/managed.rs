@@ -118,6 +118,9 @@ impl ManagedCatalogClient {
                 {
                     continue;
                 }
+                Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
+                    return Err(ManagedCatalogError::Conflict);
+                }
                 Ok(response) => {
                     return Err(ManagedCatalogError::Rejected(response.status().as_u16()));
                 }
@@ -145,7 +148,7 @@ impl ManagedCatalogClient {
 
 /// Returns statuses that mean the request reached no currently serving leader.
 fn retryable(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+    status == reqwest::StatusCode::SERVICE_UNAVAILABLE
 }
 
 #[cfg(test)]
@@ -194,6 +197,28 @@ mod tests {
         assert_eq!(*first.lock().await, *second.lock().await);
     }
 
+    /// A typed catalog conflict is final and never ingress-retried.
+    #[tokio::test]
+    async fn conflict_is_not_retried_at_another_ingress() {
+        let first = Arc::new(Mutex::new(Vec::new()));
+        let second = Arc::new(Mutex::new(Vec::new()));
+        let first_addr = serve(StatusCode::CONFLICT, first.clone()).await;
+        let second_addr = serve(StatusCode::OK, second.clone()).await;
+        let client = ManagedCatalogClient::with_ingresses(
+            [
+                format!("http://{first_addr}"),
+                format!("http://{second_addr}"),
+            ],
+            "tenant",
+            "warehouse",
+        )
+        .expect("ingresses");
+        let result = client.execute(&ManagedCatalogRequest::Namespaces).await;
+        assert!(matches!(result, Err(super::ManagedCatalogError::Conflict)));
+        assert!(!first.lock().await.is_empty());
+        assert!(second.lock().await.is_empty());
+    }
+
     /// Starts one loopback ingress and captures its unmodified request body.
     async fn serve(status: StatusCode, captured: Arc<Mutex<Vec<u8>>>) -> std::net::SocketAddr {
         async fn handler(
@@ -232,6 +257,9 @@ pub enum ManagedCatalogError {
     /// Network or JSON framing failure.
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// The catalog atomically rejected an optimistic or idempotency conflict.
+    #[error("managed catalog conflict")]
+    Conflict,
     /// The consensus ingress refused the operation.
     #[error("managed catalog ingress returned HTTP {0}")]
     Rejected(u16),

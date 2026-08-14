@@ -1,5 +1,10 @@
 # verglas-cluster worklog
 
+- #135: Classified refused consensus-peer HTTP connections as OpenRaft
+  `Unreachable` instead of immediately retriable network errors. Replication
+  now uses OpenRaft's bounded 500ms peer backoff after a node is killed, so a
+  retained group cannot burn CPU in a connection-refusal retry storm.
+
 - #135: Added authenticated HTTP/2 OpenRaft vote, append, and snapshot routes,
   plus a numeric-voter network factory. Requests only reach registered local
   Raft instances and unresolved or rejected peers fail closed.
@@ -115,6 +120,7 @@
 - #135: Added authenticated HTTP/2 OpenRaft vote, append, and snapshot RPCs,
   keyed by both group and voter identity. One cache node can host many independent
   warehouse and timeline groups without one registration overwriting another.
+
 - #135: Allowed the cache peer listener to merge the authenticated consensus
   router with block and fragment routes. Raft reuses the existing multiplexed
   peer port instead of introducing another deployment endpoint.
@@ -135,3 +141,21 @@
 - #135: Made the explicit Raft peer registry safely extensible for a prospective
   voter address. Learner admission can now bind its exact peer endpoint before
   replication starts, while unknown identities still fail closed.
+- #135: Reopen a configured local Raft voter from authenticated vote, append,
+  and snapshot traffic before looking up its in-memory replica. A restarted node
+  now reloads retained durable groups lazily; unknown targets still return 404
+  and unauthenticated traffic cannot invoke the opener.
+
+- #135: Gave fragment recovery reads their own short availability deadline while
+  preserving the longer fsync budget for fragment placement. A retained catalog
+  leader now treats a blackholed certified holder as unavailable quickly, so it
+  can verify the full committed prefix from surviving replicas before the
+  request deadline without skipping corruption checks.
+- #135: Bound the authenticated leader-command route explicitly for one
+  JSON-expanded canonical 8 MiB WAL append. Non-leader ingresses can now
+  forward the complete command without reopening an unbounded peer endpoint.
+
+- #135: Moved the internal peer listener onto an owned two-worker Tokio runtime
+  on its own OS thread. Raft and fragment RPCs now remain schedulable while the
+  public S3/WAL/NBD runtime is saturated, and shutdown drains then joins that
+  runtime so the peer listener does not outlive its cache node.

@@ -13,6 +13,7 @@ use std::{
 
 use bytes::Bytes;
 use crc32c::crc32c;
+use futures::{StreamExt, future::join_all, stream};
 use sha2::{Digest, Sha256};
 
 use crate::{PayloadCertificate, ReplicationMode, RequestId, decode, encode};
@@ -168,28 +169,35 @@ impl PayloadStore for DistributedPayloadStore {
         configuration_generation: u64,
         mode: ReplicationMode,
         body: &[u8],
-        holders: &[u64],
+        candidates: &[u64],
     ) -> Result<StagedPayload, PayloadError> {
-        let certificate = PayloadCertificate::with_voters(
-            mode,
-            self.k,
-            self.m,
-            self.voters
-                .read()
-                .map_err(|_| PayloadError::Transport("payload voters are poisoned".to_owned()))?
-                .clone(),
-            holders.to_vec(),
-        )
-        .map_err(|error| PayloadError::InsufficientDurability {
-            required: error.required(),
-            durable: holders.iter().copied().collect::<BTreeSet<_>>().len(),
-        })?;
-        let hash: [u8; 32] = Sha256::digest(body).into();
         let voters = self
             .voters
             .read()
             .map_err(|_| PayloadError::Transport("payload voters are poisoned".to_owned()))?
             .clone();
+        // The current group configuration is the only authority that can name
+        // a staging target. Ingress may prefer recently reachable voters, but
+        // the remaining committed voters stay eligible: a stale caller cannot
+        // shrink a committed voter set and gossip cannot promote a non-voter
+        // into a certificate.
+        let mut ordered = Vec::with_capacity(voters.len());
+        for candidate in candidates {
+            if voters.contains(candidate) && !ordered.contains(candidate) {
+                ordered.push(*candidate);
+            }
+        }
+        for voter in &voters {
+            if !ordered.contains(voter) {
+                ordered.push(*voter);
+            }
+        }
+        let election_quorum = voters.len() / 2 + 1;
+        let required = match mode {
+            ReplicationMode::Coded => voters.len() - election_quorum + self.k,
+            ReplicationMode::Complete => election_quorum,
+        };
+        let hash: [u8; 32] = Sha256::digest(body).into();
         let representations = match mode {
             ReplicationMode::Coded => {
                 encode(self.k, self.m, body).map_err(|_| PayloadError::ReconstructionUnavailable)?
@@ -199,33 +207,63 @@ impl PayloadStore for DistributedPayloadStore {
                 .map(|_| Bytes::copy_from_slice(body))
                 .collect(),
         };
-        for voter in certificate.holders() {
+        // Every committed voter is a staging candidate. Start the fixed set
+        // together so a dead preferred holder cannot consume the command
+        // deadline before the surviving safe quorum fsyncs its fragments.
+        let mut staging = stream::iter(ordered.into_iter().map(|voter| {
             let slot = voters
                 .iter()
-                .position(|candidate| candidate == voter)
-                .ok_or(PayloadError::UnknownHolder)?;
-            self.transport
-                .store(
-                    *voter,
-                    PayloadRepresentation {
-                        term: 0,
-                        index: 0,
-                        group: group.to_owned(),
-                        configuration_generation,
+                .position(|configured| configured == &voter)
+                .ok_or(PayloadError::UnknownHolder);
+            let transport = Arc::clone(&self.transport);
+            let representation = slot.map(|slot| PayloadRepresentation {
+                term: 0,
+                index: 0,
+                group: group.to_owned(),
+                configuration_generation,
+                mode,
+                hash,
+                request,
+                length: body.len(),
+                slot,
+                bytes: representations[slot].clone(),
+            });
+            async move {
+                let result = match representation {
+                    Ok(representation) => transport.store(voter, representation).await,
+                    Err(error) => Err(error),
+                };
+                (voter, result)
+            }
+        }))
+        .buffer_unordered(voters.len());
+        let mut durable = Vec::with_capacity(required);
+        while let Some((voter, result)) = staging.next().await {
+            if result.is_ok() {
+                durable.push(voter);
+                if durable.len() == required {
+                    let certificate = PayloadCertificate::with_voters(
                         mode,
+                        self.k,
+                        self.m,
+                        voters.clone(),
+                        durable,
+                    )
+                    .map_err(|_| PayloadError::InsufficientDurability {
+                        required,
+                        durable: required,
+                    })?;
+                    return Ok(StagedPayload {
                         hash,
-                        request,
-                        length: body.len(),
-                        slot,
-                        bytes: representations[slot].clone(),
-                    },
-                )
-                .await?;
+                        length: body.len() as u64,
+                        certificate,
+                    });
+                }
+            }
         }
-        Ok(StagedPayload {
-            hash,
-            length: body.len() as u64,
-            certificate,
+        Err(PayloadError::InsufficientDurability {
+            required,
+            durable: durable.len(),
         })
     }
 
@@ -240,32 +278,58 @@ impl PayloadStore for DistributedPayloadStore {
             index,
             certificate,
         } = read;
-        let mut records = Vec::new();
-        for voter in certificate.holders() {
-            if let Some(record) = self
-                .transport
-                .load(*voter, hash, group, configuration_generation, request)
-                .await?
-            {
-                let expected_slot = certificate
-                    .voters()
-                    .iter()
-                    .position(|candidate| candidate == voter)
-                    .ok_or(PayloadError::UnknownHolder)?;
-                if record.group != group
-                    || record.configuration_generation != configuration_generation
-                    || record.mode != certificate.mode()
-                    || record.hash != hash
-                    || record.request != request
-                    || record.length as u64 != length
-                    || record.slot != expected_slot
-                    || record.term != term
-                    || record.index != index
-                {
-                    return Err(PayloadError::CorruptRepresentation);
-                }
-                records.push(record);
+        // Start every certified peer load together. Recovery must wait for all
+        // returned representations before accepting a body: returning after a
+        // first complete copy would hide a corrupt response from another peer.
+        let loaded = join_all(certificate.holders().iter().copied().map(|voter| {
+            let transport = Arc::clone(&self.transport);
+            async move {
+                (
+                    voter,
+                    transport
+                        .load(voter, hash, group, configuration_generation, request)
+                        .await,
+                )
             }
+        }))
+        .await;
+        let mut records = Vec::new();
+        for (voter, result) in loaded {
+            let record = match result {
+                Ok(Some(record)) => record,
+                // A committed certificate can outlive an individual peer. The
+                // remaining holders are sufficient when they meet the mode's
+                // reconstruction threshold; a future wire protocol may add
+                // finer-grained peer error classes here without changing that
+                // invariant.
+                Ok(None) | Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let expected_slot = certificate
+                .voters()
+                .iter()
+                .position(|candidate| *candidate == voter)
+                .ok_or(PayloadError::UnknownHolder)?;
+            if record.group != group
+                || record.configuration_generation != configuration_generation
+                || record.mode != certificate.mode()
+                || record.hash != hash
+                || record.request != request
+                || record.length as u64 != length
+                || record.slot != expected_slot
+                || record.term != term
+                || record.index != index
+            {
+                return Err(PayloadError::CorruptRepresentation);
+            }
+            records.push(record);
+        }
+        let required = match certificate.mode() {
+            ReplicationMode::Complete => 1,
+            ReplicationMode::Coded => certificate.k(),
+        };
+        if records.len() < required {
+            return Err(PayloadError::ReconstructionUnavailable);
         }
         let first = records
             .first()
@@ -397,25 +461,70 @@ impl PayloadStore for DistributedPayloadStore {
         if term == 0 || index == 0 {
             return Err(PayloadError::CorruptRepresentation);
         }
-        for voter in certificate.holders() {
-            let mut record = self
-                .transport
-                .load(*voter, hash, group, configuration_generation, request)
-                .await?
-                .ok_or(PayloadError::ReconstructionUnavailable)?;
+        // Load all holders before writing a seal. This retains the corruption
+        // check for every response that completed, while an unavailable former
+        // leader no longer serializes recovery of a long committed prefix.
+        let loaded = join_all(certificate.holders().iter().copied().map(|voter| {
+            let transport = Arc::clone(&self.transport);
+            async move {
+                (
+                    voter,
+                    transport
+                        .load(voter, hash, group, configuration_generation, request)
+                        .await,
+                )
+            }
+        }))
+        .await;
+        let mut sealed = 0;
+        let mut pending = Vec::new();
+        for (voter, result) in loaded {
+            let mut record = match result {
+                Ok(Some(record)) => record,
+                Ok(None) | Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            };
+            let expected_slot = certificate
+                .voters()
+                .iter()
+                .position(|candidate| *candidate == voter)
+                .ok_or(PayloadError::UnknownHolder)?;
             if record.request != request
                 || record.group != group
                 || record.configuration_generation != configuration_generation
+                || record.mode != certificate.mode()
+                || record.hash != hash
+                || record.slot != expected_slot
                 || (record.term != 0 && (record.term != term || record.index != index))
             {
                 return Err(PayloadError::CorruptRepresentation);
             }
             if record.term == term && record.index == index {
+                sealed += 1;
                 continue;
             }
             record.term = term;
             record.index = index;
-            self.transport.store(*voter, record).await?;
+            pending.push((voter, record));
+        }
+        let stored = join_all(pending.into_iter().map(|(voter, record)| {
+            let transport = Arc::clone(&self.transport);
+            async move { transport.store(voter, record).await }
+        }))
+        .await;
+        for result in stored {
+            match result {
+                Ok(()) => sealed += 1,
+                Err(PayloadError::Transport(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        let required = match certificate.mode() {
+            ReplicationMode::Complete => 1,
+            ReplicationMode::Coded => certificate.k(),
+        };
+        if sealed < required {
+            return Err(PayloadError::ReconstructionUnavailable);
         }
         Ok(())
     }
@@ -468,6 +577,10 @@ pub trait PayloadStore: Send + Sync {
     /// Publishes the uniform committed voter allocation for subsequent staging.
     async fn set_voters(&self, voters: Vec<u64>) -> Result<(), PayloadError>;
     /// Stages representations before returning a certificate eligible for Raft.
+    ///
+    /// `candidates` is an ingress reachability hint only. Implementations must
+    /// derive every actual staging target and the certificate voter set from
+    /// committed group membership, never from gossip or an untrusted caller.
     async fn stage(
         &self,
         request: RequestId,
@@ -475,7 +588,7 @@ pub trait PayloadStore: Send + Sync {
         configuration_generation: u64,
         mode: ReplicationMode,
         body: &[u8],
-        holders: &[u64],
+        candidates: &[u64],
     ) -> Result<StagedPayload, PayloadError>;
 
     /// Reconstructs and verifies a committed logical body.

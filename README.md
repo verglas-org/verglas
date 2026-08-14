@@ -11,26 +11,22 @@ DRAM or NVMe instead of repeatedly crossing the object-store boundary.
 
 ## What lives here
 
-This repository contains only the public data engine:
+This repository contains the public data engine and its client surfaces:
 
 - `verglas-cache-node`: S3 read/write-through, Iceberg catalog watching,
   warming, cache tiers, ring routing, block storage, and WAL ingress.
-- `verglas-query`: stateless SQL execution over an Iceberg catalog through a
-  Verglas cache endpoint.
-- `verglas-write`: isolated Iceberg table writes through the same data plane.
-- The reusable Rust crates that implement those roles.
+- `cli`: the `verglas` command-line client.
+- `sdks`: the public Rust and TypeScript SDKs.
+- `rime`: the RIME package installed by the CLI for supported agent hosts.
+- The reusable Rust crates that implement the storage and client roles.
 
-Product boundaries are deliberate:
+The remaining product boundaries are deliberate:
 
-- [verglas-client](https://github.com/verglas-org/verglas-client) owns the
-  public CLI and language SDKs.
 - `verglas-cloud` owns hosted access, scheduling, workers, integrations,
   databases, applications, and agent runtime services.
 - `verglas-app` is the private cloud console and workspace client.
-- [rime](https://github.com/verglas-org/rime) is the public parallel software
-  engineering plugin.
 
-CI rejects copies of those products in this repository.
+CI rejects copies of those hosted products in this repository.
 
 ## License
 
@@ -39,9 +35,6 @@ Verglas is available under the Functional Source License 1.1 with an Apache
 Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
-The embedded Lakekeeper-derived catalog keeps the Apache 2.0 rights that apply
-to its upstream code; its Verglas-specific components use FSL. See the
-[catalog licensing boundary](crates/verglas-catalog-service/LICENSING.md).
 
 ## Run the engine locally
 
@@ -76,8 +69,8 @@ just test
 just lint
 ```
 
-Install the three engine roles from source with `just install`. Install the CLI
-and SDKs from `verglas-client`.
+Install the cache node and CLI from source with `just install`. The Rust and
+TypeScript SDKs live under `sdks/`; RIME lives under `rime/`.
 
 The [architecture overview](docs/architecture/overview.mdx) explains the cache
 tiers, Iceberg awareness, routing, and write path. Every crate and binary keeps

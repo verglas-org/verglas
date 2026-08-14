@@ -29,7 +29,7 @@ pub use payload::{
 };
 pub use raft::{
     AppliedOutcome, EntryHeader, EntryMetadata, PayloadCertificate, RaftCommand, RaftResponse,
-    VerglasRaftConfig,
+    VerglasRaftConfig, WalArchiveSegment,
 };
 pub use raft_store::{PersistentLogStore, PersistentStateMachine};
 

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{HeaderValue, StatusCode, header::CONTENT_TYPE},
     response::Response,
     routing::post,
@@ -19,11 +19,11 @@ use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
 use verglas_backend::MultipartObjectStore;
 use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
-use verglas_consensus::{GroupRequest, GroupResponse, ReplicationMode};
+use verglas_consensus::{GroupError, GroupRequest, GroupResponse, ReplicationMode};
 use verglas_core::activity::ActivityTracker;
 use verglas_safekeeper::{
     AppendGeometry, ArchiveError, ArchiveObject, ArchiveTimeline, ImmutableSegmentStore,
-    SegmentArchiver, SegmentRelease, WalRequest, WalResponse,
+    SegmentArchiver, SegmentRelease, WalRequest, WalResponse, read_archived_wal_prefix,
 };
 
 use crate::{VERSION, consensus::ConsensusPlane, ring::RingPlane};
@@ -31,6 +31,13 @@ use crate::{VERSION, consensus::ConsensusPlane, ring::RingPlane};
 /// Default HTTP/2 address for the Verglas Neon WAL protocol.
 const DEFAULT_SAFEKEEPER_ADDR: &str = "0.0.0.0:5454";
 const WAL_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Hard ingress budget: one complete 16 MiB WAL segment and bounded frame headroom.
+///
+/// The public benchmark appends 8 MiB frames, while archive scheduling operates on
+/// complete 16 MiB segments. This prevents the HTTP extractor from retaining an
+/// unbounded request and leaves room for the canonical wire envelope and catalog
+/// command metadata.
+const INGRESS_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
 #[derive(Clone)]
 struct WalIngress {
@@ -73,23 +80,19 @@ impl ImmutableSegmentStore for ObjectArchiveStore {
     }
 
     async fn verify(&self, object: &ArchiveObject) -> Result<(), ArchiveError> {
+        let bytes = self.read(object).await?;
+        object.verify_bytes(&bytes)
+    }
+
+    async fn read(&self, object: &ArchiveObject) -> Result<Bytes, ArchiveError> {
         let path = object_store::path::Path::from(object.key.as_str());
-        let bytes = self
-            .store
+        self.store
             .get(&path)
             .await
             .map_err(|error| ArchiveError::ObjectStore(error.to_string()))?
             .bytes()
             .await
-            .map_err(|error| ArchiveError::ObjectStore(error.to_string()))?;
-        if bytes.len() as u64 != object.length
-            || <[u8; 32]>::from(Sha256::digest(&bytes)) != object.hash
-        {
-            return Err(ArchiveError::ObjectStore(
-                "visible archive object has the wrong identity".to_owned(),
-            ));
-        }
-        Ok(())
+            .map_err(|error| ArchiveError::ObjectStore(error.to_string()))
     }
 }
 
@@ -233,6 +236,7 @@ pub async fn serve(
     let app = Router::new()
         .route("/wal/v1/{tenant}/{timeline}", post(wal_request))
         .route("/catalog/v1/{tenant}/{warehouse}", post(catalog_request))
+        .layer(DefaultBodyLimit::max(INGRESS_BODY_LIMIT_BYTES))
         .with_state(state);
     eprintln!(
         "verglas-cache-node {VERSION} Verglas Neon WAL ingress listening on http://{} (EC k={}, m={}, coded threshold={})",
@@ -241,8 +245,15 @@ pub async fn serve(
         layout.m,
         layout.w,
     );
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// Waits for process termination before closing the public WAL ingress.
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
 /// Routes catalog work through its tenant root before the warehouse group.
@@ -290,7 +301,7 @@ async fn catalog_request(
             },
         )
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(catalog_submission_error)?;
     if root_response != GroupResponse::WarehouseGroup(Some(warehouse_group.clone())) {
         return Err((
             StatusCode::CONFLICT,
@@ -301,7 +312,7 @@ async fn catalog_request(
         .consensus
         .submit(&warehouse_group, command)
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        .map_err(catalog_submission_error)?;
     let response = match response {
         GroupResponse::Applied(response) => ManagedCatalogResponse::Applied(response),
         GroupResponse::CatalogTable(table) => ManagedCatalogResponse::Table(table),
@@ -335,8 +346,25 @@ async fn catalog_request(
                 "wrong group response".to_owned(),
             ));
         }
+        GroupResponse::ArchivedWalReadPlan(_) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "wrong group response".to_owned(),
+            ));
+        }
     };
     Ok(Json(response))
+}
+
+/// Preserves availability failover while making authoritative catalog conflicts final HTTP 409 responses.
+fn catalog_submission_error(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> (StatusCode, String) {
+    let status = match error.downcast_ref::<GroupError>() {
+        Some(GroupError::CatalogConflict | GroupError::ConflictingRetry) => StatusCode::CONFLICT,
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (status, error.to_string())
 }
 
 /// Converts one transport request into the universal timeline-group command.
@@ -348,6 +376,14 @@ async fn wal_request(
     let request =
         WalRequest::decode(&body).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let group = format!("timeline/{tenant}/{timeline}");
+    if let WalRequest::ReadWal {
+        from,
+        to,
+        minimum_index,
+    } = request
+    {
+        return composed_wal_read(&state, &group, from, to, minimum_index).await;
+    }
     if let WalRequest::Append {
         request_id,
         writer_epoch,
@@ -452,6 +488,53 @@ async fn wal_request(
         _ => {}
     }
     response_binary(response)
+}
+
+/// Serves a baseline retained read or composes its archived prefix and retained tail.
+async fn composed_wal_read(
+    state: &WalIngress,
+    group: &str,
+    from: u64,
+    to: u64,
+    minimum_index: u64,
+) -> Result<Response, (StatusCode, String)> {
+    let response = state
+        .consensus
+        .submit(
+            group,
+            GroupRequest::ReadWal {
+                from,
+                to,
+                minimum_index,
+            },
+        )
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+    let plan = match response {
+        GroupResponse::Bytes(bytes) => return response_binary(GroupResponse::Bytes(bytes)),
+        GroupResponse::ArchivedWalReadPlan(plan) => plan,
+        _ => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "WAL read returned the wrong response".to_owned(),
+            ));
+        }
+    };
+    let archived_end = to.min(plan.checkpointed_end());
+    let mut output = Vec::with_capacity((to - from) as usize);
+    if from < archived_end {
+        let prefix = read_archived_wal_prefix(
+            state.archive_store.as_ref(),
+            plan.archived_segments(),
+            from,
+            archived_end,
+        )
+        .await
+        .map_err(|error| (StatusCode::CONFLICT, error.to_string()))?;
+        output.extend_from_slice(&prefix);
+    }
+    output.extend_from_slice(plan.retained_tail());
+    response_binary(GroupResponse::Bytes(output))
 }
 
 /// Archives every newly complete PostgreSQL segment without delaying append acknowledgement.
@@ -692,7 +775,8 @@ fn response_binary(response: GroupResponse) -> Result<Response, (StatusCode, Str
         | GroupResponse::CatalogRecord(_)
         | GroupResponse::CatalogRecords(_)
         | GroupResponse::CatalogExport(_)
-        | GroupResponse::WarehouseGroup(_) => {
+        | GroupResponse::WarehouseGroup(_)
+        | GroupResponse::ArchivedWalReadPlan(_) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "wrong group response".to_owned(),

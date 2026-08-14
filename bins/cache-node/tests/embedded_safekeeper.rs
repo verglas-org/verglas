@@ -1,5 +1,5 @@
-//! Process-level proof that three cache-node binaries form the fragment ring
-//! used by the embedded Neon safekeeper.
+//! Process-level proof that cache-node binaries form the fragment ring used by
+//! the embedded Neon safekeeper and retain one-node-failure availability.
 
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpListener};
@@ -8,10 +8,16 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
+use verglas_consensus::{CatalogAction, CatalogBatch};
 use verglas_safekeeper::{WalRequest, WalResponse};
 
 const TENANT: &str = "0123456789abcdef0123456789abcdef";
 const TIMELINE: &str = "fedcba9876543210fedcba9876543210";
+const CATALOG_TENANT: &str = "tenant-tpch";
+const WAREHOUSE: &str = "tpch";
+const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
+const WAL_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
 
 /// Kills child cache nodes even when an assertion fails.
 struct Fleet {
@@ -101,27 +107,122 @@ fn write_config(root: &std::path::Path, index: usize, s3: u16, admin: u16) -> st
     config
 }
 
+/// Starts one cache node against its retained directory and captures diagnostics.
+fn spawn_node(
+    index: usize,
+    config: &std::path::Path,
+    peers: &str,
+    ring_port: u16,
+    safekeeper_port: u16,
+    stderr: &Arc<Mutex<Vec<String>>>,
+) -> Child {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
+        .arg("--config")
+        .arg(config)
+        .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
+        .env("VERGLAS_NODE_ID", format!("node-{index}"))
+        .env("VERGLAS_RING_PEERS", peers)
+        .env("VERGLAS_SAFEKEEPER_EC_K", "2")
+        .env("VERGLAS_SAFEKEEPER_EC_M", "2")
+        .env("VERGLAS_SAFEKEEPER_EC_W", "3")
+        .env("VERGLAS_RING_ADDR", format!("127.0.0.1:{ring_port}"))
+        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
+        .env(
+            "VERGLAS_SAFEKEEPER_ADDR",
+            format!("127.0.0.1:{safekeeper_port}"),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn cache node");
+    let pipe = child.stderr.take().expect("piped stderr");
+    let sink = Arc::clone(stderr);
+    thread::spawn(move || {
+        for line in BufReader::new(pipe).lines() {
+            let Ok(line) = line else {
+                return;
+            };
+            if let Ok(mut lines) = sink.lock() {
+                lines.push(line);
+            }
+        }
+    });
+    child
+}
+
 /// Submits one canonical WAL operation and decodes its complete response.
-async fn submit(addr: SocketAddr, request: WalRequest) -> WalResponse {
+async fn submit(addr: SocketAddr, request: WalRequest) -> Result<WalResponse, String> {
     let body = request.encode().expect("encode WAL request");
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?
         .post(format!("http://{addr}/wal/v1/{TENANT}/{TIMELINE}"))
         .header("content-type", "application/octet-stream")
         .body(body)
         .send()
         .await
-        .expect("submit WAL operation");
-    assert!(response.status().is_success(), "{}", response.status());
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("WAL operation failed with {}", response.status()));
+    }
     WalResponse::decode(&response.bytes().await.expect("WAL response body"))
-        .expect("decode WAL response")
+        .map_err(|error| error.to_string())
 }
 
-/// Three real cache-node processes quorum-ack WAL and serve it back unchanged.
+/// Sends one complete canonical WAL request and leaves its HTTP status visible.
+async fn submit_wal_http(
+    addr: SocketAddr,
+    request: WalRequest,
+) -> Result<reqwest::Response, String> {
+    let body = request.encode().expect("encode WAL request");
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!("http://{addr}/wal/v1/{TENANT}/{TIMELINE}"))
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Submits one typed native-catalog request and decodes its linearizable response.
+async fn submit_catalog(
+    addr: SocketAddr,
+    request: ManagedCatalogRequest,
+) -> Result<ManagedCatalogResponse, String> {
+    let response = reqwest::Client::builder()
+        // Leader recovery verifies the retained catalog prefix before serving
+        // authority. Match the process-level 30-second consensus bound rather
+        // than imposing the old single-election five-second client deadline.
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!(
+            "http://{addr}/catalog/v1/{CATALOG_TENANT}/{WAREHOUSE}"
+        ))
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "catalog operation failed with {}: {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+    response.json().await.map_err(|error| error.to_string())
+}
+
+/// Four real cache nodes preserve writes with one voter down and refuse two failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cache_node_embeds_the_ring_backed_safekeeper() {
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port()];
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -129,47 +230,22 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         .collect::<Vec<_>>()
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
     let mut children = Vec::new();
-    for index in 0..3 {
-        let config = write_config(root.path(), index, free_port(), free_port());
-        let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
-            .arg("--config")
-            .arg(config)
-            .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
-            .env("VERGLAS_NODE_ID", format!("node-{index}"))
-            .env("VERGLAS_RING_PEERS", &peers)
-            .env("VERGLAS_SAFEKEEPER_EC_K", "2")
-            .env("VERGLAS_SAFEKEEPER_EC_M", "1")
-            .env("VERGLAS_SAFEKEEPER_EC_W", "3")
-            .env(
-                "VERGLAS_RING_ADDR",
-                format!("127.0.0.1:{}", ring_ports[index]),
-            )
-            .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
-            .env(
-                "VERGLAS_SAFEKEEPER_ADDR",
-                format!("127.0.0.1:{}", safekeeper_ports[index]),
-            )
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawn cache node");
-        let pipe = child.stderr.take().expect("piped stderr");
-        let sink = Arc::clone(&stderr);
-        thread::spawn(move || {
-            for line in BufReader::new(pipe).lines() {
-                let Ok(line) = line else {
-                    return;
-                };
-                if let Ok(mut lines) = sink.lock() {
-                    lines.push(line);
-                }
-            }
-        });
-        children.push(child);
+    for index in 0..4 {
+        children.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            &stderr,
+        ));
     }
     let mut fleet = Fleet { children, stderr };
-    fleet.wait_for_safekeepers(3, Duration::from_secs(30));
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
 
     let address = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
     let opened = submit(
@@ -179,7 +255,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             start_lsn: 0x16_b6ff_f000,
         },
     )
-    .await;
+    .await
+    .expect("open timeline through four-voter quorum");
     let WalResponse::Applied {
         wal_end: Some(opened_lsn),
         ..
@@ -195,7 +272,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             writer: "integration-compute".to_owned(),
         },
     )
-    .await;
+    .await
+    .expect("acquire writer through four-voter quorum");
     let WalResponse::Applied {
         index: acquire_index,
         writer_epoch: Some(writer_epoch),
@@ -216,7 +294,8 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             payload: wal.to_vec(),
         },
     )
-    .await;
+    .await
+    .expect("append through four-voter quorum");
     let WalResponse::Applied {
         index: append_index,
         wal_end: Some(committed_end),
@@ -228,7 +307,9 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
     assert_eq!(committed_end, end);
     assert!(append_index > acquire_index);
 
-    let read = submit(
+    fleet.children[0].kill().expect("stop elected leader");
+    fleet.children[0].wait().expect("reap elected leader");
+    let immediate = submit(
         SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[1])),
         WalRequest::ReadWal {
             from: start,
@@ -236,11 +317,473 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             minimum_index: append_index,
         },
     )
-    .await;
+    .await
+    .expect("a live ingress must ride out election and serve immediately after leader loss");
     assert_eq!(
-        read,
+        immediate,
         WalResponse::WalBytes {
-            payload: wal.to_vec()
+            payload: wal.to_vec(),
         }
+    );
+    fleet.children[0] = spawn_node(
+        0,
+        &configs[0],
+        &peers,
+        ring_ports[0],
+        safekeeper_ports[0],
+        &fleet.stderr,
+    );
+    fleet.wait_for_safekeepers(5, Duration::from_secs(30));
+
+    fleet.children[3].kill().expect("stop fourth voter");
+    fleet.children[3].wait().expect("reap fourth voter");
+    let second = b"-while-one-voter-is-down";
+    let second_end = end + second.len() as u64;
+    let appended = submit(
+        address,
+        WalRequest::Append {
+            request_id: (u128::from(writer_epoch) << 64) | u128::from(end),
+            writer_epoch,
+            start_lsn: end,
+            payload: second.to_vec(),
+        },
+    )
+    .await
+    .expect("three live voters must commit without waiting for the fourth");
+    let WalResponse::Applied {
+        index: second_index,
+        wal_end: Some(committed_end),
+        ..
+    } = appended
+    else {
+        panic!("unexpected one-down append response: {appended:?}");
+    };
+    assert_eq!(committed_end, second_end);
+    assert!(second_index > append_index);
+
+    let read = submit(
+        SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[1])),
+        WalRequest::ReadWal {
+            from: start,
+            to: second_end,
+            minimum_index: second_index,
+        },
+    )
+    .await
+    .expect("read committed WAL through another live ingress");
+    let mut expected = wal.to_vec();
+    expected.extend_from_slice(second);
+    assert_eq!(read, WalResponse::WalBytes { payload: expected });
+
+    fleet.children[3] = spawn_node(
+        3,
+        &configs[3],
+        &peers,
+        ring_ports[3],
+        safekeeper_ports[3],
+        &fleet.stderr,
+    );
+    fleet.wait_for_safekeepers(5, Duration::from_secs(30));
+
+    fleet.children[2].kill().expect("stop third voter");
+    fleet.children[2].wait().expect("reap third voter");
+    let recovered_payload = b"through-restarted-follower";
+    let recovered = submit(
+        address,
+        WalRequest::Append {
+            request_id: (u128::from(writer_epoch) << 64) | u128::from(second_end),
+            writer_epoch,
+            start_lsn: second_end,
+            payload: recovered_payload.to_vec(),
+        },
+    )
+    .await
+    .expect("a restarted durable follower must reopen its group from Raft traffic");
+    assert!(matches!(recovered, WalResponse::Applied { .. }));
+
+    fleet.children[3]
+        .kill()
+        .expect("stop restarted fourth voter");
+    fleet.children[3]
+        .wait()
+        .expect("reap restarted fourth voter");
+    let minority = submit(
+        address,
+        WalRequest::Append {
+            request_id: (u128::from(writer_epoch) << 64) | u128::from(second_end + 1),
+            writer_epoch,
+            start_lsn: second_end + recovered_payload.len() as u64,
+            payload: b"must-not-commit".to_vec(),
+        },
+    )
+    .await;
+    assert!(minority.is_err(), "two live voters must fail closed");
+}
+
+/// The public WAL listener accepts benchmark-sized appends but retains a hard body ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodies() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let children = (0..4)
+        .map(|index| {
+            spawn_node(
+                index,
+                &configs[index],
+                &peers,
+                ring_ports[index],
+                safekeeper_ports[index],
+                &stderr,
+            )
+        })
+        .collect();
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let address = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
+    let opened = submit(
+        address,
+        WalRequest::OpenTimeline {
+            request_id: 200,
+            start_lsn: 0,
+        },
+    )
+    .await
+    .expect("open timeline");
+    let start = match opened {
+        WalResponse::Applied {
+            wal_end: Some(start),
+            ..
+        } => start,
+        other => panic!("unexpected timeline-open response: {other:?}"),
+    };
+    let acquired = submit(
+        address,
+        WalRequest::AcquireWriter {
+            request_id: 201,
+            writer: "body-limit-compute".to_owned(),
+        },
+    )
+    .await
+    .expect("acquire writer");
+    let writer_epoch = match acquired {
+        WalResponse::Applied {
+            writer_epoch: Some(writer_epoch),
+            ..
+        } => writer_epoch,
+        other => panic!("unexpected writer-acquire response: {other:?}"),
+    };
+    let payload = vec![0xa5; CANONICAL_WAL_APPEND_BYTES];
+    let appended = submit_wal_http(
+        address,
+        WalRequest::Append {
+            request_id: 202,
+            writer_epoch,
+            start_lsn: start,
+            payload: payload.clone(),
+        },
+    )
+    .await
+    .expect("submit benchmark-sized WAL append");
+    assert!(
+        appended.status().is_success(),
+        "canonical append reaches WAL handler"
+    );
+    let response = WalResponse::decode(&appended.bytes().await.expect("append response body"))
+        .expect("decode append response");
+    assert!(
+        matches!(response, WalResponse::Applied { wal_end: Some(end), .. } if end == payload.len() as u64)
+    );
+
+    let rejected = submit_wal_http(
+        address,
+        WalRequest::Append {
+            request_id: 203,
+            writer_epoch,
+            start_lsn: start + payload.len() as u64,
+            payload: vec![0; WAL_BODY_LIMIT_BYTES],
+        },
+    )
+    .await
+    .expect("submit over-limit WAL append");
+    assert_eq!(rejected.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A large WAL tail continues through every surviving ingress after its first leader dies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_wal_append_continues_after_exact_leader_death() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let children = (0..4)
+        .map(|index| {
+            spawn_node(
+                index,
+                &configs[index],
+                &peers,
+                ring_ports[index],
+                safekeeper_ports[index],
+                &stderr,
+            )
+        })
+        .collect();
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let leader = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
+    let start = match submit(
+        leader,
+        WalRequest::OpenTimeline {
+            request_id: 300,
+            start_lsn: 0,
+        },
+    )
+    .await
+    .expect("open timeline through node zero")
+    {
+        WalResponse::Applied {
+            wal_end: Some(start),
+            ..
+        } => start,
+        other => panic!("unexpected timeline-open response: {other:?}"),
+    };
+    let writer_epoch = match submit(
+        leader,
+        WalRequest::AcquireWriter {
+            request_id: 301,
+            writer: "large-failover-compute".to_owned(),
+        },
+    )
+    .await
+    .expect("acquire writer through node zero")
+    {
+        WalResponse::Applied {
+            writer_epoch: Some(writer_epoch),
+            ..
+        } => writer_epoch,
+        other => panic!("unexpected writer-acquire response: {other:?}"),
+    };
+
+    let mut end = start;
+    for sequence in 0..4_u128 {
+        let payload = vec![sequence as u8; CANONICAL_WAL_APPEND_BYTES];
+        let response = submit_wal_http(
+            leader,
+            WalRequest::Append {
+                request_id: 0x1350_3000 + sequence,
+                writer_epoch,
+                start_lsn: end,
+                payload,
+            },
+        )
+        .await
+        .expect("submit retained large WAL frame through node zero");
+        assert!(
+            response.status().is_success(),
+            "retained large WAL frame {sequence} must commit; status={}; stderr:\n{}",
+            response.status(),
+            fleet.stderr_snapshot(),
+        );
+        let response = WalResponse::decode(&response.bytes().await.expect("append response body"))
+            .expect("decode retained large WAL append response");
+        end = match response {
+            WalResponse::Applied {
+                wal_end: Some(committed_end),
+                ..
+            } => committed_end,
+            other => panic!("unexpected retained large WAL response: {other:?}"),
+        };
+    }
+
+    fleet.children[0]
+        .kill()
+        .expect("stop exact node-zero leader after retained large tail");
+    fleet.children[0]
+        .wait()
+        .expect("reap exact node-zero leader");
+
+    let continuation = vec![4_u8; CANONICAL_WAL_APPEND_BYTES];
+    for (index, port) in safekeeper_ports.iter().enumerate().skip(1) {
+        let response = submit_wal_http(
+            SocketAddr::from(([127, 0, 0, 1], *port)),
+            WalRequest::Append {
+                request_id: 0x1350_3004,
+                writer_epoch,
+                start_lsn: end,
+                payload: continuation.clone(),
+            },
+        )
+        .await
+        .expect("submit large WAL continuation through surviving ingress");
+        let status = response.status();
+        let body = response.bytes().await.expect("continuation response body");
+        assert!(
+            status.is_success(),
+            "surviving ingress node {index} rejected the large WAL continuation with {status}: {}; stderr:\n{}",
+            String::from_utf8_lossy(&body),
+            fleet.stderr_snapshot(),
+        );
+        let response = WalResponse::decode(&body).expect("decode continuation response");
+        assert!(
+            matches!(response, WalResponse::Applied { wal_end: Some(committed_end), .. } if committed_end == end + CANONICAL_WAL_APPEND_BYTES as u64),
+            "surviving ingress node {index} returned an unexpected continuation response: {response:?}",
+        );
+    }
+}
+
+/// Four native-catalog ingresses retain linearizable availability after their elected leader dies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    for index in 0..4 {
+        children.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            &stderr,
+        ));
+    }
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let leader = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[0]));
+    let namespace = CatalogBatch::new(
+        vec![],
+        vec![CatalogAction::CreateNamespace {
+            namespace: "analytics".to_owned(),
+        }],
+    )
+    .expect("namespace batch");
+    assert!(matches!(
+        submit_catalog(
+            leader,
+            ManagedCatalogRequest::Commit {
+                request_id: 1,
+                batch: namespace,
+            },
+        )
+        .await
+        .expect("commit catalog namespace through four voters"),
+        ManagedCatalogResponse::Applied(_)
+    ));
+
+    // The dead-leader case must validate a realistic retained catalog prefix,
+    // rather than only the one registration command in the tenant-root group.
+    for revision in 0..106_u128 {
+        let batch = CatalogBatch::new(
+            vec![],
+            vec![CatalogAction::PutTable {
+                table: "analytics.lineitem".to_owned(),
+                metadata_location: format!("s3://warehouse/lineitem/v{revision}.metadata.json"),
+            }],
+        )
+        .expect("table batch");
+        assert!(matches!(
+            submit_catalog(
+                leader,
+                ManagedCatalogRequest::Commit {
+                    request_id: revision + 2,
+                    batch,
+                },
+            )
+            .await
+            .expect("commit retained catalog prefix"),
+            ManagedCatalogResponse::Applied(_)
+        ));
+    }
+
+    fleet.children[0]
+        .kill()
+        .expect("stop elected catalog leader");
+    fleet.children[0]
+        .wait()
+        .expect("reap elected catalog leader");
+    let survivor = SocketAddr::from(([127, 0, 0, 1], safekeeper_ports[1]));
+    assert_eq!(
+        submit_catalog(survivor, ManagedCatalogRequest::Namespaces)
+            .await
+            .expect("survivor serves an immediate linearizable catalog read"),
+        ManagedCatalogResponse::Namespaces(vec!["analytics".to_owned()])
+    );
+    let mutation = CatalogBatch::new(
+        vec![],
+        vec![CatalogAction::PutTable {
+            table: "analytics.lineitem".to_owned(),
+            metadata_location: "s3://warehouse/lineitem/after-leader-loss.metadata.json".to_owned(),
+        }],
+    )
+    .expect("post-loss table batch");
+    assert!(matches!(
+        submit_catalog(
+            survivor,
+            ManagedCatalogRequest::Commit {
+                request_id: 10_000,
+                batch: mutation,
+            },
+        )
+        .await
+        .expect("three live voters commit after catalog-leader loss"),
+        ManagedCatalogResponse::Applied(_)
+    ));
+
+    fleet.children[3]
+        .kill()
+        .expect("stop a second catalog voter");
+    fleet.children[3].wait().expect("reap second catalog voter");
+    let minority = CatalogBatch::new(
+        vec![],
+        vec![CatalogAction::PutTable {
+            table: "analytics.lineitem".to_owned(),
+            metadata_location: "s3://warehouse/lineitem/must-not-commit.metadata.json".to_owned(),
+        }],
+    )
+    .expect("minority table batch");
+    assert!(
+        submit_catalog(
+            survivor,
+            ManagedCatalogRequest::Commit {
+                request_id: 10_001,
+                batch: minority,
+            },
+        )
+        .await
+        .is_err(),
+        "two live voters must reject a catalog mutation"
     );
 }

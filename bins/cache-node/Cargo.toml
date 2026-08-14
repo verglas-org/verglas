@@ -24,6 +24,7 @@ verglas-backend.workspace = true
 # consume the local gateway and never receive upstream Lakekeeper credentials.
 verglas-catalog.workspace = true
 verglas-tables.workspace = true
+verglas-iceberg.workspace = true
 # The block-device tier (#382): the NBD server in this binary serves cache-served
 # virtual disks to attached NBD clients; verglas-block owns the durable chunk
 # store + manifest.
@@ -39,7 +40,7 @@ verglas-consensus.workspace = true
 # The Neon-compatible WAL listener is embedded in this process and places WAL
 # fragments through the same ring transport as block FLUSH.
 verglas-safekeeper.workspace = true
-verglas-write.workspace = true
+verglas-writeback.workspace = true
 axum.workspace = true
 futures.workspace = true
 # The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.

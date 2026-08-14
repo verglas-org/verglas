@@ -43,3 +43,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   uuidHash) now return `VectorError::Field` with a clear integer / UUID
   uuidHash message instead of `Ok(None)`. Truly empty tables still yield no
   index. Tests cover the string-id footgun and a uuidHash full-build path.
+- #137: Added a lossless arbitrary-string key bridge for Vamana. Each semantic
+  index persists a collision-free monotonic `i64` mapping in a sibling Puffin
+  blob attached to the same Iceberg snapshot as its ANN graph, so updates,
+  deletes, and a restarted reader recover exact caller keys without a hash-only
+  identifier or an authoritative in-memory map.

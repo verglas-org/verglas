@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Reject product and control-plane source that belongs in sibling repositories.
+# Reject hosted product and control-plane source that belongs in sibling repositories.
 
 set -euo pipefail
 
@@ -18,6 +18,7 @@ forbidden_paths=(
   crates/verglas-authz-openfga
   crates/verglas-authz-postgres
   crates/verglas-container-runtime
+  crates/verglas-catalog-service
   crates/verglas-database
   crates/verglas-harness
   crates/verglas-integration-runtime
@@ -27,8 +28,6 @@ forbidden_paths=(
   crates/verglas-rest
   crates/verglas-scheduler
   crates/verglas-vessel-contract
-  sdks/rust
-  sdks/typescript
 )
 
 status=0
@@ -38,5 +37,13 @@ for path in "${forbidden_paths[@]}"; do
     status=1
   fi
 done
+
+if rg -q 'lakekeeper-(bin|storage-verglas)|name = "lakekeeper"' \
+  "$repo_root/Cargo.toml" \
+  "$repo_root/bins"/*/Cargo.toml \
+  "$repo_root/crates"/*/Cargo.toml; then
+  printf 'repository boundary violation: Lakekeeper service code remains in the OSS engine\n' >&2
+  status=1
+fi
 
 exit "$status"

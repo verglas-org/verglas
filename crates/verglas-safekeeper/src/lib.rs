@@ -12,5 +12,5 @@ pub use consensus_protocol::{
 };
 pub use segment_archiver::{
     ArchiveError, ArchiveObject, ArchiveTimeline, ConsensusArchiveTimeline, ImmutableSegmentStore,
-    SegmentArchiver, SegmentRelease,
+    SegmentArchiver, SegmentRelease, read_archived_wal_prefix,
 };

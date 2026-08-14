@@ -37,7 +37,7 @@ use verglas_core::metrics::NodeMetrics;
 use verglas_core::node::NodeId;
 use verglas_core::ring::RendezvousRing;
 use verglas_s3::{PassthroughList, PassthroughRead, PassthroughWrite};
-use verglas_write::{
+use verglas_writeback::{
     JournalStore, PrefixRule, WriteCoordinator, WritebackMetrics, WritebackPolicy, WritebackTier,
 };
 
@@ -48,7 +48,7 @@ use crate::admin;
 /// so ownership is byte-identical to a pre-cluster server.
 const SINGLE_NODE_ID: &str = "single";
 /// Storage binding for the built-in managed lakehouse database.
-const MANAGED_STORAGE_BINDING_ID: &str = "managed-lakehouse";
+const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
 
 /// The default NBD listen port for the block-device tier (#382). An attach
 /// client connects a kernel NBD client here; the export name selects the
@@ -302,7 +302,7 @@ pub async fn run(
     credentials: (String, String),
 ) -> Result<(), Box<dyn std::error::Error>> {
     // One backend store shared by the read and write passthroughs.
-    let registry = BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
+    let registry = BackendStore::from_config(DEFAULT_STORAGE_BINDING_ID, &config.backend);
     eprintln!(
         "verglas-cache-node {VERSION} backend resolved: {} (serving bucket set `{}`)",
         registry.describe(),
@@ -366,7 +366,7 @@ pub async fn run(
     let mut ring_plane = None;
     let block_registry = match config.backend.bucket.as_deref() {
         Some(bucket) => {
-            let store = registry.store_for(MANAGED_STORAGE_BINDING_ID, bucket)?;
+            let store = registry.store_for(DEFAULT_STORAGE_BINDING_ID, bucket)?;
             let backend: Arc<dyn ObjectBackend> = Arc::new(ObjectStoreBackend::new(store));
             let device_registry =
                 crate::blockdev::DeviceRegistry::open(&config.cache.dir, backend).await?;
@@ -419,7 +419,7 @@ pub async fn run(
                     "wal_archive is required when the authoritative cache ring is enabled",
                 )
             })?;
-            let archive_store = registry.store_for(MANAGED_STORAGE_BINDING_ID, &archive.bucket)?;
+            let archive_store = registry.store_for(DEFAULT_STORAGE_BINDING_ID, &archive.bucket)?;
             let archive_store: Arc<dyn verglas_safekeeper::ImmutableSegmentStore> =
                 Arc::new(crate::safekeeper::ObjectArchiveStore::new(archive_store));
             let _ = bucket;
@@ -441,6 +441,7 @@ pub async fn run(
     let object_consensus = safekeeper_args
         .as_ref()
         .map(|(_, _, consensus, _, _)| Arc::clone(consensus));
+    let shutdown_consensus = object_consensus.clone();
 
     // An external Iceberg REST endpoint is always an explicitly eventual
     // source. Managed catalog transactions use the native warehouse endpoint
@@ -693,7 +694,14 @@ pub async fn run(
         }
     };
 
-    tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut).map(|_| ())
+    let result = tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut);
+    if let Some(consensus) = shutdown_consensus {
+        consensus
+            .shutdown()
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    result.map(|_| ())
 }
 
 /// Probes the origin until it is reachable, then keeps checking after failures.
@@ -752,6 +760,36 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
         activity,
     } = context;
     let (object_ring, object_consensus, writeback_slot) = writeback;
+    // Semantic state is opened from the same customer catalog and routes table
+    // FileIO back through this listener. No process-local registry survives
+    // restart: the adapter reopens graphs from Iceberg for each operation.
+    let semantic_api: Option<Arc<dyn verglas_s3::semantic::SemanticApi>> =
+        match config.catalog.as_ref() {
+            Some(catalog) => {
+                let local_addr = s3_listener.local_addr()?;
+                let connection = verglas_iceberg::Connection {
+                    catalog_uri: catalog.uri.clone(),
+                    token: catalog
+                        .resolve_bearer_token()
+                        .map_err(std::io::Error::other)?,
+                    warehouse: catalog.warehouse.clone(),
+                    s3_endpoint: Some(format!("http://{local_addr}")),
+                    region: config
+                        .backend
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| "us-east-1".to_owned()),
+                    access_key_id: Some(credentials.0.clone()),
+                    secret_access_key: Some(credentials.1.clone()),
+                };
+                Some(Arc::new(
+                    verglas_s3::semantic::IcebergCatalogSemanticStore::new(
+                        verglas_iceberg::catalog::open_catalog(&connection).await?,
+                    ),
+                ))
+            }
+            None => None,
+        };
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
     let lister: Arc<dyn verglas_core::list::ObjectList> =
@@ -766,11 +804,11 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
         let policy = Arc::new(object_writeback_policy(layout));
         let (journal_store, migrated_journals) = JournalStore::open_for_binding(
             config.cache.dir.join("object-writeback"),
-            MANAGED_STORAGE_BINDING_ID,
+            DEFAULT_STORAGE_BINDING_ID,
         )?;
         if migrated_journals > 0 {
             eprintln!(
-                "verglas-cache-node {VERSION} migrated {migrated_journals} legacy writeback journals to storage binding {MANAGED_STORAGE_BINDING_ID}"
+                "verglas-cache-node {VERSION} migrated {migrated_journals} legacy writeback journals to storage binding {DEFAULT_STORAGE_BINDING_ID}"
             );
         }
         let journals = Arc::new(journal_store);
@@ -788,39 +826,52 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             )),
             std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
         ));
-        let _repair = verglas_write::spawn_repair_loop(
+        let _repair = verglas_writeback::spawn_repair_loop(
             Arc::clone(&coordinator),
             membership,
             std::time::Duration::from_secs(2),
         );
-        let _scrub = verglas_write::spawn_scrub_loop(
+        let _scrub = verglas_writeback::spawn_scrub_loop(
             Arc::clone(&coordinator),
             std::time::Duration::from_secs(config.cache.writeback.scrub_interval_secs),
         );
         let tier = WritebackTier::new(coordinator, engine, origin, policy);
         verglas_s3::router_with_passthrough(
-            MANAGED_STORAGE_BINDING_ID,
+            DEFAULT_STORAGE_BINDING_ID,
             tier.reader,
             tier.writer,
             lister,
             invalidation,
-            Some(credentials),
+            Some(credentials.clone()),
             Some(registry as Arc<dyn verglas_backend::BackendStores>),
             config.listen.domain.as_deref(),
             Some(node_metrics),
         )
     } else {
         verglas_s3::router_with_passthrough(
-            MANAGED_STORAGE_BINDING_ID,
+            DEFAULT_STORAGE_BINDING_ID,
             engine,
             PassthroughWrite::new(registry.clone()),
             lister,
             invalidation,
-            Some(credentials),
+            Some(credentials.clone()),
             Some(registry as Arc<dyn verglas_backend::BackendStores>),
             config.listen.domain.as_deref(),
             Some(node_metrics),
         )
+    };
+    // Semantic routes exist only with a configured customer catalog and use the
+    // same configured keypair as S3 objects for their distinct SigV4 services.
+    let app = match semantic_api {
+        Some(api) => verglas_s3::semantic::router_with_sigv4(
+            api,
+            verglas_s3::semantic::SemanticCredentials::new(
+                credentials.0.clone(),
+                credentials.1.clone(),
+            ),
+        )
+        .merge(app),
+        None => app,
     };
     let app = admin::track_http(app, activity, ActivityPlane::Http);
 
@@ -859,7 +910,7 @@ mod tests {
         ] {
             assert_eq!(
                 policy.geometry_for(&verglas_core::CacheKey {
-                    storage_binding_id: MANAGED_STORAGE_BINDING_ID.to_owned(),
+                    storage_binding_id: DEFAULT_STORAGE_BINDING_ID.to_owned(),
                     bucket: "tenant".to_owned(),
                     key: key.to_owned(),
                 }),
@@ -1067,7 +1118,7 @@ mod tests {
     /// never reached — the tests never issue a read that would fill), the same
     /// single-node rendezvous ring + no-op peer the serve path uses.
     async fn build_test_engine(config: &Config) -> (CacheEngine, Arc<BackendStore>) {
-        let registry = BackendStore::from_config(MANAGED_STORAGE_BINDING_ID, &config.backend);
+        let registry = BackendStore::from_config(DEFAULT_STORAGE_BINDING_ID, &config.backend);
         let backend = PassthroughRead::new(registry.clone());
         let node = NodeId::new(SINGLE_NODE_ID);
         let ring = RendezvousRing::single(node.clone());

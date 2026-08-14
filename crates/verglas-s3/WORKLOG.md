@@ -261,3 +261,33 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   cache access key as a user or tenant principal. Regression coverage proves a
   signed object GET still succeeds while a signed `/v1` path is rejected as an
   invalid S3 bucket.
+- #137: Added checked-in AWS S3 Vectors and Verglas Graph REST-JSON contracts
+  and dispatch them through the existing S3 listener. The Graph adapter opens
+  customer Iceberg tables per operation and uses Puffin only as its existing
+  snapshot-bound acceleration, never as a local authoritative registry.
+- #258: Expanded the Verglas Graph REST-JSON model from route names into a
+  botocore-style contract with operation input/output/error bindings, typed
+  graph and traversal shapes, and list pagination. Contract tests now validate
+  every public operation and representative graph payloads before clients rely
+  on generated bindings.
+- #137: Made S3 Vector bucket metadata durable in a reserved Iceberg control
+  table rather than mutable catalog namespace properties. Bucket/index creation
+  now persists exact encryption, tags, numeric timestamps, and index definitions;
+  filters, VectorData unions, result flags, and opaque list/query cursors are
+  validated at the adapter boundary, with reopen and commit-order tests.
+- #137: Enforced the Graph REST-JSON runtime contract at the Iceberg adapter.
+  Graph names, node/edge inputs, directions, filters, confidence, pagination,
+  and camel-case traversal outputs now validate and render at the protocol
+  boundary instead of exposing graph-engine serde shapes.
+- #137: Added strict header-signed SigV4 verification to semantic routes. The
+  verifier accepts only `s3vectors` and `verglasgraphs`, binds body, headers,
+  URI/query canonicalization, and a fifteen-minute clock window before the
+  Iceberg adapter sees a request.
+- #137: Enforced exact name-or-ARN selectors and rejected unknown scalar input
+  members before resolving an Iceberg resource. The adapter also maps catalog
+  not-found, conflict, invalid-data, and unexpected failures to REST-JSON
+  status codes instead of reporting every catalog error as unavailable.
+- #137: Replaced mutable bucket and index tag/policy properties with append-only
+  Iceberg control events. State is resolved from snapshot lineage, so concurrent
+  tag writers compose and a fresh semantic adapter observes the same result.
+- #67: Exposed the checked-in S3 listener OpenAPI document and Swagger entry point alongside semantic routes. This keeps the listener contract inspectable without adding another serving API.

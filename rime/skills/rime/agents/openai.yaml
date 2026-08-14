@@ -1,0 +1,4 @@
+interface:
+  display_name: "RIME"
+  short_description: "Optimize with low-cost parallel workers"
+  default_prompt: "Use $rime to reproduce this task, prefer low-cost workers for isolated parallel candidates, and promote the best evidence-backed solution."

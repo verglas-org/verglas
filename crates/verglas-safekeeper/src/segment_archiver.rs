@@ -9,7 +9,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use verglas_consensus::{ConsensusGroup, GroupError};
+use verglas_consensus::{ConsensusGroup, GroupError, WalArchiveSegment};
 
 /// Immutable object identity computed from the exact committed segment bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,6 +20,32 @@ pub struct ArchiveObject {
     pub hash: [u8; 32],
     /// Logical segment byte count.
     pub length: u64,
+}
+
+impl ArchiveObject {
+    /// Rebuilds an object identity only from the committed archive checkpoint record.
+    pub fn from_segment(segment: &WalArchiveSegment) -> Result<Self, ArchiveError> {
+        let object = Self {
+            key: segment.key().to_owned(),
+            hash: segment.hash(),
+            length: segment.length(),
+        };
+        if object.length == 0 {
+            return Err(ArchiveError::InvalidRange);
+        }
+        Ok(object)
+    }
+
+    /// Rejects a read whose visible bytes differ from the committed immutable identity.
+    pub fn verify_bytes(&self, bytes: &[u8]) -> Result<(), ArchiveError> {
+        if bytes.len() as u64 != self.length || <[u8; 32]>::from(Sha256::digest(bytes)) != self.hash
+        {
+            return Err(ArchiveError::ObjectStore(
+                "archive object does not match its committed identity".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A checkpoint-gated boundary through which local WAL representations may be released.
@@ -48,6 +74,47 @@ pub trait ImmutableSegmentStore: Send + Sync {
 
     /// Verifies that the visible object still matches its requested immutable identity.
     async fn verify(&self, object: &ArchiveObject) -> Result<(), ArchiveError>;
+
+    /// Reads the complete immutable object named by a committed checkpoint identity.
+    async fn read(&self, object: &ArchiveObject) -> Result<Bytes, ArchiveError>;
+}
+
+/// Reads one checkpoint-derived prefix interval, rejecting every identity or coverage mismatch.
+pub async fn read_archived_wal_prefix(
+    store: &dyn ImmutableSegmentStore,
+    segments: &[WalArchiveSegment],
+    from: u64,
+    to: u64,
+) -> Result<Bytes, ArchiveError> {
+    if from >= to {
+        return Err(ArchiveError::InvalidRange);
+    }
+    let mut cursor = from;
+    let mut output = Vec::with_capacity((to - from) as usize);
+    for segment in segments {
+        if segment.end_lsn() <= cursor || segment.start_lsn() >= to {
+            continue;
+        }
+        if segment.start_lsn() > cursor || segment.end_lsn() <= cursor {
+            return Err(ArchiveError::ArchivedCoverage);
+        }
+        let object = ArchiveObject::from_segment(segment)?;
+        let bytes = store.read(&object).await?;
+        object.verify_bytes(&bytes)?;
+        let take_to = to.min(segment.end_lsn());
+        let start = (cursor - segment.start_lsn()) as usize;
+        let end = (take_to - segment.start_lsn()) as usize;
+        output.extend_from_slice(
+            bytes
+                .get(start..end)
+                .ok_or(ArchiveError::ArchivedCoverage)?,
+        );
+        cursor = take_to;
+        if cursor == to {
+            return Ok(Bytes::from(output));
+        }
+    }
+    Err(ArchiveError::ArchivedCoverage)
 }
 
 /// Timeline operations the internal archiver needs, excluding every Neon-facing control.
@@ -231,6 +298,9 @@ pub enum ArchiveError {
     /// The requested WAL range is empty or reversed.
     #[error("archive WAL range is empty or reversed")]
     InvalidRange,
+    /// Archive checkpoints fail to cover the exact requested WAL interval.
+    #[error("archive checkpoint objects do not cover the requested WAL interval")]
+    ArchivedCoverage,
     /// Object storage failed to publish or verify the immutable object.
     #[error("archive object store failed: {0}")]
     ObjectStore(String),

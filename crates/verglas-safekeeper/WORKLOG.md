@@ -96,3 +96,6 @@
   archive watermark because the regular range and checkpoint validation remain
   in force.
 - #135: Added the transport-only OpenTimeline operation carrying an exact retry identity and initial PostgreSQL LSN. Compute can now initialize a fresh consensus timeline at its real redo position instead of assuming LSN zero.
+- #135: Added verified archive-object reads and deterministic multi-segment WAL
+  prefix composition. Missing, corrupt, overlapping, or incomplete archive
+  identities fail closed before any retained tail is returned.

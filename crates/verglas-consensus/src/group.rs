@@ -10,12 +10,13 @@ use std::sync::{
 };
 
 use bytes::Bytes;
+use futures::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     AppliedOutcome, CatalogBatch, CatalogEntity, CommandKind, EntryHeader, PayloadError,
     PayloadStore, PersistentStateMachine, RaftCommand, RaftResponse, ReplicationMode, RequestId,
-    VerglasRaftConfig,
+    VerglasRaftConfig, WalArchiveSegment,
 };
 
 /// One independently elected consensus group as seen by its current leader.
@@ -34,6 +35,16 @@ pub struct WalArchiveState {
     applied_index: u64,
     committed_end: u64,
     checkpointed_end: u64,
+}
+
+/// A single fenced view used to compose an archived WAL prefix with its retained EC tail.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WalReadPlan {
+    applied_index: u64,
+    committed_end: u64,
+    checkpointed_end: u64,
+    archived_segments: Vec<WalArchiveSegment>,
+    retained_tail: Vec<u8>,
 }
 
 /// A deterministic, linearizable export of current catalog names and metadata pointers.
@@ -58,6 +69,33 @@ impl WalArchiveState {
     /// Returns the exclusive LSN verified by a committed archive checkpoint.
     pub fn checkpointed_end(self) -> u64 {
         self.checkpointed_end
+    }
+}
+
+impl WalReadPlan {
+    /// Returns the applied-index fence all archive identities in this plan satisfy.
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index
+    }
+
+    /// Returns the exclusive committed WAL tail covered by this plan.
+    pub fn committed_end(&self) -> u64 {
+        self.committed_end
+    }
+
+    /// Returns the exclusive end of the object-resident WAL prefix.
+    pub fn checkpointed_end(&self) -> u64 {
+        self.checkpointed_end
+    }
+
+    /// Returns ordered immutable objects that exactly cover the archived prefix.
+    pub fn archived_segments(&self) -> &[WalArchiveSegment] {
+        &self.archived_segments
+    }
+
+    /// Returns exact retained EC bytes for the requested suffix behind this plan's fence.
+    pub fn retained_tail(&self) -> &[u8] {
+        &self.retained_tail
     }
 }
 
@@ -122,9 +160,7 @@ impl ConsensusGroup {
                 from,
                 to,
                 minimum_index,
-            } => Ok(GroupResponse::Bytes(
-                self.read_wal(from, to, minimum_index).await?.to_vec(),
-            )),
+            } => self.wal_read_response(from, to, minimum_index).await,
             GroupRequest::WalState { minimum_index } => {
                 let state = self.wal_archive_state().await?;
                 if state.applied_index < minimum_index {
@@ -389,6 +425,11 @@ impl ConsensusGroup {
         object: &str,
         holders: &[u64],
     ) -> Result<RaftResponse, GroupError> {
+        let segment = WalArchiveSegment::from_key(object.to_owned())
+            .map_err(|_| GroupError::InvalidArchiveCheckpoint)?;
+        if segment.end_lsn() != end_lsn {
+            return Err(GroupError::InvalidArchiveCheckpoint);
+        }
         self.commit_header(
             request,
             CommandKind::ArchiveCheckpoint,
@@ -396,19 +437,99 @@ impl ConsensusGroup {
             Bytes::copy_from_slice(object.as_bytes()),
             None,
             holders,
-            |header| header.with_archive_lsn(end_lsn),
+            |header| header.with_archive_segment(segment),
         )
         .await
     }
 
     /// Returns a current-term fenced WAL archive state for background release decisions.
     pub async fn wal_archive_state(&self) -> Result<WalArchiveState, GroupError> {
-        self.read_fence().await?;
+        // This boundary exposes only Raft-applied WAL metadata, never bytes.
+        // A checkpoint may legitimately release its local payload allocation,
+        // so verifying every historical payload here would prevent the archiver
+        // from advancing the next complete segment after that release.
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| GroupError::Raft(error.to_string()))?;
         let (committed_end, checkpointed_end) = self.state_machine.wal_archive_state().await;
         Ok(WalArchiveState {
             applied_index: self.state_machine.applied_index().await,
             committed_end,
             checkpointed_end,
+        })
+    }
+
+    /// Returns an exact baseline WAL body or an archive-prefix composition response.
+    ///
+    /// The first attempt is byte-for-byte the regular `ReadWal` path. Only an
+    /// unavailable reconstruction below a committed archive watermark selects
+    /// object-resident composition; no origin or alternate-data fallback exists.
+    async fn wal_read_response(
+        &self,
+        from: u64,
+        to: u64,
+        minimum_index: u64,
+    ) -> Result<GroupResponse, GroupError> {
+        match self.read_wal(from, to, minimum_index).await {
+            Ok(bytes) => Ok(GroupResponse::Bytes(bytes.to_vec())),
+            Err(GroupError::Payload(PayloadError::ReconstructionUnavailable)) => {
+                let (_, checkpointed_end) = self.state_machine.wal_archive_state().await;
+                if from >= checkpointed_end {
+                    return Err(GroupError::Payload(PayloadError::ReconstructionUnavailable));
+                }
+                Ok(GroupResponse::ArchivedWalReadPlan(
+                    self.wal_read_plan(from, to, minimum_index).await?,
+                ))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns archive identities and retained bytes behind the same fence as a WAL read.
+    ///
+    /// WAL recovery verifies only the selected archive identities and retained
+    /// allocations. It must not reconstruct unrelated catalog payloads before
+    /// serving a fenced WAL range.
+    pub async fn wal_read_plan(
+        &self,
+        from: u64,
+        to: u64,
+        minimum_index: u64,
+    ) -> Result<WalReadPlan, GroupError> {
+        if from >= to {
+            return Err(GroupError::WalOutOfRange);
+        }
+        self.raft
+            .ensure_linearizable()
+            .await
+            .map_err(|error| GroupError::Raft(error.to_string()))?;
+        let applied_index = self.state_machine.applied_index().await;
+        if applied_index < minimum_index {
+            return Err(GroupError::NotCommitted(minimum_index));
+        }
+        let (committed_end, checkpointed_end) = self.state_machine.wal_archive_state().await;
+        if to > committed_end {
+            return Err(GroupError::WalOutOfRange);
+        }
+        let archived_segments = self
+            .state_machine
+            .archived_wal_segments(checkpointed_end)
+            .await?;
+        let tail_start = from.max(checkpointed_end);
+        let retained_tail = if tail_start < to {
+            self.read_wal_after_fence(tail_start, to, applied_index)
+                .await?
+                .to_vec()
+        } else {
+            Vec::new()
+        };
+        Ok(WalReadPlan {
+            applied_index,
+            committed_end,
+            checkpointed_end,
+            archived_segments,
+            retained_tail,
         })
     }
 
@@ -751,48 +872,75 @@ impl ConsensusGroup {
 
     /// Verifies every committed representation before this replica serves authority.
     async fn verify_committed_prefix(&self) -> Result<(), GroupError> {
-        for (index, header) in self.state_machine.committed_headers().await {
-            let (certificate, configuration_generation, log_id) =
-                if let Some(repair) = self.state_machine.repair_allocation(index).await {
-                    (
-                        repair.certificate,
-                        repair.configuration_generation,
-                        repair.log_id,
-                    )
-                } else {
-                    (
-                        header.certificate().clone(),
-                        header.configuration_generation(),
-                        self.state_machine
-                            .committed_log_id(index)
-                            .await
-                            .ok_or(GroupError::NotCommitted(index))?,
-                    )
-                };
-            self.payloads
-                .seal(crate::SealRequest {
-                    hash: header.payload_hash(),
-                    group: header.group(),
-                    configuration_generation,
-                    request: header.request(),
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: &certificate,
-                })
-                .await?;
-            self.payloads
-                .reconstruct(crate::ReconstructRequest {
-                    hash: header.payload_hash(),
-                    group: header.group(),
-                    configuration_generation,
-                    request: header.request(),
-                    length: header.payload_len(),
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: &certificate,
-                })
-                .await?;
+        // Prefix entries are independent immutable allocations. Validate them
+        // concurrently so one failed former holder adds one transport timeout,
+        // not one timeout per retained catalog command. Await every task before
+        // admitting the read, so a completed corrupt response cannot be hidden
+        // by another valid entry.
+        let verified = stream::iter(
+            self.state_machine
+                .committed_headers()
+                .await
+                .into_iter()
+                .map(|(index, header)| async move {
+                    self.verify_committed_header(index, &header).await
+                }),
+        )
+        .buffer_unordered(16)
+        .collect::<Vec<_>>()
+        .await;
+        for result in verified {
+            result?;
         }
+        Ok(())
+    }
+
+    /// Seals and reconstructs one exact committed header before authoritative service.
+    async fn verify_committed_header(
+        &self,
+        index: u64,
+        header: &EntryHeader,
+    ) -> Result<(), GroupError> {
+        let (certificate, configuration_generation, log_id) =
+            if let Some(repair) = self.state_machine.repair_allocation(index).await {
+                (
+                    repair.certificate,
+                    repair.configuration_generation,
+                    repair.log_id,
+                )
+            } else {
+                (
+                    header.certificate().clone(),
+                    header.configuration_generation(),
+                    self.state_machine
+                        .committed_log_id(index)
+                        .await
+                        .ok_or(GroupError::NotCommitted(index))?,
+                )
+            };
+        self.payloads
+            .seal(crate::SealRequest {
+                hash: header.payload_hash(),
+                group: header.group(),
+                configuration_generation,
+                request: header.request(),
+                term: log_id.leader_id.term,
+                index: log_id.index,
+                certificate: &certificate,
+            })
+            .await?;
+        self.payloads
+            .reconstruct(crate::ReconstructRequest {
+                hash: header.payload_hash(),
+                group: header.group(),
+                configuration_generation,
+                request: header.request(),
+                length: header.payload_len(),
+                term: log_id.leader_id.term,
+                index: log_id.index,
+                certificate: &certificate,
+            })
+            .await?;
         Ok(())
     }
 
@@ -810,6 +958,20 @@ impl ConsensusGroup {
             .ensure_linearizable()
             .await
             .map_err(|error| GroupError::Raft(error.to_string()))?;
+        self.read_wal_after_fence(from, to, minimum_index).await
+    }
+
+    /// Reconstructs a retained WAL suffix at an already-established applied-index fence.
+    ///
+    /// The archive read plan establishes the sole current-term fence for a
+    /// composed read. A later routed suffix request need only prove it applied
+    /// that exact plan before reconstructing its retained interval.
+    pub async fn read_wal_after_fence(
+        &self,
+        from: u64,
+        to: u64,
+        minimum_index: u64,
+    ) -> Result<Bytes, GroupError> {
         if self.state_machine.applied_index().await < minimum_index {
             return Err(GroupError::NotCommitted(minimum_index));
         }
@@ -979,6 +1141,8 @@ pub enum GroupResponse {
     Bytes(Vec<u8>),
     /// Current committed WAL and archive boundaries.
     WalState(WalArchiveState),
+    /// One current-term-fenced archive manifest and retained WAL boundary.
+    ArchivedWalReadPlan(WalReadPlan),
     /// One current Iceberg metadata pointer.
     CatalogTable(Option<String>),
     /// Lexically ordered authoritative namespaces.

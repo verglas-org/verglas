@@ -12,15 +12,15 @@ icon: "snowflake"
 
 Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
 
-We propose Verglas, an Iceberg-aware data engine that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache, query, write, and consensus engine; the hosted control plane owns the authenticated Iceberg REST composition, provisioning, and pipeline platform that call those engine contracts.
+We propose Verglas, an Iceberg-aware data engine that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache and consensus engine plus its CLI, SDKs, documentation, and RIME package; the hosted control plane owns the authenticated Lakekeeper REST composition, provisioning, and pipeline platform that call those engine contracts.
 
 ---
 
 ## Repository scope
 
 This open-source repository is the Verglas data engine: the Iceberg-aware cache
-node (including WAL and virtual block devices) plus independently deployed
-query and write roles. Cache nodes implement the coded Multi-Raft substrate and
+node (including WAL and virtual block devices) plus its public clients. Cache
+nodes implement the coded Multi-Raft substrate and
 the typed warehouse and timeline state machines. They expose private engine
 contracts, not hosted identity, provisioning, or public catalog REST modules.
 The hosted Lakekeeper adapter translates authenticated Iceberg REST operations
@@ -28,11 +28,12 @@ into the warehouse state-machine commands defined here. External-catalog
 databases bypass the managed warehouse state machine and retain the semantics
 of their configured catalog.
 
-The public CLI and SDKs live in `verglas-client`. Hosted access, scheduling,
-workers, databases, integrations, applications, and agent runtime services live
-in the private `verglas-cloud` repository. The private `verglas-app` repository
-contains only the cloud console and workspace client. `rime` is a separate
-public plugin. CI rejects copies of those products in this repository.
+The public CLI, SDKs, documentation, and RIME package live beside the engine.
+Hosted access, scheduling, workers, databases, integrations, applications,
+Lakekeeper service, and agent runtime services live in the private
+`verglas-cloud` repository. The private `verglas-app` repository contains only
+the cloud console and workspace client. CI rejects copies of those hosted
+products in this repository.
 
 ---
 
@@ -152,6 +153,15 @@ Verglas, and no dashboard registry is stored in customer tables.
 **Online serving and feature stores.** Applications and ML inference require low-latency retrieval by entity key. Feature-store architectures address this by retaining historical features in an offline store and materializing their latest values into a separate online store. Scheduled or streaming materialization keeps the two stores eventually consistent; failed or partial updates can produce training-serving skew [6].
 
 **Vector retrieval.** Embedding-based search conventionally requires a dedicated vector database that owns its index storage, consistency model, and operational lifecycle, an arrangement at odds with compute-disaggregated analytics, where executors are stateless and read all state from object storage [7]. The embeddings themselves typically originate in lakehouse tables and are copied out at index-build time.
+
+**S3 Vectors and Graph API.** The cache node's S3 listener also owns the exact
+AWS S3 Vectors REST-JSON surface and Verglas Graph REST-JSON surface. They are
+adapters over customer-owned Iceberg node, edge, and vector tables; Puffin
+attachments are snapshot-bound acceleration only. There is no query-node,
+write-node, local vector bucket registry, or second graph database.
+Each vector bucket has a reserved Iceberg control table for its creation fields,
+encryption, tags, and policy; this avoids relying on optional catalog namespace
+mutation and keeps every control-plane read restart-safe.
 
 Verglas instead serializes each Vamana ANN index as a `verglas-vamana-v1` Puffin blob, writes the Puffin file through the source table's `FileIO`, and publishes it as the `StatisticsFile` of the exact Iceberg snapshot it reflects. The catalog therefore exposes the durable snapshot-to-index binding to every Iceberg client; clients that understand the blob type can use it, while other clients ignore it. Verglas fetches the attached Puffin file through its S3 endpoint and retains a decoded local copy for ANN serving, so customer object storage remains authoritative and local DRAM/NVMe remains disposable acceleration. A query never uses an index attached to a different snapshot.
 
@@ -294,6 +304,13 @@ Consensus-backed write-back changes the failure model because acknowledged catal
 The cache fleet hosts many independent Raft groups instead of one global log. A tenant-root group owns warehouse discovery and tenant-scoped allocation; each managed warehouse owns a catalog group; each Neon timeline owns a WAL group. Independent groups elect leaders and commit concurrently, so one busy timeline or catalog does not serialize unrelated tenants. Requests may arrive at any node and are forwarded to the known leader. A client retry carries the same request identity and never becomes a second command.
 
 Each group has a committed voter configuration. Reconfiguration uses joint consensus; gossip supplies reachability hints only. Terms, votes, log indexes, command kinds, payload lengths and hashes, coding geometry, storage mode, writer epoch, and idempotency identity are fully replicated. Large payloads may be stored as Reed–Solomon fragments, but agreement remains over the complete logical entry identified by its hash.
+
+At staging time an ingress may prefer voters it has recently reached, but the
+candidate pool is the complete committed voter configuration. A failed preferred
+holder therefore causes staging to try another committed voter; it never changes
+membership or treats gossip as a commit decision. The eventual header records
+the exact voters that fsynced the selected representations, making that durable
+certificate immutable after acknowledgement.
 
 Let `N` be the voter count, `q` the smallest legal future election quorum, `k` the number of fragments required to reconstruct a coded entry, and `w` the number of distinct voters that durably store fragments before acknowledgment. A coded entry is eligible to commit only when
 

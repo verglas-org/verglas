@@ -132,3 +132,12 @@
 - #133: Removed the stale reference to the extracted monolithic server from the
   streaming query contract. The engine query node is now the sole documented
   owner of that response path.
+- #137: Added the list-of-float32 table schema type used by the S3 Vectors
+  Iceberg source table. Vector keys, data, metadata, and tombstones stay in
+  customer rows, while a Puffin index remains a disposable acceleration.
+- #137: Added committed-snapshot lineage row reads for append-only semantic
+  tables. This resolves last-write-wins updates and tombstones by Iceberg commit
+  order rather than mutable data-file path ordering.
+- #137: Added explicit-schema table creation with initial Iceberg properties.
+  Semantic resource adapters use this to atomically publish a table and its
+  durable control-plane definition, avoiding an orphaned table window.

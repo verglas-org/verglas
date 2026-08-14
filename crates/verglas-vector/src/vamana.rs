@@ -173,6 +173,15 @@ impl VamanaIndex {
             .is_some_and(|&i| !self.deleted[i as usize])
     }
 
+    /// Returns every live external id. This is used while validating a durable
+    /// string-key map paired with a snapshot-bound index, never on the hot path.
+    pub fn live_ids(&self) -> impl Iterator<Item = i64> + '_ {
+        self.ids
+            .iter()
+            .zip(&self.deleted)
+            .filter_map(|(id, deleted)| (!deleted).then_some(*id))
+    }
+
     fn next_rng(&mut self) -> u64 {
         // SplitMix64 — small, fast, dependency-free, good enough for graph init.
         self.rng = self.rng.wrapping_add(0x9E3779B97F4A7C15);

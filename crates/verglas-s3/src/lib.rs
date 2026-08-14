@@ -18,6 +18,7 @@ mod middleware;
 pub mod passthrough;
 pub mod passthrough_route;
 pub mod preconditions;
+pub mod semantic;
 
 pub use frontend::{VerglasS3, router, router_with_passthrough};
 pub use passthrough::{PassthroughList, PassthroughRead, PassthroughWrite};

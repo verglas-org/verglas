@@ -8,8 +8,80 @@ use std::io::Cursor;
 
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 
 use crate::{CatalogBatch, CommandKind, ReplicationMode, RequestId};
+
+/// Immutable object identity for one contiguous WAL segment named by a committed checkpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct WalArchiveSegment {
+    start_lsn: u64,
+    end_lsn: u64,
+    key: String,
+    hash: [u8; 32],
+}
+
+impl WalArchiveSegment {
+    /// Decodes the canonical content-addressed key emitted by the WAL archiver.
+    pub fn from_key(key: String) -> Result<Self, CertificateError> {
+        let Some(name) = key.rsplit('/').next() else {
+            return Err(CertificateError { required: 1 });
+        };
+        let mut fields = name.split('-');
+        let (Some(start), Some(end), Some(hash), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(CertificateError { required: 1 });
+        };
+        if start.len() != 16 || end.len() != 16 || hash.len() != 64 {
+            return Err(CertificateError { required: 1 });
+        }
+        let start_lsn =
+            u64::from_str_radix(start, 16).map_err(|_| CertificateError { required: 1 })?;
+        let end_lsn = u64::from_str_radix(end, 16).map_err(|_| CertificateError { required: 1 })?;
+        let bytes = hex::decode(hash).map_err(|_| CertificateError { required: 1 })?;
+        if hex::encode(&bytes) != hash {
+            return Err(CertificateError { required: 1 });
+        }
+        let hash: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| CertificateError { required: 1 })?;
+        if start_lsn >= end_lsn || key.is_empty() {
+            return Err(CertificateError { required: 1 });
+        }
+        Ok(Self {
+            start_lsn,
+            end_lsn,
+            key,
+            hash,
+        })
+    }
+
+    /// Returns the inclusive first LSN covered by this object.
+    pub fn start_lsn(&self) -> u64 {
+        self.start_lsn
+    }
+
+    /// Returns the exclusive final LSN covered by this object.
+    pub fn end_lsn(&self) -> u64 {
+        self.end_lsn
+    }
+
+    /// Returns the immutable object key recorded in the checkpoint payload.
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Returns the SHA-256 hash that the object key names.
+    pub fn hash(&self) -> [u8; 32] {
+        self.hash
+    }
+
+    /// Returns the exact byte length implied by the checkpoint LSN interval.
+    pub fn length(&self) -> u64 {
+        self.end_lsn - self.start_lsn
+    }
+}
 
 openraft::declare_raft_types!(
     /// Concrete OpenRaft types used by every Verglas consensus group.
@@ -195,11 +267,18 @@ impl EntryHeader {
     }
 
     /// Binds a verified object-store WAL archive watermark.
-    pub fn with_archive_lsn(mut self, end: u64) -> Result<Self, CertificateError> {
-        if self.kind != CommandKind::ArchiveCheckpoint {
+    pub fn with_archive_segment(
+        mut self,
+        segment: WalArchiveSegment,
+    ) -> Result<Self, CertificateError> {
+        let key_hash: [u8; 32] = sha2::Sha256::digest(segment.key.as_bytes()).into();
+        if self.kind != CommandKind::ArchiveCheckpoint
+            || self.payload_len != segment.key.len() as u64
+            || self.payload_hash != key_hash
+        {
             return Err(CertificateError { required: 1 });
         }
-        self.metadata = EntryMetadata::Archive { end };
+        self.metadata = EntryMetadata::Archive { segment };
         Ok(self)
     }
 
@@ -297,10 +376,10 @@ pub enum EntryMetadata {
         /// One past the final appended LSN.
         end: u64,
     },
-    /// Highest WAL LSN verified present in object storage.
+    /// One exact immutable WAL object verified in object storage.
     Archive {
-        /// Verified archive end LSN.
-        end: u64,
+        /// Exact interval, key, and content identity of the archive object.
+        segment: WalArchiveSegment,
     },
     /// Typed Iceberg catalog requirements and actions.
     Catalog {

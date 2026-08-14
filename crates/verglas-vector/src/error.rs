@@ -22,6 +22,14 @@ pub enum VectorError {
     #[error("invalid dimension: {0}")]
     InvalidDim(usize),
 
+    /// The collision-free `i64` string-key allocator exhausted its id space.
+    #[error("string-key index exhausted its i64 id space")]
+    KeySpaceExhausted,
+
+    /// A caller key cannot be represented by the fixed u32 blob length field.
+    #[error("string-key index key exceeds u32 byte length")]
+    KeyTooLong,
+
     /// A serialized blob was truncated, had a bad magic, or an unknown version.
     #[error("corrupt vamana blob: {0}")]
     CorruptBlob(String),

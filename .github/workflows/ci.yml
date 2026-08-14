@@ -38,8 +38,37 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Reject extracted product source
+      - name: Reject hosted product source
         run: bash scripts/check-repository-boundary.sh
+
+  typescript-sdk:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sdks/typescript/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+
+  rime:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rime
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+      - run: npm pack --dry-run
 
   rust-changes:
     runs-on: ubuntu-latest
@@ -122,16 +151,20 @@ jobs:
     # Keep one stable required-check name while the actual package checks are
     # a dynamic matrix whose labels vary with every pull request.
     if: always()
-    needs: [rust-changes, crate-tests]
+    needs: [rust-changes, crate-tests, typescript-sdk, rime]
     runs-on: ubuntu-latest
     steps:
-      - name: Require Rust gates
+      - name: Require repository gates
         env:
           CRATE_TESTS_RESULT: ${{ needs.crate-tests.result }}
+          RIME_RESULT: ${{ needs.rime.result }}
           RUST_CHANGES_RESULT: ${{ needs.rust-changes.result }}
+          TYPESCRIPT_SDK_RESULT: ${{ needs.typescript-sdk.result }}
         run: |
           [[ "$RUST_CHANGES_RESULT" == "success" ]]
           [[ "$CRATE_TESTS_RESULT" == "success" || "$CRATE_TESTS_RESULT" == "skipped" ]]
+          [[ "$TYPESCRIPT_SDK_RESULT" == "success" ]]
+          [[ "$RIME_RESULT" == "success" ]]
 
   coverage:
     # Coverage is expensive (a full llvm-cov instrumented build). Run it

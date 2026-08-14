@@ -43,6 +43,11 @@
   Coded and complete representations now yield a commit certificate only after
   the configured successor-quorum intersection is durably satisfied.
 
+- #135: Made durable payload staging continue through the full committed voter
+  allocation when an ingress-preferred holder is unavailable. The resulting
+  immutable certificate records only successful fsynced holders and still
+  requires the coded intersection threshold or a complete-entry majority.
+
 - #135: Moved exact retry identity and writer-epoch validation into the durable
   Raft state machine. Duplicate requests return their original index, while
   conflicting retries and stale writers apply as closed failures.
@@ -170,3 +175,49 @@
 - #135: Replaced compound hosted-record map keys with a typed collection of
   entity-keyed record maps. This keeps catalog record lookups and deterministic
   ordering intact while making every persisted state-machine image valid JSON.
+
+- #135: Made distributed payload reconstruction continue past unavailable and
+  absent certified holders, then require one valid complete copy or `k` valid
+  coded shards. Returned representations still require their exact committed
+  allocation identity, so a mismatched peer response fails closed.
+
+- #135: Validated certified payload holders in parallel and retained committed
+  prefixes with a bounded sixteen-entry concurrency during leader readiness.
+  Every completed holder response is still identity-checked before service, so
+  a dead former leader no longer makes catalog recovery exceed its request
+  deadline without weakening corruption checks or resource ceilings.
+- #135: Stage every committed voter concurrently and acknowledge only after
+  the existing coded or complete durability threshold fsyncs. This keeps the
+  committed configuration and certificate unchanged while a dead preferred
+  holder can no longer exhaust the foreground command deadline.
+- #135: Persist each committed WAL response boundary with its retry identity.
+  Exact retries now return the original index and WAL end, while conflicting
+  retry identities remain closed without exposing another command's result.
+- #135: Moved durable Raft log, state-machine, and snapshot image writes to
+  Tokio's blocking pool. Per-replica persistence ordering remains serialized,
+  and every OpenRaft callback still waits for the temp-file, rename, and
+  directory-fsync barrier before it reports success.
+
+- #135: Replaced the Raft log's whole-image JSON persistence with a compact
+  metadata file and checksummed append-only entry frames. Votes and commit state
+  now fsync independently of large log entries, while replay preserves append,
+  truncation, purge, and restart correctness without acknowledging before disk.
+
+- #135: Split compact Raft metadata and entry-frame durability into independent
+  ordered actors. Entry dispatch returns to OpenRaft immediately and reports its
+  flush callback only after fsync, so a large append cannot delay a vote grant.
+
+- #135: Made committed archive checkpoints carry the exact canonical WAL range,
+  immutable object key, and SHA-256 identity. A current-term WAL read plan now
+  exports those ordered checkpoint records and refuses a gap, overlap, or
+  identity mismatch before an archived prefix can be served.
+
+- #135: Kept normal ReadWal on its established direct reconstruction path. Only
+  a checkpoint-covered range whose local reconstruction is unavailable returns
+  an archive composition response; every other read error remains final and the
+  archived object identities still require exact verification by the ingress.
+
+- #135: Made automatic WAL archive-boundary reads fence only the replicated WAL
+  metadata. A verified checkpoint may release its own local payload allocation,
+  so the scheduler now continues to archive later complete segments after a
+  former certified holder or released archived prefix is unavailable.

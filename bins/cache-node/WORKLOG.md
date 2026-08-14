@@ -98,6 +98,7 @@
   depends on.
 - #127: Replaced ring-size-derived safekeeper geometry with mandatory explicit
   `VERGLAS_SAFEKEEPER_EC_K/M/W` settings validated against the complete ring.
+
   Managed four-node deployments can now declare `2/2/3`, while the OSS
   three-node stack declares `2/1/3` rather than silently changing durability.
 - #135: Served group-keyed Raft RPCs on the existing cache peer listener and
@@ -112,6 +113,10 @@
 - #135: Added any-ingress typed command routing to the leader reported by the
   local Raft replica. Forwarded commands execute only on the actual leader and
   preserve their exact request identity across leadership changes.
+- #135: Kept any-ingress routing within its existing leader-observation deadline
+  when a just-observed leader dies before receiving a command. The ingress now
+  retries the unchanged typed request only after re-observing Raft, so leader
+  loss does not become a false client conflict or alter request identity.
 - #135: Replaced the cache node's live Neon Vote/Elected safekeeper listener with
   the Verglas WAL protocol. Every ingress provisions a timeline group and routes
   writer, append, read, release, and checkpoint commands through Raft.
@@ -192,3 +197,62 @@
   Membership repair stages into a separate namespace, so candidate fragments
   cannot overwrite the currently committed source allocation before Raft
   publishes the replacement certificate.
+- #135: Made dynamic consensus-group provisioning open all configured voters
+  concurrently with a hard per-peer deadline. It now proceeds only after a
+  Raft majority opens successfully and bootstraps through the lowest successful
+  voter, so one unavailable nonleader does not block the four-voter `2/2/3`
+  geometry while a two-voter minority still fails closed. Once an ingress has
+  an initialized local replica, normal WAL and catalog requests skip group
+  provisioning and rely on the committed Raft quorum directly.
+- #135: Register this cache node's Raft voter identity before serving peer RPCs.
+  Authenticated replication can now lazily reopen a retained durable timeline
+  or warehouse group after restart, while unknown numeric targets remain closed.
+- #135: Return HTTP 409 only for CRaft catalog CAS and request-identity
+  conflicts. All other catalog submission failures are HTTP 503 so another
+  ingress can preserve availability during leader or quorum disruption.
+- #135: Added a four-process native-catalog leader-loss regression with a
+  realistic retained warehouse prefix. It proves a surviving ingress serves
+  an immediate fenced read and mutation at three of four voters, while a
+  two-voter catalog minority remains closed.
+- #137: Mounted the semantic REST-JSON dispatcher on the existing cache-node
+  S3 listener before the ordinary S3 fallback. When a catalog is configured it
+  opens the customer Iceberg catalog and routes Graph requests through it; no
+  query-node, write-node, or process-local graph registry remains.
+- #137: Mount semantic routes only when a customer Iceberg catalog is present.
+  They now reuse the configured cache credentials with the semantic SigV4
+  verifier, so unsigned REST-JSON calls never reach the durable adapter.
+- #135: Raised the embedded WAL/catalog router's explicit Axum request-body
+  ceiling to 17 MiB. This accepts the benchmark's canonical 8 MiB WAL frames
+  and one complete 16 MiB WAL segment with bounded wire headroom, while still
+  rejecting larger requests before they enter consensus.
+- #135: Removed deleted query and write roles from the root image build after
+  their workspace consolidation into cache-node. The production cache image
+  now builds only the unified binary instead of referencing absent packages.
+- #135: Added a real four-process WAL regression that retains four 8 MiB
+  frames, kills the exact first leader, and commits the same 8 MiB continuation
+  through every survivor. It captures HTTP bodies and child diagnostics so a
+  future failover rejection identifies the transport or consensus boundary.
+- #135: Moved ring-local fragment filesystem work onto Tokio's blocking pool.
+  Streaming uploads now relay a bounded number of body chunks to a worker that
+  owns append, fsync, rename, and directory fsync, and HTTP success still waits
+  until that worker reports the fragment durable.
+- #135: Put each OpenRaft core and its replication timers on a cache-node-owned
+  current-thread Tokio runtime. Group creation now dispatches to that runtime even
+  when peer HTTP opens a retained group, and teardown stops every core before
+  joining the runtime thread; a saturated-public-runtime real-vote regression
+  protects that scheduling boundary.
+- #135: Extended ranked election windows around one canonical 8 MiB durable
+  append. The 250 ms heartbeat, 2.5–3.0 s first window, and 2.5 s rank spacing
+  leave compact vote metadata time to fsync before a live follower is treated as
+  failed; client submission remains bounded at 25 seconds and still fails closed.
+- #137: Renamed the embedded erasure-coded durability dependency to verglas-writeback. The cache node retains its write-back and repair behavior without presenting a separate write product.
+- #135: Composed checkpointed WAL reads from hash-verified archive objects and
+  the retained coded tail under one consensus fence. Aborted peer uploads now
+  fail without committing a partial fragment, preserving quorum availability.
+- #135: Aligned the process-level catalog failover regression with the bounded
+  30-second consensus recovery window. Retained-prefix verification still must
+  complete before an immediate linearizable read can succeed.
+- #135: Shortened the fixed, non-overlapping ranked election slots so the first
+  survivor after any one-voter loss campaigns within 2.5 seconds. This leaves
+  the frozen five-second WAL request deadline for the required current-term
+  ReadIndex fence and exact committed-prefix reconstruction.

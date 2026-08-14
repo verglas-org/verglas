@@ -4,8 +4,8 @@ set -eu
 umask 077
 mkdir -p /var/lib/verglas/cache
 printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
-  "$VERGLAS_MANAGED_STORAGE_ACCESS_KEY_ID" \
-  "$VERGLAS_MANAGED_STORAGE_SECRET_ACCESS_KEY" \
+  "$VERGLAS_STORAGE_ACCESS_KEY_ID" \
+  "$VERGLAS_STORAGE_SECRET_ACCESS_KEY" \
   > /var/lib/verglas/backend-credentials
 printf '[default]\naws_access_key_id = %s\naws_secret_access_key = %s\n' \
   "$VERGLAS_S3_ACCESS_KEY_ID" \
@@ -26,10 +26,10 @@ printf '%s\n' \
   '' \
   '[backend]' \
   'provider = "s3"' \
-  "bucket = \"$VERGLAS_MANAGED_STORAGE_BUCKET\"" \
-  "endpoint = \"$VERGLAS_MANAGED_STORAGE_ENDPOINT\"" \
-  "region = \"$VERGLAS_MANAGED_STORAGE_REGION\"" \
-  "allow_http = ${VERGLAS_MANAGED_STORAGE_ALLOW_HTTP:-false}" \
+  "bucket = \"$VERGLAS_STORAGE_BUCKET\"" \
+  "endpoint = \"$VERGLAS_STORAGE_ENDPOINT\"" \
+  "region = \"$VERGLAS_STORAGE_REGION\"" \
+  "allow_http = ${VERGLAS_STORAGE_ALLOW_HTTP:-false}" \
   'credentials_file = "/var/lib/verglas/backend-credentials"' \
   > /var/lib/verglas/config.toml
 

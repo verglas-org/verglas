@@ -1,6 +1,6 @@
 //! Crash-safe OpenRaft log and state-machine storage.
 //!
-//! Every mutating storage callback persists an atomic image before returning.
+//! Every metadata mutation and log-flush callback waits for its own durable write.
 //! OpenRaft remains the sole owner of votes, log matching, commit indexes, and membership.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,7 +18,7 @@ use openraft::{
     StorageError, StorageIOError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, oneshot};
 
 use crate::catalog::CatalogRecords;
 use crate::{AppliedOutcome, RaftCommand, RaftResponse, RequestId, VerglasRaftConfig};
@@ -27,7 +27,12 @@ use crate::{AppliedOutcome, RaftCommand, RaftResponse, RequestId, VerglasRaftCon
 #[derive(Clone)]
 pub struct PersistentLogStore {
     path: PathBuf,
-    state: Arc<RwLock<LogData>>,
+    entries_path: PathBuf,
+    state: Arc<RwLock<LogStateData>>,
+    /// Ordered durability actor for compact term, vote, and committed metadata.
+    metadata_persistence: PersistenceActor,
+    /// Ordered durability actor for append-only Raft entry frames.
+    entries_persistence: PersistenceActor,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -35,22 +40,107 @@ struct LogData {
     last_purged: Option<LogId<u64>>,
     committed: Option<LogId<u64>>,
     vote: Option<Vote<u64>>,
+}
+
+/// In-memory Raft log state reconstructed from the durable metadata and frames.
+#[derive(Clone, Debug, Default)]
+struct LogStateData {
+    /// Compact values persisted independently from every entry frame.
+    metadata: LogData,
+    /// Entries visible after replaying the ordered append/truncate/purge frames.
     entries: BTreeMap<u64, Entry<VerglasRaftConfig>>,
+}
+
+/// One durable mutation to the append-only Raft entry journal.
+#[derive(Deserialize, Serialize)]
+enum LogRecord {
+    /// Makes the exact entries durable before OpenRaft observes its flush callback.
+    Append(Vec<Entry<VerglasRaftConfig>>),
+    /// Removes entries at and after this index.
+    Truncate { since: u64 },
+    /// Removes entries through this exact log identity.
+    Purge { log_id: LogId<u64> },
 }
 
 impl PersistentLogStore {
     /// Opens or creates one replica's Raft log file.
     pub async fn open(path: PathBuf) -> Result<Self, StorageError<u64>> {
-        let state = read_json(&path).map_err(|error| StorageIOError::read_logs(&error))?;
+        let metadata: LogData =
+            read_json(&path).map_err(|error| StorageIOError::read_logs(&error))?;
+        let entries_path = path.with_extension("entries");
+        let recovered = recover_log_records(&entries_path)
+            .map_err(|error| StorageIOError::read_logs(&error))?;
+        let mut metadata = metadata;
+        if recovered.last_purged.is_some() {
+            metadata.last_purged = recovered.last_purged;
+        }
         Ok(Self {
             path,
-            state: Arc::new(RwLock::new(state)),
+            entries_path,
+            state: Arc::new(RwLock::new(LogStateData {
+                metadata,
+                entries: recovered.entries,
+            })),
+            metadata_persistence: PersistenceActor::new(),
+            entries_persistence: PersistenceActor::new(),
         })
     }
 
-    /// Persists the small Raft metadata and log image atomically.
-    fn persist(&self, state: &LogData) -> std::io::Result<()> {
-        write_json(&self.path, state)
+    /// Queues compact Raft metadata behind every earlier mutation without
+    /// letting its fsync occupy an async runtime worker.
+    async fn enqueue_metadata(
+        &self,
+        state: LogData,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.metadata_persistence
+            .enqueue_json(self.path.clone(), state)
+            .await
+    }
+
+    /// Queues one append-only log record behind every earlier durable mutation.
+    async fn enqueue_record(
+        &self,
+        record: LogRecord,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.entries_persistence
+            .enqueue_log_record(self.entries_path.clone(), record)
+            .await
+    }
+
+    /// Adds entries to the visible in-memory log and dispatches their ordered durable frame.
+    async fn dispatch_append(
+        &self,
+        entries: Vec<Entry<VerglasRaftConfig>>,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        let mut state = self.state.write().await;
+        let previous: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.log_id.index,
+                    state.entries.get(&entry.log_id.index).cloned(),
+                )
+            })
+            .collect();
+        for entry in &entries {
+            state.entries.insert(entry.log_id.index, entry.clone());
+        }
+        match self
+            .entries_persistence
+            .try_enqueue_log_record(self.entries_path.clone(), LogRecord::Append(entries))
+        {
+            Ok(completion) => Ok(completion),
+            Err(error) => {
+                for (index, prior) in previous {
+                    if let Some(prior) = prior {
+                        state.entries.insert(index, prior);
+                    } else {
+                        state.entries.remove(&index);
+                    }
+                }
+                Err(error)
+            }
+        }
     }
 }
 
@@ -79,9 +169,9 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
             .entries
             .last_key_value()
             .map(|(_, entry)| *entry.get_log_id())
-            .or(state.last_purged);
+            .or(state.metadata.last_purged);
         Ok(LogState {
-            last_purged_log_id: state.last_purged,
+            last_purged_log_id: state.metadata.last_purged,
             last_log_id,
         })
     }
@@ -91,24 +181,36 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
         committed: Option<LogId<u64>>,
     ) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
-        state.committed = committed;
-        self.persist(&state)
-            .map_err(|error| StorageIOError::write_logs(&error).into())
+        let mut metadata = state.metadata.clone();
+        metadata.committed = committed;
+        let persisted = self.enqueue_metadata(metadata.clone()).await;
+        let persisted = persisted.map_err(|error| StorageIOError::write_logs(&error))?;
+        await_persisted(persisted)
+            .await
+            .map_err(|error| StorageIOError::write_logs(&error))?;
+        state.metadata = metadata;
+        Ok(())
     }
 
     async fn read_committed(&mut self) -> Result<Option<LogId<u64>>, StorageError<u64>> {
-        Ok(self.state.read().await.committed)
+        Ok(self.state.read().await.metadata.committed)
     }
 
     async fn save_vote(&mut self, vote: &Vote<u64>) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
-        state.vote = Some(*vote);
-        self.persist(&state)
-            .map_err(|error| StorageIOError::write_vote(&error).into())
+        let mut metadata = state.metadata.clone();
+        metadata.vote = Some(*vote);
+        let persisted = self.enqueue_metadata(metadata.clone()).await;
+        let persisted = persisted.map_err(|error| StorageIOError::write_vote(&error))?;
+        await_persisted(persisted)
+            .await
+            .map_err(|error| StorageIOError::write_vote(&error))?;
+        state.metadata = metadata;
+        Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<u64>>, StorageError<u64>> {
-        Ok(self.state.read().await.vote)
+        Ok(self.state.read().await.metadata.vote)
     }
 
     async fn append<I>(
@@ -119,13 +221,18 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
     where
         I: IntoIterator<Item = Entry<VerglasRaftConfig>> + Send,
     {
-        let mut state = self.state.write().await;
-        for entry in entries {
-            state.entries.insert(entry.log_id.index, entry);
-        }
-        match self.persist(&state) {
-            Ok(()) => {
-                callback.log_io_completed(Ok(()));
+        let entries: Vec<_> = entries.into_iter().collect();
+        match self.dispatch_append(entries).await {
+            Ok(completion) => {
+                tokio::spawn(async move {
+                    match await_persisted(completion).await {
+                        Ok(()) => callback.log_io_completed(Ok(())),
+                        Err(error) => callback.log_io_completed(Err(std::io::Error::new(
+                            error.kind(),
+                            error.to_string(),
+                        ))),
+                    }
+                });
                 Ok(())
             }
             Err(error) => {
@@ -138,17 +245,29 @@ impl RaftLogStorage<VerglasRaftConfig> for PersistentLogStore {
 
     async fn truncate(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
+        let persisted = self
+            .enqueue_record(LogRecord::Truncate {
+                since: log_id.index,
+            })
+            .await;
+        let persisted = persisted.map_err(|error| StorageIOError::write_logs(&error))?;
+        await_persisted(persisted)
+            .await
+            .map_err(|error| StorageIOError::write_logs(&error))?;
         state.entries.split_off(&log_id.index);
-        self.persist(&state)
-            .map_err(|error| StorageIOError::write_logs(&error).into())
+        Ok(())
     }
 
     async fn purge(&mut self, log_id: LogId<u64>) -> Result<(), StorageError<u64>> {
         let mut state = self.state.write().await;
-        state.last_purged = Some(log_id);
+        let persisted = self.enqueue_record(LogRecord::Purge { log_id }).await;
+        let persisted = persisted.map_err(|error| StorageIOError::write_logs(&error))?;
+        await_persisted(persisted)
+            .await
+            .map_err(|error| StorageIOError::write_logs(&error))?;
+        state.metadata.last_purged = Some(log_id);
         state.entries = state.entries.split_off(&(log_id.index + 1));
-        self.persist(&state)
-            .map_err(|error| StorageIOError::write_logs(&error).into())
+        Ok(())
     }
 
     async fn get_log_reader(&mut self) -> Self::LogReader {
@@ -162,6 +281,8 @@ pub struct PersistentStateMachine {
     path: PathBuf,
     snapshot_path: PathBuf,
     state: Arc<RwLock<StateMachineData>>,
+    /// Dedicated ordered durability actor for state and snapshot images.
+    persistence: PersistenceActor,
     snapshot_index: Arc<AtomicU64>,
     current_snapshot: Arc<RwLock<Option<StoredSnapshot>>>,
     payloads: Arc<RwLock<Option<Arc<dyn crate::PayloadStore>>>>,
@@ -194,6 +315,9 @@ struct AppliedIdentity {
     kind: crate::CommandKind,
     hash: [u8; 32],
     writer_epoch: Option<u64>,
+    wal_end: Option<u64>,
+    archive_lsn: Option<u64>,
+    catalog_changed: bool,
 }
 
 /// Latest committed replacement allocation and the Raft identity that sealed it.
@@ -224,15 +348,39 @@ impl PersistentStateMachine {
             path,
             snapshot_path,
             state: Arc::new(RwLock::new(state)),
+            persistence: PersistenceActor::new(),
             snapshot_index: Arc::new(AtomicU64::new(0)),
             current_snapshot: Arc::new(RwLock::new(current_snapshot)),
             payloads: Arc::new(RwLock::new(None)),
         })
     }
 
-    /// Persists one complete applied-state image atomically.
-    fn persist(&self, state: &StateMachineData) -> std::io::Result<()> {
-        write_json(&self.path, state)
+    /// Queues one state image in mutation order and returns the durable
+    /// acknowledgement receiver for its callback to await.
+    async fn enqueue_persist(
+        &self,
+        state: StateMachineData,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.persistence
+            .enqueue_json(self.path.clone(), state)
+            .await
+    }
+
+    /// Queues matching state and snapshot images as one ordered durability
+    /// operation, so an interrupted state write cannot publish a newer snapshot.
+    async fn enqueue_snapshot_persist(
+        &self,
+        state: StateMachineData,
+        snapshot: StoredSnapshot,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        let state_path = self.path.clone();
+        let snapshot_path = self.snapshot_path.clone();
+        self.persistence
+            .enqueue(move || {
+                write_json(&state_path, &state)?;
+                write_json(&snapshot_path, &Some(snapshot))
+            })
+            .await
     }
 
     /// Attaches the durable payload store before snapshot compaction can reclaim bodies.
@@ -280,6 +428,36 @@ impl PersistentStateMachine {
     pub async fn wal_archive_state(&self) -> (u64, u64) {
         let state = self.state.read().await;
         (state.wal_end, state.archive_lsn)
+    }
+
+    /// Returns ordered checkpoint identities that exactly cover the archived WAL prefix.
+    pub async fn archived_wal_segments(
+        &self,
+        through_lsn: u64,
+    ) -> Result<Vec<crate::WalArchiveSegment>, crate::PayloadError> {
+        let state = self.state.read().await;
+        if through_lsn != state.archive_lsn {
+            return Err(crate::PayloadError::CorruptRepresentation);
+        }
+        let mut cursor = None;
+        let mut segments = Vec::new();
+        for header in state.committed.values() {
+            let crate::EntryMetadata::Archive { segment } = header.metadata() else {
+                continue;
+            };
+            if let Some(previous_end) = cursor
+                && segment.start_lsn() != previous_end
+            {
+                return Err(crate::PayloadError::CorruptRepresentation);
+            }
+            cursor = Some(segment.end_lsn());
+            segments.push(segment.clone());
+        }
+        if cursor.is_none() || cursor == Some(through_lsn) {
+            Ok(segments)
+        } else {
+            Err(crate::PayloadError::CorruptRepresentation)
+        }
     }
 
     /// Returns the applied metadata pointer for one catalog table.
@@ -429,9 +607,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             } else {
                                 AppliedOutcome::ConflictingRetry
                             },
-                            wal_end: None,
-                            archive_lsn: None,
-                            catalog_changed: false,
+                            wal_end: same.then_some(previous.wal_end).flatten(),
+                            archive_lsn: same.then_some(previous.archive_lsn).flatten(),
+                            catalog_changed: same && previous.catalog_changed,
                         });
                         continue;
                     }
@@ -504,8 +682,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             state.wal_end = end;
                             wal_end = Some(end);
                         }
-                        crate::EntryMetadata::Archive { end }
-                            if end < state.archive_lsn || end > state.wal_end =>
+                        crate::EntryMetadata::Archive { segment }
+                            if segment.start_lsn() != state.archive_lsn
+                                || segment.end_lsn() > state.wal_end =>
                         {
                             responses.push(RaftResponse {
                                 index: entry.log_id.index,
@@ -517,9 +696,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             });
                             continue;
                         }
-                        crate::EntryMetadata::Archive { end } => {
-                            state.archive_lsn = end;
-                            archive_lsn = Some(end);
+                        crate::EntryMetadata::Archive { segment } => {
+                            state.archive_lsn = segment.end_lsn();
+                            archive_lsn = Some(segment.end_lsn());
                         }
                         crate::EntryMetadata::Catalog { batch } => {
                             let mut namespaces = state.namespaces.clone();
@@ -597,6 +776,9 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                             kind: header.kind(),
                             hash: header.payload_hash(),
                             writer_epoch,
+                            wal_end,
+                            archive_lsn,
+                            catalog_changed,
                         },
                     );
                     state.committed.insert(entry.log_id.index, header);
@@ -656,7 +838,11 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                 }
             }
         }
-        self.persist(&state)
+        let persisted = self.enqueue_persist(state.clone()).await;
+        drop(state);
+        let persisted = persisted.map_err(|error| StorageIOError::write_state_machine(&error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_state_machine(&error))?;
         Ok(responses)
     }
@@ -685,16 +871,22 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                     StorageIOError::write_state_machine(&std::io::Error::other(error.to_string()))
                 })?;
         }
-        self.persist(&decoded)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: snapshot.get_ref().clone(),
         };
-        write_json(&self.snapshot_path, &Some(stored.clone()))
+        let mut state = self.state.write().await;
+        let persisted = self
+            .enqueue_snapshot_persist(decoded.clone(), stored.clone())
+            .await;
+        *state = decoded;
+        drop(state);
+        let persisted = persisted
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         *self.current_snapshot.write().await = Some(stored);
-        *self.state.write().await = decoded;
         Ok(())
     }
 
@@ -728,26 +920,29 @@ impl RaftSnapshotBuilder<VerglasRaftConfig> for PersistentStateMachine {
                 })?;
         }
         compact_checkpointed_catalog_history(&mut state);
-        self.persist(&state)
-            .map_err(|error| StorageIOError::write_state_machine(&error))?;
-        let bytes = serde_json::to_vec(&*state)
+        let durable = state.clone();
+        let bytes = serde_json::to_vec(&durable)
             .map_err(|error| StorageIOError::read_state_machine(&error))?;
         let sequence = self.snapshot_index.fetch_add(1, Ordering::Relaxed) + 1;
-        let snapshot_id = state.last_applied.map_or_else(
+        let snapshot_id = durable.last_applied.map_or_else(
             || format!("empty-{sequence}"),
             |last| format!("{}-{}-{sequence}", last.leader_id, last.index),
         );
         let meta = SnapshotMeta {
-            last_log_id: state.last_applied,
-            last_membership: state.membership.clone(),
+            last_log_id: durable.last_applied,
+            last_membership: durable.membership.clone(),
             snapshot_id,
         };
-        drop(state);
         let stored = StoredSnapshot {
             meta: meta.clone(),
             data: bytes.clone(),
         };
-        write_json(&self.snapshot_path, &Some(stored.clone()))
+        let persisted = self.enqueue_snapshot_persist(durable, stored.clone()).await;
+        drop(state);
+        let persisted = persisted
+            .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
+        await_persisted(persisted)
+            .await
             .map_err(|error| StorageIOError::write_snapshot(Some(meta.signature()), &error))?;
         *self.current_snapshot.write().await = Some(stored);
         Ok(Snapshot {
@@ -862,11 +1057,243 @@ fn read_json<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> std::io::Re
     }
 }
 
+/// Number of queued Raft image writes allowed per replica. This is a hard
+/// backpressure ceiling; a node never accumulates unbounded serialized state
+/// while its NVMe is slow.
+const PERSISTENCE_QUEUE_CAPACITY: usize = 16;
+
+/// One ordered write plus the acknowledgement its owning Raft callback awaits.
+struct PersistenceRequest {
+    /// Filesystem work that must reach a durable result before acknowledgement.
+    operation: Box<dyn FnOnce() -> std::io::Result<()> + Send>,
+    /// Delivers the exact I/O outcome after the dedicated worker finishes.
+    completion: oneshot::Sender<std::io::Result<()>>,
+}
+
+/// Per-replica ordered filesystem actor. It runs on Tokio's blocking pool,
+/// keeping fsync out of Raft RPC workers while preserving mutation order.
+#[derive(Clone)]
+struct PersistenceActor {
+    /// Bounded queue shared by every clone of one persistent store.
+    sender: mpsc::Sender<PersistenceRequest>,
+}
+
+impl PersistenceActor {
+    /// Starts the dedicated actor for one replica's log, state, and snapshots.
+    fn new() -> Self {
+        let (sender, mut receiver) =
+            mpsc::channel::<PersistenceRequest>(PERSISTENCE_QUEUE_CAPACITY);
+        tokio::task::spawn_blocking(move || {
+            while let Some(request) = receiver.blocking_recv() {
+                let result = (request.operation)();
+                let _ = request.completion.send(result);
+            }
+        });
+        Self { sender }
+    }
+
+    /// Enqueues arbitrary ordered filesystem work and returns its acknowledgement.
+    async fn enqueue<F>(
+        &self,
+        operation: F,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>>
+    where
+        F: FnOnce() -> std::io::Result<()> + Send + 'static,
+    {
+        let (completion, received) = oneshot::channel();
+        self.sender
+            .send(PersistenceRequest {
+                operation: Box::new(operation),
+                completion,
+            })
+            .await
+            .map_err(|_| std::io::Error::other("Raft persistence actor stopped"))?;
+        Ok(received)
+    }
+
+    /// Schedules one operation without waiting behind a saturated durable queue.
+    fn try_enqueue<F>(
+        &self,
+        operation: F,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>>
+    where
+        F: FnOnce() -> std::io::Result<()> + Send + 'static,
+    {
+        let (completion, received) = oneshot::channel();
+        self.sender
+            .try_send(PersistenceRequest {
+                operation: Box::new(operation),
+                completion,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => {
+                    std::io::Error::other("Raft entry persistence queue is full")
+                }
+                mpsc::error::TrySendError::Closed(_) => {
+                    std::io::Error::other("Raft persistence actor stopped")
+                }
+            })?;
+        Ok(received)
+    }
+
+    /// Serializes and queues one owned JSON image on the dedicated actor.
+    async fn enqueue_json<T>(
+        &self,
+        path: PathBuf,
+        value: T,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>>
+    where
+        T: Serialize + Send + 'static,
+    {
+        self.enqueue(move || write_json(&path, &value)).await
+    }
+
+    /// Serializes and queues one framed append-only log record.
+    async fn enqueue_log_record(
+        &self,
+        path: PathBuf,
+        record: LogRecord,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.enqueue(move || append_log_record(&path, &record))
+            .await
+    }
+
+    /// Schedules one framed append-only log record without delaying the Raft core.
+    fn try_enqueue_log_record(
+        &self,
+        path: PathBuf,
+        record: LogRecord,
+    ) -> std::io::Result<oneshot::Receiver<std::io::Result<()>>> {
+        self.try_enqueue(move || append_log_record(&path, &record))
+    }
+}
+
+/// Awaits the ordered actor acknowledgement and fails closed if the worker stops.
+async fn await_persisted(
+    completion: oneshot::Receiver<std::io::Result<()>>,
+) -> std::io::Result<()> {
+    completion
+        .await
+        .map_err(|_| std::io::Error::other("Raft persistence actor stopped"))?
+}
+
 /// Serializes and atomically persists one JSON image.
 fn write_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
     let bytes = serde_json::to_vec(value)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     write_bytes(path, &bytes)
+}
+
+/// Replays complete checksummed log records, ignoring only an interrupted final frame.
+fn recover_log_records(path: &Path) -> std::io::Result<RecoveredLog> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RecoveredLog::default());
+        }
+        Err(error) => return Err(error),
+    };
+    let mut offset = 0_usize;
+    let mut recovered = RecoveredLog::default();
+    while offset < bytes.len() {
+        let Some(header_end) = offset.checked_add(12) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "log frame overflow",
+            ));
+        };
+        if header_end > bytes.len() {
+            break;
+        }
+        let length = u64::from_le_bytes(bytes[offset..offset + 8].try_into().map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "log frame length")
+        })?);
+        let length = usize::try_from(length).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "log frame too large")
+        })?;
+        let checksum =
+            u32::from_le_bytes(bytes[offset + 8..header_end].try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "log frame checksum")
+            })?);
+        let Some(frame_end) = header_end.checked_add(length) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "log frame overflow",
+            ));
+        };
+        if frame_end > bytes.len() {
+            break;
+        }
+        let frame = &bytes[header_end..frame_end];
+        if crc32c::crc32c(frame) != checksum {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "corrupt Raft log frame",
+            ));
+        }
+        let record = serde_json::from_slice(frame)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        apply_log_record(&mut recovered, record);
+        offset = frame_end;
+    }
+    if offset != bytes.len() {
+        let file = OpenOptions::new().write(true).open(path)?;
+        file.set_len(u64::try_from(offset).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "log offset too large")
+        })?)?;
+        file.sync_all()?;
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+        })?;
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(recovered)
+}
+
+/// Recovered journal state whose compaction boundary is authoritative over metadata.
+#[derive(Default)]
+struct RecoveredLog {
+    /// Entries visible after every verified record applies.
+    entries: BTreeMap<u64, Entry<VerglasRaftConfig>>,
+    /// Last exact compaction boundary recorded by the journal.
+    last_purged: Option<LogId<u64>>,
+}
+
+/// Applies one verified journal record exactly as it was ordered by the Raft storage actor.
+fn apply_log_record(recovered: &mut RecoveredLog, record: LogRecord) {
+    match record {
+        LogRecord::Append(appended) => {
+            for entry in appended {
+                recovered.entries.insert(entry.log_id.index, entry);
+            }
+        }
+        LogRecord::Truncate { since } => {
+            recovered.entries.split_off(&since);
+        }
+        LogRecord::Purge { log_id } => {
+            recovered.last_purged = Some(log_id);
+            recovered.entries = recovered.entries.split_off(&(log_id.index + 1));
+        }
+    }
+}
+
+/// Appends and fsyncs one complete checksummed record before OpenRaft receives an acknowledgement.
+fn append_log_record(path: &Path, record: &LogRecord) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let length = u64::try_from(bytes.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "log frame too large")
+    })?;
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&length.to_le_bytes())?;
+    file.write_all(&crc32c::crc32c(&bytes).to_le_bytes())?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    File::open(parent)?.sync_all()
 }
 
 /// Atomically replaces one file and fsyncs the file and parent directory.
@@ -885,4 +1312,290 @@ fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     fs::rename(&temporary, path)?;
     File::open(parent)?.sync_all()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use openraft::storage::{RaftLogReader, RaftLogStorage};
+    use openraft::{CommittedLeaderId, Entry, EntryPayload, LogId, Vote};
+    use sha2::Digest;
+    use tempfile::TempDir;
+
+    use super::{LogRecord, PersistenceActor, PersistentLogStore, await_persisted};
+    use crate::{
+        CatalogAction, CatalogBatch, CatalogEntity, CommandKind, EntryHeader, PayloadCertificate,
+        RaftCommand, ReplicationMode, RequestId, VerglasRaftConfig,
+    };
+
+    /// Builds a deliberately large Raft command matching the failed-election reproduction.
+    fn large_entry(index: u64) -> Entry<VerglasRaftConfig> {
+        let document = format!("\"{}\"", "x".repeat(8 * 1024 * 1024));
+        let batch = CatalogBatch::new(
+            Vec::new(),
+            vec![CatalogAction::PutRecord {
+                entity: CatalogEntity::Table,
+                id: format!("table-{index}"),
+                document,
+            }],
+        )
+        .expect("large catalog batch");
+        let header = EntryHeader::new(
+            "warehouse/a",
+            1,
+            CommandKind::Catalog,
+            RequestId::from_u128(index.into()),
+            0,
+            sha2::Sha256::digest([index as u8]).into(),
+            None,
+            PayloadCertificate::new(ReplicationMode::Coded, 3, 2, vec![1, 2, 3, 4, 5])
+                .expect("certificate"),
+        )
+        .expect("header")
+        .with_catalog_batch(batch)
+        .expect("catalog metadata");
+        Entry {
+            log_id: LogId::new(CommittedLeaderId::new(1, 1), index),
+            payload: EntryPayload::Normal(RaftCommand::Commit(header)),
+        }
+    }
+
+    /// Persists the specified entries through the storage path used by Raft callbacks.
+    async fn append_entries(
+        store: &PersistentLogStore,
+        entries: impl IntoIterator<Item = Entry<VerglasRaftConfig>>,
+    ) {
+        let mut state = store.state.write().await;
+        for entry in entries {
+            state.entries.insert(entry.log_id.index, entry);
+        }
+        let persisted = store
+            .enqueue_record(LogRecord::Append(state.entries.values().cloned().collect()))
+            .await
+            .expect("queue log image");
+        drop(state);
+        await_persisted(persisted).await.expect("durable log image");
+    }
+
+    /// A vote fsync must not serialize or replace the durable large-entry log.
+    #[tokio::test]
+    async fn vote_persistence_is_independent_of_a_large_append_only_log() {
+        let root = TempDir::new().expect("temporary replica root");
+        let metadata_path = root.path().join("raft-log.json");
+        let framed_log_path = metadata_path.with_extension("entries");
+        let mut store = PersistentLogStore::open(metadata_path.clone())
+            .await
+            .expect("open log store");
+        append_entries(&store, (1..=4).map(large_entry)).await;
+        let before_vote = fs::read(&framed_log_path).expect("append-only log exists");
+
+        store
+            .save_vote(&Vote::new(2, 2))
+            .await
+            .expect("durable vote");
+
+        assert_eq!(
+            fs::read(&framed_log_path).expect("append-only log after vote"),
+            before_vote,
+            "a RequestVote acknowledgement must persist compact metadata, not rewrite entries"
+        );
+        assert!(
+            fs::metadata(&metadata_path).expect("metadata exists").len() < 1024,
+            "vote metadata remains independent of the 32 MiB log"
+        );
+        drop(store);
+
+        let mut recovered = PersistentLogStore::open(metadata_path)
+            .await
+            .expect("recover log store");
+        assert_eq!(
+            recovered.read_vote().await.expect("read recovered vote"),
+            Some(Vote::new(2, 2))
+        );
+        assert_eq!(
+            recovered
+                .try_get_log_entries(..)
+                .await
+                .expect("read recovered entries")
+                .len(),
+            4
+        );
+    }
+
+    /// Truncation and purge records must survive restart without rewriting prior frames.
+    #[tokio::test]
+    async fn append_only_log_recovers_truncation_and_purge() {
+        let root = TempDir::new().expect("temporary replica root");
+        let metadata_path = root.path().join("raft-log.json");
+        let framed_log_path = metadata_path.with_extension("entries");
+        let mut store = PersistentLogStore::open(metadata_path.clone())
+            .await
+            .expect("open log store");
+        append_entries(&store, (1..=4).map(large_entry)).await;
+        let before_compaction = fs::metadata(&framed_log_path)
+            .expect("append-only log exists")
+            .len();
+
+        store
+            .truncate(LogId::new(CommittedLeaderId::new(1, 1), 4))
+            .await
+            .expect("durable truncate");
+        store
+            .purge(LogId::new(CommittedLeaderId::new(1, 1), 2))
+            .await
+            .expect("durable purge");
+        assert!(
+            fs::metadata(&framed_log_path)
+                .expect("append-only log remains")
+                .len()
+                > before_compaction,
+            "truncate and purge append compact durable records"
+        );
+        drop(store);
+
+        let mut recovered = PersistentLogStore::open(metadata_path)
+            .await
+            .expect("recover log store");
+        let state = recovered.get_log_state().await.expect("recovered state");
+        assert_eq!(state.last_purged_log_id.map(|id| id.index), Some(2));
+        assert_eq!(state.last_log_id.map(|id| id.index), Some(3));
+        assert_eq!(
+            recovered
+                .try_get_log_entries(..)
+                .await
+                .expect("recovered entries")
+                .into_iter()
+                .map(|entry| entry.log_id.index)
+                .collect::<Vec<_>>(),
+            vec![3]
+        );
+    }
+
+    /// A delayed entry fsync must never queue a RequestVote durability barrier behind it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn delayed_entry_frame_does_not_delay_vote_metadata() {
+        let root = TempDir::new().expect("temporary replica root");
+        let mut store = PersistentLogStore::open(root.path().join("raft-log.json"))
+            .await
+            .expect("open log store");
+        let (persistence_started, started) = tokio::sync::oneshot::channel();
+        let delayed = store
+            .entries_persistence
+            .enqueue(move || {
+                let _ = persistence_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await
+            .expect("queue delayed entry frame");
+        started.await.expect("entry persistence started");
+
+        tokio::time::timeout(Duration::from_millis(50), store.save_vote(&Vote::new(2, 2)))
+            .await
+            .expect("vote metadata bypasses the delayed entry actor")
+            .expect("durable vote");
+        await_persisted(delayed)
+            .await
+            .expect("delayed entry frame completes");
+    }
+
+    /// Entry dispatch returns before fsync, while its completion remains fenced by the frame write.
+    #[tokio::test(flavor = "current_thread")]
+    async fn append_dispatch_returns_before_its_fsync_completes() {
+        let root = TempDir::new().expect("temporary replica root");
+        let store = PersistentLogStore::open(root.path().join("raft-log.json"))
+            .await
+            .expect("open log store");
+        let (persistence_started, started) = tokio::sync::oneshot::channel();
+        let delayed = store
+            .entries_persistence
+            .enqueue(move || {
+                let _ = persistence_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await
+            .expect("queue delayed entry frame");
+        started.await.expect("entry persistence started");
+
+        let mut completion = tokio::time::timeout(
+            Duration::from_millis(50),
+            store.dispatch_append(vec![large_entry(1)]),
+        )
+        .await
+        .expect("append dispatch returns without waiting for fsync")
+        .expect("append frame is queued");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut completion)
+                .await
+                .is_err(),
+            "the callback completion cannot precede its frame fsync"
+        );
+        await_persisted(delayed)
+            .await
+            .expect("delayed entry frame completes");
+        await_persisted(completion)
+            .await
+            .expect("append frame completion follows fsync");
+    }
+
+    /// A slow durable Raft image must not monopolize the runtime that receives
+    /// the next vote RPC.
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_raft_persistence_keeps_the_runtime_responsive() {
+        let (persistence_started, started) = tokio::sync::oneshot::channel();
+        let actor = PersistenceActor::new();
+        let persist = actor
+            .enqueue(move || {
+                let _ = persistence_started.send(());
+                std::thread::sleep(Duration::from_millis(200));
+                Ok(())
+            })
+            .await;
+
+        started.await.expect("blocking persistence started");
+        let mut persist = persist.expect("enqueue persistence");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut persist)
+                .await
+                .is_err(),
+            "the Raft callback must wait for its durable image"
+        );
+        tokio::time::timeout(Duration::from_millis(50), tokio::task::yield_now())
+            .await
+            .expect("a vote RPC remains schedulable while the image fsyncs");
+        await_persisted(persist).await.expect("durable persistence");
+    }
+
+    /// Writes queued before and after a slow image remain in enqueue order, so
+    /// a later Raft callback can never overwrite its predecessor on disk.
+    #[tokio::test]
+    async fn persistence_actor_preserves_queued_image_order() {
+        let actor = PersistenceActor::new();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let first_writes = Arc::clone(&writes);
+        let first = actor
+            .enqueue(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                first_writes.lock().expect("writes lock").push(1_u8);
+                Ok(())
+            })
+            .await
+            .expect("queue first image");
+        let second_writes = Arc::clone(&writes);
+        let second = actor
+            .enqueue(move || {
+                second_writes.lock().expect("writes lock").push(2_u8);
+                Ok(())
+            })
+            .await
+            .expect("queue second image");
+
+        await_persisted(first).await.expect("first durable image");
+        await_persisted(second).await.expect("second durable image");
+        assert_eq!(*writes.lock().expect("writes lock"), vec![1, 2]);
+    }
 }

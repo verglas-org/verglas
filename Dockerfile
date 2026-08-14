@@ -1,4 +1,4 @@
-# Independently deployable Verglas engine roles.
+# Deploy the unified Verglas cache engine.
 
 FROM rust:bookworm AS build
 WORKDIR /src
@@ -8,14 +8,9 @@ COPY . .
 RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=verglas-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=verglas-engine-target,target=/src/target,sharing=locked \
-    cargo build --release \
-      -p verglas-cache-node \
-      -p verglas-query \
-      -p verglas-write-node \
+    cargo build --release -p verglas-cache-node \
     && mkdir -p /tmp/verglas-build \
-    && cp /src/target/release/verglas-cache-node /tmp/verglas-build/ \
-    && cp /src/target/release/verglas-query /tmp/verglas-build/ \
-    && cp /src/target/release/verglas-write /tmp/verglas-build/
+    && cp /src/target/release/verglas-cache-node /tmp/verglas-build/
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
@@ -32,15 +27,3 @@ RUN chmod 0755 /usr/local/bin/verglas-cache-node-start
 USER verglas
 EXPOSE 5454 8333 8334 8335 8336
 ENTRYPOINT ["verglas-cache-node-start"]
-
-FROM runtime AS verglas-query
-COPY --from=build /tmp/verglas-build/verglas-query /usr/local/bin/verglas-query
-USER verglas
-EXPOSE 8350
-ENTRYPOINT ["verglas-query"]
-
-FROM runtime AS verglas-write
-COPY --from=build /tmp/verglas-build/verglas-write /usr/local/bin/verglas-write
-USER verglas
-EXPOSE 8355
-ENTRYPOINT ["verglas-write"]
