@@ -252,3 +252,7 @@
 - #135: Aligned the process-level catalog failover regression with the bounded
   30-second consensus recovery window. Retained-prefix verification still must
   complete before an immediate linearizable read can succeed.
+- #135: Shortened the fixed, non-overlapping ranked election slots so the first
+  survivor after any one-voter loss campaigns within 2.5 seconds. This leaves
+  the frozen five-second WAL request deadline for the required current-term
+  ReadIndex fence and exact committed-prefix reconstruction.

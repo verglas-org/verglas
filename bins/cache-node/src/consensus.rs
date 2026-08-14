@@ -43,13 +43,17 @@ const GROUP_SUBMIT_TIMEOUT: Duration = Duration::from_secs(25);
 /// This leaves room for compact Raft metadata fsync under canonical 8 MiB WAL
 /// traffic without treating an overloaded live voter as dead.
 const RAFT_HEARTBEAT_INTERVAL_MS: u64 = 250;
-/// The first voter may start an election this long after heartbeats stop.
-const RAFT_ELECTION_FIRST_TIMEOUT_MS: u64 = 2_500;
-/// Each later stable voter receives a non-overlapping election window.
-const RAFT_ELECTION_RANK_STEP_MS: u64 = 2_500;
+/// The first voter may start an election after four missed heartbeats.
+///
+/// The ranked windows must also leave enough of the five-second WAL ingress
+/// deadline for the successor's current-term ReadIndex fence and exact
+/// reconstruction. A one-voter loss always leaves rank zero or one alive.
+const RAFT_ELECTION_FIRST_TIMEOUT_MS: u64 = 1_000;
+/// Each later stable voter receives a non-overlapping campaign slot.
+const RAFT_ELECTION_RANK_STEP_MS: u64 = 750;
 /// Election window width. It stays smaller than the rank step so candidate
 /// campaigns never overlap in a healthy deployment.
-const RAFT_ELECTION_WINDOW_MS: u64 = 500;
+const RAFT_ELECTION_WINDOW_MS: u64 = 250;
 
 /// Maps a stable fragment holder identity to the corresponding Raft voter id.
 fn numeric_node_id(node: &str) -> u64 {
@@ -749,8 +753,36 @@ mod tests {
         let config = raft_config(&voters, 33).expect("valid Raft timing");
 
         assert_eq!(config.heartbeat_interval, 250);
-        assert_eq!(config.election_timeout_min, 7_500);
-        assert_eq!(config.election_timeout_max, 8_000);
+        assert_eq!(config.election_timeout_min, 2_500);
+        assert_eq!(config.election_timeout_max, 2_750);
+    }
+
+    /// Keeps the first legal successor's campaign inside the WAL request deadline.
+    ///
+    /// A follower must elect and then establish its current-term read fence
+    /// before the five-second wire deadline expires. The earliest surviving
+    /// rank therefore needs a material part of that deadline left for fencing
+    /// and exact payload reconstruction.
+    #[test]
+    fn leader_loss_election_leaves_time_for_the_wal_read_fence() {
+        let voters = [44, 11, 33, 22];
+        for failed in voters {
+            let earliest_survivor_timeout = voters
+                .iter()
+                .copied()
+                .filter(|voter| *voter != failed)
+                .map(|voter| {
+                    raft_config(&voters, voter)
+                        .expect("valid ranked voter")
+                        .election_timeout_max
+                })
+                .min()
+                .expect("a four-voter group retains three voters after one loss");
+            assert!(
+                earliest_survivor_timeout <= 2_500,
+                "a one-voter loss must leave at least half of the fixed five-second ReadWal deadline for the current-term fence"
+            );
+        }
     }
 
     /// A vote remains serviceable while every public-runtime worker is blocked.
