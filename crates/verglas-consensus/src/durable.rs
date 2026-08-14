@@ -324,6 +324,7 @@ impl Header {
         });
         b.push(match self.kind {
             CommandKind::TimelineOpen => 7,
+            CommandKind::WalArchiveBinding => 9,
             CommandKind::Catalog => 0,
             CommandKind::Wal => 1,
             CommandKind::WriterLease => 2,
@@ -373,6 +374,7 @@ impl Header {
             6 => CommandKind::TenantRoot,
             7 => CommandKind::TimelineOpen,
             8 => CommandKind::CatalogCheckpoint,
+            9 => CommandKind::WalArchiveBinding,
             _ => return Err(ConsensusError::DurabilityUnavailable),
         };
         let length = u64::from_be_bytes(

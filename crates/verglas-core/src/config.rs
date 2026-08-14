@@ -53,8 +53,10 @@ pub struct Config {
     /// retry and circuit-breaker policies.
     #[serde(default)]
     pub backend: Backend,
-    /// Explicitly authorized object-storage namespace for immutable WAL archives.
-    pub wal_archive: Option<WalArchive>,
+    /// Explicitly authorized object-storage namespace for immutable catalog
+    /// checkpoints. This stays separate from WAL archives so a tenant's
+    /// catalog durability boundary can use its own bucket.
+    pub catalog_archive: Option<CatalogArchive>,
     /// Credentials the S3 endpoint accepts from query engines. Unset generates
     /// an ephemeral keypair at startup and prints it once.
     pub auth: Option<Auth>,
@@ -65,34 +67,34 @@ pub struct Config {
     pub cluster: Option<Cluster>,
 }
 
-/// Dedicated object-storage target for consensus-committed WAL archives.
+/// Dedicated object-storage target for consensus-committed catalog checkpoints.
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct WalArchive {
-    /// Bucket explicitly authorized for Verglas WAL archive objects.
+pub struct CatalogArchive {
+    /// Bucket explicitly authorized for Verglas catalog checkpoint objects.
     pub bucket: String,
-    /// Object-key prefix reserved for WAL archives.
-    #[serde(default = "default_wal_archive_prefix")]
+    /// Object-key prefix reserved for catalog checkpoints.
+    #[serde(default = "default_catalog_archive_prefix")]
     pub prefix: String,
 }
 
-/// Keeps WAL archives outside table object namespaces by default.
-fn default_wal_archive_prefix() -> String {
-    "_verglas/wal".to_owned()
+/// Keeps catalog checkpoints outside table and WAL object namespaces by default.
+fn default_catalog_archive_prefix() -> String {
+    "_verglas/catalog".to_owned()
 }
 
-impl WalArchive {
-    /// Rejects empty or unsafe archive coordinates and buckets outside the configured backend set.
+impl CatalogArchive {
+    /// Rejects empty or unsafe catalog coordinates and buckets outside the configured backend set.
     fn validate(&self, backend: &Backend) -> Result<(), ConfigError> {
         if self.bucket.is_empty() || !backend.serves_bucket(&self.bucket) {
             return Err(ConfigError::Invalid(
-                "wal_archive.bucket",
+                "catalog_archive.bucket",
                 "must name an explicitly served backend bucket".to_owned(),
             ));
         }
         if self.prefix.is_empty() || self.prefix.starts_with('/') || self.prefix.contains("..") {
             return Err(ConfigError::Invalid(
-                "wal_archive.prefix",
+                "catalog_archive.prefix",
                 "must be a non-empty relative object prefix without `..`".to_owned(),
             ));
         }
@@ -1452,7 +1454,7 @@ impl Config {
         self.backend.retry.validate()?;
         self.backend.breaker.validate()?;
         self.backend.validate()?;
-        if let Some(archive) = &self.wal_archive {
+        if let Some(archive) = &self.catalog_archive {
             archive.validate(&self.backend)?;
         }
         self.cache.validate()?;
@@ -1548,7 +1550,7 @@ impl Config {
     /// One-line startup summary so operators can eyeball what loaded.
     pub fn summary(&self) -> String {
         format!(
-            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} wal_archive={} cluster={}",
+            "s3_port={} admin_port={} tls={} addressing={} cache={} (capacity={}B dram={}B block={}B) backend={}(max_concurrent={}) auth={} catalog={} catalog_archive={} cluster={}",
             self.listen.s3_port,
             self.listen.admin_port,
             if self.listen.tls.is_some() {
@@ -1572,7 +1574,7 @@ impl Config {
                 "generated"
             },
             self.catalog.as_ref().map_or("off", |c| c.uri.as_str()),
-            self.wal_archive
+            self.catalog_archive
                 .as_ref()
                 .map_or("off", |a| a.bucket.as_str()),
             self.cluster.as_ref().map_or("off", |c| c.pod_id.as_str()),

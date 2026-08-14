@@ -256,3 +256,16 @@
   survivor after any one-voter loss campaigns within 2.5 seconds. This leaves
   the frozen five-second WAL request deadline for the required current-term
   ReadIndex fence and exact committed-prefix reconstruction.
+- #135: The cache-node image entrypoint now writes the required WAL archive configuration whenever the authoritative WAL ingress is enabled. Container deployments therefore start the four-voter durability engine with an explicit archive bucket and prefix instead of failing before health checks.
+- #135: Gave checkpointed 16 MiB WAL archival its own 120-second hard submission ceiling instead of the 25-second interactive ingress ceiling. SF10 sustained writes had proven that a live four-voter ring could need longer to reconstruct, upload, verify, checkpoint, and release one segment under load; foreground requests retain their existing bound.
+- #135: Split authoritative durability into typed WAL and catalog archive
+  destinations. The cache node now requires both configured targets when the
+  fragment ring is active, and catalog checkpoints cannot reuse the WAL store
+  or prefix by accident.
+- #135: Bound every Neon timeline to its database bucket through an authenticated,
+  consensus-backed admin operation before accepting WAL. Archive reads, writes,
+  and drains resolve that exact binding and never fall back to a global bucket.
+- #135: Sharded immutable-object headers across four bounded Raft groups per
+  storage binding and bucket instead of creating one Raft group per object.
+  A failed voter no longer creates an unbounded heartbeat storm that starves a
+  concurrently active WAL timeline after a large Iceberg ingest.

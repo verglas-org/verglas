@@ -298,6 +298,7 @@ struct StateMachineData {
     retries: BTreeMap<RequestId, AppliedIdentity>,
     writer_epoch: u64,
     writer_active: bool,
+    wal_archive_bucket: Option<String>,
     wal_initialized: bool,
     wal_end: u64,
     archive_lsn: u64,
@@ -392,6 +393,34 @@ impl PersistentStateMachine {
         Ok(())
     }
 
+    /// Releases every WAL allocation covered by the current committed archive watermark.
+    ///
+    /// The caller must commit a matching `ReleaseWal` command only after this
+    /// succeeds, so every replica prunes the same metadata after physical
+    /// reclamation has completed on all certified holders.
+    pub async fn release_checkpointed_wal_payloads(&self) -> Result<(), crate::PayloadError> {
+        let payloads = self.payloads.read().await.clone().ok_or_else(|| {
+            crate::PayloadError::Transport("payload store is not attached".to_owned())
+        })?;
+        // Physical reclamation is remote I/O. Clone the durable view before it
+        // begins so Raft apply can continue taking the live state write lock.
+        let state = self.state.read().await.clone();
+        let covered = state
+            .committed
+            .iter()
+            .filter_map(|(index, header)| match header.metadata() {
+                crate::EntryMetadata::Wal { end, .. } if end <= state.archive_lsn => {
+                    Some((*index, header.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (index, header) in covered {
+            release_committed_payload(&state, index, &header, payloads.as_ref()).await?;
+        }
+        Ok(())
+    }
+
     /// Returns one header only after the Raft state machine has applied it.
     pub async fn committed_header(&self, index: u64) -> Option<crate::EntryHeader> {
         self.state.read().await.committed.get(&index).cloned()
@@ -422,6 +451,11 @@ impl PersistentStateMachine {
     /// Returns the currently applied exclusive WAL writer epoch.
     pub async fn writer_epoch(&self) -> u64 {
         self.state.read().await.writer_epoch
+    }
+
+    /// Returns the immutable archive bucket committed for this timeline group.
+    pub async fn wal_archive_bucket(&self) -> Option<String> {
+        self.state.read().await.wal_archive_bucket.clone()
     }
 
     /// Returns the committed WAL tail and applied archive checkpoint watermark.
@@ -614,7 +648,8 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                         continue;
                     }
                     let epoch_valid = match header.kind() {
-                        crate::CommandKind::TimelineOpen => true,
+                        crate::CommandKind::TimelineOpen => state.wal_archive_bucket.is_some(),
+                        crate::CommandKind::WalArchiveBinding => true,
                         crate::CommandKind::WriterLease => {
                             state.wal_initialized
                                 && header.writer_epoch() == Some(state.writer_epoch + 1)
@@ -666,6 +701,23 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                                 state.archive_lsn = start;
                             }
                             wal_end = Some(state.wal_end);
+                        }
+                        crate::EntryMetadata::WalArchiveBinding { bucket } => {
+                            if let Some(existing) = &state.wal_archive_bucket {
+                                if existing != &bucket {
+                                    responses.push(RaftResponse {
+                                        index: entry.log_id.index,
+                                        writer_epoch: None,
+                                        outcome: AppliedOutcome::CatalogConflict,
+                                        wal_end: None,
+                                        archive_lsn: None,
+                                        catalog_changed: false,
+                                    });
+                                    continue;
+                                }
+                            } else {
+                                state.wal_archive_bucket = Some(bucket);
+                            }
                         }
                         crate::EntryMetadata::Wal { start, end: _ } if start != state.wal_end => {
                             responses.push(RaftResponse {
@@ -836,6 +888,23 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                         catalog_changed: false,
                     });
                 }
+                EntryPayload::Normal(RaftCommand::ReleaseWal { through_lsn }) => {
+                    if through_lsn > state.archive_lsn {
+                        return Err(StorageIOError::write_state_machine(&std::io::Error::other(
+                            "WAL release exceeds the committed archive checkpoint",
+                        ))
+                        .into());
+                    }
+                    compact_checkpointed_wal_history(&mut state, through_lsn);
+                    responses.push(RaftResponse {
+                        index: entry.log_id.index,
+                        writer_epoch: None,
+                        outcome: AppliedOutcome::Committed,
+                        wal_end: Some(state.wal_end),
+                        archive_lsn: Some(state.archive_lsn),
+                        catalog_changed: false,
+                    });
+                }
             }
         }
         let persisted = self.enqueue_persist(state.clone()).await;
@@ -964,7 +1033,7 @@ async fn release_checkpointed_catalog_payloads(
         if header.kind() != crate::CommandKind::Catalog {
             continue;
         }
-        release_catalog_payload(state, *index, header, payloads).await?;
+        release_committed_payload(state, *index, header, payloads).await?;
     }
     Ok(())
 }
@@ -981,14 +1050,14 @@ async fn release_catalog_payloads_pruned_by_snapshot(
     for (index, header) in local.committed.range(..=checkpoint_index) {
         if header.kind() == crate::CommandKind::Catalog && !installed.committed.contains_key(index)
         {
-            release_catalog_payload(local, *index, header, payloads).await?;
+            release_committed_payload(local, *index, header, payloads).await?;
         }
     }
     Ok(())
 }
 
 /// Releases the original and latest repaired representation for one catalog header.
-async fn release_catalog_payload(
+async fn release_committed_payload(
     state: &StateMachineData,
     index: u64,
     header: &crate::EntryHeader,
@@ -1025,6 +1094,24 @@ async fn release_catalog_payload(
             .await?;
     }
     Ok(())
+}
+
+/// Removes checkpoint-covered WAL headers after every certified representation was reclaimed.
+/// Retry identities and archive checkpoint headers remain authoritative.
+fn compact_checkpointed_wal_history(state: &mut StateMachineData, through_lsn: u64) {
+    let compacted = state
+        .committed
+        .iter()
+        .filter_map(|(index, header)| match header.metadata() {
+            crate::EntryMetadata::Wal { end, .. } if end <= through_lsn => Some(*index),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for index in compacted {
+        state.committed.remove(&index);
+        state.committed_log_ids.remove(&index);
+        state.repairs.remove(&index);
+    }
 }
 
 /// Removes catalog command records whose materialized effects are covered by the checkpoint.

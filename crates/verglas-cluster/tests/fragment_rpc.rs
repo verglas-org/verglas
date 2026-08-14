@@ -91,6 +91,20 @@ fn handlers_with_hanging_load(store: LocalFragmentStore) -> FragmentHandlers {
     handlers
 }
 
+/// Wires fragment handlers whose read is slower than a cache-block lookup but
+/// still comfortably within the peer request budget used for durable shards.
+fn handlers_with_delayed_load(store: LocalFragmentStore) -> FragmentHandlers {
+    let mut handlers = handlers_for(store.clone());
+    handlers.load = Arc::new(move |key| {
+        let store = store.clone();
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            store.load_fragment(&key)
+        })
+    });
+    handlers
+}
+
 /// Binds a fragment server over a fresh store, returning the server, a client
 /// pointed at it as `node`, and the backing store.
 async fn server_and_client(
@@ -274,7 +288,7 @@ async fn fragment_read_times_out_before_the_durability_placement_budget() {
     );
 
     let result = tokio::time::timeout(
-        Duration::from_millis(300),
+        Duration::from_secs(6),
         client.get_fragment(
             &node,
             &FragmentKey {
@@ -286,8 +300,51 @@ async fn fragment_read_times_out_before_the_durability_placement_budget() {
     .await;
     assert!(
         matches!(result, Ok(Err(_))),
-        "a stalled recovery read must fail within its short availability budget: {result:?}"
+        "a stalled recovery read must fail before the durability placement budget: {result:?}"
     );
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// Durable fragments are much larger than cache blocks and can take hundreds
+/// of milliseconds to stream from a CPU-throttled peer. Such a healthy peer
+/// must not be mistaken for a missing fragment during reconstruction.
+#[tokio::test]
+async fn fragment_read_allows_a_healthy_slow_peer() {
+    let node = NodeId::new("slow-healthy-peer");
+    let directory =
+        std::env::temp_dir().join(format!("verglas-fragrpc-slow-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let store = LocalFragmentStore::new(&directory);
+    let key = FragmentKey {
+        object_id: "large-durable-shard".to_owned(),
+        index: 1,
+    };
+    let payload = Bytes::from_static(b"durable-fragment");
+    store
+        .store_fragment(&FragmentRecord::new(key.clone(), payload.clone()))
+        .expect("seed fragment");
+    let server = PeerServer::bind_with_fragments(
+        "127.0.0.1:0".parse().expect("addr"),
+        None,
+        empty_blocks(),
+        handlers_with_delayed_load(store),
+    )
+    .await
+    .expect("bind slow peer");
+    let client = FragmentClient::new(
+        Arc::new(StaticResolver::with(node.clone(), server.local_addr())),
+        None,
+        Duration::from_millis(500),
+        Duration::from_secs(30),
+    );
+
+    let loaded = client
+        .get_fragment(&node, &key)
+        .await
+        .expect("healthy slow peer must remain readable")
+        .expect("fragment exists");
+    assert_eq!(loaded.bytes, payload);
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(directory);
 }

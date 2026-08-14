@@ -17,9 +17,9 @@ use axum::{
 };
 use object_store::ObjectStoreExt;
 use sha2::{Digest, Sha256};
-use verglas_backend::MultipartObjectStore;
+use verglas_backend::{BackendStore, BackendStores, MultipartObjectStore};
 use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
-use verglas_consensus::{GroupError, GroupRequest, GroupResponse, ReplicationMode};
+use verglas_consensus::{CatalogExport, GroupError, GroupRequest, GroupResponse, ReplicationMode};
 use verglas_core::activity::ActivityTracker;
 use verglas_safekeeper::{
     AppendGeometry, ArchiveError, ArchiveObject, ArchiveTimeline, ImmutableSegmentStore,
@@ -44,9 +44,57 @@ struct WalIngress {
     consensus: Arc<ConsensusPlane>,
     coded_holders: Vec<u64>,
     majority_holders: Vec<u64>,
-    archive_store: Arc<dyn ImmutableSegmentStore>,
-    archive_prefix: String,
+    wal_registry: Arc<BackendStore>,
     archive_inflight: Arc<Mutex<BTreeSet<String>>>,
+}
+
+/// One immutable object namespace assigned to a single durability domain.
+///
+/// The concrete type deliberately travels with its prefix so callers cannot
+/// pair a WAL store with a catalog prefix (or the reverse) at a call site.
+#[derive(Clone)]
+struct ArchiveDestination {
+    store: Arc<dyn ImmutableSegmentStore>,
+    prefix: String,
+}
+
+impl ArchiveDestination {
+    /// Pairs one archive store with its namespace prefix.
+    fn new(store: Arc<dyn ImmutableSegmentStore>, prefix: String) -> Self {
+        Self { store, prefix }
+    }
+}
+
+/// Immutable object namespace reserved for timeline WAL archive segments.
+#[derive(Clone)]
+pub(crate) struct WalArchiveDestination(ArchiveDestination);
+
+impl WalArchiveDestination {
+    /// Creates the WAL-only archive destination from the WAL config target.
+    pub(crate) fn new(store: Arc<dyn ImmutableSegmentStore>, prefix: String) -> Self {
+        Self(ArchiveDestination::new(store, prefix))
+    }
+}
+
+/// Immutable object namespace reserved for warehouse catalog checkpoints.
+#[derive(Clone)]
+pub(crate) struct CatalogArchiveDestination(ArchiveDestination);
+
+impl CatalogArchiveDestination {
+    /// Creates the catalog-only archive destination from the catalog config target.
+    pub(crate) fn new(store: Arc<dyn ImmutableSegmentStore>, prefix: String) -> Self {
+        Self(ArchiveDestination::new(store, prefix))
+    }
+}
+
+/// Separates the two authoritative object durability domains.
+///
+/// This is intentionally not a map keyed by group name: each field makes a
+/// WAL/catalog routing mistake visible in type-checked call sites.
+#[derive(Clone)]
+pub(crate) struct AuthoritativeArchives {
+    pub(crate) wal_registry: Arc<BackendStore>,
+    pub(crate) catalog: CatalogArchiveDestination,
 }
 
 /// Immutable WAL archive storage over the explicitly configured object bucket.
@@ -113,7 +161,7 @@ impl ArchiveTimeline for RoutedArchiveTimeline {
     ) -> Result<Bytes, ArchiveError> {
         match self
             .consensus
-            .submit(
+            .submit_archive(
                 &self.group,
                 GroupRequest::ReadWal {
                     from,
@@ -139,7 +187,7 @@ impl ArchiveTimeline for RoutedArchiveTimeline {
     ) -> Result<(), ArchiveError> {
         match self
             .consensus
-            .submit(
+            .submit_archive(
                 &self.group,
                 GroupRequest::ArchiveCheckpoint {
                     request_id: request,
@@ -161,7 +209,7 @@ impl ArchiveTimeline for RoutedArchiveTimeline {
     async fn release_through(&self, end_lsn: u64) -> Result<SegmentRelease, ArchiveError> {
         match self
             .consensus
-            .submit(&self.group, GroupRequest::WalState { minimum_index: 0 })
+            .submit_archive(&self.group, GroupRequest::WalState { minimum_index: 0 })
             .await
             .map_err(|error| ArchiveError::ObjectStore(error.to_string()))?
         {
@@ -216,8 +264,7 @@ pub async fn serve(
     ring: Arc<RingPlane>,
     layout: AppendGeometry,
     consensus: Arc<ConsensusPlane>,
-    archive_store: Arc<dyn ImmutableSegmentStore>,
-    archive_prefix: String,
+    archives: AuthoritativeArchives,
     _activity: ActivityTracker,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: SocketAddr = std::env::var("VERGLAS_SAFEKEEPER_ADDR")
@@ -229,8 +276,7 @@ pub async fn serve(
         consensus,
         coded_holders: voters.iter().copied().take(layout.w).collect(),
         majority_holders: voters.iter().copied().take(voters.len() / 2 + 1).collect(),
-        archive_store,
-        archive_prefix,
+        wal_registry: archives.wal_registry,
         archive_inflight: Arc::new(Mutex::new(BTreeSet::new())),
     };
     let app = Router::new()
@@ -322,7 +368,7 @@ async fn catalog_request(
         GroupResponse::CatalogTables(tables) => ManagedCatalogResponse::Tables(tables),
         GroupResponse::CatalogRecord(record) => ManagedCatalogResponse::Record(record),
         GroupResponse::CatalogRecords(records) => ManagedCatalogResponse::Records(records),
-        GroupResponse::CatalogExport(_) => {
+        GroupResponse::CatalogExport(_) | GroupResponse::WalArchiveBinding(_) => {
             return Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "wrong warehouse response".to_owned(),
@@ -523,8 +569,11 @@ async fn composed_wal_read(
     let archived_end = to.min(plan.checkpointed_end());
     let mut output = Vec::with_capacity((to - from) as usize);
     if from < archived_end {
+        let destination = resolve_wal_archive(&state.consensus, &state.wal_registry, group)
+            .await
+            .map_err(|error| (StatusCode::CONFLICT, error))?;
         let prefix = read_archived_wal_prefix(
-            state.archive_store.as_ref(),
+            destination.0.store.as_ref(),
             plan.archived_segments(),
             from,
             archived_end,
@@ -563,6 +612,14 @@ fn spawn_archive(state: WalIngress, group: String, minimum_index: u64) {
             group: group.clone(),
             groups: Arc::clone(&state.archive_inflight),
         };
+        let destination =
+            match resolve_wal_archive(&state.consensus, &state.wal_registry, &group).await {
+                Ok(destination) => destination,
+                Err(error) => {
+                    tracing::error!(%error, %group, "resolve committed WAL archive binding");
+                    return;
+                }
+            };
         let timeline = Arc::new(RoutedArchiveTimeline {
             consensus: Arc::clone(&state.consensus),
             group: group.clone(),
@@ -570,8 +627,8 @@ fn spawn_archive(state: WalIngress, group: String, minimum_index: u64) {
         });
         let archiver = match SegmentArchiver::new(
             timeline,
-            Arc::clone(&state.archive_store),
-            format!("{}/{}", state.archive_prefix, group),
+            Arc::clone(&destination.0.store),
+            format!("{}/{}", destination.0.prefix, group),
         ) {
             Ok(archiver) => archiver,
             Err(error) => {
@@ -584,7 +641,7 @@ fn spawn_archive(state: WalIngress, group: String, minimum_index: u64) {
         loop {
             let status = match state
                 .consensus
-                .submit(
+                .submit_archive(
                     &group,
                     GroupRequest::WalState {
                         minimum_index: fence,
@@ -630,6 +687,31 @@ fn spawn_archive(state: WalIngress, group: String, minimum_index: u64) {
     });
 }
 
+/// Resolves a timeline's consensus-committed archive bucket through the only
+/// authorized backend binding. An unbound timeline has no archive fallback.
+async fn resolve_wal_archive(
+    consensus: &Arc<ConsensusPlane>,
+    registry: &Arc<BackendStore>,
+    group: &str,
+) -> Result<WalArchiveDestination, String> {
+    let bucket = match consensus
+        .submit(group, GroupRequest::WalArchiveBinding)
+        .await
+        .map_err(|error| error.to_string())?
+    {
+        GroupResponse::WalArchiveBinding(Some(bucket)) => bucket,
+        GroupResponse::WalArchiveBinding(None) => {
+            return Err("timeline WAL archive bucket is not consensus-bound".to_owned());
+        }
+        _ => return Err("timeline WAL archive binding returned wrong response".to_owned()),
+    };
+    let store = registry
+        .store_for(crate::serve::DEFAULT_STORAGE_BINDING_ID, &bucket)
+        .map_err(|error| error.to_string())?;
+    let store: Arc<dyn ImmutableSegmentStore> = Arc::new(ObjectArchiveStore::new(store));
+    Ok(WalArchiveDestination::new(store, "_verglas/wal".to_owned()))
+}
+
 /// Flushes the final committed tail for one timeline during an authoritative stop.
 ///
 /// This runs only after the admin lifecycle fence rejected new mutations. It
@@ -637,8 +719,7 @@ fn spawn_archive(state: WalIngress, group: String, minimum_index: u64) {
 /// byte through the committed tail has a verified immutable representation.
 pub(crate) async fn flush_timeline_tail(
     consensus: Arc<ConsensusPlane>,
-    archive_store: Arc<dyn ImmutableSegmentStore>,
-    archive_prefix: String,
+    destination: &WalArchiveDestination,
     holders: Vec<u64>,
     group: String,
 ) -> Result<(), ArchiveError> {
@@ -668,15 +749,19 @@ pub(crate) async fn flush_timeline_tail(
         group: group.clone(),
         holders,
     });
-    SegmentArchiver::new(timeline, archive_store, format!("{archive_prefix}/{group}"))?
-        .archive_tail(
-            request,
-            status.checkpointed_end(),
-            status.committed_end(),
-            status.applied_index(),
-        )
-        .await
-        .map(|_| ())
+    SegmentArchiver::new(
+        timeline,
+        Arc::clone(&destination.0.store),
+        format!("{}/{group}", destination.0.prefix),
+    )?
+    .archive_tail(
+        request,
+        status.checkpointed_end(),
+        status.committed_end(),
+        status.applied_index(),
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Drains every locally hosted timeline tail after admission is fenced.
@@ -685,16 +770,14 @@ pub(crate) async fn flush_timeline_tail(
 /// committed checkpoint command is installed; this keeps lifecycle stop closed.
 pub(crate) async fn drain_authoritative_groups(
     consensus: Arc<ConsensusPlane>,
-    archive_store: Arc<dyn ImmutableSegmentStore>,
-    archive_prefix: String,
+    archives: AuthoritativeArchives,
     holders: Vec<u64>,
 ) -> Result<(), String> {
     for group in consensus.hosted_groups().await {
         if group.starts_with("timeline/") {
             flush_timeline_tail(
                 Arc::clone(&consensus),
-                Arc::clone(&archive_store),
-                archive_prefix.clone(),
+                &resolve_wal_archive(&consensus, &archives.wal_registry, &group).await?,
                 holders.clone(),
                 group,
             )
@@ -707,36 +790,17 @@ pub(crate) async fn drain_authoritative_groups(
                 .map_err(|error| error.to_string())?
             {
                 GroupResponse::CatalogExport(export) => {
-                    let hash: [u8; 32] = Sha256::digest(&export.bytes).into();
-                    let object = ArchiveObject {
-                        key: format!(
-                            "{archive_prefix}/{group}/catalog-{:016x}-{}",
-                            export.applied_index,
-                            hex::encode(hash)
-                        ),
-                        hash,
-                        length: export.bytes.len() as u64,
-                    };
-                    archive_store
-                        .upload(&object, Bytes::from(export.bytes))
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    archive_store
-                        .verify(&object)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    let request = u128::from_be_bytes(
-                        hash[..16]
-                            .try_into()
-                            .map_err(|_| "catalog checkpoint identity malformed".to_owned())?,
-                    );
+                    let (request, object) =
+                        persist_catalog_export(&archives.catalog, &group, &export)
+                            .await
+                            .map_err(|error| error.to_string())?;
                     match consensus
                         .submit(
                             &group,
                             GroupRequest::CatalogCheckpoint {
                                 request_id: request,
                                 applied_index: export.applied_index,
-                                object: object.key,
+                                object,
                                 holders: holders.clone(),
                             },
                         )
@@ -752,6 +816,38 @@ pub(crate) async fn drain_authoritative_groups(
         }
     }
     Ok(())
+}
+
+/// Uploads and verifies one catalog export in the catalog-only durability domain.
+///
+/// The returned request identity and object key are passed to CRaft only after
+/// immutable storage verifies the exact export bytes.
+async fn persist_catalog_export(
+    destination: &CatalogArchiveDestination,
+    group: &str,
+    export: &CatalogExport,
+) -> Result<(u128, String), ArchiveError> {
+    let hash: [u8; 32] = Sha256::digest(&export.bytes).into();
+    let object = ArchiveObject {
+        key: format!(
+            "{}/{group}/catalog-{:016x}-{}",
+            destination.0.prefix,
+            export.applied_index,
+            hex::encode(hash)
+        ),
+        hash,
+        length: export.bytes.len() as u64,
+    };
+    destination
+        .0
+        .store
+        .upload(&object, Bytes::copy_from_slice(&export.bytes))
+        .await?;
+    destination.0.store.verify(&object).await?;
+    let request = u128::from_be_bytes(hash[..16].try_into().map_err(|_| {
+        ArchiveError::ObjectStore("catalog checkpoint identity malformed".to_owned())
+    })?);
+    Ok((request, object.key))
 }
 
 /// Converts the universal engine response into the Neon WAL surface.
@@ -775,6 +871,7 @@ fn response_binary(response: GroupResponse) -> Result<Response, (StatusCode, Str
         | GroupResponse::CatalogRecord(_)
         | GroupResponse::CatalogRecords(_)
         | GroupResponse::CatalogExport(_)
+        | GroupResponse::WalArchiveBinding(_)
         | GroupResponse::WarehouseGroup(_)
         | GroupResponse::ArchivedWalReadPlan(_) => {
             return Err((
@@ -798,6 +895,37 @@ fn response_binary(response: GroupResponse) -> Result<Response, (StatusCode, Str
 mod tests {
     use super::*;
 
+    /// A recording immutable store used to prove catalog exports choose only
+    /// the catalog destination supplied to the persistence helper.
+    #[derive(Default)]
+    struct RecordingStore {
+        objects: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    #[async_trait]
+    impl ImmutableSegmentStore for RecordingStore {
+        /// Records the immutable bytes a caller attempted to archive.
+        async fn upload(&self, object: &ArchiveObject, bytes: Bytes) -> Result<(), ArchiveError> {
+            self.objects
+                .lock()
+                .map_err(|_| ArchiveError::ObjectStore("recording store lock poisoned".to_owned()))?
+                .push((object.key.clone(), bytes.to_vec()));
+            Ok(())
+        }
+
+        /// Accepts the object because upload retained it in the recording fixture.
+        async fn verify(&self, _object: &ArchiveObject) -> Result<(), ArchiveError> {
+            Ok(())
+        }
+
+        /// The routing test never reads an archived object.
+        async fn read(&self, _object: &ArchiveObject) -> Result<Bytes, ArchiveError> {
+            Err(ArchiveError::ObjectStore(
+                "recording store does not serve reads".to_owned(),
+            ))
+        }
+    }
+
     /// Four-node geometry is explicit and must consume the configured ring.
     #[test]
     fn configured_geometry_accepts_four_node_ec() {
@@ -812,5 +940,36 @@ mod tests {
     fn configured_geometry_rejects_ring_mismatch() {
         let error = configured_geometry(4, 2, 1, 3).expect_err("three fragments for four nodes");
         assert!(error.contains("4 cache nodes"), "{error}");
+    }
+
+    /// Catalog checkpoints use their dedicated destination and never the WAL destination.
+    #[tokio::test]
+    async fn catalog_checkpoint_persists_only_to_catalog_archive() {
+        let wal_store = Arc::new(RecordingStore::default());
+        let catalog_store = Arc::new(RecordingStore::default());
+        let catalog =
+            CatalogArchiveDestination::new(catalog_store.clone(), "catalog-prefix".to_owned());
+        let export = CatalogExport {
+            applied_index: 42,
+            bytes: b"canonical-catalog-export".to_vec(),
+        };
+
+        let (_request, object) = persist_catalog_export(&catalog, "warehouse/acme/main", &export)
+            .await
+            .expect("catalog export persists");
+
+        assert!(object.starts_with("catalog-prefix/warehouse/acme/main/catalog-"));
+        assert_eq!(
+            catalog_store
+                .objects
+                .lock()
+                .expect("catalog store lock")
+                .as_slice(),
+            [(object, b"canonical-catalog-export".to_vec())]
+        );
+        assert!(
+            wal_store.objects.lock().expect("wal store lock").is_empty(),
+            "the WAL archive must not receive catalog checkpoint bytes"
+        );
     }
 }

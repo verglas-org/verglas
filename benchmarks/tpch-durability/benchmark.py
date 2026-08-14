@@ -29,6 +29,14 @@ from typing import Any
 ROOT = pathlib.Path(__file__).resolve().parent
 REPOSITORY = ROOT.parents[1]
 COMPOSE = ROOT / "compose.yaml"
+LAKEKEEPER_HEALTH_URL = "http://127.0.0.1:18181/health"
+LAKEKEEPER_CATALOG_URI = "http://127.0.0.1:18181/catalog"
+S3_INGRESS_ENDPOINTS = (
+    "127.0.0.1:18333",
+    "127.0.0.1:18343",
+    "127.0.0.1:18353",
+    "127.0.0.1:18363",
+)
 WAL_BYTES = 256 * 1024 * 1024
 WAL_SEGMENT_BYTES = 16 * 1024 * 1024
 SF10_ROWS = {
@@ -104,6 +112,13 @@ def validate_report(report: Mapping[str, Any]) -> None:
     before = validate_checksums(iceberg.get("query_checksums_before"), "iceberg.query_checksums_before")
     after = validate_checksums(iceberg.get("query_checksums_after"), "iceberg.query_checksums_after")
     require(before == after, "TPC-H checksums changed across the failure protocol")
+    ingress_uploads = iceberg.get("s3_ingress_uploads")
+    require(
+        isinstance(ingress_uploads, list)
+        and len(ingress_uploads) == len(S3_INGRESS_ENDPOINTS)
+        and all(type(count) is int and count > 0 for count in ingress_uploads),
+        "every S3 ingress must receive at least one immutable upload",
+    )
     require(nonnegative_int(iceberg.get("origin_objects"), "iceberg.origin_objects") >= MIN_ORIGIN_OBJECTS, "too few immutable origin objects")
     require(nonnegative_int(iceberg.get("origin_bytes"), "iceberg.origin_bytes") >= MIN_ORIGIN_BYTES, "origin footprint is too small")
     require(nonnegative_int(iceberg.get("origin_checksum_mismatches"), "iceberg.origin_checksum_mismatches") == 0, "origin SHA-256 parity failed")
@@ -168,7 +183,7 @@ class Compose:
     def restart(self, service: str) -> None:
         """Restart one named voter and wait for its service health check."""
         self.run("start", service, timeout=90)
-        wait_http(f"http://127.0.0.1:{admin_port(service)}/admin/healthz", 90)
+        wait_compose_healthy(self, service, 90)
 
     def down(self) -> None:
         """Remove only containers and anonymous resources owned by this project."""
@@ -209,6 +224,31 @@ def docker_ps(compose: Compose) -> list[dict[str, Any]]:
             raise EvidenceError(f"Docker Compose returned malformed process JSON: {error}; {lines_error}") from lines_error
     require(isinstance(value, list) and all(isinstance(item, dict) for item in value), "Docker Compose process document is not a list of objects")
     return value
+
+
+def wait_compose_healthy(compose: Compose, service: str, timeout_seconds: float) -> None:
+    """Wait for Docker's in-container health result without using its host port proxy."""
+    deadline = time.monotonic() + timeout_seconds
+    last = "service was absent"
+    while time.monotonic() < deadline:
+        for process in docker_ps(compose):
+            if process.get("Service") != service:
+                continue
+            state = str(process.get("State", "")).lower()
+            health = str(process.get("Health", "")).lower()
+            if state == "running" and health == "healthy":
+                return
+            last = f"state={state}, health={health}"
+        time.sleep(0.5)
+    raise EvidenceError(f"service did not become healthy in Compose: {service}: {last}")
+
+
+def restart_voters(compose: Compose, services: tuple[str, ...], timeout_seconds: float) -> None:
+    """Start a stopped voter set together, then require every member to become healthy."""
+    require(bool(services), "restart voter set must not be empty")
+    compose.run("start", *services, timeout=90)
+    for service in services:
+        wait_compose_healthy(compose, service, timeout_seconds)
 
 
 def count_postgres(compose: Compose) -> int:
@@ -266,8 +306,147 @@ def canonical_tpch_queries(connection: Any) -> dict[int, str]:
     return queries
 
 
+def iceberg_s3_properties() -> dict[str, str]:
+    """Return the cache endpoint and the stack's ephemeral S3 credentials."""
+    return {
+        "s3.endpoint": "http://127.0.0.1:18333",
+        "s3.access-key-id": os.environ["TPCH_DURABILITY_S3_ACCESS_KEY"],
+        "s3.secret-access-key": os.environ["TPCH_DURABILITY_S3_SECRET_KEY"],
+        "s3.region": "us-east-1",
+        "s3.path-style-access": "true",
+    }
+
+
+def iceberg_catalog_properties() -> dict[str, str]:
+    """Return the real caller session required by the hosted catalog."""
+    return {"token": os.environ["TPCH_DURABILITY_CALLER_TOKEN"]}
+
+
+class RoundRobinS3:
+    """Distribute complete S3 operations across every configured Verglas ingress."""
+
+    def __init__(self, clients: list[Any]) -> None:
+        """Require at least one client and retain a stable round-robin order."""
+        require(bool(clients), "S3 ingress client set must not be empty")
+        self.clients = clients
+        self.next_client = 0
+        self.upload_counts = [0] * len(clients)
+
+    def _take(self) -> Any:
+        """Return the next client while advancing the stable ingress cursor."""
+        client = self.clients[self.next_client]
+        self.next_client = (self.next_client + 1) % len(self.clients)
+        return client
+
+    def upload_file(self, source: str, bucket: str, key: str) -> None:
+        """Send one immutable file as one operation through the next ingress."""
+        index = self.next_client
+        self._take().upload_file(source, bucket, key)
+        self.upload_counts[index] += 1
+
+    def get_object(self, **request: Any) -> Any:
+        """Read one complete object through the next ingress."""
+        return self._take().get_object(**request)
+
+
+def upload_iceberg_files(client: Any, table: str, files: Iterable[pathlib.Path]) -> list[str]:
+    """Upload immutable Parquet inputs through Verglas and return their S3 locations."""
+    locations: list[str] = []
+    for source in files:
+        key = f"warehouse/import/{table}/{source.name}"
+        client.upload_file(str(source), "verglas", key)
+        locations.append(f"s3://verglas/{key}")
+    return locations
+
+
+def wait_for_global_s3_visibility(
+    clients: list[Any], locations: list[str], timeout_seconds: float
+) -> float:
+    """Cross the Iceberg commit barrier only after every ingress can HEAD every file."""
+    require(bool(clients), "global visibility requires at least one S3 ingress")
+    pending = {(index, location) for index in range(len(clients)) for location in locations}
+    started = time.monotonic()
+    deadline = started + timeout_seconds
+    last_error: BaseException | None = None
+    while pending and time.monotonic() < deadline:
+        for index, location in tuple(pending):
+            require(location.startswith("s3://"), f"invalid S3 location: {location}")
+            bucket, separator, key = location[5:].partition("/")
+            require(bool(bucket) and separator == "/" and bool(key), f"invalid S3 location: {location}")
+            try:
+                clients[index].head_object(Bucket=bucket, Key=key)
+                pending.remove((index, location))
+            except Exception as error:
+                last_error = error
+        if pending:
+            time.sleep(0.05)
+    if pending:
+        raise EvidenceError(
+            f"Iceberg commit barrier timed out with {len(pending)} cross-ingress HEADs pending: {last_error}"
+        )
+    return time.monotonic() - started
+
+
+def sql_literal(value: str) -> str:
+    """Quote one trusted benchmark value as a DuckDB string literal."""
+    return "'" + value.replace("'", "''") + "'"
+
+
+def duckdb_verglas_s3_setup(endpoint: str = S3_INGRESS_ENDPOINTS[0]) -> str:
+    """Build DuckDB's S3 secret for reads through one selected Verglas ingress."""
+    return (
+        "CREATE OR REPLACE SECRET verglas_tpch (TYPE s3, "
+        f"KEY_ID {sql_literal(os.environ['TPCH_DURABILITY_S3_ACCESS_KEY'])}, "
+        f"SECRET {sql_literal(os.environ['TPCH_DURABILITY_S3_SECRET_KEY'])}, "
+        f"REGION 'us-east-1', ENDPOINT {sql_literal(endpoint)}, URL_STYLE 'path', USE_SSL false)"
+    )
+
+
+def duckdb_iceberg_scan(metadata_location: str) -> str:
+    """Return one direct Iceberg scan rooted at a consensus-loaded metadata pointer."""
+    return f"SELECT * FROM iceberg_scan({sql_literal(metadata_location)})"
+
+
+def perform_catalog_failure_mutation(catalog: Any) -> None:
+    """Commit one independent namespace while a voter is unavailable."""
+    catalog.create_namespace(("committed_with_one_voter_down",))
+
+
+def bind_wal_archive(compose: Compose, service: str) -> None:
+    """Commit the timeline archive binding through the cache container's own admin listener."""
+    binding = json.dumps({
+        "tenant_id": "durability",
+        "timeline_id": "sf10",
+        "bucket": "verglas",
+    }, separators=(",", ":"))
+    result = compose.run(
+        "exec",
+        "-T",
+        service,
+        "curl",
+        "--silent",
+        "--show-error",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_code}",
+        "--request",
+        "POST",
+        "http://127.0.0.1:8334/admin/neon/timeline-bindings",
+        "--header",
+        f"Authorization: Bearer {os.environ['TPCH_DURABILITY_CATALOG_EVENT_TOKEN']}",
+        "--header",
+        "Content-Type: application/json",
+        "--data",
+        binding,
+        timeout=30,
+    )
+    require(result.stdout.strip() == "204", "timeline archive binding did not commit")
+
+
 def run_wal_driver(compose: Compose, leader: str) -> dict[str, Any]:
     """Run canonical wire operations, kill a declared leader mid-append, and retain JSON evidence."""
+    bind_wal_archive(compose, leader)
     manifest = ROOT / "wal-driver" / "Cargo.toml"
     argv = (
         "cargo", "run", "--quiet", "--release", "--manifest-path", str(manifest), "--",
@@ -315,7 +494,9 @@ def origin_inventory(_: Compose) -> tuple[int, int, int]:
     secret = os.environ["TPCH_DURABILITY_S3_SECRET_KEY"]
     common = {"aws_access_key_id": key, "aws_secret_access_key": secret, "region_name": "us-east-1"}
     origin = boto3.client("s3", endpoint_url="http://127.0.0.1:19000", **common)
-    cache = boto3.client("s3", endpoint_url="http://127.0.0.1:18333", **common)
+    cache = RoundRobinS3(
+        [boto3.client("s3", endpoint_url=f"http://{endpoint}", **common) for endpoint in S3_INGRESS_ENDPOINTS]
+    )
     paginator = origin.get_paginator("list_objects_v2")
     objects = 0
     total_bytes = 0
@@ -348,7 +529,6 @@ def run_iceberg_protocol(compose: Compose, scratch: pathlib.Path, leader: str) -
         import duckdb
         import pyarrow.parquet as pq
         from pyiceberg.catalog import load_catalog
-        from pyiceberg.io.pyarrow import pyarrow_to_schema
     except ImportError as error:
         raise EvidenceError("install the exact dependencies in requirements.txt before running this benchmark") from error
 
@@ -372,32 +552,38 @@ def run_iceberg_protocol(compose: Compose, scratch: pathlib.Path, leader: str) -
     catalog = load_catalog(
         "durability",
         type="rest",
-        uri="http://127.0.0.1:18181/catalog/v1",
+        uri=LAKEKEEPER_CATALOG_URI,
         warehouse="durability",
-        **{
-            "s3.endpoint": "http://127.0.0.1:18333",
-            "s3.access-key-id": "verglas-local",
-            "s3.secret-access-key": "verglas-local-secret",
-            "s3.region": "us-east-1",
-            "s3.path-style-access": "true",
-        },
+        **iceberg_catalog_properties(),
+        **iceberg_s3_properties(),
     )
+    import boto3
+
+    s3_clients = [
+        boto3.client(
+            "s3",
+            endpoint_url=f"http://{endpoint}",
+            aws_access_key_id=os.environ["TPCH_DURABILITY_S3_ACCESS_KEY"],
+            aws_secret_access_key=os.environ["TPCH_DURABILITY_S3_SECRET_KEY"],
+            region_name="us-east-1",
+        )
+        for endpoint in S3_INGRESS_ENDPOINTS
+    ]
+    s3 = RoundRobinS3(s3_clients)
     namespace = ("tpch",)
     catalog.create_namespace(namespace)
     for table, files in table_files.items():
-        schema = pyarrow_to_schema(pq.ParquetFile(files[0]).schema_arrow)
+        schema = pq.ParquetFile(files[0]).schema_arrow
         iceberg_table = catalog.create_table((*namespace, table), schema=schema)
-        for file in files:
-            parquet = pq.ParquetFile(file)
-            for batch in parquet.iter_batches(batch_size=65_536):
-                iceberg_table.append(batch.to_table())
+        locations = upload_iceberg_files(s3, table, files)
+        wait_for_global_s3_visibility(s3_clients, locations, 60)
+        iceberg_table.add_files(locations)
 
     compose.kill(leader)
-    mutation = catalog.load_table((*namespace, "region"))
-    mutation.append(pq.ParquetFile(table_files["region"][0]).read_row_group(0))
+    perform_catalog_failure_mutation(catalog)
     for service in ("cache-0", "cache-1", "cache-2", "cache-3"):
         if service != leader:
-            wait_http(f"http://127.0.0.1:{admin_port(service)}/admin/healthz", 60)
+            wait_compose_healthy(compose, service, 60)
     immediate = catalog.load_table((*namespace, "lineitem"))
     require(immediate.current_snapshot() is not None, "three-voter catalog read did not return a committed snapshot")
 
@@ -411,16 +597,22 @@ def run_iceberg_protocol(compose: Compose, scratch: pathlib.Path, leader: str) -
         refused = True
     if not refused:
         raise EvidenceError("catalog mutation succeeded with only two of four voters")
-    for service in (leader, *minority):
-        compose.restart(service)
+    restart_voters(compose, (leader, *minority), 90)
 
-    after_connection = duckdb.connect(":memory:")
-    after_connection.execute("INSTALL iceberg")
-    after_connection.execute("LOAD iceberg")
-    after_connection.execute("ATTACH 'http://127.0.0.1:18181/catalog/v1' AS durability (TYPE iceberg, ENDPOINT_TYPE rest, WAREHOUSE 'durability')")
-    for table in TPCH_TABLES:
-        after_connection.execute(f"CREATE VIEW {table} AS SELECT * FROM durability.tpch.{table}")
-    after = {str(query): sql_checksum(after_connection, sql) for query, sql in queries.items()}
+    after_connections = [duckdb.connect(":memory:") for _ in S3_INGRESS_ENDPOINTS]
+    metadata_locations = {
+        table: catalog.load_table((*namespace, table)).metadata_location for table in TPCH_TABLES
+    }
+    for endpoint, connection in zip(S3_INGRESS_ENDPOINTS, after_connections, strict=True):
+        connection.execute("INSTALL iceberg")
+        connection.execute("LOAD iceberg")
+        connection.execute(duckdb_verglas_s3_setup(endpoint))
+        for table, metadata_location in metadata_locations.items():
+            connection.execute(f"CREATE VIEW {table} AS {duckdb_iceberg_scan(metadata_location)}")
+    after = {
+        str(query): sql_checksum(after_connections[(query - 1) % len(after_connections)], sql)
+        for query, sql in queries.items()
+    }
     objects, bytes_written, mismatches = origin_inventory(compose)
     return {
         "writes_through_verglas": True,
@@ -429,6 +621,7 @@ def run_iceberg_protocol(compose: Compose, scratch: pathlib.Path, leader: str) -
         "catalog_commit_with_one_down": True,
         "immediate_read_with_one_down": True,
         "minority_write_refused": True,
+        "s3_ingress_uploads": s3.upload_counts,
         "origin_objects": objects,
         "origin_bytes": bytes_written,
         "origin_checksum_mismatches": mismatches,
@@ -441,7 +634,7 @@ def build_report(compose: Compose, scratch: pathlib.Path, leader: str) -> dict[s
     require(shutil.which("docker") is not None, "docker is required")
     require(shutil.which("cargo") is not None, "cargo is required for the canonical WAL driver")
     compose.run("up", "--build", "--wait", timeout=1800)
-    wait_http("http://127.0.0.1:18181/catalog/v1/config", 180)
+    wait_http(LAKEKEEPER_HEALTH_URL, 180)
     iceberg = run_iceberg_protocol(compose, scratch, leader)
     wal = run_wal_driver(compose, leader)
     return {

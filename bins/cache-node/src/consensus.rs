@@ -27,6 +27,7 @@ use verglas_consensus::{
     ConsensusGroup, DistributedPayloadStore, GroupError, GroupRequest, GroupResponse,
     PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
+use verglas_core::CacheKey;
 use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
 
 use crate::ring::RingPlane;
@@ -38,6 +39,18 @@ const GROUP_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Caps a client submission without undercutting the latest legal ranked
 /// election window after a leader loss.
 const GROUP_SUBMIT_TIMEOUT: Duration = Duration::from_secs(25);
+/// Bounds one background archive operation without applying the interactive ceiling.
+///
+/// A complete 16 MiB segment may need to reconstruct coded shards, upload and
+/// verify an immutable object, and commit its checkpoint while foreground WAL
+/// traffic continues. This remains a hard ceiling, but it must cover that full
+/// durable pipeline rather than one client request.
+const ARCHIVE_SUBMIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Bounded immutable-object Raft shards per storage binding and bucket.
+///
+/// Object bodies remain independently erasure-coded and addressed. Sharing
+/// these small-header logs prevents one dead-peer heartbeat stream per object.
+const OBJECT_CONSENSUS_SHARDS: usize = 4;
 /// Raft heartbeat interval for fsynced multi-megabyte WAL replication.
 ///
 /// This leaves room for compact Raft metadata fsync under canonical 8 MiB WAL
@@ -232,6 +245,14 @@ impl ObjectConsensusCommitter {
     }
 }
 
+/// Maps one immutable object key onto the bounded header-log shard set.
+fn object_consensus_group(key: &CacheKey) -> String {
+    let scope = Sha256::digest(format!("{}\0{}", key.storage_binding_id, key.bucket).as_bytes());
+    let object = Sha256::digest(key.key.as_bytes());
+    let shard = usize::from(object[0]) % OBJECT_CONSENSUS_SHARDS;
+    format!("object/{}/{shard}", hex::encode(&scope[..8]))
+}
+
 #[async_trait::async_trait]
 impl ConsensusCommitter for ObjectConsensusCommitter {
     async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
@@ -256,7 +277,7 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
                 .try_into()
                 .map_err(|_| "object request identity is malformed".to_owned())?,
         );
-        let group = format!("object/{}", hex::encode(Sha256::digest(&payload[..])));
+        let group = object_consensus_group(&staged.key);
         let holders = staged
             .placements
             .iter()
@@ -514,8 +535,29 @@ impl ConsensusPlane {
         group: &str,
         request: GroupRequest,
     ) -> Result<GroupResponse, PlaneError> {
+        self.submit_with_timeout(group, request, GROUP_SUBMIT_TIMEOUT)
+            .await
+    }
+
+    /// Routes a checkpointed archive operation with its bounded transfer budget.
+    pub async fn submit_archive(
+        self: &Arc<Self>,
+        group: &str,
+        request: GroupRequest,
+    ) -> Result<GroupResponse, PlaneError> {
+        self.submit_with_timeout(group, request, ARCHIVE_SUBMIT_TIMEOUT)
+            .await
+    }
+
+    /// Routes one unchanged request within the caller-selected hard ceiling.
+    async fn submit_with_timeout(
+        self: &Arc<Self>,
+        group: &str,
+        request: GroupRequest,
+        timeout: Duration,
+    ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
-        tokio::time::timeout(GROUP_SUBMIT_TIMEOUT, async {
+        tokio::time::timeout(timeout, async {
             loop {
                 if let Some(leader) = local.leader_id().await {
                     if leader == self.ring.safekeeper_id() {
@@ -745,6 +787,13 @@ mod tests {
     use super::*;
     use openraft::{Vote, raft::VoteRequest};
 
+    /// A background segment transfer must not inherit the interactive request ceiling.
+    #[test]
+    fn archive_submission_budget_covers_a_slow_complete_segment() {
+        assert!(ARCHIVE_SUBMIT_TIMEOUT > GROUP_SUBMIT_TIMEOUT);
+        assert!(ARCHIVE_SUBMIT_TIMEOUT >= Duration::from_secs(120));
+    }
+
     /// Staggered election windows ensure only the earliest surviving voter
     /// starts a replacement campaign after the leader is killed.
     #[test]
@@ -783,6 +832,30 @@ mod tests {
                 "a one-voter loss must leave at least half of the fixed five-second ReadWal deadline for the current-term fence"
             );
         }
+    }
+
+    /// Immutable object commits share a bounded Multi-Raft shard set.
+    ///
+    /// One Raft group per object creates one dead-peer heartbeat stream per
+    /// uploaded file and can starve a timeline election after a cache dies.
+    #[test]
+    fn object_consensus_groups_are_bounded_and_key_stable() {
+        let groups = (0..100)
+            .map(|index| CacheKey {
+                storage_binding_id: "default".to_owned(),
+                bucket: "warehouse".to_owned(),
+                key: format!("data/{index}.parquet"),
+            })
+            .map(|key| object_consensus_group(&key))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(groups.len(), OBJECT_CONSENSUS_SHARDS);
+
+        let key = CacheKey {
+            storage_binding_id: "default".to_owned(),
+            bucket: "warehouse".to_owned(),
+            key: "data/retried.parquet".to_owned(),
+        };
+        assert_eq!(object_consensus_group(&key), object_consensus_group(&key));
     }
 
     /// A vote remains serviceable while every public-runtime worker is blocked.

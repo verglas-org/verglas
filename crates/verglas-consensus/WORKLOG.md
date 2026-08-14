@@ -221,3 +221,14 @@
   metadata. A verified checkpoint may release its own local payload allocation,
   so the scheduler now continues to archive later complete segments after a
   former certified holder or released archived prefix is unavailable.
+- #135: Reclaimed WAL representations only after their immutable archive object and checkpoint committed. A replicated release command now prunes the covered WAL headers on every voter while preserving retry identities and archive manifests, so a bounded cache cannot deadlock after sustained Neon writes.
+- #135: Persisted an immutable timeline-to-bucket WAL archive binding in the
+  replicated state machine. Timeline creation now fails closed until the cloud
+  provisioner commits that binding, and conflicting rebinding is rejected.
+- #135: Made checkpoint-gated WAL reclamation clone its durable state before remote fragment IO and validate/delete certified holders concurrently. A slow peer can no longer hold the state-machine lock needed by foreground Raft apply, while corruption is still rejected before any holder is deleted.
+- #135: Kept Raft state application independent from checkpointed WAL fragment reclamation by cloning the committed state view before remote deletion. Release now also deletes the exact allocation identity from every configured voter, reclaiming successful concurrent stage writes that completed outside the minimum durability certificate.
+- #135: Made checkpointed payload reclamation tolerate an unavailable former
+  holder while still validating every reachable representation before deletion.
+  A dead cache node can no longer turn a successful WAL archive checkpoint into
+  a foreground write failure; its idempotently addressed fragment is reclaimed
+  after it becomes reachable again.

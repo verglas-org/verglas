@@ -95,10 +95,11 @@ const FRAGMENT_HEADROOM_PATH: &str = "/peer/v0/fragment/headroom";
 /// Lists fragment keys whose object id begins with a requested prefix.
 const FRAGMENT_LIST_PATH: &str = "/peer/v0/fragment/list";
 
-/// The hard availability budget for one fragment recovery read. Placement keeps
-/// its longer durability budget, but a blackholed retained holder must not
-/// consume a catalog leader's request deadline.
-const FRAGMENT_RECOVERY_READ_TIMEOUT: Duration = Duration::from_millis(100);
+/// The hard availability budget for one fragment recovery read. Fragments can
+/// span several multi-megabyte stripes, so CPU-throttled peers need materially
+/// longer than a cache-block lookup. The bound remains shorter than the fsync
+/// placement budget so a blackholed holder cannot stall recovery indefinitely.
+const FRAGMENT_RECOVERY_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Header carrying the byte count a headroom check asks about.
 const FRAGMENT_BYTES_HEADER: &str = "x-verglas-fragment-bytes";
