@@ -16,3 +16,8 @@ export { VerglasGraphStore } from "./verglas-graph-store.mjs";
 export { VerglasRecursiveGraphStore } from "./verglas-recursive-graph-store.mjs";
 export { WorkspaceLifecycle } from "./workspace-lifecycle.mjs";
 export { LOW_COST_PREFERENCE, WORKER_PREFERENCES } from "./fleet-policy.mjs";
+export {
+  compactGraphContext,
+  projectGraphNamespace,
+  projectRootFromHookInput,
+} from "./project-graph.mjs";

@@ -13,6 +13,7 @@ Use Verglas Graph as the durable experiment and evidence record. Do not use it a
 - `GateEvaluation` contains one independently evaluated hard-gate result.
 - `Artifact` contains an artifact identity, kind, and short summary. Raw contents remain outside the graph.
 - `WaveClosed` is the visibility fence written after every attempt and evaluation in the wave.
+- `Decision` records one selection act: the promoted candidate, the rejected candidates, and the gate evidence that justified it, with an `objective` string property. `QueryPrecedents` ranks Decision nodes by BM25 over `objective` plus neighbor overlap with supplied entity ids (#148).
 
 Workspace identities are opaque. Do not assume Git worktrees, database clones, or lakehouse clones exist until the host supplies those facilities.
 
@@ -35,6 +36,10 @@ Persist the coordinator checkpoint separately when the current Graph SDK cannot 
 ## Context compiler
 
 Compile a bounded context around the selected parent. Include its compact result, ancestors, sibling outcomes, failed gates, and a capped list of artifact summaries. Exclude solution bodies, raw test output, raw artifacts, full graph traversal results, and unrelated historical runs.
+
+## Project graphs
+
+Each host project owns one graph namespace `rime_<project>`. Derive `<project>` from the workspace-root basename: lowercase it, replace non-alphanumeric runs with `_`, trim underscores, and cap the full namespace at 63 characters. SessionStart creates the graph if it is missing. Coordinators open `client.graph(namespace)` or `verglas --json graph` against that namespace. Do not write RIME evidence into `agent_memory`.
 
 ## Recursive harness experiments
 

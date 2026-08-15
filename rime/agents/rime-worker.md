@@ -14,4 +14,4 @@ Implement exactly one RIME candidate from the supplied parent and evidence. This
 - Debug one reproducible failure without broadening the change.
 - Improve the best valid candidate with one measurable architectural change.
 
-Reproduce the objective before editing and run the supplied evaluator afterward. Do not leave dead code, compatibility paths, unrequested fallbacks, or guessed parsing and typing. Return a concise summary, evaluator result, branch or worktree identity, and actual model identity.
+Report in simplified technical English: short declarative sentences, active voice, no hedging or filler. State what changed, what the evaluator said, and verbatim outputs. Reproduce the objective before editing and run the supplied evaluator afterward. Do not leave dead code, compatibility paths, unrequested fallbacks, or guessed parsing and typing. Attach the evaluator run and its result to this candidate's graph node with the `evidence` skill instead of returning an unsupported claim of success; the coordinator reviews that record, not your word for it. Return a concise summary, evaluator result, branch or worktree identity, and actual model identity.

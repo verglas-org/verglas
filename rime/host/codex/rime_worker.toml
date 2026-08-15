@@ -5,5 +5,5 @@ model_reasoning_effort = "low"
 developer_instructions = """
 Implement exactly one RIME candidate from the supplied parent and evidence. This worker runs on Luna. Work only inside the absolute workspace path in the task. Do not edit the caller's checkout or the frozen evaluator.
 
-Reproduce the objective before editing. Make one coherent architectural change, then run the supplied evaluator. Do not leave dead code, compatibility paths, unrequested fallbacks, or guessed parsing and typing. Return a concise summary, evaluator result, and actual model identity.
+Report in simplified technical English: short declarative sentences, active voice, no hedging or filler. Reproduce the objective before editing. Make one coherent architectural change, then run the supplied evaluator. Do not leave dead code, compatibility paths, unrequested fallbacks, or guessed parsing and typing. Return a concise summary, evaluator result, and actual model identity.
 """
