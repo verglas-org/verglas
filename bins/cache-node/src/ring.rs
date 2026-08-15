@@ -627,30 +627,32 @@ fn decode_representation(
 async fn resolve_peers_until_complete(
     raw: &str,
 ) -> Result<Vec<(NodeId, SocketAddr)>, std::io::Error> {
-    const ATTEMPTS: usize = 150;
+    // Wait indefinitely: exiting here is a ring-formation deadlock in disguise.
+    // Fly `.internal` DNS only resolves STARTED machines, so on a staggered
+    // fleet boot a node that gives up and exits removes its own DNS entry and
+    // guarantees its peers can never complete the ring either. A process that
+    // keeps waiting keeps its machine started and its name resolvable; the
+    // ring forms the moment the last peer boots.
     const RETRY_DELAY: Duration = Duration::from_millis(200);
+    const MAX_DELAY: Duration = Duration::from_secs(2);
 
-    let mut last_error = None;
-    for attempt in 1..=ATTEMPTS {
+    let mut delay = RETRY_DELAY;
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
         match resolve_peers(raw).await {
             Ok(peers) => return Ok(peers),
             Err(error) => {
                 if attempt == 1 || attempt % 25 == 0 {
                     eprintln!(
-                        "verglas-cache-node {VERSION} waiting for complete fragment ring (attempt {attempt}/{ATTEMPTS}): {error}"
+                        "verglas-cache-node {VERSION} waiting for complete fragment ring (attempt {attempt}): {error}"
                     );
                 }
-                last_error = Some(error);
-                tokio::time::sleep(RETRY_DELAY).await;
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_DELAY);
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "VERGLAS_RING_PEERS contains no resolvable entries",
-        )
-    }))
 }
 
 /// Resolves every `id=host:port` entry in `VERGLAS_RING_PEERS` exactly once.
