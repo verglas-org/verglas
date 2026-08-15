@@ -591,6 +591,20 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         Some(r#"{"namespace":["analytics"],"properties":{}}"#.to_owned())
     );
 
+    // A keyed record that a point read can see must also appear in the
+    // enumeration of its collection: same store, same group, same fence.
+    assert_eq!(
+        leader_group
+            .catalog_records(CatalogEntity::Namespace)
+            .await
+            .expect("linearizable hosted namespace enumeration"),
+        vec![(
+            "namespace/default/analytics".to_owned(),
+            r#"{"namespace":["analytics"],"properties":{}}"#.to_owned()
+        )],
+        "Records must enumerate exactly what Record can already point-read"
+    );
+
     assert_eq!(
         leader_group
             .register_warehouse(

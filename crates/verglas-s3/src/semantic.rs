@@ -2947,6 +2947,331 @@ fn graph_error(error: verglas_graph::GraphError) -> SemanticError {
     SemanticError::unavailable(error.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Semantic mutation events (R7-A)
+// ---------------------------------------------------------------------------
+//
+// Trust model: publishing is a best-effort side channel to the control-plane
+// queue ingress, not part of the durability contract. The bearer token and
+// tenant id come from the cache node's own configuration (never from the
+// caller's request), so every event this node publishes is attributed to the
+// tenant this node is configured for. By the time an event is queued the
+// mutation is already durably committed to Iceberg; a dropped or delayed
+// event only delays a downstream subscriber's notice of that commit, it
+// never puts data at risk. Publish failures (unreachable queue, non-2xx
+// response, timeout) are logged at `warn` and otherwise ignored: they must
+// never delay or fail the client's operation.
+
+/// Configuration for the fire-and-forget mutation event publisher.
+#[derive(Clone, Debug)]
+pub struct EventPublishConfig {
+    /// Control-plane queue ingress URL that accepts one JSON event per POST.
+    pub queue_url: String,
+    /// Bearer token presented on the `authorization` header.
+    pub token: String,
+    /// Tenant identifier attached to every published event.
+    pub tenant_id: String,
+}
+
+impl EventPublishConfig {
+    /// Reads the full trio from the environment. Any variable that is absent
+    /// or empty disables publishing, so a partially configured node fails
+    /// closed instead of publishing with a blank credential or tenant.
+    pub fn from_env() -> Option<Self> {
+        Some(Self {
+            queue_url: non_empty_env("VERGLAS_EVENT_QUEUE_URL")?,
+            token: non_empty_env("VERGLAS_CACHE_EVENT_TOKEN")?,
+            tenant_id: non_empty_env("VERGLAS_TENANT_ID")?,
+        })
+    }
+}
+
+/// Reads an environment variable, treating unset or empty as absent.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Bound on one publish attempt so a hung or slow queue endpoint cannot let
+/// spawned publish tasks pile up without limit; a caller's own request is
+/// never blocked on this regardless of the bound.
+const EVENT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The semantic mutation families that publish a commit event. This is the
+/// single source of truth for "which operations matter to subscribers": the
+/// match in [`mutation_kind`] is exhaustive over the two known families and
+/// falls through to "not a mutation" for everything else, so adding a new
+/// mutating operation to the checked-in contracts without deciding whether
+/// it belongs here is a deliberate, visible choice rather than a silent gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationKind {
+    VectorCommit,
+    GraphCommit,
+}
+
+/// Classifies an operation as a publishable mutation, if it is one.
+fn mutation_kind(operation: SemanticOperation) -> Option<MutationKind> {
+    match operation {
+        SemanticOperation::S3Vectors("PutVectors" | "DeleteVectors") => {
+            Some(MutationKind::VectorCommit)
+        }
+        SemanticOperation::Graph("PutNodes" | "PutEdges") => Some(MutationKind::GraphCommit),
+        _ => None,
+    }
+}
+
+/// Derives the `(eventType, subject)` pair for a successful mutation from its
+/// request input, or `None` if this operation does not publish. Field
+/// extraction tolerates missing or oddly typed fields by skipping the
+/// publish (with a warning) rather than panicking or inventing a value.
+fn mutation_event(operation: SemanticOperation, input: &Value) -> Option<(&'static str, String)> {
+    match mutation_kind(operation)? {
+        MutationKind::VectorCommit => {
+            let bucket = string_field(input, "vectorBucketName");
+            let index = string_field(input, "indexName");
+            match (bucket, index) {
+                (Some(bucket), Some(index)) => {
+                    Some(("org.verglas.vector.commit", format!("{bucket}.{index}")))
+                }
+                _ => {
+                    tracing::warn!(
+                        ?operation,
+                        "mutation event input is missing vectorBucketName/indexName; skipping publish"
+                    );
+                    None
+                }
+            }
+        }
+        MutationKind::GraphCommit => match string_field(input, "graphName") {
+            Some(graph) => Some(("org.verglas.graph.commit", graph)),
+            None => {
+                tracing::warn!(
+                    ?operation,
+                    "mutation event input is missing graphName; skipping publish"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Reads a non-empty string field, tolerating a missing key, a null, or a
+/// non-string value by returning `None`.
+fn string_field(input: &Value, field: &str) -> Option<String> {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Decorates a [`SemanticApi`] so every successful mutating operation
+/// publishes one fire-and-forget JSON event to the control-plane queue
+/// ingress. See the trust-model note above this section.
+pub fn wrap_with_event_publisher(
+    inner: Arc<dyn SemanticApi>,
+    config: EventPublishConfig,
+) -> Arc<dyn SemanticApi> {
+    let client = reqwest::Client::builder()
+        .timeout(EVENT_PUBLISH_TIMEOUT)
+        .build()
+        .expect("a reqwest client with only a bounded timeout is always constructible");
+    Arc::new(EventPublishingSemanticApi {
+        inner,
+        config,
+        client,
+    })
+}
+
+/// [`SemanticApi`] decorator that publishes mutation events after successful
+/// calls. See the trust-model note above this section.
+struct EventPublishingSemanticApi {
+    inner: Arc<dyn SemanticApi>,
+    config: EventPublishConfig,
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl SemanticApi for EventPublishingSemanticApi {
+    async fn call(
+        &self,
+        operation: SemanticOperation,
+        input: Value,
+    ) -> Result<Value, SemanticError> {
+        // Computed before the input is moved into the inner call, and only
+        // ever published once that call has returned successfully.
+        let event = mutation_event(operation, &input);
+        let output = self.inner.call(operation, input).await?;
+        if let Some((event_type, subject)) = event {
+            self.publish(event_type, subject);
+        }
+        Ok(output)
+    }
+}
+
+impl EventPublishingSemanticApi {
+    /// Spawns the publish so it can never delay or fail the caller's result.
+    fn publish(&self, event_type: &'static str, subject: String) {
+        let client = self.client.clone();
+        let queue_url = self.config.queue_url.clone();
+        let token = self.config.token.clone();
+        let tenant_id = self.config.tenant_id.clone();
+        tokio::spawn(async move {
+            let body = json!({
+                "eventType": event_type,
+                "tenant_id": tenant_id,
+                "subject": subject,
+            });
+            match client
+                .post(&queue_url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => tracing::warn!(
+                    status = %response.status(),
+                    event_type,
+                    subject,
+                    "semantic mutation event publish was rejected"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    event_type,
+                    subject,
+                    "semantic mutation event publish failed"
+                ),
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod event_publish_mapping_tests {
+    use super::*;
+
+    /// PutVectors and DeleteVectors both map to a vector commit event keyed
+    /// by "<bucket>.<index>", exactly the pair the frozen acceptance test
+    /// asserts on.
+    #[test]
+    fn vector_mutations_map_to_a_vector_commit_event() {
+        let input = json!({"vectorBucketName": "embeddings", "indexName": "docs"});
+        for operation in [
+            SemanticOperation::S3Vectors("PutVectors"),
+            SemanticOperation::S3Vectors("DeleteVectors"),
+        ] {
+            let (event_type, subject) = mutation_event(operation, &input).expect("mutation");
+            assert_eq!(event_type, "org.verglas.vector.commit");
+            assert_eq!(subject, "embeddings.docs");
+        }
+    }
+
+    /// PutNodes and PutEdges both map to a graph commit event keyed by the
+    /// graph name alone.
+    #[test]
+    fn graph_mutations_map_to_a_graph_commit_event() {
+        let input = json!({"graphName": "social"});
+        for operation in [
+            SemanticOperation::Graph("PutNodes"),
+            SemanticOperation::Graph("PutEdges"),
+        ] {
+            let (event_type, subject) = mutation_event(operation, &input).expect("mutation");
+            assert_eq!(event_type, "org.verglas.graph.commit");
+            assert_eq!(subject, "social");
+        }
+    }
+
+    /// Reads and unrelated operations never publish, whatever their input.
+    #[test]
+    fn non_mutating_operations_never_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("QueryVectors"),
+                &json!({"vectorBucketName": "embeddings", "indexName": "docs"}),
+            )
+            .is_none()
+        );
+        assert!(
+            mutation_event(
+                SemanticOperation::Graph("GetGraph"),
+                &json!({"graphName": "social"}),
+            )
+            .is_none()
+        );
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("CreateVectorBucket"),
+                &json!({"vectorBucketName": "embeddings"}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A missing indexName on a vector mutation skips the publish rather
+    /// than fabricating a subject like "embeddings." or panicking.
+    #[test]
+    fn vector_mutation_without_index_name_does_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("PutVectors"),
+                &json!({"vectorBucketName": "embeddings"}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A missing vectorBucketName is symmetric with the missing-index case.
+    #[test]
+    fn vector_mutation_without_bucket_name_does_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("DeleteVectors"),
+                &json!({"indexName": "docs"}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A non-string graphName (e.g. sent as a number) is tolerated as an
+    /// absent field, not coerced to a string.
+    #[test]
+    fn graph_mutation_with_non_string_graph_name_does_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::Graph("PutNodes"),
+                &json!({"graphName": 42}),
+            )
+            .is_none()
+        );
+    }
+
+    /// An empty-string field is treated the same as an absent one.
+    #[test]
+    fn empty_string_fields_do_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::Graph("PutEdges"),
+                &json!({"graphName": ""}),
+            )
+            .is_none()
+        );
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("PutVectors"),
+                &json!({"vectorBucketName": "embeddings", "indexName": ""}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A completely missing input object (no fields at all) does not panic.
+    #[test]
+    fn empty_object_input_does_not_publish() {
+        assert!(mutation_event(SemanticOperation::Graph("PutNodes"), &json!({})).is_none());
+        assert!(mutation_event(SemanticOperation::S3Vectors("PutVectors"), &json!({})).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

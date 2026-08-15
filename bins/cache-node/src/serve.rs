@@ -55,6 +55,15 @@ pub(crate) const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
 /// client connects a kernel NBD client here; the export name selects the
 /// device. Overridable with `VERGLAS_BLOCK_ADDR` (same shape as
 /// `VERGLAS_S3_ADDR`). Not a config knob — one fixed port, one listener.
+///
+/// The S3 service is the deliberate exception to "one listener": with the
+/// `VERGLAS_S3_TLS_*` env trio set (see [`crate::tls`]), `VERGLAS_S3_ADDR`'s
+/// plaintext listener stays up for 6PN-internal callers (lakekeeper,
+/// inter-cache peers, gateway probes) *and* a second, TLS-terminated
+/// listener serves the identical axum router on `VERGLAS_S3_TLS_ADDR` for
+/// public-internet callers — replacing fly-proxy's per-request TLS
+/// termination on that hot path. Still not a config knob: both addresses
+/// come from env, never from `config.toml`.
 const BLOCK_PORT: u16 = 8335;
 
 /// The concrete engine the cache node runs: the hybrid cache over the
@@ -356,6 +365,21 @@ pub async fn run(
     let s3_addr = std::env::var("VERGLAS_S3_ADDR")
         .unwrap_or_else(|_| format!("0.0.0.0:{}", config.listen.s3_port));
     let s3_listener = tokio::net::TcpListener::bind(&s3_addr).await?;
+
+    // The optional public S3 TLS listener (#R6-A): all-or-none env trio, no
+    // fallback to plaintext-only serving on a partial or invalid config. See
+    // `crate::tls` for the trust model and the "one fixed port, one
+    // listener" exception this adds.
+    let s3_tls_listener = crate::tls::from_env().await?;
+    match &s3_tls_listener {
+        Some(tls_listener) => eprintln!(
+            "verglas-cache-node {VERSION} TLS S3 listener bound on {} (public passthrough)",
+            tls_listener.local_addr()?
+        ),
+        None => eprintln!(
+            "verglas-cache-node {VERSION} TLS S3 listener disabled: VERGLAS_S3_TLS_* is unset"
+        ),
+    }
 
     // Block-device tier (#382): the durable chunk store + attached-device
     // registry, the block-control route on the admin surface, and the NBD
@@ -702,6 +726,7 @@ pub async fn run(
         serve_s3(S3Serve {
             config,
             s3_listener,
+            s3_tls_listener,
             credentials,
             engine,
             registry,
@@ -789,6 +814,9 @@ fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()
 struct S3Serve<'a> {
     config: &'a Config,
     s3_listener: tokio::net::TcpListener,
+    /// The TLS S3 listener, present only when the `VERGLAS_S3_TLS_*` env
+    /// trio was set at boot. Serves the identical router built below.
+    s3_tls_listener: Option<crate::tls::TlsListener>,
     credentials: (String, String),
     engine: CacheEngine,
     registry: Arc<BackendStore>,
@@ -805,6 +833,7 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let S3Serve {
         config,
         s3_listener,
+        s3_tls_listener,
         credentials,
         engine,
         registry,
@@ -843,6 +872,19 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             }
             None => None,
         };
+    // A successful vector/graph mutation optionally publishes a fire-and-
+    // forget commit event to the control-plane queue ingress; this is a
+    // best-effort notification side channel wired with the node's own
+    // configured credential and tenant id, never the caller's. See the
+    // trust-model note on `wrap_with_event_publisher` for what this can and
+    // cannot be relied on for.
+    let semantic_api =
+        semantic_api.map(
+            |api| match verglas_s3::semantic::EventPublishConfig::from_env() {
+                Some(config) => verglas_s3::semantic::wrap_with_event_publisher(api, config),
+                None => api,
+            },
+        );
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
     let lister: Arc<dyn verglas_core::list::ObjectList> =
@@ -932,9 +974,31 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     eprintln!(
         "verglas-cache-node {VERSION} serving S3 on http://{local_addr} (backend bucket set: {bucket_set})"
     );
-    axum::serve(s3_listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    // Both listeners serve the SAME router. With no TLS trio configured this
+    // is exactly the prior single-listener behavior; with it configured, the
+    // TLS listener runs concurrently rather than after the plaintext one —
+    // neither blocks the other's connections on the other's traffic.
+    match s3_tls_listener {
+        Some(tls_listener) => {
+            let tls_addr = tls_listener.local_addr()?;
+            eprintln!(
+                "verglas-cache-node {VERSION} serving S3 (TLS) on https://{tls_addr} (public passthrough, backend bucket set: {bucket_set})"
+            );
+            let tls_app = app.clone();
+            let (plaintext_result, tls_result) = tokio::join!(
+                axum::serve(s3_listener, app).with_graceful_shutdown(shutdown_signal()),
+                crate::tls::serve(tls_listener, tls_app, shutdown_signal()),
+            );
+            plaintext_result?;
+            tls_result?;
+        }
+        None => {
+            axum::serve(s3_listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
     Ok(())
 }
 

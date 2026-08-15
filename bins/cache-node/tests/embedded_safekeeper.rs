@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
-use verglas_consensus::{CatalogAction, CatalogBatch};
+use verglas_consensus::{CatalogAction, CatalogBatch, CatalogEntity, CatalogRequirement};
 use verglas_safekeeper::{WalRequest, WalResponse};
 
 const TENANT: &str = "0123456789abcdef0123456789abcdef";
@@ -830,4 +830,181 @@ async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
         .is_err(),
         "two live voters must reject a catalog mutation"
     );
+}
+
+/// Exact wire repro: create a hosted-domain record, point-read it back, then
+/// enumerate its collection. `Records` must return exactly what `Record`
+/// already proved durable, on every node — the live production bug had
+/// enumeration return nothing forever while point reads kept succeeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_catalog_records_enumeration_matches_point_read() {
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
+    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    for index in 0..4 {
+        children.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            &stderr,
+        ));
+    }
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let record_id = "namespace/default/analytics";
+    let record_document = r#"{"namespace":["analytics"],"properties":{}}"#;
+    let create_record = CatalogBatch::new(
+        vec![CatalogRequirement::RecordAbsent {
+            entity: CatalogEntity::Namespace,
+            id: record_id.to_owned(),
+        }],
+        vec![CatalogAction::PutRecord {
+            entity: CatalogEntity::Namespace,
+            id: record_id.to_owned(),
+            document: record_document.to_owned(),
+        }],
+    )
+    .expect("hosted namespace record batch");
+
+    for (index, &port) in safekeeper_ports.iter().enumerate() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        if index == 0 {
+            assert!(
+                matches!(
+                    submit_catalog(
+                        addr,
+                        ManagedCatalogRequest::Commit {
+                            request_id: 1,
+                            batch: create_record.clone(),
+                        },
+                    )
+                    .await
+                    .expect("commit hosted namespace record through four voters"),
+                    ManagedCatalogResponse::Applied(_)
+                ),
+                "record commit must apply"
+            );
+        }
+
+        assert_eq!(
+            submit_catalog(
+                addr,
+                ManagedCatalogRequest::Record {
+                    entity: CatalogEntity::Namespace,
+                    id: record_id.to_owned(),
+                },
+            )
+            .await
+            .expect("point read must succeed on every node"),
+            ManagedCatalogResponse::Record(Some(record_document.to_owned())),
+            "node {index} point read must see the committed record"
+        );
+
+        assert_eq!(
+            submit_catalog(
+                addr,
+                ManagedCatalogRequest::Records {
+                    entity: CatalogEntity::Namespace,
+                },
+            )
+            .await
+            .expect("enumeration must succeed on every node"),
+            ManagedCatalogResponse::Records(vec![(
+                record_id.to_owned(),
+                record_document.to_owned()
+            )]),
+            "node {index} enumeration must include the record its own point read sees"
+        );
+    }
+
+    // Restart the whole fleet against its retained data directories. A
+    // "forever empty" enumeration bug would plausibly show only after the
+    // state machine reloads its persisted image from disk, so re-verify
+    // Record vs Records after every node reopens its durable state.
+    for child in &mut fleet.children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut restarted = Vec::new();
+    for index in 0..4 {
+        restarted.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            &fleet.stderr,
+        ));
+    }
+    fleet.children = restarted;
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    for (index, &port) in safekeeper_ports.iter().enumerate() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        assert_eq!(
+            submit_catalog_retrying(
+                addr,
+                ManagedCatalogRequest::Record {
+                    entity: CatalogEntity::Namespace,
+                    id: record_id.to_owned(),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("point read must survive a full-fleet restart"),
+            ManagedCatalogResponse::Record(Some(record_document.to_owned())),
+            "node {index} point read must see the record after restart"
+        );
+
+        assert_eq!(
+            submit_catalog_retrying(
+                addr,
+                ManagedCatalogRequest::Records {
+                    entity: CatalogEntity::Namespace,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("enumeration must survive a full-fleet restart"),
+            ManagedCatalogResponse::Records(vec![(
+                record_id.to_owned(),
+                record_document.to_owned()
+            )]),
+            "node {index} enumeration must include the record after restart"
+        );
+    }
+}
+
+/// Retries `submit_catalog` while the just-restarted listener is not yet
+/// accepting connections or its local group has not finished re-electing.
+async fn submit_catalog_retrying(
+    addr: SocketAddr,
+    request: ManagedCatalogRequest,
+    deadline: Duration,
+) -> Result<ManagedCatalogResponse, String> {
+    let start = Instant::now();
+    loop {
+        match submit_catalog(addr, request.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error) if start.elapsed() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
