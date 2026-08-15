@@ -159,6 +159,7 @@ fn semantic_router(api: Arc<dyn SemanticApi>) -> Router {
         .route("/QueryKHop", post(dispatch_graph))
         .route("/QueryNeighborhood", post(dispatch_graph))
         .route("/QueryPaths", post(dispatch_graph))
+        .route("/QueryPrecedents", post(dispatch_graph))
         .route("/BuildGraphIndex", post(dispatch_graph))
         .with_state(state)
 }
@@ -335,7 +336,7 @@ fn s3_operation(path: &str, method: &Method) -> Option<SemanticOperation> {
 
 /// Maps each exact Graph URI to its operation name.
 fn graph_operation(path: &str) -> Option<SemanticOperation> {
-    const OPERATIONS: [&str; 11] = [
+    const OPERATIONS: [&str; 12] = [
         "CreateGraph",
         "DeleteGraph",
         "GetGraph",
@@ -346,6 +347,7 @@ fn graph_operation(path: &str) -> Option<SemanticOperation> {
         "QueryKHop",
         "QueryNeighborhood",
         "QueryPaths",
+        "QueryPrecedents",
         "BuildGraphIndex",
     ];
     let operation = path.strip_prefix('/')?;
@@ -701,6 +703,136 @@ impl IcebergCatalogSemanticStore {
         let graph = required_bounded_string(input, "graphName", 1, 255)?;
         Graph::open(self.catalog.clone(), graph).map_err(graph_error)
     }
+
+    /// Ranks `Decision` nodes by BM25 lexical match to `query`, adding a
+    /// structural boost when `entities` overlaps a decision's direct
+    /// neighbors. Fully deterministic: given the same graph snapshot and
+    /// request, the score computation and the sort (score desc, decisionId
+    /// asc) always produce the same order and the same floating-point values.
+    async fn query_precedents(&self, graph: &Graph, input: &Value) -> Result<Value, SemanticError> {
+        let query_text = required_bounded_string(input, "query", 1, 4096)?;
+        let limit = optional_precedents_limit(input)?;
+        let entities = optional_string_list(input, "entities", 1, 1024)?;
+
+        let decisions: Vec<(String, String)> = graph
+            .load_nodes(None)
+            .await
+            .map_err(graph_error)?
+            .into_iter()
+            .filter(|node| node.labels.iter().any(|label| label == "Decision"))
+            .filter_map(|node| {
+                node.properties
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .map(|objective| (node.id.clone(), objective.to_owned()))
+            })
+            .collect();
+
+        let documents: Vec<Vec<String>> = decisions
+            .iter()
+            .map(|(_, objective)| verglas_graph::precedent::tokenize(objective))
+            .collect();
+        let query_tokens = verglas_graph::precedent::tokenize(query_text);
+        let lexical_scores = verglas_graph::precedent::bm25_scores(&documents, &query_tokens);
+
+        let entity_set: std::collections::BTreeSet<&str> =
+            entities.iter().map(String::as_str).collect();
+        let reader = if entity_set.is_empty() {
+            None
+        } else {
+            Some(graph.reader(None).await.map_err(graph_error)?)
+        };
+
+        let mut precedents = decisions
+            .into_iter()
+            .zip(lexical_scores)
+            .map(|((decision_id, objective), lexical_score)| {
+                let shared_entities: Vec<String> = reader
+                    .as_ref()
+                    .map(|reader| {
+                        reader
+                            .get_neighbors(
+                                &decision_id,
+                                Direction::Both,
+                                &TraversalFilter::default(),
+                            )
+                            .into_iter()
+                            .map(|neighbor| neighbor.node_id)
+                            .filter(|node_id| entity_set.contains(node_id.as_str()))
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let structural_score = shared_entities.len() as f64;
+                let score = lexical_score + structural_score;
+                PrecedentRow {
+                    decision_id,
+                    score,
+                    lexical_score,
+                    structural_score,
+                    shared_entities,
+                    objective,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        precedents.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.decision_id.cmp(&b.decision_id))
+        });
+        if let Some(limit) = limit {
+            precedents.truncate(limit);
+        }
+
+        Ok(json!({
+            "precedents": precedents.into_iter().map(precedent_to_json).collect::<Vec<_>>()
+        }))
+    }
+}
+
+/// One scored `Decision` node, before rendering to the wire response shape.
+struct PrecedentRow {
+    /// The decision node's id.
+    decision_id: String,
+    /// The final ranking score: `lexical_score + structural_score`.
+    score: f64,
+    /// The BM25 score of `query` against the decision's `objective`.
+    lexical_score: f64,
+    /// The count of `entities` that are direct neighbors of the decision.
+    structural_score: f64,
+    /// The supplied entity ids that are direct neighbors of the decision,
+    /// sorted ascending for a deterministic response.
+    shared_entities: Vec<String>,
+    /// The decision node's `objective` property.
+    objective: String,
+}
+
+/// Renders one precedent in the public camel-case response shape.
+fn precedent_to_json(row: PrecedentRow) -> Value {
+    json!({
+        "decisionId": row.decision_id,
+        "score": row.score,
+        "lexicalScore": row.lexical_score,
+        "structuralScore": row.structural_score,
+        "sharedEntities": row.shared_entities,
+        "objective": row.objective,
+    })
+}
+
+/// Parses the optional QueryPrecedents result cap (1..=1000; unset means no cap).
+fn optional_precedents_limit(input: &Value) -> Result<Option<usize>, SemanticError> {
+    let Some(value) = input.get("limit") else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=1000).contains(value))
+        .map(Some)
+        .ok_or_else(|| SemanticError::validation("limit must be an integer from 1 to 1000"))
 }
 
 #[async_trait]
@@ -848,6 +980,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                 required_bounded_string(&input, "graphName", 1, 255)?,
                 graph.current_edges_snapshot().await.map_err(graph_error)?,
             )),
+            "QueryPrecedents" => self.query_precedents(&graph, &input).await,
             _ => Err(SemanticError::validation("unknown graph operation")),
         }
     }

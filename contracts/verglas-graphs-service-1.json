@@ -106,6 +106,15 @@
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Returns the deterministic shortest path, if one exists within maxHops."
+    },
+    "QueryPrecedents": {
+      "name": "QueryPrecedents",
+      "http": {"method": "POST", "requestUri": "/QueryPrecedents", "responseCode": 200},
+      "input": {"shape": "QueryPrecedentsInput"},
+      "output": {"shape": "QueryPrecedentsOutput"},
+      "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
+      "readonly": true,
+      "documentation": "Ranks Decision nodes by BM25 lexical match to a query, plus a structural boost from shared entity neighbors, sorted by score descending then decisionId ascending."
     }
   },
   "shapes": {
@@ -235,6 +244,19 @@
       }
     },
     "PathList": {"type": "list", "member": {"shape": "Path"}},
+    "Precedent": {
+      "type": "structure",
+      "required": ["decisionId", "score", "lexicalScore", "structuralScore", "sharedEntities", "objective"],
+      "members": {
+        "decisionId": {"shape": "NodeId"},
+        "lexicalScore": {"shape": "Score"},
+        "objective": {"shape": "Objective"},
+        "score": {"shape": "Score"},
+        "sharedEntities": {"shape": "NodeIdList"},
+        "structuralScore": {"shape": "Score"}
+      }
+    },
+    "PrecedentList": {"type": "list", "member": {"shape": "Precedent"}},
     "Predicate": {"type": "string", "min": 1, "max": 1024},
     "Properties": {
       "type": "map",
@@ -317,6 +339,21 @@
       "required": ["paths"],
       "members": {"paths": {"shape": "PathList"}}
     },
+    "QueryPrecedentsInput": {
+      "type": "structure",
+      "required": ["graphName", "query"],
+      "members": {
+        "entities": {"shape": "NodeIdList"},
+        "graphName": {"shape": "GraphName"},
+        "limit": {"shape": "MaxResults"},
+        "query": {"shape": "PrecedentQuery"}
+      }
+    },
+    "QueryPrecedentsOutput": {
+      "type": "structure",
+      "required": ["precedents"],
+      "members": {"precedents": {"shape": "PrecedentList"}}
+    },
     "ReachedNode": {
       "type": "structure",
       "required": ["nodeId", "hops", "pathConfidence"],
@@ -372,6 +409,9 @@
     "ErrorMessage": {"type": "string", "min": 1},
     "Label": {"type": "string", "min": 1, "max": 255},
     "LabelList": {"type": "list", "member": {"shape": "Label"}},
-    "NodeIdList": {"type": "list", "member": {"shape": "NodeId"}}
+    "NodeIdList": {"type": "list", "member": {"shape": "NodeId"}},
+    "Objective": {"type": "string", "min": 1, "max": 4096},
+    "PrecedentQuery": {"type": "string", "min": 1, "max": 4096},
+    "Score": {"type": "double", "min": 0}
   }
 }

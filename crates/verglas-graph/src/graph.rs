@@ -20,7 +20,7 @@ use crate::csr::AdjacencyIndex;
 use crate::error::Result;
 use crate::index::{self, IndexBuildReport};
 use crate::model::{Direction, Edge, Neighbor, Node, Path, Reached, Subgraph};
-use crate::scan::{live_edges, load_edges};
+use crate::scan::{latest_nodes_by_id, live_edges, load_edges, load_nodes};
 use crate::schema::{
     EDGES_TABLE, NODES_TABLE, edge_to_row, edges_schema, node_to_row, nodes_schema,
 };
@@ -132,6 +132,17 @@ impl Graph {
     pub async fn current_edges_snapshot(&self) -> Result<Option<i64>> {
         let table = self.catalog.load_table(&self.edges_ident).await?;
         Ok(table.metadata().current_snapshot_id())
+    }
+
+    /// Loads every node as of a snapshot (the current one when `at` is
+    /// `None`), reduced to one row per id (`PutNodes` is append-only, so a
+    /// repeated id is the node's latest edit — see [`latest_nodes_by_id`]).
+    /// Used by precedent search (#148) to read `Decision` node objectives;
+    /// there is no adjacency index for node properties, so this always scans
+    /// the plain nodes table.
+    pub async fn load_nodes(&self, at: Option<i64>) -> Result<Vec<Node>> {
+        let (nodes, _snapshot) = load_nodes(self.catalog.clone(), &self.nodes_ident, at).await?;
+        Ok(latest_nodes_by_id(nodes))
     }
 
     /// Builds the adjacency index as of a snapshot (the current one when `at` is

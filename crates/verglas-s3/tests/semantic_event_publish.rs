@@ -33,9 +33,13 @@ use verglas_s3::semantic::{
     wrap_with_event_publisher, EventPublishConfig, SemanticApi, SemanticError, SemanticOperation,
 };
 
+/// One captured publish call: the `authorization` header value (if present)
+/// alongside the decoded JSON event body.
+type CapturedEvent = (Option<String>, Value);
+
 #[derive(Clone, Default)]
 struct Capture {
-    events: Arc<Mutex<Vec<(Option<String>, Value)>>>,
+    events: Arc<Mutex<Vec<CapturedEvent>>>,
 }
 
 async fn record(
@@ -47,7 +51,11 @@ async fn record(
         .get("authorization")
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    capture.events.lock().unwrap().push((authorization, body));
+    capture
+        .events
+        .lock()
+        .expect("capture mutex poisoned")
+        .push((authorization, body));
     Json(json!({"queued": true}))
 }
 
@@ -56,10 +64,19 @@ async fn capture_server() -> (String, Capture) {
     let app = Router::new()
         .route("/v1/table-commits", post(record))
         .with_state(capture.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}/v1/table-commits", listener.local_addr().unwrap());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral capture listener");
+    let url = format!(
+        "http://{}/v1/table-commits",
+        listener
+            .local_addr()
+            .expect("bound listener has a local address")
+    );
     tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
+        axum::serve(listener, app)
+            .await
+            .expect("capture server exited unexpectedly");
     });
     (url, capture)
 }
@@ -94,17 +111,21 @@ fn wrapped(url: &str, fail: bool) -> Arc<dyn SemanticApi> {
     )
 }
 
-async fn wait_for_events(capture: &Capture, count: usize) -> Vec<(Option<String>, Value)> {
+async fn wait_for_events(capture: &Capture, count: usize) -> Vec<CapturedEvent> {
     for _ in 0..100 {
         {
-            let events = capture.events.lock().unwrap();
+            let events = capture.events.lock().expect("capture mutex poisoned");
             if events.len() >= count {
                 return events.clone();
             }
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    capture.events.lock().unwrap().clone()
+    capture
+        .events
+        .lock()
+        .expect("capture mutex poisoned")
+        .clone()
 }
 
 #[tokio::test]
@@ -136,7 +157,7 @@ async fn delete_vectors_publishes_a_vector_commit_event() {
         json!({"vectorBucketName": "embeddings", "indexName": "docs", "keys": ["k1"]}),
     )
     .await
-    .unwrap();
+    .expect("DeleteVectors should succeed against the fake api");
     let events = wait_for_events(&capture, 1).await;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].1["eventType"], "org.verglas.vector.commit");
@@ -152,13 +173,13 @@ async fn put_nodes_and_edges_publish_graph_commit_events() {
         json!({"graphName": "social", "nodes": []}),
     )
     .await
-    .unwrap();
+    .expect("PutNodes should succeed against the fake api");
     api.call(
         SemanticOperation::Graph("PutEdges"),
         json!({"graphName": "social", "edges": []}),
     )
     .await
-    .unwrap();
+    .expect("PutEdges should succeed against the fake api");
     let events = wait_for_events(&capture, 2).await;
     assert_eq!(events.len(), 2, "expected two publishes: {events:?}");
     for (_, body) in &events {
@@ -179,13 +200,13 @@ async fn reads_failures_and_unknown_operations_publish_nothing() {
         json!({"vectorBucketName": "embeddings", "indexName": "docs"}),
     )
     .await
-    .unwrap();
+    .expect("QueryVectors should succeed against the fake api");
     api.call(
         SemanticOperation::Graph("GetGraph"),
         json!({"graphName": "social"}),
     )
     .await
-    .unwrap();
+    .expect("GetGraph should succeed against the fake api");
 
     // A failing inner API on a mutating operation.
     let failing = wrapped(&url, true);
@@ -204,7 +225,7 @@ async fn reads_failures_and_unknown_operations_publish_nothing() {
         json!({"graphName": "sentinel", "edges": []}),
     )
     .await
-    .unwrap();
+    .expect("sentinel PutEdges should succeed against the fake api");
     let events = wait_for_events(&capture, 1).await;
     assert_eq!(events.len(), 1, "only the sentinel may publish: {events:?}");
     assert_eq!(events[0].1["subject"], "sentinel");

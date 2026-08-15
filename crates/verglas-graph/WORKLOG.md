@@ -16,3 +16,11 @@
 - #91: Updated graph route documentation to identify `verglas-server` as the
   serving process. Graph storage and traversal behavior are unchanged.
 - #66: Removed cloud-committer embedding language from crate placement docs.
+- #148: Added `precedent.rs`: a hand-rolled BM25 (k1=1.2, b=0.75) lexical
+  ranker with its own tokenizer, unit-tested beside the implementation. Added
+  `scan::load_nodes`/`node_from_row`/`parse_label_list` (the nodes-table
+  analogue of the existing edge scan path) and `scan::latest_nodes_by_id`
+  (last-write-wins reduction over append-only `PutNodes` rows), plus
+  `Graph::load_nodes` exposing it. Both are consumed by verglas-s3's new
+  `QueryPrecedents` operation (#148) to rank `Decision` nodes; neither existed
+  before because no caller had needed to read node properties back out.
