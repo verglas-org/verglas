@@ -74,19 +74,10 @@ The point: tests written after code tend to **confirm what the code does**; test
 
 Durable, non-obvious notes for agents in the Cursor remote / dev VM. The
 environment is defined by `.cursor/environment.json` (repo-file managed), which
-runs two scripts:
-
-- `scripts/cloud/install.sh` (install step): installs dev tooling (`just`, `jq`,
-  MinIO `minio`+`mc`, and AWS CLI), runs `cargo fetch --locked`, and pre-builds
-  `verglas-cache-node`. Every step is guarded, so re-runs are no-ops.
-- `scripts/cloud/start.sh` (start step, runs on every boot): brings up a local
-  MinIO origin on `:9000` and `verglas-cache-node` (S3 `:8333`, admin `:8334`) using
-  `deploy/dev/verglas.dev.toml`, creates the `my-bucket` origin bucket, and is
-  idempotent (skips a service already listening on its port). After binding the
-  admin port it waits for `/admin/healthz` before declaring ready. So a fresh VM
-  comes up ready to serve an S3 PUT/GET through the cache with no manual steps.
-  Its output goes to `/tmp/cursor/start-user/start-user.log`; the running stack
-  logs to `/tmp/verglas-dev/{verglas-cache-node,minio}.log`.
+declares the served ports (S3 `:8333`, admin `:8334`). There is no install or
+start automation: build with the standard `cargo`/`just` commands, and run
+`verglas-cache-node` against a real S3-compatible origin (see `docker-compose.yml`
+for the required `VERGLAS_STORAGE_*` variables).
 
 Standard commands live in the `justfile` and `README.md`; use them
 (`just build`/`just test`/`just lint`, or the underlying `cargo` commands). The
@@ -114,13 +105,13 @@ Rust workspace facts:
 Running `verglas-cache-node` locally (non-obvious gotchas):
 
 - There is **no in-memory/filesystem origin exposed by the binary**. `[backend]`
-  requires a bucket set and a reachable S3-compatible origin, so a live server
-  needs one. MinIO is preinstalled (`minio`, `mc`) — run it as a single binary
-  (no Docker): `minio server /tmp/verglas-origin --address 127.0.0.1:9000`. The
-  fully dependency-free exercises live in the cache-node and S3 crate tests.
+  requires a bucket set and a reachable S3-compatible origin (e.g. Cloudflare
+  R2), so a live server needs one. The fully dependency-free exercises live in
+  the cache-node and S3 crate tests.
 - The cache node requires `--config <file>` because an origin and cache
   directory are part of its serving contract. `just run-dev` uses the checked-in
-  MinIO development config.
+  `deploy/dev/verglas.dev.toml`; point its `[backend]` at your origin before
+  running.
 - **Two distinct credential sets:** `[auth].credentials_file` is what engines
   present to Verglas on the S3 port; the origin credentials come from the AWS
   env chain or `[backend].credentials_file`. Don't conflate them. With no

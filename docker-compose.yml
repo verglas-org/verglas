@@ -1,54 +1,35 @@
 # Local engine-only stack. Hosted control-plane services live in verglas-cloud.
+# The origin is a real S3-compatible endpoint (e.g. Cloudflare R2); set the
+# VERGLAS_STORAGE_* variables before `docker compose up`. There is no bundled
+# local object store.
 services:
-  origin:
-    image: minio/minio:latest
-    command: server /data --console-address :9001
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - verglas-origin:/data
-
-  origin-init:
-    image: minio/mc:latest
-    depends_on:
-      - origin
-    entrypoint:
-      - /bin/sh
-      - -ec
-      - |
-        until mc alias set local http://origin:9000 minioadmin minioadmin; do sleep 1; done
-        mc mb --ignore-existing local/verglas
-
   cache:
     build:
       context: .
       target: verglas-cache-node
-    depends_on:
-      origin-init:
-        condition: service_completed_successfully
     environment:
-      VERGLAS_STORAGE_BUCKET: ${VERGLAS_STORAGE_BUCKET:-verglas}
-      VERGLAS_STORAGE_ENDPOINT: ${VERGLAS_STORAGE_ENDPOINT:-http://origin:9000}
-      VERGLAS_STORAGE_REGION: ${VERGLAS_STORAGE_REGION:-us-east-1}
-      VERGLAS_STORAGE_ALLOW_HTTP: ${VERGLAS_STORAGE_ALLOW_HTTP:-true}
-      VERGLAS_STORAGE_ACCESS_KEY_ID: ${VERGLAS_STORAGE_ACCESS_KEY_ID:-minioadmin}
-      VERGLAS_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_STORAGE_SECRET_ACCESS_KEY:-minioadmin}
+      VERGLAS_STORAGE_BUCKET: ${VERGLAS_STORAGE_BUCKET:?set to the origin bucket, e.g. verglas-lakehouse}
+      VERGLAS_STORAGE_ENDPOINT: ${VERGLAS_STORAGE_ENDPOINT:?set to the S3 endpoint, e.g. https://<account-id>.r2.cloudflarestorage.com}
+      VERGLAS_STORAGE_REGION: ${VERGLAS_STORAGE_REGION:-auto}
+      VERGLAS_STORAGE_ALLOW_HTTP: ${VERGLAS_STORAGE_ALLOW_HTTP:-false}
+      VERGLAS_STORAGE_ACCESS_KEY_ID: ${VERGLAS_STORAGE_ACCESS_KEY_ID:?set to the origin S3 access key id}
+      VERGLAS_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_STORAGE_SECRET_ACCESS_KEY:?set to the origin S3 secret access key}
       VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:-verglas-local}
       VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:-verglas-local-secret}
       VERGLAS_CACHE_CAPACITY: ${VERGLAS_CACHE_CAPACITY:-20GB}
       VERGLAS_CACHE_DRAM: ${VERGLAS_CACHE_DRAM:-1GB}
       VERGLAS_CATALOG_URI: ${VERGLAS_CATALOG_URI:-}
       VERGLAS_CATALOG_WAREHOUSE: ${VERGLAS_CATALOG_WAREHOUSE:-}
+      VERGLAS_CATALOG_BEARER_TOKEN: ${VERGLAS_CATALOG_BEARER_TOKEN:-}
+      # The admin API defaults to an in-container loopback bind; publish it on
+      # 0.0.0.0 inside the container and keep it host-private via the loopback
+      # port mapping below.
+      VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
     ports:
       - "8333:8333"
-      - "8334:8334"
+      - "127.0.0.1:8334:8334"
     volumes:
       - verglas-cache:/var/lib/verglas
 
 volumes:
   verglas-cache:
-  verglas-origin:

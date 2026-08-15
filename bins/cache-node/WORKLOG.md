@@ -269,3 +269,10 @@
   storage binding and bucket instead of creating one Raft group per object.
   A failed voter no longer creates an unbounded heartbeat storm that starves a
   concurrently active WAL timeline after a large Iceberg ingest.
+
+- Container-only daemon configuration: the compose stack no longer bundles
+  MinIO — `[backend]` must point at a real S3-compatible origin (e.g. R2), and
+  the required VERGLAS_STORAGE_* variables fail fast when unset. The container
+  entrypoint gained VERGLAS_CATALOG_BEARER_TOKEN so an authenticated Iceberg
+  REST catalog (R2 Data Catalog) works with env-only configuration; the daemon
+  needs no host-side config file.

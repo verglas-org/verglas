@@ -54,6 +54,12 @@ if [ -n "${VERGLAS_CATALOG_URI:-}" ]; then
     printf 'warehouse = "%s"\n' "$VERGLAS_CATALOG_WAREHOUSE" \
       >> /var/lib/verglas/config.toml
   fi
+  if [ -n "${VERGLAS_CATALOG_BEARER_TOKEN:-}" ]; then
+    umask 077
+    printf '%s' "$VERGLAS_CATALOG_BEARER_TOKEN" > /var/lib/verglas/catalog-token
+    printf 'credentials_file = "/var/lib/verglas/catalog-token"\n' \
+      >> /var/lib/verglas/config.toml
+  fi
 fi
 
 exec verglas-cache-node --config /var/lib/verglas/config.toml
