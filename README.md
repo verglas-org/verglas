@@ -6,9 +6,8 @@ hot reads serve from local DRAM or NVMe, writes acknowledge at NVMe latency
 under quorum durability, and your object store stays the system of record.
 
 [![ci](https://github.com/verglas-org/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/badge/coverage-%E2%89%A588%25_enforced-brightgreen)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 
-> Prototype — pre-release. On-disk layouts, wire formats, and config keys may
-> change between commits.
 
 ## What lives here
 

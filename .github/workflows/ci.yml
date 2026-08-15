@@ -11,10 +11,14 @@ name: ci
 # behavior waits on conditions with tight polls, never fixed sleeps. Anything
 # that genuinely needs a real external service goes behind #[ignore] as an
 # explicit opt-in, never in the default `cargo test` path.
+#
+# One pipeline for the whole repository: format + lint + test, plus the
+# coverage floor. No per-crate change detection or matrix — every PR runs the
+# same workspace-wide gates a dev machine runs locally.
 on:
   pull_request:
   schedule:
-    - cron: "0 7 * * *"        # 07:00 UTC nightly: the heavier coverage job
+    - cron: "0 7 * * *"        # nightly rerun keeps the pin and cache warm
   workflow_dispatch:
 
 concurrency:
@@ -27,153 +31,78 @@ env:
   # error mid-link). Debug info is the bulk of the target/ tree and of linker
   # memory, and CI never reads it — no debugger ever attaches here; a failed
   # test's backtrace still names symbols. Dropping it roughly halves link
-  # inputs and disk, which is also what lets this job run WITHOUT the old
-  # "free disk space" reclaim step now that MinIO/docker are gone from the
-  # pipeline. Local builds are unaffected.
+  # inputs and disk. Local builds are unaffected.
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
-  repository-boundary:
+  verglas:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Reject hosted product source
+
+      # The patched iceberg fork (verglas-org/verglas-iceberg) is private;
+      # cargo needs credentials to clone it. Configure a read token from the
+      # VERGLAS_ICEBERG_TOKEN secret.
+      - name: Authenticate the iceberg fork
+        env:
+          TOKEN: ${{ secrets.VERGLAS_ICEBERG_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/verglas-org/verglas-iceberg".insteadOf "https://github.com/verglas-org/verglas-iceberg"
+          fi
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Repository boundary
         run: bash scripts/check-repository-boundary.sh
 
-  typescript-sdk:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdks/typescript
-    steps:
-      - uses: actions/checkout@v4
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: sdks/typescript/package-lock.json
-      - run: npm ci
-      - run: npm test
-      - run: npm run typecheck
 
-  rime:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
+      - name: TypeScript SDK
+        working-directory: sdks/typescript
+        run: |
+          npm ci
+          npm test
+          npm run typecheck
+
+      - name: RIME plugin
         working-directory: rime
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: npm test
-      - run: npm pack --dry-run
-
-  rust-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      has-packages: ${{ steps.packages.outputs.has-packages }}
-      packages: ${{ steps.packages.outputs.packages }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # Package selection compares the pull request head with its merge
-          # base. Both histories must be present for that comparison.
-          fetch-depth: 0
-
-      # rustup reads rust-toolchain.toml and installs the pinned toolchain,
-      # so CI always matches dev machines exactly.
-      - name: Install pinned toolchain
-        run: rustup show
-
-      - name: Format
-        run: cargo fmt --all --check
-
-      - name: Test package selection
-        run: bash scripts/tests/changed-cargo-packages.sh
-
-      - name: Select Cargo packages
-        id: packages
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          if [[ "$EVENT_NAME" == "pull_request" ]]; then
-            packages="$(scripts/changed-cargo-packages.sh "$BASE_SHA" "$HEAD_SHA")"
-          else
-            packages="$(scripts/changed-cargo-packages.sh --all)"
-          fi
-          echo "packages=$packages" >> "$GITHUB_OUTPUT"
-          if [[ "$packages" == "[]" ]]; then
-            echo "has-packages=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "has-packages=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  crate-tests:
-    name: crate (${{ matrix.package }})
-    needs: rust-changes
-    if: needs.rust-changes.outputs.has-packages == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        package: ${{ fromJSON(needs.rust-changes.outputs.packages) }}
-    env:
-      # sccache cannot cache incremental Rust compilation. CI jobs start from
-      # clean runners, so reusable compiler results are the useful cache.
-      CARGO_INCREMENTAL: "0"
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install pinned toolchain
-        run: rustup show
-
-      - name: Restore compiler cache
-        uses: mozilla-actions/sccache-action@v0.0.11
-
-      # Each changed package owns one independent job. Clippy and tests share
-      # that runner while sccache reuses unchanged dependency compilation from
-      # previous workflow runs.
-      - name: Lint ${{ matrix.package }}
-        run: cargo clippy -p "${{ matrix.package }}" --all-targets -- -D warnings
-
-      # No MinIO, docker, or external services (see the standing test policy
-      # at the top of this file). Real-service mirrors remain explicit opt-ins.
-      - name: Test ${{ matrix.package }}
-        run: cargo test -p "${{ matrix.package }}"
-
-  ci:
-    # Keep one stable required-check name while the actual package checks are
-    # a dynamic matrix whose labels vary with every pull request.
-    if: always()
-    needs: [rust-changes, crate-tests, typescript-sdk, rime]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Require repository gates
-        env:
-          CRATE_TESTS_RESULT: ${{ needs.crate-tests.result }}
-          RIME_RESULT: ${{ needs.rime.result }}
-          RUST_CHANGES_RESULT: ${{ needs.rust-changes.result }}
-          TYPESCRIPT_SDK_RESULT: ${{ needs.typescript-sdk.result }}
-        run: |
-          [[ "$RUST_CHANGES_RESULT" == "success" ]]
-          [[ "$CRATE_TESTS_RESULT" == "success" || "$CRATE_TESTS_RESULT" == "skipped" ]]
-          [[ "$TYPESCRIPT_SDK_RESULT" == "success" ]]
-          [[ "$RIME_RESULT" == "success" ]]
+          npm test
+          npm pack --dry-run
 
   coverage:
-    # Coverage is expensive (a full llvm-cov instrumented build). Run it
-    # nightly and on demand only; run it locally before opening a PR. The cheap
-    # lint+test `ci` job above is the default per-PR gate.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # The floor ratchets upward: when a PR raises overall coverage, it must
+    # also raise this number to just below the new value (see AGENTS.md,
+    # "Coverage"). Long-term target: >=90 lines.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Authenticate the iceberg fork
+        env:
+          TOKEN: ${{ secrets.VERGLAS_ICEBERG_TOKEN }}
+        run: |
+          if [ -n "$TOKEN" ]; then
+            git config --global url."https://x-access-token:${TOKEN}@github.com/verglas-org/verglas-iceberg".insteadOf "https://github.com/verglas-org/verglas-iceberg"
+          fi
 
       - name: Install pinned toolchain
         run: rustup show && rustup component add llvm-tools-preview
@@ -182,14 +111,6 @@ jobs:
 
       - uses: taiki-e/install-action@cargo-llvm-cov
 
-      # The backend fill test covering the per-bucket concurrency limiter's
-      # per-operation guards runs against the in-process stub origin
-      # (crates/verglas-backend/tests/fills.rs), so no MinIO here either.
-      # The floor ratchets upward: when a PR raises overall coverage, it must
-      # also raise this number to just below the new value (see AGENTS.md,
-      # "Coverage"). Long-term target: >=90 lines.
-      # (The server is a catalog CLIENT only; nothing here stands up a catalog
-      # server.)
       - name: Coverage (fails under the floor)
         run: cargo llvm-cov --workspace --fail-under-lines 88 --lcov --output-path lcov.info
 

@@ -643,7 +643,7 @@ async fn resolve_peers_until_complete(
         match resolve_peers(raw).await {
             Ok(peers) => return Ok(peers),
             Err(error) => {
-                if attempt == 1 || attempt % 25 == 0 {
+                if attempt == 1 || attempt.is_multiple_of(25) {
                     eprintln!(
                         "verglas-cache-node {VERSION} waiting for complete fragment ring (attempt {attempt}): {error}"
                     );

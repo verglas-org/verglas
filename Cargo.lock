@@ -3536,7 +3536,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.9.1"
-source = "git+https://github.com/verglas-org/iceberg-rust?rev=a40f92680e7528b15033d7168ecdc8731e3ca2b9#a40f92680e7528b15033d7168ecdc8731e3ca2b9"
+source = "git+https://github.com/verglas-org/verglas-iceberg?rev=a40f92680e7528b15033d7168ecdc8731e3ca2b9#a40f92680e7528b15033d7168ecdc8731e3ca2b9"
 dependencies = [
  "anyhow",
  "apache-avro 0.21.0",

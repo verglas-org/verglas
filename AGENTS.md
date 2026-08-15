@@ -89,8 +89,9 @@ Rust workspace facts:
 - `cargo build --workspace`, `cargo clippy --workspace --all-targets`, and
   `cargo test --workspace` each take roughly ~3 min from cold because clippy and
   test recompile with their own drivers. `cargo fmt --all --check` is fast.
-- CI gates per changed crate (`cargo clippy -p <pkg>` + `cargo test -p <pkg>`);
-  running a single crate is much faster than the whole workspace when iterating.
+- CI runs one workspace-wide pipeline (`cargo fmt --check`, `cargo clippy
+  --workspace --all-targets -- -D warnings`, `cargo test --workspace`) plus the
+  coverage floor; run single crates locally only to iterate faster.
 - Prefer per-crate `cargo test -p <pkg>` over `cargo test --workspace` on this VM.
   The workspace run serializes crates but runs each crate's tests multi-threaded;
   on 4 cores that oversubscribes CPU and can starve tokio + foyer's background
