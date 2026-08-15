@@ -4,11 +4,11 @@ description: "Run Verglas against your own S3 origin or as an edge for Verglas C
 icon: "server"
 ---
 
-The open-source container runs one `verglas-cache-node`. It does not include a
-catalog or cloud control plane. Every deployment needs an S3-compatible origin;
+The open-source container runs one runtime node (`verglas-cache-node`). It
+does not include a catalog or cloud control plane. Every deployment needs an S3-compatible origin;
 an Iceberg catalog is optional.
 
-## Standalone cache
+## Standalone runtime node
 
 In this topology Verglas sits in front of your S3 bucket. Reads fill the local
 cache. PUT, COPY, multipart completion, and DELETE write through to the
@@ -26,8 +26,9 @@ export VERGLAS_S3_SECRET_ACCESS_KEY=...
 docker compose up --detach --build cache
 ```
 
-The checked-in Compose defaults demonstrate the same layout with MinIO. The S3
-listener is `http://127.0.0.1:8333`; health and metrics are on port `8334`.
+The checked-in Compose file requires a real S3-compatible origin — there is no
+bundled object store. The S3 listener is `http://127.0.0.1:8333`; health and
+metrics are on port `8334`.
 
 ```bash
 docker compose up --detach --build
@@ -94,5 +95,5 @@ the managed S3 endpoint, not directly to the backing cloud bucket. This keeps
 the edge disposable while preserving the cloud durability and catalog push
 path.
 
-Stop the local engine with `docker compose down`. Add `--volumes` only when you
-intend to delete its local cache and the demonstration MinIO data.
+Stop the local runtime with `docker compose down`. Add `--volumes` only when
+you intend to delete its local cache state.

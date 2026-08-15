@@ -1,8 +1,9 @@
 # Verglas
 
-Verglas is an engine-neutral, Iceberg-aware S3 cache and storage engine. Point
-an S3-compatible query engine at Verglas and hot reads are served from local
-DRAM or NVMe instead of repeatedly crossing the object-store boundary.
+Verglas is the lakehouse runtime — an Iceberg-native statekeeper that makes
+data on object storage live. Point an S3-compatible query engine at Verglas:
+hot reads serve from local DRAM or NVMe, writes acknowledge at NVMe latency
+under quorum durability, and your object store stays the system of record.
 
 [![ci](https://github.com/verglas-org/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 
@@ -38,8 +39,10 @@ two years after that version is first made available. See [LICENSE](LICENSE).
 
 ## Run the engine locally
 
-The local Compose stack starts MinIO and one cache node. It contains no hosted
-control-plane, scheduler, authentication service, or application runtime.
+The local Compose stack runs one runtime node (`verglas-cache-node`) against a
+real S3-compatible origin such as Cloudflare R2 (set the `VERGLAS_STORAGE_*`
+variables). It contains no hosted control-plane, scheduler, authentication
+service, or application runtime.
 
 ```sh
 docker compose up --build
@@ -69,11 +72,11 @@ just test
 just lint
 ```
 
-Install the cache node and CLI from source with `just install`. The Rust and
+Install the runtime node and CLI from source with `just install`. The Rust and
 TypeScript SDKs live under `sdks/`; RIME lives under `rime/`.
 
-The [architecture overview](docs/architecture/overview.mdx) explains the cache
-tiers, Iceberg awareness, routing, and write path. Every crate and binary keeps
+The [architecture overview](docs/architecture/overview.mdx) explains the
+runtime's cache tiers, Iceberg awareness, routing, and write path. Every crate and binary keeps
 an append-only `WORKLOG.md` describing why it changed.
 
 ## Contributing
