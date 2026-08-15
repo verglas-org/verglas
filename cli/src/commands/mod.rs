@@ -2,14 +2,13 @@
 
 pub mod catalog;
 pub mod dashboard;
-pub mod database;
 pub mod drain;
-pub mod kv;
-pub mod queue;
+pub mod graph;
+pub mod lakehouse;
 pub mod secret;
+pub mod semantic;
 pub mod status;
 pub mod table;
-pub mod table_metrics;
 pub mod token;
-pub mod vessel;
+pub mod vector;
 pub mod workers;

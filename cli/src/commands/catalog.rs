@@ -87,6 +87,17 @@ impl CatalogClient {
         &self.base
     }
 
+    /// Resolved coordinates for opening a write-capable Iceberg client
+    /// (`verglas_sdk::ingest`): the same uri/warehouse/bearer this client
+    /// already reads from `~/.verglas/config.toml`.
+    pub fn ingest_config(&self) -> verglas_sdk::ingest::CatalogConfig {
+        verglas_sdk::ingest::CatalogConfig {
+            uri: self.base.clone(),
+            warehouse: self.warehouse.clone(),
+            bearer: self.bearer.clone(),
+        }
+    }
+
     /// Resolves the route root (`{base}/v1` or `{base}/v1/{prefix}`) by reading
     /// `/v1/config` once. The tenant catalogd advertises its prefix there, so the
     /// drop-table path is built the same way the server's catalog client builds

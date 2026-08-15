@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use verglas_core::admin::{DEFAULT_ENDPOINT, ENDPOINT_ENV};
 
 use crate::credentials::{CredentialsError, credentials_path, load_token};
 
@@ -11,16 +10,6 @@ use crate::credentials::{CredentialsError, credentials_path, load_token};
 #[derive(Debug, Parser)]
 #[command(name = "verglas", version, about = "Verglas operator CLI")]
 pub struct Cli {
-    /// Admin API base URL for the target server (`VERGLAS_ENDPOINT`).
-    #[arg(
-        id = "server_endpoint",
-        long = "server-endpoint",
-        env = ENDPOINT_ENV,
-        default_value = DEFAULT_ENDPOINT,
-        global = true
-    )]
-    pub endpoint: String,
-
     /// Tenant access/database API (`VERGLAS_ACCESS_ENDPOINT`).
     #[arg(
         long = "access-endpoint",
@@ -37,6 +26,15 @@ pub struct Cli {
     /// Owner-only file that stores locally minted access tokens.
     #[arg(long, env = "VERGLAS_CREDENTIALS_FILE", global = true)]
     pub credentials_file: Option<PathBuf>,
+
+    /// S3 semantic listener endpoint for `graph`/`vector` (`VERGLAS_S3_ENDPOINT`).
+    #[arg(
+        long = "s3-endpoint",
+        env = "VERGLAS_S3_ENDPOINT",
+        default_value = "http://127.0.0.1:8333",
+        global = true
+    )]
+    pub s3_endpoint: String,
 
     /// Emit machine-readable JSON instead of human-readable tables.
     #[arg(long, global = true)]
@@ -59,40 +57,37 @@ pub enum Command {
     /// Drain this node: stop taking new cache ownership, donate warmth to
     /// peers, then exit.
     Drain(DrainArgs),
-    /// Probe the server at `--server-endpoint` (health, version, cache warmth).
+    /// Probe the configured server (health, version, cache warmth).
     Status,
-    /// Create, append to, inspect, and drop agent-managed Iceberg tables, and
-    /// read their local per-table cache metrics.
+    /// Create, append to, inspect, and drop agent-managed Iceberg tables.
     #[command(subcommand)]
     Table(TableCommand),
-    /// Create and manage Rill dashboards over catalog-resolved Iceberg tables.
-    /// Available when the self-hosted Compose analytics profile is running.
+    /// Create and manage json-render dashboards on Verglas Cloud (`--file` specs).
+    /// The OSS stack does not host dashboards.
     #[command(subcommand)]
     Dashboard(DashboardCommand),
-    /// Scheduled or event-driven workers on the local server registry.
+    /// Scheduled or event-driven workers on Verglas Cloud.
     /// `list`/`get` read them; `create`/`delete` manage them from a spec file;
-    /// `run` dispatches one now; `follow` streams a local process or file into
-    /// a table.
+    /// `run` dispatches one now. The OSS stack does not host workers.
     #[command(subcommand)]
     Workers(WorkersCommand),
-    /// Set and get small raw values in the built-in persistent KV engine.
+    /// Create Lakekeeper-managed lakehouses.
     #[command(subcommand)]
-    Kv(KvCommand),
-    /// Manage and call long-lived local HTTP services in the Docker runtime.
-    #[command(subcommand)]
-    Vessel(VesselCommand),
-    /// Create independently bound Lakehouse and Postgres databases.
-    #[command(subcommand)]
-    Db(DbCommand),
-    /// Create and manage independently scalable PostgreSQL-backed queues.
-    #[command(subcommand)]
-    Queue(QueueCommand),
+    Lakehouse(LakehouseCommand),
     /// Create scoped credentials without exposing their values in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
     /// Mint, inspect, and revoke scoped access tokens.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Property-graph node/edge ingestion and traversal over the S3 semantic
+    /// listener (`VERGLAS_S3_ENDPOINT`).
+    #[command(subcommand)]
+    Graph(GraphCommand),
+    /// Vector bucket/index ingestion and nearest-neighbor search over the S3
+    /// semantic listener (`VERGLAS_S3_ENDPOINT`).
+    #[command(subcommand)]
+    Vector(VectorCommand),
 }
 
 impl Cli {
@@ -149,74 +144,27 @@ pub struct TokenRevokeArgs {
     pub id: String,
 }
 
-/// `verglas db` operations against the local database resource API.
+/// `verglas lakehouse` operations against the local database resource API.
 #[derive(Debug, Subcommand)]
-pub enum DbCommand {
-    /// Create one managed or externally bound database.
-    Create(DbCreateArgs),
-    /// Mint a short-lived PostgreSQL password token for one managed Postgres database.
-    Token(DbTokenArgs),
+pub enum LakehouseCommand {
+    /// Create one Lakekeeper-managed lakehouse.
+    Create(LakehouseCreateArgs),
 }
 
-/// `verglas queue` resource lifecycle operations.
-#[derive(Debug, Subcommand)]
-pub enum QueueCommand {
-    /// Provision a dedicated Neon database and queue service container.
-    Create(QueueNameArgs),
-    /// List explicitly declared queues.
-    List,
-    /// Show one queue and both managed deployment identities.
-    Show(QueueNameArgs),
-    /// Delete the queue container and its dedicated Neon database.
-    Delete(QueueNameArgs),
-}
-
-/// Stable tenant-local queue name.
+/// Arguments for `verglas lakehouse create`.
 #[derive(Debug, Args)]
-pub struct QueueNameArgs {
-    /// Queue resource name.
+pub struct LakehouseCreateArgs {
+    /// Stable lakehouse name.
     pub name: String,
-}
-
-/// Arguments for `verglas db create`.
-#[derive(Debug, Args)]
-pub struct DbCreateArgs {
-    /// Stable database name.
-    pub name: String,
-    /// Database engine and resource composition.
-    #[arg(long = "type", value_enum)]
-    pub database_type: DatabaseType,
-    /// S3 prefix for a Lakehouse that uses an authorized scoped secret.
+    /// S3 prefix for a lakehouse that uses an authorized scoped secret.
     #[arg(long)]
     pub data_path: Option<String>,
-    /// External Iceberg REST catalog URI for a Lakehouse.
-    #[arg(long)]
+    /// External Iceberg REST catalog URI.
+    #[arg(long, requires = "warehouse")]
     pub catalog: Option<String>,
     /// Warehouse selected from the external catalog.
     #[arg(long, requires = "catalog")]
     pub warehouse: Option<String>,
-}
-
-/// Arguments for `verglas db token`.
-#[derive(Debug, Args)]
-pub struct DbTokenArgs {
-    /// Managed Postgres database identifier.
-    pub database: String,
-    /// Requested connection-token lifetime in seconds, from 1 through 900.
-    #[arg(long = "expires-in", default_value_t = 900)]
-    pub expires_in_seconds: u64,
-    /// Print only the JWT suitable for `PGPASSWORD`; omit to keep it in local secure storage.
-    #[arg(long)]
-    pub print_password: bool,
-}
-
-/// Database types accepted by the local resource API.
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum DatabaseType {
-    /// Iceberg storage with managed or externally bound services.
-    Lakehouse,
-    /// A managed Neon Postgres database.
-    Postgres,
 }
 
 /// `verglas secret` operations against the local access service.
@@ -249,133 +197,53 @@ pub enum SecretType {
     IcebergRest,
 }
 
-/// `verglas vessel` operations against the local Docker runtime manager.
-#[derive(Debug, Subcommand)]
-pub enum VesselCommand {
-    /// Create or replace a Vessel from a YAML or JSON declaration.
-    Add(VesselAddArgs),
-    /// List desired Vessels and their observed state.
-    List,
-    /// Show one Vessel by name.
-    Get(VesselNameArgs),
-    /// Remove one Vessel and its owned container.
-    Remove(VesselNameArgs),
-    /// Send an HTTP GET to a path exposed by a Vessel.
-    Curl(VesselCurlArgs),
-    /// POST a JSON operation to the Vessel's `/v1/query` endpoint.
-    Query(VesselQueryArgs),
-}
-
-/// Arguments for creating or replacing a Vessel.
-#[derive(Debug, Args)]
-pub struct VesselAddArgs {
-    /// YAML or JSON Vessel declaration.
-    #[arg(long)]
-    pub file: PathBuf,
-}
-
-/// A Vessel referenced by its stable local name.
-#[derive(Debug, Args)]
-pub struct VesselNameArgs {
-    /// Stable Vessel name.
-    pub name: String,
-}
-
-/// Arguments for a direct Vessel HTTP call.
-#[derive(Debug, Args)]
-pub struct VesselCurlArgs {
-    /// Stable Vessel name.
-    pub name: String,
-    /// Origin-relative HTTP path exposed by the Vessel.
-    pub path: String,
-    /// HTTP method sent through the runtime proxy.
-    #[arg(long, default_value = "GET")]
-    pub method: String,
-    /// JSON request body. Prefer `--data-stdin` for credentials.
-    #[arg(long, conflicts_with = "data_stdin")]
-    pub data: Option<String>,
-    /// Read a JSON request body from stdin so secrets avoid shell history.
-    #[arg(long, conflicts_with = "data")]
-    pub data_stdin: bool,
-}
-
-/// Arguments for a semantic Vessel query.
-#[derive(Debug, Args)]
-pub struct VesselQueryArgs {
-    /// Stable Vessel name.
-    pub name: String,
-    /// JSON request body sent to `/v1/query`.
-    pub request: String,
-}
-
-/// `verglas kv` operations.
-#[derive(Debug, Subcommand)]
-pub enum KvCommand {
-    /// Set a raw UTF-8 value, optionally with a TTL in seconds.
-    Set(KvSetArgs),
-    /// Get a raw value.
-    Get(KvKeyArgs),
-}
-
-/// Arguments for `verglas kv set`.
-#[derive(Debug, Args)]
-pub struct KvSetArgs {
-    /// Tenant-scoped application namespace.
-    pub namespace: String,
-    /// Key within the namespace.
-    pub key: String,
-    /// Raw UTF-8 value.
-    pub value: String,
-    /// Lifetime in seconds.
-    #[arg(long)]
-    pub ttl: Option<u64>,
-}
-
-/// Arguments for `verglas kv get`.
-#[derive(Debug, Args)]
-pub struct KvKeyArgs {
-    /// Tenant-scoped application namespace.
-    pub namespace: String,
-    /// Key within the namespace.
-    pub key: String,
-}
-
-/// `verglas dashboard` subcommands for the optional on-prem Rill integration.
+/// `verglas dashboard` subcommands for Verglas Cloud json-render dashboards.
 #[derive(Debug, Subcommand)]
 pub enum DashboardCommand {
-    /// Create or refresh an Explore dashboard for an Iceberg table.
+    /// Create or update a dashboard from a json-render spec file (`--file`).
     Create(DashboardCreateArgs),
-    /// List dashboards managed by Verglas in the configured Rill project.
-    List,
-    /// Show one dashboard and its browser URL.
-    Show(DashboardNameArgs),
-    /// Delete the Rill resources owned by one Verglas dashboard.
+    /// List dashboards on Verglas Cloud.
+    List(DashboardTenantArgs),
+    /// Show one dashboard and its hosted URL.
+    Get(DashboardNameArgs),
+    /// Delete a dashboard by name.
     Delete(DashboardNameArgs),
 }
 
 /// Arguments for `verglas dashboard create`.
 #[derive(Debug, Args)]
 pub struct DashboardCreateArgs {
-    /// Dotted Iceberg table identifier, such as `sales.orders`.
-    pub table: String,
-    /// Stable Rill resource name. Defaults to the table identifier with dots
-    /// replaced by underscores.
+    /// Path to a json-render dashboard spec (JSON or TOML).
     #[arg(long)]
-    pub name: Option<String>,
+    pub file: std::path::PathBuf,
+    /// Tenant deployment id. Required when the Cloud credential is not
+    /// already scoped to one tenant.
+    #[arg(long)]
+    pub tenant_id: Option<String>,
 }
 
-/// A dashboard referenced by its Rill resource name.
+/// Optional tenant filter for list.
+#[derive(Debug, Args)]
+pub struct DashboardTenantArgs {
+    /// Tenant deployment id.
+    #[arg(long)]
+    pub tenant_id: Option<String>,
+}
+
+/// A dashboard referenced by its stable name.
 #[derive(Debug, Args)]
 pub struct DashboardNameArgs {
-    /// Dashboard resource name returned by create or list.
+    /// Dashboard name returned by create or list.
     pub name: String,
+    /// Tenant deployment id.
+    #[arg(long)]
+    pub tenant_id: Option<String>,
 }
 
-/// `verglas workers` subcommands against the local server registry
-/// (`/v1/workers`). Every verb takes `--json` for a machine-readable shape.
+/// `verglas workers` subcommands against Verglas Cloud (`/v1/workers`).
 #[derive(Debug, Subcommand)]
 pub enum WorkersCommand {
-    /// List every active worker on the local server.
+    /// List every active worker on Verglas Cloud.
     List,
     /// Show one worker's full detail by name.
     Get(WorkerRefArgs),
@@ -386,16 +254,14 @@ pub enum WorkersCommand {
     Delete(WorkerRefArgs),
     /// Dispatch a manual run of the worker now. Accepts the worker's name.
     Run(WorkerRefArgs),
-    /// Follow a local process or file and stream every captured line into a table
-    /// as rows. Wraps a command after `--`, or tails `--file <path>`. Streams
-    /// until Ctrl-C, then tears the worker down; `--keep` leaves it registered.
+    /// Not supported. Workers run on Verglas Cloud; the OSS stack has no follow runtime.
     Follow(WorkerFollowArgs),
 }
 
 /// A worker referenced by its registered name.
 #[derive(Debug, Args)]
 pub struct WorkerRefArgs {
-    /// The worker's name in the local registry.
+    /// The worker's name.
     pub worker: String,
 }
 
@@ -467,28 +333,12 @@ pub enum TableCommand {
     /// JSON (`--json`): {"table","snapshots":[{"snapshot_id","parent_snapshot_id",
     /// "timestamp_ms","timestamp","operation","summary":{...}}]}.
     History(TableInspectArgs),
-    /// Compact tables now: rewrite accumulated small data files into fewer,
-    /// larger ones and commit the result. A one-shot manual pass over every
-    /// table — the server runs no compaction on its own. Progress ratchets one
-    /// commit per group and the pass is time-bounded, so on a large backlog it
-    /// may stop partway; run it again to continue.
-    ///
-    /// JSON (`--json`): {"tables_scanned","groups_committed",
-    /// "undersized_remaining","budget_bounded","compacted":[{"table",
-    /// "groups_committed","input_data_files","output_data_files",
-    /// "undersized_remaining","budget_bounded","snapshot_id",...}],
-    /// "failures":[["table","message"]]}.
-    Compact,
     /// Drop a table via the tenant's Iceberg REST catalog. Removes the table's
     /// catalog entry; requires `--yes` or an interactive confirmation. Uses the
     /// `[catalog]` uri and bearer from `~/.verglas/config.toml`.
     ///
     /// JSON (`--json`): {"table","dropped":true}.
     Delete(TableDeleteArgs),
-    /// Per-table cache metrics from the local server (hit rate, cached bytes,
-    /// backend requests avoided, and a dollar-savings ESTIMATE at published S3 GET
-    /// list pricing).
-    Metrics,
 }
 
 /// Arguments for `verglas table delete`.
@@ -539,10 +389,8 @@ pub struct TableInspectArgs {
     pub table: String,
 }
 
-/// Arguments for `verglas drain`: drain the LOCAL server. The CLI takes no
-/// target — it POSTs `/admin/drain` on this machine's admin endpoint (the
-/// loopback default, `VERGLAS_ENDPOINT` / `--server-endpoint` override), never
-/// resolving or addressing other nodes.
+/// Arguments for `verglas drain`: drain the LOCAL OSS server. The CLI takes no
+/// target — it POSTs `/admin/drain` on this machine's loopback admin endpoint.
 #[derive(Debug, Args)]
 pub struct DrainArgs {
     /// Maximum time to keep serving as a donor before exiting, e.g. `10m`,
@@ -550,4 +398,211 @@ pub struct DrainArgs {
     /// configured drain timeout.
     #[arg(long)]
     pub timeout: Option<String>,
+}
+
+/// `verglas graph` operations against the S3 semantic listener (#144). Every
+/// verb wraps `verglas_sdk::semantic::VerglasGraphsClient`; the CLI signs
+/// nothing itself.
+#[derive(Debug, Subcommand)]
+pub enum GraphCommand {
+    /// Create an empty graph.
+    Create(GraphNameArgs),
+    /// Add or update nodes from a JSON array (a file path, or `-` for stdin).
+    AddNode(GraphInputArgs),
+    /// Add or update edges from a JSON array (a file path, or `-` for stdin).
+    AddEdge(GraphInputArgs),
+    /// List one node's immediate neighbors.
+    Neighbors(GraphNeighborsArgs),
+    /// Build the graph's traversal index.
+    Index(GraphNameArgs),
+    /// Show one graph's metadata.
+    Show(GraphNameArgs),
+    /// Delete a graph.
+    Delete(GraphNameArgs),
+    /// List every graph.
+    List,
+    /// Traverse up to `--hops` edges out from one node.
+    #[command(name = "k-hop")]
+    KHop(GraphKHopArgs),
+    /// Find paths between two nodes within `--max-hops`.
+    Paths(GraphPathsArgs),
+    /// Rank Decision nodes against a lexical query, with an optional entity
+    /// structural boost.
+    Precedents(GraphPrecedentsArgs),
+}
+
+/// A graph referenced by its stable name.
+#[derive(Debug, Args)]
+pub struct GraphNameArgs {
+    /// The graph's name.
+    pub name: String,
+}
+
+/// Arguments for `verglas graph add-node`/`add-edge`.
+#[derive(Debug, Args)]
+pub struct GraphInputArgs {
+    /// The graph's name.
+    pub name: String,
+    /// A JSON array file path, or `-` to read from stdin.
+    pub input: String,
+}
+
+/// Arguments for `verglas graph neighbors`.
+#[derive(Debug, Args)]
+pub struct GraphNeighborsArgs {
+    /// The graph's name.
+    pub name: String,
+    /// The node whose neighbors are listed.
+    pub node: String,
+}
+
+/// Arguments for `verglas graph k-hop`.
+#[derive(Debug, Args)]
+pub struct GraphKHopArgs {
+    /// The graph's name.
+    pub name: String,
+    /// The starting node.
+    pub node: String,
+    /// Maximum traversal depth.
+    #[arg(long)]
+    pub hops: i64,
+}
+
+/// Arguments for `verglas graph paths`.
+#[derive(Debug, Args)]
+pub struct GraphPathsArgs {
+    /// The graph's name.
+    pub name: String,
+    /// The source node.
+    pub source: String,
+    /// The target node.
+    pub target: String,
+    /// Maximum path length in hops.
+    #[arg(long = "max-hops")]
+    pub max_hops: i64,
+}
+
+/// Arguments for `verglas graph precedents`.
+#[derive(Debug, Args)]
+pub struct GraphPrecedentsArgs {
+    /// The graph's name.
+    pub name: String,
+    /// The lexical query text, BM25-ranked against each Decision node's
+    /// `objective` property.
+    #[arg(long)]
+    pub query: String,
+    /// Caps the number of ranked precedents returned.
+    #[arg(long)]
+    pub limit: Option<i32>,
+    /// An entity node id that boosts a decision sharing it as a direct
+    /// neighbor. Repeatable.
+    #[arg(long = "entity")]
+    pub entities: Vec<String>,
+}
+
+/// `verglas vector` operations against the S3 Vectors semantic listener
+/// (#144). Every verb wraps `verglas_sdk::semantic::S3VectorsClient`; the CLI
+/// signs nothing itself.
+#[derive(Debug, Subcommand)]
+pub enum VectorCommand {
+    /// Create a vector bucket.
+    CreateBucket(VectorBucketArgs),
+    /// Create a vector index inside a bucket.
+    CreateIndex(VectorCreateIndexArgs),
+    /// Put vectors from a JSON array (a file path, or `-` for stdin).
+    Put(VectorInputArgs),
+    /// Query the nearest vectors to `--query-vector`.
+    Query(VectorQueryArgs),
+    /// List vectors in an index.
+    List(VectorIndexArgs),
+    /// Get vectors by key.
+    Get(VectorKeysArgs),
+    /// Delete vectors by key.
+    Delete(VectorKeysArgs),
+    /// Delete a vector index.
+    DeleteIndex(VectorIndexArgs),
+    /// Delete a vector bucket.
+    DeleteBucket(VectorBucketArgs),
+    /// List every vector bucket.
+    ListBuckets,
+    /// List every index in a bucket.
+    ListIndexes(VectorBucketArgs),
+}
+
+/// A vector bucket referenced by its stable name.
+#[derive(Debug, Args)]
+pub struct VectorBucketArgs {
+    /// The bucket's name.
+    pub bucket: String,
+}
+
+/// A bucket + index pair.
+#[derive(Debug, Args)]
+pub struct VectorIndexArgs {
+    /// The bucket's name.
+    pub bucket: String,
+    /// The index's name.
+    pub index: String,
+}
+
+/// Arguments for `verglas vector create-index`.
+#[derive(Debug, Args)]
+pub struct VectorCreateIndexArgs {
+    /// The bucket's name.
+    pub bucket: String,
+    /// The index's name.
+    pub index: String,
+    /// Vector dimension.
+    #[arg(long)]
+    pub dimension: i32,
+    /// Distance metric used for nearest-neighbor queries.
+    #[arg(long, value_enum, default_value_t = VectorMetric::Cosine)]
+    pub metric: VectorMetric,
+}
+
+/// Distance metrics accepted by `verglas vector create-index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VectorMetric {
+    /// Cosine distance.
+    Cosine,
+    /// Euclidean distance.
+    Euclidean,
+}
+
+/// Arguments for `verglas vector put`.
+#[derive(Debug, Args)]
+pub struct VectorInputArgs {
+    /// The bucket's name.
+    pub bucket: String,
+    /// The index's name.
+    pub index: String,
+    /// A JSON array file path, or `-` to read from stdin.
+    pub input: String,
+}
+
+/// Arguments for `verglas vector query`.
+#[derive(Debug, Args)]
+pub struct VectorQueryArgs {
+    /// The bucket's name.
+    pub bucket: String,
+    /// The index's name.
+    pub index: String,
+    /// Number of nearest results to return.
+    #[arg(long = "top-k")]
+    pub top_k: i32,
+    /// The query vector, as a JSON float array (e.g. `[0.1,0.2,0.3]`).
+    #[arg(long = "query-vector")]
+    pub query_vector: String,
+}
+
+/// A bucket + index + key set, for `get`/`delete`.
+#[derive(Debug, Args)]
+pub struct VectorKeysArgs {
+    /// The bucket's name.
+    pub bucket: String,
+    /// The index's name.
+    pub index: String,
+    /// One or more vector keys.
+    #[arg(required = true)]
+    pub keys: Vec<String>,
 }

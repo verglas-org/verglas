@@ -37,6 +37,7 @@ pub enum WorkerRuntime {
 pub const SPEC_VERSION: u32 = 1;
 
 /// The namespace a bare follow target table lands in (mirrors the server).
+#[allow(dead_code)]
 pub const FOLLOW_NAMESPACE: &str = "follow";
 
 /// The prefix marking an env value as a reference to a named secret.

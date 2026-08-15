@@ -26,10 +26,7 @@ use crate::access::{AccessCheck, AccessDecision, AccessGrant, Principal, Resourc
 use crate::queue::{
     QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt,
 };
-use crate::token::{
-    AccessTokenCreateRequest, AccessTokenSummary, DatabaseConnectionToken,
-    DatabaseConnectionTokenRequest, IssuedAccessToken,
-};
+use crate::token::{AccessTokenCreateRequest, AccessTokenSummary, IssuedAccessToken};
 use crate::worker::ChangeEvent;
 
 /// A reconnecting push-only stream of fenced queue deliveries.
@@ -552,19 +549,6 @@ impl Client {
         self.access_json(
             self.http
                 .delete(self.access_url(&format!("/v1/access/tokens/{token_id}"))),
-        )
-        .await
-    }
-
-    /// Exchanges the current authorized bearer for a short-lived Postgres connection token.
-    pub async fn create_database_connection_token(
-        &self,
-        request: &DatabaseConnectionTokenRequest,
-    ) -> Result<DatabaseConnectionToken, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/database-tokens"))
-                .json(request),
         )
         .await
     }

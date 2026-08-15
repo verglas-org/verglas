@@ -1,29 +1,94 @@
 //! Backend resolution for the pure-client CLI — the one place that decides
 //! which server a command targets.
 //!
-//! The `verglas` CLI is a PURE CLIENT: it is never required to be co-located
-//! with a server. Every data-plane and registry verb (`table`, `workers`)
-//! targets a **server endpoint** — the global
-//! `--server-endpoint` / `VERGLAS_ENDPOINT` value (default
-//! `http://127.0.0.1:8334`). It may be localhost OR a remote self-hosted
-//! server. WHICH server owns a declaration is a property of the endpoint, not
-//! of where the CLI runs.
-//!
-//! `drain` is local by definition: it drains the server addressed by the
-//! configured endpoint. Running a local/edge server is for cache and read
-//! latency, never a requirement to use the platform.
-//!
-//! Because of that principle, the server-unreachable error ([`ServerError`])
-//! names the remote-endpoint option so a command never hangs or fails
-//! cryptically when nothing is listening.
+//! Cloud is the default (`https://api.verglas.dev`). Self-hosted OSS servers
+//! are selected with `VERGLAS_ENDPOINT`, not a CLI flag. Workers are a Cloud
+//! service and refuse the OSS stack.
 
+use std::error::Error;
+
+use verglas_core::admin::ENDPOINT_ENV;
 use verglas_sdk::server::{ServerClient, ServerError};
 
-/// Resolves a [`ServerClient`] for `endpoint`, the backend every data-plane and
-/// registry verb speaks to. The endpoint may be the default localhost server or
-/// any remote one; the client attempts no connection until its first call and
-/// then fails fast (bounded connect timeout) with a clear, remote-aware error
-/// when nothing is listening — it never silently assumes a local server.
+/// Verglas Cloud control-plane URL. Workers always target this service.
+pub const CLOUD_ENDPOINT: &str = "https://api.verglas.dev";
+
+/// Resolves the admin/control-plane URL: `VERGLAS_ENDPOINT` if set, otherwise
+/// Verglas Cloud. There is no `--server-endpoint` flag.
+pub fn resolved_endpoint() -> String {
+    std::env::var(ENDPOINT_ENV)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| CLOUD_ENDPOINT.to_owned())
+}
+
+/// Returns whether `endpoint` is Verglas Cloud (HTTPS on `*.verglas.dev`).
+pub fn is_verglas_cloud(endpoint: &str) -> bool {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let Some(rest) = trimmed.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+    host == "api.verglas.dev" || host.ends_with(".verglas.dev")
+}
+
+/// Workers are hosted only on Verglas Cloud. The OSS stack has no worker runtime.
+pub fn require_cloud_workers(endpoint: &str) -> Result<(), Box<dyn Error>> {
+    if is_verglas_cloud(endpoint) {
+        return Ok(());
+    }
+    Err("verglas workers runs on Verglas Cloud only; the OSS stack does not host workers".into())
+}
+
+/// Dashboards are hosted only on Verglas Cloud. The OSS stack has no dashboard host.
+pub fn require_cloud_dashboards(endpoint: &str) -> Result<(), Box<dyn Error>> {
+    if is_verglas_cloud(endpoint) {
+        return Ok(());
+    }
+    Err(
+        "verglas dashboard runs on Verglas Cloud only; the OSS stack does not host dashboards"
+            .into(),
+    )
+}
+
+/// Resolves a [`ServerClient`] for `endpoint`. The client attempts no connection
+/// until its first call and then fails fast with a bounded connect timeout.
 pub fn server(endpoint: &str, token: Option<&str>) -> Result<ServerClient, ServerError> {
     ServerClient::new_with_token(endpoint, token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CLOUD_ENDPOINT, is_verglas_cloud, require_cloud_dashboards, require_cloud_workers,
+    };
+
+    #[test]
+    fn cloud_hosts_are_accepted() {
+        assert!(is_verglas_cloud(CLOUD_ENDPOINT));
+        assert!(is_verglas_cloud("https://api.verglas.dev/"));
+        assert!(is_verglas_cloud("https://preview.verglas.dev"));
+        assert!(require_cloud_workers(CLOUD_ENDPOINT).is_ok());
+        assert!(require_cloud_dashboards(CLOUD_ENDPOINT).is_ok());
+    }
+
+    #[test]
+    fn oss_loopback_is_rejected() {
+        assert!(!is_verglas_cloud("http://127.0.0.1:8334"));
+        assert!(!is_verglas_cloud("https://127.0.0.1:8334"));
+        assert!(!is_verglas_cloud("http://api.verglas.dev"));
+        let err =
+            require_cloud_workers("http://127.0.0.1:8334").expect_err("loopback must be rejected");
+        assert!(err.to_string().contains("OSS stack"));
+        let dash_err = require_cloud_dashboards("http://127.0.0.1:8334")
+            .expect_err("loopback must be rejected for dashboards");
+        assert!(dash_err.to_string().contains("dashboard"));
+    }
 }

@@ -44,14 +44,19 @@ pub struct CreateGraphOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateIndexInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
     pub index_name: std::string::String,
     pub data_type: DataType,
     pub dimension: i32,
     pub distance_metric: DistanceMetric,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_configuration: Option<MetadataConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_configuration: Option<EncryptionConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<std::collections::BTreeMap<String, std::string::String>>,
 }
 
@@ -65,7 +70,9 @@ pub struct CreateIndexOutput {
 #[serde(rename_all = "camelCase")]
 pub struct CreateVectorBucketInput {
     pub vector_bucket_name: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_configuration: Option<EncryptionConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub tags: Option<std::collections::BTreeMap<String, std::string::String>>,
 }
 
@@ -95,8 +102,11 @@ pub struct DeleteGraphOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteIndexInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
 }
 
@@ -107,7 +117,9 @@ pub struct DeleteIndexOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteVectorBucketInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
 }
 
@@ -118,7 +130,9 @@ pub struct DeleteVectorBucketOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteVectorBucketPolicyInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
 }
 
@@ -129,8 +143,11 @@ pub struct DeleteVectorBucketPolicyOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteVectorsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
     pub keys: Vec<std::string::String>,
 }
@@ -166,9 +183,12 @@ pub enum DistanceMetric {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Edge {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub edge_id: Option<std::string::String>,
     pub predicate: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<std::collections::BTreeMap<String, serde_json::Value>>,
     pub provenance: std::string::String,
     pub source_id: std::string::String,
@@ -182,7 +202,9 @@ pub type EdgeList = Vec<Edge>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncryptionConfiguration {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub sse_type: Option<SseType>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub kms_key_arn: Option<std::string::String>,
 }
 
@@ -203,6 +225,7 @@ pub struct GetGraphInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetGraphOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub edges_snapshot_id: Option<i64>,
     pub graph_name: std::string::String,
 }
@@ -210,8 +233,11 @@ pub struct GetGraphOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetIndexInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
 }
 
@@ -224,7 +250,9 @@ pub struct GetIndexOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetNeighborsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<TraversalFilter>,
     pub graph_name: std::string::String,
     pub node_id: std::string::String,
@@ -240,14 +268,18 @@ pub struct GetNeighborsOutput {
 #[serde(rename_all = "camelCase")]
 pub struct GetOutputVector {
     pub key: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<VectorData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetVectorBucketInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
 }
 
@@ -260,24 +292,32 @@ pub struct GetVectorBucketOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetVectorBucketPolicyInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetVectorBucketPolicyOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub policy: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetVectorsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
     pub keys: Vec<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_metadata: Option<bool>,
 }
 
@@ -309,11 +349,15 @@ pub struct Index {
     pub vector_bucket_name: std::string::String,
     pub index_name: std::string::String,
     pub index_arn: std::string::String,
-    pub creation_time: String,
+    /// Unix epoch seconds, as the cache node's semantic listener actually
+    /// serializes it (not an ISO-8601 string).
+    pub creation_time: i64,
     pub data_type: DataType,
     pub dimension: i32,
     pub distance_metric: DistanceMetric,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata_configuration: Option<MetadataConfiguration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_configuration: Option<EncryptionConfiguration>,
 }
 
@@ -329,7 +373,9 @@ pub struct IndexSummary {
     pub vector_bucket_name: std::string::String,
     pub index_name: std::string::String,
     pub index_arn: std::string::String,
-    pub creation_time: String,
+    /// Unix epoch seconds, as the cache node's semantic listener actually
+    /// serializes it (not an ISO-8601 string).
+    pub creation_time: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,7 +417,9 @@ pub type LabelList = Vec<std::string::String>;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListGraphsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_results: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
 }
 
@@ -379,16 +427,22 @@ pub struct ListGraphsInput {
 #[serde(rename_all = "camelCase")]
 pub struct ListGraphsOutput {
     pub graphs: Vec<GraphSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListIndexesInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_results: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<std::string::String>,
 }
 
@@ -399,6 +453,7 @@ pub type ListIndexesNextToken = std::string::String;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListIndexesOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
     pub indexes: Vec<IndexSummary>,
 }
@@ -411,7 +466,9 @@ pub type ListIndexesPrefix = std::string::String;
 #[serde(rename_all = "camelCase")]
 pub struct ListOutputVector {
     pub key: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<VectorData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -430,8 +487,11 @@ pub struct ListTagsForResourceOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListVectorBucketsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_results: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prefix: Option<std::string::String>,
 }
 
@@ -442,6 +502,7 @@ pub type ListVectorBucketsNextToken = std::string::String;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListVectorBucketsOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
     pub vector_buckets: Vec<VectorBucketSummary>,
 }
@@ -453,14 +514,23 @@ pub type ListVectorBucketsPrefix = std::string::String;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListVectorsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_results: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_count: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub segment_index: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_data: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_metadata: Option<bool>,
 }
 
@@ -471,6 +541,7 @@ pub type ListVectorsNextToken = std::string::String;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListVectorsOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
     pub vectors: Vec<ListOutputVector>,
 }
@@ -508,7 +579,9 @@ pub type NeighborList = Vec<Neighbor>;
 #[serde(rename_all = "camelCase")]
 pub struct Node {
     pub id: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub labels: Option<Vec<std::string::String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub properties: Option<std::collections::BTreeMap<String, serde_json::Value>>,
 }
 
@@ -538,6 +611,19 @@ pub struct Path {
 
 pub type PathList = Vec<Path>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Precedent {
+    pub decision_id: std::string::String,
+    pub score: f64,
+    pub lexical_score: f64,
+    pub structural_score: f64,
+    pub shared_entities: Vec<std::string::String>,
+    pub objective: std::string::String,
+}
+
+pub type PrecedentList = Vec<Precedent>;
+
 pub type Predicate = std::string::String;
 
 pub type Properties = std::collections::BTreeMap<String, serde_json::Value>;
@@ -556,6 +642,7 @@ pub struct PutEdgesInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutEdgesOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
 }
 
@@ -564,6 +651,7 @@ pub struct PutEdgesOutput {
 pub struct PutInputVector {
     pub key: std::string::String,
     pub data: VectorData,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
@@ -577,13 +665,16 @@ pub struct PutNodesInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutNodesOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutVectorBucketPolicyInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_arn: Option<std::string::String>,
     pub policy: std::string::String,
 }
@@ -595,8 +686,11 @@ pub struct PutVectorBucketPolicyOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PutVectorsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
     pub vectors: Vec<PutInputVector>,
 }
@@ -610,7 +704,9 @@ pub struct PutVectorsOutput {}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryKHopInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<TraversalFilter>,
     pub graph_name: std::string::String,
     pub k: i64,
@@ -626,7 +722,9 @@ pub struct QueryKHopOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryNeighborhoodInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<TraversalFilter>,
     pub graph_name: std::string::String,
     pub k: i64,
@@ -642,15 +740,19 @@ pub struct QueryNeighborhoodOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryOutputVector {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub distance: Option<f32>,
     pub key: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct QueryPathsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<TraversalFilter>,
     pub graph_name: std::string::String,
     pub max_hops: i64,
@@ -666,15 +768,39 @@ pub struct QueryPathsOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct QueryPrecedentsInput {
+    pub graph_name: std::string::String,
+    pub query: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entities: Option<Vec<std::string::String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryPrecedentsOutput {
+    pub precedents: Vec<Precedent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct QueryVectorsInput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vector_bucket_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<std::string::String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub index_arn: Option<std::string::String>,
     pub top_k: i32,
     pub query_vector: VectorData,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_metadata: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub return_distance: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
 }
 
@@ -685,6 +811,7 @@ pub type QueryVectorsNextToken = std::string::String;
 pub struct QueryVectorsOutput {
     pub vectors: Vec<QueryOutputVector>,
     pub distance_metric: DistanceMetric,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub next_token: Option<std::string::String>,
 }
 
@@ -772,7 +899,9 @@ pub type TopK = i32;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TraversalFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_confidence: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub predicate: Option<std::string::String>,
 }
 
@@ -804,6 +933,7 @@ pub struct UntagResourceOutput {}
 #[serde(rename_all = "camelCase")]
 pub struct ValidationException {
     pub message: std::string::String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub field_list: Option<Vec<ValidationExceptionField>>,
 }
 
@@ -821,7 +951,10 @@ pub type ValidationExceptionFieldList = Vec<ValidationExceptionField>;
 pub struct VectorBucket {
     pub vector_bucket_name: std::string::String,
     pub vector_bucket_arn: std::string::String,
-    pub creation_time: String,
+    /// Unix epoch seconds, as the cache node's semantic listener actually
+    /// serializes it (not an ISO-8601 string).
+    pub creation_time: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub encryption_configuration: Option<EncryptionConfiguration>,
 }
 
@@ -836,7 +969,9 @@ pub type VectorBucketPolicy = std::string::String;
 pub struct VectorBucketSummary {
     pub vector_bucket_name: std::string::String,
     pub vector_bucket_arn: std::string::String,
-    pub creation_time: String,
+    /// Unix epoch seconds, as the cache node's semantic listener actually
+    /// serializes it (not an ISO-8601 string).
+    pub creation_time: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -11,7 +11,6 @@ use tokio::net::TcpListener;
 use verglas_sdk::server::ServerClient;
 use verglas_sdk::{
     AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, Client, ConnectOptions,
-    DatabaseConnectionTokenRequest,
 };
 
 /// Connects an SDK client to an isolated access-service fixture.
@@ -130,31 +129,4 @@ async fn generic_server_client_applies_bearer_token() {
         ServerClient::new_with_token(&endpoint, Some("scoped-server-token")).expect("client");
     let response: Value = client.get("/v1/protected").await.expect("response");
     assert_eq!(response["ok"], true);
-}
-
-/// The SDK exchanges an authorized access credential for one short-lived Neon password token.
-#[tokio::test]
-async fn client_mints_a_database_scoped_connection_token() {
-    async fn create(headers: HeaderMap, Json(body): Json<Value>) -> Json<Value> {
-        assert_eq!(headers["authorization"], "Bearer parent-token");
-        assert_eq!(
-            body,
-            json!({ "database_id": "analytics", "expires_in_seconds": 300 })
-        );
-        Json(json!({ "token": "neon-password-jwt", "expires_at": 1_786_250_100_u64 }))
-    }
-    let app = Router::new().route("/v1/access/database-tokens", post(create));
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
-    let endpoint = format!("http://{}", listener.local_addr().expect("address"));
-    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
-
-    let token = client(&endpoint)
-        .await
-        .create_database_connection_token(
-            &DatabaseConnectionTokenRequest::new("analytics").with_expiration_seconds(300),
-        )
-        .await
-        .expect("mint connection token");
-    assert_eq!(token.token, "neon-password-jwt");
-    assert_eq!(token.expires_at, 1_786_250_100);
 }

@@ -397,6 +397,13 @@ impl VerglasGraphsClient {
     ) -> Result<QueryPathsOutput, ClientError> {
         self.0.call(Method::POST, "/QueryPaths", &input).await
     }
+    /// Calls QueryPrecedents.
+    pub async fn query_precedents(
+        &self,
+        input: QueryPrecedentsInput,
+    ) -> Result<QueryPrecedentsOutput, ClientError> {
+        self.0.call(Method::POST, "/QueryPrecedents", &input).await
+    }
 }
 
 /// Computes a hexadecimal SigV4 request signature.

@@ -5,7 +5,7 @@
 fn documents_standalone_and_edge_cache_topologies() {
     let guide = include_str!("../../docs/get-started/self-host.mdx");
 
-    assert!(guide.contains("Standalone cache"));
+    assert!(guide.contains("Standalone runtime node"));
     assert!(guide.contains("Edge cache"));
     assert!(guide.contains("VERGLAS_STORAGE_BUCKET"));
     assert!(guide.contains("VERGLAS_CATALOG_URI"));

@@ -1,10 +1,11 @@
-//! Generic JSON and file-ingest transport for server control-plane routes.
+//! Generic JSON transport for server control-plane routes.
 //!
 //! Typed data-plane consumers should prefer [`crate::Client`]. The CLI also
-//! drives registry, graph, lifecycle, and file-ingest routes; this reusable
-//! transport keeps all of that HTTP behavior out of the CLI binary.
+//! drives registry, graph, and lifecycle routes; this reusable transport keeps
+//! all of that HTTP behavior out of the CLI binary. Table create/append no
+//! longer go through the server — see [`crate::ingest`] (#145): the SDK
+//! writes straight to the Iceberg REST catalog and object storage.
 
-use std::path::Path;
 use std::time::Duration;
 
 use reqwest::header::{AUTHORIZATION, HeaderValue};
@@ -115,45 +116,6 @@ impl ServerClient {
     pub async fn delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ServerError> {
         let response = self
             .authorize(self.http.delete(self.url(path)))
-            .send()
-            .await
-            .map_err(|error| self.unreachable(error))?;
-        Self::decode(response).await
-    }
-
-    /// Streams a CSV, JSONL, or Parquet file to the server ingest route.
-    pub async fn ingest<T: DeserializeOwned>(
-        &self,
-        table: &str,
-        source: &Path,
-        mode: &str,
-        partition_by: Option<&str>,
-    ) -> Result<T, ServerError> {
-        let format = match source.extension().and_then(|extension| extension.to_str()) {
-            Some("csv") => "csv",
-            Some("jsonl") => "jsonl",
-            Some("parquet") => "parquet",
-            _ => {
-                return Err(ServerError::Input(format!(
-                    "cannot infer a format for `{}`: expected a .csv, .parquet, or .jsonl file",
-                    source.display()
-                )));
-            }
-        };
-        let bytes = tokio::fs::read(source).await.map_err(|error| {
-            ServerError::Input(format!("failed to read `{}`: {error}", source.display()))
-        })?;
-        let mut url = format!(
-            "{}?mode={mode}&format={format}",
-            self.url(&format!("/v1/ingest/{table}"))
-        );
-        if let Some(column) = partition_by {
-            url.push_str(&format!("&partition_by={column}"));
-        }
-        let response = self
-            .authorize(self.http.post(url))
-            .header("content-type", "application/octet-stream")
-            .body(bytes)
             .send()
             .await
             .map_err(|error| self.unreachable(error))?;

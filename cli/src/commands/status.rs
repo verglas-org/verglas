@@ -2,7 +2,7 @@
 //!
 //! There is no OS service manager. The server runs in Docker (or `verglas
 //! dev`); this command only asks `/admin/version`, `/admin/healthz`, and
-//! `/admin/stats` at `--server-endpoint` / `VERGLAS_ENDPOINT`.
+//! `/admin/stats` at the resolved server (`VERGLAS_ENDPOINT` or Verglas Cloud).
 
 use std::error::Error;
 use std::io::Write as _;

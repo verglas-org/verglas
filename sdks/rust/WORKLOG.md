@@ -118,3 +118,53 @@
 - #67: Added direct SigV4 clients for every checked-in S3 Vectors and Graph REST-JSON operation. These clients use cache-listener service signatures instead of retired bearer routes.
 - #67: Removed the retired database query/write stream, graph handle, and table-index SDK APIs and their legacy DTO modules. The Rust SDK now exposes Iceberg catalog/table facilities, queues and KV, plus the typed cache-listener semantic clients without fallback routes.
 - #137: Aligned SigV4 canonical path/query handling with the cache listener and stopped serializing GET or DELETE request bodies. URI bindings preserve AWS-unreserved bytes, including hyphenated resource ARNs.
+- #144: Fixed two wire-format bugs in `semantic_types.rs` found while wiring the
+  `verglas graph`/`verglas vector` CLI verbs against a live cache node. Every
+  `Option<T>` request field now carries `#[serde(skip_serializing_if =
+  "Option::is_none")]`, so an absent field (e.g. `Node.labels` when the caller
+  omits it) is omitted from the request body instead of serialized as an
+  explicit `null`, which the listener's `optional_string_list` correctly
+  rejects (`"labels must be an array"`). `Index`/`IndexSummary`/`VectorBucket`/
+  `VectorBucketSummary.creation_time` changed from `String` to `i64`: the
+  listener always stores and returns `creationTime` as Unix epoch seconds
+  (`now_seconds()`/`stored_number` in `crates/verglas-s3/src/semantic.rs`),
+  never an ISO-8601 string, so the prior type failed to deserialize
+  `ListVectorBuckets`/`ListIndexes`/`GetVectorBucket`/`GetIndex` responses.
+- #145: Added a new `ingest` module making `verglas-sdk` a real client-side
+  Iceberg writer: schema inference from CSV/JSONL/Parquet (ported from the
+  server-side ingest rules), a REST catalog opened with
+  `X-Iceberg-Access-Delegation: vended-credentials` so every table load/create
+  asks the catalog to vend per-table storage credentials (no static S3 keypair
+  is configured — the R2 Data Catalog and any spec-conformant catalog return
+  scoped credentials in the response `config` map, which `iceberg-catalog-rest`
+  merges into the table's `FileIO`), and the CAS create/append write path
+  (schema coercion, fixed-8MiB-part multipart writes for strict S3-compatible
+  stores, fast-append commit with retry on `CatalogCommitConflicts`). Deleted
+  `ServerClient::ingest` and its file-ingest route usage from `server.rs` —
+  create/append no longer round-trip a server; they write straight to the
+  catalog and object storage (the turn-off invariant: a cache node being down
+  does not stop ingest). Tests were written first: `ingest::read` unit tests
+  per source format, `ingest::write` tests against an in-process
+  `MemoryCatalog` covering create/append/partition-by and an
+  append-schema-mismatch case that names the offending column, and
+  `tests/ingest_mock_rest_catalog.rs`, a mock Iceberg REST server (backed by a
+  real `MemoryCatalog` for its bookkeeping) asserting the actual wire sequence
+  a create+append makes, that every request carries the delegation header and
+  bearer, and that Parquet data files land under the mock's warehouse — the
+  write path is real, not a metadata-only round trip.
+
+- #146: Deleted the Postgres connection-token surface
+  (`create_database_connection_token`, `DatabaseConnectionTokenRequest`,
+  `DatabaseConnectionToken`) with the CLI's `db token` verb. The queue
+  delivery/subscription types stay: `client.rs` database subscriptions and
+  durable table-commit deliveries depend on them. The authorization
+  vocabulary dropped its Vessel and Application kinds with the feature;
+  Integration stays because the reflected namespace gateway still uses it.
+
+- #148: Added `VerglasGraphsClient::query_precedents`, plus the
+  `QueryPrecedentsInput`/`QueryPrecedentsOutput`/`Precedent` DTOs in
+  `semantic_types.rs`, following the existing Graph shape patterns exactly
+  (optional fields carry `skip_serializing_if`). It calls the new
+  `POST /QueryPrecedents` operation on the cache node's Graph REST-JSON
+  listener; no new dependency and no signing logic beyond the shared SigV4
+  helper every other semantic client already uses.

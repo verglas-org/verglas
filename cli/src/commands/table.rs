@@ -1,14 +1,15 @@
-//! `verglas table` — create, append, list, show, and history (issue #287).
+//! `verglas table` — create, append, list, show, history, and delete.
 //!
-//! File writes are dispatched to the isolated write role through the server;
-//! list/show/history/delete speak Iceberg REST directly. The CLI embeds no
-//! query or write engine. Results render as
-//! `--output json` (the stable shape the skill parses) or a human summary.
+//! Every verb speaks the tenant's Iceberg REST catalog directly: create/append go through `verglas_sdk::ingest` (#145), which
+//! writes Parquet data files straight to object storage with catalog-vended
+//! credentials, and list/show/history/delete speak Iceberg REST directly. The
+//! CLI embeds no query or write engine of its own — the SDK owns the whole
+//! write path. Results render as `--output json` (the stable shape the skill
+//! parses) or a human summary.
 
 use std::error::Error;
 
 use crate::cli::{TableCommand, TableDeleteArgs};
-use verglas_sdk::CompactionReport;
 use verglas_sdk::report::{
     AppendReport, CreateReport, FieldInfo, HistoryReport, ListReport, ShowReport,
 };
@@ -16,69 +17,46 @@ use verglas_sdk::report::{
 /// Dispatches a `verglas table` subcommand.
 pub async fn run(
     command: TableCommand,
-    server_endpoint: &str,
     token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    // Catalog metadata verbs bypass the server; execution and operational verbs
-    // use its thin transport.
     match command {
         TableCommand::Delete(args) => return run_delete(args, token, json).await,
         TableCommand::List(args) => {
             let report = crate::commands::catalog::CatalogClient::from_agent_config(token)?
                 .list_tables(args.namespace.as_deref())
                 .await?;
-            return emit(&report, json, render_list);
+            emit(&report, json, render_list)
         }
         TableCommand::Show(args) => {
             let report = crate::commands::catalog::CatalogClient::from_agent_config(token)?
                 .show_table(&args.table)
                 .await?;
-            return emit(&report, json, render_show);
+            emit(&report, json, render_show)
         }
         TableCommand::History(args) => {
             let report = crate::commands::catalog::CatalogClient::from_agent_config(token)?
                 .table_history(&args.table)
                 .await?;
-            return emit(&report, json, render_history);
+            emit(&report, json, render_history)
         }
-        TableCommand::Metrics => {
-            return crate::commands::table_metrics::run(server_endpoint, token, json).await;
-        }
-        _ => {}
-    }
-    let client = crate::backend::server(server_endpoint, token)?;
-    match command {
         TableCommand::Create(args) => {
-            let report: CreateReport = client
-                .ingest(
-                    &args.table,
-                    &args.source,
-                    "create",
-                    args.partition_by.as_deref(),
-                )
-                .await?;
+            let catalog = crate::commands::catalog::CatalogClient::from_agent_config(token)?;
+            let report: CreateReport = verglas_sdk::ingest::create_table(
+                &catalog.ingest_config(),
+                &args.table,
+                &args.source,
+                args.partition_by.as_deref(),
+            )
+            .await?;
             emit(&report, json, render_create)
         }
         TableCommand::Append(args) => {
-            let report: AppendReport = client
-                .ingest(&args.table, &args.source, "append", None)
-                .await?;
+            let catalog = crate::commands::catalog::CatalogClient::from_agent_config(token)?;
+            let report: AppendReport =
+                verglas_sdk::ingest::append(&catalog.ingest_config(), &args.table, &args.source)
+                    .await?;
             emit(&report, json, render_append)
-        }
-        TableCommand::Compact => {
-            let report: CompactionReport = client
-                .post_json("/admin/compact", &serde_json::json!({}))
-                .await?;
-            emit(&report, json, render_compact)
-        }
-        // Handled above, before the data-plane client was built.
-        TableCommand::Delete(_)
-        | TableCommand::List(_)
-        | TableCommand::Show(_)
-        | TableCommand::History(_)
-        | TableCommand::Metrics => {
-            unreachable!("catalog metadata and metrics are dispatched before the server client")
         }
     }
 }
@@ -219,51 +197,6 @@ fn render_show(report: &ShowReport) {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "(empty)".to_owned())
     );
-}
-
-/// Human summary for `compact`.
-fn render_compact(report: &CompactionReport) {
-    let budget = if report.budget_bounded {
-        "; budget-bounded, run again to continue"
-    } else {
-        ""
-    };
-    let history = if report.snapshots_expired > 0 || report.orphan_files_deleted > 0 {
-        format!(
-            "; expired {} old snapshot(s), reclaimed {} file(s)",
-            report.snapshots_expired, report.orphan_files_deleted
-        )
-    } else {
-        String::new()
-    };
-    println!(
-        "scanned {} table(s), committed {} group(s), {} undersized file(s) remain{budget}{history}",
-        report.tables_scanned, report.groups_committed, report.undersized_remaining
-    );
-    for table in &report.compacted {
-        let snapshot = table
-            .snapshot_id
-            .map(|s| format!("; snapshot {s}"))
-            .unwrap_or_default();
-        let table_history = if table.snapshots_expired > 0 || table.orphan_files_deleted > 0 {
-            format!(
-                "; expired {} snapshot(s), reclaimed {} file(s)",
-                table.snapshots_expired, table.orphan_files_deleted
-            )
-        } else {
-            String::new()
-        };
-        println!(
-            "  {}: {} group(s), {} file(s) -> {} file(s){snapshot}{table_history}",
-            table.table, table.groups_committed, table.input_data_files, table.output_data_files
-        );
-    }
-    for (table, message) in &report.failures {
-        println!("  {table}: failed — {message}");
-    }
-    if report.compacted.is_empty() && report.failures.is_empty() {
-        println!("  (nothing to compact)");
-    }
 }
 
 /// Human summary for `history`.

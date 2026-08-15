@@ -32,11 +32,7 @@ pub enum PrincipalKind {
     JobRun,
     /// A named role assumed for one bounded operation.
     Role,
-    /// A composable vessel definition or deployment.
-    Vessel,
-    /// An application component inside a vessel.
-    Application,
-    /// An integration component inside a vessel.
+    /// A reflected external API integration actor.
     Integration,
 }
 
@@ -62,11 +58,11 @@ pub enum ResourceKind {
     Tenant,
     /// A project that groups databases and grants.
     Project,
-    /// A logical lakehouse or Postgres database.
+    /// A logical lakehouse database.
     Database,
     /// A lakehouse warehouse beneath a database.
     Warehouse,
-    /// A lakehouse namespace or Postgres schema.
+    /// A lakehouse namespace.
     Namespace,
     /// A tabular data object.
     Table,
@@ -92,10 +88,6 @@ pub enum ResourceKind {
     Role,
     /// A durable job definition.
     Job,
-    /// A composable vessel.
-    Vessel,
-    /// A callable or interactive application.
-    Application,
     /// A model or model-provider capability.
     Model,
     /// A durable event queue.

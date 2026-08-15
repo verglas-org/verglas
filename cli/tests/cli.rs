@@ -17,26 +17,36 @@ use std::process::Command;
 
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
 /// source/MV/sink platform primitives were removed with the worker refocus; the
-/// local `workers` command is the surviving deployment surface.
-const SURVIVING_COMMANDS: [&str; 11] = [
+/// local `workers` command is the surviving deployment surface. `graph` and
+/// `vector` (#144) wrap the S3 semantic listener's property-graph and vector
+/// index REST-JSON surfaces.
+const SURVIVING_COMMANDS: [&str; 10] = [
     "drain",
     "status",
     "table",
     "dashboard",
     "workers",
-    "kv",
-    "vessel",
-    "db",
-    "queue",
+    "lakehouse",
     "secret",
     "token",
+    "graph",
+    "vector",
 ];
 
-/// Commands removed from the CLI: `--help` must not name them.
-const REMOVED_COMMANDS: [&str; 29] = [
-    "graph",
+/// Commands removed from the CLI: `--help` must not name them. `graph` (top-
+/// level `verglas graph`) came back with #144 as the property-graph command
+/// family, so it moved out of this list into `SURVIVING_COMMANDS`; the
+/// standalone `query`/`index` verbs it replaced are still gone.
+const REMOVED_COMMANDS: [&str; 32] = [
     "query",
     "index",
+    // MVP surface prune (#146): only Lakekeeper-managed lakehouses and the
+    // workers runtime survive. `db` became `lakehouse`; vessel and queue
+    // provisioning are gone.
+    "db",
+    "vessel",
+    "queue",
+    "kv",
     "version",
     "analyze",
     "deploy",
@@ -98,7 +108,7 @@ fn short_version_flag_prints_cli_version() {
 }
 
 #[test]
-fn dashboard_help_uses_the_compose_configuration_surface() {
+fn dashboard_help_is_cloud_json_render() {
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .args(["dashboard", "--help"])
         .output()
@@ -106,12 +116,12 @@ fn dashboard_help_uses_the_compose_configuration_surface() {
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("utf8");
     assert!(
-        stdout.contains("Compose analytics profile"),
-        "dashboard help must point self-hosted users at Compose: {stdout}"
+        stdout.contains("json-render") || stdout.contains("Verglas Cloud"),
+        "dashboard help must describe Cloud json-render: {stdout}"
     );
     assert!(
-        !stdout.contains("[analytics.rill]"),
-        "dashboard help must not advertise removed server TOML: {stdout}"
+        !stdout.contains("Rill") && !stdout.contains("Compose analytics"),
+        "dashboard help must not mention Rill: {stdout}"
     );
 }
 
@@ -161,6 +171,34 @@ fn memory_and_skills_subcommands_are_unknown() {
             args.join(" ")
         );
     }
+}
+
+#[test]
+fn server_endpoint_flag_is_gone() {
+    let help = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .arg("--help")
+        .output()
+        .expect("binary runs");
+    assert!(help.status.success());
+    let stdout = String::from_utf8(help.stdout).expect("utf8");
+    assert!(
+        !stdout.contains("--server-endpoint"),
+        "cloud is the default; the flag must not appear: {stdout}"
+    );
+
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["--server-endpoint", "http://127.0.0.1:8334", "status"])
+        .output()
+        .expect("binary runs");
+    assert!(
+        !out.status.success(),
+        "--server-endpoint must be an unknown flag"
+    );
+    let stderr = String::from_utf8(out.stderr).expect("utf8");
+    assert!(
+        stderr.contains("unexpected argument") || stderr.contains("unrecognized"),
+        "--server-endpoint must be rejected: {stderr}"
+    );
 }
 
 #[test]
@@ -245,21 +283,19 @@ fn help_lists_exactly_the_surviving_commands() {
 }
 
 #[test]
-fn vessel_help_lists_the_local_http_service_contract() {
+fn lakehouse_help_lists_the_create_verb() {
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["vessel", "--help"])
+        .args(["lakehouse", "--help"])
         .output()
         .expect("binary runs");
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("utf8");
-    for command in ["add", "list", "get", "remove", "curl", "query"] {
-        assert!(
-            stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with(command)),
-            "vessel help must list {command}: {stdout}"
-        );
-    }
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("create")),
+        "lakehouse help must list create: {stdout}"
+    );
 }
 
 #[test]
@@ -303,10 +339,10 @@ fn tables_plural_is_an_unknown_command() {
 }
 
 #[test]
-fn table_help_no_longer_lists_index() {
-    // `verglas table --help` must not list a retired `index` verb, but must
-    // still list the surviving `table` verbs including the new `delete` and
-    // `metrics`.
+fn table_help_lists_exactly_the_mvp_verbs() {
+    // `verglas table --help` must not list retired verbs (`index`; `metrics`
+    // and `compact` left with the MVP prune, #146) and must list every
+    // surviving table verb.
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .args(["table", "--help"])
         .output()
@@ -314,13 +350,13 @@ fn table_help_no_longer_lists_index() {
     assert!(out.status.success());
     let stdout = String::from_utf8(out.stdout).expect("utf8");
     let verbs = help_command_names(&stdout);
-    assert!(
-        !verbs.iter().any(|v| v == "index"),
-        "`verglas table --help` must not list `index`: {verbs:?}"
-    );
-    for verb in [
-        "create", "append", "list", "show", "history", "delete", "metrics",
-    ] {
+    for retired in ["index", "metrics", "compact"] {
+        assert!(
+            !verbs.iter().any(|v| v == retired),
+            "`verglas table --help` must not list `{retired}`: {verbs:?}"
+        );
+    }
+    for verb in ["create", "append", "list", "show", "history", "delete"] {
         assert!(
             verbs.iter().any(|v| v == verb),
             "`verglas table --help` must list `{verb}`: {verbs:?}"
@@ -339,6 +375,65 @@ fn table_index_is_an_unknown_command() {
         !out.status.success(),
         "`verglas table index` must fail as an unknown subcommand"
     );
+}
+
+#[test]
+fn graph_help_lists_every_verb() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["graph", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    for command in [
+        "create",
+        "add-node",
+        "add-edge",
+        "neighbors",
+        "index",
+        "show",
+        "delete",
+        "list",
+        "k-hop",
+        "paths",
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "graph help must list {command}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn vector_help_lists_every_verb() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["vector", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    for command in [
+        "create-bucket",
+        "create-index",
+        "put",
+        "query",
+        "list",
+        "get",
+        "delete",
+        "delete-index",
+        "delete-bucket",
+        "list-buckets",
+        "list-indexes",
+    ] {
+        assert!(
+            stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with(command)),
+            "vector help must list {command}: {stdout}"
+        );
+    }
 }
 
 #[test]

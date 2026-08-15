@@ -333,12 +333,12 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   two MV transforms, two sink deliveries). session_start.sh now drains the
   next_turn inbox and folds the notices into the injected context.
 
-- dashboard sink (Rill): `sink create --delivery dashboard` is now accepted (the
+- dashboard sink (removed analytics runtime): `sink create --delivery dashboard` is now accepted (the
   validation error lists spawn, next_turn, dashboard). For a dashboard sink the
   `--input` is the target Iceberg table the dashboard follows. `sink run` on a
   dashboard sink takes a new path: it resolves the daemon's S3 and catalog
-  endpoints, scaffolds the sink's Rill project under `<spool>/../dashboards/<sink>`,
-  and triggers Rill's refresh — a missing `rill` binary is a printed note, not a
+  endpoints, scaffolds the sink's dashboard project under `<spool>/../dashboards/<sink>`,
+  and triggers the dashboard refresh — a missing dashboard binary is a printed note, not a
   failure. `sink list` already prints the delivery column, so `dashboard` flows
   through unchanged. Help text documents the new delivery with no issue numbers.
 - Security fix (/admin/access credential exposure): Updated the `--secret-access-key`
@@ -735,7 +735,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #11: Added `webhook` and `data_change` to the portable worker manifest and projected them into both the local registry and cloud trigger configuration. Operators can now create every bounded scheduler trigger through `verglas workers create --file` instead of hand-writing REST payloads.
 - #11: Replaced the portable data-change manifest with a generic CloudEvent subscription over exact type and optional source and subject. Local and cloud projections now carry the same event filter contract.
 - #11: Let one portable worker declaration contain cron, HTTP, and CloudEvent triggers while keeping manual dispatch implicit. Worker files can now be bundled with relative `@file:` references, and the CLI rejects the removed singular-trigger manifest instead of preserving a compatibility path.
-- #16: Added `verglas dashboard create`, `list`, `show`, and `delete` as pure-client commands against the on-prem REST API. The commands print the generated Rill Explore URL and never access Rill or its project files directly.
+- #16: Added `verglas dashboard create`, `list`, `show`, and `delete` as pure-client commands against the on-prem REST API. The commands print the generated dashboard URL and never access the dashboard runtime or its project files directly.
 - #18: Reorganized the worker example around a reusable `market-data-ingest` definition and kept SPY only as an input symbol. The manifest tests now use the same neutral worker and callback names shown throughout the rewritten trigger guides.
 - #18: Added documentation regression tests that keep the complete Compose contract and every displayed worker file synchronized with the runnable repository examples. CLI help now points dashboard users to the Compose analytics profile instead of the removed server TOML configuration.
 - #29: Added direct `verglas kv set` and `verglas kv get` commands against the server's built-in KV engine. Set accepts an optional TTL and both commands use the existing endpoint and bearer-token environment without KV configuration.
@@ -777,3 +777,43 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #135: Corrected the self-hosted catalog guidance to describe the cloud-owned
   `serve-craft` service and CRaft authority. The regression rejects documentation
   that puts managed Lakekeeper catalog state back into PostgreSQL.
+- #144: Added `verglas graph` and `verglas vector` command families
+  (`cli/src/commands/graph.rs`, `vector.rs`, `semantic.rs`) wrapping the
+  pre-signed `verglas_sdk::semantic` clients over the S3 semantic listener.
+  The CLI performs no request signing or shaping itself; it only builds typed
+  DTOs from parsed CLI/stdin JSON and renders the SigV4-signed response.
+  Credentials come from `VERGLAS_S3_ACCESS_KEY_ID`/`VERGLAS_S3_SECRET_ACCESS_KEY`/
+  `VERGLAS_S3_REGION` env vars only (never CLI flags); the endpoint is
+  `--s3-endpoint`/`VERGLAS_S3_ENDPOINT`, defaulting to `http://127.0.0.1:8333`.
+  Tests were written first (`cli/tests/graph_vector_semantic.rs`, a mock-listener
+  axum server asserting every verb signs and POSTs the correct operation) and
+  confirmed failing against the pre-implementation binary before the command
+  families existed.
+- #145: `table create`/`table append` no longer go through the server's
+  file-ingest route (deleted — see the SDK worklog). Both verbs now call
+  `verglas_sdk::ingest::create_table`/`append`, which resolve the catalog
+  uri/warehouse/bearer from `CatalogClient::from_agent_config` (the same
+  `[catalog]` config `table delete` already reads) and write straight to the
+  tenant's Iceberg REST catalog and object storage. `cli/src/commands/table.rs`
+  never names an `iceberg::` type directly — it passes table idents and file
+  paths as plain strings and gets back the same `CreateReport`/`AppendReport`
+  shapes as before. Only `table compact` still talks to the server.
+
+- #146: MVP surface prune. `verglas db` is now `verglas lakehouse` and creates
+  only Lakekeeper-managed lakehouses; the Postgres database type, `db token`,
+  `verglas vessel`, and the `verglas queue` provisioning verbs are deleted with
+  their command modules and tests. Only `verglas workers` survives from the
+  runtime group.
+
+- #146 (addendum): `verglas kv` and `verglas table metrics`/`compact` are out
+  of MVP scope and removed — the node serves no /v1/kv or metering routes, so
+  the verbs were dead against every reachable server. All product and doc
+  mentions of the removed analytics runtime were scrubbed from the branch;
+  help-surface tests now pin its absence.
+
+- #148: Added `verglas graph precedents <name> --query <text> [--limit N]
+  [--entity <id>]...`, wrapping the new `VerglasGraphsClient::query_precedents`
+  SDK call. It signs nothing itself and never touches `iceberg::` directly, in
+  line with the other graph verbs. A mock-listener test in
+  `cli/tests/graph_vector_semantic.rs` asserts the CLI posts a signed
+  `QueryPrecedents` request and renders the ranked decision output.
