@@ -31,9 +31,19 @@ Verglas distributions can install the same package with:
 verglas skill install rime
 ```
 
-The package includes native host integrations for Pi, Codex, and Claude. Pi
-loads the extension and skill from `package.json`; Codex uses the packaged Luna
-worker declaration; Claude uses the packaged Sonnet worktree agent.
+The package includes native host integrations for Pi, Codex, Claude, and Cursor.
+Pi loads the extension and skill from `package.json`; Codex uses the packaged
+Luna worker; Claude uses the packaged Sonnet worktree agent; Cursor uses the
+`rime-worker` Composer subagent, two-loop hooks, and one Verglas graph per project.
+
+The distributed plugin is named `verglas` in every host manifest
+(`.claude-plugin`, `.codex-plugin`, `.cursor-plugin`); the RIME skill and its
+`rime-worker` agent keep their own names inside it, so Claude Code dispatches
+them as `verglas:rime` and `verglas:rime-worker`. The package also ships a
+`lakehouse` skill for the `verglas table`/`graph`/`index`/`query` CLI and an
+`evidence` skill for attaching query-reproducible proof to a graph node; RIME
+workers use `evidence` to back their evaluator claims instead of asserting
+success unsupported.
 
 ## Library
 

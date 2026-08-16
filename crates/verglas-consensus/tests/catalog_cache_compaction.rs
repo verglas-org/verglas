@@ -22,6 +22,7 @@ struct RejectRelease;
 /// Store that exposes whether physical reclamation blocks Raft state application.
 struct BlockingRelease {
     entered: Arc<Notify>,
+    continue_release: Arc<Notify>,
 }
 
 #[async_trait::async_trait]
@@ -105,7 +106,7 @@ impl PayloadStore for BlockingRelease {
 
     async fn release(&self, _release: ReleaseRequest<'_>) -> Result<(), PayloadError> {
         self.entered.notify_one();
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        self.continue_release.notified().await;
         Ok(())
     }
 }
@@ -477,9 +478,11 @@ async fn wal_payload_reclamation_does_not_hold_the_raft_state_lock()
     let root = TempDir::new()?;
     let mut state = PersistentStateMachine::open(root.path().join("state.json")).await?;
     let entered = Arc::new(Notify::new());
+    let continue_release = Arc::new(Notify::new());
     state
         .attach_payload_store(Arc::new(BlockingRelease {
             entered: Arc::clone(&entered),
+            continue_release: Arc::clone(&continue_release),
         }))
         .await?;
     let certificate =
@@ -581,10 +584,11 @@ async fn wal_payload_reclamation_does_not_hold_the_raft_state_lock()
         certificate,
     )?;
     let applied = tokio::time::timeout(
-        Duration::from_millis(100),
+        Duration::from_secs(2),
         state.apply(vec![entry(5, RaftCommand::Commit(lease))]),
     )
     .await;
+    continue_release.notify_one();
     releasing.await??;
     applied.expect("Raft apply must not wait for remote payload deletion")?;
     Ok(())

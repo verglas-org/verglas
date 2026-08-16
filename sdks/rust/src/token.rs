@@ -100,39 +100,3 @@ pub struct IssuedAccessToken {
     /// Non-secret metadata describing the issued token.
     pub summary: AccessTokenSummary,
 }
-
-/// Request to exchange an authorized access credential for a database-specific Neon token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DatabaseConnectionTokenRequest {
-    /// Stable Verglas Postgres database identifier.
-    pub database_id: String,
-    /// Optional lifetime in seconds. The access service bounds it to its Neon policy.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_in_seconds: Option<u64>,
-}
-
-impl DatabaseConnectionTokenRequest {
-    /// Starts a database-token exchange using the service's default lifetime.
-    pub fn new(database_id: impl Into<String>) -> Self {
-        Self {
-            database_id: database_id.into(),
-            expires_in_seconds: None,
-        }
-    }
-
-    /// Requests a bounded token lifetime in seconds.
-    #[must_use]
-    pub fn with_expiration_seconds(mut self, expires_in_seconds: u64) -> Self {
-        self.expires_in_seconds = Some(expires_in_seconds);
-        self
-    }
-}
-
-/// One-time PostgreSQL password credential accepted by the Verglas Neon proxy.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DatabaseConnectionToken {
-    /// Plaintext short-lived JWT passed as `PGPASSWORD`. Never log or persist outside owner-only storage.
-    pub token: String,
-    /// Unix timestamp after which the Neon proxy rejects the credential.
-    pub expires_at: u64,
-}

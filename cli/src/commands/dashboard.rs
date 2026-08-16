@@ -1,4 +1,8 @@
-//! `verglas dashboard` commands for the optional on-prem Rill integration.
+//! `verglas dashboard` — Verglas Cloud json-render dashboards.
+//!
+//! Every verb targets Verglas Cloud at `/v1/dashboards`. Specs are uploaded with
+//! `create --file`; static row arrays in element props or state are rejected by
+//! the control plane and by local validation in `dashboard_spec`.
 
 use std::error::Error;
 use std::io::{self, Write};
@@ -7,15 +11,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::cli::DashboardCommand;
 
-/// Dashboard information returned by `verglas-rest`.
+/// Dashboard information returned by Verglas Cloud.
 #[derive(Debug, Deserialize, Serialize)]
 struct DashboardInfo {
     name: String,
-    table: String,
+    #[serde(default)]
+    title: Option<String>,
     url: String,
 }
 
-/// Dashboard list returned by `verglas-rest`.
+/// Dashboard list returned by Verglas Cloud.
 #[derive(Debug, Deserialize, Serialize)]
 struct DashboardList {
     dashboards: Vec<DashboardInfo>,
@@ -27,46 +32,55 @@ struct DashboardDeleted {
     deleted: String,
 }
 
-/// Runs one dashboard command against the selected server endpoint.
+/// Runs one dashboard command against Verglas Cloud.
 pub async fn run(
     command: DashboardCommand,
     endpoint: &str,
     token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
+    crate::backend::require_cloud_dashboards(endpoint)?;
     let client = crate::backend::server(endpoint, token)?;
     match command {
         DashboardCommand::Create(args) => {
-            let mut body = serde_json::json!({"table": args.table});
-            if let Some(name) = args.name {
-                body["name"] = serde_json::Value::String(name);
-            }
+            let manifest = crate::dashboard_spec::DashboardManifest::from_file(&args.file)?;
+            let body = manifest.to_create_body(args.tenant_id.as_deref());
             let info: DashboardInfo = client.post_json("/v1/dashboards", &body).await?;
             emit_info(&info, json)?;
         }
-        DashboardCommand::List => {
-            let list: DashboardList = client.get("/v1/dashboards").await?;
+        DashboardCommand::List(args) => {
+            let path = match &args.tenant_id {
+                Some(tenant_id) => format!("/v1/dashboards?tenant_id={tenant_id}"),
+                None => "/v1/dashboards".to_owned(),
+            };
+            let list: DashboardList = client.get(&path).await?;
             crate::output::emit(&list, json, |list| {
                 let mut stdout = io::stdout();
-                writeln!(stdout, "NAME\tTABLE\tURL")?;
+                writeln!(stdout, "NAME\tURL")?;
                 for dashboard in &list.dashboards {
-                    writeln!(
-                        stdout,
-                        "{}\t{}\t{}",
-                        dashboard.name, dashboard.table, dashboard.url
-                    )?;
+                    writeln!(stdout, "{}\t{}", dashboard.name, dashboard.url)?;
                 }
                 Ok(())
             })?;
         }
-        DashboardCommand::Show(args) => {
-            let info: DashboardInfo = client.get(&format!("/v1/dashboards/{}", args.name)).await?;
+        DashboardCommand::Get(args) => {
+            let path = match &args.tenant_id {
+                Some(tenant_id) => {
+                    format!("/v1/dashboards/{}?tenant_id={tenant_id}", args.name)
+                }
+                None => format!("/v1/dashboards/{}", args.name),
+            };
+            let info: DashboardInfo = client.get(&path).await?;
             emit_info(&info, json)?;
         }
         DashboardCommand::Delete(args) => {
-            let deleted: DashboardDeleted = client
-                .delete(&format!("/v1/dashboards/{}", args.name))
-                .await?;
+            let path = match &args.tenant_id {
+                Some(tenant_id) => {
+                    format!("/v1/dashboards/{}?tenant_id={tenant_id}", args.name)
+                }
+                None => format!("/v1/dashboards/{}", args.name),
+            };
+            let deleted: DashboardDeleted = client.delete(&path).await?;
             crate::output::emit(&deleted, json, |deleted| {
                 writeln!(io::stdout(), "deleted dashboard {}", deleted.deleted)?;
                 Ok(())
@@ -81,7 +95,9 @@ fn emit_info(info: &DashboardInfo, json: bool) -> Result<(), crate::output::Outp
     crate::output::emit(info, json, |info| {
         let mut stdout = io::stdout();
         writeln!(stdout, "dashboard: {}", info.name)?;
-        writeln!(stdout, "table:     {}", info.table)?;
+        if let Some(title) = &info.title {
+            writeln!(stdout, "title:     {title}")?;
+        }
         writeln!(stdout, "url:       {}", info.url)?;
         Ok(())
     })

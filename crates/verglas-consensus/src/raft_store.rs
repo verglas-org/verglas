@@ -1573,17 +1573,24 @@ mod tests {
             .entries_persistence
             .enqueue(move || {
                 let _ = persistence_started.send(());
-                std::thread::sleep(Duration::from_millis(200));
+                // The vote below must finish while this frame is still held;
+                // the sleep is 2x the vote's timeout so a slow CI fsync cannot
+                // fake a bypass, and the timeout is generous enough that the
+                // vote's own fsync never trips it on a loaded runner.
+                std::thread::sleep(Duration::from_millis(1000));
                 Ok(())
             })
             .await
             .expect("queue delayed entry frame");
         started.await.expect("entry persistence started");
 
-        tokio::time::timeout(Duration::from_millis(50), store.save_vote(&Vote::new(2, 2)))
-            .await
-            .expect("vote metadata bypasses the delayed entry actor")
-            .expect("durable vote");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            store.save_vote(&Vote::new(2, 2)),
+        )
+        .await
+        .expect("vote metadata bypasses the delayed entry actor")
+        .expect("durable vote");
         await_persisted(delayed)
             .await
             .expect("delayed entry frame completes");

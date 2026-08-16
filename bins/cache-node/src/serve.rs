@@ -55,6 +55,15 @@ pub(crate) const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
 /// client connects a kernel NBD client here; the export name selects the
 /// device. Overridable with `VERGLAS_BLOCK_ADDR` (same shape as
 /// `VERGLAS_S3_ADDR`). Not a config knob — one fixed port, one listener.
+///
+/// The S3 service is the deliberate exception to "one listener": with the
+/// `VERGLAS_S3_TLS_*` env trio set (see [`crate::tls`]), `VERGLAS_S3_ADDR`'s
+/// plaintext listener stays up for 6PN-internal callers (lakekeeper,
+/// inter-cache peers, gateway probes) *and* a second, TLS-terminated
+/// listener serves the identical axum router on `VERGLAS_S3_TLS_ADDR` for
+/// public-internet callers — replacing fly-proxy's per-request TLS
+/// termination on that hot path. Still not a config knob: both addresses
+/// come from env, never from `config.toml`.
 const BLOCK_PORT: u16 = 8335;
 
 /// The concrete engine the cache node runs: the hybrid cache over the
@@ -347,15 +356,33 @@ pub async fn run(
     let admin_addr = std::env::var("VERGLAS_ADMIN_ADDR")
         .unwrap_or_else(|_| format!("127.0.0.1:{}", config.listen.admin_port));
     let admin_listener = tokio::net::TcpListener::bind(&admin_addr).await?;
+    let admin_bound_addr = admin_listener.local_addr()?;
+    let catalog_gateway_addr = loopback_addr(admin_bound_addr);
     eprintln!(
         "verglas-cache-node {VERSION} admin API listening on http://{}",
-        admin_listener.local_addr()?
+        admin_bound_addr
     );
 
     // Pre-bind the S3 listener too, so its port is owned before serving.
     let s3_addr = std::env::var("VERGLAS_S3_ADDR")
         .unwrap_or_else(|_| format!("0.0.0.0:{}", config.listen.s3_port));
     let s3_listener = tokio::net::TcpListener::bind(&s3_addr).await?;
+    let s3_gateway_addr = loopback_addr(s3_listener.local_addr()?);
+
+    // The optional public S3 TLS listener (#R6-A): all-or-none env trio, no
+    // fallback to plaintext-only serving on a partial or invalid config. See
+    // `crate::tls` for the trust model and the "one fixed port, one
+    // listener" exception this adds.
+    let s3_tls_listener = crate::tls::from_env().await?;
+    match &s3_tls_listener {
+        Some(tls_listener) => eprintln!(
+            "verglas-cache-node {VERSION} TLS S3 listener bound on {} (public passthrough)",
+            tls_listener.local_addr()?
+        ),
+        None => eprintln!(
+            "verglas-cache-node {VERSION} TLS S3 listener disabled: VERGLAS_S3_TLS_* is unset"
+        ),
+    }
 
     // Block-device tier (#382): the durable chunk store + attached-device
     // registry, the block-control route on the admin surface, and the NBD
@@ -481,6 +508,40 @@ pub async fn run(
         stats_slot.clone(),
         metrics_slot.clone(),
     );
+    if let Some(catalog) = config.catalog.as_ref() {
+        let connection = semantic_connection(
+            catalog,
+            catalog_gateway_addr,
+            s3_gateway_addr,
+            &credentials,
+            config.backend.region.as_deref(),
+        );
+        let public_admin_uri = std::env::var("VERGLAS_PUBLIC_ADMIN_URI")
+            .unwrap_or_else(|_| format!("http://{catalog_gateway_addr}"));
+        let public_s3_endpoint = std::env::var("VERGLAS_PUBLIC_S3_ENDPOINT")
+            .unwrap_or_else(|_| format!("http://{s3_gateway_addr}"));
+        let access = verglas_core::admin::LocalAccess {
+            s3_endpoint: public_s3_endpoint,
+            query_uri: public_admin_uri.clone(),
+            catalog_uri: Some(format!(
+                "{}/catalog",
+                public_admin_uri.trim_end_matches('/')
+            )),
+            warehouse: catalog.warehouse.clone(),
+            region: config
+                .backend
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_owned()),
+            bucket: config.backend.bucket.clone(),
+            access_key_id: Some(credentials.0.clone()),
+        };
+        admin_app = admin_app
+            .merge(admin::access_router(access))
+            .merge(crate::tables_api::router(
+                crate::tables_api::TableState::new(connection),
+            ));
+    }
     let authoritative_stop = safekeeper_args
         .as_ref()
         .map(|(ring, _, consensus, archives)| {
@@ -568,6 +629,13 @@ pub async fn run(
                     .store_for(DEFAULT_STORAGE_BINDING_ID, &request.bucket)
                     .map_err(|error| error.to_string())?;
                 let group = format!("timeline/{}/{}", request.tenant_id, request.timeline_id);
+                if consensus
+                    .resolve_committed_wal_binding(&group, &request.bucket)
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    return Ok(());
+                }
                 let digest = Sha256::digest(
                     format!(
                         "wal-archive-binding\0{}\0{}\0{}",
@@ -702,6 +770,8 @@ pub async fn run(
         serve_s3(S3Serve {
             config,
             s3_listener,
+            s3_tls_listener,
+            catalog_gateway_addr,
             credentials,
             engine,
             registry,
@@ -789,6 +859,13 @@ fn spawn_origin_probe(registry: Arc<BackendStore>) -> tokio::task::JoinHandle<()
 struct S3Serve<'a> {
     config: &'a Config,
     s3_listener: tokio::net::TcpListener,
+    /// The TLS S3 listener, present only when the `VERGLAS_S3_TLS_*` env
+    /// trio was set at boot. Serves the identical router built below.
+    s3_tls_listener: Option<crate::tls::TlsListener>,
+    /// Loopback address of this process's catalog gateway. Semantic operations
+    /// must use it so the cache node, rather than a client library, owns bearer
+    /// and SigV4 catalog authentication.
+    catalog_gateway_addr: std::net::SocketAddr,
     credentials: (String, String),
     engine: CacheEngine,
     registry: Arc<BackendStore>,
@@ -805,6 +882,8 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let S3Serve {
         config,
         s3_listener,
+        s3_tls_listener,
+        catalog_gateway_addr,
         credentials,
         engine,
         registry,
@@ -819,22 +898,14 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let semantic_api: Option<Arc<dyn verglas_s3::semantic::SemanticApi>> =
         match config.catalog.as_ref() {
             Some(catalog) => {
-                let local_addr = s3_listener.local_addr()?;
-                let connection = verglas_iceberg::Connection {
-                    catalog_uri: catalog.uri.clone(),
-                    token: catalog
-                        .resolve_bearer_token()
-                        .map_err(std::io::Error::other)?,
-                    warehouse: catalog.warehouse.clone(),
-                    s3_endpoint: Some(format!("http://{local_addr}")),
-                    region: config
-                        .backend
-                        .region
-                        .clone()
-                        .unwrap_or_else(|| "us-east-1".to_owned()),
-                    access_key_id: Some(credentials.0.clone()),
-                    secret_access_key: Some(credentials.1.clone()),
-                };
+                let local_addr = loopback_addr(s3_listener.local_addr()?);
+                let connection = semantic_connection(
+                    catalog,
+                    catalog_gateway_addr,
+                    local_addr,
+                    &credentials,
+                    config.backend.region.as_deref(),
+                );
                 Some(Arc::new(
                     verglas_s3::semantic::IcebergCatalogSemanticStore::new(
                         verglas_iceberg::catalog::open_catalog(&connection).await?,
@@ -843,6 +914,19 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             }
             None => None,
         };
+    // A successful vector/graph mutation optionally publishes a fire-and-
+    // forget commit event to the control-plane queue ingress; this is a
+    // best-effort notification side channel wired with the node's own
+    // configured credential and tenant id, never the caller's. See the
+    // trust-model note on `wrap_with_event_publisher` for what this can and
+    // cannot be relied on for.
+    let semantic_api =
+        semantic_api.map(
+            |api| match verglas_s3::semantic::EventPublishConfig::from_env() {
+                Some(config) => verglas_s3::semantic::wrap_with_event_publisher(api, config),
+                None => api,
+            },
+        );
     // Listings always pass straight through to the origin (never cached), so the
     // lister is wired to the backend registry directly, not the engine.
     let lister: Arc<dyn verglas_core::list::ObjectList> =
@@ -927,15 +1011,98 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
         None => app,
     };
     let app = admin::track_http(app, activity, ActivityPlane::Http);
+    // SigV4 verification canonicalizes the `host` header the CLIENT signed,
+    // which two legitimate hops rewrite or drop:
+    //  - The Verglas Cloud edge router proxies `<slug>.s3.verglas.dev` to this
+    //    node's Fly origin. A Cloudflare Worker cannot preserve a cross-zone
+    //    Host header, so it forwards the signed one as `x-forwarded-host`.
+    //    Trusting it is sound: a forged value still has to match a signature
+    //    only the tenant's secret key can produce.
+    //  - HTTP/2 requests carry the authority in the `:authority` pseudo-header
+    //    and omit Host entirely (h2 clients, and fly-proxy forwarding h2).
+    // Restore the signed host so both paths verify identically to direct
+    // HTTP/1.1.
+    let app = app.layer(axum::middleware::from_fn(
+        |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+            if let Some(forwarded) = request.headers().get("x-forwarded-host").cloned() {
+                request
+                    .headers_mut()
+                    .insert(axum::http::header::HOST, forwarded);
+            } else if !request.headers().contains_key(axum::http::header::HOST)
+                && let Some(authority) = request.uri().authority().cloned()
+                && let Ok(value) = axum::http::HeaderValue::from_str(authority.as_str())
+            {
+                request
+                    .headers_mut()
+                    .insert(axum::http::header::HOST, value);
+            }
+            next.run(request).await
+        },
+    ));
 
     let local_addr = s3_listener.local_addr()?;
     eprintln!(
         "verglas-cache-node {VERSION} serving S3 on http://{local_addr} (backend bucket set: {bucket_set})"
     );
-    axum::serve(s3_listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+
+    // Both listeners serve the SAME router. With no TLS trio configured this
+    // is exactly the prior single-listener behavior; with it configured, the
+    // TLS listener runs concurrently rather than after the plaintext one —
+    // neither blocks the other's connections on the other's traffic.
+    match s3_tls_listener {
+        Some(tls_listener) => {
+            let tls_addr = tls_listener.local_addr()?;
+            eprintln!(
+                "verglas-cache-node {VERSION} serving S3 (TLS) on https://{tls_addr} (public passthrough, backend bucket set: {bucket_set})"
+            );
+            let tls_app = app.clone();
+            let (plaintext_result, tls_result) = tokio::join!(
+                axum::serve(s3_listener, app).with_graceful_shutdown(shutdown_signal()),
+                crate::tls::serve(tls_listener, tls_app, shutdown_signal()),
+            );
+            plaintext_result?;
+            tls_result?;
+        }
+        None => {
+            axum::serve(s3_listener, app)
+                .with_graceful_shutdown(shutdown_signal())
+                .await?;
+        }
+    }
     Ok(())
+}
+
+/// Replaces an unspecified bind address with loopback for internal clients.
+/// A listener commonly binds `0.0.0.0`, but dialing that wildcard address is
+/// invalid; every in-process catalog and semantic request is loopback-only.
+fn loopback_addr(address: std::net::SocketAddr) -> std::net::SocketAddr {
+    if address.ip().is_unspecified() {
+        std::net::SocketAddr::from(([127, 0, 0, 1], address.port()))
+    } else {
+        address
+    }
+}
+
+/// Builds the local semantic Iceberg connection.  The local catalog gateway
+/// owns upstream credential selection and request signing; semantic code never
+/// opens the provider catalog directly.  Data-file IO still enters the local
+/// S3 listener, preserving cache residency for Tables, Graphs, and Vectors.
+fn semantic_connection(
+    catalog: &verglas_core::config::Catalog,
+    catalog_gateway_addr: std::net::SocketAddr,
+    s3_addr: std::net::SocketAddr,
+    credentials: &(String, String),
+    backend_region: Option<&str>,
+) -> verglas_iceberg::Connection {
+    verglas_iceberg::Connection {
+        catalog_uri: format!("http://{catalog_gateway_addr}/catalog"),
+        token: None,
+        warehouse: catalog.warehouse.clone(),
+        s3_endpoint: Some(format!("http://{s3_addr}")),
+        region: backend_region.unwrap_or("us-east-1").to_owned(),
+        access_key_id: Some(credentials.0.clone()),
+        secret_access_key: Some(credentials.1.clone()),
+    }
 }
 
 /// Waits for Ctrl-C before tearing down a listener.
@@ -948,6 +1115,48 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::routing::get;
+
+    /// Semantic operations use the cache process's catalog gateway rather than
+    /// bypassing its provider authentication with a direct upstream request.
+    #[test]
+    fn semantic_connection_uses_loopback_catalog_gateway() {
+        let catalog = verglas_core::config::Catalog {
+            uri: "https://provider.invalid/iceberg".to_owned(),
+            consistency: verglas_core::config::CatalogConsistency::Eventual,
+            poll_interval_secs: 30,
+            include: Vec::new(),
+            exclude: Vec::new(),
+            credentials_file: Some("/private/provider-token".to_owned()),
+            credentials_profile: None,
+            bearer_token: None,
+            sigv4_region: Some("us-west-2".to_owned()),
+            sigv4_signing_name: Some("s3tables".to_owned()),
+            warehouse: Some("arn:aws:s3tables:us-west-2:123:bucket/example".to_owned()),
+        };
+
+        let connection = semantic_connection(
+            &catalog,
+            "127.0.0.1:8334".parse().expect("admin address"),
+            "127.0.0.1:8333".parse().expect("s3 address"),
+            &("VGLOCAL".to_owned(), "local-secret".to_owned()),
+            Some("us-west-2"),
+        );
+
+        assert_eq!(connection.catalog_uri, "http://127.0.0.1:8334/catalog");
+        assert_eq!(connection.token, None);
+        assert_eq!(
+            connection.s3_endpoint.as_deref(),
+            Some("http://127.0.0.1:8333")
+        );
+        assert_eq!(
+            connection.warehouse.as_deref(),
+            Some("arn:aws:s3tables:us-west-2:123:bucket/example")
+        );
+        assert_eq!(
+            loopback_addr("0.0.0.0:8334".parse().expect("wildcard address")),
+            "127.0.0.1:8334".parse().expect("loopback address")
+        );
+    }
     use std::sync::atomic::AtomicUsize;
     use verglas_core::admin::{HEALTHZ_PATH, METRICS_PATH, STATS_PATH};
 

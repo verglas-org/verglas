@@ -35,3 +35,6 @@
 - #67: Removed the legacy client query and graph handles, table ANN-index methods, DTOs, tests, and mock routes. Callers use the typed S3 Vectors and Verglas Graph SigV4 clients for those semantic services while catalog/table support remains separate.
 - #137: Pointed generated API documentation at the checked-in S3 listener contract after deleting the retired generic platform OpenAPI inventory.
 - #137: Canonicalized decoded query fields with AWS percent encoding before SigV4 sorting, including repeated tag keys.
+- Test-slop audit: deleted `test/retired-surface.test.ts` (negatives for
+  endpoints removed in the MVP prune) and a duplicated control-plane test.
+  The compiler and the surviving contract tests cover the live surface.

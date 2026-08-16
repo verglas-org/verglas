@@ -21,32 +21,18 @@ pub struct StoredToken {
     pub token_id: String,
 }
 
-/// One locally retained PostgreSQL connection token and its expiration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StoredDatabaseToken {
-    /// Plaintext Neon JWT accepted through PostgreSQL's password field.
-    pub token: String,
-    /// Unix timestamp after which the token cannot establish a connection.
-    pub expires_at: u64,
-}
-
 /// Serialized credential inventory keyed by normalized access-service endpoint.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct CredentialsFile {
     /// Tokens available to the current OS user.
     tokens: BTreeMap<String, StoredToken>,
-    /// Database connection tokens by access-service endpoint and database identifier.
-    #[serde(default)]
-    database_tokens: BTreeMap<String, BTreeMap<String, StoredDatabaseToken>>,
 }
 
 /// Failures while reading or writing local bearer credentials.
 #[derive(Debug, Error)]
 pub enum CredentialsError {
     /// No configuration directory can be derived from the environment.
-    #[error(
-        "cannot find a local configuration directory; set --credentials-file or VERGLAS_CREDENTIALS_FILE"
-    )]
+    #[error("cannot find a home directory for Verglas credentials")]
     MissingConfigDirectory,
     /// Local credentials could not be read or written safely.
     #[error("credentials file {path}: {source}")]
@@ -118,22 +104,6 @@ pub fn remove_token(path: &Path, endpoint: &str, token_id: &str) -> Result<(), C
         save(path, &credentials)?;
     }
     Ok(())
-}
-
-/// Stores a database-specific PostgreSQL connection token in the owner-only credential file.
-pub fn save_database_token(
-    path: &Path,
-    endpoint: &str,
-    database: &str,
-    token: StoredDatabaseToken,
-) -> Result<(), CredentialsError> {
-    let mut credentials = load(path)?;
-    credentials
-        .database_tokens
-        .entry(normalized_endpoint(endpoint))
-        .or_default()
-        .insert(database.to_owned(), token);
-    save(path, &credentials)
 }
 
 /// Reads a credential inventory, treating a missing file as empty.

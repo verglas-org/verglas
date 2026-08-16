@@ -1,10 +1,7 @@
-//! `verglas workers` — local worker registry against the server admin API.
+//! `verglas workers` — Verglas Cloud worker registry.
 //!
-//! Every verb targets `--server-endpoint` / `VERGLAS_ENDPOINT` at `/v1/workers`.
-//! Create registers a portable spec; list/get read the registry; run dispatches
-//! one manual invocation; follow streams a local process or file into a table;
-//! delete archives the worker. There is no update route on the local registry
-//! beyond re-register (create again) or a state transition (delete archives).
+//! Every verb targets Verglas Cloud at `/v1/workers`. The OSS stack does not
+//! host workers; pointing `VERGLAS_ENDPOINT` at a local server is an error.
 
 use std::error::Error;
 use std::fmt::Write as _;
@@ -12,19 +9,25 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
-use crate::cli::{WorkerCreateArgs, WorkerFollowArgs, WorkerRefArgs, WorkersCommand};
+use crate::cli::{WorkerCreateArgs, WorkerRefArgs, WorkersCommand};
 use crate::worker_spec::WorkerManifest;
 
 /// The placeholder a missing/empty field renders as.
 const DASH: &str = "-";
 
-/// Dispatches `verglas workers` against the local server at `endpoint`.
+/// Dispatches `verglas workers` against Verglas Cloud.
 pub async fn run(
     command: WorkersCommand,
     endpoint: &str,
     token: Option<&str>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
+    if let WorkersCommand::Follow(_) = command {
+        return Err(
+            "verglas workers follow is not supported; create a Cloud worker with `verglas workers create --file`".into(),
+        );
+    }
+    crate::backend::require_cloud_workers(endpoint)?;
     match command {
         WorkersCommand::List => {
             let server = crate::backend::server(endpoint, token)?;
@@ -55,7 +58,7 @@ pub async fn run(
         WorkersCommand::Run(WorkerRefArgs { worker }) => {
             run_now(endpoint, token, &worker, json).await
         }
-        WorkersCommand::Follow(args) => run_follow(endpoint, token, args).await,
+        WorkersCommand::Follow(_) => unreachable!("follow rejected above"),
     }
 }
 
@@ -134,91 +137,6 @@ async fn run_now(
         serde_json::from_str(&body).map_err(|e| format!("failed to decode run response: {e}"))?
     };
     emit_object(&value, json)
-}
-
-/// Registers a throwaway follow worker and streams until Ctrl-C (or the wrapped
-/// command finishes). Torn down on exit unless `--keep` is set.
-async fn run_follow(
-    endpoint: &str,
-    token: Option<&str>,
-    args: WorkerFollowArgs,
-) -> Result<(), Box<dyn Error>> {
-    let name = args
-        .name
-        .unwrap_or_else(|| format!("follow-{}", short_id()));
-    let table = args
-        .table
-        .unwrap_or_else(|| format!("{}.{}", crate::worker_spec::FOLLOW_NAMESPACE, name));
-    let trigger = match &args.file {
-        Some(path) => crate::worker_spec::Trigger::Follow {
-            file: Some(path.to_string_lossy().into_owned()),
-        },
-        None => {
-            if args.command.is_empty() {
-                return Err(
-                    "give a command after `--`, or tail a file with `--file <path>`".into(),
-                );
-            }
-            crate::worker_spec::Trigger::Follow { file: None }
-        }
-    };
-    let manifest = WorkerManifest {
-        spec_version: crate::worker_spec::SPEC_VERSION,
-        name: name.clone(),
-        runtime: crate::worker_spec::WorkerRuntime::Container,
-        entrypoint: args.command,
-        files: std::collections::BTreeMap::from([(
-            "Dockerfile".to_owned(),
-            "FROM alpine:3.22\nWORKDIR /app\n".to_owned(),
-        )]),
-        env: Default::default(),
-        triggers: vec![trigger],
-        target_tables: vec![table.clone()],
-        scratch_target: None,
-        resources: Default::default(),
-    };
-    manifest.validate()?;
-
-    let server = crate::backend::server(endpoint, token)?;
-    let _row: Value = server
-        .post_json("/v1/workers", &manifest.to_local_worker())
-        .await?;
-    println!("following -> {table} (worker {name}); press Ctrl-C to stop");
-
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => println!("stopping {name}"),
-        _ = wait_until_finished(&server, &name) => println!("worker {name} finished"),
-    }
-
-    if args.keep {
-        println!("worker {name} left registered (--keep)");
-    } else {
-        let _: Value = server
-            .put_json(
-                &format!("/v1/workers/{name}/state"),
-                &serde_json::json!({ "state": "archived" }),
-            )
-            .await?;
-        println!("torn down worker {name}");
-    }
-    Ok(())
-}
-
-/// Polls the local worker until it leaves `running`/`created`. Transient read
-/// errors are ignored so a blip never ends the follow early.
-async fn wait_until_finished(server: &verglas_sdk::server::ServerClient, name: &str) {
-    loop {
-        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
-        if let Ok(row) = server.get::<Value>(&format!("/v1/workers/{name}")).await {
-            let state = row
-                .get("state")
-                .and_then(Value::as_str)
-                .unwrap_or("running");
-            if state != "running" && state != "created" {
-                return;
-            }
-        }
-    }
 }
 
 /// A short hex id for throwaway names and run idempotency keys.

@@ -26,10 +26,7 @@ use crate::access::{AccessCheck, AccessDecision, AccessGrant, Principal, Resourc
 use crate::queue::{
     QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt,
 };
-use crate::token::{
-    AccessTokenCreateRequest, AccessTokenSummary, DatabaseConnectionToken,
-    DatabaseConnectionTokenRequest, IssuedAccessToken,
-};
+use crate::token::{AccessTokenCreateRequest, AccessTokenSummary, IssuedAccessToken};
 use crate::worker::ChangeEvent;
 
 /// A reconnecting push-only stream of fenced queue deliveries.
@@ -556,19 +553,6 @@ impl Client {
         .await
     }
 
-    /// Exchanges the current authorized bearer for a short-lived Postgres connection token.
-    pub async fn create_database_connection_token(
-        &self,
-        request: &DatabaseConnectionTokenRequest,
-    ) -> Result<DatabaseConnectionToken, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/database-tokens"))
-                .json(request),
-        )
-        .await
-    }
-
     /// Lists every reflected Integration namespace visible to this principal.
     pub async fn namespaces(&self) -> Result<Vec<NamespaceManifest>, ClientError> {
         let response = Self::require_success(
@@ -810,11 +794,14 @@ impl Database {
             .await
     }
     /// Subscribes to exact table commits through one durable push stream.
+    ///
+    /// `max` limits the number of fenced deliveries that can be in flight.
     pub fn subscribe<I, T>(
         &self,
         group: &str,
         owner: &str,
         tables: I,
+        max: Option<usize>,
         lease_seconds: u64,
     ) -> Result<TableChangeStream, ClientError>
     where
@@ -847,7 +834,7 @@ impl Database {
                     "group": group,
                     "owner": owner,
                     "tables": tables,
-                    "max": 256,
+                    "max": max.unwrap_or(256),
                     "leaseSeconds": lease_seconds,
                 }));
                 let response = match database.client.send(request).await {
@@ -1752,19 +1739,4 @@ fn sdk_type(value: &Value) -> Result<String, ClientError> {
 /// Reads a non-empty environment value.
 fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The default header deadline covers a cold isolated worker launch plus
-    /// catalog planning against a remote warehouse.
-    #[test]
-    fn default_request_timeout_covers_cold_worker_startup() {
-        assert_eq!(
-            ConnectOptions::new("http://127.0.0.1:8334").request_timeout,
-            Duration::from_secs(120)
-        );
-    }
 }

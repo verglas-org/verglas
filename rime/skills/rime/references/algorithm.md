@@ -1,6 +1,6 @@
 # RIME algorithm contract
 
-RIME preserves AIDE's optimization loop:
+RIME is an evolutionary algorithm over code states: candidates are the population, draft/debug/improve are the mutation operators, the frozen evaluator is the fitness function, waves are generations, and git SHAs identify each state's parentage. It preserves AIDE's optimization loop:
 
 1. Select a base solution with a fixed policy.
 2. Ask a coding operator for a new solution using the base and a concise summary of the solution tree.

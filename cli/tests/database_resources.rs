@@ -86,12 +86,9 @@ async fn capture(
 fn run(endpoint: &str, args: &[&str], stdin: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_verglas"));
     child
-        .arg("--server-endpoint")
-        .arg(endpoint)
-        .arg("--access-endpoint")
-        .arg(endpoint)
-        .arg("--token")
-        .arg("local-test-token")
+        .env("VERGLAS_ENDPOINT", endpoint)
+        .env("VERGLAS_ACCESS_ENDPOINT", endpoint)
+        .env("VERGLAS_TOKEN", "local-test-token")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -117,55 +114,29 @@ fn one_request(captured: &Arc<Mutex<Vec<CapturedRequest>>>) -> CapturedRequest {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn creates_managed_lakehouse_and_postgres_database_requests() {
-    for (arguments, expected) in [
-        (
-            vec!["db", "create", "analytics", "--type", "lakehouse"],
-            serde_json::json!({
-                "name": "analytics",
-                "type": "lakehouse",
-                "storage": { "mode": "managed" },
-                "catalog": { "mode": "managed-lakekeeper" }
-            }),
-        ),
-        (
-            vec!["db", "create", "my_test_db", "--type", "postgres"],
-            serde_json::json!({
-                "name": "my_test_db",
-                "type": "postgres",
-                "engine": { "mode": "managed-neon" }
-            }),
-        ),
-    ] {
-        let (endpoint, captured) = spawn_api().await;
-        let output = run(&endpoint, &arguments, None);
-        assert!(
-            output.status.success(),
-            "CLI failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let request = one_request(&captured);
-        assert_eq!(request.path, "/v1/databases");
-        assert_eq!(
-            request.authorization.as_deref(),
-            Some("Bearer local-test-token")
-        );
-        assert_eq!(request.body, expected);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn queue_create_declares_an_explicit_resource() {
+async fn creates_a_managed_lakehouse_request() {
     let (endpoint, captured) = spawn_api().await;
-    let output = run(&endpoint, &["queue", "create", "events"], None);
+    let output = run(&endpoint, &["lakehouse", "create", "analytics"], None);
     assert!(
         output.status.success(),
         "CLI failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let request = one_request(&captured);
-    assert_eq!(request.path, "/v1/queues");
-    assert_eq!(request.body, serde_json::json!({"name": "events"}));
+    assert_eq!(request.path, "/v1/databases");
+    assert_eq!(
+        request.authorization.as_deref(),
+        Some("Bearer local-test-token")
+    );
+    assert_eq!(
+        request.body,
+        serde_json::json!({
+            "name": "analytics",
+            "type": "lakehouse",
+            "storage": { "mode": "managed" },
+            "catalog": { "mode": "managed-lakekeeper" }
+        })
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -173,11 +144,9 @@ async fn creates_byo_lakehouse_requests_without_implicit_rebinding() {
     let cases = [
         (
             vec![
-                "db",
+                "lakehouse",
                 "create",
                 "customer_lake",
-                "--type",
-                "lakehouse",
                 "--data-path",
                 "s3://customer-bucket/team",
             ],
@@ -193,11 +162,9 @@ async fn creates_byo_lakehouse_requests_without_implicit_rebinding() {
         ),
         (
             vec![
-                "db",
+                "lakehouse",
                 "create",
                 "external_lake",
-                "--type",
-                "lakehouse",
                 "--data-path",
                 "s3://customer-bucket/team",
                 "--catalog",
@@ -312,32 +279,15 @@ async fn secret_create_reads_material_from_stdin_and_never_accepts_value_argumen
 }
 
 #[test]
-fn database_options_fail_closed_for_invalid_resource_types() {
+fn lakehouse_options_fail_closed_for_invalid_argument_shapes() {
     for arguments in [
+        // Postgres was removed with the MVP prune (#146); no type selector exists.
+        vec!["lakehouse", "create", "pg", "--type", "postgres"],
+        vec!["lakehouse", "create", "lake", "--warehouse", "orphan"],
         vec![
-            "db",
-            "create",
-            "pg",
-            "--type",
-            "postgres",
-            "--data-path",
-            "s3://bucket/path",
-        ],
-        vec![
-            "db",
+            "lakehouse",
             "create",
             "lake",
-            "--type",
-            "lakehouse",
-            "--warehouse",
-            "orphan",
-        ],
-        vec![
-            "db",
-            "create",
-            "lake",
-            "--type",
-            "lakehouse",
             "--catalog",
             "https://catalog.example",
         ],

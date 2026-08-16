@@ -18,10 +18,10 @@ test("package exposes one portable skill to Pi and plugin hosts", async () => {
   assert.deepEqual(packageJson.pi.skills, ["./skills"]);
   assert.deepEqual(packageJson.pi.extensions, ["./extensions"]);
   assert.match(packageJson.description, /low-cost/i);
-  assert.equal(codex.name, "rime");
+  assert.equal(codex.name, "verglas");
   assert.equal(codex.skills, "./skills/");
   assert.match(codex.interface.longDescription, /low-cost/i);
-  assert.equal(claude.name, "rime");
+  assert.equal(claude.name, "verglas");
 });
 
 test("package supplies executable and native worker integrations", async () => {
@@ -41,6 +41,13 @@ test("package supplies executable and native worker integrations", async () => {
     new URL("agents/rime-worker.md", root),
     "utf8",
   );
+  const cursorWorker = await readFile(
+    new URL("host/cursor/rime-worker.md", root),
+    "utf8",
+  );
+  const cursorPlugin = JSON.parse(
+    await readFile(new URL(".cursor-plugin/plugin.json", root), "utf8"),
+  );
 
   assert.match(piExtension, /registerTool/);
   assert.match(piExtension, /registerCommand\("rime-status"/);
@@ -53,6 +60,11 @@ test("package supplies executable and native worker integrations", async () => {
   assert.match(claudeWorker, /model: sonnet/);
   assert.match(claudeWorker, /low-cost/i);
   assert.match(claudeWorker, /isolation: worktree/);
+  assert.equal(cursorPlugin.name, "verglas");
+  assert.match(cursorWorker, /name: rime-worker/);
+  assert.match(cursorWorker, /model: composer-2\.5-fast/);
+  assert.match(cursorWorker, /low-cost/i);
+  assert.match(cursorWorker, /isolated worktree|assigned workspace/i);
 });
 
 test("skill prefers evaluated exploration without forcing it", async () => {
@@ -82,7 +94,14 @@ test("skill prefers evaluated exploration without forcing it", async () => {
   assert.match(skill, /spawn_agent/);
   assert.match(skill, /rime_parallel/);
   assert.match(skill, /rime-worker/);
+  assert.match(skill, /verglas:rime-worker/);
+  assert.match(skill, /\*\*Cursor:\*\*/);
+  assert.match(skill, /best-of-n-runner|rime-worker/);
+  assert.match(skill, /rime_<project>|project graph/i);
+  assert.match(skill, /sessionStart/);
+  assert.match(skill, /beforeSubmitPrompt/);
   assert.match(skill, /gpt-5\.6-luna/);
+  assert.match(skill, /composer-2\.5-fast/);
   assert.match(skill, /fork_turns.*none/);
   assert.match(skill, /do not pass a model override/i);
   assert.match(skill, /lineage/i);

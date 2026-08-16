@@ -9,7 +9,7 @@
 //! turn-off path — correct, just slower). Nothing assumes local ownership: every
 //! read and write goes through the catalog and the table's FileIO.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use iceberg::{Catalog, TableIdent};
 use verglas_iceberg::parse_table_ident;
@@ -20,7 +20,7 @@ use crate::csr::AdjacencyIndex;
 use crate::error::Result;
 use crate::index::{self, IndexBuildReport};
 use crate::model::{Direction, Edge, Neighbor, Node, Path, Reached, Subgraph};
-use crate::scan::{live_edges, load_edges};
+use crate::scan::{latest_nodes_by_id, live_edges, load_edges, load_nodes};
 use crate::schema::{
     EDGES_TABLE, NODES_TABLE, edge_to_row, edges_schema, node_to_row, nodes_schema,
 };
@@ -74,9 +74,17 @@ impl Graph {
     /// Creates the node and edge tables if they do not already exist. Idempotent:
     /// an existing table is left as is.
     pub async fn ensure_tables(&self) -> Result<()> {
-        self.ensure_table(&self.nodes_ident, &nodes_schema())
+        self.ensure_tables_with_properties(HashMap::new()).await
+    }
+
+    /// Creates both graph tables with the same durable graph metadata.
+    pub async fn ensure_tables_with_properties(
+        &self,
+        properties: HashMap<String, String>,
+    ) -> Result<()> {
+        self.ensure_table(&self.nodes_ident, &nodes_schema(), &properties)
             .await?;
-        self.ensure_table(&self.edges_ident, &edges_schema())
+        self.ensure_table(&self.edges_ident, &edges_schema(), &properties)
             .await?;
         Ok(())
     }
@@ -86,11 +94,19 @@ impl Graph {
         &self,
         ident: &TableIdent,
         schema: &arrow_schema::SchemaRef,
+        properties: &HashMap<String, String>,
     ) -> Result<()> {
         if self.catalog.load_table(ident).await.is_ok() {
             return Ok(());
         }
-        write::create_table_from_schema(self.catalog.as_ref(), ident, schema, None).await?;
+        write::create_table_with_partitions_and_properties(
+            self.catalog.as_ref(),
+            ident,
+            schema,
+            &[],
+            properties.clone(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -132,6 +148,17 @@ impl Graph {
     pub async fn current_edges_snapshot(&self) -> Result<Option<i64>> {
         let table = self.catalog.load_table(&self.edges_ident).await?;
         Ok(table.metadata().current_snapshot_id())
+    }
+
+    /// Loads every node as of a snapshot (the current one when `at` is
+    /// `None`), reduced to one row per id (`PutNodes` is append-only, so a
+    /// repeated id is the node's latest edit — see [`latest_nodes_by_id`]).
+    /// Used by precedent search (#148) to read `Decision` node objectives;
+    /// there is no adjacency index for node properties, so this always scans
+    /// the plain nodes table.
+    pub async fn load_nodes(&self, at: Option<i64>) -> Result<Vec<Node>> {
+        let (nodes, _snapshot) = load_nodes(self.catalog.clone(), &self.nodes_ident, at).await?;
+        Ok(latest_nodes_by_id(nodes))
     }
 
     /// Builds the adjacency index as of a snapshot (the current one when `at` is

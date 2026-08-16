@@ -21,9 +21,7 @@ pub async fn run(
     credentials_path: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bearer = bearer.ok_or(
-        "a bearer credential is required; pass --token, set VERGLAS_TOKEN, or mint one from the Verglas OS Access page",
-    )?;
+    let bearer = bearer.ok_or("not signed in; run `verglas login`")?;
     let client = access_client(endpoint, bearer).await?;
     match command {
         TokenCommand::Create(args) => create(&client, endpoint, credentials_path, args, json).await,

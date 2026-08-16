@@ -182,7 +182,7 @@ fn graph_contract_is_complete_and_self_consistent() {
     let operations = contract["operations"]
         .as_object()
         .expect("operations object");
-    assert_eq!(operations.len(), 11);
+    assert_eq!(operations.len(), 12);
     for (operation_name, operation) in operations {
         assert_eq!(operation["http"]["method"], "POST", "{operation_name}");
         assert_eq!(
@@ -357,6 +357,7 @@ async fn graph_contract_operations_reach_the_engine_adapter() {
         "QueryKHop",
         "QueryNeighborhood",
         "QueryPaths",
+        "QueryPrecedents",
         "BuildGraphIndex",
     ] {
         let response = app
@@ -371,5 +372,5 @@ async fn graph_contract_operations_reach_the_engine_adapter() {
             .expect("route response");
         assert_eq!(response.status(), StatusCode::OK, "{operation}");
     }
-    assert_eq!(api.0.lock().expect("recording lock").len(), 11);
+    assert_eq!(api.0.lock().expect("recording lock").len(), 12);
 }

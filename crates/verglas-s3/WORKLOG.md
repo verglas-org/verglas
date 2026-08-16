@@ -291,3 +291,18 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Iceberg control events. State is resolved from snapshot lineage, so concurrent
   tag writers compose and a fresh semantic adapter observes the same result.
 - #67: Exposed the checked-in S3 listener OpenAPI document and Swagger entry point alongside semantic routes. This keeps the listener contract inspectable without adding another serving API.
+- #148: Added `POST /QueryPrecedents` to the Graph router: ranks `Decision`
+  nodes by hand-rolled BM25 (k1=1.2, b=0.75, in `verglas-graph::precedent`,
+  no embedding dependency) over each node's `objective` property, plus a
+  structural boost counting overlap between the caller's `entities` and a
+  decision's direct neighbors. Response is sorted score desc, decisionId asc,
+  and is a pure function of graph state and the request — verified
+  byte-identical across repeated calls in the new
+  `tests/precedents_protocol.rs` (ranking, entity-boost tie-flip, and
+  determinism cases, all driven through the real router over an Iceberg
+  `MemoryCatalog`). Reading node properties needed a new `Graph::load_nodes`
+  in `verglas-graph` (nodes had no read path before this; only edges did),
+  which reduces append-only `PutNodes` rows to one per id, last write wins.
+  Also mechanically fixed pre-existing clippy lint debt in
+  `tests/semantic_event_publish.rs` (unwrap → expect, a `CapturedEvent` type
+  alias for the tuple type-complexity warning) without touching its logic.

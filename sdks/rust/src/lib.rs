@@ -17,6 +17,9 @@
 //!   [`worker::WorkerContext`].
 //! - [`client`] / [`server`]: the data-plane HTTP client and local server
 //!   helpers the CLI and in-process callers use.
+//! - [`ingest`]: client-side Iceberg table create/append (#145) — schema
+//!   inference, REST catalog, and `FileIO` writes with catalog-vended
+//!   credentials, no server round trip.
 
 pub mod job;
 pub mod worker;
@@ -24,6 +27,7 @@ pub mod worker;
 pub mod access;
 pub mod client;
 pub mod grant;
+pub mod ingest;
 pub mod queue;
 pub mod report;
 pub mod semantic;
@@ -50,8 +54,7 @@ pub use report::{CompactReport, CompactionReport};
 pub use semantic::{S3VectorsClient, SigV4Credentials, VerglasGraphsClient};
 pub use semantic_types::*;
 pub use token::{
-    AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, DatabaseConnectionToken,
-    DatabaseConnectionTokenRequest, IssuedAccessToken,
+    AccessTokenCreateRequest, AccessTokenGrant, AccessTokenSummary, IssuedAccessToken,
 };
 /// Stable table request and response contracts from the dependency-leaf API crate.
 pub use verglas_api::table as tables_api;

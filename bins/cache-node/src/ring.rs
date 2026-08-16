@@ -196,11 +196,8 @@ impl RingPlane {
 
     /// Returns the explicit numeric voter ordering used for coding slots.
     pub fn consensus_voters(&self) -> Vec<u64> {
-        self.membership
-            .live_nodes()
-            .iter()
-            .map(numeric_node_id)
-            .collect()
+        let nodes = self.membership.live_nodes();
+        canonical_voter_ids(nodes.iter())
     }
 
     /// Returns distributed consensus payload I/O over the existing fragment plane.
@@ -306,18 +303,7 @@ pub async fn setup(
         self_id: self_id.clone(),
         live: peers.iter().map(|(id, _)| id.clone()).collect(),
     });
-    let payload_peers = Arc::new(RwLock::new(PayloadPeers {
-        nodes: peers
-            .iter()
-            .cloned()
-            .map(|(node, _)| (numeric_node_id(&node), node))
-            .collect(),
-        slots: peers
-            .iter()
-            .enumerate()
-            .map(|(slot, (node, _))| (numeric_node_id(node), slot))
-            .collect(),
-    }));
+    let payload_peers = Arc::new(RwLock::new(canonical_payload_peers(&peers)));
 
     // The plane MUST code over the same chunk store the registry stages into.
     let ring = RingWriteback::new(
@@ -409,6 +395,28 @@ struct PayloadPeers {
     nodes: HashMap<u64, NodeId>,
     slots: HashMap<u64, usize>,
 }
+
+/// Returns the one stable numeric voter order used by Raft persistence and payload coding.
+fn canonical_voter_ids<'a>(nodes: impl IntoIterator<Item = &'a NodeId>) -> Vec<u64> {
+    let mut voters = nodes.into_iter().map(numeric_node_id).collect::<Vec<_>>();
+    voters.sort_unstable();
+    voters
+}
+
+/// Maps every peer to the slot assigned by the canonical persisted voter order.
+fn canonical_payload_peers(peers: &[(NodeId, SocketAddr)]) -> PayloadPeers {
+    let nodes = peers
+        .iter()
+        .map(|(node, _)| (numeric_node_id(node), node.clone()))
+        .collect::<HashMap<_, _>>();
+    let slots = canonical_voter_ids(peers.iter().map(|(node, _)| node))
+        .into_iter()
+        .enumerate()
+        .map(|(slot, voter)| (voter, slot))
+        .collect();
+    PayloadPeers { nodes, slots }
+}
+
 struct RingPayloadTransport {
     transport: Arc<dyn FragmentTransport>,
     peers: Arc<RwLock<PayloadPeers>>,
@@ -627,30 +635,32 @@ fn decode_representation(
 async fn resolve_peers_until_complete(
     raw: &str,
 ) -> Result<Vec<(NodeId, SocketAddr)>, std::io::Error> {
-    const ATTEMPTS: usize = 150;
+    // Wait indefinitely: exiting here is a ring-formation deadlock in disguise.
+    // Fly `.internal` DNS only resolves STARTED machines, so on a staggered
+    // fleet boot a node that gives up and exits removes its own DNS entry and
+    // guarantees its peers can never complete the ring either. A process that
+    // keeps waiting keeps its machine started and its name resolvable; the
+    // ring forms the moment the last peer boots.
     const RETRY_DELAY: Duration = Duration::from_millis(200);
+    const MAX_DELAY: Duration = Duration::from_secs(2);
 
-    let mut last_error = None;
-    for attempt in 1..=ATTEMPTS {
+    let mut delay = RETRY_DELAY;
+    let mut attempt: u64 = 0;
+    loop {
+        attempt += 1;
         match resolve_peers(raw).await {
             Ok(peers) => return Ok(peers),
             Err(error) => {
-                if attempt == 1 || attempt % 25 == 0 {
+                if attempt == 1 || attempt.is_multiple_of(25) {
                     eprintln!(
-                        "verglas-cache-node {VERSION} waiting for complete fragment ring (attempt {attempt}/{ATTEMPTS}): {error}"
+                        "verglas-cache-node {VERSION} waiting for complete fragment ring (attempt {attempt}): {error}"
                     );
                 }
-                last_error = Some(error);
-                tokio::time::sleep(RETRY_DELAY).await;
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(MAX_DELAY);
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "VERGLAS_RING_PEERS contains no resolvable entries",
-        )
-    }))
 }
 
 /// Resolves every `id=host:port` entry in `VERGLAS_RING_PEERS` exactly once.
@@ -1041,6 +1051,44 @@ mod tests {
         assert_eq!(first, retry);
         assert_ne!(first, distinct);
         assert_ne!(first, reconfigured);
+    }
+
+    /// Restored Raft voters and live ring peers must assign every node the same
+    /// payload slot regardless of the order in which Fly supplied peer names.
+    #[test]
+    fn consensus_payload_slots_use_canonical_voter_order() {
+        let peers = vec![
+            (
+                NodeId::new("stack-cache-0"),
+                "127.0.0.1:8336".parse().expect("address"),
+            ),
+            (
+                NodeId::new("stack-cache-1"),
+                "127.0.0.1:8337".parse().expect("address"),
+            ),
+            (
+                NodeId::new("stack-cache-2"),
+                "127.0.0.1:8338".parse().expect("address"),
+            ),
+            (
+                NodeId::new("stack-cache-3"),
+                "127.0.0.1:8339".parse().expect("address"),
+            ),
+        ];
+        let payload_peers = canonical_payload_peers(&peers);
+        let mut restored_voters = peers
+            .iter()
+            .map(|(node, _)| numeric_node_id(node))
+            .collect::<Vec<_>>();
+        restored_voters.sort_unstable();
+
+        assert_eq!(
+            canonical_voter_ids(peers.iter().map(|(node, _)| node)),
+            restored_voters
+        );
+        for (slot, voter) in restored_voters.into_iter().enumerate() {
+            assert_eq!(payload_peers.slots.get(&voter), Some(&slot));
+        }
     }
 
     #[tokio::test]

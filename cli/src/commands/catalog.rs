@@ -56,9 +56,41 @@ impl CatalogClient {
         }
         let parsed: CatalogOnly =
             toml::from_str(&text).map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
-        let catalog = parsed
-            .catalog
-            .ok_or_else(|| format!("no [catalog] section in {}", path.display()))?;
+        // No explicit [catalog] section falls back to the [connection] profile
+        // `verglas login` writes: the tenant catalog mounts under /catalog on
+        // the deployment host, serves the `default` warehouse, and takes the
+        // stored catalog bearer.
+        let catalog = match parsed.catalog {
+            Some(catalog) => catalog,
+            None => {
+                let connection = crate::connection_profile::resolve_from_environment(
+                    &crate::connection_profile::environment(),
+                )
+                .map_err(|e| {
+                    format!(
+                        "no [catalog] section in {} and no usable [connection] profile: {e}",
+                        path.display()
+                    )
+                })?;
+                let uri = connection
+                    .catalog_uri
+                    .clone()
+                    .ok_or("no catalog is connected; run `verglas login`")?;
+                Catalog {
+                    uri: format!("{}/catalog", uri.trim_end_matches('/')),
+                    warehouse: Some("default".to_owned()),
+                    bearer_token: connection.bearer_token.clone(),
+                    consistency: Default::default(),
+                    poll_interval_secs: 5,
+                    include: Vec::new(),
+                    exclude: Vec::new(),
+                    credentials_file: None,
+                    credentials_profile: None,
+                    sigv4_region: None,
+                    sigv4_signing_name: None,
+                }
+            }
+        };
         let mut client = Self::from_catalog(&catalog)?;
         if let Some(token) = token {
             client.bearer = Some(token.to_owned());
@@ -85,6 +117,33 @@ impl CatalogClient {
     /// The catalog base URI, for the confirmation message.
     pub fn base(&self) -> &str {
         &self.base
+    }
+
+    /// Resolved coordinates for opening a write-capable Iceberg client
+    /// (`verglas_sdk::ingest`): the same uri/warehouse/bearer this client
+    /// already reads from `~/.verglas/config.toml`.
+    pub fn ingest_config(&self) -> verglas_sdk::ingest::CatalogConfig {
+        // The tenant catalog does not vend per-table storage credentials, so
+        // data files are written through the deployment's SigV4 S3 endpoint
+        // using the connection profile's stored keypair when one resolves.
+        let s3 = crate::connection_profile::resolve_from_environment(
+            &crate::connection_profile::environment(),
+        )
+        .ok()
+        .and_then(|connection| {
+            Some(verglas_sdk::ingest::StaticS3Config {
+                endpoint: connection.semantic_uri.clone(),
+                access_key_id: connection.access_key_id.clone()?,
+                secret_access_key: connection.secret_access_key.clone()?,
+                region: connection.region.clone(),
+            })
+        });
+        verglas_sdk::ingest::CatalogConfig {
+            uri: self.base.clone(),
+            warehouse: self.warehouse.clone(),
+            bearer: self.bearer.clone(),
+            s3,
+        }
     }
 
     /// Resolves the route root (`{base}/v1` or `{base}/v1/{prefix}`) by reading

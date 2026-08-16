@@ -1,77 +1,12 @@
-//! Dashboard CLI contract against the optional on-prem Rill integration (#16).
+//! Cloud json-render dashboard CLI contract.
 
-use std::net::TcpListener;
 use std::process::Command;
 
-use axum::extract::Path;
-use axum::routing::{get, post};
-use axum::{Json, Router, http::HeaderMap};
-use serde_json::{Value, json};
-
-/// Serves the dashboard API shape expected from `verglas-rest`.
-fn spawn_mock() -> String {
-    let app = Router::new()
-        .route(
-            "/v1/dashboards",
-            post(|headers: HeaderMap, Json(body): Json<Value>| async move {
-                assert_eq!(headers["authorization"], "Bearer dashboard-token");
-                assert_eq!(body["table"], "sales.orders");
-                Json(json!({
-                    "name": "sales_orders",
-                    "table": "sales.orders",
-                    "url": "http://127.0.0.1:9009/explore/sales_orders",
-                }))
-            })
-            .get(|headers: HeaderMap| async move {
-                assert_eq!(headers["authorization"], "Bearer dashboard-token");
-                Json(json!({"dashboards": [{
-                    "name": "sales_orders",
-                    "table": "sales.orders",
-                    "url": "http://127.0.0.1:9009/explore/sales_orders",
-                }]}))
-            }),
-        )
-        .route(
-            "/v1/dashboards/{name}",
-            get(|headers: HeaderMap, Path(name): Path<String>| async move {
-                assert_eq!(headers["authorization"], "Bearer dashboard-token");
-                assert_eq!(name, "sales_orders");
-                Json(json!({
-                    "name": name,
-                    "table": "sales.orders",
-                    "url": "http://127.0.0.1:9009/explore/sales_orders",
-                }))
-            })
-            .delete(|headers: HeaderMap, Path(name): Path<String>| async move {
-                assert_eq!(headers["authorization"], "Bearer dashboard-token");
-                assert_eq!(name, "sales_orders");
-                Json(json!({"deleted": name}))
-            }),
-        );
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
-    let addr = listener.local_addr().expect("mock address");
-    listener
-        .set_nonblocking(true)
-        .expect("nonblocking listener");
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("mock runtime");
-        runtime.block_on(async move {
-            let listener = tokio::net::TcpListener::from_std(listener).expect("tokio listener");
-            axum::serve(listener, app).await.expect("serve mock");
-        });
-    });
-    format!("http://{addr}")
-}
-
-/// Runs the real CLI against the mock endpoint.
+/// Runs the real CLI against an endpoint override.
 fn run(endpoint: &str, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .arg("--server-endpoint")
-        .arg(endpoint)
-        .args(["--token", "dashboard-token"])
+        .env("VERGLAS_ENDPOINT", endpoint)
+        .env("VERGLAS_TOKEN", "dashboard-token")
         .args(args)
         .output()
         .expect("run CLI");
@@ -82,34 +17,73 @@ fn run(endpoint: &str, args: &[&str]) -> (bool, String, String) {
     )
 }
 
-/// Create, list, show, and delete use only the composed on-prem REST API.
 #[test]
-fn dashboard_verbs_speak_the_server_api() {
-    let endpoint = spawn_mock();
-
-    let (ok, stdout, stderr) = run(
-        &endpoint,
-        &["--json", "dashboard", "create", "sales.orders"],
+fn dashboard_rejects_oss_endpoints() {
+    let (ok, _stdout, stderr) = run(
+        "http://127.0.0.1:8334",
+        &["dashboard", "list", "--tenant-id", "tenant-1"],
     );
-    assert!(ok, "dashboard create failed: {stderr}");
-    let created: Value = serde_json::from_str(&stdout).expect("create JSON");
-    assert_eq!(created["name"], "sales_orders");
-
-    let (ok, stdout, stderr) = run(&endpoint, &["--json", "dashboard", "list"]);
-    assert!(ok, "dashboard list failed: {stderr}");
-    let listed: Value = serde_json::from_str(&stdout).expect("list JSON");
-    assert_eq!(listed["dashboards"][0]["table"], "sales.orders");
-
-    let (ok, stdout, stderr) = run(&endpoint, &["--json", "dashboard", "show", "sales_orders"]);
-    assert!(ok, "dashboard show failed: {stderr}");
-    let shown: Value = serde_json::from_str(&stdout).expect("show JSON");
-    assert_eq!(shown["url"], "http://127.0.0.1:9009/explore/sales_orders");
-
-    let (ok, stdout, stderr) = run(
-        &endpoint,
-        &["--json", "dashboard", "delete", "sales_orders"],
+    assert!(!ok, "OSS endpoint must be rejected");
+    assert!(
+        stderr.contains("Verglas Cloud") || stderr.contains("OSS"),
+        "stderr must mention Cloud-only: {stderr}"
     );
-    assert!(ok, "dashboard delete failed: {stderr}");
-    let deleted: Value = serde_json::from_str(&stdout).expect("delete JSON");
-    assert_eq!(deleted["deleted"], "sales_orders");
+}
+
+#[test]
+fn dashboard_create_requires_file() {
+    let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .env("VERGLAS_ENDPOINT", "https://api.verglas.dev")
+        .args(["dashboard", "create"])
+        .output()
+        .expect("run CLI");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--file") || stderr.contains("required"),
+        "create must require --file: {stderr}"
+    );
+}
+
+#[test]
+fn dashboard_create_rejects_static_rows_locally() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("bad.json");
+    std::fs::write(
+        &path,
+        r#"{
+          "spec_version": 1,
+          "name": "bad",
+          "title": "Bad",
+          "sources": {
+            "rows": { "type": "table", "table": "sales.orders", "follow": true }
+          },
+          "root": "page",
+          "elements": {
+            "page": {
+              "type": "Table",
+              "props": { "source": "rows", "rows": [{ "id": 1 }] },
+              "children": []
+            }
+          }
+        }"#,
+    )
+    .expect("write");
+    let (ok, _stdout, stderr) = run(
+        "https://api.verglas.dev",
+        &[
+            "dashboard",
+            "create",
+            "--file",
+            path.to_str().expect("utf8"),
+            "--tenant-id",
+            "tenant-1",
+        ],
+    );
+    assert!(!ok, "static rows must fail before HTTP");
+    assert!(
+        stderr.contains("static row") || stderr.contains("embeds"),
+        "must reject static rows: {stderr}"
+    );
+    assert!(!stderr.contains("Rill"), "must not mention Rill: {stderr}");
 }

@@ -520,6 +520,7 @@ function catalogCreateRequest(name: string, definition: TableDefinition): unknow
   });
   return {
     name,
+    "stage-create": false,
     schema: { type: "struct", "schema-id": 0, fields },
     "partition-spec": { "spec-id": 0, fields: partitionFields },
   };

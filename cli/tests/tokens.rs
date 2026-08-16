@@ -128,85 +128,6 @@ async fn token_list_and_revoke_use_stored_credential() {
     );
 }
 
-/// Database credentials are retained locally and emitted only when explicitly requested.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn database_token_stores_password_without_printing_it() {
-    let (endpoint, captured) = spawn_api().await;
-    let temp = TempDir::new().expect("tempdir");
-    let credentials = temp.path().join("credentials.json");
-    let output = command(
-        &endpoint,
-        &credentials,
-        Some("parent-token"),
-        &["db", "token", "analytics", "--expires-in", "300"],
-    )
-    .output()
-    .expect("CLI runs");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("neon-password-jwt"));
-    let stored: Value = serde_json::from_slice(&fs::read(&credentials).expect("credentials"))
-        .expect("credential JSON");
-    assert_eq!(
-        stored["database_tokens"][endpoint]["analytics"]["token"],
-        "neon-password-jwt"
-    );
-    let request = captured
-        .lock()
-        .expect("lock")
-        .last()
-        .cloned()
-        .expect("request");
-    assert_eq!(request.path, "/v1/access/database-tokens");
-    assert_eq!(
-        request.authorization.as_deref(),
-        Some("Bearer parent-token")
-    );
-    assert_eq!(
-        request.body,
-        Some(json!({ "database_id": "analytics", "expires_in_seconds": 300 }))
-    );
-}
-
-/// The PGPASSWORD escape hatch prints only the short-lived token when explicitly requested.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn database_token_print_password_requires_an_explicit_flag() {
-    let (endpoint, _captured) = spawn_api().await;
-    let temp = TempDir::new().expect("tempdir");
-    let credentials = temp.path().join("credentials.json");
-    let output = command(
-        &endpoint,
-        &credentials,
-        Some("parent-token"),
-        &[
-            "db",
-            "token",
-            "analytics",
-            "--expires-in",
-            "300",
-            "--print-password",
-        ],
-    )
-    .output()
-    .expect("CLI runs");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "neon-password-jwt\n"
-    );
-    assert!(
-        !credentials.exists(),
-        "explicit stdout use does not retain a second copy"
-    );
-}
-
 /// Builds a CLI process with an explicit credential file and parent token.
 fn command(
     endpoint: &str,
@@ -216,10 +137,10 @@ fn command(
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_verglas"));
     command
-        .args(["--access-endpoint", endpoint, "--credentials-file"])
-        .arg(credentials);
+        .env("VERGLAS_ACCESS_ENDPOINT", endpoint)
+        .env("VERGLAS_CREDENTIALS_FILE", credentials);
     if let Some(token) = token {
-        command.args(["--token", token]);
+        command.env("VERGLAS_TOKEN", token);
     }
     command.args(arguments);
     command

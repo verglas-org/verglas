@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "./hooks/rime-session-start.sh"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "./hooks/rime-prompt.sh"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "./hooks/rime-subagent-stop.sh",
+        "matcher": "rime-worker|best-of-n-runner",
+        "loop_limit": 2
+      }
+    ]
+  }
+}

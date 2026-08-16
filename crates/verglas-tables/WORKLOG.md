@@ -210,3 +210,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Persisted demotions now retain the binding alongside bucket and key, preventing
   equal object names from crossing database storage origins.
 - #82: Added a strict strong watcher alongside the eventual polling watcher. It seeds completely before readiness, applies resolved quorum mutations in order, handles renames atomically, and advances its read fence only after state publication.
+- Test-slop audit: removed the manifest-summary key tautology (it restated the
+  struct definition) and deleted the now-empty `tests/manifest.rs`. Manifest
+  behavior stays covered by the scan and commit integration tests.

@@ -22,7 +22,7 @@ use verglas_graph::{
     Direction, Edge, Graph, Neighbor, Node, Path, Reached, Subgraph, TraversalFilter,
     TripletReceipt,
 };
-use verglas_iceberg::{parse_table_ident, tables_api};
+use verglas_iceberg::tables_api;
 use verglas_vector::{MaintenanceConfig, Metric, StringKeyIndex, VamanaParams};
 
 /// The operations in the checked-in AWS S3 Vectors and Verglas Graph contracts.
@@ -159,6 +159,7 @@ fn semantic_router(api: Arc<dyn SemanticApi>) -> Router {
         .route("/QueryKHop", post(dispatch_graph))
         .route("/QueryNeighborhood", post(dispatch_graph))
         .route("/QueryPaths", post(dispatch_graph))
+        .route("/QueryPrecedents", post(dispatch_graph))
         .route("/BuildGraphIndex", post(dispatch_graph))
         .with_state(state)
 }
@@ -335,7 +336,7 @@ fn s3_operation(path: &str, method: &Method) -> Option<SemanticOperation> {
 
 /// Maps each exact Graph URI to its operation name.
 fn graph_operation(path: &str) -> Option<SemanticOperation> {
-    const OPERATIONS: [&str; 11] = [
+    const OPERATIONS: [&str; 12] = [
         "CreateGraph",
         "DeleteGraph",
         "GetGraph",
@@ -346,6 +347,7 @@ fn graph_operation(path: &str) -> Option<SemanticOperation> {
         "QueryKHop",
         "QueryNeighborhood",
         "QueryPaths",
+        "QueryPrecedents",
         "BuildGraphIndex",
     ];
     let operation = path.strip_prefix('/')?;
@@ -690,6 +692,15 @@ pub struct IcebergCatalogSemanticStore {
     catalog: Arc<dyn Catalog>,
 }
 
+const GRAPH_NAMESPACE_PREFIX: &str = "verglasgraph_";
+const VECTOR_NAMESPACE_PREFIX: &str = "verglasvector_";
+const GRAPH_NAME_PROPERTY: &str = "verglas.graph.name";
+const VECTOR_BUCKET_NAME_PROPERTY: &str = "verglas.s3vectors.name";
+
+fn semantic_namespace(prefix: &str, name: &str) -> String {
+    format!("{prefix}{}", sha256_hex(name.as_bytes()))
+}
+
 impl IcebergCatalogSemanticStore {
     /// Creates an adapter over one already-open Iceberg catalog.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
@@ -699,8 +710,142 @@ impl IcebergCatalogSemanticStore {
     /// Opens the named graph directly from its Iceberg namespace.
     fn graph(&self, input: &Value) -> Result<Graph, SemanticError> {
         let graph = required_bounded_string(input, "graphName", 1, 255)?;
-        Graph::open(self.catalog.clone(), graph).map_err(graph_error)
+        Graph::open(
+            self.catalog.clone(),
+            &semantic_namespace(GRAPH_NAMESPACE_PREFIX, graph),
+        )
+        .map_err(graph_error)
     }
+
+    /// Ranks `Decision` nodes by BM25 lexical match to `query`, adding a
+    /// structural boost when `entities` overlaps a decision's direct
+    /// neighbors. Fully deterministic: given the same graph snapshot and
+    /// request, the score computation and the sort (score desc, decisionId
+    /// asc) always produce the same order and the same floating-point values.
+    async fn query_precedents(&self, graph: &Graph, input: &Value) -> Result<Value, SemanticError> {
+        let query_text = required_bounded_string(input, "query", 1, 4096)?;
+        let limit = optional_precedents_limit(input)?;
+        let entities = optional_string_list(input, "entities", 1, 1024)?;
+
+        let decisions: Vec<(String, String)> = graph
+            .load_nodes(None)
+            .await
+            .map_err(graph_error)?
+            .into_iter()
+            .filter(|node| node.labels.iter().any(|label| label == "Decision"))
+            .filter_map(|node| {
+                node.properties
+                    .get("objective")
+                    .and_then(Value::as_str)
+                    .map(|objective| (node.id.clone(), objective.to_owned()))
+            })
+            .collect();
+
+        let documents: Vec<Vec<String>> = decisions
+            .iter()
+            .map(|(_, objective)| verglas_graph::precedent::tokenize(objective))
+            .collect();
+        let query_tokens = verglas_graph::precedent::tokenize(query_text);
+        let lexical_scores = verglas_graph::precedent::bm25_scores(&documents, &query_tokens);
+
+        let entity_set: std::collections::BTreeSet<&str> =
+            entities.iter().map(String::as_str).collect();
+        let reader = if entity_set.is_empty() {
+            None
+        } else {
+            Some(graph.reader(None).await.map_err(graph_error)?)
+        };
+
+        let mut precedents = decisions
+            .into_iter()
+            .zip(lexical_scores)
+            .map(|((decision_id, objective), lexical_score)| {
+                let shared_entities: Vec<String> = reader
+                    .as_ref()
+                    .map(|reader| {
+                        reader
+                            .get_neighbors(
+                                &decision_id,
+                                Direction::Both,
+                                &TraversalFilter::default(),
+                            )
+                            .into_iter()
+                            .map(|neighbor| neighbor.node_id)
+                            .filter(|node_id| entity_set.contains(node_id.as_str()))
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let structural_score = shared_entities.len() as f64;
+                let score = lexical_score + structural_score;
+                PrecedentRow {
+                    decision_id,
+                    score,
+                    lexical_score,
+                    structural_score,
+                    shared_entities,
+                    objective,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        precedents.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.decision_id.cmp(&b.decision_id))
+        });
+        if let Some(limit) = limit {
+            precedents.truncate(limit);
+        }
+
+        Ok(json!({
+            "precedents": precedents.into_iter().map(precedent_to_json).collect::<Vec<_>>()
+        }))
+    }
+}
+
+/// One scored `Decision` node, before rendering to the wire response shape.
+struct PrecedentRow {
+    /// The decision node's id.
+    decision_id: String,
+    /// The final ranking score: `lexical_score + structural_score`.
+    score: f64,
+    /// The BM25 score of `query` against the decision's `objective`.
+    lexical_score: f64,
+    /// The count of `entities` that are direct neighbors of the decision.
+    structural_score: f64,
+    /// The supplied entity ids that are direct neighbors of the decision,
+    /// sorted ascending for a deterministic response.
+    shared_entities: Vec<String>,
+    /// The decision node's `objective` property.
+    objective: String,
+}
+
+/// Renders one precedent in the public camel-case response shape.
+fn precedent_to_json(row: PrecedentRow) -> Value {
+    json!({
+        "decisionId": row.decision_id,
+        "score": row.score,
+        "lexicalScore": row.lexical_score,
+        "structuralScore": row.structural_score,
+        "sharedEntities": row.shared_entities,
+        "objective": row.objective,
+    })
+}
+
+/// Parses the optional QueryPrecedents result cap (1..=1000; unset means no cap).
+fn optional_precedents_limit(input: &Value) -> Result<Option<usize>, SemanticError> {
+    let Some(value) = input.get("limit") else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| (1..=1000).contains(value))
+        .map(Some)
+        .ok_or_else(|| SemanticError::validation("limit must be an integer from 1 to 1000"))
 }
 
 #[async_trait]
@@ -720,18 +865,30 @@ impl SemanticApi for IcebergCatalogSemanticStore {
         if operation == "ListGraphs" {
             let max_results = list_max_results(&input)?;
             let next_token = optional_bounded_string(&input, "nextToken", 1, 2048)?;
-            let mut names = self
+            let namespaces = self
                 .catalog
                 .list_namespaces(None)
                 .await
-                .map_err(iceberg_error)?
-                .into_iter()
-                .filter_map(|namespace| {
-                    (namespace.len() == 1)
-                        .then(|| namespace.first().cloned())
-                        .flatten()
-                })
-                .collect::<Vec<_>>();
+                .map_err(iceberg_error)?;
+            let mut names = Vec::new();
+            for namespace in namespaces {
+                let Some(encoded) = (namespace.len() == 1)
+                    .then(|| namespace.first().cloned())
+                    .flatten()
+                    .filter(|name| name.starts_with(GRAPH_NAMESPACE_PREFIX))
+                else {
+                    continue;
+                };
+                let graph = Graph::open(self.catalog.clone(), &encoded).map_err(graph_error)?;
+                let table = self
+                    .catalog
+                    .load_table(graph.nodes_ident())
+                    .await
+                    .map_err(iceberg_error)?;
+                if let Some(name) = table.metadata().properties().get(GRAPH_NAME_PROPERTY) {
+                    names.push(name.clone());
+                }
+            }
             names.sort();
             names.dedup();
             let names = names
@@ -764,7 +921,13 @@ impl SemanticApi for IcebergCatalogSemanticStore {
         let graph = self.graph(&input)?;
         match operation {
             "CreateGraph" => {
-                graph.ensure_tables().await.map_err(graph_error)?;
+                graph
+                    .ensure_tables_with_properties(HashMap::from([(
+                        GRAPH_NAME_PROPERTY.to_owned(),
+                        required_bounded_string(&input, "graphName", 1, 255)?.to_owned(),
+                    )]))
+                    .await
+                    .map_err(graph_error)?;
                 Ok(json!({}))
             }
             "DeleteGraph" => {
@@ -777,9 +940,10 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     .await
                     .map_err(iceberg_error)?;
                 self.catalog
-                    .drop_namespace(&NamespaceIdent::new(
-                        required_bounded_string(&input, "graphName", 1, 255)?.to_owned(),
-                    ))
+                    .drop_namespace(&NamespaceIdent::new(semantic_namespace(
+                        GRAPH_NAMESPACE_PREFIX,
+                        required_bounded_string(&input, "graphName", 1, 255)?,
+                    )))
                     .await
                     .map_err(iceberg_error)?;
                 Ok(json!({}))
@@ -848,6 +1012,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                 required_bounded_string(&input, "graphName", 1, 255)?,
                 graph.current_edges_snapshot().await.map_err(graph_error)?,
             )),
+            "QueryPrecedents" => self.query_precedents(&graph, &input).await,
             _ => Err(SemanticError::validation("unknown graph operation")),
         }
     }
@@ -866,11 +1031,6 @@ impl IcebergCatalogSemanticStore {
             )?;
             let encryption = encryption_configuration(input.get("encryptionConfiguration"))?;
             let tags = tags_map(input.get("tags"))?;
-            let namespace = bucket_namespace(&input)?;
-            self.catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .map_err(iceberg_error)?;
             let control = bucket_control_ident(&input)?;
             tables_api::create_table_with_properties(
                 self.catalog.as_ref(),
@@ -878,6 +1038,10 @@ impl IcebergCatalogSemanticStore {
                 bucket_control_definition(),
                 HashMap::from([
                     ("verglas.s3vectors.kind".to_owned(), "bucket".to_owned()),
+                    (
+                        VECTOR_BUCKET_NAME_PROPERTY.to_owned(),
+                        required_string(&input, "vectorBucketName")?.to_owned(),
+                    ),
                     (
                         "verglas.s3vectors.created".to_owned(),
                         now_seconds().to_string(),
@@ -938,6 +1102,13 @@ impl IcebergCatalogSemanticStore {
                 .await
                 .map_err(iceberg_error)?
             {
+                if namespace.len() != 1
+                    || !namespace
+                        .first()
+                        .is_some_and(|name| name.starts_with(VECTOR_NAMESPACE_PREFIX))
+                {
+                    continue;
+                }
                 let control = match self
                     .catalog
                     .load_table(&bucket_control_ident_from_namespace(&namespace)?)
@@ -955,9 +1126,14 @@ impl IcebergCatalogSemanticStore {
                 {
                     continue;
                 }
-                let name = namespace.first().cloned().ok_or_else(|| {
-                    SemanticError::validation("managed bucket namespace is empty")
-                })?;
+                let name = control
+                    .metadata()
+                    .properties()
+                    .get(VECTOR_BUCKET_NAME_PROPERTY)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SemanticError::validation("managed bucket name metadata is missing")
+                    })?;
                 buckets.push(json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": stored_number(control.metadata().properties(), "verglas.s3vectors.created")?}));
             }
             if let Some(prefix) = input.get("prefix").and_then(Value::as_str) {
@@ -1866,46 +2042,50 @@ fn mutate_tags(
 
 /// Resolves a bucket name to the customer-owned Iceberg namespace.
 fn bucket_namespace(input: &Value) -> Result<NamespaceIdent, SemanticError> {
-    Ok(NamespaceIdent::new(
-        required_string(input, "vectorBucketName")?.to_owned(),
-    ))
+    Ok(NamespaceIdent::new(semantic_namespace(
+        VECTOR_NAMESPACE_PREFIX,
+        required_string(input, "vectorBucketName")?,
+    )))
 }
 
 /// Reserved table name used only for durable vector bucket control-plane state.
-const BUCKET_CONTROL_TABLE: &str = "_verglas_vector_bucket";
+const BUCKET_CONTROL_TABLE: &str = "verglas_vector_bucket";
 
 /// Prefix reserved for auxiliary append-only resource control tables.
-const INDEX_CONTROL_PREFIX: &str = "_verglas_vector_index_";
+const INDEX_CONTROL_PREFIX: &str = "verglas_vector_index_";
 
 /// Resolves the Iceberg table that stores bucket metadata, tags, and policy.
 fn bucket_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
-    parse_table_ident(&format!(
-        "{}.{}",
-        required_string(input, "vectorBucketName")?,
-        BUCKET_CONTROL_TABLE
+    Ok(iceberg::TableIdent::new(
+        bucket_namespace(input)?,
+        BUCKET_CONTROL_TABLE.to_owned(),
     ))
-    .map_err(iceberg_error)
 }
 
 /// Resolves the sibling control table that carries mutable index tags.
 fn index_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
-    parse_table_ident(&format!(
-        "{}.{}{}",
-        required_string(input, "vectorBucketName")?,
-        INDEX_CONTROL_PREFIX,
-        required_string(input, "indexName")?
+    Ok(iceberg::TableIdent::new(
+        bucket_namespace(input)?,
+        format!(
+            "{INDEX_CONTROL_PREFIX}{}",
+            required_string(input, "indexName")?
+        ),
     ))
-    .map_err(iceberg_error)
 }
 
 /// Resolves a control table from a catalog namespace returned by list_namespaces.
 fn bucket_control_ident_from_namespace(
     namespace: &NamespaceIdent,
 ) -> Result<iceberg::TableIdent, SemanticError> {
-    let bucket = namespace
-        .first()
-        .ok_or_else(|| SemanticError::validation("managed bucket namespace is empty"))?;
-    parse_table_ident(&format!("{bucket}.{BUCKET_CONTROL_TABLE}")).map_err(iceberg_error)
+    if namespace.is_empty() {
+        return Err(SemanticError::validation(
+            "managed bucket namespace is empty",
+        ));
+    }
+    Ok(iceberg::TableIdent::new(
+        namespace.clone(),
+        BUCKET_CONTROL_TABLE.to_owned(),
+    ))
 }
 
 /// Defines the empty durable control table schema kept apart from customer vectors.
@@ -2173,12 +2353,10 @@ fn stable_segment(key: &str, count: u64) -> u64 {
 
 /// Resolves a vector bucket/index name to its customer-owned Iceberg table.
 fn vector_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
-    parse_table_ident(&format!(
-        "{}.{}",
-        required_string(input, "vectorBucketName")?,
-        required_string(input, "indexName")?
+    Ok(iceberg::TableIdent::new(
+        bucket_namespace(input)?,
+        required_string(input, "indexName")?.to_owned(),
     ))
-    .map_err(iceberg_error)
 }
 
 /// Builds the stable local ARN returned for a newly created vector index.
@@ -2947,9 +3125,345 @@ fn graph_error(error: verglas_graph::GraphError) -> SemanticError {
     SemanticError::unavailable(error.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Semantic mutation events (R7-A)
+// ---------------------------------------------------------------------------
+//
+// Trust model: publishing is a best-effort side channel to the control-plane
+// queue ingress, not part of the durability contract. The bearer token and
+// tenant id come from the cache node's own configuration (never from the
+// caller's request), so every event this node publishes is attributed to the
+// tenant this node is configured for. By the time an event is queued the
+// mutation is already durably committed to Iceberg; a dropped or delayed
+// event only delays a downstream subscriber's notice of that commit, it
+// never puts data at risk. Publish failures (unreachable queue, non-2xx
+// response, timeout) are logged at `warn` and otherwise ignored: they must
+// never delay or fail the client's operation.
+
+/// Configuration for the fire-and-forget mutation event publisher.
+#[derive(Clone, Debug)]
+pub struct EventPublishConfig {
+    /// Control-plane queue ingress URL that accepts one JSON event per POST.
+    pub queue_url: String,
+    /// Bearer token presented on the `authorization` header.
+    pub token: String,
+    /// Tenant identifier attached to every published event.
+    pub tenant_id: String,
+}
+
+impl EventPublishConfig {
+    /// Reads the full trio from the environment. Any variable that is absent
+    /// or empty disables publishing, so a partially configured node fails
+    /// closed instead of publishing with a blank credential or tenant.
+    pub fn from_env() -> Option<Self> {
+        Some(Self {
+            queue_url: non_empty_env("VERGLAS_EVENT_QUEUE_URL")?,
+            token: non_empty_env("VERGLAS_CACHE_EVENT_TOKEN")?,
+            tenant_id: non_empty_env("VERGLAS_TENANT_ID")?,
+        })
+    }
+}
+
+/// Reads an environment variable, treating unset or empty as absent.
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Bound on one publish attempt so a hung or slow queue endpoint cannot let
+/// spawned publish tasks pile up without limit; a caller's own request is
+/// never blocked on this regardless of the bound.
+const EVENT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The semantic mutation families that publish a commit event. This is the
+/// single source of truth for "which operations matter to subscribers": the
+/// match in [`mutation_kind`] is exhaustive over the two known families and
+/// falls through to "not a mutation" for everything else, so adding a new
+/// mutating operation to the checked-in contracts without deciding whether
+/// it belongs here is a deliberate, visible choice rather than a silent gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationKind {
+    VectorCommit,
+    GraphCommit,
+}
+
+/// Classifies an operation as a publishable mutation, if it is one.
+fn mutation_kind(operation: SemanticOperation) -> Option<MutationKind> {
+    match operation {
+        SemanticOperation::S3Vectors("PutVectors" | "DeleteVectors") => {
+            Some(MutationKind::VectorCommit)
+        }
+        SemanticOperation::Graph("PutNodes" | "PutEdges") => Some(MutationKind::GraphCommit),
+        _ => None,
+    }
+}
+
+/// Derives the `(eventType, subject)` pair for a successful mutation from its
+/// request input, or `None` if this operation does not publish. Field
+/// extraction tolerates missing or oddly typed fields by skipping the
+/// publish (with a warning) rather than panicking or inventing a value.
+fn mutation_event(operation: SemanticOperation, input: &Value) -> Option<(&'static str, String)> {
+    match mutation_kind(operation)? {
+        MutationKind::VectorCommit => {
+            let bucket = string_field(input, "vectorBucketName");
+            let index = string_field(input, "indexName");
+            match (bucket, index) {
+                (Some(bucket), Some(index)) => {
+                    Some(("org.verglas.vector.commit", format!("{bucket}.{index}")))
+                }
+                _ => {
+                    tracing::warn!(
+                        ?operation,
+                        "mutation event input is missing vectorBucketName/indexName; skipping publish"
+                    );
+                    None
+                }
+            }
+        }
+        MutationKind::GraphCommit => match string_field(input, "graphName") {
+            Some(graph) => Some(("org.verglas.graph.commit", graph)),
+            None => {
+                tracing::warn!(
+                    ?operation,
+                    "mutation event input is missing graphName; skipping publish"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Reads a non-empty string field, tolerating a missing key, a null, or a
+/// non-string value by returning `None`.
+fn string_field(input: &Value, field: &str) -> Option<String> {
+    input
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Decorates a [`SemanticApi`] so every successful mutating operation
+/// publishes one fire-and-forget JSON event to the control-plane queue
+/// ingress. See the trust-model note above this section.
+pub fn wrap_with_event_publisher(
+    inner: Arc<dyn SemanticApi>,
+    config: EventPublishConfig,
+) -> Arc<dyn SemanticApi> {
+    let client = reqwest::Client::builder()
+        .timeout(EVENT_PUBLISH_TIMEOUT)
+        .build()
+        .expect("a reqwest client with only a bounded timeout is always constructible");
+    Arc::new(EventPublishingSemanticApi {
+        inner,
+        config,
+        client,
+    })
+}
+
+/// [`SemanticApi`] decorator that publishes mutation events after successful
+/// calls. See the trust-model note above this section.
+struct EventPublishingSemanticApi {
+    inner: Arc<dyn SemanticApi>,
+    config: EventPublishConfig,
+    client: reqwest::Client,
+}
+
+#[async_trait]
+impl SemanticApi for EventPublishingSemanticApi {
+    async fn call(
+        &self,
+        operation: SemanticOperation,
+        input: Value,
+    ) -> Result<Value, SemanticError> {
+        // Computed before the input is moved into the inner call, and only
+        // ever published once that call has returned successfully.
+        let event = mutation_event(operation, &input);
+        let output = self.inner.call(operation, input).await?;
+        if let Some((event_type, subject)) = event {
+            self.publish(event_type, subject);
+        }
+        Ok(output)
+    }
+}
+
+impl EventPublishingSemanticApi {
+    /// Spawns the publish so it can never delay or fail the caller's result.
+    fn publish(&self, event_type: &'static str, subject: String) {
+        let client = self.client.clone();
+        let queue_url = self.config.queue_url.clone();
+        let token = self.config.token.clone();
+        let tenant_id = self.config.tenant_id.clone();
+        tokio::spawn(async move {
+            let body = json!({
+                "eventType": event_type,
+                "tenant_id": tenant_id,
+                "subject": subject,
+            });
+            match client
+                .post(&queue_url)
+                .bearer_auth(&token)
+                .json(&body)
+                .send()
+                .await
+            {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => tracing::warn!(
+                    status = %response.status(),
+                    event_type,
+                    subject,
+                    "semantic mutation event publish was rejected"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    event_type,
+                    subject,
+                    "semantic mutation event publish failed"
+                ),
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod event_publish_mapping_tests {
+    use super::*;
+
+    /// PutVectors and DeleteVectors both map to a vector commit event keyed
+    /// by "<bucket>.<index>", exactly the pair the frozen acceptance test
+    /// asserts on.
+    #[test]
+    fn vector_mutations_map_to_a_vector_commit_event() {
+        let input = json!({"vectorBucketName": "embeddings", "indexName": "docs"});
+        for operation in [
+            SemanticOperation::S3Vectors("PutVectors"),
+            SemanticOperation::S3Vectors("DeleteVectors"),
+        ] {
+            let (event_type, subject) = mutation_event(operation, &input).expect("mutation");
+            assert_eq!(event_type, "org.verglas.vector.commit");
+            assert_eq!(subject, "embeddings.docs");
+        }
+    }
+
+    /// PutNodes and PutEdges both map to a graph commit event keyed by the
+    /// graph name alone.
+    #[test]
+    fn graph_mutations_map_to_a_graph_commit_event() {
+        let input = json!({"graphName": "social"});
+        for operation in [
+            SemanticOperation::Graph("PutNodes"),
+            SemanticOperation::Graph("PutEdges"),
+        ] {
+            let (event_type, subject) = mutation_event(operation, &input).expect("mutation");
+            assert_eq!(event_type, "org.verglas.graph.commit");
+            assert_eq!(subject, "social");
+        }
+    }
+
+    /// Reads and unrelated operations never publish, whatever their input.
+    #[test]
+    fn non_mutating_operations_never_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("QueryVectors"),
+                &json!({"vectorBucketName": "embeddings", "indexName": "docs"}),
+            )
+            .is_none()
+        );
+        assert!(
+            mutation_event(
+                SemanticOperation::Graph("GetGraph"),
+                &json!({"graphName": "social"}),
+            )
+            .is_none()
+        );
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("CreateVectorBucket"),
+                &json!({"vectorBucketName": "embeddings"}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A missing indexName on a vector mutation skips the publish rather
+    /// than fabricating a subject like "embeddings." or panicking.
+    #[test]
+    fn vector_mutation_without_index_name_does_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("PutVectors"),
+                &json!({"vectorBucketName": "embeddings"}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A missing vectorBucketName is symmetric with the missing-index case.
+    #[test]
+    fn vector_mutation_without_bucket_name_does_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("DeleteVectors"),
+                &json!({"indexName": "docs"}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A non-string graphName (e.g. sent as a number) is tolerated as an
+    /// absent field, not coerced to a string.
+    #[test]
+    fn graph_mutation_with_non_string_graph_name_does_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::Graph("PutNodes"),
+                &json!({"graphName": 42}),
+            )
+            .is_none()
+        );
+    }
+
+    /// An empty-string field is treated the same as an absent one.
+    #[test]
+    fn empty_string_fields_do_not_publish() {
+        assert!(
+            mutation_event(
+                SemanticOperation::Graph("PutEdges"),
+                &json!({"graphName": ""}),
+            )
+            .is_none()
+        );
+        assert!(
+            mutation_event(
+                SemanticOperation::S3Vectors("PutVectors"),
+                &json!({"vectorBucketName": "embeddings", "indexName": ""}),
+            )
+            .is_none()
+        );
+    }
+
+    /// A completely missing input object (no fields at all) does not panic.
+    #[test]
+    fn empty_object_input_does_not_publish() {
+        assert!(mutation_event(SemanticOperation::Graph("PutNodes"), &json!({})).is_none());
+        assert!(mutation_event(SemanticOperation::S3Vectors("PutVectors"), &json!({})).is_none());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_tables_use_the_provider_safe_bucket_namespace() {
+        let input = json!({"vectorBucketName":"bucket-with-hyphens","indexName":"index-one"});
+        let control = bucket_control_ident(&input).expect("control ident");
+        let vectors = vector_ident(&input).expect("vector ident");
+        let namespace = control.namespace().first().expect("namespace");
+        assert!(namespace.starts_with(VECTOR_NAMESPACE_PREFIX));
+        assert!(!namespace.contains('-'));
+        assert_eq!(vectors.namespace(), control.namespace());
+    }
 
     /// A cursor advances by key, so inserting an earlier key cannot duplicate a page.
     #[test]

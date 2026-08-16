@@ -123,13 +123,14 @@ async fn run_worker(
     Ok(Json(json!({ "job_id": "job-1", "created": true })))
 }
 
-/// Runs the CLI with HOME redirected and `--server-endpoint` pointed at the mock.
+/// Runs the CLI with HOME redirected and `VERGLAS_ENDPOINT` pointed at a target.
 fn run(home: &Path, endpoint: &str, args: &[&str]) -> (bool, String, String) {
-    let mut cmd_args = vec!["--server-endpoint", endpoint, "--json"];
+    let mut cmd_args = vec!["--json"];
     cmd_args.extend_from_slice(args);
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .args(&cmd_args)
         .env("HOME", home)
+        .env("VERGLAS_ENDPOINT", endpoint)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -166,49 +167,28 @@ cron = "*/5 * * * *"
 }
 
 #[test]
-fn workers_create_list_get_run_and_delete_against_local_registry() {
-    let (endpoint, state) = spawn_server();
+fn workers_reject_the_oss_stack() {
+    let (endpoint, _state) = spawn_server();
     let home = tempfile::tempdir().expect("home");
     let spec = write_spec(home.path());
 
-    let (ok, stdout, stderr) = run(
+    let (ok, _stdout, stderr) = run(
         home.path(),
         &endpoint,
         &["workers", "create", "--file", spec.to_str().expect("utf8")],
     );
-    assert!(ok, "create must succeed: {stderr}");
-    let created: Value = serde_json::from_str(&stdout).expect("create json");
-    assert_eq!(created["name"], "collector");
-    assert_eq!(created["state"], "running");
-
-    let (ok, stdout, stderr) = run(home.path(), &endpoint, &["workers", "list"]);
-    assert!(ok, "list must succeed: {stderr}");
-    let listed: Value = serde_json::from_str(&stdout).expect("list json");
-    assert_eq!(listed.as_array().expect("array").len(), 1);
-
-    let (ok, stdout, stderr) = run(home.path(), &endpoint, &["workers", "get", "collector"]);
-    assert!(ok, "get must succeed: {stderr}");
-    let detail: Value = serde_json::from_str(&stdout).expect("get json");
-    assert_eq!(detail["name"], "collector");
-
-    let (ok, stdout, stderr) = run(home.path(), &endpoint, &["workers", "run", "collector"]);
-    assert!(ok, "run must succeed: {stderr}");
-    let run_body: Value = serde_json::from_str(&stdout).expect("run json");
-    assert_eq!(run_body["job_id"], "job-1");
+    assert!(!ok, "create against OSS must fail");
     assert!(
-        state
-            .last_run_key
-            .lock()
-            .expect("lock")
-            .as_ref()
-            .is_some_and(|k| k.starts_with("cli-")),
-        "run must send an Idempotency-Key"
+        stderr.contains("Verglas Cloud") && stderr.contains("OSS"),
+        "the error names Cloud vs OSS: {stderr}"
     );
 
-    let (ok, stdout, stderr) = run(home.path(), &endpoint, &["workers", "delete", "collector"]);
-    assert!(ok, "delete must succeed: {stderr}");
-    let archived: Value = serde_json::from_str(&stdout).expect("delete json");
-    assert_eq!(archived["state"], "archived");
+    let (ok, _stdout, stderr) = run(home.path(), &endpoint, &["workers", "list"]);
+    assert!(!ok, "list against OSS must fail");
+    assert!(
+        stderr.contains("Verglas Cloud"),
+        "list error names Cloud: {stderr}"
+    );
 }
 
 #[test]
@@ -219,11 +199,11 @@ fn workers_follow_needs_a_command_or_file() {
         .env("HOME", home.path())
         .output()
         .expect("binary runs");
-    assert!(!out.status.success(), "follow with no target must fail");
+    assert!(!out.status.success(), "follow must fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("command") || stderr.contains("--file"),
-        "the error names the missing target: {stderr}"
+        stderr.contains("not supported") && stderr.contains("create --file"),
+        "follow is not an OSS runtime: {stderr}"
     );
 }
 
@@ -243,16 +223,4 @@ fn workers_help_lists_local_verbs_only() {
             "workers help must list {verb}: {stdout}"
         );
     }
-    for gone in ["push", "pull", "logs", "update"] {
-        assert!(
-            !stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with(gone)),
-            "workers help must not list removed {gone}: {stdout}"
-        );
-    }
-    assert!(
-        !stdout.contains("--local"),
-        "create no longer takes --local: {stdout}"
-    );
 }

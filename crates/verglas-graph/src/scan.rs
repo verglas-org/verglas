@@ -7,7 +7,7 @@
 //! definition. Because it reads only the tables, it is exactly what answers when
 //! no Puffin index is present — the turn-off path.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use iceberg::table::Table;
@@ -17,10 +17,10 @@ use verglas_iceberg::TimeTravel;
 use verglas_iceberg::query::query;
 
 use crate::error::{GraphError, Result};
-use crate::model::Edge;
+use crate::model::{Edge, Node};
 use crate::schema::{
-    COL_AGENT_ID, COL_CONFIDENCE, COL_DST_ID, COL_EDGE_ID, COL_NAMESPACE, COL_PREDICATE,
-    COL_PROPERTIES, COL_PROVENANCE, COL_SRC_ID, COL_SUPERSEDES, COL_VALID_FROM,
+    COL_AGENT_ID, COL_CONFIDENCE, COL_DST_ID, COL_EDGE_ID, COL_LABELS, COL_NAMESPACE, COL_NODE_ID,
+    COL_PREDICATE, COL_PROPERTIES, COL_PROVENANCE, COL_SRC_ID, COL_SUPERSEDES, COL_VALID_FROM,
 };
 
 /// The dotted `namespace.name` form of a table identifier.
@@ -72,6 +72,89 @@ pub async fn load_edges(
 /// snapshot, or `None` when the table has no data yet.
 fn resolve_snapshot(table: &Table, at: Option<i64>) -> Option<i64> {
     at.or_else(|| table.metadata().current_snapshot_id())
+}
+
+/// Loads the nodes of `nodes_ident` as of a snapshot and returns them with the
+/// snapshot they reflect. When `at` is `None` the table's current snapshot is
+/// used; a table with no snapshot yet yields an empty set and `None`.
+///
+/// The returned nodes are raw rows in scan order, one per `PutNodes` call
+/// (append-only); callers that want one row per id call [`latest_nodes_by_id`].
+pub async fn load_nodes(
+    catalog: Arc<dyn Catalog>,
+    nodes_ident: &TableIdent,
+    at: Option<i64>,
+) -> Result<(Vec<Node>, Option<i64>)> {
+    let table = catalog.load_table(nodes_ident).await?;
+    let snapshot = match resolve_snapshot(&table, at) {
+        Some(id) => id,
+        None => return Ok((Vec::new(), None)),
+    };
+
+    let table_name = dotted(nodes_ident);
+    let report = query(
+        catalog,
+        "SELECT * FROM nodes",
+        Some(TimeTravel {
+            reference: snapshot.to_string(),
+            table: table_name.clone(),
+        }),
+    )
+    .await?;
+
+    let mut nodes = Vec::with_capacity(report.rows.len());
+    for row in &report.rows {
+        nodes.push(node_from_row(row, &table_name)?);
+    }
+    Ok((nodes, Some(snapshot)))
+}
+
+/// Reduces raw node rows to one row per id, keeping the last-scanned row for a
+/// repeated id. `PutNodes` is append-only, so a repeated id is a later edit of
+/// the same entity, not a second entity; this is the node analogue of
+/// [`live_edges`]'s supersede rule, without a dedicated retraction pointer.
+pub fn latest_nodes_by_id(nodes: Vec<Node>) -> Vec<Node> {
+    let mut last_index: HashMap<String, usize> = HashMap::new();
+    for (position, node) in nodes.iter().enumerate() {
+        last_index.insert(node.id.clone(), position);
+    }
+    nodes
+        .into_iter()
+        .enumerate()
+        .filter(|(position, node)| last_index.get(&node.id) == Some(position))
+        .map(|(_, node)| node)
+        .collect()
+}
+
+/// Parses one query result row into a [`Node`], naming any missing required
+/// column so a malformed table surfaces clearly rather than silently dropping
+/// nodes.
+fn node_from_row(row: &Map<String, Value>, table: &str) -> Result<Node> {
+    Ok(Node {
+        id: required_str(row, COL_NODE_ID, table)?,
+        labels: parse_label_list(row.get(COL_LABELS)),
+        properties: parse_properties(row.get(COL_PROPERTIES)),
+        agent_id: optional_str(row, COL_AGENT_ID),
+        namespace: optional_str(row, COL_NAMESPACE),
+    })
+}
+
+/// Parses the JSON-array-string `labels` column back into a list, defaulting
+/// to empty when absent or unparseable (mirrors [`parse_properties`]).
+fn parse_label_list(value: Option<&Value>) -> Vec<String> {
+    match value.and_then(Value::as_str) {
+        Some(text) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|item| match item {
+                    Value::String(label) => Some(label),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        },
+        None => Vec::new(),
+    }
 }
 
 /// Filters raw edges to the live set: every edge whose id is not named by a

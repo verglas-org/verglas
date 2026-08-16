@@ -2,7 +2,7 @@
   "$schema": "https://mintlify.com/docs.json",
   "theme": "maple",
   "name": "Verglas documentation",
-  "description": "Run cache-pathed lakehouse workloads on a self-hosted Verglas server.",
+  "description": "Run the lakehouse runtime on a self-hosted Verglas server.",
   "colors": {
     "primary": "#2563EB",
     "light": "#60A5FA",
@@ -31,13 +31,6 @@
         ]
       },
       {
-        "group": "Analytics",
-        "icon": "chart-line",
-        "pages": [
-          "docs/analytics/rill"
-        ]
-      },
-      {
         "group": "Platform",
         "icon": "database",
         "pages": [
@@ -52,6 +45,8 @@
         "icon": "compass-drafting",
         "pages": [
           "docs/architecture/overview",
+          "docs/architecture/whitepaper",
+          "docs/architecture/rime",
           "docs/architecture/cache",
           "docs/architecture/iceberg",
           "docs/architecture/writes",

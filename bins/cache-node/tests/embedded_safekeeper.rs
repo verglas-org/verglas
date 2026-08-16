@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use verglas_catalog::{ManagedCatalogRequest, ManagedCatalogResponse};
-use verglas_consensus::{CatalogAction, CatalogBatch};
+use verglas_consensus::{CatalogAction, CatalogBatch, CatalogEntity, CatalogRequirement};
 use verglas_safekeeper::{WalRequest, WalResponse};
 
 const TENANT: &str = "0123456789abcdef0123456789abcdef";
@@ -18,6 +18,10 @@ const CATALOG_TENANT: &str = "tenant-tpch";
 const WAREHOUSE: &str = "tpch";
 const CANONICAL_WAL_APPEND_BYTES: usize = 8 * 1024 * 1024;
 const WAL_BODY_LIMIT_BYTES: usize = 17 * 1024 * 1024;
+
+/// Process-level fleets release reserved ports before their children bind them.
+/// Keep the four fleet tests from racing each other for those ports.
+static FLEET_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Kills child cache nodes even when an assertion fails.
 struct Fleet {
@@ -77,13 +81,32 @@ impl Fleet {
     }
 }
 
-/// Reserves and releases a loopback port for a child listener.
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .expect("reserve port")
-        .local_addr()
-        .expect("reserved address")
-        .port()
+/// Unique loopback ports consumed by one four-node process fleet.
+struct FleetPorts {
+    ring: [u16; 4],
+    safekeeper: [u16; 4],
+    block: [u16; 4],
+    s3: [u16; 4],
+    admin: [u16; 4],
+}
+
+/// Reserves every fleet port at once so the OS cannot return one port twice.
+fn reserve_fleet_ports() -> FleetPorts {
+    let reservations: [TcpListener; 20] =
+        std::array::from_fn(|_| TcpListener::bind("127.0.0.1:0").expect("reserve fleet port"));
+    let ports: [u16; 20] = std::array::from_fn(|index| {
+        reservations[index]
+            .local_addr()
+            .expect("reserved fleet address")
+            .port()
+    });
+    FleetPorts {
+        ring: ports[0..4].try_into().expect("four ring ports"),
+        safekeeper: ports[4..8].try_into().expect("four safekeeper ports"),
+        block: ports[8..12].try_into().expect("four block ports"),
+        s3: ports[12..16].try_into().expect("four S3 ports"),
+        admin: ports[16..20].try_into().expect("four admin ports"),
+    }
 }
 
 /// Writes the minimal cache-node config used by one child.
@@ -114,6 +137,7 @@ fn spawn_node(
     peers: &str,
     ring_port: u16,
     safekeeper_port: u16,
+    block_port: u16,
     stderr: &Arc<Mutex<Vec<String>>>,
 ) -> Child {
     let mut child = Command::new(env!("CARGO_BIN_EXE_verglas-cache-node"))
@@ -127,7 +151,7 @@ fn spawn_node(
         .env("VERGLAS_SAFEKEEPER_EC_M", "2")
         .env("VERGLAS_SAFEKEEPER_EC_W", "3")
         .env("VERGLAS_RING_ADDR", format!("127.0.0.1:{ring_port}"))
-        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{}", free_port()))
+        .env("VERGLAS_BLOCK_ADDR", format!("127.0.0.1:{block_port}"))
         .env(
             "VERGLAS_SAFEKEEPER_ADDR",
             format!("127.0.0.1:{safekeeper_port}"),
@@ -255,9 +279,11 @@ async fn submit_catalog(
 /// Four real cache nodes preserve writes with one voter down and refuse two failures.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cache_node_embeds_the_ring_backed_safekeeper() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -266,7 +292,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let mut children = Vec::new();
     for index in 0..4 {
@@ -276,6 +302,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
             &peers,
             ring_ports[index],
             safekeeper_ports[index],
+            ports.block[index],
             &stderr,
         ));
     }
@@ -369,6 +396,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         &peers,
         ring_ports[0],
         safekeeper_ports[0],
+        ports.block[0],
         &fleet.stderr,
     );
     fleet.wait_for_safekeepers(5, Duration::from_secs(30));
@@ -419,6 +447,7 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
         &peers,
         ring_ports[3],
         safekeeper_ports[3],
+        ports.block[3],
         &fleet.stderr,
     );
     fleet.wait_for_safekeepers(5, Duration::from_secs(30));
@@ -461,9 +490,11 @@ async fn cache_node_embeds_the_ring_backed_safekeeper() {
 /// The public WAL listener accepts benchmark-sized appends but retains a hard body ceiling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodies() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -472,7 +503,7 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let children = (0..4)
         .map(|index| {
@@ -482,6 +513,7 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
                 &peers,
                 ring_ports[index],
                 safekeeper_ports[index],
+                ports.block[index],
                 &stderr,
             )
         })
@@ -564,9 +596,11 @@ async fn wal_listener_accepts_canonical_eight_mib_append_and_rejects_larger_bodi
 /// A large WAL tail continues through every surviving ingress after its first leader dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_wal_append_continues_after_exact_leader_death() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -575,7 +609,7 @@ async fn large_wal_append_continues_after_exact_leader_death() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let children = (0..4)
         .map(|index| {
@@ -585,6 +619,7 @@ async fn large_wal_append_continues_after_exact_leader_death() {
                 &peers,
                 ring_ports[index],
                 safekeeper_ports[index],
+                ports.block[index],
                 &stderr,
             )
         })
@@ -699,9 +734,11 @@ async fn large_wal_append_continues_after_exact_leader_death() {
 /// Four native-catalog ingresses retain linearizable availability after their elected leader dies.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
     let root = tempfile::tempdir().expect("fleet tempdir");
-    let ring_ports = [free_port(), free_port(), free_port(), free_port()];
-    let safekeeper_ports = [free_port(), free_port(), free_port(), free_port()];
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
     let peers = ring_ports
         .iter()
         .enumerate()
@@ -710,7 +747,7 @@ async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
         .join(",");
     let stderr = Arc::new(Mutex::new(Vec::new()));
     let configs = (0..4)
-        .map(|index| write_config(root.path(), index, free_port(), free_port()))
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
         .collect::<Vec<_>>();
     let mut children = Vec::new();
     for index in 0..4 {
@@ -720,6 +757,7 @@ async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
             &peers,
             ring_ports[index],
             safekeeper_ports[index],
+            ports.block[index],
             &stderr,
         ));
     }
@@ -830,4 +868,185 @@ async fn native_catalog_survives_leader_loss_with_a_retained_prefix() {
         .is_err(),
         "two live voters must reject a catalog mutation"
     );
+}
+
+/// Exact wire repro: create a hosted-domain record, point-read it back, then
+/// enumerate its collection. `Records` must return exactly what `Record`
+/// already proved durable, on every node — the live production bug had
+/// enumeration return nothing forever while point reads kept succeeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_catalog_records_enumeration_matches_point_read() {
+    let _fleet_guard = FLEET_TEST_LOCK.lock().await;
+    let root = tempfile::tempdir().expect("fleet tempdir");
+    let ports = reserve_fleet_ports();
+    let ring_ports = ports.ring;
+    let safekeeper_ports = ports.safekeeper;
+    let peers = ring_ports
+        .iter()
+        .enumerate()
+        .map(|(index, port)| format!("node-{index}=127.0.0.1:{port}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let stderr = Arc::new(Mutex::new(Vec::new()));
+    let configs = (0..4)
+        .map(|index| write_config(root.path(), index, ports.s3[index], ports.admin[index]))
+        .collect::<Vec<_>>();
+    let mut children = Vec::new();
+    for index in 0..4 {
+        children.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            ports.block[index],
+            &stderr,
+        ));
+    }
+    let mut fleet = Fleet { children, stderr };
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    let record_id = "namespace/default/analytics";
+    let record_document = r#"{"namespace":["analytics"],"properties":{}}"#;
+    let create_record = CatalogBatch::new(
+        vec![CatalogRequirement::RecordAbsent {
+            entity: CatalogEntity::Namespace,
+            id: record_id.to_owned(),
+        }],
+        vec![CatalogAction::PutRecord {
+            entity: CatalogEntity::Namespace,
+            id: record_id.to_owned(),
+            document: record_document.to_owned(),
+        }],
+    )
+    .expect("hosted namespace record batch");
+
+    for (index, &port) in safekeeper_ports.iter().enumerate() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        if index == 0 {
+            assert!(
+                matches!(
+                    submit_catalog(
+                        addr,
+                        ManagedCatalogRequest::Commit {
+                            request_id: 1,
+                            batch: create_record.clone(),
+                        },
+                    )
+                    .await
+                    .expect("commit hosted namespace record through four voters"),
+                    ManagedCatalogResponse::Applied(_)
+                ),
+                "record commit must apply"
+            );
+        }
+
+        assert_eq!(
+            submit_catalog(
+                addr,
+                ManagedCatalogRequest::Record {
+                    entity: CatalogEntity::Namespace,
+                    id: record_id.to_owned(),
+                },
+            )
+            .await
+            .expect("point read must succeed on every node"),
+            ManagedCatalogResponse::Record(Some(record_document.to_owned())),
+            "node {index} point read must see the committed record"
+        );
+
+        assert_eq!(
+            submit_catalog(
+                addr,
+                ManagedCatalogRequest::Records {
+                    entity: CatalogEntity::Namespace,
+                },
+            )
+            .await
+            .expect("enumeration must succeed on every node"),
+            ManagedCatalogResponse::Records(vec![(
+                record_id.to_owned(),
+                record_document.to_owned()
+            )]),
+            "node {index} enumeration must include the record its own point read sees"
+        );
+    }
+
+    // Restart the whole fleet against its retained data directories. A
+    // "forever empty" enumeration bug would plausibly show only after the
+    // state machine reloads its persisted image from disk, so re-verify
+    // Record vs Records after every node reopens its durable state.
+    for child in &mut fleet.children {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut restarted = Vec::new();
+    for index in 0..4 {
+        restarted.push(spawn_node(
+            index,
+            &configs[index],
+            &peers,
+            ring_ports[index],
+            safekeeper_ports[index],
+            ports.block[index],
+            &fleet.stderr,
+        ));
+    }
+    fleet.children = restarted;
+    fleet.wait_for_safekeepers(4, Duration::from_secs(30));
+
+    for (index, &port) in safekeeper_ports.iter().enumerate() {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        assert_eq!(
+            submit_catalog_retrying(
+                addr,
+                ManagedCatalogRequest::Record {
+                    entity: CatalogEntity::Namespace,
+                    id: record_id.to_owned(),
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("point read must survive a full-fleet restart"),
+            ManagedCatalogResponse::Record(Some(record_document.to_owned())),
+            "node {index} point read must see the record after restart"
+        );
+
+        assert_eq!(
+            submit_catalog_retrying(
+                addr,
+                ManagedCatalogRequest::Records {
+                    entity: CatalogEntity::Namespace,
+                },
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("enumeration must survive a full-fleet restart"),
+            ManagedCatalogResponse::Records(vec![(
+                record_id.to_owned(),
+                record_document.to_owned()
+            )]),
+            "node {index} enumeration must include the record after restart"
+        );
+    }
+}
+
+/// Retries `submit_catalog` while the just-restarted listener is not yet
+/// accepting connections or its local group has not finished re-electing.
+async fn submit_catalog_retrying(
+    addr: SocketAddr,
+    request: ManagedCatalogRequest,
+    deadline: Duration,
+) -> Result<ManagedCatalogResponse, String> {
+    let start = Instant::now();
+    loop {
+        match submit_catalog(addr, request.clone()).await {
+            Ok(response) => return Ok(response),
+            Err(error) if start.elapsed() < deadline => {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }

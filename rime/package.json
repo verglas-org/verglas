@@ -20,6 +20,7 @@
   "files": [
     ".claude-plugin",
     ".codex-plugin",
+    ".cursor-plugin",
     "agents",
     "extensions",
     "host",

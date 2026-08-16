@@ -349,7 +349,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   without overriding existing env vars (dev overrides keep working). The
   example config documents the section.
 
-- dashboard sink (Rill): added the shared admin wire types for the
+- dashboard sink (removed analytics runtime): added the shared admin wire types for the
   `GET /dashboard` probe — the `DASHBOARD_PATH` constant, `DashboardSinkInfo`
   (name, target table, project path, scaffolded flag, last-refresh snapshot,
   state), and `DashboardInfo` wrapping the list. Both the daemon and the CLI
@@ -417,7 +417,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   discovery. These are non-secret client coordinates and do not create a
   Verglas-hosted catalog service.
 - #8: Extended local access discovery with an explicit query API URI. On-prem clients now receive separate S3, query/write, and catalog proxy coordinates.
-- #16: Replaced the obsolete worklog-only dashboard sink concept with validated `[analytics.rill]` network configuration. The configuration names Rill's private runtime, browser address, and return S3 path, and requires an Iceberg catalog for table resolution.
+- #16: Replaced the obsolete worklog-only dashboard sink concept with validated analytics network configuration. The configuration names the analytics runtime's private address, browser address, and return S3 path, and requires an Iceberg catalog for table resolution.
 - #29: Extended the shared NVMe accounting contract to include the durable KV log alongside acknowledged write-back fragments. Both are protected from eviction while the remaining object cache stays heat-managed with no fixed partition.
 
 - #66: Replaced control-plane config examples and comments that referenced api.verglas.dev / verglas login with self-host-neutral wording, and switched admin test fixtures to example.test hostnames.
@@ -438,3 +438,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #135: Removed the process-global WAL archive target. Each Neon timeline now
   receives its immutable bucket binding through the consensus-backed admin
   contract, while `[catalog_archive]` remains the fixed catalog checkpoint target.
+- Test-slop audit: dropped the config test asserting rejection of the removed
+  `fragment_fraction` field. Serde's deny-unknown-fields already rejects every
+  unknown key; pinning one historical name verifies nothing.

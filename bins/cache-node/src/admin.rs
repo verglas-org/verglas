@@ -45,8 +45,8 @@ use verglas_tables::catalog::PollingWatcher;
 
 use verglas_core::activity::{ActivityPlane, ActivityTracker};
 use verglas_core::admin::{
-    HEALTHZ_PATH, HealthzInfo, METRICS_PATH, QUIESCENCE_PATH, STATS_PATH, StatsInfo, VERSION_PATH,
-    VersionInfo,
+    ACCESS_PATH, HEALTHZ_PATH, HealthzInfo, LocalAccess, METRICS_PATH, QUIESCENCE_PATH, STATS_PATH,
+    StatsInfo, VERSION_PATH, VersionInfo,
 };
 use verglas_core::metrics::EXPOSITION_CONTENT_TYPE;
 
@@ -506,6 +506,19 @@ pub fn catalog_router(catalog: CatalogGateway) -> Router {
         .with_state(catalog)
 }
 
+/// Mounts non-secret client discovery for the local Table and semantic APIs.
+/// The catalog URI always names this process's gateway, never the upstream
+/// provider, so clients cannot bypass its credential boundary.
+pub fn access_router(access: LocalAccess) -> Router {
+    Router::new().route(
+        ACCESS_PATH,
+        get(move || {
+            let access = access.clone();
+            async move { Json(access) }
+        }),
+    )
+}
+
 /// Returns the cache-owned catalog generation. Query workers keep their
 /// DataFusion catalog session while this value is unchanged and rebuild it
 /// exactly once after the watcher observes a changed catalog response.
@@ -561,8 +574,11 @@ async fn forward_catalog(
                 )
                 .await
         }
-        (None, None) => catalog.request(method, upstream_path, headers, body).await,
-        _ => {
+        // The self-hosted SDK uses a bearer for its local API even though this
+        // deployment has no database-scoped catalog identity. Drop that caller
+        // bearer and let the gateway apply its configured provider authority.
+        (_, None) => catalog.request(method, upstream_path, headers, body).await,
+        (None, Some(_)) => {
             return (
                 StatusCode::UNAUTHORIZED,
                 "catalog bearer and database identity are required together",

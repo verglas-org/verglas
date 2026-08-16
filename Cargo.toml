@@ -151,9 +151,9 @@ unwrap_used = "warn"
 # RemoveSnapshots commits cannot be built through the public API. Compaction
 # and post-compact snapshot expiry need that escape hatch. Pin a SHA — never a
 # floating branch tip. Patch inventory:
-# https://github.com/verglas-org/iceberg-rust/blob/verglas/v0.9.1/VERGLAS.md
+# https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.9.1/VERGLAS.md
 [patch.crates-io]
-iceberg = { git = "https://github.com/verglas-org/iceberg-rust", rev = "a40f92680e7528b15033d7168ecdc8731e3ca2b9" }
+iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "a40f92680e7528b15033d7168ecdc8731e3ca2b9" }
 
 # The profile that 'dist' will build with
 [profile.dist]
