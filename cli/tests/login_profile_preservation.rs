@@ -57,7 +57,8 @@ query_uri = "https://old.query.example"
     let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .env("HOME", home.path())
         .env("VERGLAS_CONFIG", &config)
-        .args(["login", "--url", &url, "--api-key", "an-api-key"])
+        .env("VERGLAS_ACCESS_ENDPOINT", &url)
+        .args(["login", "--api-key", "an-api-key"])
         .output()
         .expect("login runs");
     assert!(

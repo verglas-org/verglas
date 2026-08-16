@@ -351,6 +351,55 @@ fn read_profile() -> Result<Profile, ConnectionProfileError> {
         .ok_or_else(|| ConnectionProfileError::MissingProfile(path.display().to_string()))
 }
 
+/// Reads the profile's control-plane URL, when a profile exists.
+pub fn control_plane_url() -> Option<String> {
+    let path = profile_path().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    let config: toml::Value = toml::from_str(&text).ok()?;
+    config
+        .get("connection")?
+        .get("control_plane_url")?
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Removes the stored connection profile and its credential files, preserving
+/// every other section of the config file (for example `[catalog]`).
+pub fn logout() -> Result<bool, ConnectionProfileError> {
+    let config_path = profile_path()?;
+    let text = match fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(ConnectionProfileError::Io {
+                path: config_path.clone(),
+                source,
+            });
+        }
+    };
+    let mut config: toml::Value =
+        toml::from_str(&text).map_err(|source| ConnectionProfileError::Toml {
+            path: config_path.clone(),
+            source,
+        })?;
+    let document = config
+        .as_table_mut()
+        .ok_or_else(|| ConnectionProfileError::InvalidConfig(config_path.clone()))?;
+    let Some(connection) = document.remove("connection") else {
+        return Ok(false);
+    };
+    if let Some(table) = connection.as_table() {
+        for key in ["credentials_file", "bearer_file", "ca_file"] {
+            if let Some(path) = table.get(key).and_then(toml::Value::as_str) {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+    let encoded = toml::to_string_pretty(&config).expect("config serializes");
+    write_config_atomic(&config_path, encoded.as_bytes())?;
+    Ok(true)
+}
+
 fn profile_path() -> Result<PathBuf, ConnectionProfileError> {
     if let Some(path) = std::env::var_os("VERGLAS_CONFIG") {
         return Ok(PathBuf::from(path));

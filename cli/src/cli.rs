@@ -10,33 +10,7 @@ use crate::credentials::{CredentialsError, credentials_path, load_token};
 #[derive(Debug, Parser)]
 #[command(name = "verglas", version, about = "Verglas operator CLI")]
 pub struct Cli {
-    /// Tenant access/database API (`VERGLAS_ACCESS_ENDPOINT`).
-    #[arg(
-        long = "access-endpoint",
-        env = "VERGLAS_ACCESS_ENDPOINT",
-        default_value = "http://127.0.0.1:8345",
-        global = true
-    )]
-    pub access_endpoint: String,
-
-    /// Bearer token for authenticated server APIs (`VERGLAS_TOKEN`).
-    #[arg(long, env = "VERGLAS_TOKEN", global = true)]
-    pub token: Option<String>,
-
-    /// Owner-only file that stores locally minted access tokens.
-    #[arg(long, env = "VERGLAS_CREDENTIALS_FILE", global = true)]
-    pub credentials_file: Option<PathBuf>,
-
-    /// S3 semantic listener endpoint for `graph`/`vector` (`VERGLAS_S3_ENDPOINT`).
-    #[arg(
-        long = "s3-endpoint",
-        env = "VERGLAS_S3_ENDPOINT",
-        default_value = "http://127.0.0.1:8333",
-        global = true
-    )]
-    pub s3_endpoint: String,
-
-    /// Emit machine-readable JSON instead of human-readable tables.
+    /// Emit machine-readable JSON.
     #[arg(long, global = true)]
     pub json: bool,
 
@@ -54,61 +28,88 @@ pub struct Cli {
 /// running server's version is reported by `verglas status`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Authenticate with Verglas Cloud (or a compatible control plane) and
-    /// write the shared, secret-free connection profile used by integrations.
+    /// Authenticate with Verglas Cloud.
+    ///
+    /// Writes the shared, secret-free connection profile used by
+    /// integrations. Self-hosted control planes override the target with
+    /// `VERGLAS_ACCESS_ENDPOINT` or `[connection] control_plane_url` in
+    /// `~/.verglas/config.toml`.
     Login(LoginArgs),
-    /// Resolve the shared connection profile for integrations such as RIME.
+    /// Sign out and remove the stored connection profile.
+    Logout,
+    /// Resolve the shared connection profile.
     Connection(ConnectionArgs),
-    /// Probe the configured server (health, version, cache warmth).
+    /// Probe the configured server.
     Status,
     /// Create, append to, inspect, and drop agent-managed Iceberg tables.
     #[command(subcommand)]
     Table(TableCommand),
-    /// Create and manage json-render dashboards on Verglas Cloud (`--file` specs).
-    /// The OSS stack does not host dashboards.
+    /// Manage json-render dashboards on Verglas Cloud.
+    ///
+    /// Dashboards are declared from `--file` specs. The OSS stack does not
+    /// host dashboards.
     #[command(subcommand)]
     Dashboard(DashboardCommand),
-    /// Scheduled or event-driven workers on Verglas Cloud.
-    /// `list`/`get` read them; `create`/`delete` manage them from a spec file;
-    /// `run` dispatches one now. The OSS stack does not host workers.
+    /// Manage workers on Verglas Cloud.
+    ///
+    /// `list`/`get` read them; `create`/`delete` manage them from a spec
+    /// file; `run` dispatches one now. The OSS stack does not host workers.
     #[command(subcommand)]
     Workers(WorkersCommand),
     /// Create Lakekeeper-managed lakehouses.
     #[command(subcommand)]
     Lakehouse(LakehouseCommand),
-    /// Create scoped credentials without exposing their values in argv.
+    /// Create scoped credentials.
+    ///
+    /// Values are read from stdin and never appear in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
-    /// Mint, inspect, and revoke scoped access tokens.
+    /// Manage scoped access tokens.
     #[command(subcommand)]
     Token(TokenCommand),
-    /// Property-graph node/edge ingestion and traversal over the S3 semantic
-    /// listener (`VERGLAS_S3_ENDPOINT`).
+    /// Property graphs: ingest nodes and edges, traverse, search precedents.
+    ///
+    /// Speaks the S3 semantic listener (`VERGLAS_S3_ENDPOINT`).
     #[command(subcommand)]
     Graph(GraphCommand),
-    /// Vector bucket/index ingestion and nearest-neighbor search over the S3
-    /// semantic listener (`VERGLAS_S3_ENDPOINT`).
+    /// Vector buckets: put vectors, build indexes, nearest-neighbor search.
+    ///
+    /// Speaks the S3 semantic listener (`VERGLAS_S3_ENDPOINT`).
     #[command(subcommand)]
     Vector(VectorCommand),
 }
 
 impl Cli {
-    /// Resolves an explicit or environment bearer token before the active local credential.
+    /// Resolves the bearer token: `VERGLAS_TOKEN`, then the local credential
+    /// stored for the resolved access endpoint.
     pub fn resolved_token(&self) -> Result<Option<String>, CredentialsError> {
-        if let Some(token) = self
-            .token
-            .as_deref()
+        if let Some(token) = std::env::var("VERGLAS_TOKEN")
+            .ok()
             .filter(|token| !token.trim().is_empty())
         {
-            return Ok(Some(token.to_owned()));
+            return Ok(Some(token));
         }
-        let path = credentials_path(self.credentials_file.as_deref())?;
-        Ok(load_token(&path, &self.access_endpoint)?.map(|stored| stored.token))
+        let path = self.resolved_credentials_path()?;
+        Ok(load_token(&path, &Self::access_endpoint())?.map(|stored| stored.token))
     }
 
-    /// Resolves the credential-file location used for token lifecycle commands.
+    /// Resolves the credential-file location: `VERGLAS_CREDENTIALS_FILE`, then
+    /// the default owner-only path.
     pub fn resolved_credentials_path(&self) -> Result<PathBuf, CredentialsError> {
-        credentials_path(self.credentials_file.as_deref())
+        let overridden = std::env::var_os("VERGLAS_CREDENTIALS_FILE").map(PathBuf::from);
+        credentials_path(overridden.as_deref())
+    }
+
+    /// Resolves the tenant access API URL: `VERGLAS_ACCESS_ENDPOINT`, then the
+    /// connection profile's control plane, then Verglas Cloud.
+    pub fn access_endpoint() -> String {
+        if let Ok(url) = std::env::var("VERGLAS_ACCESS_ENDPOINT")
+            && !url.trim().is_empty()
+        {
+            return url;
+        }
+        crate::connection_profile::control_plane_url()
+            .unwrap_or_else(|| "https://api.verglas.dev".to_owned())
     }
 }
 
@@ -149,25 +150,12 @@ pub struct TokenRevokeArgs {
 /// Arguments for the shared connection-profile login flow.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Control-plane URL. Defaults to Verglas Cloud; set this for self-hosted
-    /// compatible control planes.
-    #[arg(long, default_value = "https://api.verglas.dev")]
-    pub url: String,
-    /// Long-lived API key used by automation. Without this, `login` opens the
-    /// system browser and completes an interactive sign-in instead.
+    /// Automation API key; omit for an interactive browser sign-in.
     #[arg(long)]
     pub api_key: Option<String>,
-    /// Print the dashboard authorize URL instead of opening a system browser;
-    /// the CLI still listens for the callback either way. Ignored with `--api-key`.
+    /// Print the authorize URL instead of opening a browser.
     #[arg(long)]
     pub no_browser: bool,
-    /// Dashboard base URL used to build the browser authorize link.
-    #[arg(
-        long,
-        default_value = "https://dashboard.verglas.dev",
-        hide_short_help = true
-    )]
-    pub dashboard_url: String,
 }
 
 /// Arguments for resolving a connection profile.

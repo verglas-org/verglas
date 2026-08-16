@@ -74,14 +74,9 @@ fn no_browser_login_completes_through_the_loopback_callback() {
         .env_remove("VERGLAS_ACCESS_KEY_ID")
         .env_remove("VERGLAS_SECRET_ACCESS_KEY")
         .env_remove("VERGLAS_REGION")
-        .args([
-            "login",
-            "--url",
-            &url,
-            "--no-browser",
-            "--dashboard-url",
-            "https://dashboard.invalid",
-        ])
+        .env("VERGLAS_ACCESS_ENDPOINT", &url)
+        .env("VERGLAS_DASHBOARD_URL", "https://dashboard.invalid")
+        .args(["login", "--no-browser"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

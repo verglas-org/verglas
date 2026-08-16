@@ -87,10 +87,8 @@ fn run(endpoint: &str, args: &[&str], stdin: Option<&str>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_verglas"));
     child
         .env("VERGLAS_ENDPOINT", endpoint)
-        .arg("--access-endpoint")
-        .arg(endpoint)
-        .arg("--token")
-        .arg("local-test-token")
+        .env("VERGLAS_ACCESS_ENDPOINT", endpoint)
+        .env("VERGLAS_TOKEN", "local-test-token")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

@@ -137,10 +137,10 @@ fn command(
 ) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_verglas"));
     command
-        .args(["--access-endpoint", endpoint, "--credentials-file"])
-        .arg(credentials);
+        .env("VERGLAS_ACCESS_ENDPOINT", endpoint)
+        .env("VERGLAS_CREDENTIALS_FILE", credentials);
     if let Some(token) = token {
-        command.args(["--token", token]);
+        command.env("VERGLAS_TOKEN", token);
     }
     command.args(arguments);
     command

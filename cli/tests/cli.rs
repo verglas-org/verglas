@@ -20,8 +20,9 @@ use std::process::Command;
 /// local `workers` command is the surviving deployment surface. `graph` and
 /// `vector` (#144) wrap the S3 semantic listener's property-graph and vector
 /// index REST-JSON surfaces.
-const SURVIVING_COMMANDS: [&str; 11] = [
+const SURVIVING_COMMANDS: [&str; 12] = [
     "login",
+    "logout",
     "connection",
     "status",
     "table",
@@ -80,6 +81,53 @@ const REMOVED_COMMANDS: [&str; 32] = [
     "volumes",
     "secrets",
 ];
+
+/// The CLI exposes exactly one global flag. Endpoints and credentials resolve
+/// from the connection profile, config.toml overrides, and environment
+/// variables — never from `--` options that pollute every subcommand's help.
+#[test]
+fn top_level_options_are_only_json() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .arg("--help")
+        .output()
+        .expect("binary runs");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    for retired in [
+        "--access-endpoint",
+        "--s3-endpoint",
+        "--credentials-file",
+        "--token",
+    ] {
+        assert!(
+            !stdout.contains(retired),
+            "{retired} must not be a CLI flag: {stdout}"
+        );
+    }
+    assert!(stdout.contains("--json"), "--json survives: {stdout}");
+}
+
+/// `login --help` shows only login's own options.
+#[test]
+fn login_help_has_no_global_noise() {
+    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .args(["login", "--help"])
+        .output()
+        .expect("binary runs");
+    let stdout = String::from_utf8(out.stdout).expect("utf8");
+    assert!(stdout.contains("--api-key"), "{stdout}");
+    assert!(stdout.contains("--no-browser"), "{stdout}");
+    for retired in [
+        "--url",
+        "--dashboard-url",
+        "--access-endpoint",
+        "--s3-endpoint",
+    ] {
+        assert!(
+            !stdout.contains(retired),
+            "{retired} must not appear in login help: {stdout}"
+        );
+    }
+}
 
 #[test]
 fn long_version_flag_prints_cli_version() {

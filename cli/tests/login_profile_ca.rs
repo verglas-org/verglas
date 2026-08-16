@@ -65,7 +65,8 @@ fn login_persists_ca_certificate_when_present_and_exposes_it_via_connection_json
     let home = tempdir().expect("temporary home");
     let (url, request) = one_shot_provision_server_with_ca();
     let output = clean_command(home.path())
-        .args(["login", "--url", &url, "--api-key", CLOUD_API_KEY])
+        .env("VERGLAS_ACCESS_ENDPOINT", &url)
+        .args(["login", "--api-key", CLOUD_API_KEY])
         .output()
         .expect("login runs");
     assert!(

@@ -27,13 +27,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Login(args) => {
             commands::connection::login(
-                &args.url,
+                &Cli::access_endpoint(),
                 args.api_key.as_deref(),
-                &args.dashboard_url,
+                &dashboard_url(),
                 args.no_browser,
             )
             .await
         }
+        Command::Logout => commands::connection::logout(),
         Command::Connection(args) => {
             commands::connection::connection(args.include_secrets, cli.json)
         }
@@ -46,16 +47,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::workers::run(command, &endpoint, token.as_deref(), cli.json).await
         }
         Command::Lakehouse(command) => {
-            commands::lakehouse::run(command, &cli.access_endpoint, token.as_deref(), cli.json)
+            commands::lakehouse::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
                 .await
         }
         Command::Secret(command) => {
-            commands::secret::run(command, &cli.access_endpoint, token.as_deref(), cli.json).await
+            commands::secret::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
+                .await
         }
         Command::Token(command) => {
             commands::token::run(
                 command,
-                &cli.access_endpoint,
+                &Cli::access_endpoint(),
                 token.as_deref(),
                 &credentials_path,
                 cli.json,
@@ -63,24 +65,35 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Command::Graph(command) => {
-            commands::graph::run(command, &semantic_endpoint(&cli.s3_endpoint), cli.json).await
+            commands::graph::run(command, &semantic_endpoint(), cli.json).await
         }
         Command::Vector(command) => {
-            commands::vector::run(command, &semantic_endpoint(&cli.s3_endpoint), cli.json).await
+            commands::vector::run(command, &semantic_endpoint(), cli.json).await
         }
     }
 }
 
-/// The semantic S3 endpoint for `graph`/`vector`: an explicit flag or
-/// `VERGLAS_S3_ENDPOINT` wins; the untouched loopback default falls back to
-/// the `[connection]` profile written by `verglas login`.
-fn semantic_endpoint(flag: &str) -> String {
-    if flag != "http://127.0.0.1:8333" {
-        return flag.to_owned();
+/// The semantic S3 endpoint for `graph`/`vector`: `VERGLAS_S3_ENDPOINT` wins;
+/// then the `[connection]` profile written by `verglas login`; then the local
+/// loopback listener.
+fn semantic_endpoint() -> String {
+    if let Ok(url) = std::env::var("VERGLAS_S3_ENDPOINT")
+        && !url.trim().is_empty()
+    {
+        return url;
     }
     connection_profile::resolve_from_environment(&connection_profile::environment())
         .map(|connection| connection.semantic_uri)
-        .unwrap_or_else(|_| flag.to_owned())
+        .unwrap_or_else(|_| "http://127.0.0.1:8333".to_owned())
+}
+
+/// The dashboard base URL for the browser authorize link:
+/// `VERGLAS_DASHBOARD_URL`, then Verglas Cloud.
+fn dashboard_url() -> String {
+    std::env::var("VERGLAS_DASHBOARD_URL")
+        .ok()
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| "https://dashboard.verglas.dev".to_owned())
 }
 
 /// Entry point. Parses and dispatches inside the tokio runtime.

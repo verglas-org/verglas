@@ -823,3 +823,12 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   verglas-client repository, with their profile store and acceptance tests.
   The `drain` verb is removed — draining is an admin-API operation for
   self-hosters, not a user CLI command; the dead client methods went with it.
+
+- CLI surface audit: `--json` is the only global flag. Endpoints and
+  credentials resolve from env, the `[connection]` profile written by login,
+  and config.toml overrides — no `--access-endpoint`/`--token`/
+  `--credentials-file`/`--s3-endpoint`/`--url`/`--dashboard-url` options.
+  The access endpoint defaults to Verglas Cloud. Added `verglas logout`
+  (removes the profile and its credential files, preserves `[catalog]`).
+  Help text is one short line per command; detail lives in each subcommand's
+  own --help.

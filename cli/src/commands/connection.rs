@@ -27,6 +27,17 @@ pub async fn login(
     Ok(())
 }
 
+/// Runs `verglas logout`: removes the stored connection profile and its
+/// credential files, leaving the rest of the config untouched.
+pub fn logout() -> Result<(), Box<dyn Error>> {
+    if connection_profile::logout()? {
+        println!("Logged out: connection profile removed.");
+    } else {
+        println!("No connection profile is stored.");
+    }
+    Ok(())
+}
+
 pub fn connection(include_secrets: bool, json: bool) -> Result<(), Box<dyn Error>> {
     let mut profile =
         connection_profile::resolve_from_environment(&connection_profile::environment())?;

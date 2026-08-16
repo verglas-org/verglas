@@ -6,7 +6,7 @@ use std::process::Command;
 fn run(endpoint: &str, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .env("VERGLAS_ENDPOINT", endpoint)
-        .args(["--token", "dashboard-token"])
+        .env("VERGLAS_TOKEN", "dashboard-token")
         .args(args)
         .output()
         .expect("run CLI");
