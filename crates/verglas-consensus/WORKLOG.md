@@ -232,3 +232,8 @@
   A dead cache node can no longer turn a successful WAL archive checkpoint into
   a foreground write failure; its idempotently addressed fragment is reclaimed
   after it becomes reachable again.
+
+- Deflaked delayed_entry_frame_does_not_delay_vote_metadata: the 50ms vote
+  window raced real fsync latency on loaded 2-core CI runners. The blocked
+  frame now sleeps 1000ms against a 500ms vote timeout, so the bypass
+  invariant is still strictly proven while a slow disk cannot flake it.

@@ -41,7 +41,7 @@ The point: tests written after code tend to **confirm what the code does**; test
 
 - CI computes line coverage (`cargo llvm-cov`) on every PR and **fails below the floor** set in `ci.yml`.
 - Coverage must never decrease in a PR. When your PR raises overall coverage, **raise the floor** in `ci.yml` to just below the new value (the ratchet is part of the definition of done).
-- Long-term target: **≥90% line coverage**, with correctness-critical paths (cache read/write, invalidation ordering, ring routing, protocol surface) at effectively 100%.
+- Long-term target: **≥90% line coverage**, with correctness-critical paths (cache read/write, invalidation ordering, ring routing, protocol surface) at effectively 100%. Measured baseline after the consolidation: 28.96% (2026-08-16); the floor in `ci.yml` starts just below that and only moves up.
 - Coverage is a floor-guard, not the goal. Assertion-free tests written to move the percentage are rejected in review — the TDD rules above define what a real test is.
 
 ## Code quality
