@@ -38,18 +38,13 @@ fn resolve_credentials() -> Result<SigV4Credentials, Box<dyn Error>> {
     let connection = crate::connection_profile::resolve_from_environment(
         &crate::connection_profile::environment(),
     )
-    .map_err(|e| format!(
-        "VERGLAS_S3_ACCESS_KEY_ID is unset and no connection profile resolves (run `verglas login`): {e}"
-    ))?;
+    .map_err(|_| "not signed in; run `verglas login`")?;
     match (connection.access_key_id, connection.secret_access_key) {
         (Some(access_key_id), Some(secret_access_key)) => {
             let region = nonempty_env("VERGLAS_S3_REGION").unwrap_or(connection.region);
             Ok(SigV4Credentials::new(access_key_id, secret_access_key).with_region(region))
         }
-        _ => Err(
-            "no S3 credentials: set VERGLAS_S3_ACCESS_KEY_ID/VERGLAS_S3_SECRET_ACCESS_KEY or run `verglas login`"
-                .into(),
-        ),
+        _ => Err("not signed in; run `verglas login`".into()),
     }
 }
 
