@@ -24,37 +24,36 @@ pub async fn run(endpoint: &str, token: Option<&str>, json: bool) -> Result<(), 
 
 /// Cloud status: resolve the login profile and probe the tenant's endpoints.
 async fn run_cloud(control_plane: &str, json: bool) -> Result<(), Box<dyn Error>> {
-    let resolved = match connection_profile::resolve_from_environment(
-        &connection_profile::environment(),
-    ) {
-        Ok(resolved) => resolved,
-        Err(
-            ConnectionProfileError::MissingProfile(_) | ConnectionProfileError::Incomplete(_),
-        ) => {
-            if json {
-                let value = serde_json::json!({
-                    "signed_in": false,
-                    "control_plane": control_plane,
-                });
-                writeln!(
-                    std::io::stdout(),
-                    "{}",
-                    serde_json::to_string_pretty(&value)?
-                )?;
-            } else {
-                print!(
-                    "\n\
+    let resolved =
+        match connection_profile::resolve_from_environment(&connection_profile::environment()) {
+            Ok(resolved) => resolved,
+            Err(
+                ConnectionProfileError::MissingProfile(_) | ConnectionProfileError::Incomplete(_),
+            ) => {
+                if json {
+                    let value = serde_json::json!({
+                        "signed_in": false,
+                        "control_plane": control_plane,
+                    });
+                    writeln!(
+                        std::io::stdout(),
+                        "{}",
+                        serde_json::to_string_pretty(&value)?
+                    )?;
+                } else {
+                    print!(
+                        "\n\
                      \x20 Verglas Cloud\n\
                      \x20 signed in:  no — run `verglas login`\n\
                      \x20 control plane: {control_plane}\n\n"
-                );
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        Err(error) => return Err(error.into()),
-    };
-    let control_plane = connection_profile::control_plane_url()
-        .unwrap_or_else(|| control_plane.to_owned());
+            Err(error) => return Err(error.into()),
+        };
+    let control_plane =
+        connection_profile::control_plane_url().unwrap_or_else(|| control_plane.to_owned());
     let catalog_uri = resolved.catalog_uri.clone().unwrap_or_default();
     let catalog_state = match health_url(&catalog_uri) {
         Some(url) => probe(&url, |status| status == 200).await,
