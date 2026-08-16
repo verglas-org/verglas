@@ -1584,10 +1584,13 @@ mod tests {
             .expect("queue delayed entry frame");
         started.await.expect("entry persistence started");
 
-        tokio::time::timeout(Duration::from_millis(500), store.save_vote(&Vote::new(2, 2)))
-            .await
-            .expect("vote metadata bypasses the delayed entry actor")
-            .expect("durable vote");
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            store.save_vote(&Vote::new(2, 2)),
+        )
+        .await
+        .expect("vote metadata bypasses the delayed entry actor")
+        .expect("durable vote");
         await_persisted(delayed)
             .await
             .expect("delayed entry frame completes");
