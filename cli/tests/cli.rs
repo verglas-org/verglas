@@ -20,8 +20,9 @@ use std::process::Command;
 /// local `workers` command is the surviving deployment surface. `graph` and
 /// `vector` (#144) wrap the S3 semantic listener's property-graph and vector
 /// index REST-JSON surfaces.
-const SURVIVING_COMMANDS: [&str; 10] = [
-    "drain",
+const SURVIVING_COMMANDS: [&str; 11] = [
+    "login",
+    "connection",
     "status",
     "table",
     "dashboard",
@@ -38,6 +39,9 @@ const SURVIVING_COMMANDS: [&str; 10] = [
 /// family, so it moved out of this list into `SURVIVING_COMMANDS`; the
 /// standalone `query`/`index` verbs it replaced are still gone.
 const REMOVED_COMMANDS: [&str; 32] = [
+    // Drain is an admin-API operation for self-hosters, not a CLI verb (it
+    // implied a user could drain a cloud cache).
+    "drain",
     "query",
     "index",
     // MVP surface prune (#146): only Lakekeeper-managed lakehouses and the
@@ -70,8 +74,8 @@ const REMOVED_COMMANDS: [&str; 32] = [
     "dev",
     // `tables` (plural) duplicated `table`. Only `table` (singular) remains.
     "tables",
-    // Removed control-plane surface (#66).
-    "login",
+    // Removed control-plane surface (#66). `login` returned with the
+    // monorepo client merge.
     "containers",
     "volumes",
     "secrets",
@@ -300,9 +304,9 @@ fn lakehouse_help_lists_the_create_verb() {
 
 #[test]
 fn removed_control_plane_commands_are_unknown() {
-    // #66 removed login and the hosted resource groups. Local `db` and singular
-    // `secret` are separate OSS APIs introduced by #84.
-    for command in ["login", "containers", "volumes", "secrets"] {
+    // #66 removed the hosted resource groups (`login` returned with the
+    // monorepo client merge); `drain` moved to the admin API only.
+    for command in ["drain", "containers", "volumes", "secrets"] {
         let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
             .arg(command)
             .output()

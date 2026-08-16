@@ -2,12 +2,15 @@
 //!
 //! Cloud is the default control plane (`https://api.verglas.dev`). Self-hosted
 //! OSS servers are selected with `VERGLAS_ENDPOINT`. Workers are Cloud-only.
-//! `drain` always targets this machine's loopback admin port.
+//! Self-hosters drain a node through its admin API directly; the CLI has no
+//! drain verb.
 
 mod admin_client;
 mod backend;
+mod browser_login;
 mod cli;
 mod commands;
+mod connection_profile;
 mod credentials;
 mod dashboard_spec;
 mod output;
@@ -22,14 +25,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let credentials_path = cli.resolved_credentials_path()?;
     let endpoint = crate::backend::resolved_endpoint();
     match cli.command {
-        Command::Drain(args) => {
-            commands::drain::run(
-                verglas_core::admin::DEFAULT_ENDPOINT,
-                token.as_deref(),
-                &args,
-                cli.json,
+        Command::Login(args) => {
+            commands::connection::login(
+                &args.url,
+                args.api_key.as_deref(),
+                &args.dashboard_url,
+                args.no_browser,
             )
             .await
+        }
+        Command::Connection(args) => {
+            commands::connection::connection(args.include_secrets, cli.json)
         }
         Command::Status => commands::status::run(&endpoint, token.as_deref(), cli.json).await,
         Command::Table(command) => commands::table::run(command, token.as_deref(), cli.json).await,

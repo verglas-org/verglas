@@ -54,9 +54,11 @@ pub struct Cli {
 /// running server's version is reported by `verglas status`.
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Drain this node: stop taking new cache ownership, donate warmth to
-    /// peers, then exit.
-    Drain(DrainArgs),
+    /// Authenticate with Verglas Cloud (or a compatible control plane) and
+    /// write the shared, secret-free connection profile used by integrations.
+    Login(LoginArgs),
+    /// Resolve the shared connection profile for integrations such as RIME.
+    Connection(ConnectionArgs),
     /// Probe the configured server (health, version, cache warmth).
     Status,
     /// Create, append to, inspect, and drop agent-managed Iceberg tables.
@@ -142,6 +144,39 @@ pub struct TokenCreateArgs {
 pub struct TokenRevokeArgs {
     /// Token identifier returned by `verglas token list`.
     pub id: String,
+}
+
+/// Arguments for the shared connection-profile login flow.
+#[derive(Debug, Args)]
+pub struct LoginArgs {
+    /// Control-plane URL. Defaults to Verglas Cloud; set this for self-hosted
+    /// compatible control planes.
+    #[arg(long, default_value = "https://api.verglas.dev")]
+    pub url: String,
+    /// Long-lived API key used by automation. Without this, `login` opens the
+    /// system browser and completes an interactive sign-in instead.
+    #[arg(long)]
+    pub api_key: Option<String>,
+    /// Print the dashboard authorize URL instead of opening a system browser;
+    /// the CLI still listens for the callback either way. Ignored with `--api-key`.
+    #[arg(long)]
+    pub no_browser: bool,
+    /// Dashboard base URL used to build the browser authorize link.
+    #[arg(
+        long,
+        default_value = "https://dashboard.verglas.dev",
+        hide_short_help = true
+    )]
+    pub dashboard_url: String,
+}
+
+/// Arguments for resolving a connection profile.
+#[derive(Debug, Args)]
+pub struct ConnectionArgs {
+    /// Include the resolved bearer and SigV4 secrets. This is intended only for
+    /// a local child integration; regular output deliberately omits them.
+    #[arg(long)]
+    pub include_secrets: bool,
 }
 
 /// `verglas lakehouse` operations against the local database resource API.
@@ -387,17 +422,6 @@ pub struct TableListArgs {
 pub struct TableInspectArgs {
     /// The table, as `namespace.name`.
     pub table: String,
-}
-
-/// Arguments for `verglas drain`: drain the LOCAL OSS server. The CLI takes no
-/// target — it POSTs `/admin/drain` on this machine's loopback admin endpoint.
-#[derive(Debug, Args)]
-pub struct DrainArgs {
-    /// Maximum time to keep serving as a donor before exiting, e.g. `10m`,
-    /// `30s`, `1h`, or a plain seconds count. Omit to take the server's
-    /// configured drain timeout.
-    #[arg(long)]
-    pub timeout: Option<String>,
 }
 
 /// `verglas graph` operations against the S3 semantic listener (#144). Every

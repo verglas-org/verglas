@@ -817,3 +817,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   line with the other graph verbs. A mock-listener test in
   `cli/tests/graph_vector_semantic.rs` asserts the CLI posts a signed
   `QueryPrecedents` request and renders the ranked decision output.
+
+- Monorepo client merge: `verglas login` (browser loopback flow and --api-key
+  automation) and `verglas connection` moved here from the retired
+  verglas-client repository, with their profile store and acceptance tests.
+  The `drain` verb is removed — draining is an admin-API operation for
+  self-hosters, not a user CLI command; the dead client methods went with it.

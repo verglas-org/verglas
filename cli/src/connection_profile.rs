@@ -1,0 +1,494 @@
+//! Shared Verglas connection profile.
+//!
+//! This is deliberately a client-side contract: `login` exchanges an API key
+//! for endpoint-scoped credentials, writes a secret-free TOML profile, and
+//! integrations resolve the profile through `verglas connection --json`.  The
+//! profile never contains secret material; it only references owner-only files.
+
+use std::collections::BTreeMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+const DEFAULT_REGION: &str = "us-east-1";
+
+#[derive(Debug, Error)]
+pub enum ConnectionProfileError {
+    #[error("cannot locate ~/.verglas; set HOME or VERGLAS_CONFIG")]
+    NoConfigDirectory,
+    #[error(
+        "no Verglas connection profile found at {0}; run `verglas login` or configure [connection]"
+    )]
+    MissingProfile(String),
+    #[error("cannot read {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("cannot parse {path}: {source}")]
+    Toml {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
+    #[error("connection configuration at {0} must be a TOML table")]
+    InvalidConfig(PathBuf),
+    #[error("cannot restrict secret file {path} to owner-only permissions: {source}")]
+    SecureSecret {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("connection profile is incomplete: {0}")]
+    Incomplete(&'static str),
+    #[error("invalid control-plane URL `{0}")]
+    InvalidUrl(String),
+    #[error("control-plane request failed: {0}")]
+    Request(reqwest::Error),
+    #[error("control plane returned HTTP {status}: {body}")]
+    Provision { status: u16, body: String },
+    #[error("could not decode provision response: {0}")]
+    Decode(reqwest::Error),
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ResolvedConnection {
+    pub query_uri: String,
+    pub semantic_uri: String,
+    pub region: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_uri: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_key_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_access_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ConfigFile {
+    connection: Option<Profile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Profile {
+    #[serde(default)]
+    control_plane_url: Option<String>,
+    #[serde(default)]
+    query_uri: Option<String>,
+    #[serde(default)]
+    semantic_uri: Option<String>,
+    #[serde(default)]
+    catalog_uri: Option<String>,
+    #[serde(default)]
+    ca_file: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    credentials_file: Option<String>,
+    #[serde(default)]
+    bearer_file: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvisionResponse {
+    s3_url: String,
+    catalog_url: String,
+    query_url: String,
+    s3_access_key_id: String,
+    s3_secret_access_key: String,
+    catalog_token: String,
+    #[serde(default)]
+    ca_certificate: Option<String>,
+}
+
+/// Authenticates to a public compatible control-plane contract and persists one
+/// profile. No server behavior is implemented here.
+pub async fn login(url: &str, api_key: &str) -> Result<(), ConnectionProfileError> {
+    let provision = exchange(url, api_key).await?;
+    persist(url, Some(api_key), &provision)
+}
+
+/// Exchanges a single-use browser-login code for a connection profile. Unlike
+/// [`login`], the code is never persisted: `~/.verglas/credentials/control-plane-token`
+/// is written only on the `--api-key` path, since codes cannot be reused.
+pub async fn login_with_code(url: &str, code: &str) -> Result<(), ConnectionProfileError> {
+    let provision = exchange(url, code).await?;
+    persist(url, None, &provision)
+}
+
+/// Presents `bearer` as the `Authorization` header against `POST <url>/v1/provision`.
+/// Identical wire contract whether `bearer` is a long-lived API key or a
+/// single-use browser-login code.
+async fn exchange(url: &str, bearer: &str) -> Result<ProvisionResponse, ConnectionProfileError> {
+    let base = normalized_url(url)?;
+    let response = reqwest::Client::new()
+        .post(base.join("v1/provision").expect("validated base URL"))
+        .bearer_auth(bearer)
+        .send()
+        .await
+        .map_err(ConnectionProfileError::Request)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(ConnectionProfileError::Provision {
+            status: status.as_u16(),
+            body: response.text().await.unwrap_or_default(),
+        });
+    }
+    response
+        .json::<ProvisionResponse>()
+        .await
+        .map_err(ConnectionProfileError::Decode)
+}
+
+/// Resolves environment overrides first, then the profile and its referenced
+/// credential files. Local profiles may omit a bearer token entirely.
+pub fn resolve_from_environment(
+    env: &std::collections::HashMap<String, String>,
+) -> Result<ResolvedConnection, ConnectionProfileError> {
+    let profile = match read_profile() {
+        Ok(profile) => Some(profile),
+        Err(ConnectionProfileError::MissingProfile(_)) if has_complete_environment(env) => None,
+        Err(error) => return Err(error),
+    };
+    let value = |name: &str| {
+        env.get(name)
+            .map(String::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    };
+    let profile_value = |f: fn(&Profile) -> &Option<String>| {
+        profile.as_ref().and_then(|profile| f(profile).clone())
+    };
+    let query_uri = value("VERGLAS_ENDPOINT")
+        .or_else(|| profile_value(|p| &p.query_uri))
+        .ok_or(ConnectionProfileError::Incomplete(
+            "query_uri / VERGLAS_ENDPOINT",
+        ))?;
+    let semantic_uri = value("VERGLAS_SEMANTIC_ENDPOINT")
+        .or_else(|| value("VERGLAS_S3_ENDPOINT"))
+        .or_else(|| profile_value(|p| &p.semantic_uri))
+        .unwrap_or_else(|| query_uri.clone());
+    let region = value("VERGLAS_REGION")
+        .or_else(|| value("AWS_REGION"))
+        .or_else(|| value("AWS_DEFAULT_REGION"))
+        .or_else(|| profile_value(|p| &p.region))
+        .unwrap_or_else(|| DEFAULT_REGION.to_owned());
+    let credentials_path = profile
+        .as_ref()
+        .and_then(|p| p.credentials_file.as_deref())
+        .map(expand_home)
+        .transpose()?;
+    let credentials = credentials_path
+        .as_deref()
+        .map(read_aws_credentials)
+        .transpose()?;
+    let bearer_file = profile
+        .as_ref()
+        .and_then(|p| p.bearer_file.as_deref())
+        .map(expand_home)
+        .transpose()?;
+    let stored_bearer = bearer_file.as_deref().map(read_secret).transpose()?;
+    let bearer_token = value("VERGLAS_TOKEN").or(stored_bearer);
+    let access_key_id = value("VERGLAS_ACCESS_KEY_ID")
+        .or_else(|| value("VERGLAS_S3_ACCESS_KEY_ID"))
+        .or_else(|| value("AWS_ACCESS_KEY_ID"))
+        .or_else(|| credentials.as_ref().map(|pair| pair.0.clone()));
+    let secret_access_key = value("VERGLAS_SECRET_ACCESS_KEY")
+        .or_else(|| value("VERGLAS_S3_SECRET_ACCESS_KEY"))
+        .or_else(|| value("AWS_SECRET_ACCESS_KEY"))
+        .or_else(|| credentials.as_ref().map(|pair| pair.1.clone()));
+    Ok(ResolvedConnection {
+        query_uri,
+        semantic_uri,
+        region,
+        catalog_uri: profile_value(|p| &p.catalog_uri),
+        ca_file: profile_value(|p| &p.ca_file),
+        bearer_token,
+        access_key_id,
+        secret_access_key,
+    })
+}
+
+pub fn environment() -> std::collections::HashMap<String, String> {
+    std::env::vars().collect()
+}
+
+fn has_complete_environment(env: &std::collections::HashMap<String, String>) -> bool {
+    env.get("VERGLAS_ENDPOINT")
+        .is_some_and(|value| !value.trim().is_empty())
+        && (env
+            .get("VERGLAS_ACCESS_KEY_ID")
+            .or_else(|| env.get("VERGLAS_S3_ACCESS_KEY_ID"))
+            .or_else(|| env.get("AWS_ACCESS_KEY_ID"))
+            .is_some())
+        && (env
+            .get("VERGLAS_SECRET_ACCESS_KEY")
+            .or_else(|| env.get("VERGLAS_S3_SECRET_ACCESS_KEY"))
+            .or_else(|| env.get("AWS_SECRET_ACCESS_KEY"))
+            .is_some())
+}
+
+fn persist(
+    url: &str,
+    api_key: Option<&str>,
+    provision: &ProvisionResponse,
+) -> Result<(), ConnectionProfileError> {
+    let config_path = profile_path()?;
+    let root = config_path
+        .parent()
+        .map(Path::to_owned)
+        .ok_or(ConnectionProfileError::NoConfigDirectory)?;
+    fs::create_dir_all(&root).map_err(|source| ConnectionProfileError::Io {
+        path: root.clone(),
+        source,
+    })?;
+    let credentials = root.join("credentials");
+    fs::create_dir_all(&credentials).map_err(|source| ConnectionProfileError::Io {
+        path: credentials.clone(),
+        source,
+    })?;
+    private_directory(&credentials)?;
+    let endpoint_file = credentials.join("endpoint.ini");
+    write_private(
+        &endpoint_file,
+        format!(
+            "[default]\naws_access_key_id = {}\naws_secret_access_key = {}\n",
+            provision.s3_access_key_id, provision.s3_secret_access_key
+        )
+        .as_bytes(),
+    )?;
+    let bearer_file = credentials.join("catalog-token");
+    write_private(&bearer_file, provision.catalog_token.as_bytes())?;
+    // Single-use browser-login codes cannot be replayed, so only the
+    // long-lived `--api-key` path leaves a credential behind for them.
+    if let Some(api_key) = api_key {
+        let api_file = credentials.join("control-plane-token");
+        write_private(&api_file, api_key.as_bytes())?;
+    }
+    // The CA is only present when the control plane issues one (R6-D); older
+    // servers and the frozen login tests' mocks omit it, so no file or
+    // profile key is written in that case.
+    let ca_file = match provision.ca_certificate.as_deref() {
+        Some(ca_certificate) => {
+            let ca_file = credentials.join("ca.pem");
+            write_private(&ca_file, ca_certificate.as_bytes())?;
+            Some(ca_file.to_string_lossy().to_string())
+        }
+        None => None,
+    };
+    let profile = Profile {
+        control_plane_url: Some(url.trim_end_matches('/').to_owned()),
+        query_uri: Some(provision.query_url.clone()),
+        semantic_uri: Some(provision.s3_url.clone()),
+        catalog_uri: Some(provision.catalog_url.clone()),
+        ca_file,
+        region: Some(DEFAULT_REGION.to_owned()),
+        credentials_file: Some(endpoint_file.to_string_lossy().to_string()),
+        bearer_file: Some(bearer_file.to_string_lossy().to_string()),
+    };
+    let mut config = match fs::read_to_string(&config_path) {
+        Ok(text) => {
+            toml::from_str::<toml::Value>(&text).map_err(|source| ConnectionProfileError::Toml {
+                path: config_path.clone(),
+                source,
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            toml::Value::Table(Default::default())
+        }
+        Err(source) => {
+            return Err(ConnectionProfileError::Io {
+                path: config_path.clone(),
+                source,
+            });
+        }
+    };
+    let document = config
+        .as_table_mut()
+        .ok_or_else(|| ConnectionProfileError::InvalidConfig(config_path.clone()))?;
+    let profile_fields = toml::Value::try_from(profile).expect("profile serializes");
+    let connection = document
+        .entry("connection".to_owned())
+        .or_insert_with(|| toml::Value::Table(Default::default()));
+    let connection = connection
+        .as_table_mut()
+        .ok_or_else(|| ConnectionProfileError::InvalidConfig(config_path.clone()))?;
+    let fields = profile_fields
+        .as_table()
+        .expect("serialized profile is a table");
+    for (key, value) in fields {
+        connection.insert(key.clone(), value.clone());
+    }
+    let encoded = toml::to_string_pretty(&config).expect("config serializes");
+    write_config_atomic(&config_path, encoded.as_bytes())?;
+    Ok(())
+}
+
+fn read_profile() -> Result<Profile, ConnectionProfileError> {
+    let path = profile_path()?;
+    let text = fs::read_to_string(&path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            ConnectionProfileError::MissingProfile(path.display().to_string())
+        } else {
+            ConnectionProfileError::Io {
+                path: path.clone(),
+                source,
+            }
+        }
+    })?;
+    let config: ConfigFile =
+        toml::from_str(&text).map_err(|source| ConnectionProfileError::Toml {
+            path: path.clone(),
+            source,
+        })?;
+    config
+        .connection
+        .ok_or_else(|| ConnectionProfileError::MissingProfile(path.display().to_string()))
+}
+
+fn profile_path() -> Result<PathBuf, ConnectionProfileError> {
+    if let Some(path) = std::env::var_os("VERGLAS_CONFIG") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(profile_root()?.join("config.toml"))
+}
+
+fn profile_root() -> Result<PathBuf, ConnectionProfileError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".verglas"))
+        .ok_or(ConnectionProfileError::NoConfigDirectory)
+}
+
+fn normalized_url(url: &str) -> Result<reqwest::Url, ConnectionProfileError> {
+    let normalized = format!("{}/", url.trim_end_matches('/'));
+    reqwest::Url::parse(&normalized).map_err(|_| ConnectionProfileError::InvalidUrl(url.to_owned()))
+}
+
+fn expand_home(value: &str) -> Result<PathBuf, ConnectionProfileError> {
+    if value == "~" || value.starts_with("~/") {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(value.strip_prefix("~/").unwrap_or("")))
+            .ok_or(ConnectionProfileError::NoConfigDirectory);
+    }
+    Ok(PathBuf::from(value))
+}
+
+fn read_secret(path: &Path) -> Result<String, ConnectionProfileError> {
+    harden_secret_file(path)?;
+    fs::read_to_string(path)
+        .map(|value| value.trim().to_owned())
+        .map_err(|source| ConnectionProfileError::Io {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+fn read_aws_credentials(path: &Path) -> Result<(String, String), ConnectionProfileError> {
+    harden_secret_file(path)?;
+    let text = fs::read_to_string(path).map_err(|source| ConnectionProfileError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    let values = text
+        .lines()
+        .filter_map(|line| {
+            line.split_once('=')
+                .map(|(key, value)| (key.trim(), value.trim()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let access = values
+        .get("aws_access_key_id")
+        .ok_or(ConnectionProfileError::Incomplete("aws_access_key_id"))?
+        .to_string();
+    let secret = values
+        .get("aws_secret_access_key")
+        .ok_or(ConnectionProfileError::Incomplete("aws_secret_access_key"))?
+        .to_string();
+    Ok((access, secret))
+}
+
+/// Shared profiles may refer to credentials written by a user.  On Unix bring
+/// those files to the same owner-only posture as files created by `login`.
+fn harden_secret_file(path: &Path) -> Result<(), ConnectionProfileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = fs::metadata(path).map_err(|source| ConnectionProfileError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+                ConnectionProfileError::SecureSecret {
+                    path: path.to_owned(),
+                    source,
+                }
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConnectionProfileError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|source| ConnectionProfileError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    file.write_all(contents)
+        .map_err(|source| ConnectionProfileError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
+            ConnectionProfileError::Io {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+fn private_directory(path: &Path) -> Result<(), ConnectionProfileError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
+            ConnectionProfileError::Io {
+                path: path.to_owned(),
+                source,
+            }
+        })?;
+    }
+    Ok(())
+}
+
+/// Replaces the profile atomically so a hook never observes an interrupted
+/// login write.  The file is owner-only even though it carries no secrets.
+fn write_config_atomic(path: &Path, contents: &[u8]) -> Result<(), ConnectionProfileError> {
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    write_private(&temporary, contents)?;
+    fs::rename(&temporary, path).map_err(|source| ConnectionProfileError::Io {
+        path: path.to_owned(),
+        source,
+    })
+}

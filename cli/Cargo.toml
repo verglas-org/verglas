@@ -13,6 +13,7 @@ verglas-core.workspace = true
 # the report and tables_api wire types they deserialize and render.
 verglas-sdk.workspace = true
 clap.workspace = true
+getrandom = "0.2"
 reqwest.workspace = true
 rpassword = "7.4.0"
 serde.workspace = true

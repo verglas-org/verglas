@@ -8,7 +8,7 @@
 use reqwest::StatusCode;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use thiserror::Error;
-use verglas_core::admin::{DRAIN_PATH, DrainAck, DrainRequest, VERSION_PATH, VersionInfo};
+use verglas_core::admin::{VERSION_PATH, VersionInfo};
 
 /// HTTP client for the server admin API.
 #[derive(Debug, Clone)]
@@ -68,46 +68,6 @@ impl AdminClient {
     /// Fetches server version metadata from `GET /admin/version`.
     pub async fn version(&self) -> Result<VersionInfo, AdminClientError> {
         self.get(VERSION_PATH).await
-    }
-
-    /// Initiates a graceful drain of the local server via
-    /// `POST /admin/drain` (#31), returning the server's ack.
-    pub async fn drain(&self, request: &DrainRequest) -> Result<DrainAck, AdminClientError> {
-        self.post(DRAIN_PATH, request).await
-    }
-
-    /// Performs a typed JSON `POST` against a path relative to the base URL.
-    async fn post<Req, Resp>(
-        &self,
-        path: &'static str,
-        body: &Req,
-    ) -> Result<Resp, AdminClientError>
-    where
-        Req: serde::Serialize,
-        Resp: serde::de::DeserializeOwned,
-    {
-        let url = self.base_url.join(path).map_err(|error| {
-            AdminClientError::InvalidEndpoint(format!(
-                "failed to resolve admin path {path} against {}: {error}",
-                self.base_url
-            ))
-        })?;
-        let response = self
-            .authorize(self.http.post(url))
-            .json(body)
-            .send()
-            .await
-            .map_err(AdminClientError::RequestFailed)?;
-
-        let status = response.status();
-        if !status.is_success() {
-            return Err(AdminClientError::UnexpectedStatus { status, path });
-        }
-
-        response
-            .json::<Resp>()
-            .await
-            .map_err(|source| AdminClientError::DecodeFailed { path, source })
     }
 
     /// Performs a typed JSON `GET` against a path relative to the base URL.
