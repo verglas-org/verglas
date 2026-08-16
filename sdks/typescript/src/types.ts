@@ -93,7 +93,7 @@ export interface ConnectOptions {
    * self-hosted server).
    */
   endpoint: string;
-  /** Access/queue edge when it differs from the query endpoint. */
+  /** Access edge when it differs from the query endpoint. */
   accessEndpoint?: string;
   /** Bearer token for the endpoint. Never logged. */
   token: string;
@@ -112,77 +112,12 @@ export interface ConnectOptions {
   timeoutMs?: number;
 }
 
-/** Options for one durable KV put. */
-export interface KvPutOptions {
-  /** Relative logical lifetime in seconds. */
-  ttlSeconds?: number;
-  /** Absolute logical expiration in Unix milliseconds. */
-  expiresAtMs?: number;
-  /** MIME type returned with the raw value. */
-  contentType?: string;
-  /** Bounded application metadata mapped directly to response headers. */
-  metadata?: Record<string, string>;
-  /** Required current version. */
-  ifMatch?: string;
-  /** Require the key to have no live value. */
-  ifNoneMatch?: boolean;
-  /** Identity for one logical write. The SDK never retries it itself. */
-  idempotencyKey?: string;
-}
 
-/** Result of a committed KV put. */
-export interface KvPutResult {
-  /** Opaque committed version/ETag. */
-  version: string;
-  /** Whether the server replayed an existing idempotent result. */
-  idempotent: boolean;
-}
 
-/** One raw KV value and its bounded metadata. */
-export interface KvValue {
-  /** Raw value bytes. */
-  bytes: Uint8Array;
-  /** Opaque committed version/ETag. */
-  version: string;
-  /** MIME type supplied on write. */
-  contentType?: string;
-  /** Commit time in Unix milliseconds. */
-  modifiedAtMs: number;
-  /** Logical expiration time in Unix milliseconds. */
-  expiresAtMs?: number;
-  /** Bounded application metadata. */
-  metadata: Record<string, string>;
-  /** Local tier that served the value. */
-  tier: "ram" | "nvme" | "unspecified";
-}
 
-/** Metadata-only KV list entry. */
-export interface KvListEntry {
-  key: string;
-  version: string;
-  modifiedAtMs: number;
-  expiresAtMs?: number;
-  contentType?: string;
-  metadata: Record<string, string>;
-}
 
-/** Options for one bounded prefix list. */
-export interface KvListOptions {
-  prefix?: string;
-  limit?: number;
-  cursor?: string;
-}
 
-/** One metadata-only KV list page. */
-export interface KvListPage {
-  entries: KvListEntry[];
-  nextCursor?: string;
-}
 
-/** Result of an idempotent KV delete. */
-export interface KvDeleteResult {
-  removed: boolean;
-}
 
 /** Options for `Table.scan`. */
 export interface ScanOptions {
@@ -327,51 +262,10 @@ export interface CommitResult {
   idempotent: boolean;
 }
 
-/** The result of enqueuing rows onto a queue. */
-export interface QueueEnqueueResult {
-  /** Stable ordered positions assigned by PostgreSQL. */
-  positions: number[];
-}
 
-/** One idempotent message published to an exact topic. */
-export interface QueueMessage<T extends Row = Row> {
-  /** Producer-defined idempotency identity. */
-  id: string;
-  /** Exact subscription topic. */
-  topic: string;
-  /** Caller-supplied message body. */
-  payload: T;
-}
 
-/** Opaque proof that one consumer owns a delivery generation. */
-export interface QueueReceipt {
-  /** Stable message position. */
-  position: number;
-  /** Consumer process owning this lease. */
-  owner: string;
-  /** Monotonic generation fencing prior deliveries. */
-  generation: number;
-}
 
-/** One exclusively leased queue message. */
-export interface QueueDelivery<T extends Row = Row> {
-  /** Stable message position. */
-  position: number;
-  /** Exact topic that matched this subscription. */
-  topic: string;
-  /** Caller-supplied JSON payload. */
-  payload: T;
-  /** Receipt required for acknowledgement. */
-  receipt: QueueReceipt;
-  /** RFC 3339 lease deadline. */
-  expiresAt: string;
-}
 
-/** Exclusive deliveries returned by one poll. */
-export interface QueuePollResult<T extends Row = Row> {
-  /** Messages claimed under distinct fenced receipts. */
-  deliveries: QueueDelivery<T>[];
-}
 
 /**
  * One column of an explicit table schema: a name, an Arrow type spelled as a
