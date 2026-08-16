@@ -41,17 +41,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The patched iceberg fork (verglas-org/verglas-iceberg) is private;
-      # cargo needs credentials to clone it. Configure a read token from the
-      # VERGLAS_ICEBERG_TOKEN secret.
-      - name: Authenticate the iceberg fork
-        env:
-          TOKEN: ${{ secrets.VERGLAS_ICEBERG_TOKEN }}
-        run: |
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/verglas-org/verglas-iceberg".insteadOf "https://github.com/verglas-org/verglas-iceberg"
-          fi
-
       - name: Install pinned toolchain
         run: rustup show
 
@@ -95,14 +84,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Authenticate the iceberg fork
-        env:
-          TOKEN: ${{ secrets.VERGLAS_ICEBERG_TOKEN }}
-        run: |
-          if [ -n "$TOKEN" ]; then
-            git config --global url."https://x-access-token:${TOKEN}@github.com/verglas-org/verglas-iceberg".insteadOf "https://github.com/verglas-org/verglas-iceberg"
-          fi
 
       - name: Install pinned toolchain
         run: rustup show && rustup component add llvm-tools-preview
