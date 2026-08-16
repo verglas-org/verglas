@@ -498,7 +498,9 @@ impl PeerServer {
                     // Nagle off on every accepted peer socket: the quorum
                     // write path is small multiplexed h2 frames, exactly the
                     // pattern Nagle+delayed-ACK stalls.
-                    let listener = listener.tap_io(|io| { let _ = io.set_nodelay(true); });
+                    let listener = listener.tap_io(|io| {
+                        let _ = io.set_nodelay(true);
+                    });
                     let _ = axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             let _ = stopping.await;

@@ -185,3 +185,8 @@
   the `delete_stream` delegate to the fixed-part storage wrapper, dropped
   the removed `configured_scheme` factory field, and moved Arrow to 58 to
   match iceberg's pin.
+- Removed the Kv and Queue client surface (types, verbs, module, tests)
+  until further notice. The database-subscription stream that reads pushed
+  update events keeps working: its wire frame and receipt moved into the
+  client as `DeliveryFrame`/`DeliveryReceipt`, and subscription ack is
+  unchanged.

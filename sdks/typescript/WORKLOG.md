@@ -43,3 +43,6 @@
   `dist/`) instead of raw TypeScript sources, so plain Node consumers can
   import it; tests and typecheck still run against `src/`. License field
   corrected to FSL-1.1-ALv2 and the repository LICENSE ships in the tarball.
+- Removed the Kv and Queue client surface (classes, verbs, types, exports,
+  tests, README section) until further notice, before the first npm publish
+  freezes the package surface. Subscriptions and change feeds are unaffected.

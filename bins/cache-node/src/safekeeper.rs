@@ -293,7 +293,9 @@ pub async fn serve(
         layout.w,
     );
     // Consensus rounds are latency-critical small writes: Nagle off.
-    let listener = listener.tap_io(|io| { let _ = io.set_nodelay(true); });
+    let listener = listener.tap_io(|io| {
+        let _ = io.set_nodelay(true);
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
