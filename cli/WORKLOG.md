@@ -832,3 +832,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   (removes the profile and its credential files, preserves `[catalog]`).
   Help text is one short line per command; detail lives in each subcommand's
   own --help.
+
+- Help-text sweep, level two: every subcommand family's list entries are one
+  short line, and help text never mentions config files, config keys, or
+  environment variables — plumbing lives in rustdoc and the docs site, not in
+  --help. Google developer documentation style throughout.

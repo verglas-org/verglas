@@ -31,9 +31,7 @@ pub enum Command {
     /// Authenticate with Verglas Cloud.
     ///
     /// Writes the shared, secret-free connection profile used by
-    /// integrations. Self-hosted control planes override the target with
-    /// `VERGLAS_ACCESS_ENDPOINT` or `[connection] control_plane_url` in
-    /// `~/.verglas/config.toml`.
+    /// integrations.
     Login(LoginArgs),
     /// Sign out and remove the stored connection profile.
     Logout,
@@ -68,13 +66,9 @@ pub enum Command {
     #[command(subcommand)]
     Token(TokenCommand),
     /// Property graphs: ingest nodes and edges, traverse, search precedents.
-    ///
-    /// Speaks the S3 semantic listener (`VERGLAS_S3_ENDPOINT`).
     #[command(subcommand)]
     Graph(GraphCommand),
     /// Vector buckets: put vectors, build indexes, nearest-neighbor search.
-    ///
-    /// Speaks the S3 semantic listener (`VERGLAS_S3_ENDPOINT`).
     #[command(subcommand)]
     Vector(VectorCommand),
 }
@@ -271,13 +265,20 @@ pub enum WorkersCommand {
     /// Show one worker's full detail by name.
     Get(WorkerRefArgs),
     /// Register a worker from a portable spec file (`--file`, JSON or TOML).
+    ///
     /// `--name`/`--schedule` override the matching spec fields.
     Create(WorkerCreateArgs),
-    /// Archive a worker (lifecycle state transition). Accepts the worker's name.
+    /// Archive a worker (lifecycle state transition).
+    ///
+    /// Accepts the worker's name.
     Delete(WorkerRefArgs),
-    /// Dispatch a manual run of the worker now. Accepts the worker's name.
+    /// Dispatch a manual run of the worker now.
+    ///
+    /// Accepts the worker's name.
     Run(WorkerRefArgs),
-    /// Not supported. Workers run on Verglas Cloud; the OSS stack has no follow runtime.
+    /// Not supported.
+    ///
+    /// Workers run on Verglas Cloud; the OSS stack has no follow runtime.
     Follow(WorkerFollowArgs),
 }
 
@@ -329,18 +330,20 @@ pub struct WorkerFollowArgs {
 /// `--json` flag; the JSON shape is documented in each verb's long help.
 #[derive(Debug, Subcommand)]
 pub enum TableCommand {
-    /// Create a table from a source file. CSV, Parquet, and JSONL infer their
-    /// schema from the extension.
+    /// Create a table from a source file.
     ///
-    /// JSON (`--json`): {"table","operation":"create","schema":[{"id","name",
+    /// CSV, Parquet, and JSONL infer their schema from the extension. JSON
+    /// (`--json`): {"table","operation":"create","schema":[{"id","name",
     /// "type","required"}],"partition_by":[...],"records_added","data_files_added",
     /// "snapshot_id"}.
     Create(TableCreateArgs),
-    /// Append a source file to an existing table. Same formats as `create`.
+    /// Append a source file to an existing table.
     ///
-    /// JSON (`--json`): {"table","operation":"append","records_added",
-    /// "data_files_added","snapshot_id"}. A schema mismatch fails naming the
-    /// column, with a nonzero exit code, and leaves the table unchanged.
+    /// Same formats as `create`. JSON (`--json`):
+    /// {"table","operation":"append","records_added",
+    /// "data_files_added","snapshot_id"}. A schema mismatch fails naming
+    /// the column, with a nonzero exit code, and leaves the table
+    /// unchanged.
     Append(TableAppendArgs),
     /// List tables, optionally within one namespace.
     ///
@@ -348,19 +351,20 @@ pub enum TableCommand {
     List(TableListArgs),
     /// Show a table's schema, partitioning, and current-snapshot counters.
     ///
-    /// JSON (`--json`): {"table","schema":[...],"partition_by":[...],"row_count",
+    /// JSON (`--json`):
+    /// {"table","schema":[...],"partition_by":[...],"row_count",
     /// "file_count","size_bytes","current_snapshot_id"}.
     Show(TableInspectArgs),
     /// Show a table's snapshot history (ids, times, operations, summaries).
     ///
-    /// JSON (`--json`): {"table","snapshots":[{"snapshot_id","parent_snapshot_id",
+    /// JSON (`--json`):
+    /// {"table","snapshots":[{"snapshot_id","parent_snapshot_id",
     /// "timestamp_ms","timestamp","operation","summary":{...}}]}.
     History(TableInspectArgs),
-    /// Drop a table via the tenant's Iceberg REST catalog. Removes the table's
-    /// catalog entry; requires `--yes` or an interactive confirmation. Uses the
-    /// `[catalog]` uri and bearer from `~/.verglas/config.toml`.
+    /// Drop a table.
     ///
-    /// JSON (`--json`): {"table","dropped":true}.
+    /// Removes the table's catalog entry. Requires `--yes` or an
+    /// interactive confirmation.
     Delete(TableDeleteArgs),
 }
 
@@ -438,8 +442,7 @@ pub enum GraphCommand {
     KHop(GraphKHopArgs),
     /// Find paths between two nodes within `--max-hops`.
     Paths(GraphPathsArgs),
-    /// Rank Decision nodes against a lexical query, with an optional entity
-    /// structural boost.
+    /// Rank Decision nodes against a lexical query, with an optional entity structural boost.
     Precedents(GraphPrecedentsArgs),
 }
 
