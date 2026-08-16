@@ -979,7 +979,9 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
                 && let Some(authority) = request.uri().authority().cloned()
                 && let Ok(value) = axum::http::HeaderValue::from_str(authority.as_str())
             {
-                request.headers_mut().insert(axum::http::header::HOST, value);
+                request
+                    .headers_mut()
+                    .insert(axum::http::header::HOST, value);
             }
             next.run(request).await
         },
