@@ -551,9 +551,10 @@ async fn read_tasks_to_json(table: &Table, tasks: Vec<FileScanTask>) -> Result<V
     if tasks.is_empty() {
         return Ok(Vec::new());
     }
-    let reader = ArrowReaderBuilder::new(table.file_io().clone()).build();
+    let runtime = iceberg::Runtime::try_current()?;
+    let reader = ArrowReaderBuilder::new(table.file_io().clone(), runtime).build();
     let stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
-    let batches: Vec<RecordBatch> = reader.read(stream)?.try_collect().await?;
+    let batches: Vec<RecordBatch> = reader.read(stream)?.stream().try_collect().await?;
     batches_to_json(&batches)
 }
 

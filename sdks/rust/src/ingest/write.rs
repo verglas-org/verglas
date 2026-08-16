@@ -215,7 +215,7 @@ async fn write_data_files(
     iceberg_schema: &Arc<IcebergSchema>,
     batches: Vec<RecordBatch>,
 ) -> Result<Vec<DataFile>> {
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_gen = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("verglas-{}", uuid::Uuid::new_v4()),
         None,

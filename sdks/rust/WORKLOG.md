@@ -180,3 +180,8 @@
   stock upstream iceberg 0.9.1 in consumer builds; the engine crates that do
   need the fork stay unpublished. License ships as license-file (FSL-1.1-ALv2
   is not an SPDX identifier).
+- Iceberg 0.10.1 migration: the published SDK now depends on the stock
+  upstream release (the fork patch never applied to consumers anyway). Added
+  the `delete_stream` delegate to the fixed-part storage wrapper, dropped
+  the removed `configured_scheme` factory field, and moved Arrow to 58 to
+  match iceberg's pin.

@@ -106,7 +106,7 @@ pub async fn build_adjacency_index(
         .data(bytes)
         .properties(HashMap::new())
         .build();
-    writer.add(blob, CompressionCodec::Zstd).await?;
+    writer.add(blob, CompressionCodec::zstd_default()).await?;
     writer.close().await?;
 
     let (file_size, footer_size) = puffin_sizes(&table, &blob_path).await?;

@@ -128,7 +128,7 @@ async fn attach_with_optional_key_map(
         .data(crate::codec::encode(index))
         .properties(properties)
         .build();
-    writer.add(blob, CompressionCodec::Zstd).await?;
+    writer.add(blob, CompressionCodec::zstd_default()).await?;
     if let Some(keys) = keys {
         let key_blob = Blob::builder()
             .r#type(STRING_KEY_MAP_BLOB_TYPE.to_owned())
@@ -141,7 +141,9 @@ async fn attach_with_optional_key_map(
                 config.vec_field.clone(),
             )]))
             .build();
-        writer.add(key_blob, CompressionCodec::Zstd).await?;
+        writer
+            .add(key_blob, CompressionCodec::zstd_default())
+            .await?;
     }
     writer.close().await?;
 

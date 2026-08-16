@@ -698,9 +698,7 @@ async fn live_files_by_partition(table: &Table) -> Result<HashMap<PartitionKey, 
         .into_iter()
         .map(|task| (task.data_file_path.clone(), task))
         .collect();
-    let manifest_list = current
-        .load_manifest_list(table.file_io(), &table.metadata_ref())
-        .await?;
+    let manifest_list = table.manifest_list_reader(current).load().await?;
     let mut by_partition: HashMap<PartitionKey, Vec<LiveFile>> = HashMap::new();
     for manifest_file in manifest_list.entries() {
         if manifest_file.content == ManifestContentType::Deletes {
@@ -755,8 +753,9 @@ async fn read_data_files(file_io: &FileIO, files: &[LiveFile]) -> Result<Vec<Rec
         .map(|file| Ok(file.scan_task.clone()))
         .collect();
     let task_stream = Box::pin(futures::stream::iter(tasks));
-    let reader = ArrowReaderBuilder::new(file_io.clone()).build();
-    let batch_stream = reader.read(task_stream)?;
+    let runtime = iceberg::Runtime::try_current().map_err(AgentError::Iceberg)?;
+    let reader = ArrowReaderBuilder::new(file_io.clone(), runtime).build();
+    let batch_stream = reader.read(task_stream)?.stream();
     let batches: Vec<RecordBatch> = batch_stream
         .try_collect()
         .await
@@ -823,7 +822,7 @@ async fn write_compacted(
     batches: Vec<RecordBatch>,
     target_file_bytes: u64,
 ) -> Result<Vec<DataFile>> {
-    let location_gen = DefaultLocationGenerator::new(table.metadata().clone())?;
+    let location_gen = DefaultLocationGenerator::new(table.metadata())?;
     let file_name_gen = DefaultFileNameGenerator::new(
         format!("verglas-compact-{}", uuid::Uuid::new_v4()),
         None,
@@ -882,11 +881,10 @@ async fn commit_replace(
     let snapshot_id = unique_snapshot_id(table);
     let next_seq = metadata.next_sequence_number();
     let parent = metadata.current_snapshot_id();
-    let current_manifests = metadata
+    let current_snapshot = metadata
         .current_snapshot()
-        .ok_or_else(|| AgentError::Compaction("table has no current snapshot".to_owned()))?
-        .load_manifest_list(file_io, &table.metadata_ref())
-        .await?;
+        .ok_or_else(|| AgentError::Compaction("table has no current snapshot".to_owned()))?;
+    let current_manifests = table.manifest_list_reader(current_snapshot).load().await?;
     let affected_manifests: HashSet<&str> = removed
         .iter()
         .map(|file| file.manifest_path.as_str())
@@ -930,7 +928,6 @@ async fn commit_replace(
         let builder = ManifestWriterBuilder::new(
             output,
             Some(snapshot_id),
-            None,
             metadata.current_schema().clone(),
             spec.as_ref().clone(),
         );
@@ -967,7 +964,6 @@ async fn commit_replace(
     let builder = ManifestWriterBuilder::new(
         output,
         Some(snapshot_id),
-        None,
         metadata.current_schema().clone(),
         metadata.default_partition_spec().as_ref().clone(),
     );
@@ -1004,7 +1000,10 @@ async fn commit_replace(
         format!("{location}/{METADATA_DIR}/snap-{snapshot_id}-0-{commit_uuid}.avro");
     let list_output = file_io
         .new_output(&manifest_list_path)
-        .map_err(|e| AgentError::Compaction(format!("open manifest list output: {e}")))?;
+        .map_err(|e| AgentError::Compaction(format!("open manifest list output: {e}")))?
+        .writer()
+        .await
+        .map_err(|e| AgentError::Compaction(format!("open manifest list writer: {e}")))?;
     let mut list_writer = match format_version {
         FormatVersion::V1 => ManifestListWriter::v1(list_output, snapshot_id, parent),
         FormatVersion::V2 => ManifestListWriter::v2(list_output, snapshot_id, parent, next_seq),
@@ -1187,9 +1186,7 @@ async fn reachable_data_files(table: &Table) -> Result<HashSet<String>> {
     let file_io = table.file_io();
     let mut reachable = HashSet::new();
     for snapshot in metadata.snapshots() {
-        let manifest_list = snapshot
-            .load_manifest_list(file_io, &table.metadata_ref())
-            .await?;
+        let manifest_list = table.manifest_list_reader(snapshot).load().await?;
         for manifest_file in manifest_list.entries() {
             let manifest = manifest_file.load_manifest(file_io).await?;
             for entry in manifest.entries() {

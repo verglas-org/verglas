@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use futures::stream::BoxStream;
 use iceberg::Result;
 use iceberg::io::{
     FileMetadata, FileRead, FileWrite, InputFile, OutputFile, Storage, StorageConfig,
@@ -109,6 +110,11 @@ impl Storage for FixedPartStorage {
     /// Delegates to the inner storage.
     async fn delete_prefix(&self, path: &str) -> Result<()> {
         self.inner.delete_prefix(path).await
+    }
+
+    /// Delegates to the inner storage.
+    async fn delete_stream(&self, paths: BoxStream<'static, String>) -> Result<()> {
+        self.inner.delete_stream(paths).await
     }
 
     /// Reads are unaffected, so the input file may point at the inner storage.

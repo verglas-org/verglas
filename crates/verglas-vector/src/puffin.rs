@@ -45,7 +45,7 @@ pub async fn to_puffin_bytes(
         .properties(properties)
         .build();
     writer
-        .add(blob, CompressionCodec::Zstd)
+        .add(blob, CompressionCodec::zstd_default())
         .await
         .map_err(|e| VectorError::Puffin(e.to_string()))?;
     writer

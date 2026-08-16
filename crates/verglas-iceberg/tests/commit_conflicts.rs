@@ -134,6 +134,10 @@ impl Catalog for ConflictingCatalog {
         self.inner.drop_table(table).await
     }
 
+    async fn purge_table(&self, table: &TableIdent) -> IcebergResult<()> {
+        self.inner.purge_table(table).await
+    }
+
     async fn table_exists(&self, table: &TableIdent) -> IcebergResult<bool> {
         self.inner.table_exists(table).await
     }

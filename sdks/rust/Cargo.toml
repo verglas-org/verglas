@@ -14,11 +14,11 @@ license-file.workspace = true
 verglas-api.workspace = true
 verglas-core.workspace = true
 arrow-array.workspace = true
-arrow-buffer = "57"
+arrow-buffer = "58"
 arrow-schema.workspace = true
 # Arrow IPC stream encoding for the data frames — the wire format connectors
 # emit. Pinned to the workspace's Arrow major version.
-arrow-ipc = "57"
+arrow-ipc = "58"
 # CSV/JSONL schema inference and Parquet footer reads for client-side ingest
 # (#145): the SDK owns the whole write path, no server round trip.
 arrow-csv.workspace = true

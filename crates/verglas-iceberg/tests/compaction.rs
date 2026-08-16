@@ -260,8 +260,9 @@ async fn compaction_preserves_unaffected_data_manifests() {
 
     let table = catalog.load_table(&ident).await.expect("load");
     let current = table.metadata().current_snapshot().expect("snapshot");
-    let manifest_list = current
-        .load_manifest_list(table.file_io(), &table.metadata_ref())
+    let manifest_list = table
+        .manifest_list_reader(current)
+        .load()
         .await
         .expect("manifest list");
     let mut largest = None;
@@ -300,8 +301,9 @@ async fn compaction_preserves_unaffected_data_manifests() {
 
     let table = catalog.load_table(&ident).await.expect("reload");
     let current = table.metadata().current_snapshot().expect("snapshot");
-    let manifest_list = current
-        .load_manifest_list(table.file_io(), &table.metadata_ref())
+    let manifest_list = table
+        .manifest_list_reader(current)
+        .load()
         .await
         .expect("manifest list");
     assert!(
