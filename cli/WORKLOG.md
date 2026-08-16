@@ -842,3 +842,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   the profile in-process) and scrubbed every runtime string of config-file,
   config-key, and environment-variable mentions — errors now say what to do
   ("not signed in; run `verglas login`"), not where settings live.
+
+- Dropped the removed-commands ban list from the help-surface tests. The
+  exact-set assertion on `--help` already prevents anything unshipped from
+  appearing, so the fixture pins only what exists.
