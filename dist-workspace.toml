@@ -16,7 +16,11 @@ ci = "github"
 # One-line installers users curl | sh (shell, mac/linux) or iwr | iex
 # (powershell, windows). The homebrew installer generates a formula artifact
 # into each GitHub Release; see the deferred `tap` note below.
-installers = ["shell", "powershell", "homebrew"]
+installers = ["shell", "powershell", "homebrew", "npm"]
+# The npm installer publishes the CLI as @verglas/cli, so `npx @verglas/cli`
+# runs it with zero install. Publishing needs the NPM_TOKEN repo secret.
+npm-scope = "@verglas"
+npm-package = "cli"
 # Target platforms. musl is intentionally NOT built: aws-lc-sys (S3 TLS) and
 # several native deps add musl-static friction. Linux ships glibc (gnu) instead,
 # which covers the mainstream distros. windows-msvc is the real compile gate for
@@ -32,6 +36,9 @@ targets = [
 checksum = "sha256"
 # No release-plan job on PRs: releases are explicit tag pushes only.
 pr-run-mode = "skip"
+# Publish steps that run after every target build is green: the npm package
+# for the CLI, and the daemon container image (.github/workflows/publish-docker.yml).
+publish-jobs = ["npm", "./publish-docker"]
 # Link the DYNAMIC MSVC CRT on windows. cargo-dist defaults to +crt-static,
 # but the ONNX Runtime objects (fastembed -> ort, prebuilt) are compiled
 # against the dynamic CRT — static linking fails with LNK2001 unresolved

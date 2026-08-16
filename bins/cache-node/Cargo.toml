@@ -98,7 +98,7 @@ toml.workspace = true
 [lints]
 workspace = true
 
-# Ship this binary in the cargo-dist release archives (workspace packages set
-# `publish = false` for the crates.io ban), like the other bins.
+# Not distributed as raw prebuilt binaries: the daemon ships as a container
+# image (ghcr.io, built by the release pipeline's publish-docker job).
 [package.metadata.dist]
-dist = true
+dist = false

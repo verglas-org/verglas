@@ -36,6 +36,22 @@ Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
 
+## Install
+
+The CLI runs directly through npm:
+
+```sh
+npx @verglas/cli --help
+```
+
+Shell and Homebrew installers ship with every
+[GitHub Release](https://github.com/verglas-org/verglas/releases). The daemon
+is distributed as a container image:
+
+```sh
+docker pull ghcr.io/verglas-org/verglas-cache-node:latest
+```
+
 ## Run the engine locally
 
 The open-source Compose stack starts exactly one disposable `verglas-cache-node`.

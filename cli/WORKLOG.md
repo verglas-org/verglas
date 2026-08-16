@@ -853,3 +853,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   strings. Aligned the login profile tests with the removal of the query
   endpoint: login no longer writes `query_uri`, and a pre-existing key is
   preserved like any other foreign key.
+- Release packaging: added the cargo-dist npm installer publishing the CLI
+  as `@verglas/cli`, so `npx @verglas/cli` runs it with zero install.
+  Publishing requires the NPM_TOKEN repository secret.

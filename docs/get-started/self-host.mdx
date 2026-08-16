@@ -33,6 +33,10 @@ docker compose up --detach --build verglas
 until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 1; done
 ```
 
+To run the released image instead of building from source, use
+`ghcr.io/verglas-org/verglas-cache-node:latest` with the same environment
+variables and ports.
+
 Ports 8333 and 8334 are the defaults. Set `VERGLAS_S3_HOST_PORT` and
 `VERGLAS_ADMIN_HOST_PORT` before Compose when those host ports are occupied;
 client discovery advertises the selected mappings.
