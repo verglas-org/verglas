@@ -37,8 +37,9 @@ checksum = "sha256"
 # No release-plan job on PRs: releases are explicit tag pushes only.
 pr-run-mode = "skip"
 # Publish steps that run after every target build is green: the npm package
-# for the CLI, and the daemon container image (.github/workflows/publish-docker.yml).
-publish-jobs = ["npm", "./publish-docker"]
+# for the CLI, the daemon container image (publish-docker.yml), and the
+# TypeScript SDK npm package (publish-sdk.yml).
+publish-jobs = ["npm", "./publish-docker", "./publish-sdk"]
 # Link the DYNAMIC MSVC CRT on windows. cargo-dist defaults to +crt-static,
 # but the ONNX Runtime objects (fastembed -> ort, prebuilt) are compiled
 # against the dynamic CRT — static linking fails with LNK2001 unresolved

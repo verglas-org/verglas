@@ -44,6 +44,12 @@ The CLI runs directly through npm:
 npx @verglas/cli --help
 ```
 
+The TypeScript SDK installs from npm:
+
+```sh
+npm install @verglas/sdk
+```
+
 The daemon is distributed as a container image:
 
 ```sh
