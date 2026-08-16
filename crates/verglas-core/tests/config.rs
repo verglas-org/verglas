@@ -1117,21 +1117,6 @@ fn writeback_rejects_zero_k_or_m() {
     }
 }
 
-/// `fragment_fraction` is gone: dynamic sizing replaced the fixed carve (#223),
-/// so a config that still sets it is rejected as an unknown field, naming it.
-#[test]
-fn writeback_rejects_removed_fragment_fraction_field() {
-    let toml = format!(
-        "{}[cache.writeback]\nenabled = true\nk = 4\nm = 2\nw = 5\nfragment_fraction = 0.25\n",
-        valid_toml("wb-frac-gone")
-    );
-    let err = Config::from_toml_str(&toml).expect_err("removed field is unknown");
-    assert!(
-        err.to_string().contains("fragment_fraction"),
-        "error names the removed field: {err}"
-    );
-}
-
 /// There is one NVMe budget and no fragment sizing knob (#223): enabling the
 /// write-back tier adds no size field — fragments share `cache.capacity_bytes`
 /// with the block cache first come, first served, enforced by the server's

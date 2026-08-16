@@ -25,28 +25,32 @@ const SURVIVING_COMMANDS: [&str; 11] = [
     "vector",
 ];
 
-/// The CLI exposes exactly one global flag. Endpoints and credentials resolve
-/// from the connection profile, config.toml overrides, and environment
-/// variables — never from `--` options that pollute every subcommand's help.
+/// The CLI exposes exactly one global flag: endpoints and credentials
+/// resolve from the profile, settings, and environment, never from options.
 #[test]
-fn top_level_options_are_only_json() {
+fn top_level_options_are_exactly_json_help_version() {
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .arg("--help")
         .output()
         .expect("binary runs");
     let stdout = String::from_utf8(out.stdout).expect("utf8");
-    for retired in [
-        "--access-endpoint",
-        "--s3-endpoint",
-        "--credentials-file",
-        "--token",
-    ] {
-        assert!(
-            !stdout.contains(retired),
-            "{retired} must not be a CLI flag: {stdout}"
-        );
-    }
-    assert!(stdout.contains("--json"), "--json survives: {stdout}");
+    let options: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| {
+            let t = line.trim_start();
+            t.starts_with("--")
+                .then(|| t.split_whitespace().next().unwrap_or_default())
+                .or_else(|| {
+                    t.starts_with("-")
+                        .then(|| t.split(',').next().unwrap_or_default().trim())
+                })
+        })
+        .collect();
+    assert_eq!(
+        options,
+        ["--json", "-h", "-V"],
+        "global options are exactly --json, -h, -V: {stdout}"
+    );
 }
 
 /// `login --help` shows only login's own options.
@@ -120,57 +124,6 @@ fn dashboard_help_is_cloud_json_render() {
     );
 }
 
-#[test]
-fn server_endpoint_flag_is_gone() {
-    let help = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .arg("--help")
-        .output()
-        .expect("binary runs");
-    assert!(help.status.success());
-    let stdout = String::from_utf8(help.stdout).expect("utf8");
-    assert!(
-        !stdout.contains("--server-endpoint"),
-        "cloud is the default; the flag must not appear: {stdout}"
-    );
-
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["--server-endpoint", "http://127.0.0.1:8334", "status"])
-        .output()
-        .expect("binary runs");
-    assert!(
-        !out.status.success(),
-        "--server-endpoint must be an unknown flag"
-    );
-    let stderr = String::from_utf8(out.stderr).expect("utf8");
-    assert!(
-        stderr.contains("unexpected argument") || stderr.contains("unrecognized"),
-        "--server-endpoint must be rejected: {stderr}"
-    );
-}
-
-#[test]
-fn internal_seed_target_is_hidden_from_help() {
-    // The installer detaches background seeding to a hidden internal subcommand
-    // (`__seed`). It exists solely as the detach target and must never surface in
-    // `--help` as a user verb.
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .arg("--help")
-        .output()
-        .expect("binary runs");
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    assert!(
-        !stdout.contains("__seed"),
-        "the internal seed target must be hidden from --help: {stdout}"
-    );
-    assert!(
-        !help_command_names(&stdout)
-            .iter()
-            .any(|c| c == "__seed" || c == "seed"),
-        "no seed verb is listed in --help"
-    );
-}
-
 /// The subcommand names `verglas --help` advertises, taken from the `Commands:`
 /// block only — so a command word appearing inside a description or an option
 /// (`-V, --version`) is not mistaken for a listed subcommand.
@@ -240,25 +193,6 @@ fn lakehouse_help_lists_the_create_verb() {
 }
 
 #[test]
-fn tables_plural_is_an_unknown_command() {
-    // `verglas tables` duplicated `verglas table` and was removed. Invoking it
-    // must be a clap unknown-command error and exit non-zero.
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .arg("tables")
-        .output()
-        .expect("binary runs");
-    assert!(
-        !out.status.success(),
-        "`verglas tables` must fail as an unknown command"
-    );
-    let stderr = String::from_utf8(out.stderr).expect("utf8");
-    assert!(
-        stderr.contains("unrecognized subcommand") || stderr.contains("unexpected argument"),
-        "`verglas tables` must be a clap unknown-command error: {stderr}"
-    );
-}
-
-#[test]
 fn table_help_lists_exactly_the_mvp_verbs() {
     // `verglas table --help` lists exactly the shipped verbs.
     let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
@@ -277,19 +211,6 @@ fn table_help_lists_exactly_the_mvp_verbs() {
     assert_eq!(
         listed, expected,
         "`verglas table --help` lists exactly the shipped verbs"
-    );
-}
-
-#[test]
-fn table_index_is_an_unknown_command() {
-    // The retired `table index` path must error.
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["table", "index"])
-        .output()
-        .expect("binary runs");
-    assert!(
-        !out.status.success(),
-        "`verglas table index` must fail as an unknown subcommand"
     );
 }
 

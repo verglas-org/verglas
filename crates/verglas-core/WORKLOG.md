@@ -438,3 +438,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #135: Removed the process-global WAL archive target. Each Neon timeline now
   receives its immutable bucket binding through the consensus-backed admin
   contract, while `[catalog_archive]` remains the fixed catalog checkpoint target.
+- Test-slop audit: dropped the config test asserting rejection of the removed
+  `fragment_fraction` field. Serde's deny-unknown-fields already rejects every
+  unknown key; pinning one historical name verifies nothing.

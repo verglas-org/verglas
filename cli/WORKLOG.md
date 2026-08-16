@@ -846,3 +846,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - Dropped the removed-commands ban list from the help-surface tests. The
   exact-set assertion on `--help` already prevents anything unshipped from
   appearing, so the fixture pins only what exists.
+- Test-slop audit: deleted negative tests that guarded removed functionality
+  (gone flags, retired verbs, unknown-command probes) and a login tautology.
+  Replaced the top-level option ban list with one exact-set assertion
+  (`--json`, `-h`, `-V`), which catches option creep without carrying dead
+  strings. Aligned the login profile tests with the removal of the query
+  endpoint: login no longer writes `query_uri`, and a pre-existing key is
+  preserved like any other foreign key.

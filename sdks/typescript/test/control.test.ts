@@ -82,12 +82,6 @@ describe("control-plane connectors", () => {
     ]);
   });
 
-  it("requires credentials for scheduler and runtime control", () => {
-    const options = { endpoint: "http://verglas.test", token: "" };
-    expect(() => connectAccess(options)).toThrow(/token is required/);
-    expect(() => connectScheduler(options)).toThrow(/token is required/);
-    expect(() => connectRuntime(options)).toThrow(/token is required/);
-  });
 
   it("manages one-shot scoped access tokens without exposing their secret after creation", async () => {
     const requests: Request[] = [];

@@ -168,3 +168,8 @@
   `POST /QueryPrecedents` operation on the cache node's Graph REST-JSON
   listener; no new dependency and no signing logic beyond the shared SigV4
   helper every other semantic client already uses.
+- Test-slop audit: removed assertion-free serialization walks in the semantic
+  client tests, a rejected-spec negative for a trigger type the builder can no
+  longer produce, and a default-timeout tautology (with its now-empty inline
+  test module). Remaining tests all assert wire behavior the SDK can still get
+  wrong.

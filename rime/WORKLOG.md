@@ -62,3 +62,7 @@
   as document editing. RIME workers pin evaluator evidence to their worktree
   HEAD. Claims at different states are succession, not contradiction, and
   unscoped claims rank below pinned ones.
+- Test-slop audit: dropped `doesNotMatch` guards against the pre-rename
+  `rime:rime-worker` agent string from the package and lakehouse-skill tests.
+  The positive assertions on the current `verglas:rime-worker` name already
+  fail if the rename regresses.

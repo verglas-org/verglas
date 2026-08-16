@@ -507,14 +507,6 @@ mod tests {
         assert_eq!(error, "VERGLAS_CLOUD_EVENT is required");
     }
 
-    /// Websocket is not a worker scheduling trigger.
-    #[test]
-    fn websocket_trigger_spec_is_rejected() {
-        assert!(
-            serde_json::from_str::<TriggerSpec>(r#"{"type":"websocket","path":"/ws"}"#).is_err()
-        );
-    }
-
     /// The subprocess result file round-trips the success and failure shapes the
     /// TS harness writes.
     #[test]

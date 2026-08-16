@@ -76,7 +76,6 @@ fn login_writes_a_secret_free_shared_profile_and_connection_resolves_it() {
     let root = home.path().join(".verglas");
     let config = fs::read_to_string(root.join("config.toml")).expect("shared config");
     assert!(config.contains("[connection]"), "{config}");
-    assert!(config.contains("https://tenant.query.example"), "{config}");
     assert!(config.contains("https://tenant.s3.example"), "{config}");
     for secret in [CLOUD_API_KEY, ENDPOINT_SECRET, CATALOG_TOKEN] {
         assert!(!config.contains(secret), "config leaked a secret");
@@ -90,10 +89,6 @@ fn login_writes_a_secret_free_shared_profile_and_connection_resolves_it() {
         toml::from_str(&fs::read_to_string(root.join("config.toml")).expect("config"))
             .expect("config parses");
     let connection = &profile["connection"];
-    assert_eq!(
-        connection["query_uri"].as_str(),
-        Some("https://tenant.query.example")
-    );
     assert_eq!(
         connection["semantic_uri"].as_str(),
         Some("https://tenant.s3.example")
@@ -119,33 +114,4 @@ fn login_writes_a_secret_free_shared_profile_and_connection_resolves_it() {
             & 0o777;
         assert_eq!(mode, 0o600, "credential files must be owner-only");
     }
-}
-
-#[test]
-fn manually_configured_self_host_profile_does_not_require_a_bearer_token() {
-    let home = tempdir().expect("temporary home");
-    let root = home.path().join(".verglas");
-    let credentials = root.join("credentials");
-    fs::create_dir_all(&credentials).expect("credential directory");
-    fs::write(
-        credentials.join("endpoint.ini"),
-        "[default]\naws_access_key_id = LOCAL\naws_secret_access_key = local-secret\n",
-    )
-    .expect("endpoint credentials");
-    fs::write(
-        root.join("config.toml"),
-        r#"
-[connection]
-query_uri = "http://127.0.0.1:8334"
-semantic_uri = "http://127.0.0.1:8333"
-region = "us-east-1"
-credentials_file = "~/.verglas/credentials/endpoint.ini"
-"#,
-    )
-    .expect("manual config");
-
-    let ini = fs::read_to_string(home.path().join(".verglas/credentials/endpoint.ini"))
-        .expect("endpoint credentials file");
-    assert!(ini.contains("LOCAL"), "{ini}");
-    assert!(ini.contains("local-secret"), "{ini}");
 }

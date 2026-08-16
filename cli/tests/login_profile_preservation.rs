@@ -80,9 +80,11 @@ query_uri = "https://old.query.example"
         value["connection"]["custom_extension"].as_str(),
         Some("retain-me")
     );
+    // Login no longer manages a query endpoint; a manually configured key is
+    // preserved untouched like any other foreign key.
     assert_eq!(
         value["connection"]["query_uri"].as_str(),
-        Some("https://query.example")
+        Some("https://old.query.example")
     );
     assert!(config_dir.join("credentials/endpoint.ini").is_file());
 }

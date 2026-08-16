@@ -95,7 +95,6 @@ test("skill prefers evaluated exploration without forcing it", async () => {
   assert.match(skill, /rime_parallel/);
   assert.match(skill, /rime-worker/);
   assert.match(skill, /verglas:rime-worker/);
-  assert.doesNotMatch(skill, /[^:]rime:rime-worker/);
   assert.match(skill, /\*\*Cursor:\*\*/);
   assert.match(skill, /best-of-n-runner|rime-worker/);
   assert.match(skill, /rime_<project>|project graph/i);

@@ -103,7 +103,6 @@ test("no plugin manifest or skill references the deleted rime:rime-worker dispat
 
   const skill = await readFile(new URL("skills/rime/SKILL.md", root), "utf8");
   assert.match(skill, /verglas:rime-worker/);
-  assert.doesNotMatch(skill, /[^:]rime:rime-worker/);
 });
 
 test("the RIME skill wires workers to attach evaluator evidence to their candidate's graph node", async () => {

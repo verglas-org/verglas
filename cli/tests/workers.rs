@@ -223,16 +223,4 @@ fn workers_help_lists_local_verbs_only() {
             "workers help must list {verb}: {stdout}"
         );
     }
-    for gone in ["push", "pull", "logs", "update"] {
-        assert!(
-            !stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with(gone)),
-            "workers help must not list removed {gone}: {stdout}"
-        );
-    }
-    assert!(
-        !stdout.contains("--local"),
-        "create no longer takes --local: {stdout}"
-    );
 }

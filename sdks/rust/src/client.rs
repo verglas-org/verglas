@@ -1737,18 +1737,3 @@ fn sdk_type(value: &Value) -> Result<String, ClientError> {
 fn nonempty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The default header deadline covers a cold isolated worker launch plus
-    /// catalog planning against a remote warehouse.
-    #[test]
-    fn default_request_timeout_covers_cold_worker_startup() {
-        assert_eq!(
-            ConnectOptions::new("http://127.0.0.1:8334").request_timeout,
-            Duration::from_secs(120)
-        );
-    }
-}
