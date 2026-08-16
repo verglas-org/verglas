@@ -44,9 +44,7 @@ The CLI runs directly through npm:
 npx @verglas/cli --help
 ```
 
-Shell and Homebrew installers ship with every
-[GitHub Release](https://github.com/verglas-org/verglas/releases). The daemon
-is distributed as a container image:
+The daemon is distributed as a container image:
 
 ```sh
 docker pull ghcr.io/verglas-org/verglas-cache-node:latest

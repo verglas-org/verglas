@@ -13,12 +13,12 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backend that runs the release workflow.
 ci = "github"
-# One-line installers users curl | sh (shell, mac/linux) or iwr | iex
-# (powershell, windows). The homebrew installer generates a formula artifact
-# into each GitHub Release; see the deferred `tap` note below.
-installers = ["shell", "powershell", "homebrew", "npm"]
-# The npm installer publishes the CLI as @verglas/cli, so `npx @verglas/cli`
-# runs it with zero install. Publishing needs the NPM_TOKEN repo secret.
+# The CLI's one distribution channel: the npm installer publishes it as
+# @verglas/cli, so `npx @verglas/cli` runs it with zero install. It downloads
+# the per-target archives from the GitHub Release at install time, which is
+# why those archives are still built and attached. Publishing needs the
+# NPM_TOKEN repo secret.
+installers = ["npm"]
 npm-scope = "@verglas"
 npm-package = "cli"
 # Target platforms. musl is intentionally NOT built: aws-lc-sys (S3 TLS) and
@@ -48,12 +48,3 @@ msvc-crt-static = false
 # Releases publish to this same public repo (verglas-org/verglas). No separate
 # releases-only override.
 
-# Homebrew tap publishing is DEFERRED until the tap repo exists. The homebrew
-# installer above still generates the formula as a release artifact (users can
-# install the raw formula file); it is only the automatic push to a tap repo
-# that is turned off. To enable it once `verglas-org/homebrew-tap` exists:
-#   1. Create the (public) github.com/verglas-org/homebrew-tap repo.
-#   2. Add a HOMEBREW_TAP_TOKEN repo secret (a PAT with contents:write on the tap).
-#   3. Uncomment the line below and re-run `dist init` / `dist generate` to add
-#      the publish-homebrew-formula job to release.yml.
-# tap = "verglas-org/homebrew-tap"
