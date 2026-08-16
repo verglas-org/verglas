@@ -108,4 +108,4 @@ jobs:
       # the old 88 floor predated the consolidation and was never enforced on
       # PRs. The ratchet applies from the measured number upward.
       - name: Enforce the floor
-        run: cargo llvm-cov report --fail-under-lines 28
+        run: cargo llvm-cov report --fail-under-lines 76
