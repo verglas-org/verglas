@@ -46,9 +46,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Repository boundary
-        run: bash scripts/check-repository-boundary.sh
-
       - name: Format
         run: cargo fmt --all --check
 

@@ -1,99 +1,137 @@
 ---
 title: "Self-host Verglas"
-description: "Run Verglas against your own S3 origin or as an edge for Verglas Cloud."
+description: "Run one local Verglas cache against a managed Iceberg catalog."
 icon: "server"
 ---
 
-The open-source container runs one runtime node (`verglas-cache-node`). It
-does not include a catalog or cloud control plane. Every deployment needs an S3-compatible origin;
-an Iceberg catalog is optional.
+The OSS distribution is one disposable `verglas-cache-node`. Production
+control-plane services remain in Verglas Cloud. The node does not bootstrap an
+object store or an Iceberg catalog; its provider owns catalog transactions and
+table placement.
 
-## Standalone runtime node
+Every profile enables all local core surfaces:
 
-In this topology Verglas sits in front of your S3 bucket. Reads fill the local
-cache. PUT, COPY, multipart completion, and DELETE write through to the
-configured S3 origin, so the single node is not the only copy of an
-acknowledged object.
+- **Tables** use the cache-owned Iceberg REST gateway at
+  `http://127.0.0.1:8334/catalog` and the cache S3 endpoint at
+  `http://127.0.0.1:8333`.
+- **Graphs** and **Vectors** use their signed APIs on the local S3 endpoint.
+- Data files route through that local S3 endpoint, while the cache gateway owns
+  provider catalog authentication. Clients never receive the provider catalog
+  token or AWS signing credentials.
+
+Set the local cache's own SigV4 keypair for every profile:
 
 ```bash
-export VERGLAS_STORAGE_BUCKET=my-data
-export VERGLAS_STORAGE_ENDPOINT=https://s3.us-west-2.amazonaws.com
-export VERGLAS_STORAGE_REGION=us-west-2
-export VERGLAS_STORAGE_ACCESS_KEY_ID=...
-export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
-export VERGLAS_S3_ACCESS_KEY_ID=verglas-client
-export VERGLAS_S3_SECRET_ACCESS_KEY=...
-docker compose up --detach --build cache
+export VERGLAS_S3_ACCESS_KEY_ID=verglas-local
+export VERGLAS_S3_SECRET_ACCESS_KEY='choose-a-local-secret'
 ```
 
-The checked-in Compose file requires a real S3-compatible origin — there is no
-bundled object store. The S3 listener is `http://127.0.0.1:8333`; health and
-metrics are on port `8334`.
+Start the one-process deployment after choosing exactly one profile:
 
 ```bash
-docker compose up --detach --build
+docker compose up --detach --build verglas
 until curl --fail --silent http://127.0.0.1:8334/admin/healthz; do sleep 1; done
-
-AWS_ACCESS_KEY_ID=verglas-local \
-AWS_SECRET_ACCESS_KEY=verglas-local-secret \
-AWS_DEFAULT_REGION=us-east-1 \
-aws --endpoint-url http://127.0.0.1:8333 s3 ls
 ```
 
-### Choose a catalog
+Ports 8333 and 8334 are the defaults. Set `VERGLAS_S3_HOST_PORT` and
+`VERGLAS_ADMIN_HOST_PORT` before Compose when those host ports are occupied;
+client discovery advertises the selected mappings.
 
-Without a catalog, ordinary S3 operations remain correct but Verglas cannot
-classify Iceberg metadata or warm a table after a commit. Configure any
-compatible Iceberg REST catalog with:
+The cache state is only `./.verglas` by default. Delete it when the local node
+is no longer needed:
 
 ```bash
-export VERGLAS_CATALOG_URI=https://catalog.example.com/catalog
-export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
-docker compose up --detach --build cache
+docker compose down
+rm -rf ./.verglas
 ```
 
-For the best managed experience, point these values at Verglas Catalog. The
-cloud service adds warehouse provisioning, scoped credential vending,
-compaction and snapshot-maintenance scheduling, push notifications to the
-Verglas cache fleet, and event delivery for workers. The cloud-owned Lakekeeper
-service runs `serve-craft`: its catalog commits are linearized and durably
-replicated by the managed Verglas CRaft ring rather than a Lakekeeper Postgres
-database. Losing a minority of that ring does not make the catalog unavailable;
-losing quorum refuses writes instead of accepting unsafe catalog state.
+## Verglas Cloud
 
-Verglas also works with other catalog authorities. Apache Polaris, Lakekeeper,
-Nessie, and another Iceberg REST catalog can be configured directly. AWS Glue
-and S3 Tables remain valid authorities for the Iceberg clients; connect them to
-the cache watcher through an Iceberg REST bridge until a native watcher is
-available. With a third-party catalog, use that catalog's notification
-integration when it has one; otherwise Verglas observes changes by polling and
-warming may lag a commit. Verglas does not replace or mirror the catalog's
-transaction state.
-
-## Edge cache
-
-A self-hosted node can instead cache the managed Verglas S3 endpoint close to
-your applications. In this topology the node's origin is already a durable
-Verglas Cloud cache backed by managed object storage, and both layers observe
-the same managed catalog.
+This profile is the self-hosted edge/cache configuration for a Verglas Cloud
+catalog and managed object endpoint. It is intentionally a wiring stub in OSS:
+Cloud provisions the catalog, scoped storage credentials, and callback target.
 
 ```bash
-export VERGLAS_STORAGE_BUCKET=my-managed-bucket
-export VERGLAS_STORAGE_ENDPOINT=https://s3.my-region.verglas.example
+export VERGLAS_PROVIDER=verglas-cloud
+export VERGLAS_STORAGE_BUCKET=cloud-managed-bucket
+export VERGLAS_STORAGE_ENDPOINT=https://s3.region.verglas.example
 export VERGLAS_STORAGE_REGION=us-west-2
 export VERGLAS_STORAGE_ACCESS_KEY_ID=...
 export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
-export VERGLAS_CATALOG_URI=https://catalog.my-region.verglas.example/catalog
-export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
-export VERGLAS_S3_ACCESS_KEY_ID=edge-client
-export VERGLAS_S3_SECRET_ACCESS_KEY=...
-docker compose up --detach --build cache
+export VERGLAS_CATALOG_URI=https://catalog.region.verglas.example/iceberg
+export VERGLAS_CATALOG_WAREHOUSE=cloud-warehouse
+export VERGLAS_CATALOG_TOKEN=...
+export VERGLAS_CATALOG_EVENT_TOKEN='shared-cache-callback-secret'
+docker compose up --detach --build verglas
 ```
 
-Applications use the edge node's S3 listener. Misses and write-throughs go to
-the managed S3 endpoint, not directly to the backing cloud bucket. This keeps
-the edge disposable while preserving the cloud durability and catalog push
-path.
+Cloud sends authenticated mutation hints to
+`POST /admin/catalog/events`. Hints wake reconciliation early; they never
+replace it. The cache always polls at
+`VERGLAS_CATALOG_POLL_INTERVAL_SECONDS` (30 seconds by default), so a missed
+event converges safely.
 
-Stop the local runtime with `docker compose down`. Add `--volumes` only when
-you intend to delete its local cache state.
+## Cloudflare R2 Data Catalog
+
+Cloudflare R2 Data Catalog is the Iceberg REST catalog and controls where
+tables live. Do not configure a `data_path` or create a second warehouse. Use
+the catalog URI and warehouse Cloudflare provides, plus an R2 credential that
+can read and write the catalog-managed bucket.
+
+```bash
+export VERGLAS_PROVIDER=cloudflare
+export VERGLAS_STORAGE_BUCKET=r2-catalog-managed-bucket
+export VERGLAS_STORAGE_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+export VERGLAS_STORAGE_REGION=auto
+export VERGLAS_STORAGE_ACCESS_KEY_ID=...
+export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
+export VERGLAS_CATALOG_URI='<Catalog URI printed by Cloudflare>'
+export VERGLAS_CATALOG_WAREHOUSE='<Warehouse printed by Cloudflare>'
+export VERGLAS_CATALOG_TOKEN=...
+docker compose up --detach --build verglas
+```
+
+R2 Data Catalog has no cache callback contract in the OSS deployment. The
+cache polls its catalog for committed changes. The catalog gateway retains the
+R2 bearer credential in an owner-only file, and Graphs, Vectors, and Tables
+all use the local gateway instead of connecting to Cloudflare directly.
+
+## Amazon S3 Tables
+
+Amazon S3 Tables is a catalog-managed provider: the table-bucket ARN is the
+warehouse and its service chooses underlying table storage. Do not set a data
+bucket. The cache accepts the dynamic `*--table-s3` table buckets through its
+local S3 listener and signs both catalog and storage requests with the supplied
+AWS credentials.
+
+```bash
+export VERGLAS_PROVIDER=aws-s3-tables
+export VERGLAS_STORAGE_REGION=us-west-2
+export VERGLAS_STORAGE_ACCESS_KEY_ID=...
+export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
+export VERGLAS_CATALOG_WAREHOUSE=arn:aws:s3tables:us-west-2:123456789012:bucket/example
+docker compose up --detach --build verglas
+```
+
+The profile derives `https://s3tables.<region>.amazonaws.com/iceberg`; set
+`VERGLAS_CATALOG_URI` only to override that standard endpoint. The S3 Tables
+REST catalog uses SigV4 service name `s3tables`. Verglas polls it
+for committed metadata changes; no event callback is assumed. The generated
+configuration stores AWS credentials in owner-only files and never places them
+in `config.toml`.
+
+## Connect a client
+
+Use `GET /admin/access` on port 8334 for client discovery. It advertises the
+local `/catalog` Iceberg gateway for explicit table create/ensure. The current
+SDK Table routes run on the same local admin listener:
+
+- `POST /v1/ingest/{name}?mode=append&format=jsonl` appends rows.
+- `GET /v1/tables/{name}/snapshot` reads the current snapshot.
+- `GET /v1/tables/{name}/rows?limit&cursor` scans a bounded page.
+- `GET /v1/tables/{name}/delta?since=&limit=` reads committed changes.
+
+Configure Iceberg clients with the local S3 endpoint and the `VERGLAS_S3_*`
+keypair above. Use the local signed semantic clients for Graphs and Vectors.
+All client data-plane traffic then stays on the cache node before it reaches
+provider-managed table storage.

@@ -613,13 +613,33 @@ impl RestCatalogSource {
     /// Resolves a local gateway path into the upstream path owned by this cache.
     /// Query workers deliberately omit warehouse configuration; the cache adds
     /// it to config discovery so the request shares the watcher's prepared entry.
-    fn gateway_path(&self, path_and_query: &str) -> String {
-        if path_and_query == "/v1/config"
+    async fn gateway_path(&self, path_and_query: &str) -> Result<String, CatalogError> {
+        if path_and_query
+            .split_once('?')
+            .map_or(path_and_query, |(path, _)| path)
+            == "/v1/config"
             && let Some(warehouse) = &self.warehouse
         {
-            return format!("/v1/config?warehouse={}", encode(warehouse));
+            return Ok(format!("/v1/config?warehouse={}", encode(warehouse)));
         }
-        path_and_query.to_owned()
+        if self.warehouse.is_none() || !path_and_query.starts_with("/v1/") {
+            return Ok(path_and_query.to_owned());
+        }
+
+        // SDK clients use Verglas as a prefix-free catalog façade, while some
+        // managed catalogs (S3 Tables and R2 Data Catalog) return a warehouse
+        // prefix from `/v1/config`. Resolve that prefix here and add it exactly
+        // once. Full Iceberg clients that already honored the config response
+        // retain their provider-prefixed path unchanged.
+        let route_root = self.route_root().await?;
+        let root = route_root.strip_prefix(&self.base).unwrap_or(&route_root);
+        if root == "/v1"
+            || path_and_query == root
+            || path_and_query.starts_with(&format!("{root}/"))
+        {
+            return Ok(path_and_query.to_owned());
+        }
+        Ok(format!("{root}{}", &path_and_query[3..]))
     }
 
     /// Sends one request to the configured upstream catalog, applying bearer or
@@ -716,7 +736,7 @@ impl RestCatalogSource {
                 detail: "catalog gateway path must start with '/'".to_owned(),
             });
         }
-        let resolved_path = self.gateway_path(path_and_query);
+        let resolved_path = self.gateway_path(path_and_query).await?;
         if forwarded_authorization.is_none()
             && method == Method::GET
             && let Some(response) = self.responses.read().await.get(&resolved_path)
@@ -981,8 +1001,8 @@ mod tests {
     /// A local query worker does not know the upstream warehouse. The cache
     /// gateway adds its owned warehouse to `/v1/config`, matching the response
     /// the watcher already prepared.
-    #[test]
-    fn gateway_config_uses_the_cache_owned_warehouse() {
+    #[tokio::test]
+    async fn gateway_config_uses_the_cache_owned_warehouse() {
         let source = RestCatalogSource::build(
             "http://catalog".to_owned(),
             None,
@@ -990,7 +1010,17 @@ mod tests {
             Some("tenant-001".to_owned()),
         );
         assert_eq!(
-            source.gateway_path("/v1/config"),
+            source
+                .gateway_path("/v1/config")
+                .await
+                .expect("gateway path"),
+            "/v1/config?warehouse=tenant-001"
+        );
+        assert_eq!(
+            source
+                .gateway_path("/v1/config?warehouse=tenant-001")
+                .await
+                .expect("queried gateway path"),
             "/v1/config?warehouse=tenant-001"
         );
     }

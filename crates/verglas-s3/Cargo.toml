@@ -30,12 +30,10 @@ sha2.workspace = true
 reqwest.workspace = true
 s3s.workspace = true
 sync_wrapper.workspace = true
-thiserror.workspace = true
 http-body-util = "0.1.3"
 tower = "0.5.2"
 tracing = "0.1.44"
 tokio.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 iceberg.workspace = true
 

@@ -8,10 +8,8 @@ publish.workspace = true
 
 [dependencies]
 verglas-core.workspace = true
-verglas-catalog.workspace = true
 verglas-cache.workspace = true
 verglas-cluster.workspace = true
-verglas-consensus.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true

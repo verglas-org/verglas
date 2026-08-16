@@ -1,7 +1,5 @@
 # verglas-sdk worklog
 
-- #1: Moved the Rust data-plane and worker SDK beside the unified CLI in the public client repository. The SDK remains source-compatible while shared wire and authorization contracts are pinned explicitly to the reviewed engine commit.
-
 - #81: Added a separately addressable access-service endpoint and typed principal, resource, grant, and policy-check APIs using scoped bearer credentials.
 - #43: Added the Rust half of the reflected Integration namespace contract. Clients can discover manifests, create a namespace handle, invoke bounded methods, and incrementally decode streaming methods through the same authenticated routes as the TypeScript SDK.
 
@@ -173,3 +171,6 @@
   longer produce, and a default-timeout tautology (with its now-empty inline
   test module). Remaining tests all assert wire behavior the SDK can still get
   wrong.
+- #128: Exposed the database table-subscription batch limit so consumers can
+  bound their in-flight fenced receipts. This prevents slow handlers from
+  receiving more commits than they can acknowledge within one lease.

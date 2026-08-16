@@ -276,3 +276,20 @@
   entrypoint gained VERGLAS_CATALOG_BEARER_TOKEN so an authenticated Iceberg
   REST catalog (R2 Data Catalog) works with env-only configuration; the daemon
   needs no host-side config file.
+- #20 #96: Replaced the bundled local object-store Compose topology with one
+  disposable cache process and three provider profiles: Verglas Cloud,
+  Cloudflare R2 Data Catalog, and Amazon S3 Tables. Provider catalog credentials
+  are rendered into owner-only files; external catalog changes reconcile by poll
+  while Cloud can additionally wake reconciliation through its event hint.
+- #20 #96: Restored the local SDK Table read/append surface and `/admin/access`
+  discovery in the cache process. Tables, Graphs, and Vectors open Iceberg only
+  through the loopback catalog gateway, so provider bearer and SigV4 authority
+  stays inside this process while all table FileIO re-enters its local S3 cache.
+- #135: Invalidated a restored local committed-leader vote before reopening its
+  Raft group. A restarted leader now runs a fresh election and reconstructs its
+  replication workers instead of accepting commands that can never commit.
+  Exact immutable WAL-binding replays also return from locally applied
+  committed state without appending a redundant Raft command.
+- #135: Canonicalized consensus voter and fragment-slot ordering by numeric
+  voter identity. A restarted group now seals and reconstructs payloads from
+  the same slots used before and after Raft restores its sorted voter set.

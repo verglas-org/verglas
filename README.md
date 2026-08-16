@@ -38,30 +38,31 @@ two years after that version is first made available. See [LICENSE](LICENSE).
 
 ## Run the engine locally
 
-The local Compose stack runs one runtime node (`verglas-cache-node`) against a
-real S3-compatible origin such as Cloudflare R2 (set the `VERGLAS_STORAGE_*`
-variables). It contains no hosted control-plane, scheduler, authentication
-service, or application runtime.
+The open-source Compose stack starts exactly one disposable `verglas-cache-node`.
+It contains no catalog, object store, scheduler, or hosted control plane. Choose
+one provider profile in [the self-hosting guide](docs/get-started/self-host.mdx),
+then start it with the provider's credentials:
 
 ```sh
-docker compose up --build
+docker compose up --build verglas
 ```
 
-The S3 surface is available at `http://127.0.0.1:8333` with the development
-credentials `verglas-local` / `verglas-local-secret`. The node health and
-metrics endpoints are on `http://127.0.0.1:8334`.
+The node exposes its S3 surface at `http://127.0.0.1:8333` and its health,
+catalog gateway, and metrics endpoints at `http://127.0.0.1:8334`. Tables use
+the local Iceberg REST gateway at `http://127.0.0.1:8334/catalog`; Graphs and
+Vectors use the same local S3 listener. All three therefore keep provider
+credentials inside the node process and route data files through it.
 
-To enable Iceberg-aware watching and warming, point the node at an existing
-Iceberg REST catalog before starting it:
+The supported profiles are Verglas Cloud, Cloudflare R2 Data Catalog, and
+Amazon S3 Tables. The Cloud profile accepts event hints at
+`/admin/catalog/events` and always reconciles by polling. Cloudflare and AWS
+are polling-only upstreams. Stop the disposable node and remove its local
+state with:
 
 ```sh
-export VERGLAS_CATALOG_URI=https://catalog.example.com
-export VERGLAS_CATALOG_WAREHOUSE=warehouse_name
-docker compose up --build
+docker compose down
+rm -rf ./.verglas
 ```
-
-Without a catalog, Verglas remains a correct S3 pass-through. It does not claim
-Iceberg-aware acceleration is active.
 
 ## Build and test
 

@@ -1,20 +1,26 @@
-//! Documentation boundary checks for the two supported self-hosted deployments.
+//! Documentation boundary checks for the supported self-hosted deployment.
 
-/// Self-hosting documentation must cover direct-origin and managed-edge layouts.
+/// Self-hosting documentation must cover the one-node provider-backed layout.
 #[test]
-fn documents_standalone_and_edge_cache_topologies() {
+fn documents_one_node_and_all_managed_catalog_profiles() {
     let guide = include_str!("../../docs/get-started/self-host.mdx");
 
-    assert!(guide.contains("Standalone runtime node"));
-    assert!(guide.contains("Edge cache"));
-    assert!(guide.contains("VERGLAS_STORAGE_BUCKET"));
-    assert!(guide.contains("VERGLAS_CATALOG_URI"));
-    assert!(guide.contains("Apache Polaris"));
-    assert!(guide.contains("AWS Glue"));
-    assert!(guide.contains("S3 Tables"));
-    assert!(guide.contains("push notifications"));
-    assert!(guide.contains("compaction"));
-    assert!(guide.contains("serve-craft"));
-    assert!(guide.contains("CRaft ring"));
-    assert!(!guide.contains("catalog service's PostgreSQL database"));
+    for required in [
+        "one disposable `verglas-cache-node`",
+        "Verglas Cloud",
+        "Cloudflare R2 Data Catalog",
+        "Amazon S3 Tables",
+        "VERGLAS_PROVIDER",
+        "VERGLAS_CATALOG_URI",
+        "Tables",
+        "Graphs",
+        "Vectors",
+        "/admin/catalog/events",
+    ] {
+        assert!(
+            guide.contains(required),
+            "missing self-host documentation: {required}"
+        );
+    }
+    assert!(!guide.to_ascii_lowercase().contains("minio"));
 }

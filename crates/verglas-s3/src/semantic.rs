@@ -22,7 +22,7 @@ use verglas_graph::{
     Direction, Edge, Graph, Neighbor, Node, Path, Reached, Subgraph, TraversalFilter,
     TripletReceipt,
 };
-use verglas_iceberg::{parse_table_ident, tables_api};
+use verglas_iceberg::tables_api;
 use verglas_vector::{MaintenanceConfig, Metric, StringKeyIndex, VamanaParams};
 
 /// The operations in the checked-in AWS S3 Vectors and Verglas Graph contracts.
@@ -692,6 +692,15 @@ pub struct IcebergCatalogSemanticStore {
     catalog: Arc<dyn Catalog>,
 }
 
+const GRAPH_NAMESPACE_PREFIX: &str = "verglasgraph_";
+const VECTOR_NAMESPACE_PREFIX: &str = "verglasvector_";
+const GRAPH_NAME_PROPERTY: &str = "verglas.graph.name";
+const VECTOR_BUCKET_NAME_PROPERTY: &str = "verglas.s3vectors.name";
+
+fn semantic_namespace(prefix: &str, name: &str) -> String {
+    format!("{prefix}{}", sha256_hex(name.as_bytes()))
+}
+
 impl IcebergCatalogSemanticStore {
     /// Creates an adapter over one already-open Iceberg catalog.
     pub fn new(catalog: Arc<dyn Catalog>) -> Self {
@@ -701,7 +710,11 @@ impl IcebergCatalogSemanticStore {
     /// Opens the named graph directly from its Iceberg namespace.
     fn graph(&self, input: &Value) -> Result<Graph, SemanticError> {
         let graph = required_bounded_string(input, "graphName", 1, 255)?;
-        Graph::open(self.catalog.clone(), graph).map_err(graph_error)
+        Graph::open(
+            self.catalog.clone(),
+            &semantic_namespace(GRAPH_NAMESPACE_PREFIX, graph),
+        )
+        .map_err(graph_error)
     }
 
     /// Ranks `Decision` nodes by BM25 lexical match to `query`, adding a
@@ -852,18 +865,30 @@ impl SemanticApi for IcebergCatalogSemanticStore {
         if operation == "ListGraphs" {
             let max_results = list_max_results(&input)?;
             let next_token = optional_bounded_string(&input, "nextToken", 1, 2048)?;
-            let mut names = self
+            let namespaces = self
                 .catalog
                 .list_namespaces(None)
                 .await
-                .map_err(iceberg_error)?
-                .into_iter()
-                .filter_map(|namespace| {
-                    (namespace.len() == 1)
-                        .then(|| namespace.first().cloned())
-                        .flatten()
-                })
-                .collect::<Vec<_>>();
+                .map_err(iceberg_error)?;
+            let mut names = Vec::new();
+            for namespace in namespaces {
+                let Some(encoded) = (namespace.len() == 1)
+                    .then(|| namespace.first().cloned())
+                    .flatten()
+                    .filter(|name| name.starts_with(GRAPH_NAMESPACE_PREFIX))
+                else {
+                    continue;
+                };
+                let graph = Graph::open(self.catalog.clone(), &encoded).map_err(graph_error)?;
+                let table = self
+                    .catalog
+                    .load_table(graph.nodes_ident())
+                    .await
+                    .map_err(iceberg_error)?;
+                if let Some(name) = table.metadata().properties().get(GRAPH_NAME_PROPERTY) {
+                    names.push(name.clone());
+                }
+            }
             names.sort();
             names.dedup();
             let names = names
@@ -896,7 +921,13 @@ impl SemanticApi for IcebergCatalogSemanticStore {
         let graph = self.graph(&input)?;
         match operation {
             "CreateGraph" => {
-                graph.ensure_tables().await.map_err(graph_error)?;
+                graph
+                    .ensure_tables_with_properties(HashMap::from([(
+                        GRAPH_NAME_PROPERTY.to_owned(),
+                        required_bounded_string(&input, "graphName", 1, 255)?.to_owned(),
+                    )]))
+                    .await
+                    .map_err(graph_error)?;
                 Ok(json!({}))
             }
             "DeleteGraph" => {
@@ -909,9 +940,10 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     .await
                     .map_err(iceberg_error)?;
                 self.catalog
-                    .drop_namespace(&NamespaceIdent::new(
-                        required_bounded_string(&input, "graphName", 1, 255)?.to_owned(),
-                    ))
+                    .drop_namespace(&NamespaceIdent::new(semantic_namespace(
+                        GRAPH_NAMESPACE_PREFIX,
+                        required_bounded_string(&input, "graphName", 1, 255)?,
+                    )))
                     .await
                     .map_err(iceberg_error)?;
                 Ok(json!({}))
@@ -999,11 +1031,6 @@ impl IcebergCatalogSemanticStore {
             )?;
             let encryption = encryption_configuration(input.get("encryptionConfiguration"))?;
             let tags = tags_map(input.get("tags"))?;
-            let namespace = bucket_namespace(&input)?;
-            self.catalog
-                .create_namespace(&namespace, HashMap::new())
-                .await
-                .map_err(iceberg_error)?;
             let control = bucket_control_ident(&input)?;
             tables_api::create_table_with_properties(
                 self.catalog.as_ref(),
@@ -1011,6 +1038,10 @@ impl IcebergCatalogSemanticStore {
                 bucket_control_definition(),
                 HashMap::from([
                     ("verglas.s3vectors.kind".to_owned(), "bucket".to_owned()),
+                    (
+                        VECTOR_BUCKET_NAME_PROPERTY.to_owned(),
+                        required_string(&input, "vectorBucketName")?.to_owned(),
+                    ),
                     (
                         "verglas.s3vectors.created".to_owned(),
                         now_seconds().to_string(),
@@ -1071,6 +1102,13 @@ impl IcebergCatalogSemanticStore {
                 .await
                 .map_err(iceberg_error)?
             {
+                if namespace.len() != 1
+                    || !namespace
+                        .first()
+                        .is_some_and(|name| name.starts_with(VECTOR_NAMESPACE_PREFIX))
+                {
+                    continue;
+                }
                 let control = match self
                     .catalog
                     .load_table(&bucket_control_ident_from_namespace(&namespace)?)
@@ -1088,9 +1126,14 @@ impl IcebergCatalogSemanticStore {
                 {
                     continue;
                 }
-                let name = namespace.first().cloned().ok_or_else(|| {
-                    SemanticError::validation("managed bucket namespace is empty")
-                })?;
+                let name = control
+                    .metadata()
+                    .properties()
+                    .get(VECTOR_BUCKET_NAME_PROPERTY)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SemanticError::validation("managed bucket name metadata is missing")
+                    })?;
                 buckets.push(json!({"vectorBucketName": name, "vectorBucketArn": format!("arn:aws:s3vectors:us-east-1:000000000000:bucket/{name}"), "creationTime": stored_number(control.metadata().properties(), "verglas.s3vectors.created")?}));
             }
             if let Some(prefix) = input.get("prefix").and_then(Value::as_str) {
@@ -1999,46 +2042,50 @@ fn mutate_tags(
 
 /// Resolves a bucket name to the customer-owned Iceberg namespace.
 fn bucket_namespace(input: &Value) -> Result<NamespaceIdent, SemanticError> {
-    Ok(NamespaceIdent::new(
-        required_string(input, "vectorBucketName")?.to_owned(),
-    ))
+    Ok(NamespaceIdent::new(semantic_namespace(
+        VECTOR_NAMESPACE_PREFIX,
+        required_string(input, "vectorBucketName")?,
+    )))
 }
 
 /// Reserved table name used only for durable vector bucket control-plane state.
-const BUCKET_CONTROL_TABLE: &str = "_verglas_vector_bucket";
+const BUCKET_CONTROL_TABLE: &str = "verglas_vector_bucket";
 
 /// Prefix reserved for auxiliary append-only resource control tables.
-const INDEX_CONTROL_PREFIX: &str = "_verglas_vector_index_";
+const INDEX_CONTROL_PREFIX: &str = "verglas_vector_index_";
 
 /// Resolves the Iceberg table that stores bucket metadata, tags, and policy.
 fn bucket_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
-    parse_table_ident(&format!(
-        "{}.{}",
-        required_string(input, "vectorBucketName")?,
-        BUCKET_CONTROL_TABLE
+    Ok(iceberg::TableIdent::new(
+        bucket_namespace(input)?,
+        BUCKET_CONTROL_TABLE.to_owned(),
     ))
-    .map_err(iceberg_error)
 }
 
 /// Resolves the sibling control table that carries mutable index tags.
 fn index_control_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
-    parse_table_ident(&format!(
-        "{}.{}{}",
-        required_string(input, "vectorBucketName")?,
-        INDEX_CONTROL_PREFIX,
-        required_string(input, "indexName")?
+    Ok(iceberg::TableIdent::new(
+        bucket_namespace(input)?,
+        format!(
+            "{INDEX_CONTROL_PREFIX}{}",
+            required_string(input, "indexName")?
+        ),
     ))
-    .map_err(iceberg_error)
 }
 
 /// Resolves a control table from a catalog namespace returned by list_namespaces.
 fn bucket_control_ident_from_namespace(
     namespace: &NamespaceIdent,
 ) -> Result<iceberg::TableIdent, SemanticError> {
-    let bucket = namespace
-        .first()
-        .ok_or_else(|| SemanticError::validation("managed bucket namespace is empty"))?;
-    parse_table_ident(&format!("{bucket}.{BUCKET_CONTROL_TABLE}")).map_err(iceberg_error)
+    if namespace.is_empty() {
+        return Err(SemanticError::validation(
+            "managed bucket namespace is empty",
+        ));
+    }
+    Ok(iceberg::TableIdent::new(
+        namespace.clone(),
+        BUCKET_CONTROL_TABLE.to_owned(),
+    ))
 }
 
 /// Defines the empty durable control table schema kept apart from customer vectors.
@@ -2306,12 +2353,10 @@ fn stable_segment(key: &str, count: u64) -> u64 {
 
 /// Resolves a vector bucket/index name to its customer-owned Iceberg table.
 fn vector_ident(input: &Value) -> Result<iceberg::TableIdent, SemanticError> {
-    parse_table_ident(&format!(
-        "{}.{}",
-        required_string(input, "vectorBucketName")?,
-        required_string(input, "indexName")?
+    Ok(iceberg::TableIdent::new(
+        bucket_namespace(input)?,
+        required_string(input, "indexName")?.to_owned(),
     ))
-    .map_err(iceberg_error)
 }
 
 /// Builds the stable local ARN returned for a newly created vector index.
@@ -3408,6 +3453,17 @@ mod event_publish_mapping_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_tables_use_the_provider_safe_bucket_namespace() {
+        let input = json!({"vectorBucketName":"bucket-with-hyphens","indexName":"index-one"});
+        let control = bucket_control_ident(&input).expect("control ident");
+        let vectors = vector_ident(&input).expect("vector ident");
+        let namespace = control.namespace().first().expect("namespace");
+        assert!(namespace.starts_with(VECTOR_NAMESPACE_PREFIX));
+        assert!(!namespace.contains('-'));
+        assert_eq!(vectors.namespace(), control.namespace());
+    }
 
     /// A cursor advances by key, so inserting an earlier key cannot duplicate a page.
     #[test]

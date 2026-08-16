@@ -481,7 +481,14 @@ impl PayloadStore for DistributedPayloadStore {
         for (voter, result) in loaded {
             let mut record = match result {
                 Ok(Some(record)) => record,
-                Ok(None) | Err(PayloadError::Transport(_)) => continue,
+                Ok(None) => {
+                    eprintln!("consensus payload seal missed staged holder {voter}");
+                    continue;
+                }
+                Err(PayloadError::Transport(error)) => {
+                    eprintln!("consensus payload seal could not load holder {voter}: {error}");
+                    continue;
+                }
                 Err(error) => return Err(error),
             };
             let expected_slot = certificate
@@ -512,10 +519,13 @@ impl PayloadStore for DistributedPayloadStore {
             async move { transport.store(voter, record).await }
         }))
         .await;
-        for result in stored {
+        for (voter, result) in certificate.holders().iter().copied().zip(stored) {
             match result {
                 Ok(()) => sealed += 1,
-                Err(PayloadError::Transport(_)) => continue,
+                Err(PayloadError::Transport(error)) => {
+                    eprintln!("consensus payload seal could not store holder {voter}: {error}");
+                    continue;
+                }
                 Err(error) => return Err(error),
             }
         }

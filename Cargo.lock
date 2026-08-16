@@ -6902,7 +6902,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "verglas-backend",
  "verglas-core",
  "verglas-sdk",
 ]
@@ -6934,7 +6933,6 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
- "toml",
  "verglas-core",
 ]
 
@@ -6993,7 +6991,7 @@ dependencies = [
  "hex",
  "hyper",
  "hyper-util",
- "libc",
+ "iceberg",
  "object_store 0.14.0",
  "openraft",
  "rcgen",
@@ -7115,10 +7113,7 @@ dependencies = [
 name = "verglas-graph"
 version = "0.1.1"
 dependencies = [
- "arrow-array 57.3.1",
  "arrow-schema 57.3.1",
- "async-trait",
- "futures",
  "iceberg",
  "serde",
  "serde_json",
@@ -7181,7 +7176,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -7203,12 +7197,10 @@ dependencies = [
  "percent-encoding",
  "reqwest 0.12.28",
  "s3s",
- "serde",
  "serde_json",
  "sha2 0.10.9",
  "sync_wrapper",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tower",
  "tracing",
@@ -7279,11 +7271,6 @@ dependencies = [
  "arrow-array 56.2.1",
  "arrow-schema 56.2.1",
  "async-trait",
- "aws-config",
- "aws-credential-types",
- "aws-runtime",
- "aws-sigv4",
- "aws-smithy-runtime-api",
  "axum",
  "bytes",
  "criterion",
@@ -7291,7 +7278,6 @@ dependencies = [
  "futures",
  "object_store 0.14.0",
  "parquet 56.2.1",
- "reqwest 0.12.28",
  "rustc-hash",
  "serde",
  "serde_json",
@@ -7338,9 +7324,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "verglas-cache",
- "verglas-catalog",
  "verglas-cluster",
- "verglas-consensus",
  "verglas-core",
  "xxhash-rust",
 ]

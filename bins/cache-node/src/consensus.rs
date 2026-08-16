@@ -15,7 +15,7 @@ use std::{
 };
 
 use futures::future::join_all;
-use openraft::BasicNode;
+use openraft::{BasicNode, Vote, storage::RaftLogStorage};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
@@ -109,6 +109,27 @@ fn raft_config(voters: &[u64], local: u64) -> Result<openraft::Config, PlaneErro
     }
     .validate()
     .map_err(Into::into)
+}
+
+/// Replaces a restored local committed-leader vote with the next uncommitted
+/// term so OpenRaft rebuilds replication after a process restart.
+async fn invalidate_restored_leader_vote(
+    log: &mut PersistentLogStore,
+    local: u64,
+) -> Result<bool, PlaneError> {
+    let Some(vote) = log.read_vote().await? else {
+        return Ok(false);
+    };
+    if !vote.is_committed() || vote.leader_id.node_id != local {
+        return Ok(false);
+    }
+    let term = vote
+        .leader_id
+        .term
+        .checked_add(1)
+        .ok_or("restored Raft leader term overflowed")?;
+    log.save_vote(&Vote::new(term, local)).await?;
+    Ok(true)
 }
 
 /// Owns the one-thread Tokio scheduler on which OpenRaft creates its core and replication tasks.
@@ -253,6 +274,17 @@ fn object_consensus_group(key: &CacheKey) -> String {
     format!("object/{}/{shard}", hex::encode(&scope[..8]))
 }
 
+/// Resolves an immutable binding replay from one locally applied committed value.
+fn existing_wal_binding_outcome(existing: Option<&str>, requested: &str) -> Result<bool, String> {
+    match existing {
+        Some(bucket) if bucket == requested => Ok(true),
+        Some(bucket) => Err(format!(
+            "timeline WAL archive is already bound to `{bucket}`"
+        )),
+        None => Ok(false),
+    }
+}
+
 #[async_trait::async_trait]
 impl ConsensusCommitter for ObjectConsensusCommitter {
     async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
@@ -385,6 +417,29 @@ impl ConsensusPlane {
             .ok_or("group disappeared while reading membership")?;
         let _ = local;
         Ok(replica.state_machine.committed_voters().await)
+    }
+
+    /// Resolves an exact immutable WAL-binding replay without appending another
+    /// command to a Raft group whose committed state already proves the result.
+    pub async fn resolve_committed_wal_binding(
+        &self,
+        group: &str,
+        requested: &str,
+    ) -> Result<bool, PlaneError> {
+        let _ = self.open_local(group).await?;
+        let state_machine = {
+            let groups = self.groups.lock().await;
+            groups
+                .get(group)
+                .ok_or("group disappeared while reading its WAL binding")?
+                .state_machine
+                .clone()
+        };
+        existing_wal_binding_outcome(
+            state_machine.wal_archive_bucket().await.as_deref(),
+            requested,
+        )
+        .map_err(Into::into)
     }
 
     /// Refuses process stop while this node remains a committed voter of any hosted group.
@@ -644,8 +699,10 @@ impl ConsensusPlane {
         }
         let directory = root.join(hex::encode(Sha256::digest(group.as_bytes())));
         std::fs::create_dir_all(&directory)?;
-        let log = PersistentLogStore::open(directory.join("raft-log.json")).await?;
+        let mut log = PersistentLogStore::open(directory.join("raft-log.json")).await?;
         let state_machine = PersistentStateMachine::open(directory.join("state.json")).await?;
+        let reopened_leader =
+            invalidate_restored_leader_vote(&mut log, ring.safekeeper_id()).await?;
         let committed_voters = state_machine.committed_voters().await;
         let voters = if committed_voters.len() == k + m {
             committed_voters.into_iter().collect()
@@ -672,6 +729,9 @@ impl ConsensusPlane {
         ring.raft_registry()
             .register(group, ring.safekeeper_id(), raft.clone())
             .await;
+        if reopened_leader {
+            raft.trigger().elect().await?;
+        }
         let generation = state_machine.membership_generation().await.max(1);
         let consensus = Arc::new(ConsensusGroup::new(
             group,
@@ -858,6 +918,21 @@ mod tests {
         assert_eq!(object_consensus_group(&key), object_consensus_group(&key));
     }
 
+    /// An immutable WAL binding replay is answered from committed local state;
+    /// a different bucket remains a hard conflict.
+    #[test]
+    fn committed_wal_binding_replay_does_not_enter_raft_again() {
+        assert_eq!(
+            existing_wal_binding_outcome(Some("database-bucket"), "database-bucket"),
+            Ok(true)
+        );
+        assert_eq!(
+            existing_wal_binding_outcome(None, "database-bucket"),
+            Ok(false)
+        );
+        assert!(existing_wal_binding_outcome(Some("first-bucket"), "second-bucket").is_err());
+    }
+
     /// A vote remains serviceable while every public-runtime worker is blocked.
     ///
     /// This is intentionally a real OpenRaft vote, not a scheduler-only probe:
@@ -866,6 +941,16 @@ mod tests {
     /// expires.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn real_vote_survives_public_runtime_saturation() {
+        struct SaturationRelease(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+        impl Drop for SaturationRelease {
+            fn drop(&mut self) {
+                let (released, wake) = &*self.0;
+                *released.lock().expect("lock saturation release") = true;
+                wake.notify_all();
+            }
+        }
+
         let directory = tempfile::tempdir().expect("temporary consensus state");
         let runtime = ConsensusRuntime::start().expect("start consensus runtime");
         let log = PersistentLogStore::open(directory.path().join("raft-log.json"))
@@ -894,11 +979,20 @@ mod tests {
             .expect("create Raft on the consensus runtime");
 
         let (entered, entered_rx) = std::sync::mpsc::channel();
+        let release = SaturationRelease(Arc::new((
+            std::sync::Mutex::new(false),
+            std::sync::Condvar::new(),
+        )));
         for _ in 0..2 {
             let entered = entered.clone();
+            let release = Arc::clone(&release.0);
             tokio::spawn(async move {
                 entered.send(()).expect("report public worker saturation");
-                std::thread::sleep(Duration::from_millis(300));
+                let (released, wake) = &*release;
+                let mut released = released.lock().expect("lock saturation release");
+                while !*released {
+                    released = wake.wait(released).expect("wait for saturation release");
+                }
             });
         }
         drop(entered);
@@ -924,10 +1018,11 @@ mod tests {
             let _ = vote_tx.send(result);
         });
         let response = vote_rx
-            .recv_timeout(Duration::from_millis(150))
+            .recv_timeout(Duration::from_secs(2))
             .expect("private Raft core answers during public saturation")
             .expect("real Raft vote succeeds");
         assert!(response.vote_granted);
+        drop(release);
 
         let shutdown_raft = raft.clone();
         runtime
@@ -938,5 +1033,30 @@ mod tests {
             .await
             .expect("stop private Raft core");
         runtime.shutdown().await.expect("stop consensus runtime");
+    }
+
+    /// A process that persisted the committed leader vote must not reopen as a
+    /// leader without replication workers after every voter restarts.
+    #[tokio::test]
+    async fn restored_leader_vote_is_invalidated_before_raft_reopens() {
+        use openraft::storage::RaftLogStorage;
+
+        let directory = tempfile::tempdir().expect("temporary consensus state");
+        let path = directory.path().join("raft-log.json");
+        let mut log = PersistentLogStore::open(path)
+            .await
+            .expect("open durable log");
+        log.save_vote(&Vote::new_committed(18, 7))
+            .await
+            .expect("persist committed leader vote");
+
+        invalidate_restored_leader_vote(&mut log, 7)
+            .await
+            .expect("invalidate restored leader vote");
+
+        assert_eq!(
+            log.read_vote().await.expect("read replacement vote"),
+            Some(Vote::new(19, 7))
+        );
     }
 }
