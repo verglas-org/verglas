@@ -24,16 +24,33 @@ pub fn vector_client(s3_endpoint: &str) -> Result<S3VectorsClient, Box<dyn Error
 }
 
 /// Reads `VERGLAS_S3_ACCESS_KEY_ID`/`VERGLAS_S3_SECRET_ACCESS_KEY`/`VERGLAS_S3_REGION`
-/// (region defaults to `auto`). These are read from the environment only,
-/// never accepted as CLI flags, so they cannot land in shell history or a
-/// process listing.
+/// (region defaults to `auto`), falling back to the `[connection]` profile
+/// `verglas login` writes. Secrets are never accepted as CLI flags, so they
+/// cannot land in shell history or a process listing.
 fn resolve_credentials() -> Result<SigV4Credentials, Box<dyn Error>> {
-    let access_key_id = nonempty_env("VERGLAS_S3_ACCESS_KEY_ID")
-        .ok_or("VERGLAS_S3_ACCESS_KEY_ID must be set to call the S3 semantic listener")?;
-    let secret_access_key = nonempty_env("VERGLAS_S3_SECRET_ACCESS_KEY")
-        .ok_or("VERGLAS_S3_SECRET_ACCESS_KEY must be set to call the S3 semantic listener")?;
-    let region = nonempty_env("VERGLAS_S3_REGION").unwrap_or_else(|| "auto".to_owned());
-    Ok(SigV4Credentials::new(access_key_id, secret_access_key).with_region(region))
+    if let (Some(access_key_id), Some(secret_access_key)) = (
+        nonempty_env("VERGLAS_S3_ACCESS_KEY_ID"),
+        nonempty_env("VERGLAS_S3_SECRET_ACCESS_KEY"),
+    ) {
+        let region = nonempty_env("VERGLAS_S3_REGION").unwrap_or_else(|| "auto".to_owned());
+        return Ok(SigV4Credentials::new(access_key_id, secret_access_key).with_region(region));
+    }
+    let connection = crate::connection_profile::resolve_from_environment(
+        &crate::connection_profile::environment(),
+    )
+    .map_err(|e| format!(
+        "VERGLAS_S3_ACCESS_KEY_ID is unset and no connection profile resolves (run `verglas login`): {e}"
+    ))?;
+    match (connection.access_key_id, connection.secret_access_key) {
+        (Some(access_key_id), Some(secret_access_key)) => {
+            let region = nonempty_env("VERGLAS_S3_REGION").unwrap_or(connection.region);
+            Ok(SigV4Credentials::new(access_key_id, secret_access_key).with_region(region))
+        }
+        _ => Err(
+            "no S3 credentials: set VERGLAS_S3_ACCESS_KEY_ID/VERGLAS_S3_SECRET_ACCESS_KEY or run `verglas login`"
+                .into(),
+        ),
+    }
 }
 
 /// Reads a non-empty, trimmed environment variable.

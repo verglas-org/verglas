@@ -969,6 +969,21 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
         None => app,
     };
     let app = admin::track_http(app, activity, ActivityPlane::Http);
+    // HTTP/2 requests carry the authority in the `:authority` pseudo-header
+    // and omit the Host header entirely, but SigV4 verification canonicalizes
+    // the `host` header the client signed. Reconstruct it so h2 clients (and
+    // fly-proxy forwarding h2) verify identically to HTTP/1.1.
+    let app = app.layer(axum::middleware::from_fn(
+        |mut request: axum::extract::Request, next: axum::middleware::Next| async move {
+            if !request.headers().contains_key(axum::http::header::HOST)
+                && let Some(authority) = request.uri().authority().cloned()
+                && let Ok(value) = axum::http::HeaderValue::from_str(authority.as_str())
+            {
+                request.headers_mut().insert(axum::http::header::HOST, value);
+            }
+            next.run(request).await
+        },
+    ));
 
     let local_addr = s3_listener.local_addr()?;
     eprintln!(

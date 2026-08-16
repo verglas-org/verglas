@@ -23,7 +23,7 @@ mod read;
 mod storage;
 mod write;
 
-pub use catalog::{CatalogConfig, open_catalog};
+pub use catalog::{CatalogConfig, StaticS3Config, open_catalog};
 pub use error::{IngestError, Result};
 pub use ident::parse_table_ident;
 pub use read::{Format, Ingested};

@@ -43,6 +43,20 @@ pub struct CatalogConfig {
     pub warehouse: Option<String>,
     /// Bearer token presented on every catalog request.
     pub bearer: Option<String>,
+    /// Static S3 coordinates for data-file IO, for catalogs that do not vend
+    /// per-table storage credentials (the Verglas tenant catalog): endpoint,
+    /// access key id, secret access key, region. Vended credentials, when
+    /// present in a LoadTable response, still take precedence.
+    pub s3: Option<StaticS3Config>,
+}
+
+/// Static S3 coordinates merged into every table's `FileIO`.
+#[derive(Debug, Clone)]
+pub struct StaticS3Config {
+    pub endpoint: String,
+    pub access_key_id: String,
+    pub secret_access_key: String,
+    pub region: String,
 }
 
 /// Opens a REST [`Catalog`] from `config`. Data files are written through the
@@ -64,6 +78,15 @@ pub async fn open_catalog(config: &CatalogConfig) -> Result<Arc<dyn Catalog>> {
         ACCESS_DELEGATION_HEADER.to_owned(),
         VENDED_CREDENTIALS.to_owned(),
     );
+    if let Some(s3) = &config.s3 {
+        props.insert("s3.endpoint".to_owned(), s3.endpoint.clone());
+        props.insert("s3.access-key-id".to_owned(), s3.access_key_id.clone());
+        props.insert(
+            "s3.secret-access-key".to_owned(),
+            s3.secret_access_key.clone(),
+        );
+        props.insert("s3.region".to_owned(), s3.region.clone());
+    }
 
     let storage = FixedPartStorageFactory::new(OpenDalStorageFactory::S3 {
         configured_scheme: "s3".to_owned(),

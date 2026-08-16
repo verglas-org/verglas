@@ -62,11 +62,25 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
-        Command::Graph(command) => commands::graph::run(command, &cli.s3_endpoint, cli.json).await,
+        Command::Graph(command) => {
+            commands::graph::run(command, &semantic_endpoint(&cli.s3_endpoint), cli.json).await
+        }
         Command::Vector(command) => {
-            commands::vector::run(command, &cli.s3_endpoint, cli.json).await
+            commands::vector::run(command, &semantic_endpoint(&cli.s3_endpoint), cli.json).await
         }
     }
+}
+
+/// The semantic S3 endpoint for `graph`/`vector`: an explicit flag or
+/// `VERGLAS_S3_ENDPOINT` wins; the untouched loopback default falls back to
+/// the `[connection]` profile written by `verglas login`.
+fn semantic_endpoint(flag: &str) -> String {
+    if flag != "http://127.0.0.1:8333" {
+        return flag.to_owned();
+    }
+    connection_profile::resolve_from_environment(&connection_profile::environment())
+        .map(|connection| connection.semantic_uri)
+        .unwrap_or_else(|_| flag.to_owned())
 }
 
 /// Entry point. Parses and dispatches inside the tokio runtime.
