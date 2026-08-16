@@ -4,7 +4,11 @@ description = "The Rust SDK for the agent-data platform: the worker/trigger cont
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-publish.workspace = true
+# Published to crates.io as the Rust SDK; overrides the workspace-wide
+# publish = false (which exists because the engine crates depend on the
+# patched Iceberg fork — this crate does not).
+publish = true
+license-file.workspace = true
 
 [dependencies]
 verglas-api.workspace = true

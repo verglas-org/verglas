@@ -32,10 +32,15 @@ version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/verglas-org/verglas"
 homepage = "https://github.com/verglas-org/verglas"
+# FSL-1.1-ALv2 is not an SPDX identifier, so crates that publish ship the
+# license file itself.
+license-file = "LICENSE"
 publish = false
 
 [workspace.dependencies]
-verglas-core = { path = "crates/verglas-core" }
+# Version alongside path: required for the crates.io publishes (verglas-api,
+# verglas-core, verglas-sdk). The release version sweep must bump these too.
+verglas-core = { path = "crates/verglas-core", version = "0.1.1" }
 verglas-backend = { path = "crates/verglas-backend" }
 verglas-cluster = { path = "crates/verglas-cluster" }
 verglas-cache = { path = "crates/verglas-cache" }
@@ -48,7 +53,7 @@ verglas-consensus = { path = "crates/verglas-consensus" }
 verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }
-verglas-api = { path = "crates/verglas-api" }
+verglas-api = { path = "crates/verglas-api", version = "0.1.1" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-block = { path = "crates/verglas-block" }

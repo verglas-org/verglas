@@ -441,3 +441,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - Test-slop audit: dropped the config test asserting rejection of the removed
   `fragment_fraction` field. Serde's deny-unknown-fields already rejects every
   unknown key; pinning one historical name verifies nothing.
+- Published to crates.io as a dependency of verglas-sdk (publish-crates
+  release job). This crate does not depend on the patched Iceberg fork, so
+  the workspace publish ban does not apply; workspace dependency entries now
+  carry a version alongside the path for the registry publish.

@@ -4,7 +4,11 @@ description = "Dependency-leaf request and response contracts shared by Verglas 
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-publish.workspace = true
+# Published to crates.io as the SDK's contract types; overrides the workspace-wide
+# publish = false (which exists because the engine crates depend on the
+# patched Iceberg fork — this crate does not).
+publish = true
+license-file.workspace = true
 
 [dependencies]
 serde.workspace = true

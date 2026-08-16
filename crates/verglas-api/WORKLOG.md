@@ -10,3 +10,7 @@
 - #91: Updated API ownership documentation to call the foreground process the
   server. Wire behavior is unchanged by the executable rename.
 - #133: Clarified that this leaf crate is the public wire boundary between independently versioned clients and the engine. No client implementation remains in the engine workspace.
+- Published to crates.io as a dependency of verglas-sdk (publish-crates
+  release job). This crate does not depend on the patched Iceberg fork, so
+  the workspace publish ban does not apply; workspace dependency entries now
+  carry a version alongside the path for the registry publish.

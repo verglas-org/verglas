@@ -4,7 +4,11 @@ description = "Core types shared across Verglas: configuration, errors, and logi
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-publish.workspace = true
+# Published to crates.io as the SDK's shared core types; overrides the workspace-wide
+# publish = false (which exists because the engine crates depend on the
+# patched Iceberg fork — this crate does not).
+publish = true
+license-file.workspace = true
 
 [dependencies]
 async-trait.workspace = true
