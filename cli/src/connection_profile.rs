@@ -17,11 +17,9 @@ const DEFAULT_REGION: &str = "us-east-1";
 
 #[derive(Debug, Error)]
 pub enum ConnectionProfileError {
-    #[error("cannot locate ~/.verglas; set HOME or VERGLAS_CONFIG")]
+    #[error("cannot locate a home directory for Verglas settings")]
     NoConfigDirectory,
-    #[error(
-        "no Verglas connection profile found at {0}; run `verglas login` or configure [connection]"
-    )]
+    #[error("not signed in; run `verglas login`")]
     MissingProfile(String),
     #[error("cannot read {path}: {source}")]
     Io {

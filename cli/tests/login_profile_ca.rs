@@ -12,7 +12,6 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::thread;
 
-use serde_json::Value;
 use tempfile::tempdir;
 
 const CLOUD_API_KEY: &str = "cloud-api-key-secret";
@@ -100,18 +99,11 @@ fn login_persists_ca_certificate_when_present_and_exposes_it_via_connection_json
         "config must reference the ca file by path, not embed its contents"
     );
 
-    let resolved = clean_command(home.path())
-        .args(["connection", "--json", "--include-secrets"])
-        .output()
-        .expect("connection resolution runs");
-    assert!(
-        resolved.status.success(),
-        "resolution failed: {}",
-        String::from_utf8_lossy(&resolved.stderr)
-    );
-    let profile: Value = serde_json::from_slice(&resolved.stdout).expect("connection json");
+    let profile: toml::Value = toml::from_str(&config).expect("config parses");
     assert_eq!(
-        profile["ca_file"].as_str().expect("ca_file present"),
+        profile["connection"]["ca_file"]
+            .as_str()
+            .expect("ca_file present"),
         ca_path.to_string_lossy()
     );
 }

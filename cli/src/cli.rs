@@ -35,8 +35,6 @@ pub enum Command {
     Login(LoginArgs),
     /// Sign out and remove the stored connection profile.
     Logout,
-    /// Resolve the shared connection profile.
-    Connection(ConnectionArgs),
     /// Probe the configured server.
     Status,
     /// Create, append to, inspect, and drop agent-managed Iceberg tables.
@@ -150,15 +148,6 @@ pub struct LoginArgs {
     /// Print the authorize URL instead of opening a browser.
     #[arg(long)]
     pub no_browser: bool,
-}
-
-/// Arguments for resolving a connection profile.
-#[derive(Debug, Args)]
-pub struct ConnectionArgs {
-    /// Include the resolved bearer and SigV4 secrets. This is intended only for
-    /// a local child integration; regular output deliberately omits them.
-    #[arg(long)]
-    pub include_secrets: bool,
 }
 
 /// `verglas lakehouse` operations against the local database resource API.

@@ -20,10 +20,9 @@ use std::process::Command;
 /// local `workers` command is the surviving deployment surface. `graph` and
 /// `vector` (#144) wrap the S3 semantic listener's property-graph and vector
 /// index REST-JSON surfaces.
-const SURVIVING_COMMANDS: [&str; 12] = [
+const SURVIVING_COMMANDS: [&str; 11] = [
     "login",
     "logout",
-    "connection",
     "status",
     "table",
     "dashboard",
@@ -39,7 +38,9 @@ const SURVIVING_COMMANDS: [&str; 12] = [
 /// level `verglas graph`) came back with #144 as the property-graph command
 /// family, so it moved out of this list into `SURVIVING_COMMANDS`; the
 /// standalone `query`/`index` verbs it replaced are still gone.
-const REMOVED_COMMANDS: [&str; 32] = [
+const REMOVED_COMMANDS: [&str; 33] = [
+    // `connection` was redundant with `status`; integrations read the profile.
+    "connection",
     // Drain is an admin-API operation for self-hosters, not a CLI verb (it
     // implied a user could drain a cloud cache).
     "drain",

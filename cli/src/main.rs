@@ -35,9 +35,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             .await
         }
         Command::Logout => commands::connection::logout(),
-        Command::Connection(args) => {
-            commands::connection::connection(args.include_secrets, cli.json)
-        }
         Command::Status => commands::status::run(&endpoint, token.as_deref(), cli.json).await,
         Command::Table(command) => commands::table::run(command, token.as_deref(), cli.json).await,
         Command::Dashboard(command) => {

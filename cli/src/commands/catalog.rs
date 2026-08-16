@@ -72,12 +72,10 @@ impl CatalogClient {
                         path.display()
                     )
                 })?;
-                let uri = connection.catalog_uri.clone().ok_or_else(|| {
-                    format!(
-                        "no [catalog] section in {} and the [connection] profile has no catalog_uri",
-                        path.display()
-                    )
-                })?;
+                let uri = connection
+                    .catalog_uri
+                    .clone()
+                    .ok_or("no catalog is connected; run `verglas login`")?;
                 Catalog {
                     uri: format!("{}/catalog", uri.trim_end_matches('/')),
                     warehouse: Some("default".to_owned()),

@@ -32,9 +32,7 @@ struct CredentialsFile {
 #[derive(Debug, Error)]
 pub enum CredentialsError {
     /// No configuration directory can be derived from the environment.
-    #[error(
-        "cannot find a local configuration directory; set --credentials-file or VERGLAS_CREDENTIALS_FILE"
-    )]
+    #[error("cannot find a home directory for Verglas credentials")]
     MissingConfigDirectory,
     /// Local credentials could not be read or written safely.
     #[error("credentials file {path}: {source}")]

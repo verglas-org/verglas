@@ -837,3 +837,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   short line, and help text never mentions config files, config keys, or
   environment variables — plumbing lives in rustdoc and the docs site, not in
   --help. Google developer documentation style throughout.
+
+- Removed `verglas connection` (redundant with `status`; integrations resolve
+  the profile in-process) and scrubbed every runtime string of config-file,
+  config-key, and environment-variable mentions — errors now say what to do
+  ("not signed in; run `verglas login`"), not where settings live.

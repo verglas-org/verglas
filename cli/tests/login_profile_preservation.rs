@@ -89,7 +89,7 @@ query_uri = "https://old.query.example"
 
 #[cfg(unix)]
 #[test]
-fn connection_hardens_manually_referenced_secret_files() {
+fn profile_resolution_hardens_manually_referenced_secret_files() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let home = tempdir().expect("home");
@@ -112,17 +112,17 @@ fn connection_hardens_manually_referenced_secret_files() {
         ),
     )
     .expect("config");
-    let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
+    // Any command that resolves the profile hardens the referenced secret
+    // files; `graph list` resolves the semantic endpoint from the profile.
+    // The listener is not running, so the command itself fails — hardening
+    // happens during resolution, before any request.
+    let _ = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .env("HOME", home.path())
         .env("VERGLAS_CONFIG", &config)
-        .args(["connection", "--json", "--include-secrets"])
+        .env_remove("VERGLAS_S3_ENDPOINT")
+        .args(["graph", "list"])
         .output()
-        .expect("connection runs");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        .expect("graph list runs");
     assert_eq!(
         fs::metadata(endpoint)
             .expect("endpoint metadata")

@@ -6,7 +6,6 @@ use std::net::TcpListener;
 use std::process::Command;
 use std::thread;
 
-use serde_json::Value;
 use tempfile::tempdir;
 
 const CLOUD_API_KEY: &str = "cloud-api-key-secret";
@@ -87,21 +86,26 @@ fn login_writes_a_secret_free_shared_profile_and_connection_resolves_it() {
         );
     }
 
-    let resolved = clean_command(home.path())
-        .args(["connection", "--json", "--include-secrets"])
-        .output()
-        .expect("connection resolution runs");
-    assert!(
-        resolved.status.success(),
-        "resolution failed: {}",
-        String::from_utf8_lossy(&resolved.stderr)
+    let profile: toml::Value =
+        toml::from_str(&fs::read_to_string(root.join("config.toml")).expect("config"))
+            .expect("config parses");
+    let connection = &profile["connection"];
+    assert_eq!(
+        connection["query_uri"].as_str(),
+        Some("https://tenant.query.example")
     );
-    let profile: Value = serde_json::from_slice(&resolved.stdout).expect("connection json");
-    assert_eq!(profile["query_uri"], "https://tenant.query.example");
-    assert_eq!(profile["semantic_uri"], "https://tenant.s3.example");
-    assert_eq!(profile["access_key_id"], "VGACME");
-    assert_eq!(profile["secret_access_key"], ENDPOINT_SECRET);
-    assert_eq!(profile["bearer_token"], CATALOG_TOKEN);
+    assert_eq!(
+        connection["semantic_uri"].as_str(),
+        Some("https://tenant.s3.example")
+    );
+    let endpoint_ini =
+        fs::read_to_string(connection["credentials_file"].as_str().expect("creds path"))
+            .expect("endpoint credentials file");
+    assert!(endpoint_ini.contains("VGACME"), "{endpoint_ini}");
+    assert!(endpoint_ini.contains(ENDPOINT_SECRET), "{endpoint_ini}");
+    let bearer = fs::read_to_string(connection["bearer_file"].as_str().expect("bearer path"))
+        .expect("bearer file");
+    assert_eq!(bearer, CATALOG_TOKEN);
 
     #[cfg(unix)]
     for entry in fs::read_dir(root.join("credentials")).expect("credential directory") {
@@ -140,17 +144,8 @@ credentials_file = "~/.verglas/credentials/endpoint.ini"
     )
     .expect("manual config");
 
-    let output = clean_command(home.path())
-        .args(["connection", "--json", "--include-secrets"])
-        .output()
-        .expect("connection resolution runs");
-    assert!(
-        output.status.success(),
-        "resolution failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let profile: Value = serde_json::from_slice(&output.stdout).expect("connection json");
-    assert_eq!(profile["access_key_id"], "LOCAL");
-    assert_eq!(profile["secret_access_key"], "local-secret");
-    assert!(profile.get("bearer_token").is_none() || profile["bearer_token"].is_null());
+    let ini = fs::read_to_string(home.path().join(".verglas/credentials/endpoint.ini"))
+        .expect("endpoint credentials file");
+    assert!(ini.contains("LOCAL"), "{ini}");
+    assert!(ini.contains("local-secret"), "{ini}");
 }

@@ -3,7 +3,7 @@
 use std::error::Error;
 
 use crate::browser_login;
-use crate::connection_profile::{self, ResolvedConnection};
+use crate::connection_profile;
 
 /// Runs `verglas login`. With `--api-key`, exchanges it directly. Otherwise
 /// runs the browser flow: listen on a loopback callback, hand the user to the
@@ -21,9 +21,7 @@ pub async fn login(
             connection_profile::login_with_code(url, &code).await?;
         }
     }
-    println!(
-        "Verglas connection profile saved. Integrations can now run `verglas connection --json --include-secrets`."
-    );
+    println!("Signed in. Connection profile saved.");
     Ok(())
 }
 
@@ -34,30 +32,6 @@ pub fn logout() -> Result<(), Box<dyn Error>> {
         println!("Logged out: connection profile removed.");
     } else {
         println!("No connection profile is stored.");
-    }
-    Ok(())
-}
-
-pub fn connection(include_secrets: bool, json: bool) -> Result<(), Box<dyn Error>> {
-    let mut profile =
-        connection_profile::resolve_from_environment(&connection_profile::environment())?;
-    if !include_secrets {
-        profile.bearer_token = None;
-        profile.access_key_id = None;
-        profile.secret_access_key = None;
-    }
-    render(&profile, json)?;
-    Ok(())
-}
-
-fn render(profile: &ResolvedConnection, json: bool) -> Result<(), Box<dyn Error>> {
-    if json {
-        println!("{}", serde_json::to_string(profile)?);
-    } else {
-        println!(
-            "query: {}\nsemantic: {}\nregion: {}",
-            profile.query_uri, profile.semantic_uri, profile.region
-        );
     }
     Ok(())
 }
