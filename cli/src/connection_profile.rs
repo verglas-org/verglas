@@ -52,7 +52,11 @@ pub enum ConnectionProfileError {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ResolvedConnection {
-    pub query_uri: String,
+    /// Self-hosted server endpoint (`VERGLAS_ENDPOINT`) or a legacy profile's
+    /// stored value. Cloud profiles no longer carry one: there is no hosted
+    /// query service.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_uri: Option<String>,
     pub semantic_uri: String,
     pub region: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,7 +100,6 @@ struct Profile {
 struct ProvisionResponse {
     s3_url: String,
     catalog_url: String,
-    query_url: String,
     s3_access_key_id: String,
     s3_secret_access_key: String,
     catalog_token: String,
@@ -162,15 +165,14 @@ pub fn resolve_from_environment(
     let profile_value = |f: fn(&Profile) -> &Option<String>| {
         profile.as_ref().and_then(|profile| f(profile).clone())
     };
-    let query_uri = value("VERGLAS_ENDPOINT")
-        .or_else(|| profile_value(|p| &p.query_uri))
-        .ok_or(ConnectionProfileError::Incomplete(
-            "query_uri / VERGLAS_ENDPOINT",
-        ))?;
+    let query_uri = value("VERGLAS_ENDPOINT").or_else(|| profile_value(|p| &p.query_uri));
     let semantic_uri = value("VERGLAS_SEMANTIC_ENDPOINT")
         .or_else(|| value("VERGLAS_S3_ENDPOINT"))
         .or_else(|| profile_value(|p| &p.semantic_uri))
-        .unwrap_or_else(|| query_uri.clone());
+        .or_else(|| query_uri.clone())
+        .ok_or(ConnectionProfileError::Incomplete(
+            "semantic_uri / VERGLAS_S3_ENDPOINT",
+        ))?;
     let region = value("VERGLAS_REGION")
         .or_else(|| value("AWS_REGION"))
         .or_else(|| value("AWS_DEFAULT_REGION"))
@@ -281,7 +283,7 @@ fn persist(
     };
     let profile = Profile {
         control_plane_url: Some(url.trim_end_matches('/').to_owned()),
-        query_uri: Some(provision.query_url.clone()),
+        query_uri: None,
         semantic_uri: Some(provision.s3_url.clone()),
         catalog_uri: Some(provision.catalog_url.clone()),
         ca_file,

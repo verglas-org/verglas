@@ -69,7 +69,6 @@ async fn run_cloud(control_plane: &str, json: bool) -> Result<(), Box<dyn Error>
             "control_plane": control_plane,
             "catalog": { "url": catalog_uri, "state": catalog_state },
             "s3": { "url": resolved.semantic_uri, "state": s3_state },
-            "query": resolved.query_uri,
             "region": resolved.region,
         });
         writeln!(
@@ -85,9 +84,8 @@ async fn run_cloud(control_plane: &str, json: bool) -> Result<(), Box<dyn Error>
          \x20 signed in:  yes\n\
          \x20 control plane: {control_plane}\n\
          \x20 catalog:    {catalog_uri}  ({catalog_state})\n\
-         \x20 s3:         {}  ({s3_state})\n\
-         \x20 query:      {}\n\n",
-        resolved.semantic_uri, resolved.query_uri,
+         \x20 s3:         {}  ({s3_state})\n\n",
+        resolved.semantic_uri,
     );
     Ok(())
 }
