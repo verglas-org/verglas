@@ -20,6 +20,7 @@ use serde_json::Value;
 use tokio::sync::OnceCell;
 use verglas_iceberg::AsyncIngestQueue;
 use verglas_iceberg::tables_api::{self, CommitRequest};
+use verglas_iceberg::write::TableCache;
 
 /// Maximum bounded JSONL source upload the local Table API accepts.
 const INGEST_BODY_LIMIT_BYTES: usize = 32 * 1024 * 1024;
@@ -41,6 +42,11 @@ pub struct TableState {
     /// construction for the same reason the catalog is: replay needs the
     /// catalog, which only opens after the loopback `/catalog` mount serves.
     replayed: Arc<OnceCell<()>>,
+    /// Process-wide cache of each table's last-committed metadata, so a warm
+    /// synchronous append against a table this process just wrote to skips a
+    /// full `catalog.load_table` round trip. Shared across every request
+    /// through this `TableState`'s clones (see [`TableCache`]).
+    table_cache: Arc<TableCache>,
 }
 
 impl TableState {
@@ -55,6 +61,7 @@ impl TableState {
             catalog: Arc::new(OnceCell::new()),
             async_ingest: Arc::new(async_ingest),
             replayed: Arc::new(OnceCell::new()),
+            table_cache: Arc::new(TableCache::new()),
         })
     }
 
@@ -228,7 +235,7 @@ async fn commit(
         Ok(catalog) => catalog,
         Err(error) => return table_error(error),
     };
-    match tables_api::commit(catalog.as_ref(), &ident, request).await {
+    match tables_api::commit_cached(catalog.as_ref(), &state.table_cache, &ident, request).await {
         Ok(commit) => Json(commit).into_response(),
         Err(error) => table_error(error),
     }
@@ -294,23 +301,28 @@ async fn ingest(
                     Ok(ingested) => ingested,
                     Err(error) => return table_error(error),
                 };
-                tables_api::commit_batches(catalog.as_ref(), &ident, ingested.batches, Some(key))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|report| {
-                        serde_json::to_value(report).map_err(|error| error.to_string())
-                    })
+                tables_api::commit_batches_cached(
+                    catalog.as_ref(),
+                    &state.table_cache,
+                    &ident,
+                    ingested.batches,
+                    Some(key),
+                )
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|report| serde_json::to_value(report).map_err(|error| error.to_string()))
             }
             None if sync_commit => {
                 let ingested = match verglas_iceberg::ingest::read(source.path()) {
                     Ok(ingested) => ingested,
                     Err(error) => return table_error(error),
                 };
-                verglas_iceberg::write::append_batches(
+                tables_api::commit_batches_cached(
                     catalog.as_ref(),
+                    &state.table_cache,
                     &ident,
                     ingested.batches,
-                    std::collections::HashMap::new(),
+                    None,
                 )
                 .await
                 .map_err(|error| error.to_string())

@@ -165,3 +165,23 @@
   coalescing several acks into one commit, synchronous schema rejection,
   the synchronous commit path's immediate snapshot id, and replay after a
   simulated restart.
+- ingest-perf-pipeline: Added `write::TableCache`, a process-wide cache of
+  each identifier's last-committed `Table`. A warm append (identifier already
+  cached) starts its transaction from the cached table instead of this
+  crate's own unconditional `catalog.load_table` — one of the two
+  `load_table` round trips a repeat append otherwise pays. The other is a
+  fixed cost outside this repo: the vendored `iceberg-rust` fork's
+  `Transaction::do_commit` unconditionally re-fetches the table from the
+  catalog at the start of every commit attempt regardless of the base table
+  it was handed, so a cold (first) append still pays both. The CAS commit
+  (`update_table`) is unchanged and remains the sole correctness authority; a
+  cached table that lost a race is caught by the existing
+  `CatalogCommitConflicts` retry in `commit_data_files`, which reloads
+  through the catalog and refreshes the cache, so a stale entry self-heals on
+  its next use. Added `write::append_cached`, `append_batches_cached`, and
+  `append_batches_from_table`, plus `tables_api::commit_cached` and
+  `commit_batches_cached` for the server's commit and keyed-ingest routes.
+  New hermetic tests in `tests/table_cache.rs` pin the call-count reduction
+  (2 `load_table` calls per uncached append vs. 1 per warm cached append)
+  with an instrumented counting catalog, and prove a stale cache entry still
+  commits correctly with no row lost or duplicated.

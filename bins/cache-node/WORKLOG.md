@@ -315,3 +315,12 @@
   and replays it once, lazily, the first time an async ingest request needs
   the catalog. `TableState::new` gained the WAL directory parameter and is
   now fallible.
+- ingest-perf-pipeline: `TableState` now holds a process-wide
+  `verglas_iceberg::write::TableCache`, shared across every request through
+  its clones. The `/v1/tables/{name}/commit` route and the `/v1/ingest`
+  append route (both the idempotency-keyed and plain paths) now call the
+  cached `tables_api`/`write` entry points instead of the unconditional ones,
+  so a warm append against a table this process already committed skips one
+  of the two `catalog.load_table` round trips it used to pay. See
+  `verglas-iceberg`'s worklog for the structural detail and the hermetic test
+  that pins it.
