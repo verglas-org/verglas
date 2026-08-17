@@ -798,6 +798,11 @@ async fn second_read_issues_zero_backend_requests() {
 
     let (_, _, first) = read_all(&engine, &k, ReadRange::Full).await.expect("first");
     assert_eq!(first, body);
+    // Admission barrier: the detached fill tasks admit to DRAM asynchronously.
+    // Without this, a starved scheduler can run the second read before the
+    // blocks are resident and the DRAM-tier assertions race (the exact flake
+    // the flush() contract documents).
+    engine.flush().await;
     let after_first = calls.snapshot();
     let fills_after_first = engine.counters().snapshot().backend_fills;
     assert_eq!(fills_after_first, 2, "one fill per covering block");
@@ -840,6 +845,10 @@ async fn served_from_reports_backend_on_a_cold_read_then_dram_when_warm() {
         ServedTier::Backend,
         "a cold read serves its first block from a backend fill"
     );
+
+    // Admission barrier: DRAM residency is only guaranteed once the detached
+    // fill task has admitted the block.
+    engine.flush().await;
 
     // Warm: the block is now DRAM-resident.
     let got = engine.get(&k, ReadRange::Full).await.expect("warm get");
@@ -3731,6 +3740,10 @@ async fn mutable_unchanged_revalidation_keeps_block_warm() {
         .await
         .expect("first read");
     assert_eq!(got, body);
+    // Admission barrier: `dram_hits > before` below requires the block to be
+    // resident before the re-read, which the detached fill only guarantees
+    // after flush().
+    engine.flush().await;
     let before = engine.counters().snapshot();
     let gets_before = calls.snapshot().0;
 
