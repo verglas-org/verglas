@@ -13,7 +13,7 @@ use std::process::Command;
 /// index REST-JSON surfaces. `ingest` and `sql` are the /v0 data-plane verbs
 /// (append-ingest and ad hoc SQL) that replaced the retired tenant-local
 /// access-service era's `lakehouse` and `token` commands.
-const SURVIVING_COMMANDS: [&str; 12] = [
+const SURVIVING_COMMANDS: [&str; 13] = [
     "login",
     "logout",
     "status",
@@ -22,6 +22,7 @@ const SURVIVING_COMMANDS: [&str; 12] = [
     "workers",
     "secret",
     "lakehouse",
+    "token",
     "ingest",
     "sql",
     "graph",

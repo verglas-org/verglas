@@ -878,3 +878,24 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `tenant_id` in the connection profile so tenant-scoped routes need no
   discovery round trip. Tests were written first and failed with
   "unrecognized subcommand" before the implementation.
+- Login now persists the control plane's durable machine token: provisioning
+  responses carry `api_token`, and both login paths store it in the
+  endpoint-keyed credential inventory that `resolved_token()` reads (new
+  `credentials::save_token`). Browser logins therefore authenticate to
+  tenant-scoped routes without VERGLAS_TOKEN, while the single-use browser
+  code itself is still never written to disk.
+- Authorization failures on `verglas lakehouse` now map to renewal guidance:
+  a 401 (rejected bearer), or a 404 when the stored machine token has
+  outlived its 30-day life, prints "lakehouse token expired; run `verglas
+  login` to renew" instead of the raw status. The 404 mapping never fires on
+  a fresh token because the server's opaque 404 also covers non-membership.
+  Tokens now record their issue time in the credential store.
+- Scoped access tokens and silent renewal (Tinybird/MotherDuck parity):
+  `verglas token create NAME --scope ingest:<ds>|sql:read` mints a
+  producer/reader credential (value printed once, never stored), `list`
+  shows ids/names/scopes without values, `revoke` deletes by id. Every
+  command now transparently renews a stored machine token past its 15-day
+  half-life via POST /v1/tokens/renew before running, so an actively used
+  login never expires; VERGLAS_TOKEN and fresh tokens are untouched, and a
+  failed renewal falls back to the still-valid stored token. Contract tests
+  written first (failed: unrecognized subcommand).

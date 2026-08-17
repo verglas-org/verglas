@@ -57,6 +57,13 @@ pub enum Command {
     /// Values are read from stdin and never appear in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Scoped access tokens for producers and readers.
+    ///
+    /// `create` mints a token limited to the scopes you name (for example
+    /// `ingest:app_logs` or `sql:read`); `list` shows tokens without their
+    /// values; `revoke` invalidates one.
+    #[command(subcommand)]
+    Token(TokenCommand),
     /// Iceberg lakehouses: list them or create one.
     ///
     /// Every deployment has a managed default lakehouse. `create` adds
@@ -146,6 +153,34 @@ pub struct SecretCreateArgs {
     /// URI prefix to which this secret grants access.
     #[arg(long)]
     pub scope: String,
+}
+
+/// Subcommands of `verglas token`.
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Mint a scoped token. The value prints once and is never stored.
+    Create(TokenCreateArgs),
+    /// List tokens: id, name, and scopes. Values are never shown.
+    List,
+    /// Revoke a token by id.
+    Revoke(TokenRevokeArgs),
+}
+
+/// Arguments for `verglas token create`.
+#[derive(Debug, Args)]
+pub struct TokenCreateArgs {
+    /// A name identifying where the token will live.
+    pub name: String,
+    /// A scope the token is limited to; repeatable.
+    #[arg(long = "scope", required = true)]
+    pub scopes: Vec<String>,
+}
+
+/// Arguments for `verglas token revoke`.
+#[derive(Debug, Args)]
+pub struct TokenRevokeArgs {
+    /// The token id shown by `verglas token list`.
+    pub token_id: String,
 }
 
 /// Subcommands of `verglas lakehouse`.

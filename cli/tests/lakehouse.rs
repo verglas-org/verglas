@@ -49,6 +49,42 @@ fn one_shot_server(
     (format!("http://{address}"), handle)
 }
 
+/// Serves two sequential one-request connections.
+fn two_shot_server(
+    first: (&'static str, &'static str),
+    second: (&'static str, &'static str),
+) -> (String, thread::JoinHandle<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let address = listener.local_addr().expect("address");
+    let handle = thread::spawn(move || {
+        let mut last = String::new();
+        for (status, body) in [first, second] {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let read = stream.read(&mut buffer).expect("read");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("respond");
+            last = String::from_utf8_lossy(&request).into_owned();
+        }
+        last
+    });
+    (format!("http://{address}"), handle)
+}
+
 /// Writes a connection profile carrying a tenant id and a bearer file.
 fn write_profile(home: &std::path::Path, tenant: &str) -> std::path::PathBuf {
     let root = home.join(".verglas");
@@ -173,6 +209,69 @@ fn create_with_data_path_posts_an_external_s3_storage_profile() {
     assert_eq!(profile["secret_access_key"], "ext-secret");
     // The secret arrives via environment, never argv.
     assert!(!request.contains("ext-secret\r\n") || request.contains("secret_access_key"));
+}
+
+#[test]
+fn an_unauthorized_response_maps_to_token_renewal_guidance() {
+    let home = tempdir().expect("home");
+    write_profile(home.path(), "11111111-2222-4333-8444-555555555555");
+    let (url, server) = one_shot_server("401 Unauthorized", r#"{"error":"unauthorized"}"#);
+    let output = lakehouse_command(home.path(), &url)
+        .args(["lakehouse", "list"])
+        .output()
+        .expect("runs");
+    assert!(!output.status.success());
+    server.join().expect("server");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expired"), "{stderr}");
+    assert!(stderr.contains("verglas login"), "{stderr}");
+}
+
+#[test]
+fn a_not_found_with_an_aged_stored_token_maps_to_token_renewal_guidance() {
+    let home = tempdir().expect("home");
+    write_profile(home.path(), "11111111-2222-4333-8444-555555555555");
+    // The aged token first triggers a transparent renewal attempt, which the
+    // server rejects (401); the command then proceeds with the old token and
+    // gets the opaque 404 that maps to renewal guidance.
+    let (url, server) = two_shot_server(
+        ("401 Unauthorized", r#"{"error":"unauthorized"}"#),
+        ("404 Not Found", r#"{"error":"not found"}"#),
+    );
+    // A stored token issued 40 days ago, past the 30-day machine-token life.
+    let issued = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        - 40 * 24 * 3600;
+    let store_dir = home.path().join(".config").join("verglas");
+    fs::create_dir_all(&store_dir).expect("store dir");
+    let store = store_dir.join("credentials.json");
+    fs::write(
+        &store,
+        format!(
+            r#"{{"tokens":{{"{}":{{"token":"vgt_old","token_id":"provisioned","issued_at":{issued}}}}}}}"#,
+            url.trim_end_matches('/')
+        ),
+    )
+    .expect("store");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).expect("mode");
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
+        .env("HOME", home.path())
+        .env_remove("VERGLAS_TOKEN")
+        .env("VERGLAS_ACCESS_ENDPOINT", &url)
+        .args(["lakehouse", "list"])
+        .output()
+        .expect("runs");
+    assert!(!output.status.success());
+    server.join().expect("server");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("expired"), "{stderr}");
+    assert!(stderr.contains("verglas login"), "{stderr}");
 }
 
 #[test]
