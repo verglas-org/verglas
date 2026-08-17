@@ -42,7 +42,7 @@ fn one_shot_provision_server() -> (String, thread::JoinHandle<String>) {
             }
         }
         let body = format!(
-            r#"{{"s3_url":"https://tenant.s3.example","catalog_url":"https://tenant.catalog.example","query_url":"https://tenant.query.example","slug":"acme","s3_access_key_id":"VGACME","s3_secret_access_key":"{ENDPOINT_SECRET}","catalog_token":"{CATALOG_TOKEN}","tier":"starter","tenant_id":"11111111-2222-4333-8444-555555555555"}}"#,
+            r#"{{"s3_url":"https://tenant.s3.example","catalog_url":"https://tenant.catalog.example","query_url":"https://tenant.query.example","slug":"acme","s3_access_key_id":"VGACME","s3_secret_access_key":"{ENDPOINT_SECRET}","catalog_token":"{CATALOG_TOKEN}","tier":"starter","tenant_id":"11111111-2222-4333-8444-555555555555","api_token":"vgt_durable-machine-token"}}"#,
         );
         write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}", body.len(), body).expect("write response");
         String::from_utf8(request).expect("request utf8")
@@ -99,6 +99,21 @@ fn login_writes_a_secret_free_shared_profile_and_connection_resolves_it() {
         connection["tenant_id"].as_str(),
         Some("11111111-2222-4333-8444-555555555555")
     );
+
+    // The durable machine token from provisioning lands in the endpoint-keyed
+    // credential store, so tenant-scoped commands resolve a bearer with no
+    // VERGLAS_TOKEN in the environment.
+    let store = fs::read_to_string(
+        home.path()
+            .join(".config")
+            .join("verglas")
+            .join("credentials.json"),
+    )
+    .expect("credential store");
+    assert!(store.contains("vgt_durable-machine-token"), "{store}");
+    for secret in [CLOUD_API_KEY, ENDPOINT_SECRET, CATALOG_TOKEN] {
+        assert!(!store.contains(secret), "store leaked an unrelated secret");
+    }
     let endpoint_ini =
         fs::read_to_string(connection["credentials_file"].as_str().expect("creds path"))
             .expect("endpoint credentials file");
