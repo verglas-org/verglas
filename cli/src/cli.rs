@@ -57,6 +57,12 @@ pub enum Command {
     /// Values are read from stdin and never appear in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
+    /// Iceberg lakehouses: list them or create one.
+    ///
+    /// Every deployment has a managed default lakehouse. `create` adds
+    /// another, either managed or on your own S3 bucket (`--data-path`).
+    #[command(subcommand)]
+    Lakehouse(LakehouseCommand),
     /// Append NDJSON rows to a datasource.
     ///
     /// Table writes, vector writes, and log shipping are the same append
@@ -140,6 +146,33 @@ pub struct SecretCreateArgs {
     /// URI prefix to which this secret grants access.
     #[arg(long)]
     pub scope: String,
+}
+
+/// Subcommands of `verglas lakehouse`.
+#[derive(Debug, Subcommand)]
+pub enum LakehouseCommand {
+    /// List this deployment's lakehouses.
+    List,
+    /// Create a lakehouse.
+    Create(LakehouseCreateArgs),
+}
+
+/// Arguments for `verglas lakehouse create`.
+#[derive(Debug, Args)]
+pub struct LakehouseCreateArgs {
+    /// The lakehouse name.
+    pub name: String,
+    /// Store data in your own bucket (`s3://bucket/prefix`) instead of
+    /// managed storage. Credentials are read from
+    /// `VERGLAS_STORAGE_ACCESS_KEY_ID` / `VERGLAS_STORAGE_SECRET_ACCESS_KEY`.
+    #[arg(long)]
+    pub data_path: Option<String>,
+    /// S3 endpoint for `--data-path`.
+    #[arg(long, requires = "data_path")]
+    pub storage_endpoint: Option<String>,
+    /// S3 region for `--data-path`.
+    #[arg(long, requires = "data_path")]
+    pub storage_region: Option<String>,
 }
 
 /// Secret types accepted by the local access service.

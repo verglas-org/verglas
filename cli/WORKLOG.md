@@ -870,3 +870,11 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   the private file-writing helpers behind them — `token create` was their
   only caller; `load_token`/`Cli::resolved_token` (VERGLAS_TOKEN, then this
   file) are unchanged and still used by every Cloud-authenticated command.
+- Restored `verglas lakehouse` (list/create) against the control plane's
+  live `/v1/lakehouses` surface — the old command spoke the retired access
+  service. Create is managed by default; `--data-path s3://bucket/prefix`
+  posts an external-s3 storage profile with credentials from the
+  environment, never argv. Login now records the provisioning payload's
+  `tenant_id` in the connection profile so tenant-scoped routes need no
+  discovery round trip. Tests were written first and failed with
+  "unrecognized subcommand" before the implementation.

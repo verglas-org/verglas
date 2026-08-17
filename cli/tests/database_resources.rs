@@ -129,7 +129,10 @@ async fn secret_create_reads_material_from_stdin_and_never_accepts_value_argumen
     );
     let request = one_request(&captured);
     assert_eq!(request.path, "/v1/secrets");
-    assert_eq!(request.authorization.as_deref(), Some("Bearer local-test-token"));
+    assert_eq!(
+        request.authorization.as_deref(),
+        Some("Bearer local-test-token")
+    );
     assert_eq!(
         request.body,
         serde_json::json!({

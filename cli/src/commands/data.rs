@@ -130,7 +130,10 @@ mod tests {
         let path = dir.path().join("rows.ndjson");
         std::fs::write(&path, "{\"a\":1}\n\n{\"a\":2}\n").expect("write rows");
         let rows = read_ndjson(Some(&path)).expect("parsed rows");
-        assert_eq!(rows, vec![serde_json::json!({"a": 1}), serde_json::json!({"a": 2})]);
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({"a": 1}), serde_json::json!({"a": 2})]
+        );
     }
 
     /// A file with no rows is rejected rather than silently ingesting nothing.

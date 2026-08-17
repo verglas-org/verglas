@@ -76,6 +76,10 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             )
             .await
         }
+        Command::Lakehouse(command) => {
+            commands::lakehouse::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
+                .await
+        }
         Command::Secret(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
             after_success(

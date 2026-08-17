@@ -13,7 +13,7 @@ use std::process::Command;
 /// index REST-JSON surfaces. `ingest` and `sql` are the /v0 data-plane verbs
 /// (append-ingest and ad hoc SQL) that replaced the retired tenant-local
 /// access-service era's `lakehouse` and `token` commands.
-const SURVIVING_COMMANDS: [&str; 11] = [
+const SURVIVING_COMMANDS: [&str; 12] = [
     "login",
     "logout",
     "status",
@@ -21,6 +21,7 @@ const SURVIVING_COMMANDS: [&str; 11] = [
     "dashboard",
     "workers",
     "secret",
+    "lakehouse",
     "ingest",
     "sql",
     "graph",
@@ -185,7 +186,11 @@ fn ingest_and_sql_help_render() {
             .args(args)
             .output()
             .expect("binary runs");
-        assert!(out.status.success(), "`verglas {} --help` must render", args[0]);
+        assert!(
+            out.status.success(),
+            "`verglas {} --help` must render",
+            args[0]
+        );
     }
 }
 
