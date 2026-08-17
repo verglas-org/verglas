@@ -11,7 +11,7 @@
 //! Every cloud-API call site resolves its bearer through [`resolved_bearer`]
 //! (env → scoped-token store → durable token file) instead of scattering its
 //! own token logic, and every retryable call site routes its error through
-//! [`with_reauth`] / [`with_reauth_required`] for one loud, consistent 401
+//! [`cloud_call`] / [`cloud_call_with_bearer`] for one loud, consistent 401
 //! message. There is no refresh loop: a 401 always fails with guidance to
 //! run `verglas login` again. As a value-add on top of the server's own
 //! sliding window, a successful cloud command opportunistically asks the
@@ -206,7 +206,7 @@ pub async fn resolved_bearer(credentials_path: &Path) -> Result<Option<String>, 
 /// refresh loop; only re-running `verglas login` can replace a durable token
 /// that the control plane has rejected. Used by call sites where a missing
 /// bearer is not itself an error (self-hosted `workers`/`dashboard`).
-pub async fn with_reauth<T, E, F, Fut>(
+pub async fn cloud_call<T, E, F, Fut>(
     bearer: Option<String>,
     mut attempt: F,
 ) -> Result<T, Box<dyn std::error::Error>>
@@ -218,9 +218,9 @@ where
     attempt(bearer).await.map_err(loud_unauthorized)
 }
 
-/// Same contract as [`with_reauth`] for call sites that always require a
+/// Same contract as [`cloud_call`] for call sites that always require a
 /// bearer (the standalone access service has no anonymous mode).
-pub async fn with_reauth_required<T, E, F, Fut>(
+pub async fn cloud_call_with_bearer<T, E, F, Fut>(
     bearer: String,
     mut attempt: F,
 ) -> Result<T, Box<dyn std::error::Error>>
@@ -251,7 +251,7 @@ fn loud_unauthorized<E: Unauthorized + std::error::Error + 'static>(
 /// no renewal route at all), or an unparseable response — is silently
 /// ignored. Renewal is a value-add on top of the durable token's own
 /// server-side 30-day sliding window; it is never a precondition for the
-/// loud-401 contract in [`with_reauth`] / [`with_reauth_required`].
+/// loud-401 contract in [`cloud_call`] / [`cloud_call_with_bearer`].
 pub async fn maybe_renew_durable_token() {
     let Ok(path) = durable_token_path() else {
         return;

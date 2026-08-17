@@ -30,7 +30,7 @@ pub async fn run(
     crate::backend::require_cloud_workers(endpoint)?;
     match command {
         WorkersCommand::List => {
-            let rows: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+            let rows: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
                 let endpoint = endpoint.to_owned();
                 async move {
                     let server = crate::backend::server(&endpoint, bearer.as_deref())?;
@@ -41,7 +41,7 @@ pub async fn run(
             emit_list(&rows, &["name", "state", "output", "created_by"], json)
         }
         WorkersCommand::Get(WorkerRefArgs { worker }) => {
-            let detail: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+            let detail: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
                 let endpoint = endpoint.to_owned();
                 let worker = worker.clone();
                 async move {
@@ -54,7 +54,7 @@ pub async fn run(
         }
         WorkersCommand::Create(args) => run_create(endpoint, token, args, json).await,
         WorkersCommand::Delete(WorkerRefArgs { worker }) => {
-            let response: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
                 let endpoint = endpoint.to_owned();
                 let worker = worker.clone();
                 async move {
@@ -93,7 +93,7 @@ async fn run_create(
     apply_create_overrides(&mut manifest, args.name, args.schedule);
     manifest.validate()?;
     let body = manifest.to_local_worker();
-    let row: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+    let row: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
         let endpoint = endpoint.to_owned();
         let body = body.clone();
         async move {
@@ -144,7 +144,7 @@ async fn run_now(
     // request either way, and reusing it keeps a retry idempotent even if
     // the first attempt's 401 arrived after the server saw the request.
     let key = format!("cli-{}", short_id());
-    let response = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+    let response = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
         let url = url.clone();
         let key = key.clone();
         async move {

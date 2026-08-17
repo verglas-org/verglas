@@ -14,7 +14,7 @@ use crate::cli::{TokenCommand, TokenCreateArgs, TokenRevokeArgs};
 use crate::credentials::{StoredToken, remove_token, save_token};
 
 /// Runs one token lifecycle command against the configured access service.
-/// Every verb routes its call through `auth::with_reauth_required` so a 401
+/// Every verb routes its call through `auth::cloud_call_with_bearer` so a 401
 /// fails loud with guidance to re-run `verglas login`; there is no refresh.
 pub async fn run(
     command: TokenCommand,
@@ -52,7 +52,7 @@ async fn create(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = request_from_args(args)?;
-    let issued = crate::auth::with_reauth_required(bearer, move |bearer| {
+    let issued = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
         let endpoint = endpoint.to_owned();
         let request = request.clone();
         async move {
@@ -74,7 +74,7 @@ async fn create(
 
 /// Lists token metadata without ever materializing plaintext values.
 async fn list(endpoint: &str, bearer: String, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let tokens = crate::auth::with_reauth_required(bearer, move |bearer| {
+    let tokens = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
         let endpoint = endpoint.to_owned();
         async move {
             let client = access_client(&endpoint, &bearer).await?;
@@ -115,7 +115,7 @@ async fn revoke(
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id = args.id.clone();
-    let summary = crate::auth::with_reauth_required(bearer, move |bearer| {
+    let summary = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
         let endpoint = endpoint.to_owned();
         let id = id.clone();
         async move {

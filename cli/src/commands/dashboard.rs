@@ -45,7 +45,7 @@ pub async fn run(
         DashboardCommand::Create(args) => {
             let manifest = crate::dashboard_spec::DashboardManifest::from_file(&args.file)?;
             let body = manifest.to_create_body(args.tenant_id.as_deref());
-            let info: DashboardInfo = crate::auth::with_reauth(bearer, |bearer| {
+            let info: DashboardInfo = crate::auth::cloud_call(bearer, |bearer| {
                 let endpoint = endpoint.to_owned();
                 let body = body.clone();
                 async move {
@@ -61,7 +61,7 @@ pub async fn run(
                 Some(tenant_id) => format!("/v1/dashboards?tenant_id={tenant_id}"),
                 None => "/v1/dashboards".to_owned(),
             };
-            let list: DashboardList = crate::auth::with_reauth(bearer, |bearer| {
+            let list: DashboardList = crate::auth::cloud_call(bearer, |bearer| {
                 let endpoint = endpoint.to_owned();
                 let path = path.clone();
                 async move {
@@ -86,7 +86,7 @@ pub async fn run(
                 }
                 None => format!("/v1/dashboards/{}", args.name),
             };
-            let info: DashboardInfo = crate::auth::with_reauth(bearer, |bearer| {
+            let info: DashboardInfo = crate::auth::cloud_call(bearer, |bearer| {
                 let endpoint = endpoint.to_owned();
                 let path = path.clone();
                 async move {
@@ -104,7 +104,7 @@ pub async fn run(
                 }
                 None => format!("/v1/dashboards/{}", args.name),
             };
-            let deleted: DashboardDeleted = crate::auth::with_reauth(bearer, |bearer| {
+            let deleted: DashboardDeleted = crate::auth::cloud_call(bearer, |bearer| {
                 let endpoint = endpoint.to_owned();
                 let path = path.clone();
                 async move {

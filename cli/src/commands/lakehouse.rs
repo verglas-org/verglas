@@ -146,7 +146,7 @@ fn validate_uri(
 }
 
 /// Sends a typed create request and returns the server's JSON response. A
-/// 401 fails loud through `auth::with_reauth` with guidance to re-run
+/// 401 fails loud through `auth::cloud_call` with guidance to re-run
 /// `verglas login`; there is no refresh.
 async fn post_json(
     endpoint: &str,
@@ -155,7 +155,7 @@ async fn post_json(
     body: &CreateLakehouseRequest,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let url = Url::parse(endpoint)?.join(path)?;
-    let response = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+    let response = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
         let url = url.clone();
         let body = body.clone();
         async move {
