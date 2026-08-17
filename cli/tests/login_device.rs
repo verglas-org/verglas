@@ -2,24 +2,25 @@
 //! Candidates may not edit this file. Coordinator wrote it 2026-08-17.
 //!
 //! Contract:
-//!   - `verglas login --no-browser` runs the OAuth 2.0 Device Authorization
-//!     Grant against WorkOS as a public client (client_id only, no secret):
-//!       POST {VERGLAS_WORKOS_API_BASE}/user_management/authorize/device
-//!       poll POST {VERGLAS_WORKOS_API_BASE}/user_management/authenticate
-//!         with grant_type=urn:ietf:params:oauth:grant-type:device_code,
-//!         honoring `authorization_pending` responses.
-//!     It prints the user_code and verification URI, never opens a browser
-//!     under --no-browser, then exchanges the WorkOS access token at
-//!     POST {VERGLAS_ACCESS_ENDPOINT}/v1/provision with
-//!     `Authorization: Bearer <workos access token>`.
-//!   - WorkOS tokens persist to ~/.verglas/credentials/workos-tokens.json
-//!     (owner-only 0600) with at least `access_token` and `refresh_token`.
-//!     They never appear in config.toml.
-//!   - When a cloud API call gets 401 with a stored refresh token, the CLI
-//!     refreshes (grant_type=refresh_token), persists the rotated pair, and
-//!     retries the call once.
-//!   - `verglas logout` deletes workos-tokens.json along with the profile.
-//!   - Env overrides: VERGLAS_WORKOS_API_BASE, VERGLAS_WORKOS_CLIENT_ID.
+//!
+//! - `verglas login --no-browser` runs the OAuth 2.0 Device Authorization
+//!   Grant against WorkOS as a public client (client_id only, no secret):
+//!   POST {VERGLAS_WORKOS_API_BASE}/user_management/authorize/device, then
+//!   poll POST {VERGLAS_WORKOS_API_BASE}/user_management/authenticate with
+//!   grant_type=urn:ietf:params:oauth:grant-type:device_code, honoring
+//!   `authorization_pending` responses. It prints the user_code and
+//!   verification URI, never opens a browser under --no-browser, then
+//!   exchanges the WorkOS access token at
+//!   POST {VERGLAS_ACCESS_ENDPOINT}/v1/provision with
+//!   `Authorization: Bearer <workos access token>`.
+//! - WorkOS tokens persist to ~/.verglas/credentials/workos-tokens.json
+//!   (owner-only 0600) with at least `access_token` and `refresh_token`.
+//!   They never appear in config.toml.
+//! - When a cloud API call gets 401 with a stored refresh token, the CLI
+//!   refreshes (grant_type=refresh_token), persists the rotated pair, and
+//!   retries the call once.
+//! - `verglas logout` deletes workos-tokens.json along with the profile.
+//! - Env overrides: VERGLAS_WORKOS_API_BASE, VERGLAS_WORKOS_CLIENT_ID.
 
 use std::fs;
 #[cfg(unix)]
@@ -42,19 +43,19 @@ const ACCESS_TOKEN_2: &str = "workos-access-token-2";
 const REFRESH_TOKEN_2: &str = "workos-refresh-token-2";
 
 fn body_param(body: &Bytes, key: &str) -> Option<String> {
-    if let Ok(value) = serde_json::from_slice::<Value>(body) {
-        if let Some(found) = value.get(key).and_then(Value::as_str) {
-            return Some(found.to_owned());
-        }
+    if let Some(found) = serde_json::from_slice::<Value>(body)
+        .ok()
+        .as_ref()
+        .and_then(|value| value.get(key))
+        .and_then(Value::as_str)
+    {
+        return Some(found.to_owned());
     }
     let text = String::from_utf8_lossy(body);
     for pair in text.split('&') {
-        if let Some((k, v)) = pair.split_once('=') {
-            if k == key {
-                return Some(
-                    urlencoding_decode(v),
-                );
-            }
+        match pair.split_once('=') {
+            Some((k, v)) if k == key => return Some(urlencoding_decode(v)),
+            _ => {}
         }
     }
     None
