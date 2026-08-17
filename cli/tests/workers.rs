@@ -1,4 +1,4 @@
-//! Local workers CLI against a mock server `/v1/workers` registry (#66).
+//! Local workers CLI against a mock server `/v0/workers` registry (#66).
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -23,10 +23,10 @@ struct MockState {
 fn spawn_server() -> (String, MockState) {
     let state = MockState::default();
     let app = Router::new()
-        .route("/v1/workers", get(list_workers).post(register_worker))
-        .route("/v1/workers/{name}", get(get_worker))
-        .route("/v1/workers/{name}/state", put(set_state))
-        .route("/v1/workers/{name}/run", post(run_worker))
+        .route("/v0/workers", get(list_workers).post(register_worker))
+        .route("/v0/workers/{name}", get(get_worker))
+        .route("/v0/workers/{name}/state", put(set_state))
+        .route("/v0/workers/{name}/run", post(run_worker))
         .with_state(state.clone());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -45,13 +45,13 @@ fn spawn_server() -> (String, MockState) {
     (format!("http://{addr}"), state)
 }
 
-/// `GET /v1/workers` — bare array, matching the server.
+/// `GET /v0/workers` — bare array, matching the server.
 async fn list_workers(State(state): State<MockState>) -> Json<Value> {
     let workers = state.workers.lock().expect("lock");
     Json(Value::Array(workers.clone()))
 }
 
-/// `POST /v1/workers` — echo the body with a running state.
+/// `POST /v0/workers` — echo the body with a running state.
 async fn register_worker(
     State(state): State<MockState>,
     Json(mut body): Json<Value>,
@@ -66,7 +66,7 @@ async fn register_worker(
     Json(body)
 }
 
-/// `GET /v1/workers/{name}`.
+/// `GET /v0/workers/{name}`.
 async fn get_worker(
     State(state): State<MockState>,
     AxumPath(name): AxumPath<String>,
@@ -80,7 +80,7 @@ async fn get_worker(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
-/// `PUT /v1/workers/{name}/state`.
+/// `PUT /v0/workers/{name}/state`.
 async fn set_state(
     State(state): State<MockState>,
     AxumPath(name): AxumPath<String>,
@@ -99,7 +99,7 @@ async fn set_state(
     Ok(Json(row.clone()))
 }
 
-/// `POST /v1/workers/{name}/run` — requires Idempotency-Key.
+/// `POST /v0/workers/{name}/run` — requires Idempotency-Key.
 async fn run_worker(
     State(state): State<MockState>,
     AxumPath(name): AxumPath<String>,

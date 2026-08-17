@@ -858,3 +858,15 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   zero install. Dropped the shell/powershell installer scripts and the
   homebrew formula (no tap existed, so brew install never worked). Publishing
   requires the NPM_TOKEN repository secret.
+- Retargeted `workers` from the retired `/v1/workers` route to `/v0/workers`.
+  Added `verglas ingest <datasource>` (NDJSON from `--file` or stdin ->
+  `POST /v0/events?name=<datasource>`) and `verglas sql <query>`
+  (`POST /v0/sql`) in a new `commands/data.rs`, using the SDK's new
+  `DataClient`. Deleted `verglas token` (`commands/token.rs`, `TokenCommand`)
+  and `verglas lakehouse` (`commands/lakehouse.rs`, `LakehouseCommand`): both
+  called dead Verglas Cloud surfaces (`/v1/access/tokens` and friends,
+  `/v1/databases`) from the retired tenant-local access-service era, with no
+  replacement in scope. `credentials.rs` lost `save_token`/`remove_token` and
+  the private file-writing helpers behind them — `token create` was their
+  only caller; `load_token`/`Cli::resolved_token` (VERGLAS_TOKEN, then this
+  file) are unchanged and still used by every Cloud-authenticated command.

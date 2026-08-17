@@ -10,7 +10,9 @@ use std::process::Command;
 /// source/MV/sink platform primitives were removed with the worker refocus; the
 /// local `workers` command is the surviving deployment surface. `graph` and
 /// `vector` (#144) wrap the S3 semantic listener's property-graph and vector
-/// index REST-JSON surfaces.
+/// index REST-JSON surfaces. `ingest` and `sql` are the /v0 data-plane verbs
+/// (append-ingest and ad hoc SQL) that replaced the retired tenant-local
+/// access-service era's `lakehouse` and `token` commands.
 const SURVIVING_COMMANDS: [&str; 11] = [
     "login",
     "logout",
@@ -18,9 +20,9 @@ const SURVIVING_COMMANDS: [&str; 11] = [
     "table",
     "dashboard",
     "workers",
-    "lakehouse",
     "secret",
-    "token",
+    "ingest",
+    "sql",
     "graph",
     "vector",
 ];
@@ -177,19 +179,14 @@ fn help_lists_exactly_the_surviving_commands() {
 }
 
 #[test]
-fn lakehouse_help_lists_the_create_verb() {
-    let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
-        .args(["lakehouse", "--help"])
-        .output()
-        .expect("binary runs");
-    assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).expect("utf8");
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.trim_start().starts_with("create")),
-        "lakehouse help must list create: {stdout}"
-    );
+fn ingest_and_sql_help_render() {
+    for args in [["ingest", "--help"], ["sql", "--help"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_verglas"))
+            .args(args)
+            .output()
+            .expect("binary runs");
+        assert!(out.status.success(), "`verglas {} --help` must render", args[0]);
+    }
 }
 
 #[test]

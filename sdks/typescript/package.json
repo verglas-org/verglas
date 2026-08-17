@@ -21,6 +21,10 @@
       "types": "./dist/control.d.ts",
       "default": "./dist/control.js"
     },
+    "./data": {
+      "types": "./dist/data.d.ts",
+      "default": "./dist/data.js"
+    },
     "./logging": {
       "types": "./dist/logging.d.ts",
       "default": "./dist/logging.js"
@@ -34,7 +38,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "build": "tsup --entry.index src/index.ts --entry.control src/control.ts --entry.logging src/logging.ts --entry.examples src/examples/index.ts --format esm --dts --out-dir dist --clean",
+    "build": "tsup --entry.index src/index.ts --entry.control src/control.ts --entry.data src/data.ts --entry.logging src/logging.ts --entry.examples src/examples/index.ts --format esm --dts --out-dir dist --clean",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

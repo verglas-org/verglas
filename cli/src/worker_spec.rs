@@ -3,7 +3,7 @@
 //! A single versioned file (TOML or JSON) describes a worker completely: its
 //! name, its locked build runtime, container command, files, environment (with
 //! `@secret:` references), its trigger, its target tables, and its resource
-//! hints. The CLI translates it into the local server's `POST /v1/workers`
+//! hints. The CLI translates it into Verglas Cloud's `POST /v0/workers`
 //! body so the same file registers and round-trips without edits.
 //!
 //! Python and Bun projects use platform-owned OCI build policies. A container
@@ -341,7 +341,7 @@ impl WorkerManifest {
         Value::String(Value::Object(config).to_string())
     }
 
-    /// Translates this spec into the local server's `POST /v1/workers` body.
+    /// Translates this spec into Verglas Cloud's `POST /v0/workers` body.
     pub fn to_local_worker(&self) -> Value {
         let mut body = json!({
             "name": self.name,

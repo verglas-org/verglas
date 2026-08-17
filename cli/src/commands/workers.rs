@@ -1,6 +1,6 @@
 //! `verglas workers` — Verglas Cloud worker registry.
 //!
-//! Every verb targets Verglas Cloud at `/v1/workers`. The OSS stack does not
+//! Every verb targets Verglas Cloud at `/v0/workers`. The OSS stack does not
 //! host workers; pointing `VERGLAS_ENDPOINT` at a local server is an error.
 
 use std::error::Error;
@@ -34,7 +34,7 @@ pub async fn run(
                 let endpoint = endpoint.to_owned();
                 async move {
                     let server = crate::backend::server(&endpoint, bearer.as_deref())?;
-                    server.get("/v1/workers").await
+                    server.get("/v0/workers").await
                 }
             })
             .await?;
@@ -46,7 +46,7 @@ pub async fn run(
                 let worker = worker.clone();
                 async move {
                     let server = crate::backend::server(&endpoint, bearer.as_deref())?;
-                    server.get(&format!("/v1/workers/{worker}")).await
+                    server.get(&format!("/v0/workers/{worker}")).await
                 }
             })
             .await?;
@@ -61,7 +61,7 @@ pub async fn run(
                     let server = crate::backend::server(&endpoint, bearer.as_deref())?;
                     server
                         .put_json(
-                            &format!("/v1/workers/{worker}/state"),
+                            &format!("/v0/workers/{worker}/state"),
                             &serde_json::json!({ "state": "archived" }),
                         )
                         .await
@@ -82,7 +82,7 @@ pub async fn run(
     }
 }
 
-/// Registers a worker from a portable spec file (`POST /v1/workers`).
+/// Registers a worker from a portable spec file (`POST /v0/workers`).
 async fn run_create(
     endpoint: &str,
     token: Option<&str>,
@@ -98,7 +98,7 @@ async fn run_create(
         let body = body.clone();
         async move {
             let server = crate::backend::server(&endpoint, bearer.as_deref())?;
-            server.post_json("/v1/workers", &body).await
+            server.post_json("/v0/workers", &body).await
         }
     })
     .await?;
@@ -131,7 +131,7 @@ fn apply_create_overrides(
     }
 }
 
-/// Dispatches a manual run (`POST /v1/workers/{name}/run`) with a fresh
+/// Dispatches a manual run (`POST /v0/workers/{name}/run`) with a fresh
 /// Idempotency-Key so the server accepts the request.
 async fn run_now(
     endpoint: &str,
@@ -139,7 +139,7 @@ async fn run_now(
     worker: &str,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let url = format!("{}/v1/workers/{worker}/run", endpoint.trim_end_matches('/'));
+    let url = format!("{}/v0/workers/{worker}/run", endpoint.trim_end_matches('/'));
     // Minted once and reused across the retry: it is the same logical
     // request either way, and reusing it keeps a retry idempotent even if
     // the first attempt's 401 arrived after the server saw the request.
