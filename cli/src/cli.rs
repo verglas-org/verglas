@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
-use crate::credentials::{CredentialsError, credentials_path, load_token};
+use crate::credentials::{CredentialsError, credentials_path};
 
 /// Global flags shared by every subcommand.
 #[derive(Debug, Parser)]
@@ -72,19 +72,6 @@ pub enum Command {
 }
 
 impl Cli {
-    /// Resolves the bearer token: `VERGLAS_TOKEN`, then the local credential
-    /// stored for the resolved access endpoint.
-    pub fn resolved_token(&self) -> Result<Option<String>, CredentialsError> {
-        if let Some(token) = std::env::var("VERGLAS_TOKEN")
-            .ok()
-            .filter(|token| !token.trim().is_empty())
-        {
-            return Ok(Some(token));
-        }
-        let path = self.resolved_credentials_path()?;
-        Ok(load_token(&path, &Self::access_endpoint())?.map(|stored| stored.token))
-    }
-
     /// Resolves the credential-file location: `VERGLAS_CREDENTIALS_FILE`, then
     /// the default owner-only path.
     pub fn resolved_credentials_path(&self) -> Result<PathBuf, CredentialsError> {
@@ -142,10 +129,10 @@ pub struct TokenRevokeArgs {
 /// Arguments for the shared connection-profile login flow.
 #[derive(Debug, Args)]
 pub struct LoginArgs {
-    /// Automation API key; omit for an interactive browser sign-in.
+    /// Automation API key; omit for an interactive WorkOS device sign-in.
     #[arg(long)]
     pub api_key: Option<String>,
-    /// Print the authorize URL instead of opening a browser.
+    /// Never open a browser; print the verification URI to sign in manually.
     #[arg(long)]
     pub no_browser: bool,
 }

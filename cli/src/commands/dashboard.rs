@@ -40,12 +40,20 @@ pub async fn run(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     crate::backend::require_cloud_dashboards(endpoint)?;
-    let client = crate::backend::server(endpoint, token)?;
+    let bearer = token.map(str::to_owned);
     match command {
         DashboardCommand::Create(args) => {
             let manifest = crate::dashboard_spec::DashboardManifest::from_file(&args.file)?;
             let body = manifest.to_create_body(args.tenant_id.as_deref());
-            let info: DashboardInfo = client.post_json("/v1/dashboards", &body).await?;
+            let info: DashboardInfo = crate::auth::with_reauth(bearer, |bearer| {
+                let endpoint = endpoint.to_owned();
+                let body = body.clone();
+                async move {
+                    let client = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    client.post_json("/v1/dashboards", &body).await
+                }
+            })
+            .await?;
             emit_info(&info, json)?;
         }
         DashboardCommand::List(args) => {
@@ -53,7 +61,15 @@ pub async fn run(
                 Some(tenant_id) => format!("/v1/dashboards?tenant_id={tenant_id}"),
                 None => "/v1/dashboards".to_owned(),
             };
-            let list: DashboardList = client.get(&path).await?;
+            let list: DashboardList = crate::auth::with_reauth(bearer, |bearer| {
+                let endpoint = endpoint.to_owned();
+                let path = path.clone();
+                async move {
+                    let client = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    client.get(&path).await
+                }
+            })
+            .await?;
             crate::output::emit(&list, json, |list| {
                 let mut stdout = io::stdout();
                 writeln!(stdout, "NAME\tURL")?;
@@ -70,7 +86,15 @@ pub async fn run(
                 }
                 None => format!("/v1/dashboards/{}", args.name),
             };
-            let info: DashboardInfo = client.get(&path).await?;
+            let info: DashboardInfo = crate::auth::with_reauth(bearer, |bearer| {
+                let endpoint = endpoint.to_owned();
+                let path = path.clone();
+                async move {
+                    let client = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    client.get(&path).await
+                }
+            })
+            .await?;
             emit_info(&info, json)?;
         }
         DashboardCommand::Delete(args) => {
@@ -80,7 +104,15 @@ pub async fn run(
                 }
                 None => format!("/v1/dashboards/{}", args.name),
             };
-            let deleted: DashboardDeleted = client.delete(&path).await?;
+            let deleted: DashboardDeleted = crate::auth::with_reauth(bearer, |bearer| {
+                let endpoint = endpoint.to_owned();
+                let path = path.clone();
+                async move {
+                    let client = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    client.delete(&path).await
+                }
+            })
+            .await?;
             crate::output::emit(&deleted, json, |deleted| {
                 writeln!(io::stdout(), "deleted dashboard {}", deleted.deleted)?;
                 Ok(())

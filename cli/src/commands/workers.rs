@@ -30,24 +30,44 @@ pub async fn run(
     crate::backend::require_cloud_workers(endpoint)?;
     match command {
         WorkersCommand::List => {
-            let server = crate::backend::server(endpoint, token)?;
-            let rows: Value = server.get("/v1/workers").await?;
+            let rows: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.get("/v1/workers").await
+                }
+            })
+            .await?;
             emit_list(&rows, &["name", "state", "output", "created_by"], json)
         }
         WorkersCommand::Get(WorkerRefArgs { worker }) => {
-            let server = crate::backend::server(endpoint, token)?;
-            let detail: Value = server.get(&format!("/v1/workers/{worker}")).await?;
+            let detail: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let worker = worker.clone();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.get(&format!("/v1/workers/{worker}")).await
+                }
+            })
+            .await?;
             emit_object(&detail, json)
         }
         WorkersCommand::Create(args) => run_create(endpoint, token, args, json).await,
         WorkersCommand::Delete(WorkerRefArgs { worker }) => {
-            let server = crate::backend::server(endpoint, token)?;
-            let response: Value = server
-                .put_json(
-                    &format!("/v1/workers/{worker}/state"),
-                    &serde_json::json!({ "state": "archived" }),
-                )
-                .await?;
+            let response: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let worker = worker.clone();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server
+                        .put_json(
+                            &format!("/v1/workers/{worker}/state"),
+                            &serde_json::json!({ "state": "archived" }),
+                        )
+                        .await
+                }
+            })
+            .await?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {
@@ -72,10 +92,16 @@ async fn run_create(
     let mut manifest = WorkerManifest::from_file(&args.file)?;
     apply_create_overrides(&mut manifest, args.name, args.schedule);
     manifest.validate()?;
-    let server = crate::backend::server(endpoint, token)?;
-    let row: Value = server
-        .post_json("/v1/workers", &manifest.to_local_worker())
-        .await?;
+    let body = manifest.to_local_worker();
+    let row: Value = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+        let endpoint = endpoint.to_owned();
+        let body = body.clone();
+        async move {
+            let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+            server.post_json("/v1/workers", &body).await
+        }
+    })
+    .await?;
     emit_object(&row, json)
 }
 
@@ -113,24 +139,27 @@ async fn run_now(
     worker: &str,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let base = endpoint.trim_end_matches('/');
-    let url = format!("{base}/v1/workers/{worker}/run");
+    let url = format!("{}/v1/workers/{worker}/run", endpoint.trim_end_matches('/'));
+    // Minted once and reused across the retry: it is the same logical
+    // request either way, and reusing it keeps a retry idempotent even if
+    // the first attempt's 401 arrived after the server saw the request.
     let key = format!("cli-{}", short_id());
-    let mut request = reqwest::Client::new()
-        .post(&url)
-        .header("Idempotency-Key", &key);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request
-        .send()
-        .await
-        .map_err(|e| format!("could not reach server at {base}: {e}"))?;
-    let status = response.status();
+    let response = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+        let url = url.clone();
+        let key = key.clone();
+        async move {
+            let mut request = reqwest::Client::new()
+                .post(&url)
+                .header("Idempotency-Key", &key);
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            request.send().await?.error_for_status()
+        }
+    })
+    .await
+    .map_err(|error| format!("could not run worker at {url}: {error}"))?;
     let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Err(format!("server: {body} (HTTP {})", status.as_u16()).into());
-    }
     let value: Value = if body.trim().is_empty() {
         Value::Null
     } else {
