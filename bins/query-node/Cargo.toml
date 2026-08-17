@@ -1,0 +1,48 @@
+[package]
+name = "verglas-query-node"
+description = "The standalone Verglas tenant query server: POST /v1/query over verglas-iceberg's DataFusion catalog, and nothing else."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "verglas-query-node"
+path = "src/main.rs"
+
+[dependencies]
+# The embedded SQL engine and nothing off it: catalog open, PreparedCatalog /
+# query_stream, and the JSON row fragment writer. No cache, no S3 frontend, no
+# cluster/consensus/writeback — a query worker reads through whatever S3
+# endpoint the connection names.
+verglas-iceberg.workspace = true
+# `Arc<dyn Catalog>` is the type `open_catalog`/`PreparedCatalog` speak; the
+# server state and its `run_query` need the trait name in scope. Already a
+# full build dependency of verglas-iceberg (via `iceberg.workspace`), so this
+# adds no new engine surface.
+iceberg.workspace = true
+# Polls `QueryExecution::batches` (a `SendableRecordBatchStream`) for each
+# result batch. `.schema()` is callable on the trait object without a direct
+# `datafusion` dependency; only the stream adaptor is needed here.
+futures.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "net", "signal", "time"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest.workspace = true
+# The timeout test wraps a real `Catalog` in a delegating wrapper that
+# delays exactly one method, to force a genuine tokio-timer wait — see
+# `server::tests::SlowCatalog`.
+async-trait.workspace = true
+
+[lints]
+workspace = true
+
+# Not distributed as raw prebuilt binaries: ships as a container image, same as
+# verglas-cache-node.
+[package.metadata.dist]
+dist = false

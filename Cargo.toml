@@ -21,6 +21,7 @@ members = [
     "crates/verglas-vector",
     "crates/verglas-kv",
     "bins/cache-node",
+    "bins/query-node",
     "crates/verglas-block",
 ]
 

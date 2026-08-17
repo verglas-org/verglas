@@ -7433,6 +7433,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "verglas-query-node"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures",
+ "iceberg",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "verglas-iceberg",
+]
+
+[[package]]
 name = "verglas-s3"
 version = "0.1.1"
 dependencies = [

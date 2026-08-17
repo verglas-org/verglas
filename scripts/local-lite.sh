@@ -1,20 +1,25 @@
 #!/usr/bin/env bash
 # scripts/local-lite.sh — implements the frozen protocol in
-# scripts/LOCAL_LITE_ACCEPTANCE.md (v2). Boots, on localhost, from CURRENT
+# scripts/LOCAL_LITE_ACCEPTANCE.md (v3). Boots, on localhost, from CURRENT
 # source trees: a MinIO object store, FOUR verglas-cache-node processes built
 # --release from this tree forming a real fragment ring (the engine's
 # ring.rs hard-requires >=3 VERGLAS_RING_PEERS before the embedded safekeeper
 # route lakekeeper commits through even starts — see bins/cache-node/src/
-# ring.rs and serve.rs's `safekeeper_args` gate), and FOUR Lakekeeper
-# serve-craft instances built from $LAKEKEEPER_DIR, one colocated per node.
+# ring.rs and serve.rs's `safekeeper_args` gate), FOUR Lakekeeper
+# serve-craft instances built from $LAKEKEEPER_DIR, one colocated per node,
+# and ONE `bins/query-node` (verglas-query-node) instance serving POST
+# /v1/query, built from this tree.
 #
-# All eight processes launch through the SAME boot.sh scripts verglas-cloud
-# images use (env parity is enforced by construction: this script patches
-# only the `exec` target inside a scratch copy of each boot.sh, never its
-# env-var contract, and threads per-node values through extra environment
-# variables the binaries already read directly — VERGLAS_NODE_ID,
-# VERGLAS_RING_PEERS, VERGLAS_RING_ADDR, VERGLAS_SAFEKEEPER_ADDR — so a fix to
-# either boot script is exercised exactly as production would run it).
+# All eight ring processes launch through the SAME boot.sh scripts
+# verglas-cloud images use (env parity is enforced by construction: this
+# script patches only the `exec` target inside a scratch copy of each
+# boot.sh, never its env-var contract, and threads per-node values through
+# extra environment variables the binaries already read directly —
+# VERGLAS_NODE_ID, VERGLAS_RING_PEERS, VERGLAS_RING_ADDR,
+# VERGLAS_SAFEKEEPER_ADDR — so a fix to either boot script is exercised
+# exactly as production would run it). The query node has no comparable
+# cloud image/boot script yet (v3 adds the binary itself); it reads its
+# coordinates as plain env vars — see `launch_query_node`.
 #
 # Port layout (node N, 1-indexed):
 #   cache-node S3:         18333 / 18343 / 18353 / 18363
@@ -22,6 +27,7 @@
 #   cache-node safekeeper: 18335 / 18345 / 18355 / 18365  (VERGLAS_CATALOG_ENDPOINTS target)
 #   cache-node ring/gossip:28335 / 28345 / 28355 / 28365  (VERGLAS_RING_PEERS target)
 #   lakekeeper:            18181 / 18191 / 18201 / 18211
+#   query-node:            18400  (POST /v1/query only; catalog -> cache-node node1 gateway)
 #
 # JUDGMENT CALL: production wires VERGLAS_RING_PEERS to the fragment-ring
 # listener (default :8336, VERGLAS_RING_ADDR) and VERGLAS_CATALOG_ENDPOINTS to
@@ -66,6 +72,11 @@ RING_PORTS=(${VERGLAS_LOCAL_LITE_RING_PORTS:-28335 28345 28355 28365})
 BLOCK_PORTS=(${VERGLAS_LOCAL_LITE_BLOCK_PORTS:-8335 8345 8355 8365})
 LAKEKEEPER_PORTS=(${VERGLAS_LOCAL_LITE_LAKEKEEPER_PORTS:-18181 18191 18201 18211})
 NODE_IDS=(node1 node2 node3 node4)
+# The tenant query node (v3): ONE `bins/query-node` instance, POST /v1/query
+# only. Frozen doc default; override to dodge a squatted port.
+QUERY_PORT="${VERGLAS_LOCAL_LITE_QUERY_PORT:-18400}"
+# Frozen doc pins the run's node memory ceiling to 1 GiB.
+QUERY_MEMORY_LIMIT_BYTES="${VERGLAS_LOCAL_LITE_QUERY_MEMORY_LIMIT_BYTES:-1073741824}"
 
 TENANT="local-lite"
 WAREHOUSE="default"
@@ -97,6 +108,25 @@ wait_for_http() {
     waited=$((waited + 1))
     if [ "$waited" -ge "$deadline" ]; then
       fail "$label did not answer $url within ${deadline}s"
+    fi
+    sleep 1
+  done
+  log "$label is up ($url, ${waited}s)"
+}
+
+# wait_for_query_node URL DEADLINE_SECONDS LABEL — the query node exposes no
+# GET health route (POST /v1/query only, per the frozen protocol), so
+# readiness is a trivial catalog-reaching query rather than a GET probe.
+wait_for_query_node() {
+  local url="$1" deadline="$2" label="$3" waited=0 status
+  while true; do
+    status=$(curl -sS -o /dev/null -m 2 -w '%{http_code}' -X POST "$url" \
+      -H 'content-type: application/json' \
+      --data '{"sql":"SELECT 1"}' 2>/dev/null || echo 000)
+    [ "$status" = "200" ] && break
+    waited=$((waited + 1))
+    if [ "$waited" -ge "$deadline" ]; then
+      fail "$label did not answer $url within ${deadline}s (last status $status)"
     fi
     sleep 1
   done
@@ -145,6 +175,7 @@ cmd_up() {
   create_buckets
   mint_credentials
   build_engine
+  build_query_node
   build_lakekeeper
 
   local i
@@ -160,11 +191,14 @@ cmd_up() {
   for i in 0 1 2 3; do
     wait_for_http "http://127.0.0.1:${LAKEKEEPER_PORTS[$i]}/health" 30 "lakekeeper ${NODE_IDS[$i]}"
   done
+  launch_query_node
+  wait_for_query_node "http://127.0.0.1:$QUERY_PORT/v1/query" 30 "query-node"
   log "stack up: minio=:$MINIO_S3_PORT"
   for i in 0 1 2 3; do
     log "  ${NODE_IDS[$i]}: cache s3=:${S3_PORTS[$i]} admin=:${ADMIN_PORTS[$i]} safekeeper=:${SAFEKEEPER_PORTS[$i]} ring=:${RING_PORTS[$i]} lakekeeper=:${LAKEKEEPER_PORTS[$i]}"
   done
-  log "logs: $STATE_DIR/cache-node-*.log , $STATE_DIR/lakekeeper-*.log"
+  log "  query-node: :$QUERY_PORT (catalog -> cache-node node1 gateway, S3 -> minio, memory_limit_bytes=$QUERY_MEMORY_LIMIT_BYTES)"
+  log "logs: $STATE_DIR/cache-node-*.log , $STATE_DIR/lakekeeper-*.log , $STATE_DIR/query-node.log"
 }
 
 start_minio() {
@@ -222,6 +256,13 @@ build_lakekeeper() {
   ( cd "$LAKEKEEPER_DIR" && cargo build --release -p lakekeeper-bin )
   LAKEKEEPER_BIN="$LAKEKEEPER_DIR/target/release/lakekeeper"
   [ -x "$LAKEKEEPER_BIN" ] || fail "build did not produce $LAKEKEEPER_BIN"
+}
+
+build_query_node() {
+  log "building verglas-query-node --release from $ENGINE_DIR"
+  ( cd "$ENGINE_DIR" && cargo build --release -p verglas-query-node )
+  QUERY_NODE_BIN="$ENGINE_DIR/target/release/verglas-query-node"
+  [ -x "$QUERY_NODE_BIN" ] || fail "build did not produce $QUERY_NODE_BIN"
 }
 
 # Patches only the hardcoded `exec /usr/local/bin/...` install path inside a
@@ -299,11 +340,48 @@ launch_lakekeeper() {
   echo $! > "$STATE_DIR/lakekeeper-$node_id.pid"
 }
 
+# Launches the one tenant query node. Coordinates mirror the ones a
+# production tenant query machine receives: the cache node's own catalog
+# gateway (node1's loopback `/catalog` mount — see
+# `bins/cache-node/src/admin.rs::catalog_router`: "Query workers therefore
+# consume already-observed metadata without Lakekeeper credentials or an
+# independent catalog cache", the exact contract `bins/cache-node/Cargo.toml`
+# documents), never Lakekeeper directly. That gateway is unauthenticated
+# behind the node-local admin surface, so no bearer token is needed here. The
+# ring's S3 endpoint (MinIO here) and its keypair round out the coordinates.
+# No admin/health route beyond POST /v1/query itself (org-network-only, v1).
+launch_query_node() {
+  log "launching query-node (catalog -> cache-node node1 gateway, memory_limit_bytes=$QUERY_MEMORY_LIMIT_BYTES)"
+  env \
+    VERGLAS_QUERY_LISTEN="0.0.0.0:$QUERY_PORT" \
+    VERGLAS_CATALOG_URI="http://127.0.0.1:${ADMIN_PORTS[0]}/catalog" \
+    VERGLAS_WAREHOUSE="$WAREHOUSE" \
+    VERGLAS_BACKEND_S3_ENDPOINT="http://127.0.0.1:$MINIO_S3_PORT" \
+    VERGLAS_BACKEND_REGION=us-east-1 \
+    VERGLAS_BACKEND_ACCESS_KEY_ID="$MINIO_ROOT_USER" \
+    VERGLAS_BACKEND_SECRET_ACCESS_KEY="$MINIO_ROOT_PASSWORD" \
+    VERGLAS_QUERY_MEMORY_LIMIT_BYTES="$QUERY_MEMORY_LIMIT_BYTES" \
+    "$QUERY_NODE_BIN" > "$STATE_DIR/query-node.log" 2>&1 &
+  echo $! > "$STATE_DIR/query-node.pid"
+}
+
 # ---------------------------------------------------------------------------
 # down
 # ---------------------------------------------------------------------------
 cmd_down() {
   local idx node_id pid_file pid
+  for pid_file in "$STATE_DIR/query-node.pid"; do
+    if [ -f "$pid_file" ]; then
+      pid=$(cat "$pid_file")
+      if pid_alive "$pid"; then
+        log "stopping pid $pid ($pid_file)"
+        kill "$pid" 2>/dev/null || true
+        for _ in $(seq 1 10); do pid_alive "$pid" || break; sleep 0.5; done
+        pid_alive "$pid" && kill -9 "$pid" 2>/dev/null || true
+      fi
+      rm -f "$pid_file"
+    fi
+  done
   for idx in 0 1 2 3; do
     node_id="${NODE_IDS[$idx]}"
     for pid_file in "$STATE_DIR/cache-node-$node_id.pid" "$STATE_DIR/lakekeeper-$node_id.pid"; do
@@ -480,6 +558,34 @@ cmd_check() {
     log "async append p50 = ${p50}ms (samples: $(echo "$sorted" | tr '\n' ' '))"
   else
     log "no successful async appends to report"
+  fi
+
+  log "9. SQL (query-node :$QUERY_PORT)"
+  local query_url="http://127.0.0.1:$QUERY_PORT/v1/query"
+  local n
+  status=$(curl -sS -o "$STATE_DIR/query-count.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELECT COUNT(*) AS n FROM main.pairing_events"}')
+  body=$(cat "$STATE_DIR/query-count.json")
+  n=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['data'][0]['n'])" "$STATE_DIR/query-count.json" 2>/dev/null || echo "")
+  if [ "$status" != "200" ] || [ "$n" != "5" ]; then
+    log "SQL COUNT FAILED status=$status n=$n body=$body"
+    failures=$((failures + 1))
+  else
+    log "SQL COUNT ok status=$status n=$n"
+  fi
+
+  status=$(curl -sS -o "$STATE_DIR/query-syntax-error.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELEKT this is not valid sql"}')
+  body=$(cat "$STATE_DIR/query-syntax-error.json")
+  if [ "${status:0:1}" != "4" ] || ! grep -q '"error"' "$STATE_DIR/query-syntax-error.json"; then
+    log "SQL SYNTAX ERROR FAILED status=$status body=$body"
+    failures=$((failures + 1))
+  else
+    log "SQL SYNTAX ERROR ok status=$status (clean 4xx JSON, not a hang or 5xx)"
   fi
 
   if [ "$failures" -gt 0 ]; then
