@@ -141,3 +141,10 @@
 - #137: Added explicit-schema table creation with initial Iceberg properties.
   Semantic resource adapters use this to atomically publish a table and its
   durable control-plane definition, avoiding an orphaned table window.
+- Migrated to iceberg 0.10.1 (fork rebased onto upstream v0.10.1 as
+  verglas/v0.10.1, patch shrunk to just `TableCommit::from_parts`): manifest
+  lists load through `Table::manifest_list_reader`, `ArrowReaderBuilder`
+  takes a `Runtime` and returns `ScanResult`, `ManifestWriterBuilder` lost
+  its key-metadata argument, `ManifestListWriter` takes a `FileWrite`, and
+  the storage delegate implements the new `delete_stream`. Upstream now has
+  `expire_snapshots`; `from_parts` remains only for the REPLACE commit.

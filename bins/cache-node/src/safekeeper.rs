@@ -1,5 +1,6 @@
 //! Neon WAL ingress over the cache fleet's universal coded Multi-Raft groups.
 
+use axum::serve::ListenerExt as _;
 use std::{
     collections::BTreeSet,
     net::SocketAddr,
@@ -291,6 +292,10 @@ pub async fn serve(
         layout.m,
         layout.w,
     );
+    // Consensus rounds are latency-critical small writes: Nagle off.
+    let listener = listener.tap_io(|io| {
+        let _ = io.set_nodelay(true);
+    });
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;

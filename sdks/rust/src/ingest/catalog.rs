@@ -89,7 +89,6 @@ pub async fn open_catalog(config: &CatalogConfig) -> Result<Arc<dyn Catalog>> {
     }
 
     let storage = FixedPartStorageFactory::new(OpenDalStorageFactory::S3 {
-        configured_scheme: "s3".to_owned(),
         customized_credential_load: None,
     });
     let catalog = RestCatalogBuilder::default()

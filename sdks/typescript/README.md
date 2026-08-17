@@ -170,7 +170,7 @@ await access.revokeToken(localCli.id);
 ```
 
 Use `access.authorize()` when a management surface needs to explain whether the
-presented token can perform a database, table, queue, Vessel, or Integration
+presented token can perform a database, table, or Integration
 operation. The returned decision includes the matched grant and policy revision.
 
 For a direct connection to an authorized managed Postgres database, mint a
@@ -195,7 +195,7 @@ An Integration publishes a reflection manifest instead of requiring a
 product-specific SDK change. The manifest declares its stable namespace,
 dot-separated methods, JSON Schema inputs and outputs, and whether each method
 is a bounded read, bounded write, or stream. The same authenticated client
-therefore composes external APIs with tables, queues, vectors, and graphs:
+therefore composes external APIs with tables, vectors, and graphs:
 
 ```ts
 const manifest = await client.reflect("crm");
@@ -455,18 +455,6 @@ over the endpoint's routes.
 partition spec when first-commit inference cannot express the exact column types
 or partitioning you need.
 
-### Queues
-
-A worker may target an explicitly created **queue** instead of a table.
-`client.queue(name)` returns a `Queue` with `enqueue(messages)`,
-`poll(group, { owner, max, leaseSeconds })`, and `ack(group, receipt)`. Each queue
-owns a managed Verglas Neon database and an independently scalable queue
-container. Poll grants an exclusive expiring lease and returns a generation-fenced
-receipt. A crash before ack causes redelivery; a stale receipt cannot acknowledge
-a message reclaimed by another worker. Delivery is **at-least-once with
-consumer-side idempotency**.
-
-
 ## Automatic run logging + observability
 
 Every worker run emits standardized structured logs with **no logging code in
@@ -605,7 +593,7 @@ The root exports exactly two layers; internals live behind subpaths.
 - Types: `Row`, `Watermark`, `ConnectOptions`, `ScanOptions`, `ScanResult`,
   `DeltaResult`, `Snapshot`, `FollowRowsOptions`, `FollowHandler`, `ChangeEvent`,
   `ChangeHandler`, `FollowFeedOptions`, `FeedSubscription`, `CommitOptions`,
-  `CommitResult`, plus the table/queue/graph/index result types
+  `CommitResult`, plus the table/graph/index result types
   and reflected namespace manifest, method, call, and static typing helpers
 
 Subpaths (internals the runner uses on the author's behalf — import only when

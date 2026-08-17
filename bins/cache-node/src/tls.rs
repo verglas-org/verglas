@@ -251,7 +251,12 @@ pub async fn serve(
             biased;
             () = &mut shutdown => break,
             accepted = tcp.accept() => match accepted {
-                Ok(pair) => pair,
+                Ok(pair) => {
+                    // Nagle off before the TLS handshake: SigV4 request/response
+                    // exchanges are small and latency-bound.
+                    let _ = pair.0.set_nodelay(true);
+                    pair
+                }
                 Err(error) => {
                     // Matches axum's own accept-error handling (transient:
                     // log and keep the listener alive) rather than tearing

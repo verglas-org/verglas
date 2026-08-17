@@ -1,0 +1,34 @@
+# Publishes the Rust SDK and its two dependency crates to crates.io as part
+# of a release.
+#
+# Called by the dist-generated release.yml ("./publish-crates" in
+# dist-workspace.toml's publish-jobs) after every target build is green.
+# cargo orders the publishes by dependency (verglas-api and verglas-core
+# before verglas-sdk) and waits for each to be indexed.
+#
+# Only these three crates publish: they are the ones that do not depend on
+# the patched Iceberg fork. The engine crates stay at the workspace-wide
+# publish = false because crates.io ignores [patch.crates-io] in consumer
+# builds, so anything using the fork's added APIs would not compile
+# downstream. The SDK builds against stock upstream iceberg.
+
+name: Publish Rust crates
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo publish -p verglas-api -p verglas-core -p verglas-sdk
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

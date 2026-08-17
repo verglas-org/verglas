@@ -39,6 +39,7 @@
 //! matching already makes a stale-epoch request safe (it either hits the right
 //! bytes or misses cleanly), so a `NotOwner` round-trip would buy nothing here.
 
+use axum::serve::ListenerExt as _;
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -494,6 +495,12 @@ impl PeerServer {
                 runtime.block_on(async move {
                     // A serving error tears down only the peer surface. The
                     // public cache endpoint still has its origin-safe path.
+                    // Nagle off on every accepted peer socket: the quorum
+                    // write path is small multiplexed h2 frames, exactly the
+                    // pattern Nagle+delayed-ACK stalls.
+                    let listener = listener.tap_io(|io| {
+                        let _ = io.set_nodelay(true);
+                    });
                     let _ = axum::serve(listener, app)
                         .with_graceful_shutdown(async move {
                             let _ = stopping.await;

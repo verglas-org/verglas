@@ -23,6 +23,7 @@
 //!   fragment store and peer RPC. With no ring configured, object PUT and block
 //!   FLUSH retain the synchronous origin barrier and no safekeeper starts.
 
+use axum::serve::ListenerExt as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -705,6 +706,9 @@ pub async fn run(
         ));
     }
     let admin_fut = async move {
+        let admin_listener = admin_listener.tap_io(|io| {
+            let _ = io.set_nodelay(true);
+        });
         axum::serve(admin_listener, admin_app)
             .with_graceful_shutdown(shutdown_signal())
             .await
@@ -1057,16 +1061,27 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             );
             let tls_app = app.clone();
             let (plaintext_result, tls_result) = tokio::join!(
-                axum::serve(s3_listener, app).with_graceful_shutdown(shutdown_signal()),
+                axum::serve(
+                    s3_listener.tap_io(|io| {
+                        let _ = io.set_nodelay(true);
+                    }),
+                    app
+                )
+                .with_graceful_shutdown(shutdown_signal()),
                 crate::tls::serve(tls_listener, tls_app, shutdown_signal()),
             );
             plaintext_result?;
             tls_result?;
         }
         None => {
-            axum::serve(s3_listener, app)
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+            axum::serve(
+                s3_listener.tap_io(|io| {
+                    let _ = io.set_nodelay(true);
+                }),
+                app,
+            )
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
         }
     }
     Ok(())

@@ -75,44 +75,6 @@ class MockTable {
 
 }
 
-/** In-memory approximation of exclusive PostgreSQL queue leases. */
-class MockQueue {
-  records: {id: string; topic: string; payload: Record<string, unknown>}[] = [];
-  claims = new Map<string, Set<number>>();
-
-  enqueue(messages: {id: string; topic: string; payload: Record<string, unknown>}[]) {
-    const positions: number[] = [];
-    for (const message of messages) {
-      positions.push(this.records.length);
-      this.records.push(message);
-    }
-    return { positions };
-  }
-
-  poll(group: string, owner: string, topics: string[], max: number) {
-    const claims = this.claims.get(group) ?? new Set<number>();
-    this.claims.set(group, claims);
-    const deliveries = this.records
-      .map((message, position) => ({position, message}))
-      .filter(({position, message}) => !claims.has(position) && topics.includes(message.topic))
-      .slice(0, max)
-      .map(({position, message}) => {
-        claims.add(position);
-        return {
-          position,
-          topic: message.topic,
-          payload: message.payload,
-          receipt: {position, owner, generation: 1},
-          expiresAt: "2026-08-10T00:00:30Z",
-        };
-      });
-    return {deliveries};
-  }
-
-  ack(_group: string, _receipt: {position: number; owner: string; generation: number}) {
-    return undefined;
-  }
-}
 
 
 export interface MockEndpoint {
@@ -133,12 +95,6 @@ export interface MockEndpoint {
 export async function startMockEndpoint(token = "test-token"): Promise<MockEndpoint> {
   const tables = new Map<string, MockTable>();
   const definitions = new Map<string, { schema: unknown[]; partitions: unknown[] }>();
-  const queues = new Map<string, MockQueue>();
-  const queueState = (name: string): MockQueue => {
-    let queue = queues.get(name);
-    if (!queue) queues.set(name, (queue = new MockQueue()));
-    return queue;
-  };
   const requests: MockEndpoint["requests"] = [];
   const tableState = (name: string): MockTable => {
     let t = tables.get(name);
@@ -279,27 +235,6 @@ export async function startMockEndpoint(token = "test-token"): Promise<MockEndpo
     }
 
 
-    // /v1/queues/:name/:action — the queue output type.
-    const q = url.pathname.match(/^\/v1\/queues\/([^/]+)\/(enqueue|poll|ack)$/);
-    if (q) {
-      const queue = queueState(decodeURIComponent(q[1]));
-      const action = q[2];
-      if (req.method === "POST") {
-        let raw = "";
-        req.on("data", (c) => (raw += c));
-        req.on("end", () => {
-          const body = raw ? JSON.parse(raw) : {};
-          requests.push({ method: "POST", path: url.pathname, body });
-          if (action === "enqueue") return send(200, queue.enqueue(body.messages ?? []));
-          if (action === "poll") return send(200, queue.poll(body.group ?? "", body.owner ?? "", body.topics ?? [], Number(body.max ?? 256)));
-          queue.ack(body.group ?? "", body.receipt);
-          res.writeHead(204);
-          return res.end();
-        });
-        return;
-      }
-      return send(405, { error: "method not allowed" });
-    }
 
     // /v1/tables/:name/:action  (name is a single URL-encoded segment)
     const m = url.pathname.match(/^\/v1\/tables\/([^/]+)\/(snapshot|rows|delta|commit)$/);

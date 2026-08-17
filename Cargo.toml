@@ -32,10 +32,15 @@ version = "0.1.1"
 edition = "2024"
 repository = "https://github.com/verglas-org/verglas"
 homepage = "https://github.com/verglas-org/verglas"
+# FSL-1.1-ALv2 is not an SPDX identifier, so crates that publish ship the
+# license file itself.
+license-file = "LICENSE"
 publish = false
 
 [workspace.dependencies]
-verglas-core = { path = "crates/verglas-core" }
+# Version alongside path: required for the crates.io publishes (verglas-api,
+# verglas-core, verglas-sdk). The release version sweep must bump these too.
+verglas-core = { path = "crates/verglas-core", version = "0.1.1" }
 verglas-backend = { path = "crates/verglas-backend" }
 verglas-cluster = { path = "crates/verglas-cluster" }
 verglas-cache = { path = "crates/verglas-cache" }
@@ -48,7 +53,7 @@ verglas-consensus = { path = "crates/verglas-consensus" }
 verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }
-verglas-api = { path = "crates/verglas-api" }
+verglas-api = { path = "crates/verglas-api", version = "0.1.1" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-block = { path = "crates/verglas-block" }
@@ -56,23 +61,23 @@ verglas-sdk = { path = "sdks/rust" }
 tonic = "0.13.1"
 prost = "0.13.5"
 # Iceberg read/write and DataFusion integration shared by engine roles.
-iceberg = "0.9.1"
-iceberg-catalog-rest = "0.9.1"
-iceberg-datafusion = "0.9.1"
+iceberg = "0.10.1"
+iceberg-catalog-rest = "0.10.1"
+iceberg-datafusion = "0.10.1"
 # S3/fs/memory storage backends for Iceberg FileIO. RestCatalog requires an
 # explicit StorageFactory; the S3 one routes data-file writes and reads through
 # the configured cache endpoint.
-iceberg-storage-opendal = "0.9.1"
-datafusion = "52.2"
+iceberg-storage-opendal = "0.10.1"
+datafusion = "53.1"
 # Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
-arrow-array = "57"
-arrow-buffer = "57"
-arrow-ipc = "57"
-arrow-schema = "57"
-arrow-csv = "57"
-arrow-json = "57"
-arrow-cast = "57"
-parquet = "57"
+arrow-array = "58"
+arrow-buffer = "58"
+arrow-ipc = "58"
+arrow-schema = "58"
+arrow-csv = "58"
+arrow-json = "58"
+arrow-cast = "58"
+parquet = "58"
 uuid = { version = "1.18", features = ["v4"] }
 axum = "0.8.8"
 bytes = "1.12.0"
@@ -144,16 +149,16 @@ todo = "warn"
 unimplemented = "warn"
 unwrap_used = "warn"
 
-# VERGLAS PATCH: iceberg 0.9.1 from verglas-org/iceberg-rust (branch
-# verglas/v0.9.1) with one added public constructor, `TableCommit::from_parts`.
-# Upstream 0.9.1 gates `TableCommit` construction to the transaction action set
+# VERGLAS PATCH: iceberg 0.10.1 from verglas-org/verglas-iceberg (branch
+# verglas/v0.10.1) with one added public constructor, `TableCommit::from_parts`.
+# Upstream gates `TableCommit` construction to the transaction action set
 # (fast-append + property updates, no overwrite or delete), so REPLACE /
 # RemoveSnapshots commits cannot be built through the public API. Compaction
 # and post-compact snapshot expiry need that escape hatch. Pin a SHA — never a
 # floating branch tip. Patch inventory:
-# https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.9.1/VERGLAS.md
+# https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.1/VERGLAS.md
 [patch.crates-io]
-iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "a40f92680e7528b15033d7168ecdc8731e3ca2b9" }
+iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "39f251a452ab2ab48728917b56182e35bb6b805b" }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -174,3 +174,19 @@
 - #128: Exposed the database table-subscription batch limit so consumers can
   bound their in-flight fenced receipts. This prevents slow handlers from
   receiving more commits than they can acknowledge within one lease.
+- Published to crates.io (with verglas-api and verglas-core, its two
+  workspace dependencies) by the release pipeline's publish-crates job. The
+  SDK never uses the patched Iceberg fork's added APIs, so it builds against
+  stock upstream iceberg 0.9.1 in consumer builds; the engine crates that do
+  need the fork stay unpublished. License ships as license-file (FSL-1.1-ALv2
+  is not an SPDX identifier).
+- Iceberg 0.10.1 migration: the published SDK now depends on the stock
+  upstream release (the fork patch never applied to consumers anyway). Added
+  the `delete_stream` delegate to the fixed-part storage wrapper, dropped
+  the removed `configured_scheme` factory field, and moved Arrow to 58 to
+  match iceberg's pin.
+- Removed the Kv and Queue client surface (types, verbs, module, tests)
+  until further notice. The database-subscription stream that reads pushed
+  update events keeps working: its wire frame and receipt moved into the
+  client as `DeliveryFrame`/`DeliveryReceipt`, and subscription ack is
+  unchanged.

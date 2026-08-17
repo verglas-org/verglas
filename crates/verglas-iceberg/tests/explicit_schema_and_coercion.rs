@@ -76,11 +76,13 @@ async fn read_batches(table: &Table) -> Vec<RecordBatch> {
         .try_collect()
         .await
         .expect("collect tasks");
-    let reader = ArrowReaderBuilder::new(table.file_io().clone()).build();
+    let runtime = iceberg::Runtime::try_current().expect("runtime");
+    let reader = ArrowReaderBuilder::new(table.file_io().clone(), runtime).build();
     let stream = futures::stream::iter(tasks.into_iter().map(Ok)).boxed();
     reader
         .read(stream)
         .expect("read")
+        .stream()
         .try_collect()
         .await
         .expect("collect batches")

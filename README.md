@@ -6,7 +6,7 @@ hot reads serve from local DRAM or NVMe, writes acknowledge at NVMe latency
 under quorum durability, and your object store stays the system of record.
 
 [![ci](https://github.com/verglas-org/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
-[![coverage](https://img.shields.io/badge/coverage-29%25_measured%2C_ratcheting-yellow)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
+[![coverage](https://img.shields.io/badge/coverage-77%25_measured%2C_ratcheting-green)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 
 
 ## What lives here
@@ -35,6 +35,27 @@ Verglas is available under the Functional Source License 1.1 with an Apache
 Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
+
+## Install
+
+The CLI runs directly through npm:
+
+```sh
+npx @verglas/cli --help
+```
+
+The SDKs install from their package managers:
+
+```sh
+npm install @verglas/sdk    # TypeScript
+cargo add verglas-sdk       # Rust
+```
+
+The daemon is distributed as a container image:
+
+```sh
+docker pull ghcr.io/verglas-org/verglas-cache-node:latest
+```
 
 ## Run the engine locally
 

@@ -2,7 +2,7 @@
 // Iceberg tables. Runs in any fetch-capable runtime and in Node 18+.
 //
 // The public surface is exactly two layers:
-//   1. Data-plane verbs — connect() and the client objects (Table and Queue),
+//   1. Data-plane verbs — connect() and the client objects (Table),
 //      plus the change feed (client.follow) and change-driven row follow
 //      (client.followRows).
 //   2. The worker contract — defineWorker() + the trigger types.
@@ -10,7 +10,7 @@
 // examples) are NOT re-exported here; reach them explicitly via the
 // `@verglas/sdk/logging` and `@verglas/sdk/examples` subpaths.
 
-export { connect, VerglasClient, Table, Queue, Kv } from "./client";
+export { connect, VerglasClient, Table } from "./client";
 export { VerglasHttpError } from "./http";
 export { S3VectorsClient, VerglasGraphsClient } from "./semantic";
 export type { SemanticDocument, SigV4Credentials } from "./semantic";
@@ -84,18 +84,6 @@ export type {
   CreateTableResult,
   EnsureTableResult,
   QueryAt,
-  QueueEnqueueResult,
-  QueueMessage,
-  QueueReceipt,
-  QueueDelivery,
-  QueuePollResult,
-  KvDeleteResult,
-  KvListEntry,
-  KvListOptions,
-  KvListPage,
-  KvPutOptions,
-  KvPutResult,
-  KvValue,
   DynamicNamespaceRegistry,
   NamespaceBindings,
   NamespaceCall,

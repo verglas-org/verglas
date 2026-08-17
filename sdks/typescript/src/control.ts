@@ -101,7 +101,7 @@ export type AccessAction =
 
 /** Resource actions delegated from an authenticated owner to one new token principal. */
 export interface AccessTokenGrant {
-  /** Stable ID of the database, table, queue, Vessel, or other protected resource. */
+  /** Stable ID of the database, table, or other protected resource. */
   resource_id: string;
   /** Operations the authenticated principal delegates to this token. */
   actions: AccessAction[];

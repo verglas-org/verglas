@@ -293,3 +293,7 @@
 - #135: Canonicalized consensus voter and fragment-slot ordering by numeric
   voter identity. A restarted group now seals and reconstructs payloads from
   the same slots used before and after Raft restores its sorted voter set.
+- Release packaging: the daemon no longer ships as raw prebuilt binaries
+  (`dist = false`). Releases build the root Dockerfile into a multi-arch
+  container image at ghcr.io/verglas-org/verglas-cache-node via the
+  publish-docker job in the release pipeline.

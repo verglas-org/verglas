@@ -19,18 +19,7 @@ import type {
   NamespaceBindings,
   NamespaceManifest,
   NamespaceRegistry,
-  KvDeleteResult,
-  KvListOptions,
-  KvListPage,
-  KvPutOptions,
-  KvPutResult,
-  KvValue,
   FollowHandler,
-  QueueEnqueueResult,
-  QueueDelivery,
-  QueueMessage,
-  QueuePollResult,
-  QueueReceipt,
   Row,
   ScanOptions,
   ScanResult,
@@ -54,8 +43,7 @@ export function connect<Namespaces extends NamespaceRegistry = DynamicNamespaceR
     throw new Error("connect: no global fetch; pass one via ConnectOptions.fetch");
   }
   const transport = makeTransport(opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  const queueTransport = makeTransport(opts.accessEndpoint ?? opts.endpoint, opts.token, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  return new VerglasClient<Namespaces>(transport, queueTransport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  return new VerglasClient<Namespaces>(transport, opts.endpoint, opts.token, opts.catalogUri, fetchImpl, opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 }
 
 /** A connected Verglas client. Cheap to hold; makes no requests until used. */
@@ -73,7 +61,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
   /** @internal */
   constructor(
     private readonly transport: Transport,
-    private readonly queueTransport: Transport,
     /** The endpoint this client is bound to (for logging/diagnostics). */
     readonly endpoint: string,
     /** Bearer token, reused to authenticate the change-feed websocket. */
@@ -95,11 +82,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
     return namespace === undefined ? this.#namespaces.reflect() : this.#namespaces.manifest(namespace);
   }
 
-  /** Returns a thin handle to one tenant-authorized KV namespace. */
-  kv(namespace: string): Kv {
-    if (!namespace) throw new Error("kv: namespace is required");
-    return new Kv(this.transport, namespace);
-  }
 
   /**
    * Follows table-commit notifications over the platform's edge change feed and
@@ -217,14 +199,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
   }
 
   /**
-   * A handle to one explicitly provisioned PostgreSQL-backed queue.
-   */
-  queue<T extends Row = Row>(name: string): Queue<T> {
-    if (!name) throw new Error("queue: name is required");
-    return new Queue<T>(this.queueTransport, name);
-  }
-
-  /**
    * Creates a table from an explicit schema and partition spec. Use this when the
    * table needs exact column types (decimals, dates), per-column nullability, or
    * a partition spec (month transform, several columns) that the schema inference
@@ -307,117 +281,6 @@ export class VerglasClient<Namespaces extends NamespaceRegistry = DynamicNamespa
   /** Executes SQL through the configured database query endpoint. */
 }
 
-/** A thin raw-byte handle to one KV namespace. */
-export class Kv {
-  /** @internal */
-  constructor(
-    private readonly transport: Transport,
-    readonly namespace: string,
-  ) {}
-
-  private base(): string {
-    return `/v1/kv/${encodeURIComponent(this.namespace)}`;
-  }
-
-  private path(key: string): string {
-    if (!key) throw new Error("KV key is required");
-    return `${this.base()}/${encodeURIComponent(key)}`;
-  }
-
-  /** Durably sets raw bytes and returns the server-owned version. */
-  async put(key: string, bytes: Uint8Array, opts?: KvPutOptions): Promise<KvPutResult> {
-    if (opts?.ttlSeconds !== undefined && opts.expiresAtMs !== undefined) {
-      throw new Error("KV put accepts ttlSeconds or expiresAtMs, not both");
-    }
-    const headers: Record<string, string> = {};
-    if (opts?.ttlSeconds !== undefined) headers["x-verglas-ttl-seconds"] = String(opts.ttlSeconds);
-    if (opts?.expiresAtMs !== undefined) headers["x-verglas-expires-at-ms"] = String(opts.expiresAtMs);
-    if (opts?.contentType) headers["content-type"] = opts.contentType;
-    if (opts?.ifMatch) headers["if-match"] = opts.ifMatch;
-    if (opts?.ifNoneMatch) headers["if-none-match"] = "*";
-    if (opts?.idempotencyKey) headers["idempotency-key"] = opts.idempotencyKey;
-    for (const [name, value] of Object.entries(opts?.metadata ?? {})) {
-      headers[`x-verglas-meta-${name}`] = value;
-    }
-    const response = await this.transport.requestRaw("PUT", this.path(key), {
-      body: Uint8Array.from(bytes).buffer,
-      headers,
-    });
-    const version = response.headers.get("etag");
-    if (!version) throw new Error("KV put response has no ETag");
-    return {
-      version,
-      idempotent: response.headers.get("x-verglas-idempotent") === "true",
-    };
-  }
-
-  /** Gets raw bytes, or null when the key is absent or expired. */
-  async get(key: string): Promise<KvValue | null> {
-    let response: Response;
-    try {
-      response = await this.transport.requestRaw("GET", this.path(key));
-    } catch (error) {
-      if (error instanceof VerglasHttpError && error.status === 404) return null;
-      throw error;
-    }
-    const version = response.headers.get("etag");
-    const modified = response.headers.get("x-verglas-modified-at-ms");
-    if (!version || !modified) throw new Error("KV get response is missing metadata headers");
-    const metadata: Record<string, string> = {};
-    response.headers.forEach((value, name) => {
-      if (name.startsWith("x-verglas-meta-")) metadata[name.slice("x-verglas-meta-".length)] = value;
-    });
-    const expires = response.headers.get("x-verglas-expires-at-ms");
-    return {
-      bytes: new Uint8Array(await response.arrayBuffer()),
-      version,
-      contentType: response.headers.get("content-type") ?? undefined,
-      modifiedAtMs: Number(modified),
-      expiresAtMs: expires === null ? undefined : Number(expires),
-      metadata,
-      tier: (() => {
-        const tier = response.headers.get("x-verglas-kv-tier");
-        return tier === "ram" || tier === "nvme" ? tier : "unspecified";
-      })(),
-    };
-  }
-
-  /** Deletes one key idempotently with an optional expected version. */
-  async delete(key: string, opts?: { ifMatch?: string }): Promise<KvDeleteResult> {
-    const response = await this.transport.requestRaw("DELETE", this.path(key), {
-      headers: opts?.ifMatch ? { "if-match": opts.ifMatch } : undefined,
-    });
-    return (await response.json()) as KvDeleteResult;
-  }
-
-  /** Lists one bounded metadata-only prefix page without interpreting its cursor. */
-  async list(opts?: KvListOptions): Promise<KvListPage> {
-    const page = await this.transport.request<{
-      entries: Array<{
-        key: string;
-        version: string;
-        modified_at_ms: number;
-        expires_at_ms?: number;
-        content_type?: string;
-        metadata: Record<string, string>;
-      }>;
-      next_cursor?: string;
-    }>("GET", this.base(), {
-      query: { prefix: opts?.prefix, limit: opts?.limit, cursor: opts?.cursor },
-    });
-    return {
-      entries: page.entries.map((entry) => ({
-        key: entry.key,
-        version: entry.version,
-        modifiedAtMs: entry.modified_at_ms,
-        expiresAtMs: entry.expires_at_ms,
-        contentType: entry.content_type,
-        metadata: entry.metadata,
-      })),
-      nextCursor: page.next_cursor,
-    };
-  }
-}
 
 /** A read/write handle to a single Verglas table. */
 export class Table<T extends Row = Row> {
@@ -606,101 +469,3 @@ function reverseCatalogType(typeName: string): string {
   }
 }
 
-/**
- * A read/write handle to a single Verglas queue — the queue output type.
- *
- * A queue is an independently scalable service over a dedicated Neon database.
- * Poll returns exclusive expiring deliveries and ack requires the exact receipt.
- *
- * # Semantics: at-least-once with consumer-side idempotency
- *
- * A crash before ack lets the lease expire and redelivers the message under a
- * higher generation. A stale receipt is rejected rather than acknowledging a
- * newer consumer's delivery.
- */
-export class Queue<T extends Row = Row> {
-  /** @internal */
-  constructor(
-    private readonly transport: Transport,
-    readonly name: string,
-  ) {}
-
-  private base(): string {
-    return `/v1/queues/${encodeURIComponent(this.name)}`;
-  }
-
-  /** Appends messages to the queue. */
-  enqueue(messages: QueueMessage<T>[]): Promise<QueueEnqueueResult> {
-    return this.transport.request<QueueEnqueueResult>("POST", `${this.base()}/enqueue`, {
-      body: { messages },
-    });
-  }
-
-  /**
-   * Claims up to `max` exclusive messages for one consumer process.
-   */
-  poll(group: string, opts: { owner: string; topics: string[]; max?: number; leaseSeconds: number }): Promise<QueuePollResult<T>> {
-    if (!group) throw new Error("poll: group is required");
-    if (!opts.owner) throw new Error("poll: owner is required");
-    if (opts.topics.length === 0) throw new Error("poll: topics are required");
-    return this.transport.request<QueuePollResult<T>>("POST", `${this.base()}/poll`, {
-      body: { group, owner: opts.owner, topics: opts.topics, max: opts.max ?? 256, leaseSeconds: opts.leaseSeconds },
-    });
-  }
-
-  /** Pushes matching deliveries and reconnects without issuing poll requests. */
-  async *subscribe(
-    group: string,
-    opts: { owner: string; topics: string[]; max?: number; leaseSeconds: number },
-  ): AsyncGenerator<QueueDelivery<T>> {
-    if (!group) throw new Error("subscribe: group is required");
-    if (!opts.owner) throw new Error("subscribe: owner is required");
-    if (opts.topics.length === 0) throw new Error("subscribe: topics are required");
-    let delay = 250;
-    for (;;) {
-      try {
-        const response = await this.transport.requestRaw("POST", `${this.base()}/subscribe`, {
-          headers: { "content-type": "application/json", accept: "application/x-ndjson" },
-          body: JSON.stringify({
-            group,
-            owner: opts.owner,
-            topics: opts.topics,
-            max: opts.max ?? 256,
-            leaseSeconds: opts.leaseSeconds,
-          }),
-        });
-        delay = 250;
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("subscribe: response body is unavailable");
-        const decoder = new TextDecoder();
-        let buffered = "";
-        for (;;) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          buffered += decoder.decode(chunk.value, { stream: true });
-          let newline = buffered.indexOf("\n");
-          while (newline >= 0) {
-            const frame = buffered.slice(0, newline);
-            buffered = buffered.slice(newline + 1);
-            if (frame) yield JSON.parse(frame) as QueueDelivery<T>;
-            newline = buffered.indexOf("\n");
-          }
-        }
-      } catch (error) {
-        if (error instanceof VerglasHttpError && error.status < 500) throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 2, 30_000);
-    }
-  }
-
-  /**
-   * Acknowledges exactly the live delivery generation after committing work.
-   */
-  ack(group: string, receipt: QueueReceipt): Promise<void> {
-    if (!group) throw new Error("ack: group is required");
-    return this.transport.request<void>("POST", `${this.base()}/ack`, {
-      body: { group, receipt },
-    });
-  }
-}

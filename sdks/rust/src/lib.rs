@@ -11,8 +11,6 @@
 //! - [`report`]: the create/append/list/show/history/query report wire types,
 //!   including compaction reports — what server routes serve and the CLI
 //!   renders without linking the storage engine.
-//! - [`queue`]: the queue enqueue/poll/ack wire types the `/v1/queues/...`
-//!   routes serve and both language SDKs speak.
 //! - [`grant`]: the memory grant contract every worker inherits through
 //!   [`worker::WorkerContext`].
 //! - [`client`] / [`server`]: the data-plane HTTP client and local server
@@ -28,7 +26,6 @@ pub mod access;
 pub mod client;
 pub mod grant;
 pub mod ingest;
-pub mod queue;
 pub mod report;
 pub mod semantic;
 pub mod semantic_types;
@@ -41,15 +38,12 @@ pub use access::{
     Resource, ResourceKind, ScopedTokenClaims,
 };
 pub use client::{
-    Client, ClientError, ColumnSpec, ConnectOptions, Database, EnsureTable, Kv, KvDeleteResult,
-    KvListEntry, KvListPage, KvPutOptions, KvPutResult, KvReadTier, KvValue, Namespace,
-    NamespaceManifest, NamespaceMethodManifest, NamespaceMethodMode, NamespaceStream,
-    PartitionSpec, Queue, QueueStream, TableChangeDelivery, TableChangeStream, TableDefinition,
-    TableSubscriptionEvent,
+    Client, ClientError, ColumnSpec, ConnectOptions, Database, DeliveryReceipt, EnsureTable,
+    Namespace, NamespaceManifest, NamespaceMethodManifest, NamespaceMethodMode, NamespaceStream,
+    PartitionSpec, TableChangeDelivery, TableChangeStream, TableDefinition, TableSubscriptionEvent,
 };
 pub use grant::{GrantError, LocalGrantHost, MemoryGrant, MemoryGrantHost, MemoryGrantRequest};
 pub use job::{JobError, Logger, Row};
-pub use queue::{QueueDelivery, QueueEnqueueResult, QueueMessage, QueuePollResult, QueueReceipt};
 pub use report::{CompactReport, CompactionReport};
 pub use semantic::{S3VectorsClient, SigV4Credentials, VerglasGraphsClient};
 pub use semantic_types::*;

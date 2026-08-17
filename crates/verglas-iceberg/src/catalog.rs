@@ -60,7 +60,6 @@ pub async fn open_catalog(connection: &Connection) -> Result<Arc<dyn Catalog>> {
     // Wrap the S3 storage so data-file multipart uploads use fixed-size parts.
     // Variable-size parts are AWS-only; stricter S3-compatible stores reject them (issue #308).
     let storage = FixedPartStorageFactory::new(OpenDalStorageFactory::S3 {
-        configured_scheme: "s3".to_owned(),
         customized_credential_load: None,
     });
     let catalog = RestCatalogBuilder::default()

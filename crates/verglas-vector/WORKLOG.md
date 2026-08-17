@@ -48,3 +48,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   blob attached to the same Iceberg snapshot as its ANN graph, so updates,
   deletes, and a restarted reader recover exact caller keys without a hash-only
   identifier or an authoritative in-memory map.
+- Iceberg 0.10.1: `CompressionCodec::Zstd` became `Zstd(level)`; Puffin
+  writes now use `CompressionCodec::zstd_default()`.

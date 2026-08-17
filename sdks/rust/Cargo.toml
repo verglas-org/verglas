@@ -4,17 +4,21 @@ description = "The Rust SDK for the agent-data platform: the worker/trigger cont
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
-publish.workspace = true
+# Published to crates.io as the Rust SDK; overrides the workspace-wide
+# publish = false (which exists because the engine crates depend on the
+# patched Iceberg fork — this crate does not).
+publish = true
+license-file.workspace = true
 
 [dependencies]
 verglas-api.workspace = true
 verglas-core.workspace = true
 arrow-array.workspace = true
-arrow-buffer = "57"
+arrow-buffer = "58"
 arrow-schema.workspace = true
 # Arrow IPC stream encoding for the data frames — the wire format connectors
 # emit. Pinned to the workspace's Arrow major version.
-arrow-ipc = "57"
+arrow-ipc = "58"
 # CSV/JSONL schema inference and Parquet footer reads for client-side ingest
 # (#145): the SDK owns the whole write path, no server round trip.
 arrow-csv.workspace = true

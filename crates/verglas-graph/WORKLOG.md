@@ -24,3 +24,5 @@
   `Graph::load_nodes` exposing it. Both are consumed by verglas-s3's new
   `QueryPrecedents` operation (#148) to rank `Decision` nodes; neither existed
   before because no caller had needed to read node properties back out.
+- Iceberg 0.10.1: `CompressionCodec::Zstd` became `Zstd(level)`; the
+  adjacency Puffin write uses `CompressionCodec::zstd_default()`.
