@@ -10,7 +10,7 @@ use crate::cli::{LakehouseCommand, LakehouseCreateArgs};
 
 /// Request sent to the local database resource API. The wire shape keeps the
 /// explicit `type` tag so the server needs no default database kind.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum CreateLakehouseRequest {
     /// An Iceberg Lakehouse with explicit storage and catalog ownership.
@@ -25,7 +25,7 @@ enum CreateLakehouseRequest {
 }
 
 /// Lakehouse storage selection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 enum StorageRequest {
     /// Verglas-managed object storage.
@@ -38,7 +38,7 @@ enum StorageRequest {
 }
 
 /// Lakehouse catalog selection.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(tag = "mode", rename_all = "kebab-case")]
 enum CatalogRequest {
     /// A managed Lakekeeper warehouse.
@@ -145,19 +145,27 @@ fn validate_uri(
     Ok(())
 }
 
-/// Sends a typed create request and returns the server's JSON response.
-async fn post_json<T: Serialize>(
+/// Sends a typed create request and returns the server's JSON response,
+/// retrying once through `auth::with_reauth` on a 401 with a refreshed
+/// WorkOS bearer.
+async fn post_json(
     endpoint: &str,
     path: &str,
     token: Option<&str>,
-    body: &T,
+    body: &CreateLakehouseRequest,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let url = Url::parse(endpoint)?.join(path)?;
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).json(body);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await?.error_for_status()?;
-    Ok(response.json().await?)
+    let response = crate::auth::with_reauth(token.map(str::to_owned), |bearer| {
+        let url = url.clone();
+        let body = body.clone();
+        async move {
+            let mut request = reqwest::Client::new().post(url).json(&body);
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            request.send().await?.error_for_status()?.json().await
+        }
+    })
+    .await?;
+    Ok(response)
 }

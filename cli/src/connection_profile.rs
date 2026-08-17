@@ -114,11 +114,13 @@ pub async fn login(url: &str, api_key: &str) -> Result<(), ConnectionProfileErro
     persist(url, Some(api_key), &provision)
 }
 
-/// Exchanges a single-use browser-login code for a connection profile. Unlike
-/// [`login`], the code is never persisted: `~/.verglas/credentials/control-plane-token`
-/// is written only on the `--api-key` path, since codes cannot be reused.
-pub async fn login_with_code(url: &str, code: &str) -> Result<(), ConnectionProfileError> {
-    let provision = exchange(url, code).await?;
+/// Exchanges a WorkOS device-login access token for a connection profile.
+/// Unlike [`login`], the bearer is never persisted as a local credential:
+/// `~/.verglas/credentials/control-plane-token` is written only on the
+/// `--api-key` path. The WorkOS access/refresh pair is persisted separately
+/// by `crate::auth`.
+pub async fn login_with_bearer(url: &str, bearer: &str) -> Result<(), ConnectionProfileError> {
+    let provision = exchange(url, bearer).await?;
     persist(url, None, &provision)
 }
 
@@ -407,6 +409,20 @@ fn profile_path() -> Result<PathBuf, ConnectionProfileError> {
     Ok(profile_root()?.join("config.toml"))
 }
 
+/// Resolves the credentials directory sibling to the shared profile file —
+/// the same root `login`/`logout` use for `endpoint.ini`, `catalog-token`,
+/// and `ca.pem`, honoring `VERGLAS_CONFIG` when a caller has redirected the
+/// profile to a custom location. `crate::auth` persists `workos-tokens.json`
+/// here so it moves with the profile instead of always following `$HOME`.
+pub(crate) fn credentials_dir() -> Result<PathBuf, ConnectionProfileError> {
+    let config_path = profile_path()?;
+    let root = config_path
+        .parent()
+        .map(Path::to_owned)
+        .ok_or(ConnectionProfileError::NoConfigDirectory)?;
+    Ok(root.join("credentials"))
+}
+
 fn profile_root() -> Result<PathBuf, ConnectionProfileError> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -485,7 +501,7 @@ fn harden_secret_file(path: &Path) -> Result<(), ConnectionProfileError> {
     Ok(())
 }
 
-fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConnectionProfileError> {
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConnectionProfileError> {
     let mut options = OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -517,7 +533,7 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<(), ConnectionProfileEr
     Ok(())
 }
 
-fn private_directory(path: &Path) -> Result<(), ConnectionProfileError> {
+pub(crate) fn private_directory(path: &Path) -> Result<(), ConnectionProfileError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
