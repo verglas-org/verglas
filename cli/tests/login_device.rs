@@ -1,25 +1,23 @@
-//! FROZEN RIME EVALUATOR — WorkOS device-flow login for the Verglas CLI.
-//! Candidates may not edit this file. Coordinator wrote it 2026-08-17.
+//! FROZEN RIME EVALUATOR v2 — WorkOS device login exchanges for a durable
+//! first-party token. Candidates may not edit this file. Coordinator rewrote
+//! it 2026-08-17 (user directive: no runtime WorkOS dependency).
 //!
 //! Contract:
 //!
 //! - `verglas login --no-browser` runs the OAuth 2.0 Device Authorization
-//!   Grant against WorkOS as a public client (client_id only, no secret):
-//!   POST {VERGLAS_WORKOS_API_BASE}/user_management/authorize/device, then
-//!   poll POST {VERGLAS_WORKOS_API_BASE}/user_management/authenticate with
-//!   grant_type=urn:ietf:params:oauth:grant-type:device_code, honoring
-//!   `authorization_pending` responses. It prints the user_code and
-//!   verification URI, never opens a browser under --no-browser, then
-//!   exchanges the WorkOS access token at
-//!   POST {VERGLAS_ACCESS_ENDPOINT}/v1/provision with
-//!   `Authorization: Bearer <workos access token>`.
-//! - WorkOS tokens persist to ~/.verglas/credentials/workos-tokens.json
-//!   (owner-only 0600) with at least `access_token` and `refresh_token`.
-//!   They never appear in config.toml.
-//! - When a cloud API call gets 401 with a stored refresh token, the CLI
-//!   refreshes (grant_type=refresh_token), persists the rotated pair, and
-//!   retries the call once.
-//! - `verglas logout` deletes workos-tokens.json along with the profile.
+//!   Grant against WorkOS as a public client (client_id only), printing the
+//!   user_code and verification URI and honoring `authorization_pending`.
+//!   The WorkOS access token is used EXACTLY ONCE: as the bearer on
+//!   POST {VERGLAS_ACCESS_ENDPOINT}/v1/provision. The response's `api_token`
+//!   (the durable tenant token) persists to
+//!   ~/.verglas/credentials/control-plane-token (owner-only 0600).
+//! - NO WorkOS material survives login: no workos-tokens.json, no refresh
+//!   token on disk, nothing WorkOS-shaped in config.toml.
+//! - Cloud API commands resolve their bearer VERGLAS_TOKEN → scoped
+//!   credentials.json → control-plane-token, and NEVER contact WorkOS.
+//! - A 401 from the cloud API fails loud with guidance to run
+//!   `verglas login` — no silent refresh, no retry loop.
+//! - `verglas logout` deletes the durable token file.
 //! - Env overrides: VERGLAS_WORKOS_API_BASE, VERGLAS_WORKOS_CLIENT_ID.
 
 use std::fs;
@@ -37,10 +35,8 @@ use serde_json::{Value, json};
 use tempfile::TempDir;
 
 const CLIENT_ID: &str = "client_test_cli";
-const ACCESS_TOKEN_1: &str = "workos-access-token-1";
-const REFRESH_TOKEN_1: &str = "workos-refresh-token-1";
-const ACCESS_TOKEN_2: &str = "workos-access-token-2";
-const REFRESH_TOKEN_2: &str = "workos-refresh-token-2";
+const WORKOS_ACCESS_TOKEN: &str = "workos-access-token-1";
+const API_TOKEN: &str = "vg-durable-api-token-1";
 
 fn body_param(body: &Bytes, key: &str) -> Option<String> {
     if let Some(found) = serde_json::from_slice::<Value>(body)
@@ -54,42 +50,11 @@ fn body_param(body: &Bytes, key: &str) -> Option<String> {
     let text = String::from_utf8_lossy(body);
     for pair in text.split('&') {
         match pair.split_once('=') {
-            Some((k, v)) if k == key => return Some(urlencoding_decode(v)),
+            Some((k, v)) if k == key => return Some(v.replace('+', " ")),
             _ => {}
         }
     }
     None
-}
-
-fn urlencoding_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'%' if index + 2 < bytes.len() => {
-                match u8::from_str_radix(&value[index + 1..index + 3], 16) {
-                    Ok(byte) => {
-                        out.push(byte);
-                        index += 3;
-                    }
-                    Err(_) => {
-                        out.push(b'%');
-                        index += 1;
-                    }
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                index += 1;
-            }
-            byte => {
-                out.push(byte);
-                index += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 async fn spawn(router: Router) -> String {
@@ -103,78 +68,63 @@ async fn spawn(router: Router) -> String {
     format!("http://{address}")
 }
 
-fn workos_router(poll_count: Arc<AtomicUsize>) -> Router {
+/// WorkOS mock: counts every request so runtime paths can assert ZERO
+/// contact; serves the device grant for the login test.
+fn workos_router(hits: Arc<AtomicUsize>, polls: Arc<AtomicUsize>) -> Router {
+    let count_hits = hits.clone();
+    let device_hits = hits.clone();
     Router::new()
         .route(
             "/user_management/authorize/device",
-            post(move |body: Bytes| async move {
-                assert_eq!(
-                    body_param(&body, "client_id").as_deref(),
-                    Some(CLIENT_ID),
-                    "device authorize must send the public client_id"
-                );
-                (
-                    StatusCode::OK,
-                    axum::Json(json!({
-                        "device_code": "dc_frozen_1",
-                        "user_code": "RRGQ-BJVS",
-                        "verification_uri": "https://auth.test/device",
-                        "verification_uri_complete": "https://auth.test/device?user_code=RRGQ-BJVS",
-                        "expires_in": 300,
-                        "interval": 1
-                    })),
-                )
+            post(move |body: Bytes| {
+                let _ = device_hits.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    assert_eq!(
+                        body_param(&body, "client_id").as_deref(),
+                        Some(CLIENT_ID),
+                        "device authorize must send the public client_id"
+                    );
+                    (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "device_code": "dc_frozen_1",
+                            "user_code": "RRGQ-BJVS",
+                            "verification_uri": "https://auth.test/device",
+                            "verification_uri_complete": "https://auth.test/device?user_code=RRGQ-BJVS",
+                            "expires_in": 300,
+                            "interval": 1
+                        })),
+                    )
+                }
             }),
         )
         .route(
             "/user_management/authenticate",
             post(move |body: Bytes| {
-                let poll_count = poll_count.clone();
+                let _ = count_hits.fetch_add(1, Ordering::SeqCst);
+                let polls = polls.clone();
                 async move {
                     let grant = body_param(&body, "grant_type").unwrap_or_default();
-                    if grant == "urn:ietf:params:oauth:grant-type:device_code" {
-                        assert_eq!(
-                            body_param(&body, "device_code").as_deref(),
-                            Some("dc_frozen_1")
-                        );
-                        assert_eq!(body_param(&body, "client_id").as_deref(), Some(CLIENT_ID));
-                        let polls = poll_count.fetch_add(1, Ordering::SeqCst);
-                        if polls == 0 {
-                            return (
-                                StatusCode::BAD_REQUEST,
-                                axum::Json(json!({ "error": "authorization_pending" })),
-                            );
-                        }
+                    assert_eq!(
+                        grant, "urn:ietf:params:oauth:grant-type:device_code",
+                        "only the device grant is ever allowed; got {grant}"
+                    );
+                    assert_eq!(body_param(&body, "device_code").as_deref(), Some("dc_frozen_1"));
+                    if polls.fetch_add(1, Ordering::SeqCst) == 0 {
                         return (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "access_token": ACCESS_TOKEN_1,
-                                "refresh_token": REFRESH_TOKEN_1,
-                                "user": { "object": "user", "id": "user_cli_1", "email": "dev@example.test" },
-                                "organization_id": "org_frozen",
-                                "authentication_method": "GitHubOAuth"
-                            })),
-                        );
-                    }
-                    if grant == "refresh_token" {
-                        assert_eq!(
-                            body_param(&body, "refresh_token").as_deref(),
-                            Some(REFRESH_TOKEN_1),
-                            "refresh must present the stored refresh token"
-                        );
-                        assert_eq!(body_param(&body, "client_id").as_deref(), Some(CLIENT_ID));
-                        return (
-                            StatusCode::OK,
-                            axum::Json(json!({
-                                "access_token": ACCESS_TOKEN_2,
-                                "refresh_token": REFRESH_TOKEN_2,
-                                "user": { "object": "user", "id": "user_cli_1", "email": "dev@example.test" }
-                            })),
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(json!({ "error": "authorization_pending" })),
                         );
                     }
                     (
-                        StatusCode::BAD_REQUEST,
-                        axum::Json(json!({ "error": "unsupported_grant_type", "got": grant })),
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "access_token": WORKOS_ACCESS_TOKEN,
+                            "refresh_token": "workos-refresh-token-1",
+                            "user": { "object": "user", "id": "user_cli_1", "email": "dev@example.test" },
+                            "organization_id": "org_frozen",
+                            "authentication_method": "GitHubOAuth"
+                        })),
                     )
                 }
             }),
@@ -190,36 +140,35 @@ fn provision_body() -> Value {
         "s3_access_key_id": "VG0123456789ABCDEF01",
         "s3_secret_access_key": "endpoint-signing-secret",
         "catalog_token": "catalog-query-bearer-secret",
+        "api_token": API_TOKEN,
         "tier": "free"
     })
 }
 
-fn base_command(binary_env: &TempDir, workos: &str, control_plane: &str) -> Command {
+fn base_command(home: &TempDir, workos: &str, control_plane: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_verglas"));
     command
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("HOME", binary_env.path())
+        .env("HOME", home.path())
         .env("VERGLAS_WORKOS_API_BASE", workos)
         .env("VERGLAS_WORKOS_CLIENT_ID", CLIENT_ID)
         .env("VERGLAS_ACCESS_ENDPOINT", control_plane);
     command
 }
 
-fn workos_tokens_path(home: &TempDir) -> std::path::PathBuf {
-    home.path()
-        .join(".verglas")
-        .join("credentials")
-        .join("workos-tokens.json")
+fn credentials_dir(home: &TempDir) -> std::path::PathBuf {
+    home.path().join(".verglas").join("credentials")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn device_login_persists_workos_tokens_and_provisions() {
+async fn device_login_exchanges_for_the_durable_token_and_keeps_no_workos_material() {
+    let hits = Arc::new(AtomicUsize::new(0));
     let polls = Arc::new(AtomicUsize::new(0));
-    let workos = spawn(workos_router(polls.clone())).await;
+    let workos = spawn(workos_router(hits.clone(), polls.clone())).await;
 
-    let provision_auth: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-    let seen = provision_auth.clone();
+    let provision_bearers: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen = provision_bearers.clone();
     let control_plane = spawn(Router::new().route(
         "/v1/provision",
         post(move |headers: HeaderMap, _body: Bytes| {
@@ -229,7 +178,7 @@ async fn device_login_persists_workos_tokens_and_provisions() {
                     .get("authorization")
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
-                    .to_owned();
+                    .to_ascii_lowercase();
                 seen.lock().expect("lock").push(authorization);
                 (StatusCode::OK, axum::Json(provision_body()))
             }
@@ -239,15 +188,8 @@ async fn device_login_persists_workos_tokens_and_provisions() {
 
     let home = TempDir::new().expect("home");
     let output = tokio::task::spawn_blocking({
-        let workos = workos.clone();
-        let control_plane = control_plane.clone();
         let mut command = base_command(&home, &workos, &control_plane);
-        move || {
-            command
-                .args(["login", "--no-browser"])
-                .output()
-                .expect("login runs")
-        }
+        move || command.args(["login", "--no-browser"]).output().expect("login runs")
     })
     .await
     .expect("join");
@@ -257,65 +199,52 @@ async fn device_login_persists_workos_tokens_and_provisions() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        output.status.success(),
-        "login failed:\n{combined}"
-    );
+    assert!(output.status.success(), "login failed:\n{combined}");
     assert!(combined.contains("RRGQ-BJVS"), "must print the user code:\n{combined}");
     assert!(
         combined.contains("https://auth.test/device"),
         "must print the verification URI:\n{combined}"
     );
-    assert!(
-        polls.load(Ordering::SeqCst) >= 2,
-        "must poll through authorization_pending"
-    );
+    assert!(polls.load(Ordering::SeqCst) >= 2, "must poll through authorization_pending");
 
-    let bearers = provision_auth.lock().expect("lock").clone();
     assert_eq!(
-        bearers
-            .iter()
-            .map(|value| value.to_ascii_lowercase())
-            .collect::<Vec<_>>(),
-        vec![format!("bearer {ACCESS_TOKEN_1}")],
-        "provision must present the WorkOS access token"
+        provision_bearers.lock().expect("lock").clone(),
+        vec![format!("bearer {WORKOS_ACCESS_TOKEN}")],
+        "the WorkOS token is spent exactly once, on provision"
     );
 
-    let tokens_path = workos_tokens_path(&home);
-    let stored: Value =
-        serde_json::from_slice(&fs::read(&tokens_path).expect("workos tokens stored"))
-            .expect("token JSON");
-    assert_eq!(stored["access_token"], ACCESS_TOKEN_1);
-    assert_eq!(stored["refresh_token"], REFRESH_TOKEN_1);
+    let token_path = credentials_dir(&home).join("control-plane-token");
+    let stored = fs::read_to_string(&token_path).expect("durable token stored");
+    assert_eq!(stored.trim(), API_TOKEN);
     #[cfg(unix)]
     assert_eq!(
-        fs::metadata(&tokens_path).expect("metadata").permissions().mode() & 0o777,
+        fs::metadata(&token_path).expect("metadata").permissions().mode() & 0o777,
         0o600,
-        "workos token store must be owner-only"
+        "durable token must be owner-only"
     );
 
+    assert!(
+        !credentials_dir(&home).join("workos-tokens.json").exists(),
+        "no WorkOS token store may exist after login"
+    );
     let config = fs::read_to_string(home.path().join(".verglas").join("config.toml"))
         .expect("profile config");
-    for secret in [ACCESS_TOKEN_1, REFRESH_TOKEN_1, "endpoint-signing-secret"] {
+    for secret in [WORKOS_ACCESS_TOKEN, "workos-refresh-token-1", API_TOKEN, "endpoint-signing-secret"] {
         assert!(!config.contains(secret), "config.toml leaked a secret");
     }
     assert!(
-        home.path()
-            .join(".verglas")
-            .join("credentials")
-            .join("endpoint.ini")
-            .exists(),
+        credentials_dir(&home).join("endpoint.ini").exists(),
         "vended S3 credentials must persist as before"
     );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn expired_access_token_refreshes_rotates_and_retries() {
-    let polls = Arc::new(AtomicUsize::new(0));
-    let workos = spawn(workos_router(polls)).await;
+async fn cloud_commands_use_the_stored_token_and_never_contact_workos() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let workos = spawn(workos_router(hits.clone(), Arc::new(AtomicUsize::new(0)))).await;
 
-    let list_calls: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
-    let seen = list_calls.clone();
+    let list_bearers: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen = list_bearers.clone();
     let control_plane = spawn(Router::new().route(
         "/v1/access/tokens",
         get(move |headers: HeaderMap| {
@@ -326,46 +255,23 @@ async fn expired_access_token_refreshes_rotates_and_retries() {
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                seen.lock().expect("lock").push(authorization.clone());
-                if authorization == format!("bearer {ACCESS_TOKEN_2}") {
-                    (StatusCode::OK, axum::Json(json!([])))
-                } else {
-                    (
-                        StatusCode::UNAUTHORIZED,
-                        axum::Json(json!({ "error": "token expired" })),
-                    )
-                }
+                seen.lock().expect("lock").push(authorization);
+                (StatusCode::OK, axum::Json(json!([])))
             }
         }),
     ))
     .await;
 
     let home = TempDir::new().expect("home");
-    let credentials_dir = home.path().join(".verglas").join("credentials");
-    fs::create_dir_all(&credentials_dir).expect("credentials dir");
-    let tokens_path = credentials_dir.join("workos-tokens.json");
-    fs::write(
-        &tokens_path,
-        json!({
-            "access_token": "workos-access-token-stale",
-            "refresh_token": REFRESH_TOKEN_1
-        })
-        .to_string(),
-    )
-    .expect("seed tokens");
+    fs::create_dir_all(credentials_dir(&home)).expect("credentials dir");
+    let token_path = credentials_dir(&home).join("control-plane-token");
+    fs::write(&token_path, API_TOKEN).expect("seed token");
     #[cfg(unix)]
-    fs::set_permissions(&tokens_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).expect("chmod");
 
     let output = tokio::task::spawn_blocking({
-        let workos = workos.clone();
-        let control_plane = control_plane.clone();
         let mut command = base_command(&home, &workos, &control_plane);
-        move || {
-            command
-                .args(["token", "list"])
-                .output()
-                .expect("token list runs")
-        }
+        move || command.args(["token", "list"]).output().expect("token list runs")
     })
     .await
     .expect("join");
@@ -375,30 +281,54 @@ async fn expired_access_token_refreshes_rotates_and_retries() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-
-    let calls = list_calls.lock().expect("lock").clone();
-    assert!(
-        calls.contains(&format!("bearer {ACCESS_TOKEN_2}")),
-        "must retry with the refreshed token: {calls:?}"
+    assert_eq!(
+        list_bearers.lock().expect("lock").clone(),
+        vec![format!("bearer {API_TOKEN}")],
+        "cloud commands present the durable token"
     );
-
-    let stored: Value = serde_json::from_slice(&fs::read(&tokens_path).expect("tokens"))
-        .expect("token JSON");
-    assert_eq!(stored["access_token"], ACCESS_TOKEN_2, "rotated access token persists");
-    assert_eq!(stored["refresh_token"], REFRESH_TOKEN_2, "rotated refresh token persists");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "runtime paths must never contact WorkOS");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn logout_deletes_the_workos_token_store() {
+async fn an_expired_token_fails_loud_with_relogin_guidance() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let workos = spawn(workos_router(hits.clone(), Arc::new(AtomicUsize::new(0)))).await;
+    let control_plane = spawn(Router::new().route(
+        "/v1/access/tokens",
+        get(|| async {
+            (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": "token expired" })))
+        }),
+    ))
+    .await;
+
     let home = TempDir::new().expect("home");
-    let credentials_dir = home.path().join(".verglas").join("credentials");
-    fs::create_dir_all(&credentials_dir).expect("credentials dir");
-    let tokens_path = credentials_dir.join("workos-tokens.json");
-    fs::write(
-        &tokens_path,
-        json!({ "access_token": "a", "refresh_token": "r" }).to_string(),
-    )
-    .expect("seed tokens");
+    fs::create_dir_all(credentials_dir(&home)).expect("credentials dir");
+    let token_path = credentials_dir(&home).join("control-plane-token");
+    fs::write(&token_path, "vg-expired-token").expect("seed token");
+    #[cfg(unix)]
+    fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+    let output = tokio::task::spawn_blocking({
+        let mut command = base_command(&home, &workos, &control_plane);
+        move || command.args(["token", "list"]).output().expect("token list runs")
+    })
+    .await
+    .expect("join");
+    assert!(!output.status.success(), "a 401 must fail the command");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("verglas login"),
+        "failure must tell the user to re-login: {stderr}"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "no silent WorkOS refresh on 401");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn logout_deletes_the_durable_token() {
+    let home = TempDir::new().expect("home");
+    fs::create_dir_all(credentials_dir(&home)).expect("credentials dir");
+    let token_path = credentials_dir(&home).join("control-plane-token");
+    fs::write(&token_path, API_TOKEN).expect("seed token");
 
     let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
         .env_clear()
@@ -412,8 +342,5 @@ async fn logout_deletes_the_workos_token_store() {
         "logout failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(
-        !tokens_path.exists(),
-        "logout must delete the WorkOS token store"
-    );
+    assert!(!token_path.exists(), "logout must delete the durable token");
 }
