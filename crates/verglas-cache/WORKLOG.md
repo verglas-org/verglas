@@ -490,3 +490,12 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   ordinary hybrid-cache data. DRAM uses explicit W-TinyLFU and the shared NVMe
   admission sketch records hits as well as fills, with mixed-size scan and
   shifting-hotset regressions.
+- Made the engine tier-assertion tests deterministic for the release: three
+  tests (second_read_issues_zero_backend_requests,
+  served_from_reports_backend_on_a_cold_read_then_dram_when_warm,
+  mutable_unchanged_revalidation_keeps_block_warm) asserted DRAM residency
+  immediately after a read, racing the detached fill task's asynchronous
+  admission — the exact starvation flake flush()'s doc comment describes,
+  and what aborted the CI coverage run. Each now awaits engine.flush() (the
+  admission barrier) before its warm-read assertions. Verified under a
+  60-busy-loop CPU-contention harness: 20/20 rounds green.
