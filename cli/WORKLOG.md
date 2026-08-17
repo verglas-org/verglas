@@ -890,7 +890,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   login` to renew" instead of the raw status. The 404 mapping never fires on
   a fresh token because the server's opaque 404 also covers non-membership.
   Tokens now record their issue time in the credential store.
-- Scoped access tokens and silent renewal (Tinybird/MotherDuck parity):
+- Scoped access tokens and silent renewal:
   `verglas token create NAME --scope ingest:<ds>|sql:read` mints a
   producer/reader credential (value printed once, never stored), `list`
   shows ids/names/scopes without values, `revoke` deletes by id. Every
@@ -899,3 +899,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   login never expires; VERGLAS_TOKEN and fresh tokens are untouched, and a
   failed renewal falls back to the still-valid stored token. Contract tests
   written first (failed: unrecognized subcommand).
+- Aligned `verglas token` to the deployed control-plane contract: CRUD lives
+  at /v0/tokens (create via repeated `scope` query params, list field is
+  `id`, revoke accepts id or name and returns {ok:true}); renewal stays at
+  /v1/tokens/renew. Scrubbed third-party service names from code comments
+  and docs across the CLI and SDKs per the naming directive — we mirror the
+  spec, we don't name it.

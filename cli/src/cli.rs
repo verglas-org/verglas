@@ -162,7 +162,7 @@ pub enum TokenCommand {
     Create(TokenCreateArgs),
     /// List tokens: id, name, and scopes. Values are never shown.
     List,
-    /// Revoke a token by id.
+    /// Revoke a token by id or name.
     Revoke(TokenRevokeArgs),
 }
 
@@ -179,7 +179,7 @@ pub struct TokenCreateArgs {
 /// Arguments for `verglas token revoke`.
 #[derive(Debug, Args)]
 pub struct TokenRevokeArgs {
-    /// The token id shown by `verglas token list`.
+    /// The token id or name shown by `verglas token list`.
     pub token_id: String,
 }
 

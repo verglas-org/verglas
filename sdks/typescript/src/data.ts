@@ -1,6 +1,6 @@
 // The /v0 data client: the ONE append-ingest shape (NDJSON to /v0/events) for
 // table writes, vector writes, and log shipping alike, plus SQL through
-// /v0/sql. This is the SDK speaking the Tinybird-compatible /v0 surface
+// /v0/sql. This is the SDK speaking the /v0 data surface
 // natively — a deliberate break from the older per-kind write shapes.
 
 import { makeTransport, type Transport } from "./http";
@@ -11,7 +11,7 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export interface DataClientOptions {
   /** Base URL of the /v0 API (e.g. https://api.verglas.dev). */
   baseUrl: string;
-  /** A Tinybird-style workspace bearer token. */
+  /** A workspace bearer token. */
   token: string;
   /** Optional fetch implementation for non-browser runtimes and tests. */
   fetch?: typeof fetch;

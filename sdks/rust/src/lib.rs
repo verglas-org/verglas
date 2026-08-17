@@ -15,7 +15,7 @@
 //!   [`worker::WorkerContext`].
 //! - [`client`] / [`server`]: the data-plane HTTP client and local server
 //!   helpers the CLI and in-process callers use. [`client::DataClient`] is the
-//!   separate /v0 client (events append + SQL) for the Tinybird-compatible
+//!   separate /v0 client (events append + SQL) for the /v0 data
 //!   surface on Verglas Cloud.
 //! - [`ingest`]: client-side Iceberg table create/append (#145) — schema
 //!   inference, REST catalog, and `FileIO` writes with catalog-vended

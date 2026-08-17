@@ -117,7 +117,8 @@ fn token_create_posts_name_and_scopes_and_prints_the_token_once() {
     );
     let requests = server.join().expect("server");
     assert!(
-        requests[0].starts_with("POST /v1/tokens "),
+        requests[0]
+            .starts_with("POST /v0/tokens?name=producer&scope=ingest%3Aapp_logs&scope=sql%3Aread "),
         "{}",
         requests[0]
     );
@@ -128,11 +129,6 @@ fn token_create_posts_name_and_scopes_and_prints_the_token_once() {
         "{}",
         requests[0]
     );
-    let body: serde_json::Value =
-        serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).expect("body")).expect("json");
-    assert_eq!(body["name"], "producer");
-    assert_eq!(body["scopes"][0], "ingest:app_logs");
-    assert_eq!(body["scopes"][1], "sql:read");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("vgs_scoped-secret"), "{stdout}");
 }
@@ -144,7 +140,7 @@ fn token_list_shows_names_and_scopes_never_values() {
         1,
         vec![(
             "200 OK",
-            r#"{"tokens":[{"token_id":"tok_1","name":"producer","scopes":["ingest:app_logs"],"created_at":"2026-08-17T00:00:00Z"}]}"#,
+            r#"{"tokens":[{"id":"tok_1","name":"producer","token":"vgs_pre…","scopes":["ingest:app_logs"],"created_at":"2026-08-17T00:00:00Z"}]}"#,
         )],
     );
     write_store(home.path(), &url, "vgt_machine", 1);
@@ -159,19 +155,24 @@ fn token_list_shows_names_and_scopes_never_values() {
     );
     let requests = server.join().expect("server");
     assert!(
-        requests[0].starts_with("GET /v1/tokens "),
+        requests[0].starts_with("GET /v0/tokens "),
         "{}",
         requests[0]
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("tok_1"), "{stdout}");
     assert!(stdout.contains("producer"), "{stdout}");
     assert!(stdout.contains("ingest:app_logs"), "{stdout}");
+    assert!(
+        !stdout.contains("vgs_pre"),
+        "even truncated token values stay out of list output: {stdout}"
+    );
 }
 
 #[test]
 fn token_revoke_deletes_by_id() {
     let home = tempdir().expect("home");
-    let (url, server) = serving(1, vec![("204 No Content", "")]);
+    let (url, server) = serving(1, vec![("200 OK", r#"{"ok":true}"#)]);
     write_store(home.path(), &url, "vgt_machine", 1);
     let output = command(home.path(), &url)
         .args(["token", "revoke", "tok_1"])
@@ -184,7 +185,7 @@ fn token_revoke_deletes_by_id() {
     );
     let requests = server.join().expect("server");
     assert!(
-        requests[0].starts_with("DELETE /v1/tokens/tok_1 "),
+        requests[0].starts_with("DELETE /v0/tokens/tok_1 "),
         "{}",
         requests[0]
     );
@@ -264,7 +265,7 @@ fn a_fresh_token_does_not_renew() {
     );
     let requests = server.join().expect("server");
     assert!(
-        requests[0].starts_with("GET /v1/tokens "),
+        requests[0].starts_with("GET /v0/tokens "),
         "{}",
         requests[0]
     );

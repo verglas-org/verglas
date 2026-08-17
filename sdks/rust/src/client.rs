@@ -564,7 +564,7 @@ pub struct IngestResult {
 ///
 /// Table writes, vector writes, and log shipping all resolve to the same
 /// NDJSON append to `POST /v0/events?name=<datasource>`; SQL runs through
-/// `POST /v0/sql`. This is a Tinybird-compatible surface on Verglas Cloud, a
+/// `POST /v0/sql`. This is the /v0 data surface on Verglas Cloud, a
 /// deliberate break from the older per-kind write shapes.
 #[derive(Debug, Clone)]
 pub struct DataClient {

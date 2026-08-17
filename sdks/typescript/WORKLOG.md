@@ -47,7 +47,7 @@
   tests, README section) until further notice, before the first npm publish
   freezes the package surface. Subscriptions and change feeds are unaffected.
 - Added `src/data.ts`: the /v0 data client (`createDataClient`) speaking the
-  Tinybird-compatible surface natively — one append-ingest shape (NDJSON to
+  /v0 data surface natively — one append-ingest shape (NDJSON to
   `POST /v0/events?name=<datasource>`) for table writes, vector writes, and
   log shipping, plus SQL through `POST /v0/sql`. Moved `control.ts`'s worker
   methods off the retired `/v1/workers` route onto `/v0/workers`. Deleted

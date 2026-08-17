@@ -1,12 +1,25 @@
 //! `verglas token` — scoped access tokens on the control plane
-//! (`/v1/tokens`): mint producer/reader credentials limited to named scopes,
-//! list them without values, revoke by id.
+//! (`/v0/tokens`): mint producer/reader credentials limited to named scopes,
+//! list them without values, revoke by id or name.
 
 use std::error::Error;
 
 use serde_json::{Value, json};
 
 use crate::cli::{TokenCommand, TokenCreateArgs, TokenRevokeArgs};
+
+/// Percent-encodes one query-parameter value (RFC 3986 unreserved set).
+fn urlencode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            other => format!("%{other:02X}"),
+        })
+        .collect()
+}
 
 /// Dispatches `verglas token` against the control plane.
 pub async fn run(
@@ -18,9 +31,14 @@ pub async fn run(
     let server = crate::backend::server(endpoint, token)?;
     match command {
         TokenCommand::Create(TokenCreateArgs { name, scopes }) => {
-            let response: Value = server
-                .post_json("/v1/tokens", &json!({ "name": name, "scopes": scopes }))
-                .await?;
+            // The spec-mirror accepts creation parameters as query params;
+            // scope repeats per grant.
+            let mut path = format!("/v0/tokens?name={}", urlencode(&name));
+            for scope in &scopes {
+                path.push_str("&scope=");
+                path.push_str(&urlencode(scope));
+            }
+            let response: Value = server.post_json(&path, &json!({})).await?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
@@ -31,7 +49,7 @@ pub async fn run(
             Ok(())
         }
         TokenCommand::List => {
-            let response: Value = server.get("/v1/tokens").await?;
+            let response: Value = server.get("/v0/tokens").await?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
@@ -49,7 +67,7 @@ pub async fn run(
                     .unwrap_or_default();
                 println!(
                     "{}\t{}\t{}",
-                    row["token_id"].as_str().unwrap_or("-"),
+                    row["id"].as_str().unwrap_or("-"),
                     row["name"].as_str().unwrap_or("-"),
                     scopes,
                 );
@@ -57,16 +75,7 @@ pub async fn run(
             Ok(())
         }
         TokenCommand::Revoke(TokenRevokeArgs { token_id }) => {
-            // A revoke success is a 204 with no body; only a non-success
-            // status is an error, not the empty-body decode.
-            match server
-                .delete::<Value>(&format!("/v1/tokens/{token_id}"))
-                .await
-            {
-                Ok(_) => {}
-                Err(verglas_sdk::server::ServerError::Decode(_)) => {}
-                Err(error) => return Err(error.into()),
-            }
+            let _: Value = server.delete(&format!("/v0/tokens/{token_id}")).await?;
             if !json_output {
                 println!("Revoked {token_id}.");
             }

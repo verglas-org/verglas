@@ -80,7 +80,7 @@ fn read_ndjson(file: Option<&Path>) -> Result<Vec<Value>, Box<dyn Error>> {
     Ok(rows)
 }
 
-/// Renders a Tinybird-style `{meta, data}` query result as a tab-separated
+/// Renders a `{meta, data}` query result as a tab-separated
 /// table, falling back to raw JSON when the response does not match that shape.
 fn print_rows(result: &Value) {
     let columns: Vec<String> = result
