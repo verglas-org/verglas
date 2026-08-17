@@ -94,7 +94,7 @@ fn token_create_posts_name_and_scopes_and_prints_the_token_once() {
         1,
         vec![(
             "201 Created",
-            r#"{"token":"vgs_scoped-secret","token_id":"tok_1"}"#,
+            r#"{"token":"vgs_scoped-secret","token_id":"tok_1","name":"producer","scopes":["ingest:app_logs","sql:read"]}"#,
         )],
     );
     write_store(home.path(), &url, "vgt_machine", 1);
@@ -131,6 +131,48 @@ fn token_create_posts_name_and_scopes_and_prints_the_token_once() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("vgs_scoped-secret"), "{stdout}");
+}
+
+#[test]
+fn token_create_json_round_trips_every_granted_scope() {
+    // Regression for the control plane once honoring only the first ?scope=
+    // param: the response's scopes must reflect the full granted set.
+    let home = tempdir().expect("home");
+    let (url, server) = serving(
+        1,
+        vec![(
+            "201 Created",
+            r#"{"token":"vgs_scoped-secret","token_id":"tok_1","name":"producer","scopes":["ingest:app_logs","sql:read"]}"#,
+        )],
+    );
+    write_store(home.path(), &url, "vgt_machine", 1);
+    let output = command(home.path(), &url)
+        .args([
+            "--json",
+            "token",
+            "create",
+            "producer",
+            "--scope",
+            "ingest:app_logs",
+            "--scope",
+            "sql:read",
+        ])
+        .output()
+        .expect("runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().expect("server");
+    let parsed: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json output");
+    let scopes: Vec<&str> = parsed["scopes"]
+        .as_array()
+        .expect("scopes array")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect();
+    assert_eq!(scopes, ["ingest:app_logs", "sql:read"]);
 }
 
 #[test]

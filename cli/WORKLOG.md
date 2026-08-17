@@ -905,3 +905,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   /v1/tokens/renew. Scrubbed third-party service names from code comments
   and docs across the CLI and SDKs per the naming directive — we mirror the
   spec, we don't name it.
+- Added a multi-scope round-trip regression test for token creation: the
+  control plane once honored only the first repeated `scope` param, silently
+  minting single-scope tokens. `--json` create output must now reflect every
+  granted scope.
