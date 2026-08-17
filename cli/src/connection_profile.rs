@@ -105,6 +105,12 @@ struct ProvisionResponse {
     catalog_token: String,
     #[serde(default)]
     ca_certificate: Option<String>,
+    /// The durable, first-party tenant machine token (server-side 30-day
+    /// sliding renewal). Present on the WorkOS device-login exchange; the
+    /// `--api-key` exchange keeps writing the caller's own long-lived key
+    /// instead, so this is `None` there.
+    #[serde(default)]
+    api_token: Option<String>,
 }
 
 /// Authenticates to a public compatible control-plane contract and persists one
@@ -115,10 +121,9 @@ pub async fn login(url: &str, api_key: &str) -> Result<(), ConnectionProfileErro
 }
 
 /// Exchanges a WorkOS device-login access token for a connection profile.
-/// Unlike [`login`], the bearer is never persisted as a local credential:
-/// `~/.verglas/credentials/control-plane-token` is written only on the
-/// `--api-key` path. The WorkOS access/refresh pair is persisted separately
-/// by `crate::auth`.
+/// The WorkOS bearer itself is spent here and discarded; the durable local
+/// credential written to `~/.verglas/credentials/control-plane-token` is the
+/// response's own `api_token`, not the WorkOS token.
 pub async fn login_with_bearer(url: &str, bearer: &str) -> Result<(), ConnectionProfileError> {
     let provision = exchange(url, bearer).await?;
     persist(url, None, &provision)
@@ -266,11 +271,13 @@ fn persist(
     )?;
     let bearer_file = credentials.join("catalog-token");
     write_private(&bearer_file, provision.catalog_token.as_bytes())?;
-    // Single-use browser-login codes cannot be replayed, so only the
-    // long-lived `--api-key` path leaves a credential behind for them.
-    if let Some(api_key) = api_key {
+    // The `--api-key` path's own long-lived key is the durable credential;
+    // the WorkOS device-login path has no reusable credential of its own; it
+    // is spent exactly once here, so the durable credential is instead the
+    // control plane's freshly minted `api_token`.
+    if let Some(api_token) = api_key.or(provision.api_token.as_deref()) {
         let api_file = credentials.join("control-plane-token");
-        write_private(&api_file, api_key.as_bytes())?;
+        write_private(&api_file, api_token.as_bytes())?;
     }
     // The CA is only present when the control plane issues one (R6-D); older
     // servers and the frozen login tests' mocks omit it, so no file or
@@ -412,8 +419,9 @@ fn profile_path() -> Result<PathBuf, ConnectionProfileError> {
 /// Resolves the credentials directory sibling to the shared profile file —
 /// the same root `login`/`logout` use for `endpoint.ini`, `catalog-token`,
 /// and `ca.pem`, honoring `VERGLAS_CONFIG` when a caller has redirected the
-/// profile to a custom location. `crate::auth` persists `workos-tokens.json`
-/// here so it moves with the profile instead of always following `$HOME`.
+/// profile to a custom location. `crate::auth` persists the durable
+/// `control-plane-token` here too, so it moves with the profile instead of
+/// always following `$HOME`.
 pub(crate) fn credentials_dir() -> Result<PathBuf, ConnectionProfileError> {
     let config_path = profile_path()?;
     let root = config_path

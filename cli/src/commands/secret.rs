@@ -125,9 +125,9 @@ fn validate_scope(scope: &str, schemes: &[&str]) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Sends an opaque secret request and returns the service's JSON response,
-/// retrying once through `auth::with_reauth` on a 401 with a refreshed
-/// WorkOS bearer.
+/// Sends an opaque secret request and returns the service's JSON response. A
+/// 401 fails loud through `auth::with_reauth` with guidance to re-run
+/// `verglas login`; there is no refresh.
 async fn post_json(
     endpoint: &str,
     token: Option<&str>,

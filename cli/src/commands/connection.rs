@@ -7,8 +7,9 @@ use crate::connection_profile;
 
 /// Runs `verglas login`. With `--api-key`, exchanges it directly. Otherwise
 /// runs the WorkOS OAuth 2.0 Device Authorization Grant: print the user code
-/// and verification URI, poll until sign-in completes, then exchange the
-/// WorkOS access token for a connection profile.
+/// and verification URI, poll until sign-in completes, then spend the WorkOS
+/// access token exactly once for a connection profile and a durable
+/// control-plane token. WorkOS is never contacted again after this call.
 pub async fn login(url: &str, api_key: Option<&str>, no_browser: bool) -> Result<(), Box<dyn Error>> {
     match api_key.filter(|value| !value.trim().is_empty()) {
         Some(api_key) => connection_profile::login(url, api_key).await?,
@@ -19,8 +20,8 @@ pub async fn login(url: &str, api_key: Option<&str>, no_browser: bool) -> Result
 }
 
 /// Runs `verglas logout`: removes the stored connection profile, its
-/// credential files, and the WorkOS token store, leaving the rest of the
-/// config untouched.
+/// credential files, and the durable control-plane token, leaving the rest
+/// of the config untouched.
 pub fn logout() -> Result<(), Box<dyn Error>> {
     let profile_removed = connection_profile::logout()?;
     let tokens_removed = auth::logout()?;

@@ -14,9 +14,8 @@ use crate::cli::{TokenCommand, TokenCreateArgs, TokenRevokeArgs};
 use crate::credentials::{StoredToken, remove_token, save_token};
 
 /// Runs one token lifecycle command against the configured access service.
-/// Every verb rebuilds its client per attempt through `auth::with_reauth_required`
-/// so a bearer that has expired since `main` resolved it still gets one
-/// automatic refresh-and-retry.
+/// Every verb routes its call through `auth::with_reauth_required` so a 401
+/// fails loud with guidance to re-run `verglas login`; there is no refresh.
 pub async fn run(
     command: TokenCommand,
     endpoint: &str,

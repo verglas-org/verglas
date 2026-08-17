@@ -23,7 +23,11 @@ use cli::{Cli, Command};
 /// and `logout` never resolve an existing bearer (a stale or absent session
 /// must not block them); every other command resolves its bearer through
 /// `auth::resolved_bearer`, the CLI's single choke point for `VERGLAS_TOKEN`,
-/// the scoped-token store, and the WorkOS session.
+/// the scoped-token store, and the durable control-plane token — never
+/// WorkOS, which is spent once at login and never contacted again. Cloud
+/// commands (everything except `login`/`logout`/`graph`/`vector`) also give
+/// `auth` a chance to opportunistically renew a stale durable token after a
+/// successful call; see `auth::maybe_renew_durable_token`.
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let credentials_path = cli.resolved_credentials_path()?;
     let endpoint = crate::backend::resolved_endpoint();
@@ -35,38 +39,53 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Logout => commands::connection::logout(),
         Command::Status => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::status::run(&endpoint, token.as_deref(), cli.json).await
+            after_success(commands::status::run(&endpoint, token.as_deref(), cli.json).await).await
         }
         Command::Table(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::table::run(command, token.as_deref(), cli.json).await
+            after_success(commands::table::run(command, token.as_deref(), cli.json).await).await
         }
         Command::Dashboard(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::dashboard::run(command, &endpoint, token.as_deref(), cli.json).await
+            after_success(
+                commands::dashboard::run(command, &endpoint, token.as_deref(), cli.json).await,
+            )
+            .await
         }
         Command::Workers(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::workers::run(command, &endpoint, token.as_deref(), cli.json).await
+            after_success(
+                commands::workers::run(command, &endpoint, token.as_deref(), cli.json).await,
+            )
+            .await
         }
         Command::Lakehouse(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::lakehouse::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
-                .await
+            after_success(
+                commands::lakehouse::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
+                    .await,
+            )
+            .await
         }
         Command::Secret(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::secret::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
-                .await
+            after_success(
+                commands::secret::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
+                    .await,
+            )
+            .await
         }
         Command::Token(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
-            commands::token::run(
-                command,
-                &Cli::access_endpoint(),
-                token.as_deref(),
-                &credentials_path,
-                cli.json,
+            after_success(
+                commands::token::run(
+                    command,
+                    &Cli::access_endpoint(),
+                    token.as_deref(),
+                    &credentials_path,
+                    cli.json,
+                )
+                .await,
             )
             .await
         }
@@ -77,6 +96,17 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             commands::vector::run(command, &semantic_endpoint(), cli.json).await
         }
     }
+}
+
+/// Gives `auth` a chance to opportunistically renew a stale durable token
+/// after a cloud command succeeds. A no-op when the command failed, when
+/// there is no durable token file, or when it is not yet stale; renewal
+/// itself is entirely best-effort and never changes `result`.
+async fn after_success<T, E>(result: Result<T, E>) -> Result<T, E> {
+    if result.is_ok() {
+        auth::maybe_renew_durable_token().await;
+    }
+    result
 }
 
 /// The semantic S3 endpoint for `graph`/`vector`: `VERGLAS_S3_ENDPOINT` wins;

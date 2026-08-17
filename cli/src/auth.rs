@@ -1,18 +1,29 @@
-//! `AuthSession`: the single choke point for WorkOS device-flow login, token
-//! persistence, expiry tracking, and refresh.
+//! `CloudCredential`: the single choke point for the WorkOS device-login
+//! ceremony and the durable control-plane token it mints.
+//!
+//! WorkOS is the login ceremony only. Its access token is spent exactly
+//! once, as the bearer on `POST {access_endpoint}/v1/provision`; nothing
+//! WorkOS-shaped is ever persisted to disk, and no runtime code path
+//! contacts WorkOS again. The response's `api_token` — a durable tenant
+//! machine token with a server-side 30-day sliding renewal window —
+//! persists to `~/.verglas/credentials/control-plane-token` (owner-only).
 //!
 //! Every cloud-API call site resolves its bearer through [`resolved_bearer`]
-//! and retries a 401 through [`with_reauth`] / [`with_reauth_required`]
-//! instead of scattering its own token logic. WorkOS tokens persist to
-//! `workos-tokens.json` next to the shared connection profile (honoring
-//! `VERGLAS_CONFIG` the same way `connection_profile` does), separately from
-//! the scoped-token store in `credentials.rs`.
+//! (env → scoped-token store → durable token file) instead of scattering its
+//! own token logic, and every retryable call site routes its error through
+//! [`with_reauth`] / [`with_reauth_required`] for one loud, consistent 401
+//! message. There is no refresh loop: a 401 always fails with guidance to
+//! run `verglas login` again. As a value-add on top of the server's own
+//! sliding window, a successful cloud command opportunistically asks the
+//! control plane to rotate the durable token once it is a week old — see
+//! [`maybe_renew_durable_token`] — entirely best-effort and never a
+//! precondition for the loud-401 contract.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
 /// Verglas Cloud's production WorkOS public client id, compiled in so a
@@ -26,11 +37,12 @@ const MIN_POLL_INTERVAL_SECS: u64 = 1;
 /// Overall wall-clock budget for the device code to be approved, mirroring a
 /// typical WorkOS device-code lifetime.
 const DEVICE_FLOW_DEADLINE: Duration = Duration::from_secs(600);
-/// Refresh this many seconds before the access token's JWT `exp` claim so a
-/// proactive refresh always lands before the token actually expires.
-const EXPIRY_SKEW_SECS: i64 = 30;
+/// A durable token untouched for this long is offered for opportunistic
+/// renewal on the next successful cloud command, keeping a monthly-cadence
+/// user signed in indefinitely without ever touching WorkOS again.
+const RENEWAL_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// Failures in the WorkOS device-login, persistence, or refresh paths.
+/// Failures in the WorkOS device-login or durable-token persistence paths.
 #[derive(Debug, Error)]
 pub enum AuthError {
     #[error("cannot read {path}: {source}")]
@@ -38,13 +50,6 @@ pub enum AuthError {
         path: PathBuf,
         source: std::io::Error,
     },
-    #[error("WorkOS token store {path} is not valid JSON: {source}")]
-    Decode {
-        path: PathBuf,
-        source: serde_json::Error,
-    },
-    #[error("could not encode WorkOS tokens: {0}")]
-    Encode(serde_json::Error),
     #[error("WorkOS request failed: {0}")]
     Request(reqwest::Error),
     #[error("WorkOS returned HTTP {status}: {body}")]
@@ -59,19 +64,8 @@ pub enum AuthError {
     Credentials(#[from] crate::credentials::CredentialsError),
 }
 
-/// Tokens persisted after a successful WorkOS device login or refresh.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkosTokens {
-    pub access_token: String,
-    pub refresh_token: String,
-    /// Unix-seconds expiry decoded from the access token's JWT `exp` claim,
-    /// when the token is a parseable JWT. `None` disables proactive
-    /// refresh for this token; the reactive 401 path still catches it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expires_at: Option<i64>,
-}
-
-/// A cloud-API error that can be resolved by presenting a fresh bearer.
+/// A cloud-API error that can be identified as a 401 so the call site can
+/// fail loud with re-login guidance.
 pub trait Unauthorized {
     fn is_unauthorized(&self) -> bool;
 }
@@ -101,9 +95,11 @@ impl Unauthorized for reqwest::Error {
 /// Runs the full WorkOS OAuth 2.0 Device Authorization Grant as a public
 /// client: request a device code, print the user code and verification URI
 /// (opening a browser to `verification_uri_complete` unless `no_browser`),
-/// poll until the user finishes signing in, then exchange the WorkOS access
-/// token at `POST {access_endpoint}/v1/provision` and persist both the
-/// connection profile and the WorkOS token pair.
+/// poll until the user finishes signing in, then spend the WorkOS access
+/// token exactly once at `POST {access_endpoint}/v1/provision` and persist
+/// the resulting connection profile and durable control-plane token. The
+/// WorkOS access token and any refresh token are discarded the moment the
+/// exchange completes; neither is ever written to disk.
 pub async fn device_login(access_endpoint: &str, no_browser: bool) -> Result<(), AuthError> {
     let base = workos_api_base();
     let client_id = workos_client_id();
@@ -138,7 +134,7 @@ pub async fn device_login(access_endpoint: &str, no_browser: bool) -> Result<(),
 
     let interval = Duration::from_secs(authorize.interval.unwrap_or(5).max(MIN_POLL_INTERVAL_SECS));
     let deadline = tokio::time::Instant::now() + DEVICE_FLOW_DEADLINE;
-    let tokens = loop {
+    let access_token = loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(AuthError::Timeout);
         }
@@ -157,11 +153,7 @@ pub async fn device_login(access_endpoint: &str, no_browser: bool) -> Result<(),
         if status.is_success() {
             let parsed: DeviceAuthenticateResponse =
                 response.json().await.map_err(AuthError::Request)?;
-            break WorkosTokens {
-                expires_at: jwt_exp(&parsed.access_token),
-                access_token: parsed.access_token,
-                refresh_token: parsed.refresh_token,
-            };
+            break parsed.access_token;
         }
         let body = response.text().await.unwrap_or_default();
         let pending = serde_json::from_str::<DeviceAuthenticateError>(&body)
@@ -175,15 +167,15 @@ pub async fn device_login(access_endpoint: &str, no_browser: bool) -> Result<(),
         }
     };
 
-    crate::connection_profile::login_with_bearer(access_endpoint, &tokens.access_token).await?;
-    store_tokens(&tokens)?;
+    // The WorkOS access token is spent here, exactly once, and then dropped.
+    crate::connection_profile::login_with_bearer(access_endpoint, &access_token).await?;
     Ok(())
 }
 
-/// Deletes the WorkOS token store, if one exists. Returns whether a file was
-/// removed.
+/// Deletes the durable control-plane token, if one exists. Returns whether a
+/// file was removed.
 pub fn logout() -> Result<bool, AuthError> {
-    let path = tokens_path()?;
+    let path = durable_token_path()?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
@@ -193,8 +185,8 @@ pub fn logout() -> Result<bool, AuthError> {
 
 /// Resolves the bearer for cloud-API calls: `VERGLAS_TOKEN` (automation)
 /// wins, then the local scoped-token store keyed by the access endpoint,
-/// then the WorkOS session — refreshed proactively when its decoded
-/// expiry has passed.
+/// then the durable control-plane token written by `verglas login`. Never
+/// contacts WorkOS: WorkOS is spent once, at login, to mint this token.
 pub async fn resolved_bearer(credentials_path: &Path) -> Result<Option<String>, AuthError> {
     if let Some(token) = std::env::var("VERGLAS_TOKEN")
         .ok()
@@ -206,137 +198,137 @@ pub async fn resolved_bearer(credentials_path: &Path) -> Result<Option<String>, 
     if let Some(stored) = crate::credentials::load_token(credentials_path, &endpoint)? {
         return Ok(Some(stored.token));
     }
-    let Some(tokens) = load_tokens()? else {
-        return Ok(None);
-    };
-    if is_expired(&tokens)
-        && let Ok(rotated) = refresh(&tokens).await
-    {
-        let _ = store_tokens(&rotated);
-        return Ok(Some(rotated.access_token));
-    }
-    Ok(Some(tokens.access_token))
+    load_durable_token()
 }
 
-/// Calls `attempt` with the current (possibly absent) bearer. On an
-/// unauthorized failure with a stored WorkOS refresh token, refreshes,
-/// persists the rotated pair, and retries `attempt` exactly once with the
-/// new bearer. Self-hosted servers that run without a bearer at all simply
-/// see their original error surface unchanged. Used by call sites where a
-/// missing bearer is not itself an error (self-hosted `workers`/`dashboard`).
-pub async fn with_reauth<T, E, F, Fut>(bearer: Option<String>, mut attempt: F) -> Result<T, E>
+/// Calls `attempt` once with the current (possibly absent) bearer. A 401
+/// fails loud with guidance to run `verglas login` again — there is no
+/// refresh loop; only re-running `verglas login` can replace a durable token
+/// that the control plane has rejected. Used by call sites where a missing
+/// bearer is not itself an error (self-hosted `workers`/`dashboard`).
+pub async fn with_reauth<T, E, F, Fut>(
+    bearer: Option<String>,
+    mut attempt: F,
+) -> Result<T, Box<dyn std::error::Error>>
 where
-    E: Unauthorized,
+    E: Unauthorized + std::error::Error + 'static,
     F: FnMut(Option<String>) -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    match attempt(bearer).await {
-        Ok(value) => Ok(value),
-        Err(error) if error.is_unauthorized() => match reauthorize().await {
-            Some(new_bearer) => attempt(Some(new_bearer)).await,
-            None => Err(error),
-        },
-        Err(error) => Err(error),
-    }
+    attempt(bearer).await.map_err(loud_unauthorized)
 }
 
-/// Same retry contract as [`with_reauth`] for call sites that always require
-/// a bearer (the standalone access service has no anonymous mode).
-pub async fn with_reauth_required<T, E, F, Fut>(bearer: String, mut attempt: F) -> Result<T, E>
+/// Same contract as [`with_reauth`] for call sites that always require a
+/// bearer (the standalone access service has no anonymous mode).
+pub async fn with_reauth_required<T, E, F, Fut>(
+    bearer: String,
+    mut attempt: F,
+) -> Result<T, Box<dyn std::error::Error>>
 where
-    E: Unauthorized,
+    E: Unauthorized + std::error::Error + 'static,
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    match attempt(bearer).await {
-        Ok(value) => Ok(value),
-        Err(error) if error.is_unauthorized() => match reauthorize().await {
-            Some(new_bearer) => attempt(new_bearer).await,
-            None => Err(error),
-        },
-        Err(error) => Err(error),
+    attempt(bearer).await.map_err(loud_unauthorized)
+}
+
+/// Wraps an unauthorized failure with re-login guidance; every other error
+/// passes through with its own message unchanged.
+fn loud_unauthorized<E: Unauthorized + std::error::Error + 'static>(
+    error: E,
+) -> Box<dyn std::error::Error> {
+    if error.is_unauthorized() {
+        format!("{error}; run `verglas login` to sign in again").into()
+    } else {
+        Box::new(error)
     }
 }
 
-/// Refreshes the stored WorkOS session and persists the rotated pair,
-/// returning the new access token on success.
-async fn reauthorize() -> Option<String> {
-    let tokens = load_tokens().ok().flatten()?;
-    let rotated = refresh(&tokens).await.ok()?;
-    store_tokens(&rotated).ok()?;
-    Some(rotated.access_token)
-}
-
-/// Exchanges a stored refresh token for a rotated WorkOS access/refresh pair.
-async fn refresh(tokens: &WorkosTokens) -> Result<WorkosTokens, AuthError> {
-    let base = workos_api_base();
-    let client_id = workos_client_id();
-    let response = reqwest::Client::new()
-        .post(format!("{base}/user_management/authenticate"))
-        .json(&serde_json::json!({
-            "client_id": client_id,
-            "grant_type": "refresh_token",
-            "refresh_token": tokens.refresh_token,
-        }))
-        .send()
-        .await
-        .map_err(AuthError::Request)?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(AuthError::Workos {
-            status: status.as_u16(),
-            body: response.text().await.unwrap_or_default(),
-        });
-    }
-    let parsed: DeviceAuthenticateResponse = response.json().await.map_err(AuthError::Request)?;
-    Ok(WorkosTokens {
-        expires_at: jwt_exp(&parsed.access_token),
-        access_token: parsed.access_token,
-        refresh_token: parsed.refresh_token,
-    })
-}
-
-/// Whether `tokens` has passed its decoded expiry (with a safety margin).
-/// A token with no decodable expiry is never proactively refreshed; the
-/// reactive 401 path in [`with_reauth`] still catches it.
-fn is_expired(tokens: &WorkosTokens) -> bool {
-    let Some(expires_at) = tokens.expires_at else {
-        return false;
+/// Best-effort: if the durable control-plane token is at least
+/// [`RENEWAL_AGE`] old, asks the control plane to rotate it and persists the
+/// rotated value with the same owner-only permissions. Any failure —
+/// no stored token, network error, non-2xx (including a control plane with
+/// no renewal route at all), or an unparseable response — is silently
+/// ignored. Renewal is a value-add on top of the durable token's own
+/// server-side 30-day sliding window; it is never a precondition for the
+/// loud-401 contract in [`with_reauth`] / [`with_reauth_required`].
+pub async fn maybe_renew_durable_token() {
+    let Ok(path) = durable_token_path() else {
+        return;
     };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0);
-    now >= expires_at.saturating_sub(EXPIRY_SKEW_SECS)
+    let endpoint = crate::cli::Cli::access_endpoint();
+    renew_if_stale(&path, &endpoint).await;
 }
 
-/// The WorkOS token store: `credentials/workos-tokens.json` next to the
-/// shared connection profile.
-fn tokens_path() -> Result<PathBuf, AuthError> {
-    Ok(crate::connection_profile::credentials_dir()?.join("workos-tokens.json"))
-}
-
-fn load_tokens() -> Result<Option<WorkosTokens>, AuthError> {
-    let path = tokens_path()?;
-    match std::fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|source| AuthError::Decode { path, source }),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(source) => Err(AuthError::Io { path, source }),
+/// The renewal policy, parameterized on the token file path and access
+/// endpoint so it can be exercised directly in tests without touching
+/// process-wide environment state.
+async fn renew_if_stale(path: &Path, endpoint: &str) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return;
+    };
+    let Ok(age) = SystemTime::now().duration_since(modified) else {
+        return;
+    };
+    if age < RENEWAL_AGE {
+        return;
     }
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return;
+    };
+    let token = contents.trim();
+    if token.is_empty() {
+        return;
+    }
+    let Ok(base) = reqwest::Url::parse(&format!("{}/", endpoint.trim_end_matches('/'))) else {
+        return;
+    };
+    let Ok(url) = base.join("v1/tokens/renew") else {
+        return;
+    };
+    let Ok(response) = reqwest::Client::new().post(url).bearer_auth(token).send().await else {
+        return;
+    };
+    if !response.status().is_success() {
+        return;
+    }
+    let Ok(renewed) = response.json::<RenewResponse>().await else {
+        return;
+    };
+    let _ = crate::connection_profile::write_private(path, renewed.api_token.as_bytes());
 }
 
-fn store_tokens(tokens: &WorkosTokens) -> Result<(), AuthError> {
-    let dir = crate::connection_profile::credentials_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|source| AuthError::Io {
-        path: dir.clone(),
-        source,
-    })?;
-    crate::connection_profile::private_directory(&dir)?;
-    let encoded = serde_json::to_vec_pretty(tokens).map_err(AuthError::Encode)?;
-    crate::connection_profile::write_private(&dir.join("workos-tokens.json"), &encoded)?;
-    Ok(())
+/// The durable control-plane token file: `credentials/control-plane-token`
+/// next to the shared connection profile.
+fn durable_token_path() -> Result<PathBuf, AuthError> {
+    Ok(crate::connection_profile::credentials_dir()?.join("control-plane-token"))
+}
+
+/// Reads the durable token file, treating a missing or blank file as "not
+/// signed in" rather than an error.
+fn load_durable_token() -> Result<Option<String>, AuthError> {
+    let path = durable_token_path()?;
+    read_token_file(&path)
+}
+
+/// Reads and trims one durable-token file at an explicit path, so both the
+/// production lookup and unit tests share this logic without either one
+/// needing to relocate the shared config root.
+fn read_token_file(path: &Path) -> Result<Option<String>, AuthError> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let token = contents.trim();
+            Ok((!token.is_empty()).then(|| token.to_owned()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(AuthError::Io {
+            path: path.to_owned(),
+            source,
+        }),
+    }
 }
 
 fn workos_api_base() -> String {
@@ -368,7 +360,6 @@ struct DeviceAuthorizeResponse {
 #[derive(Debug, Deserialize)]
 struct DeviceAuthenticateResponse {
     access_token: String,
-    refresh_token: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -376,42 +367,12 @@ struct DeviceAuthenticateError {
     error: String,
 }
 
-/// Decodes the unverified `exp` claim from a JWT's payload segment. Returns
-/// `None` for anything that is not a three-segment, base64url-encoded JWT
-/// with an integer `exp` — the caller treats that as "expiry unknown" and
-/// relies on the reactive 401 path instead of failing the login.
-fn jwt_exp(token: &str) -> Option<i64> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = decode_base64url(payload)?;
-    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    value.get("exp")?.as_i64()
-}
-
-/// Minimal unpadded base64url decoder, just enough to read a JWT payload
-/// segment without pulling in a dependency for one field.
-fn decode_base64url(input: &str) -> Option<Vec<u8>> {
-    fn sextet(byte: u8) -> Option<u8> {
-        match byte {
-            b'A'..=b'Z' => Some(byte - b'A'),
-            b'a'..=b'z' => Some(byte - b'a' + 26),
-            b'0'..=b'9' => Some(byte - b'0' + 52),
-            b'-' => Some(62),
-            b'_' => Some(63),
-            _ => None,
-        }
-    }
-    let mut out = Vec::with_capacity(input.len() * 3 / 4 + 3);
-    let mut buffer: u32 = 0;
-    let mut bits: u32 = 0;
-    for byte in input.bytes().filter(|&byte| byte != b'=') {
-        buffer = (buffer << 6) | sextet(byte)? as u32;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((buffer >> bits) as u8);
-        }
-    }
-    Some(out)
+/// The control plane's `POST /v1/tokens/renew` response. `expires_in` is
+/// accepted (and ignored by serde's default field handling) since the
+/// renewal cadence here is mtime-based, not expiry-based.
+#[derive(Debug, Deserialize)]
+struct RenewResponse {
+    api_token: String,
 }
 
 /// Best-effort system browser launch, per-OS, with no dedicated crate: `open`
@@ -446,48 +407,113 @@ fn open_browser_url(url: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
 
+    /// `read_token_file` treats a missing file as "not signed in", not an
+    /// error, so `resolved_bearer` can fall through cleanly.
     #[test]
-    fn jwt_exp_decodes_the_exp_claim() {
-        // {"sub":"user_1","exp":1735689600}
-        let header = "eyJhbGciOiJIUzI1NiJ9";
-        let payload = "eyJzdWIiOiJ1c2VyXzEiLCJleHAiOjE3MzU2ODk2MDB9";
-        let token = format!("{header}.{payload}.signature");
-        assert_eq!(jwt_exp(&token), Some(1_735_689_600));
+    fn read_token_file_returns_none_when_absent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            read_token_file(&dir.path().join("control-plane-token")).expect("no error"),
+            None
+        );
     }
 
-    #[test]
-    fn jwt_exp_returns_none_for_a_non_jwt_token() {
-        assert_eq!(jwt_exp("workos-access-token-1"), None);
+    /// A freshly written durable token is not offered for renewal.
+    #[tokio::test]
+    async fn renew_if_stale_is_a_noop_for_a_fresh_token() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("control-plane-token");
+        fs::write(&token_path, "fresh-token").expect("seed token");
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        // No mock server is listening; a network call here would fail the
+        // test with a connection error, proving no request was attempted.
+        renew_if_stale(&token_path, "http://127.0.0.1:1").await;
+
+        assert_eq!(
+            fs::read_to_string(&token_path).expect("token unchanged"),
+            "fresh-token",
+            "a fresh token must not be rewritten"
+        );
     }
 
-    #[test]
-    fn is_expired_treats_an_unknown_expiry_as_not_expired() {
-        let tokens = WorkosTokens {
-            access_token: "a".to_owned(),
-            refresh_token: "r".to_owned(),
-            expires_at: None,
-        };
-        assert!(!is_expired(&tokens));
+    /// A durable token older than the renewal age is rotated from a
+    /// successful `/v1/tokens/renew` response and persisted owner-only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renew_if_stale_rotates_a_stale_token_on_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("control-plane-token");
+        fs::write(&token_path, "stale-token").expect("seed token");
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).expect("chmod");
+        let stale = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        fs::File::open(&token_path)
+            .expect("open for backdating")
+            .set_modified(stale)
+            .expect("backdate mtime");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let address = listener.local_addr().expect("addr");
+        let router = axum::Router::new().route(
+            "/v1/tokens/renew",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({ "api_token": "rotated-token", "expires_in": 2_592_000 }))
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve mock");
+        });
+
+        renew_if_stale(&token_path, &format!("http://{address}")).await;
+
+        assert_eq!(
+            fs::read_to_string(&token_path).expect("rotated token"),
+            "rotated-token"
+        );
+        assert_eq!(
+            fs::metadata(&token_path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the rotated token file must stay owner-only"
+        );
     }
 
-    #[test]
-    fn is_expired_honors_the_safety_margin() {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_secs() as i64;
-        let almost_expired = WorkosTokens {
-            access_token: "a".to_owned(),
-            refresh_token: "r".to_owned(),
-            expires_at: Some(now + EXPIRY_SKEW_SECS - 1),
-        };
-        assert!(is_expired(&almost_expired));
-        let plenty_of_time = WorkosTokens {
-            access_token: "a".to_owned(),
-            refresh_token: "r".to_owned(),
-            expires_at: Some(now + EXPIRY_SKEW_SECS + 3600),
-        };
-        assert!(!is_expired(&plenty_of_time));
+    /// A control plane with no renewal route (a 404) must leave the stale
+    /// token in place rather than failing the surrounding command.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn renew_if_stale_ignores_a_404_renewal_route() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let token_path = dir.path().join("control-plane-token");
+        fs::write(&token_path, "stale-token").expect("seed token");
+        let stale = SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60);
+        fs::File::open(&token_path)
+            .expect("open for backdating")
+            .set_modified(stale)
+            .expect("backdate mtime");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock");
+        let address = listener.local_addr().expect("addr");
+        // No /v1/tokens/renew route registered: any request 404s.
+        let router = axum::Router::new();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve mock");
+        });
+
+        renew_if_stale(&token_path, &format!("http://{address}")).await;
+
+        assert_eq!(
+            fs::read_to_string(&token_path).expect("token unchanged"),
+            "stale-token",
+            "a 404 renewal response must be ignored, not clear the token"
+        );
     }
 }
