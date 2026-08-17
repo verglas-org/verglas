@@ -448,3 +448,12 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - Deleted verglas.example.toml and its freshness tests: deployment is
   container + environment (start.sh renders the config); a hand-maintained
   example file was dead surface.
+- Removed the disk-decision poll machinery (`disk_decision`, `DiskParams`,
+  fs hysteresis): the cloud disk is dedicated and fixed, so the budget is
+  the only bound and the event-driven space broker owns the fragment
+  ceiling. `free_bytes` survives solely for the boot-time budget check. The
+  hard-ceiling interleaving invariant test was rewritten against the
+  broker's ceiling formula rather than deleted. Added
+  `file_allocated_bytes` (physical occupancy) and the
+  `writeback.disk_floor_bytes` config field (guaranteed fragment headroom;
+  0 derives a 1/16-of-budget reserve).

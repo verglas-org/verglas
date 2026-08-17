@@ -351,6 +351,17 @@ impl Admission {
         (prev % PROBABILITY_SCALE) + self.admit_probability_ppm >= PROBABILITY_SCALE
     }
 
+    /// Rebases the pressure proxy after a live resize changed resident
+    /// reality (#223 follow-up): a shrink evicted blocks the cumulative proxy
+    /// still counts, so it is set to the store's actual physical occupancy.
+    /// Without this, a deep shrink leaves `under_pressure()` permanently true
+    /// and every later one-touch fill is rejected against blocks that no
+    /// longer exist. The frequency sketch is deliberately kept — access
+    /// history survives a resize; only the byte proxy rebases.
+    pub(crate) fn rebase_pressure(&self, resident_bytes: u64) {
+        self.admitted_bytes.store(resident_bytes, Ordering::Relaxed);
+    }
+
     /// Resets the pressure proxy, frequency sketch, and probabilistic-admitter
     /// accumulator to cold — called when the cache is purged (#138) so a
     /// repeat-cold leg starts admitting freely again, exactly as a fresh server

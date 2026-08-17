@@ -163,6 +163,14 @@ impl FragmentIoError {
 pub struct LocalFragmentStore {
     /// Root holding all fragment blobs for this node.
     root: Arc<PathBuf>,
+    /// Demand signal (#223 follow-up): invoked with the byte deficit when a
+    /// reservation is refused, so reclamation starts at the moment of demand
+    /// instead of a poll tick. On the refusal path only — never on a
+    /// successful placement.
+    shortfall_handler: Arc<std::sync::RwLock<SpaceHandler>>,
+    /// Drain signal: invoked with the freed bytes when fragments are deleted
+    /// after the origin barrier, so the cache can grow back into the space.
+    release_handler: Arc<std::sync::RwLock<SpaceHandler>>,
     /// Live ceiling on total fragment bytes; `u64::MAX` means unbudgeted. Shared
     /// so the server's disk poll can raise or lower it while placements run.
     ceiling: Arc<AtomicU64>,
@@ -172,6 +180,31 @@ pub struct LocalFragmentStore {
     /// fsyncs remain concurrent, while two placements of one key cannot both
     /// charge or release the previous live file.
     commit_lock: Arc<Mutex<()>>,
+}
+
+/// An optional space-lifecycle callback; a newtype so the store keeps its
+/// derived `Debug`.
+#[derive(Default)]
+struct SpaceHandler(Option<Arc<dyn Fn(u64) + Send + Sync>>);
+
+impl std::fmt::Debug for SpaceHandler {
+    /// Shows only presence; the closure has no useful rendering.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("SpaceHandler")
+            .field(&self.0.is_some())
+            .finish()
+    }
+}
+
+impl SpaceHandler {
+    /// Invokes the handler with `bytes` when one is registered.
+    fn signal(&self, bytes: u64) {
+        if let Some(handler) = &self.0
+            && bytes > 0
+        {
+            handler(bytes);
+        }
+    }
 }
 
 impl LocalFragmentStore {
@@ -199,7 +232,21 @@ impl LocalFragmentStore {
             ceiling,
             used: Arc::new(AtomicU64::new(used)),
             commit_lock: Arc::new(Mutex::new(())),
+            shortfall_handler: Arc::default(),
+            release_handler: Arc::default(),
         }
+    }
+
+    /// Registers the demand signal: called with the byte deficit whenever a
+    /// reservation is refused for space.
+    pub fn set_shortfall_handler(&self, handler: Arc<dyn Fn(u64) + Send + Sync>) {
+        self.shortfall_handler.write().expect("handler lock").0 = Some(handler);
+    }
+
+    /// Registers the drain signal: called with the freed bytes whenever
+    /// fragments are deleted after the origin barrier.
+    pub fn set_release_handler(&self, handler: Arc<dyn Fn(u64) + Send + Sync>) {
+        self.release_handler.write().expect("handler lock").0 = Some(handler);
     }
 
     /// The root directory this store writes under.
@@ -338,6 +385,10 @@ impl LocalFragmentStore {
         match fs::remove_file(&path) {
             Ok(()) => {
                 self.used.fetch_sub(len, Ordering::AcqRel);
+                self.release_handler
+                    .read()
+                    .expect("handler lock")
+                    .signal(len);
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -356,6 +407,10 @@ impl LocalFragmentStore {
         match fs::remove_dir_all(&dir) {
             Ok(()) => {
                 self.used.fetch_sub(freed, Ordering::AcqRel);
+                self.release_handler
+                    .read()
+                    .expect("handler lock")
+                    .signal(freed);
                 Ok(())
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -379,9 +434,14 @@ impl LocalFragmentStore {
             let ceiling = self.ceiling.load(Ordering::Acquire);
             let next = used.saturating_add(len);
             if next > ceiling {
+                let available = ceiling.saturating_sub(used);
+                self.shortfall_handler
+                    .read()
+                    .expect("handler lock")
+                    .signal(len.saturating_sub(available));
                 return Err(FragmentIoError::Full {
                     needed: len,
-                    available: ceiling.saturating_sub(used),
+                    available,
                 });
             }
             match self
@@ -736,6 +796,55 @@ fn hex_component_decode(input: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_drained_fragment_reports_its_release() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().expect("dir");
+        let store = super::LocalFragmentStore::with_budget(dir.path(), 1024);
+        let freed = std::sync::Arc::new(AtomicU64::new(0));
+        let sink = std::sync::Arc::clone(&freed);
+        store.set_release_handler(std::sync::Arc::new(move |bytes| {
+            sink.fetch_add(bytes, Ordering::Relaxed);
+        }));
+        let bytes = bytes::Bytes::from(vec![7u8; 256]);
+        let record = super::FragmentRecord {
+            key: super::FragmentKey {
+                object_id: "o".into(),
+                index: 0,
+            },
+            checksum: super::fragment_checksum(&bytes),
+            bytes,
+        };
+        store.store_fragment(&record).expect("store");
+        store.delete_object("o").expect("drain release");
+        assert_eq!(freed.load(Ordering::Relaxed), 256);
+    }
+
+    #[test]
+    fn a_refused_reservation_reports_its_shortfall() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().expect("dir");
+        let store = super::LocalFragmentStore::with_budget(dir.path(), 100);
+        let reported = std::sync::Arc::new(AtomicU64::new(0));
+        let sink = std::sync::Arc::clone(&reported);
+        store.set_shortfall_handler(std::sync::Arc::new(move |deficit| {
+            sink.fetch_add(deficit, Ordering::Relaxed);
+        }));
+        let bytes = bytes::Bytes::from(vec![0u8; 300]);
+        let record = super::FragmentRecord {
+            key: super::FragmentKey {
+                object_id: "o".into(),
+                index: 0,
+            },
+            checksum: super::fragment_checksum(&bytes),
+            bytes,
+        };
+        let error = store.store_fragment(&record).expect_err("over budget");
+        assert!(matches!(error, super::FragmentIoError::Full { .. }));
+        // Deficit = needed - available = 300 - 100.
+        assert_eq!(reported.load(Ordering::Relaxed), 200);
+    }
+
     use super::*;
 
     /// A unique scratch directory per test.

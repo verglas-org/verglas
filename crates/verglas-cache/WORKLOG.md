@@ -516,3 +516,13 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `verglas-cache` suite (all green), `cargo clippy -p verglas-cache
   --all-targets -- -D warnings` clean, `cargo fmt --all --check` unchanged by
   this edit.
+- Write-pressure space lifecycle (frozen RIME evaluator +
+  write_pressure_restore): `reclaim_disk_for_writeback` shrinks the data
+  block store by observed physical gain (driven by the foyer fork's live
+  resize) and `restore_disk` grows it back after drained fragments release
+  their bytes. Growth-room accounting is now budget-minus-physical, so a
+  truncation is observed immediately. A resize rebases the scan-resistance
+  pressure proxy to physical occupancy — without that, a deep shrink left
+  `under_pressure()` permanently true and every later fill was rejected
+  against blocks that no longer existed. Metadata stores are untouched by
+  reclamation (gated).

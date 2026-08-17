@@ -297,3 +297,8 @@
   (`dist = false`). Releases build the root Dockerfile into a multi-arch
   container image at ghcr.io/verglas-org/verglas-cache-node via the
   publish-docker job in the release pipeline.
+- Replaced the 1 s disk poll with the event-driven space broker: fragment
+  shortfall reclaims cold cache blocks (deficit plus the configured floor)
+  and republishes the ceiling immediately; drain releases grow the cache
+  back beyond live fragments plus the floor. No filesystem watching — the
+  disk is dedicated and fixed-size, so the budget is the only bound.

@@ -159,6 +159,13 @@ unwrap_used = "warn"
 # https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.1/VERGLAS.md
 [patch.crates-io]
 iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "39f251a452ab2ab48728917b56182e35bb6b805b" }
+# VERGLAS PATCH: foyer 0.22.3 from verglas-org/verglas-foyer (branch
+# verglas/v0.22.3) with live disk-resize for the block engine — the watermark
+# model the write-pressure reclamation needs: shrink retires tail partitions
+# and truncates the backing file, grow-back restores them. Pin a SHA — never
+# a floating branch tip. Patch inventory:
+# https://github.com/verglas-org/verglas-foyer/blob/verglas/v0.22.3/VERGLAS.md
+foyer = { git = "https://github.com/verglas-org/verglas-foyer", rev = "58a7f001d8cd894423106713904daf948db20e65" }
 
 # The profile that 'dist' will build with
 [profile.dist]

@@ -3026,8 +3026,7 @@ dependencies = [
 [[package]]
 name = "foyer"
 version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b0abc0b87814989efa711f9becd9f26969820e2d3905db27d10969c4bd45890"
+source = "git+https://github.com/verglas-org/verglas-foyer?rev=58a7f001d8cd894423106713904daf948db20e65#58a7f001d8cd894423106713904daf948db20e65"
 dependencies = [
  "anyhow",
  "equivalent",
@@ -3046,8 +3045,7 @@ dependencies = [
 [[package]]
 name = "foyer-common"
 version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3db80d5dece93adb7ad709c84578794724a9cba342a7e566c3551c7ec626789"
+source = "git+https://github.com/verglas-org/verglas-foyer?rev=58a7f001d8cd894423106713904daf948db20e65#58a7f001d8cd894423106713904daf948db20e65"
 dependencies = [
  "anyhow",
  "bytes",
@@ -3071,8 +3069,7 @@ dependencies = [
 [[package]]
 name = "foyer-memory"
 version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db907f40a527ca2aa2f40a5f68b32ea58aa70f050cd233518e9ffd402cfba6ce"
+source = "git+https://github.com/verglas-org/verglas-foyer?rev=58a7f001d8cd894423106713904daf948db20e65#58a7f001d8cd894423106713904daf948db20e65"
 dependencies = [
  "anyhow",
  "bitflags 2.13.1",
@@ -3096,8 +3093,7 @@ dependencies = [
 [[package]]
 name = "foyer-storage"
 version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1983f1db3d0710e9c9d5fc116d9202dccd41a2d1e032572224f1aff5520aa958"
+source = "git+https://github.com/verglas-org/verglas-foyer?rev=58a7f001d8cd894423106713904daf948db20e65#58a7f001d8cd894423106713904daf948db20e65"
 dependencies = [
  "allocator-api2",
  "anyhow",
@@ -3128,8 +3124,7 @@ dependencies = [
 [[package]]
 name = "foyer-tokio"
 version = "0.22.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6577b05a7ffad0db555aedf00bfe52af818220fc4c1c3a7a12520896fc38627"
+source = "git+https://github.com/verglas-org/verglas-foyer?rev=58a7f001d8cd894423106713904daf948db20e65#58a7f001d8cd894423106713904daf948db20e65"
 dependencies = [
  "tokio",
 ]
@@ -7320,6 +7315,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tower",

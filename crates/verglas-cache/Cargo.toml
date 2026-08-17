@@ -45,7 +45,7 @@ object_store.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 # Captures the structured fill-failure events for the #61 logging test.
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "env-filter"] }
 serde_json.workspace = true
 # Only for the codec throughput comparison example (#180); never a library dep.
 reed-solomon-erasure.workspace = true
