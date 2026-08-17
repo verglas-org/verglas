@@ -603,7 +603,7 @@ impl ObjectRead for PassthroughRead {
 /// the backend as one atomic PUT; longer ones stream through the backend's
 /// multipart API in parts of EXACTLY this size (trailing part excepted).
 /// Comfortably above S3's 5 MiB minimum-part-size floor. Exactness is a hard
-/// requirement, not tidiness: R2 rejects a multipart completion whose
+/// requirement, not tidiness: strict origins reject a multipart completion whose
 /// non-trailing parts differ in length (the 2026-08-02 pageserver incident),
 /// so the split must never let a part absorb chunk overshoot.
 const PUT_PART_SIZE: usize = 8 * 1024 * 1024;
@@ -753,7 +753,7 @@ fn contiguous_parts(mut parts: Vec<CompletedPartRef>) -> Result<Vec<CompletedPar
 /// included): a body that fits one part buffer becomes a single raw PUT (S3
 /// demands a known `Content-Length`, so the slice is materialized first);
 /// anything longer streams through the raw multipart trio in parts of exactly
-/// [`PUT_PART_SIZE`] (R2's uniform-length rule), aborted on any failure so
+/// [`PUT_PART_SIZE`] (the uniform-length rule), aborted on any failure so
 /// nothing partial becomes visible — the raw mirror of
 /// [`stream_body_to_store`].
 async fn raw_put(
@@ -954,7 +954,7 @@ struct BufferedSlice {
 }
 
 /// Slices a client body into exact-length parts for the internal multipart
-/// split. R2 requires every non-trailing part of one upload to be
+/// split. Strict origins require every non-trailing part of one upload to be
 /// byte-identical in length (the 2026-08-02 InvalidPart incident), so a part
 /// must never overshoot its target by "whatever the boundary chunk brought":
 /// the boundary chunk is split at the target (a zero-copy `Bytes::split_off`)
@@ -1022,7 +1022,7 @@ impl<'a> PartSlicer<'a> {
 /// Streams `body` into `store` at `path`, carrying `attributes`, in bounded
 /// memory: a body that fits in one part buffer becomes a single atomic PUT;
 /// anything longer streams through the origin's multipart API in parts of
-/// exactly [`PUT_PART_SIZE`] (R2's uniform-length rule), aborted on any
+/// exactly [`PUT_PART_SIZE`] (the uniform-length rule), aborted on any
 /// failure so nothing partial becomes visible. Returns only once the origin
 /// confirms the object durable. Shared by [`PassthroughWrite::put`] and the
 /// copy-with-REPLACE path, which re-streams a source object through a fresh
@@ -1310,7 +1310,7 @@ impl ObjectWrite for PassthroughWrite {
     }
 
     /// Streams one part to the origin as EXACTLY one backend part — same part
-    /// number, same bytes. Never re-chunked, merged, or split: R2 requires
+    /// number, same bytes. Never re-chunked, merged, or split: strict origins require
     /// every non-trailing part of an upload to be byte-identical in length, so
     /// the client's part boundaries are the only correct ones. The part body
     /// is buffered (a part is bounded by the client's part size — Iceberg

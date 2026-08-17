@@ -133,7 +133,7 @@
   server-side ingest rules), a REST catalog opened with
   `X-Iceberg-Access-Delegation: vended-credentials` so every table load/create
   asks the catalog to vend per-table storage credentials (no static S3 keypair
-  is configured — the R2 Data Catalog and any spec-conformant catalog return
+  is configured — the Cloudflare Data Catalog and any spec-conformant catalog return
   scoped credentials in the response `config` map, which `iceberg-catalog-rest`
   merges into the table's `FileIO`), and the CAS create/append write path
   (schema coercion, fixed-8MiB-part multipart writes for strict S3-compatible

@@ -37,7 +37,7 @@ struct Inner {
     /// The content-addressed chunk store backing every device on this node.
     store: ChunkStore,
     /// The ring flush plane, set once at startup when the node is on a ring.
-    /// Absent means a single-node deployment: FLUSH is the synchronous R2
+    /// Absent means a single-node deployment: FLUSH is the synchronous origin
     /// barrier, exactly as before the write-back plane existed.
     ring: OnceLock<Arc<RingWriteback>>,
     /// Devices opened on this node, keyed by device id (the NBD export name).
@@ -48,7 +48,7 @@ impl DeviceRegistry {
     /// Opens the registry: roots the local chunk store under `cache_dir` and
     /// wires it to the durable object `backend` (the cache's backing bucket). The
     /// flush plane is attached separately via [`DeviceRegistry::attach_ring`] once
-    /// the node's ring peers are known; until then FLUSH is the synchronous R2
+    /// the node's ring peers are known; until then FLUSH is the synchronous origin
     /// barrier.
     pub async fn open(
         cache_dir: &std::path::Path,

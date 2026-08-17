@@ -26,7 +26,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "sync
 # are built on — the Reed-Solomon codec, the local fragment store, the peer
 # fragment transport, and the live-membership view. This crate adds the block
 # flush write-back (seal the dirty set, EC it across the ring, ack on a quorum,
-# drain to R2 in the background) over them; it re-implements none of them.
+# drain to the origin in the background) over them; it re-implements none of them.
 verglas-core.workspace = true
 verglas-cache.workspace = true
 verglas-cluster.workspace = true

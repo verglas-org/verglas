@@ -111,7 +111,7 @@ async fn main() {
         return;
     }
 
-    // Pin the process rustls CryptoProvider so an https origin (R2/S3) resolves
+    // Pin the process rustls CryptoProvider so an https origin resolves
     // TLS through a chosen provider rather than panicking when the dep graph
     // carries more than one. Harmless when ring is the only provider present.
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -203,7 +203,7 @@ mod tests {
              dram_bytes = \"80MB\"\n\n\
              [backend]\n\
              bucket = \"verglas-cache-test\"\n\
-             endpoint = \"https://accountid.r2.cloudflarestorage.com\"\n\
+             endpoint = \"https://objects.example.com\"\n\
              region = \"us-east-1\"\n\
              credentials_file = \"{backend_creds}\"\n\n\
              [auth]\n\
@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(config.backend.bucket.as_deref(), Some("verglas-cache-test"));
         assert_eq!(
             config.backend.endpoint.as_deref(),
-            Some("https://accountid.r2.cloudflarestorage.com")
+            Some("https://objects.example.com")
         );
         assert_eq!(
             config.backend.credentials_file.as_deref(),

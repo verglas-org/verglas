@@ -71,7 +71,7 @@ struct Inner {
     store: ChunkStore,
     /// The flush write-back plane, when this device is attached on a ring. Absent
     /// on a plain single-node deployment, where FLUSH is the inline synchronous
-    /// R2 barrier; present on the fleet ring, where FLUSH erasure-codes the
+    /// origin barrier; present on the fleet ring, where FLUSH erasure-codes the
     /// sealed set across peers and acks on a quorum (the plane itself still takes
     /// the synchronous barrier for a degenerate or quorum-short ring).
     ring: Option<Arc<RingWriteback>>,
@@ -106,7 +106,7 @@ impl BlockDevice {
 
     /// Like [`BlockDevice::ensure`], but attaches the device on a ring: its FLUSH
     /// erasure-codes the sealed set across the ring and acks on a quorum, draining
-    /// to R2 in the background (a degenerate or quorum-short ring still takes the
+    /// to the origin in the background (a degenerate or quorum-short ring still takes the
     /// synchronous barrier inside the plane). This is the fleet attach entry.
     pub async fn ensure_on_ring(
         device_id: impl Into<String>,
@@ -292,11 +292,11 @@ impl BlockDevice {
     ///
     /// How "durable" is reached is the flush plane's job:
     /// - No ring plane (a plain single-node deployment): the inline synchronous
-    ///   R2 barrier — every referenced chunk durable, THEN the manifest — the
+    ///   origin barrier — every referenced chunk durable, THEN the manifest — the
     ///   invariant that a committed manifest never names a non-durable chunk.
     /// - A ring plane: the sealed set (target manifest + the not-yet-durable
     ///   chunk bytes) is erasure-coded across the ring and acked on a quorum, with
-    ///   the R2 drain running behind the ack. The device version is advanced only
+    ///   the origin drain running behind the ack. The device version is advanced only
     ///   after the ack, so a failed flush never advances it.
     pub async fn flush(&self) -> Result<u64, DeviceError> {
         let mut state = self.inner.state.lock().await;
@@ -325,7 +325,7 @@ impl BlockDevice {
                 manifest.commit(self.inner.store.backend().as_ref()).await?;
             }
             Some(ring) => {
-                // Seal only the chunks not yet durable in R2 — exactly what a
+                // Seal only the chunks not yet durable at the origin — exactly what a
                 // drain (originator or takeover peer) must PUT — and hand the
                 // sealed set to the ring plane, which acks on a quorum.
                 let dirty = self.inner.store.undurable_chunks(&referenced).await?;

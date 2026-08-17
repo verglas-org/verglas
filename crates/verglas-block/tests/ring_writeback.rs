@@ -1,17 +1,17 @@
 //! Ring write-back acceptance tests (the block-flush erasure-coded write-back).
 //!
 //! These map to the pipeline's acceptance criteria:
-//! - a single-node ring degenerates to the synchronous R2 barrier;
-//! - a multi-node FLUSH acks on a ring quorum, not on an R2 round-trip (proven
+//! - a single-node ring degenerates to the synchronous origin barrier;
+//! - a multi-node FLUSH acks on a ring quorum, not on an origin round-trip (proven
 //!   with a failing backend that cannot serve the ack);
 //! - an originator crash mid-drain is completed by a peer that reconstructs the
 //!   sealed flush from the surviving fragments (one shard lost) and finishes the
-//!   R2 barrier, committing the manifest version exactly once;
+//!   origin barrier, committing the manifest version exactly once;
 //! - a ring that cannot place its quorum falls back to the synchronous barrier.
 //!
 //! The transport is faked over real per-node [`LocalFragmentStore`]s (not an
 //! in-memory map), so the takeover pass exercises the true descriptor
-//! enumeration path. The R2 backend is a controllable in-memory
+//! enumeration path. The origin backend is a controllable in-memory
 //! [`ObjectBackend`] whose PUTs can be made to fail on demand.
 
 use std::collections::{HashMap, HashSet};
@@ -31,10 +31,10 @@ use verglas_cluster::fragments::{FragmentIoError, FragmentKey, FragmentRecord, L
 use verglas_core::node::NodeId;
 use verglas_writeback::transport::ShardStream;
 
-// ---- controllable in-memory R2 backend --------------------------------------
+// ---- controllable in-memory origin backend --------------------------------------
 
 /// An in-memory object backend whose PUTs can be toggled to fail, standing in
-/// for R2 during the ack-vs-drain window. GETs and existence checks always work,
+/// for the origin during the ack-vs-drain window. GETs and existence checks always work,
 /// so a drain that runs while PUTs fail simply cannot commit.
 #[derive(Default)]
 struct FlakyBackend {
@@ -307,8 +307,8 @@ async fn one_chunk_flush(
 
 // ---- tests ------------------------------------------------------------------
 
-/// A single-node ring degenerates to the synchronous R2 barrier: the flush
-/// commits the chunk and manifest to R2 before it returns, and places no ring
+/// A single-node ring degenerates to the synchronous origin barrier: the flush
+/// commits the chunk and manifest to the origin before it returns, and places no ring
 /// fragments at all. This is topology-driven, not a config choice.
 #[tokio::test]
 async fn single_node_ring_degenerates_to_synchronous_barrier() {
@@ -334,11 +334,11 @@ async fn single_node_ring_degenerates_to_synchronous_barrier() {
         .await
         .expect("flush acks");
 
-    // Synchronous: the manifest is durable in R2 the instant the flush returns.
+    // Synchronous: the manifest is durable at the origin the instant the flush returns.
     assert_eq!(
         flaky.latest_version("solo-dev"),
         Some(1),
-        "single-node flush commits synchronously to R2"
+        "single-node flush commits synchronously to the origin"
     );
     // No peers to code across: no fragment was ever placed.
     assert_eq!(
@@ -348,15 +348,15 @@ async fn single_node_ring_degenerates_to_synchronous_barrier() {
     );
 }
 
-/// A multi-node FLUSH acks on the ring quorum, not on R2: with the backend
+/// A multi-node FLUSH acks on the ring quorum, not on the origin: with the backend
 /// refusing every PUT, the flush still returns Ok and the fragments plus
-/// descriptors are on the ring, while R2 holds no manifest. The ack cost is a
-/// ring RTT; the R2 barrier is deferred to the drain.
+/// descriptors are on the ring, while the origin holds no manifest. The ack cost is a
+/// ring RTT; the origin barrier is deferred to the drain.
 #[tokio::test]
-async fn flush_acks_on_quorum_not_on_r2() {
+async fn flush_acks_on_quorum_not_on_origin() {
     let dir = tempfile::tempdir().expect("tempdir");
     let flaky = FlakyBackend::new();
-    flaky.set_fail(true); // R2 is unavailable for the whole test
+    flaky.set_fail(true); // the origin is unavailable for the whole test
     let backend: Arc<dyn ObjectBackend> = Arc::clone(&flaky) as Arc<dyn ObjectBackend>;
     let nodes = ["a", "b", "c"];
     let transport = MemoryTransport::new(dir.path(), &nodes);
@@ -376,10 +376,10 @@ async fn flush_acks_on_quorum_not_on_r2() {
     node.ring
         .flush("dev", manifest, dirty)
         .await
-        .expect("flush acks despite R2 being down");
+        .expect("flush acks despite the origin being down");
 
-    // The ack landed even though R2 cannot serve a single PUT.
-    assert_eq!(flaky.latest_version("dev"), None, "no manifest reached R2");
+    // The ack landed even though the origin cannot serve a single PUT.
+    assert_eq!(flaky.latest_version("dev"), None, "no manifest reached the origin");
     // RS(2,1) over 3 nodes: each node holds exactly one data/parity fragment plus
     // a full descriptor copy (the sentinel index).
     for n in nodes {
@@ -388,11 +388,11 @@ async fn flush_acks_on_quorum_not_on_r2() {
     }
 }
 
-/// Originator crash mid-drain: the flush acks on the quorum, then R2 is briefly
+/// Originator crash mid-drain: the flush acks on the quorum, then the origin is briefly
 /// down so the originator's own drain cannot complete; the originator's box is
 /// lost (its fragment gone); a surviving peer's takeover pass reconstructs the
 /// sealed flush from the two remaining fragments (one shard lost), completes the
-/// R2 barrier, and commits the manifest version exactly once.
+/// origin barrier, and commits the manifest version exactly once.
 #[tokio::test]
 async fn originator_crash_peer_reconstructs_and_drains_exactly_once() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -435,15 +435,15 @@ async fn originator_crash_peer_reconstructs_and_drains_exactly_once() {
         .flush("dev", manifest, dirty)
         .await
         .expect("flush acks");
-    // Let the originator's background drain attempt (and fail against the down R2).
+    // Let the originator's background drain attempt (and fail against the down origin).
     tokio::task::yield_now().await;
     assert_eq!(
         flaky.latest_version("dev"),
         None,
-        "drain blocked while R2 down"
+        "drain blocked while the origin is down"
     );
 
-    // R2 comes back; the originator's box is lost before it could re-drain.
+    // The origin comes back; the originator's box is lost before it could re-drain.
     flaky.set_fail(false);
     transport.kill("a");
 
@@ -454,9 +454,9 @@ async fn originator_crash_peer_reconstructs_and_drains_exactly_once() {
     assert_eq!(
         flaky.latest_version("dev"),
         Some(1),
-        "peer completed the R2 barrier"
+        "peer completed the origin barrier"
     );
-    assert!(flaky.has(&chunk_key), "the flushed chunk reached R2");
+    assert!(flaky.has(&chunk_key), "the flushed chunk reached the origin");
 
     // Exactly once: another pass (or the same one again) never advances the
     // version, and the ring holds have been released.
@@ -479,7 +479,7 @@ async fn originator_crash_peer_reconstructs_and_drains_exactly_once() {
 }
 
 /// A block device attached on a single-node ring flushes exactly like the
-/// pre-write-back synchronous path: written bytes are durable in R2 after FLUSH
+/// pre-write-back synchronous path: written bytes are durable at the origin after FLUSH
 /// and read back from a fresh attach over the same backend. Confirms the device
 /// integration keeps the degenerate-ring behaviour byte-identical.
 #[tokio::test]
@@ -512,7 +512,7 @@ async fn block_device_on_single_node_ring_reads_back_after_flush() {
     assert_eq!(dev.flush().await.expect("flush"), 1);
 
     // A fresh attach over the same backend reads the flushed bytes back (they are
-    // durable in R2 synchronously on a single-node ring).
+    // durable at the origin synchronously on a single-node ring).
     let store2 = ChunkStore::open(dir.path().join("dev-nvme-b"), backend)
         .await
         .expect("store b");
@@ -524,12 +524,12 @@ async fn block_device_on_single_node_ring_reads_back_after_flush() {
 }
 
 /// A ring that cannot place its quorum (a peer refuses placement) falls back to
-/// the synchronous R2 barrier — the always-safe path — committing the manifest
-/// to R2 before the flush returns and leaving no orphaned fragments.
+/// the synchronous origin barrier — the always-safe path — committing the manifest
+/// to the origin before the flush returns and leaving no orphaned fragments.
 #[tokio::test]
 async fn quorum_short_ring_falls_back_to_synchronous_barrier() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let flaky = FlakyBackend::new(); // R2 is up, so the sync barrier can commit
+    let flaky = FlakyBackend::new(); // the origin is up, so the sync barrier can commit
     let backend: Arc<dyn ObjectBackend> = Arc::clone(&flaky) as Arc<dyn ObjectBackend>;
     let nodes = ["a", "b", "c"];
     let transport = MemoryTransport::new(dir.path(), &nodes);

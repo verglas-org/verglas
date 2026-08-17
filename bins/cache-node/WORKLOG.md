@@ -35,7 +35,7 @@
   fragment RPC endpoints peers place shards through on VERGLAS_RING_ADDR
   (default :8336, no new authz — VXLAN isolation like the NBD plane), and runs the
   drain-takeover loop. With no ring configured the block tier stays single-node and
-  FLUSH is the synchronous R2 barrier, unchanged. The object serve path is still a
+  FLUSH is the synchronous origin barrier, unchanged. The object serve path is still a
   peerless cluster-of-one; only the block tier reaches verglas-cluster's fragment
   store and peer RPC. `DeviceRegistry` gained an optional ring plane it attaches
   once at startup; ensure/get route flushes through it when present.
@@ -271,14 +271,14 @@
   concurrently active WAL timeline after a large Iceberg ingest.
 
 - Container-only daemon configuration: the compose stack no longer bundles
-  MinIO — `[backend]` must point at a real S3-compatible origin (e.g. R2), and
+  MinIO — `[backend]` must point at a real S3-compatible origin, and
   the required VERGLAS_STORAGE_* variables fail fast when unset. The container
   entrypoint gained VERGLAS_CATALOG_BEARER_TOKEN so an authenticated Iceberg
-  REST catalog (R2 Data Catalog) works with env-only configuration; the daemon
+  REST catalog (Cloudflare Data Catalog) works with env-only configuration; the daemon
   needs no host-side config file.
 - #20 #96: Replaced the bundled local object-store Compose topology with one
   disposable cache process and three provider profiles: Verglas Cloud,
-  Cloudflare R2 Data Catalog, and Amazon S3 Tables. Provider catalog credentials
+  Cloudflare Data Catalog, and Amazon S3 Tables. Provider catalog credentials
   are rendered into owner-only files; external catalog changes reconcile by poll
   while Cloud can additionally wake reconciliation through its event hint.
 - #20 #96: Restored the local SDK Table read/append surface and `/admin/access`

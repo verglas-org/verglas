@@ -62,7 +62,7 @@ object_store.workspace = true
 iceberg.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-# Pin the process rustls CryptoProvider so an https origin (R2/S3) resolves TLS
+# Pin the process rustls CryptoProvider so an https origin resolves TLS
 # through a chosen provider rather than panicking when the dep graph carries more
 # than one. Ring matches what reqwest's rustls-tls pulls in.
 rustls = "0.23"

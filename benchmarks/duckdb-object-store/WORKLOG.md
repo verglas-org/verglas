@@ -19,21 +19,21 @@
   carry the running server's cache configuration and counters. This lets
   constrained and NVMe-resident results be distinguished using observed
   evidence rather than a handwritten profile label.
-- #126: Added the live Cloudflare R2 profile with TLS, mounted credentials,
-  external-origin provenance, and request counts from R2's GraphQL operations
-  dataset. The same bounded Quack topology now runs against durable R2 directly
-  and through Verglas, and both write paths are hashed after direct R2 readback.
-- #126: Extended the live R2 benchmark to compare QuackStore's real persistent
+- #126: Added the live the origin store profile with TLS, mounted credentials,
+  external-origin provenance, and request counts from the origin's GraphQL operations
+  dataset. The same bounded Quack topology now runs against durable origin directly
+  and through Verglas, and both write paths are hashed after direct origin readback.
+- #126: Extended the live origin benchmark to compare QuackStore's real persistent
   block cache with Verglas under the same 256 MiB logical cache budget. Each of
   five isolated repetitions records direct, cold, warm, and fresh-process cache
   legs, plus cache occupancy, immutable-data configuration, cgroups, spill,
-  R2 operations, result hashes, and direct-origin write readback.
+  origin operations, result hashes, and direct-origin write readback.
 - #126: Corrected the QuackStore comparison to use the extension's global
   cache settings and a persistent cache file rather than a directory. Every
   workload now stops its primary QuackStore process before a fresh process
   reopens that same file, and the report records each handoff with file and
   process evidence.
-- #126: Retained each complete live-R2 repetition as a numbered JSON artifact
+- #126: Retained each complete live-origin repetition as a numbered JSON artifact
   and embedded its raw evidence in the final summary. The contract now rejects
   missing raw reports, cache-file paths, overlapping QuackStore processes, and
   missing logical or physical cache-size evidence.
@@ -43,11 +43,11 @@
   configuration for every measured read leg; the data-size and spill gates are
   unchanged.
 - #126: Raised the same uniform DuckDB operator limit to 352 MB after the
-  320 MB live-R2 retry again exhausted QuackStore's external sort allocator at
+  320 MB live-origin retry again exhausted QuackStore's external sort allocator at
   299.0 of 305.1 MiB. The 1,501,993,637-byte measured dataset remains larger
   than four times the 352,000,000-byte operator budget, and spill evidence is
   still mandatory.
 - #126: Changed the external-sort key from the wide payload string to the
-  numeric metric after the 352 MB live-R2 retry also exhausted the string
+  numeric metric after the 352 MB live-origin retry also exhausted the string
   buffer. The workload remains a full global `row_number()` sort, and the
   benchmark continues to reject any run without observed spill.

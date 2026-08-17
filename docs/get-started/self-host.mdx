@@ -75,17 +75,17 @@ replace it. The cache always polls at
 `VERGLAS_CATALOG_POLL_INTERVAL_SECONDS` (30 seconds by default), so a missed
 event converges safely.
 
-## Cloudflare R2 Data Catalog
+## Cloudflare Data Catalog
 
-Cloudflare R2 Data Catalog is the Iceberg REST catalog and controls where
+Cloudflare Data Catalog is the Iceberg REST catalog and controls where
 tables live. Do not configure a `data_path` or create a second warehouse. Use
-the catalog URI and warehouse Cloudflare provides, plus an R2 credential that
+the catalog URI and warehouse the provider issues, plus an object-storage credential that
 can read and write the catalog-managed bucket.
 
 ```bash
 export VERGLAS_PROVIDER=cloudflare
-export VERGLAS_STORAGE_BUCKET=r2-catalog-managed-bucket
-export VERGLAS_STORAGE_ENDPOINT=https://ACCOUNT_ID.r2.cloudflarestorage.com
+export VERGLAS_STORAGE_BUCKET=catalog-managed-bucket
+export VERGLAS_STORAGE_ENDPOINT=https://objects.example.com
 export VERGLAS_STORAGE_REGION=auto
 export VERGLAS_STORAGE_ACCESS_KEY_ID=...
 export VERGLAS_STORAGE_SECRET_ACCESS_KEY=...
@@ -95,9 +95,9 @@ export VERGLAS_CATALOG_TOKEN=...
 docker compose up --detach --build verglas
 ```
 
-R2 Data Catalog has no cache callback contract in the OSS deployment. The
+Cloudflare Data Catalog has no cache callback contract in the OSS deployment. The
 cache polls its catalog for committed changes. The catalog gateway retains the
-R2 bearer credential in an owner-only file, and Graphs, Vectors, and Tables
+object-storage bearer credential in an owner-only file, and Graphs, Vectors, and Tables
 all use the local gateway instead of connecting to Cloudflare directly.
 
 ## Amazon S3 Tables

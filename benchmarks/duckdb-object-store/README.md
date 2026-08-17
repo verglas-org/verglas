@@ -37,28 +37,28 @@ the evaluator must prove spilled to disk.
 MinIO's admin trace is hashed into the report. Container IDs, immutable image
 IDs, and Docker's applied CPU/RAM limits are recorded rather than inferred.
 
-## R2
+## the origin
 
-The live R2 profile uses the same SQL, limits, and evidence gates. R2's S3 API
+The live origin profile uses the same SQL, limits, and evidence gates. the origin's S3 API
 requires three independent values: `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, and
 `R2_SECRET_ACCESS_KEY`. The isolated bucket is
 `verglas-duckdb-bench-20260812`. `CLOUDFLARE_API_TOKEN` must also be an account
-token allowed to read R2 analytics, because the report obtains its request
+token allowed to read origin analytics, because the report obtains its request
 counts from Cloudflare's GraphQL operations dataset.
 
 ```bash
-export R2_ACCOUNT_ID=...
-export R2_ACCESS_KEY_ID=...
-export R2_SECRET_ACCESS_KEY=...
+export the origin_ACCOUNT_ID=...
+export the origin_ACCESS_KEY_ID=...
+export the origin_SECRET_ACCESS_KEY=...
 export CLOUDFLARE_API_TOKEN=...
 python3 benchmarks/duckdb-object-store/benchmark.py \
-  --profile live-r2 \
+  --profile live-origin \
   --cache-capacity-bytes 268435456 \
-  --output /path/on/external/disk/r2-result.json
+  --output /path/on/external/disk/origin-result.json
 ```
 
 The coordinator mounts S3 credentials into containers as read-only files; it
-does not place the live secret in container arguments or the report. The R2
+does not place the live secret in container arguments or the report. The the origin
 endpoint uses TLS and region `auto`. Dataset generation has a 512 MiB DuckDB
 allocator and a 1 GiB setup container because remote multipart upload has a
 larger buffering requirement. That setup is not timed. All measured Quack
@@ -66,7 +66,7 @@ servers remain single-CPU with a 352 MB DuckDB allocator and 2 GiB process
 ceiling.
 
 The live profile runs five isolated repetitions. Each repetition measures seven
-legs: direct R2; QuackStore cold, warm, and a newly started Quack process that
+legs: direct the origin; QuackStore cold, warm, and a newly started Quack process that
 reuses its persistent cache; then Verglas cold, warm, and a newly started Quack
 process that reuses Verglas. QuackStore is installed in the measured server
 with `INSTALL quackstore FROM community; LOAD quackstore`, reads the immutable
@@ -79,9 +79,9 @@ warm leg. The report records logical capacity, file length, allocated bytes,
 and the non-overlapping container identities for every handoff. It writes five
 numbered full raw reports beside the requested summary artifact, and the
 summary retains each report's digest and raw evidence. The report rejects a
-run without observed nonzero occupancy for both caches, live R2 operation
+run without observed nonzero occupancy for both caches, live origin operation
 evidence, container/image provenance, cgroup limits, spill, result
-equivalence, and direct-R2 readback of writes.
+equivalence, and direct-origin readback of writes.
 
 ## What the number means
 

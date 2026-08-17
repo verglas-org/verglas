@@ -203,8 +203,8 @@ impl ChunkStore {
     /// in the backend, reading each from local NVMe. This is the dirty set the
     /// ring write-back plane seals into a flush bundle: exactly the chunks a
     /// drain (whether by the originator or by a peer that reconstructed the
-    /// bundle) must PUT to R2, since the already-durable chunks are in R2 already.
-    /// A chunk not known durable that is actually in R2 costs one idempotent
+    /// bundle) must PUT to the origin, since the already-durable chunks are at the origin already.
+    /// A chunk not known durable that is actually at the origin costs one idempotent
     /// re-PUT — content addressing makes that harmless.
     pub async fn undurable_chunks(
         &self,

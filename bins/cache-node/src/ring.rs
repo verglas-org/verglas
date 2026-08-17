@@ -21,7 +21,7 @@
 //!
 //! With no ring configured (`VERGLAS_RING_PEERS` unset or naming fewer than three
 //! nodes) this module does nothing and the block tier stays single-node: FLUSH is
-//! the synchronous R2 barrier, byte-identical to before the write-back plane
+//! the synchronous origin barrier, byte-identical to before the write-back plane
 //! existed. That is topology-driven, not a config knob.
 
 use std::collections::HashMap;

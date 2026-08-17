@@ -74,7 +74,7 @@ the local Iceberg REST gateway at `http://127.0.0.1:8334/catalog`; Graphs and
 Vectors use the same local S3 listener. All three therefore keep provider
 credentials inside the node process and route data files through it.
 
-The supported profiles are Verglas Cloud, Cloudflare R2 Data Catalog, and
+The supported profiles are Verglas Cloud, Cloudflare Data Catalog, and
 Amazon S3 Tables. The Cloud profile accepts event hints at
 `/admin/catalog/events` and always reconciles by polling. Cloudflare and AWS
 are polling-only upstreams. Stop the disposable node and remove its local

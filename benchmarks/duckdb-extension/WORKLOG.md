@@ -25,9 +25,9 @@
   containers, and rejects any missing catalog, cache, origin-byte, snapshot, or
   result-identity proof instead of manufacturing a benchmark result.
 - #126: Added failing tests for the repository-owned managed runner. They
-  distinguish direct-R2 Quack from Quack loading the real Verglas extension and
+  distinguish direct-origin Quack from Quack loading the real Verglas extension and
   require every product path to execute the same out-of-core SQL semantics.
-- #126: Added the managed-Iceberg runner used by the full-stack benchmark. It creates a unique Iceberg v2 table through Lakekeeper, keeps Quack's direct R2 path separate from the Query worker and extension path, and streams typed Arrow evidence from real clients.
+- #126: Added the managed-Iceberg runner used by the full-stack benchmark. It creates a unique Iceberg v2 table through Lakekeeper, keeps Quack's direct origin path separate from the Query worker and extension path, and streams typed Arrow evidence from real clients.
 - #126: Added a regression contract that keeps the two Quack transports
   distinct. The extension-hosting server must receive `verglas_query(...)`,
   while direct Quack receives the canonical Iceberg SQL unchanged.
@@ -35,6 +35,6 @@
   compressed Iceberg footprint. A row estimate cannot substitute for proving
   the committed data files exceed four worker-memory budgets.
 - #126: Made the managed benchmark bind its catalog-created tables to the
-  database's explicit R2 FileIO and compare typed row results independently of
+  database's explicit origin FileIO and compare typed row results independently of
   Arrow batch boundaries. Direct and extension Quack servers now share fixed
   operator limits, persistent protocol sessions, and a stable metadata snapshot.

@@ -172,10 +172,10 @@ async fn multipart_response(
     }
     if *method == Method::POST {
         let mut guard = uploads.lock().unwrap_or_else(|e| e.into_inner());
-        // Cloudflare R2's rule (2026-08-02 incident): every part except the
+        // the origin store's rule (2026-08-02 incident): every part except the
         // last must be byte-identical in length, or the completion fails with
         // 400 InvalidPart. The mock enforces it so any split that alters part
-        // boundaries fails here exactly as it does against R2.
+        // boundaries fails here exactly as it does against a strict origin.
         {
             let upload = guard.get(&upload_id)?;
             let lens: Vec<usize> = upload.parts.values().map(Vec::len).collect();
@@ -880,10 +880,10 @@ async fn large_raw_put_streams_through_raw_multipart() {
     assert_eq!(stored.body, payload, "large body must land byte-exact");
 }
 
-/// REPRODUCTION (R2 InvalidPart, 2026-08-02), raw-path twin of the typed
+/// REPRODUCTION (origin InvalidPart, 2026-08-02), raw-path twin of the typed
 /// `streamed_put_splits_into_uniform_parts` test: the raw multipart split of a
 /// large streamed body must produce byte-identical non-trailing parts no
-/// matter how the client's chunks arrive — the mock origin enforces R2's rule
+/// matter how the client's chunks arrive — the mock origin enforces the uniform-part rule
 /// at completion, so an overshooting split fails this write outright.
 #[tokio::test]
 async fn large_raw_put_splits_into_uniform_parts() {
@@ -904,7 +904,7 @@ async fn large_raw_put_splits_into_uniform_parts() {
     let key = "raw/uniform dir/";
 
     // ~21 MiB delivered in irregular, non-repeating chunk sizes: under an
-    // overshooting split, part 1 and part 2 differ in length and R2 (and the
+    // overshooting split, part 1 and part 2 differ in length and a strict origin (and the
     // mock) reject the completion.
     let chunk_lens: Vec<usize> = (0..14).map(|i| 1_000_000 + i * 77_777).collect();
     let total: usize = chunk_lens.iter().sum();
@@ -930,7 +930,7 @@ async fn large_raw_put_splits_into_uniform_parts() {
             body,
         )
         .await
-        .expect("streamed raw PUT must satisfy R2's uniform-part rule");
+        .expect("streamed raw PUT must satisfy the uniform-part rule");
 
     let guard = store.lock().unwrap_or_else(|e| e.into_inner());
     let stored = guard

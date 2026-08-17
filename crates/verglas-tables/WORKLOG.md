@@ -148,7 +148,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   for the newest commit, so a replay cannot storm the executor.
 
 - #307/#310: The loopback catalog gateway now decompresses gzip upstream
-  responses and forwards plain JSON. Cloudflare R2 Data Catalog returns
+  responses and forwards plain JSON. Cloudflare Data Catalog returns
   `Content-Encoding: gzip`; reqwest is built without the gzip feature, so the
   proxy was passing raw gzip bytes to clients that expect JSON (the CLI and the
   sidecar iceberg-rust client), which rejected them and fell back to the vendor
@@ -162,9 +162,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   fully-enumerated `Cache` config literals in warming.rs and lifecycle.rs so they
   keep compiling; no library change.
 
-- #336: Gunzip gzip-compressed table metadata objects before parsing. A catalog with `write.metadata.compression-codec=gzip` (R2 Data Catalog) stores `metadata.json` gzip-compressed as `NNNNN-<uuid>.gz.metadata.json`; warming and mapper rebuild were feeding the raw gzip bytes to the JSON parser, failing thousands of times a day with "malformed metadata ... expected value at line 1 column 1". The shared `iceberg::parse_metadata_json` helper now decompresses when the object carries the gzip magic bytes (authoritative) or the `.gz.metadata.json` suffix; a decompression failure surfaces as the same warn-and-retry `Malformed` error, never a panic. Plain `.metadata.json` parses unchanged.
+- #336: Gunzip gzip-compressed table metadata objects before parsing. A catalog with `write.metadata.compression-codec=gzip` (Cloudflare Data Catalog) stores `metadata.json` gzip-compressed as `NNNNN-<uuid>.gz.metadata.json`; warming and mapper rebuild were feeding the raw gzip bytes to the JSON parser, failing thousands of times a day with "malformed metadata ... expected value at line 1 column 1". The shared `iceberg::parse_metadata_json` helper now decompresses when the object carries the gzip magic bytes (authoritative) or the `.gz.metadata.json` suffix; a decompression failure surfaces as the same warn-and-retry `Malformed` error, never a panic. Plain `.metadata.json` parses unchanged.
 
-- cloud-agnostic sweep: removed every Cloudflare/R2 mention and tenant-named
+- cloud-agnostic sweep: removed every provider-specific mention and tenant-named
   fixture from code, docs, and tests. Comments now describe the constraint
   ("strict S3-compatible stores reject variable-size parts", "some managed REST
   catalogs gzip responses") instead of naming a vendor; test fixtures use

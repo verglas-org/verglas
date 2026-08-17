@@ -18,7 +18,7 @@
 //!   remain outside normal cache eviction while origin propagation runs.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
 //!   reaches the ring. When `VERGLAS_RING_PEERS` names a ring, a device FLUSH is
-//!   erasure-coded across the boxes and acked on a quorum (draining to R2 in the
+//!   erasure-coded across the boxes and acked on a quorum (draining to the origin in the
 //!   background); see [`crate::ring`]. The embedded safekeeper shares that same
 //!   fragment store and peer RPC. With no ring configured, object PUT and block
 //!   FLUSH retain the synchronous origin barrier and no safekeeper starts.

@@ -20,6 +20,6 @@
   preserving leader-availability failover without retrying failed CAS writes.
 - #96: Made the self-hosted catalog gateway a prefix-free façade for SDK
   callers while preserving already-prefixed Iceberg requests. The gateway now
-  resolves a provider's warehouse prefix once and adds it exactly once, so R2
+  resolves a provider's warehouse prefix once and adds it exactly once, so the provider
   Data Catalog and Amazon S3 Tables work without exposing provider routing to
   local Tables, Graphs, or Vectors clients.
