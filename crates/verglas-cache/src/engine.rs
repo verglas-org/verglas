@@ -155,7 +155,7 @@ use crate::block::{block_len, covering_blocks, resolve_range};
 use crate::classify::{MetaClass, MetaRouter, Mutability, classify_mutability};
 use crate::counters::CacheCounters;
 use crate::demotion::{DEMOTED_GENERATION_BIT, Demotions};
-use crate::entry::{BlockEntryKey, CachedMeta};
+use crate::entry::{BlockEntryKey, CachedMeta, ObjectHeaders};
 use crate::materialized::{MaterializedPageError, MaterializedPageKey, POSTGRES_PAGE_BYTES};
 use crate::meta_store::{
     META_DISK_MIN_BYTES, META_PIPELINE_RESERVED_BYTES, MetaEntryKey, MetaStore, foyer_block_size,
@@ -1468,6 +1468,98 @@ where
         }
         self.inner.insert_block(block_key, page);
         Ok(true)
+    }
+
+    /// Converts a durable write's already-in-hand bytes directly into cache
+    /// residency, so a read-back need not pay the origin GET a cold miss
+    /// would. This is write-allocate: the caller already proved `body` is
+    /// durable at `etag` (an S3 `PUT`/`PutObject` ack); population trusts that
+    /// proof instead of re-deriving it from a fill.
+    ///
+    /// The key→ETag mapping installs immediately (through the same
+    /// [`MetaFence`]-guarded path [`Inner::admit_meta_if_fresh`] uses, so a
+    /// racing invalidation of a still-newer write cannot be undone by this
+    /// call), which is what lets a read issued right after this call resolve
+    /// the correct version with no backend HEAD. Each block, by contrast, is
+    /// queued onto a detached task and this method returns before that task
+    /// runs — mirroring the backend-fill path (#273), *not* routed through
+    /// its singleflight machinery, because there is no concurrent identical
+    /// fill to deduplicate against; the bytes are already in hand. The task
+    /// is registered against [`InFlight::size`] before it is spawned and
+    /// decrements it (notifying [`InFlight::quiesced`]) only once every block
+    /// has cleared admission, so [`HybridCacheEngine::flush`] — which already
+    /// drains `InFlight` before the disk queue — is population's residency
+    /// barrier for free, no separate barrier needed.
+    ///
+    /// Each block runs through [`Inner::admit_block`], the same
+    /// scan-resistant policy a backend fill's blocks clear (#15): a bulk
+    /// write burst is a one-touch sequence exactly like a bulk read scan, so
+    /// it is rejectable in the same way and cannot evict the working set.
+    /// Ring discipline (#17) applies per block: a block this node does not
+    /// own is offered to its rendezvous owner instead of admitted locally
+    /// (best-effort cache placement, like [`PeerFetch::store`]'s other
+    /// caller — a failure there is safe to ignore, since the object is
+    /// already durable at the origin regardless of cache placement).
+    pub async fn populate_on_write(
+        &self,
+        key: &CacheKey,
+        etag: &str,
+        body: Bytes,
+    ) -> Result<(), EngineError> {
+        let size = body.len() as u64;
+        let meta = CachedMeta {
+            size,
+            etag: etag.to_owned(),
+            last_modified: None,
+            content_type: None,
+            headers: Box::new(ObjectHeaders::default()),
+        };
+        {
+            // Fence discipline (#124), same as every other metadata admission:
+            // register before the mapping is installed so a racing
+            // invalidation of a still-newer write can fence this one off
+            // rather than being silently undone by it.
+            let guard = self.inner.fence.register(key);
+            self.inner.admit_meta_if_fresh(&guard, key, &meta);
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let key = key.clone();
+        let etag = etag.to_owned();
+        let block_bytes = self.inner.block_bytes;
+        let owner = self.inner.ring.owner(&key);
+        inner.inflight.size.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            for index in 0..size.div_ceil(block_bytes) {
+                let offset = (index * block_bytes) as usize;
+                let len = block_len(size, index, block_bytes);
+                let block = BlockKey {
+                    object: key.clone(),
+                    etag: etag.clone(),
+                    block_bytes,
+                    block_index: index,
+                };
+                let bytes = body.slice(offset..offset + len);
+                if owner == inner.node {
+                    let block_key = inner.block_entry_key(block);
+                    if inner.admit_block(&block_key, bytes.len()) {
+                        inner.insert_block(block_key, bytes);
+                    }
+                } else {
+                    // Cache placement, not durable write-back (the object is
+                    // already durable at the origin): a failure to reach the
+                    // owner just means this block is not locally cached
+                    // anywhere, which is always a correct — if slower —
+                    // outcome.
+                    let _ = inner.peers.store(owner.clone(), &block, bytes).await;
+                }
+            }
+            // Release so the flush barrier's Acquire load, once it sees this
+            // decrement, also sees every admission this task just did.
+            inner.inflight.size.fetch_sub(1, Ordering::Release);
+            inner.inflight.quiesced.notify_waiters();
+        });
+        Ok(())
     }
 
     /// Serves one block to a *peer* (#29): the exact [`BlockKey`], from this

@@ -499,3 +499,20 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   and what aborted the CI coverage run. Each now awaits engine.flush() (the
   admission barrier) before its warm-read assertions. Verified under a
   60-busy-loop CPU-contention harness: 20/20 rounds green.
+- RIME write-allocate: implemented `HybridCacheEngine::populate_on_write`,
+  converting a durable write's already-in-hand bytes directly into cache
+  residency so a read-back need not pay the origin GET a cold miss would. The
+  key->ETag mapping installs synchronously through the existing
+  `MetaFence`-guarded `admit_meta_if_fresh` path; each block is queued onto a
+  detached task, registered against `InFlight::size` before spawning, that
+  runs the same `admit_block`/`insert_block` scan-resistant admission a
+  backend fill's blocks clear (not routed through the fill singleflight
+  machinery, since there is no concurrent fill to dedup against). A block
+  this node does not own is offered to its rendezvous owner via
+  `PeerFetch::store` instead of admitted locally. `flush()` already drains
+  `InFlight` before the disk queue, so it is population's residency barrier
+  for free. Verified against the frozen evaluator
+  `crates/verglas-cache/tests/write_allocate.rs` (4/4 passing) and the full
+  `verglas-cache` suite (all green), `cargo clippy -p verglas-cache
+  --all-targets -- -D warnings` clean, `cargo fmt --all --check` unchanged by
+  this edit.
