@@ -194,11 +194,7 @@ async fn populated_write_serves_reads_with_zero_backend_requests() {
         gets, 0,
         "a populated write must serve its first read without any backend request"
     );
-    assert_eq!(
-        engine.counters().snapshot().backend_fills,
-        0,
-        "no fill ran"
-    );
+    assert_eq!(engine.counters().snapshot().backend_fills, 0, "no fill ran");
 }
 
 /// Gate 1b: population is keyed to the durable write. A read of a DIFFERENT
@@ -237,7 +233,12 @@ async fn bulk_write_population_does_not_evict_the_working_set() {
 
     // Warm a 6-object read working set (48 MiB, half the disk budget).
     let working_set: Vec<(String, Bytes)> = (0..6)
-        .map(|i| (format!("ws-{i}.parquet"), pattern(700 + i, TEST_BLOCK_BYTES)))
+        .map(|i| {
+            (
+                format!("ws-{i}.parquet"),
+                pattern(700 + i, TEST_BLOCK_BYTES),
+            )
+        })
         .collect();
     for (name, body) in &working_set {
         origin_put(&store, name, body).await;
