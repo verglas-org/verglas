@@ -21,6 +21,9 @@ arrow-schema.workspace = true
 arrow-csv.workspace = true
 arrow-json.workspace = true
 arrow-cast.workspace = true
+# Durable on-disk encoding for the async-ingest write-ahead log
+# (`async_ingest`): one Arrow IPC stream per journaled request.
+arrow-ipc.workspace = true
 parquet.workspace = true
 uuid.workspace = true
 futures.workspace = true

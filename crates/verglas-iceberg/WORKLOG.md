@@ -148,3 +148,20 @@
   its key-metadata argument, `ManifestListWriter` takes a `FileWrite`, and
   the storage delegate implements the new `delete_stream`. Upstream now has
   `expire_snapshots`; `from_parts` remains only for the REPLACE commit.
+
+- RIME ingest-perf-journal: added `async_ingest`, the `mode=append` async-ack
+  path. Rows are validated against the target schema and fsynced to a local
+  write-ahead log (Arrow IPC stream files, atomic write-rename-fsync) before
+  the ack returns; a background task coalesces everything queued for a table
+  into one Iceberg CAS commit. `AsyncIngestQueue::replay` recovers
+  journaled-but-uncommitted rows after a restart. This is a bounded
+  in-process commit-coalescing queue with local-disk durability, not the
+  consensus-admitted write-back journal in `verglas-writeback` — see the
+  module's doc comment for the exact durability level and the narrow
+  duplicate-row window a crash mid-cleanup leaves. `write::coerce_batches`
+  is now `pub(crate)` so the async path reuses the same schema-coercion
+  logic as the synchronous append path instead of duplicating it. New
+  hermetic tests in `tests/async_ingest.rs` cover: ack-then-eventual-commit,
+  coalescing several acks into one commit, synchronous schema rejection,
+  the synchronous commit path's immediate snapshot id, and replay after a
+  simulated restart.

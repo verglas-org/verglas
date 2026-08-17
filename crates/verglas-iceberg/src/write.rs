@@ -434,7 +434,7 @@ async fn write_data_files(
 /// table does not have, a table column the source lacks, or a type that cannot
 /// be cast is a [`AgentError::SchemaMismatch`] naming the column — the append is
 /// rejected before any data file is written.
-fn coerce_batches(
+pub(crate) fn coerce_batches(
     batches: &[RecordBatch],
     target: &Arc<ArrowSchema>,
     table_name: &str,

@@ -78,6 +78,12 @@ pub enum AgentError {
     /// not be built or committed.
     #[error("compaction failed: {0}")]
     Compaction(String),
+
+    /// The async-ingest write-ahead log could not be written, fsynced, read,
+    /// or decoded. This is a local-disk durability failure, not a schema or
+    /// catalog error.
+    #[error("async ingest journal: {0}")]
+    AsyncIngest(String),
 }
 
 /// The crate's result alias.

@@ -18,6 +18,10 @@
 //! - [`storage`]: the fixed-part S3 storage factory (fixed-part multipart uploads for strict S3-compatible stores).
 //! - [`ingest`]: read a CSV / JSONL / Parquet source into Arrow batches with an
 //!   inferred schema.
+//! - [`async_ingest`]: the `mode=append` async-ack path — validate and
+//!   durably journal rows to local disk, ack, and commit them for real in a
+//!   coalescing background task. See its module docs for the exact
+//!   durability level (not the consensus-admitted write-back journal).
 //! - [`write`]: create tables and append data (schema-checked, CAS commit).
 //! - [`inspect`]: list, show, and history.
 //! - [`query`]: embedded SQL with optional time travel.
@@ -33,6 +37,7 @@
 //! - [`report`]: the stable `--output json` result data shapes (the CLI renders
 //!   the human-readable forms).
 
+pub mod async_ingest;
 pub mod catalog;
 pub mod compaction;
 pub mod conn;
@@ -48,6 +53,7 @@ pub mod storage;
 pub mod tables_api;
 pub mod write;
 
+pub use async_ingest::AsyncIngestQueue;
 pub use compaction::{
     CompactReport, CompactionOptions, CompactionReport, OrphanReport, cleanup_orphans,
     compact_table, compact_table_once, run_compaction, undersized_file_count,

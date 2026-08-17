@@ -302,3 +302,16 @@
   and republishes the ceiling immediately; drain releases grow the cache
   back beyond live fragments plus the floor. No filesystem watching — the
   disk is dedicated and fixed-size, so the budget is the only bound.
+
+- RIME ingest-perf-journal: `POST /v1/ingest/{name}?mode=append` now acks
+  after durable local-disk journaling instead of waiting for the Iceberg
+  commit, cutting warm NDJSON append latency (the synchronous CAS commit was
+  ~20 sequential ops, 1.6-2.1s on the lite topology). `wait=true` or
+  `commit=sync` keeps the old synchronous behavior and still returns the
+  committed snapshot id; an `idempotency-key` header always forces the
+  synchronous path (duplicate detection reads a committed snapshot's
+  summary, which an uncommitted async ack does not have). `TableState` now
+  opens `verglas_iceberg::AsyncIngestQueue` over `cache.dir/async-ingest`
+  and replays it once, lazily, the first time an async ingest request needs
+  the catalog. `TableState::new` gained the WAL directory parameter and is
+  now fallible.

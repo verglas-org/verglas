@@ -554,11 +554,18 @@ pub async fn run(
             bucket: config.backend.bucket.clone(),
             access_key_id: Some(credentials.0.clone()),
         };
+        let table_state = match crate::tables_api::TableState::new(
+            connection,
+            config.cache.dir.join("async-ingest"),
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(format!("open async-ingest queue: {error}").into());
+            }
+        };
         admin_app = admin_app
             .merge(admin::access_router(access))
-            .merge(crate::tables_api::router(
-                crate::tables_api::TableState::new(connection),
-            ));
+            .merge(crate::tables_api::router(table_state));
     }
     let authoritative_stop = safekeeper_args
         .as_ref()
