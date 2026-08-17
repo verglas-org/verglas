@@ -379,7 +379,11 @@ async fn flush_acks_on_quorum_not_on_origin() {
         .expect("flush acks despite the origin being down");
 
     // The ack landed even though the origin cannot serve a single PUT.
-    assert_eq!(flaky.latest_version("dev"), None, "no manifest reached the origin");
+    assert_eq!(
+        flaky.latest_version("dev"),
+        None,
+        "no manifest reached the origin"
+    );
     // RS(2,1) over 3 nodes: each node holds exactly one data/parity fragment plus
     // a full descriptor copy (the sentinel index).
     for n in nodes {
@@ -456,7 +460,10 @@ async fn originator_crash_peer_reconstructs_and_drains_exactly_once() {
         Some(1),
         "peer completed the origin barrier"
     );
-    assert!(flaky.has(&chunk_key), "the flushed chunk reached the origin");
+    assert!(
+        flaky.has(&chunk_key),
+        "the flushed chunk reached the origin"
+    );
 
     // Exactly once: another pass (or the same one again) never advances the
     // version, and the ring holds have been released.
