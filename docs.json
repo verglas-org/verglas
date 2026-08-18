@@ -15,8 +15,7 @@
         "icon": "rocket",
         "pages": [
           "docs/index",
-          "docs/get-started/self-host",
-          "docs/get-started/first-table"
+          "docs/get-started/self-host"
         ]
       },
       {
@@ -28,16 +27,6 @@
           "docs/workers/http",
           "docs/workers/cron",
           "docs/workers/cloudevents"
-        ]
-      },
-      {
-        "group": "Platform",
-        "icon": "database",
-        "pages": [
-          "docs/platform/databases",
-          "docs/platform/secrets",
-          "docs/platform/security",
-          "docs/platform/kv"
         ]
       },
       {
@@ -55,14 +44,9 @@
         ]
       },
       {
-        "group": "SDKs",
-        "icon": "code-2",
+        "group": "Reference",
+        "icon": "book",
         "pages": [
-          "docs/sdk/overview",
-          "docs/sdk/http",
-          "docs/sdk/cli",
-          "docs/sdk/typescript",
-          "docs/sdk/rust",
           "docs/reference/semantic-api"
         ]
       }
