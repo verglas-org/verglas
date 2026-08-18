@@ -526,3 +526,13 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `under_pressure()` permanently true and every later fill was rejected
   against blocks that no longer existed. Metadata stores are untouched by
   reclamation (gated).
+- Made the metadata-isolation test deterministic. It sampled the backend-GET
+  counter immediately after the data scan, while that scan's detached
+  look-ahead fills were still landing, so the metadata re-read assertion
+  raced the scan's own tail — an off-by-one that only appeared under CI
+  contention. The warm phase and the scan now each end with the flush
+  barrier, and the comment claiming the metadata working set fits the meta
+  store's DRAM front is corrected (1.5 MiB against a 1.2 MiB front: it spans
+  DRAM and NVMe by design, which is the stronger isolation test).
+  Reproduced the failure locally under 100 busy-loop hogs (2/12 rounds),
+  then 0/16 rounds with the barriers.

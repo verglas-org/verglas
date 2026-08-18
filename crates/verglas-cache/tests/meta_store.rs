@@ -134,9 +134,13 @@ async fn read_all(engine: &Engine, k: &CacheKey, range: ReadRange) -> (Range<u64
 async fn data_scan_pressure_never_evicts_pinned_metadata() {
     let dir = TempDir::new().expect("temp dir");
     // Admission OFF so the scan genuinely fills and evicts the data tier. The
-    // DRAM is sized so the metadata working set (~1.5 MiB) fits the meta store
-    // comfortably — the only way it can lose an entry is data pressure, which is
-    // exactly what this test forbids.
+    // metadata working set (~1.5 MiB) is deliberately larger than the meta
+    // store's DRAM front (5% of the block DRAM, less its own write pipeline),
+    // so it spans the pinned store's DRAM *and* NVMe tiers — a stronger
+    // isolation test than a DRAM-only set. The warm phase therefore ends with
+    // a flush: an entry whose NVMe write is still queued when the scan starts
+    // is not yet stored, and losing it would report as an eviction this test
+    // forbids when it is really a missing durability barrier.
     let (store, engine, calls) = engine(&dir, 128 * MIB, 48 * MIB, false).await;
 
     // Warm 6 metadata objects (metadata.json + manifests) into the pinned
@@ -163,6 +167,11 @@ async fn data_scan_pressure_never_evicts_pinned_metadata() {
         assert_eq!(&got, body);
     }
 
+    // Durability barrier: every metadata entry is admitted and its disk write
+    // drained before any data pressure exists. Without this the scan races the
+    // meta store's queued writes.
+    engine.flush().await;
+
     let before = engine.counters().snapshot();
     let (gets_before, _) = (calls.gets.load(Ordering::Relaxed), 0);
 
@@ -175,6 +184,12 @@ async fn data_scan_pressure_never_evicts_pinned_metadata() {
         let (_, got) = read_all(&engine, &key(&name), ReadRange::Full).await;
         assert_eq!(got.len(), body.len(), "scan bytes served");
     }
+
+    // Second barrier: a multi-block scan read leaves look-ahead fills detached,
+    // so the backend-GET counter is still moving when the loop ends. Sampling
+    // it before those drain makes the metadata assertion below race the scan's
+    // own tail — the off-by-one this test used to flake on.
+    engine.flush().await;
 
     let gets_after_scan = calls.gets.load(Ordering::Relaxed);
     assert!(
