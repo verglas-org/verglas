@@ -5,9 +5,10 @@ icon: "snowflake"
 ---
 
 Verglas is the lakehouse runtime: an Iceberg-native statekeeper that makes data
-on object storage live. Query engines talk to its S3 endpoint, while your
-object store and Iceberg catalog stay authoritative. Turn Verglas off and your
-lakehouse still works — just slower.
+on object storage live. Query engines talk to its S3 endpoint. Against a bucket
+you already own, Verglas accelerates reads and writes through to your object
+store. Against a bucket Verglas manages, it owns the object layout and serves
+every read.
 
 ## Install the CLI
 

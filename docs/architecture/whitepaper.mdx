@@ -235,7 +235,7 @@ The server runs as a container. Self-hosted deployments use the published Docker
 
 Six requirements constrain the design.
 
-1. **Open durable output.** Verglas does not replace Iceberg objects with a proprietary table representation. Data, manifests, and metadata files drain to ordinary object storage. A deliberate detach first fences new mutations, archives committed WAL, exports and checkpoints the managed catalog, and then redirects clients; after that drain, the lakehouse remains standard Iceberg. Abruptly destroying a quorum while acknowledged state is not yet archived is data loss, not a supported turn-off path.
+1. **Open durable output.** Verglas does not replace Iceberg objects with a proprietary table representation. Data, manifests, and metadata files drain to ordinary object storage. A deliberate detach first fences new mutations, archives committed WAL, exports and checkpoints the managed catalog, and then redirects clients; after that drain, the lakehouse remains standard Iceberg. Abruptly destroying a quorum while acknowledged state is not yet archived is data loss, not a supported way to stop.
 2. **Version-specific reads.** Cached blocks are identified by object ETag, bucket, key, block geometry, and block index. A mutable read spanning multiple blocks commits to one ETag before streaming, so a response cannot combine cached bytes from one object version with origin bytes from another.
 3. **Shared acceleration.** Cache state belongs to the Verglas nodes rather than to a query-engine process. Any S3 client using the endpoint can reuse blocks populated by another client. Cluster ownership distributes the cache across nodes while preserving a backend path for every miss.
 4. **Bounded resource use.** DRAM, NVMe, metadata, and write-back fragment capacity are configured as ceilings. Admission and background warming operate within those budgets. Property tests exercise the DRAM and disk ceilings under randomized workloads.
@@ -460,13 +460,13 @@ sequenceDiagram
 
 The request identity makes retries exact. Repeating an identity with the same group, command, payload hash, and writer epoch returns the original result. Reusing it for different content fails closed. An ingress cannot manufacture success: client-visible success includes the committed group index and is produced only after the state machine applies the command.
 
-### 6.2 Degraded operation, repair, and archive
+### 6.2 Degraded operation and repair
 
 If the coded write threshold cannot be reached but a Raft majority remains, the leader proposes a complete-entry representation to that majority. This is a committed storage-mode decision, not an origin-write fallback. If no majority exists, no managed mutation is acknowledged. A partitioned minority may continue serving immutable origin-backed cache reads, but it refuses catalog writes, WAL writes, and linearizable reads.
 
 Each representation carries a checksum, and the replicated header carries the logical payload hash. Reconstruction verifies both before applying an entry. Corrupt or missing fragments are erasures. Repair runs from committed placement metadata, reconstructs only from verified fragments, and writes replacement fragments under the same logical entry hash. Compaction may rewrite the physical representation after a new safe representation is durable, but cannot change the logical log entry.
 
-Committed immutable object bodies, complete WAL segments, and catalog checkpoints drain to object storage in the background. An uploader first makes the object visible and verifies its identity, then proposes an `ArchiveCheckpoint` command. Only application of that committed command permits log truncation or release of the last reconstructable local representation. Origin failure therefore consumes the configured dirty-state budget and eventually applies backpressure; it never permits unsafe eviction or an acknowledgment from RAM.
+Committed immutable object bodies, complete WAL segments, and catalog checkpoints drain to object storage behind the acknowledgment, through the offload path of §6.6. Origin failure consumes the configured dirty-state budget and eventually applies backpressure; it never permits unsafe eviction or an acknowledgment from RAM.
 
 ### 6.3 Authoritative Iceberg catalog
 
@@ -487,6 +487,30 @@ Pageservers read the committed stream through any ingress. A read carries an LSN
 ### 6.5 Safety evaluation
 
 Deterministic model tests enumerate elections, partitions, message reordering, duplicate requests, fragment loss, corrupt fragments, joint membership, and crashes between every persistence and acknowledgment boundary. Integration tests use several independent ingresses and kill leaders during concurrent WAL and catalog writes. Required assertions are: one committed value per group index; every committed coded entry reconstructable by every legal successor quorum; no stale writer acknowledgment; no catalog requirement evaluated against stale state; no linearizable read below its fence; and no truncation beyond a committed archive checkpoint. Performance measurements report foreground acknowledgment latency, encoded bytes per logical byte, recovery time, and throughput per independent group, but no performance result can override a safety failure.
+
+### 6.6 Offload
+
+Offload is one streaming engine shared by immutable object bodies, WAL segments, and catalog checkpoints. A stream accumulates durably staged units and flushes when accumulated bytes reach its size limit or when a caller drains it explicitly. An uploader makes the flushed object visible and verifies its identity, then proposes the committed record for it. Only application of that committed record permits log truncation or release of the last reconstructable local representation.
+
+The three uses differ in three policy values and nothing else: how a flush unit is named and given its idempotent request identity, whether committed records must advance monotonically, and whether a new record supersedes its predecessor fully, partially, or never. WAL requires monotonic records and never supersedes. A catalog checkpoint supersedes its predecessor entirely and does not accumulate, because its export reads applied state directly. Object groups carry no ordering requirement and supersede partially, leaving dead space that a repack reclaims.
+
+Grouping is what makes small writes cheap. An object below the stream's size limit accumulates, so one flush writes many logical objects as a single origin object, and a committed index maps each logical key to its group object, offset, and length. An object above the limit bypasses accumulation and streams to the origin as it is written, so a large write never waits behind a buffer.
+
+Offload uses the whole cluster. Fragments are already distributed across the voter set, so each flush unit is assigned to a node deterministically from its identity, preferring a node that already holds fragments for that unit. Uploads proceed concurrently under a per-node bound, and the group leader remains authoritative for the committed record without carrying the bytes. A unit whose assigned node leaves the live set is reassigned by the same function, and uploads are idempotent, so a brief overlap during reconfiguration still commits one unit.
+
+Offload never materializes a second copy. The offloader receives fragment references rather than bytes, streams the group object from them, uploads it, inserts the decoded bytes into the cache when admission accepts them, and only then releases the fragments. The decode runs once and feeds both consumers. Releasing fragments before the cache insert would make a just-written object cost an origin fetch, so the order is load-bearing; admission rejection under budget pressure is a normal result and does not fail the offload.
+
+Compaction runs before offload rather than after. Grouping reduces origin request count; compaction reduces the number of data files a query plans and reads, which grouping does not change because logical files remain separate inside a group object. Compacting after grouping would leave the group object immediately dead. Since acknowledged data files are staged but not yet persisted, a table over its compaction threshold has its buffered files rewritten first, and the rewritten files exceed the size limit and stream out directly. Files superseded by that rewrite never upload. Grouping then serves what remains genuinely small: manifests, manifest lists, metadata pointers, and delete files.
+
+### 6.7 Managed and customer bindings
+
+A storage binding is either customer-owned or managed, and the two carry different obligations.
+
+A customer binding preserves the customer's object layout, and readers may reach the bucket without Verglas. A table commit against such a binding therefore waits for its referenced data files to reach the origin before it publishes, because a direct reader that followed the catalog would otherwise find a table pointing at absent files.
+
+A managed binding has no direct reader. Verglas owns its object layout, serves every read of it, and returns an acknowledged object from its staged fragments or its group object before the origin has it. The wait is therefore unnecessary, and a commit against a managed binding publishes on the quorum acknowledgment. Grouping and pre-offload compaction apply only to managed bindings, since both change the origin layout.
+
+Leaving a managed binding is an explicit detach, not a shutdown: fence new mutations, archive committed WAL, export and checkpoint the managed catalog, drain buffered objects, then redirect clients. After that drain the result is standard Iceberg in ordinary object storage.
 
 ---
 
@@ -574,7 +598,7 @@ The hosted scheduler owns durable triggers, jobs, and leases but never executes 
 
 Local I/O routes through the server's own S3 surface — the cache. This is a wiring property, not a code dependency: the engine reads and writes through whatever storage endpoint it is given, and the server hands it its own. Two guarantees follow. First, residency: every read and write a workload makes populates the cache as a side effect, so the tables an operator's workloads touch are precisely the tables the cache keeps warm. Second, ownership: the §4 ring routes below the engine, so no user or harness code path can assume a key is locally owned. A clean detach preserves portability by draining objects and exporting the catalog as described in §3.2; destroying the authoritative quorum before that fence is not equivalent to disabling a disposable read cache.
 
-Client-side ingest follows the same wiring. The SDK is a standard Iceberg client: `table create`/`append` infer an Arrow schema from the source file, write Parquet data files through the configured S3 endpoint using catalog-vended credentials, and commit an append snapshot through the Iceberg REST catalog's optimistic concurrency. No server-side ingest route exists; a table write succeeds with the runtime node stopped, because the catalog and object store — not Verglas — own the commit (the turn-off invariant applied to writes).
+Client-side ingest follows the same wiring. The SDK is a standard Iceberg client: `table create`/`append` infer an Arrow schema from the source file, write Parquet data files through the configured S3 endpoint using catalog-vended credentials, and commit an append snapshot through the Iceberg REST catalog's optimistic concurrency. No server-side ingest route exists. Against a customer binding the commit belongs to the catalog and object store, so a table write succeeds with the runtime node stopped. Against a managed binding the commit belongs to Verglas, and the acknowledged objects reach the origin through the offload path of §6.
 
 ### 7.7 Sockets on hibernating edge objects
 
