@@ -46,3 +46,16 @@
 - Removed the Kv and Queue client surface (classes, verbs, types, exports,
   tests, README section) until further notice, before the first npm publish
   freezes the package surface. Subscriptions and change feeds are unaffected.
+- Added `src/data.ts`: the /v0 data client (`createDataClient`) speaking the
+  /v0 data surface natively — one append-ingest shape (NDJSON to
+  `POST /v0/events?name=<datasource>`) for table writes, vector writes, and
+  log shipping, plus SQL through `POST /v0/sql`. Moved `control.ts`'s worker
+  methods off the retired `/v1/workers` route onto `/v0/workers`. Deleted
+  `VerglasAccessClient` (`/v1/databases` CRUD, `/v1/access/tokens`,
+  `/v1/access/database-tokens`, `/v1/access/authorize`), `VerglasAdminClient`
+  (its one method queried the same dead `/v1/databases` surface), and
+  `VerglasRuntimeClient` (`/v1/vessels`) — the retired tenant-local
+  access-service/vessel era. `listWorkerJobs`/`getJob`/`JobSummary` were
+  dropped with them: the old per-worker job history route has no /v0
+  equivalent, and guessing at one was out of scope. `databasePathSegment`
+  (only used by the deleted admin query) came out of `http.ts` too.

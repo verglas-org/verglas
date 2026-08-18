@@ -16,35 +16,18 @@ export { S3VectorsClient, VerglasGraphsClient } from "./semantic";
 export type { SemanticDocument, SigV4Credentials } from "./semantic";
 export type * from "./semantic-types";
 export {
-  connectAccess,
-  connectAdmin,
-  connectRuntime,
   connectScheduler,
   extractWorkerSource,
-  VerglasAccessClient,
-  VerglasAdminClient,
-  VerglasRuntimeClient,
   VerglasSchedulerClient,
 } from "./control";
 export type {
-  AccessAction,
-  AccessAuthorization,
-  AccessAuthorizationRequest,
-  AccessDecision,
-  AccessIdentity,
-  AccessTokenGrant,
-  AccessTokenSummary,
   ControlConnectOptions,
-  CreateAccessTokenRequest,
-  CreateDatabaseTokenRequest,
-  CreateDatabaseRequest,
-  DatabaseAccessToken,
-  DatabaseView,
-  JobSummary,
-  MintedAccessToken,
   WorkerRow,
   WorkerSpec,
 } from "./control";
+
+export { createDataClient } from "./data";
+export type { DataClient, DataClientOptions, IngestResult } from "./data";
 
 export { defineWorker, runWorker } from "./contracts";
 export type {

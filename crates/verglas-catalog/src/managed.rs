@@ -48,6 +48,22 @@ pub enum ManagedCatalogResponse {
     Records(Vec<(String, String)>),
 }
 
+/// Additional same-ingress attempts a `retryable` failure gets once every
+/// configured ingress has had one try. A stateless Lakekeeper instance often
+/// has exactly one ingress (its own node's loopback safekeeper — the prod
+/// contract mirrored by `scripts/local-lite.sh`'s ring topology: every
+/// instance's ingress list names ONLY its own node, no cross-node failover
+/// list). With one ingress, "try the next one" never applies, so a 503
+/// ("reached no currently serving leader," see [`retryable`]) would
+/// otherwise have zero recovery path — including the ordinary case of a
+/// leader momentarily busy with a concurrent commit from the same process.
+const EXTRA_RETRIES: usize = 2;
+
+/// Backoff between same-ingress retries. Short: the condition this recovers
+/// from (a leader busy with one other in-flight commit) normally clears in
+/// low hundreds of milliseconds, not seconds.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// HTTP client used by the Lakekeeper REST/domain adapter.
 pub struct ManagedCatalogClient {
     endpoints: Vec<String>,
@@ -96,12 +112,28 @@ impl ManagedCatalogClient {
     }
 
     /// Sends one request and fails closed on non-success or malformed responses.
+    ///
+    /// Tries every configured ingress once (deterministic failover order),
+    /// then — only for a `retryable` failure — keeps retrying the same
+    /// rotation for [`EXTRA_RETRIES`] more rounds with a short backoff. This
+    /// is what makes a single-ingress client (see [`EXTRA_RETRIES`]'s doc)
+    /// resilient to a transient "no currently serving leader" at all: with
+    /// one ingress the first loop pass is also the last one, so without the
+    /// extra rounds a single 503 would be immediately fatal.
     pub async fn execute(
         &self,
         request: &ManagedCatalogRequest,
     ) -> Result<ManagedCatalogResponse, ManagedCatalogError> {
         let body = serde_json::to_vec(request).map_err(ManagedCatalogError::Encoding)?;
-        for (index, endpoint) in self.endpoints.iter().enumerate() {
+        // `with_ingresses` rejects an empty endpoint list at construction, so
+        // `self.endpoints` is never empty here.
+        let total_attempts = self.endpoints.len() * (1 + EXTRA_RETRIES);
+        let mut last_error = None;
+        for attempt in 0..total_attempts {
+            if attempt >= self.endpoints.len() {
+                tokio::time::sleep(RETRY_BACKOFF).await;
+            }
+            let endpoint = &self.endpoints[attempt % self.endpoints.len()];
             let response = self
                 .http
                 .post(self.request_endpoint(endpoint))
@@ -113,22 +145,19 @@ impl ManagedCatalogClient {
                 Ok(response) if response.status().is_success() => {
                     return response.json().await.map_err(ManagedCatalogError::Http);
                 }
-                Ok(response)
-                    if retryable(response.status()) && index + 1 < self.endpoints.len() =>
-                {
-                    continue;
-                }
                 Ok(response) if response.status() == reqwest::StatusCode::CONFLICT => {
                     return Err(ManagedCatalogError::Conflict);
+                }
+                Ok(response) if retryable(response.status()) => {
+                    last_error = Some(ManagedCatalogError::Rejected(response.status().as_u16()));
                 }
                 Ok(response) => {
                     return Err(ManagedCatalogError::Rejected(response.status().as_u16()));
                 }
-                Err(_error) if index + 1 < self.endpoints.len() => continue,
-                Err(error) => return Err(ManagedCatalogError::Http(error)),
+                Err(error) => last_error = Some(ManagedCatalogError::Http(error)),
             }
         }
-        Err(ManagedCatalogError::NoIngresses)
+        Err(last_error.unwrap_or(ManagedCatalogError::NoIngresses))
     }
 
     /// Builds the tenant-rooted warehouse route used by every catalog operation.
@@ -154,6 +183,7 @@ fn retryable(status: reqwest::StatusCode) -> bool {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post};
     use tokio::sync::Mutex;
@@ -217,6 +247,73 @@ mod tests {
         assert!(matches!(result, Err(super::ManagedCatalogError::Conflict)));
         assert!(!first.lock().await.is_empty());
         assert!(second.lock().await.is_empty());
+    }
+
+    /// A single-ingress client (the stateless-Lakekeeper contract: every
+    /// instance's ingress list names only its own node) recovers from a
+    /// transient leader-busy 503 by retrying the SAME ingress — there is no
+    /// "next" one to fail over to.
+    #[tokio::test]
+    async fn single_ingress_retries_past_a_transient_service_unavailable() {
+        let addr = serve_recovering_after(1).await;
+        let client = ManagedCatalogClient::new(format!("http://{addr}"), "tenant", "warehouse");
+        assert_eq!(
+            client
+                .execute(&ManagedCatalogRequest::Namespaces)
+                .await
+                .expect("retries past the single transient 503"),
+            ManagedCatalogResponse::Namespaces(vec![])
+        );
+    }
+
+    /// A single ingress failing on every attempt exhausts the retry budget
+    /// and reports the failure instead of hanging or retrying forever.
+    #[tokio::test]
+    async fn single_ingress_exhausts_retries_on_sustained_unavailability() {
+        let addr = serve(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let client = ManagedCatalogClient::new(format!("http://{addr}"), "tenant", "warehouse");
+        let result = client.execute(&ManagedCatalogRequest::Namespaces).await;
+        assert!(matches!(
+            result,
+            Err(super::ManagedCatalogError::Rejected(503))
+        ));
+    }
+
+    /// Starts one loopback ingress that answers 503 for its first `fail_times`
+    /// requests, then 200 forever after — a leader that is momentarily busy
+    /// with one other in-flight commit and then free.
+    async fn serve_recovering_after(fail_times: usize) -> std::net::SocketAddr {
+        async fn handler(
+            State((calls, fail_times)): State<(Arc<AtomicUsize>, usize)>,
+            _body: Bytes,
+        ) -> (StatusCode, &'static str) {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            let status = if call < fail_times {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::OK
+            };
+            (status, "{\"Namespaces\":[]}")
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                Router::new()
+                    .route("/catalog/v1/{tenant}/{warehouse}", post(handler))
+                    .with_state((calls, fail_times)),
+            )
+            .await;
+        });
+        address
     }
 
     /// Starts one loopback ingress and captures its unmodified request body.

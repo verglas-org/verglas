@@ -1,171 +1,102 @@
-//! Creates Lakekeeper-managed lakehouse resources through the server's
-//! database API. The MVP supports exactly one database shape (#146); this
-//! command only validates and serializes intent, and the server resolves
-//! scoped secrets and persists immutable binding identities.
+//! `verglas lakehouse` — the control plane's tenant-scoped Iceberg warehouse
+//! surface (`/v1/lakehouses`): list this deployment's lakehouses or create one,
+//! managed or on the caller's own S3 bucket.
 
-use reqwest::Url;
-use serde::Serialize;
+use std::error::Error;
+
+use serde_json::{Value, json};
 
 use crate::cli::{LakehouseCommand, LakehouseCreateArgs};
 
-/// Request sent to the local database resource API. The wire shape keeps the
-/// explicit `type` tag so the server needs no default database kind.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum CreateLakehouseRequest {
-    /// An Iceberg Lakehouse with explicit storage and catalog ownership.
-    Lakehouse {
-        /// Stable lakehouse name.
-        name: String,
-        /// Storage selection resolved by the server.
-        storage: StorageRequest,
-        /// Catalog selection resolved by the server.
-        catalog: CatalogRequest,
-    },
-}
-
-/// Lakehouse storage selection.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "mode", rename_all = "kebab-case")]
-enum StorageRequest {
-    /// Verglas-managed object storage.
-    Managed,
-    /// Customer storage selected through longest-scope secret resolution.
-    ScopedSecret {
-        /// S3 prefix whose authorized secret must be bound.
-        data_path: String,
-    },
-}
-
-/// Lakehouse catalog selection.
-#[derive(Debug, Clone, Serialize)]
-#[serde(tag = "mode", rename_all = "kebab-case")]
-enum CatalogRequest {
-    /// A managed Lakekeeper warehouse.
-    ManagedLakekeeper,
-    /// A customer Iceberg REST service selected through a scoped secret.
-    External {
-        /// Catalog base URI.
-        uri: String,
-        /// Warehouse name within that catalog.
-        warehouse: String,
-    },
-}
-
-/// Runs one lakehouse command against the selected local server.
+/// Dispatches `verglas lakehouse` against the control plane.
 pub async fn run(
     command: LakehouseCommand,
     endpoint: &str,
     token: Option<&str>,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    json_output: bool,
+) -> Result<(), Box<dyn Error>> {
+    let tenant =
+        crate::connection_profile::tenant_id().ok_or("not signed in; run `verglas login`")?;
     match command {
-        LakehouseCommand::Create(args) => create(endpoint, token, args, json).await,
-    }
-}
-
-/// Creates one lakehouse from validated CLI arguments.
-async fn create(
-    endpoint: &str,
-    token: Option<&str>,
-    args: LakehouseCreateArgs,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    validate_name(&args.name)?;
-    let name = args.name.clone();
-    let request = request_from_args(args)?;
-    let response = post_json(endpoint, "/v1/databases", token, &request).await?;
-    if json {
-        println!("{}", serde_json::to_string(&response)?);
-    } else {
-        println!("created lakehouse {name}");
-    }
-    Ok(())
-}
-
-/// Converts CLI arguments into one unambiguous lakehouse composition.
-fn request_from_args(
-    args: LakehouseCreateArgs,
-) -> Result<CreateLakehouseRequest, Box<dyn std::error::Error>> {
-    let storage = match args.data_path {
-        Some(data_path) => {
-            validate_uri(&data_path, &["s3"], "data path")?;
-            StorageRequest::ScopedSecret { data_path }
-        }
-        None => StorageRequest::Managed,
-    };
-    let catalog = match (args.catalog, args.warehouse) {
-        (None, None) => CatalogRequest::ManagedLakekeeper,
-        (Some(uri), Some(warehouse)) => {
-            if matches!(&storage, StorageRequest::Managed) {
-                return Err("an external catalog requires --data-path".into());
+        LakehouseCommand::List => {
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let tenant = tenant.clone();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server
+                        .get(&format!("/v1/lakehouses?tenant_id={tenant}"))
+                        .await
+                }
+            })
+            .await?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                return Ok(());
             }
-            validate_uri(&uri, &["http", "https"], "catalog")?;
-            if warehouse.trim().is_empty() {
-                return Err("warehouse must not be empty".into());
+            let rows = response["lakehouses"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            for row in rows {
+                println!(
+                    "{}\t{}",
+                    row["name"].as_str().unwrap_or("-"),
+                    row["storage"]["mode"].as_str().unwrap_or("-"),
+                );
             }
-            CatalogRequest::External { uri, warehouse }
+            Ok(())
         }
-        (Some(_), None) => return Err("--catalog requires --warehouse".into()),
-        (None, Some(_)) => return Err("--warehouse requires --catalog".into()),
-    };
-    Ok(CreateLakehouseRequest::Lakehouse {
-        name: args.name,
-        storage,
-        catalog,
-    })
-}
-
-/// Rejects names that cannot be stable local resource identifiers.
-fn validate_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let mut characters = name.chars();
-    let Some(first) = characters.next() else {
-        return Err("resource name must not be empty".into());
-    };
-    if !(first.is_ascii_alphabetic() || first == '_')
-        || !characters.all(|character| {
-            character.is_ascii_alphanumeric() || character == '_' || character == '-'
-        })
-    {
-        return Err("resource name must start with a letter or underscore and contain only ASCII letters, digits, underscores, or hyphens".into());
-    }
-    Ok(())
-}
-
-/// Validates a binding URI against its allowed schemes and required authority.
-fn validate_uri(
-    value: &str,
-    schemes: &[&str],
-    label: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let parsed = Url::parse(value).map_err(|error| format!("invalid {label} URI: {error}"))?;
-    if !schemes.contains(&parsed.scheme()) || parsed.host_str().is_none() {
-        return Err(format!("{label} must be an absolute {} URI", schemes.join(" or ")).into());
-    }
-    Ok(())
-}
-
-/// Sends a typed create request and returns the server's JSON response. A
-/// 401 fails loud through `auth::cloud_call` with guidance to re-run
-/// `verglas login`; there is no refresh.
-async fn post_json(
-    endpoint: &str,
-    path: &str,
-    token: Option<&str>,
-    body: &CreateLakehouseRequest,
-) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let url = Url::parse(endpoint)?.join(path)?;
-    let response = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
-        let url = url.clone();
-        let body = body.clone();
-        async move {
-            let mut request = reqwest::Client::new().post(url).json(&body);
-            if let Some(bearer) = bearer {
-                request = request.bearer_auth(bearer);
+        LakehouseCommand::Create(args) => {
+            let storage = storage_body(&args)?;
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let body = json!({ "tenant_id": tenant, "name": args.name, "storage": storage });
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.post_json("/v1/lakehouses", &body).await
+                }
+            })
+            .await?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!("Created lakehouse {}.", args.name);
             }
-            request.send().await?.error_for_status()?.json().await
+            Ok(())
         }
-    })
-    .await?;
-    Ok(response)
+    }
+}
+
+/// Builds the create request's storage object: managed by default, or an
+/// external-s3 profile when `--data-path` names the caller's bucket. The
+/// bucket credentials come from the environment, never argv.
+fn storage_body(args: &LakehouseCreateArgs) -> Result<Value, Box<dyn Error>> {
+    let Some(data_path) = args.data_path.as_deref() else {
+        return Ok(json!({ "mode": "managed" }));
+    };
+    let rest = data_path
+        .strip_prefix("s3://")
+        .ok_or("--data-path must look like s3://bucket/prefix")?;
+    let (bucket, key_prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() {
+        return Err("--data-path must name a bucket".into());
+    }
+    let access_key_id = std::env::var("VERGLAS_STORAGE_ACCESS_KEY_ID")
+        .map_err(|_| "set VERGLAS_STORAGE_ACCESS_KEY_ID for --data-path")?;
+    let secret_access_key = std::env::var("VERGLAS_STORAGE_SECRET_ACCESS_KEY")
+        .map_err(|_| "set VERGLAS_STORAGE_SECRET_ACCESS_KEY for --data-path")?;
+    let mut profile = json!({
+        "bucket": bucket,
+        "key_prefix": key_prefix,
+        "access_key_id": access_key_id,
+        "secret_access_key": secret_access_key,
+    });
+    if let Some(endpoint) = args.storage_endpoint.as_deref() {
+        profile["endpoint"] = Value::String(endpoint.to_owned());
+    }
+    if let Some(region) = args.storage_region.as_deref() {
+        profile["region"] = Value::String(region.to_owned());
+    }
+    Ok(json!({ "mode": "external-s3", "profile": profile }))
 }

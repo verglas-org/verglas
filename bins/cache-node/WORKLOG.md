@@ -297,3 +297,30 @@
   (`dist = false`). Releases build the root Dockerfile into a multi-arch
   container image at ghcr.io/verglas-org/verglas-cache-node via the
   publish-docker job in the release pipeline.
+- Replaced the 1 s disk poll with the event-driven space broker: fragment
+  shortfall reclaims cold cache blocks (deficit plus the configured floor)
+  and republishes the ceiling immediately; drain releases grow the cache
+  back beyond live fragments plus the floor. No filesystem watching — the
+  disk is dedicated and fixed-size, so the budget is the only bound.
+
+- RIME ingest-perf-journal: `POST /v1/ingest/{name}?mode=append` now acks
+  after durable local-disk journaling instead of waiting for the Iceberg
+  commit, cutting warm NDJSON append latency (the synchronous CAS commit was
+  ~20 sequential ops, 1.6-2.1s on the lite topology). `wait=true` or
+  `commit=sync` keeps the old synchronous behavior and still returns the
+  committed snapshot id; an `idempotency-key` header always forces the
+  synchronous path (duplicate detection reads a committed snapshot's
+  summary, which an uncommitted async ack does not have). `TableState` now
+  opens `verglas_iceberg::AsyncIngestQueue` over `cache.dir/async-ingest`
+  and replays it once, lazily, the first time an async ingest request needs
+  the catalog. `TableState::new` gained the WAL directory parameter and is
+  now fallible.
+- ingest-perf-pipeline: `TableState` now holds a process-wide
+  `verglas_iceberg::write::TableCache`, shared across every request through
+  its clones. The `/v1/tables/{name}/commit` route and the `/v1/ingest`
+  append route (both the idempotency-keyed and plain paths) now call the
+  cached `tables_api`/`write` entry points instead of the unconditional ones,
+  so a warm append against a table this process already committed skips one
+  of the two `catalog.load_table` round trips it used to pay. See
+  `verglas-iceberg`'s worklog for the structural detail and the hermetic test
+  that pins it.

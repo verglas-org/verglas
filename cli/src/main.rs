@@ -87,16 +87,20 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Token(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
             after_success(
-                commands::token::run(
-                    command,
-                    &Cli::access_endpoint(),
-                    token.as_deref(),
-                    &credentials_path,
-                    cli.json,
-                )
-                .await,
+                commands::token::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
+                    .await,
             )
             .await
+        }
+        Command::Ingest(args) => {
+            let token = auth::resolved_bearer(&credentials_path).await?;
+            after_success(commands::data::ingest(&endpoint, token.as_deref(), args, cli.json).await)
+                .await
+        }
+        Command::Sql(args) => {
+            let token = auth::resolved_bearer(&credentials_path).await?;
+            after_success(commands::data::sql(&endpoint, token.as_deref(), args, cli.json).await)
+                .await
         }
         Command::Graph(command) => {
             commands::graph::run(command, &semantic_endpoint(), cli.json).await

@@ -155,7 +155,7 @@ use crate::block::{block_len, covering_blocks, resolve_range};
 use crate::classify::{MetaClass, MetaRouter, Mutability, classify_mutability};
 use crate::counters::CacheCounters;
 use crate::demotion::{DEMOTED_GENERATION_BIT, Demotions};
-use crate::entry::{BlockEntryKey, CachedMeta};
+use crate::entry::{BlockEntryKey, CachedMeta, ObjectHeaders};
 use crate::materialized::{MaterializedPageError, MaterializedPageKey, POSTGRES_PAGE_BYTES};
 use crate::meta_store::{
     META_DISK_MIN_BYTES, META_PIPELINE_RESERVED_BYTES, MetaEntryKey, MetaStore, foyer_block_size,
@@ -941,6 +941,12 @@ struct Inner<B, P, R> {
     device_paths: [PathBuf; 2],
     /// Total logical NVMe budget shared by the sparse device files.
     disk_capacity_bytes: u64,
+    /// The data block store's disk ceiling fixed at build (the budget minus
+    /// the metadata carve); live resize never exceeds it.
+    data_disk_ceiling_bytes: u64,
+    /// Bytes the data store has yielded to write-back via live shrink.
+    /// `ceiling - yielded` is the store's current active footprint.
+    data_disk_yielded_bytes: AtomicU64,
 }
 
 impl<B> HybridCacheEngine<B, NoopPeerFetch, RendezvousRing>
@@ -1061,7 +1067,8 @@ where
         // silent flush-buffer drops here, off-thread, and the counter snapshot
         // reads it (#278).
         let overflows = Arc::new(AtomicU64::new(0));
-        let (blocks, meta, meta_store) = build_caches(config, Arc::clone(&overflows)).await?;
+        let (blocks, meta, meta_store, data_disk_ceiling) =
+            build_caches(config, Arc::clone(&overflows)).await?;
         // Recover the persisted purge generation (#178): a restart resumes at
         // the generation it last ran at, so entries written under it recover
         // warm (#16) while any pre-purge generation stays unreachable garbage.
@@ -1104,6 +1111,8 @@ where
                     config.dir.join(META_DEVICE_FILE),
                 ],
                 disk_capacity_bytes: config.capacity_bytes.0,
+                data_disk_ceiling_bytes: data_disk_ceiling,
+                data_disk_yielded_bytes: AtomicU64::new(0),
             }),
         })
     }
@@ -1135,11 +1144,98 @@ where
     /// share `cache.capacity_bytes` first come, first served. Two `stat` calls;
     /// only ever called from the background poll, never on a request path.
     pub fn disk_growth_room_bytes(&self) -> u64 {
-        self.inner
+        // Budget minus physical allocation, not logical-length minus
+        // allocation: after a live shrink the data file's logical length is
+        // below the budget, and the truncated tail's bytes are exactly what
+        // the fragment store may now spend.
+        let allocated: u64 = self
+            .inner
             .device_paths
             .iter()
-            .map(|path| verglas_core::disk::file_growth_room(path))
-            .sum()
+            .map(|path| verglas_core::disk::file_allocated_bytes(path))
+            .sum();
+        self.inner.disk_capacity_bytes.saturating_sub(allocated)
+    }
+
+    /// Yields physical disk to the write-back fragment store by shrinking the
+    /// data block store's active footprint (#223 follow-up): cold data blocks
+    /// in the retired tail are evicted and the backing file is truncated, so
+    /// [`Self::disk_growth_room_bytes`] observes the gain immediately. The
+    /// metadata store and materialized pages are separate stores and are
+    /// never touched. Returns the bytes made available. Evicted blocks
+    /// degrade to backend refills — slower, never wrong. Never called on a
+    /// request path; the server's disk poll drives it when fragment demand
+    /// exceeds the free room.
+    /// Grows the data block store back toward its ceiling after drained
+    /// fragments release their bytes, keeping `reserve` bytes yielded as the
+    /// write-back headroom. Returns the bytes restored to the cache. The
+    /// drain-release signal drives this — the counterpart of
+    /// [`Self::reclaim_disk_for_writeback`]'s claim-on-demand.
+    pub async fn restore_disk(&self, reserve: u64) -> u64 {
+        let ceiling = self.inner.data_disk_ceiling_bytes;
+        let yielded = self.inner.data_disk_yielded_bytes.load(Ordering::Relaxed);
+        if yielded <= reserve {
+            return 0;
+        }
+        let active = ceiling.saturating_sub(yielded);
+        let target = ceiling.saturating_sub(reserve);
+        let resulting = match self.inner.blocks.resize_disk(target).await {
+            Ok(resulting) => resulting,
+            Err(_) => return 0,
+        };
+        self.inner
+            .data_disk_yielded_bytes
+            .store(ceiling.saturating_sub(resulting), Ordering::Relaxed);
+        self.rebase_admission_pressure();
+        resulting.saturating_sub(active)
+    }
+
+    pub async fn reclaim_disk_for_writeback(&self, bytes: u64) -> u64 {
+        if bytes == 0 {
+            return 0;
+        }
+        let ceiling = self.inner.data_disk_ceiling_bytes;
+        let room_start = self.disk_growth_room_bytes();
+        // The shrink is driven by OBSERVED physical gain, not logical size:
+        // truncating never-written sparse tail frees nothing, so the loop
+        // steps the active footprint down until data-bearing partitions
+        // retire (their entries evicted, their bytes truncated) and the
+        // growth room the fragment store spends actually grows — or the
+        // store refuses to shrink further (its functional floor).
+        let mut active =
+            ceiling.saturating_sub(self.inner.data_disk_yielded_bytes.load(Ordering::Relaxed));
+        loop {
+            let gained = self.disk_growth_room_bytes().saturating_sub(room_start);
+            if gained >= bytes {
+                break;
+            }
+            let step = (bytes - gained).max(self.inner.block_bytes);
+            let target = active.saturating_sub(step);
+            let resulting = match self.inner.blocks.resize_disk(target).await {
+                Ok(resulting) => resulting,
+                // A resize refusal yields what was gained so far; the
+                // fragment store stays paused at the current room. Slow,
+                // never wrong.
+                Err(_) => break,
+            };
+            if resulting >= active {
+                // Functional floor reached; nothing further to yield.
+                break;
+            }
+            active = resulting;
+        }
+        self.inner
+            .data_disk_yielded_bytes
+            .store(ceiling.saturating_sub(active), Ordering::Relaxed);
+        self.rebase_admission_pressure();
+        self.disk_growth_room_bytes().saturating_sub(room_start)
+    }
+
+    /// Rebases the admission pressure proxy to the data store's physical
+    /// occupancy after a resize changed what is actually resident.
+    fn rebase_admission_pressure(&self) {
+        let resident = verglas_core::disk::file_allocated_bytes(&self.inner.device_paths[0]);
+        self.inner.admission.rebase_pressure(resident);
     }
 
     /// Bytes physically allocated from the configured NVMe budget.
@@ -1468,6 +1564,98 @@ where
         }
         self.inner.insert_block(block_key, page);
         Ok(true)
+    }
+
+    /// Converts a durable write's already-in-hand bytes directly into cache
+    /// residency, so a read-back need not pay the origin GET a cold miss
+    /// would. This is write-allocate: the caller already proved `body` is
+    /// durable at `etag` (an S3 `PUT`/`PutObject` ack); population trusts that
+    /// proof instead of re-deriving it from a fill.
+    ///
+    /// The key→ETag mapping installs immediately (through the same
+    /// [`MetaFence`]-guarded path [`Inner::admit_meta_if_fresh`] uses, so a
+    /// racing invalidation of a still-newer write cannot be undone by this
+    /// call), which is what lets a read issued right after this call resolve
+    /// the correct version with no backend HEAD. Each block, by contrast, is
+    /// queued onto a detached task and this method returns before that task
+    /// runs — mirroring the backend-fill path (#273), *not* routed through
+    /// its singleflight machinery, because there is no concurrent identical
+    /// fill to deduplicate against; the bytes are already in hand. The task
+    /// is registered against [`InFlight::size`] before it is spawned and
+    /// decrements it (notifying [`InFlight::quiesced`]) only once every block
+    /// has cleared admission, so [`HybridCacheEngine::flush`] — which already
+    /// drains `InFlight` before the disk queue — is population's residency
+    /// barrier for free, no separate barrier needed.
+    ///
+    /// Each block runs through [`Inner::admit_block`], the same
+    /// scan-resistant policy a backend fill's blocks clear (#15): a bulk
+    /// write burst is a one-touch sequence exactly like a bulk read scan, so
+    /// it is rejectable in the same way and cannot evict the working set.
+    /// Ring discipline (#17) applies per block: a block this node does not
+    /// own is offered to its rendezvous owner instead of admitted locally
+    /// (best-effort cache placement, like [`PeerFetch::store`]'s other
+    /// caller — a failure there is safe to ignore, since the object is
+    /// already durable at the origin regardless of cache placement).
+    pub async fn populate_on_write(
+        &self,
+        key: &CacheKey,
+        etag: &str,
+        body: Bytes,
+    ) -> Result<(), EngineError> {
+        let size = body.len() as u64;
+        let meta = CachedMeta {
+            size,
+            etag: etag.to_owned(),
+            last_modified: None,
+            content_type: None,
+            headers: Box::new(ObjectHeaders::default()),
+        };
+        {
+            // Fence discipline (#124), same as every other metadata admission:
+            // register before the mapping is installed so a racing
+            // invalidation of a still-newer write can fence this one off
+            // rather than being silently undone by it.
+            let guard = self.inner.fence.register(key);
+            self.inner.admit_meta_if_fresh(&guard, key, &meta);
+        }
+
+        let inner = Arc::clone(&self.inner);
+        let key = key.clone();
+        let etag = etag.to_owned();
+        let block_bytes = self.inner.block_bytes;
+        let owner = self.inner.ring.owner(&key);
+        inner.inflight.size.fetch_add(1, Ordering::Relaxed);
+        tokio::spawn(async move {
+            for index in 0..size.div_ceil(block_bytes) {
+                let offset = (index * block_bytes) as usize;
+                let len = block_len(size, index, block_bytes);
+                let block = BlockKey {
+                    object: key.clone(),
+                    etag: etag.clone(),
+                    block_bytes,
+                    block_index: index,
+                };
+                let bytes = body.slice(offset..offset + len);
+                if owner == inner.node {
+                    let block_key = inner.block_entry_key(block);
+                    if inner.admit_block(&block_key, bytes.len()) {
+                        inner.insert_block(block_key, bytes);
+                    }
+                } else {
+                    // Cache placement, not durable write-back (the object is
+                    // already durable at the origin): a failure to reach the
+                    // owner just means this block is not locally cached
+                    // anywhere, which is always a correct — if slower —
+                    // outcome.
+                    let _ = inner.peers.store(owner.clone(), &block, bytes).await;
+                }
+            }
+            // Release so the flush barrier's Acquire load, once it sees this
+            // decrement, also sees every admission this task just did.
+            inner.inflight.size.fetch_sub(1, Ordering::Release);
+            inner.inflight.quiesced.notify_waiters();
+        });
+        Ok(())
     }
 
     /// Serves one block to a *peer* (#29): the exact [`BlockKey`], from this
@@ -1812,6 +2000,7 @@ async fn build_caches(
         HybridCache<BlockEntryKey, Bytes>,
         Cache<CacheKey, MappingEntry>,
         MetaStore,
+        u64,
     ),
     EngineError,
 > {
@@ -1968,7 +2157,7 @@ async fn build_caches(
     .await
     .map_err(EngineError::Build)?;
 
-    Ok((blocks, meta, meta_store))
+    Ok((blocks, meta, meta_store, disk_capacity as u64))
 }
 
 impl<B, P, R> ObjectRead for HybridCacheEngine<B, P, R>

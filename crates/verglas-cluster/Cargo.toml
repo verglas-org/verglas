@@ -29,6 +29,7 @@ openraft.workspace = true
 percent-encoding = "2"
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "time"] }
 tower = "0.5.2"
 

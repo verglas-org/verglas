@@ -52,17 +52,32 @@ pub enum Command {
     /// file; `run` dispatches one now. The OSS stack does not host workers.
     #[command(subcommand)]
     Workers(WorkersCommand),
-    /// Create Lakekeeper-managed lakehouses.
-    #[command(subcommand)]
-    Lakehouse(LakehouseCommand),
     /// Create scoped credentials.
     ///
     /// Values are read from stdin and never appear in argv.
     #[command(subcommand)]
     Secret(SecretCommand),
-    /// Manage scoped access tokens.
+    /// Scoped access tokens for producers and readers.
+    ///
+    /// `create` mints a token limited to the scopes you name (for example
+    /// `ingest:app_logs` or `sql:read`); `list` shows tokens without their
+    /// values; `revoke` invalidates one.
     #[command(subcommand)]
     Token(TokenCommand),
+    /// Iceberg lakehouses: list them or create one.
+    ///
+    /// Every deployment has a managed default lakehouse. `create` adds
+    /// another, either managed or on your own S3 bucket (`--data-path`).
+    #[command(subcommand)]
+    Lakehouse(LakehouseCommand),
+    /// Append NDJSON rows to a datasource.
+    ///
+    /// Table writes, vector writes, and log shipping are the same append
+    /// shape: `POST /v0/events?name=<datasource>`. Reads from `--file` or
+    /// standard input.
+    Ingest(IngestArgs),
+    /// Run a SQL query against Verglas Cloud (`POST /v0/sql`).
+    Sql(SqlArgs),
     /// Property graphs: ingest nodes and edges, traverse, search precedents.
     #[command(subcommand)]
     Graph(GraphCommand),
@@ -92,38 +107,21 @@ impl Cli {
     }
 }
 
-/// `verglas token` operations against the authorization service.
-#[derive(Debug, Subcommand)]
-pub enum TokenCommand {
-    /// Mint a delegated token and retain its one-time plaintext value locally.
-    Create(TokenCreateArgs),
-    /// List token metadata visible to the authenticated principal.
-    List,
-    /// Revoke one token and remove an exactly matching local credential.
-    Revoke(TokenRevokeArgs),
-}
-
-/// Arguments for `verglas token create`.
+/// Arguments for `verglas ingest`.
 #[derive(Debug, Args)]
-pub struct TokenCreateArgs {
-    /// Human-readable label for the new token.
-    pub name: String,
-    /// Runtime audience that may present the token.
-    #[arg(long, default_value = "verglas-cli")]
-    pub audience: String,
-    /// Token lifetime in seconds. Omit only for deliberately non-expiring local credentials.
+pub struct IngestArgs {
+    /// The target datasource name.
+    pub datasource: String,
+    /// Read NDJSON from this file instead of standard input.
     #[arg(long)]
-    pub expires_in_seconds: Option<u64>,
-    /// Delegated resource actions as RESOURCE=action,action. Repeat for multiple resources.
-    #[arg(long = "grant")]
-    pub grants: Vec<String>,
+    pub file: Option<PathBuf>,
 }
 
-/// Arguments for `verglas token revoke`.
+/// Arguments for `verglas sql`.
 #[derive(Debug, Args)]
-pub struct TokenRevokeArgs {
-    /// Token identifier returned by `verglas token list`.
-    pub id: String,
+pub struct SqlArgs {
+    /// The SQL query to run.
+    pub query: String,
 }
 
 /// Arguments for the shared connection-profile login flow.
@@ -135,29 +133,6 @@ pub struct LoginArgs {
     /// Never open a browser; print the verification URI to sign in manually.
     #[arg(long)]
     pub no_browser: bool,
-}
-
-/// `verglas lakehouse` operations against the local database resource API.
-#[derive(Debug, Subcommand)]
-pub enum LakehouseCommand {
-    /// Create one Lakekeeper-managed lakehouse.
-    Create(LakehouseCreateArgs),
-}
-
-/// Arguments for `verglas lakehouse create`.
-#[derive(Debug, Args)]
-pub struct LakehouseCreateArgs {
-    /// Stable lakehouse name.
-    pub name: String,
-    /// S3 prefix for a lakehouse that uses an authorized scoped secret.
-    #[arg(long)]
-    pub data_path: Option<String>,
-    /// External Iceberg REST catalog URI.
-    #[arg(long, requires = "warehouse")]
-    pub catalog: Option<String>,
-    /// Warehouse selected from the external catalog.
-    #[arg(long, requires = "catalog")]
-    pub warehouse: Option<String>,
 }
 
 /// `verglas secret` operations against the local access service.
@@ -178,6 +153,61 @@ pub struct SecretCreateArgs {
     /// URI prefix to which this secret grants access.
     #[arg(long)]
     pub scope: String,
+}
+
+/// Subcommands of `verglas token`.
+#[derive(Debug, Subcommand)]
+pub enum TokenCommand {
+    /// Mint a scoped token. The value prints once and is never stored.
+    Create(TokenCreateArgs),
+    /// List tokens: id, name, and scopes. Values are never shown.
+    List,
+    /// Revoke a token by id or name.
+    Revoke(TokenRevokeArgs),
+}
+
+/// Arguments for `verglas token create`.
+#[derive(Debug, Args)]
+pub struct TokenCreateArgs {
+    /// A name identifying where the token will live.
+    pub name: String,
+    /// A scope the token is limited to; repeatable.
+    #[arg(long = "scope", required = true)]
+    pub scopes: Vec<String>,
+}
+
+/// Arguments for `verglas token revoke`.
+#[derive(Debug, Args)]
+pub struct TokenRevokeArgs {
+    /// The token id or name shown by `verglas token list`.
+    pub token_id: String,
+}
+
+/// Subcommands of `verglas lakehouse`.
+#[derive(Debug, Subcommand)]
+pub enum LakehouseCommand {
+    /// List this deployment's lakehouses.
+    List,
+    /// Create a lakehouse.
+    Create(LakehouseCreateArgs),
+}
+
+/// Arguments for `verglas lakehouse create`.
+#[derive(Debug, Args)]
+pub struct LakehouseCreateArgs {
+    /// The lakehouse name.
+    pub name: String,
+    /// Store data in your own bucket (`s3://bucket/prefix`) instead of
+    /// managed storage. Credentials are read from
+    /// `VERGLAS_STORAGE_ACCESS_KEY_ID` / `VERGLAS_STORAGE_SECRET_ACCESS_KEY`.
+    #[arg(long)]
+    pub data_path: Option<String>,
+    /// S3 endpoint for `--data-path`.
+    #[arg(long, requires = "data_path")]
+    pub storage_endpoint: Option<String>,
+    /// S3 region for `--data-path`.
+    #[arg(long, requires = "data_path")]
+    pub storage_region: Option<String>,
 }
 
 /// Secret types accepted by the local access service.
@@ -233,7 +263,7 @@ pub struct DashboardNameArgs {
     pub tenant_id: Option<String>,
 }
 
-/// `verglas workers` subcommands against Verglas Cloud (`/v1/workers`).
+/// `verglas workers` subcommands against Verglas Cloud (`/v0/workers`).
 #[derive(Debug, Subcommand)]
 pub enum WorkersCommand {
     /// List every active worker on Verglas Cloud.

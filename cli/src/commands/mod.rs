@@ -3,6 +3,7 @@
 pub mod catalog;
 pub mod connection;
 pub mod dashboard;
+pub mod data;
 pub mod graph;
 pub mod lakehouse;
 pub mod secret;

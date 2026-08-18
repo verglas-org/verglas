@@ -38,10 +38,10 @@ two years after that version is first made available. See [LICENSE](LICENSE).
 
 ## Install
 
-The CLI runs directly through npm:
+Install the CLI with one command:
 
 ```sh
-npx @verglas/cli --help
+curl -fsSL https://verglas.dev/install.sh | sh
 ```
 
 The SDKs install from their package managers:

@@ -14,3 +14,7 @@
   release job). This crate does not depend on the patched Iceberg fork, so
   the workspace publish ban does not apply; workspace dependency entries now
   carry a version alongside the path for the registry publish.
+- RIME ingest-perf-journal: added `table::IngestAckResponse`, the wire shape
+  for the new async `mode=append` ack (`successfulRows`, `committed: false`
+  always). Distinct from `CommitResponse` because an async ack carries no
+  snapshot id — the commit has not happened yet when it is returned.

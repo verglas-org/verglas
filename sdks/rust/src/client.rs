@@ -3,6 +3,12 @@
 //! The client keeps transport, authentication, Arrow IPC, idempotency, and
 //! table-contract validation in the SDK. Applications and the CLI therefore
 //! call the same implementation instead of rebuilding HTTP behavior.
+//!
+//! [`DataClient`] is the separate /v0 client: the ONE append-ingest shape
+//! (NDJSON to `/v0/events`) for table writes, vector writes, and log shipping
+//! alike, plus SQL through `/v0/sql`. The retired tenant-local access-service
+//! era (the old v1 access-token principal, resource, grant, and token CRUD
+//! routes) has no client here — it was deleted with the surface it called.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
@@ -10,7 +16,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt, stream};
-use reqwest::header::{ACCEPT, AUTHORIZATION, HeaderValue};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -20,8 +26,6 @@ use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
 
-use crate::access::{AccessCheck, AccessDecision, AccessGrant, Principal, Resource};
-use crate::token::{AccessTokenCreateRequest, AccessTokenSummary, IssuedAccessToken};
 use crate::worker::ChangeEvent;
 
 /// One durable table commit and the queue receipt that fences its acknowledgement.
@@ -345,113 +349,6 @@ impl Client {
         })
     }
 
-    /// Creates one principal in the tenant authorization registry.
-    pub async fn create_principal(&self, principal: &Principal) -> Result<Principal, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/principals"))
-                .json(principal),
-        )
-        .await
-    }
-
-    /// Lists principals registered in one tenant.
-    pub async fn list_principals(&self, tenant_id: &str) -> Result<Vec<Principal>, ClientError> {
-        self.access_json(
-            self.http
-                .get(self.access_url("/v1/access/principals"))
-                .query(&[("tenant_id", tenant_id)]),
-        )
-        .await
-    }
-
-    /// Creates one protected resource in the tenant hierarchy.
-    pub async fn create_resource(&self, resource: &Resource) -> Result<Resource, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/resources"))
-                .json(resource),
-        )
-        .await
-    }
-
-    /// Lists protected resources registered in one tenant.
-    pub async fn list_resources(&self, tenant_id: &str) -> Result<Vec<Resource>, ClientError> {
-        self.access_json(
-            self.http
-                .get(self.access_url("/v1/access/resources"))
-                .query(&[("tenant_id", tenant_id)]),
-        )
-        .await
-    }
-
-    /// Creates one additive authorization grant.
-    pub async fn create_access_grant(
-        &self,
-        grant: &AccessGrant,
-    ) -> Result<AccessGrant, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/grants"))
-                .json(grant),
-        )
-        .await
-    }
-
-    /// Lists authorization grants registered in one tenant.
-    pub async fn list_access_grants(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<AccessGrant>, ClientError> {
-        self.access_json(
-            self.http
-                .get(self.access_url("/v1/access/grants"))
-                .query(&[("tenant_id", tenant_id)]),
-        )
-        .await
-    }
-
-    /// Evaluates one action with the client's scoped bearer credential.
-    pub async fn check_access(&self, check: &AccessCheck) -> Result<AccessDecision, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/check"))
-                .json(check),
-        )
-        .await
-    }
-
-    /// Mints a delegated token for the authenticated principal and returns its plaintext once.
-    pub async fn create_access_token(
-        &self,
-        request: &AccessTokenCreateRequest,
-    ) -> Result<IssuedAccessToken, ClientError> {
-        self.access_json(
-            self.http
-                .post(self.access_url("/v1/access/tokens"))
-                .json(request),
-        )
-        .await
-    }
-
-    /// Lists the authenticated principal's token inventory without exposing plaintext tokens.
-    pub async fn list_access_tokens(&self) -> Result<Vec<AccessTokenSummary>, ClientError> {
-        self.access_json(self.http.get(self.access_url("/v1/access/tokens")))
-            .await
-    }
-
-    /// Revokes one token owned or manageable by the authenticated principal.
-    pub async fn revoke_access_token(
-        &self,
-        token_id: &str,
-    ) -> Result<AccessTokenSummary, ClientError> {
-        self.access_json(
-            self.http
-                .delete(self.access_url(&format!("/v1/access/tokens/{token_id}"))),
-        )
-        .await
-    }
-
     /// Lists every reflected Integration namespace visible to this principal.
     pub async fn namespaces(&self) -> Result<Vec<NamespaceManifest>, ClientError> {
         let response = Self::require_success(
@@ -550,15 +447,6 @@ impl Client {
             Some(token) => request.header(AUTHORIZATION, token.clone()),
             None => request,
         }
-    }
-
-    /// Sends one authenticated authorization request and decodes its JSON result.
-    async fn access_json<T: DeserializeOwned>(
-        &self,
-        request: reqwest::RequestBuilder,
-    ) -> Result<T, ClientError> {
-        let response = Self::require_success(self.send(self.authorize(request)).await?).await?;
-        response.json().await.map_err(ClientError::Transport)
     }
 
     /// Compares a REST load-table response with the caller's exact contract.
@@ -661,11 +549,124 @@ impl Client {
     fn url(&self, path: &str) -> String {
         format!("{}{path}", self.query_uri)
     }
+}
 
-    /// Joins an authorization path to the configured access service.
-    fn access_url(&self, path: &str) -> String {
-        format!("{}{path}", self.access_uri)
+/// One ingest acknowledgement, as returned by `POST /v0/events`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub struct IngestResult {
+    /// Rows accepted into the datasource.
+    pub successful_rows: u64,
+    /// Rows rejected and quarantined instead of accepted.
+    pub quarantined_rows: u64,
+}
+
+/// The /v0 data client: append-ingest (one shape, every kind of row) plus SQL.
+///
+/// Table writes, vector writes, and log shipping all resolve to the same
+/// NDJSON append to `POST /v0/events?name=<datasource>`; SQL runs through
+/// `POST /v0/sql`. This is the /v0 data surface on Verglas Cloud, a
+/// deliberate break from the older per-kind write shapes.
+#[derive(Debug, Clone)]
+pub struct DataClient {
+    base: String,
+    token: String,
+    http: reqwest::Client,
+}
+
+impl DataClient {
+    /// Opens a /v0 data client bound to one endpoint and workspace bearer token.
+    pub fn connect(base_url: &str, token: impl Into<String>) -> Result<Self, ClientError> {
+        if base_url.trim().is_empty() {
+            return Err(ClientError::Configuration(
+                "data client: base_url is required".to_owned(),
+            ));
+        }
+        let token = token.into();
+        if token.trim().is_empty() {
+            return Err(ClientError::Configuration(
+                "data client: token is required".to_owned(),
+            ));
+        }
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(120))
+            .connect_timeout(Duration::from_secs(5))
+            .build()?;
+        Ok(Self {
+            base: base_url.trim_end_matches('/').to_owned(),
+            token,
+            http,
+        })
     }
+
+    /// Appends rows to a datasource as NDJSON via `POST /v0/events?name=<datasource>`.
+    pub async fn append_events(
+        &self,
+        datasource: &str,
+        rows: &[Value],
+    ) -> Result<IngestResult, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/v0/events", self.base))
+            .query(&[("name", datasource)])
+            .header(AUTHORIZATION, self.bearer()?)
+            .header(CONTENT_TYPE, "application/x-ndjson")
+            .body(ndjson(rows))
+            .send()
+            .await?;
+        Self::decode(response).await
+    }
+
+    /// Same append shape as [`Self::append_events`] — a table write is just rows on a datasource.
+    pub async fn table_write(
+        &self,
+        datasource: &str,
+        rows: &[Value],
+    ) -> Result<IngestResult, ClientError> {
+        self.append_events(datasource, rows).await
+    }
+
+    /// Same append shape as [`Self::append_events`] — a vector write is just rows on a datasource.
+    pub async fn vector_write(
+        &self,
+        datasource: &str,
+        rows: &[Value],
+    ) -> Result<IngestResult, ClientError> {
+        self.append_events(datasource, rows).await
+    }
+
+    /// Runs a query through `POST /v0/sql`.
+    pub async fn sql<T: DeserializeOwned>(&self, query: &str) -> Result<T, ClientError> {
+        let response = self
+            .http
+            .post(format!("{}/v0/sql", self.base))
+            .header(AUTHORIZATION, self.bearer()?)
+            .json(&json!({ "q": query }))
+            .send()
+            .await?;
+        Self::decode(response).await
+    }
+
+    /// Builds the bearer header value for the configured workspace token.
+    fn bearer(&self) -> Result<HeaderValue, ClientError> {
+        HeaderValue::from_str(&format!("Bearer {}", self.token))
+            .map_err(|error| ClientError::Configuration(error.to_string()))
+    }
+
+    /// Decodes success JSON or converts a non-success response to a diagnostic error.
+    async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ClientError> {
+        let response = Client::require_success(response).await?;
+        response.json().await.map_err(ClientError::Transport)
+    }
+}
+
+/// Encodes rows as NDJSON: one compact JSON object per line, trailing newline.
+fn ndjson(rows: &[Value]) -> String {
+    let mut out = String::new();
+    for row in rows {
+        out.push_str(&row.to_string());
+        out.push('\n');
+    }
+    out
 }
 
 /// One named database selected for all catalog and execution operations.

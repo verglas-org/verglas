@@ -148,3 +148,60 @@
   its key-metadata argument, `ManifestListWriter` takes a `FileWrite`, and
   the storage delegate implements the new `delete_stream`. Upstream now has
   `expire_snapshots`; `from_parts` remains only for the REPLACE commit.
+
+- RIME ingest-perf-journal: added `async_ingest`, the `mode=append` async-ack
+  path. Rows are validated against the target schema and fsynced to a local
+  write-ahead log (Arrow IPC stream files, atomic write-rename-fsync) before
+  the ack returns; a background task coalesces everything queued for a table
+  into one Iceberg CAS commit. `AsyncIngestQueue::replay` recovers
+  journaled-but-uncommitted rows after a restart. This is a bounded
+  in-process commit-coalescing queue with local-disk durability, not the
+  consensus-admitted write-back journal in `verglas-writeback` — see the
+  module's doc comment for the exact durability level and the narrow
+  duplicate-row window a crash mid-cleanup leaves. `write::coerce_batches`
+  is now `pub(crate)` so the async path reuses the same schema-coercion
+  logic as the synchronous append path instead of duplicating it. New
+  hermetic tests in `tests/async_ingest.rs` cover: ack-then-eventual-commit,
+  coalescing several acks into one commit, synchronous schema rejection,
+  the synchronous commit path's immediate snapshot id, and replay after a
+  simulated restart.
+- ingest-perf-pipeline: Added `write::TableCache`, a process-wide cache of
+  each identifier's last-committed `Table`. A warm append (identifier already
+  cached) starts its transaction from the cached table instead of this
+  crate's own unconditional `catalog.load_table` — one of the two
+  `load_table` round trips a repeat append otherwise pays. The other is a
+  fixed cost outside this repo: the vendored `iceberg-rust` fork's
+  `Transaction::do_commit` unconditionally re-fetches the table from the
+  catalog at the start of every commit attempt regardless of the base table
+  it was handed, so a cold (first) append still pays both. The CAS commit
+  (`update_table`) is unchanged and remains the sole correctness authority; a
+  cached table that lost a race is caught by the existing
+  `CatalogCommitConflicts` retry in `commit_data_files`, which reloads
+  through the catalog and refreshes the cache, so a stale entry self-heals on
+  its next use. Added `write::append_cached`, `append_batches_cached`, and
+  `append_batches_from_table`, plus `tables_api::commit_cached` and
+  `commit_batches_cached` for the server's commit and keyed-ingest routes.
+  New hermetic tests in `tests/table_cache.rs` pin the call-count reduction
+  (2 `load_table` calls per uncached append vs. 1 per warm cached append)
+  with an instrumented counting catalog, and prove a stale cache entry still
+  commits correctly with no row lost or duplicated.
+
+- RIME query-node candidate A, protocol v4 step 9a: pins the DataFusion
+  session's default schema to `"default"` — `query::query_session_config`
+  already set it there before this change; step 9a's requirement (an
+  unqualified `FROM <table>` resolves without a namespace prefix, matching
+  where `/v0` ingest writes) was already met by the stock DataFusion default.
+  This candidate's first pass instead switched the default to `"main"`; the
+  frozen protocol doc was amended mid-task (coordinator commit `9cbec80`,
+  "USER RULING") to pin `"default"` once the DuckDB engine path
+  (`bins/query-node`) showed that an attached Iceberg namespace named `main`
+  gets shadowed by DuckDB's own hardcoded per-catalog default schema of that
+  same name — `"default"` has no such collision in either engine. The `"main"`
+  attempt is not carried forward; `query_session_config`'s only change here is
+  a comment explaining why `"default"`, not `"main"`, is deliberate. No test
+  in this crate relied on a different default (every whole-catalog
+  `query`/`query_stream` test already names its namespace; the two
+  unqualified references in `tests/compaction.rs` and `tests/table_verbs.rs`
+  both go through the separate `time_travel_context` path, which registers
+  one table directly and never touches this session config). New test:
+  `tests/table_verbs.rs::unqualified_table_name_resolves_in_the_default_namespace`.

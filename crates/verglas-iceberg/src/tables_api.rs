@@ -33,7 +33,7 @@ pub use verglas_api::table::{
 
 use crate::error::{AgentError, Result};
 use crate::ident::ident_to_dotted;
-use crate::write::{self, PartitionField, PartitionTransform, append_batches};
+use crate::write::{self, PartitionField, PartitionTransform, TableCache, append_batches};
 
 /// The snapshot-summary property that records a commit's idempotency key, so a
 /// replay of the same key is recognised and not written twice.
@@ -71,6 +71,48 @@ pub async fn commit(
     commit_batches(catalog, ident, batches, request.idempotency_key).await
 }
 
+/// Same contract as [`commit`], but resolves the table through `cache` (see
+/// [`TableCache`]) instead of an unconditional `catalog.load_table` — the
+/// warm-append path the server's commit route takes.
+pub async fn commit_cached(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    ident: &TableIdent,
+    request: CommitRequest,
+) -> Result<CommitResponse> {
+    let table = cache.get_or_load(catalog, ident).await?;
+    let table_name = ident_to_dotted(ident);
+
+    if let Some(key) = request.idempotency_key.as_deref()
+        && let Some(existing) = find_idempotent_commit(&table, key)
+    {
+        return Ok(existing);
+    }
+
+    let target = schema_to_arrow_schema(table.metadata().current_schema())?;
+    let batches = rows_to_batches(&request.rows, &target, &table_name)?;
+
+    let mut properties = HashMap::new();
+    if let Some(key) = request.idempotency_key.as_deref() {
+        let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        properties.insert(IDEMPOTENCY_KEY_PROP.to_owned(), key.to_owned());
+        properties.insert(IDEMPOTENCY_ROWS_PROP.to_owned(), row_count.to_string());
+    }
+
+    let report =
+        write::append_batches_from_table(catalog, cache, &table, batches, properties).await?;
+    let snapshot_id = report
+        .snapshot_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    Ok(CommitResponse {
+        rows_committed: report.records_added,
+        watermark: snapshot_id.clone(),
+        snapshot_id,
+        idempotent: false,
+    })
+}
+
 /// Appends already-decoded Arrow batches through the same idempotent CAS path
 /// as JSON commits.
 pub async fn commit_batches(
@@ -94,6 +136,45 @@ pub async fn commit_batches(
     }
 
     let report = append_batches(catalog, ident, batches, properties).await?;
+    let snapshot_id = report
+        .snapshot_id
+        .map(|id| id.to_string())
+        .unwrap_or_default();
+    Ok(CommitResponse {
+        rows_committed: report.records_added,
+        watermark: snapshot_id.clone(),
+        snapshot_id,
+        idempotent: false,
+    })
+}
+
+/// Same contract as [`commit_batches`], but resolves the table through
+/// `cache` (see [`TableCache`]) instead of an unconditional
+/// `catalog.load_table` — the warm-append path the server's ingest route
+/// takes for a keyed commit.
+pub async fn commit_batches_cached(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    ident: &TableIdent,
+    batches: Vec<RecordBatch>,
+    idempotency_key: Option<String>,
+) -> Result<CommitResponse> {
+    let table = cache.get_or_load(catalog, ident).await?;
+    if let Some(key) = idempotency_key.as_deref()
+        && let Some(existing) = find_idempotent_commit(&table, key)
+    {
+        return Ok(existing);
+    }
+
+    let mut properties = HashMap::new();
+    if let Some(key) = idempotency_key.as_deref() {
+        let row_count: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        properties.insert(IDEMPOTENCY_KEY_PROP.to_owned(), key.to_owned());
+        properties.insert(IDEMPOTENCY_ROWS_PROP.to_owned(), row_count.to_string());
+    }
+
+    let report =
+        write::append_batches_from_table(catalog, cache, &table, batches, properties).await?;
     let snapshot_id = report
         .snapshot_id
         .map(|id| id.to_string())

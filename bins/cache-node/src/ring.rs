@@ -218,6 +218,18 @@ impl RingPlane {
     pub fn set_fragment_ceiling(&self, bytes: u64) {
         self.fragment_ceiling.store(bytes, Ordering::Release);
     }
+
+    /// Registers the demand signal: invoked with the byte deficit when a
+    /// fragment reservation is refused for space.
+    pub fn set_shortfall_handler(&self, handler: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.local.set_shortfall_handler(handler);
+    }
+
+    /// Registers the drain signal: invoked with the freed bytes when drained
+    /// fragments are deleted after the origin barrier.
+    pub fn set_release_handler(&self, handler: std::sync::Arc<dyn Fn(u64) + Send + Sync>) {
+        self.local.set_release_handler(handler);
+    }
 }
 
 /// Wires the block-flush write-back plane onto `registry` from the environment,

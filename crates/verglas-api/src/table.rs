@@ -118,6 +118,24 @@ pub struct CommitResponse {
     pub idempotent: bool,
 }
 
+/// Result of an async `mode=append` ingest ack: rows passed schema validation
+/// and are durably journaled, but not yet committed to the Iceberg table. A
+/// background task performs the real commit; this response carries no
+/// snapshot id because none exists yet — poll `/snapshot` or `/delta`, or
+/// pass `wait=true`/`commit=sync` on the request to get the committed
+/// snapshot id synchronously instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IngestAckResponse {
+    /// Rows accepted after schema validation and journaled durably. Rows that
+    /// fail schema validation are rejected synchronously and are not counted
+    /// here — the whole request fails instead, so this is always the full
+    /// request's row count on success.
+    pub successful_rows: u64,
+    /// Always `false`: the commit has not happened yet when this is returned.
+    pub committed: bool,
+}
+
 /// Current table snapshot summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

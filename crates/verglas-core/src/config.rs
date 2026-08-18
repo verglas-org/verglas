@@ -305,6 +305,12 @@ pub struct Writeback {
     /// Milliseconds to wait for the write quorum before falling back to
     /// write-through.
     pub ack_deadline_ms: u64,
+    /// Guaranteed fragment headroom: when the free room falls below this, the
+    /// disk poll reclaims cache blocks to restore it, so a write burst never
+    /// waits on space a cold read block is holding. 0 derives the poll's
+    /// low-water reserve.
+    #[serde(default)]
+    pub disk_floor_bytes: ByteSize,
     /// How often the background scrubber walks stored write-back fragments to
     /// verify their checksums and re-encode any corrupt or missing ones, in
     /// seconds. Silent bit-rot fires no membership event, so node-loss repair
@@ -345,6 +351,7 @@ impl Default for Writeback {
             m: 2,
             w: 5,
             ack_deadline_ms: 2000,
+            disk_floor_bytes: ByteSize(0),
             scrub_interval_secs: default_scrub_interval_secs(),
             prefixes: Vec::new(),
         }
@@ -1352,7 +1359,7 @@ pub const DEFAULT_DATA_BLOCK_BYTES: u64 = 2 * 1024 * 1024;
 
 /// A byte count deserialized from a human-size string (`"512MB"`, `"20GB"`;
 /// suffixes B/KB/MB/GB/TB, binary multiples; a bare number means bytes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ByteSize(pub u64);
 
 impl schemars::JsonSchema for ByteSize {

@@ -1,4 +1,6 @@
-//! CLI contract tests for local database and scoped-secret creation (#84).
+//! CLI contract tests for scoped-secret creation (#84). The dynamic-database
+//! (`lakehouse create`) tests that used to live here were removed with the
+//! retired `/v1/databases` access-service surface (no client here anymore).
 
 use std::io::Write;
 use std::net::SocketAddr;
@@ -22,15 +24,6 @@ struct CapturedRequest {
 async fn spawn_api() -> (String, Arc<Mutex<Vec<CapturedRequest>>>) {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let app = Router::new()
-        .route(
-            "/v1/databases",
-            post({
-                let captured = Arc::clone(&captured);
-                move |headers: HeaderMap, body: Bytes| {
-                    capture("/v1/databases", captured, headers, body)
-                }
-            }),
-        )
         .route(
             "/v1/secrets",
             post({
@@ -114,93 +107,6 @@ fn one_request(captured: &Arc<Mutex<Vec<CapturedRequest>>>) -> CapturedRequest {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn creates_a_managed_lakehouse_request() {
-    let (endpoint, captured) = spawn_api().await;
-    let output = run(&endpoint, &["lakehouse", "create", "analytics"], None);
-    assert!(
-        output.status.success(),
-        "CLI failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let request = one_request(&captured);
-    assert_eq!(request.path, "/v1/databases");
-    assert_eq!(
-        request.authorization.as_deref(),
-        Some("Bearer local-test-token")
-    );
-    assert_eq!(
-        request.body,
-        serde_json::json!({
-            "name": "analytics",
-            "type": "lakehouse",
-            "storage": { "mode": "managed" },
-            "catalog": { "mode": "managed-lakekeeper" }
-        })
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn creates_byo_lakehouse_requests_without_implicit_rebinding() {
-    let cases = [
-        (
-            vec![
-                "lakehouse",
-                "create",
-                "customer_lake",
-                "--data-path",
-                "s3://customer-bucket/team",
-            ],
-            serde_json::json!({
-                "name": "customer_lake",
-                "type": "lakehouse",
-                "storage": {
-                    "mode": "scoped-secret",
-                    "data_path": "s3://customer-bucket/team"
-                },
-                "catalog": { "mode": "managed-lakekeeper" }
-            }),
-        ),
-        (
-            vec![
-                "lakehouse",
-                "create",
-                "external_lake",
-                "--data-path",
-                "s3://customer-bucket/team",
-                "--catalog",
-                "https://catalog.customer.com",
-                "--warehouse",
-                "customer_warehouse",
-            ],
-            serde_json::json!({
-                "name": "external_lake",
-                "type": "lakehouse",
-                "storage": {
-                    "mode": "scoped-secret",
-                    "data_path": "s3://customer-bucket/team"
-                },
-                "catalog": {
-                    "mode": "external",
-                    "uri": "https://catalog.customer.com",
-                    "warehouse": "customer_warehouse"
-                }
-            }),
-        ),
-    ];
-
-    for (arguments, expected) in cases {
-        let (endpoint, captured) = spawn_api().await;
-        let output = run(&endpoint, &arguments, None);
-        assert!(
-            output.status.success(),
-            "CLI failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(one_request(&captured).body, expected);
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn secret_create_reads_material_from_stdin_and_never_accepts_value_argument() {
     let (endpoint, captured) = spawn_api().await;
     let output = run(
@@ -221,8 +127,14 @@ async fn secret_create_reads_material_from_stdin_and_never_accepts_value_argumen
         "CLI failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let request = one_request(&captured);
+    assert_eq!(request.path, "/v1/secrets");
     assert_eq!(
-        one_request(&captured).body,
+        request.authorization.as_deref(),
+        Some("Bearer local-test-token")
+    );
+    assert_eq!(
+        request.body,
         serde_json::json!({
             "name": "customer_s3",
             "type": "s3",
@@ -276,26 +188,4 @@ async fn secret_create_reads_material_from_stdin_and_never_accepts_value_argumen
         None,
     );
     assert!(!invalid.status.success());
-}
-
-#[test]
-fn lakehouse_options_fail_closed_for_invalid_argument_shapes() {
-    for arguments in [
-        // Postgres was removed with the MVP prune (#146); no type selector exists.
-        vec!["lakehouse", "create", "pg", "--type", "postgres"],
-        vec!["lakehouse", "create", "lake", "--warehouse", "orphan"],
-        vec![
-            "lakehouse",
-            "create",
-            "lake",
-            "--catalog",
-            "https://catalog.example",
-        ],
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_verglas"))
-            .args(arguments)
-            .output()
-            .expect("CLI runs");
-        assert!(!output.status.success());
-    }
 }

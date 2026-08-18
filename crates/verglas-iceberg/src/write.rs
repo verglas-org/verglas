@@ -14,6 +14,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
+
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Schema as ArrowSchema, SchemaRef};
 use iceberg::arrow::{
@@ -74,7 +76,7 @@ pub async fn create_table(
 
     // Write the rows as the initial append (a create with no data leaves an
     // empty table, which is still valid).
-    let (records, files, snapshot_id) =
+    let (records, files, snapshot_id, _) =
         write_append(catalog, &table, &ingested.batches, &HashMap::new()).await?;
 
     let schema = table
@@ -106,7 +108,7 @@ pub async fn append(
 ) -> Result<AppendReport> {
     let ingested = ingest::read(source)?;
     let table = catalog.load_table(ident).await?;
-    let (records, files, snapshot_id) =
+    let (records, files, snapshot_id, _) =
         write_append(catalog, &table, &ingested.batches, &HashMap::new()).await?;
     Ok(AppendReport {
         table: ident_to_dotted(ident),
@@ -134,10 +136,122 @@ pub async fn append_batches(
     snapshot_properties: HashMap<String, String>,
 ) -> Result<AppendReport> {
     let table = catalog.load_table(ident).await?;
-    let (records, files, snapshot_id) =
+    let (records, files, snapshot_id, _) =
         write_append(catalog, &table, &batches, &snapshot_properties).await?;
     Ok(AppendReport {
         table: ident_to_dotted(ident),
+        operation: "append".to_owned(),
+        records_added: records,
+        data_files_added: files,
+        snapshot_id,
+    })
+}
+
+/// Caches the most recently committed [`iceberg::table::Table`] per
+/// identifier, shared across requests on one serving process. A warm append
+/// against an identifier already in the cache starts its transaction from the
+/// cached table instead of paying this crate's own `catalog.load_table` round
+/// trip to the catalog service before ever entering the transaction.
+///
+/// This removes one of two `load_table` calls a warm append otherwise makes,
+/// not both: the vendored `iceberg-rust` fork's `Transaction::do_commit`
+/// unconditionally re-fetches the table from the catalog at the start of
+/// every commit attempt, regardless of what base table it was handed — that
+/// second round trip is a fixed cost of the commit path outside this repo. A
+/// cold (first) append against an identifier still pays both; every warm
+/// append after it pays one instead of two (see
+/// `crates/verglas-iceberg/tests/table_cache.rs`).
+///
+/// This is strictly an optimization: the CAS commit (`update_table`) still
+/// runs on every append and remains the sole correctness authority. A cached
+/// table that lost a race against another writer is caught by
+/// [`commit_data_files`]'s existing `CatalogCommitConflicts` retry, which
+/// reloads through the catalog and hands back the fresh table — callers
+/// refresh the cache with that result, so a stale entry self-heals on its
+/// very next use.
+#[derive(Default)]
+pub struct TableCache {
+    tables: Mutex<HashMap<TableIdent, iceberg::table::Table>>,
+}
+
+impl TableCache {
+    /// An empty cache. One instance is meant to live for a serving process's
+    /// lifetime and be shared across requests.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached table for `ident`, loading and caching it through
+    /// `catalog` on a miss. The lock is held only for the `HashMap` lookup or
+    /// insert, never across the network call.
+    pub async fn get_or_load(
+        &self,
+        catalog: &dyn Catalog,
+        ident: &TableIdent,
+    ) -> Result<iceberg::table::Table> {
+        if let Some(table) = self.tables.lock().await.get(ident) {
+            return Ok(table.clone());
+        }
+        let table = catalog.load_table(ident).await?;
+        self.tables
+            .lock()
+            .await
+            .insert(ident.clone(), table.clone());
+        Ok(table)
+    }
+
+    /// Replaces the cached table for `ident` with the result of a commit —
+    /// the new optimistic starting point for the next append.
+    async fn put(&self, ident: TableIdent, table: iceberg::table::Table) {
+        self.tables.lock().await.insert(ident, table);
+    }
+}
+
+/// Appends a source file to an existing table through the same CAS path as
+/// [`append`], but resolves the starting table through `cache` instead of an
+/// unconditional `catalog.load_table` — see [`TableCache`].
+pub async fn append_cached(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    ident: &TableIdent,
+    source: &Path,
+) -> Result<AppendReport> {
+    let ingested = ingest::read(source)?;
+    let table = cache.get_or_load(catalog, ident).await?;
+    append_batches_from_table(catalog, cache, &table, ingested.batches, HashMap::new()).await
+}
+
+/// Appends already-in-memory Arrow batches through the same CAS path as
+/// [`append_batches`], but resolves the starting table through `cache`
+/// instead of an unconditional `catalog.load_table` — see [`TableCache`].
+pub async fn append_batches_cached(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    ident: &TableIdent,
+    batches: Vec<RecordBatch>,
+    snapshot_properties: HashMap<String, String>,
+) -> Result<AppendReport> {
+    let table = cache.get_or_load(catalog, ident).await?;
+    append_batches_from_table(catalog, cache, &table, batches, snapshot_properties).await
+}
+
+/// Same as [`append_batches_cached`] but starts from an already-resolved
+/// `table` instead of a cache lookup — for a caller (e.g. an idempotency-key
+/// check) that already pulled the table out of `cache` itself and would
+/// otherwise look it up twice. Refreshes `cache` with the commit's result.
+pub async fn append_batches_from_table(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    table: &iceberg::table::Table,
+    batches: Vec<RecordBatch>,
+    snapshot_properties: HashMap<String, String>,
+) -> Result<AppendReport> {
+    let ident = table.identifier().clone();
+    let (records, files, snapshot_id, committed) =
+        write_append(catalog, table, &batches, &snapshot_properties).await?;
+    cache.put(ident.clone(), committed).await;
+    Ok(AppendReport {
+        table: ident_to_dotted(&ident),
         operation: "append".to_owned(),
         records_added: records,
         data_files_added: files,
@@ -300,26 +414,28 @@ const COMMIT_ATTEMPTS: u32 = 8;
 
 /// Coerces the batches to the table schema, writes them as Parquet data files
 /// through the table's FileIO, and commits a fast append carrying
-/// `snapshot_properties` on the new snapshot. Returns the row count, data-file
-/// count, and the new snapshot id.
+/// `snapshot_properties` on the new snapshot. Returns the row count,
+/// data-file count, the new snapshot id, and the resulting `Table` — callers
+/// that keep a [`TableCache`] use the returned table to refresh it without a
+/// second `catalog.load_table` call.
 ///
 /// With no rows and no properties the table is left untouched (zero, zero,
-/// current snapshot). With no rows but properties set, a metadata-only snapshot
-/// is committed so the properties (a watermark) are recorded — Iceberg allows a
-/// property-only append.
+/// current snapshot, the same table). With no rows but properties set, a
+/// metadata-only snapshot is committed so the properties (a watermark) are
+/// recorded — Iceberg allows a property-only append.
 async fn write_append(
     catalog: &dyn Catalog,
     table: &iceberg::table::Table,
     batches: &[RecordBatch],
     snapshot_properties: &HashMap<String, String>,
-) -> Result<(u64, u64, Option<i64>)> {
+) -> Result<(u64, u64, Option<i64>, iceberg::table::Table)> {
     let table_name = ident_to_dotted(table.identifier());
     let iceberg_schema = table.metadata().current_schema();
     let target_arrow = Arc::new(schema_to_arrow_schema(iceberg_schema)?);
     let batches = coerce_batches(batches, &target_arrow, &table_name)?;
     let row_count: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
     if row_count == 0 && snapshot_properties.is_empty() {
-        return Ok((0, 0, table.metadata().current_snapshot_id()));
+        return Ok((0, 0, table.metadata().current_snapshot_id(), table.clone()));
     }
 
     let data_files = if row_count == 0 {
@@ -330,11 +446,8 @@ async fn write_append(
     let file_count = data_files.len() as u64;
     let committed = commit_data_files(catalog, table, data_files, snapshot_properties).await?;
 
-    Ok((
-        row_count,
-        file_count,
-        committed.metadata().current_snapshot_id(),
-    ))
+    let snapshot_id = committed.metadata().current_snapshot_id();
+    Ok((row_count, file_count, snapshot_id, committed))
 }
 
 /// Commits already-written data files as a fast append, retrying past
@@ -434,7 +547,7 @@ async fn write_data_files(
 /// table does not have, a table column the source lacks, or a type that cannot
 /// be cast is a [`AgentError::SchemaMismatch`] naming the column — the append is
 /// rejected before any data file is written.
-fn coerce_batches(
+pub(crate) fn coerce_batches(
     batches: &[RecordBatch],
     target: &Arc<ArrowSchema>,
     table_name: &str,

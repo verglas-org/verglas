@@ -190,3 +190,17 @@
   update events keeps working: its wire frame and receipt moved into the
   client as `DeliveryFrame`/`DeliveryReceipt`, and subscription ack is
   unchanged.
+- Added `client::DataClient`: the /v0 data client (events append + SQL)
+  matching the TypeScript SDK's one-shape append-ingest contract
+  (`append_events`/`table_write`/`vector_write` all post NDJSON to
+  `POST /v0/events?name=<datasource>`; `sql` posts `{"q": ...}` to
+  `POST /v0/sql`). Deleted `access.rs` and `token.rs` and the ten `Client`
+  methods that called them (`create_principal`, `list_principals`,
+  `create_resource`, `list_resources`, `create_access_grant`,
+  `list_access_grants`, `check_access`, `create_access_token`,
+  `list_access_tokens`, `revoke_access_token`) — the retired tenant-local
+  access-service era's `/v1/access/*` principal/resource/grant/token CRUD.
+  `access_uri`/`Database::subscribe`/`Database::ack` are untouched: they build
+  their `databases/.../subscribe` path from separate string literals, not the
+  deleted access-service surface. Deleted `tests/client_access.rs` and
+  `tests/client_tokens.rs` with the methods they exercised.

@@ -21,6 +21,9 @@ arrow-schema.workspace = true
 arrow-csv.workspace = true
 arrow-json.workspace = true
 arrow-cast.workspace = true
+# Durable on-disk encoding for the async-ingest write-ahead log
+# (`async_ingest`): one Arrow IPC stream per journaled request.
+arrow-ipc.workspace = true
 parquet.workspace = true
 uuid.workspace = true
 futures.workspace = true
@@ -28,7 +31,7 @@ chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "fs", "time", "sync"] }
 
 [dev-dependencies]
 async-trait.workspace = true

@@ -1,12 +1,15 @@
-//! Owner-only local persistence for CLI access tokens.
+//! Owner-only local read access to a legacy CLI bearer-credential file.
 //!
-//! The credentials file is intentionally separate from server configuration.
-//! It stores bearer values only after the access service has returned them once,
-//! and all writes create an owner-only file on platforms with POSIX permissions.
+//! The credentials file is intentionally separate from server configuration
+//! and from the connection profile `verglas login` writes
+//! (`crate::connection_profile`). `VERGLAS_TOKEN` and this file are the two
+//! ways `Cli::resolved_token` finds a bearer for commands that call Verglas
+//! Cloud directly (workers, dashboards, secrets). Nothing in this CLI writes
+//! the file; an operator populates it out of band when they want a token
+//! resolved without setting the environment variable each time.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -28,13 +31,13 @@ struct CredentialsFile {
     tokens: BTreeMap<String, StoredToken>,
 }
 
-/// Failures while reading or writing local bearer credentials.
+/// Failures while reading local bearer credentials.
 #[derive(Debug, Error)]
 pub enum CredentialsError {
     /// No configuration directory can be derived from the environment.
     #[error("cannot find a home directory for Verglas credentials")]
     MissingConfigDirectory,
-    /// Local credentials could not be read or written safely.
+    /// Local credentials could not be read safely.
     #[error("credentials file {path}: {source}")]
     Io {
         /// File that caused the I/O failure.
@@ -56,9 +59,6 @@ pub enum CredentialsError {
         /// Underlying JSON decoding failure.
         source: serde_json::Error,
     },
-    /// Credentials could not be encoded before writing.
-    #[error("could not encode local credentials: {0}")]
-    Encode(serde_json::Error),
 }
 
 /// Resolves one explicit or platform-default credentials file path.
@@ -80,30 +80,6 @@ pub fn load_token(path: &Path, endpoint: &str) -> Result<Option<StoredToken>, Cr
         .tokens
         .get(&normalized_endpoint(endpoint))
         .cloned())
-}
-
-/// Stores or replaces one access-service token with owner-only file permissions.
-pub fn save_token(path: &Path, endpoint: &str, token: StoredToken) -> Result<(), CredentialsError> {
-    let mut credentials = load(path)?;
-    credentials
-        .tokens
-        .insert(normalized_endpoint(endpoint), token);
-    save(path, &credentials)
-}
-
-/// Removes an exact local token record after its service-side revocation succeeds.
-pub fn remove_token(path: &Path, endpoint: &str, token_id: &str) -> Result<(), CredentialsError> {
-    let mut credentials = load(path)?;
-    let key = normalized_endpoint(endpoint);
-    if credentials
-        .tokens
-        .get(&key)
-        .is_some_and(|stored| stored.token_id == token_id)
-    {
-        credentials.tokens.remove(&key);
-        save(path, &credentials)?;
-    }
-    Ok(())
 }
 
 /// Reads a credential inventory, treating a missing file as empty.
@@ -147,90 +123,6 @@ fn ensure_private_file(path: &Path) -> Result<(), CredentialsError> {
     Ok(())
 }
 
-/// Writes the complete credential inventory through an owner-only temporary file.
-fn save(path: &Path, credentials: &CredentialsFile) -> Result<(), CredentialsError> {
-    let parent = path.parent().ok_or_else(|| CredentialsError::Io {
-        path: path.to_owned(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "credentials path has no parent",
-        ),
-    })?;
-    fs::create_dir_all(parent).map_err(|source| CredentialsError::Io {
-        path: parent.to_owned(),
-        source,
-    })?;
-    set_private_directory_permissions(parent)?;
-    let encoded = serde_json::to_vec_pretty(credentials).map_err(CredentialsError::Encode)?;
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let mut file = private_file(&temporary)?;
-    file.write_all(&encoded)
-        .map_err(|source| CredentialsError::Io {
-            path: temporary.clone(),
-            source,
-        })?;
-    file.write_all(b"\n")
-        .map_err(|source| CredentialsError::Io {
-            path: temporary.clone(),
-            source,
-        })?;
-    file.sync_all().map_err(|source| CredentialsError::Io {
-        path: temporary.clone(),
-        source,
-    })?;
-    fs::rename(&temporary, path).map_err(|source| CredentialsError::Io {
-        path: path.to_owned(),
-        source,
-    })?;
-    set_private_file_permissions(path)?;
-    Ok(())
-}
-
-/// Opens a replacement file with owner-only permissions from its first byte.
-fn private_file(path: &Path) -> Result<fs::File, CredentialsError> {
-    let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path).map_err(|source| CredentialsError::Io {
-        path: path.to_owned(),
-        source,
-    })
-}
-
-/// Restricts an existing directory to its owner where the platform supports it.
-fn set_private_directory_permissions(path: &Path) -> Result<(), CredentialsError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            CredentialsError::Io {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-    }
-    Ok(())
-}
-
-/// Restricts an existing credential file to its owner where the platform supports it.
-fn set_private_file_permissions(path: &Path) -> Result<(), CredentialsError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            CredentialsError::Io {
-                path: path.to_owned(),
-                source,
-            }
-        })?;
-    }
-    Ok(())
-}
-
 /// Canonicalizes URL spelling so a trailing slash does not create a second profile.
 fn normalized_endpoint(endpoint: &str) -> String {
     endpoint.trim_end_matches('/').to_owned()
@@ -240,26 +132,57 @@ fn normalized_endpoint(endpoint: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Stores and retrieves the exact token by normalized endpoint.
+    #[cfg(unix)]
+    fn write_owner_only(path: &Path, contents: &str) {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::write(path, contents).expect("write credentials");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("chmod");
+    }
+
+    /// Reads back the token stored under a normalized endpoint, tolerating a
+    /// trailing slash on the lookup.
+    #[cfg(unix)]
     #[test]
-    fn token_round_trip_normalizes_trailing_slash() {
+    fn load_token_normalizes_a_trailing_slash() {
         let directory = tempfile::tempdir().expect("tempdir");
         let path = directory.path().join("credentials.json");
-        save_token(
+        write_owner_only(
             &path,
-            "http://localhost:8345/",
-            StoredToken {
-                token: "secret".to_owned(),
-                token_id: "token-1".to_owned(),
-            },
-        )
-        .expect("save");
+            r#"{"tokens":{"http://localhost:8345":{"token":"secret","token_id":"token-1"}}}"#,
+        );
         assert_eq!(
-            load_token(&path, "http://localhost:8345")
+            load_token(&path, "http://localhost:8345/")
                 .expect("load")
                 .expect("token")
                 .token,
             "secret"
         );
+    }
+
+    /// A missing credentials file resolves to no stored token, not an error.
+    #[test]
+    fn load_token_tolerates_a_missing_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.json");
+        assert!(
+            load_token(&path, "http://localhost:8345")
+                .expect("missing file is not an error")
+                .is_none()
+        );
+    }
+
+    /// A group- or world-readable credentials file is rejected rather than trusted.
+    #[cfg(unix)]
+    #[test]
+    fn load_token_rejects_insecure_permissions() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("credentials.json");
+        fs::write(&path, r#"{"tokens":{}}"#).expect("write credentials");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(matches!(
+            load_token(&path, "http://localhost:8345"),
+            Err(CredentialsError::InsecurePermissions { .. })
+        ));
     }
 }

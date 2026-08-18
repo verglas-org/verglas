@@ -25,7 +25,7 @@
 
 use axum::serve::ListenerExt as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
 use verglas_backend::{BackendStore, BackendStores};
@@ -240,63 +240,80 @@ fn metrics_source(
     })
 }
 
-/// Spawns the disk-full guardrail poll (#96). Once a second it reads the free
-/// space under `cache.dir` and the engine's remaining physical growth room and
-/// publishes one decision the fill path reads as a plain atomic: pause block
-/// admission when the filesystem nears full so a full disk degrades the node to
-/// origin fills rather than crashing it (budgets are hard ceilings). The
-/// same decision publishes the unused physical budget to the fragment store.
-/// Dirty fragments remain protected when the ceiling shrinks. Detached for the
-/// process lifetime.
-fn spawn_disk_monitor(
-    config: &Config,
-    caching_paused: Arc<AtomicBool>,
+/// Spawns the write-pressure space broker: claim-on-demand and
+/// return-on-drain, both event-driven. A fragment reservation refused for
+/// space signals its deficit here and the broker reclaims cold cache blocks
+/// (plus the floor, so the next burst has headroom) and republishes the
+/// fragment ceiling immediately — no wait for a poll tick. A drain deleting
+/// persisted fragments signals the freed bytes and the broker grows the cache
+/// back, keeping `floor` plus live fragment usage yielded. The 1 s disk poll
+/// remains only for what has no event source: external filesystem pressure.
+fn spawn_space_broker(
     engine: CacheEngine,
-    object_ring: Option<Arc<crate::ring::RingPlane>>,
+    ring: Arc<crate::ring::RingPlane>,
+    floor: u64,
 ) -> tokio::task::JoinHandle<()> {
-    use verglas_core::disk::{DiskParams, disk_decision, free_bytes};
-
-    let dir = config.cache.dir.clone();
-    let capacity = config.cache.capacity_bytes.0;
-    // Keep a headroom reserve so admission stops before the disk is truly spent;
-    // the gap to `high_water` is the hysteresis band. Floored at 64 MiB so a tiny
-    // test budget still leaves a sane reserve. Same shape as verglas-cache-node's poll.
-    let low_water = (capacity / 16).max(64 * 1024 * 1024);
-    let high_water = low_water.saturating_mul(2);
-    let params = DiskParams {
-        low_water,
-        high_water,
-    };
+    let demand = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
+    {
+        let demand = Arc::clone(&demand);
+        let notify = Arc::clone(&notify);
+        ring.set_shortfall_handler(Arc::new(move |deficit| {
+            demand.fetch_add(deficit, Ordering::Relaxed);
+            notify.notify_one();
+        }));
+    }
+    let released = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    {
+        let released = Arc::clone(&released);
+        let notify = Arc::clone(&notify);
+        ring.set_release_handler(Arc::new(move |bytes| {
+            released.fetch_add(bytes, Ordering::Relaxed);
+            notify.notify_one();
+        }));
+    }
+    // Publish the starting ceiling before any event: fragments may spend the
+    // whole unspent budget from boot.
+    ring.set_fragment_ceiling(
+        ring.fragment_used_bytes()
+            .saturating_add(engine.disk_growth_room_bytes()),
+    );
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
-            ticker.tick().await;
-            let was_paused = caching_paused.load(Ordering::Relaxed);
-            let free = free_bytes(&dir);
-            let room = engine.disk_growth_room_bytes();
-            let frag_used = object_ring
-                .as_ref()
-                .map_or(0, |ring| ring.fragment_used_bytes());
-            let state = disk_decision(free, room, frag_used, was_paused, &params);
-            if let Some(ring) = &object_ring {
-                ring.set_fragment_ceiling(state.fragment_max);
-            }
-            caching_paused.store(state.caching_paused, Ordering::Relaxed);
-            if state.caching_paused != was_paused {
-                if state.caching_paused {
-                    tracing::warn!(
-                        fs_free_bytes = free,
-                        foyer_growth_room = room,
-                        "cache admission paused: disk headroom below low water"
-                    );
-                } else {
+            notify.notified().await;
+            let wanted = demand.swap(0, Ordering::Relaxed);
+            if wanted > 0 {
+                let reclaimed = engine
+                    .reclaim_disk_for_writeback(wanted.saturating_add(floor))
+                    .await;
+                if reclaimed > 0 {
                     tracing::info!(
-                        fs_free_bytes = free,
-                        foyer_growth_room = room,
-                        "cache admission resumed"
+                        reclaimed_bytes = reclaimed,
+                        deficit = wanted,
+                        fragment_floor = floor,
+                        "reclaimed cache blocks for write-back demand"
                     );
                 }
             }
+            if released.swap(0, Ordering::Relaxed) > 0 {
+                let reserve = ring.fragment_used_bytes().saturating_add(floor);
+                let restored = engine.restore_disk(reserve).await;
+                if restored > 0 {
+                    tracing::info!(
+                        restored_bytes = restored,
+                        "cache grew back into space drained fragments released"
+                    );
+                }
+            }
+            // Republish the ceiling now — the moved space is usable this
+            // instant. The ceiling is the dirty bytes already held plus the
+            // budget the cache is not physically using; the budget is the
+            // only bound because the disk is dedicated and fixed (nothing
+            // external competes for it).
+            ring.set_fragment_ceiling(
+                ring.fragment_used_bytes()
+                    .saturating_add(engine.disk_growth_room_bytes()),
+            );
         }
     })
 }
@@ -537,11 +554,18 @@ pub async fn run(
             bucket: config.backend.bucket.clone(),
             access_key_id: Some(credentials.0.clone()),
         };
+        let table_state = match crate::tables_api::TableState::new(
+            connection,
+            config.cache.dir.join("async-ingest"),
+        ) {
+            Ok(state) => state,
+            Err(error) => {
+                return Err(format!("open async-ingest queue: {error}").into());
+            }
+        };
         admin_app = admin_app
             .merge(admin::access_router(access))
-            .merge(crate::tables_api::router(
-                crate::tables_api::TableState::new(connection),
-            ));
+            .merge(crate::tables_api::router(table_state));
     }
     let authoritative_stop = safekeeper_args
         .as_ref()
@@ -747,12 +771,26 @@ pub async fn run(
         );
 
         // Disk-full guardrail poll (#96). Held for the process lifetime.
-        let _disk_monitor = spawn_disk_monitor(
-            config,
-            engine.caching_paused_handle(),
-            engine.clone(),
-            object_ring.clone(),
-        );
+        // The event-driven space broker (claim on demand, return on drain)
+        // rides the ring's fragment store signals; without a ring there is no
+        // write-back plane and nothing to broker. The disk is dedicated and
+        // fixed-size, so the budget is the only bound — no filesystem watch.
+        if let Some(ring) = &object_ring {
+            // The guaranteed fragment headroom reclaimed beyond each deficit
+            // so the next burst does not wait. Zero derives a 1/16-of-budget
+            // reserve, floored at 64 MiB.
+            let floor = if config.cache.writeback.enabled {
+                let configured = config.cache.writeback.disk_floor_bytes.0;
+                if configured == 0 {
+                    (config.cache.capacity_bytes.0 / 16).max(64 * 1024 * 1024)
+                } else {
+                    configured
+                }
+            } else {
+                0
+            };
+            let _space_broker = spawn_space_broker(engine.clone(), Arc::clone(ring), floor);
+        }
 
         // Recovery is done: fill the engine-dependent admin routes, then flip the
         // health gate so a load balancer may start routing here.

@@ -163,3 +163,9 @@
   multi-megabyte shards served by CPU-throttled peers. A delayed-peer regression
   keeps healthy durable fragments available while blackholed reads still fail
   before the longer placement budget.
+- The fragment store signals its space lifecycle: a reservation refused for
+  space invokes a shortfall handler with the exact deficit (claim on
+  demand), and fragment deletion after the origin barrier invokes a release
+  handler with the freed bytes (return on drain). Both tested
+  failing-first; signals fire only on the refusal/delete paths, never on a
+  successful placement.

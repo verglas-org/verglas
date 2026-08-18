@@ -21,6 +21,7 @@ members = [
     "crates/verglas-vector",
     "crates/verglas-kv",
     "bins/cache-node",
+    "bins/query-node",
     "crates/verglas-block",
 ]
 
@@ -69,6 +70,15 @@ iceberg-datafusion = "0.10.1"
 # the configured cache endpoint.
 iceberg-storage-opendal = "0.10.1"
 datafusion = "53.1"
+# bins/query-node's second query engine (protocol v4 step 9b): the bundled
+# build statically links libduckdb so the binary carries its own engine, no
+# system libduckdb at runtime. DuckDB's own Iceberg REST catalog support
+# (its `iceberg`/`httpfs` extensions, loaded at session init) reads the same
+# catalog and S3 endpoint the DataFusion path uses. Its `arrow` dependency
+# pins to the same arrow-rs "58" line as the rest of the workspace, so
+# `duckdb::arrow::record_batch::RecordBatch` and `arrow_array::RecordBatch`
+# are the same type — query-node's JSON row writer serves both engines.
+duckdb = { version = "1.10505.0", features = ["bundled"] }
 # Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "58"
 arrow-buffer = "58"
@@ -159,6 +169,13 @@ unwrap_used = "warn"
 # https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.1/VERGLAS.md
 [patch.crates-io]
 iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "39f251a452ab2ab48728917b56182e35bb6b805b" }
+# VERGLAS PATCH: foyer 0.22.3 from verglas-org/verglas-foyer (branch
+# verglas/v0.22.3) with live disk-resize for the block engine — the watermark
+# model the write-pressure reclamation needs: shrink retires tail partitions
+# and truncates the backing file, grow-back restores them. Pin a SHA — never
+# a floating branch tip. Patch inventory:
+# https://github.com/verglas-org/verglas-foyer/blob/verglas/v0.22.3/VERGLAS.md
+foyer = { git = "https://github.com/verglas-org/verglas-foyer", rev = "58a7f001d8cd894423106713904daf948db20e65" }
 
 # The profile that 'dist' will build with
 [profile.dist]

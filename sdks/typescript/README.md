@@ -130,63 +130,48 @@ Inside a worker you never call `connect` yourself — the runner hands you a
 connected `ctx.verglas`. You call `connect` only when driving the SDK directly
 (tests, a script, a harness entry).
 
-## Scoped access tokens
+## The /v0 data client
 
-Every SDK connector requires a non-empty scoped bearer token. There is no
-deployment-wide service-token fallback. Create a token from an owner credential,
-then store the returned bearer value in your local credential store. Verglas
-returns that value only once.
+Table writes, vector writes, and log shipping all speak the same append-ingest
+shape: NDJSON rows posted to `POST /v0/events?name=<datasource>` with a
+workspace bearer token. SQL runs through `POST /v0/sql`. There is no
+deployment-wide service-token fallback — every call requires a non-empty
+workspace token.
 
 ```ts
-import { connect, connectAccess } from "@verglas/sdk";
+import { createDataClient } from "@verglas/sdk";
 
-const access = connectAccess({
-  endpoint: "http://127.0.0.1:8345",
-  token: process.env.VERGLAS_OWNER_TOKEN!,
+const data = createDataClient({
+  baseUrl: "https://api.verglas.dev",
+  token: process.env.VERGLAS_WORKSPACE_TOKEN!,
 });
 
-const localCli = await access.createToken({
-  name: "Local analytics script",
-  audience: "data-plane",
-  expires_in_seconds: 60 * 60 * 24 * 30,
-  grants: [{ resource_id: "database/analytics", actions: ["discover", "query"] }],
-});
+await data.appendEvents("app_logs", [{ level: "info", msg: "boot" }]);
+await data.tableWrite("analytics.events", [{ path: "/" }]);
+await data.vectorWrite("embeddings", [{ id: "a", vector: [0.1, 0.2] }]);
 
-// Save localCli.token in a mode-0600 credentials file. It cannot be read again.
-const analytics = connect({
-  endpoint: "http://127.0.0.1:8334",
-  token: localCli.token,
-});
+const rows = await data.sql("SELECT count() FROM analytics_events");
 ```
 
-The token creates a child process principal. The access service delegates only
-the requested resource actions that the owner already has, then evaluates the
-child principal on every request. Listing and revoking tokens returns public
-metadata only:
+`tableWrite` and `vectorWrite` are aliases for `appendEvents` — every kind of
+row lands through the same endpoint, distinguished only by the target
+datasource.
+
+## Workers and secrets
+
+`connectScheduler` manages workers (`/v0/workers`) and scheduler secrets
+(`/v1/secrets`) on the same authenticated listener:
 
 ```ts
-await access.listTokens();
-await access.revokeToken(localCli.id);
-```
+import { connectScheduler } from "@verglas/sdk";
 
-Use `access.authorize()` when a management surface needs to explain whether the
-presented token can perform a database, table, or Integration
-operation. The returned decision includes the matched grant and policy revision.
-
-For a direct connection to an authorized managed Postgres database, mint a
-separate short-lived database credential. This is not a tenant administrator
-password and it is returned only once. The access service caps its lifetime at
-15 minutes:
-
-```ts
-const direct = await access.createDatabaseToken({
-  database_id: "operations",
-  expires_in_seconds: 900,
+const scheduler = connectScheduler({
+  endpoint: "https://api.verglas.dev",
+  token: process.env.VERGLAS_WORKSPACE_TOKEN!,
 });
 
-// Pass direct.token to the database driver as its temporary credential.
-// Do not log it or write it to source control.
-console.log(new Date(direct.expires_at * 1000));
+await scheduler.listWorkers();
+await scheduler.runWorker("sync-linear", crypto.randomUUID());
 ```
 
 ## Reflected Integration namespaces

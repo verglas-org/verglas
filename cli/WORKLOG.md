@@ -858,3 +858,76 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   zero install. Dropped the shell/powershell installer scripts and the
   homebrew formula (no tap existed, so brew install never worked). Publishing
   requires the NPM_TOKEN repository secret.
+- Retargeted `workers` from the retired `/v1/workers` route to `/v0/workers`.
+  Added `verglas ingest <datasource>` (NDJSON from `--file` or stdin ->
+  `POST /v0/events?name=<datasource>`) and `verglas sql <query>`
+  (`POST /v0/sql`) in a new `commands/data.rs`, using the SDK's new
+  `DataClient`. Deleted `verglas token` (`commands/token.rs`, `TokenCommand`)
+  and `verglas lakehouse` (`commands/lakehouse.rs`, `LakehouseCommand`): both
+  called dead Verglas Cloud surfaces (`/v1/access/tokens` and friends,
+  `/v1/databases`) from the retired tenant-local access-service era, with no
+  replacement in scope. `credentials.rs` lost `save_token`/`remove_token` and
+  the private file-writing helpers behind them — `token create` was their
+  only caller; `load_token`/`Cli::resolved_token` (VERGLAS_TOKEN, then this
+  file) are unchanged and still used by every Cloud-authenticated command.
+- Restored `verglas lakehouse` (list/create) against the control plane's
+  live `/v1/lakehouses` surface — the old command spoke the retired access
+  service. Create is managed by default; `--data-path s3://bucket/prefix`
+  posts an external-s3 storage profile with credentials from the
+  environment, never argv. Login now records the provisioning payload's
+  `tenant_id` in the connection profile so tenant-scoped routes need no
+  discovery round trip. Tests were written first and failed with
+  "unrecognized subcommand" before the implementation.
+- Login now persists the control plane's durable machine token: provisioning
+  responses carry `api_token`, and both login paths store it in the
+  endpoint-keyed credential inventory that `resolved_token()` reads (new
+  `credentials::save_token`). Browser logins therefore authenticate to
+  tenant-scoped routes without VERGLAS_TOKEN, while the single-use browser
+  code itself is still never written to disk.
+- Authorization failures on `verglas lakehouse` now map to renewal guidance:
+  a 401 (rejected bearer), or a 404 when the stored machine token has
+  outlived its 30-day life, prints "lakehouse token expired; run `verglas
+  login` to renew" instead of the raw status. The 404 mapping never fires on
+  a fresh token because the server's opaque 404 also covers non-membership.
+  Tokens now record their issue time in the credential store.
+- Scoped access tokens and silent renewal:
+  `verglas token create NAME --scope ingest:<ds>|sql:read` mints a
+  producer/reader credential (value printed once, never stored), `list`
+  shows ids/names/scopes without values, `revoke` deletes by id. Every
+  command now transparently renews a stored machine token past its 15-day
+  half-life via POST /v1/tokens/renew before running, so an actively used
+  login never expires; VERGLAS_TOKEN and fresh tokens are untouched, and a
+  failed renewal falls back to the still-valid stored token. Contract tests
+  written first (failed: unrecognized subcommand).
+- Aligned `verglas token` to the deployed control-plane contract: CRUD lives
+  at /v0/tokens (create via repeated `scope` query params, list field is
+  `id`, revoke accepts id or name and returns {ok:true}); renewal stays at
+  /v1/tokens/renew. Scrubbed third-party service names from code comments
+  and docs across the CLI and SDKs per the naming directive — we mirror the
+  spec, we don't name it.
+- Added a multi-scope round-trip regression test for token creation: the
+  control plane once honored only the first repeated `scope` param, silently
+  minting single-scope tokens. `--json` create output must now reflect every
+  granted scope.
+- Fixed a CI hang: the lakehouse tests' two-connection mock responded after
+  reading only request headers, so closing while the client still wrote the
+  body reset the connection and wedged it into retry — a hang under a slow
+  coverage-instrumented build. The mock now drains to content-length before
+  responding, like the token-test mock always did.
+- Reconciled the /v0 series with the WorkOS login work that merged to main
+  (#159/#161): their auth choke point (resolved_bearer, cloud_call 401
+  guidance, post-success durable-token renewal) supersedes this branch's
+  client-side renewal and issued-at aging, both dropped; this branch's
+  /v0/tokens verbs and /v1/lakehouses commands supersede the retired
+  access-service versions, now routed through cloud_call like every other
+  cloud command. Device-test mocks repathed to /v0/tokens.
+- Token tests seed the durable control-plane token file (HOME-based) rather
+  than the endpoint-keyed store, and clear XDG_CONFIG_HOME: CI runners set
+  it, which pointed the store outside the test's temporary HOME and left the
+  request unauthenticated. Verified with XDG_CONFIG_HOME set locally.
+- CLI distribution switched from the npm package to the shell installer:
+  every release attaches a self-contained verglas-installer.sh and
+  `curl -fsSL https://verglas.dev/install.sh | sh` is the install command
+  (the site redirects to the latest release's script). The @verglas/cli npm
+  package is gone; @verglas/sdk (a library) still publishes to npm. The CLI
+  no longer needs the npm scope at all.

@@ -94,6 +94,10 @@ struct Profile {
     credentials_file: Option<String>,
     #[serde(default)]
     bearer_file: Option<String>,
+    /// The deployment (tenant) id provisioning reported; addresses the control
+    /// plane's tenant-scoped routes (`verglas lakehouse`).
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,6 +115,10 @@ struct ProvisionResponse {
     /// instead, so this is `None` there.
     #[serde(default)]
     api_token: Option<String>,
+    /// Present on control planes that report the deployment id; recorded in
+    /// the profile so tenant-scoped commands need no discovery round trip.
+    #[serde(default)]
+    tenant_id: Option<String>,
 }
 
 /// Authenticates to a public compatible control-plane contract and persists one
@@ -299,6 +307,7 @@ fn persist(
         region: Some(DEFAULT_REGION.to_owned()),
         credentials_file: Some(endpoint_file.to_string_lossy().to_string()),
         bearer_file: Some(bearer_file.to_string_lossy().to_string()),
+        tenant_id: provision.tenant_id.clone(),
     };
     let mut config = match fs::read_to_string(&config_path) {
         Ok(text) => {
@@ -361,6 +370,15 @@ fn read_profile() -> Result<Profile, ConnectionProfileError> {
 }
 
 /// Reads the profile's control-plane URL, when a profile exists.
+/// The tenant (deployment) id recorded at login, if the control plane
+/// reported one.
+pub fn tenant_id() -> Option<String> {
+    let path = profile_path().ok()?;
+    let text = fs::read_to_string(path).ok()?;
+    let config: ConfigFile = toml::from_str(&text).ok()?;
+    config.connection?.tenant_id
+}
+
 pub fn control_plane_url() -> Option<String> {
     let path = profile_path().ok()?;
     let text = std::fs::read_to_string(path).ok()?;
