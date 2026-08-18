@@ -925,3 +925,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   than the endpoint-keyed store, and clear XDG_CONFIG_HOME: CI runners set
   it, which pointed the store outside the test's temporary HOME and left the
   request unauthenticated. Verified with XDG_CONFIG_HOME set locally.
+- CLI distribution switched from the npm package to the shell installer:
+  every release attaches a self-contained verglas-installer.sh and
+  `curl -fsSL https://verglas.dev/install.sh | sh` is the install command
+  (the site redirects to the latest release's script). The @verglas/cli npm
+  package is gone; @verglas/sdk (a library) still publishes to npm. The CLI
+  no longer needs the npm scope at all.
