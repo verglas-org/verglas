@@ -1,0 +1,10 @@
+# `tracing_unstable` only: it gates `tracing`/`tracing-subscriber`'s `valuable`
+# feature, which the structured-logging path and the `Valuable` derives on
+# `NamespaceIdent`/`TableIdent` depend on.
+#
+# `tokio_unstable` was here for `tokio-metrics`' runtime collector. That was
+# dropped (see `lakekeeper/src/metrics.rs`): rustflags are global, so one
+# optional gauge set was forcing the whole workspace onto tokio's unstable
+# surface. Do not add it back.
+[build]
+rustflags = ["--cfg", "tracing_unstable"]

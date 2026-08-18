@@ -1,0 +1,268 @@
+services:
+  jupyter:
+    image: quay.io/jupyter/pyspark-notebook:2024-10-14
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    command: start-notebook.sh --NotebookApp.token=''
+    volumes:
+      - ./notebooks:/home/jovyan/examples/
+    networks:
+      iceberg_net:
+    ports:
+      - "8888:8888"
+
+  opa:
+    image: openpolicyagent/opa:1.10.1
+    command:
+      [
+        "run",
+        "--server",
+        "--log-format",
+        "text",
+        "--log-level",
+        "debug",
+        "--addr",
+        "0.0.0.0:8181",
+        "/policies",
+      ]
+    volumes:
+      - ../../authz/opa-bridge/policies:/policies
+    networks:
+      iceberg_net:
+    environment:
+      - LAKEKEEPER_URL=http://lakekeeper:8181
+      - LAKEKEEPER_TOKEN_ENDPOINT=http://keycloak:8080/realms/iceberg/protocol/openid-connect/token
+      - LAKEKEEPER_CLIENT_ID=trino
+      - LAKEKEEPER_CLIENT_SECRET=AK48QgaKsqdEpP9PomRJw7l2T7qWGHdZ
+      - LAKEKEEPER_SCOPE=lakekeeper
+      - TRINO_LAKEKEEPER_CATALOG_NAME=lakekeeper
+      - LAKEKEEPER_LAKEKEEPER_WAREHOUSE=demo
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8181/health" ]
+      interval: 5s
+      timeout: 10s
+      retries: 3
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.7
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=admin
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "exec 3<>/dev/tcp/127.0.0.1/8080;echo -e \"GET
+            /realms/master/.well-known/openid-configuration HTTP/1.1\\r\\nhost:
+            127.0.0.1:8080\\r\\nConnection: close\\r\\n\\r\\n\" >&3;grep
+            \"jwks_uri\"  <&3",
+        ]
+      interval: 2s
+      timeout: 10s
+      retries: 2
+      start_period: 60s
+    ports:
+      - "30080:8080"
+    command:
+      [
+        "start-dev",
+        "--metrics-enabled=true",
+        "--health-enabled=true",
+        "--import-realm",
+        "--verbose",
+        "--log-level=INFO",
+        "--features=token-exchange",
+      ]
+    networks:
+      iceberg_net:
+
+  lakekeeper:
+    image: ${LAKEKEEPER_TEST__SERVER_IMAGE:-quay.io/lakekeeper/catalog:latest-main}
+    pull_policy: always
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
+      - LAKEKEEPER__OPENFGA__MAX_BATCH_CHECK_SIZE=200
+      - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg
+      - LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://localhost:30080/realms/iceberg
+      - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+      - LAKEKEEPER__UI__OPENID_CLIENT_ID=lakekeeper
+      - LAKEKEEPER__UI__OPENID_PROVIDER_URI=http://localhost:30080/realms/iceberg
+      - LAKEKEEPER__DEBUG__LOG_REQUEST_BODIES=true
+      # Optional: Restrict who can set / modify security sensitive "trino.run-as-owner" property
+      - LAKEKEEPER__TRUSTED_ENGINES__TRINO__TYPE=trino
+      - LAKEKEEPER__TRUSTED_ENGINES__TRINO__OWNER_PROPERTY=trino.run-as-owner
+      # Allow "trino" keycloak service principal (also used for OPA for simplicity) to modify the property also without using trino.
+      - LAKEKEEPER__TRUSTED_ENGINES__TRINO__IDENTITIES__OIDC__SUBJECTS=["94eb1d88-7854-43a0-b517-a75f92c533a5"]
+      - RUST_LOG=info,lakekeeper=debug
+    command: [ "serve" ]
+    healthcheck:
+      test: [ "CMD", "/home/nonroot/lakekeeper", "healthcheck" ]
+      interval: 1s
+      timeout: 10s
+      retries: 3
+      start_period: 3s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    ports:
+      - "8181:8181"
+    networks:
+      iceberg_net:
+
+  trino-opa:
+    image: trinodb/trino:476
+    environment:
+      - OIDC_ISSUER=http://localhost:30080/realms/iceberg
+    healthcheck:
+      test: [ "CMD", "curl", "-I", "http://localhost:8080/v1/status" ]
+      interval: 2s
+      timeout: 10s
+      retries: 2
+      start_period: 10s
+    networks:
+      - iceberg_net
+    volumes:
+      - ./trino/access-control.properties:/etc/trino/access-control.properties
+      - ./trino/config.properties:/etc/trino/config.properties
+      - ./trino/log.properties:/etc/trino/log.properties
+
+  # Emulates a reverse proxy that secures the connection to the server.
+  # This is required as trino requires HTTPS in OAUTH2 settings (rightfully so!)
+  trino-proxy:
+    image: nginx
+    ports:
+      - 443:443
+      - 38191:38191
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./certs:/etc/nginx/certs
+    networks:
+      iceberg_net:
+
+  migrate:
+    image: ${LAKEKEEPER_TEST__SERVER_IMAGE:-quay.io/lakekeeper/catalog:latest-main}
+    pull_policy: always
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
+      - RUST_LOG=info
+    restart: "no"
+    entrypoint: [ "/home/nonroot/lakekeeper", "migrate" ]
+    depends_on:
+      db:
+        condition: service_healthy
+      openfga:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      iceberg_net:
+
+  db:
+    image: postgres:17
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres" ]
+      interval: 2s
+      timeout: 10s
+      retries: 2
+      start_period: 10s
+    networks:
+      iceberg_net:
+
+  openfga-db:
+    image: postgres:17
+    command: postgres -c max_connections=1000
+    environment:
+      - POSTGRES_PASSWORD=postgres
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres" ]
+      interval: 2s
+      timeout: 10s
+      retries: 2
+      start_period: 10s
+    networks:
+      iceberg_net:
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.36
+    # `mini` is SeaweedFS' single-process dev mode (master + volume + filer + S3).
+    # -bucket pre-creates the `examples` bucket, and the IAM config enables STS so
+    # Lakekeeper can vend short-lived credentials to query engines.
+    command:
+      - mini
+      - -dir=/data
+      - -bucket=examples
+      - -s3.config=/etc/seaweedfs/iam.json
+      - -s3.iam.config=/etc/seaweedfs/iam.json
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8333/status" ]
+      interval: 2s
+      timeout: 10s
+      retries: 2
+      start_period: 15s
+    volumes:
+      - ./seaweedfs-iam.json:/etc/seaweedfs/iam.json:ro
+    networks:
+      iceberg_net:
+
+  openfga-migrate:
+    image: openfga/openfga:v1.8
+    command: migrate
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:postgres@openfga-db:5432/postgres?sslmode=disable
+    networks:
+      iceberg_net:
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+
+  openfga:
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+      openfga-migrate:
+        condition: service_completed_successfully
+    image: openfga/openfga:v1.12
+    command: run
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:postgres@openfga-db:5432/postgres?sslmode=disable
+      - OPENFGA_PLAYGROUND_ENABLED=false
+      - OPENFGA_DATASTORE_MAX_OPEN_CONNS=200
+      - OPENFGA_DATASTORE_MAX_IDLE_CONNS=100
+      - OPENFGA_CACHE_CONTROLLER_ENABLED=true
+      - OPENFGA_CHECK_QUERY_CACHE_ENABLED=true
+      - OPENFGA_CHECK_ITERATOR_CACHE_ENABLED=true
+      - OPENFGA_MAX_CHECKS_PER_BATCH_CHECK=200
+    networks:
+      iceberg_net:
+    healthcheck:
+      test: [ "CMD", "/usr/local/bin/grpc_health_probe", "-addr=openfga:8081" ]
+      interval: 5s
+      timeout: 30s
+      retries: 3
+
+networks:
+  iceberg_net:

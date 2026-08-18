@@ -51,7 +51,9 @@
 set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LAKEKEEPER_DIR="${LAKEKEEPER_DIR:-$HOME/code/verglas-lakekeeper}"
+# In-tree since the fork moved into this repository. Still overridable, so a
+# run can point at a scratch checkout of the catalog.
+LAKEKEEPER_DIR="${LAKEKEEPER_DIR:-$ENGINE_DIR/lakekeeper}"
 CLOUD_DIR="${CLOUD_DIR:-$HOME/code/verglas-cloud}"
 STATE_DIR="${VERGLAS_LOCAL_LITE_STATE_DIR:-${TMPDIR:-/tmp}/verglas-local-lite}"
 

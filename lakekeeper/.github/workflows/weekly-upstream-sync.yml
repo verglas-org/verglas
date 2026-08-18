@@ -1,0 +1,81 @@
+name: Weekly upstream sync
+
+on:
+  schedule:
+    - cron: "21 7 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: weekly-upstream-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_URL: https://github.com/lakekeeper/lakekeeper.git
+      UPSTREAM_WEB: https://github.com/lakekeeper/lakekeeper
+      UPSTREAM_BRANCH: main
+      SYNC_BRANCH: automation/upstream-sync
+    steps:
+      - name: Check out private main
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          ref: main
+
+      - name: Publish or refresh upstream sync PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "${UPSTREAM_URL}"
+          git fetch --no-tags upstream "${UPSTREAM_BRANCH}"
+          git fetch --no-tags origin main
+
+          upstream_sha=$(git rev-parse "upstream/${UPSTREAM_BRANCH}")
+          private_sha=$(git rev-parse origin/main)
+          existing_pr=$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base main \
+            --head "${SYNC_BRANCH}" \
+            --state open \
+            --json number \
+            --jq '.[0].number // empty')
+
+          if git merge-base --is-ancestor "${upstream_sha}" "${private_sha}"; then
+            if [[ -n "${existing_pr}" ]]; then
+              gh pr close "${existing_pr}" \
+                --repo "${GITHUB_REPOSITORY}" \
+                --comment "Private main already contains upstream ${upstream_sha}."
+            fi
+            echo "Private main already contains upstream ${upstream_sha}."
+            exit 0
+          fi
+
+          git push --force origin \
+            "${upstream_sha}:refs/heads/${SYNC_BRANCH}"
+
+          body=$(printf '%s\n\n%s\n\n%s\n\n%s\n' \
+            'Automated weekly synchronization with the canonical open-source repository.' \
+            "- Upstream: ${UPSTREAM_WEB}" \
+            "- Upstream commit: \`${upstream_sha}\`" \
+            'The sync branch is the upstream branch directly. If GitHub reports merge conflicts, this PR must remain open for manual resolution; this workflow never rebases or resolves conflicts.')
+
+          if [[ -n "${existing_pr}" ]]; then
+            gh pr edit "${existing_pr}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "chore: sync ${UPSTREAM_WEB##*/} upstream" \
+              --body "${body}"
+          else
+            gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base main \
+              --head "${SYNC_BRANCH}" \
+              --title "chore: sync ${UPSTREAM_WEB##*/} upstream" \
+              --body "${body}"
+          fi

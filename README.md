@@ -18,6 +18,9 @@ This repository contains the public data engine and its client surfaces:
 - `cli`: the `verglas` command-line client.
 - `sdks`: the public Rust and TypeScript SDKs.
 - `rime`: the RIME package installed by the CLI for supported agent hosts.
+- `lakekeeper`: the Verglas fork of Lakekeeper, the Apache Iceberg REST
+  catalog. A nested cargo workspace with its own lockfile — the root
+  `cargo --workspace` commands do not reach it. See [AGENTS.md](AGENTS.md).
 - The reusable Rust crates that implement the storage and client roles.
 
 The remaining product boundaries are deliberate:
@@ -35,6 +38,11 @@ Verglas is available under the Functional Source License 1.1 with an Apache
 Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
+
+`lakekeeper/` is the exception. It is Lakekeeper-derived code and is mostly
+Apache 2.0, with only the Verglas-authored adapters under FSL-1.1-ALv2.
+[lakekeeper/LICENSING.md](lakekeeper/LICENSING.md) governs that subtree and
+states which crates fall under which license.
 
 ## Install
 
@@ -88,10 +96,15 @@ rm -rf ./.verglas
 ## Build and test
 
 ```sh
-just build
-just test
-just lint
+just build   # both workspaces
+just test    # engine only
+just lint    # both workspaces
 ```
+
+The catalog is a separate cargo workspace, so it has its own recipes:
+`just lakekeeper-build`, `just lakekeeper-lint`, and `just lakekeeper-test`.
+Its suite needs a reachable Postgres in `DATABASE_URL`, which is why it is not
+part of `just test`.
 
 Install the runtime node and CLI from source with `just install`. The Rust and
 TypeScript SDKs live under `sdks/`; RIME lives under `rime/`.

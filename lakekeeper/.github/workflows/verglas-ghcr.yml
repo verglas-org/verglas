@@ -1,0 +1,57 @@
+name: Publish Verglas Lakekeeper image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: verglas-lakekeeper-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    if: github.repository_owner == 'verglas-org'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@06116385d9baf250c9f4dcb4858b16962ea869c3 # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish immutable image
+        env:
+          IMAGE: ghcr.io/verglas-org/lakekeeper
+        run: |
+          docker buildx create --use
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg NO_CHEF=true \
+            --file docker/full.Dockerfile \
+            --tag "${IMAGE}:${GITHUB_SHA}" \
+            --push \
+            .
+
+      - name: Publish main alias
+        if: github.ref == 'refs/heads/main'
+        env:
+          IMAGE: ghcr.io/verglas-org/lakekeeper
+        run: |
+          docker buildx imagetools create \
+            --tag "${IMAGE}:latest" \
+            "${IMAGE}:${GITHUB_SHA}"

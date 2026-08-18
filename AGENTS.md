@@ -10,6 +10,48 @@ This project is pre-release. The rules that follow from that are strict:
 - **No versioning machinery.** Do not implement format versions, protocol version negotiation, migration paths, or feature flags for compatibility. Wire formats, on-disk layouts, and APIs may break freely between commits.
 - **Upgradeability is a design consideration, not an implementation requirement.** Where the architecture defines an extension point that will one day carry version skew (peer RPC, on-disk extents, Puffin blob types, the successor-takeover protocol), *note the extension point in a comment* — but do not build the upgrade path. Each update does not need to be implemented as upgradeable at this time.
 
+## Repository layout
+
+One cargo workspace covers the whole repository. `crates/`, `bins/`, `cli/`, and
+`sdks/rust` hold the engine; `lakekeeper/crates/` holds the Verglas fork of
+[Lakekeeper](https://github.com/lakekeeper/lakekeeper), the Apache Iceberg REST
+catalog, which moved in from the separate `verglas-org/verglas-lakekeeper`
+repository. That repository is historical; catalog changes land here.
+
+`cargo build --workspace` builds all of it. `just build`, `just test`, and
+`just lint` are the entry points.
+
+The catalog is being adapted heavily and will not stay recognisable as upstream
+Lakekeeper. Treat its code as Verglas code: the standing rules in this file
+(no fallbacks, delete rather than deprecate, tests first) apply there too.
+
+Things that are easy to get wrong:
+
+- **The catalog's tests need PostgreSQL.** `just test` therefore excludes those
+  crates, and `.github/workflows/lakekeeper.yml` runs them against a Postgres
+  service. `just lakekeeper-test` runs them locally against `DATABASE_URL`.
+- **`.cargo/config.toml` sets `--cfg tracing_unstable` for the whole
+  workspace.** It gates `tracing`/`tracing-subscriber`'s `valuable` feature.
+  Rustflags set in the environment *replace* that table rather than merging, so
+  exporting `RUSTFLAGS` breaks the build. `tokio_unstable` was deliberately
+  removed — do not reintroduce it (see `lakekeeper/crates/lakekeeper/src/metrics.rs`).
+- **`.sqlx/` at the root is the sqlx offline cache** and must stay current with
+  the queries in the tree; CI checks it. Regenerate with `just sqlx-prepare`
+  against a live database.
+- **One `iceberg`, and it is forked.** `[patch.crates-io]` redirects `iceberg`
+  and its three sibling crates to `verglas-org/verglas-iceberg`, whose base is
+  the Lakekeeper fork plus a public `TableCommit::from_parts`. All four are
+  pinned with `=` requirements: a caret requirement lets the higher crates.io
+  0.10.1 outrank the fork's 0.10.0 and the patch silently stops applying.
+  Unifying this is what allowed one workspace at all.
+- **`lakekeeper/LICENSING.md` governs licensing under `lakekeeper/`** — mostly
+  Apache-2.0, with the Verglas-authored adapters under FSL-1.1-ALv2. The root
+  `LICENSE` does not cover that subtree. Catalog crates inherit
+  `license.workspace`; engine crates inherit `license-file.workspace`.
+- **`lakekeeper/.github/workflows/` is inert.** GitHub reads workflows only from
+  the repository root; those files are kept as the reference for gates not yet
+  ported.
+
 ## Sources of truth
 
 1. **docs/architecture/whitepaper.mdx** — the architecture and its reasoning. Read the relevant section before implementing; if an implementation decision contradicts the whitepaper, stop and raise it rather than silently diverging.

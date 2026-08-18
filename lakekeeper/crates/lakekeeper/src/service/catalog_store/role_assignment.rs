@@ -1,0 +1,1573 @@
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
+
+use axum_prometheus::metrics;
+use http::StatusCode;
+use iceberg_ext::catalog::rest::ErrorModel;
+
+use crate::{
+    ProjectId,
+    api::management::v1::user::{UserLastUpdatedWith, UserType},
+    service::{
+        ArcProjectId, CatalogBackendError, CatalogStore, DatabaseIntegrityError, RoleId,
+        RoleIdNotFoundInProject, RoleIdent, RoleNameAlreadyExists, RoleProviderId, Transaction,
+        authn::{UserId, UserIdRef},
+        cache_metrics, define_transparent_error,
+        events::{EventDispatcher, RoleMembersSyncedEvent, UserRoleAssignmentsSyncedEvent},
+        identifier::role::ArcRoleIdent,
+        impl_error_stack_methods, impl_from_with_detail, role_assignments_cache, role_cache,
+    },
+};
+
+// ============================================================================
+// Request / response types
+// ============================================================================
+
+/// User data supplied by an external role provider (LDAP, SCIM, …) when
+/// assigning a user to a role.  The implementation upserts the user into the
+/// `users` table before writing the `user_role` row.
+#[derive(Debug, Clone)]
+pub struct CatalogUserRoleAssignmentUser<'a> {
+    pub user_id: &'a UserIdRef,
+    /// Display name. When `None` a new row is stored with a NULL name (rendered
+    /// as a `"Nameless User with id {id}"` placeholder at read time); the
+    /// existing name is preserved for updates.
+    pub name: Option<&'a str>,
+    pub email: Option<&'a str>,
+    /// User type. When `None` defaults to `Human` for new users and preserves
+    /// the existing type for updates.
+    pub user_type: Option<UserType>,
+    /// Mechanism that triggered the upsert; stored in `last_updated_with` on
+    /// the `users` row. Allows distinguishing role-provider syncs from future
+    /// callers such as a SCIM endpoint.
+    pub updated_with: UserLastUpdatedWith,
+}
+
+/// Role data supplied by an external provider when syncing a user's assignments.
+///
+/// The implementation upserts the role (creating it with a fresh [`RoleId`] if
+/// absent, or leaving it unchanged if it already exists) before writing the
+/// `user_role` row.  `ident.provider_id()` must equal the `provider_id`
+/// argument passed to [`CatalogRoleAssignmentOps::sync_user_role_assignments_by_provider`];
+/// passing a mismatched provider returns [`RoleProviderMismatchError`].
+#[derive(Debug, Clone)]
+pub struct CatalogRoleForAssignment<'a> {
+    pub ident: &'a Arc<RoleIdent>,
+    /// Display name. When `None` the role is stored / kept with its `source_id`
+    /// as the name for new rows, and the existing name is preserved for updates.
+    pub name: Option<&'a str>,
+    pub description: Option<&'a str>,
+}
+
+// ----------------------------------------------------------------------------
+// List / result item types
+// ----------------------------------------------------------------------------
+
+/// A role assignment as seen from a **user's** perspective.
+///
+/// Carries all three identifiers so different consumers can pick what they need:
+/// - `role_id` — opaque UUID used by internal authorizers (e.g. OpenFGA).
+/// - `role_ident` + `project_id` — stable external identifiers used by
+///   external authorizers (e.g. LDAP / SCIM-based providers) that need to
+///   correlate Lakekeeper roles back to their source system.
+#[derive(Debug, Clone)]
+pub struct AssignedRole {
+    pub role_id: RoleId,
+    pub role_ident: ArcRoleIdent,
+    pub project_id: ArcProjectId,
+}
+
+/// A member as seen from a **role's** perspective.
+#[derive(Debug, Clone)]
+pub struct AssignedUser {
+    pub user_id: UserIdRef,
+}
+
+/// Sync metadata for one `(project_id, provider_id)` pair as recorded in the
+/// external-provider sync log for a user.
+///
+/// The sync timestamp is at the `(user_id, project_id, provider_id)` level —
+/// one entry covers **all** roles from that provider in that project.
+#[derive(Debug, Clone)]
+pub struct UserProviderSyncInfo {
+    pub project_id: ArcProjectId,
+    pub provider_id: RoleProviderId,
+    /// When this provider last successfully synced the user's assignments for
+    /// `project_id`.  Role providers compare this against their TTL to decide
+    /// whether a re-fetch from the source system is required.
+    pub synced_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ----------------------------------------------------------------------------
+// Aggregate results
+// ----------------------------------------------------------------------------
+
+/// Result of [`CatalogRoleAssignmentOps::list_role_assignments_for_user`].
+#[derive(Debug, Clone)]
+pub struct ListUserRoleAssignmentsResult {
+    pub roles: Vec<AssignedRole>,
+    /// One [`UserProviderSyncInfo`] entry per `(project_id, provider_id)` pair
+    /// for which the user currently has at least one assignment row.  Pairs
+    /// whose assignments have all been removed are not included even if a sync
+    /// was previously recorded for them.  Empty when the user has no
+    /// externally-managed assignments.
+    pub provider_sync_times: Vec<UserProviderSyncInfo>,
+}
+
+/// Result of [`CatalogRoleAssignmentOps::list_role_assignments_for_role`] and
+/// [`CatalogRoleAssignmentOps::list_role_assignments_for_role_by_ident`].
+///
+/// Carries the role's own identifiers so that every consumer — cache layers,
+/// event listeners, external callers — can work with the result without a
+/// second look-up.
+#[derive(Debug, Clone)]
+pub struct ListRoleMembersResult {
+    /// The UUID of this role.
+    pub role_id: RoleId,
+    /// The project that owns this role.
+    pub project_id: ArcProjectId,
+    /// The provider-scoped identifier of this role.
+    pub role_ident: ArcRoleIdent,
+    pub members: Vec<AssignedUser>,
+    /// When a provider last successfully synced this role's member list.
+    /// `None` if the role's members have never been synced by an external
+    /// provider (e.g. all assignments are manually managed).
+    pub last_synced_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Outcome of a [`CatalogRoleAssignmentOps::sync_role_members_by_ident`] call.
+#[derive(Debug, Clone)]
+pub struct SyncRoleMembersResult {
+    /// The UUID of the role whose members were synced.
+    ///
+    /// Returned so the caller (and the default trait impl) can invalidate the
+    /// role-members cache without a separate role-lookup round-trip.
+    pub role_id: RoleId,
+    /// Members for whom a new `user_role` row was inserted.
+    pub added: Vec<AssignedUser>,
+    /// Members for whom the `user_role` row was removed because they were
+    /// absent from `members`.
+    pub removed: Vec<AssignedUser>,
+    /// The timestamp written to the role member sync log by this sync run.
+    pub synced_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Outcome of a [`CatalogRoleAssignmentOps::sync_user_role_assignments_by_provider`] call.
+#[derive(Debug, Clone)]
+pub struct SyncUserRoleAssignmentsResult {
+    /// IDs of roles newly assigned to the user.
+    pub added: Vec<RoleId>,
+    /// IDs of roles removed from the user (were assigned via `provider_id`,
+    /// are no longer present in `roles`).
+    pub removed: Vec<RoleId>,
+    /// The timestamp written to the user role sync log for
+    /// `(user_id, project_id, provider_id)` by this sync run.
+    pub synced_at: chrono::DateTime<chrono::Utc>,
+    /// The complete, authoritative role assignment list for this user after the
+    /// sync run, covering **all** providers (not just `provider_id`).
+    ///
+    /// Returned so the caller can build [`ListUserRoleAssignmentsResult`]
+    /// without a separate DB round-trip.
+    pub all_roles: Vec<AssignedRole>,
+    /// One [`UserProviderSyncInfo`] per `(project_id, provider_id)` pair for
+    /// which the user has at least one assignment row after this sync run.
+    /// Pairs with no remaining assignments are omitted even if a prior sync was
+    /// recorded for them.
+    ///
+    /// Matches the `provider_sync_times` field of [`ListUserRoleAssignmentsResult`].
+    pub provider_sync_times: Vec<UserProviderSyncInfo>,
+}
+
+// ============================================================================
+// Validated input wrappers — uniqueness encoded in the type
+// ============================================================================
+
+/// A member with the given `user_id` appears more than once in the input slice.
+#[derive(Debug)]
+pub struct DuplicateMemberError {
+    pub user_id: String,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(DuplicateMemberError);
+impl DuplicateMemberError {
+    fn new(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for DuplicateMemberError {}
+impl std::fmt::Display for DuplicateMemberError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Duplicate member user_id in sync request: '{}'",
+            self.user_id
+        )
+    }
+}
+impl From<DuplicateMemberError> for ErrorModel {
+    fn from(err: DuplicateMemberError) -> Self {
+        ErrorModel::builder()
+            .r#type("DuplicateMemberError")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(format!(
+                "Duplicate member user_id in sync request: '{}'",
+                err.user_id
+            ))
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// A role with the given `source_id` appears more than once in the input slice.
+#[derive(Debug)]
+pub struct DuplicateRoleError {
+    pub source_id: String,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(DuplicateRoleError);
+impl DuplicateRoleError {
+    fn new(source_id: impl Into<String>) -> Self {
+        Self {
+            source_id: source_id.into(),
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for DuplicateRoleError {}
+impl std::fmt::Display for DuplicateRoleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Duplicate role source_id in sync request: '{}'",
+            self.source_id
+        )
+    }
+}
+impl From<DuplicateRoleError> for ErrorModel {
+    fn from(err: DuplicateRoleError) -> Self {
+        ErrorModel::builder()
+            .r#type("DuplicateRoleError")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(format!(
+                "Duplicate role source_id in sync request: '{}'",
+                err.source_id
+            ))
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// A role in the input slice has a `provider_id` that differs from the
+/// `provider_id` argument supplied to the sync call.
+#[derive(Debug)]
+pub struct RoleProviderMismatchError {
+    pub expected: RoleProviderId,
+    pub found: RoleProviderId,
+    pub source_id: String,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(RoleProviderMismatchError);
+impl RoleProviderMismatchError {
+    fn new(
+        expected: &RoleProviderId,
+        found: &RoleProviderId,
+        source_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            expected: expected.clone(),
+            found: found.clone(),
+            source_id: source_id.into(),
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for RoleProviderMismatchError {}
+impl std::fmt::Display for RoleProviderMismatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Role '{}' has provider_id '{}' but the sync call targets provider '{}'",
+            self.source_id, self.found, self.expected
+        )
+    }
+}
+impl From<RoleProviderMismatchError> for ErrorModel {
+    fn from(err: RoleProviderMismatchError) -> Self {
+        ErrorModel::builder()
+            .r#type("RoleProviderMismatchError")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(format!(
+                "Role '{}' has provider_id '{}' but the sync call targets provider '{}'",
+                err.source_id, err.found, err.expected
+            ))
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// The `system` and `lakekeeper` providers are reserved for catalog-managed
+/// roles (built-in system roles and roles created via the role-management API).
+/// An external role-provider sync must not target them — otherwise a provider
+/// configured with one of those ids could create or converge members into the
+/// catalog-managed namespace (e.g. inject users into `system` roles). Returned
+/// when a sync call's role provider is `system` or `lakekeeper`.
+#[derive(thiserror::Error, Debug)]
+#[error(
+    "provider_id '{provider_id}' is reserved for catalog-managed roles and cannot be synced by an external role provider"
+)]
+pub struct ReservedRoleProvider {
+    pub provider_id: RoleProviderId,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(ReservedRoleProvider);
+impl ReservedRoleProvider {
+    #[must_use]
+    pub fn new(provider_id: RoleProviderId) -> Self {
+        Self {
+            provider_id,
+            stack: Vec::new(),
+        }
+    }
+}
+impl From<ReservedRoleProvider> for ErrorModel {
+    fn from(err: ReservedRoleProvider) -> Self {
+        ErrorModel::builder()
+            .r#type("ReservedRoleProvider")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// Reject an external role-provider sync that targets a reserved provider
+/// (`system` / `lakekeeper`). Backend-independent — enforced here in the
+/// `*Ops` layer so every storage backend and every sync entry point is covered.
+fn reject_reserved_sync_provider(
+    provider_id: &RoleProviderId,
+) -> std::result::Result<(), ReservedRoleProvider> {
+    if provider_id.is_system() || provider_id.is_lakekeeper() {
+        return Err(ReservedRoleProvider::new(provider_id.clone()));
+    }
+    Ok(())
+}
+
+/// Deduplicate user ids, preserving first-seen order. Backend-independent — done
+/// in the `*Ops` layer (like the typed `UniqueMembers` for sync) so every storage
+/// backend receives a unique set and never double-counts an assignment.
+///
+/// Borrows the input when it is already unique (the common case — the API adds
+/// one member per request), allocating only when a duplicate is actually present.
+fn dedup_user_ids(user_ids: &[UserId]) -> Cow<'_, [UserId]> {
+    if user_ids.len() <= 1 {
+        return Cow::Borrowed(user_ids);
+    }
+    let mut seen: HashSet<&UserId> = HashSet::with_capacity(user_ids.len());
+    // First duplicate's index, if any. On short-circuit `seen` already holds the
+    // known-unique prefix `user_ids[..first_dup]`, so we reuse it for the tail.
+    let Some(first_dup) = user_ids.iter().position(|u| !seen.insert(u)) else {
+        return Cow::Borrowed(user_ids);
+    };
+    let mut out = user_ids[..first_dup].to_vec();
+    out.extend(
+        user_ids[first_dup..]
+            .iter()
+            .filter(|u| seen.insert(u))
+            .cloned(),
+    );
+    Cow::Owned(out)
+}
+
+/// A validated, ordered collection of role members where every `user_id` is unique.
+///
+/// Constructable via [`UniqueMembers::try_from_slice`] (validates, returns an error
+/// on the first duplicate) or [`UniqueMembers::from_unchecked`] (crate-internal,
+/// skips validation when uniqueness is guaranteed by the caller — i.e. after the
+/// catalog-store layer has already validated).
+pub struct UniqueMembers<'slice, 'data> {
+    inner: &'slice [CatalogUserRoleAssignmentUser<'data>],
+}
+impl std::fmt::Debug for UniqueMembers<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("UniqueMembers").field(&self.inner).finish()
+    }
+}
+impl<'slice, 'data> UniqueMembers<'slice, 'data> {
+    /// Validates that every `user_id` in `members` is unique.
+    /// Returns [`DuplicateMemberError`] naming the first duplicate found.
+    pub fn try_from_slice(
+        members: &'slice [CatalogUserRoleAssignmentUser<'data>],
+    ) -> Result<Self, DuplicateMemberError> {
+        let mut seen = HashSet::with_capacity(members.len());
+        for m in members {
+            let key = m.user_id.to_string();
+            if !seen.insert(key.clone()) {
+                return Err(DuplicateMemberError::new(key));
+            }
+        }
+        Ok(Self { inner: members })
+    }
+
+    /// Wraps `members` without validating uniqueness.
+    ///
+    /// # Caller contract
+    /// Every `user_id` in `members` must be unique. Violating this contract
+    /// causes a runtime database error, not memory unsafety.
+}
+impl<'data> std::ops::Deref for UniqueMembers<'_, 'data> {
+    type Target = [CatalogUserRoleAssignmentUser<'data>];
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+/// A validated, ordered collection of roles where every `source_id` is unique.
+///
+/// Constructable via [`UniqueRoles::try_from_slice`] (validates, returns an error
+/// on the first duplicate) or [`UniqueRoles::from_unchecked`] (crate-internal).
+pub struct UniqueRoles<'slice, 'data> {
+    inner: &'slice [CatalogRoleForAssignment<'data>],
+}
+impl std::fmt::Debug for UniqueRoles<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("UniqueRoles").field(&self.inner).finish()
+    }
+}
+impl<'slice, 'data> UniqueRoles<'slice, 'data> {
+    /// Validates that every `source_id` in `roles` is unique.
+    /// Returns [`DuplicateRoleError`] naming the first duplicate found.
+    pub fn try_from_slice(
+        roles: &'slice [CatalogRoleForAssignment<'data>],
+    ) -> Result<Self, DuplicateRoleError> {
+        let mut seen = HashSet::with_capacity(roles.len());
+        for r in roles {
+            let key = r.ident.source_id().to_string();
+            if !seen.insert(key.clone()) {
+                return Err(DuplicateRoleError::new(key));
+            }
+        }
+        Ok(Self { inner: roles })
+    }
+
+    /// Wraps `roles` without validating uniqueness.
+    ///
+    /// # Caller contract
+    /// Every `source_id` in `roles` must be unique. Violating this contract
+    /// causes a runtime database error, not memory unsafety.
+}
+impl<'data> std::ops::Deref for UniqueRoles<'_, 'data> {
+    type Target = [CatalogRoleForAssignment<'data>];
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
+}
+
+// ============================================================================
+// Error types
+// ============================================================================
+
+define_transparent_error! {
+    pub enum SyncRoleMembersError,
+    stack_message: "Error syncing role members",
+    variants: [
+        CatalogBackendError,
+        DatabaseIntegrityError,
+        RoleNameAlreadyExists,
+        DuplicateMemberError,
+        ReservedRoleProvider
+    ]
+}
+
+define_transparent_error! {
+    pub enum SyncUserRoleAssignmentsError,
+    stack_message: "Error syncing user role assignments",
+    variants: [
+        CatalogBackendError,
+        RoleNameAlreadyExists,
+        DuplicateRoleError,
+        RoleProviderMismatchError,
+        ReservedRoleProvider
+    ]
+}
+
+/// Adding the requested role->role edge would create a cycle in the
+/// `role_membership` graph: `member_role_id` is already a transitive ancestor
+/// of `parent_role_id` (or the two ids are equal).
+#[derive(Debug, PartialEq)]
+pub struct RoleMembershipCycle {
+    pub parent_role_id: RoleId,
+    pub member_role_id: RoleId,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(RoleMembershipCycle);
+impl RoleMembershipCycle {
+    #[must_use]
+    pub fn new(parent_role_id: RoleId, member_role_id: RoleId) -> Self {
+        Self {
+            parent_role_id,
+            member_role_id,
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for RoleMembershipCycle {}
+impl std::fmt::Display for RoleMembershipCycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Adding role '{}' as a member of role '{}' would create a cycle in the role membership graph",
+            self.member_role_id, self.parent_role_id
+        )
+    }
+}
+impl From<RoleMembershipCycle> for ErrorModel {
+    fn from(err: RoleMembershipCycle) -> Self {
+        ErrorModel::builder()
+            .r#type("RoleMembershipCycle")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// Adding the requested role->role edge would make some role-nesting chain
+/// longer than the configured maximum (`LAKEKEEPER__ROLE__MAX_NESTING_DEPTH`).
+/// The depth is
+/// the number of `role_membership` (role→role) edges in a chain; adding edge
+/// `parent -> member` the longest chain through it is
+/// `longest_chain_above(parent) + 1 + longest_chain_below(member)`.
+#[derive(Debug, PartialEq)]
+pub struct RoleMembershipDepthExceeded {
+    pub parent_role_id: RoleId,
+    pub member_role_id: RoleId,
+    pub max_depth: usize,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(RoleMembershipDepthExceeded);
+impl RoleMembershipDepthExceeded {
+    #[must_use]
+    pub fn new(parent_role_id: RoleId, member_role_id: RoleId, max_depth: usize) -> Self {
+        Self {
+            parent_role_id,
+            member_role_id,
+            max_depth,
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for RoleMembershipDepthExceeded {}
+impl std::fmt::Display for RoleMembershipDepthExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Adding role '{}' as a member of role '{}' would exceed the maximum role nesting depth of {} edges",
+            self.member_role_id, self.parent_role_id, self.max_depth
+        )
+    }
+}
+impl From<RoleMembershipDepthExceeded> for ErrorModel {
+    fn from(err: RoleMembershipDepthExceeded) -> Self {
+        ErrorModel::builder()
+            .r#type("RoleMembershipDepthExceeded")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// A role endpoint of a requested membership edge is not catalog-managed.
+///
+/// Only roles owned by the catalog itself (the `lakekeeper` and `system`
+/// providers) may participate in `role_membership` edges. Roles owned by an
+/// external provider (LDAP, SCIM, …) have their membership driven by that
+/// provider and cannot be wired together via this API.
+#[derive(Debug, PartialEq)]
+pub struct RoleNotManuallyAssignable {
+    pub role_id: RoleId,
+    pub provider_id: RoleProviderId,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(RoleNotManuallyAssignable);
+impl RoleNotManuallyAssignable {
+    #[must_use]
+    pub fn new(role_id: RoleId, provider_id: RoleProviderId) -> Self {
+        Self {
+            role_id,
+            provider_id,
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for RoleNotManuallyAssignable {}
+impl std::fmt::Display for RoleNotManuallyAssignable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Role '{role_id}' is managed by provider '{provider_id}' and is not catalog-managed; only lakekeeper/system roles can participate in role membership edges",
+            role_id = self.role_id,
+            provider_id = self.provider_id
+        )
+    }
+}
+impl From<RoleNotManuallyAssignable> for ErrorModel {
+    fn from(err: RoleNotManuallyAssignable) -> Self {
+        ErrorModel::builder()
+            .r#type("RoleNotManuallyAssignable")
+            .code(StatusCode::BAD_REQUEST.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// A user named as a member to assign to a role does not exist
+/// (provision-then-assign). Surfaced as **404** so the caller provisions the
+/// user first, rather than the opaque FK-violation 500 that a blind insert into
+/// `role_assignment` (FK `user_id → users`) would otherwise raise.
+///
+/// Catalog-path behavior only — this is **not** forced onto other authorizers.
+/// An assignment-managing authorizer (e.g. OpenFGA) has no such foreign key and
+/// is not pre-checked: it persists the assignment even for a not-yet-provisioned
+/// user. That divergence is intentional and documented — the response to
+/// assigning an unknown user legitimately differs by authorizer backend.
+#[derive(thiserror::Error, Debug, PartialEq)]
+#[error("User '{user_id}' does not exist; provision the user before assigning it to a role")]
+pub struct RoleAssignmentUserNotFound {
+    pub user_id: UserId,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(RoleAssignmentUserNotFound);
+impl RoleAssignmentUserNotFound {
+    #[must_use]
+    pub fn new(user_id: UserId) -> Self {
+        Self {
+            user_id,
+            stack: Vec::new(),
+        }
+    }
+}
+impl From<RoleAssignmentUserNotFound> for ErrorModel {
+    fn from(err: RoleAssignmentUserNotFound) -> Self {
+        ErrorModel::builder()
+            .r#type("RoleAssignmentUserNotFound")
+            .code(StatusCode::NOT_FOUND.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// Returned when the per-project role-membership lock could not be acquired
+/// within the timeout, i.e. a concurrent membership change for the same project
+/// is in progress. The caller should retry.
+///
+/// Membership writes serialize per project via a transaction-scoped advisory
+/// lock so concurrent edge additions cannot race a cycle into the graph.
+#[derive(Debug, PartialEq)]
+pub struct RoleMembershipLockTimeout {
+    pub project_id: ArcProjectId,
+    pub stack: Vec<String>,
+}
+impl_error_stack_methods!(RoleMembershipLockTimeout);
+impl RoleMembershipLockTimeout {
+    #[must_use]
+    pub fn new(project_id: ArcProjectId) -> Self {
+        Self {
+            project_id,
+            stack: Vec::new(),
+        }
+    }
+}
+impl std::error::Error for RoleMembershipLockTimeout {}
+impl std::fmt::Display for RoleMembershipLockTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Could not acquire the role-membership lock for project '{project_id}'; a concurrent membership change is in progress — retry",
+            project_id = self.project_id
+        )
+    }
+}
+impl From<RoleMembershipLockTimeout> for ErrorModel {
+    fn from(err: RoleMembershipLockTimeout) -> Self {
+        ErrorModel::builder()
+            .r#type("RoleMembershipLockTimeout")
+            .code(StatusCode::CONFLICT.as_u16())
+            .message(err.to_string())
+            .stack(err.stack)
+            .build()
+    }
+}
+
+/// A role reachable through a `role_membership` edge, with enough identity to
+/// determine whether it is manually assignable via the management API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleMembershipEntry {
+    pub role_id: RoleId,
+    pub role_ident: Arc<RoleIdent>,
+    /// The role's human-readable display name (`role.name`). Carried so the
+    /// `member-of` and `user roles` listings can render names without a
+    /// per-row follow-up lookup.
+    pub name: String,
+    /// When the membership edge to this role was created. Non-optional: the
+    /// `role_membership.created_at` column is `NOT NULL`.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+impl RoleMembershipEntry {
+    /// True if this role is catalog-managed (lakekeeper/system) and thus
+    /// manually assignable via the management API.
+    #[must_use]
+    pub fn manually_assignable(&self) -> bool {
+        self.role_ident.is_lakekeeper() || self.role_ident.is_system()
+    }
+}
+
+/// A user's identity for a membership listing, read raw from the catalog: the
+/// nullable `name`/`email` exactly as stored — NO `display_user_name` placeholder
+/// (a nameless user surfaces as `None`). The user-side counterpart of
+/// [`RoleMembershipEntry`]; the API layer maps it to the `user` member variant.
+/// (`PartialEq` only — `UserType` is not `Eq`.)
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserMembershipEntry {
+    pub user_id: UserId,
+    /// Display name, raw from the column — `None` for a nameless user (no
+    /// placeholder is applied here, unlike the user-management `User` DTO).
+    pub name: Option<String>,
+    pub email: Option<String>,
+    pub user_type: UserType,
+}
+
+/// One enriched, display-ready member of a role read directly from the catalog
+/// (JOIN-hydrated). The catalog arm of the members listing produces these so the
+/// page needs no second round-trip; an assignment-managing authorizer (OpenFGA)
+/// instead returns id-only assignment rows that the API layer hydrates. The
+/// `role_membership.created_at` carried by the `Role` variant's
+/// [`RoleMembershipEntry`] is the edge timestamp (vestigial for the listing — the
+/// API drops it; for transitive listings it is the role's own creation time, used
+/// only as the keyset key).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CatalogRoleMember {
+    User(UserMembershipEntry),
+    Role(RoleMembershipEntry),
+}
+
+/// One page of a role's direct or transitive members (users ∪ member roles),
+/// each enriched with display identity, under one opaque continuation token.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListCatalogRoleMembersPage {
+    pub members: Vec<CatalogRoleMember>,
+    pub next_page_token: Option<String>,
+}
+
+/// Filter for the merged role-members listing: restrict to user members, role
+/// members, or (when `None` at the call site) return both. The API surfaces this
+/// as an optional `?type=user|role` query parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleMemberKind {
+    User,
+    Role,
+}
+
+/// One page of a role listing keyed by `(created_at, role_id)`, with an opaque
+/// continuation token. Used by the direct `parents` and `user roles` listings,
+/// both of which return a set of roles plus the timestamp of the edge that
+/// produced them (`role_membership.created_at` / `role_assignment.created_at`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListRolesPage {
+    pub entries: Vec<RoleMembershipEntry>,
+    pub next_page_token: Option<String>,
+}
+
+/// Which direction of the `role_membership` graph to walk from a given role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleMembershipDirection {
+    /// Direct (depth-1) member roles of the given role (it is the parent).
+    Members,
+    /// Direct (depth-1) roles the given role is a member of (it is the member).
+    MemberOf,
+}
+
+/// Outcome of adding role->role edges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddRoleMembersResult {
+    /// Member roles actually newly added. Adds are idempotent, so members that
+    /// were already present are excluded — empty when every requested edge
+    /// already existed. Drives cache invalidation and events.
+    pub added: Vec<RoleId>,
+}
+
+/// Outcome of removing role->role edges.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveRoleMembersResult {
+    /// Member roles actually removed. Removes are idempotent, so members that
+    /// were not present are excluded — empty when no requested edge existed.
+    /// Drives cache invalidation and events.
+    pub removed: Vec<RoleId>,
+}
+
+define_transparent_error! {
+    pub enum AddRoleMembersError,
+    stack_message: "Error adding role members",
+    variants: [
+        CatalogBackendError,
+        RoleIdNotFoundInProject,
+        RoleNotManuallyAssignable,
+        RoleMembershipCycle,
+        RoleMembershipDepthExceeded,
+        RoleMembershipLockTimeout
+    ]
+}
+
+define_transparent_error! {
+    pub enum RemoveRoleMembersError,
+    stack_message: "Error removing role members",
+    variants: [
+        CatalogBackendError
+    ]
+}
+
+/// Outcome of adding user->role assignments (the catalog persistence path for
+/// `POST /role/{id}/members` with user members, used when the authorizer does
+/// not manage assignments). Mirrors [`AddRoleMembersResult`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AddUserRoleAssignmentsResult {
+    /// Users actually newly assigned. Idempotent: users already assigned are
+    /// excluded — empty when every requested assignment already existed. Drives
+    /// cache invalidation.
+    pub added: Vec<UserId>,
+}
+
+/// Outcome of removing user->role assignments. Mirrors [`RemoveRoleMembersResult`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoveUserRoleAssignmentsResult {
+    /// Users actually removed. Idempotent: users that were not assigned are
+    /// excluded. Drives cache invalidation.
+    pub removed: Vec<UserId>,
+}
+
+define_transparent_error! {
+    pub enum AddUserRoleAssignmentsError,
+    stack_message: "Error adding user role assignments",
+    variants: [
+        CatalogBackendError,
+        RoleIdNotFoundInProject,
+        RoleNotManuallyAssignable,
+        RoleAssignmentUserNotFound
+    ]
+}
+
+define_transparent_error! {
+    pub enum RemoveUserRoleAssignmentsError,
+    stack_message: "Error removing user role assignments",
+    variants: [
+        CatalogBackendError
+    ]
+}
+
+// ============================================================================
+// Trait
+// ============================================================================
+
+#[async_trait::async_trait]
+pub trait CatalogRoleAssignmentOps
+where
+    Self: CatalogStore,
+{
+    // -----------------------------------------------------------------------
+    // WRITE: bulk sync
+    // -----------------------------------------------------------------------
+
+    /// Atomically replace the complete member list of a role, creating the role
+    /// if it does not yet exist.
+    ///
+    /// Designed for external role providers (LDAP, SCIM) that supply the
+    /// authoritative member list and need Lakekeeper to converge to it:
+    ///
+    /// 1. Upsert the role for `project_id`:
+    ///    create with a fresh [`RoleId`] if absent, leave unchanged if present.
+    /// 2. Upsert every user in `members`.
+    /// 3. Add assignment rows for newly assigned users.
+    /// 4. Delete assignment rows for users absent from `members`.
+    /// 5. Record the sync timestamp in the role member sync log.
+    async fn sync_role_members_by_ident<'a>(
+        project_id: &ProjectId,
+        role: &CatalogRoleForAssignment<'_>,
+        members: &[CatalogUserRoleAssignmentUser<'_>],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<SyncRoleMembersResult, SyncRoleMembersError> {
+        UniqueMembers::try_from_slice(members)?;
+        reject_reserved_sync_provider(role.ident.provider_id())?;
+        Self::sync_role_members_by_ident_impl(project_id, role, members, transaction).await
+    }
+
+    /// Atomically converge a user's role assignments from one provider to an
+    /// authoritative list, creating roles that do not yet exist.
+    ///
+    /// After querying "which groups does user U belong to in provider P?", call
+    /// this method with the result to converge the store to that truth.
+    ///
+    /// Scoped to `(user_id, project_id, provider_id)` — assignments to roles
+    /// owned by **other providers** for the same user are never touched.
+    ///
+    /// Steps performed in a single transaction:
+    /// 1. Upsert the user.
+    /// 2. Upsert each role in `roles` for `project_id`:
+    ///    create with a fresh [`RoleId`] if absent, leave unchanged if present.
+    /// 3. Add assignment rows for roles not yet assigned.
+    /// 4. Remove assignment rows for roles (from `provider_id`) that are no
+    ///    longer in `roles`.
+    /// 5. Record the sync timestamp in the user role sync log for
+    ///    `(user_id, project_id, provider_id)`.
+    ///
+    /// Returns [`RoleProviderMismatchError`] if any role's `ident.provider_id()`
+    /// differs from `provider_id`.
+    async fn sync_user_role_assignments_by_provider<'a>(
+        user: CatalogUserRoleAssignmentUser<'_>,
+        project_id: &ProjectId,
+        provider_id: &RoleProviderId,
+        roles: &[CatalogRoleForAssignment<'_>],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<SyncUserRoleAssignmentsResult, SyncUserRoleAssignmentsError> {
+        UniqueRoles::try_from_slice(roles)?;
+        reject_reserved_sync_provider(provider_id)?;
+        if let Some(r) = roles.iter().find(|r| r.ident.provider_id() != provider_id) {
+            return Err(RoleProviderMismatchError::new(
+                provider_id,
+                r.ident.provider_id(),
+                r.ident.source_id().to_string(),
+            )
+            .into());
+        }
+        Self::sync_user_role_assignments_by_provider_impl(
+            &user,
+            project_id,
+            provider_id,
+            roles,
+            transaction,
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // WRITE: standalone sync (owns its own transaction)
+    // -----------------------------------------------------------------------
+
+    /// Sync a role's complete member list, commit, populate the cache with the
+    /// authoritative result, and dispatch a [`RoleMembersSyncedEvent`].
+    ///
+    /// This is the preferred entry point for external role providers (LDAP,
+    /// SCIM) that drive the sync and want to serve cached data immediately
+    /// after.  Unlike [`sync_role_members_by_ident`], this method:
+    ///
+    /// 1. Opens and commits its own transaction.
+    /// 2. Builds [`ListRoleMembersResult`] directly from the inputs — the
+    ///    `members` slice is by definition the complete new member list, so no
+    ///    extra DB round-trip is needed.
+    /// 3. Inserts the result into `ROLE_MEMBERS_CACHE`.
+    /// 4. Emits [`RoleMembersSyncedEvent`] via `dispatcher`
+    async fn sync_role_members(
+        project_id: &ArcProjectId,
+        role: &CatalogRoleForAssignment<'_>,
+        members: &[CatalogUserRoleAssignmentUser<'_>],
+        catalog_state: Self::State,
+        dispatcher: &EventDispatcher,
+    ) -> crate::api::Result<Arc<ListRoleMembersResult>> {
+        UniqueMembers::try_from_slice(members).map_err(SyncRoleMembersError::from)?;
+        reject_reserved_sync_provider(role.ident.provider_id())
+            .map_err(SyncRoleMembersError::from)?;
+        let mut t = Self::Transaction::begin_write(catalog_state).await?;
+        let sync_result =
+            Self::sync_role_members_by_ident_impl(project_id, role, members, t.transaction())
+                .await?;
+        t.commit().await?;
+
+        // Build the authoritative member list directly from the sync inputs.
+        // `members` is exactly the complete new state — no DB read required.
+        let list_result = Arc::new(ListRoleMembersResult {
+            role_id: sync_result.role_id,
+            project_id: project_id.clone(),
+            role_ident: role.ident.clone(),
+            members: members
+                .iter()
+                .map(|m| AssignedUser {
+                    user_id: m.user_id.clone(),
+                })
+                .collect(),
+            last_synced_at: Some(sync_result.synced_at),
+        });
+
+        role_assignments_cache::role_members_cache_insert(
+            sync_result.role_id,
+            Arc::clone(&list_result),
+        )
+        .await;
+        for user_id in sync_result
+            .added
+            .iter()
+            .chain(sync_result.removed.iter())
+            .map(|u| &u.user_id)
+        {
+            role_assignments_cache::user_assignments_cache_invalidate(user_id).await;
+        }
+
+        let event = RoleMembersSyncedEvent {
+            added: sync_result.added.into_iter().map(|u| u.user_id).collect(),
+            removed: sync_result.removed.into_iter().map(|u| u.user_id).collect(),
+            synced_at: sync_result.synced_at,
+            result: Arc::clone(&list_result),
+        };
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            dispatcher.role_members_synced(event).await;
+        });
+
+        Ok(list_result)
+    }
+
+    /// Sync a user's role assignments for one provider scope, commit, populate
+    /// the cache with fresh data, and dispatch a
+    /// [`UserRoleAssignmentsSyncedEvent`].
+    ///
+    /// This is the preferred entry point for external role providers (LDAP,
+    /// SCIM) that drive the sync and want to serve cached data immediately
+    /// after.  Unlike [`sync_user_role_assignments_by_provider`], this method:
+    ///
+    /// 1. Opens and commits its own transaction.
+    /// 2. Builds [`ListUserRoleAssignmentsResult`] directly from the data
+    ///    returned by the impl — `all_roles` and `provider_sync_times` contain
+    ///    the authoritative post-sync state across all providers, so no extra
+    ///    DB round-trip is needed.
+    /// 3. Inserts the result into `USER_ASSIGNMENTS_CACHE`.
+    /// 4. Emits [`UserRoleAssignmentsSyncedEvent`] via `dispatcher` so that
+    ///    listeners can invalidate per-role member caches on this and other
+    ///    instances.
+    async fn sync_user_role_assignments(
+        user: CatalogUserRoleAssignmentUser<'_>,
+        project_id: &ProjectId,
+        provider_id: &RoleProviderId,
+        roles: &[CatalogRoleForAssignment<'_>],
+        catalog_state: Self::State,
+        dispatcher: &EventDispatcher,
+    ) -> crate::api::Result<Arc<ListUserRoleAssignmentsResult>> {
+        UniqueRoles::try_from_slice(roles).map_err(SyncUserRoleAssignmentsError::from)?;
+        reject_reserved_sync_provider(provider_id).map_err(SyncUserRoleAssignmentsError::from)?;
+        if let Some(r) = roles.iter().find(|r| r.ident.provider_id() != provider_id) {
+            return Err(
+                SyncUserRoleAssignmentsError::from(RoleProviderMismatchError::new(
+                    provider_id,
+                    r.ident.provider_id(),
+                    r.ident.source_id().to_string(),
+                ))
+                .into(),
+            );
+        }
+        let mut t = Self::Transaction::begin_write(catalog_state).await?;
+        let sync_result = Self::sync_user_role_assignments_by_provider_impl(
+            &user,
+            project_id,
+            provider_id,
+            roles,
+            t.transaction(),
+        )
+        .await?;
+        t.commit().await?;
+
+        let mut list = ListUserRoleAssignmentsResult {
+            roles: sync_result.all_roles,
+            provider_sync_times: sync_result.provider_sync_times,
+        };
+        // Dedup role/project identity across cached users before storing.
+        role_assignments_cache::share_identities(&mut list).await;
+        let list_result = Arc::new(list);
+
+        // Update the cache directly after the commit, before dispatching the
+        // event (mirrors the warehouse / namespace cache-on-read pattern).
+        role_assignments_cache::user_assignments_cache_insert(
+            user.user_id,
+            Arc::clone(&list_result),
+        )
+        .await;
+        for role_id in sync_result
+            .added
+            .iter()
+            .chain(sync_result.removed.iter())
+            .copied()
+        {
+            role_assignments_cache::role_members_cache_invalidate(role_id).await;
+        }
+
+        let event = UserRoleAssignmentsSyncedEvent {
+            user_id: user.user_id.clone(),
+            added: sync_result.added.into(),
+            removed: sync_result.removed.into(),
+            synced_at: sync_result.synced_at,
+            result: Arc::clone(&list_result),
+        };
+        let dispatcher = dispatcher.clone();
+        tokio::spawn(async move {
+            dispatcher.user_role_assignments_synced(event).await;
+        });
+
+        Ok(list_result)
+    }
+
+    // -----------------------------------------------------------------------
+    // WRITE: role->role membership graph
+    // -----------------------------------------------------------------------
+    //
+    // Same split as the sync APIs above: `add_role_members`/`remove_role_members`
+    // compose into a caller's transaction; `*_and_invalidate` own their transaction
+    // and reconcile caches. The composing wrappers are thin because membership
+    // validation is DB-bound and lives in `_impl`.
+
+    /// Add role->role edges: `parent_role_id` gains every role in
+    /// `member_role_ids` as a direct member. Duplicate entries in
+    /// `member_role_ids` are deduplicated. Idempotent — edges that already
+    /// exist are left untouched.
+    ///
+    /// Both endpoints of every edge must be **catalog-managed** (provider
+    /// `lakekeeper` or `system`) and belong to `project_id`. A member (or the
+    /// parent) that is missing or lives in a different project yields
+    /// [`RoleIdNotFoundInProject`]; an endpoint owned by an external provider
+    /// yields [`RoleNotManuallyAssignable`].
+    ///
+    /// Cycles are rejected: if `member` is already a transitive ancestor of
+    /// `parent` (or `member == parent`), the call returns
+    /// [`RoleMembershipCycle`] and no edges are written.
+    async fn add_role_members<'a>(
+        project_id: &ArcProjectId,
+        parent_role_id: RoleId,
+        member_role_ids: &[RoleId],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<AddRoleMembersResult, AddRoleMembersError> {
+        Self::add_role_members_impl(project_id, parent_role_id, member_role_ids, transaction).await
+    }
+
+    /// Remove role->role edges: drop every `(parent_role_id, member)` edge for
+    /// `member` in `member_role_ids`. Idempotent — absent edges are a no-op.
+    async fn remove_role_members<'a>(
+        parent_role_id: RoleId,
+        member_role_ids: &[RoleId],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<RemoveRoleMembersResult, RemoveRoleMembersError> {
+        Self::remove_role_members_impl(parent_role_id, member_role_ids, transaction).await
+    }
+
+    /// Standalone counterpart to [`add_role_members`] that owns its transaction and
+    /// invalidates the `USER_ASSIGNMENTS_CACHE` for affected users.
+    ///
+    /// An edge change only alters *transitive* effective roles, never direct
+    /// assignments, so only `USER_ASSIGNMENTS_CACHE` is invalidated (for users
+    /// assigned to `member` or its descendants) — `ROLE_MEMBERS_CACHE` is not.
+    async fn add_role_members_and_invalidate(
+        project_id: &ArcProjectId,
+        parent_role_id: RoleId,
+        member_role_ids: &[RoleId],
+        catalog_state: Self::State,
+    ) -> crate::api::Result<AddRoleMembersResult> {
+        let mut t = Self::Transaction::begin_write(catalog_state.clone()).await?;
+        let result = Self::add_role_members_impl(
+            project_id,
+            parent_role_id,
+            member_role_ids,
+            t.transaction(),
+        )
+        .await?;
+
+        // Compute affected users on the same transaction, before commit: a read
+        // failure then rolls the edge change back rather than leaving it committed
+        // with stale caches that an (idempotent, empty-delta) retry won't refresh.
+        let affected = membership_edge_affected_users::<Self>(&result.added, &mut t)
+            .await
+            .map_err(ErrorModel::from)?;
+        t.commit().await?;
+
+        // Post-commit eviction is infallible (in-memory). A crash in the
+        // commit→evict window leaves affected entries stale until the
+        // `USER_ASSIGNMENTS_CACHE` TTL — stale-permissive for removes, but bounded
+        // and acceptable for this cache.
+        record_membership_edge_fanout("add", parent_role_id, &affected);
+        role_assignments_cache::user_assignments_cache_invalidate_many(&affected).await;
+        Ok(result)
+    }
+
+    /// Standalone counterpart to [`remove_role_members`] that owns its transaction
+    /// and invalidates the `USER_ASSIGNMENTS_CACHE`. See
+    /// [`add_role_members_and_invalidate`] for the cache rationale.
+    async fn remove_role_members_and_invalidate(
+        parent_role_id: RoleId,
+        member_role_ids: &[RoleId],
+        catalog_state: Self::State,
+    ) -> crate::api::Result<RemoveRoleMembersResult> {
+        let mut t = Self::Transaction::begin_write(catalog_state.clone()).await?;
+        let result =
+            Self::remove_role_members_impl(parent_role_id, member_role_ids, t.transaction())
+                .await?;
+
+        // Computed before commit; see `add_role_members_and_invalidate`.
+        let affected = membership_edge_affected_users::<Self>(&result.removed, &mut t)
+            .await
+            .map_err(ErrorModel::from)?;
+        t.commit().await?;
+
+        // Infallible post-commit eviction; see `add_role_members_and_invalidate`.
+        record_membership_edge_fanout("remove", parent_role_id, &affected);
+        role_assignments_cache::user_assignments_cache_invalidate_many(&affected).await;
+        Ok(result)
+    }
+
+    /// Additively assign `user_ids` to `role_id` (catalog persistence for
+    /// `POST /role/{id}/members` user members). Idempotent. See
+    /// [`add_user_role_assignments_and_invalidate`] for the standalone variant.
+    async fn add_user_role_assignments<'a>(
+        project_id: &ArcProjectId,
+        role_id: RoleId,
+        user_ids: &[UserId],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<AddUserRoleAssignmentsResult, AddUserRoleAssignmentsError> {
+        let user_ids = dedup_user_ids(user_ids);
+        Self::add_user_role_assignments_impl(project_id, role_id, &user_ids, transaction).await
+    }
+
+    /// Remove `user_ids` from `role_id`. Idempotent — absent assignments are a no-op.
+    async fn remove_user_role_assignments<'a>(
+        role_id: RoleId,
+        user_ids: &[UserId],
+        transaction: <Self::Transaction as Transaction<Self::State>>::Transaction<'a>,
+    ) -> Result<RemoveUserRoleAssignmentsResult, RemoveUserRoleAssignmentsError> {
+        let user_ids = dedup_user_ids(user_ids);
+        Self::remove_user_role_assignments_impl(role_id, &user_ids, transaction).await
+    }
+
+    /// Standalone counterpart to [`add_user_role_assignments`] that owns its
+    /// transaction and invalidates caches.
+    ///
+    /// A *direct* user→role assignment changes only the assigned user's effective
+    /// roles (no transitive fan-out to other users — unlike a role→role edge), so
+    /// only those users' `USER_ASSIGNMENTS_CACHE` entries plus the role's
+    /// `ROLE_MEMBERS_CACHE` (its direct user-member list) need eviction.
+    async fn add_user_role_assignments_and_invalidate(
+        project_id: &ArcProjectId,
+        role_id: RoleId,
+        user_ids: &[UserId],
+        catalog_state: Self::State,
+    ) -> crate::api::Result<AddUserRoleAssignmentsResult> {
+        let user_ids = dedup_user_ids(user_ids);
+        let mut t = Self::Transaction::begin_write(catalog_state.clone()).await?;
+        let result =
+            Self::add_user_role_assignments_impl(project_id, role_id, &user_ids, t.transaction())
+                .await?;
+        t.commit().await?;
+
+        // Post-commit, infallible (in-memory). Only the newly-assigned users and
+        // this role's member list are affected.
+        for user_id in &result.added {
+            role_assignments_cache::user_assignments_cache_invalidate(user_id).await;
+        }
+        role_assignments_cache::role_members_cache_invalidate(role_id).await;
+        Ok(result)
+    }
+
+    /// Standalone counterpart to [`remove_user_role_assignments`]. See
+    /// [`add_user_role_assignments_and_invalidate`] for the cache rationale.
+    async fn remove_user_role_assignments_and_invalidate(
+        role_id: RoleId,
+        user_ids: &[UserId],
+        catalog_state: Self::State,
+    ) -> crate::api::Result<RemoveUserRoleAssignmentsResult> {
+        let user_ids = dedup_user_ids(user_ids);
+        let mut t = Self::Transaction::begin_write(catalog_state.clone()).await?;
+        let result =
+            Self::remove_user_role_assignments_impl(role_id, &user_ids, t.transaction()).await?;
+        t.commit().await?;
+
+        for user_id in &result.removed {
+            role_assignments_cache::user_assignments_cache_invalidate(user_id).await;
+        }
+        role_assignments_cache::role_members_cache_invalidate(role_id).await;
+        Ok(result)
+    }
+
+    /// Atomic mixed batch for `POST /role/{id}/members`: in ONE transaction,
+    /// assign `user_ids` (direct user→role) AND add `member_role_ids` (role→role
+    /// edges) to `role_id`, then invalidate caches. All-or-nothing — any failure
+    /// rolls the whole batch back. The two single-kind `*_and_invalidate` wrappers
+    /// each own a separate transaction, so calling both would not be atomic across
+    /// kinds; this wrapper exists precisely to span both writes on one transaction.
+    ///
+    /// Combines their cache rationale: each newly-assigned user evicts its
+    /// `USER_ASSIGNMENTS_CACHE`, the role's `ROLE_MEMBERS_CACHE` is evicted iff a
+    /// direct user member was added, and edge additions evict the transitively-
+    /// affected users' `USER_ASSIGNMENTS_CACHE`.
+    async fn add_role_members_mixed_and_invalidate(
+        project_id: &ArcProjectId,
+        role_id: RoleId,
+        user_ids: &[UserId],
+        member_role_ids: &[RoleId],
+        catalog_state: Self::State,
+    ) -> crate::api::Result<(AddUserRoleAssignmentsResult, AddRoleMembersResult)> {
+        let user_ids = dedup_user_ids(user_ids);
+        let mut t = Self::Transaction::begin_write(catalog_state.clone()).await?;
+
+        // Lock ordering matters here. `add_role_members_impl` takes the per-project
+        // membership advisory lock as its FIRST action; `add_user_role_assignments_impl`
+        // takes `FOR UPDATE` on the parent role row and no advisory lock. Running the
+        // role-edge write FIRST keeps this mixed batch advisory-first, matching the
+        // standalone `add_role_members` path — otherwise the two would acquire the
+        // advisory lock and the parent-row lock in opposite orders and could deadlock
+        // under concurrency. Each empty arm still skips its write.
+        let role_result = if member_role_ids.is_empty() {
+            AddRoleMembersResult::default()
+        } else {
+            Self::add_role_members_impl(project_id, role_id, member_role_ids, t.transaction())
+                .await?
+        };
+        let user_result = if user_ids.is_empty() {
+            AddUserRoleAssignmentsResult::default()
+        } else {
+            Self::add_user_role_assignments_impl(project_id, role_id, &user_ids, t.transaction())
+                .await?
+        };
+
+        // Transitively-affected users from the edge additions, computed on the same
+        // transaction before commit (see `add_role_members_and_invalidate`).
+        let edge_affected = membership_edge_affected_users::<Self>(&role_result.added, &mut t)
+            .await
+            .map_err(ErrorModel::from)?;
+        t.commit().await?;
+
+        // Post-commit, infallible in-memory eviction.
+        for user_id in &user_result.added {
+            role_assignments_cache::user_assignments_cache_invalidate(user_id).await;
+        }
+        role_assignments_cache::user_assignments_cache_invalidate_many(&edge_affected).await;
+        if !user_result.added.is_empty() {
+            role_assignments_cache::role_members_cache_invalidate(role_id).await;
+        }
+        Ok((user_result, role_result))
+    }
+
+    /// Direct (depth-1) adjacent roles of `role_id` in the membership graph:
+    /// its member roles ([`RoleMembershipDirection::Members`]) or the roles it
+    /// is a member of ([`RoleMembershipDirection::MemberOf`]).
+    async fn list_role_memberships(
+        role_id: RoleId,
+        direction: RoleMembershipDirection,
+        catalog_state: Self::State,
+    ) -> Result<Vec<RoleMembershipEntry>, CatalogBackendError> {
+        Self::list_role_memberships_impl(role_id, direction, catalog_state).await
+    }
+
+    // -----------------------------------------------------------------------
+    // READ: three lookup paths
+    // -----------------------------------------------------------------------
+
+    /// Return all roles the given user is currently assigned to, together with
+    /// per-provider sync metadata.
+    ///
+    /// Each [`AssignedRole`] carries `role_id` (for internal authorizers) as
+    /// well as `role_ident` + `project_id` (for external authorizers).
+    /// [`ListUserRoleAssignmentsResult::provider_sync_times`] holds one
+    /// [`UserProviderSyncInfo`] per `(project_id, provider_id)` pair for which
+    /// the user has at least one active assignment — the sync clock is at that
+    /// granularity, not per individual role.
+    ///
+    /// Primary consumer: authorizers resolving a user's effective roles for a
+    /// permission check.
+    async fn list_role_assignments_for_user(
+        user_id: &UserId,
+        catalog_state: Self::State,
+    ) -> Result<Arc<ListUserRoleAssignmentsResult>, CatalogBackendError> {
+        // Single-flight read-through: concurrent misses for the same user coalesce
+        // onto one loader run (see `user_assignments_cache_get_or_load`).
+        let owned_user_id = user_id.clone();
+        role_assignments_cache::user_assignments_cache_get_or_load(user_id, async move {
+            let mut result =
+                Self::list_role_assignments_for_user_impl(&owned_user_id, catalog_state).await?;
+            // Dedup role/project identity across cached users before storing.
+            role_assignments_cache::share_identities(&mut result).await;
+            Ok(Arc::new(result))
+        })
+        .await
+    }
+
+    /// Return all members of the given role, together with the last sync
+    /// timestamp for this role's member list.
+    ///
+    /// Identified by [`RoleId`] — use when the UUID is already known (e.g.
+    /// inside an authorizer after having resolved the role).
+    async fn list_role_assignments_for_role(
+        role_id: RoleId,
+        catalog_state: Self::State,
+    ) -> Result<Option<Arc<ListRoleMembersResult>>, CatalogBackendError> {
+        // Single-flight read-through: concurrent misses for the same role coalesce
+        // onto one loader run (see `role_members_cache_get_or_load`). The helper
+        // owns the `ROLE_MEMBERS_CACHE` insert; the loader populates the secondary
+        // ident→id index on that single load.
+        role_assignments_cache::role_members_cache_get_or_load(role_id, async move {
+            let Some(result) =
+                Self::list_role_assignments_for_role_impl(role_id, catalog_state).await?
+            else {
+                return Ok(None);
+            };
+            let result = Arc::new(result);
+            role_cache::role_ident_insert(
+                result.project_id.clone(),
+                result.role_ident.clone(),
+                role_id,
+            )
+            .await;
+            Ok(Some(result))
+        })
+        .await
+    }
+
+    /// Return all members of a role identified by its project-scoped ident,
+    /// together with the last sync timestamp for this role's member list.
+    ///
+    /// Resolves `(project_id, role_ident)` → [`RoleId`] internally.  Use when
+    /// the caller has an external identifier (LDAP group DN, SCIM group ID)
+    /// and wants to avoid a separate role-lookup round-trip.
+    async fn list_role_assignments_for_role_by_ident(
+        project_id: &ArcProjectId,
+        role_ident: &Arc<RoleIdent>,
+        catalog_state: Self::State,
+    ) -> Result<Option<Arc<ListRoleMembersResult>>, CatalogBackendError> {
+        // Try to resolve (project_id, role_ident) → RoleId via the secondary
+        // ident cache (populated by role-create/update events and sync events).
+        // A cache hit lets us serve ROLE_MEMBERS_CACHE without touching the DB.
+        if let Some(role_id) =
+            role_cache::role_ident_to_id(project_id.clone(), role_ident.clone()).await
+            && let Some(cached) = role_assignments_cache::role_members_cache_get(role_id).await
+        {
+            // Guard against stale ident→id mappings: if the cached result's
+            // ident no longer matches the requested ident (e.g. source_id
+            // was changed since the entry was written), fall through to the
+            // DB path so we don't return members for the wrong role.
+            if cached.role_ident.as_ref() == role_ident.as_ref() {
+                return Ok(Some(cached));
+            }
+        }
+
+        // DB fetch — the result carries role_id, project_id and role_ident so
+        // we can populate both caches without a second round-trip.
+        let result = match Self::list_role_assignments_for_role_by_ident_impl(
+            project_id,
+            role_ident,
+            catalog_state,
+        )
+        .await?
+        {
+            Some(r) => Arc::new(r),
+            None => return Ok(None),
+        };
+        role_assignments_cache::role_members_cache_insert(result.role_id, Arc::clone(&result))
+            .await;
+        role_cache::role_ident_insert(
+            result.project_id.clone(),
+            result.role_ident.clone(),
+            result.role_id,
+        )
+        .await;
+        Ok(Some(result))
+    }
+}
+
+impl<T> CatalogRoleAssignmentOps for T where T: CatalogStore {}
+
+/// Above this many users invalidated by one role-membership edge change, emit a
+/// `warn`: the materialized per-user closure fanned out unusually wide, which may
+/// signal a pathological role graph. Operational signal only — not an error.
+const ROLE_MEMBERSHIP_FANOUT_WARN_THRESHOLD: usize = 1000;
+
+/// Record the role-membership edge fan-out histogram for one edge mutation and
+/// `warn` when the fan-out is large. Called at the edge-mutation sites (where the
+/// `add`/`remove` op label is known), never inside the shared
+/// `user_assignments_cache_invalidate_many` — that helper is also used by direct
+/// user deletion, which is not an edge fan-out and would conflate the two events.
+#[allow(clippy::cast_precision_loss)]
+fn record_membership_edge_fanout(
+    operation: &'static str,
+    parent_role_id: RoleId,
+    affected: &[UserId],
+) {
+    let () = &*cache_metrics::METRICS_INITIALIZED;
+    let count = affected.len();
+    metrics::histogram!(
+        cache_metrics::METRIC_ROLE_MEMBERSHIP_EDGE_FANOUT_USERS,
+        "operation" => operation
+    )
+    .record(count as f64);
+    if count > ROLE_MEMBERSHIP_FANOUT_WARN_THRESHOLD {
+        tracing::warn!(
+            count,
+            %parent_role_id,
+            operation,
+            "large role-membership edge fan-out invalidated many user-assignment caches"
+        );
+    }
+}
+
+/// Users whose effective roles a `role_membership` edge change on `member_role_ids`
+/// makes stale: those assigned to a member or any role in its descendant closure.
+///
+/// Runs on the caller's write transaction. The result is identical before and after
+/// the edge mutation (the changed edge is never on the descendant walk — `member`
+/// only appears as `member_role_id`), so computing it pre-commit is sound and keeps
+/// invalidation atomic with the edge change.
+async fn membership_edge_affected_users<S: CatalogStore>(
+    member_role_ids: &[RoleId],
+    t: &mut S::Transaction,
+) -> Result<Vec<UserId>, CatalogBackendError> {
+    if member_role_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    // One query seeded from the whole member set computes the union descendant
+    // closure and de-duplicates affected users in SQL (`SELECT DISTINCT`) — no
+    // per-member round-trip inside the held write transaction / advisory lock.
+    S::affected_users_for_membership_edges_impl(member_role_ids, t.transaction()).await
+}
+
+#[cfg(test)]
+mod fanout_metric_tests {
+    use super::*;
+
+    fn users(n: usize) -> Vec<UserId> {
+        (0..n)
+            .map(|i| UserId::new_unchecked("test", &format!("u{i}")))
+            .collect()
+    }
+
+    /// A fan-out above the warn threshold logs the operational `warn`. The
+    /// histogram `.record()` also runs (with no recorder installed in the test it
+    /// is a no-op), so this guards the threshold/warn logic — the part worth
+    /// asserting. Capturing the exact recorded histogram value would require a
+    /// metrics test recorder, which is not worth a new dev-dependency for one
+    /// `.record()` call.
+    #[test]
+    #[tracing_test::traced_test]
+    fn warns_above_threshold() {
+        let many = users(ROLE_MEMBERSHIP_FANOUT_WARN_THRESHOLD + 1);
+        record_membership_edge_fanout("add", RoleId::new_random(), &many);
+        assert!(logs_contain(
+            "large role-membership edge fan-out invalidated many user-assignment caches"
+        ));
+    }
+
+    /// At the threshold, and for a zero fan-out, no `warn` is emitted.
+    #[test]
+    #[tracing_test::traced_test]
+    fn silent_at_or_below_threshold() {
+        record_membership_edge_fanout(
+            "remove",
+            RoleId::new_random(),
+            &users(ROLE_MEMBERSHIP_FANOUT_WARN_THRESHOLD),
+        );
+        record_membership_edge_fanout("add", RoleId::new_random(), &[]);
+        assert!(!logs_contain("large role-membership edge fan-out"));
+    }
+}
