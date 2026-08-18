@@ -17,12 +17,19 @@ pub async fn run(
 ) -> Result<(), Box<dyn Error>> {
     let tenant =
         crate::connection_profile::tenant_id().ok_or("not signed in; run `verglas login`")?;
-    let server = crate::backend::server(endpoint, token)?;
     match command {
         LakehouseCommand::List => {
-            let response: Value = server
-                .get(&format!("/v1/lakehouses?tenant_id={tenant}"))
-                .await?;
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let tenant = tenant.clone();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server
+                        .get(&format!("/v1/lakehouses?tenant_id={tenant}"))
+                        .await
+                }
+            })
+            .await?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
@@ -42,12 +49,15 @@ pub async fn run(
         }
         LakehouseCommand::Create(args) => {
             let storage = storage_body(&args)?;
-            let response: Value = server
-                .post_json(
-                    "/v1/lakehouses",
-                    &json!({ "tenant_id": tenant, "name": args.name, "storage": storage }),
-                )
-                .await?;
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let body = json!({ "tenant_id": tenant, "name": args.name, "storage": storage });
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.post_json("/v1/lakehouses", &body).await
+                }
+            })
+            .await?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&response)?);
             } else {

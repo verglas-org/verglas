@@ -216,20 +216,6 @@ where
     attempt(bearer).await.map_err(loud_unauthorized)
 }
 
-/// Same contract as [`cloud_call`] for call sites that always require a
-/// bearer (the standalone access service has no anonymous mode).
-pub async fn cloud_call_with_bearer<T, E, F, Fut>(
-    bearer: String,
-    mut attempt: F,
-) -> Result<T, Box<dyn std::error::Error>>
-where
-    E: Unauthorized + std::error::Error + 'static,
-    F: FnMut(String) -> Fut,
-    Fut: Future<Output = Result<T, E>>,
-{
-    attempt(bearer).await.map_err(loud_unauthorized)
-}
-
 /// Wraps an unauthorized failure with re-login guidance; every other error
 /// passes through with its own message unchanged.
 fn loud_unauthorized<E: Unauthorized + std::error::Error + 'static>(

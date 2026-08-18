@@ -103,14 +103,8 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Token(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
             after_success(
-                commands::token::run(
-                    command,
-                    &Cli::access_endpoint(),
-                    token.as_deref(),
-                    &credentials_path,
-                    cli.json,
-                )
-                .await,
+                commands::token::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
+                    .await,
             )
             .await
         }

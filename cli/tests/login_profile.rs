@@ -100,20 +100,12 @@ fn login_writes_a_secret_free_shared_profile_and_connection_resolves_it() {
         Some("11111111-2222-4333-8444-555555555555")
     );
 
-    // The durable machine token from provisioning lands in the endpoint-keyed
-    // credential store, so tenant-scoped commands resolve a bearer with no
-    // VERGLAS_TOKEN in the environment.
-    let store = fs::read_to_string(
-        home.path()
-            .join(".config")
-            .join("verglas")
-            .join("credentials.json"),
-    )
-    .expect("credential store");
-    assert!(store.contains("vgt_durable-machine-token"), "{store}");
-    for secret in [CLOUD_API_KEY, ENDPOINT_SECRET, CATALOG_TOKEN] {
-        assert!(!store.contains(secret), "store leaked an unrelated secret");
-    }
+    // The api-key path stores the key itself as the durable bearer (the
+    // device flow stores the provisioned machine token instead), so
+    // tenant-scoped commands resolve a bearer with no VERGLAS_TOKEN set.
+    let durable = fs::read_to_string(root.join("credentials").join("control-plane-token"))
+        .expect("durable token file");
+    assert_eq!(durable.trim(), CLOUD_API_KEY);
     let endpoint_ini =
         fs::read_to_string(connection["credentials_file"].as_str().expect("creds path"))
             .expect("endpoint credentials file");

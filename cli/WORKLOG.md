@@ -914,3 +914,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   body reset the connection and wedged it into retry — a hang under a slow
   coverage-instrumented build. The mock now drains to content-length before
   responding, like the token-test mock always did.
+- Reconciled the /v0 series with the WorkOS login work that merged to main
+  (#159/#161): their auth choke point (resolved_bearer, cloud_call 401
+  guidance, post-success durable-token renewal) supersedes this branch's
+  client-side renewal and issued-at aging, both dropped; this branch's
+  /v0/tokens verbs and /v1/lakehouses commands supersede the retired
+  access-service versions, now routed through cloud_call like every other
+  cloud command. Device-test mocks repathed to /v0/tokens.

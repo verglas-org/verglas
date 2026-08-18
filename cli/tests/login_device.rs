@@ -266,7 +266,7 @@ async fn cloud_commands_use_the_stored_token_and_never_contact_workos() {
     let list_bearers: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
     let seen = list_bearers.clone();
     let control_plane = spawn(Router::new().route(
-        "/v1/access/tokens",
+        "/v0/tokens",
         get(move |headers: HeaderMap| {
             let seen = seen.clone();
             async move {
@@ -276,7 +276,7 @@ async fn cloud_commands_use_the_stored_token_and_never_contact_workos() {
                     .unwrap_or_default()
                     .to_ascii_lowercase();
                 seen.lock().expect("lock").push(authorization);
-                (StatusCode::OK, axum::Json(json!([])))
+                (StatusCode::OK, axum::Json(json!({ "tokens": [] })))
             }
         }),
     ))
@@ -323,7 +323,7 @@ async fn an_expired_token_fails_loud_with_relogin_guidance() {
     let hits = Arc::new(AtomicUsize::new(0));
     let workos = spawn(workos_router(hits.clone(), Arc::new(AtomicUsize::new(0)))).await;
     let control_plane = spawn(Router::new().route(
-        "/v1/access/tokens",
+        "/v0/tokens",
         get(|| async {
             (
                 StatusCode::UNAUTHORIZED,

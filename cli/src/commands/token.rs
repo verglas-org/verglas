@@ -28,7 +28,6 @@ pub async fn run(
     token: Option<&str>,
     json_output: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let server = crate::backend::server(endpoint, token)?;
     match command {
         TokenCommand::Create(TokenCreateArgs { name, scopes }) => {
             // The spec-mirror accepts creation parameters as query params;
@@ -38,7 +37,15 @@ pub async fn run(
                 path.push_str("&scope=");
                 path.push_str(&urlencode(scope));
             }
-            let response: Value = server.post_json(&path, &json!({})).await?;
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let path = path.clone();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.post_json(&path, &json!({})).await
+                }
+            })
+            .await?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
@@ -49,7 +56,14 @@ pub async fn run(
             Ok(())
         }
         TokenCommand::List => {
-            let response: Value = server.get("/v0/tokens").await?;
+            let response: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.get("/v0/tokens").await
+                }
+            })
+            .await?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&response)?);
                 return Ok(());
@@ -75,7 +89,15 @@ pub async fn run(
             Ok(())
         }
         TokenCommand::Revoke(TokenRevokeArgs { token_id }) => {
-            let _: Value = server.delete(&format!("/v0/tokens/{token_id}")).await?;
+            let _: Value = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+                let endpoint = endpoint.to_owned();
+                let token_id = token_id.clone();
+                async move {
+                    let server = crate::backend::server(&endpoint, bearer.as_deref())?;
+                    server.delete(&format!("/v0/tokens/{token_id}")).await
+                }
+            })
+            .await?;
             if !json_output {
                 println!("Revoked {token_id}.");
             }
