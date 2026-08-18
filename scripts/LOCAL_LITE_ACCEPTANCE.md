@@ -1,4 +1,4 @@
-# Local lite pairing acceptance (FROZEN RIME evaluation protocol — v3)
+# Local lite pairing acceptance (FROZEN RIME evaluation protocol — v4)
 
 Candidates implement `scripts/local-lite.sh` satisfying this protocol exactly;
 the coordinator re-runs it independently and probes the held-up stack by hand.
@@ -59,6 +59,20 @@ Runs against the booted stack; prints each step's latency; exit 0 only if ALL pa
    rows from steps 1–3). A second query with an intentional syntax error →
    HTTP 4xx with a JSON error, NOT a hang or 5xx. Query-node memory limit
    set to 1 GiB for the run; a query exceeding it fails cleanly.
+
+> **v4 amendment (coordinator, 2026-08-19).** Step 9 grows engine parity
+> and ergonomics, all against the SAME live ring:
+> 9a. DEFAULT NAMESPACE: `{"sql":"SELECT COUNT(*) AS n FROM pairing_events"}`
+>     (UNQUALIFIED) → 200 with n = 5. The session's default namespace is
+>     `main` — /v0 ingest writes there and spec parity requires unqualified
+>     names to resolve.
+> 9b. DUCKDB ENGINE: `{"sql":"SELECT COUNT(*) AS n FROM pairing_events",
+>     "engine":"duckdb"}` → 200 with n = 5 executed by DuckDB (its iceberg
+>     support), same /v0 result shape. `"engine":"datafusion"` and absent
+>     both select DataFusion. An unknown engine → clean 4xx JSON.
+> 9c. DuckDB syntax error → clean 4xx JSON, not a hang or 5xx; the memory
+>     limit applies to DuckDB sessions too (max_memory).
+> Candidates may not edit this file.
 
 > **v3 amendment (coordinator, 2026-08-19).** Adds the tenant query node:
 > `up` additionally boots ONE query-node binary (new `bins/query-node`)
