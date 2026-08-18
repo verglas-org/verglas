@@ -1,0 +1,108 @@
+# Four-node Verglas ring over MinIO. This is the local evaluation harness for
+# the offload work in #164: MinIO is the origin, and its Prometheus counters
+# are the authoritative record of how many S3 PUTs the cluster issued.
+#
+# Bring it up with ./run.sh up. Do not point this at a real bucket.
+name: verglas-local
+
+services:
+  minio:
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: verglas-local
+      MINIO_ROOT_PASSWORD: verglas-local-secret
+      # Unauthenticated scrape so the evaluator reads PUT counts without
+      # holding a credential.
+      MINIO_PROMETHEUS_AUTH_TYPE: public
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Creates the origin bucket once, then exits.
+  minio-init:
+    image: minio/mc:RELEASE.2025-07-21T05-28-08Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "mc alias set local http://minio:9000 verglas-local verglas-local-secret &&
+             mc mb --ignore-existing local/verglas-test &&
+             echo bucket-ready"
+
+  node1: &node
+    build:
+      context: ../..
+      target: verglas-cache-node
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    entrypoint: ["verglas-cache-node", "--config", "/etc/verglas/config.toml"]
+    environment: &node_env
+      VERGLAS_NODE_ID: node1
+      VERGLAS_RING_ADDR: 0.0.0.0:8335
+      VERGLAS_RING_PEERS: node1=node1:8335,node2=node2:8335,node3=node3:8335,node4=node4:8335
+      VERGLAS_CLUSTER_SECRET: verglas-local-ring-secret
+      VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
+      VERGLAS_LOG_FORMAT: json
+    volumes:
+      - ./node1.toml:/etc/verglas/config.toml:ro
+      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
+      - node1-state:/var/lib/verglas
+    ports:
+      - "18333:8333"
+      - "18334:8334"
+
+  node2:
+    <<: *node
+    environment:
+      <<: *node_env
+      VERGLAS_NODE_ID: node2
+    volumes:
+      - ./node2.toml:/etc/verglas/config.toml:ro
+      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
+      - node2-state:/var/lib/verglas
+    ports:
+      - "18343:8333"
+      - "18344:8334"
+
+  node3:
+    <<: *node
+    environment:
+      <<: *node_env
+      VERGLAS_NODE_ID: node3
+    volumes:
+      - ./node3.toml:/etc/verglas/config.toml:ro
+      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
+      - node3-state:/var/lib/verglas
+    ports:
+      - "18353:8333"
+      - "18354:8334"
+
+  node4:
+    <<: *node
+    environment:
+      <<: *node_env
+      VERGLAS_NODE_ID: node4
+    volumes:
+      - ./node4.toml:/etc/verglas/config.toml:ro
+      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
+      - node4-state:/var/lib/verglas
+    ports:
+      - "18363:8333"
+      - "18364:8334"
+
+volumes:
+  node1-state:
+  node2-state:
+  node3-state:
+  node4-state:

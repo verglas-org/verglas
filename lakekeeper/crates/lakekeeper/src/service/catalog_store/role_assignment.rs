@@ -409,12 +409,6 @@ impl<'slice, 'data> UniqueMembers<'slice, 'data> {
         }
         Ok(Self { inner: members })
     }
-
-    /// Wraps `members` without validating uniqueness.
-    ///
-    /// # Caller contract
-    /// Every `user_id` in `members` must be unique. Violating this contract
-    /// causes a runtime database error, not memory unsafety.
 }
 impl<'data> std::ops::Deref for UniqueMembers<'_, 'data> {
     type Target = [CatalogUserRoleAssignmentUser<'data>];
@@ -450,12 +444,6 @@ impl<'slice, 'data> UniqueRoles<'slice, 'data> {
         }
         Ok(Self { inner: roles })
     }
-
-    /// Wraps `roles` without validating uniqueness.
-    ///
-    /// # Caller contract
-    /// Every `source_id` in `roles` must be unique. Violating this contract
-    /// causes a runtime database error, not memory unsafety.
 }
 impl<'data> std::ops::Deref for UniqueRoles<'_, 'data> {
     type Target = [CatalogRoleForAssignment<'data>];

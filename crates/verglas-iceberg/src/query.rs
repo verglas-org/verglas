@@ -12,7 +12,6 @@
 //! this build (see the crate docs / PR notes) so the offline-native DataFusion
 //! provider stands in, wired to the same catalog and endpoint.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
@@ -269,11 +268,6 @@ impl CaseInsensitiveCatalogProvider {
 }
 
 impl CatalogProvider for CaseInsensitiveCatalogProvider {
-    /// Exposes this provider for downcasting, as the trait requires.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Delegates the exact-cased schema names of the inner provider.
     fn schema_names(&self) -> Vec<String> {
         self.inner.schema_names()
@@ -321,11 +315,6 @@ impl CaseInsensitiveSchemaProvider {
 
 #[async_trait::async_trait]
 impl SchemaProvider for CaseInsensitiveSchemaProvider {
-    /// Exposes this provider for downcasting, as the trait requires.
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     /// Delegates the exact-cased table names of the inner schema.
     fn table_names(&self) -> Vec<String> {
         self.inner.table_names()
