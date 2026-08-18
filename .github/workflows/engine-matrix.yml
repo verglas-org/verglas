@@ -5,18 +5,20 @@ name: engine-matrix
 # Verglas endpoint, and the results are diffed at the Arrow level (schema +
 # values). Wrong results are Verglas's existential risk, so any difference
 # fails this build. Kept a distinct workflow from the main `ci` one because it
-# is heavy: it runs nightly and on demand (see the triggers below), not on
-# every PR push.
+# needs docker, Python engines, and a JVM fixture builder.
 #
 # Runs all three #23 fixture variants (#159): Parquet (pyiceberg), and Avro +
 # mixed-format, whose data files are written by the plain-Java iceberg-core
 # builder in tests/engine-matrix/fixture-jvm/ (pyiceberg and DuckDB write Parquet
 # data files only). The JVM builder is compiled once with a cached Gradle build.
 
-# Heavy (docker MinIO + DuckDB + Polars). Runs nightly and on demand, and
-# should be run locally before a PR that touches the S3 or read path. Not on
-# every PR push, to keep Actions spend down.
+# Docker MinIO + DuckDB + Polars, ~6 minutes. Wrong results are the one
+# failure this project cannot ship, so it gates every PR — a tripwire that
+# only fires at 07:00 UTC reports wrong bytes a day after they merge. Also
+# runs nightly (catching drift in the pinned engines and fixtures) and on
+# demand.
 on:
+  pull_request:
   schedule:
     - cron: "0 7 * * *"        # 07:00 UTC nightly
   workflow_dispatch:

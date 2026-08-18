@@ -13,6 +13,7 @@ name: s3-conformance
 # per-PR gate.
 
 on:
+  pull_request:
   schedule:
     - cron: "0 7 * * *"        # 07:00 UTC nightly
   workflow_dispatch:
@@ -26,10 +27,11 @@ env:
 
 jobs:
   # Fast PR-path smoke: a handful of core GET/PUT/LIST/multipart/copy/delete/
-  # error tests. Only triggers on the path filter above. Debug build for speed.
+  # error tests, debug build for speed. Gates every PR so a protocol
+  # regression fails within minutes; the full suite below stays the
+  # authoritative signal.
   smoke:
-    # Fast subset for a quick manual check. The full suite below is authoritative.
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +45,10 @@ jobs:
         run: ./tests/s3-conformance/run.sh --smoke --debug
 
   # Nightly / on-demand full suite: the authoritative conformance signal.
+  # Not on the PR path — it is the whole ceph suite against a live server, far
+  # too slow to gate a push; the smoke job above covers PRs.
   full:
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
