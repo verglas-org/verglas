@@ -13,10 +13,8 @@ use verglas_s3::semantic::{SemanticApi, SemanticError, SemanticOperation, router
 
 /// Loads the checked-in Graph REST-JSON service model.
 fn graph_contract() -> Value {
-    serde_json::from_str(include_str!(
-        "../models/verglas-graphs-service-1.json"
-    ))
-    .expect("Graph contract is valid JSON")
+    serde_json::from_str(include_str!("../models/verglas-graphs-service-1.json"))
+        .expect("Graph contract is valid JSON")
 }
 
 /// Resolves a named shape from the service model.
