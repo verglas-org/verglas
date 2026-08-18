@@ -1,4 +1,4 @@
-//! Integration tests for the M1 config: the committed example parses, typos
+//! Integration tests for the M1 config: typos
 //! and bad values produce errors naming the field, and defaults apply.
 
 use std::path::PathBuf;
@@ -26,48 +26,6 @@ fn valid_toml(tag: &str) -> String {
         "[backend]\nbucket = \"test-bucket\"\n[cache]\ndir = \"{}\"\ncapacity_bytes = \"64MB\"\n",
         scratch_dir(tag).display()
     )
-}
-
-#[test]
-fn committed_example_parses_with_documented_values() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../verglas.example.toml");
-    let text = std::fs::read_to_string(&path).expect("read verglas.example.toml");
-    let config = Config::from_toml_str(&text).expect("example config parses");
-    assert_eq!(config.listen.s3_port, 8333);
-    assert_eq!(config.listen.admin_port, 8334);
-    assert_eq!(
-        config.cache.capacity_bytes,
-        ByteSize(20 * 1024 * 1024 * 1024)
-    );
-    assert_eq!(config.cache.data_block_bytes, ByteSize(2 * 1024 * 1024));
-    // The example names the required bucket and the concurrency ceiling at its
-    // default.
-    assert_eq!(config.backend.bucket.as_deref(), Some("my-bucket"));
-    assert_eq!(config.backend.max_concurrent_requests, 64);
-}
-
-#[test]
-fn committed_example_documents_current_catalog_auth_surface() {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../verglas.example.toml");
-    let text = std::fs::read_to_string(&path).expect("read verglas.example.toml");
-    // The example must document the same catalog auth surface as the generated
-    // template (#238): a credentials file plus the SigV4 fields — and must not
-    // advertise an inline bearer token, which the template deliberately omits.
-    for field in [
-        "credentials_file",
-        "credentials_profile",
-        "sigv4_region",
-        "sigv4_signing_name",
-    ] {
-        assert!(
-            text.contains(field),
-            "example catalog block is missing `{field}`"
-        );
-    }
-    assert!(
-        !text.contains("bearer_token"),
-        "example must not show an inline bearer_token"
-    );
 }
 
 #[test]

@@ -445,3 +445,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   release job). This crate does not depend on the patched Iceberg fork, so
   the workspace publish ban does not apply; workspace dependency entries now
   carry a version alongside the path for the registry publish.
+- Deleted verglas.example.toml and its freshness tests: deployment is
+  container + environment (start.sh renders the config); a hand-maintained
+  example file was dead surface.
