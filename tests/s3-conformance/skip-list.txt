@@ -249,7 +249,8 @@ s3tests/functional/test_s3.py::test_bucket_delete_notexist
 # pass and are no longer skipped. These two remaining cases assert RGW-specific
 # read-stats response headers (x-rgw-object-count, x-rgw-bytes-used, the
 # read-stats param) that MinIO does not emit; they are marked fails_on_aws
-# upstream and cannot pass against a non-RGW origin.s3tests/functional/test_s3.py::test_bucket_head_extended
+# upstream and cannot pass against a non-RGW origin.
+s3tests/functional/test_s3.py::test_bucket_head_extended
 s3tests/functional/test_s3.py::test_head_bucket_usage
 
 # --- #153: UploadPartCopy (server-side multipart copy, cross-bucket included)
