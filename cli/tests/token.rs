@@ -54,28 +54,18 @@ fn serving(
     (format!("http://{address}"), handle)
 }
 
-/// Writes the endpoint-keyed credential store with a token of the given age.
-fn write_store(home: &std::path::Path, endpoint: &str, token: &str, age_days: u64) {
-    let issued = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_secs()
-        - age_days * 24 * 3600;
-    let dir = home.join(".config").join("verglas");
-    fs::create_dir_all(&dir).expect("store dir");
-    let store = dir.join("credentials.json");
-    fs::write(
-        &store,
-        format!(
-            r#"{{"tokens":{{"{}":{{"token":"{token}","token_id":"provisioned","issued_at":{issued}}}}}}}"#,
-            endpoint.trim_end_matches('/')
-        ),
-    )
-    .expect("store");
+/// Seeds the durable control-plane token `verglas login` writes, which
+/// `auth::resolved_bearer` falls back to. HOME-based, so it does not depend
+/// on XDG_CONFIG_HOME (which CI runners set and developer machines do not).
+fn write_store(home: &std::path::Path, _endpoint: &str, token: &str, _age_days: u64) {
+    let dir = home.join(".verglas").join("credentials");
+    fs::create_dir_all(&dir).expect("credentials dir");
+    let path = dir.join("control-plane-token");
+    fs::write(&path, token).expect("durable token");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
-        fs::set_permissions(&store, fs::Permissions::from_mode(0o600)).expect("mode");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
     }
 }
 
@@ -83,6 +73,9 @@ fn command(home: &std::path::Path, url: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_verglas"));
     cmd.env("HOME", home)
         .env_remove("VERGLAS_TOKEN")
+        // CI runners set XDG_CONFIG_HOME; leaving it through would point the
+        // credential store outside the test's temporary HOME.
+        .env_remove("XDG_CONFIG_HOME")
         .env("VERGLAS_ACCESS_ENDPOINT", url);
     cmd
 }

@@ -921,3 +921,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   /v0/tokens verbs and /v1/lakehouses commands supersede the retired
   access-service versions, now routed through cloud_call like every other
   cloud command. Device-test mocks repathed to /v0/tokens.
+- Token tests seed the durable control-plane token file (HOME-based) rather
+  than the endpoint-keyed store, and clear XDG_CONFIG_HOME: CI runners set
+  it, which pointed the store outside the test's temporary HOME and left the
+  request unauthenticated. Verified with XDG_CONFIG_HOME set locally.
