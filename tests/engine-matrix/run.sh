@@ -160,7 +160,7 @@ ensure_jar() {
   if [[ -f "$JAR" ]]; then return 0; fi
   if [[ -x "$HERE/fixture-jvm/gradlew" ]]; then
     echo "[setup] building fixture-jvm jar (one-time)" >&2
-    ( cd "$HERE/fixture-jvm" && ./gradlew --no-server shadowJar >&2 )
+    ( cd "$HERE/fixture-jvm" && ./gradlew --no-daemon shadowJar >&2 )
   else
     echo "error: $JAR missing and fixture-jvm/gradlew not found." >&2
     exit 2

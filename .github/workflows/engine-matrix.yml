@@ -3,9 +3,10 @@ name: engine-matrix
 # The result-diffing tripwire (issue #23): two real query engines (DuckDB and
 # Polars) read the same Iceberg fixture direct-from-MinIO and through the
 # Verglas endpoint, and the results are diffed at the Arrow level (schema +
-# values). Wrong results are Verglas's existential risk; this runs on every PR
-# and fails the build on any difference. Kept a distinct workflow so it stays on
-# the PR path independent of the main `ci` workflow.
+# values). Wrong results are Verglas's existential risk, so any difference
+# fails this build. Kept a distinct workflow from the main `ci` one because it
+# is heavy: it runs nightly and on demand (see the triggers below), not on
+# every PR push.
 #
 # Runs all three #23 fixture variants (#159): Parquet (pyiceberg), and Avro +
 # mixed-format, whose data files are written by the plain-Java iceberg-core
@@ -64,7 +65,7 @@ jobs:
       # (no Spark). Runs once; the matrix reuses it for the avro and mixed variants.
       - name: Build Avro/mixed fixture builder (iceberg-core, no Spark)
         working-directory: tests/engine-matrix/fixture-jvm
-        run: ./gradlew --no-server shadowJar
+        run: ./gradlew --no-daemon shadowJar
 
       - name: Start MinIO
         run: |
