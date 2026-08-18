@@ -547,6 +547,37 @@ async fn batch_fragment_concatenation_matches_the_collected_report() {
     assert_eq!(reassembled_rows, collected_rows);
 }
 
+/// Acceptance (frozen local-lite protocol step 9a): an UNQUALIFIED table
+/// reference resolves against the `default` namespace, since `/v0` ingest
+/// always writes `default.<dataset>` and spec parity requires unqualified
+/// names to resolve there without a namespace prefix. Not `main` — DuckDB's
+/// own per-catalog default schema is hardcoded to that name, and an attached
+/// Iceberg namespace also named `main` gets shadowed by it (the protocol's
+/// "USER RULING" amendment), so `default` is the namespace both engines
+/// agree on without a collision.
+#[tokio::test]
+async fn unqualified_table_name_resolves_in_the_default_namespace() {
+    let catalog = memory_catalog().await;
+    let ident = parse_table_ident("default.pairing_events").expect("ident");
+    write::create_table(
+        catalog.as_ref(),
+        &ident,
+        &source_file("rows.csv", "id\n1\n2\n3\n4\n5\n"),
+        None,
+    )
+    .await
+    .expect("create");
+
+    let report = query::query(
+        catalog.clone(),
+        "SELECT COUNT(*) AS n FROM pairing_events",
+        None,
+    )
+    .await
+    .expect("unqualified query resolves in default");
+    assert_eq!(report.rows[0]["n"], serde_json::json!(5));
+}
+
 /// An empty batch contributes no bytes and no rows — a streaming caller must
 /// never emit a stray `[]` or an unwanted comma for it.
 #[tokio::test]

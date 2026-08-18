@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # scripts/local-lite.sh — implements the frozen protocol in
-# scripts/LOCAL_LITE_ACCEPTANCE.md (v3). Boots, on localhost, from CURRENT
+# scripts/LOCAL_LITE_ACCEPTANCE.md (v4: step 9 grows a `default`-namespace
+# default (9a) and a second query engine, DuckDB, selected per-request via
+# `{"engine":"duckdb"}` (9b/9c) — see `bins/query-node/src/server.rs`).
+# Not `main`: DuckDB hardcodes `main` as every catalog's own built-in default
+# schema, so an attached Iceberg namespace also named `main` gets shadowed by
+# it (the frozen doc's "USER RULING" amendment).
+# Boots, on localhost, from CURRENT
 # source trees: a MinIO object store, FOUR verglas-cache-node processes built
 # --release from this tree forming a real fragment ring (the engine's
 # ring.rs hard-requires >=3 VERGLAS_RING_PEERS before the embedded safekeeper
@@ -90,7 +96,7 @@ CATALOG_ARCHIVE_BUCKET="$BACKEND_BUCKET"
 # into the managed S3 profile today; local-lite mirrors it rather than
 # guessing at a "fix" for behavior outside this task's scope.
 METADATA_BUCKET="managed-template"
-TABLE="main.pairing_events"
+TABLE="default.pairing_events"
 
 CREDENTIALS_JSON="$STATE_DIR/credentials.json"
 
@@ -566,7 +572,7 @@ cmd_check() {
   status=$(curl -sS -o "$STATE_DIR/query-count.json" -w '%{http_code}' \
     -X POST "$query_url" \
     -H 'content-type: application/json' \
-    --data '{"sql":"SELECT COUNT(*) AS n FROM main.pairing_events"}')
+    --data "{\"sql\":\"SELECT COUNT(*) AS n FROM $TABLE\"}")
   body=$(cat "$STATE_DIR/query-count.json")
   n=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['data'][0]['n'])" "$STATE_DIR/query-count.json" 2>/dev/null || echo "")
   if [ "$status" != "200" ] || [ "$n" != "5" ]; then
@@ -586,6 +592,72 @@ cmd_check() {
     failures=$((failures + 1))
   else
     log "SQL SYNTAX ERROR ok status=$status (clean 4xx JSON, not a hang or 5xx)"
+  fi
+
+  log "9a. DEFAULT NAMESPACE (unqualified table name resolves in default)"
+  status=$(curl -sS -o "$STATE_DIR/query-9a-unqualified.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELECT COUNT(*) AS n FROM pairing_events"}')
+  body=$(cat "$STATE_DIR/query-9a-unqualified.json")
+  n=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['data'][0]['n'])" "$STATE_DIR/query-9a-unqualified.json" 2>/dev/null || echo "")
+  if [ "$status" != "200" ] || [ "$n" != "5" ]; then
+    log "9a DEFAULT NAMESPACE FAILED status=$status n=$n body=$body"
+    failures=$((failures + 1))
+  else
+    log "9a DEFAULT NAMESPACE ok status=$status n=$n"
+  fi
+
+  log "9b. ENGINE PARITY (duckdb, datafusion, unknown)"
+  status=$(curl -sS -o "$STATE_DIR/query-9b-duckdb.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELECT COUNT(*) AS n FROM pairing_events","engine":"duckdb"}')
+  body=$(cat "$STATE_DIR/query-9b-duckdb.json")
+  n=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['data'][0]['n'])" "$STATE_DIR/query-9b-duckdb.json" 2>/dev/null || echo "")
+  if [ "$status" != "200" ] || [ "$n" != "5" ]; then
+    log "9b DUCKDB ENGINE FAILED status=$status n=$n body=$body"
+    failures=$((failures + 1))
+  else
+    log "9b DUCKDB ENGINE ok status=$status n=$n"
+  fi
+
+  status=$(curl -sS -o "$STATE_DIR/query-9b-datafusion.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELECT COUNT(*) AS n FROM pairing_events","engine":"datafusion"}')
+  body=$(cat "$STATE_DIR/query-9b-datafusion.json")
+  n=$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d['data'][0]['n'])" "$STATE_DIR/query-9b-datafusion.json" 2>/dev/null || echo "")
+  if [ "$status" != "200" ] || [ "$n" != "5" ]; then
+    log "9b DATAFUSION ENGINE FAILED status=$status n=$n body=$body"
+    failures=$((failures + 1))
+  else
+    log "9b DATAFUSION ENGINE ok status=$status n=$n"
+  fi
+
+  status=$(curl -sS -o "$STATE_DIR/query-9b-unknown-engine.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELECT 1","engine":"snowflake"}')
+  body=$(cat "$STATE_DIR/query-9b-unknown-engine.json")
+  if [ "${status:0:1}" != "4" ] || ! grep -q '"error"' "$STATE_DIR/query-9b-unknown-engine.json"; then
+    log "9b UNKNOWN ENGINE FAILED status=$status body=$body"
+    failures=$((failures + 1))
+  else
+    log "9b UNKNOWN ENGINE ok status=$status (clean 4xx JSON)"
+  fi
+
+  log "9c. DUCKDB SYNTAX ERROR and memory limit"
+  status=$(curl -sS -o "$STATE_DIR/query-9c-duckdb-syntax-error.json" -w '%{http_code}' \
+    -X POST "$query_url" \
+    -H 'content-type: application/json' \
+    --data '{"sql":"SELEKT this is not valid sql","engine":"duckdb"}')
+  body=$(cat "$STATE_DIR/query-9c-duckdb-syntax-error.json")
+  if [ "${status:0:1}" != "4" ] || ! grep -q '"error"' "$STATE_DIR/query-9c-duckdb-syntax-error.json"; then
+    log "9c DUCKDB SYNTAX ERROR FAILED status=$status body=$body"
+    failures=$((failures + 1))
+  else
+    log "9c DUCKDB SYNTAX ERROR ok status=$status (clean 4xx JSON, not a hang or 5xx)"
   fi
 
   if [ "$failures" -gt 0 ]; then

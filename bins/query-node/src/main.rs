@@ -56,6 +56,7 @@ async fn main() {
 
     let state = server::AppState::new(
         Arc::clone(&catalog),
+        connection.clone(),
         config.memory_limit_bytes,
         config.query_timeout,
     );

@@ -185,3 +185,23 @@
   (2 `load_table` calls per uncached append vs. 1 per warm cached append)
   with an instrumented counting catalog, and prove a stale cache entry still
   commits correctly with no row lost or duplicated.
+
+- RIME query-node candidate A, protocol v4 step 9a: pins the DataFusion
+  session's default schema to `"default"` — `query::query_session_config`
+  already set it there before this change; step 9a's requirement (an
+  unqualified `FROM <table>` resolves without a namespace prefix, matching
+  where `/v0` ingest writes) was already met by the stock DataFusion default.
+  This candidate's first pass instead switched the default to `"main"`; the
+  frozen protocol doc was amended mid-task (coordinator commit `9cbec80`,
+  "USER RULING") to pin `"default"` once the DuckDB engine path
+  (`bins/query-node`) showed that an attached Iceberg namespace named `main`
+  gets shadowed by DuckDB's own hardcoded per-catalog default schema of that
+  same name — `"default"` has no such collision in either engine. The `"main"`
+  attempt is not carried forward; `query_session_config`'s only change here is
+  a comment explaining why `"default"`, not `"main"`, is deliberate. No test
+  in this crate relied on a different default (every whole-catalog
+  `query`/`query_stream` test already names its namespace; the two
+  unqualified references in `tests/compaction.rs` and `tests/table_verbs.rs`
+  both go through the separate `time_travel_context` path, which registers
+  one table directly and never touches this session config). New test:
+  `tests/table_verbs.rs::unqualified_table_name_resolves_in_the_default_namespace`.

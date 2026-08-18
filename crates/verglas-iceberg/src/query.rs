@@ -226,6 +226,14 @@ async fn catalog_context_with_runtime(
 }
 
 fn query_session_config(bounded: bool) -> SessionConfig {
+    // "default" is the session's default schema, matching DataFusion's own
+    // stock default: /v0 ingest writes `default.<dataset>`, and the frozen
+    // local-lite protocol's step 9a requires an unqualified `FROM <table>`
+    // to resolve there without a namespace prefix. Not "main" — DuckDB's own
+    // per-catalog default schema is hardcoded to that name, and an attached
+    // Iceberg namespace also named "main" gets shadowed by it (protocol v4's
+    // "USER RULING" amendment, found live running the DuckDB engine path in
+    // `bins/query-node`).
     let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
     if bounded {
         // HashJoin materializes its build side and can exhaust a fixed memory

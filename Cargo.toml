@@ -70,6 +70,15 @@ iceberg-datafusion = "0.10.1"
 # the configured cache endpoint.
 iceberg-storage-opendal = "0.10.1"
 datafusion = "53.1"
+# bins/query-node's second query engine (protocol v4 step 9b): the bundled
+# build statically links libduckdb so the binary carries its own engine, no
+# system libduckdb at runtime. DuckDB's own Iceberg REST catalog support
+# (its `iceberg`/`httpfs` extensions, loaded at session init) reads the same
+# catalog and S3 endpoint the DataFusion path uses. Its `arrow` dependency
+# pins to the same arrow-rs "58" line as the rest of the workspace, so
+# `duckdb::arrow::record_batch::RecordBatch` and `arrow_array::RecordBatch`
+# are the same type — query-node's JSON row writer serves both engines.
+duckdb = { version = "1.10505.0", features = ["bundled"] }
 # Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "58"
 arrow-buffer = "58"

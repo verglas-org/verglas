@@ -22,6 +22,10 @@ verglas-iceberg.workspace = true
 # full build dependency of verglas-iceberg (via `iceberg.workspace`), so this
 # adds no new engine surface.
 iceberg.workspace = true
+# The second query engine (protocol v4 step 9b). Runs in-process, ATTACHed to
+# the same Iceberg REST catalog/S3 endpoint coordinates as the DataFusion
+# path — see `run_query_duckdb`/`duckdb_query` in `src/server.rs`.
+duckdb.workspace = true
 # Polls `QueryExecution::batches` (a `SendableRecordBatchStream`) for each
 # result batch. `.schema()` is callable on the trait object without a direct
 # `datafusion` dependency; only the stream adaptor is needed here.
