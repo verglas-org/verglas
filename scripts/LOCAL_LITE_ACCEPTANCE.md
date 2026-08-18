@@ -37,14 +37,14 @@ Boots, on localhost, from CURRENT source trees:
 
 ## `scripts/local-lite.sh check`
 Runs against the booted stack; prints each step's latency; exit 0 only if ALL pass:
-1. CREATE:  `POST 127.0.0.1:18334/v1/ingest/main.pairing_events?mode=create&format=jsonl`
+1. CREATE:  `POST 127.0.0.1:18334/v1/ingest/default.pairing_events?mode=create&format=jsonl`
    with one NDJSON row → HTTP 200, body contains `"snapshot_id"` and `"records_added":1`.
 2. ASYNC APPEND ×3: same URL `mode=append` → HTTP 200/202, `successful_rows`
    in body, ack latency printed.
 3. SYNC APPEND: `...&wait=true` (or `commit=sync`) → HTTP 200 with a committed
    snapshot id.
 4. READ-BACK (poll ≤10s for async commits to land):
-   `GET /v1/tables/main.pairing_events/rows?limit=10` → all 5 rows present.
+   `GET /v1/tables/default.pairing_events/rows?limit=10` → all 5 rows present.
 5. CATALOG HEALTH: no engine log on ANY node contains `WarehouseIdIsNotUUID`,
    `catalog gateway error`, or 5xx catalog poll failures after startup settles.
 6. STATELESS PARITY: `GET 127.0.0.1:18191/catalog/v1/config?warehouse=lite`
@@ -54,7 +54,7 @@ Runs against the booted stack; prints each step's latency; exit 0 only if ALL pa
    admin port (e.g. :18344) returns the same 5 rows — commits are
    ring-durable, not node-local.
 8. Latency REPORT (informational, not a gate): p50 of the async appends.
-9. SQL (v3): `POST 127.0.0.1:18400/v1/query` with `{"sql":"SELECT COUNT(*) AS n FROM main.pairing_events"}`
+9. SQL (v3): `POST 127.0.0.1:18400/v1/query` with `{"sql":"SELECT COUNT(*) AS n FROM default.pairing_events"}`
    → HTTP 200, JSON body whose data rows contain n = 5 (the five committed
    rows from steps 1–3). A second query with an intentional syntax error →
    HTTP 4xx with a JSON error, NOT a hang or 5xx. Query-node memory limit
@@ -64,8 +64,9 @@ Runs against the booted stack; prints each step's latency; exit 0 only if ALL pa
 > and ergonomics, all against the SAME live ring:
 > 9a. DEFAULT NAMESPACE: `{"sql":"SELECT COUNT(*) AS n FROM pairing_events"}`
 >     (UNQUALIFIED) → 200 with n = 5. The session's default namespace is
->     `main` — /v0 ingest writes there and spec parity requires unqualified
->     names to resolve.
+>     `default` (USER RULING 2026-08-19, chosen over public/verglas; DuckDB
+>     reserves `main`, empirically verified) — /v0 ingest writes there and
+>     spec parity requires unqualified names to resolve.
 > 9b. DUCKDB ENGINE: `{"sql":"SELECT COUNT(*) AS n FROM pairing_events",
 >     "engine":"duckdb"}` → 200 with n = 5 executed by DuckDB (its iceberg
 >     support), same /v0 result shape. `"engine":"datafusion"` and absent
