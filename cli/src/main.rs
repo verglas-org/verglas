@@ -33,8 +33,12 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = crate::backend::resolved_endpoint();
     match cli.command {
         Command::Login(args) => {
-            commands::connection::login(&Cli::access_endpoint(), args.api_key.as_deref(), args.no_browser)
-                .await
+            commands::connection::login(
+                &Cli::access_endpoint(),
+                args.api_key.as_deref(),
+                args.no_browser,
+            )
+            .await
         }
         Command::Logout => commands::connection::logout(),
         Command::Status => {
@@ -62,8 +66,13 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Lakehouse(command) => {
             let token = auth::resolved_bearer(&credentials_path).await?;
             after_success(
-                commands::lakehouse::run(command, &Cli::access_endpoint(), token.as_deref(), cli.json)
-                    .await,
+                commands::lakehouse::run(
+                    command,
+                    &Cli::access_endpoint(),
+                    token.as_deref(),
+                    cli.json,
+                )
+                .await,
             )
             .await
         }

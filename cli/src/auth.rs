@@ -54,9 +54,7 @@ pub enum AuthError {
     Request(reqwest::Error),
     #[error("WorkOS returned HTTP {status}: {body}")]
     Workos { status: u16, body: String },
-    #[error(
-        "timed out waiting for the device code to be approved; run `verglas login` again"
-    )]
+    #[error("timed out waiting for the device code to be approved; run `verglas login` again")]
     Timeout,
     #[error(transparent)]
     Provision(#[from] crate::connection_profile::ConnectionProfileError),
@@ -289,7 +287,12 @@ async fn renew_if_stale(path: &Path, endpoint: &str) {
     let Ok(url) = base.join("v1/tokens/renew") else {
         return;
     };
-    let Ok(response) = reqwest::Client::new().post(url).bearer_auth(token).send().await else {
+    let Ok(response) = reqwest::Client::new()
+        .post(url)
+        .bearer_auth(token)
+        .send()
+        .await
+    else {
         return;
     };
     if !response.status().is_success() {
@@ -461,7 +464,9 @@ mod tests {
         let router = axum::Router::new().route(
             "/v1/tokens/renew",
             axum::routing::post(|| async {
-                axum::Json(serde_json::json!({ "api_token": "rotated-token", "expires_in": 2_592_000 }))
+                axum::Json(
+                    serde_json::json!({ "api_token": "rotated-token", "expires_in": 2_592_000 }),
+                )
             }),
         );
         tokio::spawn(async move {

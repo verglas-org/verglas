@@ -23,7 +23,9 @@ pub async fn run(
     credentials_path: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bearer = bearer.ok_or("not signed in; run `verglas login`")?.to_owned();
+    let bearer = bearer
+        .ok_or("not signed in; run `verglas login`")?
+        .to_owned();
     match command {
         TokenCommand::Create(args) => create(endpoint, bearer, credentials_path, args, json).await,
         TokenCommand::List => list(endpoint, bearer, json).await,
@@ -73,7 +75,11 @@ async fn create(
 }
 
 /// Lists token metadata without ever materializing plaintext values.
-async fn list(endpoint: &str, bearer: String, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+async fn list(
+    endpoint: &str,
+    bearer: String,
+    json: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let tokens = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
         let endpoint = endpoint.to_owned();
         async move {

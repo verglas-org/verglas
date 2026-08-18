@@ -189,7 +189,12 @@ async fn device_login_exchanges_for_the_durable_token_and_keeps_no_workos_materi
     let home = TempDir::new().expect("home");
     let output = tokio::task::spawn_blocking({
         let mut command = base_command(&home, &workos, &control_plane);
-        move || command.args(["login", "--no-browser"]).output().expect("login runs")
+        move || {
+            command
+                .args(["login", "--no-browser"])
+                .output()
+                .expect("login runs")
+        }
     })
     .await
     .expect("join");
@@ -200,12 +205,18 @@ async fn device_login_exchanges_for_the_durable_token_and_keeps_no_workos_materi
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.status.success(), "login failed:\n{combined}");
-    assert!(combined.contains("RRGQ-BJVS"), "must print the user code:\n{combined}");
+    assert!(
+        combined.contains("RRGQ-BJVS"),
+        "must print the user code:\n{combined}"
+    );
     assert!(
         combined.contains("https://auth.test/device"),
         "must print the verification URI:\n{combined}"
     );
-    assert!(polls.load(Ordering::SeqCst) >= 2, "must poll through authorization_pending");
+    assert!(
+        polls.load(Ordering::SeqCst) >= 2,
+        "must poll through authorization_pending"
+    );
 
     assert_eq!(
         provision_bearers.lock().expect("lock").clone(),
@@ -218,7 +229,11 @@ async fn device_login_exchanges_for_the_durable_token_and_keeps_no_workos_materi
     assert_eq!(stored.trim(), API_TOKEN);
     #[cfg(unix)]
     assert_eq!(
-        fs::metadata(&token_path).expect("metadata").permissions().mode() & 0o777,
+        fs::metadata(&token_path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
         0o600,
         "durable token must be owner-only"
     );
@@ -229,7 +244,12 @@ async fn device_login_exchanges_for_the_durable_token_and_keeps_no_workos_materi
     );
     let config = fs::read_to_string(home.path().join(".verglas").join("config.toml"))
         .expect("profile config");
-    for secret in [WORKOS_ACCESS_TOKEN, "workos-refresh-token-1", API_TOKEN, "endpoint-signing-secret"] {
+    for secret in [
+        WORKOS_ACCESS_TOKEN,
+        "workos-refresh-token-1",
+        API_TOKEN,
+        "endpoint-signing-secret",
+    ] {
         assert!(!config.contains(secret), "config.toml leaked a secret");
     }
     assert!(
@@ -271,7 +291,12 @@ async fn cloud_commands_use_the_stored_token_and_never_contact_workos() {
 
     let output = tokio::task::spawn_blocking({
         let mut command = base_command(&home, &workos, &control_plane);
-        move || command.args(["token", "list"]).output().expect("token list runs")
+        move || {
+            command
+                .args(["token", "list"])
+                .output()
+                .expect("token list runs")
+        }
     })
     .await
     .expect("join");
@@ -286,7 +311,11 @@ async fn cloud_commands_use_the_stored_token_and_never_contact_workos() {
         vec![format!("bearer {API_TOKEN}")],
         "cloud commands present the durable token"
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 0, "runtime paths must never contact WorkOS");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "runtime paths must never contact WorkOS"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -296,7 +325,10 @@ async fn an_expired_token_fails_loud_with_relogin_guidance() {
     let control_plane = spawn(Router::new().route(
         "/v1/access/tokens",
         get(|| async {
-            (StatusCode::UNAUTHORIZED, axum::Json(json!({ "error": "token expired" })))
+            (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({ "error": "token expired" })),
+            )
         }),
     ))
     .await;
@@ -310,7 +342,12 @@ async fn an_expired_token_fails_loud_with_relogin_guidance() {
 
     let output = tokio::task::spawn_blocking({
         let mut command = base_command(&home, &workos, &control_plane);
-        move || command.args(["token", "list"]).output().expect("token list runs")
+        move || {
+            command
+                .args(["token", "list"])
+                .output()
+                .expect("token list runs")
+        }
     })
     .await
     .expect("join");
@@ -320,7 +357,11 @@ async fn an_expired_token_fails_loud_with_relogin_guidance() {
         stderr.contains("verglas login"),
         "failure must tell the user to re-login: {stderr}"
     );
-    assert_eq!(hits.load(Ordering::SeqCst), 0, "no silent WorkOS refresh on 401");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "no silent WorkOS refresh on 401"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

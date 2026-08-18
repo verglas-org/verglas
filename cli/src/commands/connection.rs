@@ -10,7 +10,11 @@ use crate::connection_profile;
 /// and verification URI, poll until sign-in completes, then spend the WorkOS
 /// access token exactly once for a connection profile and a durable
 /// control-plane token. WorkOS is never contacted again after this call.
-pub async fn login(url: &str, api_key: Option<&str>, no_browser: bool) -> Result<(), Box<dyn Error>> {
+pub async fn login(
+    url: &str,
+    api_key: Option<&str>,
+    no_browser: bool,
+) -> Result<(), Box<dyn Error>> {
     match api_key.filter(|value| !value.trim().is_empty()) {
         Some(api_key) => connection_profile::login(url, api_key).await?,
         None => auth::device_login(url, no_browser).await?,
