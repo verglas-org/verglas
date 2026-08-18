@@ -14,6 +14,8 @@ use crate::cli::{TokenCommand, TokenCreateArgs, TokenRevokeArgs};
 use crate::credentials::{StoredToken, remove_token, save_token};
 
 /// Runs one token lifecycle command against the configured access service.
+/// Every verb routes its call through `auth::cloud_call_with_bearer` so a 401
+/// fails loud with guidance to re-run `verglas login`; there is no refresh.
 pub async fn run(
     command: TokenCommand,
     endpoint: &str,
@@ -21,12 +23,11 @@ pub async fn run(
     credentials_path: &Path,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bearer = bearer.ok_or("not signed in; run `verglas login`")?;
-    let client = access_client(endpoint, bearer).await?;
+    let bearer = bearer.ok_or("not signed in; run `verglas login`")?.to_owned();
     match command {
-        TokenCommand::Create(args) => create(&client, endpoint, credentials_path, args, json).await,
-        TokenCommand::List => list(&client, json).await,
-        TokenCommand::Revoke(args) => revoke(&client, endpoint, credentials_path, args, json).await,
+        TokenCommand::Create(args) => create(endpoint, bearer, credentials_path, args, json).await,
+        TokenCommand::List => list(endpoint, bearer, json).await,
+        TokenCommand::Revoke(args) => revoke(endpoint, bearer, credentials_path, args, json).await,
     }
 }
 
@@ -44,14 +45,22 @@ async fn access_client(endpoint: &str, bearer: &str) -> Result<Client, verglas_s
 
 /// Mints a token and writes its one-time plaintext value to local secure storage.
 async fn create(
-    client: &Client,
     endpoint: &str,
+    bearer: String,
     credentials_path: &Path,
     args: TokenCreateArgs,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let request = request_from_args(args)?;
-    let issued = client.create_access_token(&request).await?;
+    let issued = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
+        let endpoint = endpoint.to_owned();
+        let request = request.clone();
+        async move {
+            let client = access_client(&endpoint, &bearer).await?;
+            client.create_access_token(&request).await
+        }
+    })
+    .await?;
     save_token(
         credentials_path,
         endpoint,
@@ -64,8 +73,15 @@ async fn create(
 }
 
 /// Lists token metadata without ever materializing plaintext values.
-async fn list(client: &Client, json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let tokens = client.list_access_tokens().await?;
+async fn list(endpoint: &str, bearer: String, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let tokens = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
+        let endpoint = endpoint.to_owned();
+        async move {
+            let client = access_client(&endpoint, &bearer).await?;
+            client.list_access_tokens().await
+        }
+    })
+    .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&tokens)?);
     } else if tokens.is_empty() {
@@ -92,13 +108,22 @@ async fn list(client: &Client, json: bool) -> Result<(), Box<dyn std::error::Err
 
 /// Revokes a token and removes the matching local credential record.
 async fn revoke(
-    client: &Client,
     endpoint: &str,
+    bearer: String,
     credentials_path: &Path,
     args: TokenRevokeArgs,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let summary = client.revoke_access_token(&args.id).await?;
+    let id = args.id.clone();
+    let summary = crate::auth::cloud_call_with_bearer(bearer, move |bearer| {
+        let endpoint = endpoint.to_owned();
+        let id = id.clone();
+        async move {
+            let client = access_client(&endpoint, &bearer).await?;
+            client.revoke_access_token(&id).await
+        }
+    })
+    .await?;
     remove_token(credentials_path, endpoint, &summary.id)?;
     render_summary(&summary, json, None)
 }

@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::cli::{SecretCommand, SecretCreateArgs, SecretType};
 
 /// Secret creation request sent to the local access service.
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct CreateSecretRequest {
     /// Stable secret name.
     name: String,
@@ -25,7 +25,7 @@ struct CreateSecretRequest {
 }
 
 /// Secret type serialized for the local access service.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "kebab-case")]
 enum SecretRequestType {
     /// S3-compatible credentials.
@@ -125,18 +125,26 @@ fn validate_scope(scope: &str, schemes: &[&str]) -> Result<(), Box<dyn std::erro
     Ok(())
 }
 
-/// Sends an opaque secret request and returns the service's JSON response.
+/// Sends an opaque secret request and returns the service's JSON response. A
+/// 401 fails loud through `auth::cloud_call` with guidance to re-run
+/// `verglas login`; there is no refresh.
 async fn post_json(
     endpoint: &str,
     token: Option<&str>,
     body: &CreateSecretRequest,
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let url = Url::parse(endpoint)?.join("/v1/secrets")?;
-    let client = reqwest::Client::new();
-    let mut request = client.post(url).json(body);
-    if let Some(token) = token {
-        request = request.bearer_auth(token);
-    }
-    let response = request.send().await?.error_for_status()?;
-    Ok(response.json().await?)
+    let response = crate::auth::cloud_call(token.map(str::to_owned), |bearer| {
+        let url = url.clone();
+        let body = body.clone();
+        async move {
+            let mut request = reqwest::Client::new().post(url).json(&body);
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            request.send().await?.error_for_status()?.json().await
+        }
+    })
+    .await?;
+    Ok(response)
 }

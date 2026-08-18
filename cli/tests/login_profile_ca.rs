@@ -3,7 +3,7 @@
 //! CLI must persist it to `~/.verglas/credentials/ca.pem` (owner-only),
 //! record `ca_file` in the `[connection]` profile, and expose `ca_file`
 //! through `verglas connection --json`. This is additive to the frozen
-//! `login_profile*.rs` / `login_browser.rs` tests, whose mock servers omit
+//! `login_profile*.rs` / `login_device.rs` tests, whose mock servers omit
 //! the field and must keep writing no file and no profile key.
 
 use std::fs;
