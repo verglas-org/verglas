@@ -91,6 +91,6 @@
     "eyebrows": "breadcrumbs"
   },
   "api": {
-    "openapi": "contracts/s3-openapi.json"
+    "openapi": "crates/verglas-s3/models/s3-openapi.json"
   }
 }
