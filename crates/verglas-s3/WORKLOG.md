@@ -306,3 +306,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Also mechanically fixed pre-existing clippy lint debt in
   `tests/semantic_event_publish.rs` (unwrap → expect, a `CapturedEvent` type
   alias for the tuple type-complexity warning) without touching its logic.
+- Moved the wire-contract JSON models (S3 OpenAPI, S3 Vectors, Verglas
+  Graphs) from the top-level contracts/ directory into crates/verglas-s3/
+  models/ — colocated with the one crate that compiles and tests against
+  them. No content change.

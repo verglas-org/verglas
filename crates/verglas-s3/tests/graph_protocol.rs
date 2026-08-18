@@ -14,7 +14,7 @@ use verglas_s3::semantic::{SemanticApi, SemanticError, SemanticOperation, router
 /// Loads the checked-in Graph REST-JSON service model.
 fn graph_contract() -> Value {
     serde_json::from_str(include_str!(
-        "../../../contracts/verglas-graphs-service-1.json"
+        "../models/verglas-graphs-service-1.json"
     ))
     .expect("Graph contract is valid JSON")
 }

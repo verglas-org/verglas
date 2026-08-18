@@ -168,7 +168,7 @@ fn semantic_router(api: Arc<dyn SemanticApi>) -> Router {
 async fn s3_openapi() -> impl IntoResponse {
     (
         [("content-type", "application/json")],
-        include_str!("../../../contracts/s3-openapi.json"),
+        include_str!("../models/s3-openapi.json"),
     )
 }
 
