@@ -56,7 +56,8 @@ The point: tests written after code tend to **confirm what the code does**; test
 
 ## Standing invariants (violations are release-blocking, in any PR)
 
-- **The turn-off test:** Verglas off = customer's lakehouse still works, just slower. Nothing may make serving depend on Verglas-only state.
+- **A managed binding is authoritative; a customer binding is not.** Verglas owns the object layout of a bucket it manages, and every read of that bucket routes through Verglas. A customer binding keeps the customer's own layout, and nothing may make serving from it depend on Verglas-only state.
+- **A managed deployment is left by an explicit detach, never by stopping nodes.** Detach fences new mutations, archives committed WAL, exports and checkpoints the managed catalog, and drains buffered objects to the origin. Destroying a quorum while acknowledged state is unarchived is data loss.
 - **Never write to customer tables or buckets autonomously.** Explicit customer-invoked index builds may attach derived Puffin statistics files to the target snapshot; no background operation may publish one without that authorization.
 - **Slow is acceptable; wrong is never.** Degrade to backend fills, never to incorrect bytes. No code path may assume a key is locally owned (everything routes through the ring).
 - **Budgets are hard ceilings** (DRAM, NVMe, CPU) — especially in colocated mode, where Verglas must be a provably polite tenant.
