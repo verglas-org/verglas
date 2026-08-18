@@ -28,7 +28,7 @@ use thiserror::Error;
 
 /// Verglas Cloud's production WorkOS public client id, compiled in so a
 /// fresh install can `verglas login` with no configuration.
-const DEFAULT_CLIENT_ID: &str = "client_01M089ZKFT1SFR9JTJRN1HQEF9";
+const DEFAULT_CLIENT_ID: &str = "client_01M089ZKTV6PV8AX4DY6JV7X7N";
 const DEFAULT_WORKOS_API_BASE: &str = "https://api.workos.com";
 
 /// Floor under a WorkOS-advertised poll interval so a misbehaving or mocked
