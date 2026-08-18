@@ -909,3 +909,8 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   control plane once honored only the first repeated `scope` param, silently
   minting single-scope tokens. `--json` create output must now reflect every
   granted scope.
+- Fixed a CI hang: the lakehouse tests' two-connection mock responded after
+  reading only request headers, so closing while the client still wrote the
+  body reset the connection and wedged it into retry — a hang under a slow
+  coverage-instrumented build. The mock now drains to content-length before
+  responding, like the token-test mock always did.

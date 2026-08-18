@@ -62,14 +62,26 @@ fn two_shot_server(
             let (mut stream, _) = listener.accept().expect("accept");
             let mut request = Vec::new();
             let mut buffer = [0_u8; 8192];
+            let mut content_length = 0usize;
             loop {
                 let read = stream.read(&mut buffer).expect("read");
                 if read == 0 {
                     break;
                 }
                 request.extend_from_slice(&buffer[..read]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") {
-                    break;
+                // Drain the body to content-length before responding: closing
+                // while the client is still writing resets the connection and
+                // wedges it into retry, which is a hang under a slow
+                // instrumented build.
+                if let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                    if let Some(line) = head.lines().find(|l| l.starts_with("content-length:")) {
+                        content_length =
+                            line["content-length:".len()..].trim().parse().unwrap_or(0);
+                    }
+                    if request.len() >= head_end + 4 + content_length {
+                        break;
+                    }
                 }
             }
             write!(
