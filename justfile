@@ -13,9 +13,6 @@ lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Run the cache server locally.
-run-dev:
-    cargo run --bin verglas-cache-node -- --config deploy/dev/verglas.dev.toml
 
 # Ceph s3-tests conformance: full suite against verglas-cache-node over MinIO.
 # Pass extra flags through, e.g. `just s3-tests --smoke` or `just s3-tests --debug`.

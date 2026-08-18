@@ -4,7 +4,7 @@ The result-correctness tripwire (issue #23). Protocol conformance (#22) proves
 Verglas *speaks* S3 correctly; this proves real query engines get **byte-for-byte
 identical results** through Verglas versus straight from the origin. Wrong
 results are Verglas's existential risk, so **this runs in PR CI on every change**
-(unlike everything under `benchmarks/`, which is manual).
+(manual benchmark harnesses are not kept in-repo).
 
 Two engines, three fixture variants (Parquet, Avro, mixed — see below), three
 legs, diffed at the Arrow level:

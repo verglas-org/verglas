@@ -52,7 +52,7 @@ fn startup_renders_cloudflare_and_s3_tables_profiles_without_inline_secrets() {
         }
 
         let status = Command::new("sh")
-            .arg(root().join("deploy/cache-node/start.sh"))
+            .arg(root().join("docker-entrypoint.sh"))
             .env("VERGLAS_PROVIDER", provider)
             .env("VERGLAS_STATE_DIR", temp.path())
             .env("VERGLAS_CACHE_NODE_BIN", &fake)

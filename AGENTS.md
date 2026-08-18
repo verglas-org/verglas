@@ -110,9 +110,11 @@ Running `verglas-cache-node` locally (non-obvious gotchas):
   store), so a live server needs one. The fully dependency-free exercises live in
   the cache-node and S3 crate tests.
 - The cache node requires `--config <file>` because an origin and cache
-  directory are part of its serving contract. `just run-dev` uses the checked-in
-  `deploy/dev/verglas.dev.toml`; point its `[backend]` at your origin before
-  running.
+  directory are part of its serving contract. The container entrypoint
+  (`docker-entrypoint.sh`) renders the config from `VERGLAS_*` environment
+  variables; run it through `docker compose up`.
+run `verglas-cache-node` against a real S3-compatible origin (see `docker-compose.yml`
+for the required `VERGLAS_STORAGE_*` variables).
 - **Two distinct credential sets:** `[auth].credentials_file` is what engines
   present to Verglas on the S3 port; the origin credentials come from the AWS
   env chain or `[backend].credentials_file`. Don't conflate them. With no

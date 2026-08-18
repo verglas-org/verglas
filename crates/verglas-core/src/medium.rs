@@ -4,7 +4,7 @@
 //! Warm-path performance depends on what backs the cache directory (laptop
 //! SSD vs workstation NVMe vs instance-store) and on whether the OS serves the
 //! cache device with `O_DIRECT` or buffered IO. Local diagnostics print this at
-//! startup and the benchmarks under `benchmarks/` record it
+//! startup and benchmark runs record it
 //! alongside their results, so two runs on different machines are never
 //! conflated.
 

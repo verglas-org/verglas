@@ -22,7 +22,7 @@ RUN apt-get update \
 
 FROM runtime AS verglas-cache-node
 COPY --from=build /tmp/verglas-build/verglas-cache-node /usr/local/bin/verglas-cache-node
-COPY deploy/cache-node/start.sh /usr/local/bin/verglas-cache-node-start
+COPY docker-entrypoint.sh /usr/local/bin/verglas-cache-node-start
 RUN chmod 0755 /usr/local/bin/verglas-cache-node-start
 USER verglas
 EXPOSE 5454 8333 8334 8335 8336
