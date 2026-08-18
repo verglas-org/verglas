@@ -198,7 +198,9 @@ impl AsyncIngestQueue {
         }
         let owner = Arc::clone(self);
         tokio::spawn(async move {
-            owner.drain_and_commit_loop(catalog.as_ref(), &ident, &queue).await;
+            owner
+                .drain_and_commit_loop(catalog.as_ref(), &ident, &queue)
+                .await;
         });
     }
 
@@ -336,10 +338,9 @@ fn write_wal_entry(
     buf.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
     buf.extend_from_slice(name_bytes);
     {
-        let schema = batches
-            .first()
-            .map(|b| b.schema())
-            .ok_or_else(|| AgentError::AsyncIngest("cannot journal an empty batch set".to_owned()))?;
+        let schema = batches.first().map(|b| b.schema()).ok_or_else(|| {
+            AgentError::AsyncIngest("cannot journal an empty batch set".to_owned())
+        })?;
         let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut buf, schema.as_ref())
             .map_err(|e| AgentError::AsyncIngest(format!("encode ingest wal entry: {e}")))?;
         for batch in batches {
@@ -374,7 +375,9 @@ fn read_wal_entry(path: &Path) -> Result<(String, TableIdent, Vec<RecordBatch>)>
     let id = path
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| AgentError::AsyncIngest(format!("{} has no usable file stem", path.display())))?
+        .ok_or_else(|| {
+            AgentError::AsyncIngest(format!("{} has no usable file stem", path.display()))
+        })?
         .to_owned();
     let bytes = fs::read(path)
         .map_err(|e| AgentError::AsyncIngest(format!("read {}: {e}", path.display())))?;
@@ -388,9 +391,12 @@ fn read_wal_entry(path: &Path) -> Result<(String, TableIdent, Vec<RecordBatch>)>
     let name_end = 4usize
         .checked_add(name_len)
         .filter(|&end| end <= bytes.len())
-        .ok_or_else(|| AgentError::AsyncIngest(format!("{} has a corrupt header", path.display())))?;
-    let table_name = std::str::from_utf8(&bytes[4..name_end])
-        .map_err(|e| AgentError::AsyncIngest(format!("{} has a non-utf8 table name: {e}", path.display())))?;
+        .ok_or_else(|| {
+            AgentError::AsyncIngest(format!("{} has a corrupt header", path.display()))
+        })?;
+    let table_name = std::str::from_utf8(&bytes[4..name_end]).map_err(|e| {
+        AgentError::AsyncIngest(format!("{} has a non-utf8 table name: {e}", path.display()))
+    })?;
     let ident = parse_table_ident(table_name)?;
 
     let cursor = std::io::Cursor::new(&bytes[name_end..]);
@@ -399,7 +405,8 @@ fn read_wal_entry(path: &Path) -> Result<(String, TableIdent, Vec<RecordBatch>)>
     let mut batches = Vec::new();
     for batch in reader {
         batches.push(
-            batch.map_err(|e| AgentError::AsyncIngest(format!("decode {}: {e}", path.display())))?,
+            batch
+                .map_err(|e| AgentError::AsyncIngest(format!("decode {}: {e}", path.display())))?,
         );
     }
     Ok((id, ident, batches))
@@ -411,7 +418,12 @@ fn remove_wal_entry(dir: &Path, path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(AgentError::AsyncIngest(format!("delete {}: {e}", path.display()))),
+        Err(e) => {
+            return Err(AgentError::AsyncIngest(format!(
+                "delete {}: {e}",
+                path.display()
+            )));
+        }
     }
     fsync_dir(dir)
 }

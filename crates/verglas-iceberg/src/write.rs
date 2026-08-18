@@ -193,7 +193,10 @@ impl TableCache {
             return Ok(table.clone());
         }
         let table = catalog.load_table(ident).await?;
-        self.tables.lock().await.insert(ident.clone(), table.clone());
+        self.tables
+            .lock()
+            .await
+            .insert(ident.clone(), table.clone());
         Ok(table)
     }
 

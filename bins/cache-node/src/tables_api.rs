@@ -53,7 +53,10 @@ impl TableState {
     /// Creates state without opening the catalog before the loopback route
     /// exists. `async_ingest_dir` is where the async-ingest write-ahead log
     /// lives; it is created if missing.
-    pub fn new(connection: verglas_iceberg::Connection, async_ingest_dir: PathBuf) -> Result<Self, String> {
+    pub fn new(
+        connection: verglas_iceberg::Connection,
+        async_ingest_dir: PathBuf,
+    ) -> Result<Self, String> {
         let async_ingest =
             AsyncIngestQueue::open(async_ingest_dir).map_err(|error| error.to_string())?;
         Ok(Self {

@@ -9,4 +9,6 @@ pub mod report;
 pub mod table;
 
 pub use report::{CompactReport, CompactionReport};
-pub use table::{ColumnSpec, EnsureTableResponse, IngestAckResponse, PartitionSpec, TableDefinition};
+pub use table::{
+    ColumnSpec, EnsureTableResponse, IngestAckResponse, PartitionSpec, TableDefinition,
+};

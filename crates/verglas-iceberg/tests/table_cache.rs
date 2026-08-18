@@ -266,9 +266,15 @@ async fn cached_append_recovers_from_a_stale_cache_entry() {
     let cache = write::TableCache::new();
 
     // Populates the cache at the post-create snapshot.
-    write::append_batches_cached(catalog.as_ref(), &cache, &ident, vec![one_row(0)], HashMap::new())
-        .await
-        .expect("first cached append");
+    write::append_batches_cached(
+        catalog.as_ref(),
+        &cache,
+        &ident,
+        vec![one_row(0)],
+        HashMap::new(),
+    )
+    .await
+    .expect("first cached append");
 
     // A second writer commits directly through the catalog, bypassing the
     // cache entirely — the cache now names a stale base snapshot.
@@ -277,10 +283,15 @@ async fn cached_append_recovers_from_a_stale_cache_entry() {
         .expect("bypassing append");
 
     // The cached append's optimistic base is stale; it must still succeed.
-    let report =
-        write::append_batches_cached(catalog.as_ref(), &cache, &ident, vec![one_row(2)], HashMap::new())
-            .await
-            .expect("cached append recovers from a stale base");
+    let report = write::append_batches_cached(
+        catalog.as_ref(),
+        &cache,
+        &ident,
+        vec![one_row(2)],
+        HashMap::new(),
+    )
+    .await
+    .expect("cached append recovers from a stale base");
     assert_eq!(report.records_added, 1);
 
     // All three rows are present exactly once.

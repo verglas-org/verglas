@@ -256,8 +256,7 @@ mod tests {
     #[tokio::test]
     async fn single_ingress_retries_past_a_transient_service_unavailable() {
         let addr = serve_recovering_after(1).await;
-        let client =
-            ManagedCatalogClient::new(format!("http://{addr}"), "tenant", "warehouse");
+        let client = ManagedCatalogClient::new(format!("http://{addr}"), "tenant", "warehouse");
         assert_eq!(
             client
                 .execute(&ManagedCatalogRequest::Namespaces)
@@ -271,9 +270,12 @@ mod tests {
     /// and reports the failure instead of hanging or retrying forever.
     #[tokio::test]
     async fn single_ingress_exhausts_retries_on_sustained_unavailability() {
-        let addr = serve(StatusCode::SERVICE_UNAVAILABLE, Arc::new(Mutex::new(Vec::new()))).await;
-        let client =
-            ManagedCatalogClient::new(format!("http://{addr}"), "tenant", "warehouse");
+        let addr = serve(
+            StatusCode::SERVICE_UNAVAILABLE,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .await;
+        let client = ManagedCatalogClient::new(format!("http://{addr}"), "tenant", "warehouse");
         let result = client.execute(&ManagedCatalogRequest::Namespaces).await;
         assert!(matches!(
             result,

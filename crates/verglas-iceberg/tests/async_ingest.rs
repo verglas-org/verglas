@@ -177,9 +177,7 @@ async fn schema_rejection_is_synchronous_and_nothing_is_journaled() {
     );
 
     assert!(queue.is_idle(&ident), "nothing was queued");
-    let wal_entries = std::fs::read_dir(dir.path())
-        .expect("read wal dir")
-        .count();
+    let wal_entries = std::fs::read_dir(dir.path()).expect("read wal dir").count();
     assert_eq!(wal_entries, 0, "nothing was journaled to disk");
 
     let snap = tables_api::snapshot(catalog.as_ref(), &ident)
@@ -211,7 +209,10 @@ async fn synchronous_append_commits_immediately_with_a_snapshot_id() {
     let snap = tables_api::snapshot(catalog.as_ref(), &ident)
         .await
         .expect("snapshot");
-    assert_eq!(snap.record_count, 1, "visible immediately, no polling needed");
+    assert_eq!(
+        snap.record_count, 1,
+        "visible immediately, no polling needed"
+    );
 }
 
 /// Acceptance (crash safety): rows acked and durably journaled, but never
@@ -243,9 +244,7 @@ async fn uncommitted_journaled_rows_replay_after_simulated_restart() {
         .await
         .expect("snapshot");
     assert_eq!(snap.record_count, 0, "nothing committed before the crash");
-    let wal_entries_before = std::fs::read_dir(dir.path())
-        .expect("read wal dir")
-        .count();
+    let wal_entries_before = std::fs::read_dir(dir.path()).expect("read wal dir").count();
     assert_eq!(wal_entries_before, 2, "both acks were durably journaled");
 
     // The "after restart" process: a fresh queue instance, same directory.
@@ -258,8 +257,6 @@ async fn uncommitted_journaled_rows_replay_after_simulated_restart() {
         .expect("snapshot");
     assert_eq!(snap.record_count, 2, "the replay committed them");
 
-    let wal_entries_after = std::fs::read_dir(dir.path())
-        .expect("read wal dir")
-        .count();
+    let wal_entries_after = std::fs::read_dir(dir.path()).expect("read wal dir").count();
     assert_eq!(wal_entries_after, 0, "the WAL was cleaned up after replay");
 }
