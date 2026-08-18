@@ -224,17 +224,17 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   carry is now the id the client sees). Each request emits one INFO completion
   line (op, tier, status, duration) tagged with the id; the object key is never
   logged.
-- (incident 2026-08-02, R2 InvalidPart): Fixed the internal multipart split of
+- (incident 2026-08-02, origin InvalidPart): Fixed the internal multipart split of
   large streamed PUTs producing non-uniform part sizes. `fill_slice` stopped at
   "at least 8 MiB", so each non-trailing part absorbed up to one chunk of
-  overshoot and part lengths varied with network chunk boundaries; R2 rejects a
+  overshoot and part lengths varied with network chunk boundaries; strict origins reject a
   completion whose non-trailing parts differ in length, failing pageserver
   layer uploads with 400 InvalidPart. Replaced it with `PartSlicer`, which
   splits the boundary chunk zero-copy at exactly `PUT_PART_SIZE` and carries
   the tail into the next part — same one-part memory bound, both the raw and
   typed split paths. Added `tests/multipart_forwarding.rs` (recording backend:
   uniform-split repro, client-part 1:1 forwarding, single-part, part retry,
-  completion ETag mapping) and taught the raw-fidelity mock origin R2's
+  completion ETag mapping) and taught the raw-fidelity mock origin the
   uniform-length completion rule with a raw-path repro.
 - serving surface: Added `serving_api` — a `ServingApi` trait over an owned
   `ApiRequest`/`ApiResponse` pair, an s3s `V1ServingRoute` that forwards

@@ -5,7 +5,7 @@
 //! `[catalog]` (uri/warehouse/bearer), and asks the catalog to vend per-table
 //! storage credentials on every table load/create by sending
 //! `X-Iceberg-Access-Delegation: vended-credentials` (the Iceberg REST spec's
-//! standard delegation header — the R2 Data Catalog and other conformant
+//! standard delegation header — the Cloudflare Data Catalog and other conformant
 //! catalogs answer with scoped S3 credentials in the response `config` map,
 //! which `iceberg-catalog-rest` merges straight into the table's `FileIO`
 //! props). No static access key is configured here, so those vended
@@ -38,7 +38,7 @@ const VENDED_CREDENTIALS: &str = "vended-credentials";
 pub struct CatalogConfig {
     /// Base URI of the Iceberg REST catalog (no trailing slash required).
     pub uri: String,
-    /// Warehouse identifier, required by multi-warehouse catalogs (the R2 Data
+    /// Warehouse identifier, required by multi-warehouse catalogs (the Cloudflare Data
     /// Catalog's account/bucket-scoped warehouse id).
     pub warehouse: Option<String>,
     /// Bearer token presented on every catalog request.

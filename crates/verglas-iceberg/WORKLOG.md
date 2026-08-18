@@ -31,7 +31,7 @@
   field ids from 1000 so SDK-created partitioned tables (e.g. the `_LOGS` tables)
   carry valid field ids over a strict Iceberg REST catalog rather than null ones.
 
-- cloud-agnostic sweep: removed every Cloudflare/R2 mention and tenant-named
+- cloud-agnostic sweep: removed every provider-specific mention and tenant-named
   fixture from code, docs, and tests. Comments now describe the constraint
   ("strict S3-compatible stores reject variable-size parts", "some managed REST
   catalogs gzip responses") instead of naming a vendor; test fixtures use

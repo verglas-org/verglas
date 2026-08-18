@@ -1,19 +1,19 @@
 //! The block-flush write-back plane: erasure-code a device flush across the
-//! cache ring, ack on a quorum, and drain to R2 in the background.
+//! cache ring, ack on a quorum, and drain to the origin in the background.
 //!
 //! # Why the block FLUSH is write-back, not write-through
 //!
 //! The synchronous flush barrier (see [`crate::device::BlockDevice::flush`] and
 //! [`crate::store::ChunkStore::ensure_durable`]) makes every dirty chunk and the
-//! manifest durable in R2 *before* the NBD FLUSH is acked. That is correct but
-//! pays an R2 round-trip on every FLUSH — the same latency the WAL quorum
+//! manifest durable at the origin *before* the NBD FLUSH is acked. That is correct but
+//! pays an origin round-trip on every FLUSH — the same latency the WAL quorum
 //! write-back and the Iceberg commit-ack model already remove for their write
 //! paths. This plane applies that model to block devices: on FLUSH the dirty set
 //! is sealed, erasure-coded across the ring, and the FLUSH is acked once a
 //! reconstructable quorum of fragments is fsynced on distinct peers. The drain
-//! to R2 runs behind the ack; the ring copies are released only after the R2
+//! to the origin runs behind the ack; the ring copies are released only after the origin
 //! barrier completes. An acked flush survives any single box loss during the
-//! writeback window; the ack latency is a ring RTT, not an R2 RTT.
+//! writeback window; the ack latency is a ring RTT, not an origin RTT.
 //!
 //! # The same substrate as the object write-back tier
 //!
@@ -32,7 +32,7 @@
 //! `n` fragments (one per node) are durable — so a 3-box ring is `RS(2, 1)` and
 //! tolerates the loss of any one box after the ack (any `k = 2` of the `3`
 //! fragments reconstruct). A one-node ring (dev / free tier) has no peers to
-//! code across, so the flush falls through to the existing synchronous R2
+//! code across, so the flush falls through to the existing synchronous origin
 //! barrier: that is topology, not a fallback for errors and not a config knob. A
 //! multi-node ring that cannot place its quorum right now (a peer is down or
 //! full) also falls through to the synchronous barrier — the always-safe path,
@@ -41,8 +41,8 @@
 //! # Exactly-once drain and cross-node takeover
 //!
 //! The unit that is erasure-coded is the whole sealed flush: the target manifest
-//! version plus the bytes of every chunk that is not yet durable in R2. So a
-//! peer that reconstructs the fragments holds everything needed to finish the R2
+//! version plus the bytes of every chunk that is not yet durable at the origin. So a
+//! peer that reconstructs the fragments holds everything needed to finish the origin
 //! barrier exactly as the originating node would — PUT the chunks, commit the
 //! manifest version. Both are idempotent (chunks are content-addressed; a
 //! manifest version object and its `latest` pointer are rewritten identically),
@@ -65,11 +65,11 @@
 //! ack in version order — but their background drains could still commit the
 //! manifest `latest` pointer out of order and regress it. Each device's drains
 //! therefore serialize through a per-device drain lock, and under it a drain
-//! re-reads R2's current committed version: a flush at or below what R2 already
+//! re-reads the origin's current committed version: a flush at or below what the origin already
 //! holds is superseded (a newer flush drained first, or this exact one already
 //! ran) and skips the commit, releasing only its ring holds. This keeps `latest`
 //! monotonic for a node's own drains and for a takeover after the originator is
-//! gone (the peer reads the newer version R2 already holds). The one residual
+//! gone (the peer reads the newer version the origin already holds). The one residual
 //! window is two *different* live nodes draining two versions of one device at
 //! the same instant — possible only if the originator is alive but stalled past
 //! a drain lease — which a conditional-PUT (compare-and-set) on the `latest`
@@ -107,13 +107,13 @@ const DESCRIPTOR_INDEX: usize = usize::MAX;
 /// How long after a flush ack the originating node is trusted to complete the
 /// drain before any surviving shard-holder may take it over. A fixed constant,
 /// not a knob: long enough that a healthy background drain always finishes
-/// first, short enough that a crashed originator's flush reaches R2 promptly.
+/// first, short enough that a crashed originator's flush reaches the origin promptly.
 const DEFAULT_DRAIN_LEASE: Duration = Duration::from_secs(30);
 
 /// A ring write-back failure.
 #[derive(Debug, thiserror::Error)]
 pub enum RingError {
-    /// The chunk store (local NVMe or the R2 backend) failed.
+    /// The chunk store (local NVMe or the origin backend) failed.
     #[error(transparent)]
     Store(#[from] StoreError),
     /// The durable backend failed on a drain PUT.
@@ -147,7 +147,7 @@ pub struct ShardPlacement {
 /// The replicated descriptor that lets any shard-holder complete a drain.
 ///
 /// Written (a full copy) to every node that holds a fragment of the flush, so a
-/// peer can drive the R2 barrier if the originator dies. It carries only what a
+/// peer can drive the origin barrier if the originator dies. It carries only what a
 /// takeover needs: the object id and geometry to reassemble, the placement list
 /// to fetch fragments from, and the drain lease.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,7 +187,7 @@ pub struct RingWriteback {
     /// This node's local fragment store, for enumerating descriptors during a
     /// takeover pass (the transport trait cannot list; the store can).
     local: LocalFragmentStore,
-    /// The chunk store: local NVMe reads for the sync barrier, and the R2
+    /// The chunk store: local NVMe reads for the sync barrier, and the origin
     /// backend the drain PUTs chunks and commits the manifest to.
     store: ChunkStore,
     /// The drain lease applied to every descriptor.
@@ -196,7 +196,7 @@ pub struct RingWriteback {
     counter: AtomicU64,
     /// Per-device drain locks. A device's drains serialize through one lock so
     /// two background drains of successive versions never commit the manifest
-    /// `latest` pointer out of order — the lock holder re-reads R2's current
+    /// `latest` pointer out of order — the lock holder re-reads the origin's current
     /// version under the lock and skips a superseded flush. Keyed by device id.
     drain_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -241,9 +241,9 @@ impl RingWriteback {
     }
 
     /// The flush entry the device calls with the sealed set: the target manifest
-    /// version and the bytes of every chunk not yet durable in R2. Returns once
+    /// version and the bytes of every chunk not yet durable at the origin. Returns once
     /// the flush is durable — on a ring quorum (ack = ring RTT, drain runs
-    /// behind it), or via the synchronous R2 barrier for a degenerate or
+    /// behind it), or via the synchronous origin barrier for a degenerate or
     /// quorum-short ring. The manifest version is only advanced by the caller
     /// after this returns Ok, so a failed flush never advances the device.
     pub async fn flush(
@@ -255,7 +255,7 @@ impl RingWriteback {
         let live = self.membership.live_nodes();
         // Degenerate ring (single-node deployment) or a ring degraded to one
         // live member: no peers to code across, so the flush IS the synchronous
-        // R2 barrier. Topology-driven, not an error fallback.
+        // origin barrier. Topology-driven, not an error fallback.
         if self.membership.is_single_node() || live.len() < 2 {
             return self.sync_barrier(&manifest).await;
         }
@@ -297,12 +297,12 @@ impl RingWriteback {
             return self.sync_barrier(&manifest).await;
         }
 
-        // Quorum durable and takeover-covered: this is the ack. Drain to R2 in
-        // the background and release the ring holds after the R2 barrier.
+        // Quorum durable and takeover-covered: this is the ack. Drain to the origin in
+        // the background and release the ring holds after the origin barrier.
         let me = Arc::clone(self);
         tokio::spawn(async move {
             if let Err(error) = me.drain(&descriptor).await {
-                // The background drain failed (R2 down, say). The descriptors
+                // The background drain failed (origin down, say). The descriptors
                 // stay past their lease, so a takeover pass — on this node or a
                 // peer — retries it. Nothing is lost; the flush is already acked
                 // and quorum-durable.
@@ -315,7 +315,7 @@ impl RingWriteback {
         Ok(())
     }
 
-    /// The synchronous R2 barrier: make every referenced chunk durable, then
+    /// The synchronous origin barrier: make every referenced chunk durable, then
     /// commit the manifest version. Byte-identical to the pre-write-back flush,
     /// and the always-safe path for a degenerate or quorum-short ring.
     async fn sync_barrier(&self, manifest: &Manifest) -> Result<(), RingError> {
@@ -406,32 +406,32 @@ impl RingWriteback {
         )
     }
 
-    /// Completes the R2 barrier for one sealed flush and releases its ring holds.
+    /// Completes the origin barrier for one sealed flush and releases its ring holds.
     /// Reconstructs the bundle from any `k` surviving fragments, PUTs its chunks
-    /// to R2 (idempotent, content-addressed), commits the manifest version
+    /// to the origin (idempotent, content-addressed), commits the manifest version
     /// (idempotent), then deletes the fragments and descriptors. Safe to run
     /// concurrently on several holders and to re-run after a partial crash: every
     /// step is idempotent, so the committed version is exactly-once.
     ///
     /// A device's drains serialize through the device lock, and under it the drain
-    /// re-reads R2's current committed version: a flush whose target is at or
-    /// below what R2 already holds is superseded (a newer flush drained first, or
+    /// re-reads the origin's current committed version: a flush whose target is at or
+    /// below what the origin already holds is superseded (a newer flush drained first, or
     /// this one already ran) — it skips the PUT and commit and just releases its
     /// ring holds, so `latest` never regresses to an older version.
     pub async fn drain(&self, descriptor: &DrainDescriptor) -> Result<(), RingError> {
         let device_lock = self.device_lock(&descriptor.device_id);
         let _guard = device_lock.lock().await;
 
-        // Superseded? Re-read R2's current version under the device lock.
+        // Superseded? Re-read the origin's current version under the device lock.
         let current = Manifest::load_latest(self.store.backend().as_ref(), &descriptor.device_id)
             .await?
             .map(|m| m.version)
             .unwrap_or(0);
         // A real flush targets version >= 1; `current == 0` (or no manifest) means
-        // nothing newer is in R2, so this branch only fires for a genuinely
+        // nothing newer is at the origin, so this branch only fires for a genuinely
         // superseded or already-committed flush.
         if descriptor.target_version <= current {
-            // A newer flush already reached R2 (or this exact one did): do not
+            // A newer flush already reached the origin (or this exact one did): do not
             // regress `latest`. Just release this flush's ring holds.
             self.release_all(descriptor).await;
             return Ok(());
@@ -450,7 +450,7 @@ impl RingWriteback {
             self.store.note_durable(hash);
         }
         manifest.commit(self.store.backend().as_ref()).await?;
-        // The R2 barrier is complete: release the ring copies.
+        // The origin barrier is complete: release the ring copies.
         self.release_all(descriptor).await;
         Ok(())
     }
@@ -501,7 +501,7 @@ impl RingWriteback {
     }
 
     /// Best-effort deletion of the fragments `indices` for `object_id` on every
-    /// live node — the ring-hold release after the R2 barrier, and the cleanup
+    /// live node — the ring-hold release after the origin barrier, and the cleanup
     /// for a quorum-short EC attempt.
     async fn release_holds(&self, object_id: &str, indices: &[usize], live: &[NodeId]) {
         for node in live {

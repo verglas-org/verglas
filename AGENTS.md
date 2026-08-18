@@ -106,8 +106,8 @@ Rust workspace facts:
 Running `verglas-cache-node` locally (non-obvious gotchas):
 
 - There is **no in-memory/filesystem origin exposed by the binary**. `[backend]`
-  requires a bucket set and a reachable S3-compatible origin (e.g. Cloudflare
-  R2), so a live server needs one. The fully dependency-free exercises live in
+  requires a bucket set and a reachable S3-compatible origin (an S3-compatible
+  store), so a live server needs one. The fully dependency-free exercises live in
   the cache-node and S3 crate tests.
 - The cache node requires `--config <file>` because an origin and cache
   directory are part of its serving contract. `just run-dev` uses the checked-in

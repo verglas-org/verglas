@@ -18,9 +18,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #382: Added the ring flush write-back plane (`ring.rs`). On FLUSH a device seals
   the target manifest plus its not-yet-durable chunk bytes into a bundle,
   erasure-codes it across the cache ring (RS(n-1,1), one fragment per node, acked
-  once all n are durable), and returns on that ring quorum — the R2 drain runs in
-  the background and releases the ring copies only after the R2 barrier. A
-  degenerate or quorum-short ring falls through to the existing synchronous R2
+  once all n are durable), and returns on that ring quorum — the origin drain runs in
+  the background and releases the ring copies only after the origin barrier. A
+  degenerate or quorum-short ring falls through to the existing synchronous origin
   barrier (topology-driven, not a knob). A replicated per-flush drain descriptor
   lets any surviving shard-holder reconstruct and finish the drain after an
   originator crash (lease-expiry takeover); the chunk PUTs and manifest commit are
@@ -30,7 +30,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   rather than inventing a parallel mechanism. `BlockDevice` gains a flush plane;
   `ensure`/`open` keep the synchronous barrier, `ensure_on_ring`/`open_on_ring`
   attach the plane. Tests: EC bundle round-trip with one shard lost, flush acks on
-  the ring quorum not R2 (proven with a failing backend), originator-crash peer
+  the ring quorum not the origin (proven with a failing backend), originator-crash peer
   reconstruct-and-drain committing the version exactly once, quorum-short fallback
   to the synchronous barrier, and the device-level single-node read-back.
 - #3: Updated the logical-write subsystem dependency to its `verglas-write` package name.

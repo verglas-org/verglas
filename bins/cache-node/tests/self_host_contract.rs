@@ -92,7 +92,7 @@ fn public_docs_cover_all_three_catalog_modes_and_local_core_apis() {
     );
     for required in [
         "Verglas Cloud",
-        "Cloudflare R2 Data Catalog",
+        "Cloudflare Data Catalog",
         "Amazon S3 Tables",
         "Tables",
         "Graphs",

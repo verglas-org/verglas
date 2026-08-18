@@ -627,7 +627,7 @@ impl RestCatalogSource {
         }
 
         // SDK clients use Verglas as a prefix-free catalog façade, while some
-        // managed catalogs (S3 Tables and R2 Data Catalog) return a warehouse
+        // managed catalogs (S3 Tables and Cloudflare Data Catalog) return a warehouse
         // prefix from `/v1/config`. Resolve that prefix here and add it exactly
         // once. Full Iceberg clients that already honored the config response
         // retain their provider-prefixed path unchanged.

@@ -4,7 +4,7 @@
 //! and no chunk size, so OpenDAL runs its S3 multipart writer in non-exact mode:
 //! each `FileWrite::write` call from the Parquet writer becomes one upload part,
 //! and those calls are variable-sized (one per Parquet flush). AWS S3 accepts
-//! variable non-final parts; stricter S3-compatible stores (including the R2
+//! variable non-final parts; stricter S3-compatible stores (including the object-store
 //! Data Catalog's backing bucket) reject them with `InvalidPart: All
 //! non-trailing parts must have the same length`, which fails any object over a
 //! few MiB.

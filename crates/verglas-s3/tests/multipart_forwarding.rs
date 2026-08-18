@@ -1,5 +1,5 @@
-//! Multipart part-boundary forwarding contract (R2 production incident,
-//! 2026-08-02): Cloudflare R2 requires every non-trailing part of a multipart
+//! Multipart part-boundary forwarding contract (origin-store production incident,
+//! 2026-08-02): the origin store requires every non-trailing part of a multipart
 //! upload to be byte-identical in length, so the passthrough must (a) forward
 //! each client UploadPart as exactly one backend part — same number, same
 //! bytes — and (b) split an internally-streamed PUT body into exact-size parts
@@ -320,8 +320,8 @@ async fn stored_bytes(store: &RecordingStore, name: &str) -> Bytes {
         .expect("assembled bytes")
 }
 
-/// REPRODUCTION (R2 InvalidPart, 2026-08-02): a streamed PUT larger than one
-/// part buffer is split into backend parts internally. R2 requires all
+/// REPRODUCTION (origin InvalidPart, 2026-08-02): a streamed PUT larger than one
+/// part buffer is split into backend parts internally. Several S3-compatible origins require all
 /// non-trailing parts of one upload to be byte-identical in length, so the
 /// split must produce exact-size parts regardless of how the client's chunks
 /// arrive — overshooting a part boundary by "whatever the last chunk brought"
@@ -359,7 +359,7 @@ async fn streamed_put_splits_into_uniform_parts() {
                 part.bytes.len(),
                 first_len,
                 "non-trailing part {} has length {} but part 0 has {first_len}; \
-                 R2 rejects the upload unless all non-trailing parts are equal",
+                 the origin rejects the upload unless all non-trailing parts are equal",
                 i + 1,
                 part.bytes.len()
             );
