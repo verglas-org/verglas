@@ -4728,6 +4728,7 @@ dependencies = [
 [[package]]
 name = "iceberg"
 version = "0.10.0"
+source = "git+https://github.com/verglas-org/verglas-iceberg?rev=ae7972f56003c108afac91a4975aee6a55187887#ae7972f56003c108afac91a4975aee6a55187887"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4784,6 +4785,7 @@ dependencies = [
 [[package]]
 name = "iceberg-catalog-rest"
 version = "0.10.0"
+source = "git+https://github.com/verglas-org/verglas-iceberg?rev=ae7972f56003c108afac91a4975aee6a55187887#ae7972f56003c108afac91a4975aee6a55187887"
 dependencies = [
  "async-trait",
  "chrono",
@@ -4802,6 +4804,7 @@ dependencies = [
 [[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
+source = "git+https://github.com/verglas-org/verglas-iceberg?rev=ae7972f56003c108afac91a4975aee6a55187887#ae7972f56003c108afac91a4975aee6a55187887"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4845,6 +4848,7 @@ dependencies = [
 [[package]]
 name = "iceberg-storage-opendal"
 version = "0.10.0"
+source = "git+https://github.com/verglas-org/verglas-iceberg?rev=ae7972f56003c108afac91a4975aee6a55187887#ae7972f56003c108afac91a4975aee6a55187887"
 dependencies = [
  "anyhow",
  "async-trait",

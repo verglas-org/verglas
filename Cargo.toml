@@ -357,7 +357,7 @@ unimplemented = "warn"
 unwrap_used = "warn"
 
 # VERGLAS PATCH: the iceberg crates from verglas-org/verglas-iceberg, branch
-# `verglas/lakekeeper` — the Lakekeeper fork's base plus one added public
+# `verglas/v0.10.0` — the lakekeeper/iceberg-rust base plus one added public
 # constructor, `TableCommit::from_parts`. Apache upstream gates `TableCommit`
 # construction to the transaction action set (fast-append + property updates,
 # no overwrite or delete), so REPLACE commits cannot be built through the
@@ -375,12 +375,12 @@ unwrap_used = "warn"
 # reject the patched 0.10.0.
 #
 # Pin a SHA — never a floating branch tip. Patch inventory:
-# https://github.com/verglas-org/verglas-iceberg/blob/verglas/lakekeeper/VERGLAS.md
+# https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.0/VERGLAS.md
 [patch.crates-io]
-iceberg = { path = "/Users/jfbrown/code/verglas-iceberg/crates/iceberg" }
-iceberg-catalog-rest = { path = "/Users/jfbrown/code/verglas-iceberg/crates/catalog/rest" }
-iceberg-datafusion = { path = "/Users/jfbrown/code/verglas-iceberg/crates/integrations/datafusion" }
-iceberg-storage-opendal = { path = "/Users/jfbrown/code/verglas-iceberg/crates/storage/opendal" }
+iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
+iceberg-catalog-rest = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
+iceberg-datafusion = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
+iceberg-storage-opendal = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
 # VERGLAS PATCH: foyer 0.22.3 from verglas-org/verglas-foyer (branch
 # verglas/v0.22.3) with live disk-resize for the block engine — the watermark
 # model the write-pressure reclamation needs: shrink retires tail partitions
