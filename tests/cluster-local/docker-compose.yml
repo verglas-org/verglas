@@ -42,11 +42,22 @@ services:
     depends_on:
       minio-init:
         condition: service_completed_successfully
-    entrypoint: ["verglas-cache-node", "--config", "/etc/verglas/config.toml"]
+    # The image entrypoint renders a config from VERGLAS_* env and creates the
+    # cache directory. This harness mounts its own config, so it must create
+    # that directory itself.
+    entrypoint: ["sh", "-c", "mkdir -p /var/lib/verglas/cache && exec verglas-cache-node --config /etc/verglas/config.toml"]
     environment: &node_env
       VERGLAS_NODE_ID: node1
-      VERGLAS_RING_ADDR: 0.0.0.0:8335
-      VERGLAS_RING_PEERS: node1=node1:8335,node2=node2:8335,node3=node3:8335,node4=node4:8335
+      # Distinct ports per listener. The safekeeper and block listeners both
+      # default to 8335, so the ring plane needs its own.
+      VERGLAS_SAFEKEEPER_ADDR: 0.0.0.0:8335
+      # Same geometry as the write-back tier: tolerates one lost node of four.
+      VERGLAS_SAFEKEEPER_EC_K: "2"
+      VERGLAS_SAFEKEEPER_EC_M: "2"
+      VERGLAS_SAFEKEEPER_EC_W: "3"
+      VERGLAS_BLOCK_ADDR: 0.0.0.0:8336
+      VERGLAS_RING_ADDR: 0.0.0.0:8337
+      VERGLAS_RING_PEERS: node1=node1:8337,node2=node2:8337,node3=node3:8337,node4=node4:8337
       VERGLAS_CLUSTER_SECRET: verglas-local-ring-secret
       VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
       VERGLAS_LOG_FORMAT: json

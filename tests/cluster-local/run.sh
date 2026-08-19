@@ -23,6 +23,12 @@ export AWS_DEFAULT_REGION=us-east-1
 # resulting PUT count is bounded by total_bytes / size_limit + 1.
 COUNT=${COUNT:-1000}
 OBJECT_BYTES=${OBJECT_BYTES:-4096}
+# Client upload concurrency. The AWS CLI defaults to 10, which overruns the
+# ring's peer-RPC timeouts on Docker Desktop's VM network and fails the write
+# quorum. 4 is sustained. This is a property of the harness host, not of the
+# code under test, but it is part of the frozen protocol so every candidate is
+# measured under the same load.
+CONCURRENCY=${CONCURRENCY:-4}
 
 putcount() {
   # minio_s3_requests_total is labelled by api; the label is lowercase.
@@ -53,25 +59,38 @@ case "${1:-}" in
     ;;
   measure)
     before=$(putcount)
-    payload=$(mktemp); head -c "$OBJECT_BYTES" /dev/urandom > "$payload"
+    # One local tree of COUNT objects, uploaded by a single client process.
+    # Per-object `aws s3api` invocations spend more time on process startup
+    # than on the request and make the write window meaningless.
+    src=$(mktemp -d)
+    for i in $(seq 1 "$COUNT"); do head -c "$OBJECT_BYTES" /dev/urandom > "$src/obj-$i"; done
+    aws configure set default.s3.max_concurrent_requests "$CONCURRENCY"
     start=$(date +%s)
-    for i in $(seq 1 "$COUNT"); do
-      aws --endpoint-url "$S3_ENDPOINT" s3api put-object \
-        --bucket verglas-test --key "measure/obj-$i" --body "$payload" >/dev/null
-    done
+    aws --endpoint-url "$S3_ENDPOINT" s3 cp "$src" "s3://verglas-test/measure/" \
+      --recursive --only-show-errors
     wrote=$(date +%s)
-    # Give the drain a bounded window to finish before reading the counter.
+    # Bounded window for the drain to finish before reading the counter.
     sleep "${DRAIN_WAIT:-30}"
     after=$(putcount)
-    rm -f "$payload"
+    # G5: every object must read back byte-identical through Verglas.
+    out=$(mktemp -d)
+    aws --endpoint-url "$S3_ENDPOINT" s3 cp "s3://verglas-test/measure/" "$out" \
+      --recursive --only-show-errors
+    mismatched=0
+    for i in $(seq 1 "$COUNT"); do
+      cmp -s "$src/obj-$i" "$out/obj-$i" || mismatched=$((mismatched+1))
+    done
     total_bytes=$(( COUNT * OBJECT_BYTES ))
     echo "objects_written=$COUNT"
+    echo "client_concurrency=$CONCURRENCY"
     echo "object_bytes=$OBJECT_BYTES"
     echo "total_bytes=$total_bytes"
     echo "origin_put_before=$before"
     echo "origin_put_after=$after"
     echo "origin_put_delta=$(( after - before ))"
     echo "client_write_seconds=$(( wrote - start ))"
+    echo "readback_mismatched=$mismatched"
+    rm -rf "$src" "$out"
     ;;
   *)
     echo "usage: $0 {up|down|putcount|measure}" >&2; exit 64 ;;

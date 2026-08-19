@@ -33,5 +33,13 @@ region = "us-east-1"
 allow_http = true
 credentials_file = "/etc/verglas/backend-credentials"
 
+# Required once the authoritative cache ring is enabled: the explicitly
+# authorized namespace for consensus-committed catalog checkpoints. Catalog
+# awareness is off in this harness, so nothing writes here during an
+# object-path measurement.
+[catalog_archive]
+bucket = "verglas-test"
+prefix = "_verglas/catalog"
+
 [auth]
 credentials_file = "/etc/verglas/endpoint-credentials"
