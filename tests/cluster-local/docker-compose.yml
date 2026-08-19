@@ -72,6 +72,7 @@ services:
       - "18333:8333"
       - "18334:8334"
     cpus: "6"
+    mem_limit: 12g
 
   node2:
     <<: *node
@@ -87,6 +88,7 @@ services:
       - "18343:8333"
       - "18344:8334"
     cpus: "6"
+    mem_limit: 12g
 
   node3:
     <<: *node
@@ -102,6 +104,7 @@ services:
       - "18353:8333"
       - "18354:8334"
     cpus: "6"
+    mem_limit: 12g
 
   node4:
     <<: *node
@@ -117,6 +120,7 @@ services:
       - "18363:8333"
       - "18364:8334"
     cpus: "6"
+    mem_limit: 12g
 
   # The Verglas fork of Lakekeeper, serving the Iceberg REST catalog over the
   # four nodes' CRaft ingress. This is the product under test: the catalog's

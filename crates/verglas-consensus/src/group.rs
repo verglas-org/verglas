@@ -683,6 +683,7 @@ impl ConsensusGroup {
         holders: &[u64],
         decorate: impl FnOnce(EntryHeader) -> Result<EntryHeader, crate::raft::CertificateError>,
     ) -> Result<RaftResponse, GroupError> {
+        let t_stage = std::time::Instant::now();
         let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
         let staged = self
             .payloads
@@ -695,6 +696,9 @@ impl ConsensusGroup {
                 holders,
             )
             .await?;
+        let stage_ms = t_stage.elapsed().as_secs_f64() * 1000.0;
+        let payload_len = staged.length();
+        let t_raft = std::time::Instant::now();
         let base = EntryHeader::new(
             self.group.clone(),
             configuration_generation,
@@ -717,6 +721,8 @@ impl ConsensusGroup {
             response.outcome,
             AppliedOutcome::Committed | AppliedOutcome::Duplicate
         ) {
+            let raft_ms = t_raft.elapsed().as_secs_f64() * 1000.0;
+            let t_final = std::time::Instant::now();
             let log_id = self
                 .state_machine
                 .committed_log_id(response.index)
@@ -733,6 +739,10 @@ impl ConsensusGroup {
                     certificate: staged.certificate(),
                 })
                 .await?;
+            eprintln!(
+                "CONSTIMING stage_ms={stage_ms:.1} raft_ms={raft_ms:.1} finalize_ms={:.1} payload_bytes={payload_len}",
+                t_final.elapsed().as_secs_f64() * 1000.0
+            );
         }
         match response.outcome {
             AppliedOutcome::Committed | AppliedOutcome::Duplicate => Ok(response),

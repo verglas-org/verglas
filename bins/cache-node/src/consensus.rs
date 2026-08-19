@@ -729,6 +729,9 @@ impl ConsensusPlane {
     ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
         tokio::time::timeout(timeout, async {
+            let t_submit = std::time::Instant::now();
+            let mut spins = 0usize;
+            let mut forwarded = 0usize;
             loop {
                 if let Some(leader) = local.leader_id().await {
                     if leader == self.ring.safekeeper_id() {
@@ -739,13 +742,31 @@ impl ConsensusPlane {
                         }
                     }
                     let encoded = serde_json::to_vec(&request)?;
-                    if let Ok(response) = self.network(group)?.command(leader, encoded).await {
-                        return serde_json::from_slice(&response).map_err(Into::into);
+                    forwarded += 1;
+                    match self.network(group)?.command(leader, encoded).await {
+                        Ok(response) => {
+                            return serde_json::from_slice(&response).map_err(Into::into);
+                        }
+                        Err(error) => {
+                            if forwarded <= 2 || forwarded % 8 == 0 {
+                                eprintln!(
+                                    "FORWARDFAIL group={group} leader={leader} self={} err={error}",
+                                    self.ring.safekeeper_id()
+                                );
+                            }
+                        }
                     }
                 }
                 // A leader may die after this replica observes it but before the
                 // command reaches it. Re-observe Raft instead of treating that
                 // transport race as a client-visible command rejection.
+                spins += 1;
+                if spins == 1 || spins % 8 == 0 {
+                    eprintln!(
+                        "SUBMIT spin={spins} forwarded={forwarded} elapsed_ms={:.1} group={group}",
+                        t_submit.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         })

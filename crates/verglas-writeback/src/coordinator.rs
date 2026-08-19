@@ -274,6 +274,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         // yet known (it is streaming), so headroom is probed at the stripe-chunk
         // granularity; a node that fills mid-stream refuses the next shard and
         // counts against the committed certificate.
+        let phase_start = std::time::Instant::now();
         let ordered = placement_order(key, &object_id, &live);
         let nodes = self
             .nodes_with_headroom(ordered, MAX_STRIPE_CHUNK as u64)
@@ -334,7 +335,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         // Close every channel so the placement tasks finish and commit.
         senders.clear();
 
+        let t_encode_done = phase_start.elapsed();
         // Gather committed fragments until `w` land or the deadline passes.
+        let t_quorum_start = std::time::Instant::now();
         let deadline = tokio::time::Instant::now() + self.ack_deadline;
         let mut acked: Vec<Placement> = Vec::new();
         loop {
@@ -352,6 +355,12 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             }
         }
 
+        eprintln!(
+            "WBTIMING setup_ms={:.1} quorum_ms={:.1} acked={}",
+            t_encode_done.as_secs_f64() * 1000.0,
+            t_quorum_start.elapsed().as_secs_f64() * 1000.0,
+            acked.len()
+        );
         let etag = synthetic_object_etag(&object_id, object_len);
         if acked.len() >= w {
             self.finish_stream_ack(
@@ -391,6 +400,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         rx: mpsc::UnboundedReceiver<(usize, NodeId, Result<(), crate::transport::TransportError>)>,
         key_guard: OwnedMutexGuard<()>,
     ) -> Result<PutOutcome, WriteError> {
+        let acked_count = acked.len();
         let journal = Journal {
             object_id: object_id.to_owned(),
             storage_binding_id: key.storage_binding_id.clone(),
@@ -407,6 +417,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             propagated_ms: None,
             placements: acked,
         };
+        let t_commit_start = std::time::Instant::now();
         self.committer
             .commit(StagedObject {
                 key: key.clone(),
@@ -418,9 +429,26 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             })
             .await
             .map_err(|error| WriteError::Backend(format!("write-back consensus: {error}")))?;
+        let t_commit = t_commit_start.elapsed();
+        let t_journal_start = std::time::Instant::now();
         self.journals
             .put(&journal)
             .map_err(|e| WriteError::Backend(format!("write-back journal: {e}")))?;
+        let t_journal = t_journal_start.elapsed();
+
+        // Phase breakdown for the ack path. The write-back promise is that a
+        // quorum ack beats an origin PUT, so when it does not, this says which
+        // phase spent the time: fragment placement, the quorum wait, the
+        // consensus round trip, or the local journal fsync.
+        // Phase breakdown for the ack path. The write-back promise is that a
+        // quorum ack beats an origin PUT; when it does not, this says whether
+        // the consensus round trip or the local journal fsync spent the time.
+        eprintln!(
+            "WBTIMING commit_ms={:.1} journal_ms={:.1} acked={}",
+            t_commit.as_secs_f64() * 1000.0,
+            t_journal.as_secs_f64() * 1000.0,
+            acked_count
+        );
 
         WritebackMetrics::bump(&self.metrics.acked_via_quorum);
         self.record_mode(MODE_QUORUM);

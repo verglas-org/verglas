@@ -11,8 +11,8 @@ format = "json"
 
 [cache]
 dir = "/var/lib/verglas/cache"
-capacity_bytes = "2GB"
-dram_bytes = "256MB"
+capacity_bytes = "48GB"
+dram_bytes = "10GB"
 
 # The tier under test. k=2/m=2/w=3 tolerates one lost node on a four-node ring.
 # An empty `prefixes` list opts every key in at this geometry, which is what the
