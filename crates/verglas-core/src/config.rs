@@ -322,6 +322,23 @@ pub struct Writeback {
     /// list opts in every key at the default geometry.
     #[serde(default)]
     pub prefixes: Vec<WritebackPrefix>,
+    /// Size, in bytes, at which the object offload stream flushes its
+    /// accumulated small objects into one packed S3 object (#164 §4). An
+    /// object at or above this limit bypasses accumulation and streams to the
+    /// origin alone, so a large write never waits behind a buffer of unrelated
+    /// small ones. Mirrors `WAL_SEGMENT_BYTES`
+    /// (`bins/cache-node/src/safekeeper.rs`), the same accumulate/flush shape
+    /// generalized to objects; the 16 MiB default matches it.
+    #[serde(default = "default_offload_size_limit_bytes")]
+    pub offload_size_limit_bytes: ByteSize,
+    /// How often, in seconds, the background offload drain loop flushes each
+    /// binding's partially filled offload stream. Bounds how long small
+    /// objects can sit unpacked when the size limit is never reached, without
+    /// changing the two triggers the stream itself exposes (size limit, or an
+    /// explicit caller-invoked drain): the loop is simply a caller that drains
+    /// on a schedule.
+    #[serde(default = "default_offload_drain_interval_secs")]
+    pub offload_drain_interval_secs: u64,
 }
 
 /// One opt-in key prefix, optionally overriding the default fragment geometry.
@@ -354,6 +371,8 @@ impl Default for Writeback {
             disk_floor_bytes: ByteSize(0),
             scrub_interval_secs: default_scrub_interval_secs(),
             prefixes: Vec::new(),
+            offload_size_limit_bytes: default_offload_size_limit_bytes(),
+            offload_drain_interval_secs: default_offload_drain_interval_secs(),
         }
     }
 }
@@ -376,6 +395,18 @@ impl Writeback {
         if self.scrub_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "cache.writeback.scrub_interval_secs",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.offload_size_limit_bytes.0 == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.offload_size_limit_bytes",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.offload_drain_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.offload_drain_interval_secs",
                 "must be at least 1".into(),
             ));
         }
@@ -427,6 +458,21 @@ fn default_meta_fraction() -> f64 {
 /// re-encode is a negligible tenant on the NVMe and pod LAN.
 fn default_scrub_interval_secs() -> u64 {
     6 * 60 * 60
+}
+
+/// The documented default object offload size limit: 16 MiB (#164 §4),
+/// matching `WAL_SEGMENT_BYTES` (`bins/cache-node/src/safekeeper.rs`). The
+/// frozen benchmark protocol in `tests/cluster-local/OBJECTIVE.md` bakes this
+/// exact value into its PUT-count bound.
+fn default_offload_size_limit_bytes() -> ByteSize {
+    ByteSize(16 * 1024 * 1024)
+}
+
+/// The documented default offload drain loop interval: 5 seconds (#164 §4).
+/// Short enough that a partially filled offload stream still drains inside
+/// the frozen benchmark's 30 s post-write window.
+fn default_offload_drain_interval_secs() -> u64 {
+    5
 }
 
 /// The documented default mutable-mapping TTL: 5 seconds (#14).

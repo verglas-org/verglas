@@ -34,7 +34,7 @@ use verglas_writeback::membership::LiveMembership;
 use verglas_writeback::metrics::WritebackMetrics;
 use verglas_writeback::reader::WritebackReader;
 use verglas_writeback::transport::{FragmentTransport, TransportError};
-use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
+use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
 // ---- in-memory fragment transport ----------------------------------------
 
@@ -67,6 +67,14 @@ impl ConsensusCommitter for TestCommitter {
         }
         Ok(ObjectCommit { index: 1 })
     }
+
+    /// Accepts a non-empty pack as a deterministic test commit.
+    async fn commit_pack(&self, staged: StagedPack) -> Result<PackCommit, String> {
+        if staged.entries.is_empty() {
+            return Err("empty pack".to_owned());
+        }
+        Ok(PackCommit { index: 1 })
+    }
 }
 
 /// Test consensus rejects a staged certificate before it reaches a committed log index.
@@ -76,6 +84,11 @@ struct RejectingCommitter;
 impl ConsensusCommitter for RejectingCommitter {
     /// Refuses every staged header to prove fragment durability alone never acknowledges.
     async fn commit(&self, _staged: StagedObject) -> Result<ObjectCommit, String> {
+        Err("leader quorum unavailable".to_owned())
+    }
+
+    /// Refuses every staged pack too.
+    async fn commit_pack(&self, _staged: StagedPack) -> Result<PackCommit, String> {
         Err("leader quorum unavailable".to_owned())
     }
 }
@@ -431,7 +444,11 @@ fn build(
     build_with_committer(transport, membership, origin, Arc::new(TestCommitter))
 }
 
-/// Builds a coordinator with a caller-selected consensus outcome.
+/// Builds a coordinator with a caller-selected consensus outcome. The offload
+/// size limit is 1 byte, so every test body (all well over that) bypasses
+/// accumulation and propagates directly, exactly as write-back did before
+/// #164 §4 — these tests exercise the ack/repair/scrub/reassembly contract,
+/// not the offload batching path (see `tests/offload.rs` for that).
 fn build_with_committer(
     transport: Arc<MemoryTransport>,
     membership: Arc<FakeMembership>,
@@ -449,6 +466,7 @@ fn build_with_committer(
         origin,
         committer,
         Duration::from_secs(5),
+        1,
     ));
     (coordinator, dir)
 }
@@ -739,7 +757,12 @@ async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
         .await
         .expect("quorum ack before origin propagation");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Bounded generously: this waits on a CPU-bound Reed-Solomon reassemble
+    // plus the direct-upload path, which can take much longer than its own
+    // work under host CPU contention (observed multi-second stalls on a
+    // loaded CI/dev host). The condition still ends the wait immediately once
+    // met; the deadline only matters on genuine failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !origin.put_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         tokio::task::yield_now().await;
     }
@@ -1136,8 +1159,12 @@ async fn acked_object_propagates_and_frees_fragments() {
         .expect("ack");
 
     // Propagation runs in the background: wait for it to upload and clean up.
+    // Bounded generously (400 * 50ms = 20s): the wait covers a CPU-bound
+    // Reed-Solomon reassemble, which can take much longer than its own work
+    // under host CPU contention. The loop still exits immediately once the
+    // condition is met; the bound only matters on genuine failure.
     let mut propagated = false;
-    for _ in 0..50 {
+    for _ in 0..400 {
         if coordinator.metrics().snapshot().propagated == 1 {
             propagated = true;
             break;

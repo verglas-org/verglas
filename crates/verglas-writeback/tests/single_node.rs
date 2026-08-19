@@ -44,7 +44,7 @@ use verglas_writeback::journal::JournalStore;
 use verglas_writeback::membership::SingleNodeMembership;
 use verglas_writeback::metrics::WritebackMetrics;
 use verglas_writeback::transport::{FragmentTransport, TransportError};
-use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
+use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
 const SELF: &str = "solo-node";
 
@@ -297,11 +297,23 @@ impl ConsensusCommitter for TestCommitter {
         }
         Ok(ObjectCommit { index: 1 })
     }
+
+    /// Accepts a non-empty pack as a deterministic test commit.
+    async fn commit_pack(&self, staged: StagedPack) -> Result<PackCommit, String> {
+        if staged.entries.is_empty() {
+            return Err("empty pack".to_owned());
+        }
+        Ok(PackCommit { index: 1 })
+    }
 }
 
 /// A single-node coordinator over the given transport, journal dir, and origin.
 /// The configured pod geometry (k=4,m=2,w=5) is what a clustered deployment
-/// would use; the single-node path degenerates it to (1,0,1) internally.
+/// would use; the single-node path degenerates it to (1,0,1) internally. The
+/// offload size limit is 1 byte, so every test body bypasses accumulation and
+/// propagates directly, matching write-back's pre-#164-§4 behavior — these
+/// tests exercise fast-ack, backpressure, and the commit barrier, not offload
+/// batching.
 fn single_node_coordinator(
     transport: Arc<MemoryTransport>,
     journals: Arc<JournalStore>,
@@ -317,6 +329,7 @@ fn single_node_coordinator(
         origin,
         Arc::new(TestCommitter),
         Duration::from_secs(2),
+        1,
     ))
 }
 

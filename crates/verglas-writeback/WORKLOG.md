@@ -105,3 +105,26 @@
   ordering and durability now belong only to the consensus substrate, so the
   write-back crate no longer exposes a competing authority.
 - #137: Restored the verglas-writeback library name so the EC durability layer is not confused with a standalone write service. Its quorum acknowledgement and repair implementation are unchanged.
+- #164: Replaced per-object propagation with a size-triggered offload stream
+  (new `offload.rs`: `OffloadStream` accumulator plus `PackIndex`, the local
+  resolver for flushed packs). An acked object below the configured size
+  limit joins its `(storage binding, bucket)` offload stream; the stream
+  flushes the whole accumulated batch into one packed S3 object, keyed under
+  a reserved `_verglas/packs/` prefix, when accumulated bytes cross the limit
+  or a caller invokes `WriteCoordinator::drain_offload`/`drain_all_offload`.
+  An object at or above the limit bypasses accumulation and uploads directly,
+  reusing the old per-object logic under new names
+  (`bypass_upload_once`/`bypass_upload_with_retry`) since `propagate`,
+  `propagate_locked`, and `propagate_once` are deleted outright, with no
+  fallback path left to the old immediate-propagation behavior. The pack
+  index (key to pack object, offset, length) commits through
+  `ConsensusCommitter::commit_pack`, a new trait method mirroring the
+  existing `commit`, never a sidecar file. `WritebackReader` resolves a
+  flushed key by reading the exact byte range of its pack object through the
+  ordinary read path, so read-your-writes holds across a flush exactly as it
+  already held across the dirty window. Shaped deliberately to mirror the WAL
+  segment-archive model (accumulate, flush on threshold or drain, commit,
+  release local storage) so collapsing the two onto one engine (issue #164
+  §6) stays a small step; that unification is not done here. Tests written
+  first in `tests/offload.rs` and `offload.rs`'s own unit tests; confirmed
+  failing to compile against the pre-#164 API before implementing.

@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,11 +31,12 @@ use verglas_core::node::NodeId;
 use verglas_core::ring::rendezvous_hash;
 use verglas_core::write::{ObjectWrite, PutOutcome, WriteBodyStream, WriteError, WriteMetadata};
 
-use crate::consensus::{ConsensusCommitter, StagedObject};
+use crate::consensus::{ConsensusCommitter, PackedEntry, StagedObject, StagedPack};
 use crate::journal::{Journal, JournalState, JournalStore, Placement};
 use crate::membership::LiveMembership;
 use crate::meta::{StoredMetadata, now_unix_ms};
 use crate::metrics::WritebackMetrics;
+use crate::offload::{OffloadStream, PackIndex, PackIndexEntry, PendingEntry};
 use crate::transport::FragmentTransport;
 
 /// Default background propagation retry attempts before giving up for this
@@ -131,10 +132,25 @@ pub struct WriteCoordinator<W: ObjectWrite> {
     /// exit at their next wake instead of acting on a coordinator whose owner
     /// is gone. The journals stay dirty for the next run's recovery replay.
     shutdown: AtomicBool,
+    /// Size, in bytes, at which a binding's offload stream flushes (#164 §4).
+    /// An object at or above this limit bypasses accumulation entirely.
+    offload_size_limit: u64,
+    /// One size-triggered offload stream per `(storage binding, bucket)`,
+    /// created lazily on first use.
+    offload: Mutex<HashMap<(String, String), Arc<OffloadStream>>>,
+    /// The local materialization of every flushed pack's committed index,
+    /// consulted by [`crate::reader::WritebackReader`] once a key's dirty
+    /// journal is gone.
+    pack_index: PackIndex,
 }
 
 impl<W: ObjectWrite> WriteCoordinator<W> {
-    /// Builds a coordinator.
+    /// Builds a coordinator. `offload_size_limit_bytes` is the object offload
+    /// stream's flush threshold (#164 §4,
+    /// `cache.writeback.offload_size_limit_bytes`): an acked object at or
+    /// above it bypasses accumulation and streams to the origin alone; below
+    /// it, the object joins its binding's offload stream and is packed with
+    /// others on the next threshold crossing or explicit drain.
     pub fn new(
         transport: Arc<dyn FragmentTransport>,
         membership: Arc<dyn LiveMembership>,
@@ -143,6 +159,7 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         origin: Arc<W>,
         committer: Arc<dyn ConsensusCommitter>,
         ack_deadline: Duration,
+        offload_size_limit_bytes: u64,
     ) -> Self {
         let self_id = membership.self_id();
         Self {
@@ -158,6 +175,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             object_counter: AtomicU64::new(0),
             key_locks: Mutex::new(HashMap::new()),
             shutdown: AtomicBool::new(false),
+            offload_size_limit: offload_size_limit_bytes.max(1),
+            offload: Mutex::new(HashMap::new()),
+            pack_index: PackIndex::new(),
         }
     }
 
@@ -180,6 +200,15 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     /// The counters (for admin export and tests).
     pub fn metrics(&self) -> &Arc<WritebackMetrics> {
         &self.metrics
+    }
+
+    /// The local pack-index materialization (for the reader wrapper and
+    /// tests). Authoritative state is the consensus commit each flush makes
+    /// through [`ConsensusCommitter::commit_pack`]; this is the same kind of
+    /// local, cheap-to-consult cache the dirty journal already is ahead of
+    /// its own consensus commit.
+    pub fn pack_index(&self) -> &PackIndex {
+        &self.pack_index
     }
 
     /// Executes a write-back PUT for `key` from a fully-buffered `body`. A thin
@@ -397,12 +426,18 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         self.record_mode(MODE_QUORUM);
 
         // Merge each straggler placement into the current journal (never a bulk
-        // overwrite, so a concurrent repair is not clobbered), then propagate.
+        // overwrite, so a concurrent repair is not clobbered), then hand the
+        // object to the offload path: either the binding's offload stream
+        // (accumulate, possibly triggering a flush) or a direct bypass upload
+        // when it is at or above the size limit (#164 §4).
         let me = Arc::clone(self);
         let object_id = object_id.to_owned();
+        let binding = key.storage_binding_id.clone();
+        let bucket = key.bucket.clone();
+        let logical_key = key.key.clone();
         tokio::spawn(async move {
             // Keep the key serialized from the start of the accepted PUT until
-            // every straggler is recorded and propagation has finished (or its
+            // every straggler is recorded and offload has finished (or its
             // bounded retries are exhausted). This is what makes a subsequent
             // successful DELETE final rather than vulnerable to resurrection.
             let _key_guard = key_guard;
@@ -418,7 +453,8 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
                     );
                 }
             }
-            me.propagate_locked(object_id).await;
+            me.offload(binding, bucket, logical_key, object_id, object_len)
+                .await;
         });
 
         Ok(PutOutcome {
@@ -507,12 +543,21 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
     }
 
     /// Deletes an object after any earlier quorum-acked PUT for the same key
-    /// has either reached the origin or exhausted its propagation attempts.
-    /// The origin delete happens before the dirty journal is discarded, so a
+    /// has either reached the origin or exhausted its offload attempts. The
+    /// origin delete happens before the dirty journal is discarded, so a
     /// failed delete preserves the acknowledged object for retry/recovery.
+    ///
+    /// A key already resolved through a flushed pack has no object at its own
+    /// origin key (its bytes live inside the pack object), so the origin
+    /// delete above is a harmless no-op for it; the pack index entry is what
+    /// must stop resolving, and is removed here. The pack object's dead space
+    /// is not reclaimed — repack policy is an open decision tracked in #164,
+    /// not this issue's scope.
     pub async fn delete(&self, key: &CacheKey) -> Result<(), WriteError> {
         let _key_guard = self.key_lock(key).lock_owned().await;
         self.origin.delete(key).await?;
+        self.pack_index
+            .remove(&key.storage_binding_id, &key.bucket, &key.key);
 
         let Some(object_id) =
             self.journals
@@ -540,34 +585,110 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         Ok(())
     }
 
-    /// Propagates one object to the origin with bounded retries. A still-dirty
-    /// journal after all attempts is left for a later run to replay.
-    pub async fn propagate(self: Arc<Self>, object_id: String) {
-        let Some(journal) = self.journals.read(&object_id).ok().flatten() else {
+    /// Routes one just-acked object to the offload path (#164 §4): at or
+    /// above the binding's offload size limit it bypasses accumulation and
+    /// streams to the origin alone (a large write never waits behind a buffer
+    /// of unrelated small ones); below the limit it joins the binding's
+    /// offload stream, flushing the whole accumulated batch if this append
+    /// crosses the threshold.
+    async fn offload(
+        &self,
+        storage_binding_id: String,
+        bucket: String,
+        key: String,
+        object_id: String,
+        object_len: u64,
+    ) {
+        let stream = self.offload_stream(&storage_binding_id, &bucket);
+        if object_len > stream.size_limit() {
+            self.bypass_upload_with_retry(object_id).await;
             return;
+        }
+        let entry = PendingEntry {
+            object_id,
+            key,
+            len: object_len,
         };
-        let key = CacheKey {
-            storage_binding_id: journal.storage_binding_id,
-            bucket: journal.bucket,
-            key: journal.key,
-        };
-        let _key_guard = self.key_lock(&key).lock_owned().await;
-        self.propagate_locked(object_id).await;
+        if let Some(batch) = stream.append(entry).await {
+            self.flush_pack(&storage_binding_id, &bucket, batch).await;
+        }
     }
 
-    /// Propagates while the caller owns the per-key operation lock.
-    async fn propagate_locked(&self, object_id: String) {
+    /// Gets or lazily creates the offload stream for `(storage_binding_id,
+    /// bucket)`, sized at the coordinator's configured offload size limit.
+    fn offload_stream(&self, storage_binding_id: &str, bucket: &str) -> Arc<OffloadStream> {
+        let mut guard = self.offload.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(
+            guard
+                .entry((storage_binding_id.to_owned(), bucket.to_owned()))
+                .or_insert_with(|| Arc::new(OffloadStream::new(self.offload_size_limit))),
+        )
+    }
+
+    /// The existing offload stream for `(storage_binding_id, bucket)`, or
+    /// `None` if nothing has ever been offloaded for it — used by drain so an
+    /// idle binding never materializes a stream just to find it empty.
+    fn existing_offload_stream(
+        &self,
+        storage_binding_id: &str,
+        bucket: &str,
+    ) -> Option<Arc<OffloadStream>> {
+        self.offload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(storage_binding_id.to_owned(), bucket.to_owned()))
+            .cloned()
+    }
+
+    /// Flushes `(storage_binding_id, bucket)`'s offload stream regardless of
+    /// accumulated size, or does nothing if it is empty or was never used
+    /// (#164 §4). Callable explicitly, for lifecycle shutdown and for tests.
+    pub async fn drain_offload(&self, storage_binding_id: &str, bucket: &str) {
+        let Some(stream) = self.existing_offload_stream(storage_binding_id, bucket) else {
+            return;
+        };
+        if let Some(batch) = stream.drain().await {
+            self.flush_pack(storage_binding_id, bucket, batch).await;
+        }
+    }
+
+    /// Flushes every `(storage_binding_id, bucket)` offload stream that
+    /// currently exists, regardless of accumulated size. Wired to the
+    /// periodic drain loop ([`crate::spawn_offload_drain_loop`]) so a stream
+    /// below its size limit is never held open indefinitely.
+    pub async fn drain_all_offload(&self) {
+        let keys: Vec<(String, String)> = self
+            .offload
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .keys()
+            .cloned()
+            .collect();
+        for (storage_binding_id, bucket) in keys {
+            self.drain_offload(&storage_binding_id, &bucket).await;
+        }
+    }
+
+    /// Uploads one object directly to the origin with bounded retries,
+    /// bypassing accumulation. Used for objects at or above the offload size
+    /// limit, and for replaying every dirty journal after a restart
+    /// ([`Self::resume_propagation`]) — recovery reuses the direct path
+    /// rather than re-entering a fresh offload stream, since a crashed run's
+    /// dirty objects must reach the origin as soon as possible, not wait on a
+    /// new accumulation window. A still-dirty journal after all attempts is
+    /// left for a later run to replay.
+    async fn bypass_upload_with_retry(&self, object_id: String) {
         let mut backoff = PROPAGATION_BACKOFF;
         for attempt in 0..PROPAGATION_ATTEMPTS {
             if self.shutdown.load(Ordering::SeqCst) {
                 return;
             }
-            match self.propagate_once(&object_id).await {
+            match self.bypass_upload_once(&object_id).await {
                 Ok(()) => return,
                 Err(error) => {
                     WritebackMetrics::bump(&self.metrics.propagation_failures);
                     eprintln!(
-                        "writeback: propagation of {object_id} attempt {} failed: {error}",
+                        "writeback: direct upload of {object_id} attempt {} failed: {error}",
                         attempt + 1
                     );
                     tokio::time::sleep(backoff).await;
@@ -577,9 +698,9 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         }
     }
 
-    /// Reassembles one dirty object, uploads it to the origin, marks the
-    /// journal clean, and frees the fragments.
-    async fn propagate_once(&self, object_id: &str) -> Result<(), WritebackError> {
+    /// Reassembles one dirty object, uploads it to the origin at its own key,
+    /// marks the journal clean, and frees the fragments.
+    async fn bypass_upload_once(&self, object_id: &str) -> Result<(), WritebackError> {
         let Some(journal) = self.journals.read(object_id)? else {
             return Ok(());
         };
@@ -617,6 +738,174 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
         let _ = self.journals.delete(object_id);
         WritebackMetrics::bump(&self.metrics.propagated);
         Ok(())
+    }
+
+    /// Reassembles every object in `batch` from its still-durable fragments,
+    /// packs them into one buffer, uploads that buffer as one origin object,
+    /// and commits the resulting index through
+    /// [`ConsensusCommitter::commit_pack`] (gate G8: the index is
+    /// authoritative consensus state, never a sidecar file). Only on a
+    /// successful commit are the packed objects' journals marked clean and
+    /// their fragments freed — a failed flush after bounded retries leaves
+    /// every object in `batch` dirty (still readable from fragments) for a
+    /// later drain or restart to retry.
+    ///
+    /// An object whose fragments fail to reassemble is skipped and stays
+    /// dirty; it does not block the rest of the batch.
+    async fn flush_pack(&self, storage_binding_id: &str, bucket: &str, batch: Vec<PendingEntry>) {
+        let mut pack: Vec<u8> = Vec::new();
+        let mut consensus_entries: Vec<PackedEntry> = Vec::new();
+        let mut local_rows: Vec<(String, PackIndexEntry)> = Vec::new();
+        let mut packed_journals: Vec<(String, Journal)> = Vec::new();
+        for pending in &batch {
+            let Some(journal) = self.journals.read(&pending.object_id).ok().flatten() else {
+                continue; // already handled (e.g. concurrently deleted)
+            };
+            if journal.state == JournalState::Clean {
+                continue;
+            }
+            let bytes = match self.reassemble(&journal).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    eprintln!(
+                        "writeback: offload flush could not reassemble {}: {error}; left dirty for retry",
+                        pending.object_id
+                    );
+                    continue;
+                }
+            };
+            let offset = pack.len() as u64;
+            let length = bytes.len() as u64;
+            pack.extend_from_slice(&bytes);
+            consensus_entries.push(PackedEntry {
+                key: journal.key.clone(),
+                offset,
+                length,
+                etag: journal.etag.clone(),
+                created_ms: journal.created_ms,
+            });
+            local_rows.push((
+                journal.key.clone(),
+                PackIndexEntry {
+                    pack_key: String::new(), // filled in once the pack key is known
+                    offset,
+                    length,
+                    etag: journal.etag.clone(),
+                    metadata: journal.metadata.clone(),
+                    created_ms: journal.created_ms,
+                },
+            ));
+            packed_journals.push((pending.object_id.clone(), journal));
+        }
+        if consensus_entries.is_empty() {
+            return;
+        }
+
+        let pack_key = self.pack_object_key(storage_binding_id, &pack);
+        let payload_hash: [u8; 32] = Sha256::digest(&pack).into();
+        let staged = StagedPack {
+            storage_binding_id: storage_binding_id.to_owned(),
+            bucket: bucket.to_owned(),
+            pack_key: pack_key.clone(),
+            pack_len: pack.len() as u64,
+            payload_hash,
+            entries: consensus_entries,
+        };
+
+        let mut backoff = PROPAGATION_BACKOFF;
+        let mut committed = false;
+        for attempt in 0..PROPAGATION_ATTEMPTS {
+            if self.shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            match self.upload_and_commit_pack(&staged, &pack).await {
+                Ok(()) => {
+                    committed = true;
+                    break;
+                }
+                Err(error) => {
+                    WritebackMetrics::bump(&self.metrics.propagation_failures);
+                    eprintln!(
+                        "writeback: pack flush of {pack_key} attempt {} failed: {error}",
+                        attempt + 1
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(10));
+                }
+            }
+        }
+        if !committed {
+            // Every packed object stays dirty; a later drain or restart
+            // retries it, exactly like a still-dirty journal always has.
+            return;
+        }
+
+        for (key, mut row) in local_rows {
+            row.pack_key = pack_key.clone();
+            self.pack_index
+                .insert(storage_binding_id, bucket, &key, row);
+        }
+        for (object_id, journal) in packed_journals {
+            let _ = self.journals.mark_clean(&object_id);
+            for placement in &journal.placements {
+                let node = NodeId::new(placement.node.as_str());
+                let fkey = FragmentKey {
+                    object_id: object_id.clone(),
+                    index: placement.index,
+                };
+                let _ = self.transport.delete(&node, &fkey).await;
+            }
+            let _ = self.journals.delete(&object_id);
+            WritebackMetrics::bump(&self.metrics.propagated);
+        }
+    }
+
+    /// Uploads the pack buffer to the origin, then commits its index through
+    /// consensus. Both must succeed for the flush to count as committed;
+    /// [`Self::flush_pack`] retries the whole pair on either failure.
+    async fn upload_and_commit_pack(
+        &self,
+        staged: &StagedPack,
+        pack: &[u8],
+    ) -> Result<(), WritebackError> {
+        let key = CacheKey {
+            storage_binding_id: staged.storage_binding_id.clone(),
+            bucket: staged.bucket.clone(),
+            key: staged.pack_key.clone(),
+        };
+        self.origin
+            .put(
+                &key,
+                WriteMetadata::default(),
+                once_body(Bytes::copy_from_slice(pack)),
+            )
+            .await
+            .map_err(|e| WritebackError::Reassembly(format!("origin pack put: {e}")))?;
+        self.committer
+            .commit_pack(staged.clone())
+            .await
+            .map_err(|e| WritebackError::Reassembly(format!("pack index commit: {e}")))?;
+        Ok(())
+    }
+
+    /// Derives a content-addressed pack object key under a reserved prefix,
+    /// so a packed object never collides with a customer key.
+    fn pack_object_key(&self, storage_binding_id: &str, pack: &[u8]) -> String {
+        let seq = self.object_counter.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(self.self_id.as_str().as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&nanos.to_le_bytes());
+        buf.extend_from_slice(&seq.to_le_bytes());
+        buf.extend_from_slice(&(pack.len() as u64).to_le_bytes());
+        format!(
+            "_verglas/packs/{storage_binding_id}/{:032x}",
+            xxhash_rust::xxh3::xxh3_128(&buf)
+        )
     }
 
     /// Reassembles the object bytes from any `k` surviving fragments named in
@@ -658,13 +947,25 @@ impl<W: ObjectWrite> WriteCoordinator<W> {
             .map_err(|e| WritebackError::Reassembly(e.to_string()))
     }
 
-    /// Replays every dirty journal on startup: rebuild placement and finish the
-    /// origin upload the crashed run did not.
+    /// Replays every dirty journal on startup: rebuild placement and finish
+    /// the origin upload the crashed run did not. Recovery uploads each
+    /// object directly rather than re-entering a fresh offload stream — a
+    /// crashed run's dirty objects must reach the origin as soon as possible,
+    /// not wait on a new accumulation window.
     pub fn resume_propagation(self: &Arc<Self>) {
         for object_id in self.journals.dirty_object_ids() {
             let me = Arc::clone(self);
             tokio::spawn(async move {
-                me.propagate(object_id).await;
+                let Some(journal) = me.journals.read(&object_id).ok().flatten() else {
+                    return;
+                };
+                let key = CacheKey {
+                    storage_binding_id: journal.storage_binding_id,
+                    bucket: journal.bucket,
+                    key: journal.key,
+                };
+                let _key_guard = me.key_lock(&key).lock_owned().await;
+                me.bypass_upload_with_retry(object_id).await;
             });
         }
     }

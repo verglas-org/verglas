@@ -1004,6 +1004,7 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
                 object_consensus.ok_or("ring write-back requires the consensus plane")?,
             )),
             std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
+            config.cache.writeback.offload_size_limit_bytes.0,
         ));
         let _repair = verglas_writeback::spawn_repair_loop(
             Arc::clone(&coordinator),
@@ -1013,6 +1014,10 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
         let _scrub = verglas_writeback::spawn_scrub_loop(
             Arc::clone(&coordinator),
             std::time::Duration::from_secs(config.cache.writeback.scrub_interval_secs),
+        );
+        let _offload_drain = verglas_writeback::spawn_offload_drain_loop(
+            Arc::clone(&coordinator),
+            std::time::Duration::from_secs(config.cache.writeback.offload_drain_interval_secs),
         );
         let tier = WritebackTier::new(coordinator, engine, origin, policy);
         verglas_s3::router_with_passthrough(

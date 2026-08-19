@@ -457,3 +457,9 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   `file_allocated_bytes` (physical occupancy) and the
   `writeback.disk_floor_bytes` config field (guaranteed fragment headroom;
   0 derives a 1/16-of-budget reserve).
+- #164: Added `cache.writeback.offload_size_limit_bytes` (default 16 MiB,
+  matching `WAL_SEGMENT_BYTES`) and `cache.writeback.offload_drain_interval_secs`
+  (default 5s) for the object offload stream's size-triggered flush and its
+  background drain loop. Both are rejected as zero when write-back is
+  enabled, following the existing `ack_deadline_ms`/`scrub_interval_secs`
+  validation pattern.

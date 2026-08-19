@@ -324,3 +324,13 @@
   of the two `catalog.load_table` round trips it used to pay. See
   `verglas-iceberg`'s worklog for the structural detail and the hermetic test
   that pins it.
+- #164: `ObjectConsensusCommitter` now implements `commit_pack`, committing a
+  flushed offload-stream pack's index (key to pack object, offset, length)
+  through the same per-object Raft shard group as `commit`, via the existing
+  generic `GroupRequest::CommitObject` verb with `ReplicationMode::Complete`
+  (no fragment holders — the pack lives at the origin, not distributed
+  across pod fragments, so it replicates fully to the group's voters like
+  the plane's other small metadata commits). `serve.rs` passes
+  `cache.writeback.offload_size_limit_bytes` into `WriteCoordinator::new` and
+  spawns `spawn_offload_drain_loop` alongside the existing repair/scrub
+  loops, at `cache.writeback.offload_drain_interval_secs`.

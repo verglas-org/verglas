@@ -28,7 +28,7 @@ use verglas_consensus::{
     PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
 use verglas_core::CacheKey;
-use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
+use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
 use crate::ring::RingPlane;
 
@@ -285,6 +285,16 @@ fn existing_wal_binding_outcome(existing: Option<&str>, requested: &str) -> Resu
     }
 }
 
+/// Derives a deterministic idempotent request identity from a commit payload,
+/// so a retried submission of the exact same content never double-applies.
+fn payload_request_id(payload: &[u8]) -> Result<u128, String> {
+    let digest = Sha256::digest(payload);
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| "request identity is malformed".to_owned())?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
 #[async_trait::async_trait]
 impl ConsensusCommitter for ObjectConsensusCommitter {
     async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
@@ -303,12 +313,7 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
             }).collect::<Vec<_>>(),
         });
         let payload = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
-        let digest = Sha256::digest(&payload);
-        let request_id = u128::from_be_bytes(
-            digest[..16]
-                .try_into()
-                .map_err(|_| "object request identity is malformed".to_owned())?,
-        );
+        let request_id = payload_request_id(&payload)?;
         let group = object_consensus_group(&staged.key);
         let holders = staged
             .placements
@@ -333,6 +338,56 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
                 index: response.index,
             }),
             _ => Err("object group returned a non-applied response".to_owned()),
+        }
+    }
+
+    async fn commit_pack(&self, staged: StagedPack) -> Result<PackCommit, String> {
+        let identity = serde_json::json!({
+            "storage_binding": staged.storage_binding_id,
+            "bucket": staged.bucket,
+            "pack_key": staged.pack_key,
+            "pack_len": staged.pack_len,
+            "payload_hash": hex::encode(staged.payload_hash),
+            "entries": staged.entries.iter().map(|entry| {
+                serde_json::json!({
+                    "key": entry.key,
+                    "offset": entry.offset,
+                    "length": entry.length,
+                    "etag": entry.etag,
+                    "created_ms": entry.created_ms,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let payload = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+        let request_id = payload_request_id(&payload)?;
+        // The pack index carries no erasure-coded fragment holders — the pack
+        // lives at the origin, not distributed across pod fragments — so it
+        // commits fully replicated to the group's voters rather than coded,
+        // exactly like the other small metadata commits on this plane
+        // (`TimelineOpen`, `WalArchiveBinding`, `WriterLease`).
+        let group = object_consensus_group(&CacheKey {
+            storage_binding_id: staged.storage_binding_id.clone(),
+            bucket: staged.bucket.clone(),
+            key: staged.pack_key.clone(),
+        });
+        match self
+            .plane
+            .submit(
+                &group,
+                GroupRequest::CommitObject {
+                    request_id,
+                    payload,
+                    holders: Vec::new(),
+                    mode: ReplicationMode::Complete,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            GroupResponse::Applied(response) => Ok(PackCommit {
+                index: response.index,
+            }),
+            _ => Err("pack index group returned a non-applied response".to_owned()),
         }
     }
 }
