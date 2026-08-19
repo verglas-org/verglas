@@ -341,6 +341,7 @@ static SUPPORTED_ENDPOINTS: LazyLock<Vec<String>> = LazyLock::new(|| {
         .collect()
 });
 
+#[must_use]
 pub fn supported_endpoints() -> &'static [String] {
     &SUPPORTED_ENDPOINTS
 }

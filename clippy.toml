@@ -1,1 +1,3 @@
-doc-valid-idents = ["OpenFGA", "OAuth", "CloudEvents", "UUIDv7", "SemVer"]
+# CRaft is the name of the Verglas coded-Raft consensus substrate. It reads as
+# an item name to clippy::doc_markdown, but it is a proper noun in prose.
+doc-valid-idents = ["OpenFGA", "OAuth", "CloudEvents", "UUIDv7", "SemVer", "CRaft"]

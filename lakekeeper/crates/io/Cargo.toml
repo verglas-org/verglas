@@ -21,6 +21,14 @@ ignored = [
 
 [features]
 all = ["storage-s3", "storage-adls", "storage-gcs", "storage-in-memory"]
+# Gates the `integration_tests` target, whose every test needs a live cloud
+# backend and credentials in LAKEKEEPER_TEST__* variables. Off by default so
+# `cargo test --workspace` stays free of external services, matching the policy
+# at the top of .github/workflows/ci.yml. Opt in with
+# `--features cloud-integration-tests` once those variables are set. Upstream
+# achieved the same exclusion through the nextest filter in
+# .config/nextest.toml, which cargo test does not read.
+cloud-integration-tests = []
 storage-s3 = [
     "dep:aws-sdk-s3",
     "dep:aws-config",
@@ -109,3 +117,9 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+
+# Requires the opt-in feature, so the default test path neither builds nor runs
+# it. Every test in this target reaches a real S3, ADLS, GCS, or OSS endpoint.
+[[test]]
+name = "integration_tests"
+required-features = ["cloud-integration-tests"]

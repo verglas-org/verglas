@@ -775,6 +775,7 @@ pub fn determine_forwarded_prefix(headers: &HeaderMap) -> Option<&str> {
     }
 }
 
+#[must_use]
 pub fn determine_base_uri(headers: &HeaderMap) -> Option<String> {
     determine_base_uri_with(
         headers,
