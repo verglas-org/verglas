@@ -589,6 +589,7 @@ mod openfga_integration_tests {
         Ok(OpenFGAAuthorizer::new(client_v4, server_id))
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_projects() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -637,6 +638,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_projects_empty_server() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -647,6 +649,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_warehouses() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -706,6 +709,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_warehouses_empty_project() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -717,6 +721,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_namespaces() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -792,6 +797,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_namespaces_empty_warehouse() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -802,6 +808,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tabulars() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -881,6 +888,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tabulars_empty_namespaces() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -895,6 +903,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tuples_with_object() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -975,6 +984,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tuples_with_object_empty() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -987,6 +997,7 @@ mod openfga_integration_tests {
     }
 
     /// Testing for user type `table` which can be the user in only one relation as of v3.
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tuples_with_user() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -1039,6 +1050,7 @@ mod openfga_integration_tests {
     }
 
     /// Testing for user type `namespace` which can be the user in multiple relations.
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tuples_with_user_multiple_results() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -1118,6 +1130,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     async fn test_get_all_tuples_with_user_empty() -> anyhow::Result<()> {
         let authorizer = new_v3_authorizer_for_empty_store().await?;
@@ -1129,6 +1142,7 @@ mod openfga_integration_tests {
         Ok(())
     }
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_v4_push_down_warehouse_id() -> anyhow::Result<()> {
@@ -1697,6 +1711,7 @@ mod openfga_integration_tests {
     // Tests below check v4 specific behavior, so they need an OpenFGA client/authorizer
     // migrated to v4.
 
+    #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn test_reuse_tabular_ids_across_warehouses() -> anyhow::Result<()> {

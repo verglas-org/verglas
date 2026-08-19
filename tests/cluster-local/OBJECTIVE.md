@@ -30,6 +30,10 @@ All are binary. A candidate failing any gate is rejected regardless of metrics.
 | G6 | `propagate`, `propagate_locked`, and `propagate_once` are gone from `WriteCoordinator`. No fallback to per-object propagation remains |
 | G7 | A `WORKLOG.md` entry exists in every crate the candidate touches |
 | G8 | The pack index commits through `ConsensusGroup`. A sidecar file is a rejection |
+| G9 | Aggregate-write tests exist and pass: many small objects produce one pack; a superseded key within one unflushed stream produces one entry, not several; an object over the size limit bypasses accumulation |
+| G10 | EC durability tests exist and pass: an acknowledged object survives the loss of one node of four at `k=2 m=2 w=3`, both before flush (from fragments) and after flush (from the pack) |
+| G11 | Read-on-write tests exist and pass: a read immediately after acknowledgement is served locally, before flush and after flush, when the cache has room. Admission rejection under budget pressure is a normal result and must not fail the offload |
+| G12 | LIST resolves through the pack index. `list-objects-v2` enumerates every written key at every stage. Wave 1 rejected all three candidates here; the issue never stated it |
 
 ## Metrics
 
@@ -47,7 +51,20 @@ At the frozen protocol below that is `4096000 / 16777216 + 1` = **1**.
 Wall-clock for the 1000 client PUTs. A candidate may not regress this by more
 than 20% against the baseline. Buffering must not be paid for by the writer.
 
-M1 and M2 are not scalarized together. Rank by M1 ascending, then M2 ascending.
+**M3 — `throughput_ratio` (dimensionless, maximize). Hard bound.**
+
+Client-observed write throughput through Verglas divided by the same workload
+written directly to the origin. The whole premise of the write-back path is that
+acknowledging on an EC quorum beats waiting for an origin PUT, so this must
+exceed 1.0. A candidate at or below 1.0 is rejected: it has added a packing
+layer and bought nothing.
+
+Measured by `./run.sh throughput`, which runs the identical object set twice —
+once against the Verglas endpoint, once against MinIO directly — and reports
+both rates and the ratio.
+
+M1, M2, and M3 are not scalarized together. Rank by M1 ascending, then M3
+descending, then M2 ascending.
 
 ## Benchmark protocol
 

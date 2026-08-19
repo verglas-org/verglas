@@ -776,7 +776,26 @@ pub fn determine_forwarded_prefix(headers: &HeaderMap) -> Option<&str> {
 }
 
 pub fn determine_base_uri(headers: &HeaderMap) -> Option<String> {
-    if let Some(uri) = CONFIG.base_uri.as_ref() {
+    determine_base_uri_with(
+        headers,
+        CONFIG.base_uri.as_ref(),
+        CONFIG.use_x_forwarded_headers,
+    )
+}
+
+/// Resolves the base URI from `headers` under an explicit configuration.
+///
+/// `determine_base_uri` reads the process-global `CONFIG`, which is a
+/// `LazyLock` initialised once on first access. A test that sets configuration
+/// environment variables cannot influence it if any earlier test in the same
+/// process already read it, so the behaviour here is only reachable through
+/// this function. Callers in production go through `determine_base_uri`.
+fn determine_base_uri_with(
+    headers: &HeaderMap,
+    configured_base_uri: Option<&url::Url>,
+    use_x_forwarded_headers: bool,
+) -> Option<String> {
+    if let Some(uri) = configured_base_uri {
         return Some(uri.to_string());
     }
 
@@ -784,7 +803,7 @@ pub fn determine_base_uri(headers: &HeaderMap) -> Option<String> {
         .get(http::header::HOST)
         .and_then(|hv| hv.to_str().ok());
 
-    if CONFIG.use_x_forwarded_headers {
+    if use_x_forwarded_headers {
         let any_x_forwarded_header_present = headers
             .get(X_FORWARDED_HOST_HEADER)
             .or(headers.get(X_FORWARDED_PROTO_HEADER))
@@ -894,18 +913,10 @@ mod test {
 
     #[test]
     fn test_determine_host_without_host_header_with_config_provided_base_uri() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("LAKEKEEPER_TEST__BASE_URI", "https://localhost:8181/a/b/");
-            let host = determine_base_uri(&HeaderMap::new());
-            assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
-            Ok(())
-        });
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("LAKEKEEPER_TEST__BASE_URI", "https://localhost:8181/a/b");
-            let host = determine_base_uri(&HeaderMap::new());
-            assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
-            Ok(())
-        });
+        let base = url::Url::parse("https://localhost:8181/a/b/").expect("test base uri parses");
+        // No Host header at all: the configured base URI is the only source.
+        let host = determine_base_uri_with(&HeaderMap::new(), Some(&base), false);
+        assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
     }
 
     #[test]
@@ -938,48 +949,27 @@ mod test {
 
     #[test]
     fn test_determine_host_with_host_header_with_config_provided_base_uri() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("LAKEKEEPER_TEST__BASE_URI", "https://localhost:8181/a/b/");
-            let mut headers = HeaderMap::new();
-            headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
-            let host = determine_base_uri(&headers);
-            assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
-            Ok(())
-        });
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("LAKEKEEPER_TEST__BASE_URI", "https://localhost:8181/a/b");
-            let mut headers = HeaderMap::new();
-            headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
-            let host = determine_base_uri(&headers);
-            assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
-            Ok(())
-        });
+        // Config loading normalises the trailing slash (see config.rs and
+        // test_base_uri_trailing_slash_stripped). This test owns precedence:
+        // a configured base URI wins over the Host header.
+        let base = url::Url::parse("https://localhost:8181/a/b/").expect("test base uri parses");
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::HOST, HeaderValue::from_static("example.com"));
+        let host = determine_base_uri_with(&headers, Some(&base), false);
+        assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
     }
 
     #[test]
     fn test_determine_host_with_x_forwarded_for_with_config_provided_base_uri() {
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("LAKEKEEPER_TEST__BASE_URI", "https://localhost:8181/a/b/");
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                X_FORWARDED_HOST_HEADER,
-                HeaderValue::from_static("example.com"),
-            );
-            let host = determine_base_uri(&headers);
-            assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
-            Ok(())
-        });
-        figment::Jail::expect_with(|jail| {
-            jail.set_env("LAKEKEEPER_TEST__BASE_URI", "https://localhost:8181/a/b");
-            let mut headers = HeaderMap::new();
-            headers.insert(
-                X_FORWARDED_HOST_HEADER,
-                HeaderValue::from_static("example.com"),
-            );
-            let host = determine_base_uri(&headers);
-            assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
-            Ok(())
-        });
+        let base = url::Url::parse("https://localhost:8181/a/b/").expect("test base uri parses");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            X_FORWARDED_HOST_HEADER,
+            HeaderValue::from_static("example.com"),
+        );
+        // A configured base URI wins even when forwarding headers are honoured.
+        let host = determine_base_uri_with(&headers, Some(&base), true);
+        assert_eq!(host, Some("https://localhost:8181/a/b/".to_string()));
     }
 
     #[test]

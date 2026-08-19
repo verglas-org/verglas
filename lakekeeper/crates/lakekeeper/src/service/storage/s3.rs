@@ -2485,6 +2485,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_can_validate() {
             // we need to use a shared runtime since the static client is shared between tests here
@@ -2539,6 +2540,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         #[tracing_test::traced_test]
         fn test_signing_identity() {
@@ -2556,6 +2558,7 @@ pub(crate) mod test {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         #[tracing_test::traced_test]
         fn test_signing_identity_with_assumed_role() {
@@ -2574,6 +2577,7 @@ pub(crate) mod test {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_can_validate() {
             // we need to use a shared runtime since the static client is shared between tests here
@@ -2597,6 +2601,7 @@ pub(crate) mod test {
                 true,
             );
         }
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         #[allow(clippy::too_many_lines)]
         fn test_multipart_upload_with_vended_credentials() {
@@ -2753,6 +2758,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_can_validate() {
             // we need to use a shared runtime since the static client is shared between tests here
@@ -2811,6 +2817,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_can_validate() {
             // we need to use a shared runtime since the static client is shared between tests here
@@ -2869,6 +2876,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_can_validate() {
             // we need to use a shared runtime since the static client is shared between tests here
@@ -2893,6 +2901,7 @@ pub(crate) mod test {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         #[allow(clippy::too_many_lines)]
         fn test_multipart_upload_with_vended_credentials() {

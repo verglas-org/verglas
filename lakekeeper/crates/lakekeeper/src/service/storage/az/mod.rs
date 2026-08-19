@@ -845,6 +845,7 @@ pub(crate) mod test {
             AzCredential::SharedAccessKey { key }
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_can_validate_adls() {
             for (cred, typ) in [
@@ -869,6 +870,7 @@ pub(crate) mod test {
         mod azure_system_credentials_integration_tests {
             use super::*;
 
+            #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
             #[tokio::test]
             async fn test_system_identity_can_validate() {
                 let prof = azure_profile();

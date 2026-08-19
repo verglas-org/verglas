@@ -1924,6 +1924,7 @@ mod tests {
     mod azure_integration_tests {
         use super::*;
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_vended_az() {
             for (cred, _typ) in [
@@ -1964,6 +1965,7 @@ mod tests {
     mod gcs_integration_tests {
         use super::*;
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_vended_gcs() {
             let key_prefix = Some(format!("test_prefix-{}", uuid::Uuid::now_v7()));
@@ -1991,6 +1993,7 @@ mod tests {
     mod aws_integration_tests {
         use super::*;
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_vended_aws() {
             test_block_on(
@@ -2028,6 +2031,7 @@ mod tests {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         // #[tracing_test::traced_test]
         async fn test_validate_aws() {
@@ -2049,6 +2053,7 @@ mod tests {
     mod minio_integration_tests {
         use super::*;
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[test]
         fn test_vended_s3_compat() {
             use super::super::s3::test::minio_integration_tests::storage_profile;

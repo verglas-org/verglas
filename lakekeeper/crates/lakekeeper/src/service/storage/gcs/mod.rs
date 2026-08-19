@@ -575,6 +575,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_can_validate() {
             let (profile, cred) = get_storage_profile();
@@ -600,6 +601,7 @@ pub(crate) mod test {
         mod gcp_system_credentials_integration_tests {
             use super::*;
 
+            #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
             #[tokio::test]
             async fn test_system_identity_can_validate() {
                 let (profile, credential) = get_storage_profile();
@@ -646,6 +648,7 @@ pub(crate) mod test {
             (profile, cred)
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_can_validate() {
             let (profile, cred) = get_storage_profile();

@@ -1659,6 +1659,7 @@ pub(crate) mod tests {
                 .unwrap()
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_list_projects() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1695,6 +1696,7 @@ pub(crate) mod tests {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_require_no_relations_own_relations() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1723,6 +1725,7 @@ pub(crate) mod tests {
             assert_eq!(err.error.r#type, "ObjectHasRelations");
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_require_no_relations_used_in_other_relations() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1750,6 +1753,7 @@ pub(crate) mod tests {
             assert_eq!(err.error.r#type, "ObjectUsedInRelation");
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_own_relations_direct() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1777,6 +1781,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_own_relations_usersets() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1804,6 +1809,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_own_relations_many() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1843,6 +1849,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_own_relations_empty() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1853,6 +1860,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_user_relations() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1882,6 +1890,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_non_existing_relation_gives_404() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1904,6 +1913,7 @@ pub(crate) mod tests {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_duplicate_writes_give_409() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1939,6 +1949,7 @@ pub(crate) mod tests {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_user_relations_empty() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1948,6 +1959,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_user_relations_many() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -1985,6 +1997,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&project_id).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_user_relations_userset() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2009,6 +2022,7 @@ pub(crate) mod tests {
             authorizer.require_no_relations(&user).await.unwrap();
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_are_allowed_project_actions_without_for_user() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2060,6 +2074,7 @@ pub(crate) mod tests {
             assert_eq!(results, vec![true, true]);
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_are_allowed_project_actions_with_for_user() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2148,6 +2163,7 @@ pub(crate) mod tests {
         /// `ReadRoleAssignments` must reflect the *inspected subject's* permission
         /// to know about users, not the caller's. Regression for the bug where the
         /// `for_user` path returned the actor's `CanListUsers` result.
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_are_allowed_user_actions_read_role_assignments_uses_inspected_subject() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2232,6 +2248,7 @@ pub(crate) mod tests {
             assert_eq!(results, vec![true]);
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_are_allowed_project_actions_for_user_checks_correct_user() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2285,6 +2302,7 @@ pub(crate) mod tests {
             assert_eq!(results, vec![true, false]);
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_generic_table_permissions_lifecycle() {
             use std::collections::HashMap;
@@ -2386,6 +2404,7 @@ pub(crate) mod tests {
             assert_eq!(results, vec![false, false]);
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn role_member_can_assume_parent_transitively() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2443,6 +2462,7 @@ pub(crate) mod tests {
         /// `B member of A` and the cycle-closing `A member of B` succeed, and
         /// `can_assume` resolves the cyclic userset safely (returns promptly, no
         /// infinite loop). This test locks that behavior against a live server.
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn openfga_tolerates_cyclic_role_membership() {
             use std::time::Duration;
@@ -2520,6 +2540,7 @@ pub(crate) mod tests {
         /// Then a user U assigned to C must transitively assume C, A and B, while
         /// a holder of B (`role:B#assignee`) must NOT be able to assume C, proving
         /// the chain stays directional (no reverse/cyclic edge was created).
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn openfga_accepts_deep_noncyclic_role_chain() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2613,6 +2634,7 @@ pub(crate) mod tests {
             );
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn list_role_assignments_returns_role_members() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2666,6 +2688,7 @@ pub(crate) mod tests {
             assert_eq!(subjects, expected);
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn list_role_assignments_populates_created_at() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2740,6 +2763,7 @@ pub(crate) mod tests {
 
         /// `ByAssignee` lists every role a subject is assigned to (the inverse
         /// axis of `ByRole`), parsing the role from the tuple's `object`.
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn list_role_assignments_by_assignee_returns_roles() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2785,6 +2809,7 @@ pub(crate) mod tests {
 
         /// Round-trip: a role-member assignment can be added, listed, removed, and
         /// removing it again is idempotent (ignore-on-missing).
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn remove_role_assignments_round_trip() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -2854,6 +2879,7 @@ pub(crate) mod tests {
         /// Pagination: a `page_size` of 1 over two assignments yields one row plus
         /// a continuation token; following the token returns the rest, and the
         /// union across pages is exactly the full set (no gaps, no duplicates).
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn list_role_assignments_paginates() {
             let authorizer = new_authorizer_in_empty_store().await;

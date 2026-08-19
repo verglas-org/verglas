@@ -47,6 +47,7 @@ mod tests {
             migration::migrate,
         };
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_health() {
             let client = new_client_from_default_config().await.unwrap();

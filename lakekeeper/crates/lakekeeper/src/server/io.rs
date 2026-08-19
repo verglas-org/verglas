@@ -272,6 +272,7 @@ mod tests {
             StorageCredential, StorageProfile, s3::test::aws_integration_tests::get_storage_profile,
         };
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_remove_all_s3() {
             let (profile, cred) = get_storage_profile();
@@ -289,6 +290,7 @@ mod tests {
             az::test::azure_integration_tests::{azure_profile, client_creds},
         };
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_remove_all_az() {
             let cred: StorageCredential = client_creds().into();
@@ -305,6 +307,7 @@ mod tests {
             gcs::test::gcs_integration_tests::get_storage_profile,
         };
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_remove_all_gcs() {
             let (profile, cred) = get_storage_profile();

@@ -358,6 +358,7 @@ mod tests {
             entities::OpenFgaEntity as _, relations::WarehouseRelation,
         };
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_non_existing_tuple_err_parsed_correctly() {
             let authorizer = new_authorizer_in_empty_store().await;
@@ -380,6 +381,7 @@ mod tests {
             assert_eq!(err_model.r#type, "TupleNotFoundError");
         }
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_write_existing_tuple_err_parsed_correctly() {
             let authorizer = new_authorizer_in_empty_store().await;

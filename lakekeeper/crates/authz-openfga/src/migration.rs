@@ -201,6 +201,7 @@ pub(crate) mod tests {
         use super::super::*;
         use crate::client::new_client_from_default_config;
 
+        #[ignore = "requires live cloud credentials; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_migrate() {
             let mut client = new_client_from_default_config().await.unwrap();

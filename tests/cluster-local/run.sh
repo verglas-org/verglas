@@ -122,6 +122,34 @@ case "${1:-}" in
     echo "get_mismatched=$get_mismatched"
     rm -rf "$src" "$out"
     ;;
+  throughput)
+    # M3. Same object set written twice: once through Verglas, once straight to
+    # the origin. The write-back path exists to acknowledge on an EC quorum
+    # instead of waiting for an origin PUT, so the ratio must exceed 1.0.
+    src=$(mktemp -d)
+    for i in $(seq 1 "$COUNT"); do head -c "$OBJECT_BYTES" /dev/urandom > "$src/obj-$i"; done
+    aws configure set default.s3.max_concurrent_requests "$CONCURRENCY"
+    total_bytes=$(( COUNT * OBJECT_BYTES ))
+
+    v_start=$(date +%s%N)
+    aws --endpoint-url "$S3_ENDPOINT" s3 cp "$src" "s3://verglas-test/thr-verglas/" \
+      --recursive --only-show-errors
+    v_ns=$(( $(date +%s%N) - v_start ))
+
+    d_start=$(date +%s%N)
+    AWS_ACCESS_KEY_ID=verglas-local AWS_SECRET_ACCESS_KEY=verglas-local-secret \
+      aws --endpoint-url http://127.0.0.1:19000 s3 cp "$src" "s3://verglas-test/thr-direct/" \
+      --recursive --only-show-errors
+    d_ns=$(( $(date +%s%N) - d_start ))
+
+    rm -rf "$src"
+    echo "objects=$COUNT object_bytes=$OBJECT_BYTES total_bytes=$total_bytes"
+    echo "verglas_seconds=$(awk "BEGIN{printf \"%.3f\", $v_ns/1000000000}")"
+    echo "direct_seconds=$(awk "BEGIN{printf \"%.3f\", $d_ns/1000000000}")"
+    echo "verglas_mib_s=$(awk "BEGIN{printf \"%.2f\", ($total_bytes/1048576)/($v_ns/1000000000)}")"
+    echo "direct_mib_s=$(awk "BEGIN{printf \"%.2f\", ($total_bytes/1048576)/($d_ns/1000000000)}")"
+    echo "throughput_ratio=$(awk "BEGIN{printf \"%.3f\", $d_ns/$v_ns}")"
+    ;;
   *)
-    echo "usage: $0 {up|down|putcount|measure}" >&2; exit 64 ;;
+    echo "usage: $0 {up|down|putcount|measure|throughput}" >&2; exit 64 ;;
 esac
