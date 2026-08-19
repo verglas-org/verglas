@@ -85,7 +85,9 @@ async fn warehouse_admin_scope_authorizes_the_pyiceberg_session() {
     let namespace =
         NamespaceWithParent::test_default(NamespaceId::new_random(), warehouse.warehouse_id);
     let metadata = RequestMetadataTestBuilder::builder()
-        .verglas_bearer_token(token(json!([{"resource": "warehouse/*", "action": "admin"}])))
+        .verglas_bearer_token(token(
+            json!([{"resource": "warehouse/*", "action": "admin"}]),
+        ))
         .build();
     let authorizer = authorizer();
 

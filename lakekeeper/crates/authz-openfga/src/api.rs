@@ -2966,5 +2966,4 @@ mod tests {
         });
         assert_eq!(serialized, expected);
     }
-
 }

@@ -1444,6 +1444,10 @@ mod warehouse_filter_tests {
     fn namespace_documents_match_their_warehouse_by_durable_id() {
         let stored = durable_id("warehouse", "lite");
         assert_ne!(stored, "lite", "durable id must not equal the raw prefix");
-        assert_eq!(stored, durable_id("warehouse", "lite"), "durable id is deterministic");
+        assert_eq!(
+            stored,
+            durable_id("warehouse", "lite"),
+            "durable id is deterministic"
+        );
     }
 }
