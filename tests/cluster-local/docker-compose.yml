@@ -3,7 +3,7 @@
 # are the authoritative record of how many S3 PUTs the cluster issued.
 #
 # Bring it up with ./run.sh up. Do not point this at a real bucket.
-name: verglas-local
+name: verglas-base
 
 services:
   minio:
@@ -39,6 +39,8 @@ services:
     build:
       context: ../..
       target: verglas-cache-node
+      args:
+        CACHE_NS: base
     depends_on:
       minio-init:
         condition: service_completed_successfully
