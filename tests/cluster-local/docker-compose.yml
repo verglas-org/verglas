@@ -114,6 +114,65 @@ services:
       - "18363:8333"
       - "18364:8334"
 
+  # The Verglas fork of Lakekeeper, serving the Iceberg REST catalog over the
+  # four nodes' CRaft ingress. This is the product under test: the catalog's
+  # authoritative state lives in Verglas consensus, not PostgreSQL. Data files
+  # written by an Iceberg client go to the Verglas S3 endpoint on node1, so
+  # both the catalog path and the object path run through Verglas.
+  lakekeeper:
+    build:
+      context: ../..
+      dockerfile: tests/cluster-local/Dockerfile.lakekeeper
+      args:
+        CACHE_NS: ${CACHE_NS:-base}
+    depends_on:
+      node1:
+        condition: service_started
+    command:
+      - serve-craft
+      - --endpoints
+      - http://node1:8334,http://node2:8334,http://node3:8334,http://node4:8334
+      - --tenant
+      - local
+      - --warehouse
+      - lite
+      - --managed-s3-profile
+      - '{"bucket":"verglas-test","region":"us-east-1","endpoint":"http://node1:8333","path-style-access":true,"key-prefix":"warehouse"}'
+    environment:
+      # Credentials the catalog presents to the Verglas S3 endpoint for
+      # metadata objects. These are the endpoint credentials, not MinIO's.
+      AWS_ACCESS_KEY_ID: verglas-engine
+      AWS_SECRET_ACCESS_KEY: verglas-engine-secret
+      AWS_REGION: us-east-1
+      LAKEKEEPER__BASE_URI: http://127.0.0.1:18181
+      LAKEKEEPER__LISTEN_PORT: "8181"
+      RUST_LOG: info
+    ports:
+      - "18181:8181"
+
+  # Drives real Iceberg traffic: catalog operations to serve-craft, Parquet data
+  # files to the Verglas S3 endpoint. Run on demand:
+  #   docker compose run --rm workload
+  workload:
+    image: python:3.12-slim
+    depends_on:
+      lakekeeper:
+        condition: service_started
+    environment:
+      CATALOG_URI: http://lakekeeper:8181/catalog
+      S3_ENDPOINT: http://node1:8333
+      MINIO_METRICS_URL: http://minio:9000/minio/v2/metrics/cluster
+      WAREHOUSE: lite
+      FILES: ${FILES:-50}
+      ROWS: ${ROWS:-100}
+    volumes:
+      - ./catalog-workload.py:/w/catalog-workload.py:ro
+    working_dir: /w
+    entrypoint:
+      - sh
+      - -c
+      - pip install --quiet "pyiceberg[s3fs]" pyarrow && python catalog-workload.py
+
 volumes:
   node1-state:
   node2-state:

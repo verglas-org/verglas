@@ -2905,10 +2905,6 @@ mod tests {
         );
     }
 
-    fn random_namespace(namespace_id: NamespaceId) -> NamespaceHierarchy {
-        NamespaceHierarchy::new_with_id(Uuid::nil().into(), namespace_id)
-    }
-
     #[test]
     fn test_get_role_assignments_response_serde() {
         let response = GetRoleAssignmentsResponse {

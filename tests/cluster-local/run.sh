@@ -96,8 +96,12 @@ case "${1:-}" in
     # G5 has two independent halves. LIST must enumerate the written keys, and
     # GET must return their bytes. A packing implementation can pass one and
     # fail the other, so they are reported separately.
-    listed=$(aws --endpoint-url "$S3_ENDPOINT" s3api list-objects-v2 \
-      --bucket verglas-test --prefix "measure/" --query 'KeyCount' --output text 2>/dev/null || echo 0)
+    # Count via a paginated listing, not KeyCount. S3 omits KeyCount entirely
+    # when IsTruncated is true, so querying it returns None on any listing over
+    # one page and reads as zero keys — a false negative that nearly rejected a
+    # working candidate.
+    listed=$(aws --endpoint-url "$S3_ENDPOINT" s3 ls "s3://verglas-test/measure/" \
+      --recursive 2>/dev/null | wc -l | tr -d ' ')
     out=$(mktemp -d)
     get_mismatched=0
     for i in $(seq 1 "$COUNT"); do
@@ -143,12 +147,20 @@ case "${1:-}" in
     d_ns=$(( $(date +%s%N) - d_start ))
 
     rm -rf "$src"
-    echo "objects=$COUNT object_bytes=$OBJECT_BYTES total_bytes=$total_bytes"
-    echo "verglas_seconds=$(awk "BEGIN{printf \"%.3f\", $v_ns/1000000000}")"
-    echo "direct_seconds=$(awk "BEGIN{printf \"%.3f\", $d_ns/1000000000}")"
-    echo "verglas_mib_s=$(awk "BEGIN{printf \"%.2f\", ($total_bytes/1048576)/($v_ns/1000000000)}")"
-    echo "direct_mib_s=$(awk "BEGIN{printf \"%.2f\", ($total_bytes/1048576)/($d_ns/1000000000)}")"
-    echo "throughput_ratio=$(awk "BEGIN{printf \"%.3f\", $d_ns/$v_ns}")"
+    # python, not awk: the shell quoting around awk's BEGIN block did not
+    # survive and silently produced empty metrics.
+    python3 - "$COUNT" "$OBJECT_BYTES" "$v_ns" "$d_ns" <<'PYEOF'
+import sys
+count, obj, v_ns, d_ns = (int(x) for x in sys.argv[1:5])
+total = count * obj
+v_s, d_s = v_ns / 1e9, d_ns / 1e9
+print(f"objects={count} object_bytes={obj} total_bytes={total}")
+print(f"verglas_seconds={v_s:.3f}")
+print(f"direct_seconds={d_s:.3f}")
+print(f"verglas_mib_s={(total/1048576)/v_s:.2f}")
+print(f"direct_mib_s={(total/1048576)/d_s:.2f}")
+print(f"throughput_ratio={d_s/v_s:.3f}")
+PYEOF
     ;;
   *)
     echo "usage: $0 {up|down|putcount|measure|throughput}" >&2; exit 64 ;;

@@ -171,29 +171,6 @@ pub(crate) mod tests {
         *,
     };
     use crate::client::new_client_from_default_config;
-    pub(crate) async fn authorizer_for_empty_store()
-    -> (BasicOpenFgaServiceClient, OpenFGAAuthorizer) {
-        let client = new_client_from_default_config().await.unwrap();
-
-        let server_id = ServerId::new_random();
-        let test_uuid = uuid::Uuid::now_v7();
-        let store_name = format!("test_store_{test_uuid}");
-        migrate(&client, Some(store_name.clone()), server_id)
-            .await
-            .unwrap();
-
-        let authorizer = new_authorizer(
-            client.clone(),
-            Some(store_name),
-            ConsistencyPreference::HigherConsistency,
-            server_id,
-        )
-        .await
-        .unwrap();
-
-        (client, authorizer)
-    }
-
     mod openfga_integration_tests {
         use lakekeeper::tokio;
         use openfga_client::client::ReadAuthorizationModelsRequest;

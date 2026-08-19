@@ -290,6 +290,7 @@ mod tests {
         use super::super::*;
         use crate::config::CONFIG;
 
+        #[ignore = "requires a live Vault KV v2; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_write_read_secret() {
             let state = SecretsState::from_config(CONFIG.kv2.as_ref().unwrap())
@@ -310,6 +311,7 @@ mod tests {
             assert_eq!(&*read_secret.secret, &secret);
         }
 
+        #[ignore = "requires a live Vault KV v2; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_read_missing_secret() {
             let state = SecretsState::from_config(CONFIG.kv2.as_ref().unwrap())
@@ -325,6 +327,7 @@ mod tests {
             assert!(read_secret.unwrap().is_none());
         }
 
+        #[ignore = "requires a live Vault KV v2; see .config/nextest.toml"]
         #[tokio::test]
         async fn test_delete_secret() {
             let state = SecretsState::from_config(CONFIG.kv2.as_ref().expect("vault cfg missing"))

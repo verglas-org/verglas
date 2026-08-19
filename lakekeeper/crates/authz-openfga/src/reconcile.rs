@@ -200,10 +200,9 @@ where
 ///
 /// The caller passes a `lock_guard` that it owns for the duration of the
 /// call; this module never inspects it and the guard drops at function
-/// exit. Use it to serialize concurrent reconciles — e.g. acquire a
-/// Postgres advisory lock with
-/// a catalog-store advisory lock (
-/// state, RECONCILE_LOCK_KEY)` and pass the guard in. Single-replica
+/// exit. Use it to serialize concurrent reconciles — acquire a catalog-store
+/// advisory lock keyed by `RECONCILE_LOCK_KEY` and pass the guard in.
+/// Single-replica
 /// deployments may pass [`lakekeeper::service::maintenance::NoMaintenanceLock`]
 /// as an explicit opt-out.
 ///
