@@ -3,7 +3,7 @@
 # are the authoritative record of how many S3 PUTs the cluster issued.
 #
 # Bring it up with ./run.sh up. Do not point this at a real bucket.
-name: verglas-base
+name: verglas-perf
 
 services:
   minio:
@@ -40,7 +40,7 @@ services:
       context: ../..
       target: verglas-cache-node
       args:
-        CACHE_NS: base
+        CACHE_NS: perf
     depends_on:
       minio-init:
         condition: service_completed_successfully
@@ -65,12 +65,13 @@ services:
       VERGLAS_LOG_FORMAT: json
     volumes:
       - ./node1.toml:/etc/verglas/config.toml:ro
-      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/backend-r2:/etc/verglas/backend-r2:ro
       - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
       - node1-state:/var/lib/verglas
     ports:
       - "18333:8333"
       - "18334:8334"
+    cpus: "6"
 
   node2:
     <<: *node
@@ -79,12 +80,13 @@ services:
       VERGLAS_NODE_ID: node2
     volumes:
       - ./node2.toml:/etc/verglas/config.toml:ro
-      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/backend-r2:/etc/verglas/backend-r2:ro
       - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
       - node2-state:/var/lib/verglas
     ports:
       - "18343:8333"
       - "18344:8334"
+    cpus: "6"
 
   node3:
     <<: *node
@@ -93,12 +95,13 @@ services:
       VERGLAS_NODE_ID: node3
     volumes:
       - ./node3.toml:/etc/verglas/config.toml:ro
-      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/backend-r2:/etc/verglas/backend-r2:ro
       - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
       - node3-state:/var/lib/verglas
     ports:
       - "18353:8333"
       - "18354:8334"
+    cpus: "6"
 
   node4:
     <<: *node
@@ -107,12 +110,13 @@ services:
       VERGLAS_NODE_ID: node4
     volumes:
       - ./node4.toml:/etc/verglas/config.toml:ro
-      - ./credentials/backend:/etc/verglas/backend-credentials:ro
+      - ./credentials/backend-r2:/etc/verglas/backend-r2:ro
       - ./credentials/endpoint:/etc/verglas/endpoint-credentials:ro
       - node4-state:/var/lib/verglas
     ports:
       - "18363:8333"
       - "18364:8334"
+    cpus: "6"
 
   # The Verglas fork of Lakekeeper, serving the Iceberg REST catalog over the
   # four nodes' CRaft ingress. This is the product under test: the catalog's
@@ -124,7 +128,7 @@ services:
       context: ../..
       dockerfile: tests/cluster-local/Dockerfile.lakekeeper
       args:
-        CACHE_NS: ${CACHE_NS:-base}
+        CACHE_NS: perf
     depends_on:
       node1:
         condition: service_started

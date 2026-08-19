@@ -26,19 +26,19 @@ ack_deadline_ms = 2000
 
 [backend]
 provider = "s3"
-bucket = "verglas-test"
-bucket_globs = ["verglas-test"]
-endpoint = "http://minio:9000"
-region = "us-east-1"
-allow_http = true
-credentials_file = "/etc/verglas/backend-credentials"
+bucket = "cascadelabs"
+bucket_globs = ["cascadelabs"]
+endpoint = "https://856387ff129d6ed69bf6fc5abe57ab22.r2.cloudflarestorage.com"
+region = "auto"
+allow_http = false
+credentials_file = "/etc/verglas/backend-r2"
 
 # Required once the authoritative cache ring is enabled: the explicitly
 # authorized namespace for consensus-committed catalog checkpoints. Catalog
 # awareness is off in this harness, so nothing writes here during an
 # object-path measurement.
 [catalog_archive]
-bucket = "verglas-test"
+bucket = "cascadelabs"
 prefix = "_verglas/catalog"
 
 [auth]

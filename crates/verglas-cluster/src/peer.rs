@@ -352,28 +352,33 @@ struct FragmentListRequest {
 
 /// Worker-thread count for the dedicated peer runtime.
 ///
-/// This runtime is the only path for every fragment placement/read/headroom
-/// RPC this node receives — write-back data fragments AND the consensus
-/// payload-certificate fragments `RingPayloadTransport` places through the
-/// same `FragmentTransport` (#180) — plus all inbound Raft RPC traffic for
-/// every hosted group. A fixed, small thread count is a hard ceiling on how
-/// many of those requests this node can run at once, independent of load: at
-/// concurrency 16 (PERF-OBJECTIVE.md M1) a busy node can see well over a
-/// dozen fragment placements land in the same short window, and a pool too
-/// small to run them concurrently makes the rest queue behind each other on
-/// this runtime until the write-back ack deadline expires — failing a
-/// perfectly healthy write (`write-back quorum requires N durable fragments;
-/// only M available`) with no peer down and no peer genuinely slow. Scale
-/// with the host instead of pinning a constant so serving capacity tracks the
-/// machine it runs on; clamp so a constrained host still gets real
-/// concurrency for this small, mostly I/O-bound workload, and a large host
-/// does not hand this internal RPC plane an unbounded share of its cores
-/// (budgets are hard ceilings — a provably polite tenant in colocated mode).
+/// This runtime carries every fragment placement, read, and headroom RPC this
+/// node receives, plus all inbound Raft traffic for every hosted group. Sizing
+/// it below the machine's allotment caps how much of the box the node can use;
+/// sizing it above oversubscribes.
+///
+/// Use the reported vCPU thread count. `available_parallelism` honours the
+/// cgroup CPU quota on Linux where one is set, and falls back to the affinity
+/// mask otherwise, so a node in a 4 vCPU container gets 4 and a node on a
+/// 64 vCPU host gets 64. Do not clamp to a constant: a fixed upper bound
+/// leaves most of a large machine idle, which is the whole reason this
+/// runtime was a bottleneck at 2 threads.
+///
+/// `VERGLAS_PEER_RUNTIME_THREADS` overrides it for a colocated deployment that
+/// must hand the RPC plane less than the full machine (budgets are hard
+/// ceilings).
 fn peer_runtime_worker_threads() -> usize {
+    if let Some(explicit) = std::env::var("VERGLAS_PEER_RUNTIME_THREADS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+    {
+        return explicit;
+    }
     std::thread::available_parallelism()
-        .map(|n| n.get())
+        .map(std::num::NonZeroUsize::get)
         .unwrap_or(8)
-        .clamp(8, 16)
+        .max(2)
 }
 
 /// The peer-fetch server: listens on this node's advertised address and serves
