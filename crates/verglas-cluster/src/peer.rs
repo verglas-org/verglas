@@ -350,6 +350,32 @@ struct FragmentListRequest {
     prefix: String,
 }
 
+/// Worker-thread count for the dedicated peer runtime.
+///
+/// This runtime is the only path for every fragment placement/read/headroom
+/// RPC this node receives — write-back data fragments AND the consensus
+/// payload-certificate fragments `RingPayloadTransport` places through the
+/// same `FragmentTransport` (#180) — plus all inbound Raft RPC traffic for
+/// every hosted group. A fixed, small thread count is a hard ceiling on how
+/// many of those requests this node can run at once, independent of load: at
+/// concurrency 16 (PERF-OBJECTIVE.md M1) a busy node can see well over a
+/// dozen fragment placements land in the same short window, and a pool too
+/// small to run them concurrently makes the rest queue behind each other on
+/// this runtime until the write-back ack deadline expires — failing a
+/// perfectly healthy write (`write-back quorum requires N durable fragments;
+/// only M available`) with no peer down and no peer genuinely slow. Scale
+/// with the host instead of pinning a constant so serving capacity tracks the
+/// machine it runs on; clamp so a constrained host still gets real
+/// concurrency for this small, mostly I/O-bound workload, and a large host
+/// does not hand this internal RPC plane an unbounded share of its cores
+/// (budgets are hard ceilings — a provably polite tenant in colocated mode).
+fn peer_runtime_worker_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(8, 16)
+}
+
 /// The peer-fetch server: listens on this node's advertised address and serves
 /// blocks from the local cache tiers only. Its listener has a dedicated Tokio
 /// runtime so Raft vote and fragment RPCs remain schedulable while the public
@@ -469,7 +495,7 @@ impl PeerServer {
             .name("verglas-peer-rpc".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    .worker_threads(peer_runtime_worker_threads())
                     .enable_all()
                     .build()
                 {
