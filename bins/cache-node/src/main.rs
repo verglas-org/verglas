@@ -18,6 +18,7 @@ mod blockdev;
 mod consensus;
 mod logging;
 mod nbd;
+mod object_batch;
 mod page_cache;
 mod ring;
 mod safekeeper;

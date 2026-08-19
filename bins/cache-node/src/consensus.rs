@@ -30,6 +30,7 @@ use verglas_consensus::{
 use verglas_core::CacheKey;
 use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
+use crate::object_batch::{BatchSubmitter, ObjectCommitBatcher};
 use crate::ring::RingPlane;
 
 type Raft = openraft::Raft<VerglasRaftConfig>;
@@ -257,12 +258,26 @@ pub struct ConsensusPlane {
 /// Commits staged immutable-object certificates through per-object Raft groups.
 pub struct ObjectConsensusCommitter {
     plane: Arc<ConsensusPlane>,
+    /// Folds concurrent object commits bound for one group into single Raft
+    /// entries. Without it every client write costs a round trip and
+    /// throughput is capped at `groups / round_trip`.
+    batcher: crate::object_batch::ObjectCommitBatcher,
 }
 
 impl ObjectConsensusCommitter {
-    /// Binds S3 write-back publication to the process's universal Multi-Raft plane.
-    pub fn new(plane: Arc<ConsensusPlane>) -> Self {
-        Self { plane }
+    /// Binds S3 write-back publication to the process's universal Multi-Raft
+    /// plane, folding concurrent commits under `linger`/`max_batch`.
+    pub fn new(
+        plane: Arc<ConsensusPlane>,
+        linger: std::time::Duration,
+        max_batch: usize,
+    ) -> Self {
+        let batcher = crate::object_batch::ObjectCommitBatcher::new(
+            Arc::new(ObjectGroupSubmitter::new(Arc::clone(&plane))),
+            linger,
+            max_batch,
+        );
+        Self { plane, batcher }
     }
 }
 
@@ -295,10 +310,26 @@ fn payload_request_id(payload: &[u8]) -> Result<u128, String> {
     Ok(u128::from_be_bytes(bytes))
 }
 
-#[async_trait::async_trait]
-impl ConsensusCommitter for ObjectConsensusCommitter {
-    async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
-        let identity = serde_json::json!({
+
+/// Appends one Raft entry per batch of staged objects.
+///
+/// The object group treats its payload as opaque bytes and the caller consumes
+/// only the applied index, so folding many object identities into one entry
+/// needs no state-machine change. Atomicity is inherent: one entry either
+/// applies or it does not.
+pub(crate) struct ObjectGroupSubmitter {
+    plane: Arc<ConsensusPlane>,
+}
+
+impl ObjectGroupSubmitter {
+    /// Binds the submitter to the consensus plane it appends through.
+    pub(crate) fn new(plane: Arc<ConsensusPlane>) -> Self {
+        Self { plane }
+    }
+
+    /// Renders one staged object's durable identity.
+    fn identity(staged: &StagedObject) -> serde_json::Value {
+        serde_json::json!({
             "storage_binding": staged.key.storage_binding_id,
             "bucket": staged.key.bucket,
             "key": staged.key.key,
@@ -311,23 +342,39 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
             "placements": staged.placements.iter().map(|placement| {
                 serde_json::json!({"index": placement.index, "node": placement.node})
             }).collect::<Vec<_>>(),
-        });
-        let payload = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::object_batch::BatchSubmitter for ObjectGroupSubmitter {
+    async fn submit_batch(
+        &self,
+        group: &str,
+        items: &[StagedObject],
+    ) -> Result<ObjectCommit, String> {
+        if items.is_empty() {
+            return Err("cannot commit an empty object batch".to_owned());
+        }
+        let payload = serde_json::to_vec(
+            &items.iter().map(Self::identity).collect::<Vec<_>>(),
+        )
+        .map_err(|error| error.to_string())?;
         let request_id = payload_request_id(&payload)?;
-        let group = object_consensus_group(&staged.key);
-        let holders = staged
-            .placements
+        // Every holder named by any object in the batch, deduplicated.
+        let holders: std::collections::BTreeSet<_> = items
             .iter()
+            .flat_map(|staged| staged.placements.iter())
             .map(|placement| numeric_node_id(&placement.node))
             .collect();
         match self
             .plane
             .submit(
-                &group,
+                group,
                 GroupRequest::CommitObject {
                     request_id,
                     payload,
-                    holders,
+                    holders: holders.into_iter().collect(),
                     mode: ReplicationMode::Coded,
                 },
             )
@@ -339,6 +386,20 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
             }),
             _ => Err("object group returned a non-applied response".to_owned()),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConsensusCommitter for ObjectConsensusCommitter {
+    async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
+        // Enqueue rather than append. The batcher folds every staged object
+        // bound for the same group inside one bounded linger window into a
+        // single Raft entry, so client throughput is no longer one round trip
+        // per object. The caller still returns only after ITS object is
+        // committed; batching changes how many entries the log takes, not what
+        // the acknowledgement promises.
+        let group = object_consensus_group(&staged.key);
+        self.batcher.commit(group, staged).await
     }
 
     async fn commit_pack(&self, staged: StagedPack) -> Result<PackCommit, String> {

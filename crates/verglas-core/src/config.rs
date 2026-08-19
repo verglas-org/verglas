@@ -339,6 +339,21 @@ pub struct Writeback {
     /// on a schedule.
     #[serde(default = "default_offload_drain_interval_secs")]
     pub offload_drain_interval_secs: u64,
+    /// Bounded linger window, in milliseconds, that the object-header
+    /// consensus commit waits for concurrent commits to the same shard
+    /// before flushing whatever has accumulated as one Raft entry (#RIME-P1).
+    /// Amortises the per-object Raft round trip that otherwise caps client
+    /// throughput at `shards / raft_round_trip`
+    /// (`tests/cluster-local/PERF-OBJECTIVE.md`). Internal tuning knob, not
+    /// surfaced in the generated config.
+    #[serde(default = "default_object_commit_linger_ms")]
+    pub object_commit_linger_ms: u64,
+    /// Maximum staged objects folded into one batched consensus commit,
+    /// whichever comes first against the linger window. Bounds how large one
+    /// Raft entry (and its all-or-nothing atomicity) gets. Internal tuning
+    /// knob, not surfaced in the generated config.
+    #[serde(default = "default_object_commit_max_batch")]
+    pub object_commit_max_batch: usize,
 }
 
 /// One opt-in key prefix, optionally overriding the default fragment geometry.
@@ -373,6 +388,8 @@ impl Default for Writeback {
             prefixes: Vec::new(),
             offload_size_limit_bytes: default_offload_size_limit_bytes(),
             offload_drain_interval_secs: default_offload_drain_interval_secs(),
+            object_commit_linger_ms: default_object_commit_linger_ms(),
+            object_commit_max_batch: default_object_commit_max_batch(),
         }
     }
 }
@@ -407,6 +424,18 @@ impl Writeback {
         if self.offload_drain_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "cache.writeback.offload_drain_interval_secs",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.object_commit_linger_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.object_commit_linger_ms",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.object_commit_max_batch == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.object_commit_max_batch",
                 "must be at least 1".into(),
             ));
         }
@@ -473,6 +502,24 @@ fn default_offload_size_limit_bytes() -> ByteSize {
 /// the frozen benchmark's 30 s post-write window.
 fn default_offload_drain_interval_secs() -> u64 {
     5
+}
+
+/// The documented default object-header commit linger: 5 milliseconds.
+/// Amortises the per-object Raft round trip (tens to low-hundreds of
+/// milliseconds) over a burst of concurrent writes to the same shard, while
+/// staying far below the write-back ack deadline so a lone write still acks
+/// promptly.
+fn default_object_commit_linger_ms() -> u64 {
+    5
+}
+
+/// The documented default cap on staged objects per batched consensus
+/// commit. Large enough to absorb a full concurrency-16 burst to one shard
+/// (`OBJECT_CONSENSUS_SHARDS = 4` in `bins/cache-node/src/consensus.rs`) in a
+/// single Raft entry; small enough that one batch's header payload and its
+/// all-or-nothing retry blast radius both stay bounded.
+fn default_object_commit_max_batch() -> usize {
+    64
 }
 
 /// The documented default mutable-mapping TTL: 5 seconds (#14).

@@ -1002,6 +1002,8 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             Arc::clone(&origin),
             Arc::new(crate::consensus::ObjectConsensusCommitter::new(
                 object_consensus.ok_or("ring write-back requires the consensus plane")?,
+                std::time::Duration::from_millis(config.cache.writeback.object_commit_linger_ms),
+                config.cache.writeback.object_commit_max_batch,
             )),
             std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
             config.cache.writeback.offload_size_limit_bytes.0,
