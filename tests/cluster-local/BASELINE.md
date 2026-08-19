@@ -51,7 +51,11 @@ Baseline 1000 → target ≤ 1.
 - MinIO's counter is process-wide. Nothing else writes to it during a run, and
   the measurement is a before/after delta, so unrelated earlier traffic (the
   count starts at 1103 from setup probes) does not affect the result.
-- The 30 s drain window is fixed. A candidate that defers uploads past it would
-  report a falsely low count; gate G5's post-drain readback and the explicit
-  drain requirement in section 4 are what catch that. Any candidate reporting
-  a delta of 0 must be checked for deferred work rather than accepted.
+- The original protocol used a fixed 30 s drain window. Candidate D showed why
+  that is wrong: it reported `origin_put_delta=3` while still flushing, and the
+  count kept climbing for many minutes afterwards. The window rewarded deferred
+  work. The protocol now polls to quiescence and reports `quiesced`.
+- G5 is split. Candidate D passed GET by key and failed LIST entirely
+  (`KeyCount: 0`), so a single "readback" number conflated two independent
+  properties. They are now reported separately as `list_key_count` and
+  `get_mismatched`.

@@ -25,7 +25,8 @@ All are binary. A candidate failing any gate is rejected regardless of metrics.
 | G2 | `cargo clippy --workspace --all-targets -- -D warnings` exits 0 |
 | G3 | `cargo fmt --all --check` exits 0 |
 | G4 | `cargo test --workspace` exits 0; no existing test deleted or `#[ignore]`d to pass |
-| G5 | Every object written by the measurement reads back byte-identical through the Verglas S3 endpoint, both before and after an explicit drain |
+| G5a | `list-objects-v2` on the written prefix enumerates all written keys. Packing must not make logical keys invisible to enumeration |
+| G5b | Every written key returns byte-identical content on GET through the Verglas S3 endpoint |
 | G6 | `propagate`, `propagate_locked`, and `propagate_once` are gone from `WriteCoordinator`. No fallback to per-object propagation remains |
 | G7 | A `WORKLOG.md` entry exists in every crate the candidate touches |
 | G8 | The pack index commits through `ConsensusGroup`. A sidecar file is a rejection |
@@ -59,7 +60,10 @@ Fixed. A candidate that changes it is rejected.
   default of 10 overruns the ring's peer-RPC timeouts on Docker Desktop's VM
   network and fails the write quorum; 4 is sustained. This is a property of the
   harness host, not of the code under test
-- Drain window: 30 s after the last client PUT, then read the counter
+- After the last client PUT, poll the origin PUT counter until it stops moving
+  (4 consecutive equal reads, 5 s apart), then read it. A fixed drain window
+  silently rewards a candidate that defers uploads past it; quiescence does
+  not. The run reports `quiesced=yes|no`, and `quiesced=no` invalidates M1
 - Command: `./run.sh measure`
 
 ## Baseline
