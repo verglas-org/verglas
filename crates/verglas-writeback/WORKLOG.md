@@ -128,3 +128,51 @@
   §6) stays a small step; that unification is not done here. Tests written
   first in `tests/offload.rs` and `offload.rs`'s own unit tests; confirmed
   failing to compile against the pre-#164 API before implementing.
+
+- #180 (RIME perf candidate P2, negative result): investigated moving
+  `finish_stream_ack`'s consensus commit off the client-ack path (defer it to
+  a background task) to remove the per-object Raft round trip from write-back
+  throughput. Rejected after proof by test, not by inspection.
+
+  The write-back journal (`JournalStore`) is local, unreplicated filesystem
+  state on the accepting node only — nothing else in this codebase
+  reconstructs it from a peer. The synchronous `ConsensusCommitter::commit`
+  call is the only mechanism that makes an object's identity, geometry, and
+  fragment placements durable anywhere off that one node. Deferring it means
+  the client can be acked before that replication happens; if the accepting
+  node is then lost (the exact case the write-back durability contract must
+  survive — `w=3` fragments living on other nodes is worthless if nothing
+  durable maps them back to a key), the object is unrecoverable.
+
+  Added `ack_never_precedes_the_consensus_commit_completing` to
+  `tests/coordinator.rs` (a `BlockingCommitter` fake that stalls inside
+  `commit` so the test can observe ordering directly) and confirmed it passes
+  against the current synchronous implementation. Then experimentally
+  rewrote `finish_stream_ack` to spawn the commit in the background and ack
+  immediately after fragment quorum + local journal fsync. Both the new test
+  and the pre-existing `staged_fragments_do_not_ack_before_the_consensus_commit`
+  (which uses a `RejectingCommitter` to prove fragment durability alone must
+  never acknowledge) failed:
+
+  ```
+  thread 'ack_never_precedes_the_consensus_commit_completing' panicked:
+  the client must not be acked while the commit is still in flight
+
+  thread 'staged_fragments_do_not_ack_before_the_consensus_commit' panicked:
+  a non-committed header cannot acknowledge the PUT: PutOutcome { e_tag:
+  Some("\"e7cd741eca0e9a2d61976038472228bd\""), ... }
+  ```
+
+  The second failure is the sharper proof: with a committer that will *never*
+  succeed, the deferred design still returns a success `PutOutcome` to the
+  client. That is exactly gate P4 in `tests/cluster-local/PERF-OBJECTIVE.md`
+  ("making the commit best-effort with no ordering guarantee is a
+  rejection"), demonstrated rather than merely asserted. Reverted
+  `coordinator.rs` to the original synchronous commit (byte-identical to
+  `f5f5104d`) and kept the new regression test, which now guards against a
+  future attempt to make the same change without re-deriving this proof.
+  Conclusion: the commit must stay on the ack path under the current
+  architecture; the shard-count/RTT throughput ceiling needs a different
+  candidate (e.g., batching many concurrent objects into fewer Raft round
+  trips while still awaiting the commit before ack), not removing the
+  synchronous commit.
