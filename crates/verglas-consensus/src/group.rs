@@ -4,9 +4,12 @@
 //! verifies the large body first, commits its small header, then serves it only
 //! after a linearizable Raft fence and local state-machine application.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -117,6 +120,37 @@ impl ConsensusGroup {
     /// Returns the leader currently observed by this local Raft replica.
     pub async fn leader_id(&self) -> Option<u64> {
         self.raft.current_leader().await
+    }
+
+    /// Waits for this replica to observe an elected leader, or returns `None`
+    /// once `timeout` elapses without one.
+    ///
+    /// This blocks on OpenRaft's own metrics-change signal rather than polling
+    /// on a fixed interval: the wait wakes the instant the local Raft core
+    /// reports a leader (or any other metrics change worth re-checking), so
+    /// submit latency tracks real election time instead of an arbitrary poll
+    /// tick. A group that never elects a leader within `timeout` returns
+    /// `None`; the caller turns that into a client-visible error rather than
+    /// retrying further.
+    pub async fn await_leader(&self, timeout: Duration) -> Result<Option<u64>, GroupError> {
+        if let Some(leader) = self.raft.current_leader().await {
+            return Ok(Some(leader));
+        }
+        match self
+            .raft
+            .wait(Some(timeout))
+            .metrics(
+                |metrics| metrics.current_leader.is_some(),
+                "await an elected consensus leader",
+            )
+            .await
+        {
+            Ok(metrics) => Ok(metrics.current_leader),
+            Err(openraft::metrics::WaitError::Timeout(_, _)) => Ok(None),
+            Err(openraft::metrics::WaitError::ShuttingDown) => Err(GroupError::Raft(
+                "consensus core is shutting down".to_owned(),
+            )),
+        }
     }
 
     /// Executes one universal catalog or WAL operation through this group.

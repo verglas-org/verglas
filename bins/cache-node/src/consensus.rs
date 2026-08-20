@@ -24,8 +24,8 @@ use verglas_cluster::{
     RaftHttpTransport,
 };
 use verglas_consensus::{
-    ConsensusGroup, DistributedPayloadStore, GroupError, GroupRequest, GroupResponse,
-    PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
+    ConsensusGroup, DistributedPayloadStore, GroupRequest, GroupResponse, PersistentLogStore,
+    PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
 use verglas_core::CacheKey;
 use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
@@ -721,6 +721,14 @@ impl ConsensusPlane {
     }
 
     /// Routes one unchanged request within the caller-selected hard ceiling.
+    ///
+    /// Leader resolution is event-driven: this waits on Raft's own metrics
+    /// signal for an elected leader instead of polling on a fixed interval
+    /// (see [`ConsensusGroup::await_leader`]). Once a leader is known, this
+    /// makes exactly one execute-or-forward attempt — no retry loop. A leader
+    /// that refuses the forwarded command, or a group that never elects a
+    /// leader within `timeout`, surfaces as an error immediately rather than
+    /// being silently retried into the timeout.
     async fn submit_with_timeout(
         self: &Arc<Self>,
         group: &str,
@@ -728,49 +736,17 @@ impl ConsensusPlane {
         timeout: Duration,
     ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
-        tokio::time::timeout(timeout, async {
-            let t_submit = std::time::Instant::now();
-            let mut spins = 0usize;
-            let mut forwarded = 0usize;
-            loop {
-                if let Some(leader) = local.leader_id().await {
-                    if leader == self.ring.safekeeper_id() {
-                        match local.execute(request.clone()).await {
-                            Ok(response) => return Ok(response),
-                            Err(GroupError::Raft(_)) => {}
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    let encoded = serde_json::to_vec(&request)?;
-                    forwarded += 1;
-                    match self.network(group)?.command(leader, encoded).await {
-                        Ok(response) => {
-                            return serde_json::from_slice(&response).map_err(Into::into);
-                        }
-                        Err(error) => {
-                            if forwarded <= 2 || forwarded % 8 == 0 {
-                                eprintln!(
-                                    "FORWARDFAIL group={group} leader={leader} self={} err={error}",
-                                    self.ring.safekeeper_id()
-                                );
-                            }
-                        }
-                    }
-                }
-                // A leader may die after this replica observes it but before the
-                // command reaches it. Re-observe Raft instead of treating that
-                // transport race as a client-visible command rejection.
-                spins += 1;
-                if spins == 1 || spins % 8 == 0 {
-                    eprintln!(
-                        "SUBMIT spin={spins} forwarded={forwarded} elapsed_ms={:.1} group={group}",
-                        t_submit.elapsed().as_secs_f64() * 1000.0
-                    );
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
-        })
-        .await?
+        let Some(leader) = local.await_leader(timeout).await? else {
+            return Err(
+                format!("consensus group `{group}` elected no leader within {timeout:?}").into(),
+            );
+        };
+        if leader == self.ring.safekeeper_id() {
+            return local.execute(request).await.map_err(Into::into);
+        }
+        let encoded = serde_json::to_vec(&request)?;
+        let response = self.network(group)?.command(leader, encoded).await?;
+        serde_json::from_slice(&response).map_err(Into::into)
     }
 
     /// Returns the locally opened authoritative group names in deterministic order.

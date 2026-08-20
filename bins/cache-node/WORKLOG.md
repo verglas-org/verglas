@@ -334,3 +334,10 @@
   `cache.writeback.offload_size_limit_bytes` into `WriteCoordinator::new` and
   spawns `spawn_offload_drain_loop` alongside the existing repair/scrub
   loops, at `cache.writeback.offload_drain_interval_secs`.
+- #164: Removed the polling retry loop from the consensus submit path. Leader
+  resolution now waits on OpenRaft's own metrics-change channel through
+  `ConsensusGroup::await_leader`, and a submit makes exactly one attempt:
+  execute locally when this node leads, otherwise forward once. A leader that
+  refuses the command now surfaces that error immediately instead of being
+  retried behind a fixed 25 ms sleep, which is what disguised a total forward
+  failure as 116 ms of "slow consensus" in the profile.

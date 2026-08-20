@@ -237,3 +237,10 @@
   window raced real fsync latency on loaded 2-core CI runners. The blocked
   frame now sleeps 1000ms against a 500ms vote timeout, so the bypass
   invariant is still strictly proven while a slow disk cannot flake it.
+- #164: Removed the polling retry loop from the consensus submit path. Leader
+  resolution now waits on OpenRaft's own metrics-change channel through
+  `ConsensusGroup::await_leader`, and a submit makes exactly one attempt:
+  execute locally when this node leads, otherwise forward once. A leader that
+  refuses the command now surfaces that error immediately instead of being
+  retried behind a fixed 25 ms sleep, which is what disguised a total forward
+  failure as 116 ms of "slow consensus" in the profile.
