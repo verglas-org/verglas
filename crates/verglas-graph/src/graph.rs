@@ -20,7 +20,7 @@ use crate::csr::AdjacencyIndex;
 use crate::error::Result;
 use crate::index::{self, IndexBuildReport};
 use crate::model::{Direction, Edge, Neighbor, Node, Path, Reached, Subgraph};
-use crate::scan::{live_edges, load_edges};
+use crate::scan::{latest_nodes_by_id, live_edges, load_edges, load_nodes};
 use crate::schema::{
     EDGES_TABLE, NODES_TABLE, edge_to_row, edges_schema, node_to_row, nodes_schema,
 };
@@ -132,6 +132,18 @@ impl Graph {
     pub async fn current_edges_snapshot(&self) -> Result<Option<i64>> {
         let table = self.catalog.load_table(&self.edges_ident).await?;
         Ok(table.metadata().current_snapshot_id())
+    }
+
+    /// Loads every node as of a snapshot, reduced to one row per id.
+    pub async fn load_nodes(&self, at: Option<i64>) -> Result<Vec<Node>> {
+        let (nodes, _snapshot) = load_nodes(self.catalog.clone(), &self.nodes_ident, at).await?;
+        Ok(latest_nodes_by_id(nodes))
+    }
+
+    /// Loads live edges as of a snapshot, applying the supersede filter.
+    pub async fn load_live_edges(&self, at: Option<i64>) -> Result<Vec<Edge>> {
+        let (edges, _snapshot) = load_edges(self.catalog.clone(), &self.edges_ident, at).await?;
+        Ok(live_edges(edges))
     }
 
     /// Builds the adjacency index as of a snapshot (the current one when `at` is

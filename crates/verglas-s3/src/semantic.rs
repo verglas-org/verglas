@@ -844,10 +844,25 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     json!({"paths": reader.paths(required_bounded_string(&input, "sourceId", 1, 1024)?, required_bounded_string(&input, "targetId", 1, 1024)?, required_u32(&input, "maxHops")?, direction(&input)?, &filter(&input)?).into_iter().map(path_to_json).collect::<Vec<_>>() }),
                 )
             }
-            "GetGraph" => Ok(graph_output(
-                required_bounded_string(&input, "graphName", 1, 255)?,
-                graph.current_edges_snapshot().await.map_err(graph_error)?,
-            )),
+            "GetGraph" => {
+                let graph_name = required_bounded_string(&input, "graphName", 1, 255)?;
+                let snapshot = graph.current_edges_snapshot().await.map_err(graph_error)?;
+                let nodes = graph.load_nodes(None).await.map_err(graph_error)?;
+                let edges = graph.load_live_edges(None).await.map_err(graph_error)?;
+                let mut output = graph_output(graph_name, snapshot)
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default();
+                output.insert(
+                    "nodes".to_owned(),
+                    Value::Array(nodes.into_iter().map(full_node_to_json).collect()),
+                );
+                output.insert(
+                    "edges".to_owned(),
+                    Value::Array(edges.into_iter().map(full_edge_to_json).collect()),
+                );
+                Ok(Value::Object(output))
+            }
             _ => Err(SemanticError::validation("unknown graph operation")),
         }
     }
@@ -2735,6 +2750,32 @@ fn graph_output(graph_name: &str, snapshot: Option<i64>) -> Value {
         output.insert("edgesSnapshotId".to_owned(), json!(snapshot));
     }
     Value::Object(output)
+}
+
+/// Renders a full durable node (id, labels, properties) for GetGraph dumps.
+fn full_node_to_json(node: Node) -> Value {
+    json!({
+        "id": node.id,
+        "labels": node.labels,
+        "properties": Value::Object(node.properties),
+    })
+}
+
+/// Renders a full live edge for GetGraph dumps.
+fn full_edge_to_json(edge: Edge) -> Value {
+    let mut output = json!({
+        "edgeId": edge.edge_id,
+        "sourceId": edge.src_id,
+        "predicate": edge.predicate,
+        "targetId": edge.dst_id,
+        "confidence": edge.confidence,
+        "provenance": edge.provenance,
+        "properties": Value::Object(edge.properties),
+    });
+    if let Some(supersedes) = edge.supersedes {
+        output["supersedes"] = json!(supersedes);
+    }
+    output
 }
 
 /// Renders engine direction in the Graph REST-JSON enum spelling.
