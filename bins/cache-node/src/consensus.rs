@@ -892,9 +892,14 @@ impl ConsensusPlane {
             .map_err(|error| error.to_string())?;
         let request: GroupRequest =
             serde_json::from_slice(body).map_err(|error| error.to_string())?;
-        if local.leader_id().await != Some(self.ring.safekeeper_id()) {
-            return Err("forwarded command reached a non-leader".to_owned());
-        }
+        // No local leader check here. Group replicas open lazily, so this
+        // node's replica can still be catching up on leadership when a command
+        // arrives — including when it *is* the elected leader. Rejecting on a
+        // stale local view turned every forwarded command into a 409, which
+        // the sender retried behind a fixed sleep and reported as slow
+        // consensus. Raft is the authority: `execute` submits to the local
+        // replica and OpenRaft answers with ForwardToLeader when this node is
+        // not the leader, carrying the leader's identity.
         let response = local
             .execute(request)
             .await

@@ -457,9 +457,17 @@ impl<R: RaftAddressResolver> RaftHttpTransport<R> {
             .await
             .map_err(|error| NetworkError::new(&error))?;
         if !response.status().is_success() {
-            return Err(NetworkError::new(&io::Error::other(
-                "group leader refused application command",
-            )));
+            // Carry the peer's own explanation. Collapsing every non-2xx into a
+            // generic refusal hid a serde failure behind what looked like a
+            // leadership problem.
+            let status = response.status();
+            let detail = response
+                .text()
+                .await
+                .unwrap_or_else(|error| format!("<unreadable body: {error}>"));
+            return Err(NetworkError::new(&io::Error::other(format!(
+                "group leader rejected application command: {status}: {detail}"
+            ))));
         }
         response
             .bytes()
