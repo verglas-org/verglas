@@ -1,8 +1,11 @@
 //! Safe leader-facing composition of durable payload staging and Raft agreement.
 //!
-//! Callers cannot submit a bare storage certificate. This boundary stages and
-//! verifies the large body first, commits its small header, then serves it only
-//! after a linearizable Raft fence and local state-machine application.
+//! Callers cannot submit a bare storage certificate. For a body over
+//! `INLINE_PAYLOAD_THRESHOLD_BYTES`, this boundary stages and verifies it
+//! first, commits its small header, then serves it only after a linearizable
+//! Raft fence and local state-machine application. A smaller body skips
+//! staging: it rides inside the committed header itself, since the Raft
+//! append already replicates that header to every voter.
 
 use std::{
     sync::{
@@ -21,6 +24,23 @@ use crate::{
     PayloadStore, PersistentStateMachine, RaftCommand, RaftResponse, ReplicationMode, RequestId,
     VerglasRaftConfig, WalArchiveSegment,
 };
+
+/// Bodies at or under this size ride inside the Raft entry instead of being
+/// staged through the durable payload store.
+///
+/// Measured cost (`tests/cluster-local/RAFT-DEFECT.md`): the EC fragment
+/// quorum staging phase alone costs ~33 ms p50 of network round trips to a
+/// quorum of voters, and sealing costs a second such round trip after commit.
+/// Raft already fsyncs this header to every voter as part of the append this
+/// commit is already paying for, so a body that fits comfortably inside one
+/// log entry gains nothing from a second staged copy -- it only pays for one.
+/// 4 KiB comfortably covers the actual case that motivated this threshold
+/// (a few hundred bytes of object-commit JSON: storage binding, bucket, key,
+/// object id, length, payload hash, geometry, placements) while staying far
+/// below the point where growing the Raft log entry itself would start to
+/// matter. Real object and WAL payloads run from tens of KB to megabytes and
+/// keep taking the coded path untouched.
+const INLINE_PAYLOAD_THRESHOLD_BYTES: u64 = 4096;
 
 /// One independently elected consensus group as seen by its current leader.
 pub struct ConsensusGroup {
@@ -719,31 +739,54 @@ impl ConsensusGroup {
     ) -> Result<RaftResponse, GroupError> {
         let t_stage = std::time::Instant::now();
         let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
-        let staged = self
-            .payloads
-            .stage(
-                request,
-                &self.group,
-                configuration_generation,
-                mode,
-                &body,
-                holders,
-            )
-            .await?;
+        // A body at or under the inline threshold skips PayloadStore entirely:
+        // no stage, no seal, no certificate. Raft's own append already fsyncs
+        // this header to every voter, which is the durability staging exists
+        // to buy in the first place. See the threshold's doc comment for the
+        // cost accounting.
+        let (payload_len, base, staged_certificate) =
+            if body.len() as u64 <= INLINE_PAYLOAD_THRESHOLD_BYTES {
+                let base = EntryHeader::new_inline(
+                    self.group.clone(),
+                    configuration_generation,
+                    kind,
+                    request,
+                    writer_epoch,
+                    body,
+                )
+                .map_err(|_| GroupError::InvalidCertificate)?;
+                (base.payload_len(), base, None)
+            } else {
+                let staged = self
+                    .payloads
+                    .stage(
+                        request,
+                        &self.group,
+                        configuration_generation,
+                        mode,
+                        &body,
+                        holders,
+                    )
+                    .await?;
+                let base = EntryHeader::new(
+                    self.group.clone(),
+                    configuration_generation,
+                    kind,
+                    request,
+                    staged.length(),
+                    staged.hash(),
+                    writer_epoch,
+                    staged.certificate().clone(),
+                )
+                .map_err(|_| GroupError::InvalidCertificate)?;
+                (
+                    base.payload_len(),
+                    base,
+                    Some((staged.hash(), staged.certificate().clone())),
+                )
+            };
         let stage_ms = t_stage.elapsed().as_secs_f64() * 1000.0;
-        let payload_len = staged.length();
         let t_raft = std::time::Instant::now();
-        let base = EntryHeader::new(
-            self.group.clone(),
-            configuration_generation,
-            kind,
-            request,
-            staged.length(),
-            staged.hash(),
-            writer_epoch,
-            staged.certificate().clone(),
-        )
-        .map_err(|_| GroupError::InvalidCertificate)?;
         let header = decorate(base).map_err(|_| GroupError::InvalidCertificate)?;
         let response = self
             .raft
@@ -757,22 +800,24 @@ impl ConsensusGroup {
         ) {
             let raft_ms = t_raft.elapsed().as_secs_f64() * 1000.0;
             let t_final = std::time::Instant::now();
-            let log_id = self
-                .state_machine
-                .committed_log_id(response.index)
-                .await
-                .ok_or(GroupError::NotCommitted(response.index))?;
-            self.payloads
-                .seal(crate::SealRequest {
-                    hash: staged.hash(),
-                    group: &self.group,
-                    configuration_generation,
-                    request,
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: staged.certificate(),
-                })
-                .await?;
+            if let Some((hash, certificate)) = staged_certificate {
+                let log_id = self
+                    .state_machine
+                    .committed_log_id(response.index)
+                    .await
+                    .ok_or(GroupError::NotCommitted(response.index))?;
+                self.payloads
+                    .seal(crate::SealRequest {
+                        hash,
+                        group: &self.group,
+                        configuration_generation,
+                        request,
+                        term: log_id.leader_id.term,
+                        index: log_id.index,
+                        certificate: &certificate,
+                    })
+                    .await?;
+            }
             eprintln!(
                 "CONSTIMING stage_ms={stage_ms:.1} raft_ms={raft_ms:.1} finalize_ms={:.1} payload_bytes={payload_len}",
                 t_final.elapsed().as_secs_f64() * 1000.0
@@ -802,6 +847,11 @@ impl ConsensusGroup {
         if header.group() != self.group {
             return Err(GroupError::WrongGroup);
         }
+        // An inline body has no external representation: the header the Raft
+        // log just handed back already is the durable copy.
+        if let Some(body) = header.inline_body() {
+            return Ok(Bytes::copy_from_slice(body));
+        }
         let (certificate, configuration_generation, log_id) =
             if let Some(repair) = self.state_machine.repair_allocation(index).await {
                 (
@@ -811,7 +861,10 @@ impl ConsensusGroup {
                 )
             } else {
                 (
-                    header.certificate().clone(),
+                    header
+                        .certificate()
+                        .ok_or(GroupError::InvalidCertificate)?
+                        .clone(),
                     header.configuration_generation(),
                     self.state_machine
                         .committed_log_id(index)
@@ -848,6 +901,12 @@ impl ConsensusGroup {
     /// Repairs each committed immutable body then commits its target allocation.
     pub async fn repair_committed(&self, target_voters: Vec<u64>) -> Result<(), GroupError> {
         for (index, header) in self.state_machine.committed_headers().await {
+            // An inline body has no external representation to reallocate:
+            // it already lives in every voter's Raft log, membership changes
+            // included, so there is nothing here for repair to do.
+            if header.inline_body().is_some() {
+                continue;
+            }
             let (source_certificate, source_generation, source) =
                 if let Some(repair) = self.state_machine.repair_allocation(index).await {
                     (
@@ -857,7 +916,10 @@ impl ConsensusGroup {
                     )
                 } else {
                     (
-                        header.certificate().clone(),
+                        header
+                            .certificate()
+                            .ok_or(GroupError::InvalidCertificate)?
+                            .clone(),
                         header.configuration_generation(),
                         self.state_machine
                             .committed_log_id(index)
@@ -996,6 +1058,11 @@ impl ConsensusGroup {
         index: u64,
         header: &EntryHeader,
     ) -> Result<(), GroupError> {
+        // An inline body was already verified by the Raft commit that applied
+        // it locally; there is no external representation to seal or reconstruct.
+        if header.inline_body().is_some() {
+            return Ok(());
+        }
         let (certificate, configuration_generation, log_id) =
             if let Some(repair) = self.state_machine.repair_allocation(index).await {
                 (
@@ -1005,7 +1072,10 @@ impl ConsensusGroup {
                 )
             } else {
                 (
-                    header.certificate().clone(),
+                    header
+                        .certificate()
+                        .ok_or(GroupError::InvalidCertificate)?
+                        .clone(),
                     header.configuration_generation(),
                     self.state_machine
                         .committed_log_id(index)
@@ -1082,47 +1152,55 @@ impl ConsensusGroup {
             if start > cursor {
                 return Err(GroupError::WalOutOfRange);
             }
-            let (certificate, configuration_generation, log_id) =
-                if let Some(repair) = self.state_machine.repair_allocation(index).await {
-                    (
-                        repair.certificate,
-                        repair.configuration_generation,
-                        repair.log_id,
-                    )
-                } else {
-                    (
-                        header.certificate().clone(),
-                        header.configuration_generation(),
-                        self.state_machine
-                            .committed_log_id(index)
-                            .await
-                            .ok_or(GroupError::NotCommitted(index))?,
-                    )
-                };
-            self.payloads
-                .seal(crate::SealRequest {
-                    hash: header.payload_hash(),
-                    group: header.group(),
-                    configuration_generation,
-                    request: header.request(),
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: &certificate,
-                })
-                .await?;
-            let body = self
-                .payloads
-                .reconstruct(crate::ReconstructRequest {
-                    hash: header.payload_hash(),
-                    group: header.group(),
-                    configuration_generation,
-                    request: header.request(),
-                    length: header.payload_len(),
-                    term: log_id.leader_id.term,
-                    index: log_id.index,
-                    certificate: &certificate,
-                })
-                .await?;
+            // An inline WAL chunk carries its bytes in the header itself; no
+            // external representation exists to seal or reconstruct.
+            let body = if let Some(inline) = header.inline_body() {
+                Bytes::copy_from_slice(inline)
+            } else {
+                let (certificate, configuration_generation, log_id) =
+                    if let Some(repair) = self.state_machine.repair_allocation(index).await {
+                        (
+                            repair.certificate,
+                            repair.configuration_generation,
+                            repair.log_id,
+                        )
+                    } else {
+                        (
+                            header
+                                .certificate()
+                                .ok_or(GroupError::InvalidCertificate)?
+                                .clone(),
+                            header.configuration_generation(),
+                            self.state_machine
+                                .committed_log_id(index)
+                                .await
+                                .ok_or(GroupError::NotCommitted(index))?,
+                        )
+                    };
+                self.payloads
+                    .seal(crate::SealRequest {
+                        hash: header.payload_hash(),
+                        group: header.group(),
+                        configuration_generation,
+                        request: header.request(),
+                        term: log_id.leader_id.term,
+                        index: log_id.index,
+                        certificate: &certificate,
+                    })
+                    .await?;
+                self.payloads
+                    .reconstruct(crate::ReconstructRequest {
+                        hash: header.payload_hash(),
+                        group: header.group(),
+                        configuration_generation,
+                        request: header.request(),
+                        length: header.payload_len(),
+                        term: log_id.leader_id.term,
+                        index: log_id.index,
+                        certificate: &certificate,
+                    })
+                    .await?
+            };
             let take_from = cursor.saturating_sub(start) as usize;
             let take_to = (to.min(end) - start) as usize;
             output.extend_from_slice(

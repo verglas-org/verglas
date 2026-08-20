@@ -857,10 +857,16 @@ impl RaftStateMachine<VerglasRaftConfig> for PersistentStateMachine {
                         ))
                         .into());
                     };
-                    if certificate.mode() != header.certificate().mode()
-                        || certificate.k() != header.certificate().k()
-                        || certificate.m() != header.certificate().m()
-                        || certificate.voters().len() != header.certificate().voters().len()
+                    let Some(header_certificate) = header.certificate() else {
+                        return Err(StorageIOError::write_state_machine(&std::io::Error::other(
+                            "repair targets an inline-committed header with no external representation",
+                        ))
+                        .into());
+                    };
+                    if certificate.mode() != header_certificate.mode()
+                        || certificate.k() != header_certificate.k()
+                        || certificate.m() != header_certificate.m()
+                        || certificate.voters().len() != header_certificate.voters().len()
                         || configuration_generation <= header.configuration_generation()
                         || state.repairs.get(&index).is_some_and(|existing| {
                             configuration_generation <= existing.configuration_generation
@@ -1057,12 +1063,18 @@ async fn release_catalog_payloads_pruned_by_snapshot(
 }
 
 /// Releases the original and latest repaired representation for one catalog header.
+///
+/// An inline header has no external representation: its body lives only in
+/// the Raft log entry that committed it, so there is nothing to release here.
 async fn release_committed_payload(
     state: &StateMachineData,
     index: u64,
     header: &crate::EntryHeader,
     payloads: &dyn crate::PayloadStore,
 ) -> Result<(), crate::PayloadError> {
+    let Some(certificate) = header.certificate() else {
+        return Ok(());
+    };
     let log_id = state
         .committed_log_ids
         .get(&index)
@@ -1076,7 +1088,7 @@ async fn release_committed_payload(
             length: header.payload_len(),
             term: log_id.leader_id.term,
             index: log_id.index,
-            certificate: header.certificate(),
+            certificate,
         })
         .await?;
     if let Some(repair) = state.repairs.get(&index) {

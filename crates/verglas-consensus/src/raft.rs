@@ -1,11 +1,15 @@
 //! Raft-replicated command types for the universal consensus substrate.
 //!
-//! Payload bytes never enter this log. A leader first stages verifiable payload
-//! representations, then commits the immutable certificate here. Terms, votes,
-//! log matching, commit indexes, and membership are owned by OpenRaft.
+//! A large payload is staged and coded before this log ever sees it: a leader
+//! stages a verifiable representation, then commits only the immutable
+//! certificate here. A payload at or under `INLINE_PAYLOAD_THRESHOLD_BYTES`
+//! skips staging entirely and rides inside the header itself, because OpenRaft
+//! already fsyncs this header to every voter as part of the append. Terms,
+//! votes, log matching, commit indexes, and membership are owned by OpenRaft.
 
 use std::io::Cursor;
 
+use bytes::Bytes;
 use openraft::BasicNode;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
@@ -205,6 +209,12 @@ impl CertificateError {
 }
 
 /// The immutable small command replicated identically by Raft.
+///
+/// Exactly one of `certificate` and `inline` is set. `certificate` names a
+/// body staged out-of-band through `PayloadStore`; `inline` carries the body
+/// itself, replicated as part of this header by the Raft log append that
+/// already has to happen. See `INLINE_PAYLOAD_THRESHOLD_BYTES` in
+/// `group.rs` for which bodies qualify and why.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EntryHeader {
     group: String,
@@ -214,12 +224,17 @@ pub struct EntryHeader {
     payload_len: u64,
     payload_hash: [u8; 32],
     writer_epoch: Option<u64>,
-    certificate: PayloadCertificate,
+    certificate: Option<PayloadCertificate>,
+    // `bytes::Bytes` has no serde impl in this workspace's dependency
+    // configuration; `Vec<u8>` carries the same bytes through the Raft log
+    // JSON encoding without adding a new feature flag for one field.
+    inline: Option<Vec<u8>>,
     metadata: EntryMetadata,
 }
 
 impl EntryHeader {
-    /// Builds a header after validating group identity and coding geometry.
+    /// Builds a header for a body staged out-of-band, after validating group
+    /// identity and coding geometry.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         group: impl Into<String>,
@@ -243,7 +258,43 @@ impl EntryHeader {
             payload_len,
             payload_hash,
             writer_epoch,
-            certificate,
+            certificate: Some(certificate),
+            inline: None,
+            metadata: EntryMetadata::None,
+        })
+    }
+
+    /// Builds a header whose body travels inside this Raft entry.
+    ///
+    /// No `PayloadStore` staging or sealing is needed: the body is small
+    /// enough (see `INLINE_PAYLOAD_THRESHOLD_BYTES`) that carrying it here is
+    /// cheaper than the network round trips staging would cost, and the Raft
+    /// log already replicates this header to every voter as part of the
+    /// append. The body's hash is computed here, matching what `stage` would
+    /// have produced, so downstream verification is representation-agnostic.
+    pub fn new_inline(
+        group: impl Into<String>,
+        configuration_generation: u64,
+        kind: CommandKind,
+        request: RequestId,
+        writer_epoch: Option<u64>,
+        body: Bytes,
+    ) -> Result<Self, CertificateError> {
+        let group = group.into();
+        if group.is_empty() {
+            return Err(CertificateError { required: 1 });
+        }
+        let payload_hash: [u8; 32] = sha2::Sha256::digest(&body).into();
+        Ok(Self {
+            group,
+            configuration_generation,
+            kind,
+            request,
+            payload_len: body.len() as u64,
+            payload_hash,
+            writer_epoch,
+            certificate: None,
+            inline: Some(body.to_vec()),
             metadata: EntryMetadata::None,
         })
     }
@@ -360,9 +411,17 @@ impl EntryHeader {
         self.writer_epoch
     }
 
-    /// Returns the durable payload certificate.
-    pub fn certificate(&self) -> &PayloadCertificate {
-        &self.certificate
+    /// Returns the durable payload certificate for a staged body.
+    ///
+    /// `None` when the body is carried inline in this header instead; callers
+    /// must check `inline_body` first, since exactly one is ever set.
+    pub fn certificate(&self) -> Option<&PayloadCertificate> {
+        self.certificate.as_ref()
+    }
+
+    /// Returns the body carried directly in this header, when inline.
+    pub fn inline_body(&self) -> Option<&[u8]> {
+        self.inline.as_deref()
     }
 
     /// Returns deterministic command metadata needed without decoding its body.
