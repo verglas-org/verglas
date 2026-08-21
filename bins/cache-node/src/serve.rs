@@ -847,7 +847,23 @@ pub async fn run(
             access_key_id: Some(credentials.0.clone()),
             secret_access_key: Some(credentials.1.clone()),
         };
-        let state = crate::query_api::QueryState::from_env(connection, token)
+        // SQL reads customer table data, so it verifies its caller against the
+        // same JWKS the catalog trusts rather than inheriting the admin
+        // listener's unauthenticated operator-probe model.
+        let trusted_jwks = match self_issuer.as_ref() {
+            Some(issuer) => {
+                crate::self_credential::merge_jwks(&catalog_server.authz_jwks, issuer.jwks())
+                    .map_err(|error| format!("catalog authz jwks: {error}"))?
+            }
+            None => catalog_server.authz_jwks.clone(),
+        };
+        let authorization = crate::query_api::QueryAuthorization::required(
+            catalog_server.authz_issuer.clone(),
+            trusted_jwks,
+            catalog_server.authz_tenant_id.clone(),
+        )
+        .map_err(std::io::Error::other)?;
+        let state = crate::query_api::QueryState::from_env(connection, token, authorization)
             .map_err(std::io::Error::other)?;
         admin_app = admin_app.merge(crate::query_api::router(state));
     }

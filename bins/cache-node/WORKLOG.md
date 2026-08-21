@@ -427,3 +427,12 @@
   malformed document. The SQL query API mints per query rather than once at
   startup: the credential's TTL is five minutes, so a token captured at boot
   would expire while the node was still serving.
+- #164: Required a verified bearer on `POST /v1/query`. The route had inherited
+  the admin listener's unauthenticated operator-probe model, so anyone who
+  could reach the port could run arbitrary SQL against customer tables. It now
+  verifies an ES256 credential against the same JWKS the catalog trusts —
+  including the node's own published key — through `DecisionClient` with
+  `VerglasAction::Query`. Authorization is checked before the body is parsed,
+  so an unauthorized caller learns nothing about their SQL, and
+  `QueryState::from_env` takes the verifier as a parameter so a served route
+  cannot be built without one.
