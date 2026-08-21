@@ -328,8 +328,10 @@ fn single_node_coordinator(
         metrics,
         origin,
         Arc::new(TestCommitter),
-        Duration::from_secs(2),
-        1,
+        verglas_writeback::WritebackThresholds {
+            ack_deadline: Duration::from_secs(2),
+            offload_size_limit_bytes: 1,
+        },
     ))
 }
 

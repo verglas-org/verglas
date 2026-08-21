@@ -41,5 +41,14 @@ credentials_file = "/etc/verglas/backend-r2"
 bucket = "cascadelabs"
 prefix = "_verglas/catalog"
 
+# Iceberg awareness. Without this every read is served tier="passthrough" —
+# correct bytes, but not locally accelerated, so cache hits stay 0. Eventual
+# consistency so a node still starts when the catalog is not up yet.
+[catalog]
+uri = "http://node1:8181/catalog"
+warehouse = "lite"
+consistency = "eventual"
+poll_interval_secs = 5
+
 [auth]
 credentials_file = "/etc/verglas/endpoint-credentials"

@@ -13,15 +13,21 @@
 //!   server started without `[cluster]`, and it drops the whole `verglas-cluster`
 //!   dependency (gossip, peer RPC, fragment store).
 //! - **Peers**: [`NoopPeerFetch`] — there are no peers to fetch from.
-//! - **Object write-back**: a configured fragment ring stages every S3 PUT as
-//!   erasure-coded, fsynced fragments before acknowledgement. Dirty fragments
-//!   remain outside normal cache eviction while origin propagation runs.
+//! - **Object write-back**: only a three-or-more-node fragment ring with
+//!   `[cache.writeback].enabled = true` stages S3 PUTs as erasure-coded, fsynced
+//!   fragments before acknowledgement. Solo nodes always use passthrough writes.
 //! - **Block-device write-back**: the block tier (#382) is the exception that
 //!   reaches the ring. When `VERGLAS_RING_PEERS` names a ring, a device FLUSH is
 //!   erasure-coded across the boxes and acked on a quorum (draining to the origin in the
 //!   background); see [`crate::ring`]. The embedded safekeeper shares that same
 //!   fragment store and peer RPC. With no ring configured, object PUT and block
 //!   FLUSH retain the synchronous origin barrier and no safekeeper starts.
+//! - **Hosted catalog**: `VERGLAS_CATALOG` is `off` by default. `on` requires
+//!   `[catalog_server]` and opens its consensus-backed HTTP server; `off` leaves
+//!   the Neon safekeeper and WAL/EC consensus untouched.
+//!
+//! A solo node has one copy and no durability or write acceleration. Its object
+//! writes run at origin speed through the passthrough path.
 
 use axum::serve::ListenerExt as _;
 use std::sync::Arc;
@@ -52,6 +58,87 @@ const SINGLE_NODE_ID: &str = "single";
 /// Storage binding for the built-in managed lakehouse database.
 pub(crate) const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
 
+/// Explicit hosted-catalog startup mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogMode {
+    /// Do not open hosted-catalog consensus or serve its embedded HTTP API.
+    Off,
+    /// Require `[catalog_server]` and start the hosted catalog.
+    On,
+}
+
+/// Parses the exact `VERGLAS_CATALOG` contract. An absent value keeps the
+/// cache-only default; every present value must name one supported mode.
+fn parse_catalog_mode(value: Option<&str>) -> Result<CatalogMode, String> {
+    match value.map(str::trim) {
+        None => Ok(CatalogMode::Off),
+        Some("off") => Ok(CatalogMode::Off),
+        Some("on") => Ok(CatalogMode::On),
+        Some(value) => Err(format!(
+            "VERGLAS_CATALOG must be `off` or `on`; received `{value}`"
+        )),
+    }
+}
+
+/// Reads and validates `VERGLAS_CATALOG` before any catalog or consensus state
+/// is opened, including a clear error for non-UTF-8 process environments.
+fn catalog_mode_from_env() -> Result<CatalogMode, std::io::Error> {
+    match std::env::var("VERGLAS_CATALOG") {
+        Ok(value) => parse_catalog_mode(Some(&value)).map_err(std::io::Error::other),
+        Err(std::env::VarError::NotPresent) => {
+            parse_catalog_mode(None).map_err(std::io::Error::other)
+        }
+        Err(std::env::VarError::NotUnicode(_)) => Err(std::io::Error::other(
+            "VERGLAS_CATALOG is not valid UTF-8; use `off` or `on`",
+        )),
+    }
+}
+
+/// Resolves whether the hosted catalog may start without changing the
+/// safekeeper decision. `on` is never silently ignored when its config is absent.
+fn catalog_server_enabled(
+    mode: CatalogMode,
+    catalog_server_configured: bool,
+) -> Result<bool, &'static str> {
+    match (mode, catalog_server_configured) {
+        (CatalogMode::Off, _) => Ok(false),
+        (CatalogMode::On, true) => Ok(true),
+        (CatalogMode::On, false) => {
+            Err("VERGLAS_CATALOG=on requires a [catalog_server] configuration")
+        }
+    }
+}
+
+/// Records which independent consensus planes startup must open.
+#[derive(Debug, Eq, PartialEq)]
+struct ConsensusStartupDecision {
+    /// Whether the hosted catalog plane may be opened.
+    catalog: bool,
+    /// Whether the ring-backed Neon WAL/EC plane remains active.
+    safekeeper: bool,
+}
+
+/// Keeps the hosted catalog switch independent from ring-backed Neon durability.
+///
+/// A catalog asked for but not configured is an error, never a silently
+/// disabled catalog: the operator would get a node that serves no catalog and
+/// reports nothing about why.
+fn consensus_startup_decision(
+    mode: CatalogMode,
+    peer_count: usize,
+    catalog_server_configured: bool,
+) -> Result<ConsensusStartupDecision, &'static str> {
+    Ok(ConsensusStartupDecision {
+        catalog: catalog_server_enabled(mode, catalog_server_configured)?,
+        safekeeper: peer_count >= 3,
+    })
+}
+
+/// Enables object write-back only when both topology and config explicitly allow it.
+fn object_writeback_enabled(ring_supports_writeback: bool, configured: bool) -> bool {
+    ring_supports_writeback && configured
+}
+
 /// The default NBD listen port for the block-device tier (#382). An attach
 /// client connects a kernel NBD client here; the export name selects the
 /// device. Overridable with `VERGLAS_BLOCK_ADDR` (same shape as
@@ -59,7 +146,7 @@ pub(crate) const DEFAULT_STORAGE_BINDING_ID: &str = "default-storage";
 ///
 /// The S3 service is the deliberate exception to "one listener": with the
 /// `VERGLAS_S3_TLS_*` env trio set (see [`crate::tls`]), `VERGLAS_S3_ADDR`'s
-/// plaintext listener stays up for 6PN-internal callers (lakekeeper,
+/// plaintext listener stays up for 6PN-internal callers (catalog,
 /// inter-cache peers, gateway probes) *and* a second, TLS-terminated
 /// listener serves the identical axum router on `VERGLAS_S3_TLS_ADDR` for
 /// public-internet callers — replacing fly-proxy's per-request TLS
@@ -329,6 +416,8 @@ pub async fn run(
     config: &Config,
     credentials: (String, String),
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let catalog_mode = catalog_mode_from_env()?;
+    let catalog_enabled = catalog_server_enabled(catalog_mode, config.catalog_server.is_some())?;
     // One backend store shared by the read and write passthroughs.
     let registry = BackendStore::from_config(DEFAULT_STORAGE_BINDING_ID, &config.backend);
     eprintln!(
@@ -425,6 +514,7 @@ pub async fn run(
                 &device_registry,
                 Arc::clone(&page_cache_slot),
                 activity.clone(),
+                catalog_enabled,
             )
             .await?
             .map(Arc::new);
@@ -446,24 +536,86 @@ pub async fn run(
     };
 
     // The Neon listener is another data plane of this same process. It is
-    // present whenever this node belongs to the fragment ring and shares that
-    // ring's transport/listener/store with block FLUSH.
+    // present only on a three-or-more-node ring and shares that ring's
+    // transport/listener/store with block FLUSH. A one-node local plane is
+    // reserved for the hosted catalog and never starts the WAL listener.
     let object_ring = ring_plane.clone();
-    let safekeeper_args = match (config.backend.bucket.clone(), ring_plane.as_ref()) {
-        (Some(bucket), Some(ring)) => {
-            let layout = crate::safekeeper::geometry_from_env(ring.node_count())?;
-            let consensus = crate::consensus::ConsensusPlane::new(
-                config.cache.dir.clone(),
-                Arc::clone(ring),
-                layout.k,
-                layout.m,
-            )
-            .await
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            let catalog_archive = config.catalog_archive.as_ref().ok_or_else(|| {
-                std::io::Error::other(
-                    "catalog_archive is required when the authoritative cache ring is enabled",
+    let peer_count = ring_plane.as_ref().map_or(0, |ring| ring.node_count());
+    let consensus_decision =
+        consensus_startup_decision(catalog_mode, peer_count, config.catalog_server.is_some())?;
+    let safekeeper_args = if consensus_decision.safekeeper {
+        match (config.backend.bucket.clone(), ring_plane.as_ref()) {
+            (Some(_bucket), Some(ring)) => {
+                let layout = crate::safekeeper::geometry_from_env(ring.node_count())?;
+                let consensus = crate::consensus::ConsensusPlane::new(
+                    config.cache.dir.clone(),
+                    Arc::clone(ring),
+                    layout.k,
+                    layout.m,
                 )
+                .await
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+                // A WAL-only ring needs no catalog archive. Requiring one here
+                // would reject a cache-only deployment that never serves a
+                // warehouse group.
+                let catalog = match config.catalog_archive.as_ref() {
+                    Some(catalog_archive) => {
+                        let catalog_store = registry
+                            .store_for(DEFAULT_STORAGE_BINDING_ID, &catalog_archive.bucket)?;
+                        let catalog_store: Arc<dyn verglas_safekeeper::ImmutableSegmentStore> =
+                            Arc::new(crate::safekeeper::ObjectArchiveStore::new(catalog_store));
+                        Some(crate::safekeeper::CatalogArchiveDestination::new(
+                            catalog_store,
+                            catalog_archive.prefix.clone(),
+                        ))
+                    }
+                    None => None,
+                };
+                let archives = crate::safekeeper::AuthoritativeArchives {
+                    wal_registry: Arc::clone(&registry),
+                    catalog,
+                };
+                Some((Arc::clone(ring), layout, consensus, archives))
+            }
+            _ => {
+                eprintln!(
+                    "verglas-cache-node {VERSION} embedded safekeeper disabled: this node is not a configured fragment-ring member"
+                );
+                None
+            }
+        }
+    } else {
+        eprintln!(
+            "verglas-cache-node {VERSION} embedded safekeeper disabled: topology has fewer than three voters"
+        );
+        None
+    };
+
+    // Hosted catalog consensus is independent from the Neon WAL plane. A
+    // single explicit peer gets a local one-voter group only when the catalog
+    // mode is on; it never turns on object write-back or WAL service.
+    let catalog_args = if consensus_decision.catalog {
+        let ring = ring_plane.as_ref().ok_or_else(|| {
+            std::io::Error::other(
+                "VERGLAS_CATALOG=on requires one configured ring voter for hosted catalog consensus",
+            )
+        })?;
+        if let Some((_, layout, consensus, archives)) = safekeeper_args.as_ref() {
+            // The ring built these archives without knowing the catalog would
+            // run. Serving a warehouse group without a checkpoint destination
+            // would fail later, at the first export, so refuse it now.
+            if archives.catalog.is_none() {
+                return Err("catalog_archive is required when VERGLAS_CATALOG=on".into());
+            }
+            Some((
+                Arc::clone(ring),
+                *layout,
+                Arc::clone(consensus),
+                archives.clone(),
+            ))
+        } else {
+            let catalog_archive = config.catalog_archive.as_ref().ok_or_else(|| {
+                std::io::Error::other("catalog_archive is required when VERGLAS_CATALOG=on")
             })?;
             let catalog_store =
                 registry.store_for(DEFAULT_STORAGE_BINDING_ID, &catalog_archive.bucket)?;
@@ -471,25 +623,159 @@ pub async fn run(
                 Arc::new(crate::safekeeper::ObjectArchiveStore::new(catalog_store));
             let archives = crate::safekeeper::AuthoritativeArchives {
                 wal_registry: Arc::clone(&registry),
-                catalog: crate::safekeeper::CatalogArchiveDestination::new(
+                catalog: Some(crate::safekeeper::CatalogArchiveDestination::new(
                     catalog_store,
                     catalog_archive.prefix.clone(),
-                ),
+                )),
             };
-            let _ = bucket;
+            let consensus = crate::consensus::ConsensusPlane::new(
+                config.cache.dir.clone(),
+                Arc::clone(ring),
+                1,
+                0,
+            )
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let layout = verglas_safekeeper::AppendGeometry { k: 1, m: 0, w: 1 };
             Some((Arc::clone(ring), layout, consensus, archives))
         }
-        _ => {
-            eprintln!(
-                "verglas-cache-node {VERSION} embedded safekeeper disabled: this node is not a configured fragment-ring member"
-            );
-            None
-        }
+    } else {
+        None
     };
     let object_consensus = safekeeper_args
         .as_ref()
         .map(|(_, _, consensus, _)| Arc::clone(consensus));
-    let shutdown_consensus = object_consensus.clone();
+    let catalog_consensus = catalog_args
+        .as_ref()
+        .map(|(_, _, consensus, _)| Arc::clone(consensus));
+    let mut shutdown_consensus = Vec::new();
+    if let Some(consensus) = object_consensus.as_ref() {
+        shutdown_consensus.push(Arc::clone(consensus));
+    }
+    if let Some(consensus) = catalog_consensus.as_ref()
+        && !shutdown_consensus
+            .iter()
+            .any(|existing| Arc::ptr_eq(existing, consensus))
+    {
+        shutdown_consensus.push(Arc::clone(consensus));
+    }
+
+    // A node hosting its own catalog is one of that catalog's callers: the
+    // semantic store authorizes with this key exactly as the control plane's
+    // callers authorize with theirs. Built before the catalog so the same key
+    // both signs those calls and joins the JWKS the catalog trusts.
+    // Shared: both the semantic store and the SQL query API sign with this one
+    // key, and the catalog trusts exactly one published JWKS entry for it.
+    let self_issuer = match config.catalog_server.as_ref() {
+        Some(catalog_server) => Some(Arc::new(
+            crate::self_credential::SelfCredentialIssuer::load_or_create(
+                &config.cache.dir,
+                catalog_server.authz_issuer.clone(),
+                catalog_server.authz_tenant_id.clone(),
+            )
+            .map_err(|error| format!("catalog self-credential: {error}"))?,
+        )),
+        None => None,
+    };
+    // The hosted Iceberg catalog, served from inside this process. The cloud
+    // topology pins one stateless catalog to every ring node, so it reaches
+    // consensus through an in-process transport rather than issuing HTTP
+    // requests to this node's own ingress.
+    let catalog_server = match (
+        catalog_enabled,
+        config.catalog_server.as_ref(),
+        catalog_args.as_ref(),
+    ) {
+        (true, Some(catalog_server), Some((ring, layout, consensus, archives))) => {
+            let transport = Arc::new(crate::safekeeper::LocalCatalogTransport::new(
+                Arc::clone(consensus),
+                ring,
+                *layout,
+                Arc::clone(&archives.wal_registry),
+                catalog_server.tenant.clone(),
+                catalog_server.warehouse.clone(),
+            ));
+            // Secrets never live in the config file, so the metadata identity
+            // comes from the environment.
+            let deployment = verglas_catalog_storage::hosted_deployment::HostedDeployment {
+                tenant: catalog_server.tenant.clone(),
+                warehouse: catalog_server.warehouse.clone(),
+                managed_s3_profile: serde_json::from_str(&catalog_server.managed_s3_profile)
+                    .map_err(|error| format!("catalog_server.managed_s3_profile: {error}"))?,
+                metadata_access_key_id: std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
+                    "AWS_ACCESS_KEY_ID is required when catalog_server is set".to_owned()
+                })?,
+                metadata_secret_access_key: std::env::var("AWS_SECRET_ACCESS_KEY").map_err(
+                    |_| "AWS_SECRET_ACCESS_KEY is required when catalog_server is set".to_owned(),
+                )?,
+            };
+            // This node calls its own catalog when the semantic store opens a
+            // graph, so it authorizes like any other caller. Trusting its own
+            // published key alongside the configured one keeps that path on
+            // the same verification code the control plane's callers use.
+            let trusted_jwks = match self_issuer.as_ref() {
+                Some(issuer) => {
+                    crate::self_credential::merge_jwks(&catalog_server.authz_jwks, issuer.jwks())
+                        .map_err(|error| format!("catalog authz jwks: {error}"))?
+                }
+                None => catalog_server.authz_jwks.clone(),
+            };
+            let authorizer = verglas_catalog_authz::VerglasAuthorizer::try_new(
+                deployment.server_id(),
+                verglas_catalog_authz::CredentialAuthzConfig {
+                    issuer: catalog_server.authz_issuer.clone(),
+                    jwks: trusted_jwks,
+                    tenant_id: catalog_server.authz_tenant_id.clone(),
+                },
+            )
+            .map_err(|error| format!("hosted catalog authorizer: {error}"))?;
+            let state = verglas_catalog_storage::hosted_deployment::hosted_catalog_state(
+                transport,
+                &deployment,
+                authorizer.clone(),
+            )
+            .await?;
+            let router = axum::Router::new().nest(
+                "/catalog/v1",
+                verglas_catalog_core::api::iceberg::v1::new_v1_hosted_router::<
+                    verglas_catalog_storage::AuthorizedVerglasCatalog<_>,
+                    verglas_catalog_storage::AuthorizedVerglasCatalog<_>,
+                >(),
+            );
+            let addr = std::net::SocketAddr::from(([0, 0, 0, 0], catalog_server.port));
+            eprintln!(
+                "verglas-cache-node {VERSION} hosted Iceberg catalog listening on http://{addr} (warehouse `{}`)",
+                catalog_server.warehouse
+            );
+            Some(tokio::spawn(async move {
+                verglas_catalog_core::serve::serve_hosted(
+                    verglas_catalog_core::serve::HostedServeConfiguration::builder()
+                        .bind_addr(addr)
+                        .router(router)
+                        .state(state)
+                        .authorizer(authorizer)
+                        .build(),
+                )
+                .await
+            }))
+        }
+        (true, Some(_), None) => {
+            return Err(
+                "VERGLAS_CATALOG=on requires this node to host a configured catalog consensus voter"
+                    .into(),
+            );
+        }
+        (false, _, _) => None,
+        (true, None, _) => {
+            return Err("VERGLAS_CATALOG=on requires a [catalog_server] configuration".into());
+        }
+    };
+    let _catalog_server = catalog_server;
+    if !catalog_enabled {
+        eprintln!(
+            "verglas-cache-node {VERSION} hosted Iceberg catalog disabled: VERGLAS_CATALOG=off"
+        );
+    }
 
     // An external Iceberg REST endpoint is always an explicitly eventual
     // source. Managed catalog transactions use the native warehouse endpoint
@@ -525,14 +811,55 @@ pub async fn run(
         health.clone(),
         stats_slot.clone(),
         metrics_slot.clone(),
-    );
+    )
+    // Unconditional: an operator needs to see the surfaces this node has
+    // switched off in order to know what to turn on.
+    .merge(crate::api_docs::router());
+
+    // SQL reads through the Iceberg REST catalog this node hosts, so it exists
+    // only when that catalog does. It addresses the hosted listener over
+    // loopback rather than the `/catalog` admin gateway, which proxies an
+    // external `[catalog]` this deployment does not have.
+    if let Some(catalog_server) = config.catalog_server.as_ref().filter(|_| catalog_enabled) {
+        // The hosted catalog authorizes this call like any other caller, so
+        // the query client presents the node's own credential — the same key
+        // the semantic store signs with, published in the catalog's JWKS.
+        // Minted per query: the credential's TTL is minutes, so a token baked
+        // in at startup would expire while the node is still serving.
+        let issuer = self_issuer.clone();
+        let token: crate::query_api::TokenFactory = Arc::new(move || match issuer.as_ref() {
+            Some(issuer) => issuer
+                .mint()
+                .map(Some)
+                .map_err(|error| format!("catalog self-credential: {error}")),
+            None => Ok(None),
+        });
+        let connection = verglas_iceberg::Connection {
+            catalog_uri: format!("http://127.0.0.1:{}/catalog", catalog_server.port),
+            token: None,
+            warehouse: Some(catalog_server.warehouse.clone()),
+            s3_endpoint: Some(format!("http://{s3_gateway_addr}")),
+            region: config
+                .backend
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_owned()),
+            access_key_id: Some(credentials.0.clone()),
+            secret_access_key: Some(credentials.1.clone()),
+        };
+        let state = crate::query_api::QueryState::from_env(connection, token)
+            .map_err(std::io::Error::other)?;
+        admin_app = admin_app.merge(crate::query_api::router(state));
+    }
+
     if let Some(catalog) = config.catalog.as_ref() {
         let connection = semantic_connection(
-            catalog,
+            catalog.warehouse.clone(),
             catalog_gateway_addr,
             s3_gateway_addr,
             &credentials,
             config.backend.region.as_deref(),
+            None,
         );
         let public_admin_uri = std::env::var("VERGLAS_PUBLIC_ADMIN_URI")
             .unwrap_or_else(|_| format!("http://{catalog_gateway_addr}"));
@@ -810,6 +1137,7 @@ pub async fn run(
         health.mark_ready();
 
         serve_s3(S3Serve {
+            self_issuer,
             config,
             s3_listener,
             s3_tls_listener,
@@ -860,7 +1188,7 @@ pub async fn run(
     };
 
     let result = tokio::try_join!(admin_fut, data_plane, nbd_fut, safekeeper_fut);
-    if let Some(consensus) = shutdown_consensus {
+    for consensus in shutdown_consensus {
         consensus
             .shutdown()
             .await
@@ -908,6 +1236,10 @@ struct S3Serve<'a> {
     /// must use it so the cache node, rather than a client library, owns bearer
     /// and SigV4 catalog authentication.
     catalog_gateway_addr: std::net::SocketAddr,
+    /// Mints the credential this node presents to a catalog it hosts itself.
+    /// Absent when no hosted catalog runs, leaving semantic calls unauthorized
+    /// exactly as a node tracking an external catalog leaves them.
+    self_issuer: Option<Arc<crate::self_credential::SelfCredentialIssuer>>,
     credentials: (String, String),
     engine: CacheEngine,
     registry: Arc<BackendStore>,
@@ -922,6 +1254,7 @@ struct S3Serve<'a> {
 
 async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let S3Serve {
+        self_issuer,
         config,
         s3_listener,
         s3_tls_listener,
@@ -937,25 +1270,67 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     // Semantic state is opened from the same customer catalog and routes table
     // FileIO back through this listener. No process-local registry survives
     // restart: the adapter reopens graphs from Iceberg for each operation.
-    let semantic_api: Option<Arc<dyn verglas_s3::semantic::SemanticApi>> =
-        match config.catalog.as_ref() {
-            Some(catalog) => {
-                let local_addr = loopback_addr(s3_listener.local_addr()?);
-                let connection = semantic_connection(
-                    catalog,
-                    catalog_gateway_addr,
-                    local_addr,
-                    &credentials,
-                    config.backend.region.as_deref(),
-                );
-                Some(Arc::new(
-                    verglas_s3::semantic::IcebergCatalogSemanticStore::new(
-                        verglas_iceberg::catalog::open_catalog(&connection).await?,
-                    ),
-                ))
-            }
-            None => None,
-        };
+    // `semantic_connection` always addresses this node's own catalog gateway and
+    // reads only `warehouse` from the tracked catalog, so a node hosting its own
+    // catalog needs no external one: it borrows that warehouse and takes the
+    // identical loopback path. Without either section there is no warehouse to
+    // open, and the routes stay absent.
+    // A tracked catalog is reached through the admin plane's `/catalog` proxy;
+    // a self-hosted one answers on its own port and has no such proxy. Carry
+    // both the warehouse and the address that serves it.
+    let semantic_catalog = config
+        .catalog
+        .as_ref()
+        .map(|catalog| (catalog.warehouse.clone(), catalog_gateway_addr))
+        .or_else(|| {
+            config.catalog_server.as_ref().map(|server| {
+                (
+                    Some(server.warehouse.clone()),
+                    std::net::SocketAddr::from(([127, 0, 0, 1], server.port)),
+                )
+            })
+        });
+    let semantic_api: Option<Arc<dyn verglas_s3::semantic::SemanticApi>> = match semantic_catalog {
+        Some((warehouse, catalog_addr)) => {
+            let local_addr = loopback_addr(s3_listener.local_addr()?);
+            // A hosted catalog authorizes this call like any other caller; a
+            // tracked one is reached through the admin proxy and needs no
+            // bearer from here.
+            let token = match self_issuer.as_ref() {
+                Some(issuer) => Some(
+                    issuer
+                        .mint()
+                        .map_err(|error| format!("catalog self-credential: {error}"))?,
+                ),
+                None => None,
+            };
+            let connection = semantic_connection(
+                warehouse,
+                catalog_addr,
+                local_addr,
+                &credentials,
+                config.backend.region.as_deref(),
+                token,
+            );
+            Some(Arc::new(
+                verglas_s3::semantic::IcebergCatalogSemanticStore::new(
+                    verglas_iceberg::catalog::open_catalog(&connection).await?,
+                ),
+            ))
+        }
+        None => None,
+    };
+    // Without a warehouse the graph and vector routes are absent, and every
+    // call to one falls through to the S3 fallback and returns an unrelated
+    // bucket error. Name the missing configuration so an operator reads the
+    // cause here rather than inferring it from that error.
+    if semantic_api.is_none() {
+        println!(
+            "verglas-cache-node {} graph and vector routes disabled: neither [catalog] nor \
+             [catalog_server] names a warehouse to open them against",
+            crate::VERSION,
+        );
+    }
     // A successful vector/graph mutation optionally publishes a fire-and-
     // forget commit event to the control-plane queue ingress; this is a
     // best-effort notification side channel wired with the node's own
@@ -977,8 +1352,15 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     let invalidation: Arc<dyn verglas_core::write::Invalidation> = Arc::new(engine.clone());
     let bucket_set = registry.bucket_set();
     let origin = Arc::new(PassthroughWrite::new(registry.clone()));
+    let writeback_enabled = object_writeback_enabled(
+        object_ring
+            .as_ref()
+            .is_some_and(|ring| ring.node_count() >= 3),
+        config.cache.writeback.enabled,
+    );
 
-    let app = if let Some(ring) = object_ring {
+    let app = if writeback_enabled {
+        let ring = object_ring.ok_or("object write-back requires a three-voter ring")?;
         let layout = crate::safekeeper::geometry_from_env(ring.node_count())?;
         let policy = Arc::new(object_writeback_policy(layout));
         let (journal_store, migrated_journals) = JournalStore::open_for_binding(
@@ -1002,11 +1384,14 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
             Arc::clone(&origin),
             Arc::new(crate::consensus::ObjectConsensusCommitter::new(
                 object_consensus.ok_or("ring write-back requires the consensus plane")?,
-                std::time::Duration::from_millis(config.cache.writeback.object_commit_linger_ms),
                 config.cache.writeback.object_commit_max_batch,
             )),
-            std::time::Duration::from_millis(config.cache.writeback.ack_deadline_ms),
-            config.cache.writeback.offload_size_limit_bytes.0,
+            verglas_writeback::WritebackThresholds {
+                ack_deadline: std::time::Duration::from_millis(
+                    config.cache.writeback.ack_deadline_ms,
+                ),
+                offload_size_limit_bytes: config.cache.writeback.offload_size_limit_bytes.0,
+            },
         ));
         let _repair = verglas_writeback::spawn_repair_loop(
             Arc::clone(&coordinator),
@@ -1063,7 +1448,7 @@ async fn serve_s3(context: S3Serve<'_>) -> Result<(), Box<dyn std::error::Error>
     // SigV4 verification canonicalizes the `host` header the CLIENT signed,
     // which two legitimate hops rewrite or drop:
     //  - The Verglas Cloud edge router proxies `<slug>.s3.verglas.dev` to this
-    //    node's Fly origin. A Cloudflare Worker cannot preserve a cross-zone
+    //    node's Fly origin. A control plane cannot preserve a cross-zone
     //    Host header, so it forwards the signed one as `x-forwarded-host`.
     //    Trusting it is sound: a forged value still has to match a signature
     //    only the tenant's secret key can produce.
@@ -1148,16 +1533,17 @@ fn loopback_addr(address: std::net::SocketAddr) -> std::net::SocketAddr {
 /// opens the provider catalog directly.  Data-file IO still enters the local
 /// S3 listener, preserving cache residency for Tables, Graphs, and Vectors.
 fn semantic_connection(
-    catalog: &verglas_core::config::Catalog,
+    warehouse: Option<String>,
     catalog_gateway_addr: std::net::SocketAddr,
     s3_addr: std::net::SocketAddr,
     credentials: &(String, String),
     backend_region: Option<&str>,
+    token: Option<String>,
 ) -> verglas_iceberg::Connection {
     verglas_iceberg::Connection {
         catalog_uri: format!("http://{catalog_gateway_addr}/catalog"),
-        token: None,
-        warehouse: catalog.warehouse.clone(),
+        token,
+        warehouse,
         s3_endpoint: Some(format!("http://{s3_addr}")),
         region: backend_region.unwrap_or("us-east-1").to_owned(),
         access_key_id: Some(credentials.0.clone()),
@@ -1175,6 +1561,66 @@ mod tests {
     use super::*;
     use axum::Router;
     use axum::routing::get;
+
+    /// The explicit catalog environment accepts both modes, defaults to off,
+    /// and rejects values that would make startup topology-dependent again.
+    #[test]
+    fn catalog_mode_parses_off_on_absent_and_invalid_values() {
+        assert_eq!(parse_catalog_mode(None), Ok(CatalogMode::Off));
+        assert_eq!(parse_catalog_mode(Some("off")), Ok(CatalogMode::Off));
+        assert_eq!(parse_catalog_mode(Some("on")), Ok(CatalogMode::On));
+        let error = parse_catalog_mode(Some("maybe")).expect_err("invalid catalog mode");
+        assert!(error.contains("VERGLAS_CATALOG"));
+        assert!(error.contains("off"));
+        assert!(error.contains("on"));
+    }
+
+    /// A hosted catalog requires its explicit config only when the operator
+    /// enables it; off never opens a catalog consensus group.
+    #[test]
+    fn catalog_startup_gate_is_explicit_and_never_infers_from_peer_count() {
+        assert_eq!(catalog_server_enabled(CatalogMode::Off, true), Ok(false));
+        assert_eq!(catalog_server_enabled(CatalogMode::Off, false), Ok(false));
+        assert_eq!(catalog_server_enabled(CatalogMode::On, true), Ok(true));
+        let error = catalog_server_enabled(CatalogMode::On, false)
+            .expect_err("catalog on without catalog_server");
+        assert!(error.contains("catalog_server"));
+    }
+
+    /// Object write-back requires both a configured ring and the explicit
+    /// write-back setting, so solo cache nodes retain the passthrough writer.
+    #[test]
+    fn solo_catalog_off_selects_passthrough_object_writes() {
+        assert!(!object_writeback_enabled(false, false));
+        assert!(!object_writeback_enabled(false, true));
+        assert!(!object_writeback_enabled(true, false));
+        assert!(object_writeback_enabled(true, true));
+    }
+
+    /// Neon keeps its WAL and erasure-coded consensus plane when the hosted
+    /// catalog is off, while the catalog plane remains closed.
+    #[test]
+    fn neon_topology_keeps_safekeeper_consensus_when_catalog_is_off() {
+        let decision =
+            consensus_startup_decision(CatalogMode::Off, 4, true).expect("catalog off is valid");
+        assert!(!decision.catalog);
+        assert!(decision.safekeeper);
+
+        // Neon configures no [catalog_server] at all.
+        let bare = consensus_startup_decision(CatalogMode::Off, 4, false)
+            .expect("a WAL-only ring needs no catalog configuration");
+        assert!(!bare.catalog);
+        assert!(bare.safekeeper);
+    }
+
+    /// A catalog asked for but never configured must stop startup. Booting a
+    /// node that silently serves no catalog hides the operator's mistake.
+    #[test]
+    fn catalog_on_without_catalog_configuration_fails_startup() {
+        assert!(consensus_startup_decision(CatalogMode::On, 1, false).is_err());
+        assert!(consensus_startup_decision(CatalogMode::On, 4, false).is_err());
+        assert!(consensus_startup_decision(CatalogMode::On, 1, true).is_ok());
+    }
 
     /// Semantic operations use the cache process's catalog gateway rather than
     /// bypassing its provider authentication with a direct upstream request.
@@ -1195,11 +1641,12 @@ mod tests {
         };
 
         let connection = semantic_connection(
-            &catalog,
+            catalog.warehouse.clone(),
             "127.0.0.1:8334".parse().expect("admin address"),
             "127.0.0.1:8333".parse().expect("s3 address"),
             &("VGLOCAL".to_owned(), "local-secret".to_owned()),
             Some("us-west-2"),
+            None,
         );
 
         assert_eq!(connection.catalog_uri, "http://127.0.0.1:8334/catalog");
@@ -1347,7 +1794,7 @@ mod tests {
 
     /// The cache node owns the upstream catalog response cache. Repeated query
     /// workers loading the same snapshot use its local gateway without another
-    /// Lakekeeper request.
+    /// Catalog request.
     #[tokio::test]
     async fn catalog_gateway_serves_repeated_metadata_from_cache() {
         let upstream_hits = Arc::new(AtomicUsize::new(0));

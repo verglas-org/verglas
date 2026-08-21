@@ -2,7 +2,7 @@
 
 use verglas_consensus::{CatalogAction, CatalogBatch, CatalogEntity, CatalogRequirement};
 
-/// Builds an opaque Lakekeeper-domain record under a typed entity namespace.
+/// Builds an opaque Catalog-domain record under a typed entity namespace.
 fn record(entity: CatalogEntity, id: &str, document: &str) -> CatalogAction {
     CatalogAction::PutRecord {
         entity,

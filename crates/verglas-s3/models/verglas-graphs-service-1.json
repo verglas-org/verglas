@@ -13,11 +13,11 @@
     "uid": "verglas-graphs-2026-08-13"
   },
   "operations": {
-    "BuildGraphIndex": {
-      "name": "BuildGraphIndex",
-      "http": {"method": "POST", "requestUri": "/BuildGraphIndex", "responseCode": 200},
-      "input": {"shape": "BuildGraphIndexInput"},
-      "output": {"shape": "BuildGraphIndexOutput"},
+    "BuildIndex": {
+      "name": "BuildIndex",
+      "http": {"method": "POST", "requestUri": "/BuildIndex", "responseCode": 200},
+      "input": {"shape": "BuildIndexInput"},
+      "output": {"shape": "BuildIndexOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "documentation": "Builds and attaches a Puffin adjacency index to the graph edge snapshot."
     },
@@ -37,20 +37,20 @@
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "documentation": "Deletes a graph namespace and its node and edge tables."
     },
-    "GetGraph": {
-      "name": "GetGraph",
-      "http": {"method": "POST", "requestUri": "/GetGraph", "responseCode": 200},
-      "input": {"shape": "GetGraphInput"},
-      "output": {"shape": "GetGraphOutput"},
+    "DescribeGraph": {
+      "name": "DescribeGraph",
+      "http": {"method": "POST", "requestUri": "/DescribeGraph", "responseCode": 200},
+      "input": {"shape": "DescribeGraphInput"},
+      "output": {"shape": "DescribeGraphOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Returns the graph name and its current edge-table snapshot when one exists."
     },
-    "GetNeighbors": {
-      "name": "GetNeighbors",
-      "http": {"method": "POST", "requestUri": "/GetNeighbors", "responseCode": 200},
-      "input": {"shape": "GetNeighborsInput"},
-      "output": {"shape": "GetNeighborsOutput"},
+    "RetrieveNeighbors": {
+      "name": "RetrieveNeighbors",
+      "http": {"method": "POST", "requestUri": "/RetrieveNeighbors", "responseCode": 200},
+      "input": {"shape": "RetrieveNeighborsInput"},
+      "output": {"shape": "RetrieveNeighborsOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Returns direct neighbors of a node after applying the traversal direction and filter."
@@ -64,66 +64,66 @@
       "readonly": true,
       "documentation": "Lists graph namespaces with token pagination."
     },
-    "PutEdges": {
-      "name": "PutEdges",
-      "http": {"method": "POST", "requestUri": "/PutEdges", "responseCode": 200},
-      "input": {"shape": "PutEdgesInput"},
-      "output": {"shape": "PutEdgesOutput"},
+    "AddEdges": {
+      "name": "AddEdges",
+      "http": {"method": "POST", "requestUri": "/AddEdges", "responseCode": 200},
+      "input": {"shape": "AddEdgesInput"},
+      "output": {"shape": "AddEdgesOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "documentation": "Appends directed, provenance-bearing edge assertions to a graph."
     },
-    "PutNodes": {
-      "name": "PutNodes",
-      "http": {"method": "POST", "requestUri": "/PutNodes", "responseCode": 200},
-      "input": {"shape": "PutNodesInput"},
-      "output": {"shape": "PutNodesOutput"},
+    "AddNodes": {
+      "name": "AddNodes",
+      "http": {"method": "POST", "requestUri": "/AddNodes", "responseCode": 200},
+      "input": {"shape": "AddNodesInput"},
+      "output": {"shape": "AddNodesOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "documentation": "Appends node rows to a graph."
     },
-    "QueryKHop": {
-      "name": "QueryKHop",
-      "http": {"method": "POST", "requestUri": "/QueryKHop", "responseCode": 200},
-      "input": {"shape": "QueryKHopInput"},
-      "output": {"shape": "QueryKHopOutput"},
+    "SearchKHop": {
+      "name": "SearchKHop",
+      "http": {"method": "POST", "requestUri": "/SearchKHop", "responseCode": 200},
+      "input": {"shape": "SearchKHopInput"},
+      "output": {"shape": "SearchKHopOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Returns nodes reached within the requested number of hops."
     },
-    "QueryNeighborhood": {
-      "name": "QueryNeighborhood",
-      "http": {"method": "POST", "requestUri": "/QueryNeighborhood", "responseCode": 200},
-      "input": {"shape": "QueryNeighborhoodInput"},
-      "output": {"shape": "QueryNeighborhoodOutput"},
+    "SearchNeighborhood": {
+      "name": "SearchNeighborhood",
+      "http": {"method": "POST", "requestUri": "/SearchNeighborhood", "responseCode": 200},
+      "input": {"shape": "SearchNeighborhoodInput"},
+      "output": {"shape": "SearchNeighborhoodOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Returns the reached nodes and traversed edges within the requested number of hops."
     },
-    "QueryPaths": {
-      "name": "QueryPaths",
-      "http": {"method": "POST", "requestUri": "/QueryPaths", "responseCode": 200},
-      "input": {"shape": "QueryPathsInput"},
-      "output": {"shape": "QueryPathsOutput"},
+    "SearchPaths": {
+      "name": "SearchPaths",
+      "http": {"method": "POST", "requestUri": "/SearchPaths", "responseCode": 200},
+      "input": {"shape": "SearchPathsInput"},
+      "output": {"shape": "SearchPathsOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Returns the deterministic shortest path, if one exists within maxHops."
     },
-    "QueryPrecedents": {
-      "name": "QueryPrecedents",
-      "http": {"method": "POST", "requestUri": "/QueryPrecedents", "responseCode": 200},
-      "input": {"shape": "QueryPrecedentsInput"},
-      "output": {"shape": "QueryPrecedentsOutput"},
+    "SearchPrecedents": {
+      "name": "SearchPrecedents",
+      "http": {"method": "POST", "requestUri": "/SearchPrecedents", "responseCode": 200},
+      "input": {"shape": "SearchPrecedentsInput"},
+      "output": {"shape": "SearchPrecedentsOutput"},
       "errors": [{"shape": "ValidationException"}, {"shape": "ServiceUnavailableException"}],
       "readonly": true,
       "documentation": "Ranks Decision nodes by BM25 lexical match to a query, plus a structural boost from shared entity neighbors, sorted by score descending then decisionId ascending."
     }
   },
   "shapes": {
-    "BuildGraphIndexInput": {
+    "BuildIndexInput": {
       "type": "structure",
       "required": ["graphName"],
       "members": {"graphName": {"shape": "GraphName"}}
     },
-    "BuildGraphIndexOutput": {
+    "BuildIndexOutput": {
       "type": "structure",
       "required": ["index"],
       "members": {"index": {"shape": "IndexBuilt"}}
@@ -156,12 +156,12 @@
     },
     "EdgeId": {"type": "string", "min": 1, "max": 255},
     "EdgeList": {"type": "list", "member": {"shape": "Edge"}},
-    "GetGraphInput": {
+    "DescribeGraphInput": {
       "type": "structure",
       "required": ["graphName"],
       "members": {"graphName": {"shape": "GraphName"}}
     },
-    "GetGraphOutput": {
+    "DescribeGraphOutput": {
       "type": "structure",
       "required": ["graphName"],
       "members": {
@@ -169,7 +169,7 @@
         "graphName": {"shape": "GraphName"}
       }
     },
-    "GetNeighborsInput": {
+    "RetrieveNeighborsInput": {
       "type": "structure",
       "required": ["graphName", "nodeId"],
       "members": {
@@ -179,7 +179,7 @@
         "nodeId": {"shape": "NodeId"}
       }
     },
-    "GetNeighborsOutput": {
+    "RetrieveNeighborsOutput": {
       "type": "structure",
       "required": ["neighbors"],
       "members": {"neighbors": {"shape": "NeighborList"}}
@@ -266,7 +266,7 @@
     "PropertyName": {"type": "string", "min": 1, "max": 255},
     "PropertyValue": {"type": "document"},
     "Provenance": {"type": "string", "min": 1, "max": 1024},
-    "PutEdgesInput": {
+    "AddEdgesInput": {
       "type": "structure",
       "required": ["graphName", "edges"],
       "members": {
@@ -274,11 +274,11 @@
         "graphName": {"shape": "GraphName"}
       }
     },
-    "PutEdgesOutput": {
+    "AddEdgesOutput": {
       "type": "structure",
       "members": {"snapshotId": {"shape": "SnapshotId"}}
     },
-    "PutNodesInput": {
+    "AddNodesInput": {
       "type": "structure",
       "required": ["graphName", "nodes"],
       "members": {
@@ -286,11 +286,11 @@
         "nodes": {"shape": "NodeList"}
       }
     },
-    "PutNodesOutput": {
+    "AddNodesOutput": {
       "type": "structure",
       "members": {"snapshotId": {"shape": "SnapshotId"}}
     },
-    "QueryKHopInput": {
+    "SearchKHopInput": {
       "type": "structure",
       "required": ["graphName", "nodeId", "k"],
       "members": {
@@ -301,12 +301,12 @@
         "nodeId": {"shape": "NodeId"}
       }
     },
-    "QueryKHopOutput": {
+    "SearchKHopOutput": {
       "type": "structure",
       "required": ["nodes"],
       "members": {"nodes": {"shape": "ReachedNodeList"}}
     },
-    "QueryNeighborhoodInput": {
+    "SearchNeighborhoodInput": {
       "type": "structure",
       "required": ["graphName", "nodeId", "k"],
       "members": {
@@ -317,12 +317,12 @@
         "nodeId": {"shape": "NodeId"}
       }
     },
-    "QueryNeighborhoodOutput": {
+    "SearchNeighborhoodOutput": {
       "type": "structure",
       "required": ["neighborhood"],
       "members": {"neighborhood": {"shape": "Subgraph"}}
     },
-    "QueryPathsInput": {
+    "SearchPathsInput": {
       "type": "structure",
       "required": ["graphName", "sourceId", "targetId", "maxHops"],
       "members": {
@@ -334,12 +334,12 @@
         "targetId": {"shape": "NodeId"}
       }
     },
-    "QueryPathsOutput": {
+    "SearchPathsOutput": {
       "type": "structure",
       "required": ["paths"],
       "members": {"paths": {"shape": "PathList"}}
     },
-    "QueryPrecedentsInput": {
+    "SearchPrecedentsInput": {
       "type": "structure",
       "required": ["graphName", "query"],
       "members": {
@@ -349,7 +349,7 @@
         "query": {"shape": "PrecedentQuery"}
       }
     },
-    "QueryPrecedentsOutput": {
+    "SearchPrecedentsOutput": {
       "type": "structure",
       "required": ["precedents"],
       "members": {"precedents": {"shape": "PrecedentList"}}

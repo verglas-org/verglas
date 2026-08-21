@@ -69,7 +69,7 @@ pub use barrier::{BarrierError, BarrierOutcome, CommitBarrier, JournalBarrier};
 pub use consensus::{
     ConsensusCommitter, ObjectCommit, PackCommit, PackedEntry, StagedObject, StagedPack,
 };
-pub use coordinator::{ScrubReport, WriteCoordinator, WritebackError};
+pub use coordinator::{ScrubReport, WriteCoordinator, WritebackError, WritebackThresholds};
 pub use journal::{Journal, JournalState, JournalStore, Placement};
 pub use membership::{AgentMembership, LiveMembership, SingleNodeMembership};
 pub use metrics::{WritebackMetrics, WritebackMetricsSnapshot};

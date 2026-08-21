@@ -402,8 +402,10 @@ fn build(
         metrics,
         origin.clone(),
         Arc::new(TestCommitter),
-        Duration::from_secs(5),
-        size_limit_bytes,
+        verglas_writeback::WritebackThresholds {
+            ack_deadline: Duration::from_secs(5),
+            offload_size_limit_bytes: size_limit_bytes,
+        },
     ));
     (coordinator, origin, transport, dir)
 }

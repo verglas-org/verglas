@@ -70,9 +70,41 @@ pub type OpenGroupFn =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 /// Initializes one already-open group from its deterministic bootstrap voter.
 pub type BootstrapGroupFn = OpenGroupFn;
+/// Why one forwarded group command did not apply.
+#[derive(Clone, Debug)]
+pub enum GroupCommandError {
+    /// The receiving replica is not the group leader.
+    ///
+    /// Distinguished from a genuine failure so the sender can re-resolve the
+    /// leader and retry. A sender forwards to whichever node it last observed
+    /// as leader, and that view goes stale during an election.
+    NotLeader {
+        /// The leader the receiving replica observes, if it knows one.
+        leader: Option<u64>,
+    },
+    /// The leader could not be reached at all.
+    ///
+    /// Retriable for the same reason as [`Self::NotLeader`]: a leader that
+    /// died is unreachable until the group elects its successor, and the
+    /// sender should ride out that election rather than fail the write.
+    Unreachable(String),
+    /// The command reached the leader and failed.
+    Failed(String),
+}
+
+/// HTTP status carrying [`GroupCommandError::NotLeader`] across the peer RPC
+/// boundary. Distinct from the 409 a real failure returns.
+///
+/// Extension point: a future release may add conditions here, which would
+/// carry version skew across peers. Not built now (prototype).
+const NOT_LEADER_STATUS: StatusCode = StatusCode::MISDIRECTED_REQUEST;
+
 /// Routes one opaque universal group command to the local consensus runtime.
 pub type GroupCommandFn = Arc<
-    dyn Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send>>
+    dyn Fn(
+            String,
+            Vec<u8>,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, GroupCommandError>> + Send>>
         + Send
         + Sync,
 >;
@@ -243,7 +275,16 @@ async fn group_command(
     ))?;
     commander(group, body.to_vec())
         .await
-        .map_err(|error| (StatusCode::CONFLICT, error))
+        .map_err(|error| match error {
+            // The leader hint travels in the body so the sender can resolve
+            // directly rather than waiting out another election.
+            GroupCommandError::NotLeader { leader } => (
+                NOT_LEADER_STATUS,
+                leader.map(|leader| leader.to_string()).unwrap_or_default(),
+            ),
+            GroupCommandError::Unreachable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail),
+            GroupCommandError::Failed(detail) => (StatusCode::CONFLICT, detail),
+        })
 }
 
 /// Initializes one fully provisioned group on its designated first voter.
@@ -435,13 +476,14 @@ impl<R: RaftAddressResolver> RaftHttpTransport<R> {
     }
 
     /// Routes one serialized universal command to a specific group leader.
-    pub async fn command(&self, target: u64, body: Vec<u8>) -> Result<Vec<u8>, NetworkError> {
-        let address = self.resolver.resolve(target).ok_or_else(|| {
-            NetworkError::new(&io::Error::new(
-                io::ErrorKind::NotFound,
-                "unknown raft voter",
-            ))
-        })?;
+    ///
+    /// Returns [`GroupCommandError::NotLeader`] when the target is not the
+    /// leader, so the caller re-resolves instead of failing the write.
+    pub async fn command(&self, target: u64, body: Vec<u8>) -> Result<Vec<u8>, GroupCommandError> {
+        let address = self
+            .resolver
+            .resolve(target)
+            .ok_or_else(|| GroupCommandError::Unreachable("unknown raft voter".to_owned()))?;
         let response = self
             .client
             .post(format!(
@@ -455,7 +497,19 @@ impl<R: RaftAddressResolver> RaftHttpTransport<R> {
             .body(body)
             .send()
             .await
-            .map_err(|error| NetworkError::new(&error))?;
+            .map_err(|error| GroupCommandError::Unreachable(error.to_string()))?;
+        if response.status() == StatusCode::SERVICE_UNAVAILABLE {
+            let detail = response.text().await.unwrap_or_default();
+            return Err(GroupCommandError::Unreachable(detail));
+        }
+        if response.status() == NOT_LEADER_STATUS {
+            let leader = response
+                .text()
+                .await
+                .ok()
+                .and_then(|body| body.trim().parse().ok());
+            return Err(GroupCommandError::NotLeader { leader });
+        }
         if !response.status().is_success() {
             // Carry the peer's own explanation. Collapsing every non-2xx into a
             // generic refusal hid a serde failure behind what looked like a
@@ -465,15 +519,15 @@ impl<R: RaftAddressResolver> RaftHttpTransport<R> {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("<unreadable body: {error}>"));
-            return Err(NetworkError::new(&io::Error::other(format!(
+            return Err(GroupCommandError::Failed(format!(
                 "group leader rejected application command: {status}: {detail}"
-            ))));
+            )));
         }
         response
             .bytes()
             .await
             .map(|bytes| bytes.to_vec())
-            .map_err(|error| NetworkError::new(&error))
+            .map_err(|error| GroupCommandError::Failed(error.to_string()))
     }
 
     /// Sends one authenticated group lifecycle operation.
@@ -681,12 +735,14 @@ mod tests {
         registry
             .set_commander(Arc::new(|group, body| {
                 Box::pin(async move {
-                    let command: verglas_consensus::GroupRequest =
-                        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+                    let command: verglas_consensus::GroupRequest = serde_json::from_slice(&body)
+                        .map_err(|error| GroupCommandError::Failed(error.to_string()))?;
                     if group != "timeline/a"
                         || !matches!(command, verglas_consensus::GroupRequest::AppendWal { .. })
                     {
-                        return Err("wrong forwarded command".to_owned());
+                        return Err(GroupCommandError::Failed(
+                            "wrong forwarded command".to_owned(),
+                        ));
                     }
                     Ok(Vec::new())
                 })

@@ -744,7 +744,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #66: Neutralized CLI tests that asserted removed control-plane verbs (#66); renamed catalog_delete token fixture away from cloud-catalog.token.
 - #84: Added local `db create` commands for managed Lakehouse, managed Neon Postgres, customer S3, and external Iceberg REST compositions. Added singular `secret create` with typed URI scopes and secret material accepted only through a hidden terminal prompt or stdin; both commands are thin clients of the local resource APIs and reject ambiguous compositions before sending a request.
 - #84: Routed database and secret commands to `VERGLAS_ACCESS_ENDPOINT` (localhost port 8345 by default), keeping credential and database administration off the cache server's admin API.
-- #84: Updated the runnable Compose contract test for dynamic databases: Lakekeeper, the three-member cache/safekeeper ring, and the container runtime are now mandatory services rather than singleton catalog environment values.
+- #84: Updated the runnable Compose contract test for dynamic databases: Catalog, the three-member cache/safekeeper ring, and the container runtime are now mandatory services rather than singleton catalog environment values.
 
 - #access-tokens: Added `verglas token create`, `list`, and `revoke` backed by
   the access service. Minted bearer values are stored in an owner-only local
@@ -776,7 +776,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   notification and compaction guidance to remain documented together.
 - #135: Corrected the self-hosted catalog guidance to describe the cloud-owned
   `serve-craft` service and CRaft authority. The regression rejects documentation
-  that puts managed Lakekeeper catalog state back into PostgreSQL.
+  that puts managed Catalog catalog state back into PostgreSQL.
 - #144: Added `verglas graph` and `verglas vector` command families
   (`cli/src/commands/graph.rs`, `vector.rs`, `semantic.rs`) wrapping the
   pre-signed `verglas_sdk::semantic` clients over the S3 semantic listener.
@@ -800,7 +800,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   shapes as before. Only `table compact` still talks to the server.
 
 - #146: MVP surface prune. `verglas db` is now `verglas lakehouse` and creates
-  only Lakekeeper-managed lakehouses; the Postgres database type, `db token`,
+  only Catalog-managed lakehouses; the Postgres database type, `db token`,
   `verglas vessel`, and the `verglas queue` provisioning verbs are deleted with
   their command modules and tests. Only `verglas workers` survives from the
   runtime group.
@@ -931,3 +931,5 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   (the site redirects to the latest release's script). The @verglas/cli npm
   package is gone; @verglas/sdk (a library) still publishes to npm. The CLI
   no longer needs the npm scope at all.
+- #137: Updated graph CLI requests and protocol assertions for the renamed Graph REST-JSON operations.
+

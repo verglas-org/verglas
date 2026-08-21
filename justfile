@@ -1,7 +1,7 @@
 # Development tasks for the Verglas repository.
 #
-# One cargo workspace covers everything: the engine under `crates/`, `bins/`,
-# `cli/`, `sdks/rust`, and the Lakekeeper catalog under `lakekeeper/crates/`.
+# One cargo workspace covers everything: the engine and the Lakekeeper-derived
+# catalog under `crates/`, plus `bins/`, `cli/`, and `sdks/rust`.
 
 # Build everything.
 build:

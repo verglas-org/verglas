@@ -463,3 +463,7 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   background drain loop. Both are rejected as zero when write-back is
   enabled, following the existing `ack_deadline_ms`/`scrub_interval_secs`
   validation pattern.
+- #164: Removed `cache.writeback.object_commit_linger_ms` and its validation.
+  The batcher no longer has a time window to configure: a group's batch closes
+  when its previous consensus entry commits. A config field does not outlive
+  the feature it configured.

@@ -82,17 +82,17 @@ Recorded because they invalidated results before they were caught.
 ## Gate validity
 
 Three of four code-quality gates were invalid on the base, all from the
-Lakekeeper absorption, none attributable to a candidate:
+Catalog absorption, none attributable to a candidate:
 
 | Gate | Base result |
 |---|---|
 | G1 `cargo check` | pass — valid |
-| G2 clippy | `EXIT=101`, 5 errors, all in `lakekeeper` |
-| G3 fmt | fail, 4 files, all in `lakekeeper` — since fixed |
-| G4 `cargo test` | `EXIT=101`, 25 failures, all in `lakekeeper` |
+| G2 clippy | `EXIT=101`, 5 errors, all in `catalog` |
+| G3 fmt | fail, 4 files, all in `catalog` — since fixed |
+| G4 `cargo test` | `EXIT=101`, 25 failures, all in `catalog` |
 
 The 25 test failures are cloud integration tests requiring live AWS, Azure, and
-GCS credentials. Lakekeeper ran them under `cargo nextest` with the `default`
+GCS credentials. Catalog ran them under `cargo nextest` with the `default`
 profile in `.config/nextest.toml`, which exists precisely to exclude tests
 needing secrets and external services. `cargo test` ignores nextest profiles,
 so the absorption wired them into the default test path. That contradicts the

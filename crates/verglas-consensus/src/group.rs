@@ -42,13 +42,30 @@ use crate::{
 /// keep taking the coded path untouched.
 const INLINE_PAYLOAD_THRESHOLD_BYTES: u64 = 4096;
 
+/// Creates the durable payload store on the first operation that needs one.
+///
+/// The factory is called at most once. Its result is also memoized, so a
+/// construction error remains the error returned by every later payload
+/// operation. Inline bodies do not call the factory.
+pub type PayloadStoreFactory =
+    Box<dyn Fn() -> Result<Arc<dyn PayloadStore>, PayloadError> + Send + Sync + 'static>;
+
 /// One independently elected consensus group as seen by its current leader.
 pub struct ConsensusGroup {
     group: String,
     configuration_generation: AtomicU64,
     raft: openraft::Raft<VerglasRaftConfig>,
     state_machine: PersistentStateMachine,
-    payloads: Arc<dyn PayloadStore>,
+    payload_factory: Arc<PayloadStoreFactory>,
+    // The construction error is memoized deliberately: geometry is fixed for a
+    // given voter set, so a retry would fail identically while adding latency to
+    // every payload operation. `refresh_voters` forces construction but does not
+    // reset this cell, so a group whose geometry only becomes valid after a
+    // membership change would keep returning the cached error. That is
+    // unreachable today — membership replacement runs only on a multi-node ring,
+    // where geometry is already valid. Resetting the memo is the extension point
+    // if that ever stops holding.
+    payloads: Arc<tokio::sync::OnceCell<Result<Arc<dyn PayloadStore>, PayloadError>>>,
     writer_lock: tokio::sync::Mutex<()>,
 }
 
@@ -133,7 +150,8 @@ impl ConsensusGroup {
 
     /// Publishes the uniform committed voter allocation for subsequent staging.
     pub async fn refresh_voters(&self, voters: Vec<u64>) -> Result<(), GroupError> {
-        self.payloads.set_voters(voters).await?;
+        let payloads = self.payload_store().await?;
+        payloads.set_voters(voters).await?;
         Ok(())
     }
 
@@ -162,6 +180,37 @@ impl ConsensusGroup {
             .metrics(
                 |metrics| metrics.current_leader.is_some(),
                 "await an elected consensus leader",
+            )
+            .await
+        {
+            Ok(metrics) => Ok(metrics.current_leader),
+            Err(openraft::metrics::WaitError::Timeout(_, _)) => Ok(None),
+            Err(openraft::metrics::WaitError::ShuttingDown) => Err(GroupError::Raft(
+                "consensus core is shutting down".to_owned(),
+            )),
+        }
+    }
+
+    /// Waits until this replica observes a leader other than `stale`.
+    ///
+    /// Event-driven: it blocks on a Raft metrics change rather than sampling
+    /// on a timer, so re-resolving a stale leader costs nothing while the
+    /// cluster is quiet and returns the instant an election settles.
+    pub async fn await_leader_change(
+        &self,
+        stale: Option<u64>,
+        timeout: Duration,
+    ) -> Result<Option<u64>, GroupError> {
+        let current = self.raft.current_leader().await;
+        if current.is_some() && current != stale {
+            return Ok(current);
+        }
+        match self
+            .raft
+            .wait(Some(timeout))
+            .metrics(
+                move |metrics| metrics.current_leader.is_some() && metrics.current_leader != stale,
+                "await a consensus leader other than the stale one",
             )
             .await
         {
@@ -342,13 +391,18 @@ impl ConsensusGroup {
             )),
         }
     }
-    /// Binds a Raft replica and its payload stores to one stable group identity.
+    /// Binds a Raft replica to a payload-store factory resolved only when needed.
+    ///
+    /// The factory remains idle for inline commits. The first staged, sealed,
+    /// reconstructed, repaired, or voter-refresh operation creates the store,
+    /// attaches it to the state machine, and memoizes the result. A factory
+    /// error therefore surfaces at that first payload operation.
     pub fn new(
         group: impl Into<String>,
         configuration_generation: u64,
         raft: openraft::Raft<VerglasRaftConfig>,
         state_machine: PersistentStateMachine,
-        payloads: Arc<dyn PayloadStore>,
+        payload_factory: PayloadStoreFactory,
     ) -> Result<Self, GroupError> {
         let group = group.into();
         if group.is_empty() || configuration_generation == 0 {
@@ -359,9 +413,33 @@ impl ConsensusGroup {
             configuration_generation: AtomicU64::new(configuration_generation),
             raft,
             state_machine,
-            payloads,
+            payload_factory: Arc::new(payload_factory),
+            payloads: Arc::new(tokio::sync::OnceCell::new()),
             writer_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Resolves and attaches the memoized payload store for one external body.
+    ///
+    /// The state machine receives the same store before this method returns, so
+    /// snapshot and checkpoint reclamation observe the store used by the group.
+    async fn payload_store(&self) -> Result<Arc<dyn PayloadStore>, GroupError> {
+        let factory = Arc::clone(&self.payload_factory);
+        let state_machine = self.state_machine.clone();
+        let result = self
+            .payloads
+            .get_or_init(|| async move {
+                let payloads = factory()?;
+                state_machine
+                    .attach_payload_store(Arc::clone(&payloads))
+                    .await?;
+                Ok(payloads)
+            })
+            .await;
+        match result {
+            Ok(payloads) => Ok(Arc::clone(payloads)),
+            Err(error) => Err(GroupError::Payload(error.clone())),
+        }
     }
 
     /// Stages a body durably and commits only its immutable header through Raft.
@@ -542,7 +620,7 @@ impl ConsensusGroup {
                 through_lsn: end_lsn,
             })
             .await
-            .map_err(|error| GroupError::Raft(error.to_string()))?;
+            .map_err(client_write_error)?;
         Ok(response)
     }
 
@@ -737,91 +815,79 @@ impl ConsensusGroup {
         holders: &[u64],
         decorate: impl FnOnce(EntryHeader) -> Result<EntryHeader, crate::raft::CertificateError>,
     ) -> Result<RaftResponse, GroupError> {
-        let t_stage = std::time::Instant::now();
         let configuration_generation = self.configuration_generation.load(Ordering::Acquire);
         // A body at or under the inline threshold skips PayloadStore entirely:
         // no stage, no seal, no certificate. Raft's own append already fsyncs
         // this header to every voter, which is the durability staging exists
         // to buy in the first place. See the threshold's doc comment for the
         // cost accounting.
-        let (payload_len, base, staged_certificate) =
-            if body.len() as u64 <= INLINE_PAYLOAD_THRESHOLD_BYTES {
-                let base = EntryHeader::new_inline(
-                    self.group.clone(),
-                    configuration_generation,
-                    kind,
+        let (base, staged_payload) = if body.len() as u64 <= INLINE_PAYLOAD_THRESHOLD_BYTES {
+            let base = EntryHeader::new_inline(
+                self.group.clone(),
+                configuration_generation,
+                kind,
+                request,
+                writer_epoch,
+                body,
+            )
+            .map_err(|_| GroupError::InvalidCertificate)?;
+            (base, None)
+        } else {
+            let payloads = self.payload_store().await?;
+            let staged = payloads
+                .stage(
                     request,
-                    writer_epoch,
-                    body,
-                )
-                .map_err(|_| GroupError::InvalidCertificate)?;
-                (base.payload_len(), base, None)
-            } else {
-                let staged = self
-                    .payloads
-                    .stage(
-                        request,
-                        &self.group,
-                        configuration_generation,
-                        mode,
-                        &body,
-                        holders,
-                    )
-                    .await?;
-                let base = EntryHeader::new(
-                    self.group.clone(),
+                    &self.group,
                     configuration_generation,
-                    kind,
-                    request,
-                    staged.length(),
-                    staged.hash(),
-                    writer_epoch,
-                    staged.certificate().clone(),
+                    mode,
+                    &body,
+                    holders,
                 )
-                .map_err(|_| GroupError::InvalidCertificate)?;
-                (
-                    base.payload_len(),
-                    base,
-                    Some((staged.hash(), staged.certificate().clone())),
-                )
-            };
-        let stage_ms = t_stage.elapsed().as_secs_f64() * 1000.0;
-        let t_raft = std::time::Instant::now();
+                .await?;
+            let base = EntryHeader::new(
+                self.group.clone(),
+                configuration_generation,
+                kind,
+                request,
+                staged.length(),
+                staged.hash(),
+                writer_epoch,
+                staged.certificate().clone(),
+            )
+            .map_err(|_| GroupError::InvalidCertificate)?;
+            (
+                base,
+                Some((payloads, staged.hash(), staged.certificate().clone())),
+            )
+        };
         let header = decorate(base).map_err(|_| GroupError::InvalidCertificate)?;
         let response = self
             .raft
             .client_write(RaftCommand::Commit(header))
             .await
-            .map_err(|error| GroupError::Raft(error.to_string()))?
+            .map_err(client_write_error)?
             .data;
         if matches!(
             response.outcome,
             AppliedOutcome::Committed | AppliedOutcome::Duplicate
-        ) {
-            let raft_ms = t_raft.elapsed().as_secs_f64() * 1000.0;
-            let t_final = std::time::Instant::now();
-            if let Some((hash, certificate)) = staged_certificate {
-                let log_id = self
-                    .state_machine
-                    .committed_log_id(response.index)
-                    .await
-                    .ok_or(GroupError::NotCommitted(response.index))?;
-                self.payloads
-                    .seal(crate::SealRequest {
-                        hash,
-                        group: &self.group,
-                        configuration_generation,
-                        request,
-                        term: log_id.leader_id.term,
-                        index: log_id.index,
-                        certificate: &certificate,
-                    })
-                    .await?;
-            }
-            eprintln!(
-                "CONSTIMING stage_ms={stage_ms:.1} raft_ms={raft_ms:.1} finalize_ms={:.1} payload_bytes={payload_len}",
-                t_final.elapsed().as_secs_f64() * 1000.0
-            );
+        ) && let Some((payloads, hash, certificate)) = staged_payload
+        {
+            let log_id = self
+                .state_machine
+                .committed_log_id(response.index)
+                .await
+                .ok_or(GroupError::NotCommitted(response.index))?;
+            payloads
+                .seal(crate::SealRequest {
+                    hash,
+                    group: &self.group,
+                    configuration_generation,
+                    request,
+                    term: log_id.leader_id.term,
+                    index: log_id.index,
+                    certificate: &certificate,
+                })
+                .await?;
         }
         match response.outcome {
             AppliedOutcome::Committed | AppliedOutcome::Duplicate => Ok(response),
@@ -852,6 +918,7 @@ impl ConsensusGroup {
         if let Some(body) = header.inline_body() {
             return Ok(Bytes::copy_from_slice(body));
         }
+        let payloads = self.payload_store().await?;
         let (certificate, configuration_generation, log_id) =
             if let Some(repair) = self.state_machine.repair_allocation(index).await {
                 (
@@ -872,7 +939,7 @@ impl ConsensusGroup {
                         .ok_or(GroupError::NotCommitted(index))?,
                 )
             };
-        self.payloads
+        payloads
             .seal(crate::SealRequest {
                 hash: header.payload_hash(),
                 group: header.group(),
@@ -883,7 +950,7 @@ impl ConsensusGroup {
                 certificate: &certificate,
             })
             .await?;
-        self.payloads
+        payloads
             .reconstruct(crate::ReconstructRequest {
                 hash: header.payload_hash(),
                 group: header.group(),
@@ -907,6 +974,7 @@ impl ConsensusGroup {
             if header.inline_body().is_some() {
                 continue;
             }
+            let payloads = self.payload_store().await?;
             let (source_certificate, source_generation, source) =
                 if let Some(repair) = self.state_machine.repair_allocation(index).await {
                     (
@@ -927,7 +995,7 @@ impl ConsensusGroup {
                             .ok_or(GroupError::NotCommitted(index))?,
                     )
                 };
-            self.payloads
+            payloads
                 .seal(crate::SealRequest {
                     hash: header.payload_hash(),
                     group: header.group(),
@@ -941,8 +1009,7 @@ impl ConsensusGroup {
             let target_generation = source_generation
                 .checked_add(1)
                 .ok_or(GroupError::InvalidCertificate)?;
-            let certificate = self
-                .payloads
+            let certificate = payloads
                 .repair(crate::RepairRequest {
                     hash: header.payload_hash(),
                     group: header.group(),
@@ -972,7 +1039,7 @@ impl ConsensusGroup {
                 .await
                 .ok_or(GroupError::NotCommitted(response.index))?
                 .log_id;
-            self.payloads
+            payloads
                 .seal(crate::SealRequest {
                     hash: header.payload_hash(),
                     group: header.group(),
@@ -1063,6 +1130,7 @@ impl ConsensusGroup {
         if header.inline_body().is_some() {
             return Ok(());
         }
+        let payloads = self.payload_store().await?;
         let (certificate, configuration_generation, log_id) =
             if let Some(repair) = self.state_machine.repair_allocation(index).await {
                 (
@@ -1083,7 +1151,7 @@ impl ConsensusGroup {
                         .ok_or(GroupError::NotCommitted(index))?,
                 )
             };
-        self.payloads
+        payloads
             .seal(crate::SealRequest {
                 hash: header.payload_hash(),
                 group: header.group(),
@@ -1094,7 +1162,7 @@ impl ConsensusGroup {
                 certificate: &certificate,
             })
             .await?;
-        self.payloads
+        payloads
             .reconstruct(crate::ReconstructRequest {
                 hash: header.payload_hash(),
                 group: header.group(),
@@ -1157,6 +1225,7 @@ impl ConsensusGroup {
             let body = if let Some(inline) = header.inline_body() {
                 Bytes::copy_from_slice(inline)
             } else {
+                let payloads = self.payload_store().await?;
                 let (certificate, configuration_generation, log_id) =
                     if let Some(repair) = self.state_machine.repair_allocation(index).await {
                         (
@@ -1177,7 +1246,7 @@ impl ConsensusGroup {
                                 .ok_or(GroupError::NotCommitted(index))?,
                         )
                     };
-                self.payloads
+                payloads
                     .seal(crate::SealRequest {
                         hash: header.payload_hash(),
                         group: header.group(),
@@ -1188,7 +1257,7 @@ impl ConsensusGroup {
                         certificate: &certificate,
                     })
                     .await?;
-                self.payloads
+                payloads
                     .reconstruct(crate::ReconstructRequest {
                         hash: header.payload_hash(),
                         group: header.group(),
@@ -1343,6 +1412,28 @@ pub enum GroupResponse {
 }
 
 /// A closed failure at the sole payload-and-agreement boundary.
+/// Classifies one OpenRaft `client_write` failure.
+///
+/// `ForwardToLeader` is not a failure of the command — it says this replica is
+/// not the leader and names the one it believes is. It becomes
+/// [`GroupError::NotLeader`] so the sender can re-resolve and retry instead of
+/// failing the client write.
+fn client_write_error(
+    error: openraft::error::RaftError<
+        u64,
+        openraft::error::ClientWriteError<u64, openraft::BasicNode>,
+    >,
+) -> GroupError {
+    match &error {
+        openraft::error::RaftError::APIError(
+            openraft::error::ClientWriteError::ForwardToLeader(forward),
+        ) => GroupError::NotLeader {
+            leader: forward.leader_id,
+        },
+        _ => GroupError::Raft(error.to_string()),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GroupError {
     /// The stable group identity or generation is invalid.
@@ -1357,6 +1448,19 @@ pub enum GroupError {
     /// Raft refused leadership, quorum, or storage progress.
     #[error("Raft operation failed: {0}")]
     Raft(String),
+    /// This replica is not the group leader.
+    ///
+    /// A distinct variant because the sender's leader view goes stale: it
+    /// forwards to whichever node it last observed as leader, and that node
+    /// may have since lost leadership. The caller re-resolves and retries on
+    /// this condition rather than failing the client write. `leader` carries
+    /// the leader this replica knows about, or `None` when it knows of none
+    /// yet.
+    #[error("replica is not the group leader (leader: {leader:?})")]
+    NotLeader {
+        /// The leader this replica currently observes, if any.
+        leader: Option<u64>,
+    },
     /// The requested index has not applied on this replica.
     #[error("consensus index {0} is not committed locally")]
     NotCommitted(u64),

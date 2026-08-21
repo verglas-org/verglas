@@ -94,9 +94,16 @@ pub struct JournalStore {
     dirty: RwLock<HashMap<(String, String, String), String>>,
     /// Count of dirty entries. When zero, the read path skips the index lock.
     dirty_count: AtomicUsize,
-    /// Serializes read-modify-write journal mutations so a straggler merge and
-    /// a repair pass touching the same journal never interleave.
-    write_lock: std::sync::Mutex<()>,
+    /// Serializes read-modify-write journal mutations so a straggler merge
+    /// and a repair pass touching the same journal never interleave.
+    ///
+    /// Striped by object id, because that invariant is per journal. One
+    /// process-global mutex enforced it too, but also serialized every
+    /// unrelated journal write on the node behind one fsync: measured 44 ms
+    /// of lock wait against 13 ms of actual write. Two mutations of the SAME
+    /// object still land on the same stripe, which is what the invariant
+    /// requires.
+    write_locks: Vec<std::sync::Mutex<()>>,
 }
 
 impl JournalStore {
@@ -133,7 +140,9 @@ impl JournalStore {
             dir,
             dirty: RwLock::new(HashMap::new()),
             dirty_count: AtomicUsize::new(0),
-            write_lock: std::sync::Mutex::new(()),
+            write_locks: (0..JOURNAL_WRITE_STRIPES)
+                .map(|_| std::sync::Mutex::new(()))
+                .collect(),
         };
         let mut migrated = 0;
         for mut journal in store.list()? {
@@ -151,10 +160,22 @@ impl JournalStore {
         Ok((store, migrated))
     }
 
+    /// Returns the stripe serializing mutations of `object_id`.
+    ///
+    /// The same object always maps to the same stripe, so read-modify-write
+    /// mutations of one journal stay mutually exclusive.
+    fn write_lock_for(&self, object_id: &str) -> &std::sync::Mutex<()> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        object_id.hash(&mut hasher);
+        let stripe = (hasher.finish() % JOURNAL_WRITE_STRIPES as u64) as usize;
+        &self.write_locks[stripe]
+    }
+
     /// Writes and fsyncs `journal`, and if it is dirty registers it in the
     /// index so a read-your-writes GET finds it.
     pub fn put(&self, journal: &Journal) -> Result<(), JournalError> {
-        let _guard = self.write_lock.lock();
+        let _guard = self.write_lock_for(&journal.object_id).lock();
         self.write_fsynced(journal)?;
         if journal.state == JournalState::Dirty {
             self.insert_index(journal);
@@ -165,7 +186,7 @@ impl JournalStore {
     /// Marks the object clean and removes it from the dirty index. The journal
     /// stays on disk (clean) until propagation cleanup deletes it.
     pub fn mark_clean(&self, object_id: &str) -> Result<(), JournalError> {
-        let _guard = self.write_lock.lock();
+        let _guard = self.write_lock_for(object_id).lock();
         let Some(mut journal) = self.read(object_id)? else {
             return Ok(());
         };
@@ -182,7 +203,7 @@ impl JournalStore {
         object_id: &str,
         placements: Vec<Placement>,
     ) -> Result<(), JournalError> {
-        let _guard = self.write_lock.lock();
+        let _guard = self.write_lock_for(object_id).lock();
         let Some(mut journal) = self.read(object_id)? else {
             return Ok(());
         };
@@ -194,7 +215,7 @@ impl JournalStore {
     /// already recorded. Merges into the current on-disk journal so it never
     /// clobbers a concurrent repair's placements.
     pub fn add_placement(&self, object_id: &str, placement: Placement) -> Result<(), JournalError> {
-        let _guard = self.write_lock.lock();
+        let _guard = self.write_lock_for(object_id).lock();
         let Some(mut journal) = self.read(object_id)? else {
             return Ok(());
         };
@@ -340,6 +361,13 @@ impl JournalStore {
     }
 }
 
+/// Independent journal-mutation stripes.
+///
+/// Enough that unrelated objects rarely share one, small enough that the
+/// mutexes stay a rounding error. Collisions only cost the pre-existing
+/// serialization, never correctness.
+const JOURNAL_WRITE_STRIPES: usize = 64;
+
 /// A journal store error.
 #[derive(Debug, thiserror::Error)]
 #[error("writeback journal: {0}")]
@@ -469,6 +497,37 @@ mod tests {
         assert_eq!(
             store.find_dirty("managed-lakehouse", "bkt", "k").as_deref(),
             Some("obj-1")
+        );
+    }
+}
+
+#[cfg(test)]
+mod stripe_tests {
+    use super::*;
+
+    /// Striping must preserve the invariant it replaced: two mutations of one
+    /// journal still serialize. Different objects must not, or the stripe set
+    /// is doing nothing.
+    #[test]
+    fn write_stripes_serialize_one_object_but_not_unrelated_ones() {
+        let dir = tempfile::tempdir().expect("journal dir");
+        let store = JournalStore::open(dir.path()).expect("open journal store");
+
+        let same_a = store.write_lock_for("object-42") as *const _;
+        let same_b = store.write_lock_for("object-42") as *const _;
+        assert_eq!(
+            same_a, same_b,
+            "one object must always take the same stripe, or a repair and a \
+             straggler merge could interleave on it"
+        );
+
+        let distinct = (0..256)
+            .map(|i| store.write_lock_for(&format!("object-{i}")) as *const _)
+            .collect::<std::collections::HashSet<_>>();
+        assert!(
+            distinct.len() > 1,
+            "unrelated objects must spread across stripes, got {}",
+            distinct.len()
         );
     }
 }

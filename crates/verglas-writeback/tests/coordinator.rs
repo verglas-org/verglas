@@ -515,8 +515,10 @@ fn build_with_committer(
         metrics,
         origin,
         committer,
-        Duration::from_secs(5),
-        1,
+        verglas_writeback::WritebackThresholds {
+            ack_deadline: Duration::from_secs(5),
+            offload_size_limit_bytes: 1,
+        },
     ));
     (coordinator, dir)
 }
@@ -879,7 +881,7 @@ async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
     let origin = RecordingOrigin::new(false);
     origin.block_put();
     let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
-    let key = ck("lakekeeper/storage-check");
+    let key = ck("catalog/storage-check");
 
     coordinator
         .put(&key, &WriteMetadata::default(), body(4096), 2, 1, 3)
@@ -916,7 +918,7 @@ async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
         .expect("delete task")
         .expect("ordered origin delete");
     assert_eq!(
-        origin.get("bkt", "lakekeeper/storage-check"),
+        origin.get("bkt", "catalog/storage-check"),
         None,
         "the completed delete is final"
     );

@@ -248,9 +248,9 @@
         }
       }
     },
-    "/BuildGraphIndex": {
+    "/BuildIndex": {
       "post": {
-        "operationId": "BuildGraphIndex",
+        "operationId": "BuildIndex",
         "tags": [
           "Verglas Graph"
         ],
@@ -287,9 +287,9 @@
         }
       }
     },
-    "/GetGraph": {
+    "/DescribeGraph": {
       "post": {
-        "operationId": "GetGraph",
+        "operationId": "DescribeGraph",
         "tags": [
           "Verglas Graph"
         ],
@@ -300,9 +300,9 @@
         }
       }
     },
-    "/GetNeighbors": {
+    "/RetrieveNeighbors": {
       "post": {
-        "operationId": "GetNeighbors",
+        "operationId": "RetrieveNeighbors",
         "tags": [
           "Verglas Graph"
         ],
@@ -326,9 +326,9 @@
         }
       }
     },
-    "/PutEdges": {
+    "/AddEdges": {
       "post": {
-        "operationId": "PutEdges",
+        "operationId": "AddEdges",
         "tags": [
           "Verglas Graph"
         ],
@@ -339,9 +339,9 @@
         }
       }
     },
-    "/PutNodes": {
+    "/AddNodes": {
       "post": {
-        "operationId": "PutNodes",
+        "operationId": "AddNodes",
         "tags": [
           "Verglas Graph"
         ],
@@ -352,9 +352,9 @@
         }
       }
     },
-    "/QueryKHop": {
+    "/SearchKHop": {
       "post": {
-        "operationId": "QueryKHop",
+        "operationId": "SearchKHop",
         "tags": [
           "Verglas Graph"
         ],
@@ -365,9 +365,9 @@
         }
       }
     },
-    "/QueryNeighborhood": {
+    "/SearchNeighborhood": {
       "post": {
-        "operationId": "QueryNeighborhood",
+        "operationId": "SearchNeighborhood",
         "tags": [
           "Verglas Graph"
         ],
@@ -378,9 +378,9 @@
         }
       }
     },
-    "/QueryPaths": {
+    "/SearchPaths": {
       "post": {
-        "operationId": "QueryPaths",
+        "operationId": "SearchPaths",
         "tags": [
           "Verglas Graph"
         ],

@@ -330,12 +330,12 @@ impl VerglasGraphsClient {
     pub const fn signing_name(&self) -> &'static str {
         "verglasgraphs"
     }
-    /// Calls BuildGraphIndex.
-    pub async fn build_graph_index(
+    /// Calls BuildIndex.
+    pub async fn build_index(
         &self,
-        input: BuildGraphIndexInput,
-    ) -> Result<BuildGraphIndexOutput, ClientError> {
-        self.0.call(Method::POST, "/BuildGraphIndex", &input).await
+        input: BuildIndexInput,
+    ) -> Result<BuildIndexOutput, ClientError> {
+        self.0.call(Method::POST, "/BuildIndex", &input).await
     }
     /// Calls CreateGraph.
     pub async fn create_graph(
@@ -351,16 +351,21 @@ impl VerglasGraphsClient {
     ) -> Result<DeleteGraphOutput, ClientError> {
         self.0.call(Method::POST, "/DeleteGraph", &input).await
     }
-    /// Calls GetGraph.
-    pub async fn get_graph(&self, input: GetGraphInput) -> Result<GetGraphOutput, ClientError> {
-        self.0.call(Method::POST, "/GetGraph", &input).await
-    }
-    /// Calls GetNeighbors.
-    pub async fn get_neighbors(
+    /// Calls DescribeGraph.
+    pub async fn describe_graph(
         &self,
-        input: GetNeighborsInput,
-    ) -> Result<GetNeighborsOutput, ClientError> {
-        self.0.call(Method::POST, "/GetNeighbors", &input).await
+        input: DescribeGraphInput,
+    ) -> Result<DescribeGraphOutput, ClientError> {
+        self.0.call(Method::POST, "/DescribeGraph", &input).await
+    }
+    /// Calls RetrieveNeighbors.
+    pub async fn retrieve_neighbors(
+        &self,
+        input: RetrieveNeighborsInput,
+    ) -> Result<RetrieveNeighborsOutput, ClientError> {
+        self.0
+            .call(Method::POST, "/RetrieveNeighbors", &input)
+            .await
     }
     /// Calls ListGraphs.
     pub async fn list_graphs(
@@ -369,40 +374,43 @@ impl VerglasGraphsClient {
     ) -> Result<ListGraphsOutput, ClientError> {
         self.0.call(Method::POST, "/ListGraphs", &input).await
     }
-    /// Calls PutEdges.
-    pub async fn put_edges(&self, input: PutEdgesInput) -> Result<PutEdgesOutput, ClientError> {
-        self.0.call(Method::POST, "/PutEdges", &input).await
+    /// Calls AddEdges.
+    pub async fn add_edges(&self, input: AddEdgesInput) -> Result<AddEdgesOutput, ClientError> {
+        self.0.call(Method::POST, "/AddEdges", &input).await
     }
-    /// Calls PutNodes.
-    pub async fn put_nodes(&self, input: PutNodesInput) -> Result<PutNodesOutput, ClientError> {
-        self.0.call(Method::POST, "/PutNodes", &input).await
+    /// Calls AddNodes.
+    pub async fn add_nodes(&self, input: AddNodesInput) -> Result<AddNodesOutput, ClientError> {
+        self.0.call(Method::POST, "/AddNodes", &input).await
     }
-    /// Calls QueryKHop.
-    pub async fn query_k_hop(&self, input: QueryKHopInput) -> Result<QueryKHopOutput, ClientError> {
-        self.0.call(Method::POST, "/QueryKHop", &input).await
-    }
-    /// Calls QueryNeighborhood.
-    pub async fn query_neighborhood(
+    /// Calls SearchKHop.
+    pub async fn search_k_hop(
         &self,
-        input: QueryNeighborhoodInput,
-    ) -> Result<QueryNeighborhoodOutput, ClientError> {
+        input: SearchKHopInput,
+    ) -> Result<SearchKHopOutput, ClientError> {
+        self.0.call(Method::POST, "/SearchKHop", &input).await
+    }
+    /// Calls SearchNeighborhood.
+    pub async fn search_neighborhood(
+        &self,
+        input: SearchNeighborhoodInput,
+    ) -> Result<SearchNeighborhoodOutput, ClientError> {
         self.0
-            .call(Method::POST, "/QueryNeighborhood", &input)
+            .call(Method::POST, "/SearchNeighborhood", &input)
             .await
     }
-    /// Calls QueryPaths.
-    pub async fn query_paths(
+    /// Calls SearchPaths.
+    pub async fn search_paths(
         &self,
-        input: QueryPathsInput,
-    ) -> Result<QueryPathsOutput, ClientError> {
-        self.0.call(Method::POST, "/QueryPaths", &input).await
+        input: SearchPathsInput,
+    ) -> Result<SearchPathsOutput, ClientError> {
+        self.0.call(Method::POST, "/SearchPaths", &input).await
     }
-    /// Calls QueryPrecedents.
-    pub async fn query_precedents(
+    /// Calls SearchPrecedents.
+    pub async fn search_precedents(
         &self,
-        input: QueryPrecedentsInput,
-    ) -> Result<QueryPrecedentsOutput, ClientError> {
-        self.0.call(Method::POST, "/QueryPrecedents", &input).await
+        input: SearchPrecedentsInput,
+    ) -> Result<SearchPrecedentsOutput, ClientError> {
+        self.0.call(Method::POST, "/SearchPrecedents", &input).await
     }
 }
 

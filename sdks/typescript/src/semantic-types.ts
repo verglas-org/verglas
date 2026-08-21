@@ -7,11 +7,11 @@ export interface AccessDeniedException {
 
 export type Boolean = boolean;
 
-export interface BuildGraphIndexInput {
+export interface BuildIndexInput {
   graphName: string;
 }
 
-export interface BuildGraphIndexOutput {
+export interface BuildIndexOutput {
   index: boolean;
 }
 
@@ -133,11 +133,11 @@ export type Float = number;
 
 export type Float32VectorData = number[];
 
-export interface GetGraphInput {
+export interface DescribeGraphInput {
   graphName: string;
 }
 
-export interface GetGraphOutput {
+export interface DescribeGraphOutput {
   edgesSnapshotId?: number;
   graphName: string;
 }
@@ -152,14 +152,14 @@ export interface GetIndexOutput {
   index: Index;
 }
 
-export interface GetNeighborsInput {
+export interface RetrieveNeighborsInput {
   direction?: Direction;
   filter?: TraversalFilter;
   graphName: string;
   nodeId: string;
 }
 
-export interface GetNeighborsOutput {
+export interface RetrieveNeighborsOutput {
   neighbors: Neighbor[];
 }
 
@@ -411,12 +411,12 @@ export type PropertyName = string;
 
 export type Provenance = string;
 
-export interface PutEdgesInput {
+export interface AddEdgesInput {
   edges: Edge[];
   graphName: string;
 }
 
-export interface PutEdgesOutput {
+export interface AddEdgesOutput {
   snapshotId?: number;
 }
 
@@ -426,12 +426,12 @@ export interface PutInputVector {
   metadata?: unknown;
 }
 
-export interface PutNodesInput {
+export interface AddNodesInput {
   graphName: string;
   nodes: Node[];
 }
 
-export interface PutNodesOutput {
+export interface AddNodesOutput {
   snapshotId?: number;
 }
 
@@ -456,7 +456,7 @@ export type PutVectorsInputList = PutInputVector[];
 export interface PutVectorsOutput {
 }
 
-export interface QueryKHopInput {
+export interface SearchKHopInput {
   direction?: Direction;
   filter?: TraversalFilter;
   graphName: string;
@@ -464,11 +464,11 @@ export interface QueryKHopInput {
   nodeId: string;
 }
 
-export interface QueryKHopOutput {
+export interface SearchKHopOutput {
   nodes: ReachedNode[];
 }
 
-export interface QueryNeighborhoodInput {
+export interface SearchNeighborhoodInput {
   direction?: Direction;
   filter?: TraversalFilter;
   graphName: string;
@@ -476,7 +476,7 @@ export interface QueryNeighborhoodInput {
   nodeId: string;
 }
 
-export interface QueryNeighborhoodOutput {
+export interface SearchNeighborhoodOutput {
   neighborhood: Subgraph;
 }
 
@@ -486,7 +486,7 @@ export interface QueryOutputVector {
   metadata?: unknown;
 }
 
-export interface QueryPathsInput {
+export interface SearchPathsInput {
   direction?: Direction;
   filter?: TraversalFilter;
   graphName: string;
@@ -495,7 +495,7 @@ export interface QueryPathsInput {
   targetId: string;
 }
 
-export interface QueryPathsOutput {
+export interface SearchPathsOutput {
   paths: Path[];
 }
 

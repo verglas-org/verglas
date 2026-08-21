@@ -137,7 +137,19 @@ impl FragmentTransport for PeerFragmentTransport {
             while let Some(shard) = shards.next().await {
                 writer.append(&shard)?;
             }
-            writer.commit()?;
+            // The commit is the durability barrier: two fsyncs and a rename,
+            // tens of milliseconds. Running it inline would park an async
+            // worker thread for that whole time, and one of every object's
+            // fragments is placed locally — so it would stall the runtime
+            // that is concurrently driving the other fragments' peer RPCs.
+            // `append` stays inline: it is a buffered write, not a barrier.
+            tokio::task::spawn_blocking(move || writer.commit())
+                .await
+                .map_err(|error| {
+                    TransportError::Local(FragmentIoError::Io(format!(
+                        "fragment commit task failed: {error}"
+                    )))
+                })??;
             Ok(())
         } else {
             self.client.put_fragment_stream(node, key, shards).await?;

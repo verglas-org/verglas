@@ -25,8 +25,7 @@ use openraft::raft::{
 use tempfile::TempDir;
 use tokio::sync::RwLock;
 use verglas_consensus::{
-    ConsensusGroup, FilePayloadReplica, PayloadSet, PersistentLogStore, PersistentStateMachine,
-    VerglasRaftConfig,
+    ConsensusGroup, PayloadError, PersistentLogStore, PersistentStateMachine, VerglasRaftConfig,
 };
 
 type Raft = openraft::Raft<VerglasRaftConfig>;
@@ -153,21 +152,17 @@ async fn open_single_voter(
     .expect("start Raft node");
     router.nodes.write().await.insert(node, raft.clone());
 
-    // `ConsensusGroup::new` requires a payload store even though neither test
-    // here stages a payload; k=1/m=1 is the minimal valid geometry.
-    let replicas = vec![
-        FilePayloadReplica::open(node, directory.join("payload-a")).expect("payload replica a"),
-        FilePayloadReplica::open(node + 1000, directory.join("payload-b"))
-            .expect("payload replica b"),
-    ];
-    let payloads = Arc::new(PayloadSet::new(1, 1, replicas).expect("payload set"));
-    state
-        .attach_payload_store(payloads.clone())
-        .await
-        .expect("attach payload store");
-
-    let group = ConsensusGroup::new("leader-wait-test", 1, raft.clone(), state, payloads)
-        .expect("build consensus group");
+    // Neither test here stages a payload, so the factory is never resolved.
+    // A single voter has no valid coded geometry; the group still opens and
+    // serves these leadership paths because nothing forces construction.
+    let group = ConsensusGroup::new(
+        "leader-wait-test",
+        1,
+        raft.clone(),
+        state,
+        Box::new(|| Err(PayloadError::InvalidGeometry)),
+    )
+    .expect("build consensus group");
     (router, raft, group)
 }
 

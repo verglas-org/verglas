@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-# One workspace for the whole repository. The Lakekeeper catalog crates live
-# under `lakekeeper/crates/` and are members here — they are not a nested
+# One workspace for the whole repository. The Catalog catalog crates live
+# under `catalog/crates/` and are members here — they are not a nested
 # workspace. That became possible once both trees were put on a single
-# `iceberg`: the fork in `[patch.crates-io]` below is the Lakekeeper base plus
+# `iceberg`: the fork in `[patch.crates-io]` below is the Catalog base plus
 # the Verglas commit constructor, so there is no longer one `iceberg` key
 # wanted by two sources.
 exclude = ["sdks/typescript"]
@@ -27,20 +27,14 @@ members = [
     "crates/verglas-vector",
     "crates/verglas-kv",
     "bins/cache-node",
-    "bins/query-node",
     "crates/verglas-block",
 
-    # Lakekeeper catalog
-    "lakekeeper/crates/authz-openfga",
-    "lakekeeper/crates/authz-verglas",
-    "lakekeeper/crates/iceberg-ext",
-    "lakekeeper/crates/io",
-    "lakekeeper/crates/lakekeeper",
-    "lakekeeper/crates/lakekeeper-bin",
-    "lakekeeper/crates/lakekeeper-events-kafka",
-    "lakekeeper/crates/lakekeeper-events-nats",
-    "lakekeeper/crates/lakekeeper-secrets-kv2",
-    "lakekeeper/crates/lakekeeper-storage-verglas",
+    # Catalog catalog
+    "crates/verglas-catalog-authz",
+    "crates/verglas-catalog-core",
+    "crates/verglas-catalog-io",
+    "crates/verglas-catalog-storage",
+    "crates/verglas-iceberg-ext",
 ]
 
 [workspace.package]
@@ -48,7 +42,7 @@ members = [
 # are never deleted or re-pointed once pushed (the tag/version pair names the
 # artifacts forever). The tag must match this version (cargo-dist enforces it).
 #
-# 0.2.0 marks absorbing the Lakekeeper catalog. Its crates were independently
+# 0.2.0 marks absorbing the Catalog catalog. Its crates were independently
 # versioned at 0.13.1 under their own release-please; they now take this
 # version like every other crate in the repository.
 version = "0.2.0"
@@ -58,10 +52,10 @@ homepage = "https://github.com/verglas-org/verglas"
 # FSL-1.1-ALv2 is not an SPDX identifier, so crates that publish ship the
 # license file itself.
 license-file = "LICENSE"
-# The Lakekeeper-derived crates inherit `license`; the engine crates inherit
-# `license-file`. lakekeeper/LICENSING.md is authoritative for that subtree.
+# The Catalog-derived crates inherit `license`; the engine crates inherit
+# `license-file`. catalog/LICENSING.md is authoritative for that subtree.
 license = "Apache-2.0"
-# Lakekeeper's declared MSRV. The repository pins 1.96.1.
+# Catalog's declared MSRV. The repository pins 1.96.1.
 rust-version = "1.94"
 publish = false
 
@@ -106,18 +100,8 @@ iceberg-datafusion = "=0.10.0"
 # the configured cache endpoint.
 iceberg-storage-opendal = "=0.10.0"
 # 54, not 53.1: the fork's `iceberg-datafusion` builds against DataFusion 54.
-# Arrow stays on the 58 line across the bump, so the duckdb/arrow-array
-# `RecordBatch` type identity noted below still holds.
+# Arrow stays on the 58 line across the bump.
 datafusion = "54.0"
-# bins/query-node's second query engine (protocol v4 step 9b): the bundled
-# build statically links libduckdb so the binary carries its own engine, no
-# system libduckdb at runtime. DuckDB's own Iceberg REST catalog support
-# (its `iceberg`/`httpfs` extensions, loaded at session init) reads the same
-# catalog and S3 endpoint the DataFusion path uses. Its `arrow` dependency
-# pins to the same arrow-rs "58" line as the rest of the workspace, so
-# `duckdb::arrow::record_batch::RecordBatch` and `arrow_array::RecordBatch`
-# are the same type — query-node's JSON row writer serves both engines.
-duckdb = { version = "1.10505.0", features = ["bundled"] }
 # Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "58"
 arrow-buffer = "58"
@@ -189,7 +173,7 @@ prometheus = { version = "0.14.0", default-features = false }
 bollard = "0.21.0"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 
-# ---- Lakekeeper catalog dependencies ----
+# ---- Catalog catalog dependencies ----
 anyhow = "^1.0"
 assert-json-diff = "2.0.2"
 async-channel = { version = "2.3.1" }
@@ -364,8 +348,8 @@ unwrap_used = "warn"
 # public API; compaction and post-compact snapshot expiry need that escape
 # hatch.
 #
-# The base moved here from upstream's 0.10.1 tag to the Lakekeeper fork so that
-# this workspace and the catalog workspace under `lakekeeper/` resolve ONE
+# The base moved here from upstream's 0.10.1 tag to the Catalog fork so that
+# this workspace and the catalog workspace under `catalog/` resolve ONE
 # `iceberg`. While they disagreed, the two could never share a cargo workspace:
 # one `[workspace.dependencies]` table admits one `iceberg` key, and a patch
 # table cannot redirect a direct git dependency.

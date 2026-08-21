@@ -1293,6 +1293,27 @@ pub enum PayloadError {
     Io(#[from] std::io::Error),
 }
 
+impl Clone for PayloadError {
+    /// Clones a payload error for the memoized lazy-store result.
+    fn clone(&self) -> Self {
+        match self {
+            Self::InvalidGeometry => Self::InvalidGeometry,
+            Self::InsufficientDurability { required, durable } => Self::InsufficientDurability {
+                required: *required,
+                durable: *durable,
+            },
+            Self::UnknownHolder => Self::UnknownHolder,
+            Self::ReconstructionUnavailable => Self::ReconstructionUnavailable,
+            Self::CorruptRepresentation => Self::CorruptRepresentation,
+            Self::Transport(message) => Self::Transport(message.clone()),
+            Self::Io(error) => Self::Io(std::io::Error::new(
+                error.kind(),
+                std::io::Error::other(error.to_string()),
+            )),
+        }
+    }
+}
+
 impl PayloadError {
     /// Returns the durability threshold for an insufficient-holder error.
     pub fn required(&self) -> usize {

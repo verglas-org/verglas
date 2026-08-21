@@ -88,7 +88,7 @@ pub type StatsSlot = Arc<OnceLock<StatsSource>>;
 /// A metrics source wired lazily once recovery completes; see [`StatsSlot`].
 pub type MetricsSlot = Arc<OnceLock<MetricsSource>>;
 
-/// Direct Lakekeeper mutation endpoint on the tenant network. The payload is a
+/// Direct Catalog mutation endpoint on the tenant network. The payload is a
 /// CloudEvent carrying the transactionally committed catalog pointer.
 pub const CATALOG_EVENTS_PATH: &str = "/admin/catalog/events";
 /// Authenticated lifecycle endpoint that must finish authoritative drain before VM stop.
@@ -497,7 +497,7 @@ fn constant_time_eq(supplied: &str, expected: &str) -> bool {
 
 /// Mounts the cache-owned Iceberg REST metadata gateway at `/catalog`.
 /// Successful GET responses are shared with the cache node's watcher; query
-/// workers therefore consume already-observed metadata without Lakekeeper
+/// workers therefore consume already-observed metadata without Catalog
 /// credentials or an independent catalog cache.
 pub fn catalog_router(catalog: CatalogGateway) -> Router {
     Router::new()

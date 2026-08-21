@@ -20,7 +20,8 @@ mod raft_store;
 
 pub use durable::{DurableGroup, FileReplica};
 pub use group::{
-    CatalogExport, ConsensusGroup, GroupError, GroupRequest, GroupResponse, WalArchiveState,
+    CatalogExport, ConsensusGroup, GroupError, GroupRequest, GroupResponse, PayloadStoreFactory,
+    WalArchiveState,
 };
 pub use payload::{
     DistributedPayloadStore, FilePayloadReplica, PayloadError, PayloadRepresentation, PayloadSet,

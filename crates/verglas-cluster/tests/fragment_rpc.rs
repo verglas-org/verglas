@@ -575,10 +575,8 @@ async fn peer_vote_remains_responsive_when_public_runtime_is_saturated() {
 #[tokio::test(flavor = "multi_thread")]
 async fn concurrent_fragment_placements_do_not_time_out_under_load() {
     let node = NodeId::new("loaded-peer");
-    let directory = std::env::temp_dir().join(format!(
-        "verglas-fragrpc-loaded-{}",
-        std::process::id()
-    ));
+    let directory =
+        std::env::temp_dir().join(format!("verglas-fragrpc-loaded-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&directory);
     let store = LocalFragmentStore::new(&directory);
     let server = PeerServer::bind_with_fragments(
@@ -620,10 +618,12 @@ async fn concurrent_fragment_placements_do_not_time_out_under_load() {
     let failures: Vec<String> = results
         .into_iter()
         .enumerate()
-        .filter_map(|(i, joined)| match joined.expect("placement task panicked") {
-            Ok(()) => None,
-            Err(error) => Some(format!("placement {i}: {error}")),
-        })
+        .filter_map(
+            |(i, joined)| match joined.expect("placement task panicked") {
+                Ok(()) => None,
+                Err(error) => Some(format!("placement {i}: {error}")),
+            },
+        )
         .collect();
     assert!(
         failures.is_empty(),

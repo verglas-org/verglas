@@ -26,3 +26,5 @@
   before because no caller had needed to read node properties back out.
 - Iceberg 0.10.1: `CompressionCodec::Zstd` became `Zstd(level)`; the
   adjacency Puffin write uses `CompressionCodec::zstd_default()`.
+- #137: Updated graph engine contract comments to refer to the Graph API's AddNodes operation while preserving the append-only, last-write-wins node semantics.
+

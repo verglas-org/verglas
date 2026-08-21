@@ -7,7 +7,7 @@
 //!
 //!   PutVectors / DeleteVectors  -> eventType "org.verglas.vector.commit",
 //!                                  subject "<vectorBucketName>.<indexName>"
-//!   PutNodes / PutEdges         -> eventType "org.verglas.graph.commit",
+//!   AddNodes / AddEdges         -> eventType "org.verglas.graph.commit",
 //!                                  subject "<graphName>"
 //!
 //! POST body: {"eventType": ..., "tenant_id": ..., "subject": ...}
@@ -169,17 +169,17 @@ async fn put_nodes_and_edges_publish_graph_commit_events() {
     let (url, capture) = capture_server().await;
     let api = wrapped(&url, false);
     api.call(
-        SemanticOperation::Graph("PutNodes"),
+        SemanticOperation::Graph("AddNodes"),
         json!({"graphName": "social", "nodes": []}),
     )
     .await
-    .expect("PutNodes should succeed against the fake api");
+    .expect("AddNodes should succeed against the fake api");
     api.call(
-        SemanticOperation::Graph("PutEdges"),
+        SemanticOperation::Graph("AddEdges"),
         json!({"graphName": "social", "edges": []}),
     )
     .await
-    .expect("PutEdges should succeed against the fake api");
+    .expect("AddEdges should succeed against the fake api");
     let events = wait_for_events(&capture, 2).await;
     assert_eq!(events.len(), 2, "expected two publishes: {events:?}");
     for (_, body) in &events {
@@ -202,17 +202,17 @@ async fn reads_failures_and_unknown_operations_publish_nothing() {
     .await
     .expect("QueryVectors should succeed against the fake api");
     api.call(
-        SemanticOperation::Graph("GetGraph"),
+        SemanticOperation::Graph("DescribeGraph"),
         json!({"graphName": "social"}),
     )
     .await
-    .expect("GetGraph should succeed against the fake api");
+    .expect("DescribeGraph should succeed against the fake api");
 
     // A failing inner API on a mutating operation.
     let failing = wrapped(&url, true);
     let result = failing
         .call(
-            SemanticOperation::Graph("PutNodes"),
+            SemanticOperation::Graph("AddNodes"),
             json!({"graphName": "social", "nodes": []}),
         )
         .await;
@@ -221,11 +221,11 @@ async fn reads_failures_and_unknown_operations_publish_nothing() {
     // Sentinel mutation: once its event arrives, any earlier wrong publish
     // would already be in the capture ahead of it.
     api.call(
-        SemanticOperation::Graph("PutEdges"),
+        SemanticOperation::Graph("AddEdges"),
         json!({"graphName": "sentinel", "edges": []}),
     )
     .await
-    .expect("sentinel PutEdges should succeed against the fake api");
+    .expect("sentinel AddEdges should succeed against the fake api");
     let events = wait_for_events(&capture, 1).await;
     assert_eq!(events.len(), 1, "only the sentinel may publish: {events:?}");
     assert_eq!(events[0].1["subject"], "sentinel");
@@ -236,7 +236,7 @@ async fn an_unreachable_queue_never_fails_the_client_operation() {
     let api = wrapped("http://127.0.0.1:9/v1/table-commits", false);
     let result = api
         .call(
-            SemanticOperation::Graph("PutNodes"),
+            SemanticOperation::Graph("AddNodes"),
             json!({"graphName": "social", "nodes": []}),
         )
         .await;

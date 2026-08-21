@@ -13,44 +13,54 @@ This project is pre-release. The rules that follow from that are strict:
 ## Repository layout
 
 One cargo workspace covers the whole repository. `crates/`, `bins/`, `cli/`, and
-`sdks/rust` hold the engine; `lakekeeper/crates/` holds the Verglas fork of
+`sdks/rust` hold the engine. The Verglas fork of
 [Lakekeeper](https://github.com/lakekeeper/lakekeeper), the Apache Iceberg REST
-catalog, which moved in from the separate `verglas-org/verglas-lakekeeper`
-repository. That repository is historical; catalog changes land here.
+catalog, lives in `crates/verglas-catalog-*` and `crates/verglas-iceberg-ext`.
+It moved in from the separate `verglas-org/verglas-catalog` repository, which
+is historical; catalog changes land here.
 
 `cargo build --workspace` builds all of it. `just build`, `just test`, and
 `just lint` are the entry points.
 
 The catalog is being adapted heavily and will not stay recognisable as upstream
-Lakekeeper. Treat its code as Verglas code: the standing rules in this file
+Catalog. Treat its code as Verglas code: the standing rules in this file
 (no fallbacks, delete rather than deprecate, tests first) apply there too.
 
 Things that are easy to get wrong:
 
-- **The catalog's tests need PostgreSQL.** `just test` therefore excludes those
-  crates, and `.github/workflows/lakekeeper.yml` runs them against a Postgres
-  service. `just lakekeeper-test` runs them locally against `DATABASE_URL`.
+- **The catalog has no database.** Its authoritative state is the Verglas
+  consensus plane. There is no `sqlx` dependency anywhere in the workspace, so
+  `just test` runs the catalog crates like any other — no exclusions, no
+  Postgres service, no `DATABASE_URL`.
+- **There is one catalog service, and it is `verglas-cache-node`.** The catalog
+  runs in-process on the ring node when `VERGLAS_CATALOG=on`. There is no
+  standalone catalog binary; the node mounts `new_v1_hosted_router` (config,
+  namespaces, tables, views) and nothing else. Catalog's management API —
+  warehouses, projects, roles, users, permissions — is not mounted: this
+  deployment serves one warehouse from `[catalog_server]` and delegates
+  authorization to an external decision service through
+  `verglas-catalog-authz`.
 - **`.cargo/config.toml` sets `--cfg tracing_unstable` for the whole
   workspace.** It gates `tracing`/`tracing-subscriber`'s `valuable` feature.
   Rustflags set in the environment *replace* that table rather than merging, so
   exporting `RUSTFLAGS` breaks the build. `tokio_unstable` was deliberately
-  removed — do not reintroduce it (see `lakekeeper/crates/lakekeeper/src/metrics.rs`).
-- **`.sqlx/` at the root is the sqlx offline cache** and must stay current with
-  the queries in the tree; CI checks it. Regenerate with `just sqlx-prepare`
-  against a live database.
+  removed — do not reintroduce it (see
+  `crates/verglas-catalog-core/src/metrics.rs`).
 - **One `iceberg`, and it is forked.** `[patch.crates-io]` redirects `iceberg`
   and its three sibling crates to `verglas-org/verglas-iceberg`, whose base is
-  the Lakekeeper fork plus a public `TableCommit::from_parts`. All four are
+  the Catalog fork plus a public `TableCommit::from_parts`. All four are
   pinned with `=` requirements: a caret requirement lets the higher crates.io
   0.10.1 outrank the fork's 0.10.0 and the patch silently stops applying.
   Unifying this is what allowed one workspace at all.
-- **`lakekeeper/LICENSING.md` governs licensing under `lakekeeper/`** — mostly
+- **`LICENSING.md` governs the catalog crates' licensing** — mostly
   Apache-2.0, with the Verglas-authored adapters under FSL-1.1-ALv2. The root
-  `LICENSE` does not cover that subtree. Catalog crates inherit
-  `license.workspace`; engine crates inherit `license-file.workspace`.
-- **`lakekeeper/.github/workflows/` is inert.** GitHub reads workflows only from
-  the repository root; those files are kept as the reference for gates not yet
-  ported.
+  `LICENSE` does not cover them. The boundary is the *crate*, not the
+  directory: upstream-derived crates declare `license = { workspace = true }`
+  (Apache-2.0) and the Verglas adapters declare FSL explicitly, so a crate
+  keeps its license if it is ever relocated. Never switch one of them to
+  `license-file.workspace` (what engine crates inherit) — that would
+  relicense upstream-derived code.
+
 
 ## Sources of truth
 
@@ -163,9 +173,24 @@ for the required `VERGLAS_STORAGE_*` variables).
   `[auth]`, the node prints an ephemeral keypair at startup.
 - An `http://` origin needs `backend.allow_http = true` (or `AWS_ALLOW_HTTP=true`).
 - `cache.dir` must exist, be writable, and be exclusive to one node.
-- **Cache acceleration is Iceberg/Parquet-aware.** Without a `[catalog]` and real
-  Parquet data files, reads are served `tier="passthrough"` (correct read-through:
-  right bytes, just not locally accelerated), so `verglas_cache_hits_total` stays
-  0. Non-zero hits require standing up an Iceberg REST catalog + Parquet objects.
+- **The cache does not depend on a catalog, a ring, or node count.** One node
+  with no `[catalog]` caches reads. The node wires the cache engine as the
+  reader whether or not write-back is on (`serve.rs`, both `router_with_passthrough`
+  arms), so a solo node is a real read cache; only *writes* pass through to the
+  origin. A `[catalog]` adds table-aware routing (#49/#50), not caching itself.
+- **`verglas_cache_hits_total 0` usually means the reads were the wrong shape,
+  not that caching is off.** Blocks are admitted by *ranged* reads. A whole-object
+  `GET` (what `aws s3 cp` issues) is served `tier="passthrough"` and admits
+  nothing, so hits/misses both stay 0 no matter how many times it is repeated.
+  Issue a `Range` request to exercise the block cache; `op="get",tier="dram"`,
+  `verglas_bytes_served_total{tier="dram"}`, and `verglas_cache_size_bytes` are
+  the counters that prove a hit. Note that `HEAD` is served from the mapping
+  cache (`op="head",tier="dram"`) even when every `GET` is passthrough — that
+  alone does not mean blocks are being cached.
+- **A write does not populate the cache; it only invalidates.** `PassthroughWrite`
+  streams the body to the origin and the engine's `Invalidation` drops the key's
+  mapping (`engine.rs:invalidate_key`). The bytes the client just sent are not
+  admitted, so the first read after a write is always a miss served from the
+  origin. Caching on write is not implemented — do not describe it as if it were.
   Use an S3 client (`aws`, DuckDB) for object I/O on port 8333. The CLI and SDKs
   are developed in this repository under `cli/` and `sdks/`.

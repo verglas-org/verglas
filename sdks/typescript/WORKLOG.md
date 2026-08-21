@@ -59,3 +59,5 @@
   dropped with them: the old per-worker job history route has no /v0
   equivalent, and guessing at one was out of scope. `databasePathSegment`
   (only used by the deleted admin query) came out of `http.ts` too.
+- #137: Regenerated the TypeScript Graph DTO and client operation names to match the conventional Graph REST-JSON vocabulary.
+

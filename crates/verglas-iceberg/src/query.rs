@@ -46,7 +46,7 @@ const CATALOG_NAME: &str = "verglas";
 ///
 /// This is the shared streaming primitive: `query`'s buffered `QueryReport`
 /// is just `query_stream` collected, and every non-collecting caller (the
-/// standalone query role's own `/v1/query` in `bins/query-node`, its
+/// cache node's own `/v1/query` (`bins/cache-node/src/query_api.rs`), its
 /// `estimate` module walking a plan without executing it, and the server's
 /// embedded Arrow-IPC response path) is built on this same call, not a
 /// second copy of it.
@@ -232,7 +232,7 @@ fn query_session_config(bounded: bool) -> SessionConfig {
     // per-catalog default schema is hardcoded to that name, and an attached
     // Iceberg namespace also named "main" gets shadowed by it (protocol v4's
     // "USER RULING" amendment, found live running the DuckDB engine path in
-    // `bins/query-node`).
+    // `bins/cache-node/src/query_api.rs`).
     let mut config = SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, "default");
     if bounded {
         // HashJoin materializes its build side and can exhaust a fixed memory
@@ -435,7 +435,7 @@ fn batches_to_rows(
 /// Serializes one [`arrow_array::RecordBatch`] to the *inner* bytes of a JSON
 /// row-object array — `{"a":1,"b":2},{"c":3,"d":4}`, with no enclosing `[`/`]`
 /// — plus its row count. A streaming caller ([`crate::estimate`] does not use
-/// this; the HTTP layer in `bins/query-node` does) splices
+/// this; the HTTP layer in `bins/cache-node/src/query_api.rs` does) splices
 /// this between its own `[`/`]` as batches arrive, one call per batch, so
 /// nothing beyond one batch is ever held in memory building the response body.
 /// An empty batch returns empty bytes and `0`, never a bare `[]`.

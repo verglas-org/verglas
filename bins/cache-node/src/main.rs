@@ -14,14 +14,17 @@
 use verglas_core::config::Config;
 
 mod admin;
+mod api_docs;
 mod blockdev;
 mod consensus;
 mod logging;
 mod nbd;
 mod object_batch;
 mod page_cache;
+mod query_api;
 mod ring;
 mod safekeeper;
+mod self_credential;
 mod serve;
 mod tables_api;
 mod tls;

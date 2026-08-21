@@ -1,31 +1,44 @@
-# One disposable OSS cache node. Catalog and object storage are provider-managed.
+# One Verglas node: a read cache in front of an S3-compatible origin, which
+# also serves its own Iceberg REST catalog when VERGLAS_CATALOG=on.
+#
+# Point it at an origin, give it a cache directory and budgets, and it serves
+# S3 for engines and admin/metrics, plus the Iceberg REST catalog when that is
+# switched on. There is no external catalog to configure — this process is the
+# catalog. One node writes through to the origin: object write-back needs three.
 services:
   verglas:
     build:
       context: .
       target: verglas-cache-node
     environment:
-      VERGLAS_PROVIDER: ${VERGLAS_PROVIDER:?set verglas-cloud, cloudflare, or aws-s3-tables}
-      VERGLAS_STORAGE_BUCKET: ${VERGLAS_STORAGE_BUCKET:-}
-      VERGLAS_STORAGE_ENDPOINT: ${VERGLAS_STORAGE_ENDPOINT:-}
+      # --- origin: the S3-compatible bucket this node caches and offloads to
+      VERGLAS_STORAGE_BUCKET: ${VERGLAS_STORAGE_BUCKET:?set the origin bucket}
+      VERGLAS_STORAGE_ENDPOINT: ${VERGLAS_STORAGE_ENDPOINT:?set the origin S3 endpoint}
+      VERGLAS_STORAGE_ACCESS_KEY_ID: ${VERGLAS_STORAGE_ACCESS_KEY_ID:?set the origin access key}
+      VERGLAS_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_STORAGE_SECRET_ACCESS_KEY:?set the origin secret key}
       VERGLAS_STORAGE_REGION: ${VERGLAS_STORAGE_REGION:-us-east-1}
+      # A plaintext http:// origin needs this set to true.
       VERGLAS_STORAGE_ALLOW_HTTP: ${VERGLAS_STORAGE_ALLOW_HTTP:-false}
-      VERGLAS_STORAGE_ACCESS_KEY_ID: ${VERGLAS_STORAGE_ACCESS_KEY_ID:?set provider storage access key}
-      VERGLAS_STORAGE_SECRET_ACCESS_KEY: ${VERGLAS_STORAGE_SECRET_ACCESS_KEY:?set provider storage secret}
-      VERGLAS_CATALOG_URI: ${VERGLAS_CATALOG_URI:-}
-      VERGLAS_CATALOG_WAREHOUSE: ${VERGLAS_CATALOG_WAREHOUSE:?set the provider warehouse identifier}
-      VERGLAS_CATALOG_TOKEN: ${VERGLAS_CATALOG_TOKEN:-}
-      VERGLAS_CATALOG_EVENT_TOKEN: ${VERGLAS_CATALOG_EVENT_TOKEN:-}
-      VERGLAS_CATALOG_POLL_INTERVAL_SECONDS: ${VERGLAS_CATALOG_POLL_INTERVAL_SECONDS:-30}
-      VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:?set local cache S3 access key}
-      VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?set local cache S3 secret}
+
+      # --- cache: where it lives and what it may consume
       VERGLAS_CACHE_CAPACITY: ${VERGLAS_CACHE_CAPACITY:-20GB}
       VERGLAS_CACHE_DRAM: ${VERGLAS_CACHE_DRAM:-1GB}
-      VERGLAS_ADMIN_ADDR: 0.0.0.0:8334
-      VERGLAS_PUBLIC_S3_ENDPOINT: http://127.0.0.1:${VERGLAS_S3_HOST_PORT:-8333}
-      VERGLAS_PUBLIC_ADMIN_URI: http://127.0.0.1:${VERGLAS_ADMIN_HOST_PORT:-8334}
+
+      # --- what query engines present to this node's S3 endpoint
+      VERGLAS_S3_ACCESS_KEY_ID: ${VERGLAS_S3_ACCESS_KEY_ID:?set the S3 endpoint access key}
+      VERGLAS_S3_SECRET_ACCESS_KEY: ${VERGLAS_S3_SECRET_ACCESS_KEY:?set the S3 endpoint secret key}
+
+      # --- catalog: off by default. `on` serves the Iceberg REST catalog and
+      # then requires the issuer and JWKS below; the entrypoint enforces that.
+      # These stay optional here so a cache-only node starts without them.
+      VERGLAS_CATALOG: ${VERGLAS_CATALOG:-off}
+      VERGLAS_CATALOG_TENANT: ${VERGLAS_CATALOG_TENANT:-local}
+      VERGLAS_CATALOG_WAREHOUSE: ${VERGLAS_CATALOG_WAREHOUSE:-warehouse}
+      VERGLAS_CATALOG_AUTHZ_ISSUER: ${VERGLAS_CATALOG_AUTHZ_ISSUER:-}
+      VERGLAS_CATALOG_AUTHZ_JWKS: ${VERGLAS_CATALOG_AUTHZ_JWKS:-}
     ports:
       - "${VERGLAS_S3_HOST_PORT:-8333}:8333"
       - "${VERGLAS_ADMIN_HOST_PORT:-8334}:8334"
+      - "${VERGLAS_CATALOG_HOST_PORT:-8181}:8181"
     volumes:
       - ${VERGLAS_STATE_DIR:-./.verglas}:/var/lib/verglas

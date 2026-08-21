@@ -14,23 +14,23 @@ use std::{
     time::Duration,
 };
 
+use crate::object_batch::{BatchSubmitter, ObjectCommitBatcher};
 use futures::future::join_all;
 use openraft::{BasicNode, Vote, storage::RaftLogStorage};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use verglas_cluster::{
-    BootstrapGroupFn, GroupCommandFn, MembershipReplace, MembershipReplaceFn, OpenGroupFn,
-    RaftHttpTransport,
+    BootstrapGroupFn, GroupCommandError, GroupCommandFn, MembershipReplace, MembershipReplaceFn,
+    OpenGroupFn, RaftHttpTransport,
 };
 use verglas_consensus::{
-    ConsensusGroup, DistributedPayloadStore, GroupRequest, GroupResponse, PersistentLogStore,
-    PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
+    ConsensusGroup, DistributedPayloadStore, GroupRequest, GroupResponse, PayloadStore,
+    PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
 use verglas_core::CacheKey;
 use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
-use crate::object_batch::{BatchSubmitter, ObjectCommitBatcher};
 use crate::ring::RingPlane;
 
 type Raft = openraft::Raft<VerglasRaftConfig>;
@@ -261,20 +261,16 @@ pub struct ObjectConsensusCommitter {
     /// Folds concurrent object commits bound for one group into single Raft
     /// entries. Without it every client write costs a round trip and
     /// throughput is capped at `groups / round_trip`.
-    batcher: crate::object_batch::ObjectCommitBatcher,
+    batcher: ObjectCommitBatcher,
 }
 
 impl ObjectConsensusCommitter {
     /// Binds S3 write-back publication to the process's universal Multi-Raft
-    /// plane, folding concurrent commits under `linger`/`max_batch`.
-    pub fn new(
-        plane: Arc<ConsensusPlane>,
-        linger: std::time::Duration,
-        max_batch: usize,
-    ) -> Self {
-        let batcher = crate::object_batch::ObjectCommitBatcher::new(
+    /// plane. Concurrent commits to one group fold into as few entries as
+    /// that group's own commit latency allows, bounded by `max_batch`.
+    pub fn new(plane: Arc<ConsensusPlane>, max_batch: usize) -> Self {
+        let batcher = ObjectCommitBatcher::new(
             Arc::new(ObjectGroupSubmitter::new(Arc::clone(&plane))),
-            linger,
             max_batch,
         );
         Self { plane, batcher }
@@ -309,7 +305,6 @@ fn payload_request_id(payload: &[u8]) -> Result<u128, String> {
         .map_err(|_| "request identity is malformed".to_owned())?;
     Ok(u128::from_be_bytes(bytes))
 }
-
 
 /// Appends one Raft entry per batch of staged objects.
 ///
@@ -347,7 +342,7 @@ impl ObjectGroupSubmitter {
 }
 
 #[async_trait::async_trait]
-impl crate::object_batch::BatchSubmitter for ObjectGroupSubmitter {
+impl BatchSubmitter for ObjectGroupSubmitter {
     async fn submit_batch(
         &self,
         group: &str,
@@ -356,10 +351,8 @@ impl crate::object_batch::BatchSubmitter for ObjectGroupSubmitter {
         if items.is_empty() {
             return Err("cannot commit an empty object batch".to_owned());
         }
-        let payload = serde_json::to_vec(
-            &items.iter().map(Self::identity).collect::<Vec<_>>(),
-        )
-        .map_err(|error| error.to_string())?;
+        let payload = serde_json::to_vec(&items.iter().map(Self::identity).collect::<Vec<_>>())
+            .map_err(|error| error.to_string())?;
         let request_id = payload_request_id(&payload)?;
         // Every holder named by any object in the batch, deduplicated.
         let holders: std::collections::BTreeSet<_> = items
@@ -736,17 +729,86 @@ impl ConsensusPlane {
         timeout: Duration,
     ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
-        let Some(leader) = local.await_leader(timeout).await? else {
-            return Err(
-                format!("consensus group `{group}` elected no leader within {timeout:?}").into(),
-            );
-        };
-        if leader == self.ring.safekeeper_id() {
-            return local.execute(request).await.map_err(Into::into);
-        }
+        let deadline = tokio::time::Instant::now() + timeout;
         let encoded = serde_json::to_vec(&request)?;
-        let response = self.network(group)?.command(leader, encoded).await?;
-        serde_json::from_slice(&response).map_err(Into::into)
+        let mut leader = match local.await_leader(timeout).await? {
+            Some(leader) => leader,
+            None => {
+                return Err(format!(
+                    "consensus group `{group}` elected no leader within {timeout:?}"
+                )
+                .into());
+            }
+        };
+        // A leader view goes stale: between resolving one and reaching it, the
+        // election can move. That is not a failed write, so re-resolve and
+        // retry until the deadline. `await_leader_change` blocks on a Raft
+        // metrics change, so this waits on the election itself rather than
+        // sampling on a timer.
+        loop {
+            if leader == self.ring.safekeeper_id() {
+                match local.execute(request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(verglas_consensus::GroupError::NotLeader { leader: hint }) => {
+                        leader = self
+                            .resolve_leader_after_stale(&local, hint, leader, group, deadline)
+                            .await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            match self.network(group)?.command(leader, encoded.clone()).await {
+                Ok(response) => return serde_json::from_slice(&response).map_err(Into::into),
+                Err(GroupCommandError::NotLeader { leader: hint }) => {
+                    leader = self
+                        .resolve_leader_after_stale(&local, hint, leader, group, deadline)
+                        .await?;
+                }
+                // A leader that died is unreachable until its successor is
+                // elected. Ride out that election instead of failing the
+                // write: the group is available again the moment a new leader
+                // appears, which is what the caller is waiting for.
+                Err(GroupCommandError::Unreachable(_)) => {
+                    leader = self
+                        .resolve_leader_after_stale(&local, None, leader, group, deadline)
+                        .await?;
+                }
+                Err(GroupCommandError::Failed(detail)) => return Err(detail.into()),
+            }
+        }
+    }
+
+    /// Resolves the next leader to try after `stale` rejected a command.
+    ///
+    /// Prefers the hint the rejecting replica supplied, since it comes from
+    /// the replica that just refused. Otherwise it waits for this node's own
+    /// replica to observe a leader other than `stale`.
+    async fn resolve_leader_after_stale(
+        &self,
+        local: &Arc<ConsensusGroup>,
+        hint: Option<u64>,
+        stale: u64,
+        group: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<u64, PlaneError> {
+        if let Some(hint) = hint.filter(|hint| *hint != stale) {
+            return Ok(hint);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                format!("consensus group `{group}` had no reachable leader in time").into(),
+            );
+        }
+        local
+            .await_leader_change(Some(stale), remaining)
+            .await?
+            .ok_or_else(|| {
+                PlaneError::from(format!(
+                    "consensus group `{group}` elected no new leader within {remaining:?}"
+                ))
+            })
     }
 
     /// Returns the locally opened authoritative group names in deterministic order.
@@ -822,13 +884,17 @@ impl ConsensusPlane {
         } else {
             ring.consensus_voters()
         };
-        let payloads = Arc::new(DistributedPayloadStore::new(
-            k,
-            m,
-            voters.clone(),
-            ring.consensus_payload_transport(),
-        )?);
-        state_machine.attach_payload_store(payloads.clone()).await?;
+        let payload_transport = ring.consensus_payload_transport();
+        let payload_voters = voters.clone();
+        let payload_factory: verglas_consensus::PayloadStoreFactory = Box::new(move || {
+            let payloads = DistributedPayloadStore::new(
+                k,
+                m,
+                payload_voters.clone(),
+                Arc::clone(&payload_transport),
+            )?;
+            Ok(Arc::new(payloads) as Arc<dyn PayloadStore>)
+        });
         let network =
             RaftHttpTransport::new(group, ring.raft_addresses(), ring.raft_secret().to_owned())?;
         let raft = Raft::new(
@@ -851,7 +917,7 @@ impl ConsensusPlane {
             generation,
             raft.clone(),
             state_machine.clone(),
-            payloads,
+            payload_factory,
         )?);
         groups.insert(
             group.to_owned(),
@@ -885,13 +951,13 @@ impl ConsensusPlane {
     }
 
     /// Executes a forwarded command only when this replica currently leads.
-    async fn execute_local(&self, group: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    async fn execute_local(&self, group: &str, body: &[u8]) -> Result<Vec<u8>, GroupCommandError> {
         let local = self
             .open_local(group)
             .await
-            .map_err(|error| error.to_string())?;
-        let request: GroupRequest =
-            serde_json::from_slice(body).map_err(|error| error.to_string())?;
+            .map_err(|error| GroupCommandError::Failed(error.to_string()))?;
+        let request: GroupRequest = serde_json::from_slice(body)
+            .map_err(|error| GroupCommandError::Failed(error.to_string()))?;
         // No local leader check here. Group replicas open lazily, so this
         // node's replica can still be catching up on leadership when a command
         // arrives — including when it *is* the elected leader. Rejecting on a
@@ -900,11 +966,15 @@ impl ConsensusPlane {
         // consensus. Raft is the authority: `execute` submits to the local
         // replica and OpenRaft answers with ForwardToLeader when this node is
         // not the leader, carrying the leader's identity.
-        let response = local
-            .execute(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&response).map_err(|error| error.to_string())
+        let response = local.execute(request).await.map_err(|error| match error {
+            // Preserve the condition across the peer boundary so the sender
+            // re-resolves instead of failing the client write.
+            verglas_consensus::GroupError::NotLeader { leader } => {
+                GroupCommandError::NotLeader { leader }
+            }
+            other => GroupCommandError::Failed(other.to_string()),
+        })?;
+        serde_json::to_vec(&response).map_err(|error| GroupCommandError::Failed(error.to_string()))
     }
 
     /// Creates the group-specific HTTP/2 OpenRaft transport.

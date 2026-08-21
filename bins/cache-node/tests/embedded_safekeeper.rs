@@ -62,7 +62,22 @@ impl Fleet {
                 .filter(|line| line.contains("Verglas Neon WAL ingress listening on"))
                 .count();
             if ready >= count {
-                return;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let diagnostics = self.stderr_snapshot();
+                    if diagnostics
+                        .matches("hosted Iceberg catalog disabled: VERGLAS_CATALOG=off")
+                        .count()
+                        >= self.children.len()
+                    {
+                        return;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "every Neon node must keep the hosted catalog closed: {diagnostics}"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
             for (index, child) in self.children.iter_mut().enumerate() {
                 if let Ok(Some(status)) = child.try_wait() {
@@ -144,6 +159,7 @@ fn spawn_node(
         .arg("--config")
         .arg(config)
         .env("VERGLAS_DEV_ALLOW_MISSING_ORIGIN", "1")
+        .env("VERGLAS_CATALOG", "off")
         .env("VERGLAS_NODE_ID", format!("node-{index}"))
         .env("VERGLAS_CATALOG_EVENT_TOKEN", "embedded-control-token")
         .env("VERGLAS_RING_PEERS", peers)

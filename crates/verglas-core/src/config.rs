@@ -63,6 +63,8 @@ pub struct Config {
     /// Iceberg REST catalog to track for table commits. Unset leaves Iceberg
     /// awareness off.
     pub catalog: Option<Catalog>,
+    /// Hosted Iceberg catalog served by this node. Unset serves no catalog.
+    pub catalog_server: Option<CatalogServer>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
 }
@@ -339,19 +341,11 @@ pub struct Writeback {
     /// on a schedule.
     #[serde(default = "default_offload_drain_interval_secs")]
     pub offload_drain_interval_secs: u64,
-    /// Bounded linger window, in milliseconds, that the object-header
-    /// consensus commit waits for concurrent commits to the same shard
-    /// before flushing whatever has accumulated as one Raft entry (#RIME-P1).
-    /// Amortises the per-object Raft round trip that otherwise caps client
-    /// throughput at `shards / raft_round_trip`
-    /// (`tests/cluster-local/PERF-OBJECTIVE.md`). Internal tuning knob, not
-    /// surfaced in the generated config.
-    #[serde(default = "default_object_commit_linger_ms")]
-    pub object_commit_linger_ms: u64,
-    /// Maximum staged objects folded into one batched consensus commit,
-    /// whichever comes first against the linger window. Bounds how large one
-    /// Raft entry (and its all-or-nothing atomicity) gets. Internal tuning
-    /// knob, not surfaced in the generated config.
+    /// Maximum staged objects folded into one batched consensus commit.
+    /// Bounds how large one Raft entry — and the blast radius of its
+    /// all-or-nothing retry — can get. There is no companion time window:
+    /// a group's batch closes when its previous entry commits. Internal
+    /// tuning knob, not surfaced in the generated config.
     #[serde(default = "default_object_commit_max_batch")]
     pub object_commit_max_batch: usize,
 }
@@ -388,7 +382,6 @@ impl Default for Writeback {
             prefixes: Vec::new(),
             offload_size_limit_bytes: default_offload_size_limit_bytes(),
             offload_drain_interval_secs: default_offload_drain_interval_secs(),
-            object_commit_linger_ms: default_object_commit_linger_ms(),
             object_commit_max_batch: default_object_commit_max_batch(),
         }
     }
@@ -424,12 +417,6 @@ impl Writeback {
         if self.offload_drain_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "cache.writeback.offload_drain_interval_secs",
-                "must be at least 1".into(),
-            ));
-        }
-        if self.object_commit_linger_ms == 0 {
-            return Err(ConfigError::Invalid(
-                "cache.writeback.object_commit_linger_ms",
                 "must be at least 1".into(),
             ));
         }
@@ -501,15 +488,6 @@ fn default_offload_size_limit_bytes() -> ByteSize {
 /// Short enough that a partially filled offload stream still drains inside
 /// the frozen benchmark's 30 s post-write window.
 fn default_offload_drain_interval_secs() -> u64 {
-    5
-}
-
-/// The documented default object-header commit linger: 5 milliseconds.
-/// Amortises the per-object Raft round trip (tens to low-hundreds of
-/// milliseconds) over a burst of concurrent writes to the same shard, while
-/// staying far below the write-back ack deadline so a lone write still acks
-/// promptly.
-fn default_object_commit_linger_ms() -> u64 {
     5
 }
 
@@ -1100,6 +1078,56 @@ pub enum CatalogConsistency {
     Strong,
 }
 
+/// The hosted Iceberg REST catalog this node serves itself.
+///
+/// The cloud topology pins one stateless catalog to every ring node, so the
+/// catalog runs inside this process and reaches consensus in-process rather
+/// than over HTTP to its own address space. Unset leaves the catalog off.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogServer {
+    /// TCP port the hosted Iceberg REST API listens on.
+    pub port: u16,
+    /// Tenant owning the CRaft catalog groups.
+    pub tenant: String,
+    /// The single warehouse this node's catalog serves.
+    pub warehouse: String,
+    /// Catalog S3 storage profile JSON for immutable table metadata.
+    pub managed_s3_profile: String,
+    /// Expected `iss` claim of credentials minted by the control plane.
+    pub authz_issuer: String,
+    /// Control-plane JWKS JSON used for local signature checks.
+    pub authz_jwks: String,
+    /// Tenant whose grants this catalog may serve.
+    pub authz_tenant_id: String,
+}
+
+impl CatalogServer {
+    /// Rejects empty coordinates before a request can 4xx on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required coordinate is blank.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("catalog_server.tenant", &self.tenant),
+            ("catalog_server.warehouse", &self.warehouse),
+            (
+                "catalog_server.managed_s3_profile",
+                &self.managed_s3_profile,
+            ),
+            ("catalog_server.authz_issuer", &self.authz_issuer),
+            ("catalog_server.authz_jwks", &self.authz_jwks),
+            ("catalog_server.authz_tenant_id", &self.authz_tenant_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::Invalid(field, "must not be empty".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Iceberg REST catalog watcher settings (#47). Filters match against the
 /// dotted `namespace.table` name with `*` wildcards; empty `include` means
 /// every table, and `exclude` always wins over `include`.
@@ -1556,6 +1584,9 @@ impl Config {
         self.backend.validate()?;
         if let Some(archive) = &self.catalog_archive {
             archive.validate(&self.backend)?;
+        }
+        if let Some(catalog_server) = &self.catalog_server {
+            catalog_server.validate()?;
         }
         self.cache.validate()?;
         self.cache.admission.validate()?;

@@ -68,22 +68,28 @@ async fn semantic_sigv4_requires_a_valid_vectors_signature() {
     );
 }
 
-/// Public listener documentation is inspectable without semantic credentials.
+/// The customer data port serves no API documentation. The cache node's admin
+/// listener serves it instead, so nothing unauthenticated rides the S3 port.
 #[tokio::test]
-async fn semantic_openapi_is_not_behind_sigv4() {
+async fn the_s3_listener_serves_no_documentation() {
     let app = router_with_sigv4(
         Arc::new(RecordingApi(Mutex::new(Vec::new()))),
         SemanticCredentials::new("key".to_owned(), "secret".to_owned()),
     );
-    let response = app
-        .oneshot(
-            Request::get("/api-docs/s3/openapi.json")
-                .body(Body::empty())
-                .expect("request"),
-        )
-        .await
-        .expect("response");
-    assert_eq!(response.status(), StatusCode::OK);
+    // The documentation routes are gone and the sigv4 layer now covers their
+    // former paths, so an unsigned request is refused rather than answered.
+    for path in ["/api-docs/s3/openapi.json", "/swagger-ui"] {
+        let response = app
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+            .await
+            .expect("response");
+        assert_ne!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must not be served from the S3 port"
+        );
+    }
 }
 
 /// Stale or wrong-service signatures are rejected before semantic dispatch.

@@ -176,3 +176,18 @@
   candidate (e.g., batching many concurrent objects into fewer Raft round
   trips while still awaiting the commit before ack), not removing the
   synchronous commit.
+- #164: Grouped `ack_deadline` and `offload_size_limit_bytes` into
+  `WritebackThresholds`. They are one policy, set together from
+  `cache.writeback` and read together on the ack path, and the eight-argument
+  constructor was failing `clippy -D warnings` on main.
+- #164: Striped the journal `write_lock` by object id. The invariant it
+  enforces is per journal — a straggler merge and a repair pass must not
+  interleave on the SAME object — but one global mutex also serialized every
+  unrelated journal write behind an fsync: measured 44.1 ms of lock wait
+  against 13.6 ms of actual write. Two mutations of one object still take the
+  same stripe.
+- #164: Moved the local fragment commit and the journal write off the async
+  runtime with `spawn_blocking`. Both are durability barriers (fsync, rename,
+  directory fsync) that were parking a worker thread inline on the client ack
+  path, and one of every object's fragments is placed locally. The peer path
+  already did this; the local path did not.

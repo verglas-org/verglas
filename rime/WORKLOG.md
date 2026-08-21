@@ -66,3 +66,5 @@
   `rime:rime-worker` agent string from the package and lakehouse-skill tests.
   The positive assertions on the current `verglas:rime-worker` name already
   fail if the rename regresses.
+- #137: Updated the RIME graph reference to call the precedent capability SearchPrecedents.
+

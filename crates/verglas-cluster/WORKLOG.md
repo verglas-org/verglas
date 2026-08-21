@@ -190,3 +190,14 @@
   handler genuinely occupies a worker thread per request (not an async sleep,
   so it exercises the thread ceiling itself): it failed with 10/16 connection
   errors against the two-thread runtime and passes against the scaled one.
+- #164: Replaced the peer command path's stringly-typed error with
+  `GroupCommandError`, distinguishing `NotLeader` (421, carrying the leader
+  hint in the body) and `Unreachable` (503) from a genuine `Failed` (409).
+  Collapsing all three into one refusal is what made a write fail outright
+  when its leader died, instead of riding out the election.
+- #164: Scoped `FragmentWriter::commit`'s process-global `commit_lock` to the
+  size-read plus rename it actually protects, and moved the directory fsync
+  outside it. The lock's own doc said it serializes "only the final
+  replacement/accounting step" while the code held it across a ~5 ms fsync, so
+  every fragment commit on a node queued behind one. Measured lock wait fell
+  from 30.9 ms p50 to 0.00 ms and client throughput rose 22% at concurrency 32.

@@ -92,10 +92,13 @@ impl CatalogArchiveDestination {
 ///
 /// This is intentionally not a map keyed by group name: each field makes a
 /// WAL/catalog routing mistake visible in type-checked call sites.
+/// The catalog destination is absent on a cache-only node. Only `warehouse/`
+/// groups read it, and those exist only when the catalog runs, so a WAL-only
+/// ring needs no catalog archive configured.
 #[derive(Clone)]
 pub(crate) struct AuthoritativeArchives {
     pub(crate) wal_registry: Arc<BackendStore>,
-    pub(crate) catalog: CatalogArchiveDestination,
+    pub(crate) catalog: Option<CatalogArchiveDestination>,
 }
 
 /// Immutable WAL archive storage over the explicitly configured object bucket.
@@ -313,6 +316,103 @@ async fn catalog_request(
     Path((tenant, warehouse)): Path<(String, String)>,
     Json(request): Json<ManagedCatalogRequest>,
 ) -> Result<Json<ManagedCatalogResponse>, (StatusCode, String)> {
+    execute_catalog_request(&state, &tenant, &warehouse, request)
+        .await
+        .map(Json)
+}
+
+/// Serves catalog requests from inside the ring-node process.
+///
+/// The cloud topology runs one stateless catalog beside every ring node. Over
+/// HTTP that catalog would be issuing requests to a consensus plane living in
+/// its own address space; this binds it directly instead. It routes through
+/// [`execute_catalog_request`], the same function the peer HTTP route uses,
+/// so embedded and remote catalogs cannot drift in behaviour.
+pub(crate) struct LocalCatalogTransport {
+    ingress: WalIngress,
+    tenant: String,
+    warehouse: String,
+}
+
+impl LocalCatalogTransport {
+    /// Binds one warehouse route to this node's own consensus plane.
+    pub(crate) fn new(
+        consensus: Arc<ConsensusPlane>,
+        ring: &RingPlane,
+        layout: AppendGeometry,
+        wal_registry: Arc<BackendStore>,
+        tenant: impl Into<String>,
+        warehouse: impl Into<String>,
+    ) -> Self {
+        let voters = ring.consensus_voters();
+        Self {
+            ingress: WalIngress {
+                consensus,
+                coded_holders: voters.iter().copied().take(layout.w).collect(),
+                majority_holders: voters.iter().copied().take(voters.len() / 2 + 1).collect(),
+                wal_registry,
+                archive_inflight: Arc::new(Mutex::new(BTreeSet::new())),
+            },
+            tenant: tenant.into(),
+            warehouse: warehouse.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl verglas_catalog::ManagedCatalogTransport for LocalCatalogTransport {
+    /// The single warehouse this embedded catalog serves.
+    fn warehouse(&self) -> &str {
+        &self.warehouse
+    }
+
+    /// Executes in-process, preserving the HTTP route's conflict semantics.
+    ///
+    /// A catalog conflict stays final rather than becoming a retryable
+    /// transport failure; anything else keeps its status so the caller's
+    /// failover logic reads identically to the networked path.
+    async fn execute(
+        &self,
+        request: &ManagedCatalogRequest,
+    ) -> Result<ManagedCatalogResponse, verglas_catalog::ManagedCatalogError> {
+        execute_catalog_request(
+            &self.ingress,
+            &self.tenant,
+            &self.warehouse,
+            request.clone(),
+        )
+        .await
+        .map_err(|(status, detail)| {
+            if status == StatusCode::CONFLICT {
+                verglas_catalog::ManagedCatalogError::Conflict
+            } else {
+                // The typed error carries only a status, so log the reason
+                // rather than discard it: a bare 503 says nothing about which
+                // group failed or why.
+                tracing::warn!(
+                    target: "verglas_cache_node::catalog",
+                    status = %status, detail = %detail,
+                    tenant = %self.tenant, warehouse = %self.warehouse,
+                    "embedded catalog request failed"
+                );
+                verglas_catalog::ManagedCatalogError::Rejected(status.as_u16())
+            }
+        })
+    }
+}
+
+/// Executes one catalog request against this node's consensus plane.
+///
+/// Shared by the peer HTTP route above and by the in-process transport an
+/// embedded catalog uses, so a catalog co-located with a ring node runs
+/// exactly the same code as one reaching it over the network — including the
+/// tenant-root warehouse registration and the same error classification.
+async fn execute_catalog_request(
+    state: &WalIngress,
+    tenant: &str,
+    warehouse: &str,
+    request: ManagedCatalogRequest,
+) -> Result<ManagedCatalogResponse, (StatusCode, String)> {
     let command = match request {
         ManagedCatalogRequest::Commit { request_id, batch } => GroupRequest::CommitCatalog {
             request_id,
@@ -346,7 +446,7 @@ async fn catalog_request(
             &root,
             GroupRequest::RegisterWarehouse {
                 request_id,
-                warehouse: warehouse.clone(),
+                warehouse: warehouse.to_owned(),
                 group: warehouse_group.clone(),
                 holders: state.majority_holders.clone(),
             },
@@ -404,7 +504,7 @@ async fn catalog_request(
             ));
         }
     };
-    Ok(Json(response))
+    Ok(response)
 }
 
 /// Preserves availability failover while making authoritative catalog conflicts final HTTP 409 responses.
@@ -795,10 +895,14 @@ pub(crate) async fn drain_authoritative_groups(
                 .map_err(|error| error.to_string())?
             {
                 GroupResponse::CatalogExport(export) => {
-                    let (request, object) =
-                        persist_catalog_export(&archives.catalog, &group, &export)
-                            .await
-                            .map_err(|error| error.to_string())?;
+                    // A warehouse group cannot exist without the catalog, which
+                    // is what configures this destination.
+                    let destination = archives.catalog.as_ref().ok_or_else(|| {
+                        format!("group {group} needs a catalog archive, which is not configured")
+                    })?;
+                    let (request, object) = persist_catalog_export(destination, &group, &export)
+                        .await
+                        .map_err(|error| error.to_string())?;
                     match consensus
                         .submit(
                             &group,
