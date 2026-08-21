@@ -39,6 +39,7 @@
           "docs/architecture/cache",
           "docs/architecture/iceberg",
           "docs/architecture/writes",
+          "docs/architecture/durable-object",
           "docs/architecture/execution",
           "docs/architecture/benchmarks"
         ]
