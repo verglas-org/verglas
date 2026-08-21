@@ -415,6 +415,20 @@ fn canonical_voter_ids<'a>(nodes: impl IntoIterator<Item = &'a NodeId>) -> Vec<u
     voters
 }
 
+/// Returns a deterministic fixed-size voter subset from the ring membership.
+///
+/// Sorts all node identities by their canonical numeric id, then takes the
+/// first `voter_count` entries (saturating at the ring size). The result is
+/// identical on every node given the same membership view and voter count.
+fn pinned_voter_ids<'a>(
+    nodes: impl IntoIterator<Item = &'a NodeId>,
+    voter_count: usize,
+) -> Vec<u64> {
+    let all = canonical_voter_ids(nodes);
+    let n = voter_count.min(all.len());
+    all.into_iter().take(n).collect()
+}
+
 /// Maps every peer to the slot assigned by the canonical persisted voter order.
 fn canonical_payload_peers(peers: &[(NodeId, SocketAddr)]) -> PayloadPeers {
     let nodes = peers
@@ -1146,5 +1160,55 @@ mod tests {
         assert!(error.to_string().contains("fenced"));
         assert_eq!(activity.snapshot().accepted, 0);
         assert!(activity.snapshot().idle);
+    }
+
+    /// A ring grown from three to seven nodes keeps exactly the configured
+    /// number of voters. The voter set must not expand with the ring.
+    #[test]
+    fn consensus_voter_count_is_pinned_across_ring_growth() {
+        let three_peers: Vec<NodeId> = (0..3)
+            .map(|i| NodeId::new(format!("cache-{i}")))
+            .collect();
+        let seven_peers: Vec<NodeId> = (0..7)
+            .map(|i| NodeId::new(format!("cache-{i}")))
+            .collect();
+        let voter_count = 3;
+
+        let small = pinned_voter_ids(three_peers.iter(), voter_count);
+        let large = pinned_voter_ids(seven_peers.iter(), voter_count);
+
+        assert_eq!(small.len(), voter_count);
+        assert_eq!(large.len(), voter_count);
+        assert_eq!(small, large, "the same three voters are selected regardless of ring size");
+    }
+
+    /// Two nodes with the same membership view compute the same voter set
+    /// without coordination.
+    #[test]
+    fn voter_selection_is_deterministic_across_nodes() {
+        let peers: Vec<NodeId> = ["zulu", "alpha", "mike", "bravo", "foxtrot"]
+            .into_iter()
+            .map(|s| NodeId::new(s))
+            .collect();
+        let voter_count = 3;
+
+        let first = pinned_voter_ids(peers.iter(), voter_count);
+        let reversed = pinned_voter_ids(peers.iter().rev(), voter_count);
+
+        assert_eq!(first, reversed, "voter selection must be stable regardless of iteration order");
+    }
+
+    /// When the ring has fewer nodes than the configured voter count, every
+    /// node is a voter.
+    #[test]
+    fn voter_count_saturates_at_ring_size() {
+        let peers: Vec<NodeId> = (0..3)
+            .map(|i| NodeId::new(format!("node-{i}")))
+            .collect();
+        let voter_count = 5;
+
+        let voters = pinned_voter_ids(peers.iter(), voter_count);
+
+        assert_eq!(voters.len(), 3, "cannot have more voters than ring members");
     }
 }
