@@ -486,3 +486,55 @@ async fn the_node_serves_the_hosted_iceberg_surface_and_no_management_api() {
         namespaces.status()
     );
 }
+
+/// SQL is served by the catalog, under the same version prefix and behind the
+/// same bearer.
+///
+/// It reads customer table data, so it must not answer a caller without the
+/// credential the catalog already verifies. Mounting it into the catalog's own
+/// router is what gives it that check; this proves the wiring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_is_served_beside_the_catalog_and_requires_its_bearer() {
+    const ISSUER: &str = "https://verglas.test/issuer";
+    const TENANT: &str = "tenant-local";
+    const WAREHOUSE: &str = "lite";
+
+    let key = caller_key();
+    let node = start(&key, ISSUER, TENANT, WAREHOUSE);
+    let token = caller_token(&key, ISSUER, TENANT);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .build()
+        .expect("http client");
+    node.wait_ready(&client).await;
+    let query = format!("http://127.0.0.1:{}/catalog/v1/query", node.catalog_port);
+
+    let anonymous = client
+        .post(&query)
+        .json(&serde_json::json!({ "sql": "SELECT 1" }))
+        .send()
+        .await
+        .expect("unauthenticated query");
+    assert!(
+        !anonymous.status().is_success(),
+        "SQL must not serve an unauthenticated caller, got {}",
+        anonymous.status()
+    );
+
+    let authorized = client
+        .post(&query)
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "sql": "SELECT 1 AS n" }))
+        .send()
+        .await
+        .expect("authorized query");
+    assert!(
+        authorized.status().is_success(),
+        "an authorized SQL request must be served, got {}:\n{}",
+        authorized.status(),
+        node.diagnostics()
+    );
+    let body: serde_json::Value = authorized.json().await.expect("query result");
+    assert_eq!(body["rows"], 1, "one row expected, got {body}");
+    assert_eq!(body["data"][0]["n"], 1);
+}

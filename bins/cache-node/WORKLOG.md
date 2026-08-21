@@ -436,3 +436,13 @@
   so an unauthorized caller learns nothing about their SQL, and
   `QueryState::from_env` takes the verifier as a parameter so a served route
   cannot be built without one.
+- #164: Moved SQL onto the catalog listener at `POST /catalog/v1/query`,
+  beside the Iceberg REST routes. Every comparable system serves SQL from the
+  same service and base path as its catalog — Dremio's `/api/v3/sql` next to
+  `/api/v3/catalog`, Snowflake's `/api/v2/statements`, Databricks'
+  `/api/2.0/sql/statements` — all bearer-authenticated. SigV4 is for object
+  I/O; a metadata API behind it locks out bearer-only clients, which is why
+  ClickHouse cannot reach MinIO AIStor's catalog. Mounting the route into the
+  catalog's own router means `serve_hosted` layers the same external-bearer
+  verification over it, so the bespoke `QueryAuthorization` added in the
+  previous commit is deleted rather than kept beside it.

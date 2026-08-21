@@ -70,7 +70,7 @@ const APIS: &[Api] = &[
     Api {
         slug: "query",
         name: "SQL",
-        served: "Query the catalog · :8334/v1/query",
+        served: "Query the catalog · :8181/catalog/v1/query",
         spec: Spec::Yaml(include_str!(
             "../../../docs/reference/openapi/query-open-api.yaml"
         )),

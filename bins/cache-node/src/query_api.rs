@@ -43,75 +43,6 @@ pub struct QueryState {
     catalog: CatalogHandle,
     memory_limit_bytes: usize,
     query_timeout: Duration,
-    authorization: QueryAuthorization,
-}
-
-/// Who may run SQL against this node.
-///
-/// The admin listener carries operator probes that need no credential, but SQL
-/// reads customer table data, so it verifies a caller the same way the catalog
-/// does: an ES256 bearer checked against the JWKS this deployment trusts. The
-/// node's own self-issued credential verifies through that same JWKS, so an
-/// operator and the node present the same kind of token.
-#[derive(Clone)]
-pub enum QueryAuthorization {
-    /// Every request must carry a verifiable bearer.
-    Required(Arc<verglas_catalog_authz::DecisionClient>),
-    /// No verification. Reachable only from tests, which drive the router
-    /// directly over an in-process memory catalog holding no customer data.
-    /// `serve.rs` always builds `Required`, so a served route always verifies.
-    #[cfg(test)]
-    Trusted,
-}
-
-impl QueryAuthorization {
-    /// Builds the verifier from the catalog's own issuer, JWKS, and tenant.
-    ///
-    /// A JWKS this node cannot parse is a startup error: serving SQL that
-    /// refuses every caller would look like a broken query engine rather than
-    /// a misconfigured key set.
-    pub fn required(issuer: String, jwks: String, tenant_id: String) -> Result<Self, String> {
-        verglas_catalog_authz::DecisionClient::new(issuer, &jwks, tenant_id)
-            .map(|client| QueryAuthorization::Required(Arc::new(client)))
-            .map_err(|error| format!("catalog JWKS is unusable: {error}"))
-    }
-
-    /// Verifies one request's bearer, or explains the refusal.
-    async fn check(&self, headers: &axum::http::HeaderMap) -> Result<(), Response> {
-        #[cfg(test)]
-        if matches!(self, QueryAuthorization::Trusted) {
-            return Ok(());
-        }
-        #[allow(irrefutable_let_patterns)]
-        let QueryAuthorization::Required(client) = self else {
-            return Err(unauthorized("a bearer credential is required"));
-        };
-        let bearer = headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .ok_or_else(|| unauthorized("a bearer credential is required"))?;
-        // The whole catalog is the resource: a query resolves table names only
-        // after planning, so a narrower id here would have to guess at them.
-        match client
-            .authorize(bearer, "/*", verglas_catalog_authz::VerglasAction::Query)
-            .await
-        {
-            Ok(decision) if decision.allowed => Ok(()),
-            Ok(_) => Err(unauthorized("this credential may not query")),
-            Err(error) => Err(unauthorized(&format!("credential rejected: {error}"))),
-        }
-    }
-}
-
-/// Builds a 401 carrying the reason, never the credential.
-fn unauthorized(reason: &str) -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
-        Json(serde_json::json!({ "error": reason })),
-    )
-        .into_response()
 }
 
 /// Mints one short-lived catalog credential for this node.
@@ -177,7 +108,6 @@ impl QueryState {
     pub fn from_env(
         connection: verglas_iceberg::Connection,
         token: TokenFactory,
-        authorization: QueryAuthorization,
     ) -> Result<Self, String> {
         let memory_limit_bytes = match std::env::var("VERGLAS_QUERY_MEMORY_LIMIT_BYTES") {
             Ok(raw) => raw.trim().parse().map_err(|_| {
@@ -199,7 +129,6 @@ impl QueryState {
             },
             memory_limit_bytes,
             query_timeout: Duration::from_secs(timeout_secs),
-            authorization,
         })
     }
 
@@ -215,22 +144,21 @@ impl QueryState {
             catalog: CatalogHandle::Open(catalog),
             memory_limit_bytes,
             query_timeout,
-            authorization: QueryAuthorization::Trusted,
         }
-    }
-
-    /// Replaces this state's authorization, for tests that exercise refusal.
-    #[cfg(test)]
-    fn requiring(mut self, authorization: QueryAuthorization) -> Self {
-        self.authorization = authorization;
-        self
     }
 }
 
-/// Mounts `POST /v1/query`.
-pub fn router(state: QueryState) -> Router {
+/// Mounts `POST /catalog/v1/query`.
+///
+/// Generic over the surrounding router's state so it merges into the catalog's
+/// own router, which carries `ApiContext`. The query's state is applied here,
+/// so the two never mix.
+pub fn router<S>(state: QueryState) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     Router::new()
-        .route("/v1/query", post(handle_query))
+        .route("/catalog/v1/query", post(handle_query))
         .with_state(state)
 }
 
@@ -256,16 +184,7 @@ struct ColumnMeta {
 /// Parses the request, runs the query under the node's wall-clock timeout,
 /// and answers the `/v0` result shape (`{meta, data, rows, statistics}`) on
 /// success.
-async fn handle_query(
-    State(state): State<QueryState>,
-    headers: axum::http::HeaderMap,
-    body: Bytes,
-) -> Response {
-    // Before the body is even parsed: an unauthorized caller learns nothing
-    // about whether their SQL was well formed.
-    if let Err(refusal) = state.authorization.check(&headers).await {
-        return refusal;
-    }
+async fn handle_query(State(state): State<QueryState>, body: Bytes) -> Response {
     let request: QueryRequest = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(error) => {
@@ -439,20 +358,6 @@ mod tests {
         Arc::new(catalog)
     }
 
-    /// A syntactically valid one-key JWKS. No test here mints a token it
-    /// verifies: these cover the refusal paths, where the key never matters.
-    fn one_key_jwks() -> String {
-        serde_json::json!({
-            "keys": [{
-                "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig",
-                "kid": "test-key",
-                "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
-                "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0",
-            }]
-        })
-        .to_string()
-    }
-
     /// Writes `contents` to a temp CSV file, keeping the tempdir alive for the
     /// test process's lifetime.
     fn csv_source(contents: &str) -> std::path::PathBuf {
@@ -496,7 +401,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELECT COUNT(*) AS n FROM main.pairing_events" }))
             .send()
             .await
@@ -535,7 +440,7 @@ mod tests {
             .expect("create table after boot");
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELECT COUNT(*) AS n FROM main.late_table" }))
             .send()
             .await
@@ -559,7 +464,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "q": "SELECT COUNT(*) AS n FROM main.q_form" }))
             .send()
             .await
@@ -576,7 +481,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELEKT this is not sql" }))
             .send()
             .await
@@ -599,7 +504,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELECT * FROM main.does_not_exist" }))
             .send()
             .await
@@ -611,60 +516,6 @@ mod tests {
         );
     }
 
-    /// SQL reads customer table data, so an unauthenticated caller is refused
-    /// before any query runs. The admin listener carries operator probes that
-    /// need no credential; this route is not one of them.
-    #[tokio::test]
-    async fn an_unauthenticated_query_is_refused() {
-        let catalog = memory_catalog().await;
-        let state = QueryState::new(catalog, 64 * 1024 * 1024, Duration::from_secs(5)).requiring(
-            QueryAuthorization::required(
-                "https://issuer.test".to_owned(),
-                one_key_jwks(),
-                "tenant".to_owned(),
-            )
-            .expect("valid jwks"),
-        );
-        let addr = serve(router(state)).await;
-
-        let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
-            .json(&serde_json::json!({ "sql": "SELECT 1" }))
-            .send()
-            .await
-            .expect("request");
-        assert_eq!(
-            response.status(),
-            401,
-            "an unauthenticated SQL request must be refused"
-        );
-    }
-
-    /// A bearer this node's JWKS cannot verify is refused, so a token minted
-    /// by some other issuer does not become a query credential.
-    #[tokio::test]
-    async fn a_query_with_an_unverifiable_bearer_is_refused() {
-        let catalog = memory_catalog().await;
-        let state = QueryState::new(catalog, 64 * 1024 * 1024, Duration::from_secs(5)).requiring(
-            QueryAuthorization::required(
-                "https://issuer.test".to_owned(),
-                one_key_jwks(),
-                "tenant".to_owned(),
-            )
-            .expect("valid jwks"),
-        );
-        let addr = serve(router(state)).await;
-
-        let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
-            .header("authorization", "Bearer not-a-real-token")
-            .json(&serde_json::json!({ "sql": "SELECT 1" }))
-            .send()
-            .await
-            .expect("request");
-        assert_eq!(response.status(), 401);
-    }
-
     /// A request body with neither `sql` nor `q` is a clean 400, not a panic.
     #[tokio::test]
     async fn a_request_missing_sql_answers_400() {
@@ -673,7 +524,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -696,7 +547,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELECT COUNT(*) AS n FROM main.pairing_events" }))
             .send()
             .await
@@ -723,7 +574,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({
                 "sql": "SELECT COUNT(*) AS n FROM main.pairing_events",
                 "engine": "datafusion",
@@ -745,7 +596,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELECT 1", "memory_limit_bytes": 999_999_999_u64 }))
             .send()
             .await
@@ -891,7 +742,7 @@ mod tests {
         let addr = serve(router(state)).await;
 
         let response = reqwest::Client::new()
-            .post(format!("http://{addr}/v1/query"))
+            .post(format!("http://{addr}/catalog/v1/query"))
             .json(&serde_json::json!({ "sql": "SELECT 1" }))
             .send()
             .await

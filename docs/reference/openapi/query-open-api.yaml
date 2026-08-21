@@ -5,17 +5,19 @@ info:
     Executes SQL against the Iceberg catalog and returns the full result set in
     one response.
 
-    Served on the admin listener, and only when the catalog runs: the query
-    reads through this node's own catalog, so with no catalog there is nothing
-    to query.
+    Served by the catalog, beside the Iceberg REST routes and under the same
+    version prefix. Every request carries the same bearer the catalog verifies;
+    there is no second credential.
 
     Queries run under the node's wall-clock timeout and memory ceiling. Both
     are node-level settings; a request cannot raise them.
   version: 0.2.0
 servers:
-  - url: http://127.0.0.1:8334
+  - url: http://127.0.0.1:8181
+security:
+  - BearerAuth: []
 paths:
-  /v1/query:
+  /catalog/v1/query:
     post:
       summary: Execute one SQL statement
       description: |
@@ -46,6 +48,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/QueryResponse'
+        '401':
+          description: The request carried no bearer, or one this catalog cannot verify.
         '400':
           description: |
             The body was not valid JSON, carried neither `sql` nor `q`, or
@@ -55,6 +59,11 @@ paths:
               schema:
                 $ref: '#/components/schemas/Error'
 components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
   schemas:
     QueryRequest:
       type: object

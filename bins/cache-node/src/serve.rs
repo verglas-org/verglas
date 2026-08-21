@@ -735,13 +735,50 @@ pub async fn run(
                 authorizer.clone(),
             )
             .await?;
-            let router = axum::Router::new().nest(
-                "/catalog/v1",
-                verglas_catalog_core::api::iceberg::v1::new_v1_hosted_router::<
-                    verglas_catalog_storage::AuthorizedVerglasCatalog<_>,
-                    verglas_catalog_storage::AuthorizedVerglasCatalog<_>,
-                >(),
-            );
+            // SQL sits beside the catalog it reads, on the same listener and
+            // under the same version prefix, the way Dremio serves
+            // `/api/v3/sql` beside `/api/v3/catalog`. `serve_hosted` layers
+            // external-bearer verification over this whole router, so the
+            // query inherits exactly the catalog's authorization rather than
+            // carrying a second scheme of its own.
+            //
+            // Its client addresses the catalog over loopback and presents this
+            // node's own credential, minted per query: the credential's TTL is
+            // minutes, so one baked in at startup would expire while the node
+            // was still serving.
+            let issuer = self_issuer.clone();
+            let token: crate::query_api::TokenFactory = Arc::new(move || match issuer.as_ref() {
+                Some(issuer) => issuer
+                    .mint()
+                    .map(Some)
+                    .map_err(|error| format!("catalog self-credential: {error}")),
+                None => Ok(None),
+            });
+            let query_state = crate::query_api::QueryState::from_env(
+                verglas_iceberg::Connection {
+                    catalog_uri: format!("http://127.0.0.1:{}/catalog", catalog_server.port),
+                    token: None,
+                    warehouse: Some(catalog_server.warehouse.clone()),
+                    s3_endpoint: Some(format!("http://{s3_gateway_addr}")),
+                    region: config
+                        .backend
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| "us-east-1".to_owned()),
+                    access_key_id: Some(credentials.0.clone()),
+                    secret_access_key: Some(credentials.1.clone()),
+                },
+                token,
+            )?;
+            let router = axum::Router::new()
+                .nest(
+                    "/catalog/v1",
+                    verglas_catalog_core::api::iceberg::v1::new_v1_hosted_router::<
+                        verglas_catalog_storage::AuthorizedVerglasCatalog<_>,
+                        verglas_catalog_storage::AuthorizedVerglasCatalog<_>,
+                    >(),
+                )
+                .merge(crate::query_api::router(query_state));
             let addr = std::net::SocketAddr::from(([0, 0, 0, 0], catalog_server.port));
             eprintln!(
                 "verglas-cache-node {VERSION} hosted Iceberg catalog listening on http://{addr} (warehouse `{}`)",
@@ -815,58 +852,6 @@ pub async fn run(
     // Unconditional: an operator needs to see the surfaces this node has
     // switched off in order to know what to turn on.
     .merge(crate::api_docs::router());
-
-    // SQL reads through the Iceberg REST catalog this node hosts, so it exists
-    // only when that catalog does. It addresses the hosted listener over
-    // loopback rather than the `/catalog` admin gateway, which proxies an
-    // external `[catalog]` this deployment does not have.
-    if let Some(catalog_server) = config.catalog_server.as_ref().filter(|_| catalog_enabled) {
-        // The hosted catalog authorizes this call like any other caller, so
-        // the query client presents the node's own credential — the same key
-        // the semantic store signs with, published in the catalog's JWKS.
-        // Minted per query: the credential's TTL is minutes, so a token baked
-        // in at startup would expire while the node is still serving.
-        let issuer = self_issuer.clone();
-        let token: crate::query_api::TokenFactory = Arc::new(move || match issuer.as_ref() {
-            Some(issuer) => issuer
-                .mint()
-                .map(Some)
-                .map_err(|error| format!("catalog self-credential: {error}")),
-            None => Ok(None),
-        });
-        let connection = verglas_iceberg::Connection {
-            catalog_uri: format!("http://127.0.0.1:{}/catalog", catalog_server.port),
-            token: None,
-            warehouse: Some(catalog_server.warehouse.clone()),
-            s3_endpoint: Some(format!("http://{s3_gateway_addr}")),
-            region: config
-                .backend
-                .region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_owned()),
-            access_key_id: Some(credentials.0.clone()),
-            secret_access_key: Some(credentials.1.clone()),
-        };
-        // SQL reads customer table data, so it verifies its caller against the
-        // same JWKS the catalog trusts rather than inheriting the admin
-        // listener's unauthenticated operator-probe model.
-        let trusted_jwks = match self_issuer.as_ref() {
-            Some(issuer) => {
-                crate::self_credential::merge_jwks(&catalog_server.authz_jwks, issuer.jwks())
-                    .map_err(|error| format!("catalog authz jwks: {error}"))?
-            }
-            None => catalog_server.authz_jwks.clone(),
-        };
-        let authorization = crate::query_api::QueryAuthorization::required(
-            catalog_server.authz_issuer.clone(),
-            trusted_jwks,
-            catalog_server.authz_tenant_id.clone(),
-        )
-        .map_err(std::io::Error::other)?;
-        let state = crate::query_api::QueryState::from_env(connection, token, authorization)
-            .map_err(std::io::Error::other)?;
-        admin_app = admin_app.merge(crate::query_api::router(state));
-    }
 
     if let Some(catalog) = config.catalog.as_ref() {
         let connection = semantic_connection(
