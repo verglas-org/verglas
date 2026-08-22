@@ -1,0 +1,133 @@
+openapi: 3.0.3
+info:
+  title: Verglas SQL
+  description: |
+    Executes SQL against the Iceberg catalog and returns the full result set in
+    one response.
+
+    Served by the catalog, beside the Iceberg REST routes and under the same
+    version prefix. Every request carries the same bearer the catalog verifies;
+    there is no second credential.
+
+    Queries run under the node's wall-clock timeout and memory ceiling. Both
+    are node-level settings; a request cannot raise them.
+  version: 0.2.0
+servers:
+  - url: http://127.0.0.1:8181
+security:
+  - BearerAuth: []
+paths:
+  /catalog/v1/query:
+    post:
+      summary: Execute one SQL statement
+      description: |
+        Runs `sql` against the node's catalog and returns the full result set
+        in one response. Results are not paginated and not streamed to the
+        client: a statement that selects more rows than fit in memory is
+        bounded by the node's memory limit, not by the response shape.
+      operationId: executeQuery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+            examples:
+              count:
+                summary: Aggregate over a table
+                value:
+                  sql: SELECT count(*) FROM warehouse.public.events
+              select:
+                summary: Read a few rows
+                value:
+                  sql: SELECT * FROM warehouse.public.events LIMIT 10
+      responses:
+        '200':
+          description: The statement executed and the full result set follows.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+        '401':
+          description: The request carried no bearer, or one this catalog cannot verify.
+        '400':
+          description: |
+            The body was not valid JSON, carried neither `sql` nor `q`, or
+            requested a `memory_limit_bytes` above the node's cap.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    QueryRequest:
+      type: object
+      description: |
+        Exactly one of `sql` or `q` must be present. `q` is the older `/v0`
+        spelling and means the same thing.
+      properties:
+        sql:
+          type: string
+          description: The SQL statement to execute.
+        q:
+          type: string
+          description: The `/v0` spelling of `sql`.
+        memory_limit_bytes:
+          type: integer
+          format: int64
+          description: |
+            Validated against the node's cap and rejected when it exceeds it.
+            It never lowers the ceiling: the node's one prepared session
+            already runs at its configured limit.
+    QueryResponse:
+      type: object
+      required: [meta, data, rows, statistics]
+      properties:
+        meta:
+          type: array
+          description: One entry per result column, in column order.
+          items:
+            $ref: '#/components/schemas/ColumnMeta'
+        data:
+          type: array
+          description: The result rows, each an object keyed by column name.
+          items:
+            type: object
+            additionalProperties: true
+        rows:
+          type: integer
+          description: The number of rows in `data`.
+        statistics:
+          $ref: '#/components/schemas/Statistics'
+    ColumnMeta:
+      type: object
+      required: [name, type]
+      properties:
+        name:
+          type: string
+          description: The column name.
+        type:
+          type: string
+          description: The column's Arrow data type, rendered as a string.
+    Statistics:
+      type: object
+      required: [elapsed, rows_read]
+      properties:
+        elapsed:
+          type: integer
+          description: Server-side execution wall time in milliseconds.
+        rows_read:
+          type: integer
+          description: Rows produced by the statement.
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: A human-readable reason. This is the only field.

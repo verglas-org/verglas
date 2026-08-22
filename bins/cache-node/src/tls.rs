@@ -25,7 +25,7 @@
 //!   fly-proxy TLS-termination tax from the hot path; it does not change who
 //!   is trusted to write data.
 //! - **6PN stays plaintext**: `VERGLAS_S3_ADDR`, the original listener, is
-//!   not replaced. Fly's private 6PN network (lakekeeper, inter-cache peers,
+//!   not replaced. Fly's private 6PN network (catalog, inter-cache peers,
 //!   gateway health probes) already reaches this process inside the
 //!   platform's own network boundary, so wrapping that traffic in TLS would
 //!   add cost without adding trust. Only the public listener this module

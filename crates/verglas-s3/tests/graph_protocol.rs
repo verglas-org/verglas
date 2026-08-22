@@ -265,14 +265,14 @@ fn graph_contract_representative_payloads_round_trip() {
     let contract = graph_contract();
     let samples = [
         (
-            "PutNodesInput",
+            "AddNodesInput",
             json!({
                 "graphName": "knowledge",
                 "nodes": [{"id": "alice", "labels": ["Person"], "properties": {"age": 42}}]
             }),
         ),
         (
-            "PutEdgesInput",
+            "AddEdgesInput",
             json!({
                 "graphName": "knowledge",
                 "edges": [{
@@ -283,14 +283,14 @@ fn graph_contract_representative_payloads_round_trip() {
             }),
         ),
         (
-            "QueryNeighborhoodInput",
+            "SearchNeighborhoodInput",
             json!({
                 "graphName": "knowledge", "nodeId": "alice", "k": 2, "direction": "both",
                 "filter": {"predicate": "knows", "minConfidence": 0.5}
             }),
         ),
         (
-            "QueryNeighborhoodOutput",
+            "SearchNeighborhoodOutput",
             json!({
                 "neighborhood": {
                     "nodes": [{"nodeId": "alice", "hops": 0, "pathConfidence": 1.0}],
@@ -347,16 +347,16 @@ async fn graph_contract_operations_reach_the_engine_adapter() {
     for operation in [
         "CreateGraph",
         "DeleteGraph",
-        "GetGraph",
+        "DescribeGraph",
         "ListGraphs",
-        "PutNodes",
-        "PutEdges",
-        "GetNeighbors",
-        "QueryKHop",
-        "QueryNeighborhood",
-        "QueryPaths",
-        "QueryPrecedents",
-        "BuildGraphIndex",
+        "AddNodes",
+        "AddEdges",
+        "RetrieveNeighbors",
+        "SearchKHop",
+        "SearchNeighborhood",
+        "SearchPaths",
+        "SearchPrecedents",
+        "BuildIndex",
     ] {
         let response = app
             .clone()

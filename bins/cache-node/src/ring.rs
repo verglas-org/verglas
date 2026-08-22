@@ -19,10 +19,12 @@
 //! - runs the takeover pass that completes a drain a crashed originator left
 //!   behind.
 //!
-//! With no ring configured (`VERGLAS_RING_PEERS` unset or naming fewer than three
-//! nodes) this module does nothing and the block tier stays single-node: FLUSH is
+//! With no ring configured (`VERGLAS_RING_PEERS` unset) and the hosted catalog
+//! off, this module does nothing and the block tier stays single-node: FLUSH is
 //! the synchronous origin barrier, byte-identical to before the write-back plane
-//! existed. That is topology-driven, not a config knob.
+//! existed. When the hosted catalog is on, an absent peer list creates only a
+//! local one-voter substrate; it never enables object write-back. That is
+//! topology-driven, not a config knob.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -232,33 +234,89 @@ impl RingPlane {
     }
 }
 
-/// Wires the block-flush write-back plane onto `registry` from the environment,
-/// or returns `None` for a single-node deployment (no ring peers), leaving the
-/// block tier on the synchronous barrier. Called once at startup, before serving.
+/// Whether a declared peer set forms a ring this node may join.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RingAdmission {
+    /// Zero or one voter: cache service is local and object write-back is off.
+    Solo,
+    /// Three or more voters: a lost node still leaves a majority.
+    Ring,
+    /// Not a ring this node may join, with the reason to report.
+    Refused(&'static str),
+}
+
+/// Decides whether `peers` is a ring worth joining.
 ///
-/// `secret` is the shared cluster secret to honour on the fragment plane, if the
-/// env sets one; v1 requires none (VXLAN isolation, mirroring the NBD plane).
+/// Two voters is refused rather than treated as a small ring: it cannot
+/// survive a single loss (no majority remains) while still costing the
+/// coordination of a distributed commit — strictly worse than one box, which
+/// at least makes its lack of redundancy obvious.
+pub(crate) fn admit_peers(peers: usize) -> RingAdmission {
+    match peers {
+        0 | 1 => RingAdmission::Solo,
+        2 => RingAdmission::Refused(
+            "two peers cannot form a quorum that survives one loss; use one node or at least three",
+        ),
+        _ => RingAdmission::Ring,
+    }
+}
+
+/// Wires the block-flush write-back plane onto `registry` from the environment.
+///
+/// A distributed ring is built for three or more peers. A single explicit peer,
+/// or an implicit local peer for an enabled hosted catalog, only provides the
+/// local consensus substrate; object writes remain passthrough. With catalog off
+/// and no distributed ring, this returns `None` and FLUSH stays synchronous.
+/// `VERGLAS_CLUSTER_SECRET` is honored for peer RPC when present.
 pub async fn setup(
     cache_dir: &std::path::Path,
     capacity_bytes: u64,
     registry: &DeviceRegistry,
     page_cache: crate::page_cache::PageCacheSlot,
     activity: ActivityTracker,
+    catalog_enabled: bool,
 ) -> Result<Option<RingPlane>, Box<dyn std::error::Error>> {
+    let implicit_self_id = match (env_var("VERGLAS_RING_PEERS"), catalog_enabled) {
+        (None, true) => Some(NodeId::new(
+            env_var("VERGLAS_NODE_ID").unwrap_or_else(|| "single".to_owned()),
+        )),
+        _ => None,
+    };
     let peers = match env_var("VERGLAS_RING_PEERS") {
         Some(raw) => resolve_peers_until_complete(&raw).await?,
+        None if catalog_enabled => {
+            let node_id = implicit_self_id
+                .as_ref()
+                .ok_or("solo catalog identity was not initialized")?;
+            let address: SocketAddr = env_var("VERGLAS_RING_ADDR")
+                .unwrap_or_else(|| DEFAULT_RING_ADDR.to_owned())
+                .parse()?;
+            eprintln!(
+                "verglas-cache-node {VERSION} solo catalog topology: using {} at {address} for local consensus only",
+                node_id.as_str()
+            );
+            vec![(node_id.clone(), address)]
+        }
         None => Vec::new(),
     };
-    // A production cache ring needs at least three boxes; fewer is a
-    // single-node deployment and the block tier stays on the synchronous barrier.
-    if peers.len() < 3 {
-        eprintln!(
-            "verglas-cache-node {VERSION} fragment ring disabled: at least three VERGLAS_RING_PEERS are required"
-        );
-        return Ok(None);
+    match admit_peers(peers.len()) {
+        RingAdmission::Refused(reason) => {
+            eprintln!("verglas-cache-node {VERSION} fragment ring disabled: {reason}");
+            return Ok(None);
+        }
+        RingAdmission::Solo if peers.is_empty() || !catalog_enabled => {
+            eprintln!(
+                "verglas-cache-node {VERSION} solo topology: fragment ring disabled; object write-back and hosted catalog are off"
+            );
+            return Ok(None);
+        }
+        RingAdmission::Solo | RingAdmission::Ring => {}
     }
 
-    let Some(self_id) = env_var("VERGLAS_NODE_ID").map(|s| NodeId::new(s.as_str())) else {
+    let Some(self_id) = env_var("VERGLAS_NODE_ID")
+        .map(|s| NodeId::new(s.as_str()))
+        .or(implicit_self_id)
+    else {
         eprintln!(
             "verglas-cache-node {VERSION} fragment ring disabled: VERGLAS_RING_PEERS is set but VERGLAS_NODE_ID is not — cannot tell which ring member this node is"
         );
@@ -361,8 +419,13 @@ pub async fn setup(
         raft_registry.router(),
     )
     .await?;
+    let durability = if peers.len() >= 3 {
+        "RS quorum write-back"
+    } else {
+        "solo catalog consensus only; object write-back off"
+    };
     eprintln!(
-        "verglas-cache-node {VERSION} block-ring fragment plane listening on http://{} ({} peers, RS quorum write-back)",
+        "verglas-cache-node {VERSION} block-ring fragment plane listening on http://{} ({} peers, {durability})",
         peer_server.local_addr(),
         peers.len()
     );
@@ -968,6 +1031,20 @@ impl LiveMembership for StaticMembership {
 
 #[cfg(test)]
 mod tests {
+    use super::{RingAdmission, admit_peers};
+
+    /// A solo topology is supported for cache-only service; two peers remain
+    /// refused because they pay distributed coordination cost without surviving
+    /// one loss. Three or more peers form the durable ring.
+    #[test]
+    fn solo_topology_is_supported_but_two_peers_are_refused() {
+        assert_eq!(admit_peers(0), RingAdmission::Solo);
+        assert_eq!(admit_peers(1), RingAdmission::Solo);
+        assert!(matches!(admit_peers(2), RingAdmission::Refused(_)));
+        assert_eq!(admit_peers(3), RingAdmission::Ring);
+        assert_eq!(admit_peers(4), RingAdmission::Ring);
+    }
+
     use super::*;
 
     /// A slow fragment commit must not monopolize the async runtime that also

@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-/// A durable Lakekeeper domain collection owned by one warehouse consensus group.
+/// A durable Catalog domain collection owned by one warehouse consensus group.
 ///
-/// The document shape remains the Lakekeeper domain type serialized by its adapter;
+/// The document shape remains the Catalog domain type serialized by its adapter;
 /// this discriminator makes every collection explicit in the replicated state.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum CatalogEntity {
@@ -129,7 +129,7 @@ pub enum CatalogAction {
         entity: CatalogEntity,
         /// Stable domain identity.
         id: String,
-        /// JSON representation of the corresponding Lakekeeper domain object.
+        /// JSON representation of the corresponding Catalog domain object.
         document: String,
     },
     /// Removes one typed hosted-domain record without deleting customer objects.

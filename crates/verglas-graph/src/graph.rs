@@ -151,7 +151,7 @@ impl Graph {
     }
 
     /// Loads every node as of a snapshot (the current one when `at` is
-    /// `None`), reduced to one row per id (`PutNodes` is append-only, so a
+    /// `None`), reduced to one row per id (`AddNodes` is append-only, so a
     /// repeated id is the node's latest edit — see [`latest_nodes_by_id`]).
     /// Used by precedent search (#148) to read `Decision` node objectives;
     /// there is no adjacency index for node properties, so this always scans

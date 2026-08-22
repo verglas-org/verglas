@@ -13,7 +13,7 @@ Use Verglas Graph as the durable experiment and evidence record. Do not use it a
 - `GateEvaluation` contains one independently evaluated hard-gate result.
 - `Artifact` contains an artifact identity, kind, and short summary. Raw contents remain outside the graph.
 - `WaveClosed` is the visibility fence written after every attempt and evaluation in the wave.
-- `Decision` records one selection act: the promoted candidate, the rejected candidates, and the gate evidence that justified it, with an `objective` string property. `QueryPrecedents` ranks Decision nodes by BM25 over `objective` plus neighbor overlap with supplied entity ids (#148).
+- `Decision` records one selection act: the promoted candidate, the rejected candidates, and the gate evidence that justified it, with an `objective` string property. `SearchPrecedents` ranks Decision nodes by BM25 over `objective` plus neighbor overlap with supplied entity ids (#148).
 
 Workspace identities are opaque. Do not assume Git worktrees, database clones, or lakehouse clones exist until the host supplies those facilities.
 

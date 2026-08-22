@@ -204,3 +204,5 @@
   their `databases/.../subscribe` path from separate string literals, not the
   deleted access-service surface. Deleted `tests/client_access.rs` and
   `tests/client_tokens.rs` with the methods they exercised.
+- #137: Regenerated Graph DTO names and client methods for the conventional Graph operation vocabulary, including AddNodes, AddEdges, RetrieveNeighbors, Search traversals, DescribeGraph, and BuildIndex.
+

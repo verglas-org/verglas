@@ -310,3 +310,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   Graphs) from the top-level contracts/ directory into crates/verglas-s3/
   models/ — colocated with the one crate that compiles and tests against
   them. No content change.
+- #164: Deleted the S3 listener's documentation routes (`/swagger-ui` and
+  `/api-docs/s3/openapi.json`). They put an unauthenticated surface on the
+  customer data port, and the "swagger UI" was a one-line page linking to a
+  JSON file rather than a viewer. The cache node's admin listener now serves
+  every specification, including this crate's S3/graph/vector contract.
+- #137: Renamed the Graph REST-JSON operations to conventional Graphiti-derived verbs: add nodes and edges, retrieve neighbors, search traversals, describe graphs, and build indexes. The adapter, route contract, generated clients, and protocol tests now share the new names; the former ad-hoc routes are not served.
+

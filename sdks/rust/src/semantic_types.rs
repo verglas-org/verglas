@@ -13,13 +13,13 @@ pub type Boolean = bool;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BuildGraphIndexInput {
+pub struct BuildIndexInput {
     pub graph_name: std::string::String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BuildGraphIndexOutput {
+pub struct BuildIndexOutput {
     pub index: bool,
 }
 
@@ -218,13 +218,13 @@ pub type Float32VectorData = Vec<f32>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetGraphInput {
+pub struct DescribeGraphInput {
     pub graph_name: std::string::String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetGraphOutput {
+pub struct DescribeGraphOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub edges_snapshot_id: Option<i64>,
     pub graph_name: std::string::String,
@@ -249,7 +249,7 @@ pub struct GetIndexOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetNeighborsInput {
+pub struct RetrieveNeighborsInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -260,7 +260,7 @@ pub struct GetNeighborsInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetNeighborsOutput {
+pub struct RetrieveNeighborsOutput {
     pub neighbors: Vec<Neighbor>,
 }
 
@@ -634,14 +634,14 @@ pub type Provenance = std::string::String;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PutEdgesInput {
+pub struct AddEdgesInput {
     pub edges: Vec<Edge>,
     pub graph_name: std::string::String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PutEdgesOutput {
+pub struct AddEdgesOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
 }
@@ -657,14 +657,14 @@ pub struct PutInputVector {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PutNodesInput {
+pub struct AddNodesInput {
     pub graph_name: std::string::String,
     pub nodes: Vec<Node>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PutNodesOutput {
+pub struct AddNodesOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
 }
@@ -703,7 +703,7 @@ pub struct PutVectorsOutput {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryKHopInput {
+pub struct SearchKHopInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -715,13 +715,13 @@ pub struct QueryKHopInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryKHopOutput {
+pub struct SearchKHopOutput {
     pub nodes: Vec<ReachedNode>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryNeighborhoodInput {
+pub struct SearchNeighborhoodInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -733,7 +733,7 @@ pub struct QueryNeighborhoodInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryNeighborhoodOutput {
+pub struct SearchNeighborhoodOutput {
     pub neighborhood: Subgraph,
 }
 
@@ -749,7 +749,7 @@ pub struct QueryOutputVector {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryPathsInput {
+pub struct SearchPathsInput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub direction: Option<Direction>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -762,13 +762,13 @@ pub struct QueryPathsInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryPathsOutput {
+pub struct SearchPathsOutput {
     pub paths: Vec<Path>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryPrecedentsInput {
+pub struct SearchPrecedentsInput {
     pub graph_name: std::string::String,
     pub query: std::string::String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -779,7 +779,7 @@ pub struct QueryPrecedentsInput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct QueryPrecedentsOutput {
+pub struct SearchPrecedentsOutput {
     pub precedents: Vec<Precedent>,
 }
 

@@ -70,7 +70,7 @@
 - #66: Rewrote cache-node crate and serve docs for standalone self-host (dropped fleet image / cloud product contrasts); kept scripts/cloud path references out of this binary.
 - #84: Wired the cache node's built-in managed lakehouse binding explicitly
   through backend construction, block-device store lookup, and the S3 router.
-- #82: Added explicit eventual polling and strong quorum-backed catalog runtimes. Strong mode requires the three-node fragment ring, verifies ordered Lakekeeper events, catches query reads up to the EC tail, and returns applied event proofs without a polling fallback.
+- #82: Added explicit eventual polling and strong quorum-backed catalog runtimes. Strong mode requires the three-node fragment ring, verifies ordered Catalog events, catches query reads up to the EC tail, and returns applied event proofs without a polling fallback.
 - #84: Added the cache-node Docker target and rendered local startup contract used by the three-member OSS fragment ring. The ring exposes one selected embedded safekeeper for managed Neon while retaining erasure-coded WAL durability across all three cache volumes.
 - #84: Passed the cache node's managed backend binding into its embedded
    safekeeper so completed WAL segments drain to the configured object store.
@@ -124,7 +124,7 @@
   staging cannot reach its intersection threshold, the same exact append is
   retried as a full copy on a regular majority without changing Raft safety.
 - #135: Added the native managed-catalog ingress beside the WAL protocol. Typed
-  Lakekeeper transactions and fenced namespace/table reads route to independent
+  Catalog transactions and fenced namespace/table reads route to independent
   warehouse groups on the same Multi-Raft and payload substrate.
 - #135: Switched the live Neon ingress to the canonical binary WAL protocol and
   removed client-submitted archive checkpoints. The cache node now decodes
@@ -155,7 +155,7 @@
 
 - #135: Routed typed hosted-catalog record reads and listings through warehouse
   consensus groups. The cache-node ingress now exposes one read authority for
-  Lakekeeper domain state and Iceberg metadata pointers.
+  Catalog domain state and Iceberg metadata pointers.
 
 - #135: Added explicit prospective-voter peer-address registration at the ring
   boundary. Membership lifecycle code can resolve a learner's authenticated
@@ -324,3 +324,125 @@
   of the two `catalog.load_table` round trips it used to pay. See
   `verglas-iceberg`'s worklog for the structural detail and the hermetic test
   that pins it.
+- #164: `ObjectConsensusCommitter` now implements `commit_pack`, committing a
+  flushed offload-stream pack's index (key to pack object, offset, length)
+  through the same per-object Raft shard group as `commit`, via the existing
+  generic `GroupRequest::CommitObject` verb with `ReplicationMode::Complete`
+  (no fragment holders — the pack lives at the origin, not distributed
+  across pod fragments, so it replicates fully to the group's voters like
+  the plane's other small metadata commits). `serve.rs` passes
+  `cache.writeback.offload_size_limit_bytes` into `WriteCoordinator::new` and
+  spawns `spawn_offload_drain_loop` alongside the existing repair/scrub
+  loops, at `cache.writeback.offload_drain_interval_secs`.
+- #164: Removed the polling retry loop from the consensus submit path. Leader
+  resolution now waits on OpenRaft's own metrics-change channel through
+  `ConsensusGroup::await_leader`, and a submit makes exactly one attempt:
+  execute locally when this node leads, otherwise forward once. A leader that
+  refuses the command now surfaces that error immediately instead of being
+  retried behind a fixed 25 ms sleep, which is what disguised a total forward
+  failure as 116 ms of "slow consensus" in the profile.
+- #164: Made leader resolution retry until its deadline instead of failing the
+  client write on the first rejection. A stale leader view (`NotLeader`) or a
+  leader that has died (`Unreachable`) both re-resolve — preferring the hint
+  from the replica that refused, otherwise waiting on a Raft metrics change
+  for a leader other than the stale one. No timer sampling. This fixed the
+  cold-start failure where the first write to a fresh shard group returned
+  "has to forward request to: None", and fixed
+  `large_wal_append_continues_after_exact_leader_death`, which was already
+  failing on main before this change.
+- #164: Replaced the object-commit batcher's fixed linger window with the rule
+  PostgreSQL's WAL writer uses: the first arrival submits immediately, and
+  everything arriving while that entry is in flight folds into the next one.
+  No timer. The batch window becomes the previous commit's own latency, which
+  is self-tuning — an idle writer is never delayed, and under load the batch
+  grows to match the round trip it amortizes. A fixed window cannot do both.
+  Three pre-existing tests asserted `call_count() == 1`, which is
+  schedule-dependent once the batch closes on a commit rather than a clock;
+  they were rewritten against a gated submitter so they are deterministic.
+  Batching assertions use tokio's paused clock and measure virtual time, so
+  they test whether a task awaited a timer rather than how loaded the machine
+  is — a wall-clock bound failed at 20.9 ms during a full workspace run purely
+  from CPU contention.
+- Mounted the hosted Iceberg catalog inside the cache node. The cloud topology
+  pins one stateless catalog to every ring node, so it now runs in this
+  process and reaches consensus through `LocalCatalogTransport` rather than
+  issuing HTTP requests to this node's own ingress. The transport calls
+  `execute_catalog_request` — the same function the peer HTTP route calls — so
+  embedded and standalone catalogs cannot drift, and both build their state
+  from `hosted_catalog_state`. Configured by the new `[catalog_server]`
+  section; the authorizer is built from explicit config rather than
+  Catalog's process-global `CONFIG`, so this does not deepen the singleton
+  that blocks multi-warehouse. `tests/embedded_catalog.rs` covers it end to
+  end: a real ring, a real ES256 caller credential minted in-process against a
+  generated P-256 key, a namespace committed through consensus and read back,
+  and an unauthenticated caller refused. Hermetic — no Cloudflare Worker, no
+  object storage, no network.
+- #164: Added the explicit `VERGLAS_CATALOG=off|on` startup contract, defaulting
+  to off and failing on invalid values. Split hosted-catalog consensus from the
+  ring-backed Neon WAL plane, and made object write-back require both a durable
+  ring and its explicit config switch so solo nodes keep passthrough writes. The
+  consensus opener now defers payload-store construction so a one-voter catalog
+  can serve inline records without distributed erasure-coding geometry. Added
+  operator documentation for the catalog mode and solo-node limits.
+- #164: Added one API index at `/admin/api-docs` on the admin listener, serving
+  the catalog, management, generic-table, SQL query, and S3/graph/vector
+  specifications from compiled-in documents. Two documentation routers
+  previously answered the same `/swagger-ui` path in different binaries and
+  between them served one of the five specifications; neither was reachable
+  from the cache node. Each index entry states where its API is actually
+  served, including the SQL query API, which runs in a separate binary.
+- #164: Replaced that index with a real API browser: a sidebar of every API
+  beside one Swagger UI pane, with `#fragment` deep links and a single UI
+  instance whose spec URL is swapped on navigation rather than rebuilt.
+  Swagger UI is vendored under `assets/swagger-ui/` and served from the binary,
+  so a node with no outbound network still serves its own documentation; the
+  page references no external URL. Requests are disabled — the browser cannot
+  sign sigv4 for the S3 surface, so try-it-out would be misleading. One table
+  of APIs drives the routes, the sidebar, and the tests, so a specification
+  cannot be listed without being served.
+- #164: Deleted the `verglas-catalog-node` binary. It mounted exactly the same
+  `new_v1_hosted_router` at the same path as this node does in-process, was
+  absent from the Dockerfile and justfile, and no code depended on it — only
+  comments calling it "the other packaging". There is one catalog service now.
+  Also dropped the management and generic-table specs from the API browser:
+  neither is mounted, so the page was advertising 116 endpoints that answer
+  404. `embedded_catalog.rs` now probes a live catalog node to prove the
+  management API is unreachable and the Iceberg routes are served, so the
+  documented surface cannot drift from the real one again.
+- #164: Folded `verglas-query-node` into this binary as `query_api`, mounting
+  `POST /v1/query` on the admin listener when the catalog runs. DuckDB was the
+  only reason the query server needed its own process — 183 MB of build output
+  and a 68 MB static library have no place in a cache node — and removing it
+  left roughly 650 lines over DataFusion, which this binary already depends on.
+  The query reads through the node's own catalog gateway using the same
+  `semantic_connection` the semantic APIs use.
+  `VERGLAS_QUERY_MEMORY_LIMIT_BYTES` and `VERGLAS_QUERY_TIMEOUT_SECS` keep
+  their meaning and defaults; a malformed value now fails startup rather than
+  being silently ignored.
+- #164: Covered `self_credential` with tests: the signing key is reused across
+  restarts rather than regenerated (a new key would invalidate the JWKS the
+  running catalog trusts), the key file stays owner-only, a minted token
+  carries every claim the authorizer reads and expires inside its TTL, and
+  merging keeps both the configured and self-published keys while rejecting a
+  malformed document. The SQL query API mints per query rather than once at
+  startup: the credential's TTL is five minutes, so a token captured at boot
+  would expire while the node was still serving.
+- #164: Required a verified bearer on `POST /v1/query`. The route had inherited
+  the admin listener's unauthenticated operator-probe model, so anyone who
+  could reach the port could run arbitrary SQL against customer tables. It now
+  verifies an ES256 credential against the same JWKS the catalog trusts —
+  including the node's own published key — through `DecisionClient` with
+  `VerglasAction::Query`. Authorization is checked before the body is parsed,
+  so an unauthorized caller learns nothing about their SQL, and
+  `QueryState::from_env` takes the verifier as a parameter so a served route
+  cannot be built without one.
+- #164: Moved SQL onto the catalog listener at `POST /catalog/v1/query`,
+  beside the Iceberg REST routes. Every comparable system serves SQL from the
+  same service and base path as its catalog — Dremio's `/api/v3/sql` next to
+  `/api/v3/catalog`, Snowflake's `/api/v2/statements`, Databricks'
+  `/api/2.0/sql/statements` — all bearer-authenticated. SigV4 is for object
+  I/O; a metadata API behind it locks out bearer-only clients, which is why
+  ClickHouse cannot reach MinIO AIStor's catalog. Mounting the route into the
+  catalog's own router means `serve_hosted` layers the same external-bearer
+  verification over it, so the bespoke `QueryAuthorization` added in the
+  previous commit is deleted rather than kept beside it.

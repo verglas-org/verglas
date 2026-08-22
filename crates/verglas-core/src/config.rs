@@ -63,6 +63,8 @@ pub struct Config {
     /// Iceberg REST catalog to track for table commits. Unset leaves Iceberg
     /// awareness off.
     pub catalog: Option<Catalog>,
+    /// Hosted Iceberg catalog served by this node. Unset serves no catalog.
+    pub catalog_server: Option<CatalogServer>,
     /// Cluster membership over gossip. Unset runs a single node.
     pub cluster: Option<Cluster>,
 }
@@ -322,6 +324,30 @@ pub struct Writeback {
     /// list opts in every key at the default geometry.
     #[serde(default)]
     pub prefixes: Vec<WritebackPrefix>,
+    /// Size, in bytes, at which the object offload stream flushes its
+    /// accumulated small objects into one packed S3 object (#164 §4). An
+    /// object at or above this limit bypasses accumulation and streams to the
+    /// origin alone, so a large write never waits behind a buffer of unrelated
+    /// small ones. Mirrors `WAL_SEGMENT_BYTES`
+    /// (`bins/cache-node/src/safekeeper.rs`), the same accumulate/flush shape
+    /// generalized to objects; the 16 MiB default matches it.
+    #[serde(default = "default_offload_size_limit_bytes")]
+    pub offload_size_limit_bytes: ByteSize,
+    /// How often, in seconds, the background offload drain loop flushes each
+    /// binding's partially filled offload stream. Bounds how long small
+    /// objects can sit unpacked when the size limit is never reached, without
+    /// changing the two triggers the stream itself exposes (size limit, or an
+    /// explicit caller-invoked drain): the loop is simply a caller that drains
+    /// on a schedule.
+    #[serde(default = "default_offload_drain_interval_secs")]
+    pub offload_drain_interval_secs: u64,
+    /// Maximum staged objects folded into one batched consensus commit.
+    /// Bounds how large one Raft entry — and the blast radius of its
+    /// all-or-nothing retry — can get. There is no companion time window:
+    /// a group's batch closes when its previous entry commits. Internal
+    /// tuning knob, not surfaced in the generated config.
+    #[serde(default = "default_object_commit_max_batch")]
+    pub object_commit_max_batch: usize,
 }
 
 /// One opt-in key prefix, optionally overriding the default fragment geometry.
@@ -354,6 +380,9 @@ impl Default for Writeback {
             disk_floor_bytes: ByteSize(0),
             scrub_interval_secs: default_scrub_interval_secs(),
             prefixes: Vec::new(),
+            offload_size_limit_bytes: default_offload_size_limit_bytes(),
+            offload_drain_interval_secs: default_offload_drain_interval_secs(),
+            object_commit_max_batch: default_object_commit_max_batch(),
         }
     }
 }
@@ -376,6 +405,24 @@ impl Writeback {
         if self.scrub_interval_secs == 0 {
             return Err(ConfigError::Invalid(
                 "cache.writeback.scrub_interval_secs",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.offload_size_limit_bytes.0 == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.offload_size_limit_bytes",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.offload_drain_interval_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.offload_drain_interval_secs",
+                "must be at least 1".into(),
+            ));
+        }
+        if self.object_commit_max_batch == 0 {
+            return Err(ConfigError::Invalid(
+                "cache.writeback.object_commit_max_batch",
                 "must be at least 1".into(),
             ));
         }
@@ -427,6 +474,30 @@ fn default_meta_fraction() -> f64 {
 /// re-encode is a negligible tenant on the NVMe and pod LAN.
 fn default_scrub_interval_secs() -> u64 {
     6 * 60 * 60
+}
+
+/// The documented default object offload size limit: 16 MiB (#164 §4),
+/// matching `WAL_SEGMENT_BYTES` (`bins/cache-node/src/safekeeper.rs`). The
+/// frozen benchmark protocol in `tests/cluster-local/OBJECTIVE.md` bakes this
+/// exact value into its PUT-count bound.
+fn default_offload_size_limit_bytes() -> ByteSize {
+    ByteSize(16 * 1024 * 1024)
+}
+
+/// The documented default offload drain loop interval: 5 seconds (#164 §4).
+/// Short enough that a partially filled offload stream still drains inside
+/// the frozen benchmark's 30 s post-write window.
+fn default_offload_drain_interval_secs() -> u64 {
+    5
+}
+
+/// The documented default cap on staged objects per batched consensus
+/// commit. Large enough to absorb a full concurrency-16 burst to one shard
+/// (`OBJECT_CONSENSUS_SHARDS = 4` in `bins/cache-node/src/consensus.rs`) in a
+/// single Raft entry; small enough that one batch's header payload and its
+/// all-or-nothing retry blast radius both stay bounded.
+fn default_object_commit_max_batch() -> usize {
+    64
 }
 
 /// The documented default mutable-mapping TTL: 5 seconds (#14).
@@ -1007,6 +1078,56 @@ pub enum CatalogConsistency {
     Strong,
 }
 
+/// The hosted Iceberg REST catalog this node serves itself.
+///
+/// The cloud topology pins one stateless catalog to every ring node, so the
+/// catalog runs inside this process and reaches consensus in-process rather
+/// than over HTTP to its own address space. Unset leaves the catalog off.
+#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CatalogServer {
+    /// TCP port the hosted Iceberg REST API listens on.
+    pub port: u16,
+    /// Tenant owning the CRaft catalog groups.
+    pub tenant: String,
+    /// The single warehouse this node's catalog serves.
+    pub warehouse: String,
+    /// Catalog S3 storage profile JSON for immutable table metadata.
+    pub managed_s3_profile: String,
+    /// Expected `iss` claim of credentials minted by the control plane.
+    pub authz_issuer: String,
+    /// Control-plane JWKS JSON used for local signature checks.
+    pub authz_jwks: String,
+    /// Tenant whose grants this catalog may serve.
+    pub authz_tenant_id: String,
+}
+
+impl CatalogServer {
+    /// Rejects empty coordinates before a request can 4xx on them.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any required coordinate is blank.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        for (field, value) in [
+            ("catalog_server.tenant", &self.tenant),
+            ("catalog_server.warehouse", &self.warehouse),
+            (
+                "catalog_server.managed_s3_profile",
+                &self.managed_s3_profile,
+            ),
+            ("catalog_server.authz_issuer", &self.authz_issuer),
+            ("catalog_server.authz_jwks", &self.authz_jwks),
+            ("catalog_server.authz_tenant_id", &self.authz_tenant_id),
+        ] {
+            if value.trim().is_empty() {
+                return Err(ConfigError::Invalid(field, "must not be empty".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Iceberg REST catalog watcher settings (#47). Filters match against the
 /// dotted `namespace.table` name with `*` wildcards; empty `include` means
 /// every table, and `exclude` always wins over `include`.
@@ -1463,6 +1584,9 @@ impl Config {
         self.backend.validate()?;
         if let Some(archive) = &self.catalog_archive {
             archive.validate(&self.backend)?;
+        }
+        if let Some(catalog_server) = &self.catalog_server {
+            catalog_server.validate()?;
         }
         self.cache.validate()?;
         self.cache.admission.validate()?;

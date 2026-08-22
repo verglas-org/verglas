@@ -169,3 +169,35 @@
   handler with the freed bytes (return on drain). Both tested
   failing-first; signals fire only on the refusal/delete paths, never on a
   successful placement.
+- #180: Fixed a healthy-cluster write failure at write-back concurrency 16
+  (PERF-OBJECTIVE.md M1/P1): `PeerServer`'s dedicated runtime, which serves
+  every fragment placement RPC and all inbound Raft RPC for a node, was
+  pinned to exactly two worker threads regardless of host size or load. Under
+  concurrent writers this becomes a queueing bottleneck — fragment
+  placements pile up behind each other on the same two threads until the
+  write-back ack deadline expires, failing an object whose peers are all up
+  and reachable (`write-back quorum requires N durable fragments; only M
+  available`). Traced the failure to the thread ceiling, not the FragmentClient
+  RPC timeouts (500ms connect/30s request — generous, and confirmed unrelated
+  to the tight 50ms/100ms `PeerClient` timeouts used only by cache-block
+  reads, never by fragment placement). Replaced the hardcoded `worker_threads(2)`
+  with `peer_runtime_worker_threads()`, sized from
+  `std::thread::available_parallelism()` and clamped to `[8, 16]`: real
+  concurrency on a constrained host, no unbounded share of a large host's
+  cores. Added a failing-first reproduction test in
+  `tests/fragment_rpc.rs::concurrent_fragment_placements_do_not_time_out_under_load`
+  that drives 16 concurrent fragment placements against one node whose store
+  handler genuinely occupies a worker thread per request (not an async sleep,
+  so it exercises the thread ceiling itself): it failed with 10/16 connection
+  errors against the two-thread runtime and passes against the scaled one.
+- #164: Replaced the peer command path's stringly-typed error with
+  `GroupCommandError`, distinguishing `NotLeader` (421, carrying the leader
+  hint in the body) and `Unreachable` (503) from a genuine `Failed` (409).
+  Collapsing all three into one refusal is what made a write fail outright
+  when its leader died, instead of riding out the election.
+- #164: Scoped `FragmentWriter::commit`'s process-global `commit_lock` to the
+  size-read plus rename it actually protects, and moved the directory fsync
+  outside it. The lock's own doc said it serializes "only the final
+  replacement/accounting step" while the code held it across a ~5 ms fsync, so
+  every fragment commit on a node queued behind one. Measured lock wait fell
+  from 30.9 ms p50 to 0.00 ms and client throughput rose 22% at concurrency 32.

@@ -89,7 +89,7 @@ impl CatalogBinding {
         &self.endpoint
     }
 
-    /// Returns the database-specific Lakekeeper/external warehouse.
+    /// Returns the database-specific Catalog/external warehouse.
     pub fn warehouse(&self) -> Option<&str> {
         self.warehouse.as_deref()
     }

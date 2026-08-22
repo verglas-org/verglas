@@ -78,7 +78,7 @@ fn resolve_snapshot(table: &Table, at: Option<i64>) -> Option<i64> {
 /// snapshot they reflect. When `at` is `None` the table's current snapshot is
 /// used; a table with no snapshot yet yields an empty set and `None`.
 ///
-/// The returned nodes are raw rows in scan order, one per `PutNodes` call
+/// The returned nodes are raw rows in scan order, one per `AddNodes` call
 /// (append-only); callers that want one row per id call [`latest_nodes_by_id`].
 pub async fn load_nodes(
     catalog: Arc<dyn Catalog>,
@@ -110,7 +110,7 @@ pub async fn load_nodes(
 }
 
 /// Reduces raw node rows to one row per id, keeping the last-scanned row for a
-/// repeated id. `PutNodes` is append-only, so a repeated id is a later edit of
+/// repeated id. `AddNodes` is append-only, so a repeated id is a later edit of
 /// the same entity, not a second entity; this is the node analogue of
 /// [`live_edges`]'s supersede rule, without a dedicated retraction pointer.
 pub fn latest_nodes_by_id(nodes: Vec<Node>) -> Vec<Node> {

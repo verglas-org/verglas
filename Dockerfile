@@ -1,13 +1,18 @@
 # Deploy the unified Verglas cache engine.
 
 FROM rust:bookworm AS build
+# Namespaces the cargo caches. Building two source trees that share a cache id
+# lets one tree's compiled artifacts satisfy the other's imports, which
+# produces failures and successes that belong to neither. Evaluation harnesses
+# must pass a distinct value per tree.
+ARG CACHE_NS=default
 WORKDIR /src
 COPY rust-toolchain.toml ./
 RUN rustup show
 COPY . .
-RUN --mount=type=cache,id=verglas-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=verglas-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=verglas-engine-target,target=/src/target,sharing=locked \
+RUN --mount=type=cache,id=verglas-cargo-registry-${CACHE_NS},target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=verglas-cargo-git-${CACHE_NS},target=/usr/local/cargo/git,sharing=locked \
+    --mount=type=cache,id=verglas-engine-target-${CACHE_NS},target=/src/target,sharing=locked \
     cargo build --release -p verglas-cache-node \
     && mkdir -p /tmp/verglas-build \
     && cp /src/target/release/verglas-cache-node /tmp/verglas-build/

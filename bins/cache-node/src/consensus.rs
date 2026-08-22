@@ -14,21 +14,22 @@ use std::{
     time::Duration,
 };
 
+use crate::object_batch::{BatchSubmitter, ObjectCommitBatcher};
 use futures::future::join_all;
 use openraft::{BasicNode, Vote, storage::RaftLogStorage};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use verglas_cluster::{
-    BootstrapGroupFn, GroupCommandFn, MembershipReplace, MembershipReplaceFn, OpenGroupFn,
-    RaftHttpTransport,
+    BootstrapGroupFn, GroupCommandError, GroupCommandFn, MembershipReplace, MembershipReplaceFn,
+    OpenGroupFn, RaftHttpTransport,
 };
 use verglas_consensus::{
-    ConsensusGroup, DistributedPayloadStore, GroupError, GroupRequest, GroupResponse,
+    ConsensusGroup, DistributedPayloadStore, GroupRequest, GroupResponse, PayloadStore,
     PersistentLogStore, PersistentStateMachine, ReplicationMode, VerglasRaftConfig,
 };
 use verglas_core::CacheKey;
-use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
+use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
 use crate::ring::RingPlane;
 
@@ -257,12 +258,22 @@ pub struct ConsensusPlane {
 /// Commits staged immutable-object certificates through per-object Raft groups.
 pub struct ObjectConsensusCommitter {
     plane: Arc<ConsensusPlane>,
+    /// Folds concurrent object commits bound for one group into single Raft
+    /// entries. Without it every client write costs a round trip and
+    /// throughput is capped at `groups / round_trip`.
+    batcher: ObjectCommitBatcher,
 }
 
 impl ObjectConsensusCommitter {
-    /// Binds S3 write-back publication to the process's universal Multi-Raft plane.
-    pub fn new(plane: Arc<ConsensusPlane>) -> Self {
-        Self { plane }
+    /// Binds S3 write-back publication to the process's universal Multi-Raft
+    /// plane. Concurrent commits to one group fold into as few entries as
+    /// that group's own commit latency allows, bounded by `max_batch`.
+    pub fn new(plane: Arc<ConsensusPlane>, max_batch: usize) -> Self {
+        let batcher = ObjectCommitBatcher::new(
+            Arc::new(ObjectGroupSubmitter::new(Arc::clone(&plane))),
+            max_batch,
+        );
+        Self { plane, batcher }
     }
 }
 
@@ -285,10 +296,35 @@ fn existing_wal_binding_outcome(existing: Option<&str>, requested: &str) -> Resu
     }
 }
 
-#[async_trait::async_trait]
-impl ConsensusCommitter for ObjectConsensusCommitter {
-    async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
-        let identity = serde_json::json!({
+/// Derives a deterministic idempotent request identity from a commit payload,
+/// so a retried submission of the exact same content never double-applies.
+fn payload_request_id(payload: &[u8]) -> Result<u128, String> {
+    let digest = Sha256::digest(payload);
+    let bytes: [u8; 16] = digest[..16]
+        .try_into()
+        .map_err(|_| "request identity is malformed".to_owned())?;
+    Ok(u128::from_be_bytes(bytes))
+}
+
+/// Appends one Raft entry per batch of staged objects.
+///
+/// The object group treats its payload as opaque bytes and the caller consumes
+/// only the applied index, so folding many object identities into one entry
+/// needs no state-machine change. Atomicity is inherent: one entry either
+/// applies or it does not.
+pub(crate) struct ObjectGroupSubmitter {
+    plane: Arc<ConsensusPlane>,
+}
+
+impl ObjectGroupSubmitter {
+    /// Binds the submitter to the consensus plane it appends through.
+    pub(crate) fn new(plane: Arc<ConsensusPlane>) -> Self {
+        Self { plane }
+    }
+
+    /// Renders one staged object's durable identity.
+    fn identity(staged: &StagedObject) -> serde_json::Value {
+        serde_json::json!({
             "storage_binding": staged.key.storage_binding_id,
             "bucket": staged.key.bucket,
             "key": staged.key.key,
@@ -301,28 +337,37 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
             "placements": staged.placements.iter().map(|placement| {
                 serde_json::json!({"index": placement.index, "node": placement.node})
             }).collect::<Vec<_>>(),
-        });
-        let payload = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
-        let digest = Sha256::digest(&payload);
-        let request_id = u128::from_be_bytes(
-            digest[..16]
-                .try_into()
-                .map_err(|_| "object request identity is malformed".to_owned())?,
-        );
-        let group = object_consensus_group(&staged.key);
-        let holders = staged
-            .placements
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchSubmitter for ObjectGroupSubmitter {
+    async fn submit_batch(
+        &self,
+        group: &str,
+        items: &[StagedObject],
+    ) -> Result<ObjectCommit, String> {
+        if items.is_empty() {
+            return Err("cannot commit an empty object batch".to_owned());
+        }
+        let payload = serde_json::to_vec(&items.iter().map(Self::identity).collect::<Vec<_>>())
+            .map_err(|error| error.to_string())?;
+        let request_id = payload_request_id(&payload)?;
+        // Every holder named by any object in the batch, deduplicated.
+        let holders: std::collections::BTreeSet<_> = items
             .iter()
+            .flat_map(|staged| staged.placements.iter())
             .map(|placement| numeric_node_id(&placement.node))
             .collect();
         match self
             .plane
             .submit(
-                &group,
+                group,
                 GroupRequest::CommitObject {
                     request_id,
                     payload,
-                    holders,
+                    holders: holders.into_iter().collect(),
                     mode: ReplicationMode::Coded,
                 },
             )
@@ -333,6 +378,70 @@ impl ConsensusCommitter for ObjectConsensusCommitter {
                 index: response.index,
             }),
             _ => Err("object group returned a non-applied response".to_owned()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ConsensusCommitter for ObjectConsensusCommitter {
+    async fn commit(&self, staged: StagedObject) -> Result<ObjectCommit, String> {
+        // Enqueue rather than append. The batcher folds every staged object
+        // bound for the same group inside one bounded linger window into a
+        // single Raft entry, so client throughput is no longer one round trip
+        // per object. The caller still returns only after ITS object is
+        // committed; batching changes how many entries the log takes, not what
+        // the acknowledgement promises.
+        let group = object_consensus_group(&staged.key);
+        self.batcher.commit(group, staged).await
+    }
+
+    async fn commit_pack(&self, staged: StagedPack) -> Result<PackCommit, String> {
+        let identity = serde_json::json!({
+            "storage_binding": staged.storage_binding_id,
+            "bucket": staged.bucket,
+            "pack_key": staged.pack_key,
+            "pack_len": staged.pack_len,
+            "payload_hash": hex::encode(staged.payload_hash),
+            "entries": staged.entries.iter().map(|entry| {
+                serde_json::json!({
+                    "key": entry.key,
+                    "offset": entry.offset,
+                    "length": entry.length,
+                    "etag": entry.etag,
+                    "created_ms": entry.created_ms,
+                })
+            }).collect::<Vec<_>>(),
+        });
+        let payload = serde_json::to_vec(&identity).map_err(|error| error.to_string())?;
+        let request_id = payload_request_id(&payload)?;
+        // The pack index carries no erasure-coded fragment holders — the pack
+        // lives at the origin, not distributed across pod fragments — so it
+        // commits fully replicated to the group's voters rather than coded,
+        // exactly like the other small metadata commits on this plane
+        // (`TimelineOpen`, `WalArchiveBinding`, `WriterLease`).
+        let group = object_consensus_group(&CacheKey {
+            storage_binding_id: staged.storage_binding_id.clone(),
+            bucket: staged.bucket.clone(),
+            key: staged.pack_key.clone(),
+        });
+        match self
+            .plane
+            .submit(
+                &group,
+                GroupRequest::CommitObject {
+                    request_id,
+                    payload,
+                    holders: Vec::new(),
+                    mode: ReplicationMode::Complete,
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            GroupResponse::Applied(response) => Ok(PackCommit {
+                index: response.index,
+            }),
+            _ => Err("pack index group returned a non-applied response".to_owned()),
         }
     }
 }
@@ -605,6 +714,14 @@ impl ConsensusPlane {
     }
 
     /// Routes one unchanged request within the caller-selected hard ceiling.
+    ///
+    /// Leader resolution is event-driven: this waits on Raft's own metrics
+    /// signal for an elected leader instead of polling on a fixed interval
+    /// (see [`ConsensusGroup::await_leader`]). Once a leader is known, this
+    /// makes exactly one execute-or-forward attempt — no retry loop. A leader
+    /// that refuses the forwarded command, or a group that never elects a
+    /// leader within `timeout`, surfaces as an error immediately rather than
+    /// being silently retried into the timeout.
     async fn submit_with_timeout(
         self: &Arc<Self>,
         group: &str,
@@ -612,28 +729,86 @@ impl ConsensusPlane {
         timeout: Duration,
     ) -> Result<GroupResponse, PlaneError> {
         let local = self.ensure_group(group).await?;
-        tokio::time::timeout(timeout, async {
-            loop {
-                if let Some(leader) = local.leader_id().await {
-                    if leader == self.ring.safekeeper_id() {
-                        match local.execute(request.clone()).await {
-                            Ok(response) => return Ok(response),
-                            Err(GroupError::Raft(_)) => {}
-                            Err(error) => return Err(error.into()),
-                        }
-                    }
-                    let encoded = serde_json::to_vec(&request)?;
-                    if let Ok(response) = self.network(group)?.command(leader, encoded).await {
-                        return serde_json::from_slice(&response).map_err(Into::into);
-                    }
-                }
-                // A leader may die after this replica observes it but before the
-                // command reaches it. Re-observe Raft instead of treating that
-                // transport race as a client-visible command rejection.
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let deadline = tokio::time::Instant::now() + timeout;
+        let encoded = serde_json::to_vec(&request)?;
+        let mut leader = match local.await_leader(timeout).await? {
+            Some(leader) => leader,
+            None => {
+                return Err(format!(
+                    "consensus group `{group}` elected no leader within {timeout:?}"
+                )
+                .into());
             }
-        })
-        .await?
+        };
+        // A leader view goes stale: between resolving one and reaching it, the
+        // election can move. That is not a failed write, so re-resolve and
+        // retry until the deadline. `await_leader_change` blocks on a Raft
+        // metrics change, so this waits on the election itself rather than
+        // sampling on a timer.
+        loop {
+            if leader == self.ring.safekeeper_id() {
+                match local.execute(request.clone()).await {
+                    Ok(response) => return Ok(response),
+                    Err(verglas_consensus::GroupError::NotLeader { leader: hint }) => {
+                        leader = self
+                            .resolve_leader_after_stale(&local, hint, leader, group, deadline)
+                            .await?;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            match self.network(group)?.command(leader, encoded.clone()).await {
+                Ok(response) => return serde_json::from_slice(&response).map_err(Into::into),
+                Err(GroupCommandError::NotLeader { leader: hint }) => {
+                    leader = self
+                        .resolve_leader_after_stale(&local, hint, leader, group, deadline)
+                        .await?;
+                }
+                // A leader that died is unreachable until its successor is
+                // elected. Ride out that election instead of failing the
+                // write: the group is available again the moment a new leader
+                // appears, which is what the caller is waiting for.
+                Err(GroupCommandError::Unreachable(_)) => {
+                    leader = self
+                        .resolve_leader_after_stale(&local, None, leader, group, deadline)
+                        .await?;
+                }
+                Err(GroupCommandError::Failed(detail)) => return Err(detail.into()),
+            }
+        }
+    }
+
+    /// Resolves the next leader to try after `stale` rejected a command.
+    ///
+    /// Prefers the hint the rejecting replica supplied, since it comes from
+    /// the replica that just refused. Otherwise it waits for this node's own
+    /// replica to observe a leader other than `stale`.
+    async fn resolve_leader_after_stale(
+        &self,
+        local: &Arc<ConsensusGroup>,
+        hint: Option<u64>,
+        stale: u64,
+        group: &str,
+        deadline: tokio::time::Instant,
+    ) -> Result<u64, PlaneError> {
+        if let Some(hint) = hint.filter(|hint| *hint != stale) {
+            return Ok(hint);
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(
+                format!("consensus group `{group}` had no reachable leader in time").into(),
+            );
+        }
+        local
+            .await_leader_change(Some(stale), remaining)
+            .await?
+            .ok_or_else(|| {
+                PlaneError::from(format!(
+                    "consensus group `{group}` elected no new leader within {remaining:?}"
+                ))
+            })
     }
 
     /// Returns the locally opened authoritative group names in deterministic order.
@@ -709,13 +884,17 @@ impl ConsensusPlane {
         } else {
             ring.consensus_voters()
         };
-        let payloads = Arc::new(DistributedPayloadStore::new(
-            k,
-            m,
-            voters.clone(),
-            ring.consensus_payload_transport(),
-        )?);
-        state_machine.attach_payload_store(payloads.clone()).await?;
+        let payload_transport = ring.consensus_payload_transport();
+        let payload_voters = voters.clone();
+        let payload_factory: verglas_consensus::PayloadStoreFactory = Box::new(move || {
+            let payloads = DistributedPayloadStore::new(
+                k,
+                m,
+                payload_voters.clone(),
+                Arc::clone(&payload_transport),
+            )?;
+            Ok(Arc::new(payloads) as Arc<dyn PayloadStore>)
+        });
         let network =
             RaftHttpTransport::new(group, ring.raft_addresses(), ring.raft_secret().to_owned())?;
         let raft = Raft::new(
@@ -738,7 +917,7 @@ impl ConsensusPlane {
             generation,
             raft.clone(),
             state_machine.clone(),
-            payloads,
+            payload_factory,
         )?);
         groups.insert(
             group.to_owned(),
@@ -772,21 +951,30 @@ impl ConsensusPlane {
     }
 
     /// Executes a forwarded command only when this replica currently leads.
-    async fn execute_local(&self, group: &str, body: &[u8]) -> Result<Vec<u8>, String> {
+    async fn execute_local(&self, group: &str, body: &[u8]) -> Result<Vec<u8>, GroupCommandError> {
         let local = self
             .open_local(group)
             .await
-            .map_err(|error| error.to_string())?;
-        let request: GroupRequest =
-            serde_json::from_slice(body).map_err(|error| error.to_string())?;
-        if local.leader_id().await != Some(self.ring.safekeeper_id()) {
-            return Err("forwarded command reached a non-leader".to_owned());
-        }
-        let response = local
-            .execute(request)
-            .await
-            .map_err(|error| error.to_string())?;
-        serde_json::to_vec(&response).map_err(|error| error.to_string())
+            .map_err(|error| GroupCommandError::Failed(error.to_string()))?;
+        let request: GroupRequest = serde_json::from_slice(body)
+            .map_err(|error| GroupCommandError::Failed(error.to_string()))?;
+        // No local leader check here. Group replicas open lazily, so this
+        // node's replica can still be catching up on leadership when a command
+        // arrives — including when it *is* the elected leader. Rejecting on a
+        // stale local view turned every forwarded command into a 409, which
+        // the sender retried behind a fixed sleep and reported as slow
+        // consensus. Raft is the authority: `execute` submits to the local
+        // replica and OpenRaft answers with ForwardToLeader when this node is
+        // not the leader, carrying the leader's identity.
+        let response = local.execute(request).await.map_err(|error| match error {
+            // Preserve the condition across the peer boundary so the sender
+            // re-resolves instead of failing the client write.
+            verglas_consensus::GroupError::NotLeader { leader } => {
+                GroupCommandError::NotLeader { leader }
+            }
+            other => GroupCommandError::Failed(other.to_string()),
+        })?;
+        serde_json::to_vec(&response).map_err(|error| GroupCommandError::Failed(error.to_string()))
     }
 
     /// Creates the group-specific HTTP/2 OpenRaft transport.

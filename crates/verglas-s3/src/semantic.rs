@@ -122,10 +122,11 @@ struct SemanticState {
 /// This is an extension seam for future wire-format evolution; no negotiation
 /// or compatibility path exists in this prototype.
 pub fn router(api: Arc<dyn SemanticApi>) -> Router {
-    semantic_router(api).merge(documentation_router())
+    semantic_router(api)
 }
 
-/// Builds only semantic operations so authentication can exclude public docs.
+/// Builds only semantic operations. API documentation is served by the cache
+/// node's admin listener, never from the customer-facing S3 port.
 fn semantic_router(api: Arc<dyn SemanticApi>) -> Router {
     let state = SemanticState { api };
     Router::new()
@@ -151,50 +152,25 @@ fn semantic_router(api: Arc<dyn SemanticApi>) -> Router {
         )
         .route("/CreateGraph", post(dispatch_graph))
         .route("/DeleteGraph", post(dispatch_graph))
-        .route("/GetGraph", post(dispatch_graph))
+        .route("/DescribeGraph", post(dispatch_graph))
         .route("/ListGraphs", post(dispatch_graph))
-        .route("/PutNodes", post(dispatch_graph))
-        .route("/PutEdges", post(dispatch_graph))
-        .route("/GetNeighbors", post(dispatch_graph))
-        .route("/QueryKHop", post(dispatch_graph))
-        .route("/QueryNeighborhood", post(dispatch_graph))
-        .route("/QueryPaths", post(dispatch_graph))
-        .route("/QueryPrecedents", post(dispatch_graph))
-        .route("/BuildGraphIndex", post(dispatch_graph))
+        .route("/AddNodes", post(dispatch_graph))
+        .route("/AddEdges", post(dispatch_graph))
+        .route("/RetrieveNeighbors", post(dispatch_graph))
+        .route("/SearchKHop", post(dispatch_graph))
+        .route("/SearchNeighborhood", post(dispatch_graph))
+        .route("/SearchPaths", post(dispatch_graph))
+        .route("/SearchPrecedents", post(dispatch_graph))
+        .route("/BuildIndex", post(dispatch_graph))
         .with_state(state)
-}
-
-/// Serves the checked-in S3 listener contract without exposing a second API family.
-async fn s3_openapi() -> impl IntoResponse {
-    (
-        [("content-type", "application/json")],
-        include_str!("../models/s3-openapi.json"),
-    )
-}
-
-/// Directs browsers to the listener OpenAPI document for interactive inspection.
-async fn s3_swagger() -> impl IntoResponse {
-    (
-        [("content-type", "text/html; charset=utf-8")],
-        "<!doctype html><title>Verglas S3 API</title><p>Open <a href=\"/api-docs/s3/openapi.json\">the S3 listener OpenAPI document</a>.</p>",
-    )
 }
 
 /// Builds semantic routes protected by header-signed AWS SigV4 requests.
 pub fn router_with_sigv4(api: Arc<dyn SemanticApi>, credentials: SemanticCredentials) -> Router {
-    documentation_router().merge(
-        semantic_router(api).layer(axum::middleware::from_fn_with_state(
-            credentials,
-            semantic_sigv4,
-        )),
-    )
-}
-
-/// Builds unauthenticated API-documentation routes for the public listener.
-fn documentation_router() -> Router {
-    Router::new()
-        .route("/api-docs/s3/openapi.json", get(s3_openapi))
-        .route("/swagger-ui", get(s3_swagger))
+    semantic_router(api).layer(axum::middleware::from_fn_with_state(
+        credentials,
+        semantic_sigv4,
+    ))
 }
 
 /// Buffers the bounded JSON request once, verifies it, then restores it for dispatch.
@@ -339,16 +315,16 @@ fn graph_operation(path: &str) -> Option<SemanticOperation> {
     const OPERATIONS: [&str; 12] = [
         "CreateGraph",
         "DeleteGraph",
-        "GetGraph",
+        "DescribeGraph",
         "ListGraphs",
-        "PutNodes",
-        "PutEdges",
-        "GetNeighbors",
-        "QueryKHop",
-        "QueryNeighborhood",
-        "QueryPaths",
-        "QueryPrecedents",
-        "BuildGraphIndex",
+        "AddNodes",
+        "AddEdges",
+        "RetrieveNeighbors",
+        "SearchKHop",
+        "SearchNeighborhood",
+        "SearchPaths",
+        "SearchPrecedents",
+        "BuildIndex",
     ];
     let operation = path.strip_prefix('/')?;
     OPERATIONS
@@ -835,7 +811,7 @@ fn precedent_to_json(row: PrecedentRow) -> Value {
     })
 }
 
-/// Parses the optional QueryPrecedents result cap (1..=1000; unset means no cap).
+/// Parses the optional SearchPrecedents result cap (1..=1000; unset means no cap).
 fn optional_precedents_limit(input: &Value) -> Result<Option<usize>, SemanticError> {
     let Some(value) = input.get("limit") else {
         return Ok(None);
@@ -948,7 +924,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     .map_err(iceberg_error)?;
                 Ok(json!({}))
             }
-            "PutNodes" => {
+            "AddNodes" => {
                 let rows = input
                     .get("nodes")
                     .and_then(Value::as_array)
@@ -962,7 +938,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                 let snapshot = graph.insert_nodes(&nodes).await.map_err(graph_error)?;
                 Ok(snapshot_output(snapshot))
             }
-            "PutEdges" => {
+            "AddEdges" => {
                 let rows = input
                     .get("edges")
                     .and_then(Value::as_array)
@@ -976,17 +952,17 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                 let snapshot = graph.insert_edges(&edges).await.map_err(graph_error)?;
                 Ok(snapshot_output(snapshot))
             }
-            "BuildGraphIndex" => {
+            "BuildIndex" => {
                 Ok(json!({"index": graph.build_index(None).await.map_err(graph_error)?.is_some()}))
             }
-            "GetNeighbors" => {
+            "RetrieveNeighbors" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
                 let node = required_bounded_string(&input, "nodeId", 1, 1024)?;
                 Ok(
                     json!({"neighbors": reader.get_neighbors(node, direction(&input)?, &filter(&input)?).into_iter().map(neighbor_to_json).collect::<Vec<_>>() }),
                 )
             }
-            "QueryKHop" => {
+            "SearchKHop" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
                 let node = required_bounded_string(&input, "nodeId", 1, 1024)?;
                 let hops = required_u32(&input, "k")?;
@@ -994,7 +970,7 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     json!({"nodes": reader.k_hop(node, hops, direction(&input)?, &filter(&input)?).into_iter().map(reached_to_json).collect::<Vec<_>>() }),
                 )
             }
-            "QueryNeighborhood" => {
+            "SearchNeighborhood" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
                 let node = required_bounded_string(&input, "nodeId", 1, 1024)?;
                 let hops = required_u32(&input, "k")?;
@@ -1002,17 +978,17 @@ impl SemanticApi for IcebergCatalogSemanticStore {
                     json!({"neighborhood": subgraph_to_json(reader.neighborhood(node, hops, direction(&input)?, &filter(&input)?))}),
                 )
             }
-            "QueryPaths" => {
+            "SearchPaths" => {
                 let reader = graph.reader(None).await.map_err(graph_error)?;
                 Ok(
                     json!({"paths": reader.paths(required_bounded_string(&input, "sourceId", 1, 1024)?, required_bounded_string(&input, "targetId", 1, 1024)?, required_u32(&input, "maxHops")?, direction(&input)?, &filter(&input)?).into_iter().map(path_to_json).collect::<Vec<_>>() }),
                 )
             }
-            "GetGraph" => Ok(graph_output(
+            "DescribeGraph" => Ok(graph_output(
                 required_bounded_string(&input, "graphName", 1, 255)?,
                 graph.current_edges_snapshot().await.map_err(graph_error)?,
             )),
-            "QueryPrecedents" => self.query_precedents(&graph, &input).await,
+            "SearchPrecedents" => self.query_precedents(&graph, &input).await,
             _ => Err(SemanticError::validation("unknown graph operation")),
         }
     }
@@ -3192,7 +3168,7 @@ fn mutation_kind(operation: SemanticOperation) -> Option<MutationKind> {
         SemanticOperation::S3Vectors("PutVectors" | "DeleteVectors") => {
             Some(MutationKind::VectorCommit)
         }
-        SemanticOperation::Graph("PutNodes" | "PutEdges") => Some(MutationKind::GraphCommit),
+        SemanticOperation::Graph("AddNodes" | "AddEdges") => Some(MutationKind::GraphCommit),
         _ => None,
     }
 }
@@ -3344,14 +3320,14 @@ mod event_publish_mapping_tests {
         }
     }
 
-    /// PutNodes and PutEdges both map to a graph commit event keyed by the
+    /// AddNodes and AddEdges both map to a graph commit event keyed by the
     /// graph name alone.
     #[test]
     fn graph_mutations_map_to_a_graph_commit_event() {
         let input = json!({"graphName": "social"});
         for operation in [
-            SemanticOperation::Graph("PutNodes"),
-            SemanticOperation::Graph("PutEdges"),
+            SemanticOperation::Graph("AddNodes"),
+            SemanticOperation::Graph("AddEdges"),
         ] {
             let (event_type, subject) = mutation_event(operation, &input).expect("mutation");
             assert_eq!(event_type, "org.verglas.graph.commit");
@@ -3371,7 +3347,7 @@ mod event_publish_mapping_tests {
         );
         assert!(
             mutation_event(
-                SemanticOperation::Graph("GetGraph"),
+                SemanticOperation::Graph("DescribeGraph"),
                 &json!({"graphName": "social"}),
             )
             .is_none()
@@ -3416,7 +3392,7 @@ mod event_publish_mapping_tests {
     fn graph_mutation_with_non_string_graph_name_does_not_publish() {
         assert!(
             mutation_event(
-                SemanticOperation::Graph("PutNodes"),
+                SemanticOperation::Graph("AddNodes"),
                 &json!({"graphName": 42}),
             )
             .is_none()
@@ -3428,7 +3404,7 @@ mod event_publish_mapping_tests {
     fn empty_string_fields_do_not_publish() {
         assert!(
             mutation_event(
-                SemanticOperation::Graph("PutEdges"),
+                SemanticOperation::Graph("AddEdges"),
                 &json!({"graphName": ""}),
             )
             .is_none()
@@ -3445,7 +3421,7 @@ mod event_publish_mapping_tests {
     /// A completely missing input object (no fields at all) does not panic.
     #[test]
     fn empty_object_input_does_not_publish() {
-        assert!(mutation_event(SemanticOperation::Graph("PutNodes"), &json!({})).is_none());
+        assert!(mutation_event(SemanticOperation::Graph("AddNodes"), &json!({})).is_none());
         assert!(mutation_event(SemanticOperation::S3Vectors("PutVectors"), &json!({})).is_none());
     }
 }

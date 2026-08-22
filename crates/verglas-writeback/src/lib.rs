@@ -59,17 +59,21 @@ pub mod journal;
 pub mod membership;
 pub mod meta;
 pub mod metrics;
+pub mod offload;
 pub mod policy;
 pub mod reader;
 pub mod transport;
 pub mod writer;
 
 pub use barrier::{BarrierError, BarrierOutcome, CommitBarrier, JournalBarrier};
-pub use consensus::{ConsensusCommitter, ObjectCommit, StagedObject};
-pub use coordinator::{ScrubReport, WriteCoordinator, WritebackError};
+pub use consensus::{
+    ConsensusCommitter, ObjectCommit, PackCommit, PackedEntry, StagedObject, StagedPack,
+};
+pub use coordinator::{ScrubReport, WriteCoordinator, WritebackError, WritebackThresholds};
 pub use journal::{Journal, JournalState, JournalStore, Placement};
 pub use membership::{AgentMembership, LiveMembership, SingleNodeMembership};
 pub use metrics::{WritebackMetrics, WritebackMetricsSnapshot};
+pub use offload::{OffloadStream, PackIndex, PackIndexEntry, PendingEntry};
 pub use policy::{PrefixRule, WritebackPolicy};
 pub use reader::WritebackReader;
 pub use transport::{FragmentTransport, PeerFragmentTransport, TransportError};
@@ -171,6 +175,28 @@ pub fn spawn_scrub_loop<W: ObjectWrite>(
                 Ok(_) => {}
                 Err(error) => eprintln!("writeback: scrub pass failed: {error}"),
             }
+        }
+    })
+}
+
+/// Spawns the background offload drain loop (#164 §4): every `interval`,
+/// flush whatever every managed binding's offload stream is currently
+/// holding, regardless of whether it has crossed its size limit.
+///
+/// The offload stream itself exposes exactly two flush triggers — the size
+/// limit, and an explicit caller-invoked drain. This loop adds no third
+/// trigger to the stream's own API; it is simply a caller that drains on a
+/// schedule, so a binding whose traffic never reaches the size limit is not
+/// held open indefinitely. Returns the task handle so the server can abort it
+/// on shutdown.
+pub fn spawn_offload_drain_loop<W: ObjectWrite>(
+    coordinator: Arc<WriteCoordinator<W>>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            coordinator.drain_all_offload().await;
         }
     })
 }

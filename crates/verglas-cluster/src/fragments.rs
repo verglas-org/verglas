@@ -595,19 +595,27 @@ impl FragmentWriter {
             FragmentIoError::io(format!("fsync {}: {error}", self.tmp.display()))
         })?;
         drop(file);
-        let _commit = self
-            .store
-            .commit_lock
-            .lock()
-            .map_err(|_| FragmentIoError::io("fragment replacement lock poisoned"))?;
-        let replaced = self.store.fragment_len_by_path(&self.path);
-        fs::rename(&self.tmp, &self.path).map_err(|error| {
-            FragmentIoError::io(format!(
-                "rename {} to {}: {error}",
-                self.tmp.display(),
-                self.path.display()
-            ))
-        })?;
+        // Scoped deliberately. The lock pairs the size read with the rename so
+        // two placements of one key cannot both charge or release the previous
+        // live file. It must NOT cover the directory fsync: that is durability
+        // work, not accounting, and holding a process-global lock across it
+        // serialized every fragment commit on the node behind one ~5 ms fsync.
+        let replaced = {
+            let _commit = self
+                .store
+                .commit_lock
+                .lock()
+                .map_err(|_| FragmentIoError::io("fragment replacement lock poisoned"))?;
+            let replaced = self.store.fragment_len_by_path(&self.path);
+            fs::rename(&self.tmp, &self.path).map_err(|error| {
+                FragmentIoError::io(format!(
+                    "rename {} to {}: {error}",
+                    self.tmp.display(),
+                    self.path.display()
+                ))
+            })?;
+            replaced
+        };
         sync_dir(&self.parent)?;
         self.store.used.fetch_sub(replaced, Ordering::AcqRel);
         self.committed = true;

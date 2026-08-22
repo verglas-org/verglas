@@ -6,9 +6,9 @@
 use std::error::Error;
 
 use verglas_sdk::{
-    BuildGraphIndexInput, CreateGraphInput, DeleteGraphInput, Edge, GetGraphInput,
-    GetNeighborsInput, ListGraphsInput, Node, PutEdgesInput, PutNodesInput, QueryKHopInput,
-    QueryPathsInput, QueryPrecedentsInput,
+    AddEdgesInput, AddNodesInput, BuildIndexInput, CreateGraphInput, DeleteGraphInput,
+    DescribeGraphInput, Edge, ListGraphsInput, Node, RetrieveNeighborsInput, SearchKHopInput,
+    SearchPathsInput, SearchPrecedentsInput,
 };
 
 use crate::cli::{
@@ -62,7 +62,7 @@ async fn add_node(
     let nodes: Vec<Node> = serde_json::from_str(&read_json_input(&args.input)?)?;
     let count = nodes.len();
     let output = client
-        .put_nodes(PutNodesInput {
+        .add_nodes(AddNodesInput {
             graph_name: args.name.clone(),
             nodes,
         })
@@ -81,7 +81,7 @@ async fn add_edge(
     let edges: Vec<Edge> = serde_json::from_str(&read_json_input(&args.input)?)?;
     let count = edges.len();
     let output = client
-        .put_edges(PutEdgesInput {
+        .add_edges(AddEdgesInput {
             graph_name: args.name.clone(),
             edges,
         })
@@ -98,7 +98,7 @@ async fn neighbors(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let output = client
-        .get_neighbors(GetNeighborsInput {
+        .retrieve_neighbors(RetrieveNeighborsInput {
             direction: None,
             filter: None,
             graph_name: args.name.clone(),
@@ -126,7 +126,7 @@ async fn index(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let output = client
-        .build_graph_index(BuildGraphIndexInput {
+        .build_index(BuildIndexInput {
             graph_name: args.name.clone(),
         })
         .await?;
@@ -142,7 +142,7 @@ async fn show(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let output = client
-        .get_graph(GetGraphInput {
+        .describe_graph(DescribeGraphInput {
             graph_name: args.name.clone(),
         })
         .await?;
@@ -198,7 +198,7 @@ async fn k_hop(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let output = client
-        .query_k_hop(QueryKHopInput {
+        .search_k_hop(SearchKHopInput {
             direction: None,
             filter: None,
             graph_name: args.name.clone(),
@@ -227,7 +227,7 @@ async fn paths(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let output = client
-        .query_paths(QueryPathsInput {
+        .search_paths(SearchPathsInput {
             direction: None,
             filter: None,
             graph_name: args.name.clone(),
@@ -259,7 +259,7 @@ async fn precedents(
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let output = client
-        .query_precedents(QueryPrecedentsInput {
+        .search_precedents(SearchPrecedentsInput {
             graph_name: args.name.clone(),
             query: args.query.clone(),
             limit: args.limit,

@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub use managed::{
     ManagedCatalogClient, ManagedCatalogError, ManagedCatalogRequest, ManagedCatalogResponse,
+    ManagedCatalogTransport,
 };
 pub use registry::{
     CatalogBinding, CatalogBindingId, CatalogRegistry, CatalogRuntimeRegistry, DatabaseId,

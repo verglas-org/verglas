@@ -39,8 +39,8 @@ pub use peer::{
     PeerClient, PeerResolver, PeerServer, StaticResolver,
 };
 pub use raft_transport::{
-    BootstrapGroupFn, GroupCommandFn, MembershipReplace, MembershipReplaceFn, OpenGroupFn,
-    RaftAddressResolver, RaftHttpNetwork, RaftHttpTransport, RaftRpcRegistry,
+    BootstrapGroupFn, GroupCommandError, GroupCommandFn, MembershipReplace, MembershipReplaceFn,
+    OpenGroupFn, RaftAddressResolver, RaftHttpNetwork, RaftHttpTransport, RaftRpcRegistry,
     StaticRaftAddressResolver,
 };
 pub use ring::{LiveRing, RingMember, WeightedMember};

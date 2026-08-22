@@ -1,4 +1,7 @@
-# Development tasks for the Verglas workspace.
+# Development tasks for the Verglas repository.
+#
+# One cargo workspace covers everything: the engine and the Lakekeeper-derived
+# catalog under `crates/`, plus `bins/`, `cli/`, and `sdks/rust`.
 
 # Build everything.
 build:
@@ -12,7 +15,6 @@ test:
 lint:
     cargo fmt --all --check
     cargo clippy --workspace --all-targets -- -D warnings
-
 
 # Ceph s3-tests conformance: full suite against verglas-cache-node over MinIO.
 # Pass extra flags through, e.g. `just s3-tests --smoke` or `just s3-tests --debug`.

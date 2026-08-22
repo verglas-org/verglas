@@ -105,3 +105,89 @@
   ordering and durability now belong only to the consensus substrate, so the
   write-back crate no longer exposes a competing authority.
 - #137: Restored the verglas-writeback library name so the EC durability layer is not confused with a standalone write service. Its quorum acknowledgement and repair implementation are unchanged.
+- #164: Replaced per-object propagation with a size-triggered offload stream
+  (new `offload.rs`: `OffloadStream` accumulator plus `PackIndex`, the local
+  resolver for flushed packs). An acked object below the configured size
+  limit joins its `(storage binding, bucket)` offload stream; the stream
+  flushes the whole accumulated batch into one packed S3 object, keyed under
+  a reserved `_verglas/packs/` prefix, when accumulated bytes cross the limit
+  or a caller invokes `WriteCoordinator::drain_offload`/`drain_all_offload`.
+  An object at or above the limit bypasses accumulation and uploads directly,
+  reusing the old per-object logic under new names
+  (`bypass_upload_once`/`bypass_upload_with_retry`) since `propagate`,
+  `propagate_locked`, and `propagate_once` are deleted outright, with no
+  fallback path left to the old immediate-propagation behavior. The pack
+  index (key to pack object, offset, length) commits through
+  `ConsensusCommitter::commit_pack`, a new trait method mirroring the
+  existing `commit`, never a sidecar file. `WritebackReader` resolves a
+  flushed key by reading the exact byte range of its pack object through the
+  ordinary read path, so read-your-writes holds across a flush exactly as it
+  already held across the dirty window. Shaped deliberately to mirror the WAL
+  segment-archive model (accumulate, flush on threshold or drain, commit,
+  release local storage) so collapsing the two onto one engine (issue #164
+  §6) stays a small step; that unification is not done here. Tests written
+  first in `tests/offload.rs` and `offload.rs`'s own unit tests; confirmed
+  failing to compile against the pre-#164 API before implementing.
+
+- #180 (RIME perf candidate P2, negative result): investigated moving
+  `finish_stream_ack`'s consensus commit off the client-ack path (defer it to
+  a background task) to remove the per-object Raft round trip from write-back
+  throughput. Rejected after proof by test, not by inspection.
+
+  The write-back journal (`JournalStore`) is local, unreplicated filesystem
+  state on the accepting node only — nothing else in this codebase
+  reconstructs it from a peer. The synchronous `ConsensusCommitter::commit`
+  call is the only mechanism that makes an object's identity, geometry, and
+  fragment placements durable anywhere off that one node. Deferring it means
+  the client can be acked before that replication happens; if the accepting
+  node is then lost (the exact case the write-back durability contract must
+  survive — `w=3` fragments living on other nodes is worthless if nothing
+  durable maps them back to a key), the object is unrecoverable.
+
+  Added `ack_never_precedes_the_consensus_commit_completing` to
+  `tests/coordinator.rs` (a `BlockingCommitter` fake that stalls inside
+  `commit` so the test can observe ordering directly) and confirmed it passes
+  against the current synchronous implementation. Then experimentally
+  rewrote `finish_stream_ack` to spawn the commit in the background and ack
+  immediately after fragment quorum + local journal fsync. Both the new test
+  and the pre-existing `staged_fragments_do_not_ack_before_the_consensus_commit`
+  (which uses a `RejectingCommitter` to prove fragment durability alone must
+  never acknowledge) failed:
+
+  ```
+  thread 'ack_never_precedes_the_consensus_commit_completing' panicked:
+  the client must not be acked while the commit is still in flight
+
+  thread 'staged_fragments_do_not_ack_before_the_consensus_commit' panicked:
+  a non-committed header cannot acknowledge the PUT: PutOutcome { e_tag:
+  Some("\"e7cd741eca0e9a2d61976038472228bd\""), ... }
+  ```
+
+  The second failure is the sharper proof: with a committer that will *never*
+  succeed, the deferred design still returns a success `PutOutcome` to the
+  client. That is exactly gate P4 in `tests/cluster-local/PERF-OBJECTIVE.md`
+  ("making the commit best-effort with no ordering guarantee is a
+  rejection"), demonstrated rather than merely asserted. Reverted
+  `coordinator.rs` to the original synchronous commit (byte-identical to
+  `f5f5104d`) and kept the new regression test, which now guards against a
+  future attempt to make the same change without re-deriving this proof.
+  Conclusion: the commit must stay on the ack path under the current
+  architecture; the shard-count/RTT throughput ceiling needs a different
+  candidate (e.g., batching many concurrent objects into fewer Raft round
+  trips while still awaiting the commit before ack), not removing the
+  synchronous commit.
+- #164: Grouped `ack_deadline` and `offload_size_limit_bytes` into
+  `WritebackThresholds`. They are one policy, set together from
+  `cache.writeback` and read together on the ack path, and the eight-argument
+  constructor was failing `clippy -D warnings` on main.
+- #164: Striped the journal `write_lock` by object id. The invariant it
+  enforces is per journal — a straggler merge and a repair pass must not
+  interleave on the SAME object — but one global mutex also serialized every
+  unrelated journal write behind an fsync: measured 44.1 ms of lock wait
+  against 13.6 ms of actual write. Two mutations of one object still take the
+  same stripe.
+- #164: Moved the local fragment commit and the journal write off the async
+  runtime with `spawn_blocking`. Both are durability barriers (fsync, rename,
+  directory fsync) that were parking a worker thread inline on the client ack
+  path, and one of every object's fragments is placed locally. The peer path
+  already did this; the local path did not.

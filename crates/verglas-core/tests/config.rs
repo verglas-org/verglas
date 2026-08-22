@@ -1194,6 +1194,94 @@ fn writeback_rejects_zero_scrub_interval() {
     );
 }
 
+/// The object offload size limit defaults to 16 MiB (#164 §4) — the frozen
+/// benchmark protocol in `tests/cluster-local/OBJECTIVE.md` bakes this exact
+/// default into its PUT-count bound (`total_bytes / size_limit + 1`).
+#[test]
+fn writeback_offload_size_limit_defaults() {
+    let config = Config::from_toml_str(&valid_toml("wb-offload-default")).expect("parses");
+    assert_eq!(
+        config.cache.writeback.offload_size_limit_bytes,
+        ByteSize(16 * 1024 * 1024)
+    );
+}
+
+/// A custom offload size limit parses and validates.
+#[test]
+fn writeback_offload_size_limit_custom_validates() {
+    let toml = format!(
+        "{}[cache.writeback]\nenabled = true\nk = 4\nm = 2\nw = 5\noffload_size_limit_bytes = \"1MB\"\n",
+        valid_toml("wb-offload-custom")
+    );
+    let config = Config::from_toml_str(&toml).expect("parses");
+    assert_eq!(
+        config.cache.writeback.offload_size_limit_bytes,
+        ByteSize(1024 * 1024)
+    );
+    config
+        .validate()
+        .expect("custom offload size limit validates");
+}
+
+/// A zero offload size limit is rejected when the tier is enabled — every
+/// object would then bypass accumulation, defeating the point of the stream.
+#[test]
+fn writeback_rejects_zero_offload_size_limit() {
+    let toml = format!(
+        "{}[cache.writeback]\nenabled = true\nk = 4\nm = 2\nw = 5\noffload_size_limit_bytes = \"0\"\n",
+        valid_toml("wb-offload-zero")
+    );
+    let config = Config::from_toml_str(&toml).expect("parses");
+    let err = config
+        .validate()
+        .expect_err("zero offload size limit rejected");
+    assert!(
+        err.to_string().contains("offload_size_limit_bytes"),
+        "error names the field: {err}"
+    );
+}
+
+/// The offload drain loop interval defaults to 5 seconds (#164 §4) — short
+/// enough that a partially filled stream still drains inside the frozen
+/// benchmark's 30 s post-write window.
+#[test]
+fn writeback_offload_drain_interval_defaults() {
+    let config = Config::from_toml_str(&valid_toml("wb-offload-drain-default")).expect("parses");
+    assert_eq!(config.cache.writeback.offload_drain_interval_secs, 5);
+}
+
+/// A custom offload drain interval parses and validates.
+#[test]
+fn writeback_offload_drain_interval_custom_validates() {
+    let toml = format!(
+        "{}[cache.writeback]\nenabled = true\nk = 4\nm = 2\nw = 5\noffload_drain_interval_secs = 30\n",
+        valid_toml("wb-offload-drain-custom")
+    );
+    let config = Config::from_toml_str(&toml).expect("parses");
+    assert_eq!(config.cache.writeback.offload_drain_interval_secs, 30);
+    config
+        .validate()
+        .expect("custom offload drain interval validates");
+}
+
+/// A zero offload drain interval is rejected when the tier is enabled — a
+/// loop that never fires would strand small objects below the size limit.
+#[test]
+fn writeback_rejects_zero_offload_drain_interval() {
+    let toml = format!(
+        "{}[cache.writeback]\nenabled = true\nk = 4\nm = 2\nw = 5\noffload_drain_interval_secs = 0\n",
+        valid_toml("wb-offload-drain-zero")
+    );
+    let config = Config::from_toml_str(&toml).expect("parses");
+    let err = config
+        .validate()
+        .expect_err("zero offload drain interval rejected");
+    assert!(
+        err.to_string().contains("offload_drain_interval_secs"),
+        "error names the field: {err}"
+    );
+}
+
 /// A per-prefix override with an unreachable geometry is rejected too.
 #[test]
 fn writeback_rejects_bad_prefix_geometry() {

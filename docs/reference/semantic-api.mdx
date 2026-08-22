@@ -10,8 +10,9 @@ s3vectors for S3 Vectors and verglasgraphs for Graph.
 
 The S3 Vectors service uses the exact modeled operations /CreateVectorBucket,
 /CreateIndex, /PutVectors, and /QueryVectors. The Graph service uses
-/CreateGraph, /PutNodes, /PutEdges, /GetNeighbors, /QueryKHop,
-/QueryNeighborhood, and /QueryPaths. The full checked-in listener contract
+/CreateGraph, /ListGraphs, /DescribeGraph, /DeleteGraph, /AddNodes, /AddEdges,
+/RetrieveNeighbors, /SearchKHop, /SearchNeighborhood, /SearchPaths,
+/SearchPrecedents, and /BuildIndex. The full checked-in listener contract
 is served at /api-docs/s3/openapi.json; /swagger-ui links to that document.
 
 Rust callers construct S3VectorsClient or VerglasGraphsClient with cache

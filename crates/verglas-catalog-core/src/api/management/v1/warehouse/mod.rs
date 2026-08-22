@@ -1,0 +1,2793 @@
+mod undrop;
+
+use std::{sync::Arc, time::Instant};
+
+use futures::{FutureExt, StreamExt as _};
+use iceberg::spec::FormatVersion;
+use itertools::Itertools;
+use serde::{Deserialize, Serialize};
+use typed_builder::TypedBuilder;
+use verglas_iceberg_ext::catalog::rest::ErrorModel;
+
+use super::{DeleteWarehouseQuery, ProtectionResponse};
+pub use crate::service::{
+    CatalogCreateWarehouseRequest, ManagedBy, WarehouseStatus,
+    storage::{
+        AzCredential, GcsCredential, GcsProfile, GcsServiceKey, GenericAdlsProfile, OneLakeProfile,
+        S3Credential, S3Profile, StorageCredential, StorageCredentialType, StorageProfile,
+        validation::{ValidationCheck, ValidationCheckName, ValidationCheckStatus},
+    },
+};
+use crate::{
+    ProjectId, WarehouseId,
+    api::{
+        ApiContext, Result,
+        iceberg::v1::{PageToken, PaginationQuery},
+        management::v1::{
+            ApiServer, DeletedTabularResponse, GetWarehouseStatisticsQuery,
+            ListDeletedTabularsResponse,
+            task_queue::{
+                GetTaskQueueConfigResponse, SetTaskQueueConfigRequest,
+                get_task_queue_config as get_task_queue_config_authorized,
+                set_task_queue_config as set_task_queue_config_authorized,
+            },
+        },
+    },
+    request_metadata::RequestMetadata,
+    server::{UnfilteredPage, maybe_get_secret},
+    service::{
+        AllowedFormatVersions, ArcProjectId, CachePolicy, CatalogNamespaceOps, CatalogStore,
+        CatalogTabularOps, CatalogWarehouseOps, EnsureWarehouseSpecMutableError, NamespaceId,
+        ResolvedWarehouse, State, TabularId, TabularListFlags, Transaction,
+        ViewOrTableDeletionInfo, WarehouseFormatVersionPolicy, WarehouseSpecLocked,
+        authz::{
+            AuthZProjectOps, AuthZTableOps, Authorizer, AuthzNamespaceOps, AuthzWarehouseOps,
+            CatalogGenericTableAction, CatalogNamespaceAction, CatalogProjectAction,
+            CatalogTableAction, CatalogViewAction, CatalogWarehouseAction, InstanceAdminAction,
+            InstanceAdminAuthorizer,
+        },
+        events::{
+            APIEventContext,
+            context::{
+                APIEventActions, AuthzChecked, ResolutionState, TabularAction, UserProvidedEntity,
+                authz_to_error_no_audit,
+            },
+        },
+        require_namespace_for_tabular,
+        secrets::SecretStore,
+        storage::validation::{ReportBuilder, SKIPPED_PREREQUISITE, ValidationReport, elapsed_ms},
+        task_configs::TaskQueueConfigFilter,
+        tasks::{
+            CancelTasksFilter, TaskQueueName, tabular_expiration_queue::TabularExpirationTask,
+        },
+    },
+};
+
+#[derive(Debug, Deserialize, Default)]
+#[cfg_attr(feature = "open-api", derive(utoipa::IntoParams))]
+#[serde(rename_all = "camelCase")]
+pub struct ListDeletedTabularsQuery {
+    /// Filter by Namespace ID
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(value_type=uuid::Uuid))]
+    pub namespace_id: Option<NamespaceId>,
+    /// Next page token
+    #[serde(default)]
+    pub page_token: Option<String>,
+    /// Signals an upper bound of the number of results that a client will receive.
+    /// Default: 100
+    #[serde(default)]
+    pub page_size: Option<i64>,
+}
+
+impl ListDeletedTabularsQuery {
+    #[must_use]
+    pub fn pagination_query(&self) -> PaginationQuery {
+        PaginationQuery {
+            page_token: self
+                .page_token
+                .clone()
+                .map_or(PageToken::Empty, PageToken::Present),
+            page_size: self.page_size,
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, TypedBuilder)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct CreateWarehouseRequest {
+    /// Name of the warehouse to create. Must be unique
+    /// within a project and may not contain "/"
+    pub warehouse_name: String,
+    /// Project ID in which to create the warehouse.
+    /// Deprecated: Please use the `x-project-id` header instead.
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<String>))]
+    #[builder(default, setter(strip_option))]
+    pub project_id: Option<ProjectId>,
+    /// Storage profile to use for the warehouse.
+    pub storage_profile: StorageProfile,
+    /// Optional storage credential to use for the warehouse.
+    #[builder(default, setter(strip_option))]
+    pub storage_credential: Option<StorageCredential>,
+    /// Profile to determine behavior upon dropping of tabulars. Default: hard deletion.
+    #[serde(default)]
+    #[builder(default)]
+    pub delete_profile: TabularDeleteProfile,
+    /// Iceberg table format versions that may be created in, or upgraded to,
+    /// within this warehouse. Must be a non-empty subset of `[1, 2, 3]`.
+    /// Defaults to all supported versions when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<Vec<i32>>))]
+    pub allowed_format_versions: Option<Vec<FormatVersion>>,
+    /// Default Iceberg table format version applied when a create-table request
+    /// does not specify one. Must be a member of `allowed-format-versions`. When
+    /// omitted, resolves to v2 if allowed, otherwise the highest allowed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[builder(default, setter(strip_option))]
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<i32>))]
+    pub default_format_version: Option<FormatVersion>,
+    /// Which control plane, if any, exclusively manages this warehouse's spec.
+    /// Defaults to `self-managed`. Creating a managed warehouse (e.g. `instance-admin`)
+    /// requires instance-admin privilege.
+    #[serde(default)]
+    #[builder(default)]
+    pub managed_by: ManagedBy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Copy, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case", tag = "type")]
+pub enum TabularDeleteProfile {
+    #[cfg_attr(feature = "open-api", schema(title = "TabularDeleteProfileHard"))]
+    Hard {},
+    #[cfg_attr(feature = "open-api", schema(title = "TabularDeleteProfileSoft"))]
+    #[serde(rename_all = "kebab-case")]
+    Soft {
+        #[serde(
+            deserialize_with = "seconds_to_duration",
+            serialize_with = "duration_to_seconds",
+            alias = "expiration_seconds"
+        )]
+        #[cfg_attr(feature = "open-api", schema(value_type=i64))]
+        expiration_seconds: chrono::Duration,
+    },
+}
+
+fn seconds_to_duration<'de, D>(deserializer: D) -> Result<chrono::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let buf = i64::deserialize(deserializer)?;
+
+    Ok(chrono::Duration::seconds(buf))
+}
+
+fn duration_to_seconds<S>(duration: &chrono::Duration, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_i64(duration.num_seconds())
+}
+
+impl TabularDeleteProfile {
+    #[must_use]
+    pub fn expiration_seconds(&self) -> Option<chrono::Duration> {
+        match self {
+            Self::Soft { expiration_seconds } => Some(*expiration_seconds),
+            Self::Hard {} => None,
+        }
+    }
+}
+
+impl Default for TabularDeleteProfile {
+    fn default() -> Self {
+        Self::Hard {}
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(transparent)]
+pub struct CreateWarehouseResponse(GetWarehouseResponse);
+impl CreateWarehouseResponse {
+    #[must_use]
+    pub fn warehouse_id(&self) -> WarehouseId {
+        self.0.warehouse_id
+    }
+
+    #[must_use]
+    pub fn project_id(&self) -> ArcProjectId {
+        self.0.project_id.clone()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct UpdateWarehouseStorageRequest {
+    /// Storage profile to use for the warehouse.
+    /// The new profile must point to the same location as the existing profile
+    /// to avoid data loss. For S3 this means that you may not change the
+    /// bucket or key prefix. The region may only be changed if an `endpoint`
+    /// is set on the new profile (so the endpoint, not the region, determines
+    /// where S3 requests are routed).
+    pub storage_profile: StorageProfile,
+    /// Optional storage credential to use for the warehouse.
+    /// The existing credential is not re-used. If no credential is
+    /// provided, we assume that this storage does not require credentials.
+    #[serde(default)]
+    pub storage_credential: Option<StorageCredential>,
+}
+
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::IntoParams))]
+#[serde(rename_all = "camelCase")]
+pub struct ListWarehousesRequest {
+    /// Optional filter to return only warehouses
+    /// with the specified status.
+    /// If not provided, only active warehouses are returned.
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(nullable = false, required = false))]
+    pub warehouse_status: Option<Vec<WarehouseStatus>>,
+    /// The project ID to list warehouses for.
+    /// Deprecated: Please use the `x-project-id` header instead.
+    #[serde(default)]
+    #[cfg_attr(feature = "open-api", param(value_type=Option::<String>))]
+    pub project_id: Option<ProjectId>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct RenameWarehouseRequest {
+    /// New name for the warehouse.
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct UpdateWarehouseDeleteProfileRequest {
+    pub delete_profile: TabularDeleteProfile,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct UpdateWarehouseFormatVersionPolicyRequest {
+    /// Iceberg table format versions that may be created in, or upgraded to,
+    /// within this warehouse. Must be a non-empty subset of `[1, 2, 3]`.
+    #[cfg_attr(feature = "open-api", schema(value_type=Vec<i32>))]
+    pub allowed_format_versions: Vec<FormatVersion>,
+    /// Default Iceberg table format version applied when a create-table request
+    /// does not specify one. Must be a member of `allowed-format-versions`. When
+    /// omitted, resolves to v2 if allowed, otherwise the highest allowed version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<i32>))]
+    pub default_format_version: Option<FormatVersion>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct RenameProjectRequest {
+    /// New name for the project.
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct GetWarehouseResponse {
+    /// ID of the warehouse.
+    #[cfg_attr(feature = "open-api", schema(value_type=uuid::Uuid))]
+    #[deprecated(since = "0.11.0", note = "Please use 'warehouse_id' field instead.")]
+    pub id: WarehouseId,
+    /// ID of the warehouse.
+    #[cfg_attr(feature = "open-api", schema(value_type=uuid::Uuid))]
+    pub warehouse_id: WarehouseId,
+    /// Name of the warehouse.
+    pub name: String,
+    /// Project ID in which the warehouse was created.
+    #[cfg_attr(feature = "open-api", schema(value_type=String))]
+    pub project_id: ArcProjectId,
+    /// Storage profile used for the warehouse.
+    pub storage_profile: StorageProfile,
+    /// Best-effort indicator of the storage credential type. When present it
+    /// reflects the detected credential kind; when absent the warehouse may
+    /// either have no credential configured or the secret lookup may have
+    /// failed. Does not contain secret values.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_credential_type: Option<StorageCredentialType>,
+    /// Delete profile used for the warehouse.
+    pub delete_profile: TabularDeleteProfile,
+    /// Whether the warehouse is active.
+    pub status: WarehouseStatus,
+    /// Whether the warehouse is protected from being deleted.
+    pub protected: bool,
+    /// Which control plane, if any, exclusively manages this warehouse's spec.
+    /// When not `self-managed`, spec mutations are restricted to that control plane.
+    #[serde(default)]
+    pub managed_by: ManagedBy,
+    /// Iceberg table format versions that may be created in, or upgraded to,
+    /// within this warehouse.
+    #[cfg_attr(feature = "open-api", schema(value_type=Vec<i32>))]
+    pub allowed_format_versions: Vec<FormatVersion>,
+    /// Default Iceberg table format version applied when a create-table request
+    /// does not specify one. When absent, resolves to v2 if allowed, otherwise
+    /// the highest allowed version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "open-api", schema(value_type=Option::<i32>))]
+    pub default_format_version: Option<FormatVersion>,
+    /// Last updated timestamp.
+    pub updated_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct ListWarehousesResponse {
+    /// List of warehouses in the project.
+    pub warehouses: Vec<GetWarehouseResponse>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct UpdateWarehouseCredentialRequest {
+    /// New storage credential to use for the warehouse.
+    /// If not specified, the existing credential is removed.
+    pub new_storage_credential: Option<StorageCredential>,
+}
+
+/// Outcome of validating a warehouse configuration.
+///
+/// Returned with HTTP 200 whether or not the configuration is usable — a failing
+/// check is a result, not a request error. Only authorization and malformed
+/// bodies produce a 4xx.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct ValidateWarehouseResponse {
+    /// True when no check failed. Skipped checks do not make a configuration invalid.
+    pub valid: bool,
+    /// Every check that was considered, in execution order — passed, failed and
+    /// skipped alike, so the caller can see what was and was not covered.
+    pub checks: Vec<ValidationCheck>,
+}
+
+impl From<ValidationReport> for ValidateWarehouseResponse {
+    fn from(report: ValidationReport) -> Self {
+        let report = report.sanitized_for_response();
+        Self {
+            valid: report.valid,
+            checks: report.checks,
+        }
+    }
+}
+
+impl axum::response::IntoResponse for ValidateWarehouseResponse {
+    fn into_response(self) -> axum::http::Response<axum::body::Body> {
+        (http::StatusCode::OK, axum::Json(self)).into_response()
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct SetWarehouseManagedByRequest {
+    /// New managed-by marker. Use `self-managed` to clear. Setting or clearing the
+    /// marker requires instance-admin privilege.
+    pub managed_by: ManagedBy,
+}
+
+impl axum::response::IntoResponse for CreateWarehouseResponse {
+    fn into_response(self) -> axum::http::Response<axum::body::Body> {
+        (http::StatusCode::CREATED, axum::Json(self)).into_response()
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct WarehouseStatistics {
+    /// Timestamp of when these statistics are valid until
+    ///
+    /// We lazily create a new statistics entry every hour, in between hours, the existing entry
+    /// is being updated. If there's a change at `created_at` + 1 hour, a new entry is created. If
+    /// there's no change, no new entry is created.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    /// Number of tables in the warehouse.
+    pub number_of_tables: i64,
+    /// Number of views in the warehouse.
+    pub number_of_views: i64,
+    /// Timestamp of when these statistics were last updated
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct WarehouseStatisticsResponse {
+    /// ID of the warehouse for which the stats were collected.
+    pub warehouse_ident: uuid::Uuid,
+    /// Ordered list of warehouse statistics.
+    pub stats: Vec<WarehouseStatistics>,
+    /// Next page token
+    pub next_page_token: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+#[cfg_attr(feature = "open-api", derive(utoipa::ToSchema))]
+#[serde(rename_all = "kebab-case")]
+pub struct UndropTabularsRequest {
+    /// Tabulars to undrop
+    pub targets: Vec<TabularId>,
+}
+
+impl<C: CatalogStore, A: Authorizer + Clone, S: SecretStore> Service<C, A, S>
+    for ApiServer<C, A, S>
+{
+}
+
+#[async_trait::async_trait]
+pub trait Service<C: CatalogStore, A: Authorizer, S: SecretStore> {
+    async fn create_warehouse(
+        request: CreateWarehouseRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<CreateWarehouseResponse> {
+        let CreateWarehouseRequest {
+            warehouse_name,
+            project_id,
+            mut storage_profile,
+            storage_credential,
+            delete_profile,
+            allowed_format_versions,
+            default_format_version,
+            managed_by,
+        } = request;
+        let project_id = request_metadata.require_project_id(project_id)?;
+        let format_version_policy =
+            validate_format_version_policy(allowed_format_versions, default_format_version)?;
+
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_project_arc(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            project_id,
+            Arc::new(CatalogProjectAction::CreateWarehouse {
+                name: Some(warehouse_name.clone()),
+            }),
+        );
+
+        let authz_result = authorizer
+            .require_project_action(
+                event_ctx.request_metadata(),
+                event_ctx.user_provided_entity_arc_ref(),
+                event_ctx.action().clone(),
+            )
+            .await;
+
+        let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
+        let request_metadata = event_ctx.request_metadata();
+        let project_id = event_ctx.user_provided_entity();
+
+        // A warehouse may only be *born* managed if the caller can manage it
+        // (instance admin / in-process); otherwise a non-admin could lock itself
+        // — and other grant-holders — out at create time. Checked after create
+        // authz so an unauthorized caller gets a plain create denial rather than a
+        // managed-by hint, and so the rejection is recorded as an authz-failure.
+        if managed_by.is_externally_managed()
+            && !request_metadata.bypasses_control_plane_authz(None)
+        {
+            return Err(event_ctx
+                .emit_late_authz_failure(WarehouseSpecLocked::new(managed_by))
+                .into());
+        }
+
+        // ------------------- Business Logic -------------------
+        validate_warehouse_name(&warehouse_name)?;
+        storage_profile.normalize(storage_credential.as_ref())?;
+
+        // Run credential validation and storage-overlap check in parallel
+        let validation_future =
+            storage_profile.validate_access(storage_credential.as_ref(), None, request_metadata);
+        let overlap_check_future = ensure_no_storage_overlap::<C>(
+            project_id,
+            &storage_profile,
+            context.v1_state.catalog.clone(),
+        );
+
+        let (validation_result, overlap_result) =
+            tokio::join!(validation_future, overlap_check_future);
+
+        // Check results from both operations
+        validation_result?;
+        overlap_result?;
+
+        let credential_type = storage_credential
+            .as_ref()
+            .map(StorageCredential::credential_type);
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        let secret_id = if let Some(storage_credential) = storage_credential {
+            Some(
+                context
+                    .v1_state
+                    .secrets
+                    .create_storage_secret(storage_credential)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let resolved_warehouse = C::create_warehouse(
+            project_id,
+            CatalogCreateWarehouseRequest::builder()
+                .warehouse_name(warehouse_name)
+                .storage_profile(storage_profile)
+                .storage_secret_id(secret_id)
+                .delete_profile(delete_profile)
+                .format_version_policy(format_version_policy)
+                .managed_by(managed_by)
+                .build(),
+            transaction.transaction(),
+        )
+        .await?;
+        authorizer
+            .create_warehouse(
+                request_metadata,
+                resolved_warehouse.warehouse_id,
+                project_id,
+            )
+            .await?;
+
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_created(resolved_warehouse.clone());
+
+        let response =
+            GetWarehouseResponse::from_resolved((*resolved_warehouse).clone(), credential_type);
+        Ok(CreateWarehouseResponse(response))
+    }
+
+    /// Dry-run of [`Self::create_warehouse`]: run the checks the create would
+    /// run, then stop. Nothing is persisted and no secret is stored.
+    async fn validate_warehouse(
+        request: CreateWarehouseRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ValidateWarehouseResponse> {
+        // Takes the create request verbatim: the dry-run cannot drift from the
+        // thing it predicts if it is literally the same type.
+        let CreateWarehouseRequest {
+            warehouse_name,
+            project_id,
+            mut storage_profile,
+            storage_credential,
+            delete_profile: _,
+            allowed_format_versions,
+            default_format_version,
+            managed_by,
+        } = request;
+        let project_id = request_metadata.require_project_id(project_id)?;
+
+        // ------------------- AuthZ -------------------
+        // Gated by the same action as the create it stands in for: whoever may not
+        // create a warehouse may not use validation to probe storage either.
+        let authorizer = context.v1_state.authz;
+        let event_ctx = APIEventContext::for_project_arc(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            project_id,
+            Arc::new(CatalogProjectAction::CreateWarehouse {
+                name: Some(warehouse_name.clone()),
+            }),
+        );
+        let authz_result = authorizer
+            .require_project_action(
+                event_ctx.request_metadata(),
+                event_ctx.user_provided_entity_arc_ref(),
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
+        let request_metadata = event_ctx.request_metadata();
+        let project_id = event_ctx.user_provided_entity();
+
+        // ------------------- Business Logic -------------------
+        let mut report = ReportBuilder::new();
+        let normalized = report.record(
+            ValidationCheckName::ProfileWellFormed,
+            Instant::now(),
+            storage_profile.normalize(storage_credential.as_ref()),
+        );
+        report.skip(
+            ValidationCheckName::ProfileCompatible,
+            "Only applies when updating an existing warehouse.",
+        );
+        report.skip(
+            ValidationCheckName::SpecMutable,
+            "Only applies when updating an existing warehouse.",
+        );
+        let started = Instant::now();
+        report.record(
+            ValidationCheckName::FormatVersionPolicyConsistent,
+            started,
+            validate_format_version_policy(allowed_format_versions, default_format_version)
+                .map(|_| ()),
+        );
+        // Mirrors the create-time guard: only instance admins may bring a
+        // warehouse into existence already owned by a control plane.
+        report.push(managed_by_check(managed_by, request_metadata));
+
+        // The project listing serves both the name-availability and the
+        // location-overlap check; fetch it once, alongside the storage probes.
+        let listing = C::list_warehouses(
+            project_id,
+            Some(WarehouseStatus::active_and_inactive().to_vec()),
+            context.v1_state.catalog.clone(),
+        );
+        let probes = async {
+            if normalized {
+                storage_profile
+                    .validate_access_report(storage_credential.as_ref(), None, request_metadata)
+                    .await
+                    .checks
+            } else {
+                skipped_access_checks(SKIPPED_PREREQUISITE)
+            }
+        };
+        let (listing, probe_checks) = tokio::join!(listing, probes);
+
+        // Both remaining checks read the same listing. If it failed we cannot
+        // determine either, so report that once and move the error rather than
+        // duplicating it into two checks.
+        let warehouses = match listing {
+            Ok(warehouses) => warehouses,
+            Err(e) => {
+                report.push(ValidationCheck::failed(
+                    ValidationCheckName::WarehouseNameValid,
+                    0,
+                    ErrorModel::from(e),
+                ));
+                report.skip(
+                    ValidationCheckName::LocationExclusive,
+                    "Could not list the warehouses in this project.",
+                );
+                report.extend(probe_checks);
+                return Ok(report.build().into());
+            }
+        };
+
+        report.push(warehouse_name_check(&warehouse_name, &warehouses));
+        report.push(if normalized {
+            location_overlap_check(&storage_profile, &warehouses)
+        } else {
+            ValidationCheck::skipped(ValidationCheckName::LocationExclusive, SKIPPED_PREREQUISITE)
+        });
+        report.extend(probe_checks);
+
+        Ok(report.build().into())
+    }
+
+    /// Dry-run of [`Self::update_storage`].
+    async fn validate_storage_profile(
+        warehouse_id: WarehouseId,
+        request: UpdateWarehouseStorageRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ValidateWarehouseResponse> {
+        let (request_metadata, warehouse, spec_check) =
+            Self::authorize_storage_validation(warehouse_id, &context, request_metadata, true)
+                .await?;
+
+        let UpdateWarehouseStorageRequest {
+            mut storage_profile,
+            storage_credential,
+        } = request;
+
+        let mut report = ReportBuilder::new();
+        let normalized = report.record(
+            ValidationCheckName::ProfileWellFormed,
+            Instant::now(),
+            storage_profile.normalize(storage_credential.as_ref()),
+        );
+
+        // An update may not move the warehouse to a different location; report that
+        // as its own check so a rejected update is distinguishable from unreachable
+        // storage.
+        if normalized {
+            report.push(profile_compatibility_check(
+                &warehouse.storage_profile,
+                &storage_profile,
+            ));
+        } else {
+            report.skip(ValidationCheckName::ProfileCompatible, SKIPPED_PREREQUISITE);
+        }
+
+        report.push(ValidationCheck::skipped(
+            ValidationCheckName::WarehouseNameValid,
+            "Updating storage does not change the warehouse name.",
+        ));
+        report.push(ValidationCheck::skipped(
+            ValidationCheckName::LocationExclusive,
+            "An update may not change the location, so it cannot introduce an overlap.",
+        ));
+        report.push(spec_check);
+        report.skip(
+            ValidationCheckName::FormatVersionPolicyConsistent,
+            "Only applies when creating a warehouse.",
+        );
+        report.skip(
+            ValidationCheckName::ManagedByAllowed,
+            "Only applies when creating a warehouse.",
+        );
+
+        // Probe the incoming profile, matching what `update_storage` validates
+        // before merging it into the stored one.
+        report.extend(if normalized {
+            storage_profile
+                .validate_access_report(storage_credential.as_ref(), None, &request_metadata)
+                .await
+                .checks
+        } else {
+            skipped_access_checks(SKIPPED_PREREQUISITE)
+        });
+
+        Ok(report.build().into())
+    }
+
+    /// Dry-run of [`Self::update_storage_credential`]: probe the warehouse's stored
+    /// profile with a replacement credential.
+    async fn validate_storage_credential(
+        warehouse_id: WarehouseId,
+        request: UpdateWarehouseCredentialRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ValidateWarehouseResponse> {
+        let (request_metadata, warehouse, spec_check) =
+            Self::authorize_storage_validation(warehouse_id, &context, request_metadata, true)
+                .await?;
+
+        Ok(stored_profile_report(
+            &warehouse.storage_profile,
+            request.new_storage_credential.as_ref(),
+            &request_metadata,
+            "The stored storage profile is unchanged by a credential rotation.",
+            "The storage profile is unchanged, so there is nothing to be compatible with.",
+            spec_check,
+        )
+        .await
+        .into())
+    }
+
+    /// Validate the configuration a warehouse is *currently* running with, using its
+    /// stored profile and stored credential. Answers "does this warehouse still work",
+    /// as opposed to "would this change work".
+    async fn validate_storage_access(
+        warehouse_id: WarehouseId,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ValidateWarehouseResponse> {
+        let (request_metadata, warehouse, spec_check) =
+            Self::authorize_storage_validation(warehouse_id, &context, request_metadata, false)
+                .await?;
+
+        let credential =
+            maybe_get_secret(warehouse.storage_secret_id, &context.v1_state.secrets).await?;
+
+        Ok(stored_profile_report(
+            &warehouse.storage_profile,
+            credential.as_deref(),
+            &request_metadata,
+            "Validating the configuration the warehouse is currently running with.",
+            "No change is proposed, so there is nothing to be compatible with.",
+            spec_check,
+        )
+        .await
+        .into())
+    }
+
+    /// Shared authz + warehouse resolution for the storage validation endpoints.
+    ///
+    /// Uses the same action as the mutation each endpoint stands in for, so
+    /// validation never widens who can reach the storage backend.
+    /// `check_spec_mutable` should be false for read-only validation: an
+    /// externally managed warehouse is locked against *changes*, which says
+    /// nothing about whether its current configuration works.
+    ///
+    /// Read-only validation also accepts a deactivated warehouse — "does this
+    /// warehouse's storage still work" is most often asked precisely because
+    /// someone deactivated it when it stopped working. The dry-runs of the
+    /// mutations keep `active()`, matching the mutations they stand in for.
+    async fn authorize_storage_validation(
+        warehouse_id: WarehouseId,
+        context: &ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+        check_spec_mutable: bool,
+    ) -> Result<(
+        Arc<RequestMetadata>,
+        Arc<ResolvedWarehouse>,
+        ValidationCheck,
+    )> {
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::UpdateStorage,
+        );
+        let status_filter = if check_spec_mutable {
+            WarehouseStatus::active()
+        } else {
+            WarehouseStatus::active_and_inactive()
+        };
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            status_filter,
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = context
+            .v1_state
+            .authz
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+
+        // The mutations refuse an externally managed warehouse before applying
+        // anything; report that as a check rather than a rejection, so a locked
+        // warehouse produces `valid: false` instead of a misleading green.
+        // Reported, not emitted as an authz failure — a dry run is not a denial.
+        if !check_spec_mutable {
+            return Ok((
+                event_ctx.request_metadata_arc(),
+                warehouse,
+                ValidationCheck::skipped(
+                    ValidationCheckName::SpecMutable,
+                    "No change is proposed, so the warehouse's spec lock does not apply.",
+                ),
+            ));
+        }
+
+        // A write transaction: the underlying check takes `SELECT ... FOR UPDATE`.
+        // Committed before the storage probes start, so no pool connection is
+        // held across multi-second network I/O.
+        let started = Instant::now();
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog.clone()).await?;
+        let mutable = C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await;
+        transaction.commit().await?;
+        let spec_check = match mutable {
+            Ok(()) => {
+                ValidationCheck::passed(ValidationCheckName::SpecMutable, elapsed_ms(started))
+            }
+            Err(e) => ValidationCheck::failed(
+                ValidationCheckName::SpecMutable,
+                elapsed_ms(started),
+                ErrorModel::from(e),
+            ),
+        };
+
+        Ok((event_ctx.request_metadata_arc(), warehouse, spec_check))
+    }
+
+    async fn list_warehouses(
+        request: ListWarehousesRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ListWarehousesResponse> {
+        const MAX_CONCURRENT_SECRET_LOOKUPS: usize = 32;
+        // ------------------- AuthZ -------------------
+        let project_id = request_metadata.require_project_id(request.project_id)?;
+
+        let event_ctx = APIEventContext::for_project_arc(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            project_id,
+            Arc::new(CatalogProjectAction::ListWarehouses),
+        );
+
+        let authorizer = context.v1_state.authz;
+        let authz_result = authorizer
+            .require_project_action(
+                event_ctx.request_metadata(),
+                event_ctx.user_provided_entity_arc_ref(),
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
+
+        // ------------------- Business Logic -------------------
+        let warehouses = C::list_warehouses(
+            event_ctx.user_provided_entity(),
+            request.warehouse_status,
+            context.v1_state.catalog,
+        )
+        .await?;
+
+        let allowed_warehouses: Vec<_> = authorizer
+            .are_allowed_warehouse_actions_vec(
+                event_ctx.request_metadata(),
+                None,
+                &warehouses
+                    .iter()
+                    .map(|w| (&**w, CatalogWarehouseAction::IncludeInList))
+                    .collect::<Vec<_>>(),
+            )
+            .await
+            .map_err(authz_to_error_no_audit)?
+            .into_allowed()
+            .into_iter()
+            .zip(warehouses)
+            .filter_map(|(allowed, warehouse)| if allowed { Some(warehouse) } else { None })
+            .collect();
+
+        // Collect futures first to avoid for<'a> lifetime issues with stream combinators.
+        let futs: Vec<_> = allowed_warehouses
+            .iter()
+            .map(|w| resolve_credential_type(w, &context.v1_state.secrets))
+            .collect();
+        let credential_types: Vec<_> = futures::stream::iter(futs)
+            .buffered(MAX_CONCURRENT_SECRET_LOOKUPS)
+            .collect()
+            .await;
+        let warehouses: Vec<GetWarehouseResponse> = allowed_warehouses
+            .into_iter()
+            .zip(credential_types)
+            .map(|(warehouse, credential_type)| {
+                GetWarehouseResponse::from_resolved((*warehouse).clone(), credential_type)
+            })
+            .collect();
+
+        Ok(ListWarehousesResponse { warehouses })
+    }
+
+    async fn get_warehouse(
+        warehouse_id: WarehouseId,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::GetMetadata,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Skip,
+            context.v1_state.catalog,
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (_event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let credential_type = resolve_credential_type(&warehouse, &context.v1_state.secrets).await;
+        Ok(GetWarehouseResponse::from_resolved(
+            (*warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn get_warehouse_statistics(
+        warehouse_id: WarehouseId,
+        query: GetWarehouseStatisticsQuery,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<WarehouseStatisticsResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::GetMetadata,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Use,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (_event_ctx, _warehouse) = event_ctx.emit_authz(authz_result)?;
+
+        // ------------------- Business Logic -------------------
+        C::get_warehouse_stats(
+            warehouse_id,
+            query.to_pagination_query(),
+            context.v1_state.catalog,
+        )
+        .await
+    }
+
+    async fn delete_warehouse(
+        warehouse_id: WarehouseId,
+        query: DeleteWarehouseQuery,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<()> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::Delete,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let warehouse = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(warehouse)?;
+        let event_ctx = event_ctx.resolve(warehouse);
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+        C::delete_warehouse(warehouse_id, query, transaction.transaction()).await?;
+        transaction.commit().await?;
+
+        // Post-commit: best-effort authz cleanup (see `delete_project`).
+        authorizer
+            .delete_warehouse(event_ctx.request_metadata(), warehouse_id)
+            .await
+            .inspect_err(|e| {
+                tracing::error!(
+                    ?e,
+                    "Failed to delete warehouse from authorizer: {}",
+                    e.error
+                );
+            })
+            .ok();
+
+        event_ctx.emit_warehouse_deleted();
+
+        Ok(())
+    }
+
+    async fn set_warehouse_protection(
+        warehouse_id: WarehouseId,
+        protection: bool,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ProtectionResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::SetProtection,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Use,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse);
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        tracing::debug!("Setting protection for warehouse {warehouse_id} to {protection}");
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+        let resolved_warehouse =
+            C::set_warehouse_protected(warehouse_id, protection, transaction.transaction()).await?;
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_protection_set(protection, resolved_warehouse.clone());
+
+        Ok(ProtectionResponse {
+            protected: resolved_warehouse.protected,
+            updated_at: resolved_warehouse.updated_at,
+        })
+    }
+
+    /// Set (or clear) the managed-by marker on a warehouse. Authorized solely by
+    /// instance-admin privilege (not the resource authorizer): a managed
+    /// warehouse's spec is then mutable only by instance admins, locking out
+    /// normal grant-holders. Clearing the marker is the recovery path — an
+    /// instance admin can always clear it regardless of its value.
+    async fn set_warehouse_managed_by(
+        warehouse_id: WarehouseId,
+        request: SetWarehouseManagedByRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        // ------------------- AuthZ -------------------
+        // Instance-admin-only: this is NOT a resource-authorizer action (it never
+        // appears in OpenFGA/`/actions`/batch-check). The instance-admin check is
+        // the sole authorization decision here, so it emits exactly one audit
+        // event (success or denial) — no resource check, no double-logging.
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            InstanceAdminAction::SetWarehouseManagedBy,
+        );
+        let authz_result = InstanceAdminAuthorizer::require(
+            event_ctx.request_metadata(),
+            InstanceAdminAction::SetWarehouseManagedBy,
+        );
+        let (event_ctx, ()) = event_ctx.emit_authz(authz_result)?;
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        let updated_warehouse = C::set_warehouse_managed_by(
+            warehouse_id,
+            request.managed_by,
+            transaction.transaction(),
+        )
+        .await?;
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_managed_by_set(request.managed_by, updated_warehouse.clone());
+
+        let credential_type =
+            resolve_credential_type(&updated_warehouse, &context.v1_state.secrets).await;
+        Ok(GetWarehouseResponse::from_resolved(
+            (*updated_warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn rename_warehouse(
+        warehouse_id: WarehouseId,
+        request: RenameWarehouseRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::Rename,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Use,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse);
+
+        // ------------------- Business Logic -------------------
+        validate_warehouse_name(&request.new_name)?;
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+
+        let updated_warehouse =
+            C::rename_warehouse(warehouse_id, &request.new_name, transaction.transaction()).await?;
+
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_renamed(Arc::new(request), updated_warehouse.clone());
+
+        let credential_type =
+            resolve_credential_type(&updated_warehouse, &context.v1_state.secrets).await;
+        Ok(GetWarehouseResponse::from_resolved(
+            (*updated_warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn update_warehouse_delete_profile(
+        warehouse_id: WarehouseId,
+        request: UpdateWarehouseDeleteProfileRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::ModifySoftDeletion,
+        );
+
+        let warehouse =
+            C::get_active_warehouse_by_id(warehouse_id, context.v1_state.catalog.clone()).await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse);
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+        let updated_warehouse = C::set_warehouse_deletion_profile(
+            warehouse_id,
+            &request.delete_profile,
+            transaction.transaction(),
+        )
+        .await?;
+        transaction.commit().await?;
+
+        event_ctx
+            .emit_warehouse_delete_profile_updated(Arc::new(request), updated_warehouse.clone());
+
+        let credential_type =
+            resolve_credential_type(&updated_warehouse, &context.v1_state.secrets).await;
+        Ok(GetWarehouseResponse::from_resolved(
+            (*updated_warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn update_warehouse_format_version_policy(
+        warehouse_id: WarehouseId,
+        request: UpdateWarehouseFormatVersionPolicyRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        let policy = validate_format_version_policy(
+            Some(request.allowed_format_versions.clone()),
+            request.default_format_version,
+        )?;
+
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::SetFormatVersionPolicy,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse);
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+        let updated_warehouse = C::set_warehouse_format_version_policy(
+            warehouse_id,
+            &policy,
+            transaction.transaction(),
+        )
+        .await?;
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_format_version_policy_updated(
+            Arc::new(request),
+            updated_warehouse.clone(),
+        );
+
+        let credential_type =
+            resolve_credential_type(&updated_warehouse, &context.v1_state.secrets).await;
+        Ok(GetWarehouseResponse::from_resolved(
+            (*updated_warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn deactivate_warehouse(
+        warehouse_id: WarehouseId,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<()> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::Deactivate,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, _) = event_ctx.emit_authz(authz_result)?;
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+
+        C::set_warehouse_status(
+            warehouse_id,
+            WarehouseStatus::Inactive,
+            transaction.transaction(),
+        )
+        .await?;
+
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    async fn activate_warehouse(
+        warehouse_id: WarehouseId,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<()> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::Activate,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active_and_inactive(),
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, _) = event_ctx.emit_authz(authz_result)?;
+
+        // ------------------- Business Logic -------------------
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+
+        C::set_warehouse_status(
+            warehouse_id,
+            WarehouseStatus::Active,
+            transaction.transaction(),
+        )
+        .await?;
+
+        transaction.commit().await?;
+
+        Ok(())
+    }
+
+    async fn update_storage(
+        warehouse_id: WarehouseId,
+        request: UpdateWarehouseStorageRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::UpdateStorage,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active(),
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse.clone());
+
+        // ------------------- Business Logic -------------------
+        let request_for_event = Arc::new(request.clone());
+        let UpdateWarehouseStorageRequest {
+            mut storage_profile,
+            storage_credential,
+        } = request;
+
+        storage_profile.normalize(storage_credential.as_ref())?;
+        Box::pin(storage_profile.validate_access(
+            storage_credential.as_ref(),
+            None,
+            event_ctx.request_metadata(),
+        ))
+        .await?;
+
+        let credential_type = storage_credential
+            .as_ref()
+            .map(StorageCredential::credential_type);
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+        let storage_profile = warehouse
+            .storage_profile
+            .clone()
+            .update_with(storage_profile)?;
+        let old_secret_id = warehouse.storage_secret_id;
+
+        let secret_id = if let Some(storage_credential) = storage_credential {
+            Some(
+                context
+                    .v1_state
+                    .secrets
+                    .create_storage_secret(storage_credential)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let updated_warehouse = C::update_storage_profile(
+            warehouse_id,
+            storage_profile,
+            secret_id,
+            transaction.transaction(),
+        )
+        .await?;
+
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_storage_updated(request_for_event, updated_warehouse.clone());
+
+        // Delete the old secret if it exists - never fail the request if the deletion fails
+        if let Some(old_secret_id) = old_secret_id {
+            context
+                .v1_state
+                .secrets
+                .delete_secret(&old_secret_id)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error=?e.error, "Failed to delete old storage secret");
+                })
+                .ok();
+        }
+
+        Ok(GetWarehouseResponse::from_resolved(
+            (*updated_warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn update_storage_credential(
+        warehouse_id: WarehouseId,
+        request: UpdateWarehouseCredentialRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetWarehouseResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::UpdateStorage,
+        );
+
+        let warehouse = C::get_warehouse_by_id_cache_aware(
+            warehouse_id,
+            WarehouseStatus::active(),
+            CachePolicy::Skip,
+            context.v1_state.catalog.clone(),
+        )
+        .await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse.clone());
+
+        // ------------------- Business Logic -------------------
+        let request_for_event = Arc::new(request.clone());
+        let UpdateWarehouseCredentialRequest {
+            new_storage_credential,
+        } = request;
+        let credential_type = new_storage_credential
+            .as_ref()
+            .map(StorageCredential::credential_type);
+        let mut transaction = C::Transaction::begin_write(context.v1_state.catalog).await?;
+        C::ensure_warehouse_spec_mutable(
+            warehouse_id,
+            event_ctx.action(),
+            event_ctx
+                .request_metadata()
+                .bypasses_control_plane_authz(None),
+            transaction.transaction(),
+        )
+        .await
+        .map_err(|e| spec_lock_to_error(&event_ctx, e))?;
+        let old_secret_id = warehouse.storage_secret_id;
+
+        Box::pin(warehouse.storage_profile.validate_access(
+            new_storage_credential.as_ref(),
+            None,
+            event_ctx.request_metadata(),
+        ))
+        .await?;
+
+        let secret_id = if let Some(new_storage_credential) = new_storage_credential {
+            Some(
+                context
+                    .v1_state
+                    .secrets
+                    .create_storage_secret(new_storage_credential)
+                    .await?,
+            )
+        } else {
+            None
+        };
+
+        let updated_warehouse = C::update_storage_profile(
+            warehouse_id,
+            warehouse.storage_profile.clone(),
+            secret_id,
+            transaction.transaction(),
+        )
+        .await?;
+
+        transaction.commit().await?;
+
+        event_ctx.emit_warehouse_storage_credential_updated(
+            request_for_event,
+            old_secret_id,
+            updated_warehouse.clone(),
+        );
+
+        // Delete the old secret if it exists - never fail the request if the deletion fails
+        if let Some(old_secret_id) = old_secret_id {
+            context
+                .v1_state
+                .secrets
+                .delete_secret(&old_secret_id)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error=?e.error, "Failed to delete old storage secret");
+                })
+                .ok();
+        }
+
+        Ok(GetWarehouseResponse::from_resolved(
+            (*updated_warehouse).clone(),
+            credential_type,
+        ))
+    }
+
+    async fn undrop_tabulars(
+        warehouse_id: WarehouseId,
+        request_metadata: RequestMetadata,
+        request: UndropTabularsRequest,
+        context: ApiContext<State<A, C, S>>,
+    ) -> Result<()> {
+        if request.targets.is_empty() {
+            return Ok(());
+        }
+        // ------------------- AuthZ -------------------
+        let authorizer = context.v1_state.authz;
+
+        // Initial context on Warehouse level
+        let request_metadata = Arc::new(request_metadata);
+        let event_ctx = APIEventContext::for_tabulars(
+            request_metadata.clone(),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            request.targets.clone(),
+            TabularAction {
+                table_action: CatalogTableAction::Undrop,
+                view_action: CatalogViewAction::Undrop,
+                generic_table_action: CatalogGenericTableAction::Undrop,
+            },
+        );
+
+        let authz_result = undrop::require_undrop_permissions::<A, C>(
+            warehouse_id,
+            &event_ctx.user_provided_entity().tabulars,
+            &authorizer,
+            context.v1_state.catalog.clone(),
+            event_ctx.request_metadata(),
+        )
+        .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse.clone());
+
+        // ------------------- Business Logic -------------------
+        let catalog = context.v1_state.catalog;
+        let mut transaction = C::Transaction::begin_write(catalog.clone()).await?;
+        let tabular_ids = &event_ctx.user_provided_entity().tabulars;
+        let undrop_tabular_responses =
+            C::clear_tabular_deleted_at(tabular_ids, warehouse_id, transaction.transaction())
+                .await?;
+        TabularExpirationTask::cancel_scheduled_tasks::<C>(
+            CancelTasksFilter::TaskIds(
+                undrop_tabular_responses
+                    .iter()
+                    .filter_map(|r| {
+                        if r.expiration_task().is_none() {
+                            tracing::warn!(
+                                "No expiration task found for tabular '{}' with soft deletion marker set.",
+                                r.tabular_ident()
+                            );
+                        }
+                        r.expiration_task().map(|t| t.task_id)})
+                    .collect(),
+            ),
+            transaction.transaction(),
+            false,
+        )
+        .await?;
+        transaction.commit().await?;
+
+        event_ctx.emit_tabular_undropped(
+            warehouse,
+            Arc::new(request),
+            Arc::new(
+                undrop_tabular_responses
+                    .into_iter()
+                    .map(ViewOrTableDeletionInfo::into_table_or_view_info)
+                    .collect(),
+            ),
+        );
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn list_soft_deleted_tabulars(
+        warehouse_id: WarehouseId,
+        query: ListDeletedTabularsQuery,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<ListDeletedTabularsResponse> {
+        // ------------------- AuthZ -------------------
+        let catalog = context.v1_state.catalog;
+        let authorizer = context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::ListDeletedTabulars,
+        );
+
+        let authz_result = undrop::authorize_list_soft_deleted_tabulars::<C, A>(
+            event_ctx.request_metadata(),
+            warehouse_id,
+            &authorizer,
+            catalog.clone(),
+        )
+        .await;
+        let (event_ctx, authz_response) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(());
+        let warehouse = authz_response.warehouse;
+        let can_list_everything = authz_response.can_list_everything;
+
+        let can_list_everything = if can_list_everything {
+            can_list_everything
+        } else if let Some(namespace_id) = query.namespace_id {
+            let namespace = C::get_namespace(warehouse_id, namespace_id, catalog.clone()).await;
+            let namespace = authorizer
+                .require_namespace_presence(warehouse_id, namespace_id, namespace)
+                .map_err(|e| event_ctx.emit_late_authz_failure(e))?;
+            authorizer
+                .is_allowed_namespace_action(
+                    event_ctx.request_metadata(),
+                    None,
+                    &warehouse,
+                    &namespace.parents,
+                    &namespace.namespace,
+                    CatalogNamespaceAction::ListEverything,
+                )
+                .await
+                .map_err(authz_to_error_no_audit)?
+                .into_inner()
+        } else {
+            can_list_everything
+        };
+
+        // ------------------- Business Logic -------------------
+        let pagination_query = query.pagination_query();
+        let namespace_id = query.namespace_id;
+        let request_metadata = event_ctx.request_metadata().clone();
+        let mut t = C::Transaction::begin_read(catalog.clone()).await?;
+        let (tabulars, ids, next_page_token) = crate::server::fetch_until_full_page::<_, _, _, C>(
+            pagination_query.page_size,
+            pagination_query.page_token,
+            |page_size, page_token, t| {
+                let authorizer = authorizer.clone();
+                let request_metadata = request_metadata.clone();
+                let warehouse = warehouse.clone();
+                async move {
+                    let query = PaginationQuery {
+                        page_size: Some(page_size),
+                        page_token: page_token.into(),
+                    };
+
+                    let page = C::list_tabulars(
+                        warehouse_id,
+                        namespace_id,
+                        TabularListFlags::only_deleted(),
+                        t.transaction(),
+                        None,
+                        query,
+                    )
+                    .await?;
+                    let (ids, items, tokens): (Vec<_>, Vec<_>, Vec<_>) =
+                        page.into_iter_with_page_tokens().multiunzip();
+
+                    let authz_decisions = if can_list_everything {
+                        vec![true; ids.len()]
+                    } else {
+                        let namespaces = C::get_namespaces_by_id(
+                            warehouse_id,
+                            &items
+                                .iter()
+                                .map(ViewOrTableDeletionInfo::namespace_id)
+                                .collect_vec(),
+                            t.transaction(),
+                        )
+                        .await?;
+                        let actions = items
+                            .iter()
+                            .map(|t| {
+                                Ok::<_, ErrorModel>((
+                                    require_namespace_for_tabular(&namespaces, t)
+                                        .map_err(authz_to_error_no_audit)?,
+                                    t.as_action_request(
+                                        CatalogViewAction::IncludeInList,
+                                        CatalogTableAction::IncludeInList,
+                                        CatalogGenericTableAction::IncludeInList,
+                                        None,
+                                    ),
+                                ))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        authorizer
+                            .are_allowed_tabular_actions_vec(
+                                &request_metadata,
+                                &warehouse,
+                                &namespaces,
+                                &actions,
+                            )
+                            .await
+                            .map_err(authz_to_error_no_audit)?
+                            .into_allowed()
+                    };
+
+                    let (next_idents, next_uuids, next_page_tokens, mask): (
+                        Vec<_>,
+                        Vec<_>,
+                        Vec<_>,
+                        Vec<bool>,
+                    ) = authz_decisions
+                        .into_iter()
+                        .zip(items.into_iter().zip(ids))
+                        .zip(tokens)
+                        .map(|((allowed, namespace), token)| {
+                            (namespace.0, namespace.1, token, allowed)
+                        })
+                        .multiunzip();
+                    Ok(UnfilteredPage::new(
+                        next_idents,
+                        next_uuids,
+                        next_page_tokens,
+                        mask,
+                        page_size
+                            .clamp(0, i64::MAX)
+                            .try_into()
+                            .expect("We clamped."),
+                    ))
+                }
+                .boxed()
+            },
+            &mut t,
+        )
+        .await?;
+
+        let tabulars = ids
+            .into_iter()
+            .zip(tabulars)
+            .filter_map(|(k, info)| {
+                let deleted_at = info.deleted_at()?;
+                let Some(expiration_task) = info.expiration_task() else {
+                    tracing::error!(
+                        "Did not find expiration task for soft-deleted tabular with id '{k}'"
+                    );
+                    return None;
+                };
+                let tabular_ident = info.tabular_ident().clone();
+                Some(DeletedTabularResponse {
+                    id: *k,
+                    name: tabular_ident.name,
+                    namespace: tabular_ident.namespace.inner(),
+                    typ: k.into(),
+                    warehouse_id,
+                    created_at: info.created_at(),
+                    deleted_at,
+                    expiration_date: expiration_task.expiration_date,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        t.commit().await?;
+
+        Ok(ListDeletedTabularsResponse {
+            tabulars: Arc::new(tabulars),
+            next_page_token,
+        })
+    }
+
+    async fn set_task_queue_config(
+        warehouse_id: WarehouseId,
+        queue_name: &TaskQueueName,
+        request: SetTaskQueueConfigRequest,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<()> {
+        // ------------------- AuthZ -------------------
+        let authorizer = &context.v1_state.authz;
+        let request = Arc::new(request);
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::ModifyTaskQueueConfig,
+        );
+
+        let warehouse =
+            C::get_active_warehouse_by_id(warehouse_id, context.v1_state.catalog.clone()).await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let (event_ctx, warehouse) = event_ctx.emit_authz(authz_result)?;
+        let event_ctx = event_ctx.resolve(warehouse.clone());
+        let project_id = warehouse.project_id.clone();
+
+        // ------------------- Business Logic -------------------
+        set_task_queue_config_authorized(
+            project_id,
+            Some(warehouse_id),
+            queue_name,
+            &request,
+            context,
+        )
+        .await?;
+
+        event_ctx.emit_set_task_queue_config(queue_name.clone(), request);
+
+        Ok(())
+    }
+
+    async fn get_task_queue_config(
+        warehouse_id: WarehouseId,
+        queue_name: &TaskQueueName,
+        context: ApiContext<State<A, C, S>>,
+        request_metadata: RequestMetadata,
+    ) -> Result<GetTaskQueueConfigResponse> {
+        // ------------------- AuthZ -------------------
+        let authorizer = &context.v1_state.authz;
+
+        let event_ctx = APIEventContext::for_warehouse(
+            Arc::new(request_metadata),
+            context.v1_state.events.clone(),
+            warehouse_id,
+            CatalogWarehouseAction::GetTaskQueueConfig,
+        );
+
+        let warehouse =
+            C::get_active_warehouse_by_id(warehouse_id, context.v1_state.catalog.clone()).await;
+        let authz_result = authorizer
+            .require_warehouse_action(
+                event_ctx.request_metadata(),
+                warehouse_id,
+                warehouse,
+                event_ctx.action().clone(),
+            )
+            .await;
+        let _ = event_ctx.emit_authz(authz_result)?;
+
+        // ------------------- Business Logic -------------------
+        let filter = TaskQueueConfigFilter::WarehouseId { warehouse_id };
+        get_task_queue_config_authorized(&filter, queue_name, context).await
+    }
+}
+
+impl axum::response::IntoResponse for ListWarehousesResponse {
+    fn into_response(self) -> axum::http::Response<axum::body::Body> {
+        axum::Json(self).into_response()
+    }
+}
+
+impl axum::response::IntoResponse for GetWarehouseResponse {
+    fn into_response(self) -> axum::http::Response<axum::body::Body> {
+        axum::Json(self).into_response()
+    }
+}
+
+impl GetWarehouseResponse {
+    fn from_resolved(
+        warehouse: crate::service::ResolvedWarehouse,
+        storage_credential_type: Option<StorageCredentialType>,
+    ) -> Self {
+        Self {
+            warehouse_id: warehouse.warehouse_id,
+            id: warehouse.warehouse_id,
+            name: warehouse.name,
+            project_id: warehouse.project_id,
+            storage_profile: warehouse.storage_profile,
+            storage_credential_type,
+            status: warehouse.status,
+            delete_profile: warehouse.tabular_delete_profile,
+            protected: warehouse.protected,
+            managed_by: warehouse.managed_by,
+            allowed_format_versions: warehouse.allowed_format_versions.to_vec(),
+            default_format_version: warehouse.default_format_version,
+            updated_at: warehouse.updated_at,
+        }
+    }
+}
+
+/// Resolves the credential type for a warehouse by looking up the secret.
+/// Returns `None` if the warehouse has no storage secret configured, or if the
+/// secret lookup fails. Failures are logged as warnings rather than propagated
+/// so that warehouses with broken credentials can still be loaded and fixed via
+/// the UI.
+async fn resolve_credential_type<S: SecretStore>(
+    warehouse: &crate::service::ResolvedWarehouse,
+    secrets: &S,
+) -> Option<StorageCredentialType> {
+    let secret_id = warehouse.storage_secret_id?;
+    match secrets.require_storage_secret_by_id(secret_id).await {
+        Ok(secret) => Some(secret.secret.credential_type()),
+        Err(e) => {
+            tracing::warn!(
+                error=e.error.message,
+                secret_id=?secret_id,
+                warehouse_id = %warehouse.warehouse_id,
+                warehouse_name = %warehouse.name,
+                "Failed to resolve storage credential type for warehouse"
+            );
+            None
+        }
+    }
+}
+
+/// Map the spec-mutability guard's error to an API error. A [`WarehouseSpecLocked`]
+/// rejection is the *actual* authorization outcome — the resource authorizer already
+/// allowed the action, so the lock is the decision that denied it — and is recorded
+/// as a late authorization-failure audit event. Backend/integrity errors propagate
+/// without an authz event.
+fn spec_lock_to_error<P, R, A>(
+    event_ctx: &APIEventContext<P, R, A, AuthzChecked>,
+    err: EnsureWarehouseSpecMutableError,
+) -> ErrorModel
+where
+    P: UserProvidedEntity,
+    R: ResolutionState,
+    A: APIEventActions,
+{
+    match err {
+        EnsureWarehouseSpecMutableError::WarehouseSpecLocked(locked) => {
+            event_ctx.emit_late_authz_failure(locked)
+        }
+        other => other.into(),
+    }
+}
+
+/// Reject creation when the new storage profile overlaps the location of an
+/// existing warehouse in the same project.
+async fn ensure_no_storage_overlap<C: CatalogStore>(
+    project_id: &ProjectId,
+    storage_profile: &StorageProfile,
+    catalog_state: C::State,
+) -> Result<()> {
+    // Include inactive warehouses: a deactivated warehouse still occupies its
+    // storage location, so a new warehouse overlapping it is still a conflict.
+    let warehouses = C::list_warehouses(
+        project_id,
+        Some(WarehouseStatus::active_and_inactive().to_vec()),
+        catalog_state,
+    )
+    .await?;
+    if let Some(w) = find_overlapping_warehouse(storage_profile, &warehouses) {
+        return Err(storage_overlap_error(&w.name).into());
+    }
+    Ok(())
+}
+
+/// The physical-access checks, all marked skipped for one reason.
+///
+/// Keeps the report shape stable when the probes never ran, so a client can always
+/// tell which probes exist and why they are missing an outcome.
+fn skipped_access_checks(reason: &str) -> Vec<ValidationCheck> {
+    [
+        ValidationCheckName::StorageClientInitialized,
+        ValidationCheckName::CatalogReadWrite,
+        ValidationCheckName::VendedCredentialsIssued,
+        ValidationCheckName::VendedCredentialsReadWrite,
+        ValidationCheckName::VendedCredentialsScopeEnforced,
+        ValidationCheckName::Cleanup,
+    ]
+    .into_iter()
+    .map(|name| ValidationCheck::skipped(name, reason))
+    .collect()
+}
+
+/// Check that the name is well-formed and not already taken in the project.
+///
+/// Uniqueness is compared case-insensitively: `warehouse_name` is stored under a
+/// `case_insensitive` collation, so `unique_warehouse_name_in_project` treats
+/// `Analytics` and `analytics` as the same name. That collation is ICU
+/// `und-u-ks-level2`, which folds case beyond ASCII, so the comparison here has
+/// to as well — otherwise `Ä` reports a green tick against a stored `ä`.
+///
+/// Advisory only — the constraint is enforced by the database, and a concurrent
+/// create can still take the name between this check and the real request.
+fn warehouse_name_check(
+    warehouse_name: &str,
+    warehouses: &[Arc<ResolvedWarehouse>],
+) -> ValidationCheck {
+    let started = Instant::now();
+    if let Err(e) = validate_warehouse_name(warehouse_name) {
+        return ValidationCheck::failed(
+            ValidationCheckName::WarehouseNameValid,
+            elapsed_ms(started),
+            ErrorModel::from(e),
+        );
+    }
+    let folded = warehouse_name.to_lowercase();
+    if warehouses.iter().any(|w| w.name.to_lowercase() == folded) {
+        return ValidationCheck::failed(
+            ValidationCheckName::WarehouseNameValid,
+            elapsed_ms(started),
+            warehouse_name_taken_error(warehouse_name),
+        );
+    }
+    ValidationCheck::passed(ValidationCheckName::WarehouseNameValid, elapsed_ms(started))
+}
+
+/// Check that no other warehouse in the project already occupies this location.
+fn location_overlap_check(
+    storage_profile: &StorageProfile,
+    warehouses: &[Arc<ResolvedWarehouse>],
+) -> ValidationCheck {
+    let started = Instant::now();
+    match find_overlapping_warehouse(storage_profile, warehouses) {
+        Some(w) => ValidationCheck::failed(
+            ValidationCheckName::LocationExclusive,
+            elapsed_ms(started),
+            storage_overlap_error(&w.name),
+        ),
+        None => {
+            ValidationCheck::passed(ValidationCheckName::LocationExclusive, elapsed_ms(started))
+        }
+    }
+}
+
+/// The single definition of "these two warehouses share a location".
+///
+/// Shared with the create path so the dry-run and the real thing cannot drift.
+fn find_overlapping_warehouse<'a>(
+    storage_profile: &StorageProfile,
+    warehouses: &'a [Arc<ResolvedWarehouse>],
+) -> Option<&'a Arc<ResolvedWarehouse>> {
+    warehouses
+        .iter()
+        .find(|w| storage_profile.is_overlapping_location(&w.storage_profile))
+}
+
+fn storage_overlap_error(existing_warehouse_name: &str) -> ErrorModel {
+    ErrorModel::bad_request(
+        format!("Storage profile overlaps with existing warehouse {existing_warehouse_name}"),
+        "CreateWarehouseStorageProfileOverlap",
+        None,
+    )
+}
+
+fn warehouse_name_taken_error(name: &str) -> ErrorModel {
+    ErrorModel::bad_request(
+        format!("A warehouse named `{name}` already exists in this project."),
+        "WarehouseNameAlreadyTaken",
+        None,
+    )
+}
+
+/// Mirror of the create-time managed-by guard: a warehouse may only be born
+/// managed if the caller can manage it.
+fn managed_by_check(managed_by: ManagedBy, request_metadata: &RequestMetadata) -> ValidationCheck {
+    if managed_by.is_externally_managed() && !request_metadata.bypasses_control_plane_authz(None) {
+        return ValidationCheck::failed(
+            ValidationCheckName::ManagedByAllowed,
+            0,
+            ErrorModel::from(WarehouseSpecLocked::new(managed_by)),
+        );
+    }
+    ValidationCheck::passed(ValidationCheckName::ManagedByAllowed, 0)
+}
+
+/// Check that the new profile is a permitted evolution of the stored one.
+fn profile_compatibility_check(
+    current: &StorageProfile,
+    new_profile: &StorageProfile,
+) -> ValidationCheck {
+    let started = Instant::now();
+    match current.clone().update_with(new_profile.clone()) {
+        Ok(_) => {
+            ValidationCheck::passed(ValidationCheckName::ProfileCompatible, elapsed_ms(started))
+        }
+        Err(e) => ValidationCheck::failed(
+            ValidationCheckName::ProfileCompatible,
+            elapsed_ms(started),
+            ErrorModel::from(e),
+        ),
+    }
+}
+
+/// Build a report for a profile that is already stored (and therefore already
+/// normalized): only the physical-access probes apply.
+async fn stored_profile_report(
+    storage_profile: &StorageProfile,
+    credential: Option<&StorageCredential>,
+    request_metadata: &RequestMetadata,
+    profile_reason: &str,
+    compatibility_reason: &str,
+    spec_check: ValidationCheck,
+) -> ValidationReport {
+    let mut report = ReportBuilder::new();
+    report.skip(ValidationCheckName::ProfileWellFormed, profile_reason);
+    report.skip(ValidationCheckName::ProfileCompatible, compatibility_reason);
+    report.skip(
+        ValidationCheckName::WarehouseNameValid,
+        "The warehouse already exists.",
+    );
+    report.skip(
+        ValidationCheckName::LocationExclusive,
+        "The warehouse already occupies this location.",
+    );
+    report.push(spec_check);
+    report.skip(
+        ValidationCheckName::FormatVersionPolicyConsistent,
+        "Only applies when creating a warehouse.",
+    );
+    report.skip(
+        ValidationCheckName::ManagedByAllowed,
+        "Only applies when creating a warehouse.",
+    );
+    report.extend(
+        storage_profile
+            .validate_access_report(credential, None, request_metadata)
+            .await
+            .checks,
+    );
+    report.build()
+}
+
+fn validate_warehouse_name(warehouse_name: &str) -> Result<()> {
+    if warehouse_name.is_empty() {
+        return Err(ErrorModel::bad_request(
+            "Warehouse name cannot be empty",
+            "EmptyWarehouseName",
+            None,
+        )
+        .into());
+    }
+
+    if warehouse_name.len() > 128 {
+        return Err(ErrorModel::bad_request(
+            "Warehouse must be shorter than 128 chars",
+            "WarehouseNameTooLong",
+            None,
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Validate a warehouse format version policy and convert it into domain types.
+///
+/// `allowed` defaults to all supported versions when `None`. The policy is
+/// rejected if the allowed set is empty or if `default` is not a member of it.
+fn validate_format_version_policy(
+    allowed: Option<Vec<FormatVersion>>,
+    default: Option<FormatVersion>,
+) -> Result<WarehouseFormatVersionPolicy> {
+    let allowed_format_versions = match allowed {
+        Some(versions) => AllowedFormatVersions::try_new(versions).map_err(ErrorModel::from)?,
+        None => AllowedFormatVersions::default(),
+    };
+
+    if default.is_some_and(|default| !allowed_format_versions.contains(default)) {
+        return Err(ErrorModel::bad_request(
+            format!(
+                "default_format_version '{}' is not in allowed_format_versions",
+                default.expect("default is Some") as u8
+            ),
+            "DefaultFormatVersionNotAllowed",
+            None,
+        )
+        .into());
+    }
+
+    Ok(WarehouseFormatVersionPolicy {
+        allowed_format_versions,
+        default_format_version: default,
+    })
+}
+
+#[cfg(test)]
+mod test {
+    use std::sync::Arc;
+
+    use super::{GetWarehouseResponse, StorageCredentialType, resolve_credential_type};
+    use crate::service::{
+        ResolvedWarehouse, WarehouseStatus,
+        health::{Health, HealthExt},
+        secrets::{Secret, SecretId, SecretInStorage, SecretStore},
+        storage::{S3CredentialType, StorageCredential, s3::S3AccessKeyCredential},
+    };
+
+    mod validation_checks {
+        use strum::IntoEnumIterator as _;
+        use verglas_iceberg_ext::catalog::rest::ErrorModel;
+
+        use super::super::{
+            StorageProfile, ValidationCheckName, ValidationCheckStatus, location_overlap_check,
+            profile_compatibility_check, skipped_access_checks, warehouse_name_check,
+        };
+        use crate::service::{
+            ResolvedWarehouse,
+            storage::{S3Flavor, S3Profile},
+        };
+
+        fn s3_profile(bucket: &str, key_prefix: &str) -> StorageProfile {
+            S3Profile::builder()
+                .bucket(bucket.to_string())
+                .key_prefix(key_prefix.to_string())
+                .region("us-east-1".to_string())
+                .sts_enabled(false)
+                .flavor(S3Flavor::Aws)
+                .build()
+                .into()
+        }
+
+        fn warehouses(
+            name: &str,
+            storage_profile: StorageProfile,
+        ) -> Vec<std::sync::Arc<ResolvedWarehouse>> {
+            let mut warehouse = ResolvedWarehouse::new_random();
+            warehouse.name = name.to_string();
+            warehouse.storage_profile = storage_profile;
+            vec![std::sync::Arc::new(warehouse)]
+        }
+
+        #[test]
+        fn name_check_fails_on_a_name_already_in_the_project() {
+            let existing = warehouses("taken", s3_profile("bucket", "prefix"));
+            let check = warehouse_name_check("taken", &existing);
+            assert_eq!(check.status, ValidationCheckStatus::Failed);
+            assert_eq!(
+                check.error.as_ref().map(|e| e.r#type.as_str()),
+                Some("WarehouseNameAlreadyTaken")
+            );
+        }
+
+        #[test]
+        fn name_check_fails_on_a_name_differing_only_in_case() {
+            // `warehouse_name` uses a case-insensitive collation, so the database
+            // would reject this even though the strings differ.
+            let existing = warehouses("Analytics", s3_profile("bucket", "prefix"));
+            let check = warehouse_name_check("analytics", &existing);
+            assert_eq!(check.status, ValidationCheckStatus::Failed, "{check:?}");
+            assert_eq!(
+                check.error.as_ref().map(|e| e.r#type.as_str()),
+                Some("WarehouseNameAlreadyTaken")
+            );
+        }
+
+        #[test]
+        fn name_check_fails_on_a_malformed_name() {
+            let check = warehouse_name_check("", &[]);
+            assert_eq!(check.status, ValidationCheckStatus::Failed);
+            assert_eq!(
+                check.error.as_ref().map(|e| e.r#type.as_str()),
+                Some("EmptyWarehouseName")
+            );
+        }
+
+        #[test]
+        fn name_check_passes_on_a_free_name() {
+            let existing = warehouses("other", s3_profile("bucket", "prefix"));
+            let check = warehouse_name_check("free", &existing);
+            assert_eq!(check.status, ValidationCheckStatus::Passed);
+        }
+
+        #[test]
+        fn overlap_check_fails_when_another_warehouse_holds_the_location() {
+            let existing = warehouses("neighbour", s3_profile("bucket", "prefix"));
+            let check = location_overlap_check(&s3_profile("bucket", "prefix"), &existing);
+            assert_eq!(check.status, ValidationCheckStatus::Failed);
+            assert!(
+                check
+                    .error
+                    .as_ref()
+                    .is_some_and(|e| e.message.contains("neighbour")),
+                "{check:?}"
+            );
+        }
+
+        #[test]
+        fn overlap_check_passes_on_a_disjoint_location() {
+            let existing = warehouses("neighbour", s3_profile("bucket", "other-prefix"));
+            let check = location_overlap_check(&s3_profile("bucket", "prefix"), &existing);
+            assert_eq!(check.status, ValidationCheckStatus::Passed);
+        }
+
+        #[test]
+        fn compatibility_check_rejects_a_moved_location() {
+            // An update may not relocate a warehouse: its existing data would be
+            // stranded. This is the guarantee the docs make.
+            let check = profile_compatibility_check(
+                &s3_profile("bucket", "prefix"),
+                &s3_profile("bucket", "somewhere-else"),
+            );
+            assert_eq!(check.status, ValidationCheckStatus::Failed, "{check:?}");
+            assert_eq!(
+                check.error.as_ref().map(|e| e.r#type.as_str()),
+                Some("UpdateError")
+            );
+        }
+
+        #[test]
+        fn compatibility_check_rejects_a_different_storage_type() {
+            let other: StorageProfile = crate::service::storage::MemoryProfile::default().into();
+            let check = profile_compatibility_check(&s3_profile("bucket", "prefix"), &other);
+            assert_eq!(check.status, ValidationCheckStatus::Failed, "{check:?}");
+        }
+
+        #[test]
+        fn compatibility_check_passes_on_a_same_location_update() {
+            let check = profile_compatibility_check(
+                &s3_profile("bucket", "prefix"),
+                &s3_profile("bucket", "prefix"),
+            );
+            assert_eq!(check.status, ValidationCheckStatus::Passed, "{check:?}");
+        }
+
+        #[test]
+        fn skipped_access_checks_cover_every_probe() {
+            let checks = skipped_access_checks("because");
+            let names: Vec<_> = checks.iter().map(|c| c.name).collect();
+            assert_eq!(
+                names,
+                vec![
+                    ValidationCheckName::StorageClientInitialized,
+                    ValidationCheckName::CatalogReadWrite,
+                    ValidationCheckName::VendedCredentialsIssued,
+                    ValidationCheckName::VendedCredentialsReadWrite,
+                    ValidationCheckName::VendedCredentialsScopeEnforced,
+                    ValidationCheckName::Cleanup,
+                ]
+            );
+            assert!(
+                checks
+                    .iter()
+                    .all(|c| c.status == ValidationCheckStatus::Skipped)
+            );
+        }
+
+        #[test]
+        fn every_check_name_serializes_to_kebab_case() {
+            // The wire values are a permanent contract; catch an accidentally
+            // added variant that does not follow the convention.
+            for name in ValidationCheckName::iter() {
+                let json = serde_json::to_string(&name).expect("serializable");
+                let value = json.trim_matches('"');
+                assert!(
+                    value.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
+                    "{name} serializes as `{value}`"
+                );
+                assert_eq!(value, name.to_string(), "Display and serde disagree");
+            }
+        }
+
+        #[test]
+        fn error_model_is_still_the_embedded_error_shape() {
+            // Guards the assumption sanitize_embedded_error relies on.
+            let e = ErrorModel::internal("boom", "TestError", None);
+            assert!(e.code >= 500);
+        }
+    }
+
+    fn test_warehouse(storage_secret_id: Option<SecretId>) -> ResolvedWarehouse {
+        ResolvedWarehouse {
+            warehouse_id: uuid::Uuid::new_v4().into(),
+            name: "test-warehouse".to_string(),
+            project_id: Arc::new(uuid::Uuid::new_v4().into()),
+            storage_profile: crate::service::storage::MemoryProfile::default().into(),
+            storage_secret_id,
+            status: WarehouseStatus::Active,
+            tabular_delete_profile: super::TabularDeleteProfile::Hard {},
+            protected: false,
+            managed_by: crate::service::ManagedBy::SelfManaged,
+            allowed_format_versions: crate::service::AllowedFormatVersions::default(),
+            default_format_version: None,
+            updated_at: None,
+            version: crate::service::WarehouseVersion::from(0),
+        }
+    }
+
+    fn s3_access_key_credential() -> StorageCredential {
+        StorageCredential::S3(crate::service::storage::S3Credential::AccessKey(
+            S3AccessKeyCredential {
+                access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+                secret_access_key: "secret".to_string(),
+                external_id: None,
+            },
+        ))
+    }
+
+    #[test]
+    fn from_resolved_includes_credential_type_when_present() {
+        let warehouse = test_warehouse(None);
+        let cred_type = Some(StorageCredentialType::S3(S3CredentialType::AccessKey));
+        let response = GetWarehouseResponse::from_resolved(warehouse, cred_type);
+
+        assert_eq!(
+            response.storage_credential_type,
+            Some(StorageCredentialType::S3(S3CredentialType::AccessKey))
+        );
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            json["storage-credential-type"],
+            serde_json::json!({"type": "s3", "credential-type": "access-key"})
+        );
+    }
+
+    #[test]
+    fn from_resolved_omits_credential_type_when_none() {
+        let warehouse = test_warehouse(None);
+        let response = GetWarehouseResponse::from_resolved(warehouse, None);
+
+        assert_eq!(response.storage_credential_type, None);
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(
+            json.get("storage-credential-type").is_none(),
+            "storage-credential-type should be absent when None (skip_serializing_if)"
+        );
+    }
+
+    // --- Mock secret store for resolve_credential_type tests ---
+
+    #[derive(Debug, Clone)]
+    struct MockSecretStore {
+        result: std::result::Result<Secret<Arc<StorageCredential>>, ()>,
+    }
+
+    #[async_trait::async_trait]
+    impl HealthExt for MockSecretStore {
+        async fn health(&self) -> Vec<Health> {
+            vec![]
+        }
+        async fn update_health(&self) {}
+    }
+
+    #[async_trait::async_trait]
+    impl SecretStore for MockSecretStore {
+        async fn get_secret_by_id_impl<S: SecretInStorage>(
+            &self,
+            secret_id: SecretId,
+        ) -> crate::api::Result<Option<Secret<S>>> {
+            match &self.result {
+                Ok(secret) => {
+                    // Re-serialize the credential through JSON to produce Secret<S>
+                    let json = serde_json::to_value(&*secret.secret).unwrap();
+                    let deserialized: S = serde_json::from_value(json).unwrap();
+                    Ok(Some(Secret {
+                        secret_id,
+                        secret: deserialized,
+                        created_at: secret.created_at,
+                        updated_at: secret.updated_at,
+                    }))
+                }
+                Err(()) => Err(verglas_iceberg_ext::catalog::rest::ErrorModel::internal(
+                    "mock failure",
+                    "MockError",
+                    None,
+                )
+                .into()),
+            }
+        }
+
+        async fn create_secret_impl<S: SecretInStorage>(
+            &self,
+            _secret: S,
+        ) -> crate::api::Result<SecretId> {
+            unimplemented!()
+        }
+
+        async fn delete_secret_impl(&self, _secret_id: &SecretId) -> crate::api::Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_type_returns_none_when_no_secret_id() {
+        let warehouse = test_warehouse(None);
+        let store = MockSecretStore {
+            result: Err(()), // shouldn't be called
+        };
+        let result = resolve_credential_type(&warehouse, &store).await;
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_credential_type_returns_type_on_success() {
+        let secret_id = SecretId::from(uuid::Uuid::new_v4());
+        let warehouse = test_warehouse(Some(secret_id));
+
+        let store = MockSecretStore {
+            result: Ok(Secret {
+                secret_id,
+                secret: Arc::new(s3_access_key_credential()),
+                created_at: chrono::Utc::now(),
+                updated_at: None,
+            }),
+        };
+
+        let result = resolve_credential_type(&warehouse, &store).await;
+        assert_eq!(
+            result,
+            Some(StorageCredentialType::S3(S3CredentialType::AccessKey))
+        );
+    }
+
+    #[tokio::test]
+    // The update storage profile endpoint might be used to fix broken credentials,
+    // so we want to ensure that a failure to look up the secret doesn't cause the entire request to fail.
+    async fn resolve_credential_type_returns_none_on_secret_store_failure() {
+        let secret_id = SecretId::from(uuid::Uuid::new_v4());
+        let warehouse = test_warehouse(Some(secret_id));
+        let store = MockSecretStore { result: Err(()) };
+
+        let result = resolve_credential_type(&warehouse, &store).await;
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_de_create_warehouse_request() {
+        let request = serde_json::json!({
+            "warehouse-name": "test_warehouse",
+            "project-id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+            "storage-profile": {
+                "type": "s3",
+                "bucket": "test",
+                "region": "dummy",
+                "path-style-access": true,
+                "endpoint": "http://localhost:9000",
+                "sts-enabled": true,
+            },
+            "storage-credential": {
+                "type": "s3",
+                "credential-type": "access-key",
+                "aws-access-key-id": "test-access-key-id",
+                "aws-secret-access-key": "test-secret-access-key",
+            },
+        });
+
+        let request: super::CreateWarehouseRequest = serde_json::from_value(request).unwrap();
+        assert_eq!(request.warehouse_name, "test_warehouse");
+        assert_eq!(
+            request.project_id,
+            Some(
+                uuid::Uuid::parse_str("f47ac10b-58cc-4372-a567-0e02b2c3d479")
+                    .unwrap()
+                    .into()
+            )
+        );
+        let s3_profile = request.storage_profile.try_into_s3().unwrap();
+        assert_eq!(s3_profile.bucket, "test");
+        assert_eq!(s3_profile.region, "dummy");
+        assert_eq!(s3_profile.path_style_access, Some(true));
+    }
+}

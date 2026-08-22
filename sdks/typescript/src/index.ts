@@ -13,6 +13,8 @@
 export { connect, VerglasClient, Table } from "./client";
 export { VerglasHttpError } from "./http";
 export { S3VectorsClient, VerglasGraphsClient } from "./semantic";
+export { Graph, graphFromEnv } from "./graph-handle";
+export type { GraphEdgeInput, GraphFromEnvOptions, GraphNodeInput } from "./graph-handle";
 export type { SemanticDocument, SigV4Credentials } from "./semantic";
 export type * from "./semantic-types";
 export {

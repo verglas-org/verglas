@@ -105,6 +105,31 @@ fn handlers_with_delayed_load(store: LocalFragmentStore) -> FragmentHandlers {
     handlers
 }
 
+/// Wires fragment handlers whose store path blocks the OS thread it runs on
+/// for a fixed duration before committing, standing in for the aggregate
+/// synchronous cost (checksum, framing, small syscalls) a real fragment write
+/// pays on the peer runtime. Unlike [`handlers_with_delayed_load`]'s async
+/// sleep, this genuinely occupies a worker thread — exactly like the real
+/// work it represents — so it exercises the peer server's worker-thread
+/// ceiling instead of just adding latency that every worker shares for free.
+fn handlers_with_blocking_store(store: LocalFragmentStore) -> FragmentHandlers {
+    let mut handlers = handlers_for(store.clone());
+    handlers.store_stream = Arc::new(move |key, mut shards| {
+        let store = store.clone();
+        Box::pin(async move {
+            use futures::StreamExt;
+            let mut writer = store.open_fragment(&key)?;
+            while let Some(shard) = shards.next().await {
+                let shard = shard?;
+                writer.append(&shard)?;
+            }
+            std::thread::sleep(Duration::from_millis(60));
+            writer.commit()
+        })
+    });
+    handlers
+}
+
 /// Binds a fragment server over a fresh store, returning the server, a client
 /// pointed at it as `node`, and the backing store.
 async fn server_and_client(
@@ -525,6 +550,86 @@ async fn peer_vote_remains_responsive_when_public_runtime_is_saturated() {
     for blocker in blockers {
         blocker.await.expect("public runtime blocker");
     }
+    server.shutdown().await;
+    let _ = std::fs::remove_dir_all(directory);
+}
+
+/// Reproduces the write-back quorum-shortfall failure under concurrent load
+/// (PERF-OBJECTIVE.md M1 at concurrency 16, hard gate P1: zero write errors).
+///
+/// One node's peer server serves every fragment placement addressed to it,
+/// from every concurrent object write in the whole cluster. Sixteen
+/// concurrent PUTs at `k=2 m=2` each place up to 4 fragments, so a busy node
+/// can see well over a dozen placements land inside the same short window.
+/// If the peer server's dedicated runtime cannot run enough of them at once,
+/// requests queue behind each other on the same fixed-size worker pool until
+/// the client's request budget expires — surfacing as a placement error the
+/// write-back coordinator counts against quorum on a perfectly healthy node
+/// (`write-back quorum requires 3 durable fragments; only 1 available`).
+///
+/// `handlers_with_blocking_store` stands in for the real per-request cost
+/// every fragment write pays; the request timeout below is set well above one
+/// placement's own cost but well below sixteen of them queued behind a
+/// two-thread server, so a too-small worker pool fails outright here exactly
+/// as it does in the real cluster.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_fragment_placements_do_not_time_out_under_load() {
+    let node = NodeId::new("loaded-peer");
+    let directory =
+        std::env::temp_dir().join(format!("verglas-fragrpc-loaded-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    let store = LocalFragmentStore::new(&directory);
+    let server = PeerServer::bind_with_fragments(
+        "127.0.0.1:0".parse().expect("addr"),
+        None,
+        empty_blocks(),
+        handlers_with_blocking_store(store),
+    )
+    .await
+    .expect("bind loaded fragment server");
+    let client = FragmentClient::new(
+        Arc::new(StaticResolver::with(node.clone(), server.local_addr())),
+        None,
+        Duration::from_millis(500),
+        // Comfortably above one placement's own ~60ms cost, comfortably below
+        // sixteen of them serialized two at a time (~480ms tail).
+        Duration::from_millis(300),
+    );
+
+    let placements = (0..16).map(|i| {
+        let client = client.clone();
+        let node = node.clone();
+        tokio::spawn(async move {
+            client
+                .put_fragment(
+                    &node,
+                    FragmentRecord::new(
+                        FragmentKey {
+                            object_id: format!("loaded-object-{i}"),
+                            index: 0,
+                        },
+                        Bytes::from_static(b"fragment-under-load"),
+                    ),
+                )
+                .await
+        })
+    });
+    let results = futures::future::join_all(placements).await;
+    let failures: Vec<String> = results
+        .into_iter()
+        .enumerate()
+        .filter_map(
+            |(i, joined)| match joined.expect("placement task panicked") {
+                Ok(()) => None,
+                Err(error) => Some(format!("placement {i}: {error}")),
+            },
+        )
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "a healthy node must not fail fragment placements under concurrency 16: {failures:?}"
+    );
+
     server.shutdown().await;
     let _ = std::fs::remove_dir_all(directory);
 }

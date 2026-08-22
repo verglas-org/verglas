@@ -105,28 +105,28 @@ export class VerglasGraphsClient {
   constructor(endpoint: string, credentials: SigV4Credentials, fetchImpl?: typeof fetch) { this.client = new SemanticClient(endpoint, credentials, "verglasgraphs", fetchImpl); }
   /** Required SigV4 signing name. */
   signingName(): "verglasgraphs" { return "verglasgraphs"; }
-  /** Calls BuildGraphIndex. */
-  buildGraphIndex(input: Model.BuildGraphIndexInput): Promise<Model.BuildGraphIndexOutput> { return this.client.call("POST", "/BuildGraphIndex", input) as Promise<Model.BuildGraphIndexOutput>; }
+  /** Calls BuildIndex. */
+  buildIndex(input: Model.BuildIndexInput): Promise<Model.BuildIndexOutput> { return this.client.call("POST", "/BuildIndex", input) as Promise<Model.BuildIndexOutput>; }
   /** Calls CreateGraph. */
   createGraph(input: Model.CreateGraphInput): Promise<Model.CreateGraphOutput> { return this.client.call("POST", "/CreateGraph", input) as Promise<Model.CreateGraphOutput>; }
   /** Calls DeleteGraph. */
   deleteGraph(input: Model.DeleteGraphInput): Promise<Model.DeleteGraphOutput> { return this.client.call("POST", "/DeleteGraph", input) as Promise<Model.DeleteGraphOutput>; }
-  /** Calls GetGraph. */
-  getGraph(input: Model.GetGraphInput): Promise<Model.GetGraphOutput> { return this.client.call("POST", "/GetGraph", input) as Promise<Model.GetGraphOutput>; }
-  /** Calls GetNeighbors. */
-  getNeighbors(input: Model.GetNeighborsInput): Promise<Model.GetNeighborsOutput> { return this.client.call("POST", "/GetNeighbors", input) as Promise<Model.GetNeighborsOutput>; }
+  /** Calls DescribeGraph. */
+  describeGraph(input: Model.DescribeGraphInput): Promise<Model.DescribeGraphOutput> { return this.client.call("POST", "/DescribeGraph", input) as Promise<Model.DescribeGraphOutput>; }
+  /** Calls RetrieveNeighbors. */
+  retrieveNeighbors(input: Model.RetrieveNeighborsInput): Promise<Model.RetrieveNeighborsOutput> { return this.client.call("POST", "/RetrieveNeighbors", input) as Promise<Model.RetrieveNeighborsOutput>; }
   /** Calls ListGraphs. */
   listGraphs(input: Model.ListGraphsInput): Promise<Model.ListGraphsOutput> { return this.client.call("POST", "/ListGraphs", input) as Promise<Model.ListGraphsOutput>; }
-  /** Calls PutEdges. */
-  putEdges(input: Model.PutEdgesInput): Promise<Model.PutEdgesOutput> { return this.client.call("POST", "/PutEdges", input) as Promise<Model.PutEdgesOutput>; }
-  /** Calls PutNodes. */
-  putNodes(input: Model.PutNodesInput): Promise<Model.PutNodesOutput> { return this.client.call("POST", "/PutNodes", input) as Promise<Model.PutNodesOutput>; }
-  /** Calls QueryKHop. */
-  queryKHop(input: Model.QueryKHopInput): Promise<Model.QueryKHopOutput> { return this.client.call("POST", "/QueryKHop", input) as Promise<Model.QueryKHopOutput>; }
-  /** Calls QueryNeighborhood. */
-  queryNeighborhood(input: Model.QueryNeighborhoodInput): Promise<Model.QueryNeighborhoodOutput> { return this.client.call("POST", "/QueryNeighborhood", input) as Promise<Model.QueryNeighborhoodOutput>; }
-  /** Calls QueryPaths. */
-  queryPaths(input: Model.QueryPathsInput): Promise<Model.QueryPathsOutput> { return this.client.call("POST", "/QueryPaths", input) as Promise<Model.QueryPathsOutput>; }
+  /** Calls AddEdges. */
+  addEdges(input: Model.AddEdgesInput): Promise<Model.AddEdgesOutput> { return this.client.call("POST", "/AddEdges", input) as Promise<Model.AddEdgesOutput>; }
+  /** Calls AddNodes. */
+  addNodes(input: Model.AddNodesInput): Promise<Model.AddNodesOutput> { return this.client.call("POST", "/AddNodes", input) as Promise<Model.AddNodesOutput>; }
+  /** Calls SearchKHop. */
+  searchKHop(input: Model.SearchKHopInput): Promise<Model.SearchKHopOutput> { return this.client.call("POST", "/SearchKHop", input) as Promise<Model.SearchKHopOutput>; }
+  /** Calls SearchNeighborhood. */
+  searchNeighborhood(input: Model.SearchNeighborhoodInput): Promise<Model.SearchNeighborhoodOutput> { return this.client.call("POST", "/SearchNeighborhood", input) as Promise<Model.SearchNeighborhoodOutput>; }
+  /** Calls SearchPaths. */
+  searchPaths(input: Model.SearchPathsInput): Promise<Model.SearchPathsOutput> { return this.client.call("POST", "/SearchPaths", input) as Promise<Model.SearchPathsOutput>; }
 }
 
 /** Formats the UTC timestamp AWS SigV4 places in requests. */

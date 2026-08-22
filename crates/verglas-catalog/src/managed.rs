@@ -17,14 +17,14 @@ pub enum ManagedCatalogRequest {
     Namespaces,
     /// Lists every table and current metadata pointer.
     Tables,
-    /// Reads one typed Lakekeeper-domain record.
+    /// Reads one typed Catalog-domain record.
     Record {
         /// Domain collection.
         entity: CatalogEntity,
         /// Stable record identifier.
         id: String,
     },
-    /// Lists every record in one typed Lakekeeper-domain collection.
+    /// Lists every record in one typed Catalog-domain collection.
     Records {
         /// Domain collection.
         entity: CatalogEntity,
@@ -42,14 +42,14 @@ pub enum ManagedCatalogResponse {
     Namespaces(Vec<String>),
     /// Lexically ordered table identifiers and pointers.
     Tables(Vec<(String, String)>),
-    /// One typed Lakekeeper-domain record, if present.
+    /// One typed Catalog-domain record, if present.
     Record(Option<String>),
-    /// Lexically ordered records in one typed Lakekeeper-domain collection.
+    /// Lexically ordered records in one typed Catalog-domain collection.
     Records(Vec<(String, String)>),
 }
 
 /// Additional same-ingress attempts a `retryable` failure gets once every
-/// configured ingress has had one try. A stateless Lakekeeper instance often
+/// configured ingress has had one try. A stateless Catalog instance often
 /// has exactly one ingress (its own node's loopback safekeeper — the prod
 /// contract mirrored by `scripts/local-lite.sh`'s ring topology: every
 /// instance's ingress list names ONLY its own node, no cross-node failover
@@ -64,7 +64,45 @@ const EXTRA_RETRIES: usize = 2;
 /// low hundreds of milliseconds, not seconds.
 const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// HTTP client used by the Lakekeeper REST/domain adapter.
+/// How the catalog adapter reaches its warehouse's consensus groups.
+///
+/// The adapter is written against this rather than the HTTP client so a
+/// process that already hosts the consensus plane can serve catalog requests
+/// in-process. In the co-located cloud topology one stateless catalog runs
+/// beside every ring node, so the HTTP implementation would otherwise be
+/// talking to a plane inside its own address space.
+///
+/// Extension point: a peer that speaks a future wire format implements this
+/// without touching the adapter. Not built now (prototype).
+#[async_trait::async_trait]
+pub trait ManagedCatalogTransport: Send + Sync + 'static {
+    /// The warehouse route bound to every request on this transport.
+    fn warehouse(&self) -> &str;
+
+    /// Executes one catalog request against the authoritative plane.
+    async fn execute(
+        &self,
+        request: &ManagedCatalogRequest,
+    ) -> Result<ManagedCatalogResponse, ManagedCatalogError>;
+}
+
+#[async_trait::async_trait]
+impl ManagedCatalogTransport for ManagedCatalogClient {
+    /// See [`ManagedCatalogClient::warehouse`].
+    fn warehouse(&self) -> &str {
+        ManagedCatalogClient::warehouse(self)
+    }
+
+    /// See [`ManagedCatalogClient::execute`].
+    async fn execute(
+        &self,
+        request: &ManagedCatalogRequest,
+    ) -> Result<ManagedCatalogResponse, ManagedCatalogError> {
+        ManagedCatalogClient::execute(self, request).await
+    }
+}
+
+/// HTTP client used by the Catalog REST/domain adapter.
 pub struct ManagedCatalogClient {
     endpoints: Vec<String>,
     tenant: String,
@@ -249,7 +287,7 @@ mod tests {
         assert!(second.lock().await.is_empty());
     }
 
-    /// A single-ingress client (the stateless-Lakekeeper contract: every
+    /// A single-ingress client (the stateless-Catalog contract: every
     /// instance's ingress list names only its own node) recovers from a
     /// transient leader-busy 503 by retrying the SAME ingress — there is no
     /// "next" one to fail over to.

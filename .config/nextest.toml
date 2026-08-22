@@ -1,0 +1,69 @@
+# Cloud storage integration tests open many concurrent connections (e.g. the
+# 100-way delete_batch fanout). Running too many of them at once exhausts
+# ephemeral ports / SNAT against the cloud endpoints, causing connect timeouts
+# (os error 110) that exhaust the SDK retry budget. Cap how many run together.
+[test-groups]
+cloud-io = { max-threads = 4 }
+
+# Tests that can run without secrets and external services.
+[profile.default]
+default-filter = """
+    not (package(verglas-catalog-io) and binary(integration_tests))
+    and not test(::aws_integration_tests::)
+    and not test(::aws_kms_integration_tests::)
+    and not test(::azure_integration_tests::)
+    and not test(::azure_system_credentials_integration_tests::)
+    and not test(::onelake_integration_tests::)
+    and not test(::gcs_integration_tests::)
+    and not test(::gcs_hns_integration_tests::)
+    and not test(::gcp_system_credentials_integration_tests::)
+    and not test(::kv2_integration_tests::)
+    and not test(::minio_integration_tests::)
+    and not test(::openfga_integration_tests::)
+    and not test(::r2_integration_tests::)
+    and not test(::oss_integration_tests::)
+"""
+
+[profile.debug]
+default-filter = "test(::gcp_system_credentials_integration_tests::)"
+
+[profile.ci]
+default-filter = "all()"
+failure-output = "immediate-final"
+fail-fast = false
+retries = 0
+
+# The io integration tests hit live cloud backends (ADLS/GCS/S3/R2) and are
+# inherently prone to transient network blips under concurrency. Cap their
+# combined concurrency and retry transient failures: a retried test runs in
+# isolation under less load, so genuine flakes pass on re-run while real
+# failures (which fail every attempt) still fail.
+[[profile.ci.overrides]]
+filter = 'package(verglas-catalog-io) and binary(integration_tests)'
+test-group = 'cloud-io'
+retries = { backoff = "exponential", count = 2, delay = "2s", jitter = true }
+
+[profile.ci.junit] # this can be some other profile, too
+path = "junit.xml"
+
+# Can require external services but no secrets.
+[profile.ci_no_secrets]
+default-filter = """
+    not (package(verglas-catalog-io) and binary(integration_tests))
+    and not test(::aws_integration_tests::)
+    and not test(::aws_kms_integration_tests::)
+    and not test(::azure_integration_tests::)
+    and not test(::azure_system_credentials_integration_tests::)
+    and not test(::onelake_integration_tests::)
+    and not test(::gcs_integration_tests::)
+    and not test(::gcs_hns_integration_tests::)
+    and not test(::gcp_system_credentials_integration_tests::)
+    and not test(::r2_integration_tests::)
+    and not test(::oss_integration_tests::)
+"""
+failure-output = "immediate-final"
+fail-fast = false
+retries = 0
+
+[profile.ci_no_secrets.junit] # this can be some other profile, too
+path = "junit.xml"

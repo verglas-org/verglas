@@ -246,7 +246,7 @@ pub enum StrongApplyError {
     PointerMismatch {
         /// Event whose pointer did not match.
         event_id: String,
-        /// Metadata location committed by Lakekeeper.
+        /// Metadata location committed by Catalog.
         expected: String,
         /// Metadata location resolved from the catalog.
         resolved: String,
@@ -262,7 +262,7 @@ pub enum StrongApplyError {
 impl StrongWatcher {
     /// Creates an empty strong view for a new or restarting cache node.
     /// Durable EC-log replay is the authoritative bootstrap; consulting the
-    /// catalog here would create a cache -> Lakekeeper -> Postgres -> cache
+    /// catalog here would create a cache -> Catalog -> Postgres -> cache
     /// startup cycle and would make scale-to-zero recovery impossible.
     pub fn empty(options: WatcherOptions) -> Self {
         let shared = Arc::new(Shared::new());

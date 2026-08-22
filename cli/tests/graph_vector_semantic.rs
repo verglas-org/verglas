@@ -82,8 +82,8 @@ fn canned_response(path: &str) -> Value {
         | "/DeleteVectors"
         | "/DeleteIndex"
         | "/DeleteVectorBucket" => json!({}),
-        "/PutNodes" | "/PutEdges" => json!({ "snapshotId": 1 }),
-        "/GetNeighbors" => json!({
+        "/AddNodes" | "/AddEdges" => json!({ "snapshotId": 1 }),
+        "/RetrieveNeighbors" => json!({
             "neighbors": [{
                 "confidence": 0.9,
                 "direction": "out",
@@ -93,12 +93,12 @@ fn canned_response(path: &str) -> Value {
                 "provenance": "test"
             }]
         }),
-        "/BuildGraphIndex" => json!({ "index": true }),
-        "/GetGraph" => json!({ "graphName": "testgraph", "edgesSnapshotId": 1 }),
+        "/BuildIndex" => json!({ "index": true }),
+        "/DescribeGraph" => json!({ "graphName": "testgraph", "edgesSnapshotId": 1 }),
         "/ListGraphs" => json!({ "graphs": [{ "graphName": "testgraph" }], "nextToken": null }),
-        "/QueryKHop" => json!({ "nodes": [{ "hops": 1, "nodeId": "b", "pathConfidence": 0.9 }] }),
-        "/QueryPaths" => json!({ "paths": [] }),
-        "/QueryPrecedents" => json!({
+        "/SearchKHop" => json!({ "nodes": [{ "hops": 1, "nodeId": "b", "pathConfidence": 0.9 }] }),
+        "/SearchPaths" => json!({ "paths": [] }),
+        "/SearchPrecedents" => json!({
             "precedents": [{
                 "decisionId": "decision:a",
                 "score": 1.5,
@@ -205,7 +205,7 @@ fn graph_verbs_post_the_correct_signed_operations() {
         Some(nodes),
     );
     assert!(ok, "graph add-node failed: {stderr}");
-    assert_signed(&state, "POST", "/PutNodes");
+    assert_signed(&state, "POST", "/AddNodes");
 
     let edges =
         r#"[{"sourceId":"a","predicate":"rel","targetId":"b","provenance":"t","confidence":0.9}]"#;
@@ -215,7 +215,7 @@ fn graph_verbs_post_the_correct_signed_operations() {
         Some(edges),
     );
     assert!(ok, "graph add-edge failed: {stderr}");
-    assert_signed(&state, "POST", "/PutEdges");
+    assert_signed(&state, "POST", "/AddEdges");
 
     let (ok, stdout, stderr) = run(
         &endpoint,
@@ -223,7 +223,7 @@ fn graph_verbs_post_the_correct_signed_operations() {
         None,
     );
     assert!(ok, "graph neighbors failed: {stderr}");
-    assert_signed(&state, "POST", "/GetNeighbors");
+    assert_signed(&state, "POST", "/RetrieveNeighbors");
     assert!(
         stdout.contains("b"),
         "neighbors output must include \"b\": {stdout}"
@@ -231,11 +231,11 @@ fn graph_verbs_post_the_correct_signed_operations() {
 
     let (ok, _stdout, stderr) = run(&endpoint, &["--json", "graph", "index", "g1"], None);
     assert!(ok, "graph index failed: {stderr}");
-    assert_signed(&state, "POST", "/BuildGraphIndex");
+    assert_signed(&state, "POST", "/BuildIndex");
 
     let (ok, stdout, stderr) = run(&endpoint, &["--json", "graph", "show", "g1"], None);
     assert!(ok, "graph show failed: {stderr}");
-    assert_signed(&state, "POST", "/GetGraph");
+    assert_signed(&state, "POST", "/DescribeGraph");
     assert!(
         stdout.contains("testgraph"),
         "show output must include the graph name: {stdout}"
@@ -251,7 +251,7 @@ fn graph_verbs_post_the_correct_signed_operations() {
         None,
     );
     assert!(ok, "graph k-hop failed: {stderr}");
-    assert_signed(&state, "POST", "/QueryKHop");
+    assert_signed(&state, "POST", "/SearchKHop");
 
     let (ok, _stdout, stderr) = run(
         &endpoint,
@@ -268,7 +268,7 @@ fn graph_verbs_post_the_correct_signed_operations() {
         None,
     );
     assert!(ok, "graph paths failed: {stderr}");
-    assert_signed(&state, "POST", "/QueryPaths");
+    assert_signed(&state, "POST", "/SearchPaths");
 
     let (ok, stdout, stderr) = run(
         &endpoint,
@@ -287,7 +287,7 @@ fn graph_verbs_post_the_correct_signed_operations() {
         None,
     );
     assert!(ok, "graph precedents failed: {stderr}");
-    assert_signed(&state, "POST", "/QueryPrecedents");
+    assert_signed(&state, "POST", "/SearchPrecedents");
     assert!(
         stdout.contains("decision:a"),
         "precedents output must include the ranked decision id: {stdout}"
@@ -422,5 +422,5 @@ fn add_node_reads_json_array_from_a_file_path() {
         None,
     );
     assert!(ok, "graph add-node (file) failed: {stderr}");
-    assert_signed(&state, "POST", "/PutNodes");
+    assert_signed(&state, "POST", "/AddNodes");
 }

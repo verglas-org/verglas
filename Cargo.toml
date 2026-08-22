@@ -1,5 +1,11 @@
 [workspace]
 resolver = "2"
+# One workspace for the whole repository. The Catalog catalog crates live
+# under `catalog/crates/` and are members here — they are not a nested
+# workspace. That became possible once both trees were put on a single
+# `iceberg`: the fork in `[patch.crates-io]` below is the Catalog base plus
+# the Verglas commit constructor, so there is no longer one `iceberg` key
+# wanted by two sources.
 exclude = ["sdks/typescript"]
 members = [
     "cli",
@@ -21,27 +27,42 @@ members = [
     "crates/verglas-vector",
     "crates/verglas-kv",
     "bins/cache-node",
-    "bins/query-node",
     "crates/verglas-block",
+
+    # Catalog catalog
+    "crates/verglas-catalog-authz",
+    "crates/verglas-catalog-core",
+    "crates/verglas-catalog-io",
+    "crates/verglas-catalog-storage",
+    "crates/verglas-iceberg-ext",
 ]
 
 [workspace.package]
 # RELEASE POLICY: bump this before every release tag; tags are immutable and
 # are never deleted or re-pointed once pushed (the tag/version pair names the
 # artifacts forever). The tag must match this version (cargo-dist enforces it).
-version = "0.1.1"
+#
+# 0.2.0 marks absorbing the Catalog catalog. Its crates were independently
+# versioned at 0.13.1 under their own release-please; they now take this
+# version like every other crate in the repository.
+version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/verglas-org/verglas"
 homepage = "https://github.com/verglas-org/verglas"
 # FSL-1.1-ALv2 is not an SPDX identifier, so crates that publish ship the
 # license file itself.
 license-file = "LICENSE"
+# The Catalog-derived crates inherit `license`; the engine crates inherit
+# `license-file`. catalog/LICENSING.md is authoritative for that subtree.
+license = "Apache-2.0"
+# Catalog's declared MSRV. The repository pins 1.96.1.
+rust-version = "1.94"
 publish = false
 
 [workspace.dependencies]
 # Version alongside path: required for the crates.io publishes (verglas-api,
 # verglas-core, verglas-sdk). The release version sweep must bump these too.
-verglas-core = { path = "crates/verglas-core", version = "0.1.1" }
+verglas-core = { path = "crates/verglas-core", version = "0.2.0" }
 verglas-backend = { path = "crates/verglas-backend" }
 verglas-cluster = { path = "crates/verglas-cluster" }
 verglas-cache = { path = "crates/verglas-cache" }
@@ -54,7 +75,7 @@ verglas-consensus = { path = "crates/verglas-consensus" }
 verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-graph = { path = "crates/verglas-graph" }
-verglas-api = { path = "crates/verglas-api", version = "0.1.1" }
+verglas-api = { path = "crates/verglas-api", version = "0.2.0" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-block = { path = "crates/verglas-block" }
@@ -62,23 +83,25 @@ verglas-sdk = { path = "sdks/rust" }
 tonic = "0.13.1"
 prost = "0.13.5"
 # Iceberg read/write and DataFusion integration shared by engine roles.
-iceberg = "0.10.1"
-iceberg-catalog-rest = "0.10.1"
-iceberg-datafusion = "0.10.1"
+#
+# All four are redirected by `[patch.crates-io]` to the Verglas fork, and all
+# four must be, not just `iceberg`: the crates.io copies of the other three
+# require `iceberg ^0.10.1` and would reject the patched one.
+#
+# The version reads backwards on purpose. 0.10.0 here is strictly newer than
+# the 0.10.1 this used to be — upstream 0.10.1 is a patch release off the
+# 0.10.0 line, while the fork now tracks upstream `main` past 0.10.0 and never
+# took the 0.10.1 version bump. See the patch table at the bottom.
+iceberg = "=0.10.0"
+iceberg-catalog-rest = "=0.10.0"
+iceberg-datafusion = "=0.10.0"
 # S3/fs/memory storage backends for Iceberg FileIO. RestCatalog requires an
 # explicit StorageFactory; the S3 one routes data-file writes and reads through
 # the configured cache endpoint.
-iceberg-storage-opendal = "0.10.1"
-datafusion = "53.1"
-# bins/query-node's second query engine (protocol v4 step 9b): the bundled
-# build statically links libduckdb so the binary carries its own engine, no
-# system libduckdb at runtime. DuckDB's own Iceberg REST catalog support
-# (its `iceberg`/`httpfs` extensions, loaded at session init) reads the same
-# catalog and S3 endpoint the DataFusion path uses. Its `arrow` dependency
-# pins to the same arrow-rs "58" line as the rest of the workspace, so
-# `duckdb::arrow::record_batch::RecordBatch` and `arrow_array::RecordBatch`
-# are the same type — query-node's JSON row writer serves both engines.
-duckdb = { version = "1.10505.0", features = ["bundled"] }
+iceberg-storage-opendal = "=0.10.0"
+# 54, not 53.1: the fork's `iceberg-datafusion` builds against DataFusion 54.
+# Arrow stays on the 58 line across the bump.
+datafusion = "54.0"
 # Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "58"
 arrow-buffer = "58"
@@ -88,11 +111,11 @@ arrow-csv = "58"
 arrow-json = "58"
 arrow-cast = "58"
 parquet = "58"
-uuid = { version = "1.18", features = ["v4"] }
+uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }
 axum = "0.8.8"
 bytes = "1.12.0"
 async-trait = "0.1.89"
-async-stream = "0.3"
+async-stream = "0.3.6"
 foyer = "0.22.3"
 # foyer's metrics registry trait (`mixtrics::RegistryOps`). foyer does not
 # re-export it, so verglas names it directly to install a registry that reads
@@ -104,17 +127,16 @@ libc = "0.2.180"
 object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
 s3s = "0.14.1"
 sync_wrapper = { version = "1.0.2", features = ["futures"] }
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "blocking", "stream", "http2"] }
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "blocking", "stream", "http2"] }
 # AWS SigV4 request signing for AWS-backed Iceberg REST catalogs (S3 Tables,
 # Glue) — the watcher signs its own reqwest requests, no signing proxy (#236).
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
+aws-credential-types = { version = "1.2", features = ["hardcoded-credentials"] }
 aws-runtime = "1"
-aws-sigv4 = "1"
-aws-smithy-runtime-api = "1"
+aws-sigv4 = "1.2"
+aws-smithy-runtime-api = "1.8.7"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
-serde_json = "1.0.149"
-sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde_yaml = "0.9.34"
 # SHA-256 content addressing for the block-device chunk store (verglas-block,
 # #382): identical 2 MiB chunks hash to one key so they dedup across devices and
@@ -131,7 +153,7 @@ tempfile = "3.20.0"
 thiserror = "2.0.18"
 ts-rs = { version = "11.1.0", features = ["serde-compat"] }
 chrono = "0.4.44"
-tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 toml = "1.1.2"
 xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 # CRC32C (Castagnoli) for per-fragment integrity in the write-back tier (#220):
@@ -151,6 +173,165 @@ prometheus = { version = "0.14.0", default-features = false }
 bollard = "0.21.0"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 
+# ---- Catalog catalog dependencies ----
+anyhow = "^1.0"
+assert-json-diff = "2.0.2"
+async-channel = { version = "2.3.1" }
+async-compression = { version = "^0.4", features = ["tokio", "gzip"] }
+async-nats = { git = "https://github.com/lakekeeper/nats.rs.git", tag = "async-nats/v0.46.0-lakekeeper.1", default-features = false, features = [
+    "server_2_10",
+    "server_2_11",
+    "server_2_12",
+    "aws-lc-rs",
+    "service",
+    "nkeys",
+] }
+aws-sdk-s3 = { version = "1.121", default-features = false, features = [
+    "sigv4a",
+    "http-1x",
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-sdk-sts = { version = "1.82.0", default-features = false, features = [
+    "default-https-client",
+    "rt-tokio",
+] }
+aws-smithy-async = { version = "1.2.5" }
+aws-smithy-http = "0.62.3"
+aws-smithy-http-client = { version = "1.0.6" }
+aws-smithy-types = { version = "1.3.4" }
+axum-extra = { version = "0.12.0", features = ["middleware"] }
+axum-macros = { version = "0.5.0" }
+axum-prometheus = { version = "0.9.0", features = ["http-listener"] }
+azure_core = { git = "https://github.com/lakekeeper/azure-sdk-for-rust.git", rev = "f12d268cf04ea668d0224a1a55fc120591e50b9d", default-features = false, features = [
+    "hmac_rust",
+    "enable_reqwest",
+    "enable_reqwest_rustls",
+] }
+azure_identity = { git = "https://github.com/lakekeeper/azure-sdk-for-rust.git", rev = "f12d268cf04ea668d0224a1a55fc120591e50b9d", default-features = false, features = [
+    "enable_reqwest",
+    "enable_reqwest_rustls",
+] }
+azure_storage = { git = "https://github.com/lakekeeper/azure-sdk-for-rust.git", rev = "f12d268cf04ea668d0224a1a55fc120591e50b9d", default-features = false, features = [
+    "enable_reqwest",
+    "enable_reqwest_rustls",
+] }
+azure_storage_blobs = { git = "https://github.com/lakekeeper/azure-sdk-for-rust.git", rev = "f12d268cf04ea668d0224a1a55fc120591e50b9d", default-features = false, features = [
+    "enable_reqwest",
+    "enable_reqwest_rustls",
+] }
+azure_storage_datalake = { git = "https://github.com/lakekeeper/azure-sdk-for-rust.git", rev = "f12d268cf04ea668d0224a1a55fc120591e50b9d", default-features = false, features = [
+    "enable_reqwest",
+    "enable_reqwest_rustls",
+] }
+base64 = "0.22.1"
+cloudevents-sdk = { version = "0.9.0" }
+crc = "3"
+derive_more = { version = "^2.0.0", features = ["from", "debug"] }
+fastrand = "2.3.0"
+figment = { version = "^0.10", features = ["env"] }
+figment_file_provider_adapter = "0.1.1"
+flate2 = "^1.0"
+gcloud-token = "1.0.0"
+google-cloud-auth = { package = "gcloud-auth", version = "~1.2", features = [
+    "rustls-tls",
+    "jwt-aws-lc-rs",
+    "external-account",
+], default-features = false }
+google-cloud-storage = { package = "gcloud-storage", version = "~1.2", default-features = false, features = [
+    "rustls-tls",
+    "auth",
+] }
+google-cloud-token = { package = "token-source", version = "1.0" }
+headers = { version = "^0.4" }
+heck = "0.5.0"
+hmac = "0.12"
+hostname = "0.4.0"
+http = "1.3.1"
+http-body-util = "^0.1"
+iso8601 = "0.6.2"
+itertools = "0.14.0"
+jsonwebtoken = "11.0.0"
+k8s-openapi = { version = "0.28" }
+lazy-regex = { version = "3.2.0", features = ["lite"] }
+lazy_static = "^1.4"
+limes = { git = "https://github.com/vakamo-labs/limes-rs.git", tag = "v0.5.0", features = [
+    "kubernetes",
+    "axum",
+    "rustls-tls",
+] }
+maplit = "1.0.2"
+md5 = "0.8.0"
+metrics = "0.24"
+middle = { version = "0.4", features = ["tonic"] }
+mockall = "0.14.0"
+moka = { version = "^0.12", features = ["future"] }
+pastey = "0.2.1"
+percent-encoding = "2.3.1"
+pretty_assertions = "~1.4"
+quick-xml = { version = "0.41", features = ["serialize"] }
+rdkafka = { version = "0.38.0", default-features = false, features = [
+    "tokio",
+    "zstd",
+    "gssapi-vendored",
+    "curl-static",
+    "ssl-vendored",
+    "libz-static",
+    "cmake-build",
+] }
+reqwest-middleware = "0.4"
+reqwest-retry = "0.8"
+semver = "1.0.27"
+serde_derive = "^1.0"
+serde_norway = "0.9.42"
+serde_urlencoded = "0.7.1"
+serde_with = "^3.4"
+sha1 = "0.10"
+similar = "3.0.0"
+strum = { version = "0.27.0", features = ["derive"] }
+strum_macros = "0.27.0"
+tikv-jemallocator = { version = "0.6" }
+time = "0.3.36"
+tokio-metrics = { version = "0.4.9", features = [
+    "metrics-rs-integration",
+    "rt",
+] }
+tokio-util = { version = "^0.7" }
+tower = { version = "^0.5" }
+tower-http = { version = "^0.6", features = [
+    "catch-panic",
+    "compression-full",
+    "sensitive-headers",
+    "timeout",
+    "trace",
+    "normalize-path",
+] }
+tracing = { version = "^0.1.41", features = ["attributes", "valuable"] }
+tracing-subscriber = { version = "0.3.18", features = [
+    "env-filter",
+    "json",
+    "valuable",
+] }
+tracing-test = "0.2.5"
+tryhard = { version = "0.5.1" }
+typed-builder = "^0.23.0"
+unicase = "2.8.1"
+unicode-general-category = "1.1.0"
+url = { version = "^2.5", features = ["serde"] }
+urlencoding = "^2.1"
+utoipa = { version = "5.4.0", features = [
+    "axum_extras",
+    "chrono",
+    "url",
+    "uuid",
+    "yaml",
+    "rc_schema",
+] }
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+valuable = "0.1.1"
+veil = "0.2.0"
+webpki-root-certs = "1.0"
+
 [workspace.lints.clippy]
 # CI will run clippy with `-D warnings` (see `just lint`), turning these into errors.
 all = { level = "warn", priority = -1 }
@@ -159,16 +340,31 @@ todo = "warn"
 unimplemented = "warn"
 unwrap_used = "warn"
 
-# VERGLAS PATCH: iceberg 0.10.1 from verglas-org/verglas-iceberg (branch
-# verglas/v0.10.1) with one added public constructor, `TableCommit::from_parts`.
-# Upstream gates `TableCommit` construction to the transaction action set
-# (fast-append + property updates, no overwrite or delete), so REPLACE /
-# RemoveSnapshots commits cannot be built through the public API. Compaction
-# and post-compact snapshot expiry need that escape hatch. Pin a SHA — never a
-# floating branch tip. Patch inventory:
-# https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.1/VERGLAS.md
+# VERGLAS PATCH: the iceberg crates from verglas-org/verglas-iceberg, branch
+# `verglas/v0.10.0` — the lakekeeper/iceberg-rust base plus one added public
+# constructor, `TableCommit::from_parts`. Apache upstream gates `TableCommit`
+# construction to the transaction action set (fast-append + property updates,
+# no overwrite or delete), so REPLACE commits cannot be built through the
+# public API; compaction and post-compact snapshot expiry need that escape
+# hatch.
+#
+# The base moved here from upstream's 0.10.1 tag to the Catalog fork so that
+# this workspace and the catalog workspace under `catalog/` resolve ONE
+# `iceberg`. While they disagreed, the two could never share a cargo workspace:
+# one `[workspace.dependencies]` table admits one `iceberg` key, and a patch
+# table cannot redirect a direct git dependency.
+#
+# All four crates are patched together and must stay on the same rev — the
+# crates.io copies of the latter three require `iceberg ^0.10.1` and would
+# reject the patched 0.10.0.
+#
+# Pin a SHA — never a floating branch tip. Patch inventory:
+# https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.0/VERGLAS.md
 [patch.crates-io]
-iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "39f251a452ab2ab48728917b56182e35bb6b805b" }
+iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
+iceberg-catalog-rest = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
+iceberg-datafusion = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
+iceberg-storage-opendal = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
 # VERGLAS PATCH: foyer 0.22.3 from verglas-org/verglas-foyer (branch
 # verglas/v0.22.3) with live disk-resize for the block engine — the watermark
 # model the write-pressure reclamation needs: shrink retires tail partitions
@@ -176,6 +372,12 @@ iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "39f25
 # a floating branch tip. Patch inventory:
 # https://github.com/verglas-org/verglas-foyer/blob/verglas/v0.22.3/VERGLAS.md
 foyer = { git = "https://github.com/verglas-org/verglas-foyer", rev = "58a7f001d8cd894423106713904daf948db20e65" }
+
+# Carried over from the catalog workspace: proc-macro/build-script codegen is
+# optimised so debug builds of the macro-heavy catalog crates stay tolerable.
+[profile.dev.build-override]
+debug-assertions = true
+opt-level = 3
 
 # The profile that 'dist' will build with
 [profile.dist]

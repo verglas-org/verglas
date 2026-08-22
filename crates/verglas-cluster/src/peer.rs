@@ -350,6 +350,37 @@ struct FragmentListRequest {
     prefix: String,
 }
 
+/// Worker-thread count for the dedicated peer runtime.
+///
+/// This runtime carries every fragment placement, read, and headroom RPC this
+/// node receives, plus all inbound Raft traffic for every hosted group. Sizing
+/// it below the machine's allotment caps how much of the box the node can use;
+/// sizing it above oversubscribes.
+///
+/// Use the reported vCPU thread count. `available_parallelism` honours the
+/// cgroup CPU quota on Linux where one is set, and falls back to the affinity
+/// mask otherwise, so a node in a 4 vCPU container gets 4 and a node on a
+/// 64 vCPU host gets 64. Do not clamp to a constant: a fixed upper bound
+/// leaves most of a large machine idle, which is the whole reason this
+/// runtime was a bottleneck at 2 threads.
+///
+/// `VERGLAS_PEER_RUNTIME_THREADS` overrides it for a colocated deployment that
+/// must hand the RPC plane less than the full machine (budgets are hard
+/// ceilings).
+fn peer_runtime_worker_threads() -> usize {
+    if let Some(explicit) = std::env::var("VERGLAS_PEER_RUNTIME_THREADS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+    {
+        return explicit;
+    }
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(8)
+        .max(2)
+}
+
 /// The peer-fetch server: listens on this node's advertised address and serves
 /// blocks from the local cache tiers only. Its listener has a dedicated Tokio
 /// runtime so Raft vote and fragment RPCs remain schedulable while the public
@@ -469,7 +500,7 @@ impl PeerServer {
             .name("verglas-peer-rpc".to_owned())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
+                    .worker_threads(peer_runtime_worker_threads())
                     .enable_all()
                     .build()
                 {

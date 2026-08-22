@@ -1,4 +1,4 @@
-//! In-process acceptance for `QueryPrecedents` (#148): BM25 lexical ranking of
+//! In-process acceptance for `SearchPrecedents` (#148): BM25 lexical ranking of
 //! `Decision` nodes plus an entity-overlap structural boost, driven through
 //! the real Graph REST-JSON router against an Iceberg `MemoryCatalog`.
 
@@ -82,7 +82,7 @@ async fn seed_ranking_graph(app: &axum::Router, graph_name: &str) {
     post(app, "CreateGraph", json!({"graphName": graph_name})).await;
     post(
         app,
-        "PutNodes",
+        "AddNodes",
         json!({
             "graphName": graph_name,
             "nodes": [
@@ -97,7 +97,7 @@ async fn seed_ranking_graph(app: &axum::Router, graph_name: &str) {
     .await;
     post(
         app,
-        "PutEdges",
+        "AddEdges",
         json!({
             "graphName": graph_name,
             "edges": [
@@ -119,7 +119,7 @@ async fn ranking_orders_decisions_by_lexical_match_to_the_query() {
 
     let output = post(
         &app,
-        "QueryPrecedents",
+        "SearchPrecedents",
         json!({"graphName": "rankings", "query": "vector search retrieval"}),
     )
     .await;
@@ -163,7 +163,7 @@ async fn seed_tie_graph(app: &axum::Router, graph_name: &str) {
     post(app, "CreateGraph", json!({"graphName": graph_name})).await;
     post(
         app,
-        "PutNodes",
+        "AddNodes",
         json!({
             "graphName": graph_name,
             "nodes": [
@@ -177,7 +177,7 @@ async fn seed_tie_graph(app: &axum::Router, graph_name: &str) {
     .await;
     post(
         app,
-        "PutEdges",
+        "AddEdges",
         json!({
             "graphName": graph_name,
             "edges": [
@@ -199,7 +199,7 @@ async fn supplying_entities_flips_the_ranking_deterministically() {
 
     let unboosted = post(
         &app,
-        "QueryPrecedents",
+        "SearchPrecedents",
         json!({"graphName": "tie-break", "query": "migrate billing pipeline"}),
     )
     .await;
@@ -217,7 +217,7 @@ async fn supplying_entities_flips_the_ranking_deterministically() {
 
     let boosted = post(
         &app,
-        "QueryPrecedents",
+        "SearchPrecedents",
         json!({"graphName": "tie-break", "query": "migrate billing pipeline", "entities": ["entity:x"]}),
     )
     .await;
@@ -236,7 +236,7 @@ async fn supplying_entities_flips_the_ranking_deterministically() {
     assert_eq!(boosted_precedents[1]["structuralScore"], 0.0);
 }
 
-/// (c) Determinism: two identical `QueryPrecedents` calls against unchanged
+/// (c) Determinism: two identical `SearchPrecedents` calls against unchanged
 /// graph state return byte-identical response bodies.
 #[tokio::test]
 async fn identical_requests_against_unchanged_state_return_byte_identical_responses() {
@@ -245,8 +245,8 @@ async fn identical_requests_against_unchanged_state_return_byte_identical_respon
 
     let request =
         json!({"graphName": "determinism", "query": "vector search retrieval", "limit": 2});
-    let first = post_raw(&app, "QueryPrecedents", request.clone()).await;
-    let second = post_raw(&app, "QueryPrecedents", request).await;
+    let first = post_raw(&app, "SearchPrecedents", request.clone()).await;
+    let second = post_raw(&app, "SearchPrecedents", request).await;
     assert_eq!(
         first, second,
         "identical requests must return byte-identical bodies"
@@ -272,7 +272,7 @@ async fn non_decision_and_objective_less_nodes_are_excluded() {
     post(&app, "CreateGraph", json!({"graphName": graph_name})).await;
     post(
         &app,
-        "PutNodes",
+        "AddNodes",
         json!({
             "graphName": graph_name,
             "nodes": [
@@ -286,7 +286,7 @@ async fn non_decision_and_objective_less_nodes_are_excluded() {
 
     let output = post(
         &app,
-        "QueryPrecedents",
+        "SearchPrecedents",
         json!({"graphName": graph_name, "query": "cache warming"}),
     )
     .await;

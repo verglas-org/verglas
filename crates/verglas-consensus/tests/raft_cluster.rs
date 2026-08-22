@@ -273,7 +273,10 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         1,
         replacement_node.clone(),
         state_machines[&replacement].clone(),
-        payloads.clone(),
+        Box::new({
+            let payloads = Arc::clone(&payloads);
+            move || Ok(Arc::clone(&payloads) as Arc<dyn PayloadStore>)
+        }),
     )
     .expect("leader group");
     let unrecovered = leader_group.catalog_table("missing").await;
@@ -634,7 +637,10 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
         1,
         node1.clone(),
         state_machines[&1].clone(),
-        payloads,
+        Box::new({
+            let payloads = Arc::clone(&payloads);
+            move || Ok(Arc::clone(&payloads) as Arc<dyn PayloadStore>)
+        }),
     )
     .expect("isolated group");
     assert!(isolated_group.read(committed.index).await.is_err());
@@ -691,12 +697,55 @@ async fn isolated_old_leader_cannot_commit_a_conflicting_index() {
     for raft in shared_nodes.read().await.values() {
         raft.shutdown().await.expect("shutdown node");
     }
-    let recovered =
-        PersistentStateMachine::open(root.path().join(replacement.to_string()).join("state.json"))
+
+    // Restart the whole voter set. A state image is written only by a
+    // snapshot, so recovering this record proves the restarted quorum
+    // replayed it from the durable log. One node alone cannot: without a
+    // quorum it never establishes a leader, so it never advances its commit
+    // index, which is Raft behaving correctly rather than data loss.
+    let restarted_nodes = Arc::new(RwLock::new(BTreeMap::new()));
+    let restarted_blocked = Arc::new(RwLock::new(BTreeSet::new()));
+    let mut restarted_states = BTreeMap::new();
+    for node in [1, 2, 3, 4, 6] {
+        let directory = root.path().join(node.to_string());
+        let log = PersistentLogStore::open(directory.join("log.json"))
             .await
-            .expect("reopen tenant-root state");
-    assert_eq!(
-        recovered.warehouse_group("analytics").await,
-        Some("warehouse/tenant-a/analytics".to_owned())
-    );
+            .expect("reopen log store");
+        let state = PersistentStateMachine::open(directory.join("state.json"))
+            .await
+            .expect("reopen state machine");
+        let raft = Raft::new(
+            node,
+            config.clone(),
+            Router {
+                nodes: restarted_nodes.clone(),
+                blocked: restarted_blocked.clone(),
+                source: node,
+            },
+            log,
+            state.clone(),
+        )
+        .await
+        .expect("restart Raft node");
+        restarted_nodes.write().await.insert(node, raft);
+        restarted_states.insert(node, state);
+    }
+    let recovered = restarted_states
+        .remove(&replacement)
+        .expect("restarted tenant-root replica");
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if recovered.warehouse_group("analytics").await
+                == Some("warehouse/tenant-a/analytics".to_owned())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the restarted quorum replays the tenant-root mapping from its log");
+    for raft in restarted_nodes.read().await.values() {
+        raft.shutdown().await.expect("shutdown restarted node");
+    }
 }

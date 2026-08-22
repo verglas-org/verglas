@@ -110,9 +110,9 @@
 - #135: Added restart coverage for tenant-root warehouse routing and rejected conflicting registrations. The test proves that warehouse ownership survives state-machine recovery and cannot silently move between groups.
 - #135: Added a committed timeline-open command that establishes the immutable initial PostgreSQL LSN before writer acquisition. Nonzero real-world WAL positions now survive restart and conflicting attempts to reopen a timeline at another LSN fail closed.
 
-- #135: Added typed durable catalog collections for the complete hosted Lakekeeper
+- #135: Added typed durable catalog collections for the complete hosted Catalog
   domain. Canonical JSON records are transactionally guarded and applied with
-  namespace/table pointers, so the future Lakekeeper adapter has one CRaft state
+  namespace/table pointers, so the future Catalog adapter has one CRaft state
   image rather than a SQL fallback.
 
 - #135: Exposed the voter set and its committed Raft-log generation from durable
@@ -170,7 +170,7 @@
   representations that the authoritative compacted image has pruned. The local
   headers and repair records supply exact release identities, and any release
   failure now aborts before either persistent state image changes.
-- #135: Added a real Raft regression for persisting typed Lakekeeper catalog records. The test reproduces the JSON state-machine failure seen by a four-node Docker cluster before exercising a linearizable read.
+- #135: Added a real Raft regression for persisting typed Catalog catalog records. The test reproduces the JSON state-machine failure seen by a four-node Docker cluster before exercising a linearizable read.
 
 - #135: Replaced compound hosted-record map keys with a typed collection of
   entity-keyed record maps. This keeps catalog record lookups and deterministic
@@ -237,3 +237,35 @@
   window raced real fsync latency on loaded 2-core CI runners. The blocked
   frame now sleeps 1000ms against a 500ms vote timeout, so the bypass
   invariant is still strictly proven while a slow disk cannot flake it.
+- #164: Removed the polling retry loop from the consensus submit path. Leader
+  resolution now waits on OpenRaft's own metrics-change channel through
+  `ConsensusGroup::await_leader`, and a submit makes exactly one attempt:
+  execute locally when this node leads, otherwise forward once. A leader that
+  refuses the command now surfaces that error immediately instead of being
+  retried behind a fixed 25 ms sleep, which is what disguised a total forward
+  failure as 116 ms of "slow consensus" in the profile.
+- #164: Stopped rewriting the whole state-machine image on every apply. The
+  image holds every committed header and retry record, so persisting it per
+  commit cost O(committed entries) and grew for the life of the process —
+  measured Raft append p50 fell from 163.6 ms to 38.0 ms once it was removed,
+  and per-commit latency stopped drifting upward run over run. Recovery is
+  unaffected: `build_snapshot` still writes the state and snapshot images as
+  one ordered operation, and Raft purges only log entries a snapshot covers,
+  so a restarted quorum replays the tail from the durable log.
+- #164: Gave `client_write` failures a typed `GroupError::NotLeader` carrying
+  the leader hint, plus `ConsensusGroup::await_leader_change`, which blocks on
+  a Raft metrics change rather than sampling on a timer. A sender forwards to
+  whichever node it last saw as leader; that view goes stale during an
+  election, and it can only re-resolve if it can tell that case apart from a
+  real failure.
+- #164: Coalesced the framed log append into one write and one fsync, and
+  fsync the parent directory only when the log file is first created. Deleted
+  `enqueue_persist` and `try_enqueue`, which the above left unused.
+- #164: Made payload-store creation lazy behind `ConsensusGroup::with_payload_factory`,
+  so inline commits do not validate or construct a distributed store. The first
+  external payload operation memoizes the store, attaches it to the state machine,
+  and surfaces construction errors such as invalid single-voter geometry.
+- #164: Finalized the lazy payload API as `ConsensusGroup::new` accepting a
+  `PayloadStoreFactory`; the eager constructor path no longer exists. Group
+  construction now leaves invalid payload geometry dormant until an external
+  payload operation actually needs the store.

@@ -6,7 +6,7 @@
 //! so a table's `metadata.json` stops growing with every commit.
 //!
 //! Platform `_LOGS` day-partition pruning and run-event logging are not owned
-//! here — catalog-side lakekeeping (e.g. Lakekeeper expire/orphan queues) owns
+//! here — catalog-side lakekeeping (e.g. Catalog expire/orphan queues) owns
 //! telemetry retention. This module is the compute-side snapshot-expiry helper
 //! compaction needs when it commits through the engine.
 

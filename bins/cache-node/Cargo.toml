@@ -21,7 +21,7 @@ verglas-cache.workspace = true
 verglas-s3.workspace = true
 verglas-backend.workspace = true
 # Cache nodes own the tenant catalog response cache and watcher. Query workers
-# consume the local gateway and never receive upstream Lakekeeper credentials.
+# consume the local gateway and never receive upstream Catalog credentials.
 verglas-catalog.workspace = true
 verglas-tables.workspace = true
 verglas-iceberg.workspace = true
@@ -45,8 +45,17 @@ axum.workspace = true
 futures.workspace = true
 # The NBD listener needs the `io-util` AsyncRead/Write ext traits and `net`.
 tokio = { workspace = true, features = ["io-util"] }
+# The hosted Iceberg catalog, mounted in-process. The cloud topology pins one
+# stateless catalog to every ring node, so it ships in this binary rather than
+# as a second process reaching this node's consensus plane over HTTP.
+verglas-catalog-core = { path = "../../crates/verglas-catalog-core", features = ["router"] }
+verglas-catalog-storage = { path = "../../crates/verglas-catalog-storage" }
+verglas-catalog-authz = { path = "../../crates/verglas-catalog-authz" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# The checked-in OpenAPI documents are YAML; the admin API index serves them as
+# JSON so a browser can read them.
+serde_norway = { workspace = true }
 bytes.workspace = true
 tracing = "0.1.44"
 # Same `[log]` subscriber shape as verglas-cache-node (json for pipelines, pretty for dev),
@@ -84,11 +93,24 @@ tokio-util = { version = "0.7", features = ["rt"] }
 # hyper-util's connection builder expects — the same adaptor `axum::serve`
 # applies internally for the plaintext listener.
 tower = { version = "0.5.3", features = ["util"] }
+# Generates and reads the P-256 key backing the node's self-issued catalog
+# credential; `ring` matches the process crypto provider.
+rcgen = { version = "0.14.9", default-features = false, features = ["ring", "pem"] }
+# Signs that credential as the ES256 bearer the hosted catalog verifies.
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
 
 [dev-dependencies]
+# `test-util` provides the paused clock. Batching assertions measure whether a
+# task awaited a timer, which must not depend on how loaded the machine is.
+tokio = { workspace = true, features = ["io-util", "test-util"] }
 # Generates the test CA + per-deployment leaf certificate the TLS listener
 # tests hand to `tls::from_env`. `ring` matches the process crypto provider.
 rcgen = { version = "0.14.9", default-features = false, features = ["ring", "pem"] }
+# Mints the ES256 caller credential the hosted catalog requires, so the
+# embedded-catalog test needs no Cloudflare Worker and no network.
+jsonwebtoken = { workspace = true }
+base64 = { workspace = true }
 reqwest.workspace = true
 tempfile.workspace = true
 toml.workspace = true

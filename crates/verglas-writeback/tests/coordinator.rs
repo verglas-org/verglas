@@ -34,7 +34,7 @@ use verglas_writeback::membership::LiveMembership;
 use verglas_writeback::metrics::WritebackMetrics;
 use verglas_writeback::reader::WritebackReader;
 use verglas_writeback::transport::{FragmentTransport, TransportError};
-use verglas_writeback::{ConsensusCommitter, ObjectCommit, StagedObject};
+use verglas_writeback::{ConsensusCommitter, ObjectCommit, PackCommit, StagedObject, StagedPack};
 
 // ---- in-memory fragment transport ----------------------------------------
 
@@ -67,6 +67,14 @@ impl ConsensusCommitter for TestCommitter {
         }
         Ok(ObjectCommit { index: 1 })
     }
+
+    /// Accepts a non-empty pack as a deterministic test commit.
+    async fn commit_pack(&self, staged: StagedPack) -> Result<PackCommit, String> {
+        if staged.entries.is_empty() {
+            return Err("empty pack".to_owned());
+        }
+        Ok(PackCommit { index: 1 })
+    }
 }
 
 /// Test consensus rejects a staged certificate before it reaches a committed log index.
@@ -77,6 +85,61 @@ impl ConsensusCommitter for RejectingCommitter {
     /// Refuses every staged header to prove fragment durability alone never acknowledges.
     async fn commit(&self, _staged: StagedObject) -> Result<ObjectCommit, String> {
         Err("leader quorum unavailable".to_owned())
+    }
+
+    /// Refuses every staged pack too.
+    async fn commit_pack(&self, _staged: StagedPack) -> Result<PackCommit, String> {
+        Err("leader quorum unavailable".to_owned())
+    }
+}
+
+/// Test consensus that blocks inside `commit` until released, so a test can
+/// observe exactly when the coordinator calls it relative to acking the
+/// client (#180 P2: proving the ack-ordering guarantee the synchronous
+/// commit provides, so nothing else durably learns of the object's identity
+/// and fragment placements before the client is told it succeeded).
+struct BlockingCommitter {
+    entered: AtomicBool,
+    blocked: AtomicBool,
+    release: tokio::sync::Notify,
+}
+
+impl BlockingCommitter {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: AtomicBool::new(false),
+            blocked: AtomicBool::new(true),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+
+    /// Whether `commit` has been called yet (win the race against the caller
+    /// spawning the PUT).
+    fn entered(&self) -> bool {
+        self.entered.load(Ordering::SeqCst)
+    }
+
+    /// Unblocks a pending `commit` call, letting it return `Ok`.
+    fn release(&self) {
+        self.blocked.store(false, Ordering::SeqCst);
+        self.release.notify_waiters();
+    }
+}
+
+#[async_trait::async_trait]
+impl ConsensusCommitter for BlockingCommitter {
+    /// Records entry, then blocks until the test calls [`Self::release`].
+    async fn commit(&self, _staged: StagedObject) -> Result<ObjectCommit, String> {
+        self.entered.store(true, Ordering::SeqCst);
+        while self.blocked.load(Ordering::SeqCst) {
+            self.release.notified().await;
+        }
+        Ok(ObjectCommit { index: 1 })
+    }
+
+    /// Not exercised by the ack-ordering test; commits packs immediately.
+    async fn commit_pack(&self, _staged: StagedPack) -> Result<PackCommit, String> {
+        Ok(PackCommit { index: 1 })
     }
 }
 
@@ -431,7 +494,11 @@ fn build(
     build_with_committer(transport, membership, origin, Arc::new(TestCommitter))
 }
 
-/// Builds a coordinator with a caller-selected consensus outcome.
+/// Builds a coordinator with a caller-selected consensus outcome. The offload
+/// size limit is 1 byte, so every test body (all well over that) bypasses
+/// accumulation and propagates directly, exactly as write-back did before
+/// #164 §4 — these tests exercise the ack/repair/scrub/reassembly contract,
+/// not the offload batching path (see `tests/offload.rs` for that).
 fn build_with_committer(
     transport: Arc<MemoryTransport>,
     membership: Arc<FakeMembership>,
@@ -448,7 +515,10 @@ fn build_with_committer(
         metrics,
         origin,
         committer,
-        Duration::from_secs(5),
+        verglas_writeback::WritebackThresholds {
+            ack_deadline: Duration::from_secs(5),
+            offload_size_limit_bytes: 1,
+        },
     ));
     (coordinator, dir)
 }
@@ -470,6 +540,19 @@ async fn wait_for_no_fragments(transport: &MemoryTransport) -> bool {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     transport.fragment_count() == 0
+}
+
+/// Polls `condition` until it is true or two seconds pass. A condition wait,
+/// never a fixed sleep (standing test policy).
+async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < deadline {
+        if condition() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    condition()
 }
 
 fn ck(key: &str) -> CacheKey {
@@ -546,6 +629,72 @@ async fn staged_fragments_do_not_ack_before_the_consensus_commit() {
         "no visible object before commit"
     );
     assert_eq!(origin.get("bkt", "data/commit"), None);
+}
+
+/// #180 P2 (RIME perf candidate): the ack must never precede the consensus
+/// commit completing.
+///
+/// The write-back journal is local, unreplicated, filesystem state on the
+/// accepting node alone. The consensus commit is the only mechanism that
+/// makes an object's identity and fragment placements durable anywhere else.
+/// If the coordinator ever acked the client while a commit was still
+/// in flight (for example, deferring it to a background task to save a Raft
+/// round trip off the hot path), a crash of the accepting node in that
+/// window would permanently orphan the object: `w` fragments would still sit
+/// on other live nodes, but nothing durable would name the key, geometry, or
+/// placement list needed to reassemble them. This test pins the ordering
+/// that rules that out: while `commit` is in flight, the client-visible PUT
+/// future has not resolved and no journal is visible yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ack_never_precedes_the_consensus_commit_completing() {
+    let transport = MemoryTransport::new();
+    let membership = FakeMembership::new("node-0", &["node-0", "node-1", "node-2"]);
+    let origin = RecordingOrigin::new(false);
+    let committer = BlockingCommitter::new();
+    let (coordinator, _dir) =
+        build_with_committer(transport.clone(), membership, origin, committer.clone());
+
+    let put_coordinator = Arc::clone(&coordinator);
+    let handle = tokio::spawn(async move {
+        put_coordinator
+            .put(
+                &ck("data/blocked"),
+                &WriteMetadata::default(),
+                body(4096),
+                2,
+                1,
+                3,
+            )
+            .await
+    });
+
+    assert!(
+        wait_until(|| committer.entered()).await,
+        "commit must be called before the PUT can ack"
+    );
+    // The commit is now blocked mid-flight. Simulate checking "what would a
+    // successor see if the accepting node died right now?" -- nothing: no
+    // local journal yet, and (by construction of this fake) no consensus
+    // record either. The PUT must still be pending, not already resolved.
+    assert!(
+        coordinator.journals().is_idle(),
+        "no journal is visible until after the commit resolves"
+    );
+    assert!(
+        !handle.is_finished(),
+        "the client must not be acked while the commit is still in flight"
+    );
+
+    committer.release();
+    let outcome = handle
+        .await
+        .expect("task did not panic")
+        .expect("commit succeeded, so the ack follows");
+    assert!(outcome.e_tag.is_some());
+    assert!(
+        !coordinator.journals().is_idle(),
+        "the journal becomes visible only once the commit is durable"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -732,14 +881,19 @@ async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
     let origin = RecordingOrigin::new(false);
     origin.block_put();
     let (coordinator, _dir) = build(transport.clone(), membership, origin.clone());
-    let key = ck("lakekeeper/storage-check");
+    let key = ck("catalog/storage-check");
 
     coordinator
         .put(&key, &WriteMetadata::default(), body(4096), 2, 1, 3)
         .await
         .expect("quorum ack before origin propagation");
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    // Bounded generously: this waits on a CPU-bound Reed-Solomon reassemble
+    // plus the direct-upload path, which can take much longer than its own
+    // work under host CPU contention (observed multi-second stalls on a
+    // loaded CI/dev host). The condition still ends the wait immediately once
+    // met; the deadline only matters on genuine failure.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while !origin.put_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
         tokio::task::yield_now().await;
     }
@@ -764,7 +918,7 @@ async fn delete_cannot_be_resurrected_by_acked_put_propagation() {
         .expect("delete task")
         .expect("ordered origin delete");
     assert_eq!(
-        origin.get("bkt", "lakekeeper/storage-check"),
+        origin.get("bkt", "catalog/storage-check"),
         None,
         "the completed delete is final"
     );
@@ -1136,8 +1290,12 @@ async fn acked_object_propagates_and_frees_fragments() {
         .expect("ack");
 
     // Propagation runs in the background: wait for it to upload and clean up.
+    // Bounded generously (400 * 50ms = 20s): the wait covers a CPU-bound
+    // Reed-Solomon reassemble, which can take much longer than its own work
+    // under host CPU contention. The loop still exits immediately once the
+    // condition is met; the bound only matters on genuine failure.
     let mut propagated = false;
-    for _ in 0..50 {
+    for _ in 0..400 {
         if coordinator.metrics().snapshot().propagated == 1 {
             propagated = true;
             break;
