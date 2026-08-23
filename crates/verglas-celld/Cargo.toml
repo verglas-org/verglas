@@ -8,11 +8,18 @@ publish.workspace = true
 
 [dependencies]
 hex.workspace = true
+libc.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["process", "sync", "fs", "time", "net", "io-util", "signal", "macros", "rt-multi-thread"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[[bin]]
+name = "verglas-celld-test-worker"
+path = "tests/support/orchestration_worker.rs"
+test = false
+bench = false
 
 [lints]
 workspace = true

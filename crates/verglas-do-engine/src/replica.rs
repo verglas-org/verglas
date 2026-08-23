@@ -442,6 +442,103 @@ impl SqliteReplicaStore {
         Ok(pending)
     }
 
+    /// Propagates verified archive and checkpoint coverage under the active lease.
+    pub fn mark_coverage(
+        &self,
+        lease: &LeaseIdentity,
+        archived_through: u64,
+        checkpointed_through: u64,
+        checkpoint_identity: &str,
+    ) -> Result<()> {
+        if checkpoint_identity.is_empty() {
+            return Err(Error::ReplicaSequence(
+                "checkpoint identity cannot be empty".to_owned(),
+            ));
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let (generation, token_hash, applied, archived, checkpointed): (
+            i64,
+            Vec<u8>,
+            i64,
+            i64,
+            i64,
+        ) = transaction.query_row(
+            "SELECT lease_generation, lease_token_hash, applied_sequence,
+                        archive_sequence, checkpoint_sequence
+                 FROM replica_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )?;
+        let incoming_hash = lease.token_hash();
+        if lease.generation() != to_u64(generation)?
+            || token_hash.as_slice() != incoming_hash.as_slice()
+        {
+            return Err(Error::ReplicaConflict(
+                "replica coverage was fenced by another lease".to_owned(),
+            ));
+        }
+        let applied = to_u64(applied)?;
+        let archived = to_u64(archived)?;
+        let checkpointed = to_u64(checkpointed)?;
+        if archived_through < archived || archived_through > applied {
+            return Err(Error::ReplicaSequence(format!(
+                "archive coverage {archived_through} must be between {archived} and applied {applied}"
+            )));
+        }
+        if checkpointed_through < checkpointed || checkpointed_through > archived_through {
+            return Err(Error::ReplicaSequence(format!(
+                "checkpoint coverage {checkpointed_through} must be between {checkpointed} and archive {archived_through}"
+            )));
+        }
+        let uncovered = archived_through.saturating_sub(archived);
+        let committed: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM committed_transactions
+             WHERE commit_sequence > ?1 AND commit_sequence <= ?2",
+            params![to_i64(archived)?, to_i64(archived_through)?],
+            |row| row.get(0),
+        )?;
+        if to_u64(committed)? != uncovered {
+            return Err(Error::ReplicaSequence(
+                "archive coverage skips a missing transaction".to_owned(),
+            ));
+        }
+        if archived_through > archived {
+            transaction.execute(
+                "UPDATE committed_transactions
+                 SET archive_identity = ?1
+                 WHERE commit_sequence > ?2 AND commit_sequence <= ?3",
+                params![
+                    checkpoint_identity,
+                    to_i64(archived)?,
+                    to_i64(archived_through)?
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE replica_state SET archive_sequence = ?1 WHERE singleton = 1",
+                params![to_i64(archived_through)?],
+            )?;
+        }
+        if checkpointed_through > checkpointed {
+            transaction.execute(
+                "UPDATE replica_state
+                 SET checkpoint_sequence = ?1, checkpoint_identity = ?2
+                 WHERE singleton = 1",
+                params![to_i64(checkpointed_through)?, checkpoint_identity],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Advances the archive watermark by exactly one verified object.
     pub fn mark_archived(&self, sequence: u64, identity: &str) -> Result<()> {
         if identity.is_empty() {

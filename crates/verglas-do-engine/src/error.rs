@@ -50,6 +50,16 @@ pub enum Error {
     /// An object kind was configured with an incompatible durability capability.
     #[error("invalid object policy: {0}")]
     InvalidObjectPolicy(String),
+    /// A serializable transaction began before a conflicting committed sequence.
+    #[error(
+        "transaction conflict: serializable snapshot {base_commit_sequence} is behind applied sequence {current_commit_sequence}"
+    )]
+    TransactionConflict {
+        /// Sequence fixed when the transaction began.
+        base_commit_sequence: u64,
+        /// Sequence visible when commit validation ran.
+        current_commit_sequence: u64,
+    },
     /// A committed transaction conflicts with persisted replica identity or bytes.
     #[error("replica transaction conflict: {0}")]
     ReplicaConflict(String),

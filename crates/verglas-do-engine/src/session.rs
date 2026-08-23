@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use arrow_array::RecordBatch;
 use datafusion::prelude::SessionContext;
+use uuid::Uuid;
 
 use crate::error::Result;
 use crate::provider::{DoTableProvider, TransactionHandle};
@@ -25,7 +26,21 @@ impl DoSession {
         isolation: IsolationLevel,
     ) -> Result<Self> {
         let snapshot = SnapshotFence::at(engine.applied_sequence());
-        let transaction = TransactionHandle::new(engine.begin(isolation).await?);
+        Self::begin_at(engine, tables, isolation, snapshot).await
+    }
+
+    /// Implements BEGIN against a caller-supplied immutable snapshot fence.
+    pub async fn begin_at(
+        engine: Arc<DoEngine>,
+        tables: impl IntoIterator<Item = TableId>,
+        isolation: IsolationLevel,
+        snapshot: SnapshotFence,
+    ) -> Result<Self> {
+        let transaction = TransactionHandle::new(
+            engine
+                .begin_with_id_at(isolation, Uuid::new_v4(), snapshot)
+                .await?,
+        );
         let context = SessionContext::new();
         for table in tables {
             let provider = DoTableProvider::open_transactional(

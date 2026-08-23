@@ -6,7 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use crate::{
-    ChildSpec, HostSupervisor, ReplicaRole, SupervisorError, SuspendFence, WorkerDurability,
+    ChildSpec, HostSupervisor, ManagedCasConfig, ReplicaRole, SupervisorError, SuspendFence,
+    WorkerDurability,
 };
 
 const MAX_COMMAND_BYTES: usize = 8 * 1024;
@@ -145,6 +146,35 @@ impl ControlServer {
                     .map_err(|error| error.to_string())?;
                 Ok(descriptor.socket_path().display().to_string())
             }
+            "SPAWN_CAS_WORKER" if fields.len() == 15 => {
+                let token = decode_hex_string(fields[10], "lease token")?;
+                let lease_etag = decode_optional_hex(fields[13], "lease ETag")?;
+                let lease_version = decode_optional_hex(fields[14], "lease version")?;
+                let spec = ChildSpec::new(
+                    fields[1],
+                    parse_u64(fields[2], "replica id")?,
+                    ReplicaRole::Leader,
+                    parse_u64(fields[3], "applied sequence")?,
+                )
+                .map_err(|error| error.to_string())?
+                .with_durability(WorkerDurability::ManagedCas {
+                    store: ManagedCasConfig::new(
+                        fields[4], fields[5], fields[6], fields[7], fields[8], fields[9],
+                    ),
+                    lease_token: token,
+                    generation: parse_u64(fields[11], "lease generation")?,
+                    start_sequence: parse_u64(fields[12], "start sequence")?,
+                    lease_etag,
+                    lease_version,
+                })
+                .map_err(|error| error.to_string())?;
+                let descriptor = self
+                    .supervisor
+                    .spawn(spec)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(descriptor.socket_path().display().to_string())
+            }
             "SUSPEND" if fields.len() == 5 => {
                 self.supervisor
                     .suspend(
@@ -155,6 +185,13 @@ impl ControlServer {
                             parse_u64(fields[4], "checkpoint sequence")?,
                         ),
                     )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(String::new())
+            }
+            "SUSPEND_ORCHESTRATED" if fields.len() == 2 => {
+                self.supervisor
+                    .suspend_orchestrated(fields[1])
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(String::new())
@@ -206,6 +243,20 @@ impl Drop for ControlServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Decodes one required hexadecimal string field.
+fn decode_hex_string(value: &str, field: &str) -> Result<String, String> {
+    let bytes = hex::decode(value).map_err(|error| format!("invalid command: {field}: {error}"))?;
+    String::from_utf8(bytes).map_err(|error| format!("invalid command: {field}: {error}"))
+}
+
+/// Decodes an optional hexadecimal field represented by a dash.
+fn decode_optional_hex(value: &str, field: &str) -> Result<Option<String>, String> {
+    if value == "-" {
+        return Ok(None);
+    }
+    decode_hex_string(value, field).map(Some)
 }
 
 /// Parses one unsigned protocol field with a stable error message.

@@ -20,6 +20,26 @@ pub struct CheckpointReceipt {
 }
 
 impl CheckpointReceipt {
+    /// Creates a checkpoint receipt discovered in managed object storage.
+    pub fn new(
+        through_sequence: u64,
+        object_path: impl Into<String>,
+        sha256: impl Into<String>,
+    ) -> Result<Self> {
+        let object_path = object_path.into();
+        let sha256 = sha256.into();
+        if object_path.is_empty() || sha256.is_empty() {
+            return Err(Error::Materialization(
+                "checkpoint receipt identity cannot be empty".to_owned(),
+            ));
+        }
+        Ok(Self {
+            through_sequence,
+            object_path,
+            sha256,
+        })
+    }
+
     /// Returns the contiguous transaction sequence captured by SQLite.
     pub fn through_sequence(&self) -> u64 {
         self.through_sequence

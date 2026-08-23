@@ -40,6 +40,74 @@ impl MutationDomain {
     }
 }
 
+/// Relational operation represented by one canonical mutation batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MutationKind {
+    /// Appends rows to the current relational row set.
+    Insert,
+    /// Replaces the complete relational row set with this batch.
+    Replace,
+    /// Replaces rows sharing the first-column key and appends new keys.
+    Upsert,
+}
+
+impl MutationKind {
+    /// Returns the stable byte used by the canonical envelope encoding.
+    fn tag(self) -> u8 {
+        match self {
+            Self::Insert => 1,
+            Self::Replace => 2,
+            Self::Upsert => 3,
+        }
+    }
+
+    /// Decodes one canonical mutation-kind byte.
+    fn from_tag(tag: u8) -> Result<Self> {
+        match tag {
+            1 => Ok(Self::Insert),
+            2 => Ok(Self::Replace),
+            3 => Ok(Self::Upsert),
+            other => Err(Error::InvalidEnvelope(format!(
+                "unknown mutation kind tag {other}"
+            ))),
+        }
+    }
+}
+
+/// One durable SQL table declaration carried before its row mutations.
+#[derive(Debug, Clone)]
+pub struct SchemaChange {
+    table: TableId,
+    schema: arrow_schema::SchemaRef,
+}
+
+impl SchemaChange {
+    /// Creates a schema declaration for one table.
+    pub fn new(table: TableId, schema: arrow_schema::SchemaRef) -> Self {
+        Self { table, schema }
+    }
+
+    /// Returns the table declared by this change.
+    pub fn table(&self) -> &TableId {
+        &self.table
+    }
+
+    /// Returns the Arrow schema declared by this change.
+    pub fn schema(&self) -> &arrow_schema::SchemaRef {
+        &self.schema
+    }
+
+    /// Encodes the schema as a deterministic empty Arrow IPC stream.
+    fn ipc_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &self.schema)?;
+            writer.finish()?;
+        }
+        Ok(bytes)
+    }
+}
+
 /// Stable identity of one table inside a Durable Object.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableId(String);
@@ -59,19 +127,36 @@ impl TableId {
 /// One deterministic Arrow mutation batch in transaction statement order.
 #[derive(Debug, Clone)]
 pub struct MutationBatch {
+    kind: MutationKind,
     domain: MutationDomain,
     table: TableId,
     batch: RecordBatch,
 }
 
 impl MutationBatch {
-    /// Builds one domain-specific mutation batch.
+    /// Builds an INSERT mutation batch in one state domain.
     pub fn new(domain: MutationDomain, table: TableId, batch: RecordBatch) -> Self {
+        Self::with_kind(MutationKind::Insert, domain, table, batch)
+    }
+
+    /// Builds a mutation batch with an explicit relational operation kind.
+    pub fn with_kind(
+        kind: MutationKind,
+        domain: MutationDomain,
+        table: TableId,
+        batch: RecordBatch,
+    ) -> Self {
         Self {
+            kind,
             domain,
             table,
             batch,
         }
+    }
+
+    /// Returns the relational operation represented by this batch.
+    pub fn kind(&self) -> MutationKind {
+        self.kind
     }
 
     /// Returns the state domain updated by this batch.
@@ -108,6 +193,7 @@ pub struct TransactionEnvelope {
     transaction_id: Uuid,
     base_commit_sequence: u64,
     isolation: IsolationLevel,
+    schema_changes: Vec<SchemaChange>,
     mutations: Vec<MutationBatch>,
 }
 
@@ -124,6 +210,7 @@ impl TransactionEnvelope {
             transaction_id,
             base_commit_sequence,
             isolation,
+            schema_changes: Vec::new(),
             mutations: Vec::new(),
         }
     }
@@ -148,15 +235,36 @@ impl TransactionEnvelope {
         self.isolation
     }
 
+    /// Returns schema declarations in transaction order.
+    pub fn schema_changes(&self) -> &[SchemaChange] {
+        &self.schema_changes
+    }
+
     /// Returns transaction mutations in SQL statement order.
     pub fn mutations(&self) -> &[MutationBatch] {
         &self.mutations
     }
 
-    /// Appends one Arrow mutation without publishing it outside the transaction.
+    /// Appends one schema declaration before any row mutations.
+    pub fn append_schema_change(&mut self, table: TableId, schema: arrow_schema::SchemaRef) {
+        self.schema_changes.push(SchemaChange::new(table, schema));
+    }
+
+    /// Appends an INSERT Arrow mutation without publishing it outside the transaction.
     pub fn append(&mut self, domain: MutationDomain, table: TableId, batch: RecordBatch) {
+        self.append_with_kind(MutationKind::Insert, domain, table, batch);
+    }
+
+    /// Appends an explicitly typed Arrow mutation without publishing it outside the transaction.
+    pub fn append_with_kind(
+        &mut self,
+        kind: MutationKind,
+        domain: MutationDomain,
+        table: TableId,
+        batch: RecordBatch,
+    ) {
         self.mutations
-            .push(MutationBatch::new(domain, table, batch));
+            .push(MutationBatch::with_kind(kind, domain, table, batch));
     }
 
     /// Serializes the exact command hashed and proposed to consensus.
@@ -178,8 +286,16 @@ impl TransactionEnvelope {
         });
         output
             .get_mut()
+            .extend_from_slice(&(self.schema_changes.len() as u64).to_le_bytes());
+        for change in &self.schema_changes {
+            put_bytes(&mut output, change.table.as_str().as_bytes());
+            put_bytes(&mut output, &change.ipc_bytes()?);
+        }
+        output
+            .get_mut()
             .extend_from_slice(&(self.mutations.len() as u64).to_le_bytes());
         for mutation in &self.mutations {
+            output.get_mut().push(mutation.kind.tag());
             output.get_mut().push(mutation.domain.tag());
             put_bytes(&mut output, mutation.table.as_str().as_bytes());
             put_bytes(&mut output, &mutation.ipc_bytes()?);
@@ -206,10 +322,25 @@ impl TransactionEnvelope {
                 )));
             }
         };
+        let schema_count = usize::try_from(read_u64(&mut input)?)
+            .map_err(|_| Error::InvalidEnvelope("schema count exceeds memory".to_owned()))?;
+        let mut schema_changes = Vec::with_capacity(schema_count);
+        for _ in 0..schema_count {
+            let table = TableId::new(read_string(&mut input)?);
+            let ipc = read_bytes(&mut input)?;
+            let mut reader = StreamReader::try_new(Cursor::new(ipc), None)?;
+            if reader.next().is_some() {
+                return Err(Error::InvalidEnvelope(
+                    "schema IPC contains a row batch".to_owned(),
+                ));
+            }
+            schema_changes.push(SchemaChange::new(table, reader.schema()));
+        }
         let mutation_count = usize::try_from(read_u64(&mut input)?)
             .map_err(|_| Error::InvalidEnvelope("mutation count exceeds memory".to_owned()))?;
         let mut mutations = Vec::with_capacity(mutation_count);
         for _ in 0..mutation_count {
+            let kind = MutationKind::from_tag(read_u8(&mut input)?)?;
             let domain = match read_u8(&mut input)? {
                 1 => MutationDomain::Relational,
                 2 => MutationDomain::Vector,
@@ -231,7 +362,7 @@ impl TransactionEnvelope {
                     "mutation IPC contains more than one batch".to_owned(),
                 ));
             }
-            mutations.push(MutationBatch::new(domain, table, batch));
+            mutations.push(MutationBatch::with_kind(kind, domain, table, batch));
         }
         if input.position()
             != u64::try_from(bytes.len())
@@ -246,6 +377,7 @@ impl TransactionEnvelope {
             transaction_id,
             base_commit_sequence,
             isolation,
+            schema_changes,
             mutations,
         })
     }
@@ -340,6 +472,15 @@ pub trait DoTransaction: Send + Sync {
     /// Adds one deterministic Arrow batch to this transaction's private write set.
     fn append(&mut self, domain: MutationDomain, table: TableId, batch: RecordBatch) -> Result<()>;
 
+    /// Adds one explicitly typed Arrow mutation to the private write set.
+    fn append_with_kind(
+        &mut self,
+        kind: MutationKind,
+        domain: MutationDomain,
+        table: TableId,
+        batch: RecordBatch,
+    ) -> Result<()>;
+
     /// Returns the immutable command view used for validation and commit.
     fn envelope(&self) -> &TransactionEnvelope;
 }
@@ -359,7 +500,18 @@ impl EngineTransaction {
 impl DoTransaction for EngineTransaction {
     /// Appends one mutation to the private write set.
     fn append(&mut self, domain: MutationDomain, table: TableId, batch: RecordBatch) -> Result<()> {
-        self.envelope.append(domain, table, batch);
+        self.append_with_kind(MutationKind::Insert, domain, table, batch)
+    }
+
+    /// Appends one explicitly typed mutation to the private write set.
+    fn append_with_kind(
+        &mut self,
+        kind: MutationKind,
+        domain: MutationDomain,
+        table: TableId,
+        batch: RecordBatch,
+    ) -> Result<()> {
+        self.envelope.append_with_kind(kind, domain, table, batch);
         Ok(())
     }
 

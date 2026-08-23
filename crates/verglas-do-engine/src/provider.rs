@@ -1,26 +1,33 @@
-//! DataFusion table provider and INSERT sink over one DO transaction snapshot.
+//! DataFusion table provider and transactional DML over one DO snapshot.
 
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 
-use arrow_schema::SchemaRef;
+use arrow_array::{Array, ArrayRef, BooleanArray, RecordBatch, UInt64Array};
+use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::arrow::compute::kernels::zip::zip;
+use datafusion::arrow::compute::{and, concat_batches, filter_record_batch};
 use datafusion::catalog::{Session, TableProvider};
+use datafusion::common::DFSchema;
 use datafusion::datasource::MemTable;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::{Expr, TableType};
+use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+    SendableRecordBatchStream,
 };
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::storage::{DoEngine, DoStorage, Projection, SnapshotFence};
-use crate::transaction::{DoTransaction, MutationDomain, TableId};
+use crate::storage::{DoEngine, DoStorage, Projection, SnapshotFence, apply_relational_mutation};
+use crate::transaction::{DoTransaction, MutationBatch, MutationDomain, MutationKind, TableId};
 
 /// Shared private write set used by every provider in one SQL transaction.
 #[derive(Clone)]
@@ -36,17 +43,28 @@ impl TransactionHandle {
         }
     }
 
-    /// Appends a relational batch produced by one DataFusion DML plan.
-    async fn append(&self, table: TableId, batch: arrow_array::RecordBatch) -> Result<()> {
+    /// Appends a relational insert batch produced by one DataFusion DML plan.
+    async fn append(&self, table: TableId, batch: RecordBatch) -> Result<()> {
+        self.append_with_kind(MutationKind::Insert, table, batch)
+            .await
+    }
+
+    /// Appends a typed relational mutation to the private write set.
+    async fn append_with_kind(
+        &self,
+        kind: MutationKind,
+        table: TableId,
+        batch: RecordBatch,
+    ) -> Result<()> {
         let mut guard = self.transaction.lock().await;
         let transaction = guard
             .as_mut()
             .ok_or_else(|| Error::InvalidReceipt("transaction is already closed".to_owned()))?;
-        transaction.append(MutationDomain::Relational, table, batch)
+        transaction.append_with_kind(kind, MutationDomain::Relational, table, batch)
     }
 
-    /// Returns transaction-local relational batches for read-your-writes scans.
-    async fn relational_batches(&self, table: &TableId) -> Result<Vec<arrow_array::RecordBatch>> {
+    /// Returns transaction-local relational mutations for read-your-writes scans.
+    async fn relational_mutations(&self, table: &TableId) -> Result<Vec<MutationBatch>> {
         let guard = self.transaction.lock().await;
         let transaction = guard
             .as_ref()
@@ -58,7 +76,7 @@ impl TransactionHandle {
             .filter(|mutation| {
                 mutation.domain() == MutationDomain::Relational && mutation.table() == table
             })
-            .map(|mutation| mutation.batch().clone())
+            .cloned()
             .collect())
     }
 
@@ -87,7 +105,7 @@ impl DoTableProvider {
         Self::open_inner(engine, table, snapshot, None)
     }
 
-    /// Opens a provider whose INSERT plans append to one private write set.
+    /// Opens a provider whose DML plans append to one private write set.
     pub fn open_transactional(
         engine: Arc<DoEngine>,
         table: TableId,
@@ -112,6 +130,28 @@ impl DoTableProvider {
             schema,
             transaction,
         })
+    }
+
+    /// Materializes committed rows at the provider fence plus private mutations.
+    async fn visible_batches(&self) -> Result<Vec<RecordBatch>> {
+        let committed = self
+            .engine
+            .scan(
+                self.table.clone(),
+                self.snapshot,
+                Projection::all(),
+                Vec::new(),
+            )
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut visible = committed;
+        if let Some(transaction) = &self.transaction {
+            for mutation in transaction.relational_mutations(&self.table).await? {
+                apply_relational_mutation(&mut visible, mutation.kind(), mutation.batch())?;
+            }
+        }
+        Ok(visible)
     }
 }
 
@@ -147,26 +187,7 @@ impl TableProvider for DoTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let mut batches = self
-            .engine
-            .scan(
-                self.table.clone(),
-                self.snapshot,
-                Projection::all(),
-                Vec::new(),
-            )
-            .await
-            .map_err(external_error)?
-            .try_collect::<Vec<_>>()
-            .await?;
-        if let Some(transaction) = &self.transaction {
-            batches.extend(
-                transaction
-                    .relational_batches(&self.table)
-                    .await
-                    .map_err(external_error)?,
-            );
-        }
+        let batches = self.visible_batches().await.map_err(external_error)?;
         let memory = MemTable::try_new(self.schema.clone(), vec![batches])?;
         memory.scan(state, projection, filters, limit).await
     }
@@ -193,6 +214,151 @@ impl TableProvider for DoTableProvider {
         };
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
     }
+
+    /// Converts DELETE predicates into one private replacement mutation.
+    async fn delete_from(
+        &self,
+        state: &dyn Session,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let transaction = self.transaction.clone().ok_or_else(|| {
+            DataFusionError::Plan("DELETE requires an active Durable Object transaction".to_owned())
+        })?;
+        let batches = self.visible_batches().await.map_err(external_error)?;
+        let current = combine_batches(&self.schema, &batches)?;
+        let df_schema = DFSchema::try_from(self.schema.clone())?;
+        let mask =
+            evaluate_filters_to_mask(&filters, &current, &df_schema, state.execution_props())?;
+        let (remaining, deleted) = match mask {
+            Some(mask) => {
+                let deleted = mask.iter().filter(|value| *value == Some(true)).count();
+                let keep =
+                    BooleanArray::from_iter(mask.iter().map(|value| Some(value != Some(true))));
+                (filter_record_batch(&current, &keep)?, deleted as u64)
+            }
+            None => (
+                RecordBatch::new_empty(self.schema.clone()),
+                current.num_rows() as u64,
+            ),
+        };
+        transaction
+            .append_with_kind(MutationKind::Replace, self.table.clone(), remaining)
+            .await
+            .map_err(external_error)?;
+        Ok(Arc::new(DmlResultExec::new(deleted)))
+    }
+
+    /// Converts UPDATE assignments and predicates into one private replacement mutation.
+    async fn update(
+        &self,
+        state: &dyn Session,
+        assignments: Vec<(String, Expr)>,
+        filters: Vec<Expr>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let transaction = self.transaction.clone().ok_or_else(|| {
+            DataFusionError::Plan("UPDATE requires an active Durable Object transaction".to_owned())
+        })?;
+        let batches = self.visible_batches().await.map_err(external_error)?;
+        let current = combine_batches(&self.schema, &batches)?;
+        let df_schema = DFSchema::try_from(self.schema.clone())?;
+        let physical_assignments = assignments
+            .iter()
+            .map(|(name, expression)| {
+                if self.schema.field_with_name(name).is_err() {
+                    return Err(DataFusionError::Plan(format!(
+                        "UPDATE column '{name}' does not exist"
+                    )));
+                }
+                let physical =
+                    create_physical_expr(expression, &df_schema, state.execution_props())?;
+                Ok((name.clone(), physical))
+            })
+            .collect::<DataFusionResult<Vec<_>>>()?;
+        let mask =
+            evaluate_filters_to_mask(&filters, &current, &df_schema, state.execution_props())?;
+        let (updated, changed) =
+            update_batch(&current, &self.schema, &physical_assignments, mask.as_ref())?;
+        transaction
+            .append_with_kind(MutationKind::Replace, self.table.clone(), updated)
+            .await
+            .map_err(external_error)?;
+        Ok(Arc::new(DmlResultExec::new(changed)))
+    }
+}
+
+/// Combines visible batches into one batch for DataFusion expression evaluation.
+fn combine_batches(schema: &SchemaRef, batches: &[RecordBatch]) -> DataFusionResult<RecordBatch> {
+    if batches.is_empty() {
+        Ok(RecordBatch::new_empty(schema.clone()))
+    } else {
+        Ok(concat_batches(schema, batches.iter())?)
+    }
+}
+
+/// Evaluates all filter expressions into one SQL three-valued boolean mask.
+fn evaluate_filters_to_mask(
+    filters: &[Expr],
+    batch: &RecordBatch,
+    df_schema: &DFSchema,
+    execution_props: &datafusion::logical_expr::execution_props::ExecutionProps,
+) -> DataFusionResult<Option<BooleanArray>> {
+    if filters.is_empty() {
+        return Ok(None);
+    }
+    let mut combined_mask = None;
+    for filter_expr in filters {
+        let physical = create_physical_expr(filter_expr, df_schema, execution_props)?;
+        let array = physical.evaluate(batch)?.into_array(batch.num_rows())?;
+        let mask = array
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(
+                    "filter expression did not evaluate to boolean".to_owned(),
+                )
+            })?
+            .clone();
+        combined_mask = Some(match combined_mask {
+            Some(existing) => and(&existing, &mask)?,
+            None => mask,
+        });
+    }
+    Ok(combined_mask)
+}
+
+/// Applies physical assignments to matching rows and reports the affected count.
+fn update_batch(
+    batch: &RecordBatch,
+    schema: &SchemaRef,
+    assignments: &[(String, Arc<dyn PhysicalExpr>)],
+    mask: Option<&BooleanArray>,
+) -> DataFusionResult<(RecordBatch, u64)> {
+    let update_mask = mask
+        .cloned()
+        .unwrap_or_else(|| BooleanArray::from(vec![true; batch.num_rows()]));
+    let changed = update_mask
+        .iter()
+        .filter(|value| *value == Some(true))
+        .count() as u64;
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+    for field in schema.fields() {
+        let original = batch.column_by_name(field.name()).ok_or_else(|| {
+            DataFusionError::Internal(format!("column '{}' was not found", field.name()))
+        })?;
+        let new_column = if let Some((_, physical)) =
+            assignments.iter().find(|(name, _)| name == field.name())
+        {
+            let values = physical.evaluate_selection(batch, &update_mask)?;
+            let values = values.into_array(batch.num_rows())?;
+            let new_values: &dyn Array = values.as_ref();
+            let old_values: &dyn Array = original.as_ref();
+            zip(&update_mask, &new_values, &old_values)?
+        } else {
+            original.clone()
+        };
+        new_columns.push(new_column);
+    }
+    Ok((RecordBatch::try_new(schema.clone(), new_columns)?, changed))
 }
 
 /// DataFusion sink that appends every input batch to a private write set.
@@ -217,7 +383,7 @@ impl DisplayAs for TransactionSink {
     fn fmt_as(
         &self,
         _format: DisplayFormatType,
-        formatter: &mut Formatter<'_>,
+        formatter: &mut std::fmt::Formatter<'_>,
     ) -> std::fmt::Result {
         write!(formatter, "DoTransactionSink table={}", self.table.as_str())
     }
@@ -246,6 +412,98 @@ impl DataSink for TransactionSink {
                 .map_err(external_error)?;
         }
         Ok(rows)
+    }
+}
+
+/// Execution plan returning the count of rows affected by a private DML mutation.
+#[derive(Debug)]
+struct DmlResultExec {
+    rows_affected: u64,
+    schema: SchemaRef,
+    properties: Arc<PlanProperties>,
+}
+
+impl DmlResultExec {
+    /// Builds a one-row DML result with the affected-row count.
+    fn new(rows_affected: u64) -> Self {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "count",
+            DataType::UInt64,
+            false,
+        )]));
+        let properties = PlanProperties::new(
+            datafusion::physical_expr::EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        );
+        Self {
+            rows_affected,
+            schema,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for DmlResultExec {
+    /// Displays the affected-row count in a DataFusion physical plan.
+    fn fmt_as(
+        &self,
+        _format: DisplayFormatType,
+        formatter: &mut std::fmt::Formatter<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            formatter,
+            "DmlResultExec rows_affected={}",
+            self.rows_affected
+        )
+    }
+}
+
+impl ExecutionPlan for DmlResultExec {
+    /// Returns the stable plan name.
+    fn name(&self) -> &str {
+        "DmlResultExec"
+    }
+
+    /// Returns the one-column count schema.
+    fn schema(&self) -> SchemaRef {
+        self.schema.clone()
+    }
+
+    /// Returns the plan properties used by the DataFusion scheduler.
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    /// Returns no child plans because the DML has already staged its mutation.
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    /// Returns this terminal plan when DataFusion rewrites children.
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    /// Produces one Arrow count batch for the DML statement.
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> DataFusionResult<SendableRecordBatchStream> {
+        let count = UInt64Array::from(vec![self.rows_affected]);
+        let batch = RecordBatch::try_new(self.schema.clone(), vec![Arc::new(count)])?;
+        let stream = futures::stream::iter(vec![Ok(batch)]);
+        Ok(Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.schema.clone(),
+                stream,
+            ),
+        ))
     }
 }
 

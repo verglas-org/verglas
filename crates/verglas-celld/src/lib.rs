@@ -16,6 +16,6 @@ pub use placement::{
     ReplicaPlacement, ReplicaRole,
 };
 pub use supervisor::{
-    ChildCommand, ChildDescriptor, ChildSpec, ExitedChild, HostSupervisor, SupervisorError,
-    WorkerDurability,
+    ChildCommand, ChildDescriptor, ChildSpec, ExitedChild, HostSupervisor, ManagedCasConfig,
+    SupervisorError, WorkerDurability, WorkerResourceLimits,
 };

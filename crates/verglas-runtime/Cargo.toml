@@ -9,8 +9,10 @@ publish.workspace = true
 [dependencies]
 verglas-celld.workspace = true
 verglas-do-engine.workspace = true
+futures.workspace = true
 object_store.workspace = true
 tokio = { workspace = true, features = ["process", "sync", "net", "io-util", "fs", "time", "signal", "macros", "rt-multi-thread"] }
+uuid.workspace = true
 
 [dev-dependencies]
 arrow-array.workspace = true

@@ -26,6 +26,8 @@ impl SuspendFence {
 pub enum ChildState {
     /// Replica process is online in its current Raft role.
     Running(ReplicaRole),
+    /// Process is admitted to no new work while its durability fence is assembled.
+    Suspending(ReplicaRole),
     /// Process is stopped after a safe checkpoint and archive.
     Suspended,
     /// Process is restoring concurrently with its peer replicas.
@@ -86,6 +88,47 @@ impl ChildLifecycle {
     /// Returns the current process lifecycle state.
     pub fn state(self) -> ChildState {
         self.state
+    }
+
+    /// Fences admissions before the supervisor starts the asynchronous drain protocol.
+    pub fn begin_suspend(&mut self) -> Result<(), LifecycleError> {
+        let ChildState::Running(role) = self.state else {
+            return Err(LifecycleError::InvalidTransition);
+        };
+        self.state = ChildState::Suspending(role);
+        Ok(())
+    }
+
+    /// Rolls back an admission fence when orchestration cannot complete safely.
+    pub fn rollback_suspend(&mut self) -> Result<(), LifecycleError> {
+        let ChildState::Suspending(role) = self.state else {
+            return Err(LifecycleError::InvalidTransition);
+        };
+        self.state = ChildState::Running(role);
+        Ok(())
+    }
+
+    /// Completes a suspended transition after archive and checkpoint coverage is verified.
+    pub fn finish_suspend(&mut self, fence: SuspendFence) -> Result<(), LifecycleError> {
+        if !matches!(self.state, ChildState::Suspending(_)) {
+            return Err(LifecycleError::InvalidTransition);
+        }
+        let applied = self.applied.max(fence.applied);
+        if fence.archived < applied {
+            return Err(LifecycleError::Unarchived {
+                applied,
+                archived: fence.archived,
+            });
+        }
+        if fence.checkpointed < applied {
+            return Err(LifecycleError::Uncheckpointed {
+                applied,
+                checkpointed: fence.checkpointed,
+            });
+        }
+        self.applied = applied;
+        self.state = ChildState::Suspended;
+        Ok(())
     }
 
     /// Stops a running durable child only after archive and checkpoint cover it.

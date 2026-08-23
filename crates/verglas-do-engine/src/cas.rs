@@ -60,6 +60,26 @@ impl LeaseGrant {
         self.sequence
     }
 
+    /// Returns the opaque token carried by this held lease.
+    pub fn token(&self) -> &str {
+        self.identity.token()
+    }
+
+    /// Returns the monotonic generation carried by this held lease.
+    pub fn generation(&self) -> u64 {
+        self.identity.generation()
+    }
+
+    /// Returns the exact ETag required for the next conditional head update.
+    pub fn e_tag(&self) -> Option<&str> {
+        self.version.e_tag.as_deref()
+    }
+
+    /// Returns the exact object version required for the next conditional head update.
+    pub fn version(&self) -> Option<&str> {
+        self.version.version.as_deref()
+    }
+
     /// Creates a launcher grant from the successful conditional lock result.
     pub fn new(
         identity: LeaseIdentity,
@@ -208,6 +228,42 @@ impl CasCommitAuthority {
         })
     }
 
+    /// Verifies that the launcher grant still names the current managed head.
+    pub async fn validate_grant(&self) -> Result<()> {
+        let grant = self.lease_grant()?;
+        let path = head_path(&self.prefix, &self.do_id);
+        let metadata = self
+            .store
+            .head(&path)
+            .await
+            .map_err(|error| Error::Authority(format!("managed head read failed: {error}")))?;
+        if grant.version.e_tag.as_deref() != metadata.e_tag.as_deref()
+            || grant.version.version.as_deref() != metadata.version.as_deref()
+        {
+            return Err(Error::Authority(
+                "held lease version does not match the managed head".to_owned(),
+            ));
+        }
+        let bytes = self
+            .store
+            .get(&path)
+            .await
+            .map_err(|error| Error::Authority(format!("managed head read failed: {error}")))?
+            .bytes()
+            .await
+            .map_err(|error| Error::Authority(format!("managed head read failed: {error}")))?;
+        let decoded = decode_head(&bytes)?;
+        if decoded.generation != grant.identity.generation
+            || decoded.sequence != grant.sequence
+            || decoded.token_hash != grant.identity.token_hash()
+        {
+            return Err(Error::Authority(
+                "held lease identity does not match the managed head".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Returns a copy suitable for passing an already-held lock into one worker.
     pub fn lease_grant(&self) -> Result<LeaseGrant> {
         self.state
@@ -273,7 +329,7 @@ impl CommitAuthority for CasCommitAuthority {
             envelope.transaction_id(),
             payload_hash,
         );
-        let result = self
+        let result = match self
             .store
             .put_opts(
                 &head_path(&self.prefix, &self.do_id),
@@ -284,7 +340,23 @@ impl CommitAuthority for CasCommitAuthority {
                 },
             )
             .await
-            .map_err(|error| Error::Authority(format!("lease CAS failed: {error}")))?;
+        {
+            Ok(result) => result,
+            Err(error @ object_store::Error::Precondition { .. }) => {
+                discard_uncommitted_transaction(
+                    self.store.as_ref(),
+                    &transaction_path,
+                    &head_path(&self.prefix, &self.do_id),
+                    sequence,
+                    envelope.transaction_id(),
+                )
+                .await;
+                return Err(Error::Authority(format!("lease CAS failed: {error}")));
+            }
+            Err(error) => {
+                return Err(Error::Authority(format!("lease CAS failed: {error}")));
+            }
+        };
         verify_object(
             self.store.as_ref(),
             &head_path(&self.prefix, &self.do_id),
@@ -357,6 +429,29 @@ fn decode_head(bytes: &[u8]) -> Result<DecodedHead> {
         payload_hash,
         token_hash,
     })
+}
+
+/// Removes an immutable object only after a failed precondition proves it was not committed.
+async fn discard_uncommitted_transaction(
+    store: &dyn ObjectStore,
+    transaction_path: &Path,
+    head_path: &Path,
+    sequence: u64,
+    transaction_id: Uuid,
+) {
+    let committed = match store.get(head_path).await {
+        Ok(result) => match result.bytes().await {
+            Ok(bytes) => match decode_head(&bytes) {
+                Ok(head) => head.sequence == sequence && head.transaction_id == transaction_id,
+                Err(_) => false,
+            },
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if !committed {
+        let _ = store.delete(transaction_path).await;
+    }
 }
 
 /// Reads one just-written object back and verifies exact byte identity.

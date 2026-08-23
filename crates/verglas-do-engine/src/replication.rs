@@ -110,6 +110,26 @@ impl UnixReplicaSink {
         Ok(())
     }
 
+    /// Propagates managed archive and checkpoint coverage to the replica service.
+    pub async fn cover(
+        &self,
+        lease: &LeaseIdentity,
+        archived_through: u64,
+        checkpointed_through: u64,
+        checkpoint_identity: &str,
+    ) -> Result<()> {
+        self.request(format!(
+            "REPLICA_COVER {} {} {} {} {}\n",
+            lease.generation(),
+            hex::encode(lease.token()),
+            archived_through,
+            checkpointed_through,
+            hex::encode(checkpoint_identity),
+        ))
+        .await?;
+        Ok(())
+    }
+
     /// Executes one private replica command and strips its successful response framing.
     async fn request(&self, command: String) -> Result<String> {
         let mut stream = UnixStream::connect(&self.socket)

@@ -9587,6 +9587,7 @@ name = "verglas-celld"
 version = "0.2.0"
 dependencies = [
  "hex",
+ "libc",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -9666,8 +9667,11 @@ dependencies = [
  "datafusion",
  "futures",
  "hex",
+ "iceberg",
  "object_store 0.14.0",
+ "parquet 58.4.0",
  "rusqlite",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.18",
@@ -9785,6 +9789,7 @@ dependencies = [
  "arrow-schema 58.4.0",
  "axum",
  "chrono",
+ "futures",
  "hex",
  "object_store 0.14.0",
  "sha2 0.10.9",

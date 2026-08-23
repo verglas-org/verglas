@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
 
 use crate::{ChildLifecycle, ChildState, HostId, LifecycleError, ReplicaRole, SuspendFence};
@@ -33,6 +35,44 @@ impl ChildCommand {
     }
 }
 
+/// Explicit managed object-store connection fields for one CAS worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedCasConfig {
+    /// S3-compatible HTTP endpoint, including its scheme and authority.
+    pub endpoint: String,
+    /// Managed bucket containing the DO head and immutable objects.
+    pub bucket: String,
+    /// Verglas-owned object prefix within the managed bucket.
+    pub prefix: String,
+    /// AWS signing region used by the object-store client.
+    pub region: String,
+    /// Access key used to sign managed object requests.
+    pub access_key_id: String,
+    /// Secret key used to sign managed object requests.
+    pub secret_access_key: String,
+}
+
+impl ManagedCasConfig {
+    /// Creates one explicit managed object-store configuration.
+    pub fn new(
+        endpoint: impl Into<String>,
+        bucket: impl Into<String>,
+        prefix: impl Into<String>,
+        region: impl Into<String>,
+        access_key_id: impl Into<String>,
+        secret_access_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            bucket: bucket.into(),
+            prefix: prefix.into(),
+            region: region.into(),
+            access_key_id: access_key_id.into(),
+            secret_access_key: secret_access_key.into(),
+        }
+    }
+}
+
 /// Per-worker durability authority passed through without cloud composition logic.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkerDurability {
@@ -49,6 +89,63 @@ pub enum WorkerDurability {
         /// Managed compacted archive root; absent when offload is disabled.
         offload_dir: Option<PathBuf>,
     },
+    /// A lease-fenced managed S3 CAS head and immutable transaction stream.
+    ManagedCas {
+        /// Explicit managed object-store connection settings.
+        store: ManagedCasConfig,
+        /// Opaque ownership token held by the launcher.
+        lease_token: String,
+        /// Monotonic ownership generation held by the launcher.
+        generation: u64,
+        /// Sequence the worker must recover before binding.
+        start_sequence: u64,
+        /// ETag of the head version held by the launcher, when supplied.
+        lease_etag: Option<String>,
+        /// Version ID of the head version held by the launcher, when supplied.
+        lease_version: Option<String>,
+    },
+}
+
+/// Hard operating-system ceilings applied before a worker process runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorkerResourceLimits {
+    memory_ceiling_bytes: u64,
+    open_files_ceiling: u64,
+}
+
+impl WorkerResourceLimits {
+    /// Creates validated memory and descriptor ceilings for one child process.
+    pub fn new(
+        memory_ceiling_bytes: u64,
+        open_files_ceiling: u64,
+    ) -> Result<Self, SupervisorError> {
+        if memory_ceiling_bytes == 0 || open_files_ceiling < 3 {
+            return Err(SupervisorError::InvalidResourceLimits);
+        }
+        Ok(Self {
+            memory_ceiling_bytes,
+            open_files_ceiling,
+        })
+    }
+
+    /// Returns the address-space ceiling in bytes.
+    pub fn memory_ceiling_bytes(self) -> u64 {
+        self.memory_ceiling_bytes
+    }
+
+    /// Returns the maximum number of simultaneously open file descriptors.
+    pub fn open_files_ceiling(self) -> u64 {
+        self.open_files_ceiling
+    }
+}
+
+impl Default for WorkerResourceLimits {
+    fn default() -> Self {
+        Self {
+            memory_ceiling_bytes: 4 * 1024 * 1024 * 1024,
+            open_files_ceiling: 1024,
+        }
+    }
 }
 
 /// Durable identity and initial role of one host-local DO replica.
@@ -59,6 +156,7 @@ pub struct ChildSpec {
     role: ReplicaRole,
     applied: u64,
     durability: Option<WorkerDurability>,
+    resource_limits: WorkerResourceLimits,
 }
 
 impl ChildSpec {
@@ -85,6 +183,7 @@ impl ChildSpec {
             role,
             applied,
             durability: None,
+            resource_limits: WorkerResourceLimits::default(),
         })
     }
 
@@ -109,9 +208,42 @@ impl ChildSpec {
                 ));
             }
             WorkerDurability::Replica { .. } => {}
+            WorkerDurability::ManagedCas {
+                store,
+                lease_token,
+                lease_etag,
+                lease_version,
+                start_sequence,
+                ..
+            } if store.endpoint.is_empty()
+                || store.bucket.is_empty()
+                || store.region.is_empty()
+                || store.access_key_id.is_empty()
+                || store.secret_access_key.is_empty()
+                || lease_token.is_empty()
+                || (lease_etag.is_none() && lease_version.is_none())
+                || *start_sequence != self.applied =>
+            {
+                return Err(SupervisorError::InvalidDurability(
+                    "managed CAS requires store credentials, one held head version, and matching start sequence"
+                        .to_owned(),
+                ));
+            }
+            WorkerDurability::ManagedCas { .. } => {}
         }
         self.durability = Some(durability);
         Ok(self)
+    }
+
+    /// Applies validated hard resource ceilings to this child launch.
+    pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
+        self.resource_limits = resource_limits;
+        self
+    }
+
+    /// Returns the hard resource ceilings that will be applied at spawn.
+    pub fn resource_limits(&self) -> WorkerResourceLimits {
+        self.resource_limits
     }
 }
 
@@ -174,6 +306,9 @@ pub enum SupervisorError {
     /// Worker durability arguments violate the child role or recovery fence.
     #[error("invalid worker durability: {0}")]
     InvalidDurability(String),
+    /// Resource ceilings are zero or leave no descriptors for the worker runtime.
+    #[error("invalid worker resource limits")]
+    InvalidResourceLimits,
     /// This host already supervises the DO replica.
     #[error("Durable Object {0} is already supervised on this host")]
     Duplicate(String),
@@ -200,6 +335,9 @@ pub enum SupervisorError {
     /// The lifecycle fence forbids routing this request to the child.
     #[error("Durable Object {0} is not eligible for this route")]
     RouteFenced(String),
+    /// A coordinated drain, checkpoint, coverage, or clean command failed.
+    #[error("Durable Object orchestration failed: {0}")]
+    Orchestration(String),
 }
 
 struct ManagedChild {
@@ -207,6 +345,60 @@ struct ManagedChild {
     lifecycle: ChildLifecycle,
     process: Option<Child>,
     descriptor: ChildDescriptor,
+}
+
+/// Sends one bounded lifecycle command to a child endpoint.
+async fn endpoint_command(path: &Path, command: &str) -> Result<String, SupervisorError> {
+    let operation = async {
+        let mut stream = UnixStream::connect(path).await?;
+        stream.write_all(format!("{command}\n").as_bytes()).await?;
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).await?;
+        if response.is_empty() {
+            return Err(SupervisorError::Orchestration(format!(
+                "{command} returned no response"
+            )));
+        }
+        let response = response.trim_end_matches(['\r', '\n']);
+        if let Some(error) = response.strip_prefix("ERR ") {
+            return Err(SupervisorError::Orchestration(error.to_owned()));
+        }
+        if response == "OK" {
+            return Ok(String::new());
+        }
+        response
+            .strip_prefix("OK ")
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                SupervisorError::Orchestration(format!(
+                    "{command} returned malformed response {response}"
+                ))
+            })
+    };
+    tokio::time::timeout(Duration::from_secs(10), operation)
+        .await
+        .map_err(|_| SupervisorError::Orchestration(format!("{command} timed out")))?
+}
+
+/// Parses a nonnegative lifecycle sequence returned by a child command.
+fn command_sequence(command: &str, payload: &str) -> Result<u64, SupervisorError> {
+    payload.parse::<u64>().map_err(|_| {
+        SupervisorError::Orchestration(format!("{command} returned invalid sequence {payload}"))
+    })
+}
+
+/// Parses the worker or replica status watermark tuple.
+fn command_status(payload: &str, expected_role: &str) -> Result<(u64, u64, u64), SupervisorError> {
+    let fields = payload.split_ascii_whitespace().collect::<Vec<_>>();
+    if fields.len() != 4 || fields[0] != expected_role {
+        return Err(SupervisorError::Orchestration(format!(
+            "STATUS returned unexpected payload {payload}"
+        )));
+    }
+    let applied = command_sequence("STATUS applied", fields[1])?;
+    let archived = command_sequence("STATUS archived", fields[2])?;
+    let checkpointed = command_sequence("STATUS checkpointed", fields[3])?;
+    Ok((applied, archived, checkpointed))
 }
 
 /// One tenant host's registry of isolated single-Raft-group child processes.
@@ -264,6 +456,123 @@ impl HostSupervisor {
             let _ = process.wait().await?;
         }
         managed.lifecycle = lifecycle;
+        Ok(())
+    }
+
+    /// Drains, checkpoints, covers, cleans, and terminates one replica-backed worker.
+    pub async fn suspend_orchestrated(&mut self, do_id: &str) -> Result<(), SupervisorError> {
+        let (worker_socket, replica_socket, lease_generation, lease_token) = {
+            let managed = self
+                .children
+                .get_mut(do_id)
+                .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+            managed.lifecycle.begin_suspend()?;
+            let durability = managed.spec.durability.as_ref().ok_or_else(|| {
+                SupervisorError::InvalidDurability(
+                    "orchestrated suspension requires replica durability".to_owned(),
+                )
+            });
+            let durability = match durability {
+                Ok(durability) => durability,
+                Err(error) => {
+                    managed.lifecycle.rollback_suspend()?;
+                    return Err(error);
+                }
+            };
+            let WorkerDurability::Replica {
+                socket,
+                lease_token,
+                generation,
+                ..
+            } = durability
+            else {
+                managed.lifecycle.rollback_suspend()?;
+                return Err(SupervisorError::InvalidDurability(
+                    "orchestrated suspension requires replica durability".to_owned(),
+                ));
+            };
+            (
+                managed.descriptor.socket_path.clone(),
+                socket.clone(),
+                *generation,
+                lease_token.clone(),
+            )
+        };
+
+        let orchestration = async {
+            let drained =
+                command_sequence("DRAIN", &endpoint_command(&worker_socket, "DRAIN").await?)?;
+            let checkpointed = command_sequence(
+                "CHECKPOINT",
+                &endpoint_command(&worker_socket, "CHECKPOINT").await?,
+            )?;
+            let (applied, archived, worker_checkpointed) =
+                command_status(&endpoint_command(&worker_socket, "STATUS").await?, "worker")?;
+            if drained != archived || checkpointed != worker_checkpointed {
+                return Err(SupervisorError::Orchestration(
+                    "worker status did not confirm drain and checkpoint coverage".to_owned(),
+                ));
+            }
+            if archived < applied || worker_checkpointed < applied {
+                return Err(SupervisorError::Orchestration(
+                    "worker checkpoint coverage is behind applied state".to_owned(),
+                ));
+            }
+            let token = hex::encode(lease_token.as_bytes());
+            let identity = hex::encode(format!("checkpoint/{checkpointed}").as_bytes());
+            endpoint_command(
+                &replica_socket,
+                &format!(
+                    "REPLICA_COVER {lease_generation} {token} {archived} {checkpointed} {identity}"
+                ),
+            )
+            .await?;
+            let (_, replica_archived, replica_checkpointed) = command_status(
+                &endpoint_command(&replica_socket, "STATUS").await?,
+                "replica",
+            )?;
+            if replica_archived < archived || replica_checkpointed < checkpointed {
+                return Err(SupervisorError::Orchestration(
+                    "replica did not record complete checkpoint coverage".to_owned(),
+                ));
+            }
+            endpoint_command(
+                &replica_socket,
+                &format!("REPLICA_CLEAN {lease_generation} {token} {checkpointed}"),
+            )
+            .await?;
+            Ok(SuspendFence::new(applied, archived, checkpointed))
+        }
+        .await;
+
+        let fence = match orchestration {
+            Ok(fence) => fence,
+            Err(error) => {
+                let managed = self
+                    .children
+                    .get_mut(do_id)
+                    .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+                managed.lifecycle.rollback_suspend()?;
+                return Err(error);
+            }
+        };
+        let mut process = {
+            let managed = self
+                .children
+                .get_mut(do_id)
+                .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+            match managed.lifecycle.finish_suspend(fence) {
+                Ok(()) => managed.process.take(),
+                Err(error) => {
+                    managed.lifecycle.rollback_suspend()?;
+                    return Err(error.into());
+                }
+            }
+        };
+        if let Some(process) = process.as_mut() {
+            process.kill().await?;
+            let _ = process.wait().await?;
+        }
         Ok(())
     }
 
@@ -393,6 +702,39 @@ impl HostSupervisor {
         Ok(())
     }
 
+    /// Applies one hard soft-and-hard Unix resource limit in the pre-exec child.
+    fn set_child_limit(resource: libc::c_int, ceiling: u64) -> std::io::Result<()> {
+        let mut current = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if unsafe { libc::getrlimit(resource, &mut current) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let ceiling = ceiling as libc::rlim_t;
+        if current.rlim_max != libc::RLIM_INFINITY && ceiling > current.rlim_max {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "worker resource ceiling exceeds inherited hard limit",
+            ));
+        }
+        let soft_limit = libc::rlimit {
+            rlim_cur: ceiling,
+            rlim_max: current.rlim_max,
+        };
+        if unsafe { libc::setrlimit(resource, &soft_limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let hard_limit = libc::rlimit {
+            rlim_cur: ceiling,
+            rlim_max: ceiling,
+        };
+        if unsafe { libc::setrlimit(resource, &hard_limit) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Creates isolated paths and starts one configured child process.
     async fn launch(&self, spec: &ChildSpec) -> Result<(Child, ChildDescriptor), SupervisorError> {
         let data_dir = self
@@ -449,6 +791,52 @@ impl HostSupervisor {
                 command.arg("--offload-dir").arg(offload_dir);
             }
         }
+        if let Some(WorkerDurability::ManagedCas {
+            store,
+            lease_token,
+            generation,
+            start_sequence,
+            lease_etag,
+            lease_version,
+        }) = &spec.durability
+        {
+            command
+                .arg("--cas-endpoint")
+                .arg(&store.endpoint)
+                .arg("--cas-bucket")
+                .arg(&store.bucket)
+                .arg("--cas-prefix")
+                .arg(&store.prefix)
+                .arg("--cas-region")
+                .arg(&store.region)
+                .arg("--cas-access-key-id")
+                .arg(&store.access_key_id)
+                .arg("--cas-secret-access-key")
+                .arg(&store.secret_access_key)
+                .arg("--lease-token")
+                .arg(lease_token)
+                .arg("--lease-generation")
+                .arg(generation.to_string())
+                .arg("--start-sequence")
+                .arg(start_sequence.to_string());
+            if let Some(lease_etag) = lease_etag {
+                command.arg("--lease-etag").arg(lease_etag);
+            }
+            if let Some(lease_version) = lease_version {
+                command.arg("--lease-version").arg(lease_version);
+            }
+        }
+        let limits = spec.resource_limits;
+        // Extension point: move these ceilings into the future WASM/microVM runtime.
+        unsafe {
+            command.pre_exec(move || {
+                #[cfg(not(target_os = "macos"))]
+                Self::set_child_limit(libc::RLIMIT_AS, limits.memory_ceiling_bytes)?;
+                // macOS rejects lowering its inherited unlimited memory rlimits;
+                // its future microVM boundary is the memory-enforcement extension point.
+                Self::set_child_limit(libc::RLIMIT_NOFILE, limits.open_files_ceiling)
+            });
+        }
         let mut process = command.spawn()?;
         if let Some(status) = process.try_wait()? {
             return Err(SupervisorError::Exited {
@@ -459,7 +847,7 @@ impl HostSupervisor {
         let pid = process.id().ok_or_else(|| {
             SupervisorError::Io(std::io::Error::other("spawned process has no pid"))
         })?;
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(status) = process.try_wait()? {
                 return Err(SupervisorError::Exited {

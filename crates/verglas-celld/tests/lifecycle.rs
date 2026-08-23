@@ -22,6 +22,17 @@ fn durable_child_stops_only_after_archive_and_checkpoint_cover_applied_state() {
 }
 
 #[test]
+fn admission_fence_rolls_back_without_changing_replica_role() {
+    let mut child = ChildLifecycle::running(ReplicaRole::Follower, 8);
+    child.begin_suspend().expect("begin suspension");
+    assert_eq!(child.state(), ChildState::Suspending(ReplicaRole::Follower));
+    assert!(!child.may_serve_snapshot(8));
+    child.rollback_suspend().expect("rollback suspension");
+    assert_eq!(child.state(), ChildState::Running(ReplicaRole::Follower));
+    assert!(child.may_serve_snapshot(8));
+}
+
+#[test]
 fn restore_must_reach_the_requested_fence_before_events_run() {
     let mut child = ChildLifecycle::running(ReplicaRole::Follower, 8);
     child
