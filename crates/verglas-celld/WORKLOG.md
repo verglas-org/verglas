@@ -18,3 +18,6 @@ Append-only log of changes to this crate, by issue.
 - #171: Extended the supervised-child readiness ceiling to thirty seconds so real process acceptance remains deterministic under cold workspace builds and concurrent test startup.
 - #171: Added structured per-worker memory and descriptor ceilings with Unix pre-exec `setrlimit` enforcement, sane defaults, and a dependency-free diagnostic acceptance test. The limit application is marked as the extension point that will move into the future WASM/microVM runtime.
 - #171: Kept Darwin worker startup safe because its kernel rejects lowering inherited unlimited address-space/data rlimits; Linux and other supported Unix workers enforce the configured memory ceiling, while every Unix worker enforces the descriptor ceiling.
+- #171: Fixed Linux compilation of the worker rlimit enforcement: setrlimit resource
+  selectors are u32 (__rlimit_resource_t) on Linux but c_int on macOS, so the
+  pre-exec helper now takes a per-platform RlimitResource alias.

@@ -12,6 +12,13 @@ use tokio::process::{Child, Command};
 
 use crate::{ChildLifecycle, ChildState, HostId, LifecycleError, ReplicaRole, SuspendFence};
 
+/// Platform type of a `setrlimit` resource selector: `u32` on Linux, `c_int` elsewhere.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+/// Platform type of a `setrlimit` resource selector: `u32` on Linux, `c_int` elsewhere.
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
 /// Executable and fixed arguments used to launch every `verglasd` child.
 #[derive(Debug, Clone)]
 pub struct ChildCommand {
@@ -703,7 +710,7 @@ impl HostSupervisor {
     }
 
     /// Applies one hard soft-and-hard Unix resource limit in the pre-exec child.
-    fn set_child_limit(resource: libc::c_int, ceiling: u64) -> std::io::Result<()> {
+    fn set_child_limit(resource: RlimitResource, ceiling: u64) -> std::io::Result<()> {
         let mut current = libc::rlimit {
             rlim_cur: 0,
             rlim_max: 0,
