@@ -21,3 +21,5 @@ Append-only log of changes to this crate, by issue.
 - #171: Fixed Linux compilation of the worker rlimit enforcement: setrlimit resource
   selectors are u32 (__rlimit_resource_t) on Linux but c_int on macOS, so the
   pre-exec helper now takes a per-platform RlimitResource alias.
+- #171: Applied the same per-platform RlimitResource alias to the test helper's
+  getrlimit diagnostics so the worker binary also compiles on Linux.

@@ -103,8 +103,15 @@ fn serve(
     Ok(())
 }
 
+/// Platform type of a `getrlimit` resource selector: `u32` on Linux, `c_int` elsewhere.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+/// Platform type of a `getrlimit` resource selector: `u32` on Linux, `c_int` elsewhere.
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
 /// Reads one current resource ceiling from the child process.
-fn current_limit(resource: libc::c_int) -> io::Result<u64> {
+fn current_limit(resource: RlimitResource) -> io::Result<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
