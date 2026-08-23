@@ -19,8 +19,9 @@ describe("native semantic clients", () => {
       "queryVectors", "tagResource", "untagResource",
     ]));
     expect(Object.getOwnPropertyNames(VerglasGraphsClient.prototype).sort()).toEqual(expect.arrayContaining([
-      "buildGraphIndex", "createGraph", "deleteGraph", "getGraph", "getNeighbors",
-      "listGraphs", "putEdges", "putNodes", "queryKHop", "queryNeighborhood", "queryPaths",
+      "addEdges", "addNodes", "buildIndex", "createGraph", "deleteGraph", "describeGraph",
+      "listGraphs", "retrieveNeighbors", "searchKHop", "searchNeighborhood", "searchPaths",
+      "searchPrecedents",
     ]));
   });
 

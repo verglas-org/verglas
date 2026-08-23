@@ -61,3 +61,6 @@
   (only used by the deleted admin query) came out of `http.ts` too.
 - #137: Regenerated the TypeScript Graph DTO and client operation names to match the conventional Graph REST-JSON vocabulary.
 
+- #171 (CI repair): Added the missing SearchPrecedents operation (types + client method)
+  and corrected the semantic export test to the model-derived operation list; the old
+  list named operations that never existed in the checked-in model.
