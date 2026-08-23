@@ -27,4 +27,5 @@
 - Iceberg 0.10.1: `CompressionCodec::Zstd` became `Zstd(level)`; the
   adjacency Puffin write uses `CompressionCodec::zstd_default()`.
 - #137: Updated graph engine contract comments to refer to the Graph API's AddNodes operation while preserving the append-only, last-write-wins node semantics.
+- #171: Added provider-neutral in-memory Puffin framing for live DO adjacency. The helper writes and reads the existing `verglas-graph-adjacency-v1` CSR blob through Iceberg's real Puffin implementation so asynchronous publishers can stage verified bytes before attaching statistics metadata.
 

@@ -1,0 +1,32 @@
+[package]
+name = "verglas-do-engine"
+description = "DataFusion-backed Durable Object transaction and query engine"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+verglas-vector.workspace = true
+verglas-graph.workspace = true
+async-trait.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+arrow-ipc.workspace = true
+bytes.workspace = true
+datafusion.workspace = true
+futures.workspace = true
+hex.workspace = true
+object_store.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "net", "io-util", "fs", "time", "signal", "macros", "rt-multi-thread"] }
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

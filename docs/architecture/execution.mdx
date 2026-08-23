@@ -1,16 +1,40 @@
 ---
 title: "Engine roles"
-description: "Deploy the cache node with optional catalog observation and WAL durability."
+description: "Run embedded Durable Object SQL while Verglas consensus remains commit authority."
 icon: "server"
 ---
 
-Verglas exposes the cache node as its public engine process. Its reusable
-components remain libraries, not separately deployed query or write products.
+Verglas exposes `verglas-cache-node` as its public engine process and keeps its
+query, transaction, vector, graph, and offload components reusable as libraries.
+A deployment may embed those libraries in another Rust process, but it must use
+the same consensus contract.
 
-`verglas-cache-node` owns the S3 protocol, S3 Vectors and Graph REST-JSON
-surfaces, cache tiers, catalog observation, ring traffic, block devices, and
-WAL ingress. It never schedules user code or provides hosted tenant control.
+`verglas-cache-node` owns the S3 protocol, cache tiers, catalog observation,
+ring traffic, block devices, WAL ingress, and managed Durable Object ingress. It
+never schedules hosted user code or provides tenant-control functions.
 
-Iceberg engines use the catalog REST endpoint and the cache-node S3 listener.
-The `verglas-writeback` library retains the erasure-coded write-back protocol;
-it is linked into engine components rather than published as a node product.
+## Durable Object execution
+
+A managed Durable Object uses Apache DataFusion for SQL planning and execution.
+Verglas supplies `DoTableProvider`, explicit snapshot fences, transaction-local
+write sets, MVCC state, constraints, and persistence. DataFusion is never a
+commit authority and its DML plans never publish files directly.
+
+Every relational, vector, graph, and schema change in one SQL transaction is
+encoded as one deterministic Arrow transaction envelope. The isolated worker's
+configured authority assigns its commit sequence. Default mode acknowledges only
+after immutable-object verification and a lease-fenced S3 head CAS; optional
+replica mode requires three of five durable endpoint replies. All live projections
+apply that sequence atomically.
+
+The object-store and Iceberg paths are asynchronous projections of committed DO
+state. Their failure may create lag and backpressure but cannot roll back or
+replace a committed transaction. See [Durable Objects](/docs/architecture/durable-objects)
+for the complete storage and index contract.
+
+## External engines
+
+Independent Iceberg engines still use the catalog REST endpoint and S3 listener.
+Customer-owned bindings remain externally authoritative and Verglas never
+publishes autonomous data or index changes to them. The managed DO path applies
+only where Verglas owns the bucket layout and every read routes through Verglas.

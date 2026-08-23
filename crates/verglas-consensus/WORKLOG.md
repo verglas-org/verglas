@@ -269,3 +269,5 @@
   `PayloadStoreFactory`; the eager constructor path no longer exists. Group
   construction now leaves invalid payload geometry dormant until an external
   payload operation actually needs the store.
+- #171: Added a distinct `DoTransaction` coded-Raft command family and a persisted logical per-DO commit sequence independent of membership and repair log entries. Exact retries recover their original sequence, subsequent transactions advance it once, and an 8 KiB acceptance test proves large canonical envelopes use a reconstructable coded payload certificate.
+- #171: Removed the DO-specific Raft command, sequence state, and acceptance tests after the runtime contract changed to one isolated leader worker with lease-fenced S3 CAS or optional three-of-five replica persistence. Consensus remains the authority for catalog and WAL groups, but Durable Objects no longer carry an unused compatibility path through it.
