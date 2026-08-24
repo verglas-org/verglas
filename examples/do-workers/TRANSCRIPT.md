@@ -21,18 +21,26 @@ $ sdks/worker-py/.venv/bin/componentize-py --version
 componentize-py 0.25.0
 ```
 
-Build commands and digests:
+Build commands and digest checks:
 
 ```text
 $ rm -rf /tmp/verglas-do-poc && mkdir -p /tmp/verglas-do-poc/js-build /tmp/verglas-do-poc/py-build
-$ node sdks/worker-js/bin/build.mjs examples/do-workers/js-counter --out /tmp/verglas-do-poc/js-build
-2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791
-$ sdks/worker-py/.venv/bin/python sdks/worker-py/build.py examples/do-workers/py-counter --out /tmp/verglas-do-poc/py-build
-5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860
+$ node sdks/worker-js/bin/build.mjs examples/do-workers/js-counter --out /tmp/verglas-do-poc/js-build --gateway examples/do-workers/js-counter/gateway.json
+<js digest printed by this build>
+$ sdks/worker-py/.venv/bin/python sdks/worker-py/build.py examples/do-workers/py-counter --out /tmp/verglas-do-poc/py-build --gateway examples/do-workers/py-counter/gateway.json
+<python digest printed by this build>
 $ sha256sum /tmp/verglas-do-poc/js-build/*.wasm /tmp/verglas-do-poc/py-build/*.wasm
-2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791  .../js-build/2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791.wasm
-5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860  .../py-build/5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860.wasm
+$ jq -r '.component_digest, .component_dir' examples/do-workers/js-counter/gateway.json
+$ jq -r '.component_digest, .component_dir' examples/do-workers/py-counter/gateway.json
+$ test -f /tmp/verglas-do-poc/js-build/$(jq -r .component_digest examples/do-workers/js-counter/gateway.json).wasm
+$ test -f /tmp/verglas-do-poc/py-build/$(jq -r .component_digest examples/do-workers/py-counter/gateway.json).wasm
 ```
+
+The builders update the checked-in gateway manifests, including their artifact
+directories, so every replay uses the bytes produced by that invocation. ComponentizeJS
+and componentize-py can emit nondeterministic bytes; the digest values recorded
+in this transcript are historical evidence only, not pinned expectations. Use
+one persistent `/tmp/verglas-do-poc` root through each stop/restart sequence.
 
 The gateway manifests are `examples/do-workers/js-counter/gateway.json` and
 `examples/do-workers/py-counter/gateway.json`. Each contains the Wrangler
@@ -102,7 +110,9 @@ Worker, so a restart does not falsely require sequence zero.
 
 ## JS counter: `js-counter`
 
-Digest: `2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791`
+The digest printed by the replay build is authoritative; the historical
+transcript value below is evidence from one nondeterministic build:
+`2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791`.
 
 Start the whole stack with one persistent root:
 
@@ -199,7 +209,9 @@ wait "$CELLD_PID" "$GATEWAY_PID" 2>/dev/null || true
 
 ## Python counter: `py-counter`
 
-Digest: `5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860`
+The digest printed by the replay build is authoritative; the historical
+transcript value below is evidence from one nondeterministic build:
+`5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860`.
 
 Start commands (same gateway port, new persistent root):
 
@@ -277,6 +289,7 @@ The state was replayed from the committed SQLite/replica log in the same root.
 ```sh
 kill -INT "$CELLD_PID"; kill -TERM "$GATEWAY_PID"
 wait "$CELLD_PID" "$GATEWAY_PID" 2>/dev/null || true
+# Remove /tmp/verglas-do-poc only after replay checks are complete.
 ```
 
 ## Verification commands
@@ -288,25 +301,31 @@ $ cargo fmt --all --check
 $ cargo build -p verglas-celld -p verglas-gateway -p verglas-do-engine -p verglas-runtime
 Finished `dev` profile [unoptimized + debuginfo]
 $ cargo test -p verglas-celld
-6/5/3/3/3/6 integration tests passed (including the slow-start and paired-spawn regressions)
-$ cargo test -p verglas-gateway
-5 gateway tests and 6 manifest tests passed
+29 integration tests passed (including slow-start, paired-spawn, CAS, orchestration, and resource-limit regressions)
+$ cargo test -p verglas-gateway -- --test-threads=1
+6 protocol tests, 8 manifest tests, and 1 real-stack AC1 test passed
 $ cargo test -p verglas-do-engine -- --test-threads=1
 All engine targets passed, including `sql_create_table_registers_native_schema`
 $ cargo test -p verglas-runtime -- --test-threads=1
 All runtime targets passed, including real celld acceptance and event tests
+
+The gateway AC1 test is intentionally unignored. It requires the checked-out
+`target/debug/celld-host`, `target/debug/verglasd`, and `node`/the JS SDK build
+tooling; a cold component instantiation took about 90 seconds in this run.
 $ cargo clippy -p verglas-celld --all-targets -- -D warnings
 Finished
 $ cargo clippy -p verglas-gateway --all-targets -- -D warnings
 Finished
 $ cargo clippy -p verglas-do-engine --all-targets -- -D warnings
 Finished
+$ cargo clippy -p verglas-do-wasm --all-targets -- -D warnings
+Finished
 $ cargo clippy -p verglas-runtime --all-targets -- -D warnings
 Finished
 $ npm test                         # from sdks/worker-js
-9 passed
+10 passed
 $ python3 -m unittest discover -s sdks/worker-py/tests -v
-9 tests, OK
+10 tests, OK
 ```
 
 The first parallel/default DO-engine run hit the command's 300-second harness

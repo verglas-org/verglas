@@ -10,7 +10,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from build import ManifestError, load_manifest, parse_jsonc  # noqa: E402
+from build import (  # noqa: E402
+    ManifestError,
+    _update_gateway_manifest,
+    load_manifest,
+    parse_jsonc,
+)
 
 
 class ManifestTests(unittest.TestCase):
@@ -83,6 +88,30 @@ class ManifestTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ManifestError, "class_name"):
             load_manifest(self.project)
+
+    def test_gateway_manifest_tracks_digest_and_output_directory(self) -> None:
+        """A checked-in gateway points at the bytes emitted by the builder."""
+        gateway = self.project / "gateway.json"
+        gateway.write_text(
+            json.dumps(
+                {
+                    "name": "counter",
+                    "main": "counter.py",
+                    "component_digest": "0" * 64,
+                    "component_dir": "/stale/output",
+                    "data_root": "/persistent/data",
+                }
+            ),
+            encoding="utf-8",
+        )
+        output = self.project / "out"
+        output.mkdir()
+        digest = "a" * 64
+        _update_gateway_manifest(gateway, output, digest)
+        updated = json.loads(gateway.read_text(encoding="utf-8"))
+        self.assertEqual(updated["component_digest"], digest)
+        self.assertEqual(updated["component_dir"], str(output))
+        self.assertEqual(updated["data_root"], "/persistent/data")
 
 
 if __name__ == "__main__":

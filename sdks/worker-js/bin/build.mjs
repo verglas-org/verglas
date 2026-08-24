@@ -56,17 +56,49 @@ function run(command, args, options) {
 /**
  * Parses the build CLI arguments.
  * @param {string[]} args
- * @returns {{projectDir: string, outputDir: string}}
+ * @returns {{projectDir: string, outputDir: string, gatewayPath: string}}
  */
 function parseArguments(args) {
   if (args.length < 3) {
-    throw new Error('usage: node sdks/worker-js/bin/build.mjs <project-dir> --out <dir>');
+    throw new Error('usage: node sdks/worker-js/bin/build.mjs <project-dir> --out <dir> [--gateway <path>]');
   }
   const projectDir = resolve(args[0]);
-  if (args[1] !== '--out' || !args[2] || args.length !== 3) {
-    throw new Error('usage: node sdks/worker-js/bin/build.mjs <project-dir> --out <dir>');
+  if (args[1] !== '--out' || !args[2] || (args.length !== 3 && args.length !== 5) || (args.length === 5 && args[3] !== '--gateway')) {
+    throw new Error('usage: node sdks/worker-js/bin/build.mjs <project-dir> --out <dir> [--gateway <path>]');
   }
-  return { projectDir, outputDir: resolve(args[2]) };
+  return {
+    projectDir,
+    outputDir: resolve(args[2]),
+    gatewayPath: resolve(args.length === 5 ? args[4] : join(projectDir, 'gateway.json')),
+  };
+}
+
+/**
+ * Updates a checked-in gateway manifest when the project owns one.
+ * @param {string} gatewayPath
+ * @param {string} outputDir
+ * @param {string} componentDigest
+ * @returns {Promise<void>}
+ */
+async function updateGatewayManifest(gatewayPath, outputDir, componentDigest) {
+  let source;
+  try {
+    source = await readFile(gatewayPath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      return;
+    }
+    throw error;
+  }
+  const manifest = JSON.parse(source);
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    throw new Error(`gateway manifest ${gatewayPath} must contain a JSON object`);
+  }
+  manifest.component_digest = componentDigest;
+  if (Object.hasOwn(manifest, 'component_dir')) {
+    manifest.component_dir = resolve(outputDir);
+  }
+  await writeFile(gatewayPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 }
 
 /**
@@ -82,9 +114,10 @@ function importPath(path) {
  * Bundles and componentizes one wrangler-style project.
  * @param {string} projectDir
  * @param {string} outputDir
+ * @param {string} [gatewayPath]
  * @returns {Promise<{name: string, componentDigest: string, componentPath: string, manifestPath: string, componentBytes: Uint8Array, bindings: Array<{name: string, class_name: string}>}>}
  */
-export async function buildProject(projectDir, outputDir) {
+export async function buildProject(projectDir, outputDir, gatewayPath = join(projectDir, 'gateway.json')) {
   const manifest = await readWranglerManifest(projectDir);
   const mainPath = resolve(projectDir, manifest.main);
   const workDir = await mkdtemp(join(tmpdir(), 'verglas-worker-js-'));
@@ -149,6 +182,7 @@ export async function buildProject(projectDir, outputDir) {
     };
     const manifestPath = join(outputDir, 'manifest.out.json');
     await writeFile(manifestPath, `${JSON.stringify(outputManifest, null, 2)}\n`, 'utf8');
+    await updateGatewayManifest(gatewayPath, outputDir, componentDigest);
 
     return {
       name: manifest.name,

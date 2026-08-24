@@ -27,7 +27,7 @@ componentize-py -d crates/verglas-do-wasm/wit -w durable-object \
 The build entry point is:
 
 ```sh
-python sdks/worker-py/build.py <project-dir> --out <output-dir>
+python sdks/worker-py/build.py <project-dir> --out <output-dir> [--gateway <gateway.json>]
 ```
 
 It invokes the pinned executable as:
@@ -40,7 +40,9 @@ The temporary entry imports the project's `.py` main module and exposes the
 shim's generated `Handler`. `--stub-wasi` removes component imports for the
 Python runtime's ambient WASI facilities; the v0 host grants only the Verglas
 storage and sockets interfaces. The output directory receives
-`<lowercase-sha256>.wasm` and `manifest.out.json`:
+`<lowercase-sha256>.wasm` and `manifest.out.json`. If the project directory
+contains `gateway.json`, the builder updates its `component_digest` and
+`component_dir`; use `--gateway` to select another manifest:
 
 ```json
 {
@@ -132,6 +134,7 @@ python sdks/worker-py/build.py <project-dir> --out /tmp/build-a
 python sdks/worker-py/build.py <project-dir> --out /tmp/build-b
 ```
 
-The two unchanged builds should produce the same digest and bytes. This proves
-component construction and content addressing only; it is not an end-to-end
-`verglasd` execution test.
+Each output is content-addressed: its filename and `component_digest` must equal
+the SHA-256 of that output's own bytes. `componentize-py` may emit different
+bytes for unchanged source, so the two-build command is diagnostic only and is
+not a reproducibility proof. This is not an end-to-end `verglasd` execution test.

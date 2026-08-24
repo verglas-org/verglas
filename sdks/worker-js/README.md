@@ -28,7 +28,7 @@ shim with esbuild, invokes ComponentizeJS through jco, and writes the component
 as `<sha256>.wasm`:
 
 ```sh
-node sdks/worker-js/bin/build.mjs ./my-worker --out ./build
+node sdks/worker-js/bin/build.mjs ./my-worker --out ./build [--gateway <gateway.json>]
 ```
 
 The output directory also contains `manifest.out.json` with the project name,
@@ -101,9 +101,13 @@ Install the pinned dependencies and run:
 ```sh
 npm install
 npm test
+node sdks/worker-js/bin/build.mjs examples/do-workers/js-counter --out /tmp/js-build
 ```
 
-The tests reject unsupported manifest fields, check required fields, exercise
+When a project directory contains `gateway.json`, the builder updates its
+`component_digest` and `component_dir` after writing the digest-named artifact.
+Use `--gateway <path>` to select a different gateway manifest. The tests
+reject unsupported manifest fields, check required fields, and exercise
 the request/response and byte helpers, build a component, inspect its WIT with
 `jco wit`, and build unchanged source twice to compare digests. ComponentizeJS
 0.22.0 currently emits a nondeterministic StarlingMonkey snapshot: the test

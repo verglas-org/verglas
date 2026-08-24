@@ -345,12 +345,40 @@ def _run_componentize(
         raise BuildError(f"componentize-py failed: {detail or result.returncode}")
 
 
+def _update_gateway_manifest(
+    gateway_path: Path, output_dir: Path, component_digest: str
+) -> None:
+    """Update a project's checked-in gateway digest after writing the artifact."""
+    try:
+        source = gateway_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise BuildError(f"cannot read gateway manifest {gateway_path}: {error}") from error
+    try:
+        gateway = json.loads(source)
+    except json.JSONDecodeError as error:
+        raise BuildError(f"gateway manifest is not valid JSON: {gateway_path}: {error}") from error
+    if not isinstance(gateway, dict):
+        raise BuildError(f"gateway manifest must contain an object: {gateway_path}")
+    gateway["component_digest"] = component_digest
+    if "component_dir" in gateway:
+        gateway["component_dir"] = str(output_dir)
+    try:
+        gateway_path.write_text(json.dumps(gateway, indent=2) + "\n", encoding="utf-8")
+    except OSError as error:
+        raise BuildError(f"cannot update gateway manifest {gateway_path}: {error}") from error
+
+
 def build_project(
-    project_dir: str | os.PathLike[str], output_dir: str | os.PathLike[str]
+    project_dir: str | os.PathLike[str],
+    output_dir: str | os.PathLike[str],
+    gateway_path: str | os.PathLike[str] | None = None,
 ) -> BuildResult:
-    """Build one project and write its digest-named component and output manifest."""
+    """Build one project and update its gateway manifest when present."""
     project = Path(project_dir).resolve()
     output = Path(output_dir).resolve()
+    gateway = Path(gateway_path).resolve() if gateway_path is not None else project / "gateway.json"
     manifest = load_manifest(project)
 
     with tempfile.TemporaryDirectory(prefix="verglas-worker-py-") as temporary:
@@ -379,6 +407,7 @@ def build_project(
         + "\n",
         encoding="utf-8",
     )
+    _update_gateway_manifest(gateway, output, component_digest)
     return BuildResult(
         name=manifest.name,
         component_digest=component_digest,
@@ -392,17 +421,20 @@ def build_project(
 def _parse_arguments(argv: list[str]) -> argparse.Namespace:
     """Parse the deliberately small build command line."""
     parser = argparse.ArgumentParser(
-        usage="python sdks/worker-py/build.py <project-dir> --out <dir>"
+        usage="python sdks/worker-py/build.py <project-dir> --out <dir> [--gateway <path>]"
     )
     parser.add_argument("project_dir", type=Path)
     parser.add_argument("--out", dest="output_dir", type=Path, required=True)
+    parser.add_argument("--gateway", dest="gateway_path", type=Path)
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     """Build the requested project and print its lowercase component digest."""
     arguments = _parse_arguments(sys.argv[1:] if argv is None else argv)
-    result = build_project(arguments.project_dir, arguments.output_dir)
+    result = build_project(
+        arguments.project_dir, arguments.output_dir, arguments.gateway_path
+    )
     print(result.component_digest)
     return 0
 

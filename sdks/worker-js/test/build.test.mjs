@@ -12,7 +12,7 @@ import { buildProject } from '../bin/build.mjs';
 const packageDir = new URL('..', import.meta.url);
 const jcoPath = new URL('./node_modules/.bin/jco', packageDir);
 
-async function makeProject() {
+async function makeProject(withGateway = false) {
   const directory = await mkdtemp(join(tmpdir(), 'verglas-worker-js-test-'));
   await writeFile(
     join(directory, 'wrangler.jsonc'),
@@ -31,6 +31,19 @@ async function makeProject() {
       fetch() { return { status: 200, headers: { "content-type": "text/plain" }, body: "ok" }; },
     };\n`,
   );
+  if (withGateway) {
+    await writeFile(
+      join(directory, 'gateway.json'),
+      `${JSON.stringify({
+        name: 'test-worker',
+        main: 'worker.js',
+        durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
+        component_digest: '0'.repeat(64),
+        component_dir: '/stale/output',
+        data_root: '/persistent/data',
+      }, null, 2)}\n`,
+    );
+  }
   return directory;
 }
 
@@ -74,4 +87,25 @@ test('build output is valid and records digest determinism', async (t) => {
 
   t.diagnostic(`component bytes: ${first.componentBytes.byteLength}`);
   t.diagnostic(`component digest: ${first.componentDigest}`);
+});
+
+test('build updates an example gateway manifest to the emitted artifact', async (t) => {
+  const project = await makeProject(true);
+  const output = await mkdtemp(join(tmpdir(), 'verglas-worker-js-gateway-'));
+  t.after(async () => {
+    await Promise.all([
+      rm(project, { recursive: true, force: true }),
+      rm(output, { recursive: true, force: true }),
+    ]);
+  });
+
+  const result = await buildProject(project, output);
+  const gateway = JSON.parse(await readFile(join(project, 'gateway.json'), 'utf8'));
+  assert.equal(gateway.component_digest, result.componentDigest);
+  assert.equal(gateway.component_dir, output);
+  assert.equal(gateway.data_root, '/persistent/data');
+  assert.equal(
+    createHash('sha256').update(await readFile(join(output, `${gateway.component_digest}.wasm`))).digest('hex'),
+    gateway.component_digest,
+  );
 });
