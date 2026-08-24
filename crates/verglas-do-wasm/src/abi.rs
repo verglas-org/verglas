@@ -16,9 +16,6 @@ pub mod bindings {
         imports: { default: async },
         exports: { default: async },
     });
-
-    /// Compatibility name for the generated service-world instance.
-    pub use self::Service as DurableObject;
 }
 
 /// Generated WIT error record used by imported host interfaces.
@@ -340,4 +337,4 @@ impl bindings::verglas::do_worker::sockets::Host for WorkerHost {
 }
 
 /// Generated service-world instance containing both Worker and handler exports.
-pub use bindings::Service as DurableObject;
+pub use bindings::Service;

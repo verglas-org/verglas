@@ -272,7 +272,7 @@ impl WorkerPool {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|source| PoolError::Linker { source })?;
-        bindings::DurableObject::add_to_linker::<_, HasSelf<_>>(&mut linker, pool_host)
+        bindings::Service::add_to_linker::<_, HasSelf<_>>(&mut linker, pool_host)
             .map_err(|source| PoolError::Linker { source })?;
         Ok(Self {
             engine,
@@ -290,7 +290,7 @@ impl WorkerPool {
         let host = PoolHost { router };
         let mut store = Store::new(&self.engine, PoolStore::new(host));
         let instance =
-            bindings::DurableObject::instantiate_async(&mut store, &self.component, &self.linker)
+            bindings::Service::instantiate_async(&mut store, &self.component, &self.linker)
                 .await
                 .map_err(|source| PoolError::Instantiation { source })?;
         let result = instance

@@ -10,8 +10,8 @@ pub mod pool;
 pub mod runtime;
 
 pub use abi::{
-    DurableObject, HostError, MAX_ATTACHMENT_SIZE, SocketId, WitHandlerError, WorkerBindings,
-    WorkerHost, WorkerSockets, WorkerStorage, bindings,
+    HostError, MAX_ATTACHMENT_SIZE, Service, SocketId, WitHandlerError, WorkerBindings, WorkerHost,
+    WorkerSockets, WorkerStorage, bindings,
 };
 pub use artifact::{ArtifactError, ArtifactStore, ComponentDigest, CwasmCache, DirArtifactStore};
 pub use gate::{EventGate, EventPermit, StagingSockets};

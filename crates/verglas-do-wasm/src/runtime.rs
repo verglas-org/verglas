@@ -182,7 +182,7 @@ impl WorkerRuntime {
         let mut linker = Linker::new(&engine);
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|source| RuntimeError::Linker { source })?;
-        bindings::DurableObject::add_to_linker::<_, HasSelf<_>>(&mut linker, worker_host)
+        bindings::Service::add_to_linker::<_, HasSelf<_>>(&mut linker, worker_host)
             .map_err(|source| RuntimeError::Linker { source })?;
         Ok(Self {
             engine,
@@ -301,7 +301,7 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
-    ) -> Result<(EventPermit, Store<WorkerStore>, bindings::DurableObject), RuntimeError> {
+    ) -> Result<(EventPermit, Store<WorkerStore>, bindings::Service), RuntimeError> {
         let (permit, mut store, instance) =
             self.instantiate_component(gate, storage, sockets).await?;
         let result = instance
@@ -329,24 +329,21 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
-    ) -> Result<(EventPermit, Store<WorkerStore>, bindings::DurableObject), RuntimeError> {
+    ) -> Result<(EventPermit, Store<WorkerStore>, bindings::Service), RuntimeError> {
         let permit = gate.begin_event().await;
         let event_sockets = permit.staging_sockets(sockets);
         let host = WorkerHost::new(storage, event_sockets);
         let mut store = Store::new(&self.engine, WorkerStore::new(host));
-        let instance = match bindings::DurableObject::instantiate_async(
-            &mut store,
-            &self.component,
-            &self.linker,
-        )
-        .await
-        {
-            Ok(instance) => instance,
-            Err(source) => {
-                permit.abort();
-                return Err(RuntimeError::Instantiation { source });
-            }
-        };
+        let instance =
+            match bindings::Service::instantiate_async(&mut store, &self.component, &self.linker)
+                .await
+            {
+                Ok(instance) => instance,
+                Err(source) => {
+                    permit.abort();
+                    return Err(RuntimeError::Instantiation { source });
+                }
+            };
         Ok((permit, store, instance))
     }
 }
