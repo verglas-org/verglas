@@ -3,10 +3,13 @@ title: "S3 listener semantic APIs"
 description: "S3 Vectors, Graph, Iceberg catalog, and Swagger endpoint topology."
 ---
 
-Verglas has two public data endpoints. The cache node S3 listener owns ordinary
-S3 requests and the direct semantic REST-JSON APIs. It authenticates both
-semantic services with AWS SigV4, never with a bearer token: use signing name
-s3vectors for S3 Vectors and verglasgraphs for Graph.
+These are independent cache-node infrastructure APIs, not additional products
+in the six-product platform. The cache node S3 listener owns ordinary S3
+requests and the direct semantic REST-JSON APIs. It authenticates both semantic
+services with AWS SigV4, never with a bearer token: use signing name `s3vectors`
+for S3 Vectors and `verglasgraphs` for Graph. Durable Objects do not own these
+mutation domains; explicit graph/vector operations remain responsible for any
+index publication.
 
 The S3 Vectors service uses the exact modeled operations /CreateVectorBucket,
 /CreateIndex, /PutVectors, and /QueryVectors. The Graph service uses

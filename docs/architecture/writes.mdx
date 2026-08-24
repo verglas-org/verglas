@@ -4,8 +4,11 @@ description: "Understand durable staging, quorum acknowledgement, and offload to
 icon: "pen-to-square"
 ---
 
-Verglas acknowledges a write once it is durably staged across the configured
-fault boundary. Offload to object storage runs behind that acknowledgement.
+This page describes the independent cache and managed object-storage write
+path. Verglas acknowledges a write once it is durably staged across the
+configured fault boundary; offload to object storage runs behind that
+acknowledgement. It is not a Durable Object commit path. Sink and Catalog own
+product-level Parquet and Iceberg publication.
 
 ## Storage bindings
 

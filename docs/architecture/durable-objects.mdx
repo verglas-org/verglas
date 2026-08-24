@@ -1,213 +1,115 @@
 ---
 title: "Durable Objects"
-description: "DataFusion SQL, unified commits, and optional Iceberg offload from one isolated worker."
+description: "Turso-backed stateful Worker classes with serialized events and optional Stream publication."
 icon: "database"
 ---
 
-Verglas open source exposes three S3-backed object primitives. Cloud code may
-compose them for a tenant, but tenant product composition is not part of the
-engine.
+The Durable Object (DO) is one of the six products. It is a named Worker class
+with strictly serialized events and one embedded Turso `0.7.2` database. A
+Worker reaches it through an environment binding; a DO is never a public
+standalone route. This page describes the target contract and does not claim
+that the hosted product is shipped before PP2 and its evidence pass.
 
-1. A **SQL DO** is an isolated transactional database whose relational, vector,
-   and graph projections share one commit history. DataFusion supplies SQL
-   planning and execution; a lease-fenced managed S3 CAS is the default commit authority.
-2. A **Lakehouse DO** durably owns managed Iceberg catalog and materialization
-   state for an S3-backed lakehouse. It may consume SQL DO transaction ranges,
-   but its publication watermark and lifecycle are independently explicit.
-3. A **query object** is non-durable compute that pins cache state over an S3 or
-   Iceberg dataset. It has no durable authority, accepts no authoritative mutations,
-   and may disappear without a checkpoint; its source dataset remains truth. The
-   engine's executable query primitive retains an opaque cache reservation for its
-   lifetime and runs registered read providers through its own DataFusion context.
+The local Turso database is a working copy. Turso's ordinary WAL is used for
+local transactions, and the cloud provisions one distinct remote Turso
+database, URL, and token for each DO. `push()` sends committed state through an
+external sync ingress. That ingress validates the current placement lease before
+forwarding the push. The lease fences stale owners; it does not add a second SQL
+commit authority or turn object storage into the DO database.
 
-Durable SQL and Lakehouse DOs can enable asynchronous offload. Offload is a
-capability, not a requirement for constructing or querying an object.
+## State and event boundary
 
-```text
-SQL / graph / vector API
-          |
-     DataFusion
-  +-------+--------+
-  |       |        |
- rows   Vamana   traversal
-  |       |        |
-  +-------+--------+
-          |
-   DoTableProvider
-          |
-      DoStorage
-          |
- lease-fenced S3 CAS
-          |
- Arrow MVCC/SQLite state
-          |
- committed change stream
-          |
- optional Parquet/Iceberg/Puffin
-```
+A DO owns only its per-object application state and platform state:
 
-## Object and authority boundary
+- byte key/value storage;
+- SQLite-compatible SQL tables and DDL/DML;
+- one durable alarm;
+- WebSocket attachments; and
+- an optional transactional outbox for a bound Stream.
 
-One durable SQL or Lakehouse DO has one stable identity, one managed S3 storage
-binding, and one isolated `verglasd` Worker microVM. A query object has a dataset
-binding and cache reservation but no durable authority. No transaction spans two
-durable DOs. Every DO worker executes its own stateful events; there is no Raft
-group or leader election. The launcher may pass an already-held opaque lease and
-generation. The default authority writes and verifies the immutable transaction
-object before conditionally advancing the managed S3 head. An optional configured
-mode instead acknowledges after one configured lease-fenced replica service
-persists the exact bytes, then archives to S3 asynchronously. That service may
-internally use platform-provided regional replication. [Cell deployment](/docs/architecture/cells)
-defines isolation, SQLite packaging, Worker sockets, and scale-to-zero.
+Reserved Turso tables hold the platform rows. Tenant SQL runs in the same
+Turso transaction as the event. Reads observe the event snapshot plus its own
+staged writes. A successful event requires the local transaction commit and
+remote `push()` confirmation. Socket effects and other gated effects are
+released only after that boundary.
 
-This design does not change customer-binding ownership. A customer bucket or
-table remains readable and writable without Verglas, so Verglas does not
-background-publish rows or indexes into it. Automatic transaction archive and
-lake materialization apply only to managed bindings whose layout Verglas owns
-and whose reads always route through Verglas.
-
-## Storage contract
-
-The query layer depends on a Verglas-owned interface:
-
-```rust
-trait DoStorage {
-    async fn begin(&self, isolation: IsolationLevel)
-        -> Result<Box<dyn DoTransaction>>;
-    async fn scan(
-        &self,
-        table: TableId,
-        snapshot: SnapshotFence,
-        projection: Projection,
-        filters: Vec<Predicate>,
-    ) -> Result<SendableRecordBatchStream>;
-    async fn commit(
-        &self,
-        transaction: Box<dyn DoTransaction>,
-    ) -> Result<CommitReceipt>;
-    async fn checkpoint(
-        &self,
-        through: CommitSequence,
-    ) -> Result<CheckpointManifest>;
+```js
+export class Counter extends DurableObject {
+  async fetch(request) {
+    await this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS counters (value INTEGER NOT NULL)"
+    );
+    await this.ctx.storage.sql.exec(
+      "INSERT INTO counters (value) VALUES (1)"
+    );
+    return Response.json(
+      await this.ctx.storage.sql.exec("SELECT value FROM counters")
+    );
+  }
 }
 ```
 
-A scan merges the transaction's private write set, committed mutable tail,
-local immutable segments, and any offloaded files covered by the requested
-snapshot. Every input is fenced by commit sequence; storage location never
-changes query semantics.
+The target WIT boundary returns rows as JSON-compatible records. Arrow mutation
+envelopes are not part of the DO transaction protocol. There is no custom
+SQLite pager, custom replica store, or DataFusion-backed DO table provider.
+DataFusion may be used by a Pipeline's stateless SQL transform, but it is not a
+DO storage or commit engine.
 
-## Unified transaction
+## Transactional Stream publication
 
-`BEGIN` fixes a snapshot. DataFusion plans each statement against that snapshot
-plus the private write set. INSERT, UPDATE, DELETE, and MERGE providers append
-Arrow mutations instead of writing Parquet or changing an Iceberg pointer.
-`COMMIT` submits one canonical envelope:
+A DO may bind one or more Streams. Direct publication uses the binding:
 
-```text
-TransactionEnvelope {
-  do_id,
-  transaction_id,
-  base_commit_sequence,
-  schema_changes,
-  relational_mutations,
-  vector_mutations,
-  graph_mutations,
-  generated_values,
-  read_write_validation
-}
+```js
+await env.STREAM.send(records);
 ```
 
-Mutation order, Arrow schemas, generated values, and validation input are part
-of the deterministic command. A retry with the same identity and bytes returns
-the original receipt; reusing an identity for different bytes fails closed.
-The selected commit authority assigns a contiguous logical per-DO transaction
-sequence. The worker applies rows, scalar indexes, Vamana delta state, graph
-adjacency delta state, and tombstones at the receipt's one commit sequence.
-There is no vector or graph side queue.
+For selected SQL tables, a transactional outbox couples committed state to
+publication without coupling the DO to Stream storage. For event sequence `E`,
+the same Turso transaction writes rows identified by
+`(object-id, E, record-index)`. After the transaction and remote push are
+durable, the host sends pending rows to the Stream. The Stream assigns its
+strictly increasing sequence and deduplicates the producer identity.
 
-## Vector execution
+Only confirmed Stream ingestion lets the host mark a row delivered. A crash
+after ingestion and before that mark resends the same identity; Stream dedup
+makes the resend harmless. A crash before ingestion leaves a pending row. The
+host drains pending rows before admitting another event when publication is
+required. Stream unavailability applies backpressure rather than silently
+dropping a committed record.
 
-Vectors use `FixedSizeList<Float32>` with dimension, metric, and normalization
-schema metadata. Shared SQL functions expose L2, cosine, and inner-product
-distance. An optimizer rule recognizes distance ordering with a limit and
-produces `VamanaSearchExec`.
+## What the DO does not own
 
-A search must include all four sources before exact reranking:
+The six-product boundary prevents a DO from becoming a hidden lakehouse or
+semantic engine:
 
-1. snapshot-covered immutable Vamana segments;
-2. every committed vector after each segment's coverage sequence;
-3. transaction-local writes;
-4. tombstones and deletes through the query fence.
+- **Pipeline** is a prebuilt Worker/DO that owns its Stream cursor, stateless
+  SQL transform, batching, and retry state. It contains no destination-specific
+  Iceberg code.
+- **Sink** is a prebuilt Worker/DO that owns idempotent delivery. The first Sink
+  writes Parquet and commits Iceberg snapshots through a Catalog binding.
+- **Catalog** is a prebuilt Worker/DO that owns Iceberg REST, namespace/table
+  metadata, and the existing Verglas Iceberg and object-storage libraries.
+- **Cache** remains an independent S3/cache and routing infrastructure.
+- **Graph and vector** services remain independent semantic infrastructure over
+  customer-owned Iceberg tables and explicit index builds. They are not DO
+  mutation domains and receive no autonomous DO publication.
 
-An index is optional acceleration. It may be stale, but it may never silently
-omit the unindexed tail. The live engine therefore retains exact vector rows,
-updates its Vamana delta at the transaction sequence, and exact-reranks the
-complete visible row set. Registration after restart deterministically rebuilds
-that delta from the canonical SQLite transaction log. Verglas uses its Vamana
-implementation, not HNSW.
+A customer binding remains usable without Verglas. A managed binding keeps its
+Verglas-owned object layout and read path. Neither rule gives a DO a direct
+Iceberg offload path; Sink and Catalog own those operations.
 
-## Graph execution
+## Placement and recovery
 
-Graph truth is stored in ordinary relational `nodes` and `edges` tables. SQL
-recursive CTEs define portable semantics. `NeighborLookupExec`,
-`GraphExpandExec`, `ShortestPathExec`, and `BoundedTraversalExec` accelerate the
-same results from immutable adjacency segments plus the committed and private
-tails. Forward/reverse adjacency, labels, property filters, tombstones, and the
-coverage sequence are all snapshot-bound. The live engine currently maintains
-standard Arrow edge assertions as deterministic forward/reverse CSR adjacency;
-`supersedes` rows remove the prior assertion at the same commit sequence, and
-SQLite replay reconstructs the identical adjacency after restart.
+Each active DO can run in an isolated process or microVM selected by the
+platform. The executor serializes events for one object and uses the DO's own
+remote Turso database for recovery. A lifecycle supervisor may suspend an
+inactive object only after required pushes and Stream outbox publication are
+complete. A takeover revokes the old sync owner before the replacement opens
+the database.
 
-## Durable ACK and archive
-
-In default mode the canonical envelope is created under its immutable transaction
-path and read back before an S3 conditional write advances the DO head. The head
-CAS carries the launcher's lease generation and token digest, so stale workers
-cannot acknowledge. In optional replica mode, the worker sends the same lease, sequence, identity,
-and bytes to one configured durable replica service. Its durable reply advances
-the local sequence; failure does not. The service exposes bounded replay for
-failover and lease-fenced cleanup after S3 coverage. This mode is configured
-explicitly and is not a fallback for a failed S3 CAS.
-
-After an early replica ACK, a committed-range consumer archives transactions to
-the DO's managed bucket. Verified archive records advance the archive watermark and eventually
-permit release of superseded local representations. Origin failure consumes a
-hard dirty-state budget and then backpressures new writes; acknowledged state is
-never evicted unsafely.
-
-## Optional lake materialization
-
-Lake offload is independently optional. A materializer converts committed ranges
-to relational, vector, node, and edge Parquet files, then publishes one Iceberg
-snapshot with the exact commit interval. Vamana and graph adjacency indexes are
-written as `verglas-vamana-v1` and `verglas-graph-adjacency-v1` Puffin blobs.
-The engine can already frame both live indexes through Iceberg's Puffin writer
-and publish them to provider-neutral object storage under deterministic paths.
-Every artifact carries a nonempty DO transaction interval and is read back and
-SHA-256 verified before its publication receipt is accepted. Its deterministic
-path is create-only: an exact retry is accepted after verification and conflicting
-bytes fail closed. The Lakehouse primitive permits autonomous publication only
-for managed bindings; customer destinations require an explicit invocation.
-Suggested snapshot properties are:
-
-```text
-verglas.do-id
-verglas.timeline
-verglas.commit-sequence
-verglas.commit-range-start
-verglas.commit-range-end
-verglas.schema-digest
-verglas.vamana-through
-verglas.graph-through
-```
-
-The materializer verifies metadata and every referenced object before proposing
-`OffloadComplete`. Index construction may finish later than Parquet publication;
-coverage properties state the exact boundary, and Verglas-aware readers merge
-the newer tail. Standard Iceberg readers ignore unknown Puffin blobs and read
-the canonical Parquet node, edge, vector, and relational columns.
-
-A managed deployment is left only through detach: fence mutations, archive the
-committed tail, publish or explicitly abandon optional lake work, checkpoint the
-catalog, drain dirty objects, and then relinquish the binding.
+Worker execution is stateless and pool-executed. Stream, Pipeline, Sink, and
+Catalog are separate prebuilt Worker/DO deployments, not hidden modes of a DO.
+See [DO Workers](/docs/architecture/do-workers), [cell
+deployment](/docs/architecture/cells), and the [normative platform
+page](/docs/architecture/primitives-platform) for the component and lifecycle
+criteria.

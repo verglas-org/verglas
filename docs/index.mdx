@@ -1,14 +1,19 @@
 ---
-title: "Verglas engine documentation"
-description: "Run the lakehouse runtime on your infrastructure."
+title: "Verglas products and infrastructure"
+description: "The six Worker/DO products and the independent cache, Iceberg, catalog, and semantic layers."
 icon: "snowflake"
 ---
 
-Verglas is the lakehouse runtime: an Iceberg-native statekeeper that makes data
-on object storage live. Query engines talk to its S3 endpoint. Against a bucket
-you already own, Verglas accelerates reads and writes through to your object
-store. Against a bucket Verglas manages, it owns the object layout and serves
-every read.
+Verglas has exactly six products: Worker, Durable Object, Stream, Pipeline,
+Sink, and Catalog. Worker is stateless. Durable Object is a Turso-backed
+stateful Worker class. Stream, Pipeline, Sink, and Catalog are prebuilt
+Worker/DO deployments. Read the [normative platform
+page](/docs/architecture/primitives-platform) for the complete definitions and
+PP1–PP10 criteria.
+
+The same repository contains independent S3/cache, Iceberg, catalog, and
+semantic graph/vector infrastructure. Those layers remain useful to
+self-hosted query engines and external clients; they are not extra products.
 
 ## Install the TypeScript SDK
 
@@ -16,34 +21,32 @@ every read.
 npm install @verglas/sdk
 ```
 
-## Run the engine
+## Run the cache infrastructure
 
-The engine ships as a container image. Point it at an S3-compatible origin and
-start it:
+The cache node ships as a container image. Point it at an S3-compatible origin
+and start it:
 
 ```sh
 docker pull ghcr.io/verglas-org/verglas-cache-node:latest
 ```
 
 The node serves S3 on `:8333` and health, catalog gateway, and metrics on
-`:8334`. See [self-hosting](/docs/get-started/self-host) for the provider
-profiles and the environment each one needs.
+`:8334`. See [self-hosting](/docs/get-started/self-host) for provider profiles
+and required environment variables.
 
 ## Where to go next
 
 <CardGroup cols={2}>
-  <Card title="Self-host the engine" icon="server" href="/docs/get-started/self-host">
-    Run a node against your origin, then point any S3-compatible client at it.
+  <Card title="Six-product platform" icon="diagram-project" href="/docs/architecture/primitives-platform">
+    Follow Worker, Durable Object, Stream, Pipeline, Sink, and Catalog ownership.
+  </Card>
+  <Card title="Self-host the cache" icon="server" href="/docs/get-started/self-host">
+    Run a cache node against your origin, then point any S3-compatible client at it.
   </Card>
   <Card title="Understand the architecture" icon="compass-drafting" href="/docs/architecture/overview">
-    Follow reads, writes, catalog events, query roles, and ring ownership.
+    Follow product bindings and the independent cache, Iceberg, catalog, and semantic layers.
   </Card>
   <Card title="Graphs and vectors" icon="share-nodes" href="/docs/reference/semantic-api">
-    The S3-styled semantic surface: property graphs and vector indexes over the
-    same Iceberg tables.
-  </Card>
-  <Card title="DO Workers" icon="cube" href="/docs/architecture/do-workers">
-    Durable Objects run tenant WASM components — stateful, serialized, and
-    scale-to-zero.
+    Use the independent semantic surface over Iceberg tables and explicit index builds.
   </Card>
 </CardGroup>

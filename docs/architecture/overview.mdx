@@ -1,42 +1,61 @@
 ---
 title: "Architecture overview"
-description: "Understand the public engine boundary and its independently deployed roles."
+description: "Understand the six Worker/DO products and the independent infrastructure beneath them."
 icon: "compass-drafting"
 ---
 
-Verglas sits between compute and object storage. A storage binding is either
-customer-owned or managed. Against a customer binding, the object store and
-Iceberg catalog remain authoritative and Verglas accelerates access to them.
+Verglas has exactly six products: **Worker**, **Durable Object**, **Stream**,
+**Pipeline**, **Sink**, and **Catalog**. Worker is the stateless primitive. DO
+is the stateful primitive, backed by Turso `0.7.2`. Stream, Pipeline, Sink, and
+Catalog are prebuilt Worker/DO deployments with separate ownership boundaries.
+See the [normative platform page](/docs/architecture/primitives-platform) for
+PP1–PP10.
+
+The platform also contains independent infrastructure. A storage binding is
+either customer-owned or managed. Against a customer binding, the object store
+and Iceberg catalog remain authoritative and Verglas accelerates access to them.
 Against a managed binding, Verglas owns the object layout, serves every read,
-and is the authority for acknowledged state until it drains to the origin.
+and is the authority for acknowledged cache state until it drains to the
+origin.
 
 ```mermaid
 flowchart LR
-    E["Query engine"] -->|"S3"| C["verglas-cache-node"]
-    E --> I["Iceberg REST catalog"]
-    C -->|"watch commits"| I
-    C --> O["Object storage"]
+    U["HTTP / bindings"] --> W["Worker\nstateless"]
+    W --> D["Durable Object\nTurso 0.7.2"]
+    W --> S["Stream\nordered JSON"]
+    S --> P["Pipeline\nSQL + batch + retry"]
+    P --> K["Sink\nidempotent delivery"]
+    K --> C["Catalog\nIceberg REST"]
+    E["Query engine"] --> X["S3/cache infrastructure"]
+    E --> C
+    X --> O["Object storage"]
 ```
 
 ## Repository boundary
 
 | Repository | Responsibility |
 | --- | --- |
-| `verglas` | Public lakehouse runtime (cache and consensus engine), TypeScript SDK, documentation, and RIME package. |
-| `verglas-cloud` | Hosted access, scheduler, workers, databases, integrations, applications, and agent runtime. |
+| `verglas` | Public cache, storage, Iceberg/catalog, semantic infrastructure, clients, documentation, and product contracts. |
+| `verglas-cloud` | Hosted access, product provisioning, placement, lifecycle, integrations, applications, and agent runtime. |
 | `verglas-app` | Private cloud console and workspace client. |
 
-The engine does not import a hosted control-plane package. Hosted services run
-the same public role binaries and interact through explicit network and process
-contracts.
+The public repository does not add a hidden job runtime, queue engine, custom DO
+database, or direct DO-to-Iceberg path. Hosted services consume explicit public
+contracts. Product implementations that are not yet accepted are documented as
+Target or Gap rather than as shipped features.
 
-## Engine and client roles
+## Product and infrastructure roles
 
 | Role | Responsibility |
 | --- | --- |
-| Cache | Serve S3 ranges, route ownership, warm Iceberg metadata, stage writes on the ring, and offload to object storage. |
-| TypeScript SDK | Use the public S3, catalog, vector, graph, and administrative contracts. |
-| RIME | Package the evaluated parallel software-engineering skill for supported agent hosts. |
+| Worker | Stateless ingress and binding calls. |
+| Durable Object | Serialized per-object state in Turso, including KV, SQL, alarms, attachments, and optional Stream outbox rows. |
+| Stream | Ordered durable JSON records and producer-identity deduplication; no offload or consumer offsets. |
+| Pipeline | Stream cursor, stateless SQL transform, batching, retry, and Sink confirmation. |
+| Sink | Idempotent delivery; first adapter writes Parquet and commits Iceberg through Catalog. |
+| Catalog | Iceberg REST and metadata commits using the existing catalog and object-storage libraries. |
+| Cache | S3 ranges, ownership routing, cache tiers, Iceberg observation, staging, and independent object offload. |
+| Semantic services | Independent graph/vector APIs and explicit index infrastructure over Iceberg data. |
 
 ## Standing requirements
 
@@ -48,8 +67,10 @@ contracts.
 - DRAM, NVMe, CPU, concurrency, and background work obey hard ceilings.
 - Every operation resolves ownership through the ring, including a one-node
   deployment.
+- A DO never publishes directly to Iceberg or mutates graph/vector state;
+  Sink, Catalog, and explicit semantic operations own those boundaries.
 
 Continue with [cache design](/docs/architecture/cache),
 [Iceberg awareness](/docs/architecture/iceberg),
-[write path](/docs/architecture/writes), and
-[engine roles](/docs/architecture/execution).
+[write path](/docs/architecture/writes), and the [product execution
+roles](/docs/architecture/execution).

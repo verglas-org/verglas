@@ -1,125 +1,137 @@
 ---
 title: "DO Workers"
-description: "Tenant WASM components executing inside each Durable Object's verglasd microVM."
+description: "Target Worker and Durable Object components for the six-product platform."
 icon: "cube"
 ---
 
-Tenant compute has two tiers, the Cloudflare/celld shape. A **Worker** is the
-general primitive: a stateless component fetch handler, pool-executed at the
-ingress, no identity, no storage. A **Durable Object** is a stateful Worker
-class reached only through Worker code via environment bindings
-(`env.NS.idFromName` → `get` → stub `fetch`). Tenant code compiles to one
-WebAssembly component targeting the `verglas:do-worker` WIT world; a DO's
-events execute inside its own `verglasd` process — the isolated microVM,
-lease fence, and commit authority described in
-[Cell deployment](/docs/architecture/cells). There is no container scheduler
-and no V8: the isolation boundary is the WASM sandbox inside the microVM
-inside the lease fence, and the authoring surface is Cloudflare's spec
-([Cloudflare compatibility](/docs/architecture/cloudflare-compat)).
+This page describes the target execution shape for the Worker and Durable
+Object primitives. The [Worker primitives platform](/docs/architecture/primitives-platform)
+is normative and its PP1–PP10 criteria are frozen. The hosted component and
+lifecycle work is not claimed as shipped until its acceptance evidence exists.
+
+A **Worker** is the stateless primitive: a pool-executed `fetch` handler with no
+identity and no storage. A **Durable Object** is a named, stateful Worker class
+reached only through bindings (`env.NS.idFromName` → `get` → stub `fetch`). A DO
+runs strictly serialized events against one embedded Turso `0.7.2` database.
+The local database and its sync sidecars are a working copy; one remote Turso
+database belongs to that DO and is the machine-loss recovery source.
 
 ```text
 gateway (owns HTTP + WebSocket connections)
-      │  name → DO id → machine, wake on demand
-      ▼
-microVM ── verglasd
-            ├── Wasmtime engine
-            │     └── tenant component (verglas:do-worker world)
-            │           exports: fetch / alarm / websocket-message / websocket-close
-            │           imports: storage, sockets (in-process host bindings)
-            ├── DataFusion + SQLite pager (DO engine)
-            └── lease-fenced commit authority
+       │  public request → stateless Worker
+       ▼
+Worker ── env bindings ──┬── Durable Object
+                         │      ├── Turso 0.7.2 WAL database
+                         │      ├── transactional outbox (optional Stream)
+                         │      └── external lease-fenced sync ingress
+                         ├── Stream
+                         ├── Pipeline
+                         ├── Sink
+                         └── Catalog
 ```
+
+The sync ingress validates the current placement lease before forwarding a
+Turso push. The lease fences who may open or push a DO database; it does not
+create a second SQL authority. The DO runtime has no custom SQLite pager,
+DataFusion transaction provider, Arrow mutation envelope, direct Iceberg
+offloader, or vector/graph mutation domain. DataFusion, if used, belongs to a
+Pipeline's stateless SQL transform and is not DO storage.
 
 ## The ABI
 
-The component targets `world durable-object` in package `verglas:do-worker`
-(`crates/verglas-do-wasm/wit/world.wit`):
+The component targets the `verglas:do-worker` WIT world. The exact ABI remains a
+component contract; the following surfaces describe its target behavior:
 
 - **Exports** are the lifecycle and event surface: `init` runs once per
   component instantiation before the first event; `fetch` handles routed HTTP
   requests, `alarm` handles the DO's durable alarm, and `websocket-message`
   and `websocket-close` handle accepted connections.
-- **`storage` imports** — `get`, `put`, `delete`, `list`, `sql`, and the alarm
-  verbs — are host functions bound directly to the in-process DO engine. A
-  storage call is a function call, never a network hop. Reads see the event's
-  snapshot fence plus the event's own staged writes; writes join the event's
-  canonical transaction envelope and become durable only when the configured
-  commit authority acknowledges it.
+- **`storage` imports** — `get`, `put`, `delete`, `list`, `sql`, and alarm
+  verbs — are host functions bound to the embedded Turso database. A storage
+  call is local to the event executor, never a call to a separate SQL service.
+  Reads see the event's Turso snapshot plus its own staged writes. A successful
+  event requires the local transaction commit and confirmation of the remote
+  Turso `push()` boundary.
 - **`sockets` imports** — `send`, `close`, `set-attachment`, `get-attachment`,
-  `attached` — stage effects against connections the gateway holds. Attachments
-  are bounded at 16 KiB and persist in DO state.
+  and `attached` — stage effects against connections the gateway holds.
+  Attachments are bounded at 16 KiB and persist in DO state.
 
-Worker key-value state, the alarm, and connection attachments are reserved
-relational tables inside the DO's one commit history. They replay, checkpoint,
-and archive with everything else; there is no side store to lose.
+Reserved Turso tables hold byte KV, the single alarm, WebSocket attachments,
+event sequencing, and optional Stream outbox rows. Tenant SQL uses the same
+Turso transaction and the SQLite-compatible DDL/DML surface. The host exposes
+rows through the WIT JSON-row boundary; Arrow mutation envelopes are not part of
+DO commit or publication.
 
 ## Event execution: one at a time, gated
 
 Events execute strictly serialized per DO. The host admits one event, runs the
-handler to completion, commits its envelope, and only then admits the next.
-Two gates enforce the Cloudflare consistency model:
+handler to completion, commits its Turso transaction, and confirms the remote
+push before releasing the event result and any gated socket effects.
 
 - **Input gate.** No second event observes state between another event's start
-  and its commit. Concurrent arrivals queue.
+  and its Turso commit. Concurrent arrivals wait.
 - **Output gate.** Outbound socket sends staged during an event are released
-  only after the event's transaction is durable. An aborted event releases
-  nothing. No observer outside the DO can see an effect of an uncommitted
-  transaction.
+  only after the event is durable at the Turso remote boundary. An aborted or
+  unpushed event releases nothing.
+- **Publication gate.** If the DO has a Stream binding, selected committed
+  changes first become deterministic outbox rows. The host sends those rows to
+  the Stream, which deduplicates `(object-id, event-sequence, record-index)`.
+  A crash after Stream confirmation but before marking a row delivered causes
+  an idempotent resend, not a duplicate record or a gap.
 
-A handler failure aborts its envelope; committed state is never rolled back.
+A handler failure does not roll back a transaction that already reached the
+Turso durability boundary. Stream unavailability applies backpressure to a
+streaming-enabled DO rather than dropping committed records.
 
 ## Code artifacts
 
-A Worker's component is a content-addressed immutable object in the DO's
-managed bucket. `verglasd` is spawned with the component digest, fetches the
-bytes, verifies the SHA-256 before instantiation, and fails closed on mismatch.
-Compiled AOT (`cwasm`) artifacts may be cached outside the microVM keyed by the
-same digest plus Wasmtime's compatibility key; the digest names the code forever, so a
-cache is only ever an acceleration. Pre-initialization (Wizer-style) keeps
-post-wake instantiation in single-digit milliseconds; the microVM's own
-suspend/resume amortizes the outer cold start.
+A deployment artifact is a content-addressed immutable object. The host fetches
+it by digest, verifies SHA-256 before instantiation, and fails closed on a
+mismatch. Compiled AOT artifacts may be cached outside the isolation boundary
+keyed by the same digest; a cache is only an acceleration. Pre-initialization
+and machine suspend/resume are lifecycle optimizations, not storage authority.
 
 ## Languages
 
-Any language with component tooling targets the world directly — Rust via
-`cargo component`, Go via TinyGo, Python via componentize-py. JavaScript and
-TypeScript are supported by baking tenant code into the component with
-ComponentizeJS (StarlingMonkey, SpiderMonkey compiled to WASM). The platform
-runs components, not language runtimes: JS support is a build-time property of
-the artifact, not a host dependency.
+Any language with component tooling can target the world — Rust via
+`cargo component`, Go via TinyGo, and Python via componentize-py. JavaScript and
+TypeScript are bundled into the component with ComponentizeJS and
+StarlingMonkey. The platform runs components, not language runtimes: language
+support is a build-time property of the artifact.
 
 ## Connections live in the gateway, not the guest
 
 HTTP and WebSocket connections terminate at the platform ingress, never inside
-the component or the microVM. The gateway:
+the component. The gateway:
 
-1. resolves name → DO id → machine, and wakes a hibernated DO on demand;
-2. holds WebSockets open while the DO is suspended — hibernation is invisible
-   to connected clients;
-3. answers configured auto-responses (ping/pong) without waking the DO;
-4. delivers events over the DO's private endpoint and releases commit-gated
-   sends back to the right connections;
+1. resolves a name to a DO id and wakes the target on demand;
+2. holds WebSockets while the DO is suspended;
+3. answers configured auto-responses without waking the DO;
+4. delivers serialized events and releases commit-gated sends to the right
+   connections; and
 5. reads per-connection attachments from DO state on wake so a rehydrated
    Worker can rebuild its session map.
 
-Because attachments and the alarm are committed DO state, a DO that hibernates,
-migrates, or fails over rebuilds exactly the connection context its last
-committed transaction described.
+Because attachments and the alarm are committed Turso state, a DO that
+hibernates, migrates, or takes over from a failed owner rebuilds the context
+described by its last durable transaction.
 
 ## Alarms
 
-`set-alarm` writes the DO's single alarm row inside the current envelope. On
-commit, the supervisor arms a wake at the deadline; firing delivers one `alarm`
-event with the scheduled time. The alarm survives hibernation and restore
-because it is ordinary committed state, and re-arming happens from that state on
-every wake — the timer is derived, never authoritative.
+`set-alarm` writes the DO's single alarm row inside the current Turso
+transaction. After the push is confirmed, the supervisor arms a wake at the
+deadline; firing delivers one `alarm` event with the scheduled time. The alarm
+survives hibernation and restore because it is ordinary committed state; the
+timer is derived, never authoritative.
 
 ## Placement substrate
 
-`celld-host` supervises one `verglasd` per DO behind a provisioner seam. The
-local-process provisioner is the development and test substrate; the Fly.io
-Machines provisioner maps the same lifecycle onto Firecracker microVMs —
-spawn with lease held, suspend after archive-and-checkpoint, resume from
-machine snapshot on wake. The lease token and generation fence both substrates
-identically: a stale machine cannot acknowledge a mutation regardless of where
-it runs.
+The target lifecycle supervisor provisions one isolated execution environment
+per active DO. A local-process provisioner can support development and tests;
+a microVM provisioner can provide production isolation. Both pass the placement
+lease to the external Turso sync ingress and fence routing after a crash or
+restore. A stale owner cannot open or push the DO's remote database.
+
+Worker execution remains stateless and pool-executed. Stream, Pipeline, Sink,
+and Catalog are prebuilt Worker/DO deployments with their own ownership
+boundaries; they are not hidden runtimes inside a tenant DO.

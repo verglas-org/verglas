@@ -1,34 +1,40 @@
 # Verglas
 
-Verglas is the lakehouse runtime — an Iceberg-native statekeeper that makes
-data on object storage live. Point an S3-compatible query engine at Verglas:
-hot reads serve from local DRAM or NVMe, writes acknowledge at NVMe latency
-under quorum durability, and your object store stays the system of record.
+Verglas has exactly six products, all composed from two primitives:
+
+- **Worker** — stateless, pool-executed ingress with authority only from bindings.
+- **Durable Object** — a serialized stateful Worker class backed by Turso
+  `0.7.2`, with one remote Turso database per object.
+- **Stream** — a prebuilt Durable Object for durable ordered JSON records.
+- **Pipeline** — a prebuilt Worker/DO with a Stream cursor, stateless SQL
+  transforms, batching, and retry.
+- **Sink** — a prebuilt Worker/DO with idempotent delivery; Iceberg is the first
+  adapter.
+- **Catalog** — a prebuilt Worker/DO exposing Iceberg REST through the existing
+  Iceberg and catalog libraries.
+
+This repository also contains independent infrastructure used by those
+products and by self-hosted deployments: the S3/cache and routing layer,
+Iceberg and catalog libraries, and semantic graph/vector services. Those
+infrastructure components are not additional products. The TypeScript SDK and
+RIME package are client/tooling surfaces.
 
 [![ci](https://github.com/verglas-org/verglas/actions/workflows/ci.yml/badge.svg)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 [![coverage](https://img.shields.io/badge/coverage-77%25_measured%2C_ratcheting-green)](https://github.com/verglas-org/verglas/actions/workflows/ci.yml)
 
+## Repository contents
 
-## What lives here
-
-This repository contains the public data engine and its TypeScript client surface:
-
-- `verglas-cache-node`: S3 read/write-through, Iceberg catalog watching,
-  warming, cache tiers, ring routing, block storage, and WAL ingress.
+- `verglas-cache-node`: S3 read/write-through, cache tiers, ring routing, block
+  storage, WAL ingress, and independent Iceberg/catalog integration.
+- `crates/verglas-catalog-*` and `crates/verglas-iceberg-ext`: the Verglas
+  Iceberg REST catalog and its extensions.
 - `sdks/typescript`: the public TypeScript SDK.
 - `rime`: the RIME package for supported agent hosts.
-- `catalog`: the Verglas fork of Catalog, the Apache Iceberg REST
-  catalog. A nested cargo workspace with its own lockfile — the root
-  `cargo --workspace` commands do not reach it. See [AGENTS.md](AGENTS.md).
-- The reusable Rust crates that implement the storage and server roles.
+- The reusable Rust crates that implement the storage, cache, catalog, and
+  server roles.
 
-The remaining product boundaries are deliberate:
-
-- `verglas-cloud` owns hosted access, scheduling, workers, integrations,
-  databases, applications, and agent runtime services.
-- `verglas-app` is the private cloud console and workspace client.
-
-CI rejects copies of those hosted products in this repository.
+Hosted access, product provisioning, and the private cloud console remain
+outside this repository. They do not add a seventh product.
 
 ## License
 
@@ -38,10 +44,8 @@ Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
 
-`catalog/` is the exception. It is Catalog-derived code and is mostly
-Apache 2.0, with only the Verglas-authored adapters under FSL-1.1-ALv2.
-[catalog/LICENSING.md](catalog/LICENSING.md) governs that subtree and
-states which crates fall under which license.
+The catalog-derived crates have their own licensing boundary. See
+[LICENSING.md](LICENSING.md) for the applicable terms.
 
 ## Install
 
@@ -51,34 +55,32 @@ Install the TypeScript SDK from npm:
 npm install @verglas/sdk
 ```
 
-The daemon is distributed as a container image:
+The cache node is distributed as a container image:
 
 ```sh
 docker pull ghcr.io/verglas-org/verglas-cache-node:latest
 ```
 
-## Run the engine locally
+## Run the cache node locally
 
-The open-source Compose stack starts exactly one disposable `verglas-cache-node`.
-It contains no catalog, object store, scheduler, or hosted control plane. Choose
-one provider profile in [the self-hosting guide](docs/get-started/self-host.mdx),
-then start it with the provider's credentials:
+The open-source Compose stack starts one disposable `verglas-cache-node`. It
+contains no hosted control plane. Choose one provider profile in [the
+self-hosting guide](docs/get-started/self-host.mdx), then start it with the
+provider's credentials:
 
 ```sh
 docker compose up --build verglas
 ```
 
 The node exposes its S3 surface at `http://127.0.0.1:8333` and its health,
-catalog gateway, and metrics endpoints at `http://127.0.0.1:8334`. Tables use
-the local Iceberg REST gateway at `http://127.0.0.1:8334/catalog`; Graphs and
-Vectors use the same local S3 listener. All three therefore keep provider
-credentials inside the node process and route data files through it.
+Iceberg REST gateway, and metrics endpoints at `http://127.0.0.1:8334`. Existing
+semantic graph/vector endpoints use the same S3 listener; they remain
+independent infrastructure rather than products in addition to the six above.
 
-The supported profiles are Verglas Cloud, Cloudflare Data Catalog, and
-Amazon S3 Tables. The Cloud profile accepts event hints at
-`/admin/catalog/events` and always reconciles by polling. Cloudflare and AWS
-are polling-only upstreams. Stop the disposable node and remove its local
-state with:
+The supported profiles are Verglas Cloud, Cloudflare Data Catalog, and Amazon S3
+Tables. The Cloud profile accepts event hints at `/admin/catalog/events` and
+always reconciles by polling. Cloudflare and AWS are polling-only upstreams.
+Stop the disposable node and remove its local state with:
 
 ```sh
 docker compose down
@@ -88,22 +90,18 @@ rm -rf ./.verglas
 ## Build and test
 
 ```sh
-just build   # both workspaces
-just test    # engine only
-just lint    # both workspaces
+just build
+just test
+just lint
 ```
-
-The catalog is a separate cargo workspace, so it has its own recipes:
-`just catalog-build`, `just catalog-lint`, and `just catalog-test`.
-Its suite needs a reachable Postgres in `DATABASE_URL`, which is why it is not
-part of `just test`.
 
 Install the runtime node from source with `just install`. The TypeScript SDK
 lives under `sdks/typescript`; RIME lives under `rime/`.
 
-The [architecture overview](docs/architecture/overview.mdx) explains the
-runtime's cache tiers, Iceberg awareness, routing, and write path. Every crate and binary keeps
-an append-only `WORKLOG.md` describing why it changed.
+The [architecture overview](docs/architecture/overview.mdx) explains the six
+products and the independent cache, Iceberg, catalog, and semantic layers.
+Every crate and binary keeps an append-only `WORKLOG.md` describing why it
+changed.
 
 ## Contributing
 

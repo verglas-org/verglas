@@ -4,27 +4,32 @@ description: "The Worker/DO authoring surface is Cloudflare's spec, implemented 
 icon: "cloud"
 ---
 
-Verglas runs the celld/Cloudflare two-tier model:
+Verglas uses the Cloudflare two-tier model. The complete six-product inventory
+and its immutable PP1–PP10 criteria are in the [Worker primitives
+platform](/docs/architecture/primitives-platform). This page defines the
+Cloudflare-shaped Worker and Durable Object authoring surface and keeps its CC1–CC6
+criteria intact. The product integrations described there are a target contract;
+this page does not imply that an unmarked row below has shipped.
 
 1. A **Worker** is the general primitive: stateless, pool-executed, no
    identity, no storage. Its `fetch(request, env, ctx)` is the public front
    door.
-2. A **Durable Object** is a stateful Worker class with a name, its own
-   engine-backed storage, and strictly serialized events. Worker code reaches
-   it only through env bindings: `env.NS.idFromName(name)`,
-   `env.NS.get(id)`, `stub.fetch(request)`.
+2. A **Durable Object** is a stateful Worker class with a name, one embedded
+   Turso `0.7.2` database, and strictly serialized events. The local database is
+   a working copy. One remote Turso database belongs to each DO, and an external
+   lease-fenced sync ingress validates the current placement before forwarding a
+   Turso push. The fence protects placement and synchronization; it is not a
+   second SQL commit engine. Worker code reaches a DO only through env bindings:
+   `env.NS.idFromName(name)`, `env.NS.get(id)`, and `stub.fetch(request)`.
 
-**The spec is Cloudflare's; the SDK is ours.** celld inherits compatibility by
-embedding V8 and running Wrangler bundles against runtime globals. Verglas
-runs WASM components, so each language gets a Verglas-owned SDK that
-implements the Cloudflare spec surface over the `verglas:do-worker` WIT ABI
-and is bundled into the component at build time. The definition of
-"matches the spec" is: unmodified Cloudflare-style project code compiles and
-runs. Verglas-specific power (Arrow-native SQL, vector/graph, datalake
-controls) is namespaced under `verglas:` imports and never mutates the spec
-surface. The scope rule is celld's: if Cloudflare builds a feature on
-Durable Objects, it is in scope here; features on other primitives (KV, R2)
-are not.
+**The spec is Cloudflare's; the SDK is ours.** Cloudflare-style project code
+compiles to Verglas's WASM component ABI. Each language gets a Verglas-owned SDK
+that implements the Cloudflare spec surface over the `verglas:do-worker` WIT ABI
+and is bundled into the component at build time. Product-specific capabilities
+are separate bindings: Pipeline SQL is a stateless stream transform, Sinks own
+idempotent delivery, Catalog owns Iceberg REST, and cache plus semantic
+graph/vector infrastructure remain independent services. None changes the
+Worker/DO compatibility surface.
 
 ## WIT world v2 (normative sketch)
 
@@ -43,9 +48,8 @@ world service {
 ```
 
 - `bindings.do-fetch` is the flattened stub call. The SDK builds the
-  `idFromName`/`get`/stub object model on top; ids are
-  `hex(sha256(name))`, computed SDK-side, and the host accepts the name it
-  routes by.
+  `idFromName`/`get`/stub object model on top; ids are `hex(sha256(name))`,
+  computed SDK-side, and the host accepts the name it routes by.
 - **Guest-driven WebSocket accept** (replaces the v0 gateway-accept
   divergence): an upgrade request arrives as a `fetch` event carrying a
   pending `ws` id; the DO's response indicates acceptance
@@ -60,45 +64,64 @@ world service {
 - `fetch` frames gain optional `"ws": <id>` (pending upgrade) and
   `fetch-result` gains optional `"accept_ws": <id>`.
 - New frames for cross-component calls from a DO:
-  `{"type":"do-call","id":N,"binding":"NS","object":"name","...request fields"}`
-  (verglasd → gateway) answered by `{"type":"do-call-result","id":N,...}`.
+  `{"type":"do-call","id":N,"binding":"NS","object":"name",...request fields}`
+  (verglasd → gateway) answered by
+  `{"type":"do-call-result","id":N,...}`.
   Worker-tier `do-fetch` calls are host-internal in the gateway process and
   do not cross this socket.
-- Worker-tier execution runs **in the gateway process** (celld's node-daemon
-  shape): pool instantiation per request, no engine, no event gate, no
-  transaction. DO events keep the full gated path in `verglasd`.
+- Worker-tier execution runs **in the gateway process**: pool instantiation per
+  request, no DO storage transaction or event gate. DO events keep the full
+  serialized Turso transaction and push path in `verglasd`.
 
 ## Deployment surface
 
-`wrangler.jsonc`/`wrangler.json` subset (unknown keys are hard errors naming
-the key, celld's discipline): `name`, `main`, `compatibility_date`,
-`compatibility_flags`, `durable_objects` (bindings: name/class_name),
-`migrations` (new_sqlite_classes/new_classes accepted; other migration kinds
-are errors for now), `vars`. The deploy command mirrors celld's:
-build the Wrangler project (bundle → componentize → digest artifact) and
-emit the runnable manifest.
+`wrangler.jsonc`/`wrangler.json` subset (unknown keys are hard errors naming the
+key): `name`, `main`, `compatibility_date`, `compatibility_flags`,
+`durable_objects` (bindings: name/class_name), `migrations`
+(new_sqlite_classes/new_classes accepted; other migration kinds are errors for
+now), `vars`. The deploy command mirrors the Cloudflare shape: build the
+Wrangler project (bundle → componentize → digest artifact) and emit the
+runnable manifest. This deployment surface is a target until the corresponding
+acceptance evidence exists.
+
+## Pipelines binding
+
+A Pipeline is a prebuilt Worker and Durable Object. Its Worker receives the
+managed Stream binding and appends JSON records with the same binding shape used
+by tenant Workers:
+
+```js
+await env.STREAM.send(records);
+```
+
+The Stream confirms the append only after its Turso transaction reaches its
+durability boundary. Producer identities make retries idempotent; Stream
+ordering, Pipeline cursors, batching, and Sink delivery are defined by the
+[normative platform page](/docs/architecture/primitives-platform), not by the
+Cloudflare Worker/DO API.
 
 ## Compatibility matrix
 
 Status values: **Yes** (spec-conformant), **Gap** (not yet implemented,
 errors honestly), **Divergence** (implemented differently on purpose,
-documented). Nothing is silently faked.
+documented), and **Target** (the acceptance target for this milestone). Nothing
+is silently faked.
 
 | API | Status | Notes |
 | --- | --- | --- |
-| Module Workers `export default { fetch }` | target of this milestone | |
-| `env` DO bindings, `idFromName`/`get`/stub `.fetch()` | target of this milestone | ids are sha256(name) hex |
-| `DurableObject` base class (`cloudflare:workers`) | target of this milestone | |
-| `ctx.storage` `get/put/delete/list` | target of this milestone | structured-clone values over byte KV |
-| `ctx.storage.sql.exec()` | target of this milestone | cursor `.toArray()/.one()`; UPDATE/DELETE DML **Gap** (engine) |
-| `ctx.storage.setAlarm/getAlarm/deleteAlarm` + `alarm()` | target of this milestone | |
-| Hibernatable WebSockets (`acceptWebSocket`, `webSocketMessage/Close`, `WebSocketPair`, 101 responses) | target of this milestone | attachments ≤16 KiB |
-| `ctx.waitUntil` | target of this milestone | executes before event completion in v0 (Divergence) |
+| Module Workers `export default { fetch }` | Target | |
+| `env` DO bindings, `idFromName`/`get`/stub `.fetch()` | Target | ids are sha256(name) hex |
+| `DurableObject` base class (`cloudflare:workers`) | Target | |
+| `ctx.storage` `get/put/delete/list` | Target | structured-clone values over byte KV |
+| `ctx.storage.sql.exec()` | Target | Turso `0.7.2` WAL-backed SQL; cursor `.toArray()/.one()`; CREATE/INSERT/UPDATE/DELETE/SELECT are the target surface |
+| `ctx.storage.setAlarm/getAlarm/deleteAlarm` + `alarm()` | Target | |
+| Hibernatable WebSockets (`acceptWebSocket`, `webSocketMessage/Close`, `WebSocketPair`, 101 responses) | Target | attachments ≤16 KiB |
+| `ctx.waitUntil` | Target | executes before event completion in v0 (Divergence) |
 | `ctx.id` inside a DO | Gap | the WIT handler carries no object identity, so `ctx.id` is the zero id; fix is threading the DO id through the handler world (follow-up), not an SDK shim |
 | `setWebSocketAutoResponse` | Gap | gateway-side, planned |
 | JS RPC (`WorkerEntrypoint`, method calls on stubs) | Gap | `stub.fetch` only in v0 |
 | Service bindings | Gap | |
-| Python Workers API | target of this milestone | Cloudflare Python Workers surface via componentize-py |
+| Python Workers API | Target | Cloudflare Python Workers surface via componentize-py |
 | KV / R2 / D1 / Queues bindings | out of scope / future | D1-on-DO is a natural later layer |
 
 ## Acceptance criteria (immutable)
@@ -114,12 +137,11 @@ May be extended, never weakened; tests asserting them may not be deleted,
   end-to-end through the gateway with **no Verglas-specific code in the
   project**. State survives stack restart.
 - **CC2 — Worker-first ingress.** Public routes execute the Worker-tier
-  `fetch` in the gateway pool; DOs are reachable only through
-  `env` bindings from Worker/DO code. Direct DO routes are internal/debug
-  only.
+  `fetch` in the gateway pool; DOs are reachable only through `env` bindings
+  from Worker/DO code. Direct DO routes are internal/debug only.
 - **CC3 — Guest-driven WebSocket accept.** The 101/`WebSocketPair` flow
-  works: the DO decides acceptance; messages then flow as serialized DO
-  events with commit-gated sends (prior AC1 ordering guarantees intact).
+  works: the DO decides acceptance; messages then flow as serialized DO events
+  with commit-gated sends (prior AC1 ordering guarantees intact).
 - **CC4 — Python parity.** The same project shape in Cloudflare's Python
   Workers style runs end-to-end.
 - **CC5 — No regression.** Every previously green suite stays green with

@@ -4,10 +4,12 @@ description: "The Unix-socket event contract between the gateway and one verglas
 icon: "plug"
 ---
 
-The gateway and `verglasd` speak newline-delimited JSON (NDJSON, UTF-8) over
-the DO's private Unix **event socket** (separate from the replica endpoint).
-Binary payloads are base64 in `*_b64` fields. This is a prototype wire format:
-it may break freely between commits and carries no version negotiation.
+The gateway and the target DO event executor speak newline-delimited JSON
+(NDJSON, UTF-8) over the DO's private Unix **event socket**. Binary payloads
+are base64 in `*_b64` fields. This is a prototype wire format: it may break
+freely between commits and carries no version negotiation. The DO's storage
+boundary is Turso `0.7.2`; its remote sync ingress is a separate durability
+and lease-fencing path, not a second SQL protocol.
 
 `verglasd` processes events strictly one at a time (the input gate). The
 gateway may pipeline frames; responses and outbound effects are emitted in
@@ -30,10 +32,10 @@ N has already seen every send N produced.
 - `ws-open` registers a gateway-accepted connection identity. It is not a
   guest event and has no terminal frame. The gateway owns WebSocket accept in
   v0 (documented divergence from Cloudflare's guest-driven accept).
-- Alarms are **not** gateway frames: OSS `verglasd` is always resident, arms
-  its own timer from committed alarm state, and self-delivers `alarm` events
-  through the same serialized event path. Sends staged by an alarm event still
-  flow out over this socket.
+- Alarms are **not** gateway frames: the event host derives the timer from
+  committed Turso alarm state and delivers `alarm` events through the same
+  serialized path after wake. Sends staged by an alarm event still flow out over
+  this socket.
 
 ## Frames: verglasd → gateway
 
@@ -52,16 +54,17 @@ N has already seen every send N produced.
 
 ## SQL surface
 
-The `storage` WIT interface carries two SQL verbs:
+The `storage` WIT interface exposes Turso-backed SQL execution and a JSON-row
+result boundary:
 
-- `sql(statement) -> list<u8>` — Arrow IPC stream bytes, the native surface.
-- `sql-rows(statement) -> string` — the same execution, rows encoded as one
-  JSON array of objects. This exists so guests without an Arrow decoder
-  (componentized JS/Python) can consume results; it is not a fallback, it is
-  a second encoding of the same committed execution.
+- `sql(statement)` — execute a statement in the current Turso transaction.
+- `sql-rows(statement) -> string` — execute the same statement and return rows
+  as one JSON array of objects for componentized JS and Python guests.
 
-Both execute inside the current event's transaction: DML stages into the
-event's envelope; reads see the event's snapshot plus its own staged writes.
+Both execute inside the current event's Turso transaction. DML stages in Turso;
+reads see the event's snapshot plus its own staged writes. Turso WAL and the
+remote `push()` boundary provide durability; no Arrow mutation envelope or S3
+CAS is part of DO commit.
 
 ## Acceptance criteria (immutable)
 

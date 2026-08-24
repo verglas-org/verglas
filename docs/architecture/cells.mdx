@@ -1,95 +1,91 @@
 ---
 title: "Cell deployment"
-description: "Run one isolated verglasd Worker and SQLite engine per microVM."
+description: "Target isolation and lifecycle shape for one Turso-backed Durable Object."
 icon: "network-wired"
 ---
 
-A cloud deployment gives each active stateful Worker its own microVM and one
-`verglasd` process. The process owns exactly one DO, one SQLite engine, one data
-directory, and one private Unix socket. It is the DO's only event executor; DOs
-do not run Raft or elect leaders.
+This page describes the target placement shape for a stateful Durable Object.
+It does not describe a separate database product or a shipped hosted scheduler.
+The [Worker primitives platform](/docs/architecture/primitives-platform) defines
+the six products and PP1–PP10 acceptance criteria.
+
+A cell runs one active DO event executor in one isolated environment. The DO
+owns one embedded Turso `0.7.2` database and its sync sidecars. Turso's ordinary
+WAL is the local durability path; one remote Turso database per DO is the
+machine-loss recovery source.
 
 ```text
-microVM
-└── verglasd
-    ├── one stateful Worker
-    │     └── tenant WASM component (verglas:do-worker world)
-    ├── DataFusion session
-    ├── SQLite pager and canonical transaction log
-    ├── checkpoint and offload coordinator
-    └── private Unix endpoint
+isolated cell
+└── DO event executor
+    ├── one stateful Worker class
+    │   └── tenant WASM component (verglas:do-worker world)
+    ├── Turso 0.7.2 WAL database and sync sidecars
+    ├── optional transactional Stream outbox
+    └── private event endpoint
 ```
 
-The stateful Worker's tenant logic is a WASM component fetched by content
-digest and verified before instantiation; [DO Workers](/docs/architecture/do-workers)
-defines the ABI, event gating, and artifact contract.
+The tenant component is fetched by content digest and verified before
+instantiation. CPU, memory, and local disk budgets are hard ceilings. Compiled
+Worker code may be cached outside a cell, but mutable DO state and execution do
+not share a process with another tenant payload.
 
-`celld-host` is the resource and lifecycle supervisor. It allocates one isolated
-microVM-sized worker reservation per child, passes the data and socket paths,
-waits for the socket to bind, and fences routing after a crash or during restore.
-CPU, memory, and local disk budgets are hard ceilings. Compiled Worker code may
-be cached outside a microVM, but mutable payload state and execution never share
-a process with another tenant payload.
+## Turso durability and sync fencing
 
-## Commit authority
+A DO event runs inside one Turso transaction. The host acknowledges the event
+only after the transaction commits locally and `push()` confirms the remote sync
+boundary. The cloud provisions a distinct remote URL and token for every DO.
+An external sync ingress validates the current placement lease before forwarding
+the push, so a stale cell cannot open or push another owner's database.
 
-The default mode acknowledges a transaction only after `verglasd` writes its
-exact canonical Arrow envelope as an immutable object, reads it back, and
-conditionally advances the managed S3 head object. The conditional write is
-fenced by an opaque lease token and monotonic generation passed to the worker by
-the launcher. A stale worker has an old object version or generation and cannot
-acknowledge another mutation. SQLite applies the acknowledged transaction as the
-local pager and recovery image; it is not an independent commit authority.
+The lease is a placement and synchronization fence. It is not a lease-fenced
+S3 CAS, a second SQL commit authority, or a custom database protocol. The DO
+runtime retains no custom SQLite pager, DataFusion transaction provider, Arrow
+mutation envelope, or direct Iceberg offload path.
 
-A worker may be spawned with the lease already held. The launcher passes the
-opaque token, generation, current sequence, and conditional object version. The
-worker never silently reacquires or falls back to an unfenced write. For replica
-mode, `celld-host` passes the endpoint, token, generation, and exact recovered
-start sequence with `SPAWN_WORKER`; an invalid fence is rejected before launch.
+A replacement cell first revokes the prior owner, opens the DO's own remote
+Turso database, and restores a local working copy with its sync sidecars. A
+local directory must never be copied between DO identities because it carries
+the persisted Turso sync-client identity.
 
-## Optional early acknowledgement
+## Optional Stream outbox
 
-A deployment may instead configure one replica service endpoint. That service may
-itself be a Cloudflare Durable Object whose platform durability supplies regional
-three-of-five acknowledgement. The worker sends its lease identity, sequence,
-transaction UUID, and exact canonical bytes once and acknowledges only after the
-service replies durably. The transaction is then archived to managed S3
-asynchronously. Managed compacted archive publication flushes after ten seconds,
-at sixteen MiB, or on explicit lifecycle drain; foreground SQLite durability does
-not wait for that publication. This is a separate configured commit mode, not a
-fallback when the default S3 CAS fails.
+A DO may publish selected committed SQL changes to a bound Stream. The Turso
+transaction writes deterministic outbox rows identified by
+`(object-id, event-sequence, record-index)`. After the Turso durability boundary,
+the host sends pending rows to the Stream. The Stream deduplicates those
+identities; only then does the host mark rows delivered and release any effect
+that is gated on publication.
 
-The replica service exposes durable put, bounded replay after a caller's recovered
-sequence, and explicit clean-through-watermark. A replacement `verglasd` worker
-replays this exact tail into its fresh SQLite pager and verifies that the result
-matches the launcher's held start sequence before it binds its event socket. Clean
-requires the current lease and verified archive and checkpoint watermarks through
-the requested sequence; a stale worker or uncovered tail cannot remove failover
-data, and replay below an already cleaned watermark fails closed. Replica processes may also serve an explicitly
-fenced snapshot at or below their applied sequence, but never execute stateful
-Worker events.
+A crash after Stream ingestion but before the delivered mark causes an
+idempotent resend. A crash before ingestion leaves a durable pending row. The
+host drains pending rows before admitting the next event when publication is
+required. Stream unavailability applies backpressure rather than losing a
+committed record.
 
-## Independent scale-to-zero
+## Scale-to-zero
 
-A worker suspends only after its applied sequence is covered by both the managed
-transaction archive and a verified object checkpoint. Optional Iceberg and
-Puffin materialization may lag because the canonical transaction archive is its
-replay source.
+The lifecycle supervisor may suspend an inactive DO after its local sync client
+has pushed through the required durability boundary and no gated publication is
+pending. The remote Turso database remains the recovery source; retaining a
+local working copy only shortens restore.
 
 ```text
 fence new events
       ↓
-archive and checkpoint through applied sequence
+drain required Stream outbox rows
       ↓
-stop the isolated verglasd microVM
+commit and push the final Turso transaction
       ↓
-next request provisions one microVM with lease held
+suspend the isolated DO environment
       ↓
-restore SQLite from checkpoint and replay archive tail
+next request provisions an owner with a valid placement lease
       ↓
-release the triggering event at its requested fence
+open the DO's remote database and restore its local working copy
+      ↓
+release the triggering event after the sync boundary
 ```
 
-Retained local storage may shorten restore, but correctness depends on the
-verified managed checkpoint and transaction objects. No election or leadership
-transfer is required.
+The cache, Iceberg, Catalog, and semantic graph/vector infrastructure remain
+independent. Sinks own delivery and Iceberg data-file publication; Catalog owns
+Iceberg REST and metadata commits. A DO does not materialize its state directly
+to Iceberg or mutate graph/vector indexes.

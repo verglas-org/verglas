@@ -6,7 +6,10 @@ icon: "snowflake"
 
 Iceberg separates a small mutable catalog pointer from immutable metadata and
 data objects. Verglas uses that distinction to cache aggressively without
-guessing whether bytes are still current.
+guessing whether bytes are still current. In the six-product platform, Catalog
+owns REST metadata and commits, while Sink owns Parquet delivery and calls
+Catalog. Property-graph and vector-index builds remain independent semantic
+operations over Iceberg tables; a Durable Object does not mutate them.
 
 ## Catalog requests versus S3 requests
 
