@@ -41,6 +41,7 @@ class Manifest:
     name: str
     main: Path
     bindings: list[dict[str, str]]
+    pipelines: list[dict[str, str]] | None
     compatibility_date: str | None
     compatibility_flags: list[str]
     migrations: list[dict[str, Any]]
@@ -215,9 +216,37 @@ def _parse_migrations(value: Any) -> list[dict[str, Any]]:
     return migrations
 
 
+def _parse_pipelines(value: Any) -> list[dict[str, str]]:
+    """Validate the exact Wrangler Pipeline Stream binding entries."""
+    if not isinstance(value, list):
+        raise ManifestError("manifest.pipelines must be an array")
+    pipelines: list[dict[str, str]] = []
+    for index, raw_pipeline in enumerate(value):
+        path = f"manifest.pipelines[{index}]"
+        if not isinstance(raw_pipeline, dict):
+            raise ManifestError(f"{path} must be an object")
+        _reject_unknown_keys(raw_pipeline, {"binding", "stream"}, path)
+        pipelines.append(
+            {
+                "binding": _required_string(raw_pipeline, "binding", path),
+                "stream": _required_string(raw_pipeline, "stream", path),
+            }
+        )
+    return pipelines
+
+
 def _parse_manifest_data(
     raw: Any,
-) -> tuple[str, str, list[dict[str, str]], str | None, list[str], list[dict[str, Any]], dict[str, Any]]:
+) -> tuple[
+    str,
+    str,
+    list[dict[str, str]],
+    list[dict[str, str]] | None,
+    str | None,
+    list[str],
+    list[dict[str, Any]],
+    dict[str, Any],
+]:
     """Validate the supported Cloudflare Wrangler fields without resolving paths."""
     if not isinstance(raw, dict):
         raise ManifestError("wrangler.jsonc must contain a JSON object")
@@ -231,6 +260,7 @@ def _parse_manifest_data(
             "durable_objects",
             "migrations",
             "vars",
+            "pipelines",
         },
         "top-level",
     )
@@ -266,6 +296,7 @@ def _parse_manifest_data(
                 }
             )
 
+    pipelines = _parse_pipelines(raw["pipelines"]) if "pipelines" in raw else None
     names: set[str] = set()
     for binding in bindings:
         if binding["name"] in names:
@@ -273,12 +304,16 @@ def _parse_manifest_data(
                 f"duplicate durable object binding name: {binding['name']}"
             )
         names.add(binding["name"])
+    for pipeline in pipelines or []:
+        if pipeline["binding"] in names:
+            raise ManifestError(f"duplicate binding name: {pipeline['binding']}")
+        names.add(pipeline["binding"])
 
     migrations = _parse_migrations(raw["migrations"]) if "migrations" in raw else []
     variables = raw.get("vars", {})
     if not isinstance(variables, dict):
         raise ManifestError("manifest.vars must be an object")
-    return name, main, bindings, compatibility_date, compatibility_flags, migrations, dict(variables)
+    return name, main, bindings, pipelines, compatibility_date, compatibility_flags, migrations, dict(variables)
 
 
 def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
@@ -295,6 +330,7 @@ def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
         name,
         main_name,
         bindings,
+        pipelines,
         compatibility_date,
         compatibility_flags,
         migrations,
@@ -321,6 +357,7 @@ def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
         name=name,
         main=main,
         bindings=bindings,
+        pipelines=pipelines,
         compatibility_date=compatibility_date,
         compatibility_flags=compatibility_flags,
         migrations=migrations,
@@ -369,7 +406,8 @@ def _run_componentize(
     entry_path.write_text(
         "from importlib import import_module\n"
         "from workers._component import Handler, Worker, set_project\n"
-        f"set_project(import_module({module_name!r}), {manifest.bindings!r}, {manifest.vars!r})\n",
+        f"set_project(import_module({module_name!r}), {manifest.bindings!r}, "
+        f"{manifest.vars!r}, {manifest.pipelines!r})\n",
         encoding="utf-8",
     )
 
@@ -471,6 +509,8 @@ def build_project(
     }
     if manifest.compatibility_date is not None:
         output_manifest_data["compatibility_date"] = manifest.compatibility_date
+    if manifest.pipelines is not None:
+        output_manifest_data["pipelines"] = manifest.pipelines
     output_manifest_data.update(
         {
             "compatibility_flags": manifest.compatibility_flags,

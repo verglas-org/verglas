@@ -59,10 +59,12 @@ The accepted Wrangler JSON/JSONC subset is:
 - `compatibility_date` and `compatibility_flags`;
 - `durable_objects.bindings` with `name` and `class_name`;
 - `migrations` entries with `tag` and optional `new_sqlite_classes` or `new_classes`;
-- `vars`.
+- `vars`;
+- `pipelines` entries with exactly `binding` and `stream`.
 
-Unknown keys are hard errors, including unknown nested migration keys. Other
-Cloudflare bindings are not silently ignored; they are outside this milestone.
+Unknown keys are hard errors, including unknown nested migration keys and
+pipeline entries. Other Cloudflare bindings are not silently ignored; they are
+outside this milestone.
 
 ## Cloudflare Python surface
 
@@ -76,6 +78,30 @@ The binding object uses the Python spelling `id_from_name(name)`, `get(id)`, and
 locally and retains the original name for the flattened `bindings.do-fetch`
 host call. `get_by_name(name)` is provided as the Python spelling of the same
 named-stub operation for projects that use that Cloudflare helper.
+
+### Pipeline Stream bindings
+
+The manifest form follows Cloudflare's current [Stream binding
+configuration](https://developers.cloudflare.com/pipelines/streams/writing-to-streams/):
+
+```jsonc
+"pipelines": [
+  { "binding": "STREAM", "stream": "stream-id" }
+]
+```
+
+The current Cloudflare Stream page documents `send(records)` but does not
+specify a Python-specific binding class or alternate casing. This SDK therefore
+exposes the same operation as an asynchronous `env.STREAM.send(records)` and
+uses `PipelineBinding` for the concrete runtime object. The binding is separate
+from Durable Object namespaces and has no namespace methods.
+
+`send` requires a Python list of strict JSON values, encodes the compact array as
+UTF-8, and accepts an encoded body of exactly 5 MiB (5 * 1024 * 1024 bytes).
+It calls the WIT `bindings.do-fetch` capability with the binding name, stream ID,
+`POST https://verglas.internal/stream/append`, and
+`content-type: application/json`. Only a 2xx response resolves. Host failures
+and non-2xx responses propagate, with no HTTP or other fallback path.
 
 `Request` exposes `method`, `url`, case-insensitive `headers`, and a byte body;
 `await request.text()`, `await request.bytes()`, and `await request.json()`

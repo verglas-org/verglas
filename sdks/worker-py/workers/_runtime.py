@@ -810,6 +810,115 @@ class DurableObjectId:
         return self._hex
 
 
+STREAM_MAX_REQUEST_BYTES = 5 * 1024 * 1024
+STREAM_APPEND_URI = "https://verglas.internal/stream/append"
+
+
+def _assert_json_value(value: Any, ancestors: set[int]) -> None:
+    """Reject values that are not strict JSON values or that contain cycles."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise TypeError("Pipeline.send requires JSON-serializable records: numbers must be finite")
+        return
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in ancestors:
+            raise TypeError("Pipeline.send requires JSON-serializable records: cyclic value")
+        ancestors.add(identity)
+        try:
+            for entry in value:
+                _assert_json_value(entry, ancestors)
+        finally:
+            ancestors.remove(identity)
+        return
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError("Pipeline.send requires JSON-serializable records: object keys must be strings")
+        identity = id(value)
+        if identity in ancestors:
+            raise TypeError("Pipeline.send requires JSON-serializable records: cyclic value")
+        ancestors.add(identity)
+        try:
+            for entry in value.values():
+                _assert_json_value(entry, ancestors)
+        finally:
+            ancestors.remove(identity)
+        return
+    raise TypeError(
+        "Pipeline.send requires JSON-serializable records: "
+        f"unsupported {type(value).__name__}"
+    )
+
+
+class PipelineBinding:
+    """A fixed Pipeline Stream binding exposing only asynchronous ``send``."""
+
+    def __init__(self, binding_name: str, stream_name: str, imports: _BindingImports):
+        """Bind one Wrangler name to one immutable Stream identity."""
+        if not isinstance(binding_name, str) or not binding_name.strip():
+            raise TypeError("Pipeline binding name must be a non-empty string")
+        if not isinstance(stream_name, str) or not stream_name.strip():
+            raise TypeError("Stream identity must be a non-empty string")
+        if not hasattr(imports, "do_fetch") or not callable(imports.do_fetch):
+            raise TypeError("Stream binding requires the WIT bindings.do-fetch transport")
+        self._binding_name = binding_name
+        self._stream_name = stream_name
+        self._imports = imports
+
+    async def send(self, records: list[Any]) -> None:
+        """Append a JSON record array and wait for a durable 2xx acknowledgement."""
+        if not isinstance(records, list):
+            raise TypeError("Pipeline.send requires a list of JSON-serializable records")
+        _assert_json_value(records, set())
+        try:
+            encoded = json.dumps(
+                records,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (TypeError, UnicodeError, ValueError, OverflowError) as error:
+            raise TypeError(
+                f"Pipeline.send requires JSON-serializable records: {error}"
+            ) from error
+        if len(encoded) > STREAM_MAX_REQUEST_BYTES:
+            raise ValueError(
+                "Pipeline.send request exceeds the 5 MiB encoded request limit "
+                f"({len(encoded)} bytes)"
+            )
+
+        if _wit_types is None:
+            host_request: Any = SimpleNamespace(
+                method="POST",
+                uri=STREAM_APPEND_URI,
+                headers=[("content-type", "application/json")],
+                body=encoded,
+                ws=None,
+            )
+        else:
+            host_request = _wit_types.Request(
+                "POST",
+                STREAM_APPEND_URI,
+                [("content-type", "application/json")],
+                encoded,
+                None,
+            )
+        raw = _call_host(
+            self._imports.do_fetch,
+            self._binding_name,
+            self._stream_name,
+            host_request,
+        )
+        status = getattr(raw, "status", None)
+        if isinstance(status, bool) or not isinstance(status, int) or not 200 <= status < 300:
+            raise WorkerError(
+                "Pipeline.send did not receive a durable ACK: "
+                f"HTTP {status!s}"
+            )
+
+
 class DurableObjectStub:
     """A flattened Durable Object stub exposing asynchronous ``fetch``."""
 
@@ -901,7 +1010,7 @@ class DurableObjectNamespace:
 
 
 class Environment:
-    """Worker environment populated from Wrangler vars and DO bindings."""
+    """Worker environment populated from Wrangler vars, DO, and Stream bindings."""
 
     def __init__(
         self,
@@ -910,6 +1019,7 @@ class Environment:
         binding_imports: _BindingImports,
         variables: Mapping[str, Any],
         binding_records: list[Mapping[str, str]],
+        pipeline_records: list[Mapping[str, str]] | None = None,
     ):
         """Create one environment view for a Worker or Durable Object."""
         self._storage = storage
@@ -918,12 +1028,24 @@ class Environment:
             str(record["name"]): DurableObjectNamespace(str(record["name"]), binding_imports)
             for record in binding_records
         }
+        self._pipelines: dict[str, PipelineBinding] = {}
+        for record in pipeline_records or []:
+            binding = str(record["binding"])
+            if binding in self._bindings or binding in self._pipelines:
+                raise ValueError(f"duplicate binding name: {binding}")
+            self._pipelines[binding] = PipelineBinding(
+                binding,
+                str(record["stream"]),
+                binding_imports,
+            )
         self._sockets = sockets
 
     def __getattr__(self, name: str) -> Any:
-        """Resolve a Wrangler variable or Durable Object namespace binding."""
+        """Resolve a Wrangler variable or namespace or Stream binding."""
         if name in self._bindings:
             return self._bindings[name]
+        if name in self._pipelines:
+            return self._pipelines[name]
         if name in self._variables:
             return self._variables[name]
         raise AttributeError(name)
@@ -1130,6 +1252,7 @@ __all__ = [
     "DurableObjectState",
     "DurableObjectStub",
     "Environment",
+    "PipelineBinding",
     "ExecutionContext",
     "Headers",
     "Request",

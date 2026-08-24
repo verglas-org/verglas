@@ -50,6 +50,7 @@ def set_project(
     module: ModuleType,
     binding_records: list[dict[str, str]],
     variables: dict[str, Any],
+    pipeline_records: list[dict[str, str]] | None = None,
 ) -> None:
     """Configure the imported project and its validated Wrangler bindings."""
     global _project_module, _binding_records, _variables, _environment
@@ -62,6 +63,7 @@ def set_project(
         binding_imports,
         _variables,
         _binding_records,
+        pipeline_records,
     )
 
 

@@ -31,3 +31,8 @@
 - #0: Hardened the binding and storage shims to match Cloudflare's bulk key
   overloads and stable DurableObjectId behavior; the exact canonical value bytes
   remain covered by the mock-host tests.
+- #0: Added strict Wrangler Pipeline Stream bindings to the Python SDK. `env`
+  now exposes a separate asynchronous `send(records)` binding that validates
+  JSON, enforces the inclusive 5 MiB UTF-8 request ceiling, and routes only the
+  exact WIT Stream append request without fallback; manifest, mock-host, and
+  component verification coverage documents the protocol judgment.

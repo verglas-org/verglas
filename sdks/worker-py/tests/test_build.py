@@ -130,6 +130,62 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ManifestError, "class_name"):
             load_manifest(self.project)
 
+    def test_load_manifest_accepts_exact_pipeline_entries(self) -> None:
+        """Pipeline bindings preserve only the Cloudflare binding and stream IDs."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["pipelines"] = [{"binding": "STREAM", "stream": "stream-id"}]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        manifest = load_manifest(self.project)
+
+        self.assertEqual(manifest.pipelines, [{"binding": "STREAM", "stream": "stream-id"}])
+
+    def test_load_manifest_rejects_unknown_pipeline_key(self) -> None:
+        """Pipeline entries reject fields outside the exact Wrangler shape."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["pipelines"] = [{"binding": "STREAM", "stream": "stream-id", "extra": True}]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "extra"):
+            load_manifest(self.project)
+
+    def test_load_manifest_rejects_duplicate_pipeline_binding_names(self) -> None:
+        """Pipeline names cannot collide with DO names or each other."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["pipelines"] = [
+            {"binding": "COUNTER", "stream": "stream-id"},
+            {"binding": "COUNTER", "stream": "another-stream"},
+        ]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "duplicate binding name.*COUNTER"):
+            load_manifest(self.project)
+
+    def test_build_preserves_pipeline_entries_in_output_manifest(self) -> None:
+        """The generated deployment manifest carries validated pipeline bindings."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["pipelines"] = [{"binding": "STREAM", "stream": "stream-id"}]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+        output = self.project / "out"
+
+        def fake_componentize(project, manifest, work_dir, component_path):
+            del project, manifest, work_dir
+            component_path.write_bytes(b"component bytes")
+
+        with mock.patch("build._run_componentize", side_effect=fake_componentize):
+            result = build_project(self.project, output)
+
+        generated = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(generated["pipelines"], [{"binding": "STREAM", "stream": "stream-id"}])
+
     def test_build_writes_digest_artifact_and_full_deployment_manifest(self) -> None:
         """The output manifest carries the accepted Wrangler configuration."""
         output = self.project / "out"
