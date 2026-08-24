@@ -24,6 +24,7 @@ import {
   responseFromRecord,
 } from './http.js';
 import { unwrapOption } from './transport-core.js';
+import { createStreamBinding, PipelineBinding } from './streams.js';
 
 const ZERO_ID = '0'.repeat(64);
 
@@ -35,6 +36,8 @@ export {
   DurableObjectStorage,
   DurableObjectStub,
   SqlStorageCursor,
+  PipelineBinding,
+  createStreamBinding,
 };
 
 /**
@@ -209,6 +212,9 @@ function createEnvironment(manifest, transport) {
   const env = { ...(manifest?.vars ?? {}) };
   for (const binding of manifest?.bindings ?? []) {
     env[binding.name] = createDurableObjectBinding(binding.name, transport);
+  }
+  for (const pipeline of manifest?.pipelines ?? []) {
+    env[pipeline.binding] = createStreamBinding(pipeline.binding, pipeline.stream, transport);
   }
   return Object.freeze(env);
 }

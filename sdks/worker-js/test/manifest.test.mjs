@@ -78,3 +78,40 @@ test('rejects unsupported migration keys by name', () => {
     /unknown migrations\[0\] key.*deleted_classes/i,
   );
 });
+
+test('accepts exact pipeline bindings', () => {
+  assert.deepEqual(parseWranglerManifest({
+    name: 'stream-worker',
+    main: 'worker.js',
+    durable_objects: { bindings: [{ name: 'OBJECTS', class_name: 'Object' }] },
+    pipelines: [{ binding: 'STREAM', stream: 'stream-id' }],
+  }), {
+    name: 'stream-worker',
+    main: 'worker.js',
+    compatibility_flags: [],
+    bindings: [{ name: 'OBJECTS', class_name: 'Object' }],
+    migrations: [],
+    vars: {},
+    pipelines: [{ binding: 'STREAM', stream: 'stream-id' }],
+  });
+});
+
+test('rejects unknown pipeline keys and duplicate binding names', () => {
+  assert.throws(
+    () => parseWranglerManifest({
+      name: 'stream-worker',
+      main: 'worker.js',
+      pipelines: [{ binding: 'STREAM', stream: 'stream-id', extra: true }],
+    }),
+    /unknown pipelines\[0\] key.*extra/i,
+  );
+  assert.throws(
+    () => parseWranglerManifest({
+      name: 'stream-worker',
+      main: 'worker.js',
+      durable_objects: { bindings: [{ name: 'STREAM', class_name: 'Object' }] },
+      pipelines: [{ binding: 'STREAM', stream: 'stream-id' }],
+    }),
+    /duplicate binding name.*STREAM/i,
+  );
+});

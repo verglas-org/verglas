@@ -14,10 +14,12 @@ const topLevelKeys = new Set([
   'durable_objects',
   'migrations',
   'vars',
+  'pipelines',
 ]);
 const durableObjectsKeys = new Set(['bindings']);
 const bindingKeys = new Set(['name', 'class_name']);
 const migrationKeys = new Set(['tag', 'new_classes', 'new_sqlite_classes']);
+const pipelineKeys = new Set(['binding', 'stream']);
 
 /**
  * Error raised when a project manifest is outside the supported subset.
@@ -225,9 +227,29 @@ function parseMigrations(value) {
 }
 
 /**
+ * Parses the exact Cloudflare Pipeline binding shape.
+ * @param {unknown} value
+ * @returns {Array<{binding: string, stream: string}>}
+ */
+function parsePipelines(value) {
+  if (!Array.isArray(value)) throw new ManifestError('manifest.pipelines must be an array');
+  return value.map((rawPipeline, index) => {
+    if (!rawPipeline || typeof rawPipeline !== 'object' || Array.isArray(rawPipeline)) {
+      throw new ManifestError(`manifest.pipelines[${index}] must be an object`);
+    }
+    const pipeline = /** @type {Record<string, unknown>} */ (rawPipeline);
+    rejectUnknownKeys(pipeline, pipelineKeys, `pipelines[${index}]`);
+    return {
+      binding: requiredString(pipeline, 'binding', `manifest.pipelines[${index}]`),
+      stream: requiredString(pipeline, 'stream', `manifest.pipelines[${index}]`),
+    };
+  });
+}
+
+/**
  * Validates the supported wrangler manifest subset.
  * @param {unknown} raw
- * @returns {{name: string, main: string, compatibility_date?: string, compatibility_flags: string[], bindings: Array<{name: string, class_name: string}>, migrations: Array<{tag: string, new_classes: string[], new_sqlite_classes: string[]}>, vars: Record<string, unknown>}}
+ * @returns {{name: string, main: string, compatibility_date?: string, compatibility_flags: string[], bindings: Array<{name: string, class_name: string}>, migrations: Array<{tag: string, new_classes: string[], new_sqlite_classes: string[]}>, vars: Record<string, unknown>, pipelines?: Array<{binding: string, stream: string}>}}
  */
 export function parseWranglerManifest(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -276,12 +298,19 @@ export function parseWranglerManifest(raw) {
     });
   }
 
+  const pipelines = object.pipelines === undefined ? undefined : parsePipelines(object.pipelines);
   const names = new Set();
   for (const binding of bindings) {
     if (names.has(binding.name)) {
       throw new ManifestError(`duplicate durable object binding name: ${binding.name}`);
     }
     names.add(binding.name);
+  }
+  for (const pipeline of pipelines ?? []) {
+    if (names.has(pipeline.binding)) {
+      throw new ManifestError(`duplicate binding name: ${pipeline.binding}`);
+    }
+    names.add(pipeline.binding);
   }
 
   return {
@@ -292,6 +321,7 @@ export function parseWranglerManifest(raw) {
     bindings,
     migrations,
     vars,
+    ...(pipelines === undefined ? {} : { pipelines }),
   };
 }
 

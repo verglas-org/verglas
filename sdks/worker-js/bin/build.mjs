@@ -187,6 +187,7 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
       durable_objects: { bindings: manifest.bindings },
       migrations: manifest.migrations,
       vars: manifest.vars,
+      ...(manifest.pipelines === undefined ? {} : { pipelines: manifest.pipelines }),
       component_digest: componentDigest,
     };
     const manifestPath = join(outputDir, 'manifest.out.json');

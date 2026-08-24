@@ -15,6 +15,8 @@ import {
   DurableObjectStorage,
   DurableObjectStub,
   SqlStorageCursor,
+  PipelineBinding,
+  createStreamBinding,
 } from './cloudflare-workers.js';
 import { createWitTransport } from './transport.js';
 
@@ -43,6 +45,8 @@ export {
   DurableObjectStorage,
   DurableObjectStub,
   SqlStorageCursor,
+  PipelineBinding,
+  createStreamBinding,
 };
 export {
   bytesFromValue,

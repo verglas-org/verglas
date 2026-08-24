@@ -71,6 +71,26 @@ known v0 divergence from Cloudflare's ability to continue work after sending a
 response. `passThroughOnException` is accepted by the context but has no
 pass-through host route.
 
+### Pipeline Stream bindings
+
+The manifest accepts the exact Cloudflare-shaped binding form:
+
+```jsonc
+"pipelines": [
+  { "binding": "STREAM", "stream": "stream-id" }
+]
+```
+
+Unknown keys are hard errors. `env.STREAM` is a dedicated binding with only
+`send(records)`. It requires an array whose values are JSON-serializable,
+encodes the array as compact UTF-8 JSON, and rejects encoded requests above
+5 MiB before calling `verglas:do-worker/bindings@0.1.0` `do-fetch`. The call is
+`(binding, stream, { method: "POST", uri: "https://verglas.internal/stream/append",
+headers: [["content-type", "application/json"]], body, ws: undefined })`.
+Only a 2xx response resolves the Promise; host errors and every other status
+reject, with no fallback path. Structured Stream schema validation is not part
+of this SDK surface yet; Pipeline processing must perform that validation.
+
 ## Durable Object storage and events
 
 `DurableObject` receives the Cloudflare `ctx` and `env` constructor arguments.
