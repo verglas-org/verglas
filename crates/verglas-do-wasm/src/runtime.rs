@@ -12,7 +12,9 @@ use wasmtime::component::{Component, HasSelf, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
-use crate::abi::{SocketId, WitHandlerError, WorkerHost, WorkerSockets, WorkerStorage, bindings};
+use crate::abi::{
+    SocketId, WitHandlerError, WorkerBindings, WorkerHost, WorkerSockets, WorkerStorage, bindings,
+};
 use crate::artifact::{ArtifactError, ComponentDigest, CwasmCache};
 use crate::gate::{EventGate, EventPermit};
 
@@ -201,9 +203,11 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        let (permit, mut store, instance) =
-            self.instantiate_component(gate, storage, sockets).await?;
+        let (permit, mut store, instance) = self
+            .instantiate_component(gate, storage, sockets, bindings)
+            .await?;
         let result = instance
             .verglas_do_worker_handler()
             .call_init(&mut store)
@@ -222,9 +226,12 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         request: Request,
     ) -> Result<PendingEvent<Response>, RuntimeError> {
-        let (permit, mut store, instance) = self.instantiate_event(gate, storage, sockets).await?;
+        let (permit, mut store, instance) = self
+            .instantiate_event(gate, storage, sockets, bindings)
+            .await?;
         let result = instance
             .verglas_do_worker_handler()
             .call_fetch(&mut store, &request)
@@ -242,9 +249,12 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         scheduled_millis: u64,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        let (permit, mut store, instance) = self.instantiate_event(gate, storage, sockets).await?;
+        let (permit, mut store, instance) = self
+            .instantiate_event(gate, storage, sockets, bindings)
+            .await?;
         let result = instance
             .verglas_do_worker_handler()
             .call_alarm(&mut store, scheduled_millis)
@@ -262,10 +272,13 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         socket: SocketId,
         message: Vec<u8>,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        let (permit, mut store, instance) = self.instantiate_event(gate, storage, sockets).await?;
+        let (permit, mut store, instance) = self
+            .instantiate_event(gate, storage, sockets, bindings)
+            .await?;
         let result = instance
             .verglas_do_worker_handler()
             .call_websocket_message(&mut store, socket, &message)
@@ -278,16 +291,20 @@ impl WorkerRuntime {
     /// The returned permit retains socket effects until the caller's storage
     /// transaction has committed. A handler or Wasmtime error aborts it before
     /// this method returns.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_websocket_close(
         &self,
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         socket: SocketId,
         code: u16,
         reason: String,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        let (permit, mut store, instance) = self.instantiate_event(gate, storage, sockets).await?;
+        let (permit, mut store, instance) = self
+            .instantiate_event(gate, storage, sockets, bindings)
+            .await?;
         let result = instance
             .verglas_do_worker_handler()
             .call_websocket_close(&mut store, socket, code, &reason)
@@ -301,9 +318,11 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
     ) -> Result<(EventPermit, Store<WorkerStore>, bindings::Service), RuntimeError> {
-        let (permit, mut store, instance) =
-            self.instantiate_component(gate, storage, sockets).await?;
+        let (permit, mut store, instance) = self
+            .instantiate_component(gate, storage, sockets, bindings)
+            .await?;
         let result = instance
             .verglas_do_worker_handler()
             .call_init(&mut store)
@@ -329,10 +348,11 @@ impl WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
     ) -> Result<(EventPermit, Store<WorkerStore>, bindings::Service), RuntimeError> {
         let permit = gate.begin_event().await;
         let event_sockets = permit.staging_sockets(sockets);
-        let host = WorkerHost::new(storage, event_sockets);
+        let host = WorkerHost::with_bindings(storage, event_sockets, bindings);
         let mut store = Store::new(&self.engine, WorkerStore::new(host));
         let instance =
             match bindings::Service::instantiate_async(&mut store, &self.component, &self.linker)

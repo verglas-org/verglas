@@ -4,7 +4,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
-use verglas_do_wasm::{EventGate, HostError, WorkerRuntime, WorkerSockets, WorkerStorage};
+use verglas_do_wasm::{
+    EventGate, HostError, Request, Response, WorkerBindings, WorkerRuntime, WorkerSockets,
+    WorkerStorage,
+};
 
 /// Storage stub used to prove that dispatch accepts per-event capabilities.
 #[derive(Default)]
@@ -55,6 +58,25 @@ impl WorkerStorage for TestStorage {
     /// Accepts alarm removal.
     async fn delete_alarm(&self) -> Result<(), HostError> {
         Ok(())
+    }
+}
+
+/// Binding stub used by runtime tests that do not invoke cross-object calls.
+#[derive(Default)]
+struct TestBindings;
+
+#[async_trait]
+impl WorkerBindings for TestBindings {
+    /// Rejects calls because the runtime dispatch tests do not route objects.
+    async fn do_fetch(
+        &self,
+        _binding: String,
+        _object: String,
+        _request: Request,
+    ) -> Result<Response, HostError> {
+        Err(HostError::Unsupported {
+            operation: "test Durable Object binding",
+        })
     }
 }
 
@@ -124,8 +146,12 @@ async fn runtime_dispatch_init_rejects_component_without_init() {
     let gate = EventGate::new(Arc::clone(&sockets) as Arc<dyn WorkerSockets>);
     let storage = Arc::new(TestStorage) as Arc<dyn WorkerStorage>;
     let event_sockets = Arc::new(TestSockets::default()) as Arc<dyn WorkerSockets>;
+    let bindings = Arc::new(TestBindings) as Arc<dyn WorkerBindings>;
 
-    let error = match runtime.dispatch_init(&gate, storage, event_sockets).await {
+    let error = match runtime
+        .dispatch_init(&gate, storage, event_sockets, bindings)
+        .await
+    {
         Ok(_) => panic!("component without init must fail at dispatch"),
         Err(error) => error,
     };
@@ -145,9 +171,10 @@ async fn runtime_dispatch_rejects_missing_handler_without_releasing_gate_early()
     let gate = EventGate::new(Arc::clone(&sockets) as Arc<dyn WorkerSockets>);
     let storage = Arc::new(TestStorage) as Arc<dyn WorkerStorage>;
     let event_sockets = Arc::new(TestSockets::default()) as Arc<dyn WorkerSockets>;
+    let bindings = Arc::new(TestBindings) as Arc<dyn WorkerBindings>;
 
     let error = match runtime
-        .dispatch_alarm(&gate, storage, event_sockets, 42)
+        .dispatch_alarm(&gate, storage, event_sockets, bindings, 42)
         .await
     {
         Ok(_) => panic!("component without handler must fail at dispatch"),

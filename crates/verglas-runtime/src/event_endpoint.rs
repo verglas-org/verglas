@@ -3,26 +3,31 @@
 //! This module owns frame decoding, transaction-scoped Worker dispatch, commit-gated
 //! socket output, and advisory alarm delivery. Replica control traffic remains in
 //! `verglas-do-engine`; this socket carries only the gateway event protocol.
+//! Cross-object `do-call` subrequests are emitted immediately and are deliberately
+//! not output-gated: they are irreversible side effects like Cloudflare subrequests,
+//! while only WebSocket sends and closes wait for the event commit.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use verglas_do_engine::{
     DoEngine, DoStorage, Error as EngineError, IsolationLevel, SnapshotFence, WorkerStateView,
     ensure_worker_tables,
 };
 use verglas_do_wasm::{
-    EventGate, HostError, PendingEvent, Request, Response, RuntimeError, SocketId, WorkerRuntime,
-    WorkerSockets, WorkerStorage,
+    EventGate, HostError, PendingEvent, Request, Response, RuntimeError, SocketId, WorkerBindings,
+    WorkerRuntime, WorkerSockets, WorkerStorage,
 };
 
 use crate::worker_storage::EngineWorkerStorage;
@@ -58,6 +63,7 @@ pub trait EventDispatcher: Send + Sync {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
     ) -> Result<PendingEvent<()>, RuntimeError>;
 
     /// Dispatches one HTTP fetch request.
@@ -66,6 +72,7 @@ pub trait EventDispatcher: Send + Sync {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         request: Request,
     ) -> Result<PendingEvent<Response>, RuntimeError>;
 
@@ -75,6 +82,7 @@ pub trait EventDispatcher: Send + Sync {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         scheduled_millis: u64,
     ) -> Result<PendingEvent<()>, RuntimeError>;
 
@@ -84,16 +92,19 @@ pub trait EventDispatcher: Send + Sync {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         socket: SocketId,
         message: Vec<u8>,
     ) -> Result<PendingEvent<()>, RuntimeError>;
 
     /// Dispatches one WebSocket close event.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_websocket_close(
         &self,
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         socket: SocketId,
         code: u16,
         reason: String,
@@ -108,8 +119,9 @@ impl EventDispatcher for WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        WorkerRuntime::dispatch_init(self, gate, storage, sockets).await
+        WorkerRuntime::dispatch_init(self, gate, storage, sockets, bindings).await
     }
 
     /// Runs the real Worker component fetch export.
@@ -118,9 +130,10 @@ impl EventDispatcher for WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         request: Request,
     ) -> Result<PendingEvent<Response>, RuntimeError> {
-        WorkerRuntime::dispatch_fetch(self, gate, storage, sockets, request).await
+        WorkerRuntime::dispatch_fetch(self, gate, storage, sockets, bindings, request).await
     }
 
     /// Runs the real Worker component alarm export.
@@ -129,9 +142,11 @@ impl EventDispatcher for WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         scheduled_millis: u64,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        WorkerRuntime::dispatch_alarm(self, gate, storage, sockets, scheduled_millis).await
+        WorkerRuntime::dispatch_alarm(self, gate, storage, sockets, bindings, scheduled_millis)
+            .await
     }
 
     /// Runs the real Worker component WebSocket message export.
@@ -140,11 +155,14 @@ impl EventDispatcher for WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         socket: SocketId,
         message: Vec<u8>,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        WorkerRuntime::dispatch_websocket_message(self, gate, storage, sockets, socket, message)
-            .await
+        WorkerRuntime::dispatch_websocket_message(
+            self, gate, storage, sockets, bindings, socket, message,
+        )
+        .await
     }
 
     /// Runs the real Worker component WebSocket close export.
@@ -153,13 +171,25 @@ impl EventDispatcher for WorkerRuntime {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
         socket: SocketId,
         code: u16,
         reason: String,
     ) -> Result<PendingEvent<()>, RuntimeError> {
-        WorkerRuntime::dispatch_websocket_close(self, gate, storage, sockets, socket, code, reason)
-            .await
+        WorkerRuntime::dispatch_websocket_close(
+            self, gate, storage, sockets, bindings, socket, code, reason,
+        )
+        .await
     }
+}
+
+/// One typed gateway failure returned for a cross-object call.
+#[derive(Debug, Deserialize)]
+struct DoCallErrorFrame {
+    /// Stable machine-readable gateway failure code.
+    code: String,
+    /// Human-readable gateway failure description.
+    message: String,
 }
 
 /// One gateway-to-Worker NDJSON input frame.
@@ -179,6 +209,25 @@ enum InboundFrame {
         headers: Vec<(String, String)>,
         /// Base64 request body.
         body_b64: String,
+        /// Pending WebSocket identity supplied with an upgrade request.
+        #[serde(default)]
+        ws: Option<SocketId>,
+    },
+    /// Answers one cross-Durable-Object call emitted during a Worker event.
+    #[serde(rename = "do-call-result")]
+    DoCallResult {
+        /// Call identity echoed from the outbound request.
+        id: u64,
+        /// Successful response status, omitted on an error.
+        status: Option<u16>,
+        /// Successful ordered response headers, omitted on an error.
+        headers: Option<Vec<(String, String)>>,
+        /// Successful base64 response body, omitted on an error.
+        body_b64: Option<String>,
+        /// Accepted pending WebSocket identity, when present.
+        accept_ws: Option<SocketId>,
+        /// Typed gateway failure, omitted on success.
+        error: Option<DoCallErrorFrame>,
     },
     /// Registers a gateway-accepted WebSocket.
     #[serde(rename = "ws-open")]
@@ -236,6 +285,29 @@ enum OutboundFrame {
         /// Close reason.
         reason: String,
     },
+    /// Requests one cross-Durable-Object fetch from the gateway immediately.
+    /// This frame is not held by the event output gate because subrequests are
+    /// irreversible side effects; only socket output remains commit-gated.
+    #[serde(rename = "do-call")]
+    DoCall {
+        /// Call identity echoed in the result frame.
+        id: u64,
+        /// Manifest binding to resolve.
+        binding: String,
+        /// Named object within the binding.
+        object: String,
+        /// HTTP method for the target fetch.
+        method: String,
+        /// Request URL path and query string.
+        url: String,
+        /// Ordered request headers.
+        headers: Vec<(String, String)>,
+        /// Base64 request body.
+        body_b64: String,
+        /// Pending WebSocket identity propagated through the call.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ws: Option<SocketId>,
+    },
     /// Returns one fetch result.
     #[serde(rename = "fetch-result")]
     FetchResult {
@@ -247,6 +319,9 @@ enum OutboundFrame {
         headers: Vec<(String, String)>,
         /// Base64 response body.
         body_b64: String,
+        /// Pending WebSocket identity accepted by the guest, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accept_ws: Option<SocketId>,
     },
     /// Terminates a WebSocket message or close event.
     #[serde(rename = "done")]
@@ -262,6 +337,176 @@ enum OutboundFrame {
         /// Stable failure message.
         message: String,
     },
+}
+
+/// Maximum number of cross-object calls one resident event socket may await.
+const MAX_IN_FLIGHT_DO_CALLS: usize = 16;
+
+/// Pending cross-object calls and their hard concurrency budget.
+struct PendingDoCalls {
+    /// Monotonic identity assigned to each outbound call.
+    next_id: AtomicU64,
+    /// Hard ceiling on calls awaiting gateway responses.
+    permits: Arc<Semaphore>,
+    /// Result channels indexed by outbound call identity.
+    waiters: Mutex<BTreeMap<u64, oneshot::Sender<Result<Response, HostError>>>>,
+}
+
+impl PendingDoCalls {
+    /// Creates an empty pending-call registry with the fixed in-flight ceiling.
+    fn new() -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            permits: Arc::new(Semaphore::new(MAX_IN_FLIGHT_DO_CALLS)),
+            waiters: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    /// Reserves one in-flight slot and allocates a call identity and result channel.
+    async fn register(
+        &self,
+    ) -> Result<
+        (
+            u64,
+            OwnedSemaphorePermit,
+            oneshot::Receiver<Result<Response, HostError>>,
+        ),
+        HostError,
+    > {
+        let permit = Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .map_err(|_| HostError::backend("do-call concurrency budget is closed"))?;
+        let id = self
+            .next_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| HostError::backend("do-call identity exhausted"))?;
+        let (sender, receiver) = oneshot::channel();
+        let mut waiters = self.waiters.lock().await;
+        if waiters.insert(id, sender).is_some() {
+            return Err(HostError::backend(format!(
+                "duplicate do-call identity {id}"
+            )));
+        }
+        Ok((id, permit, receiver))
+    }
+
+    /// Removes one pending call after its outbound frame could not be sent.
+    async fn remove(&self, id: u64) {
+        self.waiters.lock().await.remove(&id);
+    }
+
+    /// Resolves one pending call or reports an unknown result identity.
+    async fn resolve(
+        &self,
+        id: u64,
+        result: Result<Response, HostError>,
+    ) -> Result<(), EventEndpointError> {
+        let sender = self.waiters.lock().await.remove(&id).ok_or_else(|| {
+            EventEndpointError::Protocol(format!("unknown do-call result id {id}"))
+        })?;
+        let _ = sender.send(result);
+        Ok(())
+    }
+}
+
+/// Worker binding host that emits do-call frames and awaits their results.
+#[derive(Clone)]
+struct DoCallRouter {
+    /// Per-event-socket pending call registry.
+    pending: Arc<PendingDoCalls>,
+    /// Endpoint writer channel serviced while dispatch is awaiting a call.
+    outbound: mpsc::Sender<OutboundFrame>,
+}
+
+impl DoCallRouter {
+    /// Creates a router attached to one event socket's writer channel.
+    fn new(outbound: mpsc::Sender<OutboundFrame>) -> Self {
+        Self {
+            pending: Arc::new(PendingDoCalls::new()),
+            outbound,
+        }
+    }
+
+    /// Converts one successful result frame's optional fields into a response.
+    fn decode_success(
+        status: Option<u16>,
+        headers: Option<Vec<(String, String)>>,
+        body_b64: Option<String>,
+        accept_ws: Option<SocketId>,
+    ) -> Result<Response, HostError> {
+        let status = status.ok_or_else(|| HostError::backend("do-call result omitted status"))?;
+        let headers =
+            headers.ok_or_else(|| HostError::backend("do-call result omitted headers"))?;
+        let body_b64 = body_b64.ok_or_else(|| HostError::backend("do-call result omitted body"))?;
+        let body = base64::engine::general_purpose::STANDARD
+            .decode(body_b64)
+            .map_err(|error| HostError::backend(format!("do-call body is not base64: {error}")))?;
+        Ok(Response {
+            status,
+            headers,
+            body,
+            accept_ws,
+        })
+    }
+}
+
+#[async_trait]
+impl WorkerBindings for DoCallRouter {
+    /// Emits one ungated do-call and awaits the gateway's response frame.
+    async fn do_fetch(
+        &self,
+        binding: String,
+        object: String,
+        request: Request,
+    ) -> Result<Response, HostError> {
+        let (id, permit, receiver) = self.pending.register().await?;
+        let frame = OutboundFrame::DoCall {
+            id,
+            binding,
+            object,
+            method: request.method,
+            url: request.uri,
+            headers: request.headers,
+            body_b64: base64::engine::general_purpose::STANDARD.encode(request.body),
+            ws: request.ws,
+        };
+        if self.outbound.send(frame).await.is_err() {
+            self.pending.remove(id).await;
+            drop(permit);
+            return Err(HostError::backend("event socket closed during do-call"));
+        }
+        let result = receiver
+            .await
+            .map_err(|_| HostError::backend("event socket closed during do-call"))?;
+        drop(permit);
+        result
+    }
+}
+
+/// Host binding used by startup and detached alarm events without a gateway peer.
+struct NoBindings;
+
+#[async_trait]
+impl WorkerBindings for NoBindings {
+    /// Rejects a cross-object call when no event socket can carry its frame.
+    async fn do_fetch(
+        &self,
+        _binding: String,
+        _object: String,
+        _request: Request,
+    ) -> Result<Response, HostError> {
+        Err(HostError::Unsupported {
+            operation: "do-fetch without a gateway event socket",
+        })
+    }
+}
+
+/// Creates the honest no-peer binding capability for detached events.
+fn no_bindings() -> Arc<dyn WorkerBindings> {
+    Arc::new(NoBindings)
 }
 
 /// Commit-gated output and accepted WebSocket registry for one event socket.
@@ -455,7 +700,7 @@ impl EventEndpoint {
                     }
                     () = sleep.as_mut() => {
                         self.alarm_deadline = None;
-                        self.execute_alarm(deadline).await?;
+                        let _ = self.execute_alarm(deadline, no_bindings()).await?;
                         self.refresh_alarm().await?;
                     }
                 }
@@ -475,6 +720,7 @@ impl EventEndpoint {
                 &self.gate,
                 Arc::clone(&storage) as Arc<dyn WorkerStorage>,
                 Arc::clone(&sockets) as Arc<dyn WorkerSockets>,
+                no_bindings(),
             )
             .await
             .map_err(EventEndpointError::Runtime)?;
@@ -485,74 +731,104 @@ impl EventEndpoint {
         Ok(())
     }
 
-    /// Accepts one persistent gateway stream and interleaves input with alarms.
+    /// Accepts one persistent gateway stream and services call results while events run.
     async fn handle_connection(&mut self, stream: UnixStream) -> Result<(), EventEndpointError> {
         let (read_half, mut write_half) = stream.into_split();
         self.write_effects(&mut write_half).await?;
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
+        let (outbound_sender, mut outbound_receiver) = mpsc::channel(32);
+        let router = Arc::new(DoCallRouter::new(outbound_sender));
+        let mut queued = VecDeque::new();
         loop {
-            if let Some(deadline) = self.alarm_deadline {
-                let delay = duration_until(deadline);
-                let mut sleep = Box::pin(tokio::time::sleep(delay));
+            let frame = if let Some(frame) = queued.pop_front() {
+                frame
+            } else if let Some(deadline) = self.alarm_deadline {
+                let mut sleep = Box::pin(tokio::time::sleep(duration_until(deadline)));
                 tokio::select! {
-                    result = reader.read_line(&mut line) => {
-                        if !self.handle_read_result(result?, &mut line, &mut write_half).await? {
-                            return Ok(());
-                        }
-                    }
+                    result = read_frame(&mut reader, &mut line) => match result? {
+                        Some(frame) => frame,
+                        None => return Ok(()),
+                    },
                     () = sleep.as_mut() => {
                         self.alarm_deadline = None;
-                        self.deliver_alarm(deadline, &mut write_half).await?;
+                        let binding_router: Arc<dyn WorkerBindings> = router.clone();
+                        let operation = self.execute_alarm(deadline, binding_router);
+                        let Some(frames) = wait_for_pending(
+                            operation,
+                            &mut reader,
+                            &mut write_half,
+                            &router,
+                            &mut outbound_receiver,
+                            &mut queued,
+                        ).await? else {
+                            return Ok(());
+                        };
+                        write_frames(&mut write_half, &frames).await?;
                         self.refresh_alarm().await?;
+                        continue;
                     }
                 }
             } else {
-                let read = reader.read_line(&mut line).await?;
-                if !self
-                    .handle_read_result(read, &mut line, &mut write_half)
-                    .await?
-                {
-                    return Ok(());
+                match read_frame(&mut reader, &mut line).await? {
+                    Some(frame) => frame,
+                    None => return Ok(()),
                 }
+            };
+
+            if let InboundFrame::DoCallResult {
+                id,
+                status,
+                headers,
+                body_b64,
+                accept_ws,
+                error,
+            } = frame
+            {
+                router
+                    .pending
+                    .resolve(
+                        id,
+                        decode_do_call_result(status, headers, body_b64, accept_ws, error),
+                    )
+                    .await?;
+                continue;
             }
+            let operation = self.handle_frame(frame, Arc::clone(&router));
+            let Some(frames) = wait_for_pending(
+                operation,
+                &mut reader,
+                &mut write_half,
+                &router,
+                &mut outbound_receiver,
+                &mut queued,
+            )
+            .await?
+            else {
+                return Ok(());
+            };
+            write_frames(&mut write_half, &frames).await?;
         }
     }
 
-    /// Parses and handles one completed input line, returning false on EOF.
-    async fn handle_read_result<W: AsyncWrite + Unpin>(
-        &mut self,
-        read: usize,
-        line: &mut String,
-        writer: &mut W,
-    ) -> Result<bool, EventEndpointError> {
-        if read == 0 {
-            return Ok(false);
-        }
-        if line.len() > MAX_FRAME_BYTES {
-            return Err(EventEndpointError::Protocol(
-                "event frame exceeds endpoint limit".to_owned(),
-            ));
-        }
-        let frame = serde_json::from_str::<InboundFrame>(line.trim_end())
-            .map_err(|error| EventEndpointError::Protocol(error.to_string()))?;
-        self.handle_frame(frame, writer).await?;
-        line.clear();
-        Ok(true)
-    }
-
-    /// Dispatches one protocol frame and writes its terminal response in order.
-    async fn handle_frame<W: AsyncWrite + Unpin>(
+    /// Dispatches one protocol frame and returns terminal output in event order.
+    async fn handle_frame(
         &mut self,
         frame: InboundFrame,
-        writer: &mut W,
-    ) -> Result<(), EventEndpointError> {
-        match frame {
+        router: Arc<DoCallRouter>,
+    ) -> Result<Vec<OutboundFrame>, EventEndpointError> {
+        let frames = match frame {
+            InboundFrame::DoCallResult { .. } => {
+                return Err(EventEndpointError::Protocol(
+                    "do-call result was not awaited".to_owned(),
+                ));
+            }
             InboundFrame::WsOpen { ws } => {
                 self.sink
                     .register(ws)
                     .await
                     .map_err(EventEndpointError::Host)?;
+                Vec::new()
             }
             InboundFrame::Fetch {
                 id,
@@ -560,19 +836,17 @@ impl EventEndpoint {
                 url,
                 headers,
                 body_b64,
+                ws,
             } => {
                 let body = match base64::engine::general_purpose::STANDARD.decode(body_b64) {
                     Ok(body) => body,
                     Err(error) => {
-                        self.write_frame(
-                            writer,
-                            &OutboundFrame::Error {
-                                id,
-                                message: format!("invalid fetch body: {error}"),
-                            },
-                        )
-                        .await?;
-                        return Ok(());
+                        let frames = vec![OutboundFrame::Error {
+                            id,
+                            message: format!("invalid fetch body: {error}"),
+                        }];
+                        self.refresh_alarm().await?;
+                        return Ok(frames);
                     }
                 };
                 let request = Request {
@@ -580,30 +854,25 @@ impl EventEndpoint {
                     uri: url,
                     headers,
                     body,
+                    ws,
                 };
-                let result = self
-                    .dispatch_fetch(request)
-                    .await
-                    .map_err(|error| error.to_string());
-                match result {
+                match self.dispatch_fetch(request, router).await {
                     Ok(response) => {
-                        self.write_effects(writer).await?;
-                        self.write_frame(
-                            writer,
-                            &OutboundFrame::FetchResult {
-                                id,
-                                status: response.status,
-                                headers: response.headers,
-                                body_b64: base64::engine::general_purpose::STANDARD
-                                    .encode(response.body),
-                            },
-                        )
-                        .await?;
+                        let mut frames = self.sink.take_effects().await;
+                        frames.push(OutboundFrame::FetchResult {
+                            id,
+                            status: response.status,
+                            headers: response.headers,
+                            body_b64: base64::engine::general_purpose::STANDARD
+                                .encode(response.body),
+                            accept_ws: response.accept_ws,
+                        });
+                        frames
                     }
-                    Err(message) => {
-                        self.write_frame(writer, &OutboundFrame::Error { id, message })
-                            .await?;
-                    }
+                    Err(error) => vec![OutboundFrame::Error {
+                        id,
+                        message: error.to_string(),
+                    }],
                 }
             }
             InboundFrame::WsMessage {
@@ -611,56 +880,44 @@ impl EventEndpoint {
                 ws,
                 text: _text,
                 data_b64,
-            } => {
-                let message = match base64::engine::general_purpose::STANDARD.decode(data_b64) {
-                    Ok(message) => message,
-                    Err(error) => {
-                        self.write_frame(
-                            writer,
-                            &OutboundFrame::Error {
-                                id,
-                                message: format!("invalid WebSocket body: {error}"),
-                            },
-                        )
-                        .await?;
-                        return Ok(());
-                    }
-                };
-                match self.dispatch_ws_message(ws, message).await {
+            } => match base64::engine::general_purpose::STANDARD.decode(data_b64) {
+                Ok(message) => match self.dispatch_ws_message(ws, message, router).await {
                     Ok(()) => {
-                        self.write_effects(writer).await?;
-                        self.write_frame(writer, &OutboundFrame::Done { id })
-                            .await?;
+                        let mut frames = self.sink.take_effects().await;
+                        frames.push(OutboundFrame::Done { id });
+                        frames
                     }
-                    Err(message) => {
-                        self.write_frame(writer, &OutboundFrame::Error { id, message })
-                            .await?;
-                    }
-                }
-            }
+                    Err(message) => vec![OutboundFrame::Error { id, message }],
+                },
+                Err(error) => vec![OutboundFrame::Error {
+                    id,
+                    message: format!("invalid WebSocket body: {error}"),
+                }],
+            },
             InboundFrame::WsClose {
                 id,
                 ws,
                 code,
                 reason,
-            } => match self.dispatch_ws_close(ws, code, reason).await {
+            } => match self.dispatch_ws_close(ws, code, reason, router).await {
                 Ok(()) => {
-                    self.write_effects(writer).await?;
-                    self.write_frame(writer, &OutboundFrame::Done { id })
-                        .await?;
+                    let mut frames = self.sink.take_effects().await;
+                    frames.push(OutboundFrame::Done { id });
+                    frames
                 }
-                Err(message) => {
-                    self.write_frame(writer, &OutboundFrame::Error { id, message })
-                        .await?;
-                }
+                Err(message) => vec![OutboundFrame::Error { id, message }],
             },
-        }
+        };
         self.refresh_alarm().await?;
-        Ok(())
+        Ok(frames)
     }
 
     /// Delivers one fetch through a fresh event transaction.
-    async fn dispatch_fetch(&self, request: Request) -> Result<Response, EventEndpointError> {
+    async fn dispatch_fetch(
+        &self,
+        request: Request,
+        router: Arc<DoCallRouter>,
+    ) -> Result<Response, EventEndpointError> {
         let (storage, sockets) = self.event_capabilities().await?;
         let pending = self
             .dispatcher
@@ -668,6 +925,7 @@ impl EventEndpoint {
                 &self.gate,
                 Arc::clone(&storage) as Arc<dyn WorkerStorage>,
                 Arc::clone(&sockets) as Arc<dyn WorkerSockets>,
+                router,
                 request,
             )
             .await
@@ -679,7 +937,12 @@ impl EventEndpoint {
     }
 
     /// Delivers one WebSocket message through a fresh event transaction.
-    async fn dispatch_ws_message(&self, socket: SocketId, message: Vec<u8>) -> Result<(), String> {
+    async fn dispatch_ws_message(
+        &self,
+        socket: SocketId,
+        message: Vec<u8>,
+        router: Arc<DoCallRouter>,
+    ) -> Result<(), String> {
         let (storage, sockets) = self
             .event_capabilities()
             .await
@@ -690,6 +953,7 @@ impl EventEndpoint {
                 &self.gate,
                 Arc::clone(&storage) as Arc<dyn WorkerStorage>,
                 Arc::clone(&sockets) as Arc<dyn WorkerSockets>,
+                router,
                 socket,
                 message,
             )
@@ -707,6 +971,7 @@ impl EventEndpoint {
         socket: SocketId,
         code: u16,
         reason: String,
+        router: Arc<DoCallRouter>,
     ) -> Result<(), String> {
         let (storage, sockets) = self
             .event_capabilities()
@@ -718,6 +983,7 @@ impl EventEndpoint {
                 &self.gate,
                 Arc::clone(&storage) as Arc<dyn WorkerStorage>,
                 Arc::clone(&sockets) as Arc<dyn WorkerSockets>,
+                router,
                 socket,
                 code,
                 reason,
@@ -730,25 +996,19 @@ impl EventEndpoint {
         Ok(())
     }
 
-    /// Delivers an advisory alarm only if its deadline is still committed.
-    async fn deliver_alarm<W: AsyncWrite + Unpin>(
+    /// Executes one advisory alarm and returns committed socket effects.
+    async fn execute_alarm(
         &self,
         scheduled: u64,
-        writer: &mut W,
-    ) -> Result<(), EventEndpointError> {
-        self.execute_alarm(scheduled).await?;
-        self.write_effects(writer).await
-    }
-
-    /// Executes one advisory alarm without requiring an attached gateway writer.
-    async fn execute_alarm(&self, scheduled: u64) -> Result<(), EventEndpointError> {
+        router: Arc<dyn WorkerBindings>,
+    ) -> Result<Vec<OutboundFrame>, EventEndpointError> {
         if WorkerStateView::new(self.engine.as_ref())
             .alarm()
             .await
             .map_err(EventEndpointError::Engine)?
             != Some(scheduled)
         {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let (storage, sockets) = self.event_capabilities().await?;
         let pending = self
@@ -757,6 +1017,7 @@ impl EventEndpoint {
                 &self.gate,
                 Arc::clone(&storage) as Arc<dyn WorkerStorage>,
                 Arc::clone(&sockets) as Arc<dyn WorkerSockets>,
+                router,
                 scheduled,
             )
             .await;
@@ -767,10 +1028,13 @@ impl EventEndpoint {
                     Ok(_) => {
                         if let Err(error) = permit.commit().await {
                             eprintln!("alarm output commit failed: {error}");
+                            return Ok(Vec::new());
                         }
+                        Ok(self.sink.take_effects().await)
                     }
                     Err(error) => {
                         eprintln!("alarm transaction commit failed: {error}");
+                        Ok(Vec::new())
                     }
                 }
             }
@@ -778,9 +1042,9 @@ impl EventEndpoint {
                 // Alarm frames have no gateway id, so there is no terminal error
                 // frame to emit. The dispatch error already aborted its permit.
                 eprintln!("alarm handler failed: {error}");
+                Ok(Vec::new())
             }
         }
-        Ok(())
     }
 
     /// Creates one event transaction and its event-scoped host capabilities.
@@ -838,6 +1102,126 @@ impl EventEndpoint {
         writer.flush().await?;
         Ok(())
     }
+}
+
+/// Reads and decodes one bounded NDJSON frame from the event socket.
+async fn read_frame<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    line: &mut String,
+) -> Result<Option<InboundFrame>, EventEndpointError> {
+    let read = reader.read_line(line).await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if line.len() > MAX_FRAME_BYTES {
+        return Err(EventEndpointError::Protocol(
+            "event frame exceeds endpoint limit".to_owned(),
+        ));
+    }
+    let frame = serde_json::from_str::<InboundFrame>(line.trim_end())
+        .map_err(|error| EventEndpointError::Protocol(error.to_string()))?;
+    line.clear();
+    Ok(Some(frame))
+}
+
+/// Converts one inbound call-result frame into a host response or hard gateway error.
+fn decode_do_call_result(
+    status: Option<u16>,
+    headers: Option<Vec<(String, String)>>,
+    body_b64: Option<String>,
+    accept_ws: Option<SocketId>,
+    error: Option<DoCallErrorFrame>,
+) -> Result<Response, HostError> {
+    if let Some(error) = error {
+        return Err(HostError::backend(format!(
+            "gateway do-call {}: {}",
+            error.code, error.message
+        )));
+    }
+    DoCallRouter::decode_success(status, headers, body_b64, accept_ws)
+}
+
+/// Services call frames while one event dispatch awaits its result.
+async fn wait_for_pending<R, W, F>(
+    operation: F,
+    reader: &mut BufReader<R>,
+    writer: &mut W,
+    router: &DoCallRouter,
+    outbound: &mut mpsc::Receiver<OutboundFrame>,
+    queued: &mut VecDeque<InboundFrame>,
+) -> Result<Option<Vec<OutboundFrame>>, EventEndpointError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Future<Output = Result<Vec<OutboundFrame>, EventEndpointError>>,
+{
+    let mut operation = Box::pin(operation);
+    let mut line = String::new();
+    loop {
+        tokio::select! {
+            result = &mut operation => return result.map(Some),
+            frame = outbound.recv() => {
+                let frame = frame.ok_or_else(|| {
+                    EventEndpointError::Protocol("do-call writer channel closed".to_owned())
+                })?;
+                write_frame_to(writer, &frame).await?;
+            }
+            result = read_frame(reader, &mut line) => {
+                let Some(frame) = result? else {
+                    return Ok(None);
+                };
+                match frame {
+                    InboundFrame::DoCallResult {
+                        id,
+                        status,
+                        headers,
+                        body_b64,
+                        accept_ws,
+                        error,
+                    } => {
+                        router
+                            .pending
+                            .resolve(
+                                id,
+                                decode_do_call_result(
+                                    status,
+                                    headers,
+                                    body_b64,
+                                    accept_ws,
+                                    error,
+                                ),
+                            )
+                            .await?;
+                    }
+                    frame => queued.push_back(frame),
+                }
+            }
+        }
+    }
+}
+
+/// Writes one or more frames while preserving their event order.
+async fn write_frames<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frames: &[OutboundFrame],
+) -> Result<(), EventEndpointError> {
+    for frame in frames {
+        write_frame_to(writer, frame).await?;
+    }
+    Ok(())
+}
+
+/// Serializes one output frame as exactly one NDJSON line.
+async fn write_frame_to<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    frame: &OutboundFrame,
+) -> Result<(), EventEndpointError> {
+    let mut bytes = serde_json::to_vec(frame)
+        .map_err(|error| EventEndpointError::Protocol(error.to_string()))?;
+    bytes.push(b'\n');
+    writer.write_all(&bytes).await?;
+    writer.flush().await?;
+    Ok(())
 }
 
 impl Drop for EventEndpoint {

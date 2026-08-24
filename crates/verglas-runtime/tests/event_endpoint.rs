@@ -17,8 +17,8 @@ use verglas_do_engine::{
     CommitAuthority, CommitReceipt, DoEngine, TransactionEnvelope, WorkerStateView,
 };
 use verglas_do_wasm::{
-    EventGate, EventPermit, HostError, PendingEvent, Request, Response, RuntimeError,
-    WorkerSockets, WorkerStorage,
+    EventGate, EventPermit, HostError, PendingEvent, Request, Response, RuntimeError, SocketId,
+    WorkerBindings, WorkerSockets, WorkerStorage,
 };
 use verglas_runtime::{EventDispatcher, EventEndpoint};
 
@@ -79,6 +79,7 @@ impl EventDispatcher for ScriptedDispatcher {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
     ) -> Result<PendingEvent<()>, RuntimeError> {
         let (permit, _staged_sockets) = Self::begin(gate, sockets).await;
         if let Some(deadline) = self.alarm_deadline {
@@ -99,6 +100,7 @@ impl EventDispatcher for ScriptedDispatcher {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
         request: Request,
     ) -> Result<PendingEvent<Response>, RuntimeError> {
         let (permit, _staged_sockets) = Self::begin(gate, sockets).await;
@@ -121,7 +123,10 @@ impl EventDispatcher for ScriptedDispatcher {
             outcome: Response {
                 status: 200,
                 headers: vec![("content-type".to_owned(), "text/plain".to_owned())],
-                body: request.uri.into_bytes(),
+                body: request.uri.clone().into_bytes(),
+                accept_ws: (request.uri == "/accept-ws")
+                    .then_some(request.ws)
+                    .flatten(),
             },
             permit,
         })
@@ -133,6 +138,7 @@ impl EventDispatcher for ScriptedDispatcher {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
         socket: u64,
         message: Vec<u8>,
     ) -> Result<PendingEvent<()>, RuntimeError> {
@@ -167,6 +173,7 @@ impl EventDispatcher for ScriptedDispatcher {
         gate: &EventGate,
         storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
         _scheduled_millis: u64,
     ) -> Result<PendingEvent<()>, RuntimeError> {
         let (permit, _staged_sockets) = Self::begin(gate, sockets).await;
@@ -186,6 +193,7 @@ impl EventDispatcher for ScriptedDispatcher {
         gate: &EventGate,
         _storage: Arc<dyn WorkerStorage>,
         sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
         _socket: u64,
         _code: u16,
         _reason: String,
@@ -295,6 +303,46 @@ async fn fetch_returns_fetch_result() {
     assert_eq!(result["type"], "fetch-result");
     assert_eq!(result["id"], 1);
     assert_eq!(result["status"], 200);
+    task.abort();
+}
+
+/// Guest acceptance is carried on fetch-result, while an ordinary response omits it.
+#[tokio::test]
+async fn fetch_upgrade_acceptance_is_forwarded_without_local_state() {
+    let directory = tempfile::tempdir().expect("endpoint directory");
+    let (_engine, task) = start_endpoint(&directory).await;
+    let (mut writer, mut reader) = connect(&directory).await;
+    let accepted = round_trip(
+        &mut writer,
+        &mut reader,
+        json!({
+            "type": "fetch",
+            "id": 2,
+            "method": "GET",
+            "url": "/accept-ws",
+            "headers": [],
+            "body_b64": "",
+            "ws": 17
+        }),
+    )
+    .await;
+    assert_eq!(accepted["accept_ws"], 17);
+
+    let ordinary = round_trip(
+        &mut writer,
+        &mut reader,
+        json!({
+            "type": "fetch",
+            "id": 3,
+            "method": "GET",
+            "url": "/ordinary",
+            "headers": [],
+            "body_b64": "",
+            "ws": 18
+        }),
+    )
+    .await;
+    assert!(ordinary.get("accept_ws").is_none());
     task.abort();
 }
 
@@ -429,4 +477,236 @@ async fn alarm_deadline_self_delivers_and_clears() {
         None
     );
     task.abort();
+}
+
+/// Scripted dispatcher that performs one cross-Durable-Object call during fetch.
+struct DoCallDispatcher;
+
+impl DoCallDispatcher {
+    /// Creates a successful pending event without host effects.
+    async fn empty_event(gate: &EventGate) -> PendingEvent<()> {
+        PendingEvent {
+            outcome: (),
+            permit: gate.begin_event().await,
+        }
+    }
+
+    /// Converts a failed binding call into the guest handler error shape.
+    fn binding_failure(error: HostError) -> RuntimeError {
+        RuntimeError::Handler {
+            message: error.to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl EventDispatcher for DoCallDispatcher {
+    /// Runs an empty initialization event.
+    async fn dispatch_init(
+        &self,
+        gate: &EventGate,
+        _storage: Arc<dyn WorkerStorage>,
+        _sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
+    ) -> Result<PendingEvent<()>, RuntimeError> {
+        Ok(Self::empty_event(gate).await)
+    }
+
+    /// Calls the gateway binding router and returns its response to the handler.
+    async fn dispatch_fetch(
+        &self,
+        gate: &EventGate,
+        _storage: Arc<dyn WorkerStorage>,
+        _sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
+        _request: Request,
+    ) -> Result<PendingEvent<Response>, RuntimeError> {
+        let permit = gate.begin_event().await;
+        let target = Request {
+            method: "GET".to_owned(),
+            uri: "/target".to_owned(),
+            headers: vec![("x-call".to_owned(), "yes".to_owned())],
+            body: b"call-body".to_vec(),
+            ws: None,
+        };
+        let response = bindings
+            .do_fetch("COUNTER".to_owned(), "alice".to_owned(), target)
+            .await
+            .map_err(Self::binding_failure)?;
+        Ok(PendingEvent {
+            outcome: response,
+            permit,
+        })
+    }
+
+    /// Runs an empty alarm event because this dispatcher only tests fetch calls.
+    async fn dispatch_alarm(
+        &self,
+        gate: &EventGate,
+        _storage: Arc<dyn WorkerStorage>,
+        _sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
+        _scheduled_millis: u64,
+    ) -> Result<PendingEvent<()>, RuntimeError> {
+        Ok(Self::empty_event(gate).await)
+    }
+
+    /// Runs an empty WebSocket message event because this dispatcher only tests fetch calls.
+    async fn dispatch_websocket_message(
+        &self,
+        gate: &EventGate,
+        _storage: Arc<dyn WorkerStorage>,
+        _sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
+        _socket: SocketId,
+        _message: Vec<u8>,
+    ) -> Result<PendingEvent<()>, RuntimeError> {
+        Ok(Self::empty_event(gate).await)
+    }
+
+    /// Runs an empty WebSocket close event because this dispatcher only tests fetch calls.
+    async fn dispatch_websocket_close(
+        &self,
+        gate: &EventGate,
+        _storage: Arc<dyn WorkerStorage>,
+        _sockets: Arc<dyn WorkerSockets>,
+        _bindings: Arc<dyn WorkerBindings>,
+        _socket: SocketId,
+        _code: u16,
+        _reason: String,
+    ) -> Result<PendingEvent<()>, RuntimeError> {
+        Ok(Self::empty_event(gate).await)
+    }
+}
+
+/// A scripted peer can answer a DO call while the fetch handler is suspended.
+#[tokio::test]
+async fn do_call_result_reaches_handler_before_fetch_result() {
+    let directory = tempfile::tempdir().expect("endpoint directory");
+    let (_engine, task) =
+        start_endpoint_with_dispatcher(&directory, Arc::new(DoCallDispatcher)).await;
+    let (mut writer, mut reader) = connect(&directory).await;
+    send_frame(
+        &mut writer,
+        json!({
+            "type": "fetch",
+            "id": 20,
+            "method": "GET",
+            "url": "/outer",
+            "headers": [],
+            "body_b64": ""
+        }),
+    )
+    .await;
+    let call = read_json(&mut reader).await;
+    assert_eq!(call["type"], "do-call");
+    assert_eq!(call["id"], 1);
+    assert_eq!(call["binding"], "COUNTER");
+    assert_eq!(call["object"], "alice");
+    assert_eq!(call["method"], "GET");
+    assert_eq!(call["url"], "/target");
+    assert_eq!(call["headers"][0], json!(["x-call", "yes"]));
+    writer
+        .write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "type": "do-call-result",
+                    "id": 1,
+                    "status": 201,
+                    "headers": [["x-target", "ok"]],
+                    "body_b64": "ZnJvbS10YXJnZXQ="
+                })
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write do-call result");
+    let result = read_json(&mut reader).await;
+    assert_eq!(result["type"], "fetch-result");
+    assert_eq!(result["id"], 20);
+    assert_eq!(result["status"], 201);
+    assert_eq!(result["body_b64"], "ZnJvbS10YXJnZXQ=");
+    task.abort();
+}
+
+/// A gateway error response becomes the handler error and never a fetch result.
+#[tokio::test]
+async fn do_call_gateway_error_reaches_handler_as_error() {
+    let directory = tempfile::tempdir().expect("endpoint directory");
+    let (_engine, task) =
+        start_endpoint_with_dispatcher(&directory, Arc::new(DoCallDispatcher)).await;
+    let (mut writer, mut reader) = connect(&directory).await;
+    send_frame(
+        &mut writer,
+        json!({
+            "type": "fetch",
+            "id": 21,
+            "method": "GET",
+            "url": "/outer",
+            "headers": [],
+            "body_b64": ""
+        }),
+    )
+    .await;
+    let call = read_json(&mut reader).await;
+    assert_eq!(call["type"], "do-call");
+    writer
+        .write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "type": "do-call-result",
+                    "id": call["id"],
+                    "error": {"code": "target-error", "message": "target failed"}
+                })
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("write gateway error");
+    let result = read_json(&mut reader).await;
+    assert_eq!(result["type"], "error");
+    assert_eq!(result["id"], 21);
+    assert!(result["message"].as_str().is_some_and(|message| {
+        message.contains("target-error") || message.contains("target failed")
+    }));
+    task.abort();
+}
+
+/// A result for an id with no pending call is a protocol failure.
+#[tokio::test]
+async fn unknown_do_call_result_id_is_protocol_error() {
+    let directory = tempfile::tempdir().expect("endpoint directory");
+    let (_engine, task) =
+        start_endpoint_with_dispatcher(&directory, Arc::new(DoCallDispatcher)).await;
+    let (mut writer, _reader) = connect(&directory).await;
+    send_frame(
+        &mut writer,
+        json!({
+            "type": "do-call-result",
+            "id": 999,
+            "status": 200,
+            "headers": [],
+            "body_b64": ""
+        }),
+    )
+    .await;
+    let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .expect("endpoint protocol failure")
+        .expect("endpoint task joined");
+    assert!(
+        outcome
+            .expect_err("unknown call id must fail")
+            .to_string()
+            .contains("unknown do-call")
+    );
+}
+
+/// Reads one JSON frame from a connected event peer.
+async fn read_json(reader: &mut BufReader<tokio::io::ReadHalf<UnixStream>>) -> Value {
+    let mut line = String::new();
+    reader.read_line(&mut line).await.expect("read event frame");
+    serde_json::from_str(line.trim()).expect("decode event frame")
 }
