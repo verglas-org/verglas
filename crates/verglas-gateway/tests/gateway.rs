@@ -420,13 +420,13 @@ async fn websocket_pipelined_effect_order_is_authoritative()
     Ok(())
 }
 
-/// Returns 404 for an unmatched route and exposes unknown bindings as typed errors.
+/// Returns 404 for an internal unknown binding and exposes the typed error.
 #[tokio::test]
 async fn unknown_route_and_binding_are_rejected()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut fixture = Fixture::new().await?;
     let address = fixture.start_gateway().await?;
-    let response = reqwest::get(format!("http://{address}/not-a-do-route")).await?;
+    let response = reqwest::get(format!("http://{address}/do/MISSING/alice")).await?;
     assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
     let error = fixture.gateway().resolve_binding("MISSING", "alice");
     assert!(matches!(error, Err(GatewayError::UnknownBinding { .. })));

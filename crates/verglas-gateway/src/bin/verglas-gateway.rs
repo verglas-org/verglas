@@ -70,7 +70,7 @@ fn next_value(
 
 /// Returns the one supported command-line shape.
 fn usage() -> &'static str {
-    "usage: verglas-gateway --manifest PATH --listen ADDR --celld-control PATH --data-root PATH"
+    "usage: verglas-gateway --manifest PATH --listen ADDR --celld-control PATH --data-root PATH\npublic /* routes run the Worker fetch; /do/<binding>/<name>/* is internal/debug only"
 }
 
 /// Loads the manifest and serves its resident DO routes.

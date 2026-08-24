@@ -14,6 +14,8 @@ pub struct FetchResponse {
     pub headers: Vec<(String, String)>,
     /// Raw response bytes after base64 decoding.
     pub body: Vec<u8>,
+    /// Pending WebSocket identity accepted by the guest, when present.
+    pub accept_ws: Option<u64>,
 }
 
 /// A decoded WebSocket effect released after an event commit.
@@ -35,6 +37,15 @@ pub enum WsOutbound {
     },
 }
 
+/// One typed failure returned from a cross-Durable-Object call.
+#[derive(Debug, Serialize)]
+pub(crate) struct DoCallError {
+    /// Stable machine-readable failure code.
+    pub code: String,
+    /// Human-readable reason that names the violated invariant.
+    pub message: String,
+}
+
 /// One frame emitted by the gateway into a DO event socket.
 #[derive(Debug, Serialize)]
 #[serde(tag = "type")]
@@ -52,6 +63,30 @@ pub(crate) enum GatewayFrame {
         headers: Vec<(String, String)>,
         /// Base64-encoded request body.
         body_b64: String,
+        /// Gateway-assigned pending WebSocket identity for a guest-driven upgrade.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ws: Option<u64>,
+    },
+    /// Answers one cross-Durable-Object call from the Worker.
+    #[serde(rename = "do-call-result")]
+    DoCallResult {
+        /// Call identity echoed from the request frame.
+        id: u64,
+        /// Successful response status, omitted on an error.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        /// Successful ordered response headers.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        headers: Option<Vec<(String, String)>>,
+        /// Successful base64 response body.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_b64: Option<String>,
+        /// Accepted pending WebSocket identity, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        accept_ws: Option<u64>,
+        /// Typed failure returned without entering the target gate.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<DoCallError>,
     },
     /// Registers a gateway-accepted WebSocket identity.
     #[serde(rename = "ws-open")]
@@ -120,6 +155,30 @@ pub(crate) enum WorkerFrame {
         headers: Vec<(String, String)>,
         /// Base64-encoded response body.
         body_b64: String,
+        /// Pending WebSocket identity accepted by the guest.
+        #[serde(default)]
+        accept_ws: Option<u64>,
+    },
+    /// Requests one cross-Durable-Object fetch from the gateway.
+    #[serde(rename = "do-call")]
+    DoCall {
+        /// Call identity echoed in the result frame.
+        id: u64,
+        /// Manifest binding to resolve.
+        binding: String,
+        /// Named object within the binding.
+        object: String,
+        /// HTTP method for the target fetch.
+        method: String,
+        /// Request URL path and query string.
+        url: String,
+        /// Ordered request headers.
+        headers: Vec<(String, String)>,
+        /// Base64-encoded request body.
+        body_b64: String,
+        /// Pending WebSocket identity propagated through the call.
+        #[serde(default)]
+        ws: Option<u64>,
     },
     /// Completes a WebSocket message or close event.
     #[serde(rename = "done")]

@@ -11,6 +11,7 @@ mod protocol;
 mod spawn;
 
 pub use error::GatewayError;
-pub use gateway::Gateway;
-pub use manifest::{Binding, ManagedCas, Manifest, ManifestError};
+pub use gateway::{Gateway, WorkerExecutor, WorkerPoolExecutor};
+pub use manifest::{Binding, ManagedCas, Manifest, ManifestError, Migration};
 pub use spawn::{CelldSpawner, DoSpawner, SpawnRequest};
+pub use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};

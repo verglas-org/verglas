@@ -5,17 +5,19 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use base64::Engine;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::GatewayError;
-use crate::protocol::{FetchResponse, GatewayFrame, WorkerFrame, WsOutbound};
+use crate::protocol::{DoCallError, FetchResponse, GatewayFrame, WorkerFrame, WsOutbound};
 
 /// One HTTP fetch request after conversion to protocol fields.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct FetchEvent {
     /// HTTP method text.
     pub method: String,
@@ -25,6 +27,20 @@ pub(crate) struct FetchEvent {
     pub headers: Vec<(String, String)>,
     /// Raw request body.
     pub body: Vec<u8>,
+    /// Pending WebSocket identity propagated through the fetch.
+    pub ws: Option<u64>,
+}
+
+/// Routes one DO-originated cross-object call without sharing the source gate.
+#[async_trait]
+pub(crate) trait DoCallHandler: Send + Sync {
+    /// Resolves and forwards one target fetch, or returns a typed gateway error.
+    async fn call(
+        &self,
+        binding: String,
+        object: String,
+        event: FetchEvent,
+    ) -> Result<FetchResponse, GatewayError>;
 }
 
 /// One live connection to a resident Durable Object.
@@ -34,13 +50,16 @@ pub(crate) struct DoConnection {
 
 impl DoConnection {
     /// Connects to a spawned event socket and starts its resident reader actor.
-    pub(crate) async fn connect(path: impl AsRef<Path>) -> Result<Self, GatewayError> {
+    pub(crate) async fn connect(
+        path: impl AsRef<Path>,
+        do_call: Arc<dyn DoCallHandler>,
+    ) -> Result<Self, GatewayError> {
         let stream = UnixStream::connect(path.as_ref())
             .await
             .map_err(|error| GatewayError::event_io("connect", error))?;
         let (reader, writer) = tokio::io::split(stream);
         let (commands, receiver) = mpsc::channel(128);
-        let actor = EventActor::new(reader, writer, receiver);
+        let actor = EventActor::new(reader, writer, receiver, do_call);
         tokio::spawn(async move {
             actor.run().await;
         });
@@ -57,14 +76,32 @@ impl DoConnection {
         response.await.map_err(|_| GatewayError::Disconnected)?
     }
 
-    /// Registers one WebSocket and waits until its ws-open frame is written.
+    /// Registers one WebSocket with a fresh identity and waits for ws-open.
     pub(crate) async fn open_websocket(
         &self,
+    ) -> Result<(u64, mpsc::UnboundedReceiver<WsOutbound>), GatewayError> {
+        self.open_websocket_with_id_result(None).await
+    }
+
+    /// Registers one WebSocket using a pending guest-provided identity.
+    pub(crate) async fn open_websocket_with_id(
+        &self,
+        ws: u64,
+    ) -> Result<mpsc::UnboundedReceiver<WsOutbound>, GatewayError> {
+        let (_, receiver) = self.open_websocket_with_id_result(Some(ws)).await?;
+        Ok(receiver)
+    }
+
+    /// Sends the registration command and returns its identity and effect channel.
+    async fn open_websocket_with_id_result(
+        &self,
+        ws: Option<u64>,
     ) -> Result<(u64, mpsc::UnboundedReceiver<WsOutbound>), GatewayError> {
         let (effects, receiver) = mpsc::unbounded_channel();
         let (respond_to, response) = oneshot::channel();
         self.commands
             .send(Command::OpenWebSocket {
+                ws,
                 effects,
                 respond_to,
             })
@@ -131,6 +168,8 @@ enum Command {
     },
     /// Writes ws-open and registers an effect channel.
     OpenWebSocket {
+        /// Gateway-assigned identity, or none for the internal debug route.
+        ws: Option<u64>,
         /// Client effect channel owned by the WebSocket task.
         effects: mpsc::UnboundedSender<WsOutbound>,
         /// Channel receiving the assigned identity.
@@ -178,6 +217,7 @@ struct EventActor {
     reader: BufReader<ReadHalf<UnixStream>>,
     writer: WriteHalf<UnixStream>,
     commands: mpsc::Receiver<Command>,
+    do_call: Arc<dyn DoCallHandler>,
     next_event_id: u64,
     next_ws_id: u64,
     pending: HashMap<u64, PendingEvent>,
@@ -190,11 +230,13 @@ impl EventActor {
         reader: ReadHalf<UnixStream>,
         writer: WriteHalf<UnixStream>,
         commands: mpsc::Receiver<Command>,
+        do_call: Arc<dyn DoCallHandler>,
     ) -> Self {
         Self {
             reader: BufReader::new(reader),
             writer,
             commands,
+            do_call,
             next_event_id: 1,
             next_ws_id: 1,
             pending: HashMap::new(),
@@ -224,7 +266,7 @@ impl EventActor {
                                     break;
                                 }
                             };
-                            if self.handle_worker_frame(frame).is_err() {
+                            if self.handle_worker_frame(frame).await.is_err() {
                                 break;
                             }
                             line.clear();
@@ -251,6 +293,7 @@ impl EventActor {
                     url: event.url,
                     headers: event.headers,
                     body_b64: base64::engine::general_purpose::STANDARD.encode(event.body),
+                    ws: event.ws,
                 };
                 self.pending.insert(id, PendingEvent::Fetch(respond_to));
                 if let Err(error) = self.write_frame(&frame).await {
@@ -259,10 +302,14 @@ impl EventActor {
                 }
             }
             Command::OpenWebSocket {
+                ws,
                 effects,
                 respond_to,
             } => {
-                let ws = self.next_websocket()?;
+                let ws = match ws {
+                    Some(ws) => self.reserve_websocket(ws)?,
+                    None => self.next_websocket()?,
+                };
                 let frame = GatewayFrame::WsOpen { ws };
                 self.websockets.insert(ws, effects);
                 if let Err(error) = self.write_frame(&frame).await {
@@ -334,7 +381,7 @@ impl EventActor {
     }
 
     /// Applies one worker frame without reordering effects around its terminal frame.
-    fn handle_worker_frame(&mut self, frame: WorkerFrame) -> Result<(), GatewayError> {
+    async fn handle_worker_frame(&mut self, frame: WorkerFrame) -> Result<(), GatewayError> {
         match frame {
             WorkerFrame::WsSend { ws, text, data_b64 } => {
                 let data = base64::engine::general_purpose::STANDARD
@@ -360,6 +407,7 @@ impl EventActor {
                 status,
                 headers,
                 body_b64,
+                accept_ws,
             } => {
                 let body = base64::engine::general_purpose::STANDARD
                     .decode(body_b64)
@@ -375,7 +423,62 @@ impl EventActor {
                     status,
                     headers,
                     body,
+                    accept_ws,
                 }));
+            }
+            WorkerFrame::DoCall {
+                id,
+                binding,
+                object,
+                method,
+                url,
+                headers,
+                body_b64,
+                ws,
+            } => {
+                let body = base64::engine::general_purpose::STANDARD
+                    .decode(body_b64)
+                    .map_err(|error| GatewayError::Protocol {
+                        message: format!("do-call body is not base64: {error}"),
+                    })?;
+                let result = self
+                    .do_call
+                    .call(
+                        binding,
+                        object,
+                        FetchEvent {
+                            method,
+                            url,
+                            headers,
+                            body,
+                            ws,
+                        },
+                    )
+                    .await;
+                let frame = match result {
+                    Ok(response) => GatewayFrame::DoCallResult {
+                        id,
+                        status: Some(response.status),
+                        headers: Some(response.headers),
+                        body_b64: Some(
+                            base64::engine::general_purpose::STANDARD.encode(response.body),
+                        ),
+                        accept_ws: response.accept_ws,
+                        error: None,
+                    },
+                    Err(error) => GatewayFrame::DoCallResult {
+                        id,
+                        status: None,
+                        headers: None,
+                        body_b64: None,
+                        accept_ws: None,
+                        error: Some(DoCallError {
+                            code: error.code().to_owned(),
+                            message: error.to_string(),
+                        }),
+                    },
+                };
+                self.write_frame(&frame).await?;
             }
             WorkerFrame::Done { id } => {
                 let Some(pending) = self.pending.remove(&id) else {
@@ -416,6 +519,21 @@ impl EventActor {
                 .ok_or_else(|| GatewayError::Protocol {
                     message: "event identity exhausted".to_owned(),
                 })?;
+        Ok(id)
+    }
+
+    /// Reserves a pending WebSocket identity exactly once.
+    fn reserve_websocket(&mut self, id: u64) -> Result<u64, GatewayError> {
+        if self.websockets.contains_key(&id) {
+            return Err(GatewayError::Protocol {
+                message: format!("WebSocket {id} is already registered"),
+            });
+        }
+        self.next_ws_id =
+            self.next_ws_id
+                .max(id.checked_add(1).ok_or_else(|| GatewayError::Protocol {
+                    message: "WebSocket identity exhausted".to_owned(),
+                })?);
         Ok(id)
     }
 

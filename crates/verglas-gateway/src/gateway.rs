@@ -1,15 +1,17 @@
-//! Axum HTTP and WebSocket routing for resident Durable Objects.
+//! Axum HTTP and WebSocket routing for Workers and resident Durable Objects.
 //!
-//! The gateway owns client connections and creates exactly one event actor for
-//! each `(binding, name)` key. It intentionally never suspends, restarts, or
-//! replaces a resident object during the process lifetime.
+//! Public routes execute the stateless Worker tier first. Durable Objects are
+//! resolved only through manifest bindings, while `/do/...` remains an explicit
+//! internal/debug route for inspecting a resident object's event socket.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use axum::body::Body;
-use axum::extract::{Path as RoutePath, State, WebSocketUpgrade};
+use async_trait::async_trait;
+use axum::body::{Body, to_bytes};
+use axum::extract::{FromRequestParts, Path as RoutePath, Request, State, WebSocketUpgrade};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{any, get};
@@ -18,14 +20,57 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use verglas_do_wasm::{
+    DoRouter, HostError, Request as WorkerRequest, Response as WorkerResponse, WorkerPool,
+};
 
-use crate::connection::{DoConnection, FetchEvent};
+use crate::connection::{DoCallHandler, DoConnection, FetchEvent};
 use crate::error::GatewayError;
 use crate::manifest::{Binding, Manifest};
-use crate::protocol::WsOutbound;
+use crate::protocol::{FetchResponse, WsOutbound};
 use crate::spawn::{CelldSpawner, DoSpawner, SpawnRequest};
 
-/// A resident OSS Durable Object HTTP/WebSocket gateway.
+/// Executes one stateless Worker fetch with a gateway-owned DO router.
+#[async_trait]
+pub trait WorkerExecutor: Send + Sync {
+    /// Runs the Worker fetch without granting it Durable Object storage.
+    async fn fetch(
+        &self,
+        request: WorkerRequest,
+        router: Arc<dyn DoRouter>,
+    ) -> Result<WorkerResponse, GatewayError>;
+}
+
+/// Worker-pool adapter used by production gateways and real-stack tests.
+pub struct WorkerPoolExecutor {
+    pool: Arc<WorkerPool>,
+}
+
+impl WorkerPoolExecutor {
+    /// Wraps one compiled stateless Worker pool for gateway dispatch.
+    pub fn new(pool: Arc<WorkerPool>) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl WorkerExecutor for WorkerPoolExecutor {
+    /// Dispatches one request through a fresh WorkerPool store and instance.
+    async fn fetch(
+        &self,
+        request: WorkerRequest,
+        router: Arc<dyn DoRouter>,
+    ) -> Result<WorkerResponse, GatewayError> {
+        self.pool
+            .dispatch_fetch(router, request)
+            .await
+            .map_err(|error| GatewayError::WorkerPool {
+                message: error.to_string(),
+            })
+    }
+}
+
+/// A production gateway whose public ingress is Worker-first.
 #[derive(Clone)]
 pub struct Gateway {
     state: Arc<GatewayState>,
@@ -36,7 +81,10 @@ struct GatewayState {
     manifest: Manifest,
     data_root: PathBuf,
     spawner: Arc<dyn DoSpawner>,
+    worker: Arc<dyn WorkerExecutor>,
     connections: Mutex<HashMap<DoKey, Arc<DoConnection>>>,
+    pending_websockets: Mutex<HashMap<u64, Arc<DoConnection>>>,
+    next_websocket: AtomicU64,
 }
 
 /// The manifest binding and object name that identify one resident actor.
@@ -46,36 +94,106 @@ struct DoKey {
     name: String,
 }
 
+/// A failed production Worker load that reports the error without a fallback.
+struct FailedWorker {
+    error: GatewayError,
+}
+
+#[async_trait]
+impl WorkerExecutor for FailedWorker {
+    /// Returns the immutable startup failure for every public Worker request.
+    async fn fetch(
+        &self,
+        _request: WorkerRequest,
+        _router: Arc<dyn DoRouter>,
+    ) -> Result<WorkerResponse, GatewayError> {
+        Err(self.error.clone())
+    }
+}
+
 impl Gateway {
-    /// Creates a gateway using the local celld control socket as its spawner.
+    /// Creates a gateway using celld and loads the Worker component from the manifest.
     pub fn new(
         manifest: &Manifest,
         control_socket: impl Into<PathBuf>,
         data_root: impl Into<PathBuf>,
     ) -> Self {
         let spawner = Arc::new(CelldSpawner::new(control_socket.into()));
-        Self::with_spawner(manifest, data_root, spawner)
+        let worker = match load_worker_executor(manifest) {
+            Ok(worker) => worker,
+            Err(error) => Arc::new(FailedWorker { error }),
+        };
+        Self::with_parts(manifest, data_root, spawner, worker)
     }
 
-    /// Creates a gateway with an injected spawner for tests or another substrate.
+    /// Creates a gateway with an injected spawner and no Worker component.
     pub fn with_spawner(
         manifest: &Manifest,
         data_root: impl Into<PathBuf>,
         spawner: Arc<dyn DoSpawner>,
+    ) -> Self {
+        Self::with_parts(
+            manifest,
+            data_root,
+            spawner,
+            Arc::new(FailedWorker {
+                error: GatewayError::WorkerUnavailable {
+                    message: "no Worker executor was injected".to_owned(),
+                },
+            }),
+        )
+    }
+
+    /// Creates a gateway with an injected Worker executor for fake-driven tests.
+    pub fn with_worker_executor(
+        manifest: &Manifest,
+        data_root: impl Into<PathBuf>,
+        spawner: Arc<dyn DoSpawner>,
+        worker: Arc<dyn WorkerExecutor>,
+    ) -> Self {
+        Self::with_parts(manifest, data_root, spawner, worker)
+    }
+
+    /// Creates a gateway around the sibling crate's compiled WorkerPool.
+    pub fn with_worker_pool(
+        manifest: &Manifest,
+        data_root: impl Into<PathBuf>,
+        spawner: Arc<dyn DoSpawner>,
+        pool: Arc<WorkerPool>,
+    ) -> Self {
+        Self::with_worker_executor(
+            manifest,
+            data_root,
+            spawner,
+            Arc::new(WorkerPoolExecutor::new(pool)),
+        )
+    }
+
+    /// Builds shared state while preserving one connection per object key.
+    fn with_parts(
+        manifest: &Manifest,
+        data_root: impl Into<PathBuf>,
+        spawner: Arc<dyn DoSpawner>,
+        worker: Arc<dyn WorkerExecutor>,
     ) -> Self {
         Self {
             state: Arc::new(GatewayState {
                 manifest: manifest.clone(),
                 data_root: data_root.into(),
                 spawner,
+                worker,
                 connections: Mutex::new(HashMap::new()),
+                pending_websockets: Mutex::new(HashMap::new()),
+                next_websocket: AtomicU64::new(1),
             }),
         }
     }
 
-    /// Returns the axum router exposing HTTP and WebSocket DO routes.
+    /// Returns the axum router with public Worker routes before internal DO routes.
     pub fn router(&self) -> Router {
         Router::new()
+            .route("/", any(public_handler))
+            .route("/{*path}", any(public_handler))
             .route("/do/{binding}/{name}/ws", get(websocket_handler))
             .route("/do/{binding}/{name}", any(http_root_handler))
             .route("/do/{binding}/{name}/{*path}", any(http_path_handler))
@@ -132,13 +250,233 @@ impl Gateway {
             None => request,
         };
         let event_socket = state.spawner.spawn(request).await?;
-        let connection = Arc::new(DoConnection::connect(event_socket).await?);
+        let do_call = Arc::new(GatewayDoRouter {
+            state: Arc::clone(state),
+            source: Some(key.clone()),
+        });
+        let connection = Arc::new(DoConnection::connect(event_socket, do_call).await?);
         connections.insert(key, Arc::clone(&connection));
         Ok(connection)
     }
+
+    /// Allocates one gateway-wide pending WebSocket identity.
+    fn next_websocket(state: &GatewayState) -> Result<u64, GatewayError> {
+        state
+            .next_websocket
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| GatewayError::Protocol {
+                message: "pending WebSocket identity exhausted".to_owned(),
+            })
+    }
 }
 
-/// Handles the route without a trailing path component.
+/// Routes Worker and DO binding calls into resident event actors.
+struct GatewayDoRouter {
+    state: Arc<GatewayState>,
+    source: Option<DoKey>,
+}
+
+impl GatewayDoRouter {
+    /// Forwards one fetch to a target object and tracks accepted WebSockets.
+    async fn route(
+        &self,
+        binding: String,
+        object: String,
+        event: FetchEvent,
+    ) -> Result<FetchResponse, GatewayError> {
+        if let Some(source) = &self.source
+            && source.binding == binding
+            && source.name == object
+        {
+            return Err(GatewayError::SelfCallDeadlock {
+                source_binding: source.binding.clone(),
+                source_object: source.name.clone(),
+                target_binding: binding,
+                target_object: object,
+            });
+        }
+        let connection = Gateway::connection_for(&self.state, &binding, &object).await?;
+        let response = connection.fetch(event.clone()).await?;
+        if let Some(accepted) = response.accept_ws {
+            let Some(pending) = event.ws else {
+                return Err(GatewayError::Protocol {
+                    message: format!("DO accepted WebSocket {accepted} without a pending request"),
+                });
+            };
+            if pending != accepted {
+                return Err(GatewayError::Protocol {
+                    message: format!(
+                        "DO accepted WebSocket {accepted}, but pending request was {pending}"
+                    ),
+                });
+            }
+            self.state
+                .pending_websockets
+                .lock()
+                .await
+                .insert(accepted, connection);
+        }
+        Ok(response)
+    }
+}
+
+#[async_trait]
+impl DoRouter for GatewayDoRouter {
+    /// Resolves a Worker binding and forwards its flattened stub fetch.
+    async fn do_fetch(
+        &self,
+        binding: String,
+        object: String,
+        request: WorkerRequest,
+    ) -> Result<WorkerResponse, HostError> {
+        let event = FetchEvent {
+            method: request.method,
+            url: request.uri,
+            headers: request.headers,
+            body: request.body,
+            ws: request.ws,
+        };
+        self.route(binding, object, event)
+            .await
+            .map(worker_response)
+            .map_err(|error| HostError::backend(error.to_string()))
+    }
+}
+
+#[async_trait]
+impl DoCallHandler for GatewayDoRouter {
+    /// Services a DO-originated call without allowing a source self-deadlock.
+    async fn call(
+        &self,
+        binding: String,
+        object: String,
+        event: FetchEvent,
+    ) -> Result<FetchResponse, GatewayError> {
+        self.route(binding, object, event).await
+    }
+}
+
+/// Converts the gateway response record to the WorkerPool response record.
+fn worker_response(response: FetchResponse) -> WorkerResponse {
+    WorkerResponse {
+        status: response.status,
+        headers: response.headers,
+        body: response.body,
+        accept_ws: response.accept_ws,
+    }
+}
+
+/// Loads the immutable Worker component named by the generated manifest.
+fn load_worker_executor(manifest: &Manifest) -> Result<Arc<dyn WorkerExecutor>, GatewayError> {
+    let path = manifest
+        .component_dir()
+        .join(format!("{}.wasm", manifest.component_digest()));
+    let bytes = std::fs::read(&path).map_err(|error| GatewayError::WorkerUnavailable {
+        message: format!("read Worker component {}: {error}", path.display()),
+    })?;
+    let pool = WorkerPool::load(wasmtime::Config::new(), &bytes).map_err(|error| {
+        GatewayError::WorkerUnavailable {
+            message: format!("load Worker component {}: {error}", path.display()),
+        }
+    })?;
+    Ok(Arc::new(WorkerPoolExecutor::new(Arc::new(pool))))
+}
+
+/// Handles a public request by running the Worker tier before any DO.
+async fn public_handler(
+    State(state): State<Arc<GatewayState>>,
+    request: Request,
+) -> Result<Response, GatewayError> {
+    let (mut parts, body) = request.into_parts();
+    let ws_upgrade = if is_websocket_upgrade(&parts.headers) {
+        Some(
+            WebSocketUpgrade::from_request_parts(&mut parts, &())
+                .await
+                .map_err(|error| GatewayError::InvalidHttp {
+                    message: format!("invalid WebSocket upgrade: {error:?}"),
+                })?,
+        )
+    } else {
+        None
+    };
+    let body = to_bytes(body, usize::MAX)
+        .await
+        .map_err(|error| GatewayError::InvalidHttp {
+            message: format!("request body could not be read: {error}"),
+        })?;
+    let pending_ws = ws_upgrade
+        .as_ref()
+        .map(|_| Gateway::next_websocket(&state))
+        .transpose()?;
+    let event = FetchEvent {
+        method: parts.method.to_string(),
+        url: request_url(&parts.uri),
+        headers: request_headers(&parts.headers)?,
+        body: body.to_vec(),
+        ws: pending_ws,
+    };
+    let router = Arc::new(GatewayDoRouter {
+        state: Arc::clone(&state),
+        source: None,
+    });
+    let response = match state.worker.fetch(worker_request(&event), router).await {
+        Ok(response) => response,
+        Err(error) => {
+            if let Some(ws) = pending_ws {
+                state.pending_websockets.lock().await.remove(&ws);
+            }
+            return Err(error);
+        }
+    };
+    let response = FetchResponse {
+        status: response.status,
+        headers: response.headers,
+        body: response.body,
+        accept_ws: response.accept_ws,
+    };
+    if let Some(pending) = pending_ws {
+        match response.accept_ws {
+            None => {
+                state.pending_websockets.lock().await.remove(&pending);
+                return http_response(response.status, response.headers, response.body);
+            }
+            Some(accepted) if accepted == pending => {}
+            Some(accepted) => {
+                state.pending_websockets.lock().await.remove(&pending);
+                return Err(GatewayError::Protocol {
+                    message: format!(
+                        "Worker accepted WebSocket {accepted}, but pending request was {pending}"
+                    ),
+                });
+            }
+        }
+        let connection = state
+            .pending_websockets
+            .lock()
+            .await
+            .remove(&pending)
+            .ok_or_else(|| GatewayError::Protocol {
+                message: format!("Worker accepted WebSocket {pending} without a DO connection"),
+            })?;
+        let upgrade = ws_upgrade.ok_or_else(|| GatewayError::Protocol {
+            message: "Worker accepted a WebSocket without an upgrade request".to_owned(),
+        })?;
+        let effects = connection.open_websocket_with_id(pending).await?;
+        return Ok(upgrade.on_upgrade(move |socket| {
+            websocket_session_registered(socket, connection, pending, effects)
+        }));
+    }
+    if response.accept_ws.is_some() {
+        return Err(GatewayError::Protocol {
+            message: "Worker returned accept_ws without a pending WebSocket".to_owned(),
+        });
+    }
+    http_response(response.status, response.headers, response.body)
+}
+
+/// Handles the internal route without a trailing path component.
 async fn http_root_handler(
     State(state): State<Arc<GatewayState>>,
     RoutePath((binding, name)): RoutePath<(String, String)>,
@@ -150,7 +488,7 @@ async fn http_root_handler(
     forward_http(state, binding, name, method, uri, headers, body).await
 }
 
-/// Handles the route with a wildcard path component.
+/// Handles the internal route with a wildcard path component.
 async fn http_path_handler(
     State(state): State<Arc<GatewayState>>,
     RoutePath((binding, name, _path)): RoutePath<(String, String, String)>,
@@ -162,7 +500,7 @@ async fn http_path_handler(
     forward_http(state, binding, name, method, uri, headers, body).await
 }
 
-/// Converts one axum request into a fetch frame and maps its terminal response.
+/// Converts an internal route request into a fetch frame and maps its response.
 async fn forward_http(
     state: Arc<GatewayState>,
     binding: String,
@@ -190,13 +528,14 @@ async fn forward_http(
         url,
         headers: request_headers,
         body: body.to_vec(),
+        ws: None,
     };
     let connection = Gateway::connection_for(&state, &binding, &name).await?;
     let response = connection.fetch(event).await?;
     http_response(response.status, response.headers, response.body)
 }
 
-/// Performs the gateway-owned WebSocket upgrade after spawning the DO.
+/// Performs the internal/debug WebSocket upgrade with automatic acceptance.
 async fn websocket_handler(
     State(state): State<Arc<GatewayState>>,
     RoutePath((binding, name)): RoutePath<(String, String)>,
@@ -206,15 +545,22 @@ async fn websocket_handler(
     Ok(upgrade.on_upgrade(move |socket| websocket_session(socket, connection)))
 }
 
-/// Relays one accepted WebSocket and keeps Worker errors nonfatal to the session.
-async fn websocket_session(
-    mut socket: axum::extract::ws::WebSocket,
-    connection: Arc<DoConnection>,
-) {
-    let (ws, mut effects) = match connection.open_websocket().await {
+/// Opens a debug WebSocket identity after the internal route has upgraded.
+async fn websocket_session(socket: axum::extract::ws::WebSocket, connection: Arc<DoConnection>) {
+    let (ws, effects) = match connection.open_websocket().await {
         Ok(value) => value,
         Err(_) => return,
     };
+    websocket_session_registered(socket, connection, ws, effects).await;
+}
+
+/// Relays one registered WebSocket and keeps Worker errors nonfatal to the session.
+async fn websocket_session_registered(
+    mut socket: axum::extract::ws::WebSocket,
+    connection: Arc<DoConnection>,
+    ws: u64,
+    mut effects: tokio::sync::mpsc::UnboundedReceiver<WsOutbound>,
+) {
     let mut close_event = (1000_u16, String::new());
     let mut worker_closed = false;
     loop {
@@ -252,20 +598,12 @@ async fn websocket_session(
                 let Ok(message) = incoming else { break; };
                 match message {
                     axum::extract::ws::Message::Text(text) => {
-                        if connection
-                            .websocket_message(ws, true, text.as_bytes().to_vec())
-                            .await
-                            .is_err()
-                        {
+                        if connection.websocket_message(ws, true, text.as_bytes().to_vec()).await.is_err() {
                             break;
                         }
                     }
                     axum::extract::ws::Message::Binary(data) => {
-                        if connection
-                            .websocket_message(ws, false, data.to_vec())
-                            .await
-                            .is_err()
-                        {
+                        if connection.websocket_message(ws, false, data.to_vec()).await.is_err() {
                             break;
                         }
                     }
@@ -292,6 +630,37 @@ async fn websocket_session(
             .await;
     }
     connection.remove_websocket(ws).await;
+}
+
+/// Detects the WebSocket handshake shape before asking axum to validate it.
+fn is_websocket_upgrade(headers: &HeaderMap) -> bool {
+    headers
+        .get("upgrade")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"websocket"))
+        && headers.get("connection").is_some_and(|value| {
+            value.to_str().ok().is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|part| part.trim().eq_ignore_ascii_case("upgrade"))
+            })
+        })
+}
+
+/// Converts one HTTP request into the component Worker request record.
+fn worker_request(event: &FetchEvent) -> WorkerRequest {
+    WorkerRequest {
+        method: event.method.clone(),
+        uri: event.url.clone(),
+        headers: event.headers.clone(),
+        body: event.body.clone(),
+        ws: event.ws,
+    }
+}
+
+/// Returns the path and query string expected by the WIT request record.
+fn request_url(uri: &Uri) -> String {
+    uri.path_and_query()
+        .map_or_else(|| uri.path().to_owned(), ToString::to_string)
 }
 
 /// Converts every request header to the protocol's ordered string representation.

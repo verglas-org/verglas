@@ -91,6 +91,16 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
     let address = listener.local_addr().expect("gateway address");
     let server = tokio::spawn(async move { axum::serve(listener, gateway.router()).await });
 
+    // CC2 proof: the public route executes the Worker export, which performs
+    // the DO binding fetch before this response reaches the client.
+    let worker_state = reqwest::get(format!("http://{address}/state"))
+        .await
+        .expect("public Worker fetch")
+        .text()
+        .await
+        .expect("public Worker response body");
+    assert_eq!(worker_state, "");
+
     let ws_url = format!("ws://{address}/do/COUNTER/ac1/ws");
     let (mut websocket, _) = tokio::time::timeout(Duration::from_secs(240), connect_async(ws_url))
         .await
@@ -112,7 +122,7 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
 
     // The worker's storage write is visible as soon as its effect is delivered.
     // This couples the external effect to the event commit and terminal-frame path.
-    let state = reqwest::get(format!("http://{address}/do/COUNTER/ac1/state"))
+    let state = reqwest::get(format!("http://{address}/state"))
         .await
         .expect("state fetch")
         .text()
@@ -160,6 +170,7 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
         r#"{
           "name": "ac1-worker",
           "main": "worker.js",
+          "compatibility_date": "2024-01-01",
           "durable_objects": { "bindings": [{ "name": "COUNTER", "class_name": "Counter" }] }
         }
         "#,
@@ -167,22 +178,32 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
     .expect("wrangler manifest");
     std::fs::write(
         project.join("worker.js"),
-        r#"export default {
+        r#"import { DurableObject } from 'cloudflare:workers';
+
+        export default {
           fetch(request, env) {
-            const value = env.storage.getString('last') ?? '';
-            return { status: 200, headers: { 'content-type': 'text/plain' }, body: value };
-          },
-          webSocketMessage(socket, message, env) {
-            const value = new TextDecoder().decode(message);
-            if (value === 'error') {
-              env.storage.putString('last', 'error');
-              env.sockets.send(socket, 'must-not-deliver');
-              throw new Error('intentional handler failure');
-            }
-            env.storage.putString('last', value);
-            env.sockets.send(socket, value);
+            const id = env.COUNTER.idFromName('ac1');
+            return env.COUNTER.get(id).fetch(request);
           }
         };
+
+        export class Counter extends DurableObject {
+          async fetch() {
+            const value = await this.ctx.storage.get('last');
+            return new Response(value ?? '', { headers: { 'content-type': 'text/plain' } });
+          }
+
+          async webSocketMessage(socket, message) {
+            const value = new TextDecoder().decode(message);
+            if (value === 'error') {
+              await this.ctx.storage.put('last', 'error');
+              socket.send('must-not-deliver');
+              throw new Error('intentional handler failure');
+            }
+            await this.ctx.storage.put('last', value);
+            socket.send(value);
+          }
+        }
         "#,
     )
     .expect("Worker source");
@@ -191,7 +212,11 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
         serde_json::to_vec_pretty(&json!({
             "name": "ac1-worker",
             "main": "worker.js",
+            "compatibility_date": "2024-01-01",
+            "compatibility_flags": ["nodejs_compat"],
             "durable_objects": { "bindings": [{ "name": "COUNTER", "class_name": "Counter" }] },
+            "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
+            "vars": { "AC1": "worker-first" },
             "component_digest": "0".repeat(64),
             "component_dir": components,
             "data_root": data_root,
@@ -201,8 +226,10 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
     .expect("gateway manifest");
 }
 
-/// Runs the prescribed JS builder and fails clearly when Node/tooling is absent.
+/// Runs the prescribed JS builder against the WIT v2 `service` world.
 fn build_component(project: &Path, components: &Path) {
+    // The builder invokes componentize with --world-name service. Keep this
+    // fixture on the frozen WIT v2 world rather than restoring durable-object.
     let script = repository_root().join("sdks/worker-js/bin/build.mjs");
     let output = Command::new("node")
         .arg(script)

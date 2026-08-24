@@ -101,12 +101,41 @@ impl ManagedCas {
     }
 }
 
+/// One accepted Durable Object migration declaration from a Wrangler manifest.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Migration {
+    tag: String,
+    new_classes: Vec<String>,
+    new_sqlite_classes: Vec<String>,
+}
+
+impl Migration {
+    /// Returns the migration tag used to order deployment changes.
+    pub fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    /// Returns classes introduced with the default Durable Object storage kind.
+    pub fn new_classes(&self) -> &[String] {
+        &self.new_classes
+    }
+
+    /// Returns classes introduced with SQLite-backed Durable Object storage.
+    pub fn new_sqlite_classes(&self) -> &[String] {
+        &self.new_sqlite_classes
+    }
+}
+
 /// The validated subset of a wrangler-style deployment manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
     name: String,
     main: String,
+    compatibility_date: Option<String>,
+    compatibility_flags: Vec<String>,
     bindings: Vec<Binding>,
+    migrations: Vec<Migration>,
+    vars: Map<String, Value>,
     component_digest: String,
     component_dir: PathBuf,
     data_root: PathBuf,
@@ -152,9 +181,29 @@ impl Manifest {
         &self.main
     }
 
+    /// Returns the optional Cloudflare compatibility date.
+    pub fn compatibility_date(&self) -> Option<&str> {
+        self.compatibility_date.as_deref()
+    }
+
+    /// Returns compatibility flags in manifest order.
+    pub fn compatibility_flags(&self) -> &[String] {
+        &self.compatibility_flags
+    }
+
     /// Returns all declared Durable Object bindings in manifest order.
     pub fn bindings(&self) -> &[Binding] {
         &self.bindings
+    }
+
+    /// Returns accepted Durable Object migrations in manifest order.
+    pub fn migrations(&self) -> &[Migration] {
+        &self.migrations
+    }
+
+    /// Returns worker environment values exactly as declared by Wrangler.
+    pub fn vars(&self) -> &Map<String, Value> {
+        &self.vars
     }
 
     /// Looks up one binding by its URL-visible name.
@@ -190,7 +239,11 @@ impl Manifest {
         let allowed = [
             "name",
             "main",
+            "compatibility_date",
+            "compatibility_flags",
             "durable_objects",
+            "migrations",
+            "vars",
             "component_digest",
             "component_dir",
             "data_root",
@@ -208,8 +261,27 @@ impl Manifest {
 
         let name = required_string(&mut object, "name")?;
         let main = required_string(&mut object, "main")?;
+        let compatibility_date = object
+            .remove("compatibility_date")
+            .map(|value| parse_nonempty_string(value, "compatibility_date"))
+            .transpose()?;
+        let compatibility_flags = object
+            .remove("compatibility_flags")
+            .map(|value| parse_string_array(value, "compatibility_flags"))
+            .transpose()?
+            .unwrap_or_default();
         let durable_objects = required_object(&mut object, "durable_objects")?;
         let bindings = parse_durable_objects(durable_objects)?;
+        let migrations = object
+            .remove("migrations")
+            .map(parse_migrations)
+            .transpose()?
+            .unwrap_or_default();
+        let vars = object
+            .remove("vars")
+            .map(parse_vars)
+            .transpose()?
+            .unwrap_or_default();
         let component_digest = required_string(&mut object, "component_digest")?;
         validate_digest(&component_digest)?;
         let component_dir = PathBuf::from(required_string(&mut object, "component_dir")?);
@@ -229,7 +301,11 @@ impl Manifest {
         Ok(Self {
             name,
             main,
+            compatibility_date,
+            compatibility_flags,
             bindings,
+            migrations,
+            vars,
             component_digest,
             component_dir,
             data_root,
@@ -327,6 +403,98 @@ pub enum ManifestError {
         /// Key that was not recognized.
         key: String,
     },
+    /// A migration object contains an unsupported migration kind or key.
+    #[error("unknown migrations manifest key: {key}")]
+    UnknownMigrationKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+}
+
+/// Parses one nonempty string value for an optional manifest field.
+fn parse_nonempty_string(value: Value, field: &'static str) -> Result<String, ManifestError> {
+    let Value::String(value) = value else {
+        return Err(ManifestError::InvalidType {
+            field,
+            expected: "string",
+        });
+    };
+    if value.is_empty() {
+        return Err(ManifestError::EmptyField { field });
+    }
+    Ok(value)
+}
+
+/// Parses an ordered array of nonempty strings.
+fn parse_string_array(value: Value, field: &'static str) -> Result<Vec<String>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field,
+            expected: "array",
+        });
+    };
+    values
+        .into_iter()
+        .map(|value| parse_nonempty_string(value, field))
+        .collect()
+}
+
+/// Parses the worker environment object without interpreting or dropping values.
+fn parse_vars(value: Value) -> Result<Map<String, Value>, ManifestError> {
+    let Value::Object(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "vars",
+            expected: "object",
+        });
+    };
+    Ok(values)
+}
+
+/// Parses accepted migration entries and rejects unsupported migration kinds.
+fn parse_migrations(value: Value) -> Result<Vec<Migration>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "migrations",
+            expected: "array",
+        });
+    };
+    values.into_iter().map(parse_migration).collect()
+}
+
+/// Parses one migration entry from Wrangler's accepted class-introduction forms.
+fn parse_migration(value: Value) -> Result<Migration, ManifestError> {
+    let Value::Object(mut object) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "migrations[]",
+            expected: "object",
+        });
+    };
+    let allowed = ["tag", "new_classes", "new_sqlite_classes"]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed.contains(key.as_str()))
+        .cloned()
+    {
+        return Err(ManifestError::UnknownMigrationKey { key });
+    }
+    let tag = required_string(&mut object, "tag")?;
+    let new_classes = object
+        .remove("new_classes")
+        .map(|value| parse_string_array(value, "migrations[].new_classes"))
+        .transpose()?
+        .unwrap_or_default();
+    let new_sqlite_classes = object
+        .remove("new_sqlite_classes")
+        .map(|value| parse_string_array(value, "migrations[].new_sqlite_classes"))
+        .transpose()?
+        .unwrap_or_default();
+    Ok(Migration {
+        tag,
+        new_classes,
+        new_sqlite_classes,
+    })
 }
 
 /// Extracts a required nonempty string from an object.

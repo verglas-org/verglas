@@ -10123,6 +10123,8 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "verglas-do-wasm",
+ "wasmtime",
 ]
 
 [[package]]
