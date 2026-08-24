@@ -12,7 +12,7 @@ icon: "snowflake"
 
 Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
 
-We propose Verglas, an Iceberg-aware lakehouse runtime that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache and consensus engine plus its CLI, SDKs, documentation, and RIME package; the hosted control plane owns the authenticated Lakekeeper REST composition, provisioning, and pipeline platform that call those engine contracts.
+We propose Verglas, an Iceberg-aware lakehouse runtime that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache and consensus engine plus its TypeScript SDK, documentation, and RIME package; the hosted control plane owns the authenticated Lakekeeper REST composition, provisioning, and pipeline platform that call those engine contracts.
 
 ---
 
@@ -28,7 +28,7 @@ into the warehouse state-machine commands defined here. External-catalog
 databases bypass the managed warehouse state machine and retain the semantics
 of their configured catalog.
 
-The public CLI, SDKs, documentation, and RIME package live beside the engine.
+The public TypeScript SDK, documentation, and RIME package live beside the engine.
 RIME is an evolutionary search over code states; its algorithm and the
 git-SHA evolution record are specified in [RIME architecture](/docs/architecture/rime).
 Hosted access, scheduling, workers, databases, integrations, applications,
@@ -229,7 +229,7 @@ Each tenant cache serves a dynamic set of storage bindings through one S3-compat
 
 The server implements the S3 object operations Iceberg clients use: signed GET, HEAD, range, LIST, PUT, DELETE, COPY, and multipart requests. Compatibility is exercised by the Ceph `s3-tests` suite. A separate engine matrix compares direct, cold-cache, and warm-cache results from DuckDB and Polars at the Arrow level. Parquet queries are compared end to end; Avro and mixed-format fixtures are additionally compared byte for byte because the tested engine versions do not decode Avro data files.
 
-The server runs as a container. Self-hosted deployments use the published Docker image; production fleets sit behind an L4 load balancer and deploy through container orchestration such as Terraform or Helm. The CLI remains a pure client — of the server's admin API, of the S3 listener's semantic graph and vector surfaces, and of the Iceberg REST catalog directly for table metadata and ingest — and does not manage server processes.
+The server runs as a container. Self-hosted deployments use the published Docker image; production fleets sit behind an L4 load balancer and deploy through container orchestration such as Terraform or Helm. The TypeScript SDK is a pure client — of the server's admin API, of the S3 listener's semantic graph and vector surfaces, and of the Iceberg REST catalog directly for table metadata and ingest — and does not manage server processes.
 
 ### 3.2 Design requirements
 
@@ -584,7 +584,7 @@ There is no per-deployment watermark cell. Cross-run state a worker genuinely ne
 
 A deployment declares the data it may touch: the tables and lakehouses it is granted, per record. A grant is the access-control boundary: a worker sees only what its record lists. CloudEvent subscription attributes independently determine which events invoke a worker; receiving an event never expands its data grants. Grants are part of the one record (§7.1), so what a workload can reach is inspectable and auditable as a unit, not scattered across IAM policies and connection strings.
 
-Lakehouses are explicit tenant resources and the only database shape. `verglas lakehouse create NAME` creates managed storage plus an authoritative warehouse group in the tenant's Verglas ring. Supplying `--data-path s3://…` binds a scoped S3 secret while retaining the managed Verglas catalog; supplying `--catalog https://… --warehouse NAME` instead creates an external-catalog binding. The stable secret resource IDs are stored on the lakehouse record, so later secrets with overlapping scopes cannot silently rebind an existing lakehouse; rotating a secret replaces its value under the same ID.
+Lakehouses are explicit tenant resources and the only database shape. The hosted control plane creates managed storage plus an authoritative warehouse group in the tenant's Verglas ring. A scoped S3 secret retains the managed Verglas catalog; an external catalog endpoint and warehouse name instead create an external-catalog binding. The stable secret resource IDs are stored on the lakehouse record, so later secrets with overlapping scopes cannot silently rebind an existing lakehouse; rotating a secret replaces its value under the same ID.
 
 There is one logical managed catalog service per tenant, exposed by the hosted REST fleet, not one catalog process or PostgreSQL database per warehouse. Each REST replica may route to any cache ingress. Tenant-root state maps each lakehouse to an independent warehouse group, so warehouses share the cache fleet but not a consensus log. The hosted REST and domain layer is adapted from Lakekeeper, while persistence, transactions, events, and read fencing use public Verglas engine groups. A physically dedicated voter set is an explicit isolation tier rather than the default consequence of creating a logical database.
 

@@ -36,3 +36,6 @@ Append-only log of changes to this crate, by issue. Every PR touching this crate
 - #171: Kept private endpoint workers alive when a client closes the Unix peer immediately after reading a valid response, while still surfacing all other socket failures.
 - #171: Fenced direct Iceberg commits behind LakehouseObject authorization, isolated conflicting manifest and list bytes on full content-addressed paths, and verified every planned manifest plus every live data object before acknowledging. Replace/Upsert, vector/graph, partitioned tables, non-V2 formats, and schema mismatches now reject loudly at their documented extension points.
 - #171: Extended the private worker socket with deterministic all-domain status, Vamana search, graph-neighbor, and durable vector/graph declaration commands. Declarations are restored from the shared managed root before replayed canonical mutations become queryable after process replacement.
+- #171: Added tests/ts_envelope_conformance.rs proving the TypeScript SDK's
+  canonical TransactionEnvelope encoder (sdks/typescript/src/do-protocol.ts)
+  produces bytes the engine decodes exactly, including Arrow schema and rows.

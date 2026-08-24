@@ -203,18 +203,14 @@ pids = 128
 timeout_secs = 300
 ```
 
-An `@file:` value makes the CLI embed the adjacent source into the submitted
-project. Registration builds a content-addressed image with `uv sync --frozen`.
-The scheduler does not need a shared filesystem or a Python installation.
+An `@file:` value makes the worker registration API embed the adjacent source
+into the submitted project. Registration builds a content-addressed image with
+`uv sync --frozen`. The scheduler does not need a shared filesystem or a Python
+installation.
 
 ## Register the worker
 
-Only after both files exist, register the manifest on the local server:
-
-```bash
-verglas workers create \
-  --file examples/workers/market-data-ingest/worker.toml
-```
+Only after both files exist, register the manifest through the hosted worker API.
 
 You now have one worker definition. Continue with any trigger page; none of
 them requires another worker implementation.

@@ -9,7 +9,7 @@
     "directory": "sdks/typescript"
   },
   "type": "module",
-  "description": "Thin TypeScript client that agent-generated worker code imports to read and write Verglas Iceberg tables. Runs in any fetch-capable runtime and in Node 18+.",
+  "description": "Dependency-free TypeScript SDK for Verglas data clients and the Cloudflare Workers / Durable Objects programming model. Runs in fetch-capable runtimes and Node 18+.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -46,9 +46,6 @@
     "tsup": "^8.5.1",
     "typescript": "^5.7.3",
     "vitest": "^2.1.8"
-  },
-  "dependencies": {
-    "apache-arrow": "^21.2.0"
   },
   "files": [
     "dist",

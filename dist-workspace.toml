@@ -13,11 +13,6 @@ members = ["cargo:."]
 cargo-dist-version = "0.32.0"
 # CI backend that runs the release workflow.
 ci = "github"
-# The CLI's one distribution channel: the shell installer. Every release
-# attaches a self-contained verglas-installer.sh that detects the platform
-# and pulls the matching archive — users run one curl | sh from the site
-# (verglas.dev/install.sh redirects to the latest release's script).
-installers = ["shell"]
 # Target platforms. musl is intentionally NOT built: aws-lc-sys (S3 TLS) and
 # several native deps add musl-static friction. Linux ships glibc (gnu) instead,
 # which covers the mainstream distros. windows-msvc is the real compile gate for
@@ -34,9 +29,9 @@ checksum = "sha256"
 # No release-plan job on PRs: releases are explicit tag pushes only.
 pr-run-mode = "skip"
 # Publish steps that run after every target build is green: the daemon
-# container image (publish-docker.yml), the TypeScript SDK npm package
-# (publish-sdk.yml), and the Rust SDK crates (publish-crates.yml).
-publish-jobs = ["./publish-docker", "./publish-sdk", "./publish-crates"]
+# container image (publish-docker.yml) and the TypeScript SDK npm package
+# (publish-sdk.yml).
+publish-jobs = ["./publish-docker", "./publish-sdk"]
 # Link the DYNAMIC MSVC CRT on windows. cargo-dist defaults to +crt-static,
 # but the ONNX Runtime objects (fastembed -> ort, prebuilt) are compiled
 # against the dynamic CRT — static linking fails with LNK2001 unresolved

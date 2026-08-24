@@ -12,9 +12,9 @@ This project is pre-release. The rules that follow from that are strict:
 
 ## Repository layout
 
-One cargo workspace covers the whole repository. `crates/`, `bins/`, `cli/`, and
-`sdks/rust` hold the engine. The Verglas fork of
-[Lakekeeper](https://github.com/lakekeeper/lakekeeper), the Apache Iceberg REST
+One cargo workspace covers the whole repository. `crates/` and `bins/` hold the
+engine. The TypeScript SDK under `sdks/typescript` is a separate package. The
+Verglas fork of [Lakekeeper](https://github.com/lakekeeper/lakekeeper), the Apache Iceberg REST
 catalog, lives in `crates/verglas-catalog-*` and `crates/verglas-iceberg-ext`.
 It moved in from the separate `verglas-org/verglas-catalog` repository, which
 is historical; catalog changes land here.
@@ -193,5 +193,5 @@ for the required `VERGLAS_STORAGE_*` variables).
   mapping (`engine.rs:invalidate_key`). The bytes the client just sent are not
   admitted, so the first read after a write is always a miss served from the
   origin. Caching on write is not implemented — do not describe it as if it were.
-  Use an S3 client (`aws`, DuckDB) for object I/O on port 8333. The CLI and SDKs
-  are developed in this repository under `cli/` and `sdks/`.
+  Use an S3 client (`aws`, DuckDB) or the TypeScript SDK for object I/O on port
+  8333. The SDK lives under `sdks/typescript`.

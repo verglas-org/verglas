@@ -23,3 +23,4 @@ Append-only log of changes to this crate, by issue.
   pre-exec helper now takes a per-platform RlimitResource alias.
 - #171: Applied the same per-platform RlimitResource alias to the test helper's
   getrlimit diagnostics so the worker binary also compiles on Linux.
+- #171: Added a Cloudflare Workers-shaped management router for multipart script uploads, durable-object namespace metadata, deterministic object IDs, and CF response envelopes. The router stores source modules below the celld root and shares the supervisor with the control socket so object creation, route checks, status, and suspension use real worker lifecycle machinery.

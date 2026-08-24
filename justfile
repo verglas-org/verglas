@@ -1,7 +1,7 @@
 # Development tasks for the Verglas repository.
 #
 # One cargo workspace covers everything: the engine and the Lakekeeper-derived
-# catalog under `crates/`, plus `bins/`, `cli/`, and `sdks/rust`.
+# catalog under `crates/`, plus `bins/`.
 
 # Build everything.
 build:
@@ -22,7 +22,6 @@ s3-tests *ARGS:
     ./tests/s3-conformance/run.sh {{ARGS}}
 
 # `cargo install` compiles in release by default; --force replaces an earlier
-# install. Installs the public server and CLI into ~/.cargo/bin.
+# install. Installs the public server into ~/.cargo/bin.
 install:
     cargo install --path bins/cache-node --locked --force
-    cargo install --path cli --locked --force

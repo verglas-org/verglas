@@ -1,9 +1,11 @@
 //! Local Unix control protocol used by placement agents to drive `celld-host`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::Mutex;
 
 use crate::{
     ChildSpec, HostSupervisor, ManagedCasConfig, ReplicaRole, SupervisorError, SuspendFence,
@@ -20,11 +22,29 @@ pub enum ControlError {
     Io(#[from] std::io::Error),
 }
 
-/// Unix-socket control endpoint owning one host supervisor.
+/// A clonable handle for orderly shutdown and read-only supervisor inspection.
+#[derive(Clone)]
+pub struct SupervisorHandle {
+    supervisor: Arc<Mutex<HostSupervisor>>,
+}
+
+impl SupervisorHandle {
+    /// Stops every child while the shared supervisor is exclusively borrowed.
+    pub async fn shutdown(&self) -> Result<(), SupervisorError> {
+        self.supervisor.lock().await.shutdown().await
+    }
+
+    /// Returns a child's lifecycle state when the supervisor is not busy.
+    pub fn state(&self, do_id: &str) -> Option<crate::ChildState> {
+        self.supervisor.try_lock().ok()?.state(do_id)
+    }
+}
+
+/// Unix-socket control endpoint owning one shared host supervisor.
 pub struct ControlServer {
     path: PathBuf,
     listener: UnixListener,
-    supervisor: HostSupervisor,
+    supervisor: Arc<Mutex<HostSupervisor>>,
 }
 
 impl ControlServer {
@@ -32,6 +52,14 @@ impl ControlServer {
     pub async fn bind(
         path: impl AsRef<Path>,
         supervisor: HostSupervisor,
+    ) -> Result<Self, ControlError> {
+        Self::bind_shared(path, Arc::new(Mutex::new(supervisor))).await
+    }
+
+    /// Binds a control endpoint to a supervisor also used by the HTTP API.
+    pub async fn bind_shared(
+        path: impl AsRef<Path>,
+        supervisor: Arc<Mutex<HostSupervisor>>,
     ) -> Result<Self, ControlError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -77,9 +105,11 @@ impl ControlServer {
         }
     }
 
-    /// Returns mutable access for orderly process shutdown and embedding.
-    pub fn supervisor_mut(&mut self) -> &mut HostSupervisor {
-        &mut self.supervisor
+    /// Returns a shared handle for orderly process shutdown and embedding.
+    pub fn supervisor_mut(&self) -> SupervisorHandle {
+        SupervisorHandle {
+            supervisor: self.supervisor.clone(),
+        }
     }
 
     /// Returns the bound host-local control socket path.
@@ -99,6 +129,7 @@ impl ControlServer {
     /// Applies one validated command to the owned supervisor.
     async fn execute_inner(&mut self, line: &str) -> Result<String, String> {
         let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+        let mut supervisor = self.supervisor.lock().await;
         let Some(command) = fields.first().copied() else {
             return Err("invalid command: empty request".to_owned());
         };
@@ -112,8 +143,7 @@ impl ControlServer {
                     parse_u64(fields[4], "applied sequence")?,
                 )
                 .map_err(|error| error.to_string())?;
-                let descriptor = self
-                    .supervisor
+                let descriptor = supervisor
                     .spawn(spec)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -139,8 +169,7 @@ impl ControlServer {
                     offload_dir: (fields[8] != "-").then(|| PathBuf::from(fields[8])),
                 })
                 .map_err(|error| error.to_string())?;
-                let descriptor = self
-                    .supervisor
+                let descriptor = supervisor
                     .spawn(spec)
                     .await
                     .map_err(|error| error.to_string())?;
@@ -168,15 +197,14 @@ impl ControlServer {
                     lease_version,
                 })
                 .map_err(|error| error.to_string())?;
-                let descriptor = self
-                    .supervisor
+                let descriptor = supervisor
                     .spawn(spec)
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(descriptor.socket_path().display().to_string())
             }
             "SUSPEND" if fields.len() == 5 => {
-                self.supervisor
+                supervisor
                     .suspend(
                         fields[1],
                         SuspendFence::new(
@@ -190,15 +218,14 @@ impl ControlServer {
                 Ok(String::new())
             }
             "SUSPEND_ORCHESTRATED" if fields.len() == 2 => {
-                self.supervisor
+                supervisor
                     .suspend_orchestrated(fields[1])
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(String::new())
             }
             "RESTORE" if fields.len() == 4 => {
-                let descriptor = self
-                    .supervisor
+                let descriptor = supervisor
                     .start_restore(
                         fields[1],
                         parse_u64(fields[2], "required sequence")?,
@@ -209,7 +236,7 @@ impl ControlServer {
                 Ok(descriptor.socket_path().display().to_string())
             }
             "FINISH_RESTORE" if fields.len() == 4 => {
-                self.supervisor
+                supervisor
                     .finish_restore(
                         fields[1],
                         parse_role(fields[2])?,
@@ -218,18 +245,15 @@ impl ControlServer {
                     .map_err(|error| error.to_string())?;
                 Ok(String::new())
             }
-            "PID" if fields.len() == 2 => self
-                .supervisor
+            "PID" if fields.len() == 2 => supervisor
                 .pid(fields[1])
                 .map(|pid| pid.to_string())
                 .ok_or_else(|| format!("Durable Object {} has no running process", fields[1])),
-            "ROUTE_STATEFUL" if fields.len() == 2 => self
-                .supervisor
+            "ROUTE_STATEFUL" if fields.len() == 2 => supervisor
                 .route_stateful(fields[1])
                 .map(|path| path.display().to_string())
                 .map_err(|error| error.to_string()),
-            "ROUTE_SNAPSHOT" if fields.len() == 3 => self
-                .supervisor
+            "ROUTE_SNAPSHOT" if fields.len() == 3 => supervisor
                 .route_snapshot(fields[1], parse_u64(fields[2], "snapshot fence")?)
                 .map(|path| path.display().to_string())
                 .map_err(|error| error.to_string()),

@@ -10,3 +10,4 @@
 - #171: Hardened the strict S3 test endpoint with ListObjectsV2 timestamp output and multi-object-delete responses, and made endpoint response shutdown tolerant of an already-closed Unix peer.
 - #171: Replaced a stale local replica pager with the newest verified checkpoint before replay when replica CLEAN has already removed its tail, including SQLite WAL sidecars.
 - #171: Added the real all-domain process acceptance. One canonical socket commit advances relational, Vamana, and graph watermarks together; deterministic vector search, graph neighbors, exact retry/conflict fencing, durable index declarations, and replacement reconstruction all pass through `celld-host` and `verglasd`.
+- #171: Added the optional `--management-bind` TCP listener to `celld-host` and wired it to the shared supervisor, leaving the listener disabled unless explicitly configured. The runtime now serves the celld Workers management API beside the existing Unix control protocol.

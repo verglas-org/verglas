@@ -11,17 +11,16 @@ under quorum durability, and your object store stays the system of record.
 
 ## What lives here
 
-This repository contains the public data engine and its client surfaces:
+This repository contains the public data engine and its TypeScript client surface:
 
 - `verglas-cache-node`: S3 read/write-through, Iceberg catalog watching,
   warming, cache tiers, ring routing, block storage, and WAL ingress.
-- `cli`: the `verglas` command-line client.
-- `sdks`: the public Rust and TypeScript SDKs.
-- `rime`: the RIME package installed by the CLI for supported agent hosts.
+- `sdks/typescript`: the public TypeScript SDK.
+- `rime`: the RIME package for supported agent hosts.
 - `catalog`: the Verglas fork of Catalog, the Apache Iceberg REST
   catalog. A nested cargo workspace with its own lockfile — the root
   `cargo --workspace` commands do not reach it. See [AGENTS.md](AGENTS.md).
-- The reusable Rust crates that implement the storage and client roles.
+- The reusable Rust crates that implement the storage and server roles.
 
 The remaining product boundaries are deliberate:
 
@@ -46,17 +45,10 @@ states which crates fall under which license.
 
 ## Install
 
-Install the CLI with one command:
+Install the TypeScript SDK from npm:
 
 ```sh
-curl -fsSL https://verglas.dev/install.sh | sh
-```
-
-The SDKs install from their package managers:
-
-```sh
-npm install @verglas/sdk    # TypeScript
-cargo add verglas-sdk       # Rust
+npm install @verglas/sdk
 ```
 
 The daemon is distributed as a container image:
@@ -106,8 +98,8 @@ The catalog is a separate cargo workspace, so it has its own recipes:
 Its suite needs a reachable Postgres in `DATABASE_URL`, which is why it is not
 part of `just test`.
 
-Install the runtime node and CLI from source with `just install`. The Rust and
-TypeScript SDKs live under `sdks/`; RIME lives under `rime/`.
+Install the runtime node from source with `just install`. The TypeScript SDK
+lives under `sdks/typescript`; RIME lives under `rime/`.
 
 The [architecture overview](docs/architecture/overview.mdx) explains the
 runtime's cache tiers, Iceberg awareness, routing, and write path. Every crate and binary keeps
