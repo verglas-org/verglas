@@ -71,3 +71,4 @@
   engine persists alarms.
 - Protocol correction: Replaced the provisional BEGIN/STATEMENT/COMMIT wire dialect with authoritative REGISTER/QUERY/COMMIT commands and dependency-free Arrow IPC decoding. Buffered mutations now submit one canonical TransactionEnvelope; `crates/verglas-do-engine/tests/ts_envelope_conformance.rs` verifies the serializer byte-for-byte across Rust and TypeScript.
 - Added `WorkersManagementClient` for celld's account-prefix-free Cloudflare-shaped script, namespace, and Durable Object lifecycle routes. Multipart module uploads and all JSON calls unwrap `{success, errors, messages, result}` envelopes and preserve typed error arrays.
+- Cleanup TDD: Added the package-surface regression test before removing the deleted custom Durable Object protocol. The initial targeted run failed as expected with two failures: obsolete module files still existed and the root index still exported `DurableObject` APIs.

@@ -9,7 +9,7 @@
     "directory": "sdks/typescript"
   },
   "type": "module",
-  "description": "Dependency-free TypeScript SDK for Verglas data clients and the Cloudflare Workers / Durable Objects programming model. Runs in fetch-capable runtimes and Node 18+.",
+  "description": "Dependency-free TypeScript SDK for Verglas catalog, cache, and semantic clients. Runs in fetch-capable runtimes and Node 18+.",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

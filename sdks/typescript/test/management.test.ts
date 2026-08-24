@@ -81,25 +81,11 @@ describe("Workers management client", () => {
     await client.listScripts();
     await client.getScript("demo");
     await client.deleteScript("demo");
-    await client.createNamespace({ name: "objects", script: "demo", class: "Counter" });
-    await client.listNamespaces();
-    await client.createObject("ns", "counter");
-    await client.listObjects("ns");
-    await client.getObject("ns", "counter");
-    await client.routeObject("ns", "counter");
-    await client.suspendObject("ns", "counter");
 
     expect(captured.calls.map((call) => `${call.init?.method ?? "GET"} ${pathOf(call)}`)).toEqual([
       "GET /workers/scripts",
       "GET /workers/scripts/demo",
       "DELETE /workers/scripts/demo",
-      "POST /workers/durable_objects/namespaces",
-      "GET /workers/durable_objects/namespaces",
-      "POST /workers/durable_objects/namespaces/ns/objects/counter",
-      "GET /workers/durable_objects/namespaces/ns/objects",
-      "GET /workers/durable_objects/namespaces/ns/objects/counter",
-      "POST /workers/durable_objects/namespaces/ns/objects/counter/route",
-      "POST /workers/durable_objects/namespaces/ns/objects/counter/suspend",
     ]);
     expect(await new Response(JSON.stringify({ result: "unused" })).json()).toEqual({ result: "unused" });
   });

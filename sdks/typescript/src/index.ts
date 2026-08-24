@@ -1,15 +1,8 @@
-// @verglas/sdk — the thin client a worker imports to read and write Verglas
-// Iceberg tables. Runs in any fetch-capable runtime and in Node 18+.
+// @verglas/sdk — the thin client for Verglas catalog and semantic services.
+// Runs in any fetch-capable runtime and in Node 18+.
 //
-// The public surface has three layers:
-//   1. Data-plane verbs — connect() and the client objects (Table),
-//      plus the change feed (client.follow) and change-driven row follow
-//      (client.followRows).
-//   2. The worker contract — defineWorker() + the trigger types.
-//   3. The Cloudflare Durable Objects model and local worker host.
-// Internals the runner uses on the author's behalf (run logging, reference
-// examples) are NOT re-exported here; reach them explicitly via the
-// `@verglas/sdk/logging` and `@verglas/sdk/examples` subpaths.
+// The public surface contains the catalog/table client, catalog change feed,
+// reflected Integration calls, and direct S3 Vectors and Graph clients.
 
 export { connect, VerglasClient, Table } from "./client";
 export { VerglasHttpError } from "./http";
@@ -82,43 +75,6 @@ export type {
 } from "./types";
 
 export {
-  DurableObject,
-  DurableObjectId,
-  DurableObjectNamespace,
-  DurableObjectState,
-  DurableObjectStorage,
-  DurableObjectStub,
-  DurableObjectTransaction,
-  SqlStorageCursor,
-  StorageBridge,
-  LocalExecutionContext,
-  WorkerRuntime,
-  createDurableObjectRuntime,
-  createUnixSocketTransport,
-  createWorkerRuntime,
-} from "./durable-objects";
-export type {
-  DurableObjectConstructor,
-  DurableObjectNamespaceBinding,
-  DurableObjectNamespaceOptions,
-  DurableObjectStorageGetOptions,
-  DurableObjectStorageListOptions,
-  DurableObjectStorageOptions,
-  DurableObjectStoragePutOptions,
-  DurableObjectStubRpc,
-  DurableObjectTransport,
-  DurableObjectTransportFactory,
-  ExecutionContext,
-  SqlStorage,
-  SqlStorageResult,
-  SqlStorageValue,
-  WorkerEntrypoint,
-  WorkerModule,
-  WorkerRuntimeOptions,
-} from "./durable-objects";
-export { DurableObjectRuntime } from "./durable-objects";
-
-export {
   WorkersManagementClient,
   WorkersManagementError,
   buildScriptFormData,
@@ -131,9 +87,6 @@ export type {
   WorkerScriptMetadata,
   WorkerScriptUpload,
   WorkerScriptUploadParts,
-  WorkersDurableObject,
-  WorkersDurableObjectBinding,
-  WorkersDurableObjectNamespace,
   WorkersManagementMessage,
-  WorkersObjectCreateOptions,
 } from "./management";
+

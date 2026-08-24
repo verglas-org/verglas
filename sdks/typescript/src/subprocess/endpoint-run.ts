@@ -1,5 +1,5 @@
-// Local COMMIT-ENDPOINT run mode: the bun entry the worker harness execs to run
-// a tenant WORKER against the live commit service for one bounded event.
+// Local endpoint run mode: the bun entry the worker harness execs to run
+// a tenant WORKER against the live ingest service for one bounded event.
 //
 // One invocation = one bounded worker run. This file maps the process
 // environment onto a `WorkerContext`, validates the complete CloudEvent,

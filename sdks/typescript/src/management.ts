@@ -29,24 +29,12 @@ export class WorkersManagementError extends Error {
   }
 }
 
-/** A durable-object namespace binding in script module metadata. */
-export interface WorkersDurableObjectBinding {
-  /** Worker environment binding name. */
-  name: string;
-  /** Cloudflare module-syntax binding discriminator. */
-  type: "durable_object_namespace";
-  /** Durable Object class exported by the script. */
-  class_name: string;
-  /** Optional script name for cross-script bindings. */
-  script_name?: string;
-}
-
 /** Script metadata accepted by the celld multipart upload route. */
 export interface WorkerScriptMetadata {
   /** Module file that is the Worker entrypoint. */
   main_module: string;
-  /** Cloudflare-style environment bindings. */
-  bindings: WorkersDurableObjectBinding[];
+  /** Opaque binding metadata owned by the Worker management API. */
+  bindings: Record<string, unknown>[];
 }
 
 /** Source accepted for one multipart Worker module. */
@@ -74,42 +62,6 @@ export interface WorkerScript extends WorkerScriptMetadata {
   name: string;
   /** Stored module path names. */
   modules: string[];
-}
-
-/** Durable Object namespace returned by celld. */
-export interface WorkersDurableObjectNamespace {
-  /** Namespace identifier used in object routes. */
-  id: string;
-  /** Namespace display/name key. */
-  name: string;
-  /** Script that owns the namespace. */
-  script: string;
-  /** Exported Durable Object class name. */
-  class: string;
-}
-
-/** Durable Object record returned by object lifecycle routes. */
-export interface WorkersDurableObject {
-  /** Deterministic object identifier. */
-  id: string;
-  /** Object name within its namespace. */
-  name: string;
-  /** Supervisor-facing Durable Object identifier. */
-  do_id: string;
-  /** Stateful worker socket path when running. */
-  socket_path?: string | null;
-  /** Supervisor process ID when running. */
-  pid?: number | null;
-  /** Current lifecycle status. */
-  status: string;
-}
-
-/** Optional body accepted by collection object creation. */
-export interface WorkersObjectCreateOptions {
-  /** Name for deterministic idFromName-style creation. */
-  name?: string;
-  /** Requests a unique object when no name is supplied. */
-  unique?: boolean;
 }
 
 /** Constructor fetch seam for browsers, Node, and captured-fetch tests. */
@@ -169,84 +121,6 @@ export class WorkersManagementClient {
   /** Deletes one stored Worker script and returns the API result. */
   deleteScript(name: string): Promise<boolean> {
     return this.request<boolean>("DELETE", `/workers/scripts/${segment(name)}`);
-  }
-
-  /** Creates one namespace bound to an uploaded script and exported class. */
-  createNamespace(input: {
-    name: string;
-    script: string;
-    class: string;
-  }): Promise<WorkersDurableObjectNamespace> {
-    return this.request<WorkersDurableObjectNamespace>("POST", "/workers/durable_objects/namespaces", input);
-  }
-
-  /** Lists all durable-object namespaces. */
-  listNamespaces(): Promise<WorkersDurableObjectNamespace[]> {
-    return this.request<WorkersDurableObjectNamespace[]>("GET", "/workers/durable_objects/namespaces");
-  }
-
-  /** Creates a deterministically named object, or a collection object when no name is supplied. */
-  createObject(
-    namespaceId: string,
-    objectName?: string,
-    options?: WorkersObjectCreateOptions,
-  ): Promise<WorkersDurableObject> {
-    if (objectName !== undefined) {
-      return this.request<WorkersDurableObject>(
-        "POST",
-        `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}`,
-      );
-    }
-    return this.request<WorkersDurableObject>(
-      "POST",
-      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects`,
-      options,
-    );
-  }
-
-  /** Creates an object through the collection endpoint. */
-  createCollectionObject(
-    namespaceId: string,
-    options?: WorkersObjectCreateOptions,
-  ): Promise<WorkersDurableObject> {
-    return this.createObject(namespaceId, undefined, options);
-  }
-
-  /** Lists instantiated objects in one namespace. */
-  listObjects(namespaceId: string): Promise<WorkersDurableObject[]> {
-    return this.request<WorkersDurableObject[]>(
-      "GET",
-      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects`,
-    );
-  }
-
-  /** Reads one object's current supervisor status. */
-  getObject(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
-    return this.request<WorkersDurableObject>(
-      "GET",
-      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}`,
-    );
-  }
-
-  /** Alias for callers that name the status operation explicitly. */
-  getObjectStatus(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
-    return this.getObject(namespaceId, objectName);
-  }
-
-  /** Routes one object through its stateful supervisor socket. */
-  routeObject(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
-    return this.request<WorkersDurableObject>(
-      "POST",
-      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}/route`,
-    );
-  }
-
-  /** Suspends one object through the supervisor durability fence. */
-  suspendObject(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
-    return this.request<WorkersDurableObject>(
-      "POST",
-      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}/suspend`,
-    );
   }
 
   /** Sends one request and unwraps its Cloudflare response envelope. */
