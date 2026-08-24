@@ -523,14 +523,21 @@ integration, or agent-runtime source in this repository.
 
 The preceding sections argued that derived read copies — OLAP stores, feature
 stores, caches — should collapse into one Iceberg-native tier. The same
-principle applies to tenant code. A Durable Object (DO) is the worker: a named
-stateful object with durable KV and SQL state and one tenant WASM component.
-HTTP, WebSocket, and alarm events enter through the platform gateway. The DO
-wakes on demand and runs against its own state. Its event and storage contract
-is fixed by the component ABI rather than by a per-run protocol.
+principle applies to tenant code. Tenant compute has two tiers, the
+Cloudflare/celld shape. A **Worker** is the general primitive: a stateless
+WASM component fetch handler, pool-executed at the ingress, holding no
+identity and no storage. A **Durable Object (DO)** is a stateful Worker
+class: a named object with durable KV and SQL state, reached only through
+Worker code via environment bindings (`env.NS.idFromName(name)` →
+`get` → stub `fetch`). HTTP, WebSocket, and alarm events enter through the
+platform gateway and execute Worker code first; DOs wake on demand and run
+against their own state. Both tiers' contracts are fixed by the component
+ABI, and the authoring surface is Cloudflare's spec, implemented by Verglas
+SDKs ([Cloudflare compatibility](/docs/architecture/cloudflare-compat)).
 
 The DO boundary keeps user code close to its state without making it a storage
-authority. The component can use only the capabilities in its WIT world.
+authority. A stateless Worker holds no capabilities beyond its bindings; the
+DO component can use only the capabilities in its WIT world.
 `verglasd` owns event serialization, transaction assembly, and commit. The
 lease-fenced commit authority remains the source of truth; SQLite is the local
 pager and recovery image. The trust boundary is a WASM sandbox inside one

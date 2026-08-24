@@ -77,7 +77,11 @@ may be extended, never weakened; tests asserting them may not be deleted,
   alone.
 - **AC2 — JS worker end-to-end.** A JS project with a wrangler-style manifest
   builds via the `sdks/worker-js` pipeline into a `verglas:do-worker`
-  component that runs under `verglasd`: `init` runs once, `fetch` served
+  component that runs under `verglasd`: `init` runs once **per component
+  instantiation** (Cloudflare constructor semantics — instances are created
+  per activation and per event under lazy instantiation, so `init` must be
+  idempotent; clarification added after independent verification, extending
+  not weakening this criterion), `fetch` served
   through the gateway performs real SQL (create/insert/select through
   `sql-rows`) against DO state, and the state survives a `verglasd` process
   restart (same data directory).

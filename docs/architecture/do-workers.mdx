@@ -4,12 +4,18 @@ description: "Tenant WASM components executing inside each Durable Object's verg
 icon: "cube"
 ---
 
-A Durable Object is a Worker. Tenant code compiles to one WebAssembly component
-targeting the `verglas:do-worker` WIT world and executes inside the DO's own `verglasd`
-process — the same isolated microVM, lease fence, and commit authority described
-in [Cell deployment](/docs/architecture/cells). There is no separate worker
-fleet, no container scheduler, and no V8: the isolation boundary is the WASM
-sandbox inside the microVM inside the lease fence.
+Tenant compute has two tiers, the Cloudflare/celld shape. A **Worker** is the
+general primitive: a stateless component fetch handler, pool-executed at the
+ingress, no identity, no storage. A **Durable Object** is a stateful Worker
+class reached only through Worker code via environment bindings
+(`env.NS.idFromName` → `get` → stub `fetch`). Tenant code compiles to one
+WebAssembly component targeting the `verglas:do-worker` WIT world; a DO's
+events execute inside its own `verglasd` process — the isolated microVM,
+lease fence, and commit authority described in
+[Cell deployment](/docs/architecture/cells). There is no container scheduler
+and no V8: the isolation boundary is the WASM sandbox inside the microVM
+inside the lease fence, and the authoring surface is Cloudflare's spec
+([Cloudflare compatibility](/docs/architecture/cloudflare-compat)).
 
 ```text
 gateway (owns HTTP + WebSocket connections)
