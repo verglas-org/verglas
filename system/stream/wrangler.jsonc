@@ -1,0 +1,16 @@
+{
+  "name": "verglas-stream",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "STREAM_DO", "class_name": "Stream" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Stream"] }
+  ],
+  "vars": {
+    "STREAM_NAME": "main"
+  }
+}
