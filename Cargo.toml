@@ -27,7 +27,6 @@ members = [
     "bins/cache-node",
     "crates/verglas-block",
     "crates/verglas-do-turso",
-    "crates/verglas-do-engine",
     "crates/verglas-celld",
     "crates/verglas-runtime",
     "crates/verglas-do-wasm",
@@ -83,7 +82,7 @@ verglas-api = { path = "crates/verglas-api", version = "0.2.0" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-block = { path = "crates/verglas-block" }
-verglas-do-engine = { path = "crates/verglas-do-engine" }
+verglas-do-turso = { path = "crates/verglas-do-turso" }
 verglas-do-wasm = { path = "crates/verglas-do-wasm" }
 verglas-celld = { path = "crates/verglas-celld" }
 verglas-gateway = { path = "crates/verglas-gateway" }

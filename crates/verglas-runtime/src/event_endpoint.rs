@@ -1,8 +1,8 @@
 //! NDJSON event endpoint for one resident Durable Object Worker.
 //!
 //! This module owns frame decoding, transaction-scoped Worker dispatch, commit-gated
-//! socket output, and advisory alarm delivery. Replica control traffic remains in
-//! `verglas-do-engine`; this socket carries only the gateway event protocol.
+//! socket output, and advisory alarm delivery. Durable state is supplied by one
+//! Turso store; this socket carries only the gateway event protocol.
 //! Cross-object `do-call` subrequests are emitted immediately and are deliberately
 //! not output-gated: they are irreversible side effects like Cloudflare subrequests,
 //! while only WebSocket sends and closes wait for the event commit.
@@ -21,16 +21,13 @@ use thiserror::Error;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
-use verglas_do_engine::{
-    DoEngine, DoStorage, Error as EngineError, IsolationLevel, SnapshotFence, WorkerStateView,
-    ensure_worker_tables,
-};
+use verglas_do_turso::TursoStore;
 use verglas_do_wasm::{
     EventGate, HostError, PendingEvent, Request, Response, RuntimeError, SocketId, WorkerBindings,
     WorkerRuntime, WorkerSockets, WorkerStorage,
 };
 
-use crate::worker_storage::EngineWorkerStorage;
+use crate::worker_storage::TursoWorkerStorage;
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -40,9 +37,9 @@ pub enum EventEndpointError {
     /// Reports Unix socket or stream I/O failure.
     #[error("event endpoint I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    /// Reports a durable engine failure while starting or delivering an event.
-    #[error("event endpoint engine failure: {0}")]
-    Engine(#[source] EngineError),
+    /// Reports a durable Turso failure while starting or delivering an event.
+    #[error("event endpoint Turso failure: {0}")]
+    Store(#[source] verglas_do_turso::Error),
     /// Reports a Worker component invocation failure.
     #[error("event endpoint Worker failure: {0}")]
     Runtime(#[source] RuntimeError),
@@ -599,7 +596,7 @@ struct EventSockets {
     /// Commit-gated gateway output sink.
     sink: Arc<GatewaySocketSink>,
     /// Event transaction used for attachment persistence.
-    storage: Arc<EngineWorkerStorage>,
+    storage: Arc<TursoWorkerStorage>,
 }
 
 #[async_trait]
@@ -636,8 +633,8 @@ pub struct EventEndpoint {
     path: PathBuf,
     /// Bound Unix listener.
     listener: UnixListener,
-    /// Engine and commit authority for event transactions.
-    engine: Arc<DoEngine>,
+    /// Turso database and remote durability boundary for event transactions.
+    store: Arc<TursoStore>,
     /// Real runtime or a scripted test dispatcher.
     dispatcher: Arc<dyn EventDispatcher>,
     /// Serialized event gate shared by every accepted connection.
@@ -649,15 +646,12 @@ pub struct EventEndpoint {
 }
 
 impl EventEndpoint {
-    /// Binds an event socket and ensures reserved Worker tables exist.
+    /// Binds an event socket after the Turso constructor has validated its schema.
     pub async fn bind(
         path: impl AsRef<Path>,
-        engine: Arc<DoEngine>,
+        store: Arc<TursoStore>,
         dispatcher: Arc<dyn EventDispatcher>,
     ) -> Result<Self, EventEndpointError> {
-        ensure_worker_tables(engine.as_ref())
-            .await
-            .map_err(EventEndpointError::Engine)?;
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -673,7 +667,7 @@ impl EventEndpoint {
         Ok(Self {
             path,
             listener,
-            engine,
+            store,
             dispatcher,
             gate,
             sink,
@@ -714,7 +708,7 @@ impl EventEndpoint {
     /// Commits the component initialization transaction before accepting events.
     async fn initialize(&self) -> Result<(), EventEndpointError> {
         let (storage, sockets) = self.event_capabilities().await?;
-        let pending = self
+        let pending = match self
             .dispatcher
             .dispatch_init(
                 &self.gate,
@@ -723,7 +717,13 @@ impl EventEndpoint {
                 no_bindings(),
             )
             .await
-            .map_err(EventEndpointError::Runtime)?;
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                storage.rollback().await.map_err(EventEndpointError::Host)?;
+                return Err(EventEndpointError::Runtime(error));
+            }
+        };
         let ((), permit) = pending.into_parts();
         storage.commit().await.map_err(EventEndpointError::Host)?;
         permit.commit().await.map_err(EventEndpointError::Host)?;
@@ -919,7 +919,7 @@ impl EventEndpoint {
         router: Arc<DoCallRouter>,
     ) -> Result<Response, EventEndpointError> {
         let (storage, sockets) = self.event_capabilities().await?;
-        let pending = self
+        let pending = match self
             .dispatcher
             .dispatch_fetch(
                 &self.gate,
@@ -929,7 +929,13 @@ impl EventEndpoint {
                 request,
             )
             .await
-            .map_err(EventEndpointError::Runtime)?;
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                storage.rollback().await.map_err(EventEndpointError::Host)?;
+                return Err(EventEndpointError::Runtime(error));
+            }
+        };
         let (response, permit) = pending.into_parts();
         storage.commit().await.map_err(EventEndpointError::Host)?;
         permit.commit().await.map_err(EventEndpointError::Host)?;
@@ -947,7 +953,7 @@ impl EventEndpoint {
             .event_capabilities()
             .await
             .map_err(|error| error.to_string())?;
-        let pending = self
+        let pending = match self
             .dispatcher
             .dispatch_websocket_message(
                 &self.gate,
@@ -958,7 +964,16 @@ impl EventEndpoint {
                 message,
             )
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                storage
+                    .rollback()
+                    .await
+                    .map_err(|rollback| rollback.to_string())?;
+                return Err(error.to_string());
+            }
+        };
         let ((), permit) = pending.into_parts();
         storage.commit().await.map_err(|error| error.to_string())?;
         permit.commit().await.map_err(|error| error.to_string())?;
@@ -977,7 +992,7 @@ impl EventEndpoint {
             .event_capabilities()
             .await
             .map_err(|error| error.to_string())?;
-        let pending = self
+        let pending = match self
             .dispatcher
             .dispatch_websocket_close(
                 &self.gate,
@@ -989,7 +1004,16 @@ impl EventEndpoint {
                 reason,
             )
             .await
-            .map_err(|error| error.to_string())?;
+        {
+            Ok(pending) => pending,
+            Err(error) => {
+                storage
+                    .rollback()
+                    .await
+                    .map_err(|rollback| rollback.to_string())?;
+                return Err(error.to_string());
+            }
+        };
         let ((), permit) = pending.into_parts();
         storage.commit().await.map_err(|error| error.to_string())?;
         permit.commit().await.map_err(|error| error.to_string())?;
@@ -1002,10 +1026,11 @@ impl EventEndpoint {
         scheduled: u64,
         router: Arc<dyn WorkerBindings>,
     ) -> Result<Vec<OutboundFrame>, EventEndpointError> {
-        if WorkerStateView::new(self.engine.as_ref())
+        if self
+            .store
             .alarm()
             .await
-            .map_err(EventEndpointError::Engine)?
+            .map_err(EventEndpointError::Store)?
             != Some(scheduled)
         {
             return Ok(Vec::new());
@@ -1040,7 +1065,8 @@ impl EventEndpoint {
             }
             Err(error) => {
                 // Alarm frames have no gateway id, so there is no terminal error
-                // frame to emit. The dispatch error already aborted its permit.
+                // frame to emit. Roll back before retaining the alarm deadline.
+                storage.rollback().await.map_err(EventEndpointError::Host)?;
                 eprintln!("alarm handler failed: {error}");
                 Ok(Vec::new())
             }
@@ -1050,18 +1076,12 @@ impl EventEndpoint {
     /// Creates one event transaction and its event-scoped host capabilities.
     async fn event_capabilities(
         &self,
-    ) -> Result<(Arc<EngineWorkerStorage>, Arc<EventSockets>), EventEndpointError> {
-        let transaction = self
-            .engine
-            .begin(IsolationLevel::Snapshot)
-            .await
-            .map_err(EventEndpointError::Engine)?;
-        let snapshot = SnapshotFence::at(transaction.envelope().base_commit_sequence());
-        let storage = Arc::new(EngineWorkerStorage::new_with_snapshot(
-            Arc::clone(&self.engine),
-            transaction,
-            snapshot,
-        ));
+    ) -> Result<(Arc<TursoWorkerStorage>, Arc<EventSockets>), EventEndpointError> {
+        let storage = Arc::new(
+            TursoWorkerStorage::begin(Arc::clone(&self.store))
+                .await
+                .map_err(EventEndpointError::Host)?,
+        );
         let sockets = Arc::new(EventSockets {
             sink: Arc::clone(&self.sink),
             storage: Arc::clone(&storage),
@@ -1071,10 +1091,11 @@ impl EventEndpoint {
 
     /// Refreshes the one timer from committed alarm state.
     async fn refresh_alarm(&mut self) -> Result<(), EventEndpointError> {
-        self.alarm_deadline = WorkerStateView::new(self.engine.as_ref())
+        self.alarm_deadline = self
+            .store
             .alarm()
             .await
-            .map_err(EventEndpointError::Engine)?;
+            .map_err(EventEndpointError::Store)?;
         Ok(())
     }
 

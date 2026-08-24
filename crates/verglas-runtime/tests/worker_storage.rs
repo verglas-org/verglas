@@ -1,225 +1,213 @@
-//! Acceptance tests for the transactional WorkerStorage engine adapter.
+//! Acceptance tests for Turso-backed WorkerStorage event transactions.
+//!
+//! The test-only Turso constructor uses a real embedded database and exercises
+//! the same SQL, reserved tables, rollback, and reopen paths as production.
 
-use std::sync::{Arc, Mutex};
+#![cfg(feature = "test-support")]
 
-use arrow_ipc::reader::StreamReader;
-use arrow_schema::{DataType, Field, Schema};
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use verglas_do_engine::{
-    CommitAuthority, CommitReceipt, DoEngine, DoStorage, IsolationLevel, SqliteReplicaStore,
-    TableId, TransactionEnvelope, WorkerStateView, ensure_worker_tables,
-};
-use verglas_do_wasm::WorkerStorage;
-use verglas_runtime::EngineWorkerStorage;
+use serde_json::Value;
+use tempfile::TempDir;
+use tokio::sync::Mutex;
+use verglas_do_turso::{OutboxRecord, StreamAppender};
+use verglas_do_wasm::{HostError, WorkerStorage};
+use verglas_runtime::TursoWorkerStorage;
 
-/// Sequence-assigning authority used to make commit visibility deterministic.
-#[derive(Default)]
-struct CountingAuthority {
-    /// Number of committed envelopes.
-    calls: Mutex<u64>,
+/// Test-only Stream appender that records the ACKed batch without changing storage.
+#[derive(Clone, Default)]
+struct RecordingAppender {
+    /// Records delivered outbox rows in append order.
+    records: Arc<Mutex<Vec<OutboxRecord>>>,
 }
 
 #[async_trait]
-impl CommitAuthority for CountingAuthority {
-    /// Grants one contiguous sequence to each envelope.
-    async fn commit(
-        &self,
-        envelope: &TransactionEnvelope,
-    ) -> verglas_do_engine::Result<CommitReceipt> {
-        let mut calls = self.calls.lock().expect("authority lock");
-        *calls += 1;
-        Ok(CommitReceipt::new(*calls, envelope.transaction_id()))
+impl StreamAppender for RecordingAppender {
+    /// Records one batch as the Stream ACK boundary for this test.
+    async fn append(&self, records: Vec<OutboxRecord>) -> verglas_do_turso::Result<()> {
+        self.records.lock().await.extend(records);
+        Ok(())
     }
 }
 
-/// Returns the schema used by the SQL adapter acceptance tests.
-fn items_schema() -> Arc<Schema> {
-    Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int64, false),
-        Field::new("name", DataType::Utf8, true),
-    ]))
+/// Opens one explicit test-only Turso store and one event capability.
+async fn event_storage(
+    root: &TempDir,
+) -> Result<(Arc<verglas_do_turso::TursoStore>, TursoWorkerStorage), Box<dyn std::error::Error>> {
+    let store = Arc::new(
+        verglas_do_turso::TursoStore::open_for_test(
+            root.path().join("worker.db"),
+            "runtime-worker",
+        )
+        .await?,
+    );
+    let storage = TursoWorkerStorage::begin(Arc::clone(&store)).await?;
+    Ok((store, storage))
 }
 
-/// Creates one engine, SQL table, reserved tables, and an open event transaction.
-async fn event_storage() -> (Arc<DoEngine>, EngineWorkerStorage) {
-    let engine = Arc::new(DoEngine::new(
-        "runtime-worker",
-        Arc::new(CountingAuthority::default()),
-    ));
-    engine
-        .create_table(TableId::new("items"), items_schema())
-        .await
-        .expect("items table");
-    ensure_worker_tables(engine.as_ref())
-        .await
-        .expect("worker tables");
-    let transaction = engine
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .expect("event transaction");
-    let storage = EngineWorkerStorage::new(Arc::clone(&engine), transaction);
-    (engine, storage)
-}
-
-/// Worker KV reads see writes and tombstones before the transaction commits.
+/// KV, list, alarm, and attachment operations read their own staged writes.
 #[tokio::test]
-async fn storage_reads_own_staged_writes_and_deletes() {
-    let (_engine, storage) = event_storage().await;
+async fn event_storage_reads_own_worker_state_writes() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (_store, storage) = event_storage(&root).await?;
 
-    storage
-        .put("user:a".to_owned(), b"one".to_vec())
-        .await
-        .expect("put");
+    storage.put("user:a".to_owned(), b"one".to_vec()).await?;
     assert_eq!(
-        storage.get("user:a".to_owned()).await.expect("get"),
+        storage.get("user:a".to_owned()).await?,
         Some(b"one".to_vec())
     );
+    assert_eq!(storage.list("user:".to_owned(), 10).await?, vec!["user:a"]);
+    assert!(storage.delete("user:a".to_owned()).await?);
+    assert_eq!(storage.get("user:a".to_owned()).await?, None);
+
+    storage.set_alarm(4_242).await?;
+    assert_eq!(storage.get_alarm().await?, Some(4_242));
+    storage.set_attachment(9, b"attachment".to_vec()).await?;
     assert_eq!(
-        storage.list("user:".to_owned(), 10).await.expect("list"),
-        vec!["user:a".to_owned()]
+        storage.get_attachment(9).await?,
+        Some(b"attachment".to_vec())
     );
-    assert!(storage.delete("user:a".to_owned()).await.expect("delete"));
-    assert_eq!(storage.get("user:a".to_owned()).await.expect("get"), None);
-    assert!(
-        storage
-            .list("user:".to_owned(), 10)
-            .await
-            .expect("list")
-            .is_empty()
-    );
+    assert_eq!(storage.attached_sockets().await?, vec![9]);
+    storage.rollback().await?;
+    Ok(())
 }
 
-/// Staged state is invisible to the committed view and appears after commit.
+/// SQL DDL and DML execute inside the same Turso event as Worker state.
 #[tokio::test]
-async fn storage_staged_writes_become_visible_only_after_commit() {
-    let (engine, storage) = event_storage().await;
-    let view = WorkerStateView::new(engine.as_ref());
+async fn event_storage_sql_ddl_dml_and_json_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (_store, storage) = event_storage(&root).await?;
 
-    storage
-        .put("pending".to_owned(), b"value".to_vec())
+    let arrow_error = storage
+        .sql("CREATE TABLE items (id INTEGER, name TEXT)".to_owned())
         .await
-        .expect("put");
-    assert_eq!(view.kv_get("pending").await.expect("view get"), None);
-
-    storage.commit().await.expect("commit event transaction");
+        .expect_err("Arrow IPC SQL must be a typed hard error");
+    assert!(
+        matches!(arrow_error, HostError::Unsupported { operation } if operation.contains("Arrow IPC"))
+    );
     assert_eq!(
-        view.kv_get("pending").await.expect("view get"),
+        storage
+            .sql_rows("CREATE TABLE items (id INTEGER, name TEXT)".to_owned())
+            .await?,
+        "[]"
+    );
+    storage
+        .sql_rows("INSERT INTO items VALUES (1, 'first')".to_owned())
+        .await?;
+    storage
+        .sql_rows("UPDATE items SET name = 'updated' WHERE id = 1".to_owned())
+        .await?;
+    assert_eq!(
+        serde_json::from_str::<Value>(
+            &storage
+                .sql_rows("SELECT id, name FROM items ORDER BY id".to_owned())
+                .await?,
+        )?,
+        serde_json::json!([{ "id": 1, "name": "updated" }])
+    );
+    storage
+        .sql_rows("DELETE FROM items WHERE id = 1".to_owned())
+        .await?;
+    assert_eq!(
+        storage.sql_rows("SELECT * FROM items".to_owned()).await?,
+        "[]"
+    );
+    storage.rollback().await?;
+    Ok(())
+}
+
+/// Handler errors roll back SQL and every reserved Worker mutation.
+#[tokio::test]
+async fn handler_error_rolls_back_event_transaction() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let (store, storage) = event_storage(&root).await?;
+    storage
+        .put("failed".to_owned(), b"must-not-commit".to_vec())
+        .await?;
+    storage.set_alarm(99).await?;
+    storage
+        .sql_rows("CREATE TABLE failed_table (value TEXT)".to_owned())
+        .await?;
+    storage.rollback().await?;
+
+    let next = TursoWorkerStorage::begin(Arc::clone(&store)).await?;
+    assert_eq!(next.get("failed".to_owned()).await?, None);
+    assert_eq!(next.get_alarm().await?, None);
+    assert!(
+        next.sql_rows("SELECT * FROM failed_table".to_owned())
+            .await
+            .is_err()
+    );
+    next.rollback().await?;
+    Ok(())
+}
+
+/// Committed SQL and Worker state survive reopening the same Turso local path.
+#[tokio::test]
+async fn commit_and_reopen_preserves_event_state() -> Result<(), Box<dyn std::error::Error>> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("worker.db");
+    let store =
+        Arc::new(verglas_do_turso::TursoStore::open_for_test(&path, "persistent-worker").await?);
+    let storage = TursoWorkerStorage::begin(Arc::clone(&store)).await?;
+    storage
+        .put("persisted".to_owned(), b"value".to_vec())
+        .await?;
+    storage.set_alarm(12).await?;
+    storage.set_attachment(3, b"socket".to_vec()).await?;
+    storage
+        .sql_rows("CREATE TABLE items (id INTEGER, name TEXT)".to_owned())
+        .await?;
+    storage
+        .sql_rows("INSERT INTO items VALUES (7, 'persisted')".to_owned())
+        .await?;
+    storage.commit().await?;
+    drop(storage);
+    drop(store);
+
+    let reopened =
+        Arc::new(verglas_do_turso::TursoStore::open_for_test(&path, "persistent-worker").await?);
+    let storage = TursoWorkerStorage::begin(Arc::clone(&reopened)).await?;
+    assert_eq!(
+        storage.get("persisted".to_owned()).await?,
         Some(b"value".to_vec())
     );
-}
-
-/// Alarm operations read their overlay and persist only after commit.
-#[tokio::test]
-async fn storage_alarm_verbs_round_trip_through_commit() {
-    let (engine, storage) = event_storage().await;
-    let view = WorkerStateView::new(engine.as_ref());
-
-    assert_eq!(storage.get_alarm().await.expect("initial alarm"), None);
-    storage.set_alarm(4_242).await.expect("set alarm");
+    assert_eq!(storage.get_alarm().await?, Some(12));
+    assert_eq!(storage.get_attachment(3).await?, Some(b"socket".to_vec()));
     assert_eq!(
-        storage.get_alarm().await.expect("staged alarm"),
-        Some(4_242)
-    );
-    assert_eq!(view.alarm().await.expect("committed alarm"), None);
-
-    storage.commit().await.expect("commit alarm");
-    assert_eq!(view.alarm().await.expect("committed alarm"), Some(4_242));
-
-    let transaction = engine
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .expect("clear transaction");
-    let clearing = EngineWorkerStorage::new(Arc::clone(&engine), transaction);
-    clearing.delete_alarm().await.expect("clear alarm");
-    assert_eq!(clearing.get_alarm().await.expect("staged clear"), None);
-    clearing.commit().await.expect("commit clear");
-    assert_eq!(view.alarm().await.expect("cleared alarm"), None);
-}
-
-/// SQL and JSON-row SQL share one event transaction and see staged inserts.
-#[tokio::test]
-async fn storage_sql_and_sql_rows_see_staged_rows() {
-    let (_engine, storage) = event_storage().await;
-    let ipc = storage
-        .sql("INSERT INTO items VALUES (1, 'first')".to_owned())
-        .await
-        .expect("insert SQL");
-    let mut reader = StreamReader::try_new(std::io::Cursor::new(ipc), None).expect("IPC reader");
-    let insert_batch = reader
-        .next()
-        .expect("insert batch")
-        .expect("valid insert batch");
-    assert_eq!(insert_batch.num_rows(), 1);
-
-    storage
-        .sql("INSERT INTO items VALUES (2, NULL)".to_owned())
-        .await
-        .expect("nullable insert SQL");
-    let rows = storage
-        .sql_rows("SELECT id, name FROM items ORDER BY id".to_owned())
-        .await
-        .expect("JSON rows SQL");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&rows).expect("rows JSON"),
-        serde_json::json!([
-            { "id": 1, "name": "first" },
-            { "id": 2, "name": null }
-        ])
-    );
-}
-
-/// SQL rows remain available after the SQLite replica is reopened.
-#[tokio::test]
-async fn storage_sql_rows_survive_engine_reopen() {
-    let directory = tempfile::tempdir().expect("replica directory");
-    let replica_path = directory.path().join("replica.sqlite");
-    let authority = Arc::new(CountingAuthority::default());
-    let replica =
-        Arc::new(SqliteReplicaStore::open(&replica_path, "persistent-worker").expect("replica"));
-    let engine = Arc::new(
-        DoEngine::open_persistent("persistent-worker", authority, Arc::clone(&replica))
-            .expect("persistent engine"),
-    );
-    engine
-        .create_table(TableId::new("items"), items_schema())
-        .await
-        .expect("items table");
-    ensure_worker_tables(engine.as_ref())
-        .await
-        .expect("worker tables");
-    let transaction = engine
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .expect("event transaction");
-    let storage = EngineWorkerStorage::new(Arc::clone(&engine), transaction);
-    storage
-        .sql("INSERT INTO items VALUES (7, 'persisted')".to_owned())
-        .await
-        .expect("insert SQL");
-    storage.commit().await.expect("commit SQL");
-
-    let reopened_replica = Arc::new(
-        SqliteReplicaStore::open(&replica_path, "persistent-worker").expect("reopened replica"),
-    );
-    let reopened = Arc::new(
-        DoEngine::open_persistent(
-            "persistent-worker",
-            Arc::new(CountingAuthority::default()),
-            reopened_replica,
-        )
-        .expect("reopened engine"),
-    );
-    let reopened_transaction = reopened
-        .begin(IsolationLevel::Snapshot)
-        .await
-        .expect("reopened event transaction");
-    let reopened_storage = EngineWorkerStorage::new(Arc::clone(&reopened), reopened_transaction);
-    let rows = reopened_storage
-        .sql_rows("SELECT id, name FROM items".to_owned())
-        .await
-        .expect("reopened JSON rows SQL");
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&rows).expect("reopened rows JSON"),
+        serde_json::from_str::<Value>(
+            &storage
+                .sql_rows("SELECT id, name FROM items".to_owned())
+                .await?,
+        )?,
         serde_json::json!([{ "id": 7, "name": "persisted" }])
     );
+    storage.rollback().await?;
+    Ok(())
+}
+
+/// A successful commit drains the injected outbox only after local state commits.
+#[tokio::test]
+async fn commit_drains_enabled_outbox_after_state_commit() -> Result<(), Box<dyn std::error::Error>>
+{
+    let root = tempfile::tempdir()?;
+    let (store, storage) = event_storage(&root).await?;
+    let appender = RecordingAppender::default();
+    store.set_stream_appender(Arc::new(appender.clone())).await;
+    storage
+        .put("selected".to_owned(), b"state".to_vec())
+        .await?;
+    let key = storage
+        .append_outbox(0, serde_json::json!({ "value": 1 }))
+        .await?;
+    storage.commit().await?;
+    let records = appender.records.lock().await.clone();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].key, key);
+    assert!(store.pending_outbox(10).await?.is_empty());
+    let event = store.begin_event().await?;
+    assert_eq!(event.get_kv("selected").await?, Some(b"state".to_vec()));
+    event.rollback().await?;
+    Ok(())
 }
