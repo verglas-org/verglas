@@ -87,6 +87,6 @@ export type {
   WorkerScriptMetadata,
   WorkerScriptUpload,
   WorkerScriptUploadParts,
+  WorkersDurableObjectBinding,
   WorkersManagementMessage,
 } from "./management";
-

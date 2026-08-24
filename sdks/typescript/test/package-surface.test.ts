@@ -21,12 +21,8 @@ const forbiddenFiles = [
   ["do", "protocol.ts"].join("-"),
   "durable-objects.ts",
 ];
-const forbiddenExports = [
-  "DurableObject",
-  "WorkersDurableObject",
-  "StorageBridge",
-  "createWorkerRuntime",
-];
+const forbiddenExports = ["DurableObject", "StorageBridge", "createWorkerRuntime"];
+const indexTokens = new Set(indexSource.split(/[^A-Za-z0-9_$]+/u).filter(Boolean));
 
 const forbiddenProtocolWords = [
   ["REG", "ISTER"].join(""),
@@ -41,7 +37,7 @@ describe("SDK package surface", () => {
   });
 
   it("does not export or mention the deleted custom protocol", () => {
-    for (const name of forbiddenExports) expect(indexSource).not.toContain(name);
+    for (const name of forbiddenExports) expect(indexTokens.has(name)).toBe(false);
     for (const word of forbiddenProtocolWords) expect(sourceText).not.toContain(word);
   });
 

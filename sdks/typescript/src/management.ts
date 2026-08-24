@@ -29,12 +29,24 @@ export class WorkersManagementError extends Error {
   }
 }
 
+/** A Durable Object namespace binding in script module metadata. */
+export interface WorkersDurableObjectBinding {
+  /** Worker environment binding name. */
+  name: string;
+  /** Cloudflare module-syntax binding discriminator. */
+  type: "durable_object_namespace";
+  /** Durable Object class exported by the script. */
+  class_name: string;
+  /** Optional script name for cross-script bindings. */
+  script_name?: string;
+}
+
 /** Script metadata accepted by the celld multipart upload route. */
 export interface WorkerScriptMetadata {
   /** Module file that is the Worker entrypoint. */
   main_module: string;
-  /** Opaque binding metadata owned by the Worker management API. */
-  bindings: Record<string, unknown>[];
+  /** Cloudflare-style environment bindings. */
+  bindings: WorkersDurableObjectBinding[];
 }
 
 /** Source accepted for one multipart Worker module. */
