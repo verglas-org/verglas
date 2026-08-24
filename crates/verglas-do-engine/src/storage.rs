@@ -7,8 +7,10 @@ use std::time::Instant;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
+use datafusion::arrow::compute::concat_batches;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::scalar::ScalarValue;
 use futures::stream;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -23,7 +25,7 @@ use crate::offload::{
 use crate::replica::SqliteReplicaStore;
 use crate::transaction::{
     CommitAuthority, CommitReceipt, DoTransaction, EngineTransaction, IsolationLevel,
-    MutationDomain, TableId, TransactionEnvelope,
+    MutationDomain, MutationKind, SchemaChange, TableId, TransactionEnvelope,
 };
 use crate::vector::{LiveVectorProjection, VectorIndexConfig};
 use verglas_graph::{Direction, Neighbor as GraphNeighbor};
@@ -121,6 +123,7 @@ pub trait DoStorage: Send + Sync {
 #[derive(Clone)]
 struct VersionedBatch {
     sequence: u64,
+    kind: MutationKind,
     batch: RecordBatch,
 }
 
@@ -135,6 +138,7 @@ struct TableState {
 struct AppliedState {
     sequence: u64,
     tables: HashMap<TableId, TableState>,
+    pending_schema_changes: Vec<SchemaChange>,
     vector_log: HashMap<TableId, Vec<VersionedBatch>>,
     vector_indexes: HashMap<TableId, LiveVectorProjection>,
     graph_log: HashMap<TableId, Vec<VersionedBatch>>,
@@ -204,6 +208,26 @@ impl DoEngine {
                         entry.commit_sequence()
                     )));
                 }
+                for change in envelope.schema_changes() {
+                    match state.tables.get(change.table()) {
+                        Some(table) if table.schema.as_ref() != change.schema().as_ref() => {
+                            return Err(Error::ReplicaConflict(format!(
+                                "replay schema mismatch for table {}",
+                                change.table().as_str()
+                            )));
+                        }
+                        Some(_) => {}
+                        None => {
+                            state.tables.insert(
+                                change.table().clone(),
+                                TableState {
+                                    schema: change.schema().clone(),
+                                    relational: Vec::new(),
+                                },
+                            );
+                        }
+                    }
+                }
                 for mutation in envelope.mutations() {
                     match state.tables.get(mutation.table()) {
                         Some(table)
@@ -248,17 +272,39 @@ impl DoEngine {
         Ok(engine)
     }
 
-    /// Registers a SQL table schema before row transactions begin.
+    /// Registers a SQL table schema and stages its durable declaration.
     pub async fn create_table(&self, table: TableId, schema: SchemaRef) -> Result<()> {
         let mut state = self.state.write().map_err(|_| Error::Poisoned)?;
+        if let Some(existing) = state.tables.get(&table) {
+            if existing.schema.as_ref() != schema.as_ref() {
+                return Err(Error::Arrow(arrow_schema::ArrowError::SchemaError(
+                    format!("table {} already has a different schema", table.as_str()),
+                )));
+            }
+            return Ok(());
+        }
         state.tables.insert(
-            table,
+            table.clone(),
             TableState {
-                schema,
+                schema: schema.clone(),
                 relational: Vec::new(),
             },
         );
+        state
+            .pending_schema_changes
+            .push(SchemaChange::new(table, schema));
         Ok(())
+    }
+
+    /// Commits a staged table declaration even when it contains no rows.
+    pub async fn create_table_durable(
+        &self,
+        table: TableId,
+        schema: SchemaRef,
+    ) -> Result<CommitReceipt> {
+        self.create_table(table, schema).await?;
+        let transaction = self.begin(IsolationLevel::Serializable).await?;
+        self.commit(transaction).await
     }
 
     /// Registers and rebuilds one Vamana projection from every committed vector mutation.
@@ -397,12 +443,34 @@ impl DoEngine {
         transaction_id: Uuid,
     ) -> Result<Box<dyn DoTransaction>> {
         let base = self.state.read().map_err(|_| Error::Poisoned)?.sequence;
-        Ok(Box::new(EngineTransaction::new(TransactionEnvelope::new(
+        self.begin_with_id_at(isolation, transaction_id, SnapshotFence::at(base))
+            .await
+    }
+
+    /// Begins a retryable transaction against an explicit snapshot fence.
+    pub async fn begin_with_id_at(
+        &self,
+        isolation: IsolationLevel,
+        transaction_id: Uuid,
+        snapshot: SnapshotFence,
+    ) -> Result<Box<dyn DoTransaction>> {
+        let state = self.state.read().map_err(|_| Error::Poisoned)?;
+        if snapshot.commit_sequence() > state.sequence {
+            return Err(Error::SnapshotAhead {
+                requested: snapshot.commit_sequence(),
+                applied: state.sequence,
+            });
+        }
+        let mut envelope = TransactionEnvelope::new(
             self.do_id.clone(),
             transaction_id,
-            base,
+            snapshot.commit_sequence(),
             isolation,
-        ))))
+        );
+        for change in &state.pending_schema_changes {
+            envelope.append_schema_change(change.table().clone(), change.schema().clone());
+        }
+        Ok(Box::new(EngineTransaction::new(envelope)))
     }
 
     /// Commits exact canonical bytes received by the isolated worker protocol.
@@ -434,6 +502,7 @@ impl DoEngine {
                     "transaction identity was reused for different content".to_owned(),
                 ));
             }
+            self.validate_snapshot(&state, envelope)?;
             self.validate_envelope(&state, envelope)?;
         }
         let receipt = self.authority.commit(envelope).await?;
@@ -453,20 +522,6 @@ impl DoEngine {
     /// Returns the highest transaction sequence applied to local state.
     pub fn applied_sequence(&self) -> u64 {
         self.state.read().map(|state| state.sequence).unwrap_or(0)
-    }
-
-    /// Returns every registered SQL table in deterministic name order.
-    pub fn table_ids(&self) -> Result<Vec<TableId>> {
-        let mut tables = self
-            .state
-            .read()
-            .map_err(|_| Error::Poisoned)?
-            .tables
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        tables.sort();
-        Ok(tables)
     }
 
     /// Returns the registered Arrow schema for one SQL table.
@@ -619,23 +674,74 @@ impl DoEngine {
         Ok(OffloadReport::new(archived, self.archive_watermark()))
     }
 
+    /// Rejects writes whose serializable begin snapshot is no longer current.
+    fn validate_snapshot(
+        &self,
+        state: &AppliedState,
+        envelope: &TransactionEnvelope,
+    ) -> Result<()> {
+        if envelope.base_commit_sequence() > state.sequence {
+            return Err(Error::SnapshotAhead {
+                requested: envelope.base_commit_sequence(),
+                applied: state.sequence,
+            });
+        }
+        if envelope.isolation() == IsolationLevel::Serializable
+            && envelope.base_commit_sequence() < state.sequence
+            && (!envelope.mutations().is_empty() || !envelope.schema_changes().is_empty())
+        {
+            return Err(Error::TransactionConflict {
+                base_commit_sequence: envelope.base_commit_sequence(),
+                current_commit_sequence: state.sequence,
+            });
+        }
+        Ok(())
+    }
+
     /// Rejects malformed mutations before they can reach the commit authority.
     fn validate_envelope(
         &self,
         state: &AppliedState,
         envelope: &TransactionEnvelope,
     ) -> Result<()> {
+        for change in envelope.schema_changes() {
+            if let Some(table) = state.tables.get(change.table())
+                && table.schema.as_ref() != change.schema().as_ref()
+            {
+                return Err(Error::Arrow(arrow_schema::ArrowError::SchemaError(
+                    format!(
+                        "schema declaration for {} does not match registered schema",
+                        change.table().as_str()
+                    ),
+                )));
+            }
+        }
         for mutation in envelope.mutations() {
-            let Some(table) = state.tables.get(mutation.table()) else {
+            let schema = if let Some(table) = state.tables.get(mutation.table()) {
+                table.schema.clone()
+            } else if let Some(change) = envelope
+                .schema_changes()
+                .iter()
+                .find(|change| change.table() == mutation.table())
+            {
+                change.schema().clone()
+            } else {
                 return Err(Error::UnknownTable(mutation.table().as_str().to_owned()));
             };
-            if table.schema.as_ref() != mutation.batch().schema().as_ref() {
+            if schema.as_ref() != mutation.batch().schema().as_ref() {
                 return Err(Error::Arrow(arrow_schema::ArrowError::SchemaError(
                     format!(
                         "mutation schema for {} does not match registered table schema",
                         mutation.table().as_str()
                     ),
                 )));
+            }
+            if mutation.domain() != MutationDomain::Relational
+                && mutation.kind() != MutationKind::Insert
+            {
+                return Err(Error::InvalidEnvelope(
+                    "replace and upsert mutations are relational only".to_owned(),
+                ));
             }
             if mutation.domain() == MutationDomain::Vector
                 && let Some(index) = state.vector_indexes.get(mutation.table())
@@ -682,9 +788,22 @@ impl DoEngine {
         canonical: Vec<u8>,
     ) -> Result<()> {
         let sequence = receipt.commit_sequence();
+        for change in envelope.schema_changes() {
+            state
+                .tables
+                .entry(change.table().clone())
+                .or_insert_with(|| TableState {
+                    schema: change.schema().clone(),
+                    relational: Vec::new(),
+                });
+            state
+                .pending_schema_changes
+                .retain(|pending| pending.table() != change.table());
+        }
         for mutation in envelope.mutations() {
             let versioned = VersionedBatch {
                 sequence,
+                kind: mutation.kind(),
                 batch: mutation.batch().clone(),
             };
             if mutation.domain() == MutationDomain::Relational
@@ -726,6 +845,94 @@ impl DoEngine {
             .insert(envelope.transaction_id(), (canonical, receipt));
         Ok(())
     }
+}
+
+/// Reconstructs relational rows by applying deterministic operations through a fence.
+fn materialize_relational(history: &[VersionedBatch], snapshot: u64) -> Result<Vec<RecordBatch>> {
+    let mut rows = Vec::new();
+    for version in history
+        .iter()
+        .filter(|version| version.sequence <= snapshot)
+    {
+        apply_relational_mutation(&mut rows, version.kind, &version.batch)?;
+    }
+    Ok(rows)
+}
+
+/// Applies one relational mutation to the private or committed row view.
+pub(crate) fn apply_relational_mutation(
+    rows: &mut Vec<RecordBatch>,
+    kind: MutationKind,
+    batch: &RecordBatch,
+) -> Result<()> {
+    match kind {
+        MutationKind::Insert => {
+            if batch.num_rows() > 0 {
+                rows.push(batch.clone());
+            }
+        }
+        MutationKind::Replace => {
+            rows.clear();
+            if batch.num_rows() > 0 {
+                rows.push(batch.clone());
+            }
+        }
+        MutationKind::Upsert => apply_upsert(rows, batch)?,
+    }
+    Ok(())
+}
+
+/// Applies an upsert by replacing rows with equal first-column keys.
+fn apply_upsert(rows: &mut Vec<RecordBatch>, batch: &RecordBatch) -> Result<()> {
+    if batch.num_columns() == 0 {
+        return Err(Error::InvalidEnvelope(
+            "upsert mutations require a first key column".to_owned(),
+        ));
+    }
+    if batch.num_rows() == 0 {
+        return Ok(());
+    }
+    let existing = if rows.is_empty() {
+        None
+    } else {
+        Some(concat_batches(&rows[0].schema(), rows.iter())?)
+    };
+    let Some(existing) = existing else {
+        rows.clear();
+        rows.push(batch.clone());
+        return Ok(());
+    };
+    let mut selected = Vec::with_capacity(existing.num_rows().saturating_add(batch.num_rows()));
+    let mut matched = vec![false; batch.num_rows()];
+    for existing_index in 0..existing.num_rows() {
+        let existing_key =
+            ScalarValue::try_from_array(existing.column(0).as_ref(), existing_index)?;
+        let mut incoming_index = None;
+        for candidate in 0..batch.num_rows() {
+            let incoming_key = ScalarValue::try_from_array(batch.column(0).as_ref(), candidate)?;
+            if incoming_key == existing_key {
+                incoming_index = Some(candidate);
+                break;
+            }
+        }
+        if let Some(incoming_index) = incoming_index {
+            matched[incoming_index] = true;
+            selected.push(batch.slice(incoming_index, 1));
+        } else {
+            selected.push(existing.slice(existing_index, 1));
+        }
+    }
+    for (incoming_index, is_matched) in matched.into_iter().enumerate() {
+        if !is_matched {
+            selected.push(batch.slice(incoming_index, 1));
+        }
+    }
+    let combined = concat_batches(&batch.schema(), &selected)?;
+    rows.clear();
+    if combined.num_rows() > 0 {
+        rows.push(combined);
+    }
+    Ok(())
 }
 
 #[async_trait]
@@ -777,13 +984,11 @@ impl DoStorage for DoEngine {
                 (schema, Some(columns))
             }
         };
-        let batches = table_state
-            .relational
-            .iter()
-            .filter(|version| version.sequence <= snapshot.commit_sequence())
-            .map(|version| match &columns {
-                Some(columns) => version.batch.project(columns),
-                None => Ok(version.batch.clone()),
+        let batches = materialize_relational(&table_state.relational, snapshot.commit_sequence())?
+            .into_iter()
+            .map(|batch| match &columns {
+                Some(columns) => batch.project(columns),
+                None => Ok(batch),
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let stream = stream::iter(batches.into_iter().map(Ok));

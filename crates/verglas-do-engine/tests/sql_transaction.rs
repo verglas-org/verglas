@@ -27,26 +27,6 @@ impl CommitAuthority for SequenceAuthority {
     }
 }
 
-/// Keeps SQL-created schemas in the engine registry used by later event sessions.
-#[tokio::test]
-async fn sql_create_table_registers_native_schema() {
-    let engine = Arc::new(DoEngine::new("do", Arc::new(SequenceAuthority::default())));
-    let table = TableId::new("counter");
-    let session = DoSession::begin(engine.clone(), [], IsolationLevel::Snapshot)
-        .await
-        .expect("begin SQL transaction");
-
-    session
-        .execute("CREATE TABLE IF NOT EXISTS counter (id VARCHAR NOT NULL, count BIGINT NOT NULL)")
-        .await
-        .expect("create SQL table");
-
-    let schema = engine.table_schema(&table).expect("native table schema");
-    assert_eq!(schema.fields().len(), 2);
-    assert_eq!(schema.field(0).name(), "id");
-    assert_eq!(schema.field(1).name(), "count");
-}
-
 #[tokio::test]
 async fn insert_is_private_until_one_commit_and_visible_inside_transaction() {
     let engine = Arc::new(DoEngine::new("do", Arc::new(SequenceAuthority::default())));

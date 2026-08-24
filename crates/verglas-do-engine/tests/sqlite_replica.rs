@@ -159,6 +159,36 @@ fn clean_requires_verified_archive_and_checkpoint_coverage() {
     );
 }
 
+#[test]
+fn replica_coverage_records_archive_checkpoint_and_fence() {
+    let directory = tempfile::tempdir().expect("temporary replica directory");
+    let store = SqliteReplicaStore::open(directory.path().join("replica.sqlite"), "agent")
+        .expect("open replica");
+    let lease = verglas_do_engine::LeaseIdentity::new("held-token", 4);
+    store
+        .apply_replicated(&lease, 1, Uuid::from_u128(41), b"one")
+        .expect("apply one");
+    store
+        .apply_replicated(&lease, 2, Uuid::from_u128(42), b"two")
+        .expect("apply two");
+    store
+        .mark_coverage(&lease, 2, 2, "checkpoint-two")
+        .expect("record coverage");
+    let state = store.state().expect("coverage state");
+    assert_eq!(state.applied_sequence(), 2);
+    assert_eq!(state.archive_sequence(), 2);
+    assert_eq!(state.checkpoint_sequence(), 2);
+    assert!(matches!(
+        store.mark_coverage(
+            &verglas_do_engine::LeaseIdentity::new("stale-token", 4),
+            2,
+            2,
+            "checkpoint-two",
+        ),
+        Err(Error::ReplicaConflict(_))
+    ));
+}
+
 #[tokio::test]
 async fn persistent_engine_replays_rows_after_process_restart() {
     let directory = tempfile::tempdir().expect("temporary replica directory");

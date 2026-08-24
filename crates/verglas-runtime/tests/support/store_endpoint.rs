@@ -3,13 +3,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Router;
 use axum::body::Bytes;
 use axum::extract::{OriginalUri, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED};
+use axum::http::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, LAST_MODIFIED,
+};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::any;
-use axum::Router;
 use chrono::Utc;
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 use object_store::path::Path;
@@ -68,12 +70,12 @@ pub struct StoreEndpoint {
 impl StoreEndpoint {
     /// Starts an empty endpoint on an operating-system-selected loopback port.
     pub async fn start() -> object_store::Result<Self> {
-        let listener = TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .map_err(|error| object_store::Error::Generic {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|error| {
+            object_store::Error::Generic {
                 store: "strict-test-s3",
                 source: error.to_string().into(),
-            })?;
+            }
+        })?;
         let address = listener
             .local_addr()
             .map_err(|error| object_store::Error::Generic {
@@ -135,10 +137,13 @@ impl StoreEndpoint {
                 },
             )
             .await?;
-        let first_etag = first.e_tag.clone().ok_or_else(|| object_store::Error::Generic {
-            store: "strict-test-s3",
-            source: "capability create did not return an ETag".into(),
-        })?;
+        let first_etag = first
+            .e_tag
+            .clone()
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "strict-test-s3",
+                source: "capability create did not return an ETag".into(),
+            })?;
         let metadata = self.inspector.head(&path).await?;
         if metadata.e_tag.as_deref() != Some(first_etag.as_str()) || metadata.size != 5 {
             return Err(object_store::Error::Generic {
@@ -184,10 +189,13 @@ impl StoreEndpoint {
                 },
             )
             .await?;
-        let second_etag = second.e_tag.clone().ok_or_else(|| object_store::Error::Generic {
-            store: "strict-test-s3",
-            source: "capability update did not return an ETag".into(),
-        })?;
+        let second_etag = second
+            .e_tag
+            .clone()
+            .ok_or_else(|| object_store::Error::Generic {
+                store: "strict-test-s3",
+                source: "capability update did not return an ETag".into(),
+            })?;
         if second_etag == first_etag {
             return Err(object_store::Error::Generic {
                 store: "strict-test-s3",
@@ -270,6 +278,12 @@ async fn handle_request(
             "signed authorization is required",
         );
     }
+    if method == Method::GET && uri.query().is_some_and(is_list_query) {
+        return list_objects(&state, &uri).await;
+    }
+    if method == Method::POST && uri.query().is_some_and(is_bulk_delete_query) {
+        return bulk_delete_objects(&state, &body).await;
+    }
     let Some(key) = object_key(&uri, &state.bucket) else {
         return s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "object path is invalid");
     };
@@ -296,13 +310,109 @@ fn object_key(uri: &Uri, bucket: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+/// Identifies the ListObjectsV2 query emitted by the object-store client.
+fn is_list_query(query: &str) -> bool {
+    query.split('&').any(|field| field == "list-type=2")
+}
+
+/// Identifies the S3 multi-object-delete query emitted by the capability probe.
+fn is_bulk_delete_query(query: &str) -> bool {
+    query
+        .split('&')
+        .any(|field| field == "delete" || field == "delete=")
+}
+
+/// Returns one decoded query parameter from a path-style S3 request.
+fn query_parameter(query: Option<&str>, name: &str) -> Option<String> {
+    query?.split('&').find_map(|field| {
+        let (key, value) = field.split_once('=')?;
+        (key == name).then(|| value.replace("%2F", "/").replace("%2f", "/"))
+    })
+}
+
+/// Lists matching immutable objects in the strict test bucket.
+async fn list_objects(state: &StoreState, uri: &Uri) -> Response {
+    let prefix = query_parameter(uri.query(), "prefix").unwrap_or_default();
+    let objects = state.objects.lock().await;
+    let mut matching = objects
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .collect::<Vec<_>>();
+    matching.sort_by(|left, right| left.0.cmp(right.0));
+    let mut xml = format!(
+        "<ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{}</Name><Prefix>{}</Prefix><KeyCount>{}</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>",
+        xml_escape(&state.bucket),
+        xml_escape(&prefix),
+        matching.len()
+    );
+    for (key, object) in matching {
+        xml.push_str(&format!(
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            xml_escape(key),
+            list_timestamp(&object.last_modified),
+            xml_escape(&object.e_tag),
+            object.bytes.len()
+        ));
+    }
+    xml.push_str("</ListBucketResult>");
+    let mut response = xml.into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+    response
+}
+
+/// Deletes all keys named by one S3 multi-object-delete XML request.
+async fn bulk_delete_objects(state: &StoreState, body: &Bytes) -> Response {
+    let body = String::from_utf8_lossy(body);
+    let mut keys = Vec::new();
+    let mut remainder = body.as_ref();
+    while let Some(start) = remainder.find("<Key>") {
+        let value = &remainder[start + 5..];
+        let Some(end) = value.find("</Key>") else {
+            break;
+        };
+        keys.push(value[..end].to_owned());
+        remainder = &value[end + 6..];
+    }
+    let mut objects = state.objects.lock().await;
+    let mut response_body =
+        "<DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">".to_owned();
+    for key in keys {
+        objects.remove(&key);
+        response_body.push_str(&format!(
+            "<Deleted><Key>{}</Key></Deleted>",
+            xml_escape(&key)
+        ));
+    }
+    response_body.push_str("</DeleteResult>");
+    let mut response = response_body.into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+    response
+}
+
+/// Converts the HTTP timestamp into the RFC3339 form used by S3 listings.
+fn list_timestamp(value: &str) -> String {
+    match chrono::DateTime::parse_from_rfc2822(value) {
+        Ok(timestamp) => timestamp.with_timezone(&Utc).to_rfc3339(),
+        Err(_) => value.to_owned(),
+    }
+}
+
+/// Escapes the small set of XML characters allowed in S3 object metadata.
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Applies an atomic create or ETag-matched update while holding one state lock.
-async fn put_object(
-    state: &StoreState,
-    key: &str,
-    headers: &HeaderMap,
-    bytes: Bytes,
-) -> Response {
+async fn put_object(state: &StoreState, key: &str, headers: &HeaderMap, bytes: Bytes) -> Response {
     let mut objects = state.objects.lock().await;
     let existing = objects.get(key);
     if headers

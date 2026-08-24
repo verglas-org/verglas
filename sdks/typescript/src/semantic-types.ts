@@ -499,6 +499,26 @@ export interface SearchPathsOutput {
   paths: Path[];
 }
 
+export interface SearchPrecedentsInput {
+  entities?: string[];
+  graphName: string;
+  limit?: number;
+  query: string;
+}
+
+export interface Precedent {
+  decisionId: string;
+  score: number;
+  lexicalScore: number;
+  structuralScore: number;
+  sharedEntities: string[];
+  objective: string;
+}
+
+export interface SearchPrecedentsOutput {
+  precedents: Precedent[];
+}
+
 export interface QueryVectorsInput {
   vectorBucketName?: string;
   indexName?: string;

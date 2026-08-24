@@ -1,4 +1,5 @@
-// macro to implement IntoResponse
+//! REST catalog error models and feature-gated HTTP response tracing.
+
 use std::{
     error::Error as StdError,
     fmt::{Display, Formatter},
@@ -8,6 +9,8 @@ use http::StatusCode;
 pub use iceberg::Error;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+#[cfg(feature = "axum")]
 use valuable::Valuable;
 
 #[cfg(feature = "axum")]
@@ -59,6 +62,7 @@ fn error_chain_fmt(e: impl std::error::Error, f: &mut std::fmt::Formatter<'_>) -
     Ok(())
 }
 
+#[cfg(feature = "axum")]
 fn error_chain_vec(e: &(dyn std::error::Error + Send + Sync + 'static)) -> Vec<String> {
     let mut details = Vec::new();
     let mut current = Some(e as &(dyn std::error::Error + 'static));
@@ -364,6 +368,7 @@ impl IcebergErrorResponse {
     }
 }
 
+#[cfg(feature = "axum")]
 #[derive(Debug)]
 struct TracedResponseError<'a> {
     r#type: &'a str,
@@ -374,6 +379,7 @@ struct TracedResponseError<'a> {
     source: &'a [String],
 }
 
+#[cfg(feature = "axum")]
 impl valuable::Valuable for TracedResponseError<'_> {
     fn as_value(&self) -> valuable::Value<'_> {
         valuable::Value::Mappable(self)
@@ -405,6 +411,7 @@ impl valuable::Valuable for TracedResponseError<'_> {
     }
 }
 
+#[cfg(feature = "axum")]
 impl valuable::Mappable for TracedResponseError<'_> {
     fn size_hint(&self) -> (usize, Option<usize>) {
         let mut len = 4; // type, code, message, error_id

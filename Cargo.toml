@@ -8,8 +8,6 @@ resolver = "2"
 # wanted by two sources.
 exclude = ["sdks/typescript"]
 members = [
-    "cli",
-    "sdks/rust",
     "crates/verglas-backend",
     "crates/verglas-core",
     "crates/verglas-cluster",
@@ -65,8 +63,8 @@ rust-version = "1.94"
 publish = false
 
 [workspace.dependencies]
-# Version alongside path: required for the crates.io publishes (verglas-api,
-# verglas-core, verglas-sdk). The release version sweep must bump these too.
+# Version alongside path: required for crates.io publishes of verglas-api and
+# verglas-core. The release version sweep must bump these too.
 verglas-core = { path = "crates/verglas-core", version = "0.2.0" }
 verglas-backend = { path = "crates/verglas-backend" }
 verglas-cluster = { path = "crates/verglas-cluster" }
@@ -88,7 +86,6 @@ verglas-do-engine = { path = "crates/verglas-do-engine" }
 verglas-do-wasm = { path = "crates/verglas-do-wasm" }
 verglas-celld = { path = "crates/verglas-celld" }
 verglas-gateway = { path = "crates/verglas-gateway" }
-verglas-sdk = { path = "sdks/rust" }
 tonic = "0.13.1"
 prost = "0.13.5"
 # Iceberg read/write and DataFusion integration shared by engine roles.

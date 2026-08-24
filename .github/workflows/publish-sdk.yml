@@ -2,8 +2,8 @@
 #
 # Called by the dist-generated release.yml ("./publish-sdk" in
 # dist-workspace.toml's publish-jobs) after every target build is green, so a
-# broken build can never publish an SDK version. Uses the same NPM_TOKEN
-# secret as the CLI's npm package.
+# broken build can never publish an SDK version. Uses the repository's NPM_TOKEN
+# secret for the package publish.
 
 name: Publish TypeScript SDK
 

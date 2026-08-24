@@ -75,6 +75,39 @@ which interval to run next.
 A handler may return a `WorkerResult` (an optional summary the runner folds into
 the run log and the host's JSON response) or nothing at all.
 
+## Cloudflare Durable Objects runtime
+
+The SDK also exports the Cloudflare Workers / Durable Objects programming model:
+`DurableObject`, `DurableObjectState`, `DurableObjectStorage`,
+`DurableObjectNamespace`, and `DurableObjectStub`. `createWorkerRuntime` loads a
+worker default export, injects configured namespace bindings, and dispatches HTTP
+and public RPC calls in-process.
+
+```ts
+import { DurableObject, createWorkerRuntime } from "@verglas/sdk";
+
+class Counter extends DurableObject {
+  async fetch() { return Response.json({ ok: true }); }
+  async increment() { return 1; }
+}
+
+const runtime = createWorkerRuntime({
+  module: { default: { fetch: (_request, env) =>
+    env.COUNTER.get(env.COUNTER.idFromName("one")).fetch("https://do/") } },
+  durableObjects: { COUNTER: Counter },
+  // Supply `transport` or `endpoint` for durable storage and SQL.
+});
+```
+
+Storage and SQL never fall back to process memory. A worker host must configure a
+Verglas line transport (or an engine Unix socket endpoint); unit tests may inject
+a scripted implementation of `DurableObjectTransport`. The bridge uses the
+engine grammar `REGISTER <table> <hex Arrow schema>`, `QUERY <table> <hex SQL>`,
+and one canonical `COMMIT <hex TransactionEnvelope>` for buffered mutations.
+The canonical serializer is cross-language conformance-tested in
+`crates/verglas-do-engine/tests/ts_envelope_conformance.rs`. Local alarms use
+timers until durable alarm persistence is available in the engine.
+
 ## Triggers
 
 Triggers are **deployment config, not code**. The SDK *types* them so a definition
@@ -173,6 +206,11 @@ const scheduler = connectScheduler({
 await scheduler.listWorkers();
 await scheduler.runWorker("sync-linear", crypto.randomUUID());
 ```
+
+`WorkersManagementClient` targets celld's account-prefix-free Cloudflare-shaped
+management API for module uploads, Durable Object namespaces, and object
+lifecycle. Uploads use the module-syntax multipart shape; all JSON responses are
+unwrapped from the `{success, errors, messages, result}` envelope.
 
 ## Reflected Integration namespaces
 

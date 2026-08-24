@@ -48,3 +48,4 @@ sdks/**/dist/
 # Python
 __pycache__/
 *.py[cod]
+.pnpm-store/

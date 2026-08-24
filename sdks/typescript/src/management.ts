@@ -1,0 +1,291 @@
+//! Cloudflare Workers-shaped management client for a celld host.
+//!
+//! Routes are intentionally account-prefix-free because celld already scopes the
+//! listener to one tenant cell. The client unwraps Cloudflare response envelopes
+//! and preserves structured API errors for callers.
+
+/** A message returned in a Cloudflare-style success or error envelope. */
+export interface WorkersManagementMessage {
+  /** Stable HTTP/API error code when supplied by celld. */
+  code: number | string;
+  /** Human-readable message. */
+  message: string;
+}
+
+/** Error thrown when a celld management request is not successful. */
+export class WorkersManagementError extends Error {
+  /** Structured errors exactly as returned by the API. */
+  readonly errors: WorkersManagementMessage[];
+  /** HTTP status observed for the failed request. */
+  readonly status: number;
+
+  /** Creates a typed management failure with the API error list. */
+  constructor(errors: WorkersManagementMessage[], status: number) {
+    const message = errors.map((error) => error.message).join("; ") || `management request failed with status ${status}`;
+    super(message);
+    this.name = "WorkersManagementError";
+    this.errors = errors;
+    this.status = status;
+  }
+}
+
+/** A durable-object namespace binding in script module metadata. */
+export interface WorkersDurableObjectBinding {
+  /** Worker environment binding name. */
+  name: string;
+  /** Cloudflare module-syntax binding discriminator. */
+  type: "durable_object_namespace";
+  /** Durable Object class exported by the script. */
+  class_name: string;
+  /** Optional script name for cross-script bindings. */
+  script_name?: string;
+}
+
+/** Script metadata accepted by the celld multipart upload route. */
+export interface WorkerScriptMetadata {
+  /** Module file that is the Worker entrypoint. */
+  main_module: string;
+  /** Cloudflare-style environment bindings. */
+  bindings: WorkersDurableObjectBinding[];
+}
+
+/** Source accepted for one multipart Worker module. */
+export type WorkerModuleSource = string | Blob | ArrayBuffer | ArrayBufferView;
+
+/** Complete module-syntax script upload request. */
+export interface WorkerScriptUpload extends WorkerScriptMetadata {
+  /** Module path to source content. */
+  modules: Record<string, WorkerModuleSource>;
+}
+
+/** Alternate upload shape separating the metadata part from module parts. */
+export interface WorkerScriptUploadParts {
+  /** Metadata JSON sent as the multipart metadata part. */
+  metadata: WorkerScriptMetadata;
+  /** Module path to source content. */
+  modules: Record<string, WorkerModuleSource>;
+}
+
+/** Script metadata returned by the celld management API. */
+export interface WorkerScript extends WorkerScriptMetadata {
+  /** Stable script identifier. */
+  id: string;
+  /** Script name in the management path. */
+  name: string;
+  /** Stored module path names. */
+  modules: string[];
+}
+
+/** Durable Object namespace returned by celld. */
+export interface WorkersDurableObjectNamespace {
+  /** Namespace identifier used in object routes. */
+  id: string;
+  /** Namespace display/name key. */
+  name: string;
+  /** Script that owns the namespace. */
+  script: string;
+  /** Exported Durable Object class name. */
+  class: string;
+}
+
+/** Durable Object record returned by object lifecycle routes. */
+export interface WorkersDurableObject {
+  /** Deterministic object identifier. */
+  id: string;
+  /** Object name within its namespace. */
+  name: string;
+  /** Supervisor-facing Durable Object identifier. */
+  do_id: string;
+  /** Stateful worker socket path when running. */
+  socket_path?: string | null;
+  /** Supervisor process ID when running. */
+  pid?: number | null;
+  /** Current lifecycle status. */
+  status: string;
+}
+
+/** Optional body accepted by collection object creation. */
+export interface WorkersObjectCreateOptions {
+  /** Name for deterministic idFromName-style creation. */
+  name?: string;
+  /** Requests a unique object when no name is supplied. */
+  unique?: boolean;
+}
+
+/** Constructor fetch seam for browsers, Node, and captured-fetch tests. */
+export type ManagementFetch = typeof fetch;
+
+interface WorkersEnvelope<T> {
+  success: boolean;
+  errors?: WorkersManagementMessage[];
+  messages?: WorkersManagementMessage[];
+  result?: T | null;
+}
+
+/** Builds the module-syntax multipart body expected by celld. */
+export function buildWorkerScriptFormData(upload: WorkerScriptUpload | WorkerScriptUploadParts): FormData {
+  const form = new FormData();
+  const metadata: WorkerScriptMetadata = "metadata" in upload
+    ? upload.metadata
+    : { main_module: upload.main_module, bindings: upload.bindings };
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  for (const [moduleName, source] of Object.entries(upload.modules)) {
+    form.append(moduleName, moduleBlob(source), moduleName);
+  }
+  return form;
+}
+
+/** Short alias for callers that name the multipart helper after the script form. */
+export const buildScriptFormData = buildWorkerScriptFormData;
+
+/** Client for the account-prefix-free celld Workers management API. */
+export class WorkersManagementClient {
+  readonly #baseUrl: string;
+  readonly #fetch: ManagementFetch;
+
+  /** Binds the client to one celld base URL and optional fetch implementation. */
+  constructor(baseUrl: string, fetchImpl: ManagementFetch = globalThis.fetch) {
+    if (!baseUrl) throw new Error("WorkersManagementClient: baseUrl is required");
+    if (typeof fetchImpl !== "function") throw new Error("WorkersManagementClient: fetch implementation is required");
+    this.#baseUrl = baseUrl.replace(/\/+$/, "");
+    this.#fetch = fetchImpl;
+  }
+
+  /** Uploads one Worker script using Cloudflare module-syntax multipart fields. */
+  uploadScript(name: string, upload: WorkerScriptUpload | WorkerScriptUploadParts): Promise<WorkerScript> {
+    return this.request<WorkerScript>("PUT", `/workers/scripts/${segment(name)}`, buildWorkerScriptFormData(upload));
+  }
+
+  /** Lists all stored Worker scripts. */
+  listScripts(): Promise<WorkerScript[]> {
+    return this.request<WorkerScript[]>("GET", "/workers/scripts");
+  }
+
+  /** Returns one stored Worker script. */
+  getScript(name: string): Promise<WorkerScript> {
+    return this.request<WorkerScript>("GET", `/workers/scripts/${segment(name)}`);
+  }
+
+  /** Deletes one stored Worker script and returns the API result. */
+  deleteScript(name: string): Promise<boolean> {
+    return this.request<boolean>("DELETE", `/workers/scripts/${segment(name)}`);
+  }
+
+  /** Creates one namespace bound to an uploaded script and exported class. */
+  createNamespace(input: {
+    name: string;
+    script: string;
+    class: string;
+  }): Promise<WorkersDurableObjectNamespace> {
+    return this.request<WorkersDurableObjectNamespace>("POST", "/workers/durable_objects/namespaces", input);
+  }
+
+  /** Lists all durable-object namespaces. */
+  listNamespaces(): Promise<WorkersDurableObjectNamespace[]> {
+    return this.request<WorkersDurableObjectNamespace[]>("GET", "/workers/durable_objects/namespaces");
+  }
+
+  /** Creates a deterministically named object, or a collection object when no name is supplied. */
+  createObject(
+    namespaceId: string,
+    objectName?: string,
+    options?: WorkersObjectCreateOptions,
+  ): Promise<WorkersDurableObject> {
+    if (objectName !== undefined) {
+      return this.request<WorkersDurableObject>(
+        "POST",
+        `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}`,
+      );
+    }
+    return this.request<WorkersDurableObject>(
+      "POST",
+      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects`,
+      options,
+    );
+  }
+
+  /** Creates an object through the collection endpoint. */
+  createCollectionObject(
+    namespaceId: string,
+    options?: WorkersObjectCreateOptions,
+  ): Promise<WorkersDurableObject> {
+    return this.createObject(namespaceId, undefined, options);
+  }
+
+  /** Lists instantiated objects in one namespace. */
+  listObjects(namespaceId: string): Promise<WorkersDurableObject[]> {
+    return this.request<WorkersDurableObject[]>(
+      "GET",
+      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects`,
+    );
+  }
+
+  /** Reads one object's current supervisor status. */
+  getObject(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
+    return this.request<WorkersDurableObject>(
+      "GET",
+      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}`,
+    );
+  }
+
+  /** Alias for callers that name the status operation explicitly. */
+  getObjectStatus(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
+    return this.getObject(namespaceId, objectName);
+  }
+
+  /** Routes one object through its stateful supervisor socket. */
+  routeObject(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
+    return this.request<WorkersDurableObject>(
+      "POST",
+      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}/route`,
+    );
+  }
+
+  /** Suspends one object through the supervisor durability fence. */
+  suspendObject(namespaceId: string, objectName: string): Promise<WorkersDurableObject> {
+    return this.request<WorkersDurableObject>(
+      "POST",
+      `/workers/durable_objects/namespaces/${segment(namespaceId)}/objects/${segment(objectName)}/suspend`,
+    );
+  }
+
+  /** Sends one request and unwraps its Cloudflare response envelope. */
+  private async request<T>(method: string, path: string, body?: BodyInit | object): Promise<T> {
+    const init: RequestInit = { method };
+    if (body instanceof FormData || typeof body === "string" || body instanceof Blob) {
+      init.body = body;
+    } else if (body !== undefined) {
+      init.body = JSON.stringify(body);
+      init.headers = { "content-type": "application/json" };
+    }
+    const response = await this.#fetch(`${this.#baseUrl}${path}`, init);
+    let envelope: WorkersEnvelope<T>;
+    try {
+      envelope = await response.json() as WorkersEnvelope<T>;
+    } catch {
+      throw new WorkersManagementError(
+        [{ code: response.status, message: `management API returned non-JSON status ${response.status}` }],
+        response.status,
+      );
+    }
+    if (!response.ok || envelope.success !== true) {
+      throw new WorkersManagementError(envelope.errors ?? [], response.status);
+    }
+    return envelope.result as T;
+  }
+}
+
+/** Converts one supported module source into a Blob without Node-only APIs. */
+function moduleBlob(source: WorkerModuleSource): Blob {
+  if (source instanceof Blob) return source;
+  if (typeof source === "string") return new Blob([source], { type: "application/javascript" });
+  if (source instanceof ArrayBuffer) return new Blob([source]);
+  const bytes = new Uint8Array(source.byteLength);
+  bytes.set(new Uint8Array(source.buffer, source.byteOffset, source.byteLength));
+  return new Blob([bytes.buffer]);
+}
+
+/** Escapes one path segment without allowing names to alter route structure. */
+function segment(value: string): string {
+  return encodeURIComponent(value);
+}

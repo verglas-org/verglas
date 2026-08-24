@@ -22,7 +22,7 @@ flowchart LR
 
 | Repository | Responsibility |
 | --- | --- |
-| `verglas` | Public lakehouse runtime (cache and consensus engine), CLI, SDKs, documentation, and RIME package. |
+| `verglas` | Public lakehouse runtime (cache and consensus engine), TypeScript SDK, documentation, and RIME package. |
 | `verglas-cloud` | Hosted access, scheduler, workers, databases, integrations, applications, and agent runtime. |
 | `verglas-app` | Private cloud console and workspace client. |
 
@@ -35,8 +35,8 @@ contracts.
 | Role | Responsibility |
 | --- | --- |
 | Cache | Serve S3 ranges, route ownership, warm Iceberg metadata, stage writes on the ring, and offload to object storage. |
-| CLI and SDKs | Use the public S3, catalog, vector, graph, and administrative contracts. |
-| RIME | Package the evaluated parallel software-engineering skill installed by the CLI. |
+| TypeScript SDK | Use the public S3, catalog, vector, graph, and administrative contracts. |
+| RIME | Package the evaluated parallel software-engineering skill for supported agent hosts. |
 
 ## Standing requirements
 

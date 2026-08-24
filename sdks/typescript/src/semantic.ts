@@ -127,6 +127,8 @@ export class VerglasGraphsClient {
   searchNeighborhood(input: Model.SearchNeighborhoodInput): Promise<Model.SearchNeighborhoodOutput> { return this.client.call("POST", "/SearchNeighborhood", input) as Promise<Model.SearchNeighborhoodOutput>; }
   /** Calls SearchPaths. */
   searchPaths(input: Model.SearchPathsInput): Promise<Model.SearchPathsOutput> { return this.client.call("POST", "/SearchPaths", input) as Promise<Model.SearchPathsOutput>; }
+  /** Calls SearchPrecedents. */
+  searchPrecedents(input: Model.SearchPrecedentsInput): Promise<Model.SearchPrecedentsOutput> { return this.client.call("POST", "/SearchPrecedents", input) as Promise<Model.SearchPrecedentsOutput>; }
 }
 
 /** Formats the UTC timestamp AWS SigV4 places in requests. */
