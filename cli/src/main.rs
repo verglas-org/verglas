@@ -1,8 +1,8 @@
 //! `verglas` — the Verglas CLI, a PURE CLIENT.
 //!
 //! Cloud is the default control plane (`https://api.verglas.dev`). Self-hosted
-//! OSS servers are selected with `VERGLAS_ENDPOINT`. Workers are Cloud-only.
-//! Self-hosters drain a node through its admin API directly; the CLI has no
+//! OSS servers are selected with `VERGLAS_ENDPOINT`. Self-hosters drain a node
+//! through its admin API directly; the CLI has no
 //! drain verb.
 
 mod admin_client;
@@ -14,7 +14,6 @@ mod connection_profile;
 mod credentials;
 mod dashboard_spec;
 mod output;
-mod worker_spec;
 
 use clap::Parser;
 use cli::{Cli, Command};
@@ -53,13 +52,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let token = auth::resolved_bearer(&credentials_path).await?;
             after_success(
                 commands::dashboard::run(command, &endpoint, token.as_deref(), cli.json).await,
-            )
-            .await
-        }
-        Command::Workers(command) => {
-            let token = auth::resolved_bearer(&credentials_path).await?;
-            after_success(
-                commands::workers::run(command, &endpoint, token.as_deref(), cli.json).await,
             )
             .await
         }

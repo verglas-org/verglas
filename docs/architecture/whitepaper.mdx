@@ -12,7 +12,7 @@ icon: "snowflake"
 
 Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
 
-We propose Verglas, an Iceberg-aware lakehouse runtime that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache and consensus engine plus its CLI, SDKs, documentation, and RIME package; the hosted control plane owns the authenticated Lakekeeper REST composition, provisioning, and pipeline platform that call those engine contracts.
+We propose Verglas, an Iceberg-aware lakehouse runtime that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache and consensus engine plus its CLI, SDKs, documentation, and RIME package; the hosted control plane owns the authenticated Lakekeeper REST composition, provisioning, and Durable Object platform that consumes those engine contracts.
 
 ---
 
@@ -31,8 +31,8 @@ of their configured catalog.
 The public CLI, SDKs, documentation, and RIME package live beside the engine.
 RIME is an evolutionary search over code states; its algorithm and the
 git-SHA evolution record are specified in [RIME architecture](/docs/architecture/rime).
-Hosted access, scheduling, workers, databases, integrations, applications,
-Lakekeeper service, and agent runtime services live in the private
+Hosted access, Durable Object placement and execution, databases, integrations,
+applications, Lakekeeper service, and agent runtime services live in the private
 `verglas-cloud` repository. The private `verglas-app` repository contains only
 the cloud console and workspace client. CI rejects copies of those hosted
 products in this repository.
@@ -271,7 +271,7 @@ sequenceDiagram
 
 ### 4.1 Cache node
 
-A cache node is one `verglas-cache-node` process. Its S3 front end validates SigV4 requests and maps supported operations onto separate read and write interfaces. Its private admin listener exposes health, metrics, and cache-local catalog access for engine roles. Query and write execute in their own processes. The backend layer applies concurrency limits, retry policy, and circuit breaking before issuing origin requests. The cache engine and Iceberg layer sit between these interfaces.
+A cache node is one `verglas-cache-node` process. Its S3 front end validates SigV4 requests and maps supported operations onto separate read and write interfaces. Its private admin listener exposes health, metrics, cache-local catalog access, and managed Durable Object ingress. External Iceberg query and write processes remain independently deployable; a managed DO instead runs one tenant WASM component inside an isolated `verglasd` process in one microVM through the reusable `verglas-do-engine` library. DataFusion plans and executes SQL but never assigns a commit sequence: the configured lease-fenced authority commits the canonical Arrow transaction envelope, and the DO component applies relational, Vamana, and graph projections atomically. The backend layer applies concurrency limits, retry policy, and circuit breaking before issuing origin requests. The cache engine, live DO state, and Iceberg layer sit between these interfaces.
 
 The data cache divides objects into configurable 1–8 MiB blocks (2 MiB by default) and stores them in a hybrid DRAM and NVMe cache. The default follows a local Iceberg TPC-DS SF1000 measurement: DuckDB's 1–2 MiB Parquet ranges made 8 MiB fills fetch 70.67 GB from S3 to serve 12.61 GB, while 2 MiB blocks fetched 33.29 GB and cut cold wall time from 658.142 s to 329.440 s. Block geometry is part of the block identity, so a divergent peer configuration is a miss rather than a wrong-offset serve. Changing the configured geometry is a pre-release flag day and requires an empty cache directory; Verglas deliberately has no on-disk compatibility layer. A separate hybrid store holds metadata files and bounded Parquet footer suffixes. Separating the stores prevents a data scan from consuming the capacity reserved for planning metadata. Both stores recover their NVMe indexes after restart; a recovery test reopened a 256 MiB cache containing 32 blocks in approximately 11 ms.
 
@@ -299,7 +299,7 @@ Consensus-backed write-back changes the failure model because acknowledged catal
 
 ### 4.4 Coded Multi-Raft substrate
 
-The cache fleet hosts many independent Raft groups instead of one global log. A tenant-root group owns warehouse discovery and tenant-scoped allocation; each managed warehouse owns a catalog group; each Neon timeline owns a WAL group. Independent groups elect leaders and commit concurrently, so one busy timeline or catalog does not serialize unrelated tenants. Requests may arrive at any node and are forwarded to the known leader. A client retry carries the same request identity and never becomes a second command.
+The cache fleet hosts independent Raft groups for managed warehouse catalog and Neon timeline state instead of one global log. Durable Objects are deliberately outside that substrate: each DO has one isolated `verglasd` process in one microVM and uses either a lease-fenced managed S3 CAS or one explicitly configured durable replica service endpoint. Catalog and timeline groups elect leaders and commit concurrently, so one busy timeline or warehouse does not serialize unrelated tenants. Requests for those groups may arrive at any cache node and are forwarded to the known leader. A client retry carries the same request identity and never becomes a second command.
 
 Each group has a committed voter configuration. Reconfiguration uses joint consensus; gossip supplies reachability hints only. Terms, votes, log indexes, command kinds, payload lengths and hashes, coding geometry, storage mode, writer epoch, and idempotency identity are fully replicated. Large payloads may be stored as Reed–Solomon fragments, but agreement remains over the complete logical entry identified by its hash.
 
@@ -331,7 +331,7 @@ Iceberg awareness contributes four properties to the cache, each unavailable to 
 3. **Planning-path residency** (§5.2). The metadata that gates every query — about 1% of table bytes, read serially — lives in an isolated store that data scans structurally cannot evict, warmed at commit time rather than on first miss.
 4. **Heat that survives rewrites** (§5.3). Access frequency is recorded against logical identity (table, partition, column), which compaction preserves, rather than physical identity (file, offset), which compaction destroys.
 
-Figure 4 shows the cache's handling of one illustrative range read. The query engine plans through the walk of Figure 2 — manifest pruning selects the file, the Parquet footer selects the column chunk's byte range — and issues an ordinary range GET; Verglas never parses SQL. Two things then happen to that request independently: the serving path resolves it to version-keyed blocks, and the classification path maps it to its logical table, partition, and column and records the access in the heat ledger, off the serving path.
+Figure 4 shows the cache's handling of one illustrative range read. An external query engine plans through the walk of Figure 2 — manifest pruning selects the file, the Parquet footer selects the column chunk's byte range — and issues an ordinary range GET. That S3 serving path never parses SQL. Managed DO SQL is a separate ingress above the cache: its embedded DataFusion providers resolve explicit transaction fences and ultimately issue the same storage reads. Two things then happen to a range request independently: the serving path resolves it to version-keyed blocks, and the classification path maps it to its logical table, partition, and column and records the access in the heat ledger, off the serving path.
 
 ```sql
 SELECT sum(l_extendedprice)
@@ -518,71 +518,117 @@ Leaving a managed binding is an explicit detach, not a shutdown: fence new mutat
 
 This section specifies hosted platform behavior implemented in
 `verglas-cloud`. It explains the engine contracts that platform consumes; it
-does not place scheduler, access, worker, database, application, integration,
-or agent-runtime source in this repository.
+does not place hosted access, Durable Object gateway, database, application,
+integration, or agent-runtime source in this repository.
 
-The preceding sections argued that derived read copies — OLAP stores, feature stores, caches — should collapse into one Iceberg-native tier. The same argument applies to the compute that feeds and serves them. A production estate around a lakehouse accumulates ingestion scripts, transformation jobs, delivery servers, and the long-running services that answer for the data, each with its own scheduler, offset store, retry logic, scaling policy, and logging; each is a copy of the same operational machinery, differing only in the few lines that move or serve the data. Verglas runs that machinery once, as a platform over the cache, and reduces each program to the few lines that differ. The design is shaped by one further observation: the code that differs is now routinely written by coding agents. The platform therefore fixes hard contracts around small user programs — the shape a framework must take when its programs are generated rather than hand-maintained, since a generated program can be regenerated against a stable contract but cannot be trusted to re-implement scheduling, scaling, or exactly-once bookkeeping correctly each time.
+The preceding sections argued that derived read copies — OLAP stores, feature
+stores, caches — should collapse into one Iceberg-native tier. The same
+principle applies to tenant code. A Durable Object (DO) is the worker: a named
+stateful object with durable KV and SQL state and one tenant WASM component.
+HTTP, WebSocket, and alarm events enter through the platform gateway. The DO
+wakes on demand and runs against its own state. Its event and storage contract
+is fixed by the component ABI rather than by a per-run protocol.
 
-The user-facing compute primitive is the **worker**: a stateless handler invoked once per trigger event that reads and writes tables through the client and returns. Tables (§§1–6) are the data workers operate over. The guiding property is one line: **a datalake that scales from zero to infinity with complete control over your stack** — every workload idles to nothing when unused, grows to the tenant's allocation when loaded, and is defined by the tenant, not chosen from a fixed menu.
+The DO boundary keeps user code close to its state without making it a storage
+authority. The component can use only the capabilities in its WIT world.
+`verglasd` owns event serialization, transaction assembly, and commit. The
+lease-fenced commit authority remains the source of truth; SQLite is the local
+pager and recovery image. The trust boundary is a WASM sandbox inside one
+microVM inside the lease fence.
 
 Three doctrines run through the whole design and are stated once here:
 
-- **Engine/control separation.** Cache, query, and write roles are public and independently runnable. Hosted access, placement, and worker scheduling live in `verglas-cloud`; they consume engine contracts without becoming storage-engine dependencies.
-- **Scale-to-zero by default.** Every workload idles to zero when unused. A worker holds nothing between runs; the runtime monitors every active run and owns scaling decisions — the user declares the shape, not the schedule of scale.
-- **Sockets never pin compute.** The SDK's `follow` terminates on a hibernating edge object. Managed catalog events are derived from committed warehouse-group indexes rather than delivered by a separate database-backed service. Worker scheduling accepts bounded events, including complete HTTP callbacks; it never owns a client connection.
+- **Engine/control separation.** Cache, query, and write roles are public and independently runnable. Hosted access, gateway routing, placement, and DO lifecycle live in `verglas-cloud`; they consume engine contracts without becoming storage-engine dependencies.
+- **Scale-to-zero by default.** An inactive DO is checkpointed and archived, then its microVM can suspend. A request or alarm wakes it and restores the same durable state. The platform owns placement and lifecycle; tenant code owns only its state and event behavior.
+- **Connections never pin compute.** HTTP and WebSocket connections terminate at the gateway. The gateway can hold a WebSocket while the DO hibernates and deliver each later message after wake. Catalog commit notifications remain applied-log events rather than a separate execution queue.
 
 ```mermaid
 %%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'Inter, ui-sans-serif, system-ui', 'primaryTextColor': '#0f172a', 'lineColor': '#64748b'}}}%%
 flowchart LR
     subgraph record["deployment record (verglas_sys / control plane)"]
-        R["worker × triggers × placement<br/>+ code, config, data grants"]
+        R["DO name × placement<br/>+ component digest, config, grants"]
     end
-    subgraph exec["execution"]
-        H["harness / supervisor<br/>(dispatch, scale, idempotency, run log)"]
-        J["worker<br/>(user code)"]
+    subgraph ingress["gateway / ingress"]
+        G["HTTP · WebSocket · alarm<br/>name → DO"]
     end
-    E["engine<br/>(catalog + CAS commit)"]
+    subgraph cell["one isolated microVM"]
+        P["verglasd<br/>(one DO)"]
+        W["WASM component<br/>verglas:do-worker@0.1.0"]
+    end
+    E["engine<br/>(canonical Arrow envelope + lease-fenced commit)"]
     C["cache tier (§§3–6)"]
     O[("object storage")]
-    R --> H
-    H --> J
-    J --> H
-    H --> E
+    R --> G
+    G --> P
+    P -->|invoke event| W
+    W -->|WIT calls| P
+    P --> E
     E --> C
     C --> O
     classDef data fill:#eff6ff,stroke:#3b82f6
     class R,E data
 ```
 
-*Figure 7: one deployment record drives a harness that supervises the workload; all data flows through the engine's commit path, which locally points at the cache tier.*
+*Figure 7: the deployment record maps a name to an immutable DO component and its isolation placement. The gateway or lifecycle path wakes the cell; `verglasd` runs one event and joins its storage effects to the lease-fenced transaction envelope before releasing output.*
 
-### 7.1 The deployment record
+### 7.1 The Durable Object deployment record
 
-A deployment is one record: triggers (zero or more cron, webhook, and event subscriptions) × local placement, plus the worker's code, its configuration, and the tables and lakehouses it is granted (§7.4). Everything the platform does — scheduling, dispatch, scale, pause and resume, audit — is a function of this record, which is why it must be one record: a workload whose schedule lives in a crontab, whose code lives in a repository, and whose scaling lives in a separate orchestrator cannot be inspected, moved, or replayed as a unit. The registry is the `verglas_sys` namespace: Iceberg tables whose rows are append-only revisions, so the registry inherits the audit and time-travel properties of §1.1 — the snapshot log is the complete lifecycle history of every deployment, readable by any engine.
+A deployment is one record: a stable DO name, the immutable component digest,
+configuration and secret references, placement, and the tables and lakehouses
+it is granted (§7.3). The record maps the gateway name to one DO state
+namespace. It is the unit for deployment, audit, pause, resume, and placement;
+mutable state stays in the DO engine rather than in a separate run log. The
+registry is the `verglas_sys` namespace: Iceberg tables whose rows are
+append-only revisions, so the registry inherits the audit and time-travel
+properties of §1.1 — the snapshot log is the complete lifecycle history of
+every deployment, readable by any engine.
 
-### 7.2 The worker contract and harness
+### 7.2 The DO component and event contract
 
-A worker is a single default-exported handler, `worker(ctx)`, invoked once per trigger event. Its context supplies the connected client (table read/write through the same verbs everywhere), the trigger event that invoked it, the deployment-configured output table(s), the environment (secret bindings and config), and a logger. A worker is a **pure function of two inputs**: the trigger event and the data currently committed. It holds no state between runs, and — this is a deliberate change from earlier designs — it has no durable watermark in its programming model. Progress is not something a worker tracks; it is something the platform hands the worker as input (§7.3). The output table is deployment configuration, passed in on the context, never hardcoded in the handler, so the same worker code can be pointed at a different table by editing the record.
+Tenant code compiles to a WASM component targeting the `verglas:do-worker@0.1.0`
+WIT `durable-object` world. The handler exports `init` once per component
+instantiation before `fetch`, `alarm`, `websocket-message`, and
+`websocket-close`. `verglasd` binds the storage
+imports `get`, `put`, `delete`, `list`, `sql`, `set-alarm`, `get-alarm`, and
+`delete-alarm` in-process to the DO engine. It binds the socket imports `send`,
+`close`, `set-attachment`, `get-attachment`, and `attached` to the gateway's
+connection state. These imports are capabilities, not network services.
 
-One harness executes a worker run. It builds the context, invokes the handler once, appends structured run events to the deployment's `_LOGS` table — start, a commit event per append, and end or error, with row counts — and returns the result. There is no watermark bookkeeping to get wrong because there is no watermark in the loop. Correctness under retry rests on idempotency keys the worker attaches to its commits, recorded in the committed snapshot's summary: a replayed run re-commits the same rows under the same key, and the table itself detects and absorbs the duplicate, with no side channel to keep consistent. The delivery semantics are therefore at-least-once execution with exactly-once table effects — carried, as in §1, by the lakehouse's own commit log rather than an external offset store.
+The input gate admits one HTTP request, alarm, WebSocket message, or close
+event at a committed DO fence. Events execute strictly serialized per DO, one
+at a time. `verglasd` invokes the component, and its storage effects join the
+event's canonical Arrow transaction envelope. The output gate holds WebSocket
+sends, closes, and attachment updates until the envelope commits. Only then
+does the gateway release those effects. A handler error is mapped to the event
+outcome; the host does not roll back DO state that has committed. No event
+observes another event's uncommitted state.
 
-Workers are ordinary code packaged as immutable OCI images. Python projects carry `pyproject.toml` and `uv.lock`; JavaScript and TypeScript projects carry `package.json` and `bun.lock`; other languages supply an auditable Dockerfile. Registration builds a content-addressed image, and the scheduler asks `verglas-container-runtime` to execute one fresh container per dispatch. Secrets enter only at run time. Docker enforces CPU, memory, process, and wall-clock ceilings, so a misbehaving worker is killed without touching the scheduler or server serve paths. A conformance check asserts the two properties that a generated program can violate without a type error: schema stability across runs (a worker must not silently drift its output shape) and kill-and-resume equivalence (a run killed at any point and re-dispatched produces the same table state — the observable form of the idempotent-commit discipline). Watermark monotonicity, a property of the retired job model, is no longer a conformance concern: there is no worker-visible watermark to move backward.
+Catalog and table idempotency remain storage concerns. A table commit records
+its idempotency key in the committed snapshot summary and warehouse-group
+state, so a repeated commit can be recognized by the table commit path. This
+does not require a dispatch queue or an external offset record.
 
-### 7.3 Triggers and scheduling
+The DO component artifact is an immutable, content-addressed object in the
+managed bucket. Spawn fetches it by digest and verifies the digest before
+execution. Compiled AOT artifacts may be cached outside the microVM. Wizer-
+style pre-initialization keeps post-wake component instantiation in single-
+digit milliseconds.
 
-Triggers are deployment configuration, not runtime payload variants. One worker may declare any combination of **cron**, **webhook**, and **event** subscriptions, while every dispatch is one CloudEvents 1.0 envelope delivered to `ctx.trigger`. Manual requests, cron ticks, and complete inbound HTTP requests are CloudEvent producers. Applying a managed catalog commit emits its Iceberg mutation event with the committed warehouse index as its durable identity. An event subscription matches exact `type` and optional `source` and `subject` attributes. The hosted control plane accepts structured CloudEvents and fans them out to matching subscriptions, so Kafka, RabbitMQ, and other transports connect through bridges without adding broker payloads to the scheduler. The scheduler stores bounded CloudEvents and never owns an HTTP or WebSocket connection.
+JavaScript and TypeScript compile into the component with ComponentizeJS and
+StarlingMonkey, SpiderMonkey-on-WASM. Rust and other component-toolchain
+languages compile directly to the world. There is no V8 runtime anywhere in
+this path.
 
-Scheduling follows the Airflow model: a cron dispatch carries the run's **logical time** — a nominal `logicalDate` and the half-open interval `[intervalStart, intervalEnd)` the run is responsible for. A worker doing an incremental pull ranges its query over that interval; the logical interval is the *only* progress concept a worker sees. This makes **backfill a first-class scheduling feature rather than application code**: a cron trigger declares a `startDate` and a `catchup` policy — `sequential` (replay each past interval in order), `parallel` (fan the backlog out concurrently), or `none` (start live) — and the platform dispatches the historical intervals, each as an ordinary run with its own logical window, until the schedule catches up to now. Because each run is pinned to a bounded interval and commits idempotently, a backfill and a live run are the same code path over a different window.
+### 7.3 Data grants, durable state, and lakehouses
 
-Scheduling is a separate stateless hosted service. Each deployment has one logical worker queue. Manual REST calls, complete HTTP callbacks, cron reconciliation, and catalog data-update subscriptions all materialize the same durable job shape in that queue. A deterministic trigger identity makes enqueue idempotent; lease generations fence competing or recovered consumers; a completion is accepted only for the live generation. The scheduler can therefore restart or migrate without a filesystem guard or process-local cursor. Postgres owns the scheduler's internal queue state — a hosted implementation detail; queues are not a product surface. Public engine roles remain independently runnable and do not mount worker-trigger routes.
+A deployment declares the data it may touch: the tables and lakehouses it is granted, per record. A grant is the access-control boundary: a DO component sees only what its record lists. A gateway request, WebSocket event, or alarm never expands its data grants. Grants are part of the one record (§7.1), so what a DO can reach is inspectable and auditable as a unit, not scattered across IAM policies and connection strings.
 
-The scheduler is a running queue consumer. Pushed worker events are persisted before the event API acknowledges them and are eligible to run immediately. Cron, retry, and lease deadlines use exact timers derived from durable queue state; there is no periodic queue poll and no separate wake endpoint. Managed catalog data-update events are consumed from the warehouse group's applied event stream; external catalogs enter through their configured gateway. Cache invalidation for managed tables occurs in the same state-machine apply that publishes the new pointer.
-
-There is no per-deployment watermark cell. Cross-run state a worker genuinely needs belongs in a table the worker writes through the connected client; scheduling progress remains the platform's responsibility, expressed as logical time.
-
-### 7.4 Data grants and lakehouses
-
-A deployment declares the data it may touch: the tables and lakehouses it is granted, per record. A grant is the access-control boundary: a worker sees only what its record lists. CloudEvent subscription attributes independently determine which events invoke a worker; receiving an event never expands its data grants. Grants are part of the one record (§7.1), so what a workload can reach is inspectable and auditable as a unit, not scattered across IAM policies and connection strings.
+A DO's KV and SQL surfaces are its durable cross-event state. The single
+durable alarm is a committed row in DO state. `set-alarm` replaces it,
+`get-alarm` reads its deadline, and `delete-alarm` clears it within the event
+transaction. The platform wakes the DO at the committed deadline. Alarm
+delivery uses the same serialized event path and does not create a separate
+queue.
 
 Lakehouses are explicit tenant resources and the only database shape. `verglas lakehouse create NAME` creates managed storage plus an authoritative warehouse group in the tenant's Verglas ring. Supplying `--data-path s3://…` binds a scoped S3 secret while retaining the managed Verglas catalog; supplying `--catalog https://… --warehouse NAME` instead creates an external-catalog binding. The stable secret resource IDs are stored on the lakehouse record, so later secrets with overlapping scopes cannot silently rebind an existing lakehouse; rotating a secret replaces its value under the same ID.
 
@@ -590,23 +636,66 @@ There is one logical managed catalog service per tenant, exposed by the hosted R
 
 Each cache node embeds a Postgres WAL ingress and may lead or follow timeline groups. Neon compute discovers several ingresses and speaks the Verglas WAL protocol described in §6.4; any ingress routes the session to the timeline leader. For the four-node managed geometry, `N=4`, majority `q=3`, and `k=2` require `w>=3`, so `k=2,m=2,w=3` is valid and a delayed fourth fragment does not delay commit. If coded placement cannot reach three voters but a majority survives, the entry is stored complete on that majority. Complete 16 MiB segments drain to object storage in the background; partial tails remain consensus-durable until an explicit lifecycle checkpoint. Pageservers read the committed EC tail and object-resident prefix through any ingress. The listener shares the cache node's NVMe store and peer transport without confusing gossip membership with consensus membership.
 
-### 7.5 Hosted placement and workers
+### 7.4 Placement, isolation, and scale-to-zero
 
-The hosted scheduler owns durable triggers, jobs, and leases but never executes tenant code. It builds locked worker projects through the cloud container runtime, stores the resulting immutable image identity, resolves secret references immediately before a run, and submits each claimed job to the runtime. The runtime creates, limits, observes, and removes the ephemeral container. Workload storage points at the tenant's cache surface. Because idempotency lives in snapshot summaries (§7.2), a worker observes identical semantics whether invoked by cron, HTTP, or a CloudEvent producer.
+Each active DO runs one `verglasd` process in one microVM. The process owns one
+DO, one SQLite engine and pager, one data directory, and one private Unix
+socket. It is the DO's only event executor; DOs do not run Raft or elect
+leaders. `celld-host` allocates one isolated microVM-sized reservation,
+passes data and socket paths plus the lease identity, waits for the socket to
+bind, and fences routing after a crash or restore. The launcher passes the
+opaque lease token, generation, current sequence, and conditional object
+version; a stale process cannot acknowledge another mutation.
+
+Fly.io Machines (Firecracker microVMs) are the initial isolation substrate.
+MicroVM suspend/resume amortizes cold starts at the outer layer while
+component instantiation stays cheap at the inner layer. Before suspension,
+the applied sequence is covered by the managed transaction archive and a
+verified object checkpoint. On wake, the platform restores SQLite from the
+checkpoint, replays the archive tail, and releases the event at its requested
+fence. A compiled AOT artifact may be cached outside the microVM, but mutable
+state and execution are never shared with another tenant payload.
+
+The isolation boundary is layered: a WASM sandbox inside the microVM inside
+the lease fence. Tenant code reaches host state only through the WIT imports.
+Lease-fenced commit authority, canonical Arrow envelopes, the SQLite pager,
+and checkpoint/archive scale-to-zero machinery remain the DO engine described
+in §§3–6.
+
+### 7.5 Gateway, connections, and hibernation
+
+HTTP and WebSocket connections terminate at the platform gateway/ingress
+layer, never inside the guest. The gateway resolves `name → DO` and wakes a
+hibernated DO on demand: `celld-host` performs the initial spawn, and a later
+request resumes the Fly Machines microVM. The gateway holds WebSockets open
+across hibernation and delivers each message as a serialized DO event. A
+connection attachment is a small blob, at most 16 KiB, persisted in the DO's
+own durable state. It survives hibernation without keeping `verglasd` running.
+
+Applying a managed Iceberg catalog commit emits a CloudEvents 1.0 data-update
+notification whose durable identity is the committed warehouse index. This is
+a catalog event stream, not a DO dispatch queue or a tenant-code invocation.
 
 ### 7.6 Cache-pathed I/O
 
-Local I/O routes through the server's own S3 surface — the cache. This is a wiring property, not a code dependency: the engine reads and writes through whatever storage endpoint it is given, and the server hands it its own. Two guarantees follow. First, residency: every read and write a workload makes populates the cache as a side effect, so the tables an operator's workloads touch are precisely the tables the cache keeps warm. Second, ownership: the §4 ring routes below the engine, so no user or harness code path can assume a key is locally owned. A clean detach preserves portability by draining objects and exporting the catalog as described in §3.2; destroying the authoritative quorum before that fence is not equivalent to disabling a disposable read cache.
+Local table and object I/O from a DO routes through the server's own S3 surface
+— the cache. This is a wiring property, not a code dependency: the engine
+reads and writes through whatever storage endpoint it is given, and the server
+hands it its own. Two guarantees follow. First, residency: every table read
+and write a DO makes populates the cache as a side effect, so the tables an
+operator's DOs touch are precisely the tables the cache keeps warm. Second,
+ownership: the §4 ring routes below the engine, so no component or gateway
+path can assume a key is locally owned. A clean detach preserves portability
+by draining objects and exporting the catalog as described in §3.2; destroying
+the authoritative quorum before that fence is not equivalent to disabling a
+disposable read cache.
 
-Client-side ingest follows the same wiring. The SDK is a standard Iceberg client: `table create`/`append` infer an Arrow schema from the source file, write Parquet data files through the configured S3 endpoint using catalog-vended credentials, and commit an append snapshot through the Iceberg REST catalog's optimistic concurrency. No server-side ingest route exists. Against a customer binding the commit belongs to the catalog and object store, so a table write succeeds with the runtime node stopped. Against a managed binding the commit belongs to Verglas, and the acknowledged objects reach the origin through the offload path of §6.
+External Iceberg ingest follows the same wiring. The SDK is a standard Iceberg client: `table create`/`append` infer an Arrow schema from the source file, write Parquet data files through the configured S3 endpoint using catalog-vended credentials, and commit an append snapshot through the Iceberg REST catalog's optimistic concurrency. The managed DO SQL route is different: DataFusion DML creates transaction-local Arrow mutations, and one lease-fenced S3 CAS, or one configured replica-service acknowledgement, makes the unified row/vector/graph envelope authoritative before asynchronous archive or Iceberg materialization. Against a customer binding the commit belongs to the catalog and object store, so a table write succeeds with the runtime node stopped and Verglas never publishes autonomous lake or index changes. Against a managed binding the commit belongs to Verglas, and acknowledged state reaches the managed origin through the offload path of §6.
 
-### 7.7 Sockets on hibernating edge objects
+### 7.7 Layering
 
-A long-lived inbound socket must not pin a backend that is supposed to scale to zero. Verglas terminates client-facing sockets on a hibernating edge object. Managed catalog mutation delivery is an applied-log subscription identified by warehouse index, not a client socket or a Lakekeeper outbox callback. Worker scheduling accepts bounded HTTP callback events and does not retain the client connection.
-
-### 7.8 Layering
-
-The hosted control plane resolves `database_id → catalog_binding`. A managed binding routes REST operations through an engine ingress to `tenant root → warehouse group`; the ingress exposes the private state-machine contract, not the hosted Iceberg REST or identity surface. An external binding routes to a remote catalog gateway and carries its own endpoint and stable secret ID. The same query/write engine clients and metadata-warming code operate above both bindings, but their consistency contracts remain explicit: managed reads and commits are linearizable through Raft fences, while third-party catalogs retain their own polling, notification, and transaction behavior. No managed request falls back to an external catalog or PostgreSQL persistence.
+The hosted control plane resolves `database_id → catalog_binding` and DO names
+to deployment records. A managed binding routes REST operations through an engine ingress to `tenant root → warehouse group`; the ingress exposes the private state-machine contract, not the hosted Iceberg REST or identity surface. An external binding routes to a remote catalog gateway and carries its own endpoint and stable secret ID. The same query/write engine clients and metadata-warming code operate above both bindings, but their consistency contracts remain explicit: managed reads and commits are linearizable through Raft fences, while third-party catalogs retain their own polling, notification, and transaction behavior. No managed request falls back to an external catalog or PostgreSQL persistence.
 
 ---
 
@@ -658,7 +747,7 @@ The lakehouse settled where analytical data lives; it has not settled where hot 
 
 Verglas closes both gaps with one tier. Version-keyed blocks cannot serve bytes from the wrong immutable object version, while coded Multi-Raft gives managed catalog commits and Postgres WAL one agreement and persistence boundary across every ingress. Catalog application warms metadata before queries ask, and WAL is readable as soon as its append commits rather than after S3 archival. Engines adopt the managed service through standard Iceberg REST and the Verglas Neon protocol. A clean checkpoint-and-detach leaves standard Iceberg objects and an exported catalog for another service; an authoritative ring cannot be destroyed like a disposable cache while acknowledged state is still local.
 
-The platform layer applies the same discipline to data movement. A pipeline is a deployment record executed by a harness against the same commit contract everywhere; correctness rests on commit-before-acknowledgment and snapshot-recorded idempotency keys rather than on any property of the runtime that happens to host the job.
+The platform layer applies the same discipline to stateful execution. Each Durable Object is a named WASM component in a lease-fenced `verglasd` process. Its serialized events commit storage effects as canonical Arrow transaction envelopes, and socket output is released only after commit. The trust boundary is the WASM sandbox inside one microVM inside the lease fence; suspending and resuming the outer machine does not change the durable state contract.
 
 ---
 

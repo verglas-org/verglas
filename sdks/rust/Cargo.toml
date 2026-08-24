@@ -1,6 +1,6 @@
 [package]
 name = "verglas-sdk"
-description = "The Rust SDK for the agent-data platform: the worker/trigger contract, data-plane client, and tables_api wire types (#321)"
+description = "The Rust SDK for the agent-data platform: data-plane client and tables_api wire types (#321)"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

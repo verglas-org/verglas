@@ -1,0 +1,9 @@
+{
+  "name": "py-counter",
+  "main": "counter.py",
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" }
+    ]
+  }
+}

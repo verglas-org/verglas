@@ -1,32 +1,26 @@
-//! The memory grant contract: how a worker asks whatever launched it for
+//! The memory grant contract: how a runtime asks whatever launched it for
 //! memory, and grows that ask while it runs.
 //!
-//! This lives on the framework side ([`WorkerContext`](crate::worker::WorkerContext),
-//! [`crate::worker::Worker::initial_grant_request`]) so every worker kind
-//! inherits it — not just the query role. A worker with no opinion about its
-//! memory need simply never calls it, and the default [`LocalGrantHost`]
-//! grants whatever is asked with no enforcement, so nothing changes for
-//! today's workers.
+//! The contract is deliberately neutral about the runtime using it. A host
+//! may map a grant onto a cgroup limit or another memory primitive, while
+//! [`LocalGrantHost`] provides unconstrained bookkeeping for development.
 //!
-//! The seam is deliberately neutral about *how* a grant is enforced. A grant
-//! is just a byte count the host agrees to. On a bare-metal or dev host there
-//! may be nothing enforcing it at all ([`LocalGrantHost`]); a supervising host
-//! may map a grant onto whatever primitive it manages memory with — a cgroup
-//! limit, or something else later. None of that is this crate's concern or
-//! knowledge: OSS ships the contract and the no-op local host; an enforcing
-//! host implements the same trait outside the SDK.
+//! A grant is just a byte count the host agrees to. None of the enforcement
+//! mechanism is this crate's concern or knowledge: OSS ships the contract and
+//! the no-op local host; an enforcing host implements the same trait outside
+//! the SDK.
 
 use async_trait::async_trait;
 use thiserror::Error;
 
-/// A memory ask, in bytes, that a worker makes before or during a run.
+/// A memory ask, in bytes, that a runtime makes before or during a run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryGrantRequest {
-    /// The estimated working-set size the worker expects to need. The host
+    /// The estimated working-set size the runtime expects to need. The host
     /// grants at least `minimum_bytes` and at most this, subject to its own
     /// availability.
     pub estimated_bytes: u64,
-    /// The floor below which the worker cannot usefully run (its own runtime
+    /// The floor below which the runtime cannot usefully run (its own runtime
     /// baseline). The host never grants less than this; if it cannot, the
     /// request fails rather than handing back an unusable grant.
     pub minimum_bytes: u64,
@@ -43,7 +37,7 @@ impl MemoryGrantRequest {
     }
 }
 
-/// A granted allowance, in bytes. Opaque beyond its size — the worker holding
+/// A granted allowance, in bytes. Opaque beyond its size — the runtime holding
 /// one does not know or care what enforces it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemoryGrant {
@@ -70,21 +64,19 @@ pub enum GrantError {
     Unavailable(String),
 }
 
-/// The host side of the grant contract: whatever launched the worker and can
-/// give it more memory. A worker holds a handle to one of these — the
-/// framework hands it one through [`WorkerContext`](crate::worker::WorkerContext),
-/// or a standalone role binary (not driven through `WorkerContext` at all,
-/// such as `verglas-query`) holds one directly — and calls it before starting
-/// heavy work, and again if it needs to grow.
+/// The host side of the grant contract: whatever launched the runtime and can
+/// give it more memory. A runtime holds a handle to one of these — a
+/// supervising host or standalone role binary holds it directly — and calls it
+/// before starting heavy work, and again if it needs to grow.
 ///
-/// Grow-only: there is no `shrink`. A worker that no longer needs its grant
+/// Grow-only: there is no `shrink`. A runtime that no longer needs its grant
 /// releases the whole thing and exits; it never gives back part of it while
 /// still running.
 #[async_trait]
 pub trait MemoryGrantHost: Send + Sync {
     /// Requests an initial grant sized by `request`. The host may grant less
     /// than `estimated_bytes` (but never less than `minimum_bytes`) if it is
-    /// itself constrained; the worker makes up the difference with `grow`
+    /// itself constrained; the runtime makes up the difference with `grow`
     /// calls as it discovers it needs more.
     async fn request(&self, request: MemoryGrantRequest) -> Result<MemoryGrant, GrantError>;
 
@@ -95,13 +87,13 @@ pub trait MemoryGrantHost: Send + Sync {
         additional_bytes: u64,
     ) -> Result<MemoryGrant, GrantError>;
 
-    /// Releases a grant when the worker finishes (or is being killed after
+    /// Releases a grant when the runtime finishes (or is being killed after
     /// use). Best-effort — a host that's gone is nothing to report back to.
     async fn release(&self, grant: MemoryGrant);
 }
 
 /// A host that grants exactly what is asked, unconditionally, and enforces
-/// nothing. This is what a worker gets when it runs standalone or in dev with
+/// nothing. This is what a runtime gets when it runs standalone or in dev with
 /// no host agent attached — the request/grow/release calls still work, they
 /// just have no effect beyond bookkeeping. An enforcing host (for example
 /// cgroups) lives outside this crate and implements the same trait.

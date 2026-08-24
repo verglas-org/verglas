@@ -40,6 +40,7 @@ pub mod graph;
 pub mod index;
 pub mod model;
 pub mod precedent;
+pub mod puffin;
 pub mod scan;
 pub mod schema;
 pub mod traverse;

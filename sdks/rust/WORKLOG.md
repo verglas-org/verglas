@@ -206,3 +206,4 @@
   `tests/client_tokens.rs` with the methods they exercised.
 - #137: Regenerated Graph DTO names and client methods for the conventional Graph operation vocabulary, including AddNodes, AddEdges, RetrieveNeighbors, Search traversals, DescribeGraph, and BuildIndex.
 
+- #0: Removed the job-Worker contract modules (`worker`, `job`), moved `ChangeEvent` into `client` where its only callers live, and rewrote the `grant` docs as a generic runtime memory-grant contract. The product now runs tenant Workers as Durable-Object-style WASM components instead of externally scheduled OCI containers. (Replace #0 with the tracking issue number before release.)

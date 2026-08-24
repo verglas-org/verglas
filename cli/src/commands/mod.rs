@@ -12,4 +12,3 @@ pub mod status;
 pub mod table;
 pub mod token;
 pub mod vector;
-pub mod workers;

@@ -21,8 +21,6 @@ pub struct Cli {
 /// Top-level `verglas` subcommands.
 ///
 /// Every command operates against the selected server and Iceberg catalog.
-/// Workers are the single scheduled/event-driven compute primitive; there are
-/// no source, MV, or sink command groups.
 ///
 /// The CLI's own version is a flag (`-V`/`--version`), not a subcommand; the
 /// running server's version is reported by `verglas status`.
@@ -46,12 +44,6 @@ pub enum Command {
     /// host dashboards.
     #[command(subcommand)]
     Dashboard(DashboardCommand),
-    /// Manage workers on Verglas Cloud.
-    ///
-    /// `list`/`get` read them; `create`/`delete` manage them from a spec
-    /// file; `run` dispatches one now. The OSS stack does not host workers.
-    #[command(subcommand)]
-    Workers(WorkersCommand),
     /// Create scoped credentials.
     ///
     /// Values are read from stdin and never appear in argv.
@@ -261,75 +253,6 @@ pub struct DashboardNameArgs {
     /// Tenant deployment id.
     #[arg(long)]
     pub tenant_id: Option<String>,
-}
-
-/// `verglas workers` subcommands against Verglas Cloud (`/v0/workers`).
-#[derive(Debug, Subcommand)]
-pub enum WorkersCommand {
-    /// List every active worker on Verglas Cloud.
-    List,
-    /// Show one worker's full detail by name.
-    Get(WorkerRefArgs),
-    /// Register a worker from a portable spec file (`--file`, JSON or TOML).
-    ///
-    /// `--name`/`--schedule` override the matching spec fields.
-    Create(WorkerCreateArgs),
-    /// Archive a worker (lifecycle state transition).
-    ///
-    /// Accepts the worker's name.
-    Delete(WorkerRefArgs),
-    /// Dispatch a manual run of the worker now.
-    ///
-    /// Accepts the worker's name.
-    Run(WorkerRefArgs),
-    /// Not supported.
-    ///
-    /// Workers run on Verglas Cloud; the OSS stack has no follow runtime.
-    Follow(WorkerFollowArgs),
-}
-
-/// A worker referenced by its registered name.
-#[derive(Debug, Args)]
-pub struct WorkerRefArgs {
-    /// The worker's name.
-    pub worker: String,
-}
-
-/// Arguments for `verglas workers create`.
-#[derive(Debug, Args)]
-pub struct WorkerCreateArgs {
-    /// The portable worker spec, a JSON (`.json`) or TOML (`.toml`) object.
-    #[arg(long)]
-    pub file: PathBuf,
-    /// Override the spec's `name`.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// Override the spec's cron schedule (a cron-triggered spec only).
-    #[arg(long)]
-    pub schedule: Option<String>,
-}
-
-/// Arguments for `verglas workers follow`.
-#[derive(Debug, Args)]
-pub struct WorkerFollowArgs {
-    /// Tail this file instead of wrapping a command. Mutually exclusive with a
-    /// trailing `-- <command...>`.
-    #[arg(long, conflicts_with = "command")]
-    pub file: Option<PathBuf>,
-    /// The target table captured lines are appended to (`namespace.table`).
-    /// Defaults to `follow.<name>`.
-    #[arg(long)]
-    pub table: Option<String>,
-    /// A name for the follow worker. Defaults to a generated throwaway name.
-    #[arg(long)]
-    pub name: Option<String>,
-    /// Register the worker durably instead of tearing it down when you exit.
-    #[arg(long)]
-    pub keep: bool,
-    /// The command to follow, after `--`. It is run and its stdout and stderr are
-    /// captured as rows.
-    #[arg(last = true)]
-    pub command: Vec<String>,
 }
 
 /// `verglas table` subcommands. Every verb takes `--output json` via the global

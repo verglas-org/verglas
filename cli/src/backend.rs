@@ -2,15 +2,14 @@
 //! which server a command targets.
 //!
 //! Cloud is the default (`https://api.verglas.dev`). Self-hosted OSS servers
-//! are selected with `VERGLAS_ENDPOINT`, not a CLI flag. Workers are a Cloud
-//! service and refuse the OSS stack.
+//! are selected with `VERGLAS_ENDPOINT`, not a CLI flag.
 
 use std::error::Error;
 
 use verglas_core::admin::ENDPOINT_ENV;
 use verglas_sdk::server::{ServerClient, ServerError};
 
-/// Verglas Cloud control-plane URL. Workers always target this service.
+/// Verglas Cloud control-plane URL.
 pub const CLOUD_ENDPOINT: &str = "https://api.verglas.dev";
 
 /// Resolves the admin/control-plane URL: `VERGLAS_ENDPOINT` if set, otherwise
@@ -39,14 +38,6 @@ pub fn is_verglas_cloud(endpoint: &str) -> bool {
     host == "api.verglas.dev" || host.ends_with(".verglas.dev")
 }
 
-/// Workers are hosted only on Verglas Cloud. The OSS stack has no worker runtime.
-pub fn require_cloud_workers(endpoint: &str) -> Result<(), Box<dyn Error>> {
-    if is_verglas_cloud(endpoint) {
-        return Ok(());
-    }
-    Err("verglas workers runs on Verglas Cloud only; the OSS stack does not host workers".into())
-}
-
 /// Dashboards are hosted only on Verglas Cloud. The OSS stack has no dashboard host.
 pub fn require_cloud_dashboards(endpoint: &str) -> Result<(), Box<dyn Error>> {
     if is_verglas_cloud(endpoint) {
@@ -66,16 +57,13 @@ pub fn server(endpoint: &str, token: Option<&str>) -> Result<ServerClient, Serve
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        CLOUD_ENDPOINT, is_verglas_cloud, require_cloud_dashboards, require_cloud_workers,
-    };
+    use super::{CLOUD_ENDPOINT, is_verglas_cloud, require_cloud_dashboards};
 
     #[test]
     fn cloud_hosts_are_accepted() {
         assert!(is_verglas_cloud(CLOUD_ENDPOINT));
         assert!(is_verglas_cloud("https://api.verglas.dev/"));
         assert!(is_verglas_cloud("https://preview.verglas.dev"));
-        assert!(require_cloud_workers(CLOUD_ENDPOINT).is_ok());
         assert!(require_cloud_dashboards(CLOUD_ENDPOINT).is_ok());
     }
 
@@ -84,9 +72,6 @@ mod tests {
         assert!(!is_verglas_cloud("http://127.0.0.1:8334"));
         assert!(!is_verglas_cloud("https://127.0.0.1:8334"));
         assert!(!is_verglas_cloud("http://api.verglas.dev"));
-        let err =
-            require_cloud_workers("http://127.0.0.1:8334").expect_err("loopback must be rejected");
-        assert!(err.to_string().contains("OSS stack"));
         let dash_err = require_cloud_dashboards("http://127.0.0.1:8334")
             .expect_err("loopback must be rejected for dashboards");
         assert!(dash_err.to_string().contains("dashboard"));

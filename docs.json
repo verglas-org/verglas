@@ -19,17 +19,6 @@
         ]
       },
       {
-        "group": "Workers",
-        "icon": "workflow",
-        "pages": [
-          "docs/workers/overview",
-          "docs/workers/manual",
-          "docs/workers/http",
-          "docs/workers/cron",
-          "docs/workers/cloudevents"
-        ]
-      },
-      {
         "group": "Architecture",
         "icon": "compass-drafting",
         "pages": [
@@ -40,6 +29,10 @@
           "docs/architecture/iceberg",
           "docs/architecture/writes",
           "docs/architecture/execution",
+          "docs/architecture/do-workers",
+          "docs/architecture/do-event-protocol",
+          "docs/architecture/durable-objects",
+          "docs/architecture/cells",
           "docs/architecture/benchmarks"
         ]
       },

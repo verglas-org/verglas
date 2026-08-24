@@ -1,0 +1,12 @@
+{
+  "name": "py-counter",
+  "main": "counter.py",
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" }
+    ]
+  },
+  "component_digest": "5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860",
+  "component_dir": "/tmp/verglas-do-poc/py-build",
+  "data_root": "/tmp/verglas-do-poc/py-data"
+}

@@ -4,9 +4,9 @@
 //! and from the connection profile `verglas login` writes
 //! (`crate::connection_profile`). `VERGLAS_TOKEN` and this file are the two
 //! ways `Cli::resolved_token` finds a bearer for commands that call Verglas
-//! Cloud directly (workers, dashboards, secrets). Nothing in this CLI writes
-//! the file; an operator populates it out of band when they want a token
-//! resolved without setting the environment variable each time.
+//! Cloud directly (dashboards, secrets). Nothing in this CLI writes the file;
+//! an operator populates it out of band when they want a token resolved
+//! without setting the environment variable each time.
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -28,6 +28,11 @@ members = [
     "crates/verglas-kv",
     "bins/cache-node",
     "crates/verglas-block",
+    "crates/verglas-do-engine",
+    "crates/verglas-celld",
+    "crates/verglas-runtime",
+    "crates/verglas-do-wasm",
+    "crates/verglas-gateway",
 
     # Catalog catalog
     "crates/verglas-catalog-authz",
@@ -79,6 +84,10 @@ verglas-api = { path = "crates/verglas-api", version = "0.2.0" }
 verglas-vector = { path = "crates/verglas-vector" }
 verglas-kv = { path = "crates/verglas-kv" }
 verglas-block = { path = "crates/verglas-block" }
+verglas-do-engine = { path = "crates/verglas-do-engine" }
+verglas-do-wasm = { path = "crates/verglas-do-wasm" }
+verglas-celld = { path = "crates/verglas-celld" }
+verglas-gateway = { path = "crates/verglas-gateway" }
 verglas-sdk = { path = "sdks/rust" }
 tonic = "0.13.1"
 prost = "0.13.5"
@@ -128,6 +137,7 @@ object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
 s3s = "0.14.1"
 sync_wrapper = { version = "1.0.2", features = ["futures"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "blocking", "stream", "http2"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 # AWS SigV4 request signing for AWS-backed Iceberg REST catalogs (S3 Tables,
 # Glue) — the watcher signs its own reqwest requests, no signing proxy (#236).
 aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
@@ -151,9 +161,21 @@ typetag = "0.2.22"
 schemars = "1.0.4"
 tempfile = "3.20.0"
 thiserror = "2.0.18"
+# Component-model runtime for DO Worker execution (verglas-do-wasm, verglasd).
+# Tenant Worker code is a WASM component targeting the verglas:do world; the
+# host embeds Wasmtime rather than any JS engine.
+wasmtime = { version = "48.0.0", default-features = false, features = [
+    "component-model",
+    "async",
+    "runtime",
+    "cranelift",
+] }
+wasmtime-wasi = { version = "48.0.0", default-features = false, features = ["p2"] }
+wat = "1.238.0"
 ts-rs = { version = "11.1.0", features = ["serde-compat"] }
 chrono = "0.4.44"
 tokio = { version = "1.49.0", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.29.0"
 toml = "1.1.2"
 xxhash-rust = { version = "0.8.16", features = ["xxh3"] }
 # CRC32C (Castagnoli) for per-fragment integrity in the write-back tier (#220):

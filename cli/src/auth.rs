@@ -203,7 +203,7 @@ pub async fn resolved_bearer(credentials_path: &Path) -> Result<Option<String>, 
 /// fails loud with guidance to run `verglas login` again — there is no
 /// refresh loop; only re-running `verglas login` can replace a durable token
 /// that the control plane has rejected. Used by call sites where a missing
-/// bearer is not itself an error (self-hosted `workers`/`dashboard`).
+/// bearer is not itself an error (self-hosted `dashboard`).
 pub async fn cloud_call<T, E, F, Fut>(
     bearer: Option<String>,
     mut attempt: F,

@@ -1,0 +1,119 @@
+---
+title: "DO Workers"
+description: "Tenant WASM components executing inside each Durable Object's verglasd microVM."
+icon: "cube"
+---
+
+A Durable Object is a Worker. Tenant code compiles to one WebAssembly component
+targeting the `verglas:do-worker` WIT world and executes inside the DO's own `verglasd`
+process — the same isolated microVM, lease fence, and commit authority described
+in [Cell deployment](/docs/architecture/cells). There is no separate worker
+fleet, no container scheduler, and no V8: the isolation boundary is the WASM
+sandbox inside the microVM inside the lease fence.
+
+```text
+gateway (owns HTTP + WebSocket connections)
+      │  name → DO id → machine, wake on demand
+      ▼
+microVM ── verglasd
+            ├── Wasmtime engine
+            │     └── tenant component (verglas:do-worker world)
+            │           exports: fetch / alarm / websocket-message / websocket-close
+            │           imports: storage, sockets (in-process host bindings)
+            ├── DataFusion + SQLite pager (DO engine)
+            └── lease-fenced commit authority
+```
+
+## The ABI
+
+The component targets `world durable-object` in package `verglas:do-worker`
+(`crates/verglas-do-wasm/wit/world.wit`):
+
+- **Exports** are the lifecycle and event surface: `init` runs once per
+  component instantiation before the first event; `fetch` handles routed HTTP
+  requests, `alarm` handles the DO's durable alarm, and `websocket-message`
+  and `websocket-close` handle accepted connections.
+- **`storage` imports** — `get`, `put`, `delete`, `list`, `sql`, and the alarm
+  verbs — are host functions bound directly to the in-process DO engine. A
+  storage call is a function call, never a network hop. Reads see the event's
+  snapshot fence plus the event's own staged writes; writes join the event's
+  canonical transaction envelope and become durable only when the configured
+  commit authority acknowledges it.
+- **`sockets` imports** — `send`, `close`, `set-attachment`, `get-attachment`,
+  `attached` — stage effects against connections the gateway holds. Attachments
+  are bounded at 16 KiB and persist in DO state.
+
+Worker key-value state, the alarm, and connection attachments are reserved
+relational tables inside the DO's one commit history. They replay, checkpoint,
+and archive with everything else; there is no side store to lose.
+
+## Event execution: one at a time, gated
+
+Events execute strictly serialized per DO. The host admits one event, runs the
+handler to completion, commits its envelope, and only then admits the next.
+Two gates enforce the Cloudflare consistency model:
+
+- **Input gate.** No second event observes state between another event's start
+  and its commit. Concurrent arrivals queue.
+- **Output gate.** Outbound socket sends staged during an event are released
+  only after the event's transaction is durable. An aborted event releases
+  nothing. No observer outside the DO can see an effect of an uncommitted
+  transaction.
+
+A handler failure aborts its envelope; committed state is never rolled back.
+
+## Code artifacts
+
+A Worker's component is a content-addressed immutable object in the DO's
+managed bucket. `verglasd` is spawned with the component digest, fetches the
+bytes, verifies the SHA-256 before instantiation, and fails closed on mismatch.
+Compiled AOT (`cwasm`) artifacts may be cached outside the microVM keyed by the
+same digest plus Wasmtime's compatibility key; the digest names the code forever, so a
+cache is only ever an acceleration. Pre-initialization (Wizer-style) keeps
+post-wake instantiation in single-digit milliseconds; the microVM's own
+suspend/resume amortizes the outer cold start.
+
+## Languages
+
+Any language with component tooling targets the world directly — Rust via
+`cargo component`, Go via TinyGo, Python via componentize-py. JavaScript and
+TypeScript are supported by baking tenant code into the component with
+ComponentizeJS (StarlingMonkey, SpiderMonkey compiled to WASM). The platform
+runs components, not language runtimes: JS support is a build-time property of
+the artifact, not a host dependency.
+
+## Connections live in the gateway, not the guest
+
+HTTP and WebSocket connections terminate at the platform ingress, never inside
+the component or the microVM. The gateway:
+
+1. resolves name → DO id → machine, and wakes a hibernated DO on demand;
+2. holds WebSockets open while the DO is suspended — hibernation is invisible
+   to connected clients;
+3. answers configured auto-responses (ping/pong) without waking the DO;
+4. delivers events over the DO's private endpoint and releases commit-gated
+   sends back to the right connections;
+5. reads per-connection attachments from DO state on wake so a rehydrated
+   Worker can rebuild its session map.
+
+Because attachments and the alarm are committed DO state, a DO that hibernates,
+migrates, or fails over rebuilds exactly the connection context its last
+committed transaction described.
+
+## Alarms
+
+`set-alarm` writes the DO's single alarm row inside the current envelope. On
+commit, the supervisor arms a wake at the deadline; firing delivers one `alarm`
+event with the scheduled time. The alarm survives hibernation and restore
+because it is ordinary committed state, and re-arming happens from that state on
+every wake — the timer is derived, never authoritative.
+
+## Placement substrate
+
+`celld-host` supervises one `verglasd` per DO behind a provisioner seam. The
+local-process provisioner is the development and test substrate; the Fly.io
+Machines provisioner maps the same lifecycle onto Firecracker microVMs —
+spawn with lease held, suspend after archive-and-checkpoint, resume from
+machine snapshot on wake. The lease token and generation fence both substrates
+identically: a stale machine cannot acknowledge a mutation regardless of where
+it runs.

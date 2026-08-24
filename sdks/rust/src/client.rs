@@ -26,8 +26,6 @@ use verglas_core::admin::{ACCESS_PATH, LocalAccess};
 
 pub use verglas_api::{ColumnSpec, PartitionSpec, TableDefinition};
 
-use crate::worker::ChangeEvent;
-
 /// One durable table commit and the queue receipt that fences its acknowledgement.
 /// Opaque proof that a subscriber owns one delivery generation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +37,21 @@ pub struct DeliveryReceipt {
     pub owner: String,
     /// Monotonic generation fencing prior deliveries.
     pub generation: u64,
+}
+
+/// A committed-table change from the catalog follow feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeEvent {
+    /// The feed's monotonic sequence number for this change.
+    pub seq: u64,
+    /// The fully-qualified table that committed, `namespace.table`.
+    pub table: String,
+    /// The id of the snapshot the commit produced.
+    #[serde(rename = "snapshotId", alias = "snapshot_id")]
+    pub snapshot_id: String,
+    /// When the commit landed, ISO 8601.
+    #[serde(rename = "committedAt", alias = "committed_at")]
+    pub committed_at: String,
 }
 
 /// One NDJSON frame on a database subscription stream.

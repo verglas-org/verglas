@@ -1,0 +1,9 @@
+{
+  "name": "js-counter",
+  "main": "worker.js",
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" }
+    ]
+  }
+}

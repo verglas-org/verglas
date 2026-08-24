@@ -21,7 +21,7 @@ serde_json.workspace = true
 serde_yaml.workspace = true
 chrono = "0.4.44"
 thiserror.workspace = true
-# Worker specs and catalog config are TOML on disk.
+# Catalog config is TOML on disk.
 toml.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
@@ -33,7 +33,6 @@ tempfile.workspace = true
 # Reflects over the serialized default Config to assert the init scaffold covers
 # every config field (#221).
 toml.workspace = true
-# Local workers integration tests stand up a mock `/v1/workers` server.
 axum.workspace = true
 
 [lints]

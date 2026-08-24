@@ -7,19 +7,17 @@
 use std::process::Command;
 
 /// Every subcommand `verglas --help` is allowed to list, and nothing else. The
-/// source/MV/sink platform primitives were removed with the worker refocus; the
-/// local `workers` command is the surviving deployment surface. `graph` and
-/// `vector` (#144) wrap the S3 semantic listener's property-graph and vector
-/// index REST-JSON surfaces. `ingest` and `sql` are the /v0 data-plane verbs
+/// source/MV/sink platform primitives are not commands. `graph` and `vector`
+/// (#144) wrap the S3 semantic listener's property-graph and vector index
+/// REST-JSON surfaces. `ingest` and `sql` are the /v0 data-plane verbs
 /// (append-ingest and ad hoc SQL) that replaced the retired tenant-local
 /// access-service era's `lakehouse` and `token` commands.
-const SURVIVING_COMMANDS: [&str; 13] = [
+const SURVIVING_COMMANDS: [&str; 12] = [
     "login",
     "logout",
     "status",
     "table",
     "dashboard",
-    "workers",
     "secret",
     "lakehouse",
     "token",

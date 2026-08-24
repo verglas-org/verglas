@@ -1,0 +1,19 @@
+{
+  "name": "@verglas/worker-js",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Builds JavaScript Durable Object Workers into Verglas WebAssembly components.",
+  "license": "FSL-1.1-ALv2",
+  "bin": {
+    "verglas-worker-build": "./bin/build.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@bytecodealliance/componentize-js": "0.22.0",
+    "@bytecodealliance/jco": "1.31.0",
+    "esbuild": "0.28.2"
+  }
+}

@@ -1,0 +1,95 @@
+---
+title: "Cell deployment"
+description: "Run one isolated verglasd Worker and SQLite engine per microVM."
+icon: "network-wired"
+---
+
+A cloud deployment gives each active stateful Worker its own microVM and one
+`verglasd` process. The process owns exactly one DO, one SQLite engine, one data
+directory, and one private Unix socket. It is the DO's only event executor; DOs
+do not run Raft or elect leaders.
+
+```text
+microVM
+└── verglasd
+    ├── one stateful Worker
+    │     └── tenant WASM component (verglas:do-worker world)
+    ├── DataFusion session
+    ├── SQLite pager and canonical transaction log
+    ├── checkpoint and offload coordinator
+    └── private Unix endpoint
+```
+
+The stateful Worker's tenant logic is a WASM component fetched by content
+digest and verified before instantiation; [DO Workers](/docs/architecture/do-workers)
+defines the ABI, event gating, and artifact contract.
+
+`celld-host` is the resource and lifecycle supervisor. It allocates one isolated
+microVM-sized worker reservation per child, passes the data and socket paths,
+waits for the socket to bind, and fences routing after a crash or during restore.
+CPU, memory, and local disk budgets are hard ceilings. Compiled Worker code may
+be cached outside a microVM, but mutable payload state and execution never share
+a process with another tenant payload.
+
+## Commit authority
+
+The default mode acknowledges a transaction only after `verglasd` writes its
+exact canonical Arrow envelope as an immutable object, reads it back, and
+conditionally advances the managed S3 head object. The conditional write is
+fenced by an opaque lease token and monotonic generation passed to the worker by
+the launcher. A stale worker has an old object version or generation and cannot
+acknowledge another mutation. SQLite applies the acknowledged transaction as the
+local pager and recovery image; it is not an independent commit authority.
+
+A worker may be spawned with the lease already held. The launcher passes the
+opaque token, generation, current sequence, and conditional object version. The
+worker never silently reacquires or falls back to an unfenced write. For replica
+mode, `celld-host` passes the endpoint, token, generation, and exact recovered
+start sequence with `SPAWN_WORKER`; an invalid fence is rejected before launch.
+
+## Optional early acknowledgement
+
+A deployment may instead configure one replica service endpoint. That service may
+itself be a Cloudflare Durable Object whose platform durability supplies regional
+three-of-five acknowledgement. The worker sends its lease identity, sequence,
+transaction UUID, and exact canonical bytes once and acknowledges only after the
+service replies durably. The transaction is then archived to managed S3
+asynchronously. Managed compacted archive publication flushes after ten seconds,
+at sixteen MiB, or on explicit lifecycle drain; foreground SQLite durability does
+not wait for that publication. This is a separate configured commit mode, not a
+fallback when the default S3 CAS fails.
+
+The replica service exposes durable put, bounded replay after a caller's recovered
+sequence, and explicit clean-through-watermark. A replacement `verglasd` worker
+replays this exact tail into its fresh SQLite pager and verifies that the result
+matches the launcher's held start sequence before it binds its event socket. Clean
+requires the current lease and verified archive and checkpoint watermarks through
+the requested sequence; a stale worker or uncovered tail cannot remove failover
+data, and replay below an already cleaned watermark fails closed. Replica processes may also serve an explicitly
+fenced snapshot at or below their applied sequence, but never execute stateful
+Worker events.
+
+## Independent scale-to-zero
+
+A worker suspends only after its applied sequence is covered by both the managed
+transaction archive and a verified object checkpoint. Optional Iceberg and
+Puffin materialization may lag because the canonical transaction archive is its
+replay source.
+
+```text
+fence new events
+      ↓
+archive and checkpoint through applied sequence
+      ↓
+stop the isolated verglasd microVM
+      ↓
+next request provisions one microVM with lease held
+      ↓
+restore SQLite from checkpoint and replay archive tail
+      ↓
+release the triggering event at its requested fence
+```
+
+Retained local storage may shorten restore, but correctness depends on the
+verified managed checkpoint and transaction objects. No election or leadership
+transfer is required.

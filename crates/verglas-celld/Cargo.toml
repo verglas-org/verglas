@@ -1,0 +1,19 @@
+[package]
+name = "verglas-celld"
+description = "Tenant cell supervision and resource-aware Durable Object placement"
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+hex.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "sync", "fs", "time", "net", "io-util", "signal", "macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "time"] }
+
+[lints]
+workspace = true

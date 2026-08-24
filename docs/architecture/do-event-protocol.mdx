@@ -1,0 +1,92 @@
+---
+title: "DO event protocol"
+description: "The Unix-socket event contract between the gateway and one verglasd Worker."
+icon: "plug"
+---
+
+The gateway and `verglasd` speak newline-delimited JSON (NDJSON, UTF-8) over
+the DO's private Unix **event socket** (separate from the replica endpoint).
+Binary payloads are base64 in `*_b64` fields. This is a prototype wire format:
+it may break freely between commits and carries no version negotiation.
+
+`verglasd` processes events strictly one at a time (the input gate). The
+gateway may pipeline frames; responses and outbound effects are emitted in
+event order. All staged WebSocket effects for an event are written to the
+socket **after the event's transaction is durably committed and before that
+event's terminal frame** — a reader that sees `done`/`fetch-result` for event
+N has already seen every send N produced.
+
+## Frames: gateway → verglasd
+
+```json
+{"type":"fetch","id":1,"method":"POST","url":"/counter/incr","headers":[["content-type","application/json"]],"body_b64":""}
+{"type":"ws-open","ws":7}
+{"type":"ws-message","id":2,"ws":7,"text":true,"data_b64":"aGk="}
+{"type":"ws-close","id":3,"ws":7,"code":1000,"reason":"bye"}
+```
+
+- `id` is a per-connection monotonically increasing event identity assigned by
+  the gateway; `verglasd` echoes it on the terminal frame.
+- `ws-open` registers a gateway-accepted connection identity. It is not a
+  guest event and has no terminal frame. The gateway owns WebSocket accept in
+  v0 (documented divergence from Cloudflare's guest-driven accept).
+- Alarms are **not** gateway frames: OSS `verglasd` is always resident, arms
+  its own timer from committed alarm state, and self-delivers `alarm` events
+  through the same serialized event path. Sends staged by an alarm event still
+  flow out over this socket.
+
+## Frames: verglasd → gateway
+
+```json
+{"type":"ws-send","ws":7,"text":true,"data_b64":"cG9uZw=="}
+{"type":"ws-close-out","ws":7,"code":1000,"reason":"done"}
+{"type":"fetch-result","id":1,"status":200,"headers":[["content-type","application/json"]],"body_b64":"eyJuIjoxfQ=="}
+{"type":"done","id":2}
+{"type":"error","id":3,"message":"handler error: ..."}
+```
+
+- `fetch-result` is the terminal frame for a `fetch` event; `done` for
+  `ws-message`/`ws-close`; `error` for any failed event. A handler error
+  aborts the event's transaction and releases **no** staged effects.
+- `ws-send`/`ws-close-out` are the commit-gated effects, in stage order.
+
+## SQL surface
+
+The `storage` WIT interface carries two SQL verbs:
+
+- `sql(statement) -> list<u8>` — Arrow IPC stream bytes, the native surface.
+- `sql-rows(statement) -> string` — the same execution, rows encoded as one
+  JSON array of objects. This exists so guests without an Arrow decoder
+  (componentized JS/Python) can consume results; it is not a fallback, it is
+  a second encoding of the same committed execution.
+
+Both execute inside the current event's transaction: DML stages into the
+event's envelope; reads see the event's snapshot plus its own staged writes.
+
+## Acceptance criteria (immutable)
+
+These criteria gate the OSS networking + multi-language pipeline work. They
+may be extended, never weakened; tests asserting them may not be deleted,
+`#[ignore]`d, or have assertions removed by implementing agents.
+
+- **AC1 — gated delivery.** An HTTP request routed through the gateway to a
+  DO returns the handler's response. A WebSocket message event whose handler
+  stages sends and writes storage delivers those sends only after the
+  transaction commits; an aborted handler delivers nothing. Proven by a
+  gateway-level integration test observing the socket, not by unit tests
+  alone.
+- **AC2 — JS worker end-to-end.** A JS project with a wrangler-style manifest
+  builds via the `sdks/worker-js` pipeline into a `verglas:do-worker`
+  component that runs under `verglasd`: `init` runs once, `fetch` served
+  through the gateway performs real SQL (create/insert/select through
+  `sql-rows`) against DO state, and the state survives a `verglasd` process
+  restart (same data directory).
+- **AC3 — Python worker end-to-end.** The same contract as AC2 through the
+  `sdks/worker-py` componentize-py pipeline.
+- **AC4 — no weakening.** Every previously green suite in touched crates
+  stays green with assertions intact; new code passes
+  `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check`.
+- **AC5 — captured proof.** A recorded transcript (commands + outputs) of the
+  js-counter and py-counter examples served through a locally running
+  gateway: the curl calls, the SQL-backed counter values incrementing, and
+  the restart-persistence check.

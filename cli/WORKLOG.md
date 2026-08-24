@@ -933,3 +933,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   no longer needs the npm scope at all.
 - #137: Updated graph CLI requests and protocol assertions for the renamed Graph REST-JSON operations.
 
+- #0: Removed the OCI-container/CloudEvents job-Worker execution subsystem (CLI `verglas workers` command, worker manifest parsing, subprocess trigger contract, worker docs and examples). The product now runs tenant Workers as Durable-Object-style WASM components instead of externally scheduled OCI containers; this surface had no remaining callers once removed. (Replace #0 with the tracking issue number before release.)
