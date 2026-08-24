@@ -3,10 +3,13 @@
   "main": "worker.js",
   "durable_objects": {
     "bindings": [
-      { "name": "COUNTER", "class_name": "Counter" }
+      {
+        "name": "COUNTER",
+        "class_name": "Counter"
+      }
     ]
   },
-  "component_digest": "2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791",
+  "component_digest": "42a3e8e2132fec53da059b8197d960cfdff832c16722affae7e2766c33c12788",
   "component_dir": "/tmp/verglas-do-poc/js-build",
   "data_root": "/tmp/verglas-do-poc/js-data"
 }

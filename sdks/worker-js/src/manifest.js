@@ -6,9 +6,18 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
-const topLevelKeys = new Set(['name', 'main', 'durable_objects']);
+const topLevelKeys = new Set([
+  'name',
+  'main',
+  'compatibility_date',
+  'compatibility_flags',
+  'durable_objects',
+  'migrations',
+  'vars',
+]);
 const durableObjectsKeys = new Set(['bindings']);
 const bindingKeys = new Set(['name', 'class_name']);
+const migrationKeys = new Set(['tag', 'new_classes', 'new_sqlite_classes']);
 
 /**
  * Error raised when a project manifest is outside the supported subset.
@@ -179,9 +188,46 @@ function rejectUnknownKeys(object, allowed, path) {
 }
 
 /**
+ * Validates a manifest string array.
+ * @param {unknown} value
+ * @param {string} path
+ * @returns {string[]}
+ */
+function stringArray(value, path) {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string' || entry.trim() === '')) {
+    throw new ManifestError(`${path} must be an array of non-empty strings`);
+  }
+  return [...value];
+}
+
+/**
+ * Parses the accepted Durable Object migration forms.
+ * @param {unknown} value
+ * @returns {Array<{tag:string, new_classes:string[], new_sqlite_classes:string[]}>}
+ */
+function parseMigrations(value) {
+  if (!Array.isArray(value)) throw new ManifestError('manifest.migrations must be an array');
+  return value.map((rawMigration, index) => {
+    if (!rawMigration || typeof rawMigration !== 'object' || Array.isArray(rawMigration)) {
+      throw new ManifestError(`manifest.migrations[${index}] must be an object`);
+    }
+    const migration = /** @type {Record<string, unknown>} */ (rawMigration);
+    rejectUnknownKeys(migration, migrationKeys, `migrations[${index}]`);
+    const tag = requiredString(migration, 'tag', `manifest.migrations[${index}]`);
+    const newClasses = migration.new_classes === undefined
+      ? []
+      : stringArray(migration.new_classes, `manifest.migrations[${index}].new_classes`);
+    const newSqliteClasses = migration.new_sqlite_classes === undefined
+      ? []
+      : stringArray(migration.new_sqlite_classes, `manifest.migrations[${index}].new_sqlite_classes`);
+    return { tag, new_classes: newClasses, new_sqlite_classes: newSqliteClasses };
+  });
+}
+
+/**
  * Validates the supported wrangler manifest subset.
  * @param {unknown} raw
- * @returns {{name: string, main: string, bindings: Array<{name: string, class_name: string}>}}
+ * @returns {{name: string, main: string, compatibility_date?: string, compatibility_flags: string[], bindings: Array<{name: string, class_name: string}>, migrations: Array<{tag: string, new_classes: string[], new_sqlite_classes: string[]}>, vars: Record<string, unknown>}}
  */
 export function parseWranglerManifest(raw) {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
@@ -192,6 +238,19 @@ export function parseWranglerManifest(raw) {
 
   const name = requiredString(object, 'name', 'manifest');
   const main = requiredString(object, 'main', 'manifest');
+  let compatibilityDate;
+  if (object.compatibility_date !== undefined) compatibilityDate = requiredString(object, 'compatibility_date', 'manifest');
+  const compatibilityFlags = object.compatibility_flags === undefined
+    ? []
+    : stringArray(object.compatibility_flags, 'manifest.compatibility_flags');
+  const migrations = object.migrations === undefined ? [] : parseMigrations(object.migrations);
+  let vars = {};
+  if (object.vars !== undefined) {
+    if (!object.vars || typeof object.vars !== 'object' || Array.isArray(object.vars)) {
+      throw new ManifestError('manifest.vars must be an object');
+    }
+    vars = { .../** @type {Record<string, unknown>} */ (object.vars) };
+  }
   const durableObjects = object.durable_objects;
   let bindings = [];
 
@@ -225,7 +284,15 @@ export function parseWranglerManifest(raw) {
     names.add(binding.name);
   }
 
-  return { name, main, bindings };
+  return {
+    name,
+    main,
+    ...(compatibilityDate === undefined ? {} : { compatibility_date: compatibilityDate }),
+    compatibility_flags: compatibilityFlags,
+    bindings,
+    migrations,
+    vars,
+  };
 }
 
 /**

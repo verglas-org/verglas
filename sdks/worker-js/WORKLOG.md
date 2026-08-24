@@ -1,3 +1,4 @@
 # Worklog
 
 - #0: Added the JavaScript Durable Object Worker shim and private build CLI. It translates the Cloudflare-style fetch, lifecycle, storage, SQL, alarm, and socket surface into the `verglas:do-worker@0.1.0` component world and records content-addressed build manifests.
+- #0: Replaced the invented `env.storage` authoring API with the Cloudflare `cloudflare:workers` surface. Ported Durable Object IDs, namespaces, state, storage, SQL cursors, alarms, bindings, and waitUntil from the TypeScript implementation, adapting the transport to WIT storage, SQL-row, alarm, socket, and do-fetch verbs without client-side canonical envelopes. Updated the Wrangler subset, component build, gateway digest synchronization, and literal Cloudflare counter example; the old authoring-surface assertions were replaced as required by the frozen compatibility contract.

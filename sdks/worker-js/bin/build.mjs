@@ -21,6 +21,7 @@ const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryDir = resolve(packageDir, '../..');
 const witDir = resolve(repositoryDir, 'crates/verglas-do-wasm/wit');
 const shimPath = resolve(packageDir, 'src/shim.js');
+const cloudflareWorkersPath = resolve(packageDir, 'src/cloudflare-workers.js');
 const jcoPath = resolve(packageDir, 'node_modules/.bin/jco');
 
 /**
@@ -127,9 +128,11 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
   try {
     const entryPath = join(workDir, 'entry.js');
     const entrySource = [
-      `import worker from ${importPath(mainPath)};`,
-      `import { createHandler } from ${importPath(shimPath)};`,
-      'export const handler = createHandler(worker);',
+      `import * as project from ${importPath(mainPath)};`,
+      `import { createHandler, createWorker } from ${importPath(shimPath)};`,
+      `const manifest = ${JSON.stringify(manifest)};`,
+      'export const worker = createWorker(project, manifest);',
+      'export const handler = createHandler(project, manifest);',
       '',
     ].join('\n');
     await writeFile(entryPath, entrySource, 'utf8');
@@ -143,6 +146,7 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
       write: false,
       legalComments: 'none',
       minify: true,
+      alias: { 'cloudflare:workers': cloudflareWorkersPath },
       external: ['verglas:do-worker/*@0.1.0'],
     });
     if (bundled.outputFiles.length !== 1) {
@@ -158,7 +162,7 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
         '--wit',
         witDir,
         '--world-name',
-        'durable-object',
+        'service',
         '--disable=all',
         '--out',
         componentPath,
@@ -177,8 +181,13 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
 
     const outputManifest = {
       name: manifest.name,
+      main: manifest.main,
+      ...(manifest.compatibility_date === undefined ? {} : { compatibility_date: manifest.compatibility_date }),
+      compatibility_flags: manifest.compatibility_flags,
+      durable_objects: { bindings: manifest.bindings },
+      migrations: manifest.migrations,
+      vars: manifest.vars,
       component_digest: componentDigest,
-      bindings: manifest.bindings,
     };
     const manifestPath = join(outputDir, 'manifest.out.json');
     await writeFile(manifestPath, `${JSON.stringify(outputManifest, null, 2)}\n`, 'utf8');

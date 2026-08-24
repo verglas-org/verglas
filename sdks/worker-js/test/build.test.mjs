@@ -20,16 +20,22 @@ async function makeProject(withGateway = false) {
       // The parser must accept the wrangler JSONC subset.
       "name": "test-worker",
       "main": "worker.js",
+      "compatibility_date": "2025-01-01",
       "durable_objects": {
         "bindings": [{ "name": "COUNTER", "class_name": "Counter" }],
       },
+      "vars": { "GREETING": "hello" },
     }\n`,
   );
   await writeFile(
     join(directory, 'worker.js'),
-    `export default {
-      fetch() { return { status: 200, headers: { "content-type": "text/plain" }, body: "ok" }; },
-    };\n`,
+    `import { DurableObject } from "cloudflare:workers";
+export class Counter extends DurableObject {
+  fetch() { return new Response("ok"); }
+}
+export default {
+  fetch() { return new Response("ok"); },
+};\n`,
   );
   if (withGateway) {
     await writeFile(
@@ -74,14 +80,21 @@ test('build output is valid and records digest determinism', async (t) => {
   }
   assert.deepEqual(JSON.parse(await readFile(first.manifestPath, 'utf8')), {
     name: 'test-worker',
+    main: 'worker.js',
+    compatibility_date: '2025-01-01',
+    compatibility_flags: [],
+    durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
+    migrations: [],
+    vars: { GREETING: 'hello' },
     component_digest: first.componentDigest,
-    bindings: [{ name: 'COUNTER', class_name: 'Counter' }],
   });
 
   const wit = spawnSync(fileURLToPath(jcoPath), ['wit', first.componentPath], { encoding: 'utf8' });
   assert.equal(wit.status, 0, wit.stderr);
   assert.match(wit.stdout, /verglas:do-worker\/storage@0\.1\.0/);
   assert.match(wit.stdout, /verglas:do-worker\/sockets@0\.1\.0/);
+  assert.match(wit.stdout, /verglas:do-worker\/bindings@0\.1\.0/);
+  assert.match(wit.stdout, /verglas:do-worker\/worker@0\.1\.0/);
   assert.match(wit.stdout, /verglas:do-worker\/handler@0\.1\.0/);
   assert.doesNotMatch(wit.stdout, /wasi:/);
 
@@ -100,7 +113,9 @@ test('build updates an example gateway manifest to the emitted artifact', async 
   });
 
   const result = await buildProject(project, output);
-  const gateway = JSON.parse(await readFile(join(project, 'gateway.json'), 'utf8'));
+  const gatewaySource = await readFile(join(project, 'gateway.json'), 'utf8');
+  const gateway = JSON.parse(gatewaySource);
+  assert.equal(gatewaySource.endsWith('\n'), true);
   assert.equal(gateway.component_digest, result.componentDigest);
   assert.equal(gateway.component_dir, output);
   assert.equal(gateway.data_root, '/persistent/data');
