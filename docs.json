@@ -30,6 +30,7 @@
           "docs/architecture/writes",
           "docs/architecture/execution",
           "docs/architecture/do-workers",
+          "docs/architecture/primitives-platform",
           "docs/architecture/cloudflare-compat",
           "docs/architecture/do-event-protocol",
           "docs/architecture/durable-objects",
