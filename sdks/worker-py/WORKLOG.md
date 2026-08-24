@@ -25,3 +25,6 @@
   both wrangler.json and wrangler.jsonc, preserving compatibility/migration/vars
   fields in manifest.out.json, and verifying the emitted v2 component with
   wasm-tools validation and import/export inspection.
+- #0: Matched the documented bulk storage overloads and public DurableObjectId
+  helpers (`id_from_string`/`equals`) while keeping the host boundary strictly
+  byte-based and deterministic.

@@ -84,7 +84,9 @@ consume the body. `Response` accepts text or bytes and supports
 with `ctx.accept_websocket(server)` and becomes WIT `accept-ws`.
 
 `ctx.storage.get`, `put`, `delete`, and `list` are asynchronous as in the
-Cloudflare Python API. `list` returns a deterministic mapping of keys to values.
+Cloudflare Python API. `get`/`delete` accept a key list and `put` accepts a
+mapping as well as the single-key form. `list` returns a deterministic mapping
+of keys to values.
 `ctx.storage.sql.exec(statement, *bindings)` is synchronous and returns a
 cursor with `one()`, `to_array()`, iteration, and `raw()`; rows support both
 mapping and attribute access, following Cloudflare's [SQLite storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/).

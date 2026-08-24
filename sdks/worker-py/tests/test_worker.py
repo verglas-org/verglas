@@ -99,7 +99,7 @@ class WorkerSurfaceTests(unittest.TestCase):
 
     def test_storage_round_trips_deterministic_structured_values(self) -> None:
         """Storage preserves supported values through canonical byte encoding."""
-        value = {"count": 3, "payload": b"\\x00\\xff", "items": [True, None]}
+        value = {"count": 3, "payload": b"\x00\xff", "items": [True, None]}
 
         async def exercise() -> object:
             await self.storage.put("state", value)
@@ -107,9 +107,20 @@ class WorkerSurfaceTests(unittest.TestCase):
 
         self.assertEqual(asyncio.run(exercise()), value)
         first = self.storage_imports.values["state"]
+        self.assertEqual(
+            first,
+            b'{"t":"object","v":[["count",{"t":"int","v":"3"}],'
+            b'["items",{"t":"array","v":[{"t":"bool","v":true},{"t":"null"}]}],'
+            b'["payload",{"t":"bytes","v":"AP8="}]]}',
+        )
         asyncio.run(self.storage.put("state", value))
         self.assertEqual(self.storage_imports.values["state"], first)
-        self.assertEqual(hashlib.sha256(first).hexdigest(), hashlib.sha256(first).hexdigest())
+
+        async def bulk() -> object:
+            await self.storage.put({"a": 1, "b": 2})
+            return await self.storage.get(["a", "b"])
+
+        self.assertEqual(asyncio.run(bulk()), {"a": 1, "b": 2})
 
     def test_storage_list_returns_cloudflare_style_mapping(self) -> None:
         """Storage list exposes keys and decoded values at one snapshot."""
@@ -142,6 +153,7 @@ class WorkerSurfaceTests(unittest.TestCase):
         async def exercise() -> Response:
             identifier = self.env.COUNTER.id_from_name("global")
             self.assertEqual(identifier.to_string(), hashlib.sha256(b"global").hexdigest())
+            self.assertTrue(identifier.equals(self.env.COUNTER.id_from_string(identifier.to_string())))
             return await self.env.COUNTER.get(identifier).fetch(Request("GET", "/"))
 
         response = asyncio.run(exercise())

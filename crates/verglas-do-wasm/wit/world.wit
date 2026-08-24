@@ -7,23 +7,27 @@
 package verglas:do-worker@0.1.0;
 
 interface types {
-  /// One HTTP request delivered to the Worker's fetch handler.
+  /// Identifies one accepted WebSocket held open by the gateway.
+  type websocket-id = u64;
+
+  /// One HTTP request delivered to a Worker or Durable Object fetch handler.
   record request {
     method: string,
     uri: string,
     headers: list<tuple<string, string>>,
     body: list<u8>,
+    /// The gateway's pending upgrade identity, when this request asked for a WebSocket.
+    ws: option<websocket-id>,
   }
 
-  /// The Worker's response to one fetch event.
+  /// The response to one Worker or Durable Object fetch event.
   record response {
     status: u16,
     headers: list<tuple<string, string>>,
     body: list<u8>,
+    /// The pending WebSocket accepted by the guest, when the response completes an upgrade.
+    accept-ws: option<websocket-id>,
   }
-
-  /// Identifies one accepted WebSocket held open by the gateway.
-  type websocket-id = u64;
 
   /// A handler failure. The host maps this onto its event outcome; it never
   /// rolls back the DO's committed state.
@@ -89,6 +93,20 @@ interface sockets {
   attached: func() -> result<list<websocket-id>, handler-error>;
 }
 
+interface worker {
+  use types.{request, response, handler-error};
+
+  /// Handles one stateless Worker-tier HTTP request.
+  fetch: func(request: request) -> result<response, handler-error>;
+}
+
+interface bindings {
+  use types.{request, response, handler-error};
+
+  /// Routes one flattened Durable Object stub fetch through the host.
+  do-fetch: func(binding: string, object: string, request: request) -> result<response, handler-error>;
+}
+
 interface handler {
   use types.{request, response, websocket-id, handler-error};
 
@@ -112,10 +130,12 @@ interface handler {
 // Extension point: later revisions add `wasi:clocks/wall-clock` and a
 // host-bounded outbound `wasi:http` import here. Both are capabilities the
 // host must meter (deterministic replay, egress policy), so they land only
-// with their host-side enforcement — the v0 world is deliberately
-// storage + sockets only.
-world durable-object {
+// with their host-side enforcement. Worker-tier execution deliberately grants
+// no storage or socket capability.
+world service {
   import storage;
   import sockets;
+  import bindings;
+  export worker;
   export handler;
 }

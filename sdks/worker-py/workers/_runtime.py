@@ -625,6 +625,9 @@ def _bind_sql(statement: str, bindings: tuple[Any, ...]) -> str:
     return "".join(output)
 
 
+_MISSING = object()
+
+
 class Storage:
     """Durable Object storage API with deterministic structured values."""
 
@@ -639,16 +642,62 @@ class Storage:
         encoded = _call_host(self._imports.get, key)
         return None if encoded is None else _decode_value(encoded)
 
-    async def get(self, key: str) -> StructuredValue | None:
-        """Read one structured-clone-compatible value from storage."""
+    async def get(
+        self,
+        key: str | list[str],
+        options: Mapping[str, Any] | None = None,
+    ) -> StructuredValue | dict[str, StructuredValue]:
+        """Read one value or a mapping of values from storage."""
+        del options
+        if isinstance(key, list):
+            values: dict[str, StructuredValue] = {}
+            for item in key:
+                if not isinstance(item, str):
+                    raise TypeError("storage.get keys must be strings")
+                encoded = _call_host(self._imports.get, item)
+                if encoded is not None:
+                    values[item] = _decode_value(encoded)
+            return values
+        if not isinstance(key, str):
+            raise TypeError("storage.get key must be a string")
         return self._get_sync(key)
 
-    async def put(self, key: str, value: StructuredValue) -> None:
-        """Stage one deterministically encoded value in the current transaction."""
+    async def put(
+        self,
+        key: str | Mapping[str, StructuredValue],
+        value: StructuredValue | object = _MISSING,
+        options: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Stage one value or a mapping of values in the current transaction."""
+        del options
+        if isinstance(key, Mapping):
+            if value is not _MISSING:
+                raise TypeError("storage.put mapping form accepts no value argument")
+            for entry_key, entry_value in key.items():
+                if not isinstance(entry_key, str):
+                    raise TypeError("storage.put keys must be strings")
+                _call_host(self._imports.put, entry_key, _encode_value(entry_value))
+            return
+        if not isinstance(key, str) or value is _MISSING:
+            raise TypeError("storage.put expects a string key and value")
         _call_host(self._imports.put, key, _encode_value(value))
 
-    async def delete(self, key: str) -> bool:
-        """Stage one key deletion and return whether the key existed."""
+    async def delete(
+        self,
+        key: str | list[str],
+        options: Mapping[str, Any] | None = None,
+    ) -> bool | int:
+        """Delete one key or a list of keys and report deletion count."""
+        del options
+        if isinstance(key, list):
+            deleted = 0
+            for item in key:
+                if not isinstance(item, str):
+                    raise TypeError("storage.delete keys must be strings")
+                deleted += int(bool(_call_host(self._imports.delete, item)))
+            return deleted
+        if not isinstance(key, str):
+            raise TypeError("storage.delete key must be a string")
         return bool(_call_host(self._imports.delete, key))
 
     async def list(
@@ -714,16 +763,39 @@ class Storage:
         _call_host(self._imports.delete_alarm)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class DurableObjectId:
     """A deterministic idFromName result retaining the host routing name."""
 
-    name: str
+    name: str | None
     _hex: str
+
+    def __init__(self, value: str, object_name: str | None = None):
+        """Construct an id from hex or from a named hash result."""
+        if object_name is None:
+            identifier = value
+            name = None
+        else:
+            name = value
+            identifier = object_name
+        if not isinstance(identifier, str) or len(identifier) != 64:
+            raise ValueError("DurableObjectId must be a 64-character hexadecimal string")
+        try:
+            int(identifier, 16)
+        except ValueError as error:
+            raise ValueError("DurableObjectId must be hexadecimal") from error
+        if name is not None and not isinstance(name, str):
+            raise TypeError("DurableObjectId name must be a string")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "_hex", identifier.lower())
 
     def to_string(self) -> str:
         """Return the lowercase SHA-256 id string."""
         return self._hex
+
+    def equals(self, other: object) -> bool:
+        """Compare ids by their canonical hexadecimal identity."""
+        return isinstance(other, DurableObjectId) and self._hex == other._hex
 
     def __str__(self) -> str:
         """Render the deterministic id string."""
@@ -788,11 +860,19 @@ class DurableObjectNamespace:
             raise TypeError("DurableObjectNamespace.id_from_name expects a string")
         return DurableObjectId(name, hashlib.sha256(name.encode("utf-8")).hexdigest())
 
+    def id_from_string(self, identifier: str) -> DurableObjectId:
+        """Construct an id from a validated lowercase or uppercase hex string."""
+        return DurableObjectId(identifier)
+
     def get(self, identifier: DurableObjectId) -> DurableObjectStub:
         """Return a stub for one idFromName result."""
         if not isinstance(identifier, DurableObjectId):
             raise TypeError("DurableObjectNamespace.get expects a DurableObjectId")
-        return DurableObjectStub(self._name, identifier.name, self._imports)
+        return DurableObjectStub(
+            self._name,
+            identifier.name if identifier.name is not None else identifier.to_string(),
+            self._imports,
+        )
 
     def get_by_name(self, name: str) -> DurableObjectStub:
         """Return a stub using the Python spelling of the named-id helper."""

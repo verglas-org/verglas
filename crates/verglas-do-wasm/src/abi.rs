@@ -8,14 +8,17 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use thiserror::Error;
 
-/// Bindings generated from the `verglas:do-worker/durable-object` WIT world.
+/// Bindings generated from the `verglas:do-worker/service` WIT world.
 pub mod bindings {
     wasmtime::component::bindgen!({
         path: "wit",
-        world: "durable-object",
+        world: "service",
         imports: { default: async },
         exports: { default: async },
     });
+
+    /// Compatibility name for the generated service-world instance.
+    pub use self::Service as DurableObject;
 }
 
 /// Generated WIT error record used by imported host interfaces.
@@ -23,6 +26,12 @@ pub type WitHandlerError = bindings::verglas::do_worker::types::HandlerError;
 
 /// Numeric identity of one accepted WebSocket connection.
 pub type SocketId = u64;
+
+/// Request record exchanged by Worker and Durable Object host calls.
+pub type Request = bindings::verglas::do_worker::types::Request;
+
+/// Response record exchanged by Worker and Durable Object host calls.
+pub type Response = bindings::verglas::do_worker::types::Response;
 
 /// Hard host-side limit for a connection attachment.
 pub const MAX_ATTACHMENT_SIZE: usize = 16 * 1024;
@@ -50,6 +59,12 @@ pub enum HostError {
         /// Stable operation name exposed in the WIT error record.
         operation: &'static str,
     },
+    /// Reports that a stateless Worker attempted to use Durable Object storage.
+    #[error("stateless worker has no storage")]
+    StatelessStorage,
+    /// Reports that a stateless Worker attempted to use Durable Object sockets.
+    #[error("stateless worker has no sockets")]
+    StatelessSockets,
 }
 
 impl HostError {
@@ -59,6 +74,18 @@ impl HostError {
             message: message.into(),
         }
     }
+}
+
+/// Object-safe asynchronous Durable Object binding calls granted to one Worker event.
+#[async_trait]
+pub trait WorkerBindings: Send + Sync {
+    /// Routes a flattened stub fetch to the named Durable Object.
+    async fn do_fetch(
+        &self,
+        binding: String,
+        object: String,
+        request: Request,
+    ) -> Result<Response, HostError>;
 }
 
 /// Object-safe asynchronous storage capabilities granted to one Worker event.
@@ -118,16 +145,68 @@ pub struct WorkerHost {
     storage: Arc<dyn WorkerStorage>,
     /// Gateway-held socket capability for the current event.
     sockets: Arc<dyn WorkerSockets>,
+    /// Durable Object binding router for cross-component fetches.
+    bindings: Arc<dyn WorkerBindings>,
 }
 
 impl WorkerHost {
-    /// Creates host state from the capabilities for one Durable Object.
+    /// Creates host state with storage and sockets but no binding router.
     pub fn new(storage: Arc<dyn WorkerStorage>, sockets: Arc<dyn WorkerSockets>) -> Self {
-        Self { storage, sockets }
+        Self {
+            storage,
+            sockets,
+            bindings: Arc::new(UnsupportedBindings),
+        }
+    }
+
+    /// Creates host state with all capabilities for one Durable Object event.
+    pub fn with_bindings(
+        storage: Arc<dyn WorkerStorage>,
+        sockets: Arc<dyn WorkerSockets>,
+        bindings: Arc<dyn WorkerBindings>,
+    ) -> Self {
+        Self {
+            storage,
+            sockets,
+            bindings,
+        }
+    }
+}
+
+/// Binding capability used when a caller has not supplied a router.
+struct UnsupportedBindings;
+
+#[async_trait]
+impl WorkerBindings for UnsupportedBindings {
+    /// Rejects cross-component calls when no router is configured.
+    async fn do_fetch(
+        &self,
+        _binding: String,
+        _object: String,
+        _request: Request,
+    ) -> Result<Response, HostError> {
+        Err(HostError::Unsupported {
+            operation: "Durable Object binding",
+        })
     }
 }
 
 impl bindings::verglas::do_worker::types::Host for WorkerHost {}
+
+impl bindings::verglas::do_worker::bindings::Host for WorkerHost {
+    /// Delegates a flattened Durable Object fetch to the configured router.
+    async fn do_fetch(
+        &mut self,
+        binding: String,
+        object: String,
+        request: Request,
+    ) -> Result<Response, WitHandlerError> {
+        self.bindings
+            .do_fetch(binding, object, request)
+            .await
+            .map_err(to_handler_error)
+    }
+}
 
 /// Checks the hard attachment bound before a value crosses the host boundary.
 fn validate_attachment(value: &[u8]) -> Result<(), HostError> {
@@ -260,4 +339,5 @@ impl bindings::verglas::do_worker::sockets::Host for WorkerHost {
     }
 }
 
-pub use bindings::DurableObject;
+/// Generated service-world instance containing both Worker and handler exports.
+pub use bindings::Service as DurableObject;
