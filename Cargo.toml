@@ -26,6 +26,7 @@ members = [
     "crates/verglas-kv",
     "bins/cache-node",
     "crates/verglas-block",
+    "crates/verglas-do-turso",
     "crates/verglas-do-engine",
     "crates/verglas-celld",
     "crates/verglas-runtime",
@@ -135,6 +136,9 @@ s3s = "0.14.1"
 sync_wrapper = { version = "1.0.2", features = ["futures"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "blocking", "stream", "http2"] }
 rusqlite = { version = "0.38.0", features = ["bundled"] }
+# Turso is the sole Durable Object database. Sync uses ordinary WAL/page pulls;
+# application transactions remain serialized by the DO host.
+turso = { version = "=0.7.2", default-features = false, features = ["sync"] }
 # AWS SigV4 request signing for AWS-backed Iceberg REST catalogs (S3 Tables,
 # Glue) — the watcher signs its own reqwest requests, no signing proxy (#236).
 aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
