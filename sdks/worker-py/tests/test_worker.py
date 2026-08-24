@@ -152,6 +152,7 @@ class WorkerSurfaceTests(unittest.TestCase):
 
         async def exercise() -> Response:
             identifier = self.env.COUNTER.id_from_name("global")
+            self.assertIs(identifier, self.env.COUNTER.id_from_name("global"))
             self.assertEqual(identifier.to_string(), hashlib.sha256(b"global").hexdigest())
             self.assertTrue(identifier.equals(self.env.COUNTER.id_from_string(identifier.to_string())))
             return await self.env.COUNTER.get(identifier).fetch(Request("GET", "/"))

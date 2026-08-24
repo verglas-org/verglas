@@ -553,8 +553,8 @@ class SqlStorage:
 
     def exec(self, statement: str, *bindings: Any) -> SqlCursor:
         """Execute SQL and expose a Cloudflare-style synchronous cursor."""
-        if not isinstance(statement, str):
-            raise TypeError("SQL statement must be a string")
+        if not isinstance(statement, str) or not statement.strip():
+            raise TypeError("SQL statement must be a non-empty string")
         statement = _bind_sql(statement, bindings)
         encoded = _call_host(self._imports.sql_rows, statement)
         if isinstance(encoded, bytes):
@@ -763,7 +763,7 @@ class Storage:
         _call_host(self._imports.delete_alarm)
 
 
-@dataclass(frozen=True, init=False)
+@dataclass(frozen=True, init=False, eq=False)
 class DurableObjectId:
     """A deterministic idFromName result retaining the host routing name."""
 
@@ -797,6 +797,14 @@ class DurableObjectId:
         """Compare ids by their canonical hexadecimal identity."""
         return isinstance(other, DurableObjectId) and self._hex == other._hex
 
+    def __eq__(self, other: object) -> bool:
+        """Compare ids by canonical hex even when one has no source name."""
+        return self.equals(other)
+
+    def __hash__(self) -> int:
+        """Hash ids by canonical hex so named and string ids agree."""
+        return hash(self._hex)
+
     def __str__(self) -> str:
         """Render the deterministic id string."""
         return self._hex
@@ -805,8 +813,15 @@ class DurableObjectId:
 class DurableObjectStub:
     """A flattened Durable Object stub exposing asynchronous ``fetch``."""
 
-    def __init__(self, binding: str, object_name: str, imports: _BindingImports):
+    def __init__(
+        self,
+        binding: str,
+        object_name: str,
+        imports: _BindingImports,
+        identifier: DurableObjectId | None = None,
+    ):
         """Bind one stub to a namespace, object name, and host import."""
+        self.id = identifier
         self._binding = binding
         self._object_name = object_name
         self._imports = imports
@@ -853,12 +868,17 @@ class DurableObjectNamespace:
         """Bind one manifest namespace name to the flattened host import."""
         self._name = name
         self._imports = imports
+        self._ids_by_name: dict[str, DurableObjectId] = {}
 
     def id_from_name(self, name: str) -> DurableObjectId:
         """Hash a UTF-8 name while retaining that name for host routing."""
         if not isinstance(name, str):
             raise TypeError("DurableObjectNamespace.id_from_name expects a string")
-        return DurableObjectId(name, hashlib.sha256(name.encode("utf-8")).hexdigest())
+        if name not in self._ids_by_name:
+            self._ids_by_name[name] = DurableObjectId(
+                name, hashlib.sha256(name.encode("utf-8")).hexdigest()
+            )
+        return self._ids_by_name[name]
 
     def id_from_string(self, identifier: str) -> DurableObjectId:
         """Construct an id from a validated lowercase or uppercase hex string."""
@@ -872,6 +892,7 @@ class DurableObjectNamespace:
             self._name,
             identifier.name if identifier.name is not None else identifier.to_string(),
             self._imports,
+            identifier,
         )
 
     def get_by_name(self, name: str) -> DurableObjectStub:
