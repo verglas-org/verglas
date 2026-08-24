@@ -94,6 +94,7 @@ documented). Nothing is silently faked.
 | `ctx.storage.setAlarm/getAlarm/deleteAlarm` + `alarm()` | target of this milestone | |
 | Hibernatable WebSockets (`acceptWebSocket`, `webSocketMessage/Close`, `WebSocketPair`, 101 responses) | target of this milestone | attachments ≤16 KiB |
 | `ctx.waitUntil` | target of this milestone | executes before event completion in v0 (Divergence) |
+| `ctx.id` inside a DO | Gap | the WIT handler carries no object identity, so `ctx.id` is the zero id; fix is threading the DO id through the handler world (follow-up), not an SDK shim |
 | `setWebSocketAutoResponse` | Gap | gateway-side, planned |
 | JS RPC (`WorkerEntrypoint`, method calls on stubs) | Gap | `stub.fetch` only in v0 |
 | Service bindings | Gap | |

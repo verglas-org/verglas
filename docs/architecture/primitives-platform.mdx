@@ -66,10 +66,23 @@ surfaces and are not a tenant API. Worker behavior remains specified by
 ## 2. Durable Object
 
 A Durable Object is a named Worker class with strictly serialized events. Each
-object owns one embedded Turso database. The local database file is a cache;
-the configured Turso sync authority is the durable state service. An event is
-not successful, and its gated WebSocket effects are not released, until its
-Turso commit reaches the configured durability boundary.
+object owns one embedded Turso database. The local database file is a working
+copy; one remote Turso database per DO is the machine-loss recovery source.
+Verglas pins Turso `0.7.2` in ordinary WAL mode: current MVCC and CDC hooks are
+not required for serialized DO execution, and application publication uses an
+explicit outbox rather than Turso's internal CDC tables. An event is not
+successful, and its gated WebSocket effects are not released, until the local
+transaction commits and `push()` confirms the remote sync boundary.
+
+Public Turso sync is local-first, uses last-push-wins conflict handling, and
+carries no Verglas lease generation. Therefore exactly one lease owner may open
+or push a DO database. The cloud provisions a distinct remote URL/token for
+each DO, and its sync ingress validates the current placement lease before
+forwarding a push. A takeover revokes the prior writer before the new owner
+pulls and serves events. This is a fencing/authentication wrapper around Turso,
+not a second SQL commit or storage engine. The complete Turso sidecar set is
+kept together on local NVMe; copying a local directory between DO identities is
+forbidden because it also copies the persisted sync-client identity.
 
 Reserved Turso tables implement byte KV, the single alarm, WebSocket
 attachments, event sequencing, and the optional Stream outbox. Tenant SQL uses
