@@ -1,0 +1,26 @@
+{
+  "name": "verglas-pipeline",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "PIPELINE_DO", "class_name": "Pipeline" },
+      { "name": "STREAM", "class_name": "Pipeline" },
+      { "name": "SINK_A", "class_name": "Pipeline" },
+      { "name": "SINK_B", "class_name": "Pipeline" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Pipeline"] }
+  ],
+  "vars": {
+    "PIPELINE_ID": "orders",
+    "PIPELINE_SQL": "INSERT INTO primary_sink SELECT * FROM events;",
+    "PIPELINE_SOURCE_BINDING": "STREAM",
+    "PIPELINE_SOURCE_NAME": "events",
+    "PIPELINE_SINK_BINDINGS": { "primary_sink": "SINK_A" },
+    "PIPELINE_BATCH_MAX_ROWS": 1000,
+    "PIPELINE_BATCH_MAX_BYTES": 1048576,
+    "PIPELINE_BATCH_MAX_SECONDS": 10
+  }
+}
