@@ -35,6 +35,52 @@ fn accepts_wrangler_jsonc_subset() {
     assert_eq!(manifest.component_digest(), DIGEST);
 }
 
+/// Parses the strict managed CAS launch object and preserves its fences.
+#[test]
+fn accepts_managed_cas_launch_parameters() {
+    let source = format!(
+        r#"{{
+            "name": "counter",
+            "main": "src/index.ts",
+            "durable_objects": {{"bindings": []}},
+            "component_digest": "{DIGEST}",
+            "component_dir": "./components",
+            "data_root": "./state",
+            "managed_cas": {{
+                "endpoint": "http://127.0.0.1:8333",
+                "bucket": "objects",
+                "prefix": "verglas",
+                "region": "us-east-1",
+                "access_key_id": "access",
+                "secret_access_key": "secret",
+                "lease_token": "opaque token",
+                "lease_generation": 11,
+                "start_sequence": 7,
+                "lease_version": "version-7"
+            }}
+        }}"#
+    );
+    let manifest = Manifest::parse(&source).expect("managed CAS manifest");
+    let cas = manifest.managed_cas().expect("CAS parameters");
+    assert_eq!(cas.endpoint(), "http://127.0.0.1:8333");
+    assert_eq!(cas.lease_generation(), 11);
+    assert_eq!(cas.start_sequence(), 7);
+    assert_eq!(cas.lease_etag(), None);
+    assert_eq!(cas.lease_version(), Some("version-7"));
+}
+
+/// Rejects a managed CAS object without an ETag or version fence.
+#[test]
+fn rejects_managed_cas_without_fence() {
+    let source = format!(
+        r#"{{"name":"counter","main":"src/index.ts","durable_objects":{{"bindings":[]}},"component_digest":"{DIGEST}","component_dir":"components","data_root":"state","managed_cas":{{"endpoint":"http://cas","bucket":"objects","prefix":"verglas","region":"us-east-1","access_key_id":"access","secret_access_key":"secret","lease_token":"token","lease_generation":1,"start_sequence":0}}}}"#
+    );
+    assert!(matches!(
+        Manifest::parse(&source),
+        Err(ManifestError::MissingCasFence)
+    ));
+}
+
 /// Accepts both supported manifest filename extensions when reading files.
 #[test]
 fn accepts_json_and_jsonc_paths() -> Result<(), Box<dyn std::error::Error>> {

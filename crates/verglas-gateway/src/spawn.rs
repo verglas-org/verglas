@@ -15,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::error::GatewayError;
+use crate::manifest::ManagedCas;
 
 const EVENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_SOCKET_INITIAL_DELAY: Duration = Duration::from_millis(5);
@@ -29,6 +30,7 @@ pub struct SpawnRequest {
     component_digest: String,
     component_dir: PathBuf,
     data_root: PathBuf,
+    managed_cas: Option<ManagedCas>,
 }
 
 impl SpawnRequest {
@@ -48,7 +50,19 @@ impl SpawnRequest {
             component_digest,
             component_dir,
             data_root,
+            managed_cas: None,
         }
+    }
+
+    /// Selects the managed CAS authority for this Worker launch.
+    pub fn with_managed_cas(mut self, managed_cas: ManagedCas) -> Self {
+        self.managed_cas = Some(managed_cas);
+        self
+    }
+
+    /// Returns the managed CAS authority, when configured.
+    pub fn managed_cas(&self) -> Option<&ManagedCas> {
+        self.managed_cas.as_ref()
     }
 
     /// Returns the celld-safe Durable Object identity.
@@ -181,6 +195,50 @@ impl CelldSpawner {
         Ok(())
     }
 
+    /// Sends the component-bearing worker command with a managed CAS authority.
+    async fn spawn_cas_worker(
+        &self,
+        request: &SpawnRequest,
+        event_socket: &Path,
+    ) -> Result<(), GatewayError> {
+        let cas = request
+            .managed_cas()
+            .ok_or_else(|| GatewayError::SpawnRejected {
+                message: "managed CAS worker launch is missing CAS parameters".to_owned(),
+            })?;
+        let etag = cas
+            .lease_etag()
+            .map(hex::encode)
+            .unwrap_or_else(|| "-".to_owned());
+        let version = cas
+            .lease_version()
+            .map(hex::encode)
+            .unwrap_or_else(|| "-".to_owned());
+        let command = format!(
+            "SPAWN_CAS_WORKER {do_id} 1 {applied} {endpoint} {bucket} {prefix} {region} {access_key_id} {secret_access_key} {lease_token} {generation} {start} {etag} {version} {digest} {component_dir} {event_socket}\n",
+            do_id = request.do_id(),
+            applied = cas.start_sequence(),
+            endpoint = cas.endpoint(),
+            bucket = cas.bucket(),
+            prefix = cas.prefix(),
+            region = cas.region(),
+            access_key_id = cas.access_key_id(),
+            secret_access_key = cas.secret_access_key(),
+            lease_token = hex::encode(cas.lease_token()),
+            generation = cas.lease_generation(),
+            start = cas.start_sequence(),
+            etag = etag,
+            version = version,
+            digest = request.component_digest(),
+            component_dir = request.component_dir().display(),
+            event_socket = event_socket.display(),
+        );
+        let _worker_socket = self
+            .send_control_command(&command, "SPAWN_CAS_WORKER worker")
+            .await?;
+        Ok(())
+    }
+
     /// Sends one line to celld and parses its returned child control socket path.
     async fn send_control_command(
         &self,
@@ -267,10 +325,14 @@ impl DoSpawner for CelldSpawner {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|error| GatewayError::event_io("create event socket directory", error))?;
-        let replica_socket = self.spawn_replica(&request).await?;
-        let start_sequence = self.replica_sequence(&replica_socket).await?;
-        self.spawn_worker(&request, &replica_socket, start_sequence, &event_socket)
-            .await?;
+        if request.managed_cas().is_some() {
+            self.spawn_cas_worker(&request, &event_socket).await?;
+        } else {
+            let replica_socket = self.spawn_replica(&request).await?;
+            let start_sequence = self.replica_sequence(&replica_socket).await?;
+            self.spawn_worker(&request, &replica_socket, start_sequence, &event_socket)
+                .await?;
+        }
         self.wait_for_event_socket(&event_socket).await?;
         Ok(event_socket)
     }

@@ -28,6 +28,79 @@ impl Binding {
     }
 }
 
+/// Managed object-store lease parameters for a CAS-backed Worker.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedCas {
+    endpoint: String,
+    bucket: String,
+    prefix: String,
+    region: String,
+    access_key_id: String,
+    secret_access_key: String,
+    lease_token: String,
+    lease_generation: u64,
+    start_sequence: u64,
+    lease_etag: Option<String>,
+    lease_version: Option<String>,
+}
+
+impl ManagedCas {
+    /// Returns the object-store endpoint used by verglasd.
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// Returns the object-store bucket used by verglasd.
+    pub fn bucket(&self) -> &str {
+        &self.bucket
+    }
+
+    /// Returns the immutable object prefix for this Durable Object.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
+    /// Returns the object-store region.
+    pub fn region(&self) -> &str {
+        &self.region
+    }
+
+    /// Returns the object-store access key.
+    pub fn access_key_id(&self) -> &str {
+        &self.access_key_id
+    }
+
+    /// Returns the object-store secret key.
+    pub fn secret_access_key(&self) -> &str {
+        &self.secret_access_key
+    }
+
+    /// Returns the opaque lease token before control-line hex encoding.
+    pub fn lease_token(&self) -> &str {
+        &self.lease_token
+    }
+
+    /// Returns the monotonic lease generation.
+    pub fn lease_generation(&self) -> u64 {
+        self.lease_generation
+    }
+
+    /// Returns the held applied sequence used for CAS worker recovery.
+    pub fn start_sequence(&self) -> u64 {
+        self.start_sequence
+    }
+
+    /// Returns the optional held ETag fence.
+    pub fn lease_etag(&self) -> Option<&str> {
+        self.lease_etag.as_deref()
+    }
+
+    /// Returns the optional held object-version fence.
+    pub fn lease_version(&self) -> Option<&str> {
+        self.lease_version.as_deref()
+    }
+}
+
 /// The validated subset of a wrangler-style deployment manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
@@ -37,6 +110,7 @@ pub struct Manifest {
     component_digest: String,
     component_dir: PathBuf,
     data_root: PathBuf,
+    managed_cas: Option<ManagedCas>,
 }
 
 impl Manifest {
@@ -103,6 +177,11 @@ impl Manifest {
         &self.data_root
     }
 
+    /// Returns the managed CAS launch parameters, when this deployment uses CAS.
+    pub fn managed_cas(&self) -> Option<&ManagedCas> {
+        self.managed_cas.as_ref()
+    }
+
     /// Builds a validated manifest from a parsed JSON value.
     fn from_value(value: Value) -> Result<Self, ManifestError> {
         let Value::Object(mut object) = value else {
@@ -115,6 +194,7 @@ impl Manifest {
             "component_digest",
             "component_dir",
             "data_root",
+            "managed_cas",
         ]
         .into_iter()
         .collect::<HashSet<_>>();
@@ -142,6 +222,10 @@ impl Manifest {
         if data_root.as_os_str().is_empty() {
             return Err(ManifestError::EmptyField { field: "data_root" });
         }
+        let managed_cas = object
+            .remove("managed_cas")
+            .map(parse_managed_cas)
+            .transpose()?;
         Ok(Self {
             name,
             main,
@@ -149,6 +233,7 @@ impl Manifest {
             component_digest,
             component_dir,
             data_root,
+            managed_cas,
         })
     }
 }
@@ -233,6 +318,15 @@ pub enum ManifestError {
         /// Name repeated by more than one binding.
         name: String,
     },
+    /// A CAS manifest omitted both supported object-store version fences.
+    #[error("managed_cas requires lease_etag or lease_version")]
+    MissingCasFence,
+    /// A managed CAS object contains an unknown key.
+    #[error("unknown managed_cas manifest key: {key}")]
+    UnknownManagedCasKey {
+        /// Key that was not recognized.
+        key: String,
+    },
 }
 
 /// Extracts a required nonempty string from an object.
@@ -270,6 +364,99 @@ fn required_object(
         });
     };
     Ok(value)
+}
+
+/// Extracts one required unsigned integer from a managed CAS object.
+fn required_u64(
+    object: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<u64, ManifestError> {
+    let value = object
+        .remove(field)
+        .ok_or(ManifestError::MissingField { field })?;
+    let Value::Number(value) = value else {
+        return Err(ManifestError::InvalidType {
+            field,
+            expected: "unsigned integer",
+        });
+    };
+    value.as_u64().ok_or(ManifestError::InvalidType {
+        field,
+        expected: "unsigned integer",
+    })
+}
+
+/// Extracts one optional nonempty string from a managed CAS object.
+fn optional_string(
+    object: &mut Map<String, Value>,
+    field: &'static str,
+) -> Result<Option<String>, ManifestError> {
+    let Some(value) = object.remove(field) else {
+        return Ok(None);
+    };
+    let Value::String(value) = value else {
+        return Err(ManifestError::InvalidType {
+            field,
+            expected: "string",
+        });
+    };
+    if value.is_empty() {
+        return Err(ManifestError::EmptyField { field });
+    }
+    Ok(Some(value))
+}
+
+/// Parses one strict managed CAS launch object.
+fn parse_managed_cas(value: Value) -> Result<ManagedCas, ManifestError> {
+    let mut object = match value {
+        Value::Object(object) => object,
+        _ => {
+            return Err(ManifestError::InvalidType {
+                field: "managed_cas",
+                expected: "object",
+            });
+        }
+    };
+    let allowed = [
+        "endpoint",
+        "bucket",
+        "prefix",
+        "region",
+        "access_key_id",
+        "secret_access_key",
+        "lease_token",
+        "lease_generation",
+        "start_sequence",
+        "lease_etag",
+        "lease_version",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed.contains(key.as_str()))
+        .cloned()
+    {
+        return Err(ManifestError::UnknownManagedCasKey { key });
+    }
+    let lease_etag = optional_string(&mut object, "lease_etag")?;
+    let lease_version = optional_string(&mut object, "lease_version")?;
+    if lease_etag.is_none() && lease_version.is_none() {
+        return Err(ManifestError::MissingCasFence);
+    }
+    Ok(ManagedCas {
+        endpoint: required_string(&mut object, "endpoint")?,
+        bucket: required_string(&mut object, "bucket")?,
+        prefix: required_string(&mut object, "prefix")?,
+        region: required_string(&mut object, "region")?,
+        access_key_id: required_string(&mut object, "access_key_id")?,
+        secret_access_key: required_string(&mut object, "secret_access_key")?,
+        lease_token: required_string(&mut object, "lease_token")?,
+        lease_generation: required_u64(&mut object, "lease_generation")?,
+        start_sequence: required_u64(&mut object, "start_sequence")?,
+        lease_etag,
+        lease_version,
+    })
 }
 
 /// Parses the only supported durable-object section.

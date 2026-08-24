@@ -12,5 +12,5 @@ mod spawn;
 
 pub use error::GatewayError;
 pub use gateway::Gateway;
-pub use manifest::{Binding, Manifest, ManifestError};
+pub use manifest::{Binding, ManagedCas, Manifest, ManifestError};
 pub use spawn::{CelldSpawner, DoSpawner, SpawnRequest};

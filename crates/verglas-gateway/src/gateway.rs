@@ -127,6 +127,10 @@ impl Gateway {
             state.manifest.component_dir().to_path_buf(),
             state.data_root.clone(),
         );
+        let request = match state.manifest.managed_cas() {
+            Some(cas) => request.with_managed_cas(cas.clone()),
+            None => request,
+        };
         let event_socket = state.spawner.spawn(request).await?;
         let connection = Arc::new(DoConnection::connect(event_socket).await?);
         connections.insert(key, Arc::clone(&connection));

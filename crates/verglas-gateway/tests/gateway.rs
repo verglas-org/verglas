@@ -12,7 +12,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use verglas_gateway::{Gateway, GatewayError, Manifest};
+use verglas_gateway::{CelldSpawner, DoSpawner, Gateway, GatewayError, Manifest, SpawnRequest};
 
 const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -105,6 +105,83 @@ async fn celld_spawner_sends_exact_commands_and_retries_event_bind()
     event_task.await??;
     server.abort();
     let _ = server.await;
+    Ok(())
+}
+
+/// Sends the exact managed-CAS component worker command without a replica spawn.
+#[tokio::test]
+async fn celld_spawner_sends_exact_managed_cas_command()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let directory = tempfile::tempdir()?;
+    let data_root = directory.path().join("state");
+    let control_path = directory.path().join("celld.sock");
+    let event_path = data_root.join("COUNTER--alice").join("events.sock");
+    let worker_path = directory.path().join("worker.sock");
+    let control_event_path = event_path.clone();
+    let control_listener = UnixListener::bind(&control_path)?;
+    let control_task = tokio::spawn(async move {
+        let (stream, _) = control_listener.accept().await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+        let command = lines
+            .next_line()
+            .await?
+            .ok_or("missing CAS worker command")?;
+        assert_eq!(
+            command,
+            format!(
+                "SPAWN_CAS_WORKER COUNTER--alice 1 7 http://127.0.0.1:8333 objects verglas us-east-1 access secret {} 11 7 {} - {DIGEST} components {}",
+                hex::encode("opaque token"),
+                hex::encode("etag-7"),
+                control_event_path.display()
+            )
+        );
+        write_half
+            .write_all(format!("OK {}\n", worker_path.display()).as_bytes())
+            .await?;
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    });
+    let event_path_for_task = event_path.clone();
+    let event_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        let parent = event_path_for_task.parent().ok_or("event parent")?;
+        tokio::fs::create_dir_all(parent).await?;
+        let listener = UnixListener::bind(&event_path_for_task)?;
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        drop(listener);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    });
+    let manifest = Manifest::parse(&format!(
+        r#"{{
+            "name": "counter", "main": "worker.js",
+            "durable_objects": {{"bindings": [{{"name": "COUNTER", "class_name": "Counter"}}]}},
+            "component_digest": "{DIGEST}", "component_dir": "components", "data_root": "state",
+            "managed_cas": {{
+                "endpoint": "http://127.0.0.1:8333", "bucket": "objects", "prefix": "verglas",
+                "region": "us-east-1", "access_key_id": "access", "secret_access_key": "secret",
+                "lease_token": "opaque token", "lease_generation": 11, "start_sequence": 7,
+                "lease_etag": "etag-7"
+            }}
+        }}"#
+    ))?;
+    let cas = manifest
+        .managed_cas()
+        .cloned()
+        .ok_or("missing CAS config")?;
+    let request = SpawnRequest::new(
+        "COUNTER--alice".to_owned(),
+        "COUNTER".to_owned(),
+        "alice".to_owned(),
+        DIGEST.to_owned(),
+        PathBuf::from("components"),
+        data_root,
+    )
+    .with_managed_cas(cas);
+    let spawner = CelldSpawner::new(control_path);
+    let returned_event = spawner.spawn(request).await?;
+    assert_eq!(returned_event, event_path);
+    control_task.await??;
+    event_task.await??;
     Ok(())
 }
 
