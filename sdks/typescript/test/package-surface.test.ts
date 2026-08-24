@@ -16,12 +16,47 @@ function sourceFiles(directory: string): string[] {
 
 const sourceText = sourceFiles(sourceRoot).map((path) => readFileSync(path, "utf8")).join("\n");
 
+const packageJson = JSON.parse(readFileSync(resolve(packageRoot, "package.json"), "utf8")) as {
+  exports: Record<string, unknown>;
+  scripts: Record<string, string>;
+};
+const readmeSource = readFileSync(resolve(packageRoot, "README.md"), "utf8");
 const forbiddenFiles = [
   ["arrow", "ipc.ts"].join("-"),
   ["do", "protocol.ts"].join("-"),
   "durable-objects.ts",
+  "control.ts",
+  "contracts.ts",
+  "subprocess/endpoint-run.ts",
+  "examples/index.ts",
+  "examples/http-poll-worker.ts",
+  "examples/webhook-worker.ts",
+  "examples/change-fanout-worker.ts",
 ];
-const forbiddenExports = ["DurableObject", "StorageBridge", "createWorkerRuntime"];
+const forbiddenTests = ["control.test.ts", "endpoint-run.test.ts", "examples.test.ts"];
+const forbiddenExports = [
+  "DurableObject",
+  "StorageBridge",
+  "createWorkerRuntime",
+  "connectScheduler",
+  "extractWorkerSource",
+  "VerglasSchedulerClient",
+  "ControlConnectOptions",
+  "WorkerRow",
+  "WorkerSpec",
+  "defineWorker",
+  "runWorker",
+  "WorkerContext",
+  "WorkerHandler",
+  "WorkerDefinition",
+  "WorkerResult",
+  "RunWorkerOptions",
+  "CloudEvent",
+  "TriggerSpec",
+  "CronTriggerSpec",
+  "WebhookTriggerSpec",
+  "EventTriggerSpec",
+];
 const indexTokens = new Set(indexSource.split(/[^A-Za-z0-9_$]+/u).filter(Boolean));
 
 const forbiddenProtocolWords = [
@@ -34,6 +69,18 @@ const forbiddenProtocolWords = [
 describe("SDK package surface", () => {
   it("does not retain the deleted custom Durable Object modules", () => {
     for (const file of forbiddenFiles) expect(existsSync(resolve(sourceRoot, file))).toBe(false);
+    for (const file of forbiddenTests) expect(existsSync(resolve(packageRoot, "test", file))).toBe(false);
+  });
+
+  it("does not publish the retired scheduler or job-worker surface", () => {
+    for (const name of forbiddenExports) expect(indexTokens.has(name)).toBe(false);
+    expect(packageJson.exports).not.toHaveProperty("./control");
+    expect(packageJson.exports).not.toHaveProperty("./examples");
+    expect(packageJson.scripts.build).not.toContain("entry.control");
+    expect(packageJson.scripts.build).not.toContain("entry.examples");
+    for (const text of ["defineWorker", "connectScheduler", "endpoint-run.ts", "/v0/workers"]) {
+      expect(readmeSource).not.toContain(text);
+    }
   });
 
   it("does not export or mention the deleted custom protocol", () => {

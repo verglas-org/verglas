@@ -1,17 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { connect, type VerglasClient } from "../src/index";
 import {
-  connect,
-  defineWorker,
-  runWorker,
-  type CloudEvent,
-  type WorkerContext,
-  type VerglasClient,
-} from "../src/index";
-import {
+  errorMessage,
+  inferPlacement,
+  isLogsTable,
   logsCharting,
   logsTableName,
+  newRunId,
   observabilityFor,
-  type LogRow,
+  RunLogger,
 } from "../src/logging";
 import { startMockEndpoint, type MockEndpoint } from "./mock-endpoint";
 
@@ -24,202 +21,97 @@ beforeEach(async () => {
 });
 afterEach(() => endpoint.close());
 
-const CRON: CloudEvent = {
-  specversion: "1.0",
-  id: "tick-1",
-  source: "urn:verglas:scheduler:test",
-  type: "org.verglas.schedule.tick",
-  data: {
-    logicalDate: "2026-08-01T00:05:00Z",
-    intervalStart: "2026-08-01T00:00:00Z",
-    intervalEnd: "2026-08-01T00:05:00Z",
-  },
-};
+const NOW = 1_770_000_000_000;
 
-/** A minimal WorkerContext; log is a no-op (the runner installs its own logger). */
-function ctx(output = "app.points", c: VerglasClient = client): WorkerContext {
-  return { verglas: c, client: c, trigger: CRON, output, outputs: [output], env: {}, log: () => {} };
-}
-
-/** The log rows written to `<name>_LOGS`, typed. */
-function logRows(name: string): LogRow[] {
-  return endpoint.tableState(logsTableName(name)).rows.map((r) => r.row as LogRow);
-}
-
-const NOW = 1_770_000_000_000; // fixed clock (ms) so ts/day are deterministic
-
-describe("automatic worker logging", () => {
-  it("emits run_start, a commit per append, and run_end with the standard shape", async () => {
-    const worker = defineWorker(async (c: WorkerContext) => {
-      await c.client.table(c.output).append([{ n: 1 }, { n: 2 }]);
-      return { rowsWritten: 2 };
-    });
-
-    const result = await runWorker(worker, ctx(), { now: () => NOW });
-    expect(result?.rowsWritten).toBe(2);
-
-    const rows = logRows("app.points");
-    expect(rows.map((r) => r.event)).toEqual(["run_start", "commit", "run_end"]);
-
-    // Standard shape / values.
-    const start = rows[0];
-    expect(start).toMatchObject({ pipeline: "app.points", kind: "worker", placement: "local", level: "info" });
-    expect(start.run_id).toMatch(/.+/);
-    expect(start.ts).toBe(`${NOW}000000`);
-    expect(start.day).toBe(new Date(NOW).toISOString().slice(0, 10));
-
-    const commit = rows.find((r) => r.event === "commit")!;
-    expect(commit).toMatchObject({ rows: 2, watermark: "2", level: "info" });
-
-    const end = rows.find((r) => r.event === "run_end")!;
-    expect(end).toMatchObject({ rows: 2, level: "info" });
-
-    // Every row shares one run_id.
-    expect(new Set(rows.map((r) => r.run_id)).size).toBe(1);
+describe("logging primitives", () => {
+  it("names and identifies log tables", () => {
+    expect(logsTableName("app.points")).toBe("app.points_LOGS");
+    expect(isLogsTable("app.points_LOGS")).toBe(true);
+    expect(isLogsTable("app.points")).toBe(false);
   });
 
-  it("records an author's own ctx.log steps alongside the automatic ones", async () => {
-    const worker = defineWorker(async (c: WorkerContext) => {
-      c.log("fetch", { rows: 3, message: "pulled upstream" });
-      await c.client.table(c.output).append([{ n: 1 }]);
-      return { rowsWritten: 1 };
-    });
-    await runWorker(worker, ctx(), { now: () => NOW });
-    const rows = logRows("app.points");
-    const fetch = rows.find((r) => r.event === "fetch")!;
-    expect(fetch).toMatchObject({ rows: 3, message: "pulled upstream", kind: "worker" });
+  it("generates run IDs and classifies endpoint placement", () => {
+    expect(newRunId()).toMatch(/^run-|^[0-9a-f-]{36}$/);
+    expect(inferPlacement("http://127.0.0.1:8334")).toBe("local");
+    expect(inferPlacement("https://api.example.test")).toBe("remote");
   });
 
-  it("drops non-standard ctx.log fields so a stray secret cannot land in logs", async () => {
-    const worker = defineWorker((c: WorkerContext) => {
-      // e.g. a URL carrying an API key — must not be recorded.
-      c.log("fetch", { url: "https://x/?api_key=secret", rows: 1 } as Record<string, unknown>);
-      return { rowsWritten: 0 };
-    });
-    await runWorker(worker, ctx(), { now: () => NOW });
-    const rows = logRows("app.points");
-    const fetch = rows.find((r) => r.event === "fetch")!;
-    expect(fetch.rows).toBe(1);
-    expect(JSON.stringify(fetch)).not.toContain("secret");
-    expect("url" in fetch).toBe(false);
-  });
-});
-
-describe("error runs", () => {
-  it("logs an error row and a failed run_end, and still surfaces the error", async () => {
-    const worker = defineWorker(() => {
-      throw new Error("upstream down");
-    });
-
-    await expect(runWorker(worker, ctx(), { now: () => NOW })).rejects.toThrow("upstream down");
-
-    const rows = logRows("app.points");
-    const err = rows.find((r) => r.event === "error")!;
-    expect(err).toMatchObject({ level: "error", error: "upstream down" });
-    const end = rows.find((r) => r.event === "run_end")!;
-    expect(end.level).toBe("error");
-    expect(end.error).toBe("upstream down");
+  it("converts thrown values into safe messages", () => {
+    expect(errorMessage(new Error("failed"))).toBe("failed");
+    expect(errorMessage("failed")).toBe("failed");
+    expect(errorMessage({ code: 7 })).toBe('{"code":7}');
   });
 
-  it("never fails the run when writing logs fails (best-effort)", async () => {
+  it("buffers standard rows and flushes them through the catalog client", async () => {
+    const logger = new RunLogger({
+      pipeline: "app.points",
+      kind: "worker",
+      placement: "local",
+      runId: "run-fixed",
+      now: () => NOW,
+    });
+    logger.log("step", { rows: 2, message: "loaded" });
+    expect(logger.pending).toBe(1);
+
+    await logger.flush(client);
+
+    expect(logger.pending).toBe(0);
+    const rows = endpoint.tableState("app.points_LOGS").rows.map((entry) => entry.row);
+    expect(rows).toEqual([
+      expect.objectContaining({
+        pipeline: "app.points",
+        run_id: "run-fixed",
+        event: "step",
+        rows: 2,
+        message: "loaded",
+      }),
+    ]);
+  });
+
+  it("keeps log writes best-effort when the catalog append fails", async () => {
     const warnings: unknown[] = [];
-    // A client whose logs-table commit throws; the worker append still works.
-    const flaky = connect({
+    const logger = new RunLogger({
+      pipeline: "app.points",
+      kind: "worker",
+      placement: "local",
+      warn: (...args) => warnings.push(args),
+      now: () => NOW,
+    });
+    logger.log("step");
+    const broken = connect({
       endpoint: endpoint.url,
       token: endpoint.token,
-      fetch: async (input, init) => {
-        const url = String(input);
-        if (url.includes(encodeURIComponent(logsTableName("app.points")))) {
-          throw new Error("logs endpoint unreachable");
-        }
-        return globalThis.fetch(input as string, init);
+      fetch: async () => {
+        throw new Error("catalog unavailable");
       },
     });
-    (globalThis as { console: Console }).console.warn = (...a: unknown[]) => warnings.push(a);
 
-    const worker = defineWorker(async (c: WorkerContext) => {
-      await c.client.table(c.output).append([{ n: 1 }]);
-      return { rowsWritten: 1 };
-    });
-    const result = await runWorker(worker, ctx("app.points", flaky), { now: () => NOW });
-    expect(result?.rowsWritten).toBe(1); // run succeeded despite logging failure
-    expect(warnings.length).toBeGreaterThan(0); // failure was reported, not thrown
+    await expect(logger.flush(broken)).resolves.toBeUndefined();
+    expect(warnings).toHaveLength(1);
   });
 });
 
-describe("batching + idempotency", () => {
-  it("writes all log rows for a run in a single commit to <name>_LOGS", async () => {
-    const worker = defineWorker(async (c: WorkerContext) => {
-      await c.client.table(c.output).append([{ n: 1 }]);
-      await c.client.table(c.output).append([{ n: 2 }]);
-      return { rowsWritten: 2 };
-    });
-    await runWorker(worker, ctx(), { now: () => NOW });
-
-    // Two commits + run_start + run_end = 4 rows, but exactly ONE commit to LOGS.
-    const logsCommits = endpoint.requests.filter(
-      (r) => r.method === "POST" && r.path.includes(encodeURIComponent(logsTableName("app.points"))),
-    );
-    expect(logsCommits).toHaveLength(1);
-    expect(logRows("app.points").length).toBe(4); // run_start, commit, commit, run_end
-  });
-
-  it("does not double-log when a run is retried under the same run id", async () => {
-    const worker = defineWorker(async (c: WorkerContext) => {
-      await c.client.table(c.output).append([{ n: 1 }]);
-      return { rowsWritten: 1 };
-    });
-    await runWorker(worker, ctx(), { now: () => NOW, runId: "run-fixed" });
-    await runWorker(worker, ctx(), { now: () => NOW, runId: "run-fixed" }); // retry
-
-    // The logs commit is idempotency-keyed by run id, so the second flush is a
-    // no-op: the logs table holds one run's worth of rows, not two.
-    const rows = logRows("app.points");
-    expect(new Set(rows.map((r) => r.run_id))).toEqual(new Set(["run-fixed"]));
-    expect(rows.filter((r) => r.event === "run_start")).toHaveLength(1);
-  });
-});
-
-describe("deployment name vs output table", () => {
-  it("stamps the deployment name in the pipeline column, logs to <output>_LOGS", async () => {
-    // A deployment named `alpha` writing to a shared output `app.points`. The logs
-    // TABLE follows the output; the `pipeline` COLUMN carries the deployment name.
-    const worker = defineWorker({
-      name: "alpha",
-      handler: async (c: WorkerContext) => {
-        await c.client.table(c.output).append([{ n: 1 }]);
-        return { rowsWritten: 1 };
-      },
-    });
-    await runWorker(worker, ctx(), { now: () => NOW });
-
-    const targetLogs = logRows("app.points");
-    expect(targetLogs.length).toBeGreaterThan(0);
-    expect(new Set(targetLogs.map((l) => l.pipeline))).toEqual(new Set(["alpha"]));
-    // Nothing was logged to a name-derived table.
-    expect(logRows("alpha")).toHaveLength(0);
-  });
-});
-
-describe("automatic charting", () => {
-  it("declares the standard chart spec over <name>_LOGS", () => {
+describe("chart declarations", () => {
+  it("declares the standard chart over a logs table", () => {
     const charting = logsCharting("app.points");
-    expect(charting.source).toBe(logsTableName("app.points"));
-    expect(charting.chart.input).toBe(logsTableName("app.points"));
+    expect(charting.source).toBe("app.points_LOGS");
+    expect(charting.chart.input).toBe("app.points_LOGS");
     expect(charting.chart.timeField).toBe("ts");
     expect(charting.chart.dimensions).toEqual(["event", "kind"]);
-    const measureNames = charting.chart.measures.map((m) => m.name);
-    expect(measureNames).toEqual(["runs", "errors", "rows", "duration_p50", "duration_p95", "duration_p99"]);
-    const errors = charting.chart.measures.find((m) => m.name === "errors")!;
-    expect(errors).toMatchObject({ agg: "rate", field: "level", match: "error" });
+    expect(charting.chart.measures.map((measure) => measure.name)).toEqual([
+      "runs",
+      "errors",
+      "rows",
+      "duration_p50",
+      "duration_p95",
+      "duration_p99",
+    ]);
   });
 
-  it("observabilityFor attaches the charting declaration automatically", () => {
-    const obs = observabilityFor("app.points");
-    expect(obs.pipeline).toBe("app.points");
-    expect(obs.logsTable).toBe(logsTableName("app.points"));
-    expect(obs.charting.source).toBe(logsTableName("app.points"));
-    // Retention is the serving runtime's job now, not the SDK's — no field here.
-    expect("retentionDays" in obs).toBe(false);
+  it("builds the deployment observability declaration", () => {
+    const observability = observabilityFor("app.points");
+    expect(observability.pipeline).toBe("app.points");
+    expect(observability.logsTable).toBe("app.points_LOGS");
+    expect(observability.charting.source).toBe("app.points_LOGS");
   });
 });

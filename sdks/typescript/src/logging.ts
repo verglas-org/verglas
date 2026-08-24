@@ -1,11 +1,8 @@
 // Standardized worker logging + observability for the Verglas SDK runtime.
 //
-// Every worker run — local or remote — emits structured run logs to a standard
-// `<name>_LOGS` table with a fixed shape, batched into one commit per run and
-// keyed by the run id so a retry never double-logs. The runner (contracts.ts)
-// drives this automatically; a worker never writes logging code. This module
-// also defines the automatic charting spec attached over each `<name>_LOGS`
-// table.
+// Callers can emit structured run logs to a standard `<name>_LOGS` table with a
+// fixed shape, batch rows into one append, and key a retry by run ID. This module
+// also defines the charting spec attached over each `<name>_LOGS` table.
 //
 // Framework-neutral: nothing here knows about any specific domain. It is generic
 // over any worker and any table.
