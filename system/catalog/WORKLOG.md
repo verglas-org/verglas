@@ -1,0 +1,3 @@
+# Catalog worklog
+
+- #172: Added the prebuilt Catalog Worker and Durable Object with immutable Turso configuration, a bounded Sink commit protocol, canonical payload digests, and replay-safe delivery receipts. REST traffic and commit delivery use one explicitly injected authority binding; the component contains no Iceberg metadata, object-store, or provider-credential implementation. Tests were written first; the initial run failed as expected because `worker.js` did not yet exist, then passed after implementation.
