@@ -28,3 +28,6 @@
 - #0: Matched the documented bulk storage overloads and public DurableObjectId
   helpers (`id_from_string`/`equals`) while keeping the host boundary strictly
   byte-based and deterministic.
+- #0: Hardened the binding and storage shims to match Cloudflare's bulk key
+  overloads and stable DurableObjectId behavior; the exact canonical value bytes
+  remain covered by the mock-host tests.
