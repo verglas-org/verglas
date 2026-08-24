@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
 
@@ -28,19 +29,37 @@ use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, FileNameGenerator, LocationGenerator,
 };
 use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::partitioning::PartitioningWriter;
 use iceberg::writer::partitioning::fanout_writer::FanoutWriter;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, TableCreation, TableIdent};
+use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
+use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 
 use crate::error::{AgentError, Result};
 use crate::ident::ident_to_dotted;
 use crate::ingest;
 use crate::report::{AppendReport, CreateReport};
+
+/// Narrows the non-default writer controls used by the Sink append path.
+///
+/// Ordinary create and append calls leave this empty and retain the existing
+/// random file naming and Parquet defaults. Sink calls provide one deterministic
+/// file name, one validated codec, and identity metadata used to guard a retry
+/// after a data-file write preceded its catalog commit.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AppendWriteOptions {
+    /// The relative data-file name for the first output file.
+    pub(crate) file_name: Option<String>,
+    /// The Parquet codec selected by the owning Sink.
+    pub(crate) compression: Option<Compression>,
+    /// Metadata written into a deterministic Sink data file.
+    pub(crate) file_metadata: Vec<(String, String)>,
+}
 
 /// Creates a table from a source file, then writes the rows as the first
 /// append. `partition_by`, when set, adds an identity partition on that column.
@@ -76,8 +95,14 @@ pub async fn create_table(
 
     // Write the rows as the initial append (a create with no data leaves an
     // empty table, which is still valid).
-    let (records, files, snapshot_id, _) =
-        write_append(catalog, &table, &ingested.batches, &HashMap::new()).await?;
+    let (records, files, snapshot_id, _) = write_append(
+        catalog,
+        &table,
+        &ingested.batches,
+        &HashMap::new(),
+        &AppendWriteOptions::default(),
+    )
+    .await?;
 
     let schema = table
         .metadata()
@@ -108,8 +133,14 @@ pub async fn append(
 ) -> Result<AppendReport> {
     let ingested = ingest::read(source)?;
     let table = catalog.load_table(ident).await?;
-    let (records, files, snapshot_id, _) =
-        write_append(catalog, &table, &ingested.batches, &HashMap::new()).await?;
+    let (records, files, snapshot_id, _) = write_append(
+        catalog,
+        &table,
+        &ingested.batches,
+        &HashMap::new(),
+        &AppendWriteOptions::default(),
+    )
+    .await?;
     Ok(AppendReport {
         table: ident_to_dotted(ident),
         operation: "append".to_owned(),
@@ -136,8 +167,14 @@ pub async fn append_batches(
     snapshot_properties: HashMap<String, String>,
 ) -> Result<AppendReport> {
     let table = catalog.load_table(ident).await?;
-    let (records, files, snapshot_id, _) =
-        write_append(catalog, &table, &batches, &snapshot_properties).await?;
+    let (records, files, snapshot_id, _) = write_append(
+        catalog,
+        &table,
+        &batches,
+        &snapshot_properties,
+        &AppendWriteOptions::default(),
+    )
+    .await?;
     Ok(AppendReport {
         table: ident_to_dotted(ident),
         operation: "append".to_owned(),
@@ -200,6 +237,17 @@ impl TableCache {
         Ok(table)
     }
 
+    /// Reloads the authoritative table and replaces its cache entry.
+    pub(crate) async fn reload(
+        &self,
+        catalog: &dyn Catalog,
+        ident: &TableIdent,
+    ) -> Result<iceberg::table::Table> {
+        let table = catalog.load_table(ident).await?;
+        self.put(ident.clone(), table.clone()).await;
+        Ok(table)
+    }
+
     /// Replaces the cached table for `ident` with the result of a commit —
     /// the new optimistic starting point for the next append.
     async fn put(&self, ident: TableIdent, table: iceberg::table::Table) {
@@ -247,8 +295,39 @@ pub async fn append_batches_from_table(
     snapshot_properties: HashMap<String, String>,
 ) -> Result<AppendReport> {
     let ident = table.identifier().clone();
+    let (records, files, snapshot_id, committed) = write_append(
+        catalog,
+        table,
+        &batches,
+        &snapshot_properties,
+        &AppendWriteOptions::default(),
+    )
+    .await?;
+    cache.put(ident.clone(), committed).await;
+    Ok(AppendReport {
+        table: ident_to_dotted(&ident),
+        operation: "append".to_owned(),
+        records_added: records,
+        data_files_added: files,
+        snapshot_id,
+    })
+}
+
+/// Appends batches through the cached Sink writer controls and refreshes the
+/// cache with the committed table. This is deliberately separate from the
+/// general append API so its deterministic file and codec choices cannot leak
+/// into unrelated create or append calls.
+pub(crate) async fn append_batches_from_table_with_options(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    table: &iceberg::table::Table,
+    batches: Vec<RecordBatch>,
+    snapshot_properties: HashMap<String, String>,
+    options: AppendWriteOptions,
+) -> Result<AppendReport> {
+    let ident = table.identifier().clone();
     let (records, files, snapshot_id, committed) =
-        write_append(catalog, table, &batches, &snapshot_properties).await?;
+        write_append(catalog, table, &batches, &snapshot_properties, &options).await?;
     cache.put(ident.clone(), committed).await;
     Ok(AppendReport {
         table: ident_to_dotted(&ident),
@@ -428,6 +507,7 @@ async fn write_append(
     table: &iceberg::table::Table,
     batches: &[RecordBatch],
     snapshot_properties: &HashMap<String, String>,
+    options: &AppendWriteOptions,
 ) -> Result<(u64, u64, Option<i64>, iceberg::table::Table)> {
     let table_name = ident_to_dotted(table.identifier());
     let iceberg_schema = table.metadata().current_schema();
@@ -441,7 +521,7 @@ async fn write_append(
     let data_files = if row_count == 0 {
         Vec::new()
     } else {
-        write_data_files(table, iceberg_schema, batches).await?
+        write_data_files(table, iceberg_schema, batches, options).await?
     };
     let file_count = data_files.len() as u64;
     let committed = commit_data_files(catalog, table, data_files, snapshot_properties).await?;
@@ -492,6 +572,98 @@ async fn commit_data_files(
     }
 }
 
+/// Generates one exact Sink file name, then deterministic suffixes if a
+/// non-Sink rolling policy ever creates additional files for the same batch.
+#[derive(Clone, Debug)]
+struct FixedFileNameGenerator {
+    file_name: String,
+    counter: Arc<AtomicU64>,
+}
+
+impl FixedFileNameGenerator {
+    /// Creates a generator whose first name is exactly `file_name`.
+    fn new(file_name: String) -> Self {
+        Self {
+            file_name,
+            counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+impl FileNameGenerator for FixedFileNameGenerator {
+    fn generate_file_name(&self) -> String {
+        let count = self.counter.fetch_add(1, Ordering::Relaxed);
+        if count == 0 {
+            return self.file_name.clone();
+        }
+        let stem = self
+            .file_name
+            .strip_suffix(".parquet")
+            .unwrap_or(&self.file_name);
+        format!("{stem}-{count:05}.parquet")
+    }
+}
+
+/// Selects the unchanged random generator for ordinary writes or the fixed
+/// generator for a Sink batch while keeping one concrete rolling-writer type.
+#[derive(Clone, Debug)]
+enum DataFileNameGenerator {
+    /// The existing UUID-prefixed generator used by ordinary appends.
+    Default(DefaultFileNameGenerator),
+    /// The deterministic generator used by a Sink batch.
+    Fixed(FixedFileNameGenerator),
+}
+
+impl FileNameGenerator for DataFileNameGenerator {
+    fn generate_file_name(&self) -> String {
+        match self {
+            Self::Default(generator) => generator.generate_file_name(),
+            Self::Fixed(generator) => generator.generate_file_name(),
+        }
+    }
+}
+
+/// Verifies an orphan deterministic file was produced by the same Sink batch.
+/// A mismatched or unreadable existing file is rejected rather than overwritten;
+/// this keeps a retry safe when a catalog commit was lost after file close.
+async fn ensure_existing_file_matches(
+    table: &iceberg::table::Table,
+    location_gen: &DefaultLocationGenerator,
+    file_name: &str,
+    expected_metadata: &[(String, String)],
+) -> Result<()> {
+    let path = location_gen.generate_location(None, file_name);
+    let input = table.file_io().new_input(&path)?;
+    if !input.exists().await? {
+        return Ok(());
+    }
+    let bytes = input.read().await?;
+    let metadata =
+        ArrowReaderMetadata::load(&bytes, ArrowReaderOptions::default()).map_err(|error| {
+            AgentError::TableApi(format!(
+                "deterministic Sink file `{path}` is not valid Parquet: {error}"
+            ))
+        })?;
+    let actual = metadata
+        .metadata()
+        .file_metadata()
+        .key_value_metadata()
+        .cloned()
+        .unwrap_or_default();
+    for (key, expected) in expected_metadata {
+        let found = actual
+            .iter()
+            .find(|entry| entry.key == key.as_str())
+            .and_then(|entry| entry.value.as_deref());
+        if found != Some(expected.as_str()) {
+            return Err(AgentError::TableApi(format!(
+                "deterministic Sink file `{path}` has a different `{key}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Writes `batches` as one or more Parquet data files under the table's data
 /// location, through the table's configured FileIO. An unpartitioned table
 /// takes the plain data-file writer; a partitioned one takes a fanout writer,
@@ -501,15 +673,36 @@ async fn write_data_files(
     table: &iceberg::table::Table,
     iceberg_schema: &Arc<IcebergSchema>,
     batches: Vec<RecordBatch>,
+    options: &AppendWriteOptions,
 ) -> Result<Vec<DataFile>> {
     let location_gen = DefaultLocationGenerator::new(table.metadata())?;
-    let file_name_gen = DefaultFileNameGenerator::new(
-        format!("verglas-{}", uuid::Uuid::new_v4()),
-        None,
-        DataFileFormat::Parquet,
-    );
-    let parquet_writer =
-        ParquetWriterBuilder::new(WriterProperties::builder().build(), iceberg_schema.clone());
+    if let Some(file_name) = options.file_name.as_deref() {
+        ensure_existing_file_matches(table, &location_gen, file_name, &options.file_metadata)
+            .await?;
+    }
+    let file_name_gen = match options.file_name.as_ref() {
+        Some(file_name) => {
+            DataFileNameGenerator::Fixed(FixedFileNameGenerator::new(file_name.clone()))
+        }
+        None => DataFileNameGenerator::Default(DefaultFileNameGenerator::new(
+            format!("verglas-{}", uuid::Uuid::new_v4()),
+            None,
+            DataFileFormat::Parquet,
+        )),
+    };
+    let mut properties = WriterProperties::builder();
+    if let Some(compression) = options.compression {
+        properties = properties.set_compression(compression);
+    }
+    if !options.file_metadata.is_empty() {
+        let metadata = options
+            .file_metadata
+            .iter()
+            .map(|(key, value)| parquet::file::metadata::KeyValue::new(key.clone(), value.clone()))
+            .collect();
+        properties = properties.set_key_value_metadata(Some(metadata));
+    }
+    let parquet_writer = ParquetWriterBuilder::new(properties.build(), iceberg_schema.clone());
     let rolling = RollingFileWriterBuilder::new_with_default_file_size(
         parquet_writer,
         table.file_io().clone(),

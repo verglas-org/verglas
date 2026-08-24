@@ -14,7 +14,8 @@
 //! ever appends, the delta is exactly the data files present at the tip but not
 //! at the `since` snapshot.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -24,6 +25,7 @@ use iceberg::arrow::{ArrowReaderBuilder, schema_to_arrow_schema};
 use iceberg::scan::FileScanTask;
 use iceberg::table::Table;
 use iceberg::{Catalog, TableIdent};
+use parquet::basic::Compression;
 use serde_json::Value;
 pub use verglas_api::table::{
     ColumnSpec, CommitRequest, CommitResponse, CreateTableResponse, DeltaResponse,
@@ -33,7 +35,8 @@ pub use verglas_api::table::{
 
 use crate::error::{AgentError, Result};
 use crate::ident::ident_to_dotted;
-use crate::write::{self, PartitionField, PartitionTransform, TableCache, append_batches};
+pub use crate::write::TableCache;
+use crate::write::{self, AppendWriteOptions, PartitionField, PartitionTransform, append_batches};
 
 /// The snapshot-summary property that records a commit's idempotency key, so a
 /// replay of the same key is recognised and not written twice.
@@ -42,6 +45,391 @@ const IDEMPOTENCY_KEY_PROP: &str = "verglas.commit.idempotency-key";
 /// The snapshot-summary property that records how many rows a keyed commit wrote,
 /// so a replay can return the original row count without re-reading the data.
 const IDEMPOTENCY_ROWS_PROP: &str = "verglas.commit.rows";
+
+/// The property identifying the Sink that created and owns the table and snapshot.
+pub const SINK_OWNER_PROPERTY: &str = "verglas.sink.owner";
+/// The table property fixing the Sink's Parquet compression configuration.
+pub const SINK_COMPRESSION_PROPERTY: &str = "verglas.sink.compression";
+/// The snapshot property carrying the deterministic Pipeline batch identity.
+pub const SINK_BATCH_ID_PROPERTY: &str = "verglas.sink.batch-id";
+/// The snapshot property carrying the payload digest for a batch.
+pub const SINK_PAYLOAD_DIGEST_PROPERTY: &str = "verglas.sink.payload-digest";
+/// The snapshot property carrying the deterministic data-file identity.
+pub const SINK_FILE_ID_PROPERTY: &str = "verglas.sink.file-id";
+/// The snapshot property carrying the committed row count.
+pub const SINK_ROW_COUNT_PROPERTY: &str = "verglas.sink.row-count";
+/// The codecs accepted by the Iceberg Sink contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkCompression {
+    /// Zstandard compression with the Parquet default level.
+    Zstd,
+    /// Snappy compression.
+    Snappy,
+    /// Gzip compression with the Parquet default level.
+    Gzip,
+    /// LZ4 raw-block compression.
+    Lz4,
+    /// No Parquet compression.
+    Uncompressed,
+}
+
+impl SinkCompression {
+    /// Returns the protocol spelling of this codec.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Zstd => "zstd",
+            Self::Snappy => "snappy",
+            Self::Gzip => "gzip",
+            Self::Lz4 => "lz4",
+            Self::Uncompressed => "uncompressed",
+        }
+    }
+
+    /// Converts the protocol codec into parquet-rs's writer setting.
+    fn parquet(self) -> Compression {
+        match self {
+            Self::Zstd => Compression::ZSTD(Default::default()),
+            Self::Snappy => Compression::SNAPPY,
+            Self::Gzip => Compression::GZIP(Default::default()),
+            Self::Lz4 => Compression::LZ4_RAW,
+            Self::Uncompressed => Compression::UNCOMPRESSED,
+        }
+    }
+}
+
+impl fmt::Display for SinkCompression {
+    /// Renders the lowercase protocol spelling.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for SinkCompression {
+    type Err = String;
+
+    /// Parses one of the five protocol codec spellings.
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "zstd" => Ok(Self::Zstd),
+            "snappy" => Ok(Self::Snappy),
+            "gzip" => Ok(Self::Gzip),
+            "lz4" => Ok(Self::Lz4),
+            "uncompressed" => Ok(Self::Uncompressed),
+            other => Err(format!(
+                "unsupported Sink compression `{other}`; expected zstd, snappy, gzip, lz4, or uncompressed"
+            )),
+        }
+    }
+}
+
+/// Immutable identity and codec configuration for one Iceberg Sink owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkBatchConfig {
+    /// The Sink resource identity and table owner.
+    pub sink_id: String,
+    /// The codec used for every data file this Sink writes.
+    pub compression: SinkCompression,
+}
+
+impl SinkBatchConfig {
+    /// Creates a Sink configuration from an owner and validated codec.
+    pub fn new(sink_id: impl Into<String>, compression: SinkCompression) -> Self {
+        Self {
+            sink_id: sink_id.into(),
+            compression,
+        }
+    }
+}
+
+/// One deterministic Pipeline batch handed to the Sink-owned commit engine.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SinkBatchRequest {
+    /// The deterministic Pipeline batch identity.
+    pub batch_id: String,
+    /// The digest of the complete batch payload.
+    pub payload_digest: String,
+    /// The deterministic data-file identity derived from the batch and Sink.
+    pub file_id: String,
+    /// JSON object rows selected by the Pipeline.
+    pub records: Vec<Value>,
+}
+
+impl SinkBatchRequest {
+    /// Creates a request after deriving its deterministic file identity.
+    pub fn new(
+        batch_id: impl Into<String>,
+        payload_digest: impl Into<String>,
+        sink_id: &str,
+        records: Vec<Value>,
+    ) -> Self {
+        let batch_id = batch_id.into();
+        Self {
+            file_id: deterministic_sink_file_id(sink_id, &batch_id),
+            batch_id,
+            payload_digest: payload_digest.into(),
+            records,
+        }
+    }
+}
+
+/// The receipt returned after a Sink batch is committed or replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SinkCommitReceipt {
+    /// The deterministic Pipeline batch identity.
+    pub batch_id: String,
+    /// The deterministic data-file identity.
+    pub file_id: String,
+    /// The committed Iceberg snapshot id.
+    pub snapshot_id: String,
+    /// Number of rows accepted into the snapshot.
+    pub rows_committed: u64,
+    /// The system Sink receipt spelling for the same accepted row count.
+    pub accepted: u64,
+}
+
+const MAX_SINK_ROWS: usize = 10_000;
+const MAX_SINK_BATCH_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SINK_COLUMNS: usize = 128;
+const MAX_SINK_NAME_BYTES: usize = 128;
+
+/// Returns the deterministic protocol file id for `sink_id` and `batch_id`.
+pub fn deterministic_sink_file_id(sink_id: &str, batch_id: &str) -> String {
+    format!(
+        "verglas/{sink_id}/batch-{}.parquet",
+        sha256_hex(batch_id.as_bytes())
+    )
+}
+
+/// Computes SHA-256 without widening the crate's dependency surface for one
+/// deterministic object name. The implementation follows FIPS 180-4's
+/// 512-bit block schedule and big-endian digest encoding.
+fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a_2f98,
+        0x7137_4491,
+        0xb5c0_fbcf,
+        0xe9b5_dba5,
+        0x3956_c25b,
+        0x59f1_11f1,
+        0x923f_82a4,
+        0xab1c_5ed5,
+        0xd807_aa98,
+        0x1283_5b01,
+        0x2431_85be,
+        0x550c_7dc3,
+        0x72be_5d74,
+        0x80de_b1fe,
+        0x9bdc_06a7,
+        0xc19b_f174,
+        0xe49b_69c1,
+        0xefbe_4786,
+        0x0fc1_9dc6,
+        0x240c_a1cc,
+        0x2de9_2c6f,
+        0x4a74_84aa,
+        0x5cb0_a9dc,
+        0x76f9_88da,
+        0x983e_5152,
+        0xa831_c66d,
+        0xb003_27c8,
+        0xbf59_7fc7,
+        0xc6e0_0bf3,
+        0xd5a7_9147,
+        0x06ca_6351,
+        0x1429_2967,
+        0x27b7_0a85,
+        0x2e1b_2138,
+        0x4d2c_6dfc,
+        0x5338_0d13,
+        0x650a_7354,
+        0x766a_0abb,
+        0x81c2_c92e,
+        0x9272_2c85,
+        0xa2bf_e8a1,
+        0xa81a_664b,
+        0xc24b_8b70,
+        0xc76c_51a3,
+        0xd192_e819,
+        0xd699_0624,
+        0xf40e_3585,
+        0x106a_a070,
+        0x19a4_c116,
+        0x1e37_6c08,
+        0x2748_774c,
+        0x34b0_bcb5,
+        0x391c_0cb3,
+        0x4ed8_aa4a,
+        0x5b9c_ca4f,
+        0x682e_6ff3,
+        0x748f_82ee,
+        0x78a5_636f,
+        0x84c8_7814,
+        0x8cc7_0208,
+        0x90be_fffa,
+        0xa450_6ceb,
+        0xbef9_a3f7,
+        0xc671_78f2,
+    ];
+    let mut message = input.to_vec();
+    let bit_length = (message.len() as u64) * 8;
+    message.push(0x80);
+    while message.len() % 64 != 56 {
+        message.push(0);
+    }
+    message.extend_from_slice(&bit_length.to_be_bytes());
+
+    let mut hash: [u32; 8] = [
+        0x6a09_e667,
+        0xbb67_ae85,
+        0x3c6e_f372,
+        0xa54f_f53a,
+        0x510e_527f,
+        0x9b05_688c,
+        0x1f83_d9ab,
+        0x5be0_cd19,
+    ];
+    for chunk in message.chunks_exact(64) {
+        let mut schedule = [0u32; 64];
+        for (index, word) in schedule[..16].iter_mut().enumerate() {
+            let start = index * 4;
+            *word = u32::from_be_bytes([
+                chunk[start],
+                chunk[start + 1],
+                chunk[start + 2],
+                chunk[start + 3],
+            ]);
+        }
+        for index in 16..64 {
+            let s0 = schedule[index - 15].rotate_right(7)
+                ^ schedule[index - 15].rotate_right(18)
+                ^ (schedule[index - 15] >> 3);
+            let s1 = schedule[index - 2].rotate_right(17)
+                ^ schedule[index - 2].rotate_right(19)
+                ^ (schedule[index - 2] >> 10);
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(s1);
+        }
+        let mut working = hash;
+        for index in 0..64 {
+            let sum1 = working[4].rotate_right(6)
+                ^ working[4].rotate_right(11)
+                ^ working[4].rotate_right(25);
+            let choice = (working[4] & working[5]) ^ ((!working[4]) & working[6]);
+            let temp1 = working[7]
+                .wrapping_add(sum1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(schedule[index]);
+            let sum0 = working[0].rotate_right(2)
+                ^ working[0].rotate_right(13)
+                ^ working[0].rotate_right(22);
+            let majority =
+                (working[0] & working[1]) ^ (working[0] & working[2]) ^ (working[1] & working[2]);
+            let temp2 = sum0.wrapping_add(majority);
+            let previous = working;
+            working = [
+                temp1.wrapping_add(temp2),
+                previous[0],
+                previous[1],
+                previous[2],
+                previous[3].wrapping_add(temp1),
+                previous[4],
+                previous[5],
+                previous[6],
+            ];
+        }
+        for (state, value) in hash.iter_mut().zip(working) {
+            *state = (*state).wrapping_add(value);
+        }
+    }
+
+    let mut output = String::with_capacity(64);
+    for word in hash {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{word:08x}");
+    }
+    output
+}
+
+/// Commits one Pipeline batch through the Sink-owned Iceberg path.
+///
+/// A missing table is created from a bounded top-level JSON-object inference and
+/// stamped with the Sink owner and codec. Existing tables must carry both
+/// properties for this Sink. Batch identity is resolved from snapshot summaries
+/// before any write; a matching identity returns its original receipt, while a
+/// changed digest, file, or configuration is rejected. New rows use the normal
+/// schema-aware JSON-to-Arrow conversion and the existing CAS append path with
+/// only the deterministic file and codec controls supplied by the Sink.
+pub async fn commit_sink_batch(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    ident: &TableIdent,
+    config: &SinkBatchConfig,
+    request: SinkBatchRequest,
+) -> Result<SinkCommitReceipt> {
+    validate_sink_request(config, &request)?;
+    let table = ensure_sink_table(catalog, cache, ident, config, &request.records).await?;
+
+    if let Some(snapshot) = sink_snapshot_for_batch(&table, &request.batch_id) {
+        return sink_replay_receipt(snapshot, config, &request);
+    }
+
+    let table_name = ident_to_dotted(ident);
+    let target = schema_to_arrow_schema(table.metadata().current_schema())?;
+    let batches = rows_to_batches(&request.records, &target, &table_name)?;
+    let row_count: u64 = batches.iter().map(|batch| batch.num_rows() as u64).sum();
+    if row_count == 0 {
+        return Err(AgentError::TableApi(
+            "a Sink batch must contain at least one row".to_owned(),
+        ));
+    }
+
+    let mut snapshot_properties = HashMap::new();
+    snapshot_properties.insert(SINK_BATCH_ID_PROPERTY.to_owned(), request.batch_id.clone());
+    snapshot_properties.insert(
+        SINK_PAYLOAD_DIGEST_PROPERTY.to_owned(),
+        request.payload_digest.clone(),
+    );
+    snapshot_properties.insert(SINK_FILE_ID_PROPERTY.to_owned(), request.file_id.clone());
+    snapshot_properties.insert(SINK_ROW_COUNT_PROPERTY.to_owned(), row_count.to_string());
+    snapshot_properties.insert(SINK_OWNER_PROPERTY.to_owned(), config.sink_id.clone());
+    snapshot_properties.insert(
+        SINK_COMPRESSION_PROPERTY.to_owned(),
+        config.compression.to_string(),
+    );
+
+    let file_metadata = snapshot_properties
+        .iter()
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let options = AppendWriteOptions {
+        file_name: Some(request.file_id.clone()),
+        compression: Some(config.compression.parquet()),
+        file_metadata,
+    };
+    let report = write::append_batches_from_table_with_options(
+        catalog,
+        cache,
+        &table,
+        batches,
+        snapshot_properties,
+        options,
+    )
+    .await?;
+    let snapshot_id = report
+        .snapshot_id
+        .map(|id| id.to_string())
+        .ok_or_else(|| AgentError::TableApi("Sink append did not produce a snapshot".to_owned()))?;
+    Ok(SinkCommitReceipt {
+        batch_id: request.batch_id,
+        file_id: request.file_id,
+        snapshot_id,
+        rows_committed: report.records_added,
+        accepted: report.records_added,
+    })
+}
 
 /// Appends the request's rows to the table and returns the new snapshot as the
 /// watermark. When `idempotency_key` matches a snapshot the table already
@@ -352,6 +740,310 @@ fn parse_transform(name: &str, table: &str, source: &str) -> Result<PartitionTra
             detail: format!("`{other}` is not a supported partition transform"),
         }),
     }
+}
+
+/// Validates the bounded identity and row envelope before touching the catalog.
+fn validate_sink_request(config: &SinkBatchConfig, request: &SinkBatchRequest) -> Result<()> {
+    let sink_id = config.sink_id.trim();
+    if sink_id.is_empty() || sink_id.len() > MAX_SINK_NAME_BYTES || sink_id != config.sink_id {
+        return Err(AgentError::TableApi(
+            "Sink owner must be a non-empty untrimmed name of at most 128 bytes".to_owned(),
+        ));
+    }
+    if sink_id.contains('/') || sink_id.contains('\\') || sink_id == "." || sink_id == ".." {
+        return Err(AgentError::TableApi(
+            "Sink owner must be one path-safe resource name".to_owned(),
+        ));
+    }
+    if request.batch_id.trim().is_empty() {
+        return Err(AgentError::TableApi(
+            "Sink batch_id must be non-empty".to_owned(),
+        ));
+    }
+    if request.payload_digest.trim().is_empty() {
+        return Err(AgentError::TableApi(
+            "Sink payload_digest must be non-empty".to_owned(),
+        ));
+    }
+    if request.records.is_empty() || request.records.len() > MAX_SINK_ROWS {
+        return Err(AgentError::TableApi(format!(
+            "Sink records must contain between 1 and {MAX_SINK_ROWS} rows"
+        )));
+    }
+    if request.records.iter().any(|record| !record.is_object()) {
+        return Err(AgentError::TableApi(
+            "Sink records must contain JSON objects".to_owned(),
+        ));
+    }
+    let encoded = serde_json::to_vec(&request.records)
+        .map_err(|error| AgentError::TableApi(format!("Sink records are not JSON: {error}")))?;
+    if encoded.len() > MAX_SINK_BATCH_BYTES {
+        return Err(AgentError::TableApi(format!(
+            "Sink records exceed the {MAX_SINK_BATCH_BYTES}-byte bound"
+        )));
+    }
+    let expected_file = deterministic_sink_file_id(sink_id, &request.batch_id);
+    if request.file_id != expected_file {
+        return Err(AgentError::TableApi(format!(
+            "file_id `{}` is not the deterministic file for this batch; expected `{expected_file}`",
+            request.file_id
+        )));
+    }
+    Ok(())
+}
+
+/// Ensures a Sink-owned table exists, then validates its immutable properties.
+async fn ensure_sink_table(
+    catalog: &dyn Catalog,
+    cache: &TableCache,
+    ident: &TableIdent,
+    config: &SinkBatchConfig,
+    records: &[Value],
+) -> Result<Table> {
+    let table_missing = match catalog.load_table(ident).await {
+        Ok(_) => false,
+        Err(error)
+            if matches!(
+                error.kind(),
+                iceberg::ErrorKind::TableNotFound | iceberg::ErrorKind::NamespaceNotFound
+            ) =>
+        {
+            true
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if table_missing {
+        let schema = infer_sink_schema(records, &ident_to_dotted(ident))?;
+        let properties = HashMap::from([
+            (SINK_OWNER_PROPERTY.to_owned(), config.sink_id.clone()),
+            (
+                SINK_COMPRESSION_PROPERTY.to_owned(),
+                config.compression.to_string(),
+            ),
+        ]);
+        match write::create_table_with_partitions_and_properties(
+            catalog,
+            ident,
+            &schema,
+            &[],
+            properties,
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(AgentError::Iceberg(error))
+                if error.kind() == iceberg::ErrorKind::TableAlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let table = cache.reload(catalog, ident).await?;
+    let properties = table.metadata().properties();
+    match properties.get(SINK_OWNER_PROPERTY) {
+        Some(owner) if owner == &config.sink_id => {}
+        Some(owner) => {
+            return Err(AgentError::TableApi(format!(
+                "table `{}` is owned by Sink `{owner}`, not `{}`",
+                ident_to_dotted(ident),
+                config.sink_id
+            )));
+        }
+        None => {
+            return Err(AgentError::TableApi(format!(
+                "table `{}` is not owned by a Sink",
+                ident_to_dotted(ident)
+            )));
+        }
+    }
+    if properties.get(SINK_COMPRESSION_PROPERTY) != Some(&config.compression.to_string()) {
+        return Err(AgentError::TableApi(format!(
+            "table `{}` has a different Sink compression configuration",
+            ident_to_dotted(ident)
+        )));
+    }
+    if !table
+        .metadata()
+        .default_partition_spec()
+        .fields()
+        .is_empty()
+    {
+        return Err(AgentError::TableApi(format!(
+            "Sink table `{}` must be unpartitioned",
+            ident_to_dotted(ident)
+        )));
+    }
+    Ok(table)
+}
+
+/// The in-memory state accumulated while inferring one top-level JSON column.
+struct InferredColumn {
+    /// The primitive type observed so far, if any non-null value was present.
+    data_type: Option<DataType>,
+    /// Whether a row omitted or explicitly nulled this column.
+    nullable: bool,
+    /// Number of rows that explicitly carried this column.
+    present_rows: usize,
+}
+
+/// Infers a bounded flat Arrow schema from JSON object rows.
+fn infer_sink_schema(rows: &[Value], table_name: &str) -> Result<Arc<ArrowSchema>> {
+    let mut columns: BTreeMap<String, InferredColumn> = BTreeMap::new();
+    for row in rows {
+        let object = row.as_object().ok_or_else(|| AgentError::SchemaMismatch {
+            table: table_name.to_owned(),
+            column: "<row>".to_owned(),
+            detail: "a Sink row must be a JSON object".to_owned(),
+        })?;
+        if object.is_empty() {
+            return Err(AgentError::SchemaMismatch {
+                table: table_name.to_owned(),
+                column: "<row>".to_owned(),
+                detail: "a Sink row must contain at least one field".to_owned(),
+            });
+        }
+        for (name, value) in object {
+            if name.is_empty() || name.len() > MAX_SINK_NAME_BYTES {
+                return Err(AgentError::SchemaMismatch {
+                    table: table_name.to_owned(),
+                    column: name.clone(),
+                    detail: "column names must be between 1 and 128 bytes".to_owned(),
+                });
+            }
+            if columns.len() == MAX_SINK_COLUMNS && !columns.contains_key(name) {
+                return Err(AgentError::SchemaMismatch {
+                    table: table_name.to_owned(),
+                    column: name.clone(),
+                    detail: format!("Sink schema exceeds the {MAX_SINK_COLUMNS}-column bound"),
+                });
+            }
+            let value_type = sink_value_type(value, table_name, name)?;
+            let column = columns.entry(name.clone()).or_insert(InferredColumn {
+                data_type: None,
+                nullable: false,
+                present_rows: 0,
+            });
+            column.present_rows += 1;
+            if value.is_null() {
+                column.nullable = true;
+            }
+            if let Some(value_type) = value_type {
+                column.data_type = Some(merge_sink_types(
+                    column.data_type.take(),
+                    value_type,
+                    table_name,
+                    name,
+                )?);
+            }
+        }
+    }
+
+    let fields = columns
+        .into_iter()
+        .map(|(name, column)| {
+            let data_type = column.data_type.unwrap_or(DataType::Utf8);
+            let nullable = column.nullable || column.present_rows != rows.len();
+            Field::new(name, data_type, nullable)
+        })
+        .collect::<Vec<_>>();
+    Ok(Arc::new(ArrowSchema::new(fields)))
+}
+
+/// Infers one supported primitive type from a JSON value.
+fn sink_value_type(value: &Value, table_name: &str, column: &str) -> Result<Option<DataType>> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Bool(_) => Ok(Some(DataType::Boolean)),
+        Value::Number(number) if number.is_i64() || number.is_u64() => {
+            if number.is_u64() && number.as_u64().is_some_and(|value| value > i64::MAX as u64) {
+                Ok(Some(DataType::Float64))
+            } else {
+                Ok(Some(DataType::Int64))
+            }
+        }
+        Value::Number(_) => Ok(Some(DataType::Float64)),
+        Value::String(_) => Ok(Some(DataType::Utf8)),
+        Value::Array(_) | Value::Object(_) => Err(AgentError::SchemaMismatch {
+            table: table_name.to_owned(),
+            column: column.to_owned(),
+            detail: "nested arrays and objects are not supported by bounded Sink inference"
+                .to_owned(),
+        }),
+    }
+}
+
+/// Merges two primitive inferences without silently changing their meaning.
+fn merge_sink_types(
+    existing: Option<DataType>,
+    incoming: DataType,
+    table_name: &str,
+    column: &str,
+) -> Result<DataType> {
+    let Some(existing) = existing else {
+        return Ok(incoming);
+    };
+    if existing == incoming {
+        return Ok(existing);
+    }
+    if matches!(
+        (&existing, &incoming),
+        (DataType::Int64, DataType::Float64) | (DataType::Float64, DataType::Int64)
+    ) {
+        return Ok(DataType::Float64);
+    }
+    Err(AgentError::SchemaMismatch {
+        table: table_name.to_owned(),
+        column: column.to_owned(),
+        detail: format!("cannot infer one primitive type from {existing} and {incoming}"),
+    })
+}
+
+/// Returns a previously committed Sink snapshot for `batch_id` and its summary.
+fn sink_snapshot_for_batch(
+    table: &Table,
+    batch_id: &str,
+) -> Option<(i64, HashMap<String, String>)> {
+    table.metadata().snapshots().find_map(|snapshot| {
+        let properties = &snapshot.summary().additional_properties;
+        (properties.get(SINK_BATCH_ID_PROPERTY).map(String::as_str) == Some(batch_id))
+            .then(|| (snapshot.snapshot_id(), properties.clone()))
+    })
+}
+
+/// Validates a replay summary and returns its original receipt.
+fn sink_replay_receipt(
+    (snapshot_id, properties): (i64, HashMap<String, String>),
+    config: &SinkBatchConfig,
+    request: &SinkBatchRequest,
+) -> Result<SinkCommitReceipt> {
+    let expected = [
+        (
+            SINK_PAYLOAD_DIGEST_PROPERTY,
+            request.payload_digest.as_str(),
+        ),
+        (SINK_FILE_ID_PROPERTY, request.file_id.as_str()),
+        (SINK_OWNER_PROPERTY, config.sink_id.as_str()),
+        (SINK_COMPRESSION_PROPERTY, config.compression.as_str()),
+    ];
+    for (key, value) in expected {
+        if properties.get(key).map(String::as_str) != Some(value) {
+            return Err(AgentError::TableApi(format!(
+                "Sink batch `{}` was reused with a different {key}",
+                request.batch_id
+            )));
+        }
+    }
+    let rows_committed = properties
+        .get(SINK_ROW_COUNT_PROPERTY)
+        .ok_or_else(|| AgentError::TableApi("Sink snapshot is missing its row count".to_owned()))?
+        .parse::<u64>()
+        .map_err(|_| AgentError::TableApi("Sink snapshot has an invalid row count".to_owned()))?;
+    Ok(SinkCommitReceipt {
+        batch_id: request.batch_id.clone(),
+        file_id: request.file_id.clone(),
+        snapshot_id: snapshot_id.to_string(),
+        rows_committed,
+        accepted: rows_committed,
+    })
 }
 
 /// Returns the replay result if `key` was already committed, scanning the
