@@ -1,0 +1,26 @@
+{
+  "name": "verglas-sink",
+  "main": "worker.js",
+  "compatibility_date": "2025-01-01",
+  "durable_objects": {
+    "bindings": [
+      { "name": "SINK_DO", "class_name": "Sink" },
+      { "name": "CATALOG", "class_name": "Sink" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Sink"] }
+  ],
+  "vars": {
+    "SINK_ID": "primary",
+    "SINK_TYPE": "iceberg",
+    "SINK_CATALOG_BINDING": "CATALOG",
+    "SINK_CATALOG_OBJECT": "warehouse",
+    "SINK_BUCKET": "lake",
+    "SINK_NAMESPACE": "analytics",
+    "SINK_TABLE": "events",
+    "SINK_COMPRESSION": "zstd",
+    "SINK_ROLL_INTERVAL_SECONDS": 60,
+    "SINK_ROLL_SIZE_BYTES": 5242880
+  }
+}
