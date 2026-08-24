@@ -16,6 +16,10 @@ use verglas_do_engine::{
     ReplicaCommitAuthority, ReplicaEndpoint, ReplicaEndpointRole, SqliteReplicaStore,
     TransactionEnvelope, UnixReplicaSink,
 };
+use verglas_do_wasm::{
+    ArtifactStore, ComponentDigest, CwasmCache, DirArtifactStore, WorkerRuntime,
+};
+use verglas_runtime::EventEndpoint;
 
 struct Config {
     do_id: String,
@@ -36,6 +40,10 @@ struct Config {
     cas_access_key_id: Option<String>,
     cas_secret_access_key: Option<String>,
     offload_dir: Option<PathBuf>,
+    component_digest: Option<ComponentDigest>,
+    component_dir: Option<PathBuf>,
+    cwasm_cache_dir: Option<PathBuf>,
+    event_socket: Option<PathBuf>,
 }
 
 impl Config {
@@ -60,6 +68,10 @@ impl Config {
         let mut cas_access_key_id = None;
         let mut cas_secret_access_key = None;
         let mut offload_dir = None;
+        let mut component_digest = None;
+        let mut component_dir = None;
+        let mut cwasm_cache_dir = None;
+        let mut event_socket = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--do-id" => do_id = Some(next_value(&mut arguments, "--do-id")?),
@@ -133,6 +145,30 @@ impl Config {
                 "--offload-dir" => {
                     offload_dir = Some(PathBuf::from(next_value(&mut arguments, "--offload-dir")?));
                 }
+                "--component-digest" => {
+                    let value = next_value(&mut arguments, "--component-digest")?;
+                    component_digest = Some(
+                        value
+                            .parse::<ComponentDigest>()
+                            .map_err(|error| error.to_string())?,
+                    );
+                }
+                "--component-dir" => {
+                    component_dir = Some(PathBuf::from(next_value(
+                        &mut arguments,
+                        "--component-dir",
+                    )?));
+                }
+                "--cwasm-cache-dir" => {
+                    cwasm_cache_dir = Some(PathBuf::from(next_value(
+                        &mut arguments,
+                        "--cwasm-cache-dir",
+                    )?));
+                }
+                "--event-socket" => {
+                    event_socket =
+                        Some(PathBuf::from(next_value(&mut arguments, "--event-socket")?));
+                }
                 "--help" => return Err(usage().to_owned()),
                 other => return Err(format!("unknown argument {other}\n{}", usage())),
             }
@@ -156,6 +192,10 @@ impl Config {
             cas_access_key_id,
             cas_secret_access_key,
             offload_dir,
+            component_digest,
+            component_dir,
+            cwasm_cache_dir,
+            event_socket,
         };
         let replica_complete = config.replica_socket.is_some();
         let cas_any = config.cas_endpoint.is_some()
@@ -188,6 +228,23 @@ impl Config {
         if config.role != ReplicaEndpointRole::Worker && cas_any {
             return Err("managed CAS configuration requires worker role".to_owned());
         }
+        if config.component_digest.is_some() != config.component_dir.is_some() {
+            return Err(
+                "--component-digest and --component-dir must be supplied together".to_owned(),
+            );
+        }
+        if config.role != ReplicaEndpointRole::Worker && config.component_digest.is_some() {
+            return Err("component arguments require worker role".to_owned());
+        }
+        if config.cwasm_cache_dir.is_some() && config.component_digest.is_none() {
+            return Err("--cwasm-cache-dir requires component arguments".to_owned());
+        }
+        if config.event_socket.is_some() && config.component_digest.is_none() {
+            return Err("--event-socket requires component arguments".to_owned());
+        }
+        if config.event_socket.is_some() && config.role != ReplicaEndpointRole::Worker {
+            return Err("--event-socket requires worker role".to_owned());
+        }
         Ok(config)
     }
 
@@ -216,7 +273,7 @@ fn parse_u64_option(value: String, option: &str) -> Result<u64, String> {
 
 /// Returns the child command line supplied by the host supervisor.
 fn usage() -> &'static str {
-    "usage: verglasd --do-id ID --replica-id N --role worker|replica --socket PATH --data-dir PATH [replica durability or --cas-endpoint URL --cas-bucket BUCKET --cas-prefix PREFIX --cas-region REGION --cas-access-key-id KEY --cas-secret-access-key SECRET --lease-token TOKEN --lease-generation N --start-sequence N (--lease-etag ETAG | --lease-version VERSION)]"
+    "usage: verglasd --do-id ID --replica-id N --role worker|replica --socket PATH --data-dir PATH [replica durability or --cas-endpoint URL --cas-bucket BUCKET --cas-prefix PREFIX --cas-region REGION --cas-access-key-id KEY --cas-secret-access-key SECRET --lease-token TOKEN --lease-generation N --start-sequence N (--lease-etag ETAG | --lease-version VERSION)] [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] [--event-socket PATH]]"
 }
 
 /// One immutable transaction object discovered below a managed DO prefix.
@@ -582,6 +639,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err("invalid verglasd arguments".into());
         }
     };
+    let worker_runtime = match (config.component_digest, config.component_dir.as_ref()) {
+        (Some(digest), Some(component_dir)) => {
+            let artifact_store = DirArtifactStore::new(component_dir);
+            let component_bytes = artifact_store.fetch(digest).await?;
+            let runtime = match config.cwasm_cache_dir.as_ref() {
+                Some(cache_dir) => {
+                    let cache = CwasmCache::new(cache_dir);
+                    WorkerRuntime::load_with_cache(
+                        wasmtime::Config::new(),
+                        Some((&cache, digest)),
+                        &component_bytes,
+                    )?
+                }
+                None => {
+                    WorkerRuntime::load_with_cache(wasmtime::Config::new(), None, &component_bytes)?
+                }
+            };
+            Some(runtime)
+        }
+        (None, None) if config.cwasm_cache_dir.is_none() && config.event_socket.is_none() => None,
+        (None, None) => return Err("validated runtime arguments are incomplete".into()),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err("validated component arguments are incomplete".into());
+        }
+    };
     tokio::fs::create_dir_all(&config.data_dir).await?;
     let declaration_path = (config.role == ReplicaEndpointRole::Worker)
         .then(|| {
@@ -730,9 +812,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
     if let Some(path) = declaration_path {
         endpoint.configure_index_declarations(path).await?;
     }
-    tokio::select! {
-        result = endpoint.run() => result?,
-        signal = tokio::signal::ctrl_c() => signal?,
+    if let Some(event_socket) = config.event_socket {
+        let runtime = worker_runtime
+            .map(Arc::new)
+            .ok_or("event socket requires a loaded Worker component")?;
+        let engine = endpoint
+            .engine()
+            .ok_or("event socket requires a worker engine")?;
+        let mut events = EventEndpoint::bind(event_socket, engine, runtime).await?;
+        tokio::select! {
+            result = endpoint.run() => result?,
+            result = events.run() => result?,
+            signal = tokio::signal::ctrl_c() => signal?,
+        }
+    } else {
+        tokio::select! {
+            result = endpoint.run() => result?,
+            signal = tokio::signal::ctrl_c() => signal?,
+        }
     }
     Ok(())
 }

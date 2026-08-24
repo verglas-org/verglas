@@ -111,6 +111,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
             signal = tokio::signal::ctrl_c() => signal?,
         }
     }
-    server.supervisor_mut().shutdown().await?;
+    server.shutdown().await?;
     Ok(())
 }
