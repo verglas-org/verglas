@@ -44,3 +44,4 @@ Append-only log of changes to this crate, by issue.
 - #171: Applied the same per-platform RlimitResource alias to the test helper's
   getrlimit diagnostics so the worker binary also compiles on Linux.
 - #171: Added a Cloudflare Workers-shaped management router for multipart script uploads, durable-object namespace metadata, deterministic object IDs, and CF response envelopes. The router stores source modules below the celld root and shares the supervisor with the control socket so object creation, route checks, status, and suspension use real worker lifecycle machinery.
+- #0: Unified the replica and managed-CAS worker control shapes, shared celld-host supervision with the management API, and restored orchestrated drain/checkpoint/coverage/clean ordering. Local children now receive hard resource ceilings, with a real helper binary covering the process limits and lifecycle protocol.

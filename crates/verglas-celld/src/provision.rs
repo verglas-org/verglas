@@ -54,7 +54,7 @@ pub type ProvisionFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProvisionError>> + Send + 'a>>;
 
 /// Substrate-owned process or machine handle operations.
-pub trait ProvisionHandle: Send {
+pub trait ProvisionHandle: Send + Sync {
     /// Reaps an exited handle without waiting for a running handle.
     fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProvisionError>;
 
@@ -117,6 +117,48 @@ impl ProvisionedChild {
     }
 }
 
+/// Hard process ceilings applied before a Worker child runs any code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerResourceLimits {
+    memory_bytes: u64,
+    open_files: u64,
+}
+
+impl WorkerResourceLimits {
+    /// Validates and creates one process ceiling configuration.
+    pub fn new(memory_bytes: u64, open_files: u64) -> Result<Self, SupervisorError> {
+        if memory_bytes == 0 || open_files == 0 {
+            return Err(SupervisorError::InvalidDurability(
+                "worker resource limits must be nonzero".to_owned(),
+            ));
+        }
+        Ok(Self {
+            memory_bytes,
+            open_files,
+        })
+    }
+
+    /// Returns the memory ceiling used on platforms with address-space limits.
+    pub fn memory_bytes(&self) -> u64 {
+        self.memory_bytes
+    }
+
+    /// Returns the descriptor ceiling.
+    pub fn open_files(&self) -> u64 {
+        self.open_files
+    }
+}
+
+impl Default for WorkerResourceLimits {
+    /// Returns the prototype's hard default process ceilings.
+    fn default() -> Self {
+        Self {
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+            open_files: 1024,
+        }
+    }
+}
+
 /// Program, paths, role, and held lease identity supplied to a provisioner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionRequest {
@@ -130,6 +172,7 @@ pub struct ProvisionRequest {
     data_dir: PathBuf,
     durability: Option<WorkerDurability>,
     component: Option<WorkerComponent>,
+    resource_limits: WorkerResourceLimits,
 }
 
 /// Tenant component identity and event ingress for one Worker child.
@@ -204,7 +247,19 @@ impl ProvisionRequest {
             data_dir: data_dir.into(),
             durability,
             component: None,
+            resource_limits: WorkerResourceLimits::default(),
         }
+    }
+
+    /// Attaches explicit process ceilings for the local child.
+    pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
+        self.resource_limits = resource_limits;
+        self
+    }
+
+    /// Returns the process ceilings forwarded to the local provisioner.
+    pub fn resource_limits(&self) -> &WorkerResourceLimits {
+        &self.resource_limits
     }
 
     /// Attaches the tenant component identity forwarded to the child.
@@ -284,7 +339,8 @@ impl ProvisionRequest {
             socket_path,
             data_dir,
             spec.durability.clone(),
-        );
+        )
+        .with_resource_limits(spec.resource_limits().clone());
         if let Some(component) = &spec.component {
             request = request.with_component(component.clone());
         }
@@ -341,6 +397,31 @@ pub enum WorkerDurability {
         /// Managed compacted archive root; absent when offload is disabled.
         offload_dir: Option<PathBuf>,
     },
+    /// A managed object-store CAS authority and its already-held head fence.
+    ManagedCas {
+        /// S3-compatible endpoint used for immutable CAS objects.
+        endpoint: String,
+        /// Bucket containing the managed object layout.
+        bucket: String,
+        /// Prefix containing one DO's head, transactions, and checkpoints.
+        prefix: String,
+        /// Signing region for the object-store client.
+        region: String,
+        /// Explicit object-store access key.
+        access_key_id: String,
+        /// Explicit object-store secret key.
+        secret_access_key: String,
+        /// Opaque ownership token.
+        lease_token: String,
+        /// Monotonic ownership generation.
+        generation: u64,
+        /// Sequence the worker must recover before binding.
+        start_sequence: u64,
+        /// Held head ETag, when the store exposes one.
+        lease_etag: Option<String>,
+        /// Held head version, when the store exposes one.
+        lease_version: Option<String>,
+    },
 }
 
 /// Validates one identity before it is used in a host-local path or process argument.
@@ -368,6 +449,7 @@ pub struct ChildSpec {
     applied: u64,
     durability: Option<WorkerDurability>,
     component: Option<WorkerComponent>,
+    resource_limits: WorkerResourceLimits,
 }
 
 impl ChildSpec {
@@ -387,7 +469,19 @@ impl ChildSpec {
             applied,
             durability: None,
             component: None,
+            resource_limits: WorkerResourceLimits::default(),
         })
+    }
+
+    /// Attaches explicit process ceilings for this child.
+    pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
+        self.resource_limits = resource_limits;
+        self
+    }
+
+    /// Returns the process ceilings selected for this child.
+    pub(crate) fn resource_limits(&self) -> &WorkerResourceLimits {
+        &self.resource_limits
     }
 
     /// Gives a paired replica its own host-local pager and supervision slot.
@@ -430,7 +524,17 @@ impl ChildSpec {
                     "replica lease token must be nonempty and start at applied sequence".to_owned(),
                 ));
             }
-            WorkerDurability::Replica { .. } => {}
+            WorkerDurability::ManagedCas {
+                lease_token,
+                start_sequence,
+                ..
+            } if lease_token.is_empty() || *start_sequence != self.applied => {
+                return Err(SupervisorError::InvalidDurability(
+                    "managed CAS lease token must be nonempty and start at applied sequence"
+                        .to_owned(),
+                ));
+            }
+            WorkerDurability::Replica { .. } | WorkerDurability::ManagedCas { .. } => {}
         }
         self.durability = Some(durability);
         Ok(self)
@@ -444,6 +548,11 @@ impl ChildSpec {
     /// Returns the host-local key used for this child process and pager.
     pub(crate) fn supervision_key(&self) -> &str {
         &self.supervision_key
+    }
+
+    /// Returns the configured durability authority, if any.
+    pub(crate) fn durability(&self) -> Option<&WorkerDurability> {
+        self.durability.as_ref()
     }
 
     /// Returns the initial replica role used by lifecycle fencing.
@@ -588,26 +697,67 @@ impl Provisioner for LocalProcessProvisioner {
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
-            if let Some(WorkerDurability::Replica {
-                socket,
-                lease_token,
-                generation,
-                start_sequence,
-                offload_dir,
-            }) = request.durability()
-            {
-                command
-                    .arg("--replica-socket")
-                    .arg(socket)
-                    .arg("--lease-token")
-                    .arg(lease_token)
-                    .arg("--lease-generation")
-                    .arg(generation.to_string())
-                    .arg("--start-sequence")
-                    .arg(start_sequence.to_string());
-                if let Some(offload_dir) = offload_dir {
-                    command.arg("--offload-dir").arg(offload_dir);
+            match request.durability() {
+                Some(WorkerDurability::Replica {
+                    socket,
+                    lease_token,
+                    generation,
+                    start_sequence,
+                    offload_dir,
+                }) => {
+                    command
+                        .arg("--replica-socket")
+                        .arg(socket)
+                        .arg("--lease-token")
+                        .arg(lease_token)
+                        .arg("--lease-generation")
+                        .arg(generation.to_string())
+                        .arg("--start-sequence")
+                        .arg(start_sequence.to_string());
+                    if let Some(offload_dir) = offload_dir {
+                        command.arg("--offload-dir").arg(offload_dir);
+                    }
                 }
+                Some(WorkerDurability::ManagedCas {
+                    endpoint,
+                    bucket,
+                    prefix,
+                    region,
+                    access_key_id,
+                    secret_access_key,
+                    lease_token,
+                    generation,
+                    start_sequence,
+                    lease_etag,
+                    lease_version,
+                }) => {
+                    command
+                        .arg("--cas-endpoint")
+                        .arg(endpoint)
+                        .arg("--cas-bucket")
+                        .arg(bucket)
+                        .arg("--cas-prefix")
+                        .arg(prefix)
+                        .arg("--cas-region")
+                        .arg(region)
+                        .arg("--cas-access-key-id")
+                        .arg(access_key_id)
+                        .arg("--cas-secret-access-key")
+                        .arg(secret_access_key)
+                        .arg("--lease-token")
+                        .arg(lease_token)
+                        .arg("--lease-generation")
+                        .arg(generation.to_string())
+                        .arg("--start-sequence")
+                        .arg(start_sequence.to_string());
+                    if let Some(lease_etag) = lease_etag {
+                        command.arg("--lease-etag").arg(lease_etag);
+                    }
+                    if let Some(lease_version) = lease_version {
+                        command.arg("--lease-version").arg(lease_version);
+                    }
+                }
+                None => {}
             }
             if let Some(component) = request.component() {
                 match tokio::fs::remove_file(component.event_socket()).await {
@@ -622,6 +772,30 @@ impl Provisioner for LocalProcessProvisioner {
                     .arg(component.dir())
                     .arg("--event-socket")
                     .arg(component.event_socket());
+            }
+            let resource_limits = request.resource_limits().clone();
+            // SAFETY: The closure only calls async-signal-safe setrlimit before exec.
+            unsafe {
+                command.pre_exec(move || {
+                    let descriptor_limit = libc::rlimit {
+                        rlim_cur: resource_limits.open_files as libc::rlim_t,
+                        rlim_max: resource_limits.open_files as libc::rlim_t,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_NOFILE, &descriptor_limit) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let memory_limit = libc::rlimit {
+                            rlim_cur: resource_limits.memory_bytes as libc::rlim_t,
+                            rlim_max: resource_limits.memory_bytes as libc::rlim_t,
+                        };
+                        if libc::setrlimit(libc::RLIMIT_AS, &memory_limit) != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
             }
             let process = command.spawn()?;
             let pid = process.id().ok_or_else(|| {

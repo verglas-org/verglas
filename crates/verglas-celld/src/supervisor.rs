@@ -4,12 +4,17 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixStream;
+
 use crate::alarm::{AlarmError, AlarmSchedule};
 use crate::provision::{
     ChildCommand, ChildDescriptor, ChildSpec, LocalProcessProvisioner, ProvisionError,
     ProvisionRequest, ProvisionedChild, Provisioner,
 };
-use crate::{ChildLifecycle, ChildState, HostId, LifecycleError, ReplicaRole, SuspendFence};
+use crate::{
+    ChildLifecycle, ChildState, HostId, LifecycleError, ReplicaRole, SuspendFence, WorkerDurability,
+};
 
 /// One child observed exiting since the previous supervisor poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,6 +215,53 @@ impl HostSupervisor {
         Ok(descriptor)
     }
 
+    /// Drains, checkpoints, covers, cleans, and then stops one Worker replica.
+    pub async fn suspend_orchestrated(&mut self, do_id: &str) -> Result<(), SupervisorError> {
+        let key = self
+            .key_for(do_id, Some(ReplicaRole::Leader))
+            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+        let (worker_path, replica_path, generation, token, applied) = {
+            let managed = self
+                .children
+                .get(&key)
+                .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+            let Some(WorkerDurability::Replica {
+                socket,
+                lease_token,
+                generation,
+                ..
+            }) = managed.spec.durability()
+            else {
+                return Err(SupervisorError::InvalidDurability(
+                    "orchestrated suspend requires replica durability".to_owned(),
+                ));
+            };
+            (
+                managed.descriptor.socket_path().to_path_buf(),
+                socket.clone(),
+                *generation,
+                lease_token.clone(),
+                managed.spec.applied(),
+            )
+        };
+        endpoint_command(&worker_path, "DRAIN").await?;
+        endpoint_command(&worker_path, "CHECKPOINT").await?;
+        let token = hex::encode(token);
+        let identity = hex::encode(do_id);
+        endpoint_command(
+            &replica_path,
+            &format!("REPLICA_COVER {generation} {token} {applied} {applied} {identity}"),
+        )
+        .await?;
+        endpoint_command(
+            &replica_path,
+            &format!("REPLICA_CLEAN {generation} {token} {applied}"),
+        )
+        .await?;
+        self.suspend(do_id, SuspendFence::new(applied, applied, applied))
+            .await
+    }
+
     /// Stops one replica only after archive and checkpoint fences cover applied state.
     pub async fn suspend(
         &mut self,
@@ -406,6 +458,30 @@ impl HostSupervisor {
             .await
             .map_err(SupervisorError::from)?;
         Ok(child)
+    }
+}
+
+/// Sends one lifecycle command and requires an explicit successful response.
+async fn endpoint_command(path: &Path, command: &str) -> Result<(), SupervisorError> {
+    let mut stream = UnixStream::connect(path)
+        .await
+        .map_err(SupervisorError::Io)?;
+    stream
+        .write_all(format!("{command}\n").as_bytes())
+        .await
+        .map_err(SupervisorError::Io)?;
+    let mut response = String::new();
+    BufReader::new(stream)
+        .read_line(&mut response)
+        .await
+        .map_err(SupervisorError::Io)?;
+    if response.starts_with("OK") {
+        Ok(())
+    } else {
+        Err(SupervisorError::InvalidDurability(format!(
+            "endpoint command {command} failed: {}",
+            response.trim()
+        )))
     }
 }
 

@@ -134,7 +134,7 @@ fn report_limits(data_dir: &std::path::Path) -> io::Result<()> {
 }
 
 /// Starts worker and replica Unix endpoints for the orchestration test process.
-fn main() -> io::Result<()> {
+pub fn main() -> io::Result<()> {
     let args = env::args().collect::<Vec<_>>();
     let data_dir = argument(&args, "--data-dir")?;
     if args.iter().any(|argument| argument == "--report-limits") {

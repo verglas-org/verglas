@@ -8,14 +8,16 @@ mod alarm;
 mod control;
 mod fly;
 mod lifecycle;
+mod management;
 mod placement;
 mod provision;
 mod supervisor;
 
 pub use alarm::{AlarmError, AlarmFuture, AlarmSchedule, AlarmWake};
-pub use control::{ControlError, ControlServer};
+pub use control::{ControlError, ControlServer, SharedControlServer};
 pub use fly::{FlyAuthTokenSource, FlyMachineSize, FlyMachinesConfig, FlyMachinesProvisioner};
 pub use lifecycle::{ChildLifecycle, ChildState, LifecycleError, SuspendFence};
+pub use management::ManagementApi;
 pub use placement::{
     DoLoad, GroupPlacement, HostCapacity, HostId, HostLoad, PlacementError, PlacementPlanner,
     ReplicaPlacement, ReplicaRole,
@@ -23,6 +25,6 @@ pub use placement::{
 pub use provision::{
     ChildCommand, ChildDescriptor, ChildSpec, LocalProcessProvisioner, ProvisionError,
     ProvisionFuture, ProvisionHandle, ProvisionRequest, ProvisionedChild, Provisioner,
-    WorkerComponent, WorkerDurability,
+    WorkerComponent, WorkerDurability, WorkerResourceLimits,
 };
 pub use supervisor::{ExitedChild, HostSupervisor, SupervisorError};

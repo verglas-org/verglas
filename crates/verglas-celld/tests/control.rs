@@ -157,6 +157,52 @@ async fn spawn_worker_with_component_passes_component_arguments() {
     server.supervisor_mut().shutdown().await.expect("shutdown");
 }
 
+/// A component-bearing managed CAS command forwards every CAS fence to verglasd.
+#[tokio::test]
+async fn spawn_cas_worker_passes_cas_arguments_and_component() {
+    let root = tempfile::tempdir().expect("cell root");
+    let control_path = root.path().join("celld.sock");
+    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
+    let mut server = ControlServer::bind(&control_path, supervisor)
+        .await
+        .expect("bind control");
+
+    let digest = "cd".repeat(32);
+    let event_socket = root.path().join("agent-cas-events.sock");
+    let command = format!(
+        "SPAWN_CAS_WORKER agent-cas 1 7 http://cas objects verglas us-east-1 access secret 68656c642d746f6b656e 11 7 657461672d37 - {digest} /tmp/components {}",
+        event_socket.display()
+    );
+    let response = request(&mut server, &control_path, &command).await;
+    assert!(response.starts_with("OK "), "spawn failed: {response}");
+
+    let argv = std::fs::read_to_string(root.path().join("agent-cas").join("1").join("argv.txt"))
+        .expect("child argv dump");
+    let lines: Vec<&str> = argv.lines().collect();
+    let flag_value = |flag: &str| -> &str {
+        let index = lines
+            .iter()
+            .position(|line| *line == flag)
+            .unwrap_or_else(|| panic!("missing {flag} in child argv: {argv}"));
+        lines[index + 1]
+    };
+    assert_eq!(flag_value("--cas-endpoint"), "http://cas");
+    assert_eq!(flag_value("--cas-bucket"), "objects");
+    assert_eq!(flag_value("--cas-prefix"), "verglas");
+    assert_eq!(flag_value("--cas-region"), "us-east-1");
+    assert_eq!(flag_value("--cas-access-key-id"), "access");
+    assert_eq!(flag_value("--cas-secret-access-key"), "secret");
+    assert_eq!(flag_value("--lease-token"), "held-token");
+    assert_eq!(flag_value("--lease-etag"), "etag-7");
+    assert_eq!(flag_value("--component-digest"), digest);
+    assert_eq!(
+        flag_value("--event-socket"),
+        event_socket.display().to_string()
+    );
+
+    server.supervisor_mut().shutdown().await.expect("shutdown");
+}
+
 /// A malformed component digest is rejected before any child is spawned.
 #[tokio::test]
 async fn spawn_worker_with_malformed_component_digest_is_rejected() {

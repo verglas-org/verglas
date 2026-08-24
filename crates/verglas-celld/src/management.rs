@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
+use axum::body::Bytes;
 use axum::extract::{Multipart, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -652,12 +653,22 @@ async fn create_named_object(
 async fn create_collection_object(
     State(state): State<Arc<ManagementState>>,
     AxumPath(namespace_id): AxumPath<String>,
-    body: Option<Json<ObjectRequest>>,
+    body: Bytes,
 ) -> Response {
     if let Err(error) = hydrate_records(&state).await {
         return error.into_response();
     }
-    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let request = if body.is_empty() {
+        ObjectRequest::default()
+    } else {
+        match serde_json::from_slice::<ObjectRequest>(&body) {
+            Ok(request) => request,
+            Err(error) => {
+                return ApiError::BadRequest(format!("invalid object request: {error}"))
+                    .into_response();
+            }
+        }
+    };
     let name = match (request.name, request.unique.unwrap_or(false)) {
         (Some(name), _) => name,
         (None, true) | (None, false) => Uuid::new_v4().simple().to_string(),
