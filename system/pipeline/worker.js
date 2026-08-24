@@ -14,6 +14,7 @@ export const MAX_STREAM_READ = 1000;
 export const MAX_BATCH_ROWS = 10_000;
 export const MAX_BATCH_BYTES = 8 * 1024 * 1024;
 export const MAX_BATCH_SECONDS = 24 * 60 * 60;
+export const MAX_UNNEST_ELEMENTS = 10_000;
 export const MAX_READ_RESPONSE_BYTES = 16 * 1024 * 1024;
 
 const CONFIG_TABLE = 'pipeline_config';
@@ -26,7 +27,7 @@ const textDecoder = new TextDecoder('utf-8', { fatal: true });
 const SQL_KEYWORDS = new Set([
   'INSERT', 'INTO', 'SELECT', 'FROM', 'WHERE', 'AS', 'AND', 'OR', 'NOT', 'NULL',
   'TRUE', 'FALSE', 'IS', 'LIKE', 'JOIN', 'GROUP', 'BY', 'ORDER', 'HAVING', 'LIMIT',
-  'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH', 'UNION', 'OVER', 'DISTINCT',
+  'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP', 'WITH', 'RECURSIVE', 'UNION', 'OVER', 'DISTINCT',
 ]);
 const SCALAR_FUNCTIONS = new Set([
   'UPPER', 'LOWER', 'LENGTH', 'TRIM', 'ABS', 'ROUND', 'COALESCE', 'NULLIF', 'CONCAT',
@@ -240,8 +241,9 @@ export default { fetch };
 
 /**
  * Parses and validates the deliberately small Pipeline SQL target. The parser
- * accepts one or more INSERT INTO sink SELECT projection FROM stream WHERE
- * predicate statements and rejects stateful or unknown syntax before serving.
+ * accepts one or more INSERT INTO sink SELECT statements with stateless CTEs,
+ * derived tables, projection, filters, and one top-level UNNEST per SELECT; it
+ * rejects stateful or unknown syntax before serving.
  * @param {string} sql
  * @returns {Array<object>}
  */
@@ -264,11 +266,7 @@ function validateConfiguration(env) {
   const sourceBinding = requiredString(env.PIPELINE_SOURCE_BINDING, 'PIPELINE_SOURCE_BINDING');
   const sourceName = requiredString(env.PIPELINE_SOURCE_NAME, 'PIPELINE_SOURCE_NAME');
   const statements = parsePipelineSql(sql);
-  for (const statement of statements) {
-    if (statement.sourceName !== sourceName) {
-      throw new Error(`SQL source ${statement.sourceName} does not match PIPELINE_SOURCE_NAME ${sourceName}`);
-    }
-  }
+  for (const statement of statements) validateStatementRelations(statement, sourceName);
   const sinkBindings = parseSinkBindings(env.PIPELINE_SINK_BINDINGS);
   for (const statement of statements) {
     if (!Object.hasOwn(sinkBindings, statement.sinkName)) {
@@ -428,7 +426,9 @@ async function readSource(env, config, after) {
 
 /**
  * Converts one bounded source range into per-sink deterministic batches. The
- * byte ceiling is checked against the exact Sink envelope before a row joins.
+ * byte ceiling is checked against the exact Sink envelope before a source row
+ * joins, and output expansion is capped before it can allocate an unbounded
+ * result set.
  * @param {object} config
  * @param {Array<{sequence:number,record:unknown}>} sourceRecords
  * @returns {{firstSequence:number,lastSequence:number,nextAfter:number,sinkBatches:Array<object>,flushNow:boolean}}
@@ -441,14 +441,21 @@ function assembleBatch(config, sourceRecords) {
     const candidate = new Map(outputs);
     let hasOutput = false;
     for (const statement of config.statements) {
-      const result = transformRecord(statement, source.record);
-      if (result === undefined) continue;
+      const results = transformRecord(statement, source.record, config.batchMaxRows, config.batchMaxBytes);
+      if (results.length === 0) continue;
       hasOutput = true;
       const current = candidate.get(statement.sinkName) ?? { records: [], sequences: [] };
       const next = {
-        records: [...current.records, result],
-        sequences: [...current.sequences, source.sequence],
+        records: current.records.concat(results),
+        sequences: current.sequences.concat(results.map(() => source.sequence)),
       };
+      if (next.records.length > config.batchMaxRows) {
+        if (consumed.length === 0) {
+          throw new Error(`UNNEST expansion exceeds PIPELINE_BATCH_MAX_ROWS (${config.batchMaxRows})`);
+        }
+        flushNow = true;
+        break;
+      }
       const envelope = makeSinkBatch(config, statement.sinkName, next);
       if (jsonByteLength(envelope) > config.batchMaxBytes) {
         if (consumed.length === 0) {
@@ -485,17 +492,103 @@ function assembleBatch(config, sourceRecords) {
   };
 }
 
-/** @param {object} statement @param {unknown} record @returns {object|undefined} */
-function transformRecord(statement, record) {
-  const scope = { record, sourceAlias: statement.sourceAlias };
-  if (statement.where && !truthy(evaluateExpression(statement.where, scope))) return undefined;
-  if (statement.projections.length === 1 && statement.projections[0].kind === 'star') {
-    if (record && typeof record === 'object' && !Array.isArray(record)) return cloneJson(record);
-    return { value: cloneJson(record) };
+/**
+ * Evaluates one statement against one Stream record. CTE and derived-table
+ * rows remain ordinary JSON objects, so no state or second storage engine is
+ * introduced by the relational syntax.
+ * @param {object} statement
+ * @param {unknown} record
+ * @param {number} rowBudget
+ * @param {number} byteBudget
+ * @returns {Array<object>}
+ */
+function transformRecord(statement, record, rowBudget, byteBudget) {
+  const cteRows = new Map();
+  for (const query of statement.withQueries) {
+    if (cteRows.has(query.name)) throw new Error(`duplicate CTE name ${query.name}`);
+    cteRows.set(query.name, evaluateSelect(query.select, record, cteRows, rowBudget, byteBudget));
+  }
+  return evaluateSelect(statement.select, record, cteRows, rowBudget, byteBudget);
+}
+
+/**
+ * Evaluates one SELECT relation against one source record. Every relation is
+ * either the configured Stream, a prior CTE, or a derived SELECT; joins are
+ * absent from the AST by construction.
+ * @param {object} select
+ * @param {unknown} sourceRecord
+ * @param {Map<string,Array<object>>} cteRows
+ * @param {number} rowBudget
+ * @param {number} byteBudget
+ * @returns {Array<object>}
+ */
+function evaluateSelect(select, sourceRecord, cteRows, rowBudget, byteBudget) {
+  const localCtes = new Map(cteRows);
+  for (const query of select.withQueries) {
+    if (localCtes.has(query.name)) throw new Error(`duplicate CTE name ${query.name}`);
+    localCtes.set(query.name, evaluateSelect(query.select, sourceRecord, localCtes, rowBudget, byteBudget));
+  }
+  const relationRows = evaluateRelation(select.from, sourceRecord, localCtes, rowBudget, byteBudget);
+  const result = [];
+  let resultBytes = 0;
+  for (const relation of relationRows) {
+    const scope = { record: relation.record, sourceAlias: relation.alias, unnestValues: new Map() };
+    if (select.where && !truthy(evaluateExpression(select.where, scope))) continue;
+    const expansion = select.unnest
+      ? evaluateUnnest(select.unnest, scope, rowBudget)
+      : [undefined];
+    for (const element of expansion) {
+      const rowScope = element === undefined
+        ? scope
+        : { ...scope, unnestValues: new Map([[select.unnest.alias, element]]) };
+      const row = projectRow(select.projections, rowScope, element);
+      resultBytes += jsonByteLength(row);
+      if (resultBytes > byteBudget) throw new Error(`SELECT expansion exceeds PIPELINE_BATCH_MAX_BYTES (${byteBudget})`);
+      result.push(row);
+      if (result.length > rowBudget) throw new Error(`SELECT expansion exceeds PIPELINE_BATCH_MAX_ROWS (${rowBudget})`);
+    }
+  }
+  return result;
+}
+
+/** @param {object} from @param {unknown} sourceRecord @param {Map<string,Array<object>>} cteRows @param {number} rowBudget @param {number} byteBudget @returns {Array<object>} */
+function evaluateRelation(from, sourceRecord, cteRows, rowBudget, byteBudget) {
+  if (from.kind === 'stream') return [{ record: sourceRecord, alias: from.alias }];
+  if (from.kind === 'cte') {
+    const rows = cteRows.get(from.name);
+    if (!rows) throw new Error(`CTE ${from.name} is not available`);
+    if (rows.length > rowBudget) throw new Error(`CTE ${from.name} exceeds PIPELINE_BATCH_MAX_ROWS (${rowBudget})`);
+    return rows.map((record) => ({ record, alias: from.alias }));
+  }
+  if (from.kind === 'subquery') {
+    return evaluateSelect(from.select, sourceRecord, cteRows, rowBudget, byteBudget)
+      .map((record) => ({ record, alias: from.alias }));
+  }
+  throw new Error(`unknown relation kind ${from.kind}`);
+}
+
+/** @param {object} unnest @param {object} scope @param {number} rowBudget @returns {Array<unknown>} */
+function evaluateUnnest(unnest, scope, rowBudget) {
+  const value = evaluateExpression(unnest.expression, scope);
+  if (!Array.isArray(value)) throw new Error('UNNEST requires a JSON array value');
+  if (value.length > MAX_UNNEST_ELEMENTS || value.length > rowBudget) {
+    throw new Error(`UNNEST expansion exceeds the hard limit of ${Math.min(MAX_UNNEST_ELEMENTS, rowBudget)} elements`);
+  }
+  assertJsonValue(value, new WeakSet());
+  return value;
+}
+
+/** @param {Array<object>} projections @param {object} scope @param {unknown} element @returns {object} */
+function projectRow(projections, scope, element) {
+  if (projections.length === 1 && projections[0].kind === 'star') {
+    if (scope.record && typeof scope.record === 'object' && !Array.isArray(scope.record)) return cloneJson(scope.record);
+    return { value: cloneJson(scope.record) };
   }
   const result = {};
-  for (const projection of statement.projections) {
-    const value = evaluateExpression(projection.expression, scope);
+  for (const projection of projections) {
+    const value = projection.expression.kind === 'unnest'
+      ? element
+      : evaluateExpression(projection.expression, scope);
     result[projection.name] = value === undefined ? null : cloneJson(value);
   }
   assertJsonValue(result, new WeakSet());
@@ -696,17 +789,16 @@ function parseStatement(source, index) {
   parser.expectKeyword('INSERT');
   parser.expectKeyword('INTO');
   const sinkName = parser.expectIdentifier('sink name');
-  parser.expectKeyword('SELECT');
-  const projections = parser.parseProjectionList();
-  parser.expectKeyword('FROM');
-  const sourceName = parser.expectIdentifier('stream name');
-  let sourceAlias = sourceName;
-  if (parser.matchKeyword('AS')) sourceAlias = parser.expectIdentifier('stream alias');
-  else if (parser.peek()?.kind === 'identifier' && !parser.peek().keyword) sourceAlias = parser.next().value;
-  let where;
-  if (parser.matchKeyword('WHERE')) where = parser.parseExpression();
+  const withQueries = parser.parseWithClause();
+  const select = parser.parseSelect();
   if (parser.peek()) parser.unsupported(`unexpected ${parser.peek().value} after statement ${index + 1}`);
-  return { sinkName, sourceName, sourceAlias, projections, where };
+  const directRelation = select.from.kind === 'relation' ? select.from : undefined;
+  return {
+    sinkName,
+    withQueries,
+    select,
+    ...(directRelation === undefined ? {} : { sourceName: directRelation.name, sourceAlias: directRelation.alias }),
+  };
 }
 
 /** @param {string} source @returns {Array<object>} */
@@ -763,7 +855,7 @@ function tokenize(source) {
       index += 2;
       continue;
     }
-    if ('(),.*+-/%=<>'.includes(character)) {
+    if ('(),.*+-/%=<>[]'.includes(character)) {
       tokens.push({ kind: 'operator', value: character });
       index += 1;
       continue;
@@ -816,6 +908,25 @@ class SqlParser {
   }
 
   /** @returns {Array<object>} */
+  parseWithClause() {
+    if (!this.matchKeyword('WITH')) return [];
+    if (this.matchKeyword('RECURSIVE')) this.unsupported('recursive CTEs are not supported');
+    const queries = [];
+    while (true) {
+      const name = this.expectIdentifier('CTE name');
+      this.expectKeyword('AS');
+      if (this.next().value !== '(') this.unsupported('CTE body must be parenthesized');
+      const nestedWith = this.parseWithClause();
+      const select = this.parseSelect();
+      if (this.next().value !== ')') this.unsupported('CTE body is missing its closing parenthesis');
+      select.withQueries = nestedWith;
+      queries.push({ name, select });
+      if (!this.matchValue(',')) break;
+    }
+    return queries;
+  }
+
+  /** @returns {Array<object>} */
   parseProjectionList() {
     const projections = [];
     if (this.peek()?.value === '*') {
@@ -829,15 +940,73 @@ class SqlParser {
       if (this.peek()?.value === '*') this.unsupported('SELECT * cannot be combined with projections');
       const expression = this.parseExpression();
       let name;
-      if (this.matchKeyword('AS')) name = this.expectIdentifier('projection alias');
-      else if (this.peek()?.kind === 'identifier' && !this.peek().keyword) name = this.next().value;
-      else name = projectionName(expression, projections.length);
+      let explicitAlias = false;
+      if (this.matchKeyword('AS')) {
+        name = this.expectIdentifier('projection alias');
+        explicitAlias = true;
+      } else if (this.peek()?.kind === 'identifier' && !this.peek().keyword) {
+        name = this.next().value;
+      } else {
+        name = projectionName(expression, projections.length);
+      }
+      if (expression.kind === 'unnest' && !explicitAlias) this.unsupported('UNNEST requires an explicit AS alias');
       if (projections.some((projection) => projection.name === name)) throw new Error(`projection alias ${name} is not unique`);
       projections.push({ kind: 'expression', expression, name });
       if (this.peek()?.value !== ',') break;
       this.next();
     }
     return projections;
+  }
+
+  /** @returns {object} */
+  parseSelect() {
+    const withQueries = this.parseWithClause();
+    this.expectKeyword('SELECT');
+    const projections = this.parseProjectionList();
+    this.expectKeyword('FROM');
+    const from = this.parseRelation();
+    let where;
+    if (this.matchKeyword('WHERE')) where = this.parseExpression();
+    const unnestProjections = projections.filter((projection) => projection.expression?.kind === 'unnest');
+    const projectionUnnestCount = projections.reduce((count, projection) => count + countUnnest(projection.expression), 0);
+    if (projectionUnnestCount > 1) this.unsupported('only one UNNEST expression is allowed per SELECT');
+    const nestedUnnest = projections.some((projection) => projection.expression && countUnnest(projection.expression) > 0 && projection.expression.kind !== 'unnest');
+    if (nestedUnnest || countUnnest(where) > 0) this.unsupported('UNNEST must be a top-level SELECT expression');
+    const unnest = unnestProjections.length === 0 ? undefined : {
+      alias: unnestProjections[0].name,
+      expression: unnestProjections[0].expression.expression,
+    };
+    return { withQueries, projections, from, where, unnest };
+  }
+
+  /** @returns {object} */
+  parseRelation() {
+    if (this.matchValue('(')) {
+      const select = this.parseSelect();
+      if (!this.matchValue(')')) this.unsupported('derived table is missing its closing parenthesis');
+      const alias = this.parseAlias('derived table alias', '__derived');
+      return { kind: 'subquery', select, alias };
+    }
+    const name = this.expectIdentifier('relation name');
+    const alias = this.parseAlias('relation alias', name);
+    return { kind: 'relation', name, alias };
+  }
+
+  /** @param {string} description @param {string|undefined} defaultName @returns {string} */
+  parseAlias(description, defaultName) {
+    if (this.matchKeyword('AS')) return this.expectIdentifier(description);
+    if (this.peek()?.kind === 'identifier' && !this.peek().keyword) return this.next().value;
+    if (defaultName !== undefined) return defaultName;
+    this.unsupported(`${description} is required`);
+  }
+
+  /** @param {string} value @returns {boolean} */
+  matchValue(value) {
+    if (this.peek()?.value === value) {
+      this.position += 1;
+      return true;
+    }
+    return false;
   }
 
   /** @param {number} minimum @returns {object} */
@@ -874,6 +1043,17 @@ class SqlParser {
       if (this.next().value !== ')') this.unsupported('expected closing parenthesis');
       return expression;
     }
+    if (token.value === '[') {
+      const items = [];
+      if (!this.matchValue(']')) {
+        while (true) {
+          items.push(this.parseExpression());
+          if (this.matchValue(']')) break;
+          if (!this.matchValue(',')) this.unsupported('array literal expects comma-separated values');
+        }
+      }
+      return { kind: 'array', items };
+    }
     if (token.kind === 'identifier') {
       if (token.keyword) this.unsupported(`keyword ${token.keyword} cannot start an expression`);
       const path = [token.value];
@@ -894,6 +1074,10 @@ class SqlParser {
         if (this.next().value !== ')') this.unsupported('expected closing function parenthesis');
         const functionName = path.join('.').toUpperCase();
         if (path.length !== 1) this.unsupported('qualified function names are not supported');
+        if (functionName === 'UNNEST') {
+          if (args.length !== 1) this.unsupported('UNNEST requires exactly one array expression');
+          return { kind: 'unnest', expression: args[0] };
+        }
         if (['COUNT', 'SUM', 'AVG', 'MIN', 'MAX', 'ARRAY_AGG', 'OVER'].includes(functionName)) this.unsupported(`aggregate or window function ${functionName} is not supported`);
         if (!SCALAR_FUNCTIONS.has(functionName)) this.unsupported(`scalar function ${functionName} is not supported`);
         return { kind: 'function', name: functionName, args };
@@ -929,18 +1113,72 @@ class SqlParser {
   unsupported(message) { throw new Error(`unsupported Pipeline SQL: ${message}`); }
 }
 
+/** @param {object} expression @returns {number} */
+function countUnnest(expression) {
+  if (!expression) return 0;
+  if (expression.kind === 'unnest') return 1 + countUnnest(expression.expression);
+  if (expression.kind === 'array') return expression.items.reduce((count, item) => count + countUnnest(item), 0);
+  if (expression.kind === 'function') return expression.args.reduce((count, item) => count + countUnnest(item), 0);
+  if (expression.kind === 'unary') return countUnnest(expression.value);
+  if (expression.kind === 'binary') return countUnnest(expression.left) + countUnnest(expression.right);
+  return 0;
+}
+
+/** @param {object} statement @param {string} sourceName @returns {void} */
+function validateStatementRelations(statement, sourceName) {
+  const available = new Set();
+  for (const query of statement.withQueries) {
+    if (query.name === sourceName || available.has(query.name)) throw new Error(`duplicate or conflicting CTE name ${query.name}`);
+    validateSelectRelations(query.select, sourceName, available);
+    available.add(query.name);
+  }
+  validateSelectRelations(statement.select, sourceName, available);
+}
+
+/** @param {object} select @param {string} sourceName @param {Set<string>} outerCtes @returns {void} */
+function validateSelectRelations(select, sourceName, outerCtes) {
+  const available = new Set(outerCtes);
+  for (const query of select.withQueries) {
+    if (query.name === sourceName || available.has(query.name)) throw new Error(`duplicate or conflicting CTE name ${query.name}`);
+    validateSelectRelations(query.select, sourceName, available);
+    available.add(query.name);
+  }
+  classifyRelation(select.from, sourceName, available);
+  if (countUnnest(select.where) > 0) throw new Error('UNNEST is only supported as a top-level SELECT projection');
+  if (select.from.kind === 'subquery') validateSelectRelations(select.from.select, sourceName, available);
+}
+
+/** @param {object} relation @param {string} sourceName @param {Set<string>} available @returns {void} */
+function classifyRelation(relation, sourceName, available) {
+  if (relation.kind === 'subquery') return;
+  if (relation.name === sourceName) {
+    relation.kind = 'stream';
+    return;
+  }
+  if (available.has(relation.name)) {
+    relation.kind = 'cte';
+    return;
+  }
+  throw new Error(`relation ${relation.name} is not the configured Stream or a prior CTE`);
+}
+
 /** @param {object} expression @param {number} index @returns {string} */
 function projectionName(expression, index) {
   if (expression.kind === 'path') return expression.path.at(-1);
   return `column_${index + 1}`;
 }
 
-/** @param {object} expression @param {{record:unknown,sourceAlias:string}} scope @returns {unknown} */
+/** @param {object} expression @param {{record:unknown,sourceAlias:string,unnestValues:Map<string,unknown>}} scope @returns {unknown} */
 function evaluateExpression(expression, scope) {
   if (expression.kind === 'literal') return expression.value;
+  if (expression.kind === 'array') return expression.items.map((item) => cloneJson(evaluateExpression(item, scope)));
+  if (expression.kind === 'unnest') throw new Error('UNNEST may only be evaluated as a SELECT projection');
   if (expression.kind === 'path') {
-    const path = expression.path[0] === scope.sourceAlias ? expression.path.slice(1) : expression.path;
-    let value = scope.record;
+    const aliasValue = scope.unnestValues?.get(expression.path[0]);
+    const path = aliasValue !== undefined
+      ? expression.path.slice(1)
+      : expression.path[0] === scope.sourceAlias ? expression.path.slice(1) : expression.path;
+    let value = aliasValue === undefined ? scope.record : aliasValue;
     for (const key of path) {
       if (!value || typeof value !== 'object' || !Object.hasOwn(value, key)) return null;
       value = value[key];

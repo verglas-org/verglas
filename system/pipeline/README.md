@@ -49,14 +49,30 @@ Projection expressions support field paths, numeric and string literals,
 `LOWER`, `LENGTH`, `TRIM`, `ABS`, `ROUND`, `COALESCE`, `NULLIF`, and `CONCAT`.
 A projection alias may use `AS` or the SQL implicit alias form. A source alias
 may qualify fields. Multiple statements may read the same configured Stream and
-fan out to different named Sinks.
+fan out to different named Sinks. Stateless non-recursive `WITH` CTEs and
+single derived-table subqueries in `FROM` compose the same projection, alias,
+filter, and scalar-expression evaluator. CTEs may reference the configured
+Stream or an earlier CTE; every relation ultimately resolves to that one
+Stream.
 
-The gap is deliberate: `WITH`, subqueries, `UNNEST`, joins, comma joins,
-aggregates, windows, `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, DDL,
-`UPDATE`, `DELETE`, qualified functions, double-quoted identifiers, and unknown
-functions are rejected before serving. Records are JSON values; projections
-produce JSON object rows. The evaluator uses JavaScript numeric and boolean
-semantics for this small target.
+Each `SELECT` may contain one top-level `UNNEST(array_expr) AS alias` projection.
+The array expression may be a JSON list field, a nested list field, a list
+literal, or a supported scalar expression that evaluates to a list. UNNEST
+emits one output row per element while preserving the correlated source/CTE
+fields; object elements remain JSON objects and can be projected through the
+explicit alias. Empty lists emit no row. A list must contain at most 10,000
+elements and must fit the configured batch row ceiling. The Stream JSON
+boundary and Pipeline decoder reject cyclic or malformed values; non-list
+values, missing aliases, nested or multiple UNNEST expressions fail honestly
+instead of truncating data.
+
+The remaining gap is deliberate: joins and comma joins, aggregates, windows,
+`GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`, DDL, `UPDATE`, `DELETE`, qualified
+functions, double-quoted identifiers, and unknown functions are rejected before
+serving. CTEs are non-recursive and each derived table has one relation. Records
+are JSON values; projections produce JSON object rows. The evaluator uses
+JavaScript numeric and boolean semantics for this small target, not full
+DataFusion or Cloudflare function parity.
 
 ## Binding protocol
 

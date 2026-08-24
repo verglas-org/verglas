@@ -321,6 +321,112 @@ test('Worker routes only internal process-now and status controls', async (t) =>
   t.diagnostic('public tenant routes are not exposed');
 });
 
+test('WITH CTEs and derived tables compose with projection and filters', async (t) => {
+  const fixture = await withProject(t, records(
+    { id: 1, amount: 5 },
+    { id: 2, amount: 12 },
+  ), {
+    PIPELINE_SQL: [
+      'INSERT INTO primary_sink',
+      'WITH high AS (SELECT id, amount FROM events WHERE amount > 10),',
+      'labeled AS (SELECT id, amount FROM high)',
+      'SELECT id, amount * 2 AS doubled',
+      'FROM (SELECT id, amount FROM labeled) AS chosen',
+      'WHERE amount > 10',
+    ].join(' '),
+  });
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.deepEqual(fixture.host.sinkCalls[0].payload.records, [{ id: 2, doubled: 24 }]);
+});
+
+test('UNNEST expands correlated object lists with an explicit alias', async (t) => {
+  const fixture = await withProject(t, records({
+    id: 'event-1',
+    items: [{ name: 'alpha', score: 2 }, { name: 'beta', score: 3 }],
+  }), {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT id, UNNEST(items) AS item FROM events;',
+  });
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.deepEqual(fixture.host.sinkCalls[0].payload.records, [
+    { id: 'event-1', item: { name: 'alpha', score: 2 } },
+    { id: 'event-1', item: { name: 'beta', score: 3 } },
+  ]);
+});
+
+test('CTE UNNEST rows remain correlated through outer aliases and filters', async (t) => {
+  const fixture = await withProject(t, records({
+    id: 'event-2',
+    items: [{ name: 'keep', score: 2 }, { name: 'drop', score: 0 }],
+  }), {
+    PIPELINE_SQL: [
+      'INSERT INTO primary_sink',
+      'WITH exploded AS (SELECT id, UNNEST(items) AS item FROM events)',
+      'SELECT id, item.name AS name FROM exploded WHERE item.score > 1',
+    ].join(' '),
+  });
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.deepEqual(fixture.host.sinkCalls[0].payload.records, [{ id: 'event-2', name: 'keep' }]);
+});
+
+test('UNNEST supports bounded array expressions and rejects expansion bombs', async (t) => {
+  const fixture = await withProject(t, records({ id: 1 }), {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT id, UNNEST([1, 2, 3]) AS value FROM events;',
+  });
+  assert.equal((await fixture.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 200);
+  assert.deepEqual(fixture.host.sinkCalls[0].payload.records, [
+    { id: 1, value: 1 },
+    { id: 1, value: 2 },
+    { id: 1, value: 3 },
+  ]);
+
+  const bomb = await withProject(t, records({ id: 1, items: Array.from({ length: 10_001 }, (_, index) => index) }), {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT id, UNNEST(items) AS value FROM events;',
+  });
+  const failed = await bomb.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'));
+  assert.equal(failed.status, 503);
+  assert.equal((await readJson(await bomb.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 0);
+
+  const malformed = await withProject(t, records({ id: 1, items: 'not-a-list' }), {
+    PIPELINE_SQL: 'INSERT INTO primary_sink SELECT id, UNNEST(items) AS value FROM events;',
+  });
+  assert.equal((await malformed.handler.fetch(request('POST', 'https://verglas.internal/pipeline/process-now'))).status, 503);
+  assert.equal((await readJson(await malformed.handler.fetch(request('GET', 'https://verglas.internal/pipeline/status')))).cursor, 0);
+});
+
+test('UNNEST requires one explicit alias and one occurrence per SELECT', async (t) => {
+  const loaded = await loadProject();
+  const makeInvalid = async (sql) => {
+    const directory = await mkdtemp(join(tmpdir(), 'verglas-pipeline-unnest-invalid-'));
+    const host = new PersistedHost(join(directory, 'pipeline.sqlite'));
+    await assert.rejects(
+      makeHandler(loaded.project, host, { PIPELINE_SQL: sql.replaceAll('out', 'primary_sink') }),
+      /UNNEST|alias|unsupported/i,
+    );
+    host.close();
+    await rm(directory, { recursive: true, force: true });
+  };
+  await makeInvalid('INSERT INTO out SELECT UNNEST(items) FROM events;');
+  await makeInvalid('INSERT INTO out SELECT UNNEST(items) AS first, UNNEST(other) AS second FROM events;');
+  await makeInvalid('INSERT INTO out SELECT UPPER(UNNEST(items)) AS value FROM events;');
+  await makeInvalid('INSERT INTO out SELECT UNNEST(UNNEST(items)) AS value FROM events;');
+  t.after(() => rm(loaded.directory, { recursive: true, force: true }));
+});
+
+test('WITH is non-recursive and joins remain rejected', async (t) => {
+  const loaded = await loadProject();
+  const directory = await mkdtemp(join(tmpdir(), 'verglas-pipeline-grammar-invalid-'));
+  const host = new PersistedHost(join(directory, 'pipeline.sqlite'));
+  await assert.rejects(
+    makeHandler(loaded.project, host, {
+      PIPELINE_SQL: 'INSERT INTO out WITH loop AS (SELECT id FROM loop) SELECT id FROM loop;',
+    }),
+    /recursive|CTE|stream|unsupported/i,
+  );
+  host.close();
+  await rm(directory, { recursive: true, force: true });
+  t.after(() => rm(loaded.directory, { recursive: true, force: true }));
+});
+
 test('Pipeline source has no destination or object-store dependency closure', async (t) => {
   const files = ['worker.js', 'wrangler.jsonc', 'package.json'];
   const source = (await Promise.all(files.map((file) => readFile(join(root, file), 'utf8')))).join('\n');
