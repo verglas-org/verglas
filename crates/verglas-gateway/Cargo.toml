@@ -6,11 +6,18 @@ edition.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+# Builds only the AC1 helper that swaps Turso's network sync for open_for_test.
+# This feature is never enabled by production gateway targets.
+ac1-test-support = ["dep:verglas-do-turso", "dep:verglas-runtime"]
+
 [dependencies]
 async-trait.workspace = true
 axum = { workspace = true, features = ["ws"] }
 base64.workspace = true
+verglas-do-turso = { workspace = true, optional = true, features = ["test-support"] }
 verglas-do-wasm.workspace = true
+verglas-runtime = { path = "../verglas-runtime", optional = true, features = ["test-support"] }
 bytes.workspace = true
 futures.workspace = true
 hex.workspace = true
@@ -19,6 +26,11 @@ serde_json.workspace = true
 thiserror.workspace = true
 wasmtime.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
+
+[[bin]]
+name = "verglasd-test-support"
+path = "src/bin/verglasd-test-support.rs"
+required-features = ["ac1-test-support"]
 
 [dev-dependencies]
 reqwest.workspace = true

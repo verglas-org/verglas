@@ -26,7 +26,7 @@ use verglas_do_wasm::{
 
 use crate::connection::{DoCallHandler, DoConnection, FetchEvent};
 use crate::error::GatewayError;
-use crate::manifest::{Binding, Manifest};
+use crate::manifest::{Binding, Manifest, PipelineBinding};
 use crate::protocol::{FetchResponse, WsOutbound};
 use crate::spawn::{CelldSpawner, DoSpawner, SpawnRequest};
 
@@ -217,15 +217,47 @@ impl Gateway {
             })
     }
 
+    /// Resolves a pipeline binding only when the request names its stream object.
+    pub fn resolve_pipeline(
+        &self,
+        binding: &str,
+        stream: &str,
+    ) -> Result<&PipelineBinding, GatewayError> {
+        let pipeline =
+            self.state
+                .manifest
+                .pipeline(binding)
+                .ok_or_else(|| GatewayError::UnknownBinding {
+                    binding: binding.to_owned(),
+                })?;
+        if pipeline.stream() != stream {
+            return Err(GatewayError::UnknownObject {
+                binding: binding.to_owned(),
+                name: stream.to_owned(),
+            });
+        }
+        Ok(pipeline)
+    }
+
     /// Finds or creates the one resident event actor for a route key.
     async fn connection_for(
         state: &Arc<GatewayState>,
         binding: &str,
         name: &str,
     ) -> Result<Arc<DoConnection>, GatewayError> {
-        if state.manifest.binding(binding).is_none() {
+        let is_durable = state.manifest.binding(binding).is_some();
+        let pipeline = state.manifest.pipeline(binding);
+        if !is_durable && pipeline.is_none() {
             return Err(GatewayError::UnknownBinding {
                 binding: binding.to_owned(),
+            });
+        }
+        if let Some(pipeline) = pipeline
+            && pipeline.stream() != name
+        {
+            return Err(GatewayError::UnknownObject {
+                binding: binding.to_owned(),
+                name: name.to_owned(),
             });
         }
         let do_id = do_identity(binding, name)?;
@@ -237,18 +269,28 @@ impl Gateway {
         if let Some(connection) = connections.get(&key) {
             return Ok(Arc::clone(connection));
         }
-        let request = SpawnRequest::new(
+        let deployment =
+            state
+                .manifest
+                .turso_for(binding)
+                .map_err(|error| GatewayError::SpawnRejected {
+                    message: error.to_string(),
+                })?;
+        let mut request = SpawnRequest::new(
             do_id,
             binding.to_owned(),
             name.to_owned(),
             state.manifest.component_digest().to_owned(),
             state.manifest.component_dir().to_path_buf(),
             state.data_root.clone(),
+        )
+        .with_turso(
+            deployment.url(binding, name),
+            deployment.token_file(binding, name),
         );
-        let request = match state.manifest.managed_cas() {
-            Some(cas) => request.with_managed_cas(cas.clone()),
-            None => request,
-        };
+        if let Some(cache_dir) = state.manifest.cwasm_cache_dir() {
+            request = request.with_cwasm_cache_dir(cache_dir.to_path_buf());
+        }
         let event_socket = state.spawner.spawn(request).await?;
         let do_call = Arc::new(GatewayDoRouter {
             state: Arc::clone(state),

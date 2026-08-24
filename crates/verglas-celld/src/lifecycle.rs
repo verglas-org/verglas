@@ -1,160 +1,130 @@
-//! Safety state machine for independently suspending and restoring one DO child.
+//! Lifecycle fencing for one resident Turso-backed Durable Object process.
+//!
+//! A process may stop only after its caller confirms the Turso remote push,
+//! drained outbox, and clean event-endpoint shutdown. Placement and lease
+//! validation remain outside this process.
 
-use crate::ReplicaRole;
-
-/// Durable watermarks required before all replicas of a DO may stop.
+/// Confirmations required before a Durable Object process may stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SuspendFence {
-    applied: u64,
-    archived: u64,
-    checkpointed: u64,
+    pushed: bool,
+    outbox_drained: bool,
+    event_shutdown_clean: bool,
 }
 
 impl SuspendFence {
-    /// Creates the applied, transaction-archive, and checkpoint watermarks.
-    pub fn new(applied: u64, archived: u64, checkpointed: u64) -> Self {
+    /// Creates a fence from the three external Turso/event shutdown confirmations.
+    pub const fn new(pushed: bool, outbox_drained: bool, event_shutdown_clean: bool) -> Self {
         Self {
-            applied,
-            archived,
-            checkpointed,
+            pushed,
+            outbox_drained,
+            event_shutdown_clean,
         }
+    }
+
+    /// Returns whether local Turso state reached its remote push boundary.
+    pub const fn pushed(self) -> bool {
+        self.pushed
+    }
+
+    /// Returns whether all committed outbox rows were drained.
+    pub const fn outbox_drained(self) -> bool {
+        self.outbox_drained
+    }
+
+    /// Returns whether the event endpoint shut down without a dirty termination.
+    pub const fn event_shutdown_clean(self) -> bool {
+        self.event_shutdown_clean
+    }
+
+    /// Returns whether every required stop confirmation is present.
+    pub const fn is_complete(self) -> bool {
+        self.pushed && self.outbox_drained && self.event_shutdown_clean
     }
 }
 
-/// Lifecycle state of one supervised `verglasd` child.
+/// Lifecycle state of one supervised `verglasd` process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildState {
-    /// Replica process is online in its current Raft role.
-    Running(ReplicaRole),
-    /// Process is stopped after a safe checkpoint and archive.
+    /// Process is online and accepts serialized events.
+    Running,
+    /// Process is stopped after the Turso/event shutdown fence.
     Suspended,
-    /// Process is restoring concurrently with its peer replicas.
-    Restoring {
-        /// Applied fence required before routing can resume.
-        required: u64,
-    },
+    /// Process is being restarted and is not routable.
+    Restoring,
 }
 
-/// A lifecycle transition that would lose or expose stale state.
+/// A lifecycle transition that would expose stale or incomplete state.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LifecycleError {
-    /// The transaction archive has not covered all applied commands.
-    #[error("applied sequence {applied} exceeds archive sequence {archived}")]
-    Unarchived {
-        /// Highest applied command.
-        applied: u64,
-        /// Highest verified S3 transaction archive.
-        archived: u64,
-    },
-    /// The object checkpoint has not covered all applied commands.
-    #[error("applied sequence {applied} exceeds checkpoint sequence {checkpointed}")]
-    Uncheckpointed {
-        /// Highest applied command.
-        applied: u64,
-        /// Highest committed object checkpoint.
-        checkpointed: u64,
-    },
-    /// Restored SQLite and WAL state is behind the request fence.
-    #[error("restored sequence {restored} is behind required sequence {required}")]
-    RestoreBehind {
-        /// Fence held by ingress for the triggering request.
-        required: u64,
-        /// Sequence recovered and applied by this child.
-        restored: u64,
-    },
+    /// The required Turso push, outbox drain, or clean shutdown confirmation is absent.
+    #[error("Turso push, drained outbox, and clean event shutdown are all required before suspend")]
+    SuspendUnconfirmed,
     /// The requested transition is illegal from the current state.
     #[error("invalid child lifecycle transition")]
     InvalidTransition,
 }
 
-/// Supervisor-owned lifecycle and applied fence for one child process.
+/// Supervisor-owned lifecycle state for one child process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChildLifecycle {
     state: ChildState,
-    applied: u64,
 }
 
 impl ChildLifecycle {
-    /// Creates a running leader or follower at one applied sequence.
-    pub fn running(role: ReplicaRole, applied: u64) -> Self {
+    /// Creates a running child lifecycle.
+    pub const fn running() -> Self {
         Self {
-            state: ChildState::Running(role),
-            applied,
+            state: ChildState::Running,
         }
     }
 
     /// Returns the current process lifecycle state.
-    pub fn state(self) -> ChildState {
+    pub const fn state(self) -> ChildState {
         self.state
     }
 
-    /// Stops a running durable child only after archive and checkpoint cover it.
+    /// Stops a child only after all Turso and event shutdown confirmations exist.
     pub fn suspend(&mut self, fence: SuspendFence) -> Result<(), LifecycleError> {
-        if !matches!(self.state, ChildState::Running(_)) {
+        if self.state != ChildState::Running {
             return Err(LifecycleError::InvalidTransition);
         }
-        let applied = self.applied.max(fence.applied);
-        if fence.archived < applied {
-            return Err(LifecycleError::Unarchived {
-                applied,
-                archived: fence.archived,
-            });
+        if !fence.is_complete() {
+            return Err(LifecycleError::SuspendUnconfirmed);
         }
-        if fence.checkpointed < applied {
-            return Err(LifecycleError::Uncheckpointed {
-                applied,
-                checkpointed: fence.checkpointed,
-            });
-        }
-        self.applied = applied;
         self.state = ChildState::Suspended;
         Ok(())
     }
 
-    /// Moves a crashed running process behind a restore fence at its applied state.
-    pub fn begin_crash_recovery(&mut self) -> Result<(), LifecycleError> {
-        if !matches!(self.state, ChildState::Running(_)) {
-            return Err(LifecycleError::InvalidTransition);
-        }
-        self.state = ChildState::Restoring {
-            required: self.applied,
-        };
-        Ok(())
-    }
-
-    /// Starts concurrent restore and records the triggering request fence.
-    pub fn begin_restore(&mut self, required: u64) -> Result<(), LifecycleError> {
+    /// Starts a suspended child without making it routable before readiness.
+    pub fn begin_restore(&mut self) -> Result<(), LifecycleError> {
         if self.state != ChildState::Suspended {
             return Err(LifecycleError::InvalidTransition);
         }
-        self.state = ChildState::Restoring { required };
+        self.state = ChildState::Restoring;
         Ok(())
     }
 
-    /// Makes a restored replica routable after it reaches the required fence.
-    pub fn finish_restore(
-        &mut self,
-        role: ReplicaRole,
-        restored: u64,
-    ) -> Result<(), LifecycleError> {
-        let ChildState::Restoring { required } = self.state else {
+    /// Publishes a restored child after its event socket is ready.
+    pub fn finish_restore(&mut self) -> Result<(), LifecycleError> {
+        if self.state != ChildState::Restoring {
             return Err(LifecycleError::InvalidTransition);
-        };
-        if restored < required {
-            return Err(LifecycleError::RestoreBehind { required, restored });
         }
-        self.applied = restored;
-        self.state = ChildState::Running(role);
+        self.state = ChildState::Running;
         Ok(())
     }
 
-    /// Returns whether this child may run a stateful Worker event.
-    pub fn may_execute_stateful_event(self) -> bool {
-        self.state == ChildState::Running(ReplicaRole::Leader)
+    /// Marks a crashed child unroutable until a caller starts restoration.
+    pub fn begin_crash_recovery(&mut self) -> Result<(), LifecycleError> {
+        if self.state != ChildState::Running {
+            return Err(LifecycleError::InvalidTransition);
+        }
+        self.state = ChildState::Restoring;
+        Ok(())
     }
 
-    /// Returns whether this child can serve a snapshot at the requested fence.
-    pub fn may_serve_snapshot(self, requested: u64) -> bool {
-        matches!(self.state, ChildState::Running(_)) && self.applied >= requested
+    /// Returns whether this child may receive a serialized event.
+    pub fn may_execute_event(self) -> bool {
+        self.state == ChildState::Running
     }
 }

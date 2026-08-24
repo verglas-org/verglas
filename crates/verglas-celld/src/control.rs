@@ -1,4 +1,7 @@
-//! Local Unix control protocol used by placement agents to drive `celld-host`.
+//! Strict local control protocol for one Turso Worker process per Durable Object.
+//!
+//! The only spawn command carries the complete runtime launch contract. Old
+//! replica, managed-CAS, lease, generation, and checkpoint commands are absent.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -8,11 +11,11 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
 use crate::{
-    ChildSpec, HostSupervisor, ReplicaRole, SupervisorError, SuspendFence, WorkerComponent,
-    WorkerDurability,
+    ChildSpec, HostSupervisor, SupervisorError, SuspendFence, TursoConfig, WorkerComponent,
 };
 
 const MAX_COMMAND_BYTES: usize = 8 * 1024;
+const SPAWN_WORKER_FIELDS: usize = 9;
 
 /// A control-socket bind or request-processing failure.
 #[derive(Debug, thiserror::Error)]
@@ -128,92 +131,24 @@ async fn execute_inner(supervisor: &mut HostSupervisor, line: &str) -> Result<St
         return Err("invalid command: empty request".to_owned());
     };
     match command {
-        "SPAWN" if fields.len() == 5 => {
-            let role = parse_role(fields[3])?;
-            let spec = ChildSpec::new(
-                fields[1],
-                parse_u64(fields[2], "replica id")?,
-                role,
-                parse_u64(fields[4], "applied sequence")?,
+        "SPAWN_WORKER" if fields.len() == SPAWN_WORKER_FIELDS => {
+            let data_dir = nonempty_path(fields[2], "data root")?;
+            let turso = TursoConfig::new(fields[3], nonempty_path(fields[4], "token file")?)
+                .map_err(|error| format!("invalid command: {error}"))?;
+            let cache_dir = (fields[7] != "-").then(|| PathBuf::from(fields[7]));
+            let component = WorkerComponent::new(
+                fields[5],
+                nonempty_path(fields[6], "component directory")?,
+                cache_dir,
+                nonempty_path(fields[8], "event socket")?,
             )
-            .map_err(|error| error.to_string())?
-            .with_supervision_key(format!("{}-replica", fields[1]))
-            .map_err(|error| error.to_string())?;
-            let descriptor = supervisor
-                .spawn(spec)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(descriptor.socket_path().display().to_string())
-        }
-        "SPAWN_WORKER" if fields.len() == 9 || fields.len() == 12 => {
-            let token = decode_hex_text(fields[5], "lease token")?;
-            let spec = ChildSpec::new(
-                fields[1],
-                parse_u64(fields[2], "replica id")?,
-                ReplicaRole::Leader,
-                parse_u64(fields[3], "applied sequence")?,
-            )
-            .map_err(|error| error.to_string())?
-            .with_durability(WorkerDurability::Replica {
-                socket: PathBuf::from(fields[4]),
-                lease_token: token,
-                generation: parse_u64(fields[6], "lease generation")?,
-                start_sequence: parse_u64(fields[7], "start sequence")?,
-                offload_dir: (fields[8] != "-").then(|| PathBuf::from(fields[8])),
-            })
-            .map_err(|error| error.to_string())?;
-            let spec = if fields.len() == 12 {
-                let component = WorkerComponent::new(fields[9], fields[10], fields[11])
-                    .map_err(|error| format!("invalid command: {error}"))?;
-                spec.with_component(component)
-                    .map_err(|error| format!("invalid command: {error}"))?
-            } else {
-                spec
-            };
-            let descriptor = supervisor
-                .spawn(spec)
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(descriptor.socket_path().display().to_string())
-        }
-        "SPAWN_CAS_WORKER" if fields.len() == 15 || fields.len() == 18 => {
-            let token = decode_hex_text(fields[10], "lease token")?;
-            let lease_etag = optional_hex_text(fields[13], "lease etag")?;
-            let lease_version = optional_hex_text(fields[14], "lease version")?;
-            if lease_etag.is_none() && lease_version.is_none() {
-                return Err(
-                    "invalid command: managed CAS requires an ETag or version fence".to_owned(),
-                );
-            }
-            let spec = ChildSpec::new(
-                fields[1],
-                parse_u64(fields[2], "replica id")?,
-                ReplicaRole::Leader,
-                parse_u64(fields[3], "applied sequence")?,
-            )
-            .map_err(|error| error.to_string())?
-            .with_durability(WorkerDurability::ManagedCas {
-                endpoint: fields[4].to_owned(),
-                bucket: fields[5].to_owned(),
-                prefix: fields[6].to_owned(),
-                region: fields[7].to_owned(),
-                access_key_id: fields[8].to_owned(),
-                secret_access_key: fields[9].to_owned(),
-                lease_token: token,
-                generation: parse_u64(fields[11], "lease generation")?,
-                start_sequence: parse_u64(fields[12], "start sequence")?,
-                lease_etag,
-                lease_version,
-            })
-            .map_err(|error| error.to_string())?;
-            let spec = if fields.len() == 18 {
-                let component = WorkerComponent::new(fields[15], fields[16], fields[17])
-                    .map_err(|error| format!("invalid command: {error}"))?;
-                spec.with_component(component)
-                    .map_err(|error| format!("invalid command: {error}"))?
-            } else {
-                spec
-            };
+            .map_err(|error| format!("invalid command: {error}"))?;
+            let spec = ChildSpec::new(fields[1])
+                .map_err(|error| error.to_string())?
+                .with_data_dir(data_dir)
+                .map_err(|error| error.to_string())?
+                .with_turso(turso)
+                .with_component(component);
             let descriptor = supervisor
                 .spawn(spec)
                 .await
@@ -225,33 +160,12 @@ async fn execute_inner(supervisor: &mut HostSupervisor, line: &str) -> Result<St
                 .suspend(
                     fields[1],
                     SuspendFence::new(
-                        parse_u64(fields[2], "applied sequence")?,
-                        parse_u64(fields[3], "archive sequence")?,
-                        parse_u64(fields[4], "checkpoint sequence")?,
+                        parse_confirmation(fields[2], "push confirmation")?,
+                        parse_confirmation(fields[3], "outbox drain confirmation")?,
+                        parse_confirmation(fields[4], "event shutdown confirmation")?,
                     ),
                 )
                 .await
-                .map_err(|error| error.to_string())?;
-            Ok(String::new())
-        }
-        "RESTORE" if fields.len() == 4 => {
-            let descriptor = supervisor
-                .start_restore(
-                    fields[1],
-                    parse_u64(fields[2], "required sequence")?,
-                    parse_role(fields[3])?,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(descriptor.socket_path().display().to_string())
-        }
-        "FINISH_RESTORE" if fields.len() == 4 => {
-            supervisor
-                .finish_restore(
-                    fields[1],
-                    parse_role(fields[2])?,
-                    parse_u64(fields[3], "restored sequence")?,
-                )
                 .map_err(|error| error.to_string())?;
             Ok(String::new())
         }
@@ -261,10 +175,6 @@ async fn execute_inner(supervisor: &mut HostSupervisor, line: &str) -> Result<St
             .ok_or_else(|| format!("Durable Object {} has no running process", fields[1])),
         "ROUTE_STATEFUL" if fields.len() == 2 => supervisor
             .route_stateful(fields[1])
-            .map(|path| path.display().to_string())
-            .map_err(|error| error.to_string()),
-        "ROUTE_SNAPSHOT" if fields.len() == 3 => supervisor
-            .route_snapshot(fields[1], parse_u64(fields[2], "snapshot fence")?)
             .map(|path| path.display().to_string())
             .map_err(|error| error.to_string()),
         _ => Err(format!("invalid command: {command}")),
@@ -341,34 +251,20 @@ impl Drop for ControlServer {
     }
 }
 
-/// Parses one unsigned protocol field with a stable error message.
-fn parse_u64(value: &str, field: &str) -> Result<u64, String> {
-    value
-        .parse::<u64>()
-        .map_err(|_| format!("invalid command: {field} must be an unsigned integer"))
-}
-
-/// Decodes one hexadecimal text field used to keep whitespace out of control lines.
-fn decode_hex_text(value: &str, field: &str) -> Result<String, String> {
-    let bytes = hex::decode(value).map_err(|error| format!("invalid command: {field}: {error}"))?;
-    String::from_utf8(bytes).map_err(|error| format!("invalid command: {field}: {error}"))
-}
-
-/// Decodes an optional hexadecimal text field, with `-` representing absence.
-fn optional_hex_text(value: &str, field: &str) -> Result<Option<String>, String> {
-    if value == "-" {
-        Ok(None)
-    } else {
-        decode_hex_text(value, field).map(Some)
+/// Rejects empty paths before they enter process arguments.
+fn nonempty_path(value: &str, field: &str) -> Result<PathBuf, String> {
+    if value.is_empty() || value == "-" {
+        return Err(format!("invalid command: {field} cannot be empty"));
     }
+    Ok(PathBuf::from(value))
 }
 
-/// Parses the only two Raft replica roles accepted by the host.
-fn parse_role(value: &str) -> Result<ReplicaRole, String> {
+/// Parses one explicit yes/no confirmation field.
+fn parse_confirmation(value: &str, field: &str) -> Result<bool, String> {
     match value {
-        "leader" => Ok(ReplicaRole::Leader),
-        "follower" => Ok(ReplicaRole::Follower),
-        _ => Err("invalid command: role must be leader or follower".to_owned()),
+        "yes" => Ok(true),
+        "no" => Ok(false),
+        _ => Err(format!("invalid command: {field} must be yes or no")),
     }
 }
 

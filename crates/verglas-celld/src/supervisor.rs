@@ -1,20 +1,20 @@
-//! Substrate-agnostic child lifecycle supervision and fenced Unix-socket routing.
+//! Substrate-agnostic supervision and fenced routing for one Turso Worker.
+//!
+//! Celld keeps exactly one active process owner for each Durable Object. Lease
+//! validation and placement are cloud responsibilities, including the external
+//! sync ingress that validates the current placement before forwarding Turso
+//! pushes. No in-process CAS fallback exists here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 
 use crate::alarm::{AlarmError, AlarmSchedule};
 use crate::provision::{
     ChildCommand, ChildDescriptor, ChildSpec, LocalProcessProvisioner, ProvisionError,
     ProvisionRequest, ProvisionedChild, Provisioner,
 };
-use crate::{
-    ChildLifecycle, ChildState, HostId, LifecycleError, ReplicaRole, SuspendFence, WorkerDurability,
-};
+use crate::{ChildLifecycle, ChildState, HostId, LifecycleError, SuspendFence};
 
 /// One child observed exiting since the previous supervisor poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,7 +24,7 @@ pub struct ExitedChild {
 }
 
 impl ExitedChild {
-    /// Returns the Durable Object whose replica exited.
+    /// Returns the Durable Object whose process exited.
     pub fn do_id(&self) -> &str {
         &self.do_id
     }
@@ -53,13 +53,13 @@ pub enum SupervisorError {
     /// The DO identity could escape or alias its isolated directory.
     #[error("invalid Durable Object identity: {0}")]
     InvalidDoId(String),
-    /// Worker durability arguments violate the child role or recovery fence.
-    #[error("invalid worker durability: {0}")]
-    InvalidDurability(String),
+    /// A launch field violates the one-path Turso contract.
+    #[error("invalid Turso Worker launch: {0}")]
+    InvalidLaunch(String),
     /// A component digest is not 64 hexadecimal characters.
     #[error("invalid component digest: {0}")]
     InvalidComponentDigest(String),
-    /// This host already supervises the DO replica.
+    /// This host already supervises the DO.
     #[error("Durable Object {0} is already supervised on this host")]
     Duplicate(String),
     /// The requested DO is not assigned to this host.
@@ -73,15 +73,12 @@ pub enum SupervisorError {
         /// Operating-system exit status.
         status: std::process::ExitStatus,
     },
-    /// The child did not bind its exclusive Unix socket before the launch deadline.
-    #[error("Durable Object {0} did not become socket-ready")]
+    /// The child did not bind its exclusive event socket before the launch deadline.
+    #[error("Durable Object {0} did not become event-socket-ready")]
     ReadinessTimeout(String),
     /// The child socket path was occupied by a non-socket filesystem object.
-    #[error("Durable Object {0} produced an invalid Unix socket path")]
+    #[error("Durable Object {0} produced an invalid Unix event socket path")]
     InvalidSocket(String),
-    /// Recovery completion disagrees with the role used to launch the process.
-    #[error("Durable Object {0} restore role does not match its child process")]
-    RoleMismatch(String),
     /// The lifecycle fence forbids routing this request to the child.
     #[error("Durable Object {0} is not eligible for this route")]
     RouteFenced(String),
@@ -103,7 +100,7 @@ impl From<ProvisionError> for SupervisorError {
     }
 }
 
-/// One tenant host's registry of isolated single-Raft-group children.
+/// One tenant host's registry of isolated Turso Worker children.
 pub struct HostSupervisor {
     host_id: HostId,
     root: PathBuf,
@@ -179,35 +176,18 @@ impl HostSupervisor {
         Ok(())
     }
 
-    /// Selects one logical DO child, preferring the stateful Worker over its replica.
-    fn key_for(&self, do_id: &str, role: Option<ReplicaRole>) -> Option<String> {
-        self.children
-            .iter()
-            .filter(|(_, managed)| {
-                managed.spec.do_id() == do_id
-                    && role.is_none_or(|required| managed.spec.role() == required)
-            })
-            .min_by(|(left_key, left), (right_key, right)| {
-                child_role_rank(left.spec.role())
-                    .cmp(&child_role_rank(right.spec.role()))
-                    .then_with(|| left_key.cmp(right_key))
-            })
-            .map(|(key, _)| key.clone())
-    }
-
-    /// Launches one isolated replica and records its lifecycle fence.
+    /// Launches one isolated Turso Worker and records its lifecycle fence.
     pub async fn spawn(&mut self, spec: ChildSpec) -> Result<ChildDescriptor, SupervisorError> {
-        if self.children.contains_key(spec.supervision_key()) {
+        if self.children.contains_key(spec.do_id()) {
             return Err(SupervisorError::Duplicate(spec.do_id().to_owned()));
         }
         let child = self.launch(&spec).await?;
         let descriptor = child.descriptor().clone();
-        let lifecycle = ChildLifecycle::running(spec.role(), spec.applied());
         self.children.insert(
-            spec.supervision_key().to_owned(),
+            spec.do_id().to_owned(),
             ManagedChild {
                 spec,
-                lifecycle,
+                lifecycle: ChildLifecycle::running(),
                 handle: Some(child),
                 descriptor: descriptor.clone(),
             },
@@ -215,66 +195,16 @@ impl HostSupervisor {
         Ok(descriptor)
     }
 
-    /// Drains, checkpoints, covers, cleans, and then stops one Worker replica.
-    pub async fn suspend_orchestrated(&mut self, do_id: &str) -> Result<(), SupervisorError> {
-        let key = self
-            .key_for(do_id, Some(ReplicaRole::Leader))
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-        let (worker_path, replica_path, generation, token, applied) = {
-            let managed = self
-                .children
-                .get(&key)
-                .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-            let Some(WorkerDurability::Replica {
-                socket,
-                lease_token,
-                generation,
-                ..
-            }) = managed.spec.durability()
-            else {
-                return Err(SupervisorError::InvalidDurability(
-                    "orchestrated suspend requires replica durability".to_owned(),
-                ));
-            };
-            (
-                managed.descriptor.socket_path().to_path_buf(),
-                socket.clone(),
-                *generation,
-                lease_token.clone(),
-                managed.spec.applied(),
-            )
-        };
-        endpoint_command(&worker_path, "DRAIN").await?;
-        endpoint_command(&worker_path, "CHECKPOINT").await?;
-        let token = hex::encode(token);
-        let identity = hex::encode(do_id);
-        endpoint_command(
-            &replica_path,
-            &format!("REPLICA_COVER {generation} {token} {applied} {applied} {identity}"),
-        )
-        .await?;
-        endpoint_command(
-            &replica_path,
-            &format!("REPLICA_CLEAN {generation} {token} {applied}"),
-        )
-        .await?;
-        self.suspend(do_id, SuspendFence::new(applied, applied, applied))
-            .await
-    }
-
-    /// Stops one replica only after archive and checkpoint fences cover applied state.
+    /// Stops one Worker only after push, outbox drain, and clean event shutdown.
     pub async fn suspend(
         &mut self,
         do_id: &str,
         fence: SuspendFence,
     ) -> Result<(), SupervisorError> {
         let provisioner = Arc::clone(&self.provisioner);
-        let key = self
-            .key_for(do_id, None)
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
         let managed = self
             .children
-            .get_mut(&key)
+            .get_mut(do_id)
             .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
         let mut lifecycle = managed.lifecycle;
         lifecycle.suspend(fence)?;
@@ -292,116 +222,66 @@ impl HostSupervisor {
         Ok(())
     }
 
-    /// Launches a suspended replica in restore mode without making it routable.
-    pub async fn start_restore(
-        &mut self,
-        do_id: &str,
-        required: u64,
-        role: ReplicaRole,
-    ) -> Result<ChildDescriptor, SupervisorError> {
-        let key = self
-            .key_for(do_id, None)
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+    /// Launches a suspended Worker without making it routable before readiness.
+    pub async fn start_restore(&mut self, do_id: &str) -> Result<ChildDescriptor, SupervisorError> {
         let managed = self
             .children
-            .get(&key)
+            .get(do_id)
             .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-        let mut spec = managed.spec.clone();
-        spec.set_role(role);
+        let spec = managed.spec.clone();
         let mut lifecycle = managed.lifecycle;
-        lifecycle.begin_restore(required)?;
+        lifecycle.begin_restore()?;
         let child = self.launch(&spec).await?;
         let descriptor = child.descriptor().clone();
         let managed = self
             .children
-            .get_mut(&key)
+            .get_mut(do_id)
             .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
         managed.lifecycle = lifecycle;
-        managed.spec = spec;
         managed.handle = Some(child);
         managed.descriptor = descriptor.clone();
         Ok(descriptor)
     }
 
-    /// Makes a restored process routable after it reaches the ingress fence.
-    ///
-    /// The routing layer must re-read committed alarm state and call
-    /// [`Self::arm_alarm`] after this fence; an in-memory deadline is not authoritative.
-    pub fn finish_restore(
-        &mut self,
-        do_id: &str,
-        role: ReplicaRole,
-        restored: u64,
-    ) -> Result<(), SupervisorError> {
-        let key = self
-            .key_for(do_id, None)
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
+    /// Makes a restored process routable after its event socket is ready.
+    pub fn finish_restore(&mut self, do_id: &str) -> Result<(), SupervisorError> {
         let managed = self
             .children
-            .get_mut(&key)
+            .get_mut(do_id)
             .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-        if managed.spec.role() != role {
-            return Err(SupervisorError::RoleMismatch(do_id.to_owned()));
-        }
-        managed.lifecycle.finish_restore(role, restored)?;
-        managed.spec.set_role(role);
-        managed.spec.set_applied(restored);
+        managed.lifecycle.finish_restore()?;
         Ok(())
     }
 
-    /// Routes a stateful Worker event only to the running local leader.
+    /// Routes a serialized event only to the one running Worker owner.
     pub fn route_stateful(&mut self, do_id: &str) -> Result<PathBuf, SupervisorError> {
         self.poll_exited()?;
-        let key = self
-            .key_for(do_id, Some(ReplicaRole::Leader))
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
         let managed = self
             .children
-            .get(&key)
+            .get(do_id)
             .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-        if !managed.lifecycle.may_execute_stateful_event() || managed.handle.is_none() {
+        if !managed.lifecycle.may_execute_event() || managed.handle.is_none() {
             return Err(SupervisorError::RouteFenced(do_id.to_owned()));
         }
         Ok(managed.descriptor.socket_path().to_path_buf())
     }
 
-    /// Routes a fenced snapshot read to any sufficiently applied running replica.
-    pub fn route_snapshot(
-        &mut self,
-        do_id: &str,
-        requested: u64,
-    ) -> Result<PathBuf, SupervisorError> {
-        self.poll_exited()?;
-        let key = self
-            .key_for(do_id, None)
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-        let managed = self
-            .children
-            .get(&key)
-            .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
-        if !managed.lifecycle.may_serve_snapshot(requested) || managed.handle.is_none() {
-            return Err(SupervisorError::RouteFenced(do_id.to_owned()));
-        }
-        Ok(managed.descriptor.socket_path().to_path_buf())
-    }
-
-    /// Returns one supervised replica's current lifecycle state.
+    /// Returns one supervised Worker's current lifecycle state.
     pub fn state(&self, do_id: &str) -> Option<ChildState> {
-        self.key_for(do_id, None)
-            .and_then(|key| self.children.get(&key))
+        self.children
+            .get(do_id)
             .map(|child| child.lifecycle.state())
     }
 
     /// Returns the live child process identifier, if running or restoring.
     pub fn pid(&self, do_id: &str) -> Option<u32> {
-        self.key_for(do_id, Some(ReplicaRole::Leader))
-            .or_else(|| self.key_for(do_id, None))
-            .and_then(|key| self.children.get(&key))
+        self.children
+            .get(do_id)
             .and_then(|child| child.handle.as_ref())
             .map(ProvisionedChild::pid)
     }
 
-    /// Reaps exited children immediately and fences every route behind recovery.
+    /// Reaps exited children immediately and fences routing behind recovery.
     pub fn poll_exited(&mut self) -> Result<Vec<ExitedChild>, SupervisorError> {
         let provisioner = Arc::clone(&self.provisioner);
         let mut exited = Vec::new();
@@ -414,7 +294,7 @@ impl HostSupervisor {
             };
             if let Some(status) = status {
                 managed.handle = None;
-                if matches!(managed.lifecycle.state(), ChildState::Running(_)) {
+                if managed.lifecycle.state() == ChildState::Running {
                     managed.lifecycle.begin_crash_recovery()?;
                 }
                 exited.push(ExitedChild {
@@ -447,7 +327,7 @@ impl HostSupervisor {
 
     /// Builds explicit substrate paths and waits for the provisioner's readiness fence.
     async fn launch(&self, spec: &ChildSpec) -> Result<ProvisionedChild, SupervisorError> {
-        let request = ProvisionRequest::from_child(&self.command, &self.host_id, &self.root, spec);
+        let request = ProvisionRequest::from_child(&self.command, &self.host_id, &self.root, spec)?;
         let mut child = self
             .provisioner
             .spawn(request)
@@ -458,37 +338,5 @@ impl HostSupervisor {
             .await
             .map_err(SupervisorError::from)?;
         Ok(child)
-    }
-}
-
-/// Sends one lifecycle command and requires an explicit successful response.
-async fn endpoint_command(path: &Path, command: &str) -> Result<(), SupervisorError> {
-    let mut stream = UnixStream::connect(path)
-        .await
-        .map_err(SupervisorError::Io)?;
-    stream
-        .write_all(format!("{command}\n").as_bytes())
-        .await
-        .map_err(SupervisorError::Io)?;
-    let mut response = String::new();
-    BufReader::new(stream)
-        .read_line(&mut response)
-        .await
-        .map_err(SupervisorError::Io)?;
-    if response.starts_with("OK") {
-        Ok(())
-    } else {
-        Err(SupervisorError::InvalidDurability(format!(
-            "endpoint command {command} failed: {}",
-            response.trim()
-        )))
-    }
-}
-
-/// Orders the stateful Worker before its paired durability replica.
-fn child_role_rank(role: ReplicaRole) -> u8 {
-    match role {
-        ReplicaRole::Leader => 0,
-        ReplicaRole::Follower => 1,
     }
 }

@@ -1,8 +1,8 @@
-//! Tenant cell supervision and Durable Object placement.
+//! Tenant-cell supervision for one Turso-backed Durable Object Worker per owner.
 //!
-//! One `celld-host` process uses this library to supervise many single-group
-//! `verglasd` children while preserving hard resource ceilings and balanced
-//! leader placement across the tenant's three hosts.
+//! Celld starts and fences resident processes. Cloud placement and the external
+//! lease-validating Turso sync ingress own placement authority; celld has no
+//! replica election or local CAS fallback.
 
 mod alarm;
 mod control;
@@ -18,13 +18,10 @@ pub use control::{ControlError, ControlServer, SharedControlServer};
 pub use fly::{FlyAuthTokenSource, FlyMachineSize, FlyMachinesConfig, FlyMachinesProvisioner};
 pub use lifecycle::{ChildLifecycle, ChildState, LifecycleError, SuspendFence};
 pub use management::ManagementApi;
-pub use placement::{
-    DoLoad, GroupPlacement, HostCapacity, HostId, HostLoad, PlacementError, PlacementPlanner,
-    ReplicaPlacement, ReplicaRole,
-};
+pub use placement::HostId;
 pub use provision::{
     ChildCommand, ChildDescriptor, ChildSpec, LocalProcessProvisioner, ProvisionError,
-    ProvisionFuture, ProvisionHandle, ProvisionRequest, ProvisionedChild, Provisioner,
-    WorkerComponent, WorkerDurability, WorkerResourceLimits,
+    ProvisionFuture, ProvisionHandle, ProvisionRequest, ProvisionedChild, Provisioner, TursoConfig,
+    WorkerComponent, WorkerResourceLimits,
 };
 pub use supervisor::{ExitedChild, HostSupervisor, SupervisorError};

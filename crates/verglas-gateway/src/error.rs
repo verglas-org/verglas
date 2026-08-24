@@ -15,6 +15,14 @@ pub enum GatewayError {
         /// Binding name received from the route.
         binding: String,
     },
+    /// A named object is not the identity declared by a system binding.
+    #[error("unknown object {binding}/{name}")]
+    UnknownObject {
+        /// Binding that owns the object.
+        binding: String,
+        /// Object name that was not declared.
+        name: String,
+    },
     /// A route identity cannot be represented as a celld-safe child identity.
     #[error("invalid Durable Object route identity: {identity}")]
     InvalidIdentity {
@@ -113,6 +121,7 @@ impl GatewayError {
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::UnknownBinding { .. } => "unknown-binding",
+            Self::UnknownObject { .. } => "unknown-object",
             Self::InvalidIdentity { .. } => "invalid-identity",
             Self::ControlIo { .. } => "control-io",
             Self::SpawnRejected { .. } => "spawn-rejected",
@@ -132,7 +141,7 @@ impl IntoResponse for GatewayError {
     /// Maps a typed gateway failure to a minimal HTTP response.
     fn into_response(self) -> Response {
         let status = match &self {
-            Self::UnknownBinding { .. } => StatusCode::NOT_FOUND,
+            Self::UnknownBinding { .. } | Self::UnknownObject { .. } => StatusCode::NOT_FOUND,
             Self::InvalidHttp { .. } => StatusCode::BAD_REQUEST,
             Self::WorkerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ControlIo { .. }

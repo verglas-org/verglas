@@ -10754,7 +10754,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "verglas-do-turso",
  "verglas-do-wasm",
+ "verglas-runtime",
  "wasmtime",
 ]
 

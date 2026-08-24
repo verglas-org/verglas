@@ -1,13 +1,9 @@
 //! Fail-closed Fly.io Machines provisioner configuration and extension point.
 //!
-//! A real `spawn` will call authenticated Machines create/start REST with the held
-//! lease, paths, size, and region. `await_ready` will wait for the private Worker
-//! socket; `kill` and `wait` will issue stop REST and observe completion. A future
-//! suspend/resume extension will archive and checkpoint before suspend REST, resume
-//! the machine snapshot on wake-on-request, restore the archive tail, and release
-//! the route fence as required by `docs/architecture/do-workers.mdx`; this skeleton
-//! returns `ProvisionError::Unsupported` for every operation until those guarantees
-//! exist.
+//! A future implementation will call authenticated Machines create/start and stop
+//! REST operations while preserving the explicit Turso launch contract. This
+//! skeleton rejects every operation until cloud lifecycle semantics exist; local
+//! process supervision remains the only active substrate.
 
 use std::process::ExitStatus;
 

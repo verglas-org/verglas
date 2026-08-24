@@ -1,11 +1,9 @@
-//! Cloudflare Workers-shaped management API for scripts, namespaces, and objects.
+//! Cloudflare-shaped management metadata API for one tenant cell.
 //!
-//! The paths intentionally omit Cloudflare's `/accounts/{account_id}` prefix: a
-//! celld host is already scoped to one tenant cell. Script uploads use the
-//! Cloudflare module-syntax multipart shape, while namespace and object state is
-//! owned by the local supervisor. Script execution remains an extension point
-//! for the future WASM or microVM runtime; this module only stores source and
-//! wires object lifecycle to `verglasd`.
+//! This module stores uploaded Worker modules and durable-object namespace
+//! metadata. Process launch is deliberately not inferred from management data:
+//! an explicit deployment supplies the Turso URL template and token file, and
+//! the gateway/control plane owns the one active placement owner.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -23,9 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::{
-    ChildSpec, HostSupervisor, ReplicaRole, SupervisorError, SuspendFence, WorkerDurability,
-};
+use crate::{HostSupervisor, SupervisorError};
 
 const SCRIPT_ROOT: &str = "workers/scripts";
 const NAMESPACE_FILE: &str = "workers/namespaces.json";
@@ -36,11 +32,10 @@ pub struct ManagementApi {
     state: Arc<ManagementState>,
 }
 
-/// Mutable records shared by HTTP handlers without sharing request-local data.
+/// Mutable records shared by HTTP handlers without request-local state.
 struct ManagementState {
     root: PathBuf,
-    supervisor: Arc<Mutex<HostSupervisor>>,
-    durability: WorkerDurability,
+    _supervisor: Arc<Mutex<HostSupervisor>>,
     records: Mutex<ManagementRecords>,
 }
 
@@ -87,16 +82,12 @@ struct NamespaceRecord {
     objects: BTreeMap<String, ObjectRecord>,
 }
 
-/// One deterministic Durable Object identity and its local route state.
+/// One deterministic Durable Object identity and metadata-only state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ObjectRecord {
     id: String,
     name: String,
     do_id: String,
-    #[serde(default)]
-    socket_path: Option<String>,
-    #[serde(default)]
-    pid: Option<u32>,
     #[serde(default = "default_object_status")]
     status: String,
 }
@@ -110,7 +101,7 @@ struct NamespaceRequest {
     class_name: String,
 }
 
-/// Optional request body for creating an object without a path name.
+/// Optional request body for creating an object metadata record.
 #[derive(Debug, Default, Deserialize)]
 struct ObjectRequest {
     name: Option<String>,
@@ -135,30 +126,12 @@ enum ApiError {
 }
 
 impl ManagementApi {
-    /// Creates a management API using replica durability rooted below `root`.
+    /// Creates a metadata API rooted below one celld directory.
     pub fn new(root: impl AsRef<Path>, supervisor: Arc<Mutex<HostSupervisor>>) -> Self {
-        let root = root.as_ref().to_path_buf();
-        let durability = WorkerDurability::Replica {
-            socket: root.join("management-replica.sock"),
-            lease_token: "celld-management".to_owned(),
-            generation: 0,
-            start_sequence: 0,
-            offload_dir: None,
-        };
-        Self::with_durability(root, supervisor, durability)
-    }
-
-    /// Creates a management API with the caller's replica durability authority.
-    pub fn with_durability(
-        root: impl AsRef<Path>,
-        supervisor: Arc<Mutex<HostSupervisor>>,
-        durability: WorkerDurability,
-    ) -> Self {
         Self {
             state: Arc::new(ManagementState {
                 root: root.as_ref().to_path_buf(),
-                supervisor,
-                durability,
+                _supervisor: supervisor,
                 records: Mutex::new(ManagementRecords {
                     scripts: BTreeMap::new(),
                     namespaces: BTreeMap::new(),
@@ -167,7 +140,7 @@ impl ManagementApi {
         }
     }
 
-    /// Builds the router for the account-prefix-free Workers management paths.
+    /// Builds account-prefix-free Workers management paths.
     pub fn router(&self) -> Router {
         Router::new()
             .route("/workers/scripts", get(list_scripts))
@@ -188,14 +161,6 @@ impl ManagementApi {
                 get(get_object).post(create_named_object),
             )
             .route(
-                "/workers/durable_objects/namespaces/{namespace_id}/objects/{object_name}/suspend",
-                post(suspend_object),
-            )
-            .route(
-                "/workers/durable_objects/namespaces/{namespace_id}/objects/{object_name}/route",
-                post(get_object),
-            )
-            .route(
                 "/workers/durable_objects/namespaces/{namespace_id}/objects/{object_name}/status",
                 get(get_object),
             )
@@ -203,9 +168,9 @@ impl ManagementApi {
     }
 }
 
-/// Returns the default status for a newly loaded object record.
+/// Returns the default status for a metadata-only object record.
 fn default_object_status() -> String {
-    "unknown".to_owned()
+    "unprovisioned".to_owned()
 }
 
 /// Handles a script upload in Cloudflare module-syntax multipart form.
@@ -294,7 +259,7 @@ async fn upload_script_inner(
     Ok(script)
 }
 
-/// Loads the persisted script and namespace indexes into the process cache.
+/// Loads persisted script and namespace indexes into the process cache.
 async fn hydrate_records(state: &ManagementState) -> Result<(), ApiError> {
     let mut records = state.records.lock().await;
     if records.scripts.is_empty() {
@@ -361,7 +326,7 @@ async fn hydrate_namespaces(
     Ok(())
 }
 
-/// Parses and validates metadata without accepting malformed durable-object bindings.
+/// Parses and validates metadata without accepting malformed object bindings.
 fn parse_script_metadata(bytes: &[u8]) -> Result<ParsedScriptMetadata, ApiError> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| ApiError::BadRequest(format!("metadata is not valid JSON: {error}")))?;
@@ -544,7 +509,7 @@ async fn create_namespace(
     }
 }
 
-/// Validates and records a new namespace before persisting the namespace index.
+/// Validates and records a new namespace before persisting its metadata.
 async fn create_namespace_inner(
     state: &ManagementState,
     request: NamespaceRequest,
@@ -598,7 +563,7 @@ async fn create_namespace_inner(
     Ok(namespace)
 }
 
-/// Lists namespace metadata without exposing the private object registry.
+/// Lists namespace metadata without exposing process internals.
 async fn list_namespaces(State(state): State<Arc<ManagementState>>) -> Response {
     if let Err(error) = hydrate_records(&state).await {
         return error.into_response();
@@ -612,7 +577,7 @@ async fn list_namespaces(State(state): State<Arc<ManagementState>>) -> Response 
     success_response(StatusCode::OK, namespaces)
 }
 
-/// Lists all instantiated objects in one namespace.
+/// Lists all metadata records in one namespace.
 async fn list_objects(
     State(state): State<Arc<ManagementState>>,
     AxumPath(namespace_id): AxumPath<String>,
@@ -624,32 +589,21 @@ async fn list_objects(
     let Some(namespace) = records.namespaces.get(&namespace_id) else {
         return ApiError::NotFound(format!("namespace {namespace_id}")).into_response();
     };
-    let objects = namespace.objects.values().cloned().collect::<Vec<_>>();
-    success_response(StatusCode::OK, objects)
+    success_response(
+        StatusCode::OK,
+        namespace.objects.values().cloned().collect::<Vec<_>>(),
+    )
 }
 
-/// Creates an object from a path name using deterministic `idFromName` semantics.
+/// Creates a named object metadata record without silently provisioning it.
 async fn create_named_object(
     State(state): State<Arc<ManagementState>>,
     AxumPath((namespace_id, object_name)): AxumPath<(String, String)>,
 ) -> Response {
-    if let Err(error) = hydrate_records(&state).await {
-        return error.into_response();
-    }
-    match create_object(&state, &namespace_id, object_name).await {
-        Ok((object, created)) => success_response(
-            if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            },
-            object,
-        ),
-        Err(error) => error.into_response(),
-    }
+    create_object_response(&state, &namespace_id, object_name).await
 }
 
-/// Creates a named or random object from a collection request.
+/// Creates a named or random object metadata record without provisioning it.
 async fn create_collection_object(
     State(state): State<Arc<ManagementState>>,
     AxumPath(namespace_id): AxumPath<String>,
@@ -673,194 +627,49 @@ async fn create_collection_object(
         (Some(name), _) => name,
         (None, true) | (None, false) => Uuid::new_v4().simple().to_string(),
     };
-    match create_object(&state, &namespace_id, name).await {
-        Ok((object, created)) => success_response(
-            if created {
-                StatusCode::CREATED
-            } else {
-                StatusCode::OK
-            },
-            object,
-        ),
-        Err(error) => error.into_response(),
-    }
+    create_object_response(&state, &namespace_id, name).await
 }
 
-/// Creates one object, starts its worker, and verifies its stateful route.
-async fn create_object(
+/// Creates one metadata record and fails closed before any process launch.
+async fn create_object_response(
     state: &ManagementState,
     namespace_id: &str,
     object_name: String,
-) -> Result<(ObjectRecord, bool), ApiError> {
-    validate_name(&object_name, "object name")?;
-    let (object, created) = {
-        let mut records = state.records.lock().await;
-        let namespace = records
-            .namespaces
-            .get_mut(namespace_id)
-            .ok_or_else(|| ApiError::NotFound(format!("namespace {namespace_id}")))?;
-        if let Some(object) = namespace.objects.get(&object_name).cloned() {
-            (object, false)
-        } else {
-            let object_hash = object_identity(namespace_id, &object_name);
-            let object = ObjectRecord {
-                id: object_hash.clone(),
-                name: object_name.clone(),
-                // Unix socket paths have a hard platform limit, so the
-                // supervisor identity carries the first 64 hash bits while
-                // the API still exposes the complete deterministic ID.
-                do_id: format!("do-{}", &object_hash[..16]),
-                socket_path: None,
-                pid: None,
-                status: "starting".to_owned(),
-            };
-            namespace.objects.insert(object_name, object.clone());
-            (object, true)
-        }
-    };
-    let spawned_for_request = if created {
-        true
-    } else {
-        let supervised = {
-            let supervisor = state.supervisor.lock().await;
-            supervisor.state(&object.do_id).is_some()
-        };
-        if supervised {
-            let refreshed = refresh_object(state, object, false).await?;
-            update_object(state, namespace_id, &refreshed.0).await?;
-            return Ok(refreshed);
-        }
-        false
-    };
-    // Extension point: hand stored modules to the future WASM or microVM runtime.
-    let spec = ChildSpec::new(&object.do_id, 0, ReplicaRole::Leader, 0)
-        .map_err(|error| ApiError::Internal(error.to_string()))?
-        .with_durability(state.durability.clone())
-        .map_err(|error| ApiError::Internal(error.to_string()))?;
-    let spawn_result = {
-        let mut supervisor = state.supervisor.lock().await;
-        supervisor.spawn(spec).await
-    };
-    let descriptor = match spawn_result {
-        Ok(descriptor) => descriptor,
-        Err(error) => {
-            remove_object(state, namespace_id, &object.name).await?;
-            return Err(ApiError::Internal(error.to_string()));
-        }
-    };
-    let mut object = object;
-    object.socket_path = Some(descriptor.socket_path().display().to_string());
-    object.pid = Some(descriptor.pid());
-    object.status = "running".to_owned();
-    update_object(state, namespace_id, &object).await?;
-    Ok((object, spawned_for_request))
-}
-
-/// Refreshes an existing object's state through the supervisor route.
-async fn refresh_object(
-    state: &ManagementState,
-    object: ObjectRecord,
-    created: bool,
-) -> Result<(ObjectRecord, bool), ApiError> {
-    let route = {
-        let mut supervisor = state.supervisor.lock().await;
-        supervisor.route_stateful(&object.do_id)
-    };
-    let mut object = object;
-    match route {
-        Ok(path) => {
-            object.socket_path = Some(path.display().to_string());
-            object.pid = {
-                let supervisor = state.supervisor.lock().await;
-                supervisor.pid(&object.do_id)
-            };
-            object.status = "running".to_owned();
-        }
-        Err(SupervisorError::RouteFenced(_)) => {
-            object.status = "suspended".to_owned();
-            object.pid = None;
-        }
-        Err(error) => return Err(ApiError::Internal(error.to_string())),
-    }
-    Ok((object, created))
-}
-
-/// Updates one object's persisted in-memory route metadata.
-async fn update_object(
-    state: &ManagementState,
-    namespace_id: &str,
-    object: &ObjectRecord,
-) -> Result<(), ApiError> {
-    let mut records = state.records.lock().await;
-    let namespace = records
-        .namespaces
-        .get_mut(namespace_id)
-        .ok_or_else(|| ApiError::NotFound(format!("namespace {namespace_id}")))?;
-    namespace
-        .objects
-        .insert(object.name.clone(), object.clone());
-    let snapshot = records.namespaces.values().cloned().collect::<Vec<_>>();
-    drop(records);
-    persist_namespaces(state, &snapshot).await
-}
-
-/// Removes an object reservation after its worker failed during launch.
-async fn remove_object(
-    state: &ManagementState,
-    namespace_id: &str,
-    object_name: &str,
-) -> Result<(), ApiError> {
-    let mut records = state.records.lock().await;
-    let namespace = records
-        .namespaces
-        .get_mut(namespace_id)
-        .ok_or_else(|| ApiError::NotFound(format!("namespace {namespace_id}")))?;
-    namespace.objects.remove(object_name);
-    let snapshot = records.namespaces.values().cloned().collect::<Vec<_>>();
-    drop(records);
-    persist_namespaces(state, &snapshot).await
-}
-
-/// Suspends one object through the supervisor's durability fence.
-async fn suspend_object(
-    State(state): State<Arc<ManagementState>>,
-    AxumPath((namespace_id, object_name)): AxumPath<(String, String)>,
 ) -> Response {
-    if let Err(error) = hydrate_records(&state).await {
+    if let Err(error) = hydrate_records(state).await {
         return error.into_response();
     }
-    let object = {
-        let records = state.records.lock().await;
-        let Some(namespace) = records.namespaces.get(&namespace_id) else {
-            return ApiError::NotFound(format!("namespace {namespace_id}")).into_response();
-        };
-        let Some(object) = namespace.objects.get(&object_name) else {
-            return ApiError::NotFound(format!("object {object_name}")).into_response();
-        };
-        object.clone()
-    };
-    let result = {
-        let mut supervisor = state.supervisor.lock().await;
-        supervisor
-            .suspend(&object.do_id, SuspendFence::new(0, 0, 0))
-            .await
-    };
-    match result {
-        Ok(()) => {
-            let mut object = object;
-            object.status = "suspended".to_owned();
-            object.pid = None;
-            object.socket_path = None;
-            match update_object(&state, &namespace_id, &object).await {
-                Ok(()) => success_response(StatusCode::OK, object),
-                Err(error) => error.into_response(),
-            }
-        }
-        Err(error) => ApiError::Internal(error.to_string()).into_response(),
+    if let Err(error) = validate_name(&object_name, "object name") {
+        return error.into_response();
     }
+    let mut records = state.records.lock().await;
+    let Some(namespace) = records.namespaces.get_mut(namespace_id) else {
+        return ApiError::NotFound(format!("namespace {namespace_id}")).into_response();
+    };
+    if let Some(object) = namespace.objects.get(&object_name).cloned() {
+        return success_response(StatusCode::OK, object);
+    }
+    let object_hash = object_identity(namespace_id, &object_name);
+    let object = ObjectRecord {
+        id: object_hash.clone(),
+        name: object_name.clone(),
+        do_id: format!("do-{}", &object_hash[..16]),
+        status: default_object_status(),
+    };
+    namespace.objects.insert(object_name, object.clone());
+    let snapshot = records.namespaces.values().cloned().collect::<Vec<_>>();
+    drop(records);
+    if let Err(error) = persist_namespaces(state, &snapshot).await {
+        return error.into_response();
+    }
+    ApiError::Internal(
+        "Turso deployment credentials and component are required before object activation"
+            .to_owned(),
+    )
+    .into_response()
 }
 
-/// Gets one object and asks the supervisor for its current stateful route.
+/// Returns one object metadata record without activating a process.
 async fn get_object(
     State(state): State<Arc<ManagementState>>,
     AxumPath((namespace_id, object_name)): AxumPath<(String, String)>,
@@ -868,22 +677,13 @@ async fn get_object(
     if let Err(error) = hydrate_records(&state).await {
         return error.into_response();
     }
-    let object = {
-        let records = state.records.lock().await;
-        let Some(namespace) = records.namespaces.get(&namespace_id) else {
-            return ApiError::NotFound(format!("namespace {namespace_id}")).into_response();
-        };
-        let Some(object) = namespace.objects.get(&object_name).cloned() else {
-            return ApiError::NotFound(format!("object {object_name}")).into_response();
-        };
-        object
+    let records = state.records.lock().await;
+    let Some(namespace) = records.namespaces.get(&namespace_id) else {
+        return ApiError::NotFound(format!("namespace {namespace_id}")).into_response();
     };
-    match refresh_object(&state, object, false).await {
-        Ok((object, _)) => match update_object(&state, &namespace_id, &object).await {
-            Ok(()) => success_response(StatusCode::OK, object),
-            Err(error) => error.into_response(),
-        },
-        Err(error) => error.into_response(),
+    match namespace.objects.get(&object_name).cloned() {
+        Some(object) => success_response(StatusCode::OK, object),
+        None => ApiError::NotFound(format!("object {object_name}")).into_response(),
     }
 }
 
@@ -898,16 +698,16 @@ async fn persist_namespaces(
             .await
             .map_err(|error| ApiError::Internal(format!("create namespace root: {error}")))?;
     }
-    let encoded = serde_json::to_vec_pretty(namespaces)
-        .map_err(|error| ApiError::Internal(format!("encode namespaces: {error}")))?;
-    tokio::fs::write(path, encoded)
+    let bytes = serde_json::to_vec_pretty(namespaces)
+        .map_err(|error| ApiError::Internal(format!("encode namespace index: {error}")))?;
+    tokio::fs::write(path, bytes)
         .await
-        .map_err(|error| ApiError::Internal(format!("write namespaces: {error}")))
+        .map_err(|error| ApiError::Internal(format!("write namespace index: {error}")))
 }
 
-/// Returns a public namespace shape without private object process fields.
+/// Returns the public namespace metadata shape.
 impl NamespaceRecord {
-    /// Converts a namespace's internal object registry to its CF metadata shape.
+    /// Converts one private record to the management response object.
     fn public(&self) -> PublicNamespace {
         PublicNamespace {
             id: self.id.clone(),
@@ -918,7 +718,7 @@ impl NamespaceRecord {
     }
 }
 
-/// Namespace response shape required by the Workers API.
+/// Public namespace response without private object state.
 #[derive(Debug, Serialize)]
 struct PublicNamespace {
     id: String,
@@ -928,66 +728,61 @@ struct PublicNamespace {
     class_name: String,
 }
 
-/// Computes a stable object ID from namespace ID and object name.
-fn object_identity(namespace_id: &str, object_name: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(namespace_id.as_bytes());
-    hasher.update([0]);
-    hasher.update(object_name.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Validates a path parameter that becomes a filesystem or object identity.
+/// Validates one API name against path traversal and separators.
 fn validate_name(value: &str, field: &str) -> Result<(), ApiError> {
     if value.is_empty()
         || value == "."
         || value == ".."
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || value.chars().any(|character| character.is_control())
+        || Path::new(value)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err(ApiError::BadRequest(format!("invalid {field}")));
+        return Err(ApiError::BadRequest(format!("{field} is not a safe name")));
     }
     Ok(())
 }
 
-/// Validates one relative module path without allowing traversal or aliases.
+/// Validates one uploaded module path against traversal and absolute paths.
 fn validate_module_path(value: &str) -> Result<(), ApiError> {
     if value.is_empty()
-        || Path::new(value).components().any(|component| {
-            matches!(
-                component,
-                Component::CurDir
-                    | Component::ParentDir
-                    | Component::RootDir
-                    | Component::Prefix(_)
-            )
-        })
+        || Path::new(value)
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err(ApiError::BadRequest(format!("invalid module path {value}")));
+        return Err(ApiError::BadRequest(format!(
+            "module path {value} is not safe"
+        )));
     }
     Ok(())
+}
+
+/// Derives the deterministic API object identity from namespace and name.
+fn object_identity(namespace_id: &str, object_name: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(namespace_id.as_bytes());
+    digest.update([0]);
+    digest.update(object_name.as_bytes());
+    hex::encode(digest.finalize())
 }
 
 /// Builds a successful Cloudflare response envelope.
 fn success_response<T: Serialize>(status: StatusCode, result: T) -> Response {
-    (
-        status,
-        Json(Envelope {
-            success: true,
-            errors: Vec::new(),
-            messages: Vec::new(),
-            result: Some(result),
-        }),
-    )
-        .into_response()
+    Json(Envelope {
+        success: true,
+        errors: Vec::new(),
+        messages: Vec::new(),
+        result: Some(result),
+    })
+    .into_response()
+    .with_status(status)
 }
 
-/// Converts an API failure into the standard error envelope.
+/// Builds a failed Cloudflare response envelope.
 impl IntoResponse for ApiError {
-    /// Returns the status and envelope corresponding to one management error.
+    /// Converts a management error into a status and Cloudflare envelope.
     fn into_response(self) -> Response {
-        let status = match &self {
+        let status = match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
@@ -1007,5 +802,26 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+/// Adds an HTTP status to a JSON response.
+trait ResponseStatus {
+    /// Sets one response status without changing its body.
+    fn with_status(self, status: StatusCode) -> Response;
+}
+
+impl ResponseStatus for Response {
+    /// Sets one response status without changing its body.
+    fn with_status(mut self, status: StatusCode) -> Response {
+        *self.status_mut() = status;
+        self
+    }
+}
+
+impl From<SupervisorError> for ApiError {
+    /// Converts an unavailable supervisor into an internal management error.
+    fn from(error: SupervisorError) -> Self {
+        Self::Internal(error.to_string())
     }
 }

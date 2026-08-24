@@ -1,9 +1,8 @@
-//! Celld control-plane spawning and bounded event-socket readiness.
+//! Celld control-plane spawning and bounded Turso event-socket readiness.
 //!
-//! The gateway starts a private replica authority through the strict celld
-//! control protocol, then starts the component-bearing Worker with an event
-//! socket path chosen under the configured data root. The returned celld OK
-//! payload is the Worker control socket and is deliberately not used for events.
+//! The gateway sends one complete `SPAWN_WORKER` request. It never starts a
+//! replica, managed CAS worker, or alternate storage path. The event socket is
+//! the only returned endpoint and becomes routable only after socket readiness.
 
 use std::cmp::min;
 use std::os::unix::fs::FileTypeExt;
@@ -15,13 +14,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::error::GatewayError;
-use crate::manifest::ManagedCas;
 
 const EVENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_SOCKET_INITIAL_DELAY: Duration = Duration::from_millis(5);
 const EVENT_SOCKET_MAX_DELAY: Duration = Duration::from_millis(50);
 
-/// Inputs required to launch one resident Durable Object process.
+/// Inputs required to launch one resident Turso Durable Object process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnRequest {
     do_id: String,
@@ -29,12 +27,19 @@ pub struct SpawnRequest {
     name: String,
     component_digest: String,
     component_dir: PathBuf,
+    cwasm_cache_dir: Option<PathBuf>,
     data_root: PathBuf,
-    managed_cas: Option<ManagedCas>,
+    turso_url: String,
+    turso_token_file: PathBuf,
 }
 
 impl SpawnRequest {
-    /// Creates one spawn request from a routed manifest binding.
+    /// Creates one incomplete request from a routed manifest binding.
+    ///
+    /// Production callers must attach Turso credentials with [`Self::with_turso`]
+    /// before giving the request to [`DoSpawner::spawn`]. Keeping the request
+    /// incomplete makes missing deployment configuration a hard error rather
+    /// than an implicit local-storage path.
     pub fn new(
         do_id: String,
         binding: String,
@@ -49,20 +54,28 @@ impl SpawnRequest {
             name,
             component_digest,
             component_dir,
+            cwasm_cache_dir: None,
             data_root,
-            managed_cas: None,
+            turso_url: String::new(),
+            turso_token_file: PathBuf::new(),
         }
     }
 
-    /// Selects the managed CAS authority for this Worker launch.
-    pub fn with_managed_cas(mut self, managed_cas: ManagedCas) -> Self {
-        self.managed_cas = Some(managed_cas);
+    /// Attaches explicit remote Turso URL and token-file deployment credentials.
+    pub fn with_turso(
+        mut self,
+        turso_url: impl Into<String>,
+        turso_token_file: impl Into<PathBuf>,
+    ) -> Self {
+        self.turso_url = turso_url.into();
+        self.turso_token_file = turso_token_file.into();
         self
     }
 
-    /// Returns the managed CAS authority, when configured.
-    pub fn managed_cas(&self) -> Option<&ManagedCas> {
-        self.managed_cas.as_ref()
+    /// Attaches an optional Wasmtime compiled component cache directory.
+    pub fn with_cwasm_cache_dir(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cwasm_cache_dir = Some(path.into());
+        self
     }
 
     /// Returns the celld-safe Durable Object identity.
@@ -90,9 +103,34 @@ impl SpawnRequest {
         &self.component_dir
     }
 
-    /// Returns the process data root requested by the gateway CLI.
+    /// Returns the optional compiled component cache directory.
+    pub fn cwasm_cache_dir(&self) -> Option<&Path> {
+        self.cwasm_cache_dir.as_deref()
+    }
+
+    /// Returns the process data root requested by the gateway.
     pub fn data_root(&self) -> &Path {
         &self.data_root
+    }
+
+    /// Returns the remote Turso URL selected by manifest deployment config.
+    pub fn turso_url(&self) -> &str {
+        &self.turso_url
+    }
+
+    /// Returns the token-file path selected by manifest deployment config.
+    pub fn turso_token_file(&self) -> &Path {
+        &self.turso_token_file
+    }
+
+    /// Returns the local Turso database directory for this object.
+    fn data_dir(&self) -> PathBuf {
+        self.data_root.join(&self.do_id)
+    }
+
+    /// Returns the event socket path for this object.
+    fn event_socket(&self) -> PathBuf {
+        self.data_dir().join("events.sock")
     }
 }
 
@@ -103,7 +141,7 @@ pub trait DoSpawner: Send + Sync {
     async fn spawn(&self, request: SpawnRequest) -> Result<PathBuf, GatewayError>;
 }
 
-/// Local Unix control client for the celld replica and Worker spawn commands.
+/// Local Unix control client for the one-path Worker spawn command.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CelldSpawner {
     control_socket: PathBuf,
@@ -117,139 +155,17 @@ impl CelldSpawner {
         }
     }
 
-    /// Returns the host-local control socket path.
-    pub fn control_socket(&self) -> &Path {
-        &self.control_socket
-    }
-
-    /// Returns the event socket path owned by one gateway-routed object.
-    fn event_socket_path(&self, request: &SpawnRequest) -> PathBuf {
-        request
-            .data_root()
-            .join(request.do_id())
-            .join("events.sock")
-    }
-
-    /// Sends the minimal replica command needed by the OSS single-node POC.
-    async fn spawn_replica(&self, request: &SpawnRequest) -> Result<PathBuf, GatewayError> {
-        // The replica endpoint validates every committed envelope's DO identity,
-        // so its supervised identity must match the Worker rather than gain a suffix.
-        let command = format!("SPAWN {} 1 follower 0\n", request.do_id());
-        self.send_control_command(&command, "SPAWN replica").await
-    }
-
-    /// Reads the replica's applied sequence before handing it to a Worker restart.
-    async fn replica_sequence(&self, replica_socket: &Path) -> Result<u64, GatewayError> {
-        let mut stream = UnixStream::connect(replica_socket)
-            .await
-            .map_err(|error| GatewayError::control_io("connect replica status", error))?;
-        stream
-            .write_all(b"STATUS\n")
-            .await
-            .map_err(|error| GatewayError::control_io("write replica status", error))?;
-        let mut response = String::new();
-        BufReader::new(stream)
-            .read_line(&mut response)
-            .await
-            .map_err(|error| GatewayError::control_io("read replica status", error))?;
-        let fields = response.split_ascii_whitespace().collect::<Vec<_>>();
-        if fields.len() != 5 || fields[0] != "OK" || fields[1] != "replica" {
-            return Err(GatewayError::SpawnRejected {
-                message: format!(
-                    "replica status returned an invalid response: {}",
-                    response.trim()
-                ),
-            });
-        }
-        fields[2]
-            .parse::<u64>()
-            .map_err(|_| GatewayError::SpawnRejected {
-                message: format!(
-                    "replica status applied sequence is not an unsigned integer: {}",
-                    fields[2]
-                ),
-            })
-    }
-
-    /// Sends the component-bearing worker command with the held local lease shape.
-    async fn spawn_worker(
-        &self,
-        request: &SpawnRequest,
-        replica_socket: &Path,
-        start_sequence: u64,
-        event_socket: &Path,
-    ) -> Result<(), GatewayError> {
-        let lease_token = format!("lease-{}", request.do_id());
-        let command = format!(
-            "SPAWN_WORKER {} 1 {start_sequence} {} {} 11 {start_sequence} - {} {} {}\n",
-            request.do_id(),
-            replica_socket.display(),
-            hex::encode(lease_token),
-            request.component_digest(),
-            request.component_dir().display(),
-            event_socket.display(),
-        );
-        let _worker_socket = self
-            .send_control_command(&command, "SPAWN_WORKER worker")
-            .await?;
-        Ok(())
-    }
-
-    /// Sends the component-bearing worker command with a managed CAS authority.
-    async fn spawn_cas_worker(
-        &self,
-        request: &SpawnRequest,
-        event_socket: &Path,
-    ) -> Result<(), GatewayError> {
-        let cas = request
-            .managed_cas()
-            .ok_or_else(|| GatewayError::SpawnRejected {
-                message: "managed CAS worker launch is missing CAS parameters".to_owned(),
-            })?;
-        let etag = cas
-            .lease_etag()
-            .map(hex::encode)
-            .unwrap_or_else(|| "-".to_owned());
-        let version = cas
-            .lease_version()
-            .map(hex::encode)
-            .unwrap_or_else(|| "-".to_owned());
-        let command = format!(
-            "SPAWN_CAS_WORKER {do_id} 1 {applied} {endpoint} {bucket} {prefix} {region} {access_key_id} {secret_access_key} {lease_token} {generation} {start} {etag} {version} {digest} {component_dir} {event_socket}\n",
-            do_id = request.do_id(),
-            applied = cas.start_sequence(),
-            endpoint = cas.endpoint(),
-            bucket = cas.bucket(),
-            prefix = cas.prefix(),
-            region = cas.region(),
-            access_key_id = cas.access_key_id(),
-            secret_access_key = cas.secret_access_key(),
-            lease_token = hex::encode(cas.lease_token()),
-            generation = cas.lease_generation(),
-            start = cas.start_sequence(),
-            etag = etag,
-            version = version,
-            digest = request.component_digest(),
-            component_dir = request.component_dir().display(),
-            event_socket = event_socket.display(),
-        );
-        let _worker_socket = self
-            .send_control_command(&command, "SPAWN_CAS_WORKER worker")
-            .await?;
-        Ok(())
-    }
-
-    /// Sends one line to celld and parses its returned child control socket path.
+    /// Sends one command and returns the payload after a strict `OK` response.
     async fn send_control_command(
         &self,
         command: &str,
         operation: &'static str,
-    ) -> Result<PathBuf, GatewayError> {
+    ) -> Result<String, GatewayError> {
         let mut stream = UnixStream::connect(&self.control_socket)
             .await
-            .map_err(|error| GatewayError::control_io("connect", error))?;
+            .map_err(|error| GatewayError::control_io(operation, error))?;
         stream
-            .write_all(command.as_bytes())
+            .write_all(format!("{command}\n").as_bytes())
             .await
             .map_err(|error| GatewayError::control_io(operation, error))?;
         let mut response = String::new();
@@ -257,37 +173,75 @@ impl CelldSpawner {
             .read_line(&mut response)
             .await
             .map_err(|error| GatewayError::control_io(operation, error))?;
-        let response = response.trim_end_matches(['\r', '\n']);
-        let Some(path) = response.strip_prefix("OK ") else {
-            let message = response
-                .strip_prefix("ERR ")
-                .map_or("control socket returned an invalid response", |message| {
-                    message
-                });
-            return Err(GatewayError::SpawnRejected {
-                message: message.to_owned(),
-            });
-        };
-        if path.is_empty() {
-            return Err(GatewayError::SpawnRejected {
-                message: format!("{operation} returned an empty Worker socket path"),
-            });
+        let response = response.trim();
+        if let Some(payload) = response.strip_prefix("OK ") {
+            return Ok(payload.to_owned());
         }
-        Ok(PathBuf::from(path))
+        if response == "OK" {
+            return Ok(String::new());
+        }
+        Err(GatewayError::SpawnRejected {
+            message: format!("{operation} failed: {response}"),
+        })
     }
 
-    /// Waits for celld's separately supplied event socket to become a Unix socket.
-    async fn wait_for_event_socket(&self, path: &Path) -> Result<(), GatewayError> {
+    /// Sends the complete worker launch contract to celld.
+    async fn spawn_worker(
+        &self,
+        request: &SpawnRequest,
+        event_socket: &Path,
+    ) -> Result<(), GatewayError> {
+        if request.turso_url().is_empty() {
+            return Err(GatewayError::SpawnRejected {
+                message: "Turso remote URL is required".to_owned(),
+            });
+        }
+        if request.turso_token_file().as_os_str().is_empty() {
+            return Err(GatewayError::SpawnRejected {
+                message: "Turso token-file path is required".to_owned(),
+            });
+        }
+        if request.component_digest().len() != 64
+            || !request
+                .component_digest()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(GatewayError::SpawnRejected {
+                message: "component digest must be 64 hexadecimal characters".to_owned(),
+            });
+        }
+        let cache = request
+            .cwasm_cache_dir()
+            .map_or_else(|| "-".to_owned(), |path| path.display().to_string());
+        let command = format!(
+            "SPAWN_WORKER {} {} {} {} {} {} {} {}",
+            request.do_id(),
+            request.data_dir().display(),
+            request.turso_url(),
+            request.turso_token_file().display(),
+            request.component_digest(),
+            request.component_dir().display(),
+            cache,
+            event_socket.display(),
+        );
+        self.send_control_command(&command, "SPAWN_WORKER")
+            .await
+            .map(|_| ())
+    }
+
+    /// Waits for a real Unix event socket with bounded backoff.
+    async fn wait_for_event_socket(&self, event_socket: &Path) -> Result<(), GatewayError> {
         let deadline = Instant::now() + EVENT_SOCKET_TIMEOUT;
         let mut delay = EVENT_SOCKET_INITIAL_DELAY;
         loop {
-            match tokio::fs::symlink_metadata(path).await {
+            match tokio::fs::symlink_metadata(event_socket).await {
                 Ok(metadata) if metadata.file_type().is_socket() => return Ok(()),
                 Ok(_) => {
                     return Err(GatewayError::SpawnRejected {
                         message: format!(
                             "event socket path is not a Unix socket: {}",
-                            path.display()
+                            event_socket.display()
                         ),
                     });
                 }
@@ -297,23 +251,27 @@ impl CelldSpawner {
             if Instant::now() >= deadline {
                 return Err(GatewayError::SpawnRejected {
                     message: format!(
-                        "event socket did not bind before the {}ms deadline: {}",
-                        EVENT_SOCKET_TIMEOUT.as_millis(),
-                        path.display()
+                        "event socket did not become ready: {}",
+                        event_socket.display()
                     ),
                 });
             }
             tokio::time::sleep(delay).await;
-            delay = min(delay + delay, EVENT_SOCKET_MAX_DELAY);
+            delay = min(delay.saturating_mul(2), EVENT_SOCKET_MAX_DELAY);
         }
     }
 }
 
 #[async_trait]
 impl DoSpawner for CelldSpawner {
-    /// Starts the replica, starts the component Worker, and waits for its event socket.
+    /// Starts one Turso Worker and waits until its event socket is a Unix socket.
     async fn spawn(&self, request: SpawnRequest) -> Result<PathBuf, GatewayError> {
-        let event_socket = self.event_socket_path(&request);
+        if request.do_id().is_empty() {
+            return Err(GatewayError::SpawnRejected {
+                message: "Durable Object id is required".to_owned(),
+            });
+        }
+        let event_socket = request.event_socket();
         let parent = event_socket
             .parent()
             .ok_or_else(|| GatewayError::SpawnRejected {
@@ -325,14 +283,7 @@ impl DoSpawner for CelldSpawner {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|error| GatewayError::event_io("create event socket directory", error))?;
-        if request.managed_cas().is_some() {
-            self.spawn_cas_worker(&request, &event_socket).await?;
-        } else {
-            let replica_socket = self.spawn_replica(&request).await?;
-            let start_sequence = self.replica_sequence(&replica_socket).await?;
-            self.spawn_worker(&request, &replica_socket, start_sequence, &event_socket)
-                .await?;
-        }
+        self.spawn_worker(&request, &event_socket).await?;
         self.wait_for_event_socket(&event_socket).await?;
         Ok(event_socket)
     }

@@ -1,9 +1,10 @@
-//! Strict parsing for the prototype wrangler JSON and JSONC manifest subset.
+//! Strict parsing for the Wrangler manifest and Turso deployment contract.
 //!
-//! The parser keeps only gateway deployment metadata and rejects unknown top-level
-//! keys so build-time configuration cannot silently alter runtime behavior.
+//! Durable-object namespaces and system pipeline bindings are separate maps. A
+//! deployment carrying either requires an explicit Turso URL template and token
+//! file; unknown fields and incomplete credentials fail before process launch.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
@@ -28,76 +29,98 @@ impl Binding {
     }
 }
 
-/// Managed object-store lease parameters for a CAS-backed Worker.
+/// One Wrangler `pipelines` binding targeting the prebuilt Stream deployment.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ManagedCas {
-    endpoint: String,
-    bucket: String,
-    prefix: String,
-    region: String,
-    access_key_id: String,
-    secret_access_key: String,
-    lease_token: String,
-    lease_generation: u64,
-    start_sequence: u64,
-    lease_etag: Option<String>,
-    lease_version: Option<String>,
+pub struct PipelineBinding {
+    binding: String,
+    stream: String,
 }
 
-impl ManagedCas {
-    /// Returns the object-store endpoint used by verglasd.
-    pub fn endpoint(&self) -> &str {
-        &self.endpoint
+impl PipelineBinding {
+    /// Returns the environment binding name exposed by the Worker shim.
+    pub fn binding(&self) -> &str {
+        &self.binding
     }
 
-    /// Returns the object-store bucket used by verglasd.
-    pub fn bucket(&self) -> &str {
-        &self.bucket
+    /// Returns the Stream object identity used by `PipelineBinding.send`.
+    pub fn stream(&self) -> &str {
+        &self.stream
+    }
+}
+
+/// One Turso URL/token mapping used by a deployment or one named binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TursoDeployment {
+    url_template: String,
+    token_file: PathBuf,
+}
+
+impl TursoDeployment {
+    /// Creates one explicit Turso URL template and token-file template.
+    pub fn new(
+        url_template: impl Into<String>,
+        token_file: impl Into<PathBuf>,
+    ) -> Result<Self, ManifestError> {
+        let url_template = url_template.into();
+        let token_file = token_file.into();
+        validate_turso_fields(&url_template, &token_file)?;
+        Ok(Self {
+            url_template,
+            token_file,
+        })
     }
 
-    /// Returns the immutable object prefix for this Durable Object.
-    pub fn prefix(&self) -> &str {
-        &self.prefix
+    /// Resolves `{binding}` and `{do_id}` placeholders for one object.
+    pub fn url(&self, binding: &str, do_id: &str) -> String {
+        substitute(&self.url_template, binding, do_id)
     }
 
-    /// Returns the object-store region.
-    pub fn region(&self) -> &str {
-        &self.region
+    /// Resolves `{binding}` and `{do_id}` in the token-file path.
+    pub fn token_file(&self, binding: &str, do_id: &str) -> PathBuf {
+        PathBuf::from(substitute(
+            &self.token_file.to_string_lossy(),
+            binding,
+            do_id,
+        ))
     }
 
-    /// Returns the object-store access key.
-    pub fn access_key_id(&self) -> &str {
-        &self.access_key_id
+    /// Returns the configured URL template without resolving placeholders.
+    pub fn url_template(&self) -> &str {
+        &self.url_template
     }
 
-    /// Returns the object-store secret key.
-    pub fn secret_access_key(&self) -> &str {
-        &self.secret_access_key
+    /// Returns the configured token-file template without resolving placeholders.
+    pub fn token_file_template(&self) -> &Path {
+        &self.token_file
+    }
+}
+
+/// Explicit Turso deployment defaults plus optional per-binding overrides.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TursoConfig {
+    default: Option<TursoDeployment>,
+    bindings: BTreeMap<String, TursoDeployment>,
+}
+
+impl TursoConfig {
+    /// Resolves a named binding or the deployment default, failing closed if absent.
+    pub fn for_binding(&self, binding: &str) -> Result<&TursoDeployment, ManifestError> {
+        self.bindings
+            .get(binding)
+            .or(self.default.as_ref())
+            .ok_or_else(|| ManifestError::MissingTursoDeployment {
+                binding: binding.to_owned(),
+            })
     }
 
-    /// Returns the opaque lease token before control-line hex encoding.
-    pub fn lease_token(&self) -> &str {
-        &self.lease_token
+    /// Returns the deployment-level mapping when one was declared.
+    pub fn default(&self) -> Option<&TursoDeployment> {
+        self.default.as_ref()
     }
 
-    /// Returns the monotonic lease generation.
-    pub fn lease_generation(&self) -> u64 {
-        self.lease_generation
-    }
-
-    /// Returns the held applied sequence used for CAS worker recovery.
-    pub fn start_sequence(&self) -> u64 {
-        self.start_sequence
-    }
-
-    /// Returns the optional held ETag fence.
-    pub fn lease_etag(&self) -> Option<&str> {
-        self.lease_etag.as_deref()
-    }
-
-    /// Returns the optional held object-version fence.
-    pub fn lease_version(&self) -> Option<&str> {
-        self.lease_version.as_deref()
+    /// Returns all explicit per-binding mappings.
+    pub fn bindings(&self) -> &BTreeMap<String, TursoDeployment> {
+        &self.bindings
     }
 }
 
@@ -126,7 +149,7 @@ impl Migration {
     }
 }
 
-/// The validated subset of a wrangler-style deployment manifest.
+/// The validated subset of a Wrangler-style deployment manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
     name: String,
@@ -134,12 +157,14 @@ pub struct Manifest {
     compatibility_date: Option<String>,
     compatibility_flags: Vec<String>,
     bindings: Vec<Binding>,
+    pipelines: Vec<PipelineBinding>,
     migrations: Vec<Migration>,
     vars: Map<String, Value>,
     component_digest: String,
     component_dir: PathBuf,
+    cwasm_cache_dir: Option<PathBuf>,
     data_root: PathBuf,
-    managed_cas: Option<ManagedCas>,
+    turso: Option<TursoConfig>,
 }
 
 impl Manifest {
@@ -196,7 +221,12 @@ impl Manifest {
         &self.bindings
     }
 
-    /// Returns accepted Durable Object migrations in manifest order.
+    /// Returns all declared system pipeline bindings in manifest order.
+    pub fn pipelines(&self) -> &[PipelineBinding] {
+        &self.pipelines
+    }
+
+    /// Returns accepted migration declarations in manifest order.
     pub fn migrations(&self) -> &[Migration] {
         &self.migrations
     }
@@ -206,9 +236,26 @@ impl Manifest {
         &self.vars
     }
 
-    /// Looks up one binding by its URL-visible name.
+    /// Looks up one binding in the durable-object namespace only.
     pub fn binding(&self, name: &str) -> Option<&Binding> {
         self.bindings.iter().find(|binding| binding.name == name)
+    }
+
+    /// Looks up one system pipeline binding without merging namespaces.
+    pub fn pipeline(&self, name: &str) -> Option<&PipelineBinding> {
+        self.pipelines
+            .iter()
+            .find(|pipeline| pipeline.binding == name)
+    }
+
+    /// Resolves the explicit Turso deployment for one DO or system binding.
+    pub fn turso_for(&self, binding: &str) -> Result<&TursoDeployment, ManifestError> {
+        self.turso
+            .as_ref()
+            .ok_or_else(|| ManifestError::MissingTursoDeployment {
+                binding: binding.to_owned(),
+            })?
+            .for_binding(binding)
     }
 
     /// Returns the validated hexadecimal component digest.
@@ -221,14 +268,14 @@ impl Manifest {
         &self.component_dir
     }
 
-    /// Returns the manifest's prototype runtime data root.
-    pub fn data_root(&self) -> &Path {
-        &self.data_root
+    /// Returns the optional Wasmtime compiled component cache directory.
+    pub fn cwasm_cache_dir(&self) -> Option<&Path> {
+        self.cwasm_cache_dir.as_deref()
     }
 
-    /// Returns the managed CAS launch parameters, when this deployment uses CAS.
-    pub fn managed_cas(&self) -> Option<&ManagedCas> {
-        self.managed_cas.as_ref()
+    /// Returns the manifest's runtime data root.
+    pub fn data_root(&self) -> &Path {
+        &self.data_root
     }
 
     /// Builds a validated manifest from a parsed JSON value.
@@ -242,12 +289,14 @@ impl Manifest {
             "compatibility_date",
             "compatibility_flags",
             "durable_objects",
+            "pipelines",
             "migrations",
             "vars",
             "component_digest",
             "component_dir",
+            "cwasm_cache_dir",
             "data_root",
-            "managed_cas",
+            "turso",
         ]
         .into_iter()
         .collect::<HashSet<_>>();
@@ -272,6 +321,11 @@ impl Manifest {
             .unwrap_or_default();
         let durable_objects = required_object(&mut object, "durable_objects")?;
         let bindings = parse_durable_objects(durable_objects)?;
+        let pipelines = object
+            .remove("pipelines")
+            .map(parse_pipelines)
+            .transpose()?
+            .unwrap_or_default();
         let migrations = object
             .remove("migrations")
             .map(parse_migrations)
@@ -285,31 +339,29 @@ impl Manifest {
         let component_digest = required_string(&mut object, "component_digest")?;
         validate_digest(&component_digest)?;
         let component_dir = PathBuf::from(required_string(&mut object, "component_dir")?);
-        let data_root = PathBuf::from(required_string(&mut object, "data_root")?);
-        if component_dir.as_os_str().is_empty() {
-            return Err(ManifestError::EmptyField {
-                field: "component_dir",
-            });
-        }
-        if data_root.as_os_str().is_empty() {
-            return Err(ManifestError::EmptyField { field: "data_root" });
-        }
-        let managed_cas = object
-            .remove("managed_cas")
-            .map(parse_managed_cas)
+        let cwasm_cache_dir = object
+            .remove("cwasm_cache_dir")
+            .map(|value| parse_nonempty_string(value, "cwasm_cache_dir").map(PathBuf::from))
             .transpose()?;
+        let data_root = PathBuf::from(required_string(&mut object, "data_root")?);
+        let turso = object.remove("turso").map(parse_turso).transpose()?;
+        if (!bindings.is_empty() || !pipelines.is_empty()) && turso.is_none() {
+            return Err(ManifestError::MissingField { field: "turso" });
+        }
         Ok(Self {
             name,
             main,
             compatibility_date,
             compatibility_flags,
             bindings,
+            pipelines,
             migrations,
             vars,
             component_digest,
             component_dir,
+            cwasm_cache_dir,
             data_root,
-            managed_cas,
+            turso,
         })
     }
 }
@@ -362,13 +414,31 @@ pub enum ManifestError {
         /// Key that was not recognized.
         key: String,
     },
+    /// A pipeline object contains an unknown key.
+    #[error("unknown pipelines manifest key: {key}")]
+    UnknownPipelineKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// A Turso object contains an unknown key.
+    #[error("unknown turso manifest key: {key}")]
+    UnknownTursoKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// A Turso per-binding object contains an unknown key.
+    #[error("unknown turso.bindings key: {key}")]
+    UnknownTursoBindingKey {
+        /// Key that was not recognized.
+        key: String,
+    },
     /// A required field was absent.
     #[error("manifest field {field} is required")]
     MissingField {
         /// Dotted field name that was absent.
         field: &'static str,
     },
-    /// A field had a JSON type other than a string or object as required.
+    /// A field had a JSON type other than required.
     #[error("manifest field {field} must be a {expected}")]
     InvalidType {
         /// Dotted field name with the wrong type.
@@ -394,14 +464,23 @@ pub enum ManifestError {
         /// Name repeated by more than one binding.
         name: String,
     },
-    /// A CAS manifest omitted both supported object-store version fences.
-    #[error("managed_cas requires lease_etag or lease_version")]
-    MissingCasFence,
-    /// A managed CAS object contains an unknown key.
-    #[error("unknown managed_cas manifest key: {key}")]
-    UnknownManagedCasKey {
-        /// Key that was not recognized.
-        key: String,
+    /// A pipeline did not have a unique environment binding name.
+    #[error("duplicate pipeline binding: {name}")]
+    DuplicatePipelineBinding {
+        /// Name repeated by more than one pipeline.
+        name: String,
+    },
+    /// A Turso mapping was missing for one binding.
+    #[error("Turso deployment mapping is missing for binding {binding}")]
+    MissingTursoDeployment {
+        /// Binding that could not resolve a deployment.
+        binding: String,
+    },
+    /// A Turso URL or token file template was invalid.
+    #[error("invalid Turso deployment: {message}")]
+    InvalidTursoDeployment {
+        /// Stable validation detail.
+        message: String,
     },
     /// A migration object contains an unsupported migration kind or key.
     #[error("unknown migrations manifest key: {key}")]
@@ -497,6 +576,113 @@ fn parse_migration(value: Value) -> Result<Migration, ManifestError> {
     })
 }
 
+/// Parses the exact Cloudflare pipelines binding array.
+fn parse_pipelines(value: Value) -> Result<Vec<PipelineBinding>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "pipelines",
+            expected: "array",
+        });
+    };
+    let mut pipelines = Vec::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
+    for value in values {
+        let Value::Object(mut object) = value else {
+            return Err(ManifestError::InvalidType {
+                field: "pipelines[]",
+                expected: "object",
+            });
+        };
+        let allowed = ["binding", "stream"].into_iter().collect::<HashSet<_>>();
+        if let Some(key) = object
+            .keys()
+            .find(|key| !allowed.contains(key.as_str()))
+            .cloned()
+        {
+            return Err(ManifestError::UnknownPipelineKey { key });
+        }
+        let binding = required_string(&mut object, "binding")?;
+        let stream = required_string(&mut object, "stream")?;
+        if !names.insert(binding.clone()) {
+            return Err(ManifestError::DuplicatePipelineBinding { name: binding });
+        }
+        pipelines.push(PipelineBinding { binding, stream });
+    }
+    Ok(pipelines)
+}
+
+/// Parses deployment-level and per-binding Turso mappings.
+fn parse_turso(value: Value) -> Result<TursoConfig, ManifestError> {
+    let Value::Object(mut object) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "turso",
+            expected: "object",
+        });
+    };
+    let allowed = ["url_template", "token_file", "bindings"]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed.contains(key.as_str()))
+        .cloned()
+    {
+        return Err(ManifestError::UnknownTursoKey { key });
+    }
+    let default = match (object.remove("url_template"), object.remove("token_file")) {
+        (None, None) => None,
+        (Some(url), Some(token)) => Some(TursoDeployment::new(
+            parse_nonempty_string(url, "turso.url_template")?,
+            PathBuf::from(parse_nonempty_string(token, "turso.token_file")?),
+        )?),
+        _ => {
+            return Err(ManifestError::InvalidTursoDeployment {
+                message: "url_template and token_file must be supplied together".to_owned(),
+            });
+        }
+    };
+    let bindings = match object.remove("bindings") {
+        None => BTreeMap::new(),
+        Some(Value::Object(values)) => {
+            let mut mappings = BTreeMap::new();
+            for (name, value) in values {
+                let Value::Object(mut mapping) = value else {
+                    return Err(ManifestError::InvalidType {
+                        field: "turso.bindings[]",
+                        expected: "object",
+                    });
+                };
+                let allowed = ["url_template", "token_file"]
+                    .into_iter()
+                    .collect::<HashSet<_>>();
+                if let Some(key) = mapping
+                    .keys()
+                    .find(|key| !allowed.contains(key.as_str()))
+                    .cloned()
+                {
+                    return Err(ManifestError::UnknownTursoBindingKey { key });
+                }
+                let url = required_string(&mut mapping, "url_template")?;
+                let token = required_string(&mut mapping, "token_file")?;
+                mappings.insert(name, TursoDeployment::new(url, PathBuf::from(token))?);
+            }
+            mappings
+        }
+        Some(_) => {
+            return Err(ManifestError::InvalidType {
+                field: "turso.bindings",
+                expected: "object",
+            });
+        }
+    };
+    if default.is_none() && bindings.is_empty() {
+        return Err(ManifestError::InvalidTursoDeployment {
+            message: "at least one deployment mapping is required".to_owned(),
+        });
+    }
+    Ok(TursoConfig { default, bindings })
+}
+
 /// Extracts a required nonempty string from an object.
 fn required_string(
     object: &mut Map<String, Value>,
@@ -534,99 +720,6 @@ fn required_object(
     Ok(value)
 }
 
-/// Extracts one required unsigned integer from a managed CAS object.
-fn required_u64(
-    object: &mut Map<String, Value>,
-    field: &'static str,
-) -> Result<u64, ManifestError> {
-    let value = object
-        .remove(field)
-        .ok_or(ManifestError::MissingField { field })?;
-    let Value::Number(value) = value else {
-        return Err(ManifestError::InvalidType {
-            field,
-            expected: "unsigned integer",
-        });
-    };
-    value.as_u64().ok_or(ManifestError::InvalidType {
-        field,
-        expected: "unsigned integer",
-    })
-}
-
-/// Extracts one optional nonempty string from a managed CAS object.
-fn optional_string(
-    object: &mut Map<String, Value>,
-    field: &'static str,
-) -> Result<Option<String>, ManifestError> {
-    let Some(value) = object.remove(field) else {
-        return Ok(None);
-    };
-    let Value::String(value) = value else {
-        return Err(ManifestError::InvalidType {
-            field,
-            expected: "string",
-        });
-    };
-    if value.is_empty() {
-        return Err(ManifestError::EmptyField { field });
-    }
-    Ok(Some(value))
-}
-
-/// Parses one strict managed CAS launch object.
-fn parse_managed_cas(value: Value) -> Result<ManagedCas, ManifestError> {
-    let mut object = match value {
-        Value::Object(object) => object,
-        _ => {
-            return Err(ManifestError::InvalidType {
-                field: "managed_cas",
-                expected: "object",
-            });
-        }
-    };
-    let allowed = [
-        "endpoint",
-        "bucket",
-        "prefix",
-        "region",
-        "access_key_id",
-        "secret_access_key",
-        "lease_token",
-        "lease_generation",
-        "start_sequence",
-        "lease_etag",
-        "lease_version",
-    ]
-    .into_iter()
-    .collect::<HashSet<_>>();
-    if let Some(key) = object
-        .keys()
-        .find(|key| !allowed.contains(key.as_str()))
-        .cloned()
-    {
-        return Err(ManifestError::UnknownManagedCasKey { key });
-    }
-    let lease_etag = optional_string(&mut object, "lease_etag")?;
-    let lease_version = optional_string(&mut object, "lease_version")?;
-    if lease_etag.is_none() && lease_version.is_none() {
-        return Err(ManifestError::MissingCasFence);
-    }
-    Ok(ManagedCas {
-        endpoint: required_string(&mut object, "endpoint")?,
-        bucket: required_string(&mut object, "bucket")?,
-        prefix: required_string(&mut object, "prefix")?,
-        region: required_string(&mut object, "region")?,
-        access_key_id: required_string(&mut object, "access_key_id")?,
-        secret_access_key: required_string(&mut object, "secret_access_key")?,
-        lease_token: required_string(&mut object, "lease_token")?,
-        lease_generation: required_u64(&mut object, "lease_generation")?,
-        start_sequence: required_u64(&mut object, "start_sequence")?,
-        lease_etag,
-        lease_version,
-    })
-}
-
 /// Parses the only supported durable-object section.
 fn parse_durable_objects(mut object: Map<String, Value>) -> Result<Vec<Binding>, ManifestError> {
     if let Some(key) = object
@@ -659,7 +752,7 @@ fn parse_durable_objects(mut object: Map<String, Value>) -> Result<Vec<Binding>,
     Ok(bindings)
 }
 
-/// Parses one binding object and keeps duplicate names impossible.
+/// Parses one durable-object binding object.
 fn parse_binding(value: Value) -> Result<Binding, ManifestError> {
     let Value::Object(mut object) = value else {
         return Err(ManifestError::InvalidType {
@@ -679,7 +772,7 @@ fn parse_binding(value: Value) -> Result<Binding, ManifestError> {
     Ok(Binding { name, class_name })
 }
 
-/// Validates a SHA-256 component identity without taking a dependency on the runtime crate.
+/// Validates a SHA-256 component identity without a runtime dependency.
 fn validate_digest(value: &str) -> Result<(), ManifestError> {
     if value.len() != 64 || hex::decode(value).map_or(true, |bytes| bytes.len() != 32) {
         return Err(ManifestError::InvalidComponentDigest {
@@ -689,7 +782,29 @@ fn validate_digest(value: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
-/// Removes comments and trailing commas accepted by wrangler's JSONC subset.
+/// Validates a nonempty URL and token-file template.
+fn validate_turso_fields(url: &str, token_file: &Path) -> Result<(), ManifestError> {
+    if url.is_empty() || url.chars().any(char::is_whitespace) {
+        return Err(ManifestError::InvalidTursoDeployment {
+            message: "url_template must be nonempty and contain no whitespace".to_owned(),
+        });
+    }
+    if token_file.as_os_str().is_empty() {
+        return Err(ManifestError::InvalidTursoDeployment {
+            message: "token_file must be nonempty".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Replaces only the two documented deployment placeholders.
+fn substitute(template: &str, binding: &str, do_id: &str) -> String {
+    template
+        .replace("{binding}", binding)
+        .replace("{do_id}", do_id)
+}
+
+/// Removes comments and trailing commas accepted by Wrangler's JSONC subset.
 fn strip_jsonc(source: &str) -> Result<String, ManifestError> {
     let characters = source.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(source.len());

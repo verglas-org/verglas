@@ -54,9 +54,10 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
     let digest = manifest.component_digest().to_owned();
     assert!(components.join(format!("{digest}.wasm")).is_file());
 
-    let repository = repository_root();
-    let celld = repository.join("target/debug/celld-host");
-    let verglasd = repository.join("target/debug/verglasd");
+    let celld = target_root().join("debug/celld-host");
+    // This test-only binary preserves the real EventEndpoint/WorkerRuntime chain
+    // while using TursoStore::open_for_test. Production never enables its feature.
+    let verglasd = target_root().join("debug/verglasd-test-support");
     assert!(
         celld.is_file(),
         "build target/debug/celld-host before this test"
@@ -220,6 +221,10 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
             "component_digest": "0".repeat(64),
             "component_dir": components,
             "data_root": data_root,
+            "turso": {
+                "url_template": "https://ac1.test/{binding}/{do_id}",
+                "token_file": "/dev/null"
+            },
         }))
         .expect("gateway JSON"),
     )
@@ -246,6 +251,13 @@ fn build_component(project: &Path, components: &Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// Returns the cargo target root used by this integration process.
+fn target_root() -> PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repository_root().join("target"))
 }
 
 /// Returns the checkout root containing the SDK and built runtime binaries.

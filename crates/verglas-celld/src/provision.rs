@@ -1,10 +1,8 @@
-//! Compute-substrate provisioning contracts and the local-process implementation.
+//! Process provisioning for one Turso-backed Durable Object Worker.
 //!
-//! The supervisor owns lifecycle fences while this module owns process handles,
-//! readiness observation, termination, and exit reaping. Suspend and resume are
-//! intentionally not trait operations yet: the supervisor has no caller that can
-//! provide the machine snapshot contract, so the future Fly implementation is
-//! documented in `fly` rather than represented by speculative methods.
+//! The local implementation forwards exactly the runtime CLI contract. Cloud
+//! placement and the external lease-validating Turso sync ingress remain cloud
+//! responsibilities; celld never invents a second ownership or CAS protocol.
 
 use std::future::Future;
 use std::os::unix::fs::FileTypeExt;
@@ -15,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 
+use crate::HostId;
 use crate::supervisor::SupervisorError;
-use crate::{HostId, ReplicaRole};
 
 /// Component instantiation can take minutes on cold local Wasmtime caches.
 const CHILD_READINESS_TIMEOUT: Duration = Duration::from_secs(180);
@@ -33,7 +31,7 @@ pub enum ProvisionError {
     /// A local process or filesystem operation failed.
     #[error("child process I/O failed: {0}")]
     Io(#[from] std::io::Error),
-    /// The process exited before binding its private socket.
+    /// The process exited before binding its private event socket.
     #[error("Durable Object {do_id} exited during launch with {status}")]
     Exited {
         /// Durable Object whose child failed during launch.
@@ -42,28 +40,16 @@ pub enum ProvisionError {
         status: ExitStatus,
     },
     /// The child socket path was occupied by a non-socket filesystem object.
-    #[error("Durable Object {0} produced an invalid Unix socket path")]
+    #[error("Durable Object {0} produced an invalid Unix event socket path")]
     InvalidSocket(String),
     /// The child did not bind its private socket before the launch deadline.
-    #[error("Durable Object {0} did not become socket-ready")]
+    #[error("Durable Object {0} did not become event-socket-ready")]
     ReadinessTimeout(String),
 }
 
 /// A boxed asynchronous result used by object-safe provisioner methods.
 pub type ProvisionFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, ProvisionError>> + Send + 'a>>;
-
-/// Substrate-owned process or machine handle operations.
-pub trait ProvisionHandle: Send + Sync {
-    /// Reaps an exited handle without waiting for a running handle.
-    fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProvisionError>;
-
-    /// Sends the substrate's termination signal to the handle.
-    fn kill<'a>(&'a mut self) -> ProvisionFuture<'a, ()>;
-
-    /// Waits until the substrate reports the handle's exit status.
-    fn wait<'a>(&'a mut self) -> ProvisionFuture<'a, ExitStatus>;
-}
 
 /// Descriptor and opaque handle returned by a successful substrate spawn.
 pub struct ProvisionedChild {
@@ -86,7 +72,7 @@ impl ProvisionedChild {
         }
     }
 
-    /// Returns the durable object identity used for launch errors.
+    /// Returns the Durable Object identity used for launch errors.
     pub fn do_id(&self) -> &str {
         &self.do_id
     }
@@ -101,7 +87,7 @@ impl ProvisionedChild {
         self.descriptor.pid()
     }
 
-    /// Returns the private Worker socket path.
+    /// Returns the private Worker event socket path.
     pub fn socket_path(&self) -> &Path {
         self.descriptor.socket_path()
     }
@@ -117,6 +103,18 @@ impl ProvisionedChild {
     }
 }
 
+/// Substrate-owned process or machine handle operations.
+pub trait ProvisionHandle: Send + Sync {
+    /// Reaps an exited handle without waiting for a running handle.
+    fn try_wait(&mut self) -> Result<Option<ExitStatus>, ProvisionError>;
+
+    /// Sends the substrate's termination signal to the handle.
+    fn kill<'a>(&'a mut self) -> ProvisionFuture<'a, ()>;
+
+    /// Waits until the substrate reports the handle's exit status.
+    fn wait<'a>(&'a mut self) -> ProvisionFuture<'a, ExitStatus>;
+}
+
 /// Hard process ceilings applied before a Worker child runs any code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerResourceLimits {
@@ -128,7 +126,7 @@ impl WorkerResourceLimits {
     /// Validates and creates one process ceiling configuration.
     pub fn new(memory_bytes: u64, open_files: u64) -> Result<Self, SupervisorError> {
         if memory_bytes == 0 || open_files == 0 {
-            return Err(SupervisorError::InvalidDurability(
+            return Err(SupervisorError::InvalidLaunch(
                 "worker resource limits must be nonzero".to_owned(),
             ));
         }
@@ -159,50 +157,90 @@ impl Default for WorkerResourceLimits {
     }
 }
 
-/// Program, paths, role, and held lease identity supplied to a provisioner.
+/// Remote Turso database and token-file identity for one Durable Object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvisionRequest {
-    program: PathBuf,
-    args: Vec<String>,
-    host_id: String,
-    do_id: String,
-    replica_id: u64,
-    role: ReplicaRole,
-    socket_path: PathBuf,
-    data_dir: PathBuf,
-    durability: Option<WorkerDurability>,
-    component: Option<WorkerComponent>,
-    resource_limits: WorkerResourceLimits,
+pub struct TursoConfig {
+    remote_url: String,
+    token_file: PathBuf,
+}
+
+impl TursoConfig {
+    /// Validates and creates one explicit Turso deployment configuration.
+    pub fn new(
+        remote_url: impl Into<String>,
+        token_file: impl Into<PathBuf>,
+    ) -> Result<Self, SupervisorError> {
+        let remote_url = remote_url.into();
+        let token_file = token_file.into();
+        if remote_url.is_empty() {
+            return Err(SupervisorError::InvalidLaunch(
+                "Turso remote URL cannot be empty".to_owned(),
+            ));
+        }
+        if token_file.as_os_str().is_empty() {
+            return Err(SupervisorError::InvalidLaunch(
+                "Turso token file cannot be empty".to_owned(),
+            ));
+        }
+        if remote_url.chars().any(char::is_whitespace) {
+            return Err(SupervisorError::InvalidLaunch(
+                "Turso remote URL cannot contain whitespace".to_owned(),
+            ));
+        }
+        Ok(Self {
+            remote_url,
+            token_file,
+        })
+    }
+
+    /// Returns the explicit remote Turso URL.
+    pub fn remote_url(&self) -> &str {
+        &self.remote_url
+    }
+
+    /// Returns the token-file path passed to `verglasd`.
+    pub fn token_file(&self) -> &Path {
+        &self.token_file
+    }
 }
 
 /// Tenant component identity and event ingress for one Worker child.
-///
-/// Present only on leader-role children: replicas never execute tenant code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerComponent {
     /// Lowercase SHA-256 hex identity of the component artifact.
     digest: String,
     /// Directory holding digest-named component artifacts.
     dir: PathBuf,
+    /// Optional Wasmtime compiled component cache directory.
+    cwasm_cache_dir: Option<PathBuf>,
     /// Private Unix socket where the child serves the DO event protocol.
     event_socket: PathBuf,
 }
 
 impl WorkerComponent {
-    /// Validates the digest shape and creates the component launch identity.
+    /// Validates the digest and creates the component launch identity.
     pub fn new(
         digest: impl Into<String>,
         dir: impl Into<PathBuf>,
+        cwasm_cache_dir: Option<PathBuf>,
         event_socket: impl Into<PathBuf>,
     ) -> Result<Self, SupervisorError> {
         let digest = digest.into();
+        let dir = dir.into();
+        let event_socket = event_socket.into();
         if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(SupervisorError::InvalidComponentDigest(digest));
         }
+        if dir.as_os_str().is_empty() || event_socket.as_os_str().is_empty() {
+            return Err(SupervisorError::InvalidLaunch(
+                "component directory and event socket cannot be empty".to_owned(),
+            ));
+        }
         Ok(Self {
             digest,
-            dir: dir.into(),
-            event_socket: event_socket.into(),
+            dir,
+            cwasm_cache_dir,
+            event_socket,
         })
     }
 
@@ -216,37 +254,49 @@ impl WorkerComponent {
         &self.dir
     }
 
+    /// Returns the optional compiled component cache directory.
+    pub fn cwasm_cache_dir(&self) -> Option<&Path> {
+        self.cwasm_cache_dir.as_deref()
+    }
+
     /// Returns the event-protocol socket path the child must bind.
     pub fn event_socket(&self) -> &Path {
         &self.event_socket
     }
 }
 
+/// Program and exact Turso arguments supplied to a provisioner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProvisionRequest {
+    program: PathBuf,
+    args: Vec<String>,
+    host_id: String,
+    do_id: String,
+    data_dir: PathBuf,
+    turso: TursoConfig,
+    component: WorkerComponent,
+    resource_limits: WorkerResourceLimits,
+}
+
 impl ProvisionRequest {
-    /// Creates a substrate request with explicit launch paths and lease identity.
-    #[allow(clippy::too_many_arguments)]
+    /// Creates a substrate request with the one-path Turso launch contract.
     pub fn new(
         program: impl Into<PathBuf>,
         args: Vec<String>,
         host_id: impl Into<String>,
         do_id: impl Into<String>,
-        replica_id: u64,
-        role: ReplicaRole,
-        socket_path: impl Into<PathBuf>,
         data_dir: impl Into<PathBuf>,
-        durability: Option<WorkerDurability>,
+        turso: TursoConfig,
+        component: WorkerComponent,
     ) -> Self {
         Self {
             program: program.into(),
             args,
             host_id: host_id.into(),
             do_id: do_id.into(),
-            replica_id,
-            role,
-            socket_path: socket_path.into(),
             data_dir: data_dir.into(),
-            durability,
-            component: None,
+            turso,
+            component,
             resource_limits: WorkerResourceLimits::default(),
         }
     }
@@ -262,23 +312,12 @@ impl ProvisionRequest {
         &self.resource_limits
     }
 
-    /// Attaches the tenant component identity forwarded to the child.
-    pub fn with_component(mut self, component: WorkerComponent) -> Self {
-        self.component = Some(component);
-        self
-    }
-
-    /// Returns the tenant component launch identity, if configured.
-    pub fn component(&self) -> Option<&WorkerComponent> {
-        self.component.as_ref()
-    }
-
     /// Returns the executable selected for a local or remote launch.
     pub fn program(&self) -> &Path {
         &self.program
     }
 
-    /// Returns fixed executable arguments that precede supervisor arguments.
+    /// Returns fixed executable arguments that precede runtime arguments.
     pub fn args(&self) -> &[String] {
         &self.args
     }
@@ -293,29 +332,19 @@ impl ProvisionRequest {
         &self.do_id
     }
 
-    /// Returns the per-host replica identity.
-    pub fn replica_id(&self) -> u64 {
-        self.replica_id
-    }
-
-    /// Returns the role passed to the child runtime.
-    pub fn role(&self) -> ReplicaRole {
-        self.role
-    }
-
-    /// Returns the private Worker socket path.
-    pub fn socket_path(&self) -> &Path {
-        &self.socket_path
-    }
-
-    /// Returns the isolated child data directory.
+    /// Returns the local Turso data root.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 
-    /// Returns the already-held worker durability authority, if configured.
-    pub fn durability(&self) -> Option<&WorkerDurability> {
-        self.durability.as_ref()
+    /// Returns the explicit Turso configuration.
+    pub fn turso(&self) -> &TursoConfig {
+        &self.turso
+    }
+
+    /// Returns the verified component launch identity.
+    pub fn component(&self) -> &WorkerComponent {
+        &self.component
     }
 
     /// Builds a request from the supervisor's stable child specification.
@@ -324,27 +353,26 @@ impl ProvisionRequest {
         host_id: &HostId,
         root: &Path,
         spec: &ChildSpec,
-    ) -> Self {
-        let data_dir = root
-            .join(&spec.supervision_key)
-            .join(spec.replica_id.to_string());
-        let socket_path = data_dir.join("worker.sock");
-        let mut request = Self::new(
+    ) -> Result<Self, SupervisorError> {
+        spec.validate()?;
+        let data_dir = spec
+            .data_dir
+            .clone()
+            .unwrap_or_else(|| root.join(spec.do_id()));
+        Ok(Self::new(
             command.program.clone(),
             command.args.clone(),
             host_id.as_str(),
             spec.do_id.clone(),
-            spec.replica_id,
-            spec.role,
-            socket_path,
             data_dir,
-            spec.durability.clone(),
+            spec.turso.clone().ok_or_else(|| {
+                SupervisorError::InvalidLaunch("Turso deployment is required".to_owned())
+            })?,
+            spec.component.clone().ok_or_else(|| {
+                SupervisorError::InvalidLaunch("component and event socket are required".to_owned())
+            })?,
         )
-        .with_resource_limits(spec.resource_limits().clone());
-        if let Some(component) = &spec.component {
-            request = request.with_component(component.clone());
-        }
-        request
+        .with_resource_limits(spec.resource_limits.clone()))
     }
 }
 
@@ -381,47 +409,78 @@ impl ChildCommand {
     }
 }
 
-/// Per-worker durability authority passed through without cloud composition logic.
+/// Durable identity and one-path Turso launch configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum WorkerDurability {
-    /// One externally durable replica service and an already-held lease.
-    Replica {
-        /// Private replica service socket.
-        socket: PathBuf,
-        /// Opaque ownership token.
-        lease_token: String,
-        /// Monotonic ownership generation.
-        generation: u64,
-        /// Sequence the worker must recover before binding.
-        start_sequence: u64,
-        /// Managed compacted archive root; absent when offload is disabled.
-        offload_dir: Option<PathBuf>,
-    },
-    /// A managed object-store CAS authority and its already-held head fence.
-    ManagedCas {
-        /// S3-compatible endpoint used for immutable CAS objects.
-        endpoint: String,
-        /// Bucket containing the managed object layout.
-        bucket: String,
-        /// Prefix containing one DO's head, transactions, and checkpoints.
-        prefix: String,
-        /// Signing region for the object-store client.
-        region: String,
-        /// Explicit object-store access key.
-        access_key_id: String,
-        /// Explicit object-store secret key.
-        secret_access_key: String,
-        /// Opaque ownership token.
-        lease_token: String,
-        /// Monotonic ownership generation.
-        generation: u64,
-        /// Sequence the worker must recover before binding.
-        start_sequence: u64,
-        /// Held head ETag, when the store exposes one.
-        lease_etag: Option<String>,
-        /// Held head version, when the store exposes one.
-        lease_version: Option<String>,
-    },
+pub struct ChildSpec {
+    do_id: String,
+    data_dir: Option<PathBuf>,
+    turso: Option<TursoConfig>,
+    component: Option<WorkerComponent>,
+    resource_limits: WorkerResourceLimits,
+}
+
+impl ChildSpec {
+    /// Validates a filesystem-safe DO identity and creates its launch specification.
+    pub fn new(do_id: impl Into<String>) -> Result<Self, SupervisorError> {
+        let do_id = validate_identity(do_id.into())?;
+        Ok(Self {
+            do_id,
+            data_dir: None,
+            turso: None,
+            component: None,
+            resource_limits: WorkerResourceLimits::default(),
+        })
+    }
+
+    /// Attaches the local data root passed to `verglasd`.
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Result<Self, SupervisorError> {
+        let data_dir = data_dir.into();
+        if data_dir.as_os_str().is_empty() {
+            return Err(SupervisorError::InvalidLaunch(
+                "local data root cannot be empty".to_owned(),
+            ));
+        }
+        self.data_dir = Some(data_dir);
+        Ok(self)
+    }
+
+    /// Attaches the explicit Turso remote URL and token-file path.
+    pub fn with_turso(mut self, turso: TursoConfig) -> Self {
+        self.turso = Some(turso);
+        self
+    }
+
+    /// Attaches the verified tenant component and event socket.
+    pub fn with_component(mut self, component: WorkerComponent) -> Self {
+        self.component = Some(component);
+        self
+    }
+
+    /// Attaches explicit process ceilings for this child.
+    pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
+        self.resource_limits = resource_limits;
+        self
+    }
+
+    /// Returns the Durable Object identity.
+    pub(crate) fn do_id(&self) -> &str {
+        &self.do_id
+    }
+
+    /// Returns whether the spec has all required Turso launch values.
+    pub(crate) fn validate(&self) -> Result<(), SupervisorError> {
+        if self.turso.is_none() {
+            return Err(SupervisorError::InvalidLaunch(
+                "Turso deployment is required".to_owned(),
+            ));
+        }
+        if self.component.is_none() {
+            return Err(SupervisorError::InvalidLaunch(
+                "component and event socket are required".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Validates one identity before it is used in a host-local path or process argument.
@@ -438,144 +497,6 @@ fn validate_identity(identity: String) -> Result<String, SupervisorError> {
     Ok(identity)
 }
 
-/// Durable identity and initial role of one host-local DO replica.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChildSpec {
-    do_id: String,
-    /// Host-local key that separates the replica pager from the Worker pager.
-    supervision_key: String,
-    replica_id: u64,
-    role: ReplicaRole,
-    applied: u64,
-    durability: Option<WorkerDurability>,
-    component: Option<WorkerComponent>,
-    resource_limits: WorkerResourceLimits,
-}
-
-impl ChildSpec {
-    /// Validates a filesystem-safe DO identity and creates its launch specification.
-    pub fn new(
-        do_id: impl Into<String>,
-        replica_id: u64,
-        role: ReplicaRole,
-        applied: u64,
-    ) -> Result<Self, SupervisorError> {
-        let do_id = validate_identity(do_id.into())?;
-        Ok(Self {
-            supervision_key: do_id.clone(),
-            do_id,
-            replica_id,
-            role,
-            applied,
-            durability: None,
-            component: None,
-            resource_limits: WorkerResourceLimits::default(),
-        })
-    }
-
-    /// Attaches explicit process ceilings for this child.
-    pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
-        self.resource_limits = resource_limits;
-        self
-    }
-
-    /// Returns the process ceilings selected for this child.
-    pub(crate) fn resource_limits(&self) -> &WorkerResourceLimits {
-        &self.resource_limits
-    }
-
-    /// Gives a paired replica its own host-local pager and supervision slot.
-    pub(crate) fn with_supervision_key(
-        mut self,
-        supervision_key: impl Into<String>,
-    ) -> Result<Self, SupervisorError> {
-        self.supervision_key = validate_identity(supervision_key.into())?;
-        Ok(self)
-    }
-
-    /// Attaches the tenant component the leader child must load and serve.
-    pub fn with_component(mut self, component: WorkerComponent) -> Result<Self, SupervisorError> {
-        if self.role != ReplicaRole::Leader {
-            return Err(SupervisorError::InvalidDurability(
-                "replica-only child cannot execute tenant components".to_owned(),
-            ));
-        }
-        self.component = Some(component);
-        Ok(self)
-    }
-
-    /// Attaches the already-provisioned durability authority for one worker.
-    pub fn with_durability(
-        mut self,
-        durability: WorkerDurability,
-    ) -> Result<Self, SupervisorError> {
-        if self.role != ReplicaRole::Leader {
-            return Err(SupervisorError::InvalidDurability(
-                "replica-only child cannot own worker durability".to_owned(),
-            ));
-        }
-        match &durability {
-            WorkerDurability::Replica {
-                lease_token,
-                start_sequence,
-                ..
-            } if lease_token.is_empty() || *start_sequence != self.applied => {
-                return Err(SupervisorError::InvalidDurability(
-                    "replica lease token must be nonempty and start at applied sequence".to_owned(),
-                ));
-            }
-            WorkerDurability::ManagedCas {
-                lease_token,
-                start_sequence,
-                ..
-            } if lease_token.is_empty() || *start_sequence != self.applied => {
-                return Err(SupervisorError::InvalidDurability(
-                    "managed CAS lease token must be nonempty and start at applied sequence"
-                        .to_owned(),
-                ));
-            }
-            WorkerDurability::Replica { .. } | WorkerDurability::ManagedCas { .. } => {}
-        }
-        self.durability = Some(durability);
-        Ok(self)
-    }
-
-    /// Returns the Durable Object identity.
-    pub(crate) fn do_id(&self) -> &str {
-        &self.do_id
-    }
-
-    /// Returns the host-local key used for this child process and pager.
-    pub(crate) fn supervision_key(&self) -> &str {
-        &self.supervision_key
-    }
-
-    /// Returns the configured durability authority, if any.
-    pub(crate) fn durability(&self) -> Option<&WorkerDurability> {
-        self.durability.as_ref()
-    }
-
-    /// Returns the initial replica role used by lifecycle fencing.
-    pub(crate) fn role(&self) -> ReplicaRole {
-        self.role
-    }
-
-    /// Returns the applied sequence used by lifecycle fencing.
-    pub(crate) fn applied(&self) -> u64 {
-        self.applied
-    }
-
-    /// Updates the role after a restore election has completed.
-    pub(crate) fn set_role(&mut self, role: ReplicaRole) {
-        self.role = role;
-    }
-
-    /// Updates the applied sequence after a restore fence has completed.
-    pub(crate) fn set_applied(&mut self, applied: u64) {
-        self.applied = applied;
-    }
-}
-
 /// Stable process and isolation paths returned after a successful spawn.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildDescriptor {
@@ -585,7 +506,7 @@ pub struct ChildDescriptor {
 }
 
 impl ChildDescriptor {
-    /// Creates a substrate descriptor for a process or machine endpoint.
+    /// Creates a substrate descriptor for a process endpoint.
     pub fn new(pid: u32, socket_path: impl Into<PathBuf>, data_dir: impl Into<PathBuf>) -> Self {
         Self {
             pid,
@@ -599,27 +520,23 @@ impl ChildDescriptor {
         self.pid
     }
 
-    /// Returns the child-exclusive Worker Unix socket path.
+    /// Returns the child-exclusive Worker event socket.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
 
-    /// Returns the child-exclusive SQLite, WAL, fragment, and checkpoint directory.
+    /// Returns the child-exclusive Turso data directory.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
 }
 
 /// Compute substrate operations required by the host lifecycle supervisor.
-///
-/// Suspension and resumption are deliberately not methods yet. The current
-/// supervisor has only the fenced kill-and-wait and spawn callers; a future
-/// machine-snapshot contract belongs here once those lifecycle callers exist.
 pub trait Provisioner: Send + Sync {
-    /// Starts one child or machine with its lease identity and isolation paths.
+    /// Starts one child or machine with its Turso and component launch paths.
     fn spawn<'a>(&'a self, request: ProvisionRequest) -> ProvisionFuture<'a, ProvisionedChild>;
 
-    /// Waits until the child has bound its private socket before publication.
+    /// Waits until the child has bound its private event socket before publication.
     fn await_ready<'a>(&'a self, child: &'a mut ProvisionedChild) -> ProvisionFuture<'a, ()>;
 
     /// Reaps an exited child without waiting for a running child.
@@ -666,113 +583,40 @@ impl ProvisionHandle for LocalProcessHandle {
 }
 
 impl Provisioner for LocalProcessProvisioner {
-    /// Creates one isolated local process and returns its opaque handle.
+    /// Creates one isolated local process with the exact runtime CLI arguments.
     fn spawn<'a>(&'a self, request: ProvisionRequest) -> ProvisionFuture<'a, ProvisionedChild> {
         Box::pin(async move {
             tokio::fs::create_dir_all(request.data_dir()).await?;
-            match tokio::fs::remove_file(request.socket_path()).await {
+            let event_socket = request.component().event_socket();
+            match tokio::fs::remove_file(event_socket).await {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ProvisionError::from(error)),
             }
-            let role = match request.role() {
-                ReplicaRole::Leader => "worker",
-                ReplicaRole::Follower => "replica",
-            };
             let mut command = Command::new(request.program());
             command
                 .args(request.args())
                 .arg("--do-id")
                 .arg(request.do_id())
-                .arg("--replica-id")
-                .arg(request.replica_id().to_string())
-                .arg("--role")
-                .arg(role)
-                .arg("--socket")
-                .arg(request.socket_path())
                 .arg("--data-dir")
                 .arg(request.data_dir())
+                .arg("--turso-url")
+                .arg(request.turso().remote_url())
+                .arg("--turso-token-file")
+                .arg(request.turso().token_file())
+                .arg("--component-digest")
+                .arg(request.component().digest())
+                .arg("--component-dir")
+                .arg(request.component().dir())
                 .env("VERGLAS_CELL_HOST", request.host_id())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .kill_on_drop(true);
-            match request.durability() {
-                Some(WorkerDurability::Replica {
-                    socket,
-                    lease_token,
-                    generation,
-                    start_sequence,
-                    offload_dir,
-                }) => {
-                    command
-                        .arg("--replica-socket")
-                        .arg(socket)
-                        .arg("--lease-token")
-                        .arg(lease_token)
-                        .arg("--lease-generation")
-                        .arg(generation.to_string())
-                        .arg("--start-sequence")
-                        .arg(start_sequence.to_string());
-                    if let Some(offload_dir) = offload_dir {
-                        command.arg("--offload-dir").arg(offload_dir);
-                    }
-                }
-                Some(WorkerDurability::ManagedCas {
-                    endpoint,
-                    bucket,
-                    prefix,
-                    region,
-                    access_key_id,
-                    secret_access_key,
-                    lease_token,
-                    generation,
-                    start_sequence,
-                    lease_etag,
-                    lease_version,
-                }) => {
-                    command
-                        .arg("--cas-endpoint")
-                        .arg(endpoint)
-                        .arg("--cas-bucket")
-                        .arg(bucket)
-                        .arg("--cas-prefix")
-                        .arg(prefix)
-                        .arg("--cas-region")
-                        .arg(region)
-                        .arg("--cas-access-key-id")
-                        .arg(access_key_id)
-                        .arg("--cas-secret-access-key")
-                        .arg(secret_access_key)
-                        .arg("--lease-token")
-                        .arg(lease_token)
-                        .arg("--lease-generation")
-                        .arg(generation.to_string())
-                        .arg("--start-sequence")
-                        .arg(start_sequence.to_string());
-                    if let Some(lease_etag) = lease_etag {
-                        command.arg("--lease-etag").arg(lease_etag);
-                    }
-                    if let Some(lease_version) = lease_version {
-                        command.arg("--lease-version").arg(lease_version);
-                    }
-                }
-                None => {}
+            if let Some(cache_dir) = request.component().cwasm_cache_dir() {
+                command.arg("--cwasm-cache-dir").arg(cache_dir);
             }
-            if let Some(component) = request.component() {
-                match tokio::fs::remove_file(component.event_socket()).await {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(ProvisionError::from(error)),
-                }
-                command
-                    .arg("--component-digest")
-                    .arg(component.digest())
-                    .arg("--component-dir")
-                    .arg(component.dir())
-                    .arg("--event-socket")
-                    .arg(component.event_socket());
-            }
+            command.arg("--event-socket").arg(event_socket);
             let resource_limits = request.resource_limits().clone();
             // SAFETY: The closure only calls async-signal-safe setrlimit before exec.
             unsafe {
@@ -803,7 +647,7 @@ impl Provisioner for LocalProcessProvisioner {
             })?;
             let descriptor = ChildDescriptor::new(
                 pid,
-                request.socket_path().to_path_buf(),
+                event_socket.to_path_buf(),
                 request.data_dir().to_path_buf(),
             );
             Ok(ProvisionedChild::new(
@@ -814,7 +658,7 @@ impl Provisioner for LocalProcessProvisioner {
         })
     }
 
-    /// Waits for a local child socket and fails closed on early exit or bad paths.
+    /// Waits for a local event socket and fails closed on early exit or bad paths.
     fn await_ready<'a>(&'a self, child: &'a mut ProvisionedChild) -> ProvisionFuture<'a, ()> {
         Box::pin(async move {
             let deadline = Instant::now() + CHILD_READINESS_TIMEOUT;

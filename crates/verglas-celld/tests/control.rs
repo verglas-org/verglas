@@ -1,4 +1,4 @@
-//! Unix control-plane protocol for the runnable `celld-host` daemon.
+//! Turso worker control protocol acceptance tests.
 
 use std::path::Path;
 
@@ -6,12 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use verglas_celld::{ChildCommand, ControlServer, HostId, HostSupervisor};
 
-fn socket_child() -> ChildCommand {
-    ChildCommand::new("python3").arg("-c").arg(
-        "import socket,sys,time; p=sys.argv[sys.argv.index('--socket')+1]; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); time.sleep(30)",
-    )
-}
+const DIGEST: &str = "ababaabababaabababaabababaabababaabababaabababaabababaabababaaba";
 
+/// Sends one strict command through the host control socket.
 async fn request(server: &mut ControlServer, path: &Path, command: &str) -> String {
     let client = async {
         let mut stream = UnixStream::connect(path).await.expect("connect control");
@@ -31,197 +28,131 @@ async fn request(server: &mut ControlServer, path: &Path, command: &str) -> Stri
     response
 }
 
+/// A fake child records the exact runtime argv and binds the event socket.
+fn argv_dump_child() -> ChildCommand {
+    ChildCommand::new("python3").arg("-c").arg(
+        "import os,socket,sys,time; d=sys.argv[sys.argv.index('--data-dir')+1]; os.makedirs(d,exist_ok=True); open(os.path.join(d,'argv.txt'),'w').write('\\n'.join(sys.argv)); p=sys.argv[sys.argv.index('--event-socket')+1]; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); time.sleep(30)",
+    )
+}
+
+/// The only worker command forwards the Turso and component launch contract.
 #[tokio::test]
-async fn control_socket_spawns_routes_and_suspends_a_child() {
+async fn spawn_worker_forwards_exact_turso_arguments() {
     let root = tempfile::tempdir().expect("cell root");
     let control_path = root.path().join("celld.sock");
-    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), socket_child());
+    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
     let mut server = ControlServer::bind(&control_path, supervisor)
         .await
         .expect("bind control");
+    let data_dir = root.path().join("do-1");
+    let cache_dir = root.path().join("cache");
+    let event_socket = data_dir.join("events.sock");
+    let command = format!(
+        "SPAWN_WORKER do-1 {} https://tenant.turso.io/db-1 {} {} {} {} {}",
+        data_dir.display(),
+        root.path().join("token").display(),
+        DIGEST,
+        root.path().join("components").display(),
+        cache_dir.display(),
+        event_socket.display(),
+    );
+    let response = request(&mut server, &control_path, &command).await;
+    assert_eq!(
+        response.trim().strip_prefix("OK ").expect("spawn response"),
+        event_socket.display().to_string()
+    );
+    let argv = std::fs::read_to_string(data_dir.join("argv.txt")).expect("child argv dump");
+    let lines: Vec<&str> = argv.lines().collect();
+    let flag_value = |flag: &str| -> &str {
+        let index = lines
+            .iter()
+            .position(|line| *line == flag)
+            .unwrap_or_else(|| panic!("missing {flag} in child argv: {argv}"));
+        lines[index + 1]
+    };
+    assert_eq!(flag_value("--do-id"), "do-1");
+    assert_eq!(flag_value("--data-dir"), data_dir.display().to_string());
+    assert_eq!(flag_value("--turso-url"), "https://tenant.turso.io/db-1");
+    assert_eq!(
+        flag_value("--turso-token-file"),
+        root.path().join("token").display().to_string()
+    );
+    assert_eq!(flag_value("--component-digest"), DIGEST);
+    assert_eq!(
+        flag_value("--component-dir"),
+        root.path().join("components").display().to_string()
+    );
+    assert_eq!(
+        flag_value("--cwasm-cache-dir"),
+        cache_dir.display().to_string()
+    );
+    assert_eq!(
+        flag_value("--event-socket"),
+        event_socket.display().to_string()
+    );
+    server.supervisor_mut().shutdown().await.expect("shutdown");
+}
 
-    let spawn = request(&mut server, &control_path, "SPAWN agent-1 1 leader 4").await;
-    assert!(spawn.starts_with("OK "));
-    assert!(spawn.trim_end().ends_with("worker.sock"));
-    let pid = request(&mut server, &control_path, "PID agent-1").await;
-    assert!(pid.starts_with("OK "));
-    assert!(pid.trim_start_matches("OK ").trim().parse::<u32>().is_ok());
-    let route = request(&mut server, &control_path, "ROUTE_STATEFUL agent-1").await;
-    assert!(route.starts_with("OK "));
-    let unsafe_suspend = request(&mut server, &control_path, "SUSPEND agent-1 4 3 4").await;
-    assert!(unsafe_suspend.starts_with("ERR "));
-    let suspend = request(&mut server, &control_path, "SUSPEND agent-1 4 4 4").await;
-    assert_eq!(suspend, "OK\n");
-    let fenced = request(&mut server, &control_path, "ROUTE_STATEFUL agent-1").await;
-    assert!(fenced.starts_with("ERR "));
+/// Old replica and managed-CAS commands fail closed without mutating supervision.
+#[tokio::test]
+async fn removed_durability_commands_are_hard_errors() {
+    let root = tempfile::tempdir().expect("cell root");
+    let control_path = root.path().join("celld.sock");
+    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
+    let mut server = ControlServer::bind(&control_path, supervisor)
+        .await
+        .expect("bind control");
+    for command in [
+        "SPAWN do-1 1 follower 0",
+        "SPAWN_CAS_WORKER do-1 1 0 http://cas bucket prefix region access secret token 1 0 etag - digest dir event",
+        "SPAWN_WORKER do-1 1 0 /tmp/replica token 1 0 -",
+    ] {
+        let response = request(&mut server, &control_path, command).await;
+        assert!(
+            response.starts_with("ERR invalid command"),
+            "{command}: {response}"
+        );
+    }
+    assert!(server.supervisor_mut().state("do-1").is_none());
+}
 
-    let held = request(
-        &mut server,
-        &control_path,
-        "SPAWN_WORKER agent-2 1 0 /tmp/agent-2-replica.sock 68656c642d746f6b656e 2 0 -",
-    )
-    .await;
-    assert!(held.starts_with("OK "));
+/// Suspension requires push, drained outbox, and clean event shutdown confirmations.
+#[tokio::test]
+async fn suspend_requires_turso_push_outbox_and_clean_shutdown() {
+    let root = tempfile::tempdir().expect("cell root");
+    let control_path = root.path().join("celld.sock");
+    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
+    let mut server = ControlServer::bind(&control_path, supervisor)
+        .await
+        .expect("bind control");
+    let data_dir = root.path().join("do-1");
+    let event_socket = data_dir.join("events.sock");
+    let command = format!(
+        "SPAWN_WORKER do-1 {} https://tenant.turso.io/db-1 {} {} {} - {}",
+        data_dir.display(),
+        root.path().join("token").display(),
+        DIGEST,
+        root.path().join("components").display(),
+        event_socket.display(),
+    );
     assert!(
-        request(&mut server, &control_path, "ROUTE_STATEFUL agent-2")
+        request(&mut server, &control_path, &command)
             .await
             .starts_with("OK ")
     );
-
-    server.supervisor_mut().shutdown().await.expect("shutdown");
-}
-
-#[tokio::test]
-async fn malformed_control_command_fails_without_mutating_supervision() {
-    let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
-    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), socket_child());
-    let mut server = ControlServer::bind(&control_path, supervisor)
-        .await
-        .expect("bind control");
-
-    let response = request(&mut server, &control_path, "SPAWN missing-fields").await;
-    assert!(response.starts_with("ERR invalid command"));
-    assert!(server.supervisor_mut().state("missing-fields").is_none());
-}
-
-/// Allows one logical DO to own a replica endpoint and a Worker endpoint.
-#[tokio::test]
-async fn control_spawns_replica_and_worker_for_one_do_identity() {
-    let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
-    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
-    let mut server = ControlServer::bind(&control_path, supervisor)
-        .await
-        .expect("bind control");
-
-    let replica = request(&mut server, &control_path, "SPAWN agent-pair 1 follower 0").await;
     assert!(
-        replica.starts_with("OK "),
-        "replica spawn failed: {replica}"
+        request(&mut server, &control_path, "SUSPEND do-1 yes no yes")
+            .await
+            .starts_with("ERR ")
     );
-    let worker = request(
-        &mut server,
-        &control_path,
-        "SPAWN_WORKER agent-pair 1 0 /tmp/agent-pair-replica.sock 68656c642d746f6b656e 11 0 -",
-    )
-    .await;
-    assert!(worker.starts_with("OK "), "worker spawn failed: {worker}");
-    assert!(server.supervisor_mut().pid("agent-pair").is_some());
-    server.supervisor_mut().shutdown().await.expect("shutdown");
-}
-
-/// Fake child that records its argv into the data directory before binding.
-fn argv_dump_child() -> ChildCommand {
-    ChildCommand::new("python3").arg("-c").arg(
-        "import socket,sys,time,os; d=sys.argv[sys.argv.index('--data-dir')+1]; open(os.path.join(d,'argv.txt'),'w').write('\\n'.join(sys.argv)); p=sys.argv[sys.argv.index('--socket')+1]; s=socket.socket(socket.AF_UNIX); s.bind(p); s.listen(); time.sleep(30)",
-    )
-}
-
-/// A component-bearing SPAWN_WORKER forwards digest, dir, and event socket to the child argv.
-#[tokio::test]
-async fn spawn_worker_with_component_passes_component_arguments() {
-    let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
-    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
-    let mut server = ControlServer::bind(&control_path, supervisor)
-        .await
-        .expect("bind control");
-
-    let digest = "ab".repeat(32);
-    let event_socket = root.path().join("agent-3-events.sock");
-    let command = format!(
-        "SPAWN_WORKER agent-3 1 0 /tmp/agent-3-replica.sock 68656c642d746f6b656e 2 0 - {digest} /tmp/components {}",
-        event_socket.display()
-    );
-    let response = request(&mut server, &control_path, &command).await;
-    assert!(response.starts_with("OK "), "spawn failed: {response}");
-
-    let argv = std::fs::read_to_string(root.path().join("agent-3").join("1").join("argv.txt"))
-        .expect("child argv dump");
-    let lines: Vec<&str> = argv.lines().collect();
-    let flag_value = |flag: &str| -> &str {
-        let index = lines
-            .iter()
-            .position(|line| *line == flag)
-            .unwrap_or_else(|| panic!("missing {flag} in child argv: {argv}"));
-        lines[index + 1]
-    };
-    assert_eq!(flag_value("--component-digest"), digest);
-    assert_eq!(flag_value("--component-dir"), "/tmp/components");
     assert_eq!(
-        flag_value("--event-socket"),
-        event_socket.display().to_string()
+        request(&mut server, &control_path, "SUSPEND do-1 yes yes yes").await,
+        "OK\n"
     );
-
-    server.supervisor_mut().shutdown().await.expect("shutdown");
-}
-
-/// A component-bearing managed CAS command forwards every CAS fence to verglasd.
-#[tokio::test]
-async fn spawn_cas_worker_passes_cas_arguments_and_component() {
-    let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
-    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
-    let mut server = ControlServer::bind(&control_path, supervisor)
-        .await
-        .expect("bind control");
-
-    let digest = "cd".repeat(32);
-    let event_socket = root.path().join("agent-cas-events.sock");
-    let command = format!(
-        "SPAWN_CAS_WORKER agent-cas 1 7 http://cas objects verglas us-east-1 access secret 68656c642d746f6b656e 11 7 657461672d37 - {digest} /tmp/components {}",
-        event_socket.display()
-    );
-    let response = request(&mut server, &control_path, &command).await;
-    assert!(response.starts_with("OK "), "spawn failed: {response}");
-
-    let argv = std::fs::read_to_string(root.path().join("agent-cas").join("1").join("argv.txt"))
-        .expect("child argv dump");
-    let lines: Vec<&str> = argv.lines().collect();
-    let flag_value = |flag: &str| -> &str {
-        let index = lines
-            .iter()
-            .position(|line| *line == flag)
-            .unwrap_or_else(|| panic!("missing {flag} in child argv: {argv}"));
-        lines[index + 1]
-    };
-    assert_eq!(flag_value("--cas-endpoint"), "http://cas");
-    assert_eq!(flag_value("--cas-bucket"), "objects");
-    assert_eq!(flag_value("--cas-prefix"), "verglas");
-    assert_eq!(flag_value("--cas-region"), "us-east-1");
-    assert_eq!(flag_value("--cas-access-key-id"), "access");
-    assert_eq!(flag_value("--cas-secret-access-key"), "secret");
-    assert_eq!(flag_value("--lease-token"), "held-token");
-    assert_eq!(flag_value("--lease-etag"), "etag-7");
-    assert_eq!(flag_value("--component-digest"), digest);
-    assert_eq!(
-        flag_value("--event-socket"),
-        event_socket.display().to_string()
-    );
-
-    server.supervisor_mut().shutdown().await.expect("shutdown");
-}
-
-/// A malformed component digest is rejected before any child is spawned.
-#[tokio::test]
-async fn spawn_worker_with_malformed_component_digest_is_rejected() {
-    let root = tempfile::tempdir().expect("cell root");
-    let control_path = root.path().join("celld.sock");
-    let supervisor = HostSupervisor::new(HostId::new("cell-a"), root.path(), argv_dump_child());
-    let mut server = ControlServer::bind(&control_path, supervisor)
-        .await
-        .expect("bind control");
-
-    let response = request(
-        &mut server,
-        &control_path,
-        "SPAWN_WORKER agent-4 1 0 /tmp/agent-4-replica.sock 68656c642d746f6b656e 2 0 - nothex /tmp/components /tmp/agent-4-events.sock",
-    )
-    .await;
     assert!(
-        response.starts_with("ERR invalid command"),
-        "got: {response}"
+        request(&mut server, &control_path, "PID do-1")
+            .await
+            .starts_with("ERR ")
     );
-    assert!(server.supervisor_mut().state("agent-4").is_none());
+    server.supervisor_mut().shutdown().await.expect("shutdown");
 }
