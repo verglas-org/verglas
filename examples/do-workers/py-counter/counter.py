@@ -1,56 +1,55 @@
-"""SQL-backed Python Durable Object counter example."""
+"""Cloudflare-style Python Worker and SQL-backed Durable Object counter."""
 
 from __future__ import annotations
 
-import json
+from urllib.parse import urlparse
 
-from verglas_worker import Environment, Request, Response
+from workers import DurableObject, Response, WorkerEntrypoint
 
 
 COUNTER_ID = "global"
 
 
-def _json_response(value: object, status: int = 200) -> Response:
-    """Encode one JSON value as the response body used by the counter."""
-    return Response(
-        status,
-        [("content-type", "application/json")],
-        json.dumps(value, separators=(",", ":")).encode("utf-8"),
-    )
+class Counter(DurableObject):
+    """Persist counter increments in the Durable Object's SQL storage."""
+
+    def __init__(self, ctx, env):
+        """Create the counter table before the first Durable Object event."""
+        super().__init__(ctx, env)
+        self.ctx.storage.sql.exec(
+            "CREATE TABLE IF NOT EXISTS counter "
+            "(id TEXT NOT NULL, count INTEGER NOT NULL)"
+        )
+
+    async def fetch(self, request):
+        """Serve counter reads and increments through the SQL cursor API."""
+        path = urlparse(request.url).path
+        if request.method == "POST" and path == "/incr":
+            self.ctx.storage.sql.exec(
+                "INSERT INTO counter (id, count) VALUES (?, 1)",
+                COUNTER_ID,
+            )
+            row = self.ctx.storage.sql.exec(
+                "SELECT COUNT(*) AS count FROM counter WHERE id = ?",
+                COUNTER_ID,
+            ).one()
+            return Response.json({"count": int(row.count)})
+
+        if request.method == "GET" and path == "/":
+            row = self.ctx.storage.sql.exec(
+                "SELECT COUNT(*) AS count FROM counter WHERE id = ?",
+                COUNTER_ID,
+            ).one()
+            return Response.json({"count": int(row.count)})
+
+        return Response.json({"error": "not found"}, status=404)
 
 
-def _count(env: Environment) -> int:
-    """Count committed counter rows from the SQL table."""
-    rows = env.sql("SELECT COUNT(*) AS count FROM counter WHERE id = 'global'")
-    return int(rows[0]["count"]) if rows else 0
+class Default(WorkerEntrypoint):
+    """Route public Worker requests to the named counter Durable Object."""
 
-
-def init(env: Environment) -> None:
-    """Create the counter table before the first event for this object."""
-    env.sql(
-        "CREATE TABLE IF NOT EXISTS counter "
-        "(id VARCHAR NOT NULL, count BIGINT NOT NULL)"
-    )
-
-
-def fetch(request: Request, env: Environment) -> Response:
-    """Serve counter reads and increments from the Durable Object SQL state."""
-    path = request.uri.split("?", 1)[0]
-
-    if request.method == "POST" and path == "/incr":
-        env.sql(f"INSERT INTO counter (id, count) VALUES ('{COUNTER_ID}', 1)")
-        return _json_response({"count": _count(env)})
-
-    if request.method == "GET" and path == "/":
-        return _json_response({"count": _count(env)})
-
-    return _json_response({"error": "not found"}, 404)
-
-
-def websocket_message(socket: int, message: bytes, env: Environment) -> None:
-    """Echo one WebSocket message and then send the current counter value."""
-    env.sockets.send(socket, message)
-    env.sockets.send(
-        socket,
-        json.dumps({"count": _count(env)}, separators=(",", ":")),
-    )
+    async def fetch(self, request):
+        """Forward every request to the deterministic counter stub."""
+        identifier = self.env.COUNTER.id_from_name(COUNTER_ID)
+        stub = self.env.COUNTER.get(identifier)
+        return await stub.fetch(request)

@@ -3,10 +3,13 @@
   "main": "counter.py",
   "durable_objects": {
     "bindings": [
-      { "name": "COUNTER", "class_name": "Counter" }
+      {
+        "name": "COUNTER",
+        "class_name": "Counter"
+      }
     ]
   },
-  "component_digest": "5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860",
-  "component_dir": "/tmp/verglas-do-poc/py-build",
+  "component_digest": "cc6d1312fe23fde6c5dfd87fbf94d25ef2a9cc699fa5ac150340cac39e4d19f8",
+  "component_dir": "/private/tmp/verglas-do-poc/py-build",
   "data_root": "/tmp/verglas-do-poc/py-data"
 }

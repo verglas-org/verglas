@@ -1,13 +1,36 @@
-# Verglas Python Worker SDK
+# Cloudflare Python Worker SDK
 
-This SDK builds a Python Durable Object Worker into the
-`verglas:do-worker@0.1.0` WebAssembly component. It is a prototype authoring
-surface. The builder validates the small Wrangler manifest used by this
-repository and does not run a Worker under a Verglas runtime.
+This SDK injects a `workers` module while componentizing a Cloudflare-style
+Python Worker into a `verglas:do-worker@0.1.0` component. A project imports the
+same names as Cloudflare's Python Workers runtime; it does not import a
+Verglas-specific module.
 
-## Toolchain
+The public shape follows Cloudflare's [Python Workers documentation](https://developers.cloudflare.com/workers/languages/python/):
 
-Use the local virtual environment. Do not install the toolchain globally:
+```python
+from workers import DurableObject, Response, WorkerEntrypoint
+
+class Counter(DurableObject):
+    def __init__(self, ctx, env):
+        super().__init__(ctx, env)
+
+class Default(WorkerEntrypoint):
+    async def fetch(self, request):
+        return Response("hello")
+```
+
+The module-level Cloudflare form is also accepted:
+
+```python
+from workers import Response
+
+async def on_fetch(request, env):
+    return Response("hello")
+```
+
+## Toolchain and build
+
+Use the repository-local virtual environment:
 
 ```sh
 python3 -m venv sdks/worker-py/.venv
@@ -17,124 +40,95 @@ componentize-py --version
 # componentize-py 0.25.0
 ```
 
-The pinned CLI's binding inspection command is:
-
-```sh
-componentize-py -d crates/verglas-do-wasm/wit -w durable-object \
-  bindings /tmp/verglas-worker-py-bindings
-```
-
-The build entry point is:
+Build one Wrangler project with:
 
 ```sh
 python sdks/worker-py/build.py <project-dir> --out <output-dir> [--gateway <gateway.json>]
 ```
 
-It invokes the pinned executable as:
+The builder invokes `componentize-py` against the `service` world in
+`crates/verglas-do-wasm/wit`. It injects `workers._component`, imports the
+project's `main` module, and exports both the Worker `fetch` surface and the
+Durable Object handler surface. The output directory receives
+`<sha256-of-bytes>.wasm` and `manifest.out.json`; an existing `gateway.json`
+gets the same digest and output-directory update used by the JavaScript builder.
 
-```text
-componentize-py -d <repository>/crates/verglas-do-wasm/wit -w durable-object componentize verglas_worker_entry -p <temporary-entry-dir> -p <sdk-dir> -p <project-dir> --stub-wasi -o <temporary-entry-dir>/worker.wasm
-```
+The accepted Wrangler JSON/JSONC subset is:
 
-The temporary entry imports the project's `.py` main module and exposes the
-shim's generated `Handler`. `--stub-wasi` removes component imports for the
-Python runtime's ambient WASI facilities; the v0 host grants only the Verglas
-storage and sockets interfaces. The output directory receives
-`<lowercase-sha256>.wasm` and `manifest.out.json`. If the project directory
-contains `gateway.json`, the builder updates its `component_digest` and
-`component_dir`; use `--gateway` to select another manifest:
+- `name` and `main`;
+- `compatibility_date` and `compatibility_flags`;
+- `durable_objects.bindings` with `name` and `class_name`;
+- `migrations` entries with `tag` and optional `new_sqlite_classes` or `new_classes`;
+- `vars`.
 
-```json
-{
-  "name": "py-counter",
-  "component_digest": "...",
-  "bindings": [{ "name": "COUNTER", "class_name": "Counter" }]
-}
-```
+Unknown keys are hard errors, including unknown nested migration keys. Other
+Cloudflare bindings are not silently ignored; they are outside this milestone.
 
-Only `name`, `main`, and `durable_objects.bindings` are accepted. Unknown
-top-level keys are hard errors. `main` must be an existing Python file inside
-the project and must end in `.py`.
+## Cloudflare Python surface
 
-## Authoring contract
+`Default(WorkerEntrypoint)` is instantiated for Worker-tier requests. The
+alternative `on_fetch(request, env)` or `on_fetch(request, env, ctx)` function
+is dispatched directly. Durable Object classes extend `DurableObject` and are
+constructed with `(ctx, env)` from the declared Wrangler binding.
 
-The main module exports a required synchronous callback:
+The binding object uses the Python spelling `id_from_name(name)`, `get(id)`, and
+`stub.fetch(request)`. `id_from_name` computes lowercase `hex(sha256(name))`
+locally and retains the original name for the flattened `bindings.do-fetch`
+host call. `get_by_name(name)` is provided as the Python spelling of the same
+named-stub operation for projects that use that Cloudflare helper.
 
-```python
-def fetch(request: Request, env: Environment) -> Response: ...
-```
+`Request` exposes `method`, `url`, case-insensitive `headers`, and a byte body;
+`await request.text()`, `await request.bytes()`, and `await request.json()`
+consume the body. `Response` accepts text or bytes and supports
+`Response.json(value, status=...)`. The response `web_socket` option is paired
+with `ctx.accept_websocket(server)` and becomes WIT `accept-ws`.
 
-It may also export these optional callbacks:
+`ctx.storage.get`, `put`, `delete`, and `list` are asynchronous as in the
+Cloudflare Python API. `list` returns a deterministic mapping of keys to values.
+`ctx.storage.sql.exec(statement, *bindings)` is synchronous and returns a
+cursor with `one()`, `to_array()`, iteration, and `raw()`; rows support both
+mapping and attribute access, following Cloudflare's [SQLite storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/).
+`set_alarm`, `get_alarm`, and `delete_alarm` use Python snake case. `ctx.get_websockets()`
+returns attached WebSocket objects, and `webSocketMessage`/`webSocketClose`
+retain Cloudflare's documented handler casing. `accept_websocket` is snake case
+because the Python documentation exposes the state API through the Python
+runtime's idiomatic layer; its wire result is the exact `accept-ws` field from
+the [WebSocket hibernation API](https://developers.cloudflare.com/durable-objects/api/state/).
 
-```python
-def init(env: Environment) -> None: ...
-def alarm(scheduled_epoch_millis: int, env: Environment) -> None: ...
-def websocket_message(socket: int, message: bytes, env: Environment) -> None: ...
-def websocket_close(socket: int, code: int, reason: str, env: Environment) -> None: ...
-```
+## Deterministic storage encoding
 
-The WIT world contains synchronous functions, so componentize-py generates a
-synchronous `Handler` export. The adapter keeps that generated convention and
-requires synchronous callbacks; it does not create an event loop inside a WIT
-call. A callback exception, invalid response, or host `handler-error` is
-represented as `WorkerError` at the public surface and as the WIT
-`handler-error` result at the component boundary.
+The WIT storage import carries bytes, while Cloudflare Durable Object storage
+uses JavaScript structured clone. This implementation uses canonical UTF-8 JSON
+with tagged values:
 
-`Request` and `Response` mirror the WIT records. `headers` is a list of
-`(name, value)` pairs, `body` is `bytes`, and `Response.status` is an integer
-validated as WIT `u16` by the shim and generated component bindings. WebSocket
-IDs and alarm deadlines are checked as non-negative WIT `u64` values, and
-close codes are checked as `u16` values.
+- `None`, booleans, integers, finite floats, strings, bytes, lists/tuples, and
+  string-keyed dictionaries are supported;
+- dictionary keys are sorted, integers and floats use canonical text, and bytes
+  use base64;
+- non-finite floats, non-string object keys, JavaScript `undefined`, `Date`,
+  `Map`, object identity graphs, and other JavaScript-only values fail loudly.
 
-`env.storage` is transactional and exposes:
+This is a deliberate **Divergence** from Cloudflare's exact structured-clone
+value model. It is deterministic and preserves the Python values used by the
+supported examples; it is not presented as a byte-for-byte Cloudflare encoding.
+WebSocket attachments use the same tagged encoding and remain bounded to 16 KiB.
 
-- `get(key)` / `get_bytes(key)` → `bytes | None`;
-- `get_text(key, encoding="utf-8")`;
-- `put(key, value)` and explicit `put_bytes` / `put_text` helpers, where text is
-  UTF-8 and bytes-like values are copied;
-- `delete(key)` → `bool`;
-- `list(prefix="", limit=1000)` → key strings, with the WIT `u32` limit
-  checked before the host call.
+The v0 `ctx.wait_until` implementation awaits queued work before event completion,
+which is the documented compatibility-page divergence. SQL parameter bindings
+are converted to SQLite literals before the one-string `sql-rows` import because
+WIT v2 does not yet carry a parameter list; unsupported binding types fail rather
+than being stringified.
 
-The WIT `%list` verb is generated as the Python `storage.list` method. The
-shim does not translate this into a legacy name.
-
-`env.sql(statement)` calls the versioned `storage.sql-rows` import and decodes
-its JSON string with `json.loads`, returning `list[dict[str, Any]]`. It does
-not fall back to the Arrow `storage.sql` bytes verb. Alarm methods are
-`env.set_alarm(epoch_millis)`, `env.get_alarm()`, and `env.delete_alarm()`.
-`env.sockets` provides `send`, `close`, `set_attachment`,
-`get_attachment`, and `attached`; `send` accepts text or bytes-like values and
-encodes text as UTF-8.
-
-`list<u8>` values become Python `bytes`, WIT `u16`/`u64` values become Python
-`int`, and generated result errors are converted to `WorkerError`. These are
-componentize-py's generated mappings, not runtime emulation.
-
-## Tests and standalone checks
-
-Run the unit suite from the repository root:
+## Verification
 
 ```sh
-python3 -m unittest discover -s sdks/worker-py/tests -v
+PYTHONPATH=sdks/worker-py python3 -m unittest discover -s sdks/worker-py/tests -v
+python sdks/worker-py/build.py examples/do-workers/py-counter --out /tmp/py-counter-build
+wasm-tools component wit /tmp/py-counter-build/<digest>.wasm | tail -80
+wasm-tools validate /tmp/py-counter-build/<digest>.wasm
+wc -c /tmp/py-counter-build/<digest>.wasm
 ```
 
-The manifest tests cover JSONC comments/trailing commas, the accepted subset,
-and rejection of unknown top-level fields and malformed Python projects. The
-shim tests cover records, bytes/text storage helpers, SQL-row decoding, socket
-encoding, and `WorkerError`.
-
-A built file can be checked without a Rust runtime:
-
-```sh
-wasm-tools component wit <output-dir>/<digest>.wasm | head -80
-wasm-tools component wit <output-dir>/<digest>.wasm | grep 'import wasi:'
-wc -c <output-dir>/<digest>.wasm
-python sdks/worker-py/build.py <project-dir> --out /tmp/build-a
-python sdks/worker-py/build.py <project-dir> --out /tmp/build-b
-```
-
-Each output is content-addressed: its filename and `component_digest` must equal
-the SHA-256 of that output's own bytes. `componentize-py` may emit different
-bytes for unchanged source, so the two-build command is diagnostic only and is
-not a reproducibility proof. This is not an end-to-end `verglasd` execution test.
+The artifact must expose `worker`, `handler`, and imports for `storage`,
+`sockets`, and `bindings`; its digest filename and manifest digest must equal
+the SHA-256 of the emitted bytes.

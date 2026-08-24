@@ -1,8 +1,8 @@
-"""Build a Python Durable Object project into a Verglas component.
+"""Build a Cloudflare-shaped Python Worker into a Verglas component.
 
-The builder accepts the small Wrangler manifest used by this prototype, creates
-one temporary entry module that installs the public Python shim, and delegates
-component generation to the pinned componentize-py executable.
+The builder validates the supported Wrangler subset, creates one temporary entry
+module that injects the ``workers`` runtime, and delegates component generation
+to the pinned componentize-py executable.
 """
 
 from __future__ import annotations
@@ -36,11 +36,15 @@ class BuildError(RuntimeError):
 
 @dataclass(frozen=True)
 class Manifest:
-    """Contains the validated project fields consumed by the builder."""
+    """Contains the validated Cloudflare Wrangler fields consumed by the builder."""
 
     name: str
     main: Path
     bindings: list[dict[str, str]]
+    compatibility_date: str | None
+    compatibility_flags: list[str]
+    migrations: list[dict[str, Any]]
+    vars: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -185,17 +189,62 @@ def _required_string(object_value: dict[str, Any], field: str, path: str) -> str
     return value
 
 
-def _parse_manifest_data(raw: Any) -> tuple[str, str, list[dict[str, str]]]:
-    """Validate the supported Wrangler fields without resolving project paths."""
+def _string_array(value: Any, path: str) -> list[str]:
+    """Validate one Wrangler array whose entries are non-empty strings."""
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        raise ManifestError(f"{path} must be an array of non-empty strings")
+    return list(value)
+
+
+def _parse_migrations(value: Any) -> list[dict[str, Any]]:
+    """Validate the accepted Wrangler migration kinds and preserve their values."""
+    if not isinstance(value, list):
+        raise ManifestError("manifest.migrations must be an array")
+    migrations: list[dict[str, Any]] = []
+    for index, raw_migration in enumerate(value):
+        path = f"manifest.migrations[{index}]"
+        if not isinstance(raw_migration, dict):
+            raise ManifestError(f"{path} must be an object")
+        _reject_unknown_keys(raw_migration, {"tag", "new_sqlite_classes", "new_classes"}, path)
+        tag = _required_string(raw_migration, "tag", path)
+        migration: dict[str, Any] = {"tag": tag}
+        for field in ("new_sqlite_classes", "new_classes"):
+            if field in raw_migration:
+                migration[field] = _string_array(raw_migration[field], f"{path}.{field}")
+        migrations.append(migration)
+    return migrations
+
+
+def _parse_manifest_data(
+    raw: Any,
+) -> tuple[str, str, list[dict[str, str]], str | None, list[str], list[dict[str, Any]], dict[str, Any]]:
+    """Validate the supported Cloudflare Wrangler fields without resolving paths."""
     if not isinstance(raw, dict):
         raise ManifestError("wrangler.jsonc must contain a JSON object")
-    _reject_unknown_keys(raw, {"name", "main", "durable_objects"}, "top-level")
+    _reject_unknown_keys(
+        raw,
+        {
+            "name",
+            "main",
+            "compatibility_date",
+            "compatibility_flags",
+            "durable_objects",
+            "migrations",
+            "vars",
+        },
+        "top-level",
+    )
 
     name = _required_string(raw, "name", "manifest")
     main = _required_string(raw, "main", "manifest")
+    compatibility_date = None
+    if "compatibility_date" in raw:
+        compatibility_date = _required_string(raw, "compatibility_date", "manifest")
+    compatibility_flags = _string_array(
+        raw.get("compatibility_flags", []), "manifest.compatibility_flags"
+    )
     durable_objects = raw.get("durable_objects")
     bindings: list[dict[str, str]] = []
-
     if "durable_objects" in raw:
         if not isinstance(durable_objects, dict):
             raise ManifestError("manifest.durable_objects must be an object")
@@ -225,19 +274,32 @@ def _parse_manifest_data(raw: Any) -> tuple[str, str, list[dict[str, str]]]:
             )
         names.add(binding["name"])
 
-    return name, main, bindings
+    migrations = _parse_migrations(raw["migrations"]) if "migrations" in raw else []
+    variables = raw.get("vars", {})
+    if not isinstance(variables, dict):
+        raise ManifestError("manifest.vars must be an object")
+    return name, main, bindings, compatibility_date, compatibility_flags, migrations, dict(variables)
 
 
 def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
     """Read and validate a project's ``wrangler.jsonc`` and Python main file."""
     project = Path(os.path.abspath(os.fspath(project_dir)))
-    manifest_path = project / "wrangler.jsonc"
+    manifest_candidates = (project / "wrangler.jsonc", project / "wrangler.json")
+    manifest_path = next((path for path in manifest_candidates if path.is_file()), manifest_candidates[0])
     try:
         source = manifest_path.read_text(encoding="utf-8")
     except OSError as error:
         raise ManifestError(f"cannot read {manifest_path}: {error}") from error
 
-    name, main_name, bindings = _parse_manifest_data(parse_jsonc(source))
+    (
+        name,
+        main_name,
+        bindings,
+        compatibility_date,
+        compatibility_flags,
+        migrations,
+        variables,
+    ) = _parse_manifest_data(parse_jsonc(source))
     main = Path(os.path.abspath(os.path.join(os.fspath(project), main_name)))
     if not main.resolve().is_relative_to(project.resolve()):
         raise ManifestError("manifest.main must name a file inside the project directory")
@@ -255,7 +317,15 @@ def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
             "manifest.main path components must be valid Python identifiers"
         )
 
-    return Manifest(name=name, main=main, bindings=bindings)
+    return Manifest(
+        name=name,
+        main=main,
+        bindings=bindings,
+        compatibility_date=compatibility_date,
+        compatibility_flags=compatibility_flags,
+        migrations=migrations,
+        vars=variables,
+    )
 
 
 def _main_module_name(manifest: Manifest, project_dir: Path) -> str:
@@ -293,13 +363,13 @@ def _run_componentize(
 ) -> None:
     """Run the pinned componentize-py command for one temporary entry module."""
     componentize = _componentize_executable()
-    entry_name = "verglas_worker_entry"
+    entry_name = "workers_entry"
     module_name = _main_module_name(manifest, project_dir)
     entry_path = work_dir / f"{entry_name}.py"
     entry_path.write_text(
         "from importlib import import_module\n"
-        "from verglas_worker._component import Handler, set_worker_module\n"
-        f"set_worker_module(import_module({module_name!r}))\n",
+        "from workers._component import Handler, Worker, set_project\n"
+        f"set_project(import_module({module_name!r}), {manifest.bindings!r}, {manifest.vars!r})\n",
         encoding="utf-8",
     )
 
@@ -308,7 +378,7 @@ def _run_componentize(
         "-d",
         str(_WIT_DIR),
         "-w",
-        "durable-object",
+        "service",
         "componentize",
         entry_name,
         "-p",
@@ -395,16 +465,23 @@ def build_project(
     output_component = output / f"{component_digest}.wasm"
     output_component.write_bytes(component_bytes)
     output_manifest = output / "manifest.out.json"
+    output_manifest_data: dict[str, Any] = {
+        "name": manifest.name,
+        "main": manifest.main.relative_to(project).as_posix(),
+    }
+    if manifest.compatibility_date is not None:
+        output_manifest_data["compatibility_date"] = manifest.compatibility_date
+    output_manifest_data.update(
+        {
+            "compatibility_flags": manifest.compatibility_flags,
+            "durable_objects": {"bindings": manifest.bindings},
+            "migrations": manifest.migrations,
+            "vars": manifest.vars,
+            "component_digest": component_digest,
+        }
+    )
     output_manifest.write_text(
-        json.dumps(
-            {
-                "name": manifest.name,
-                "component_digest": component_digest,
-                "bindings": manifest.bindings,
-            },
-            indent=2,
-        )
-        + "\n",
+        json.dumps(output_manifest_data, indent=2) + "\n",
         encoding="utf-8",
     )
     _update_gateway_manifest(gateway, output, component_digest)

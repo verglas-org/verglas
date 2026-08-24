@@ -1,9 +1,16 @@
 {
   "name": "py-counter",
   "main": "counter.py",
+  "compatibility_date": "2025-05-14",
   "durable_objects": {
     "bindings": [
       { "name": "COUNTER", "class_name": "Counter" }
     ]
-  }
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Counter"]
+    }
+  ]
 }

@@ -14,3 +14,14 @@
 - #0: Added explicit checks for the WIT unsigned integer widths before storage,
   alarm, socket, and response calls. This keeps invalid Python integers from
   reaching the component boundary as truncated values.
+- #0: Replaced the invented `verglas_worker` authoring surface with an injected
+  Cloudflare-shaped `workers` module supporting WorkerEntrypoint/on_fetch,
+  DurableObject bindings, deterministic storage values, SQL cursors, alarms,
+  and guest-driven WebSocket acceptance over WIT v2. Extended the Wrangler
+  subset with compatibility fields, migrations, and vars; the old surface was
+  removed rather than retained as a fallback, and tests were rewritten first
+  to fail on the old manifest/API before the implementation was added.
+- #0: Matched the JavaScript builder's deployment artifact contract by accepting
+  both wrangler.json and wrangler.jsonc, preserving compatibility/migration/vars
+  fields in manifest.out.json, and verifying the emitted v2 component with
+  wasm-tools validation and import/export inspection.
