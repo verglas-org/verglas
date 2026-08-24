@@ -481,6 +481,13 @@ pub trait DoTransaction: Send + Sync {
         batch: RecordBatch,
     ) -> Result<()>;
 
+    /// Adds one durable table schema declaration to this transaction.
+    fn append_schema_change(
+        &mut self,
+        table: TableId,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<()>;
+
     /// Returns the immutable command view used for validation and commit.
     fn envelope(&self) -> &TransactionEnvelope;
 }
@@ -512,6 +519,16 @@ impl DoTransaction for EngineTransaction {
         batch: RecordBatch,
     ) -> Result<()> {
         self.envelope.append_with_kind(kind, domain, table, batch);
+        Ok(())
+    }
+
+    /// Adds one schema declaration to the canonical envelope.
+    fn append_schema_change(
+        &mut self,
+        table: TableId,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<()> {
+        self.envelope.append_schema_change(table, schema);
         Ok(())
     }
 

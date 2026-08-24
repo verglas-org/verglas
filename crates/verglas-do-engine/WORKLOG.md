@@ -71,3 +71,7 @@ Append-only log of changes to this crate, by issue. Every PR touching this crate
 - #171: Added tests/ts_envelope_conformance.rs proving the TypeScript SDK's
   canonical TransactionEnvelope encoder (sdks/typescript/src/do-protocol.ts)
   produces bytes the engine decodes exactly, including Arrow schema and rows.
+- #0: Reconnected the reserved Worker-state table exports and restored shared SQL
+  session/provider construction, including the native CREATE TABLE schema bridge.
+  Schema declarations now travel in the caller-owned transaction envelope so event
+  sessions and replay retain the same table identity.

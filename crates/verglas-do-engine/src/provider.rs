@@ -43,6 +43,33 @@ impl TransactionHandle {
         }
     }
 
+    /// Shares an existing transaction owner with another SQL session.
+    pub fn from_shared(transaction: Arc<Mutex<Option<Box<dyn DoTransaction>>>>) -> Self {
+        Self { transaction }
+    }
+
+    /// Returns the fixed snapshot sequence carried by this transaction.
+    pub async fn base_commit_sequence(&self) -> Result<u64> {
+        let guard = self.transaction.lock().await;
+        let transaction = guard
+            .as_ref()
+            .ok_or_else(|| Error::InvalidReceipt("transaction is already closed".to_owned()))?;
+        Ok(transaction.envelope().base_commit_sequence())
+    }
+
+    /// Adds a durable table schema declaration to the shared transaction.
+    pub async fn append_schema_change(
+        &self,
+        table: TableId,
+        schema: arrow_schema::SchemaRef,
+    ) -> Result<()> {
+        let mut guard = self.transaction.lock().await;
+        let transaction = guard
+            .as_mut()
+            .ok_or_else(|| Error::InvalidReceipt("transaction is already closed".to_owned()))?;
+        transaction.append_schema_change(table, schema)
+    }
+
     /// Appends a relational insert batch produced by one DataFusion DML plan.
     async fn append(&self, table: TableId, batch: RecordBatch) -> Result<()> {
         self.append_with_kind(MutationKind::Insert, table, batch)

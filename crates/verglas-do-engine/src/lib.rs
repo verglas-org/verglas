@@ -22,6 +22,7 @@ mod session;
 mod storage;
 mod transaction;
 mod vector;
+mod worker_state;
 
 pub use cas::{CasCommitAuthority, LeaseGrant, LeaseIdentity};
 pub use checkpoint::{CheckpointReceipt, ObjectStoreCheckpointPublisher};
@@ -53,3 +54,8 @@ pub use transaction::{
     MutationBatch, MutationDomain, MutationKind, SchemaChange, TableId, TransactionEnvelope,
 };
 pub use vector::VectorIndexConfig;
+pub use worker_state::{
+    WORKER_ALARM_TABLE, WORKER_ATTACHMENTS_TABLE, WORKER_KV_TABLE, WorkerStateView,
+    ensure_worker_tables, stage_alarm_clear, stage_alarm_set, stage_attachment, stage_kv_delete,
+    stage_kv_put,
+};

@@ -535,6 +535,20 @@ impl DoEngine {
             .ok_or_else(|| Error::UnknownTable(table.as_str().to_owned()))
     }
 
+    /// Returns every registered table in deterministic SQL name order.
+    pub fn table_ids(&self) -> Result<Vec<TableId>> {
+        let mut tables = self
+            .state
+            .read()
+            .map_err(|_| Error::Poisoned)?
+            .tables
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        tables.sort();
+        Ok(tables)
+    }
+
     /// Returns the newest commit applied to one domain projection.
     pub fn domain_watermark(&self, domain: MutationDomain) -> u64 {
         self.state

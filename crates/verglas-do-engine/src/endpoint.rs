@@ -256,6 +256,11 @@ impl ReplicaEndpoint {
         &self.path
     }
 
+    /// Returns the Worker engine when this endpoint executes stateful events.
+    pub fn engine(&self) -> Option<Arc<DoEngine>> {
+        self.engine.as_ref().map(Arc::clone)
+    }
+
     /// Returns this host's stable replica identity.
     pub fn replica_id(&self) -> u64 {
         self.replica_id
