@@ -1,4 +1,4 @@
-//! Fail-closed process checks for the Turso-backed `verglasd` binary.
+//! Fail-closed process checks for the Turso-backed `verglas-runtime` binary.
 //!
 //! A real remote Turso service is intentionally not faked in this suite. These
 //! tests verify that missing configuration and obsolete durability arguments are
@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 fn binary_requires_explicit_turso_configuration() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let event_socket = directory.path().join("events.sock");
-    let status = Command::new(env!("CARGO_BIN_EXE_verglasd"))
+    let status = Command::new(env!("CARGO_BIN_EXE_verglas-runtime"))
         .args([
             "--do-id",
             "agent-1",
@@ -33,7 +33,7 @@ fn binary_requires_explicit_turso_configuration() -> Result<(), Box<dyn std::err
 #[test]
 fn binary_rejects_removed_durability_arguments() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
-    let status = Command::new(env!("CARGO_BIN_EXE_verglasd"))
+    let status = Command::new(env!("CARGO_BIN_EXE_verglas-runtime"))
         .args([
             "--do-id",
             "agent-1",

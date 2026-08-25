@@ -133,7 +133,7 @@ transactional outbox; it is not direct offload.
 
 For event sequence `E`, the Turso transaction writes state and deterministic
 outbox rows identified by `(object-id, E, record-index)`. After the transaction
-reaches the Turso durability boundary, `verglasd` sends pending rows to the
+reaches the Turso durability boundary, `verglas-runtime` sends pending rows to the
 bound Stream. The Stream deduplicates those identities. Only after confirmed
 Stream ingestion does the host mark rows delivered and release event effects.
 A crash after Stream ingestion but before the delivered mark causes an

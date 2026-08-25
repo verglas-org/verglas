@@ -35,7 +35,7 @@ fn api(root: &Path) -> axum::Router {
     let supervisor = Arc::new(tokio::sync::Mutex::new(HostSupervisor::new(
         HostId::new("cell-test"),
         root,
-        ChildCommand::new("verglasd"),
+        ChildCommand::new("verglas-runtime"),
     )));
     ManagementApi::new(root, supervisor).router()
 }

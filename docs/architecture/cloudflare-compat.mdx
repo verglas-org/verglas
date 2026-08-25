@@ -65,13 +65,13 @@ world service {
   `fetch-result` gains optional `"accept_ws": <id>`.
 - New frames for cross-component calls from a DO:
   `{"type":"do-call","id":N,"binding":"NS","object":"name",...request fields}`
-  (verglasd → gateway) answered by
+  (verglas-runtime → gateway) answered by
   `{"type":"do-call-result","id":N,...}`.
   Worker-tier `do-fetch` calls are host-internal in the gateway process and
   do not cross this socket.
 - Worker-tier execution runs **in the gateway process**: pool instantiation per
   request, no DO storage transaction or event gate. DO events keep the full
-  serialized Turso transaction and push path in `verglasd`.
+  serialized Turso transaction and push path in `verglas-runtime`.
 
 ## Deployment surface
 

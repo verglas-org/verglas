@@ -189,5 +189,5 @@ fn required_text(value: Option<String>, option: &str) -> Result<String, String> 
 
 /// Describes the accepted runtime argument surface.
 fn usage() -> &'static str {
-    "usage: verglasd --do-id ID --data-dir PATH --turso-url URL --turso-token-file PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH]"
+    "usage: verglas-runtime --do-id ID --data-dir PATH --turso-url URL --turso-token-file PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH]"
 }

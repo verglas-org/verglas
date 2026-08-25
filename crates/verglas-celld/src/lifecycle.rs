@@ -43,7 +43,7 @@ impl SuspendFence {
     }
 }
 
-/// Lifecycle state of one supervised `verglasd` process.
+/// Lifecycle state of one supervised `verglas-runtime` process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChildState {
     /// Process is online and accepts serialized events.

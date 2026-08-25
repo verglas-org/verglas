@@ -198,7 +198,7 @@ impl TursoConfig {
         &self.remote_url
     }
 
-    /// Returns the token-file path passed to `verglasd`.
+    /// Returns the token-file path passed to `verglas-runtime`.
     pub fn token_file(&self) -> &Path {
         &self.token_file
     }
@@ -376,7 +376,7 @@ impl ProvisionRequest {
     }
 }
 
-/// Executable and fixed arguments used to launch every `verglasd` child.
+/// Executable and fixed arguments used to launch every `verglas-runtime` child.
 #[derive(Debug, Clone)]
 pub struct ChildCommand {
     program: PathBuf,
@@ -432,7 +432,7 @@ impl ChildSpec {
         })
     }
 
-    /// Attaches the local data root passed to `verglasd`.
+    /// Attaches the local data root passed to `verglas-runtime`.
     pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Result<Self, SupervisorError> {
         let data_dir = data_dir.into();
         if data_dir.as_os_str().is_empty() {
@@ -549,7 +549,7 @@ pub trait Provisioner: Send + Sync {
     fn wait<'a>(&'a self, child: &'a mut ProvisionedChild) -> ProvisionFuture<'a, ExitStatus>;
 }
 
-/// Local child-process substrate used by development, tests, and `celld-host`.
+/// Local child-process substrate used by development, tests, and `verglas-runtime`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LocalProcessProvisioner;
 

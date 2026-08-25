@@ -1,6 +1,0 @@
-// Gradle project for the engine-matrix Avro/mixed-format fixture builder.
-// A single small CLI that writes spec-complete Iceberg tables with Avro (and,
-// for the mixed variant, Parquet) data files via plain iceberg-core +
-// iceberg-data — no Spark. See src/main/java/verglas/fixture/FixtureBuilder.java
-// and the engine-matrix README for why the JVM is required here.
-rootProject.name = "fixture-jvm"

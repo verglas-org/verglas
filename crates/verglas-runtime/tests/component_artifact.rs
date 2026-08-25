@@ -11,7 +11,7 @@ use verglas_do_wasm::ComponentDigest;
 fn command(directory: &tempfile::TempDir) -> Result<Command, Box<dyn std::error::Error>> {
     let token_file = directory.path().join("token");
     std::fs::write(&token_file, b"test-token")?;
-    let mut command = Command::new(env!("CARGO_BIN_EXE_verglasd"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_verglas-runtime"));
     command
         .args(["--do-id", "artifact-test", "--data-dir"])
         .arg(directory.path().join("data"))

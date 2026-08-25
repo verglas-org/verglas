@@ -29,8 +29,8 @@ wasmtime.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 
 [[bin]]
-name = "verglasd-test-support"
-path = "src/bin/verglasd-test-support.rs"
+name = "verglas-runtime-test-support"
+path = "src/bin/verglas-runtime-test-support.rs"
 required-features = ["ac1-test-support"]
 
 [dev-dependencies]

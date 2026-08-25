@@ -93,7 +93,7 @@ impl SpawnRequest {
         &self.name
     }
 
-    /// Returns the immutable component digest to pass to `verglasd`.
+    /// Returns the immutable component digest to pass to `verglas-runtime`.
     pub fn component_digest(&self) -> &str {
         &self.component_digest
     }

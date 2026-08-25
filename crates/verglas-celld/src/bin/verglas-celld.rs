@@ -75,7 +75,7 @@ fn next_value(
 
 /// Returns the one supported command-line shape.
 fn usage() -> &'static str {
-    "usage: celld-host --host-id ID --root PATH --child VERGLASD [--control SOCKET] [--management-bind IP:PORT]"
+    "usage: verglas-celld --host-id ID --root PATH --child VERGLAS_RUNTIME [--control SOCKET] [--management-bind IP:PORT]"
 }
 
 /// Runs the control endpoint until termination or a fatal socket error.
@@ -85,7 +85,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         Ok(config) => config,
         Err(message) => {
             eprintln!("{message}");
-            return Err("invalid celld-host arguments".into());
+            return Err("invalid verglas-celld arguments".into());
         }
     };
     let control_path = config.control_path();
@@ -95,11 +95,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ChildCommand::new(config.child_program),
     )));
     let mut server = ControlServer::bind_shared(&control_path, supervisor.clone()).await?;
-    eprintln!("celld-host control socket: {}", server.path().display());
+    eprintln!("verglas-celld control socket: {}", server.path().display());
     if let Some(bind_address) = config.management_bind {
         let listener = TcpListener::bind(bind_address).await?;
         let management = ManagementApi::new(&config.root, supervisor).router();
-        eprintln!("celld-host management API: http://{bind_address}");
+        eprintln!("verglas-celld management API: http://{bind_address}");
         tokio::select! {
             result = server.run() => result?,
             result = axum::serve(listener, management) => result?,

@@ -1,4 +1,4 @@
-//! NDJSON frame definitions for one gateway-to-`verglasd` event socket.
+//! NDJSON frame definitions for one gateway-to-`verglas-runtime` event socket.
 //!
 //! Binary fields stay base64 on the wire, while HTTP headers remain ordered
 //! string pairs so duplicate header values survive the gateway boundary.
@@ -120,7 +120,7 @@ pub(crate) enum GatewayFrame {
     },
 }
 
-/// One frame emitted by `verglasd` into the gateway event socket.
+/// One frame emitted by `verglas-runtime` into the gateway event socket.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type")]
 pub(crate) enum WorkerFrame {

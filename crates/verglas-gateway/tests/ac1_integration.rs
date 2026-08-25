@@ -1,4 +1,4 @@
-//! Gateway-level AC1 proof using the real celld host, verglasd, and JS component.
+//! Gateway-level AC1 proof using real celld supervision, runtime, and JS component.
 
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -58,17 +58,17 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
         .to_owned();
     assert!(components.join(format!("{digest}.wasm")).is_file());
 
-    let celld = target_root().join("debug/celld-host");
+    let celld = target_root().join("debug/verglas-celld");
     // This test-only binary preserves the real EventEndpoint/WorkerRuntime chain
     // while using TursoStore::open_for_test. Production never enables its feature.
-    let verglasd = target_root().join("debug/verglasd-test-support");
+    let runtime_child = target_root().join("debug/verglas-runtime-test-support");
     assert!(
         celld.is_file(),
-        "build target/debug/celld-host before this test"
+        "build target/debug/verglas-celld before this test"
     );
     assert!(
-        verglasd.is_file(),
-        "build target/debug/verglasd before this test"
+        runtime_child.is_file(),
+        "build target/debug/verglas-runtime-test-support before this test"
     );
     let control = root.path().join("celld.sock");
     let mut host = ManagedChild(
@@ -78,14 +78,14 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
             .arg("--root")
             .arg(&data_root)
             .arg("--child")
-            .arg(&verglasd)
+            .arg(&runtime_child)
             .arg("--control")
             .arg(&control)
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .spawn()
-            .expect("spawn real celld-host"),
+            .expect("spawn real verglas-celld"),
     );
     wait_for_socket(&mut host, &control).await;
 
@@ -314,9 +314,9 @@ fn repository_root() -> PathBuf {
 async fn wait_for_socket(child: &mut Child, path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !path.exists() {
-        if let Some(status) = child.try_wait().expect("inspect celld-host") {
+        if let Some(status) = child.try_wait().expect("inspect verglas-celld") {
             panic!(
-                "celld-host exited before binding {}: {status}",
+                "verglas-celld exited before binding {}: {status}",
                 path.display()
             );
         }
@@ -331,7 +331,7 @@ fn stop_host(host: &mut ManagedChild) {
         .arg("-INT")
         .arg(host.id().to_string())
         .status()
-        .expect("signal celld-host");
+        .expect("signal verglas-celld");
     assert!(status.success());
-    host.wait().expect("wait celld-host");
+    host.wait().expect("wait verglas-celld");
 }

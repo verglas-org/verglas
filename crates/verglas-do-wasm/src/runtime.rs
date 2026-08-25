@@ -97,7 +97,7 @@ impl<T> PendingEvent<T> {
 ///
 /// The context deliberately has no arguments, environment variables, preopens,
 /// or network permissions. Standard output and error remain inherited so guest
-/// diagnostics are visible to the resident `verglasd` process.
+/// diagnostics are visible to the resident `verglas-runtime` process.
 struct WorkerStore {
     /// Locked-down WASI capability context for this event.
     wasi: WasiCtx,

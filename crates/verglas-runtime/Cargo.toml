@@ -1,6 +1,6 @@
 [package]
 name = "verglas-runtime"
-description = "Runnable celld-host and isolated verglasd worker processes"
+description = "Wasmtime Worker and Durable Object runtime with Turso state"
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
