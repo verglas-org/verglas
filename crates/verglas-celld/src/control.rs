@@ -1,7 +1,8 @@
 //! Strict local control protocol for one Turso Worker process per Durable Object.
 //!
-//! The only spawn command carries the complete runtime launch contract. Old
-//! replica, managed-CAS, lease, generation, and checkpoint commands are absent.
+//! The only spawn command carries the complete runtime launch contract and the
+//! optional exact host capability declaration. Old replica, managed-CAS, lease,
+//! generation, and checkpoint commands are absent.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -11,11 +12,12 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
 use crate::{
-    ChildSpec, HostSupervisor, SupervisorError, SuspendFence, TursoConfig, WorkerComponent,
+    ChildSpec, HostServiceBinding, HostSupervisor, SupervisorError, SuspendFence, TursoConfig,
+    WorkerComponent,
 };
 
 const MAX_COMMAND_BYTES: usize = 8 * 1024;
-const SPAWN_WORKER_FIELDS: usize = 9;
+const SPAWN_WORKER_FIELDS: usize = 11;
 
 /// A control-socket bind or request-processing failure.
 #[derive(Debug, thiserror::Error)]
@@ -143,12 +145,17 @@ async fn execute_inner(supervisor: &mut HostSupervisor, line: &str) -> Result<St
                 nonempty_path(fields[8], "event socket")?,
             )
             .map_err(|error| format!("invalid command: {error}"))?;
+            let host_service = parse_host_service(fields[9], fields[10])?;
             let spec = ChildSpec::new(fields[1])
                 .map_err(|error| error.to_string())?
                 .with_data_dir(data_dir)
                 .map_err(|error| error.to_string())?
                 .with_turso(turso)
                 .with_component(component);
+            let spec = match host_service {
+                Some(host_service) => spec.with_host_service(host_service),
+                None => spec,
+            };
             let descriptor = supervisor
                 .spawn(spec)
                 .await
@@ -249,6 +256,22 @@ impl Drop for ControlServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// Parses the optional exact runtime host service pair.
+fn parse_host_service(binding: &str, service: &str) -> Result<Option<HostServiceBinding>, String> {
+    if binding == "-" && service == "-" {
+        return Ok(None);
+    }
+    if binding == "-" || service == "-" {
+        return Err(
+            "invalid command: host service binding and service must be supplied together"
+                .to_owned(),
+        );
+    }
+    HostServiceBinding::new(binding, service)
+        .map(Some)
+        .map_err(|error| format!("invalid command: {error}"))
 }
 
 /// Rejects empty paths before they enter process arguments.

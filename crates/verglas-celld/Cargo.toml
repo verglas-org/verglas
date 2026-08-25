@@ -22,9 +22,5 @@ tempfile.workspace = true
 tower.workspace = true
 tokio = { workspace = true, features = ["test-util", "time"] }
 
-[[bin]]
-name = "verglas-celld-test-worker"
-path = "src/bin/verglas-celld-test-worker.rs"
-
 [lints]
 workspace = true

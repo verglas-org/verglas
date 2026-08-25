@@ -217,7 +217,8 @@ fn composition_manifest_source() -> String {
             "services":[
                 {{"binding":"PIPELINE","service":"pipeline","object":"pipeline-1"}},
                 {{"binding":"SINK","service":"sink","object":"sink-1"}},
-                {{"binding":"CATALOG","service":"catalog","object":"catalog-1"}}
+                {{"binding":"CATALOG","service":"catalog","object":"catalog-1"}},
+                {{"binding":"ICEBERG_COMMIT","service":"verglas-runtime"}}
             ],
             "artifacts":{{
                 "worker":{{"digest":"{WORKER_DIGEST}","component_dir":"worker"}},
@@ -296,6 +297,151 @@ fn product_bindings_select_distinct_artifacts() {
     }
 }
 
+/// Runtime host capabilities remain infrastructure and require no seventh artifact.
+#[test]
+fn runtime_commit_service_is_a_narrow_host_capability() {
+    let manifest = Manifest::parse(&composition_manifest_source()).expect("composition manifest");
+    assert_eq!(manifest.host_services().len(), 1);
+    let capability = &manifest.host_services()[0];
+    assert_eq!(capability.binding(), "ICEBERG_COMMIT");
+    assert_eq!(capability.service(), "verglas-runtime");
+    assert!(
+        manifest
+            .product_for_binding("ICEBERG_COMMIT", "verglas-runtime")
+            .is_err(),
+        "host capability must not resolve to a product artifact"
+    );
+
+    let recursive = composition_manifest_source().replace(
+        r#"{"binding":"ICEBERG_COMMIT","service":"verglas-runtime"}"#,
+        r#"{"binding":"ICEBERG_COMMIT","service":"verglas-runtime","object":"runtime"}"#,
+    );
+    assert!(Manifest::parse(&recursive).is_err());
+    let broad = composition_manifest_source().replace("ICEBERG_COMMIT", "HOST_FETCH");
+    assert!(Manifest::parse(&broad).is_err());
+}
+
+/// The gateway carries the exact runtime capability declaration into one spawn request.
+#[tokio::test]
+async fn gateway_forwards_exact_host_service_to_spawn_request()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let manifest = Manifest::parse(&composition_manifest_source()).expect("composition manifest");
+    let directory = tempfile::tempdir()?;
+    let spawner = Arc::new(CapturingSpawner::default());
+    let gateway = Gateway::with_spawner(&manifest, directory.path().join("state"), spawner.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(gateway.serve(listener));
+
+    let response = reqwest::get(format!("http://{address}/do/CATALOG/catalog-1")).await?;
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    let requests = spawner.requests.lock().await;
+    let request = requests
+        .iter()
+        .find(|request| request.binding() == "CATALOG")
+        .expect("Catalog spawn request");
+    let service = request.host_service().expect("runtime host service");
+    assert_eq!(service.binding(), "ICEBERG_COMMIT");
+    assert_eq!(service.service(), "verglas-runtime");
+
+    server.abort();
+    let _ = server.await;
+    Ok(())
+}
+
+/// ICEBERG_COMMIT is attached only to the selected Catalog artifact spawn.
+#[tokio::test]
+async fn gateway_attaches_iceberg_commit_only_to_catalog_spawn()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let manifest = Manifest::parse(&composition_manifest_source()).expect("composition manifest");
+    let directory = tempfile::tempdir()?;
+    let spawner = Arc::new(CapturingSpawner::default());
+    let gateway = Gateway::with_spawner(&manifest, directory.path().join("state"), spawner.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(gateway.serve(listener));
+
+    for (binding, object) in [("SINK", "sink-1"), ("CATALOG", "catalog-1")] {
+        let response = reqwest::get(format!("http://{address}/do/{binding}/{object}")).await?;
+        assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+
+    let requests = spawner.requests.lock().await;
+    let sink = requests
+        .iter()
+        .find(|request| request.binding() == "SINK")
+        .expect("Sink spawn request");
+    assert!(
+        sink.host_service().is_none(),
+        "ICEBERG_COMMIT must not be attached to non-Catalog products"
+    );
+    let catalog = requests
+        .iter()
+        .find(|request| request.binding() == "CATALOG")
+        .expect("Catalog spawn request");
+    let service = catalog
+        .host_service()
+        .expect("Catalog runtime host service");
+    assert_eq!(service.binding(), "ICEBERG_COMMIT");
+    assert_eq!(service.service(), "verglas-runtime");
+
+    server.abort();
+    let _ = server.await;
+    Ok(())
+}
+
+/// The gateway serializes the exact host service declaration in the celld command.
+#[tokio::test]
+async fn celld_spawner_forwards_exact_host_service_declaration()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let manifest = Manifest::parse(&composition_manifest_source()).expect("composition manifest");
+    let directory = tempfile::tempdir()?;
+    let data_root = directory.path().join("state");
+    let control_path = directory.path().join("celld.sock");
+    let do_id = "CATALOG--catalog-1";
+    let event_path = data_root.join(do_id).join("events.sock");
+    let listener = UnixListener::bind(&control_path)?;
+    let expected_command = format!(
+        "SPAWN_WORKER {do_id} {} https://turso.test/CATALOG/catalog-1 /tokens/CATALOG.token {CATALOG_DIGEST} catalog - {} ICEBERG_COMMIT verglas-runtime",
+        data_root.join(do_id).display(),
+        event_path.display(),
+    );
+    let event_for_task = event_path.clone();
+    let command_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let (read_half, mut write_half) = stream.into_split();
+        let mut lines = BufReader::new(read_half).lines();
+        let command = lines.next_line().await?.ok_or("missing worker command")?;
+        assert_eq!(command, expected_command);
+        tokio::fs::create_dir_all(event_for_task.parent().ok_or("event parent")?).await?;
+        let event_listener = UnixListener::bind(&event_for_task)?;
+        write_half
+            .write_all(format!("OK {}\\n", event_for_task.display()).as_bytes())
+            .await?;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(event_listener);
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    });
+    let artifact = manifest.artifact_for_product(ArtifactProduct::Catalog)?;
+    let request = SpawnRequest::new(
+        do_id.to_owned(),
+        "CATALOG".to_owned(),
+        "catalog-1".to_owned(),
+        artifact.digest().to_owned(),
+        PathBuf::from("catalog"),
+        data_root,
+    )
+    .with_turso(
+        "https://turso.test/CATALOG/catalog-1",
+        "/tokens/CATALOG.token",
+    )
+    .with_host_service(manifest.host_services()[0].clone());
+    let returned = CelldSpawner::new(control_path).spawn(request).await?;
+    assert_eq!(returned, event_path);
+    command_task.await??;
+    Ok(())
+}
+
 /// Every product route forwards its selected digest and stable restart identity.
 #[tokio::test]
 async fn product_bindings_forward_distinct_commands_and_restart_identity()
@@ -342,7 +488,7 @@ async fn product_bindings_forward_distinct_commands_and_restart_identity()
             let control_path = directory.path().join("celld.sock");
             let listener = UnixListener::bind(&control_path)?;
             let expected_command = format!(
-                "SPAWN_WORKER {do_id} {} https://turso.test/{binding}/{object} /tokens/{binding}.token {digest} {component_dir} - {}",
+                "SPAWN_WORKER {do_id} {} https://turso.test/{binding}/{object} /tokens/{binding}.token {digest} {component_dir} - {} - -",
                 data_root.join(&do_id).display(),
                 event_path.display()
             );

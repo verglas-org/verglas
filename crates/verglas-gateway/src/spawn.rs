@@ -1,8 +1,9 @@
 //! Celld control-plane spawning and bounded Turso event-socket readiness.
 //!
-//! The gateway sends one complete `SPAWN_WORKER` request. It never starts a
-//! replica, managed CAS worker, or alternate storage path. The event socket is
-//! the only returned endpoint and becomes routable only after socket readiness.
+//! The gateway sends one complete `SPAWN_WORKER` request, including the exact
+//! declared host capability when present. It never starts a replica, managed CAS
+//! worker, or alternate storage path. The event socket is the only returned
+//! endpoint and becomes routable only after socket readiness.
 
 use std::cmp::min;
 use std::os::unix::fs::FileTypeExt;
@@ -14,6 +15,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use crate::error::GatewayError;
+use crate::manifest::HostServiceBinding;
 
 const EVENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_SOCKET_INITIAL_DELAY: Duration = Duration::from_millis(5);
@@ -28,6 +30,7 @@ pub struct SpawnRequest {
     component_digest: String,
     component_dir: PathBuf,
     cwasm_cache_dir: Option<PathBuf>,
+    host_service: Option<HostServiceBinding>,
     data_root: PathBuf,
     turso_url: String,
     turso_token_file: PathBuf,
@@ -55,6 +58,7 @@ impl SpawnRequest {
             component_digest,
             component_dir,
             cwasm_cache_dir: None,
+            host_service: None,
             data_root,
             turso_url: String::new(),
             turso_token_file: PathBuf::new(),
@@ -106,6 +110,17 @@ impl SpawnRequest {
     /// Returns the optional compiled component cache directory.
     pub fn cwasm_cache_dir(&self) -> Option<&Path> {
         self.cwasm_cache_dir.as_deref()
+    }
+
+    /// Attaches the exact privileged service declaration selected by the manifest.
+    pub fn with_host_service(mut self, host_service: HostServiceBinding) -> Self {
+        self.host_service = Some(host_service);
+        self
+    }
+
+    /// Returns the exact privileged service declaration selected by the manifest.
+    pub fn host_service(&self) -> Option<&HostServiceBinding> {
+        self.host_service.as_ref()
     }
 
     /// Returns the process data root requested by the gateway.
@@ -214,8 +229,11 @@ impl CelldSpawner {
         let cache = request
             .cwasm_cache_dir()
             .map_or_else(|| "-".to_owned(), |path| path.display().to_string());
+        let (host_binding, host_service) = request
+            .host_service()
+            .map_or(("-", "-"), |service| (service.binding(), service.service()));
         let command = format!(
-            "SPAWN_WORKER {} {} {} {} {} {} {} {}",
+            "SPAWN_WORKER {} {} {} {} {} {} {} {} {} {}",
             request.do_id(),
             request.data_dir().display(),
             request.turso_url(),
@@ -224,6 +242,8 @@ impl CelldSpawner {
             request.component_dir().display(),
             cache,
             event_socket.display(),
+            host_binding,
+            host_service,
         );
         self.send_control_command(&command, "SPAWN_WORKER")
             .await

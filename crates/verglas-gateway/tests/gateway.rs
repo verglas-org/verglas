@@ -41,7 +41,7 @@ async fn celld_spawner_sends_exact_turso_command_and_waits_for_event_bind()
         assert_eq!(
             command,
             format!(
-                "SPAWN_WORKER COUNTER--alice {} https://turso.test/COUNTER/alice /tokens/COUNTER.token {DIGEST} components - {}",
+                "SPAWN_WORKER COUNTER--alice {} https://turso.test/COUNTER/alice /tokens/COUNTER.token {DIGEST} components - {} - -",
                 expected_data_root.join("COUNTER--alice").display(),
                 expected_event.display()
             )
@@ -280,7 +280,7 @@ impl Fixture {
             assert_eq!(
                 command,
                 format!(
-                    "SPAWN_WORKER COUNTER--alice {} https://turso.test/COUNTER/alice /tokens/COUNTER.token {DIGEST} components - {}",
+                    "SPAWN_WORKER COUNTER--alice {} https://turso.test/COUNTER/alice /tokens/COUNTER.token {DIGEST} components - {} - -",
                     data_root.join("COUNTER--alice").display(),
                     event_path.display()
                 )

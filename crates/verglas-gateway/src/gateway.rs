@@ -27,7 +27,7 @@ use verglas_do_wasm::{
 
 use crate::connection::{DoCallHandler, DoConnection, FetchEvent};
 use crate::error::GatewayError;
-use crate::manifest::{Binding, Manifest, PipelineBinding, SystemBinding};
+use crate::manifest::{ArtifactProduct, Binding, Manifest, PipelineBinding, SystemBinding};
 use crate::protocol::{FetchResponse, WsOutbound};
 use crate::spawn::{CelldSpawner, DoSpawner, SpawnRequest};
 
@@ -270,22 +270,29 @@ impl Gateway {
         binding: &str,
         name: &str,
     ) -> Result<Arc<DoConnection>, GatewayError> {
+        let product =
+            state
+                .manifest
+                .product_for_binding(binding, name)
+                .map_err(|error| match error {
+                    crate::manifest::ManifestError::UnknownBinding { binding } => {
+                        GatewayError::UnknownBinding { binding }
+                    }
+                    crate::manifest::ManifestError::WrongBindingObject {
+                        binding, actual, ..
+                    } => GatewayError::UnknownObject {
+                        binding,
+                        name: actual,
+                    },
+                    error => GatewayError::SpawnRejected {
+                        message: error.to_string(),
+                    },
+                })?;
         let artifact = state
             .manifest
-            .artifact_for_binding(binding, name)
-            .map_err(|error| match error {
-                crate::manifest::ManifestError::UnknownBinding { binding } => {
-                    GatewayError::UnknownBinding { binding }
-                }
-                crate::manifest::ManifestError::WrongBindingObject {
-                    binding, actual, ..
-                } => GatewayError::UnknownObject {
-                    binding,
-                    name: actual,
-                },
-                error => GatewayError::SpawnRejected {
-                    message: error.to_string(),
-                },
+            .artifact_for_product(product)
+            .map_err(|error| GatewayError::SpawnRejected {
+                message: error.to_string(),
             })?;
         let do_id = do_identity(binding, name)?;
         let key = DoKey {
@@ -317,6 +324,11 @@ impl Gateway {
         );
         if let Some(cache_dir) = artifact.cwasm_cache_dir() {
             request = request.with_cwasm_cache_dir(cache_dir.to_path_buf());
+        }
+        if product == ArtifactProduct::Catalog
+            && let Some(host_service) = state.manifest.host_services().first().cloned()
+        {
+            request = request.with_host_service(host_service);
         }
         let event_socket = state.spawner.spawn(request).await?;
         let do_call = Arc::new(GatewayDoRouter {

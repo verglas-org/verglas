@@ -59,6 +59,14 @@ pub enum SupervisorError {
     /// A component digest is not 64 hexadecimal characters.
     #[error("invalid component digest: {0}")]
     InvalidComponentDigest(String),
+    /// A host capability declaration is outside the exact runtime contract.
+    #[error("invalid host service declaration: {binding} -> {service}")]
+    InvalidHostService {
+        /// Environment binding named by the declaration.
+        binding: String,
+        /// Infrastructure service named by the declaration.
+        service: String,
+    },
     /// This host already supervises the DO.
     #[error("Durable Object {0} is already supervised on this host")]
     Duplicate(String),

@@ -1,9 +1,9 @@
 //! Strict parsing for the Wrangler manifest and product deployment contract.
 //!
-//! Durable-object namespaces, Stream bindings, and system product services are
-//! separate maps. Each selected product resolves to one immutable artifact and
-//! explicit Turso credentials; unknown fields and incomplete credentials fail
-//! before process launch.
+//! Durable-object namespaces, Stream bindings, system product services, and the
+//! exact runtime host capability are separate maps. Each selected product resolves
+//! to one immutable artifact and explicit Turso credentials; unknown fields and
+//! incomplete credentials fail before process launch.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -135,6 +135,25 @@ impl SystemBinding {
     }
 }
 
+/// One declared privileged service intercepted by the resident runtime.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HostServiceBinding {
+    binding: String,
+    service: String,
+}
+
+impl HostServiceBinding {
+    /// Returns the exact guest environment binding name.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    /// Returns the infrastructure service target.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+}
+
 /// One Turso URL/token mapping used by a deployment or one named binding.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TursoDeployment {
@@ -252,6 +271,7 @@ pub struct Manifest {
     bindings: Vec<Binding>,
     pipelines: Vec<PipelineBinding>,
     services: Vec<SystemBinding>,
+    host_services: Vec<HostServiceBinding>,
     migrations: Vec<Migration>,
     vars: Map<String, Value>,
     artifacts: BTreeMap<ArtifactProduct, ArtifactDescriptor>,
@@ -321,6 +341,11 @@ impl Manifest {
     /// Returns all declared Pipeline, Sink, and Catalog service bindings.
     pub fn services(&self) -> &[SystemBinding] {
         &self.services
+    }
+
+    /// Returns declared privileged services intercepted by `verglas-runtime`.
+    pub fn host_services(&self) -> &[HostServiceBinding] {
+        &self.host_services
     }
 
     /// Returns the immutable artifact descriptor for one product.
@@ -475,12 +500,12 @@ impl Manifest {
             .map(parse_pipelines)
             .transpose()?
             .unwrap_or_default();
-        let services = object
+        let (services, host_services) = object
             .remove("services")
             .map(parse_services)
             .transpose()?
             .unwrap_or_default();
-        reject_binding_collisions(&bindings, &pipelines, &services)?;
+        reject_binding_collisions(&bindings, &pipelines, &services, &host_services)?;
         let migrations = object
             .remove("migrations")
             .map(parse_migrations)
@@ -508,6 +533,7 @@ impl Manifest {
             bindings,
             pipelines,
             services,
+            host_services,
             migrations,
             vars,
             artifacts,
@@ -815,7 +841,9 @@ fn parse_pipelines(value: Value) -> Result<Vec<PipelineBinding>, ManifestError> 
 }
 
 /// Parses explicit prebuilt Pipeline, Sink, and Catalog service bindings.
-fn parse_services(value: Value) -> Result<Vec<SystemBinding>, ManifestError> {
+fn parse_services(
+    value: Value,
+) -> Result<(Vec<SystemBinding>, Vec<HostServiceBinding>), ManifestError> {
     let Value::Array(values) = value else {
         return Err(ManifestError::InvalidType {
             field: "services",
@@ -823,6 +851,7 @@ fn parse_services(value: Value) -> Result<Vec<SystemBinding>, ManifestError> {
         });
     };
     let mut services = Vec::with_capacity(values.len());
+    let mut host_services = Vec::new();
     let mut names = HashSet::with_capacity(values.len());
     for value in values {
         let Value::Object(mut object) = value else {
@@ -843,6 +872,16 @@ fn parse_services(value: Value) -> Result<Vec<SystemBinding>, ManifestError> {
         }
         let binding = required_string(&mut object, "binding")?;
         let service = required_string(&mut object, "service")?;
+        if !names.insert(binding.clone()) {
+            return Err(ManifestError::DuplicateServiceBinding { name: binding });
+        }
+        if service == "verglas-runtime" {
+            if binding != "ICEBERG_COMMIT" || object.contains_key("object") {
+                return Err(ManifestError::UnknownServiceProduct { product: service });
+            }
+            host_services.push(HostServiceBinding { binding, service });
+            continue;
+        }
         let product = match service.as_str() {
             "pipeline" => ArtifactProduct::Pipeline,
             "sink" => ArtifactProduct::Sink,
@@ -850,16 +889,13 @@ fn parse_services(value: Value) -> Result<Vec<SystemBinding>, ManifestError> {
             _ => return Err(ManifestError::UnknownServiceProduct { product: service }),
         };
         let object = required_string(&mut object, "object")?;
-        if !names.insert(binding.clone()) {
-            return Err(ManifestError::DuplicateServiceBinding { name: binding });
-        }
         services.push(SystemBinding {
             binding,
             product,
             object,
         });
     }
-    Ok(services)
+    Ok((services, host_services))
 }
 
 /// Rejects one environment binding from selecting multiple product namespaces.
@@ -867,6 +903,7 @@ fn reject_binding_collisions(
     bindings: &[Binding],
     pipelines: &[PipelineBinding],
     services: &[SystemBinding],
+    host_services: &[HostServiceBinding],
 ) -> Result<(), ManifestError> {
     let mut names = HashSet::new();
     for name in bindings.iter().map(|binding| binding.name.as_str()) {
@@ -884,6 +921,13 @@ fn reject_binding_collisions(
         }
     }
     for name in services.iter().map(|service| service.binding.as_str()) {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    for name in host_services.iter().map(|service| service.binding.as_str()) {
         if !names.insert(name) {
             return Err(ManifestError::DuplicateBinding {
                 name: name.to_owned(),

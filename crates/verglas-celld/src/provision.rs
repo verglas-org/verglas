@@ -1,7 +1,8 @@
 //! Process provisioning for one Turso-backed Durable Object Worker.
 //!
-//! The local implementation forwards exactly the runtime CLI contract. Cloud
-//! placement and the external lease-validating Turso sync ingress remain cloud
+//! The local implementation forwards the known runtime CLI contract and retains
+//! the exact host capability declaration in the typed request. Cloud placement
+//! and the external lease-validating Turso sync ingress remain cloud
 //! responsibilities; celld never invents a second ownership or CAS protocol.
 
 use std::future::Future;
@@ -265,7 +266,39 @@ impl WorkerComponent {
     }
 }
 
-/// Program and exact Turso arguments supplied to a provisioner.
+/// The one privileged service declaration accepted by the host runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostServiceBinding {
+    binding: String,
+    service: String,
+}
+
+impl HostServiceBinding {
+    /// Validates the exact Catalog-to-runtime capability declaration.
+    pub fn new(
+        binding: impl Into<String>,
+        service: impl Into<String>,
+    ) -> Result<Self, SupervisorError> {
+        let binding = binding.into();
+        let service = service.into();
+        if binding != "ICEBERG_COMMIT" || service != "verglas-runtime" {
+            return Err(SupervisorError::InvalidHostService { binding, service });
+        }
+        Ok(Self { binding, service })
+    }
+
+    /// Returns the guest environment binding name.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    /// Returns the infrastructure runtime service name.
+    pub fn service(&self) -> &str {
+        &self.service
+    }
+}
+
+/// Program, exact Turso arguments, and declared host capability supplied to a provisioner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionRequest {
     program: PathBuf,
@@ -275,6 +308,7 @@ pub struct ProvisionRequest {
     data_dir: PathBuf,
     turso: TursoConfig,
     component: WorkerComponent,
+    host_service: Option<HostServiceBinding>,
     resource_limits: WorkerResourceLimits,
 }
 
@@ -297,8 +331,15 @@ impl ProvisionRequest {
             data_dir: data_dir.into(),
             turso,
             component,
+            host_service: None,
             resource_limits: WorkerResourceLimits::default(),
         }
+    }
+
+    /// Attaches the exact privileged service declaration for the child runtime.
+    pub fn with_host_service(mut self, host_service: HostServiceBinding) -> Self {
+        self.host_service = Some(host_service);
+        self
     }
 
     /// Attaches explicit process ceilings for the local child.
@@ -342,6 +383,11 @@ impl ProvisionRequest {
         &self.turso
     }
 
+    /// Returns the exact privileged service declaration for the child runtime.
+    pub fn host_service(&self) -> Option<&HostServiceBinding> {
+        self.host_service.as_ref()
+    }
+
     /// Returns the verified component launch identity.
     pub fn component(&self) -> &WorkerComponent {
         &self.component
@@ -359,7 +405,7 @@ impl ProvisionRequest {
             .data_dir
             .clone()
             .unwrap_or_else(|| root.join(spec.do_id()));
-        Ok(Self::new(
+        let request = Self::new(
             command.program.clone(),
             command.args.clone(),
             host_id.as_str(),
@@ -372,7 +418,11 @@ impl ProvisionRequest {
                 SupervisorError::InvalidLaunch("component and event socket are required".to_owned())
             })?,
         )
-        .with_resource_limits(spec.resource_limits.clone()))
+        .with_resource_limits(spec.resource_limits.clone());
+        Ok(match spec.host_service.clone() {
+            Some(host_service) => request.with_host_service(host_service),
+            None => request,
+        })
     }
 }
 
@@ -416,6 +466,7 @@ pub struct ChildSpec {
     data_dir: Option<PathBuf>,
     turso: Option<TursoConfig>,
     component: Option<WorkerComponent>,
+    host_service: Option<HostServiceBinding>,
     resource_limits: WorkerResourceLimits,
 }
 
@@ -428,6 +479,7 @@ impl ChildSpec {
             data_dir: None,
             turso: None,
             component: None,
+            host_service: None,
             resource_limits: WorkerResourceLimits::default(),
         })
     }
@@ -456,6 +508,12 @@ impl ChildSpec {
         self
     }
 
+    /// Attaches the exact privileged service declaration for this child.
+    pub fn with_host_service(mut self, host_service: HostServiceBinding) -> Self {
+        self.host_service = Some(host_service);
+        self
+    }
+
     /// Attaches explicit process ceilings for this child.
     pub fn with_resource_limits(mut self, resource_limits: WorkerResourceLimits) -> Self {
         self.resource_limits = resource_limits;
@@ -465,6 +523,11 @@ impl ChildSpec {
     /// Returns the Durable Object identity.
     pub(crate) fn do_id(&self) -> &str {
         &self.do_id
+    }
+
+    /// Returns the exact privileged service declaration for this child.
+    pub fn host_service(&self) -> Option<&HostServiceBinding> {
+        self.host_service.as_ref()
     }
 
     /// Returns whether the spec has all required Turso launch values.
@@ -593,6 +656,8 @@ impl Provisioner for LocalProcessProvisioner {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(ProvisionError::from(error)),
             }
+            // `verglas-runtime` has no startup input for this declaration yet. Keep it
+            // in the typed provisioning request instead of inventing an ignored CLI flag.
             let mut command = Command::new(request.program());
             command
                 .args(request.args())

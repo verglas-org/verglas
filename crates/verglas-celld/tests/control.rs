@@ -48,7 +48,7 @@ async fn spawn_worker_forwards_exact_turso_arguments() {
     let cache_dir = root.path().join("cache");
     let event_socket = data_dir.join("events.sock");
     let command = format!(
-        "SPAWN_WORKER do-1 {} https://tenant.turso.io/db-1 {} {} {} {} {}",
+        "SPAWN_WORKER do-1 {} https://tenant.turso.io/db-1 {} {} {} {} {} - -",
         data_dir.display(),
         root.path().join("token").display(),
         DIGEST,
@@ -128,7 +128,7 @@ async fn suspend_requires_turso_push_outbox_and_clean_shutdown() {
     let data_dir = root.path().join("do-1");
     let event_socket = data_dir.join("events.sock");
     let command = format!(
-        "SPAWN_WORKER do-1 {} https://tenant.turso.io/db-1 {} {} {} - {}",
+        "SPAWN_WORKER do-1 {} https://tenant.turso.io/db-1 {} {} {} - {} - -",
         data_dir.display(),
         root.path().join("token").display(),
         DIGEST,
