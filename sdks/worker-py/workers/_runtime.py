@@ -944,6 +944,68 @@ class PipelineBinding:
             )
 
 
+def _request_to_host(request: Request) -> Any:
+    """Convert one public Request into the generated bindings request record."""
+    if _wit_types is None:
+        return SimpleNamespace(
+            method=request.method,
+            uri=request.url,
+            headers=request.headers.items(),
+            body=request.body,
+            ws=request.ws,
+        )
+    return _wit_types.Request(
+        request.method,
+        request.url,
+        request.headers.items(),
+        request.body,
+        request.ws,
+    )
+
+
+def _response_from_host(raw: Any) -> Response:
+    """Convert one generated bindings response record into a public Response."""
+    if isinstance(raw, Response):
+        return raw
+    response = Response(
+        bytes(getattr(raw, "body", b"")),
+        status=int(getattr(raw, "status", 200)),
+        headers=list(getattr(raw, "headers", [])),
+    )
+    response.accept_ws = getattr(raw, "accept_ws", None)
+    return response
+
+
+class ServiceBinding:
+    """A direct Wrangler service binding exposing asynchronous ``fetch`` only."""
+
+    def __init__(self, binding: str, service: str, imports: _BindingImports):
+        """Bind one Wrangler name to one immutable service target."""
+        if not isinstance(binding, str) or not binding.strip():
+            raise TypeError("Service binding name must be a non-empty string")
+        if not isinstance(service, str) or not service.strip():
+            raise TypeError("Service target must be a non-empty string")
+        if not hasattr(imports, "do_fetch") or not callable(imports.do_fetch):
+            raise TypeError("Service binding requires the WIT bindings.do-fetch transport")
+        self._binding = binding
+        self._service = service
+        self._imports = imports
+
+    async def fetch(self, request: Request | str) -> Response:
+        """Forward one Request or URL string to the configured service target."""
+        if isinstance(request, str):
+            request = Request(request)
+        if not isinstance(request, Request):
+            raise TypeError("ServiceBinding.fetch expects a Request or URL")
+        raw = _call_host(
+            self._imports.do_fetch,
+            self._binding,
+            self._service,
+            _request_to_host(request),
+        )
+        return _response_from_host(raw)
+
+
 class DurableObjectStub:
     """A flattened Durable Object stub exposing asynchronous ``fetch``."""
 
@@ -1035,7 +1097,7 @@ class DurableObjectNamespace:
 
 
 class Environment:
-    """Worker environment populated from Wrangler vars, DO, and Stream bindings."""
+    """Worker environment populated from Wrangler vars, DO, Stream, and service bindings."""
 
     def __init__(
         self,
@@ -1045,6 +1107,7 @@ class Environment:
         variables: Mapping[str, Any],
         binding_records: list[Mapping[str, str]],
         pipeline_records: list[Mapping[str, str]] | None = None,
+        services: list[Mapping[str, str]] | None = None,
         *,
         transactional_streams: bool = False,
     ):
@@ -1066,14 +1129,26 @@ class Environment:
                 self._storage._imports if transactional_streams and self._storage is not None else binding_imports,
                 transactional=transactional_streams,
             )
+        self._services: dict[str, ServiceBinding] = {}
+        for record in services or []:
+            binding = str(record["binding"])
+            if binding in self._bindings or binding in self._pipelines or binding in self._services:
+                raise ValueError(f"duplicate binding name: {binding}")
+            self._services[binding] = ServiceBinding(
+                binding,
+                str(record["service"]),
+                binding_imports,
+            )
         self._sockets = sockets
 
     def __getattr__(self, name: str) -> Any:
-        """Resolve a Wrangler variable or namespace or Stream binding."""
+        """Resolve a Wrangler variable or namespace, Stream, or service binding."""
         if name in self._bindings:
             return self._bindings[name]
         if name in self._pipelines:
             return self._pipelines[name]
+        if name in self._services:
+            return self._services[name]
         if name in self._variables:
             return self._variables[name]
         raise AttributeError(name)

@@ -42,6 +42,7 @@ class Manifest:
     main: Path
     bindings: list[dict[str, str]]
     pipelines: list[dict[str, str]] | None
+    services: list[dict[str, str]] | None
     compatibility_date: str | None
     compatibility_flags: list[str]
     migrations: list[dict[str, Any]]
@@ -235,12 +236,32 @@ def _parse_pipelines(value: Any) -> list[dict[str, str]]:
     return pipelines
 
 
+def _parse_services(value: Any) -> list[dict[str, str]]:
+    """Validate the exact Wrangler direct service binding entries."""
+    if not isinstance(value, list):
+        raise ManifestError("manifest.services must be an array")
+    services: list[dict[str, str]] = []
+    for index, raw_service in enumerate(value):
+        path = f"manifest.services[{index}]"
+        if not isinstance(raw_service, dict):
+            raise ManifestError(f"{path} must be an object")
+        _reject_unknown_keys(raw_service, {"binding", "service"}, path)
+        services.append(
+            {
+                "binding": _required_string(raw_service, "binding", path),
+                "service": _required_string(raw_service, "service", path),
+            }
+        )
+    return services
+
+
 def _parse_manifest_data(
     raw: Any,
 ) -> tuple[
     str,
     str,
     list[dict[str, str]],
+    list[dict[str, str]] | None,
     list[dict[str, str]] | None,
     str | None,
     list[str],
@@ -261,6 +282,7 @@ def _parse_manifest_data(
             "migrations",
             "vars",
             "pipelines",
+            "services",
         },
         "top-level",
     )
@@ -297,6 +319,7 @@ def _parse_manifest_data(
             )
 
     pipelines = _parse_pipelines(raw["pipelines"]) if "pipelines" in raw else None
+    services = _parse_services(raw["services"]) if "services" in raw else None
     names: set[str] = set()
     for binding in bindings:
         if binding["name"] in names:
@@ -308,12 +331,26 @@ def _parse_manifest_data(
         if pipeline["binding"] in names:
             raise ManifestError(f"duplicate binding name: {pipeline['binding']}")
         names.add(pipeline["binding"])
+    for service in services or []:
+        if service["binding"] in names:
+            raise ManifestError(f"duplicate binding name: {service['binding']}")
+        names.add(service["binding"])
 
     migrations = _parse_migrations(raw["migrations"]) if "migrations" in raw else []
     variables = raw.get("vars", {})
     if not isinstance(variables, dict):
         raise ManifestError("manifest.vars must be an object")
-    return name, main, bindings, pipelines, compatibility_date, compatibility_flags, migrations, dict(variables)
+    return (
+        name,
+        main,
+        bindings,
+        pipelines,
+        services,
+        compatibility_date,
+        compatibility_flags,
+        migrations,
+        dict(variables),
+    )
 
 
 def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
@@ -331,6 +368,7 @@ def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
         main_name,
         bindings,
         pipelines,
+        services,
         compatibility_date,
         compatibility_flags,
         migrations,
@@ -358,6 +396,7 @@ def load_manifest(project_dir: str | os.PathLike[str]) -> Manifest:
         main=main,
         bindings=bindings,
         pipelines=pipelines,
+        services=services,
         compatibility_date=compatibility_date,
         compatibility_flags=compatibility_flags,
         migrations=migrations,
@@ -407,7 +446,7 @@ def _run_componentize(
         "from importlib import import_module\n"
         "from workers._component import Handler, Worker, set_project\n"
         f"set_project(import_module({module_name!r}), {manifest.bindings!r}, "
-        f"{manifest.vars!r}, {manifest.pipelines!r})\n",
+        f"{manifest.vars!r}, {manifest.pipelines!r}, {manifest.services!r})\n",
         encoding="utf-8",
     )
 
@@ -535,6 +574,8 @@ def build_project(
         output_manifest_data["compatibility_date"] = manifest.compatibility_date
     if manifest.pipelines is not None:
         output_manifest_data["pipelines"] = manifest.pipelines
+    if manifest.services is not None:
+        output_manifest_data["services"] = manifest.services
     output_manifest_data.update(
         {
             "compatibility_flags": manifest.compatibility_flags,

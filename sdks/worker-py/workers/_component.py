@@ -38,6 +38,7 @@ from ._runtime import (
 _project_module: ModuleType | None = None
 _binding_records: list[dict[str, str]] = []
 _pipeline_records: list[dict[str, str]] = []
+_service_records: list[dict[str, str]] = []
 _variables: dict[str, Any] = {}
 _storage = Storage(storage_imports, socket_imports)
 _environment: Environment | None = None
@@ -52,12 +53,14 @@ def set_project(
     binding_records: list[dict[str, str]],
     variables: dict[str, Any],
     pipeline_records: list[dict[str, str]] | None = None,
+    service_records: list[dict[str, str]] | None = None,
 ) -> None:
     """Configure the imported project and its validated Wrangler bindings."""
-    global _project_module, _binding_records, _pipeline_records, _variables, _environment
+    global _project_module, _binding_records, _pipeline_records, _service_records, _variables, _environment
     _project_module = module
     _binding_records = list(binding_records)
     _pipeline_records = list(pipeline_records or [])
+    _service_records = list(service_records or [])
     _variables = dict(variables)
     _environment = Environment(
         _storage,
@@ -65,7 +68,8 @@ def set_project(
         binding_imports,
         _variables,
         _binding_records,
-        pipeline_records,
+        _pipeline_records,
+        _service_records,
     )
 
 
@@ -186,6 +190,7 @@ def _ensure_object() -> DurableObject:
         _variables,
         _binding_records,
         _pipeline_records,
+        _service_records,
         transactional_streams=True,
     )
     _object_instance = object_class(_object_state, object_environment)

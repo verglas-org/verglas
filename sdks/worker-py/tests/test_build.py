@@ -143,6 +143,63 @@ class ManifestTests(unittest.TestCase):
 
         self.assertEqual(manifest.pipelines, [{"binding": "STREAM", "stream": "stream-id"}])
 
+    def test_load_manifest_accepts_exact_service_entries(self) -> None:
+        """Service bindings preserve the direct binding and configured target."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["services"] = [{"binding": "CATALOG", "service": "catalog-service"}]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        manifest = load_manifest(self.project)
+
+        self.assertEqual(
+            manifest.services,
+            [{"binding": "CATALOG", "service": "catalog-service"}],
+        )
+
+    def test_load_manifest_rejects_unknown_service_key(self) -> None:
+        """Service entries reject fields outside the exact Wrangler shape."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["services"] = [{
+            "binding": "CATALOG",
+            "service": "catalog-service",
+            "extra": True,
+        }]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "extra"):
+            load_manifest(self.project)
+
+    def test_load_manifest_rejects_duplicate_service_binding_names(self) -> None:
+        """Service names cannot collide with DO, Stream, or other services."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["services"] = [
+            {"binding": "COUNTER", "service": "catalog-service"},
+            {"binding": "CATALOG", "service": "catalog-service"},
+            {"binding": "CATALOG", "service": "other-service"},
+        ]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "duplicate binding name.*COUNTER"):
+            load_manifest(self.project)
+
+    def test_load_manifest_rejects_service_pipeline_collision(self) -> None:
+        """Service names cannot collide with pipeline names."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["pipelines"] = [{"binding": "STREAM", "stream": "stream-id"}]
+        data["services"] = [{"binding": "STREAM", "service": "catalog-service"}]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+
+        with self.assertRaisesRegex(ManifestError, "duplicate binding name.*STREAM"):
+            load_manifest(self.project)
+
     def test_load_manifest_rejects_unknown_pipeline_key(self) -> None:
         """Pipeline entries reject fields outside the exact Wrangler shape."""
         data = parse_jsonc(
@@ -186,6 +243,28 @@ class ManifestTests(unittest.TestCase):
 
         generated = json.loads(result.manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(generated["pipelines"], [{"binding": "STREAM", "stream": "stream-id"}])
+
+    def test_build_preserves_service_entries_in_output_manifest(self) -> None:
+        """The generated deployment manifest carries validated service bindings."""
+        data = parse_jsonc(
+            (self.project / "wrangler.jsonc").read_text(encoding="utf-8")
+        )
+        data["services"] = [{"binding": "CATALOG", "service": "catalog-service"}]
+        (self.project / "wrangler.jsonc").write_text(json.dumps(data), encoding="utf-8")
+        output = self.project / "out"
+
+        def fake_componentize(project, manifest, work_dir, component_path):
+            del project, manifest, work_dir
+            component_path.write_bytes(b"component bytes")
+
+        with mock.patch("build._run_componentize", side_effect=fake_componentize):
+            result = build_project(self.project, output)
+
+        generated = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            generated["services"],
+            [{"binding": "CATALOG", "service": "catalog-service"}],
+        )
 
     def test_build_writes_digest_artifact_and_full_deployment_manifest(self) -> None:
         """The output manifest carries the accepted Wrangler configuration."""

@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import unittest
 
-from workers import DurableObjectState, Request, Response, WebSocketPair
+from workers import DurableObjectState, Request, Response, ServiceBinding, WebSocketPair
 from workers._runtime import Environment, Storage, event_scope, leave_event_scope
 
 
@@ -162,6 +162,48 @@ class WorkerSurfaceTests(unittest.TestCase):
         binding, object_name, request = self.binding_imports.calls[0]
         self.assertEqual((binding, object_name), ("COUNTER", "global"))
         self.assertEqual(request.uri, "/")
+
+    def test_service_binding_fetch_uses_configured_service_target(self) -> None:
+        """A service binding forwards directly with its configured target."""
+        environment = Environment(
+            self.storage,
+            self.socket_imports,
+            self.binding_imports,
+            {},
+            [{"name": "COUNTER", "class_name": "Counter"}],
+            services=[{"binding": "CATALOG", "service": "catalog-service"}],
+        )
+
+        async def exercise() -> Response:
+            return await environment.CATALOG.fetch(Request("POST", "/commit"))
+
+        response = asyncio.run(exercise())
+        self.assertEqual(response.status, 201)
+        self.assertIsInstance(environment.CATALOG, ServiceBinding)
+        self.assertFalse(hasattr(environment.CATALOG, "id_from_name"))
+        self.assertFalse(hasattr(environment.CATALOG, "get"))
+        binding, object_name, request = self.binding_imports.calls[0]
+        self.assertEqual((binding, object_name), ("CATALOG", "catalog-service"))
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.uri, "/commit")
+
+    def test_service_binding_requires_a_request_or_url(self) -> None:
+        """Direct service fetch rejects values outside the Request surface."""
+        environment = Environment(
+            self.storage,
+            self.socket_imports,
+            self.binding_imports,
+            {},
+            [],
+            services=[{"binding": "CATALOG", "service": "catalog-service"}],
+        )
+
+        async def exercise() -> None:
+            await environment.CATALOG.fetch(object())
+
+        with self.assertRaises(TypeError):
+            asyncio.run(exercise())
+        self.assertEqual(self.binding_imports.calls, [])
 
     def test_alarms_use_transactional_storage_imports(self) -> None:
         """Alarm methods stage, read, and clear one deadline."""
