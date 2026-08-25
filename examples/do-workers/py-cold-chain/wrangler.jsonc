@@ -1,0 +1,21 @@
+{
+  "name": "py-cold-chain",
+  "main": "counter.py",
+  "compatibility_date": "2025-05-14",
+  "durable_objects": {
+    "bindings": [
+      { "name": "COUNTER", "class_name": "Counter" }
+    ]
+  },
+  "pipelines": [
+    { "binding": "STREAM", "stream": "events" }
+  ],
+  "services": [
+    { "binding": "PIPELINE", "service": "orders" },
+    { "binding": "SINK_A", "service": "primary_sink" },
+    { "binding": "CATALOG", "service": "warehouse" }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["Counter"] }
+  ]
+}
