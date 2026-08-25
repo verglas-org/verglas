@@ -479,3 +479,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   obsolete integration tests.
 - #171: Deleted the final `node`, `peer`, and rendezvous-ring modules and their tests. Cache identity documentation now describes only immutable binding/version/geometry isolation; no membership, ownership, donor, or peer-fetch seam remains.
 - #171: Corrected retained configuration and memory-grant module language to name the single runtime host rather than deleted process roles. The change is documentation-only and keeps product deployment settings out of shared origin/cache configuration.
+- #171: Added a static integration test that requires every root workspace dependency to be referenced by a retained crate manifest, while explicitly preserving the cache and S3 entries during runtime origin wiring. Pruned the stale root declarations after the deletion and kept the test as a guard against rebuilding those removed dependency graphs.
