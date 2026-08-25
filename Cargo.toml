@@ -47,7 +47,6 @@ verglas-s3 = { path = "crates/verglas-s3" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
 verglas-do-turso = { path = "crates/verglas-do-turso" }
 verglas-do-wasm = { path = "crates/verglas-do-wasm" }
-verglas-celld = { path = "crates/verglas-celld" }
 # Iceberg catalog, file I/O, and deterministic Sink writes. All retained crates
 # are redirected by `[patch.crates-io]` to the same pinned Verglas fork.
 iceberg = "=0.10.0"
@@ -72,9 +71,9 @@ object_store = { version = "0.14.0", features = ["aws", "azure", "gcp"] }
 s3s = "0.14.1"
 sync_wrapper = { version = "1.0.2", features = ["futures"] }
 reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "blocking", "stream", "http2"] }
-# Turso is the sole Durable Object database. Sync uses ordinary WAL/page pulls;
-# application transactions remain serialized by the DO host.
-turso = { version = "=0.7.2", default-features = false, features = ["sync"] }
+# Embedded Turso is the sole Durable Object database. Application transactions
+# and WAL checkpoints remain serialized by the DO host.
+turso = { version = "=0.7.2", default-features = false }
 # AWS credential-chain support for object-store backends.
 aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
 aws-credential-types = { version = "1.2", features = ["hardcoded-credentials"] }

@@ -267,12 +267,20 @@ async function fixture(t, vars = {}) {
 test('serves the Iceberg REST config and multipart namespace contract from SQLite', async (t) => {
   const fixtureValue = await fixture(t);
   const worker = createWorker(fixtureValue.loaded.project, manifest(), { transport: fixtureValue.host });
-  const config = await worker.fetch(publicRequest('GET', 'https://catalog.example/v1/config'));
+  const config = await worker.fetch(publicRequest('GET', 'https://tenant.catalog.verglas.dev/v1/config'));
   assert.equal(config.status, 200);
   const configPayload = await readJson(config);
   assert.deepEqual(configPayload.defaults, { warehouse: 'warehouse' });
-  assert.deepEqual(configPayload.overrides, {});
+  assert.deepEqual(configPayload.overrides, {
+    's3.endpoint': 'https://tenant.s3.verglas.dev',
+    's3.path-style-access': 'true',
+    's3.region': 'auto',
+  });
   assert.ok(configPayload.endpoints.includes('GET /v1/{prefix}/namespaces/{namespace}'));
+
+  const directConfig = await worker.fetch(publicRequest('GET', 'https://tenant.fly.dev/v1/config'));
+  assert.equal(directConfig.status, 200);
+  assert.equal((await readJson(directConfig)).overrides['s3.endpoint'], 'https://tenant.fly.dev:8443');
 
   const created = await worker.fetch(publicRequest(
     'POST',

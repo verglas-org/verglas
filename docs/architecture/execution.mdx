@@ -14,16 +14,16 @@ here is a target where its status is not otherwise marked.
 
 A **Worker** is stateless, pool-executed code. It has no identity or storage;
 its bindings are its authority. A **Durable Object** is a named stateful Worker
-class with strictly serialized events and one embedded Turso `0.7.2` database.
-The local database is a working copy of one remote Turso database dedicated to
-that DO. An external lease-fenced sync ingress validates placement before
-forwarding `push()`; it is not a second SQL commit authority.
+class with strictly serialized events and one embedded local Turso `0.7.2`
+database under the self-hosted cell data root. Cell filesystem durability is
+authoritative for the DO database; DO state has no clustering or replication.
 
 A DO event commits KV/SQL/alarm/attachment state in one Turso transaction. The
-host confirms the remote push before releasing event effects. Selected committed
-changes may also create transactional outbox rows for a Stream. The Stream
-deduplicates `(object-id, event-sequence, record-index)` identities, so a crash
-between Stream confirmation and the delivered mark causes an idempotent resend.
+host issues SQL `COMMIT`, completes an explicit WAL checkpoint, and then
+releases event effects. Selected committed changes may also create transactional
+outbox rows for a Stream. The Stream deduplicates `(object-id, event-sequence,
+record-index)` identities, so a crash between Stream confirmation and the
+delivered mark causes an idempotent resend.
 
 A DO has no custom SQLite pager, alternate SQL provider, alternate mutation or
 object-store authority, direct Iceberg offloader, or vector/graph mutation
@@ -45,8 +45,8 @@ domain. The Pipeline's stateless SQL transform is separate from DO storage.
 ## Shared runtime capabilities
 
 `verglas-runtime` is the shared Wasmtime host for Worker and Durable Object
-components. It owns the Turso adapter, Foyer memory and disk tiers, origin
-access, and narrow privileged capabilities such as Iceberg Catalog commits.
-Tenant components do not receive raw object-store, filesystem, or network
-authority. See [architecture overview](/docs/architecture/overview) for the
-repository boundary.
+components. It owns the local Turso adapter, Foyer memory and disk tiers,
+configured S3 origin access, and narrow privileged capabilities such as Iceberg
+Catalog commits. Tenant components do not receive raw object-store, filesystem, or
+network authority. See [architecture overview](/docs/architecture/overview) for
+the repository boundary.

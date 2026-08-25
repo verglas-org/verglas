@@ -1,10 +1,9 @@
-//! Process provisioning for one Turso-backed Durable Object Worker.
+//! Process provisioning for one Durable Object Worker.
 //!
 //! The local implementation forwards the known runtime CLI contract and passes
 //! the operator-owned Catalog startup path only for the exact host capability
-//! declaration. Cloud placement and the external lease-validating Turso sync
-//! ingress remain cloud responsibilities; celld never invents a second ownership
-//! or CAS protocol.
+//! declaration. Celld owns process isolation and lifecycle fences without
+//! inventing a second ownership or CAS protocol.
 
 use std::future::Future;
 use std::os::unix::fs::FileTypeExt;
@@ -162,53 +161,6 @@ impl Default for WorkerResourceLimits {
     }
 }
 
-/// Remote Turso database and token-file identity for one Durable Object.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TursoConfig {
-    remote_url: String,
-    token_file: PathBuf,
-}
-
-impl TursoConfig {
-    /// Validates and creates one explicit Turso deployment configuration.
-    pub fn new(
-        remote_url: impl Into<String>,
-        token_file: impl Into<PathBuf>,
-    ) -> Result<Self, SupervisorError> {
-        let remote_url = remote_url.into();
-        let token_file = token_file.into();
-        if remote_url.is_empty() {
-            return Err(SupervisorError::InvalidLaunch(
-                "Turso remote URL cannot be empty".to_owned(),
-            ));
-        }
-        if token_file.as_os_str().is_empty() {
-            return Err(SupervisorError::InvalidLaunch(
-                "Turso token file cannot be empty".to_owned(),
-            ));
-        }
-        if remote_url.chars().any(char::is_whitespace) {
-            return Err(SupervisorError::InvalidLaunch(
-                "Turso remote URL cannot contain whitespace".to_owned(),
-            ));
-        }
-        Ok(Self {
-            remote_url,
-            token_file,
-        })
-    }
-
-    /// Returns the explicit remote Turso URL.
-    pub fn remote_url(&self) -> &str {
-        &self.remote_url
-    }
-
-    /// Returns the token-file path passed to `verglas-runtime`.
-    pub fn token_file(&self) -> &Path {
-        &self.token_file
-    }
-}
-
 /// Tenant component identity and event ingress for one Worker child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerComponent {
@@ -302,7 +254,7 @@ impl HostServiceBinding {
     }
 }
 
-/// Program, exact Turso arguments, and declared host capability supplied to a provisioner.
+/// Program, launch arguments, and declared host capability supplied to a provisioner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProvisionRequest {
     program: PathBuf,
@@ -310,21 +262,19 @@ pub struct ProvisionRequest {
     host_id: String,
     do_id: String,
     data_dir: PathBuf,
-    turso: TursoConfig,
     component: WorkerComponent,
     host_service: Option<HostServiceBinding>,
     resource_limits: WorkerResourceLimits,
 }
 
 impl ProvisionRequest {
-    /// Creates a substrate request with the one-path Turso launch contract.
+    /// Creates a substrate request with the local Worker launch contract.
     pub fn new(
         program: impl Into<PathBuf>,
         args: Vec<String>,
         host_id: impl Into<String>,
         do_id: impl Into<String>,
         data_dir: impl Into<PathBuf>,
-        turso: TursoConfig,
         component: WorkerComponent,
     ) -> Self {
         Self {
@@ -333,7 +283,6 @@ impl ProvisionRequest {
             host_id: host_id.into(),
             do_id: do_id.into(),
             data_dir: data_dir.into(),
-            turso,
             component,
             host_service: None,
             resource_limits: WorkerResourceLimits::default(),
@@ -357,7 +306,7 @@ impl ProvisionRequest {
         &self.resource_limits
     }
 
-    /// Returns the executable selected for a local or remote launch.
+    /// Returns the executable selected for a local launch.
     pub fn program(&self) -> &Path {
         &self.program
     }
@@ -377,14 +326,9 @@ impl ProvisionRequest {
         &self.do_id
     }
 
-    /// Returns the local Turso data root.
+    /// Returns the local data root.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
-    }
-
-    /// Returns the explicit Turso configuration.
-    pub fn turso(&self) -> &TursoConfig {
-        &self.turso
     }
 
     /// Returns the exact privileged service declaration for the child runtime.
@@ -409,18 +353,28 @@ impl ProvisionRequest {
             .data_dir
             .clone()
             .unwrap_or_else(|| root.join(spec.do_id()));
+        let expected_data_dir = root.join(spec.do_id());
+        if data_dir != expected_data_dir {
+            return Err(SupervisorError::InvalidLaunch(
+                "local data root must be inside the cell root at the Durable Object identity"
+                    .to_owned(),
+            ));
+        }
+        let component = spec.component.clone().ok_or_else(|| {
+            SupervisorError::InvalidLaunch("component and event socket are required".to_owned())
+        })?;
+        if component.event_socket() != data_dir.join("events.sock") {
+            return Err(SupervisorError::InvalidLaunch(
+                "event socket must be inside the Durable Object data root".to_owned(),
+            ));
+        }
         let request = Self::new(
             command.program.clone(),
             command.args.clone(),
             host_id.as_str(),
             spec.do_id.clone(),
             data_dir,
-            spec.turso.clone().ok_or_else(|| {
-                SupervisorError::InvalidLaunch("Turso deployment is required".to_owned())
-            })?,
-            spec.component.clone().ok_or_else(|| {
-                SupervisorError::InvalidLaunch("component and event socket are required".to_owned())
-            })?,
+            component,
         )
         .with_resource_limits(spec.resource_limits.clone());
         Ok(match spec.host_service.clone() {
@@ -463,12 +417,11 @@ impl ChildCommand {
     }
 }
 
-/// Durable identity and one-path Turso launch configuration.
+/// Durable identity and local Worker launch configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChildSpec {
     do_id: String,
     data_dir: Option<PathBuf>,
-    turso: Option<TursoConfig>,
     component: Option<WorkerComponent>,
     host_service: Option<HostServiceBinding>,
     resource_limits: WorkerResourceLimits,
@@ -481,7 +434,6 @@ impl ChildSpec {
         Ok(Self {
             do_id,
             data_dir: None,
-            turso: None,
             component: None,
             host_service: None,
             resource_limits: WorkerResourceLimits::default(),
@@ -498,12 +450,6 @@ impl ChildSpec {
         }
         self.data_dir = Some(data_dir);
         Ok(self)
-    }
-
-    /// Attaches the explicit Turso remote URL and token-file path.
-    pub fn with_turso(mut self, turso: TursoConfig) -> Self {
-        self.turso = Some(turso);
-        self
     }
 
     /// Attaches the verified tenant component and event socket.
@@ -534,13 +480,8 @@ impl ChildSpec {
         self.host_service.as_ref()
     }
 
-    /// Returns whether the spec has all required Turso launch values.
+    /// Returns whether the spec has all required launch values.
     pub(crate) fn validate(&self) -> Result<(), SupervisorError> {
-        if self.turso.is_none() {
-            return Err(SupervisorError::InvalidLaunch(
-                "Turso deployment is required".to_owned(),
-            ));
-        }
         if self.component.is_none() {
             return Err(SupervisorError::InvalidLaunch(
                 "component and event socket are required".to_owned(),
@@ -592,7 +533,7 @@ impl ChildDescriptor {
         &self.socket_path
     }
 
-    /// Returns the child-exclusive Turso data directory.
+    /// Returns the child-exclusive data directory.
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
     }
@@ -600,7 +541,7 @@ impl ChildDescriptor {
 
 /// Compute substrate operations required by the host lifecycle supervisor.
 pub trait Provisioner: Send + Sync {
-    /// Starts one child or machine with its Turso and component launch paths.
+    /// Starts one child or machine with its local data and component launch paths.
     fn spawn<'a>(&'a self, request: ProvisionRequest) -> ProvisionFuture<'a, ProvisionedChild>;
 
     /// Waits until the child has bound its private event socket before publication.
@@ -654,9 +595,30 @@ impl ProvisionHandle for LocalProcessHandle {
         self.process.try_wait().map_err(ProvisionError::from)
     }
 
-    /// Sends SIGKILL to the local child.
+    /// Sends SIGINT so the runtime can close admission and complete its storage fence.
     fn kill<'a>(&'a mut self) -> ProvisionFuture<'a, ()> {
-        Box::pin(async move { self.process.kill().await.map_err(ProvisionError::from) })
+        Box::pin(async move {
+            let pid = self.process.id().ok_or_else(|| {
+                ProvisionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "local child process has no live pid",
+                ))
+            })?;
+            let pid = libc::pid_t::try_from(pid).map_err(|_| {
+                ProvisionError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "local child pid does not fit the platform pid type",
+                ))
+            })?;
+            // SAFETY: `pid` came from the still-owned Tokio child handle. SIGINT
+            // requests the runtime's explicit shutdown path without sharing memory.
+            let result = unsafe { libc::kill(pid, libc::SIGINT) };
+            if result == 0 {
+                Ok(())
+            } else {
+                Err(ProvisionError::Io(std::io::Error::last_os_error()))
+            }
+        })
     }
 
     /// Waits for the local child after termination.
@@ -700,10 +662,6 @@ impl Provisioner for LocalProcessProvisioner {
                 .arg(request.do_id())
                 .arg("--data-dir")
                 .arg(request.data_dir())
-                .arg("--turso-url")
-                .arg(request.turso().remote_url())
-                .arg("--turso-token-file")
-                .arg(request.turso().token_file())
                 .arg("--component-digest")
                 .arg(request.component().digest())
                 .arg("--component-dir")

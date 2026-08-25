@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use verglas_celld::{
     HostServiceBinding, LocalProcessProvisioner, ProvisionError, ProvisionRequest, Provisioner,
-    TursoConfig, WorkerComponent,
+    WorkerComponent,
 };
 
 const DIGEST: &str = "ababaabababaabababaabababaabababaabababaabababaabababaabababaaba";
@@ -20,7 +20,6 @@ fn request(root: &Path, host_service: Option<HostServiceBinding>) -> (ProvisionR
         "cell-a",
         "do-1",
         &data_dir,
-        TursoConfig::new("https://tenant.turso.io/db-1", root.join("token")).expect("Turso"),
         WorkerComponent::new(DIGEST, root.join("components"), None, &event_socket)
             .expect("component"),
     );

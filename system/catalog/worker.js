@@ -86,9 +86,12 @@ async function fetch(request, env) {
 
   const body = method === 'GET' || method === 'HEAD' ? undefined : new Uint8Array(await request.arrayBuffer());
   const target = new URL(`https://verglas.internal${url.pathname}${url.search}`);
+  const headers = new Headers(request.headers);
+  const forwardedHost = headers.get('x-forwarded-host');
+  headers.set('x-verglas-public-origin', forwardedHost ? `https://${forwardedHost}` : url.origin);
   const internal = new Request(target, {
     method,
-    headers: new Headers(request.headers),
+    headers,
     ...(body === undefined ? {} : { body }),
   });
   const id = namespace.idFromName(catalogId);
@@ -211,7 +214,7 @@ export class Catalog extends DurableObject {
       if (method === 'GET' && url.pathname === REST_CONFIG_PATH) {
         return jsonResponse({
           defaults: { warehouse: this.#config.warehouse },
-          overrides: {},
+          overrides: s3ClientOverrides(new URL(request.headers.get('x-verglas-public-origin') ?? url.origin)),
           endpoints: ICEBERG_REST_ENDPOINTS,
         });
       }
@@ -524,6 +527,25 @@ export class Catalog extends DurableObject {
       confirmed_batches: Number(rows[0]?.confirmed_batches ?? 0),
     });
   }
+}
+
+/**
+ * Advertises the S3 endpoint exposed beside this Catalog Worker. The endpoint
+ * is derived from the request host so the component bytes remain identical in
+ * every deployment.
+ * @param {URL} catalogUrl
+ * @returns {Record<string, string>}
+ */
+function s3ClientOverrides(catalogUrl) {
+  const publicHost = catalogUrl.hostname.includes('.catalog.');
+  const host = publicHost
+    ? catalogUrl.hostname.replace('.catalog.', '.s3.')
+    : `${catalogUrl.hostname}:8443`;
+  return {
+    's3.endpoint': `${catalogUrl.protocol}//${host}`,
+    's3.path-style-access': 'true',
+    's3.region': 'auto',
+  };
 }
 
 export default { fetch };

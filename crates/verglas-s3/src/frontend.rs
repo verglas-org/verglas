@@ -244,7 +244,7 @@ fn retain_response_budget(body: BodyStream, permit: OwnedSemaphorePermit) -> Bod
 
 /// Emits the single INFO completion line for one request (#61): op, key tier,
 /// HTTP status, and duration, tagged with the current request id so the line
-/// correlates with the front-end span, the peer hop, and any fill events. One
+/// correlates with the front-end span and any local fill events. One
 /// event per request; the fields are cheap and the macro compiles to a level
 /// check when INFO is disabled, so the hot path pays nothing beyond that check.
 /// The object key is never logged, only its serving tier — key redaction (#61).

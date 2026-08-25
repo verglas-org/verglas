@@ -82,7 +82,7 @@ impl StreamAppender for BindingStreamAppender {
 /// Turso-backed transactional storage capability for one Worker event.
 ///
 /// The event is held until [`Self::commit`] or [`Self::rollback`] is called.
-/// A successful commit first reaches Turso's local commit and remote `push()`
+/// A successful commit first reaches Turso's local commit and WAL checkpoint
 /// boundary, then drains any enabled Stream outbox before the caller releases
 /// its output permit.
 #[derive(Clone)]
@@ -103,10 +103,10 @@ impl TursoWorkerStorage {
         })
     }
 
-    /// Commits locally, pushes to remote Turso, and drains enabled outbox rows.
+    /// Commits locally, checkpoints the WAL, and drains enabled outbox rows.
     pub async fn commit(&self) -> Result<(), HostError> {
         let event = self.take_event().await?;
-        event.commit_and_push().await.map_err(turso_error)?;
+        event.commit().await.map_err(turso_error)?;
         self.store.drain_outbox().await.map_err(turso_error)
     }
 

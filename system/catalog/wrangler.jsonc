@@ -19,6 +19,6 @@
     "CATALOG_BUCKET": "lake",
     "CATALOG_NAMESPACE": "analytics",
     "CATALOG_TABLE": "events",
-    "CATALOG_SINK_ID": "primary"
+    "CATALOG_SINK_ID": "primary_sink"
   }
 }

@@ -543,3 +543,4 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #cache-cleanup: Added focused behavior coverage for range slicing, DRAM and
   NVMe hits, ETag isolation, invalidation/refill, concurrent fill coalescing,
   and hard DRAM/NVMe budget rejection.
+- #171: Removed the final block-geometry comment promising future peer transfer. The retained Foyer cache geometry now describes only local admission, eviction, and origin fills.

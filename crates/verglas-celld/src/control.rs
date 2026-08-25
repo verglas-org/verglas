@@ -1,4 +1,4 @@
-//! Strict local control protocol for one Turso Worker process per Durable Object.
+//! Strict local control protocol for one Worker process per Durable Object.
 //!
 //! The only spawn command carries the complete runtime launch contract and the
 //! optional exact host capability declaration. Old replica, managed-CAS, lease,
@@ -12,12 +12,11 @@ use tokio::net::UnixListener;
 use tokio::sync::Mutex;
 
 use crate::{
-    ChildSpec, HostServiceBinding, HostSupervisor, SupervisorError, SuspendFence, TursoConfig,
-    WorkerComponent,
+    ChildSpec, HostServiceBinding, HostSupervisor, SupervisorError, SuspendFence, WorkerComponent,
 };
 
 const MAX_COMMAND_BYTES: usize = 8 * 1024;
-const SPAWN_WORKER_FIELDS: usize = 11;
+const SPAWN_WORKER_FIELDS: usize = 9;
 
 /// A control-socket bind or request-processing failure.
 #[derive(Debug, thiserror::Error)]
@@ -135,22 +134,19 @@ async fn execute_inner(supervisor: &mut HostSupervisor, line: &str) -> Result<St
     match command {
         "SPAWN_WORKER" if fields.len() == SPAWN_WORKER_FIELDS => {
             let data_dir = nonempty_path(fields[2], "data root")?;
-            let turso = TursoConfig::new(fields[3], nonempty_path(fields[4], "token file")?)
-                .map_err(|error| format!("invalid command: {error}"))?;
-            let cache_dir = (fields[7] != "-").then(|| PathBuf::from(fields[7]));
+            let cache_dir = (fields[5] != "-").then(|| PathBuf::from(fields[5]));
             let component = WorkerComponent::new(
-                fields[5],
-                nonempty_path(fields[6], "component directory")?,
+                fields[3],
+                nonempty_path(fields[4], "component directory")?,
                 cache_dir,
-                nonempty_path(fields[8], "event socket")?,
+                nonempty_path(fields[6], "event socket")?,
             )
             .map_err(|error| format!("invalid command: {error}"))?;
-            let host_service = parse_host_service(fields[9], fields[10])?;
+            let host_service = parse_host_service(fields[7], fields[8])?;
             let spec = ChildSpec::new(fields[1])
                 .map_err(|error| error.to_string())?
                 .with_data_dir(data_dir)
                 .map_err(|error| error.to_string())?
-                .with_turso(turso)
                 .with_component(component);
             let spec = match host_service {
                 Some(host_service) => spec.with_host_service(host_service),

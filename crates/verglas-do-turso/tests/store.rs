@@ -1,10 +1,7 @@
 //! Acceptance tests for Turso Durable Object storage and publication seams.
 //!
-//! These tests are written before the store implementation. They cover SQL,
-//! Worker reserved state, rollback/commit visibility, and crash-safe outbox
-//! publication without depending on a remote Turso service.
-
-#![cfg(feature = "test-support")]
+//! These tests cover SQL, Worker reserved state, rollback/commit visibility,
+//! embedded WAL checkpoint durability, and crash-safe outbox publication.
 
 use std::sync::Arc;
 
@@ -33,9 +30,9 @@ impl StreamAppender for RecordingAppender {
     }
 }
 
-/// Returns a fresh test store rooted in a complete temporary sidecar family.
+/// Returns a fresh embedded store rooted in a complete temporary sidecar family.
 async fn store(root: &TempDir) -> Result<TursoStore, verglas_do_turso::Error> {
-    TursoStore::open_for_test(root.path().join("worker.db"), "worker-test").await
+    TursoStore::open(root.path().join("worker.db"), "worker-test").await
 }
 
 /// SQL DDL and every basic DML operation share one event transaction.
@@ -59,7 +56,7 @@ async fn sql_create_insert_update_delete_select() -> Result<(), verglas_do_turso
     assert_eq!(rows, json!([{ "id": 1, "name": "updated" }]));
     event.execute("DELETE FROM items WHERE id = 1").await?;
     assert_eq!(event.query_json("SELECT * FROM items").await?, json!([]));
-    event.commit_and_push().await?;
+    event.commit().await?;
     Ok(())
 }
 
@@ -85,20 +82,20 @@ async fn worker_state_reads_own_writes_and_rolls_back() -> Result<(), verglas_do
     Ok(())
 }
 
-/// Committed Worker state survives closing and reopening the local database.
+/// Production `open` commits through the local WAL checkpoint and survives reopen.
 #[tokio::test]
-async fn worker_state_commit_reopen() -> Result<(), verglas_do_turso::Error> {
+async fn production_open_commit_checkpoint_reopen() -> Result<(), verglas_do_turso::Error> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("worker.db");
-    let store = TursoStore::open_for_test(&path, "worker-test").await?;
+    let store = TursoStore::open(&path, "worker-test").await?;
     let event = store.begin_event().await?;
     event.put_kv("key", b"value".to_vec()).await?;
     event.set_alarm(42).await?;
     event.set_attachment(9, b"attachment".to_vec()).await?;
-    event.commit_and_push().await?;
+    event.commit().await?;
     drop(store);
 
-    let reopened = TursoStore::open_for_test(&path, "worker-test").await?;
+    let reopened = TursoStore::open(&path, "worker-test").await?;
     let event = reopened.begin_event().await?;
     assert_eq!(event.get_kv("key").await?, Some(b"value".to_vec()));
     assert_eq!(event.get_alarm().await?, Some(42));
@@ -157,7 +154,7 @@ async fn source_commit_before_stream_send_replays_on_activation()
     event
         .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
         .await?;
-    event.commit_and_push().await?;
+    event.commit().await?;
     assert_eq!(store.pending_outbox(10).await?.len(), 1);
 
     let appender = RecordingAppender::default();
@@ -178,7 +175,7 @@ async fn begin_event_drains_outbox_before_next_source_event() -> Result<(), verg
     event
         .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
         .await?;
-    event.commit_and_push().await?;
+    event.commit().await?;
 
     let appender = RecordingAppender::default();
     store.set_stream_appender(Arc::new(appender.clone())).await;
@@ -200,7 +197,7 @@ async fn outbox_crash_windows_are_replayable() -> Result<(), verglas_do_turso::E
         .append_stream_records("STREAM", "stream-id", vec![json!({ "kind": "selected" })])
         .await?[0]
         .clone();
-    event.commit_and_push().await?;
+    event.commit().await?;
 
     let pending = store.pending_outbox(10).await?;
     assert_eq!(pending.len(), 1);
@@ -230,7 +227,7 @@ async fn ack_before_delivered_mark_replays_the_same_identity() -> Result<(), ver
     event
         .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
         .await?;
-    event.commit_and_push().await?;
+    event.commit().await?;
     let pending = store.pending_outbox(10).await?;
     let key = pending[0].key.clone();
     store.mark_outbox_inflight(&key, "crashed-relay", 0).await?;
@@ -248,19 +245,19 @@ async fn ack_before_delivered_mark_replays_the_same_identity() -> Result<(), ver
 async fn delivered_mark_survives_recovery_without_resend() -> Result<(), verglas_do_turso::Error> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("worker.db");
-    let store = TursoStore::open_for_test(&path, "worker-test").await?;
+    let store = TursoStore::open(&path, "worker-test").await?;
     let appender = RecordingAppender::default();
     store.set_stream_appender(Arc::new(appender.clone())).await;
     let event = store.begin_event().await?;
     event
         .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
         .await?;
-    event.commit_and_push().await?;
+    event.commit().await?;
     store.drain_outbox().await?;
     assert_eq!(appender.batches.lock().await.len(), 1);
     drop(store);
 
-    let reopened = TursoStore::open_for_test(&path, "worker-test").await?;
+    let reopened = TursoStore::open(&path, "worker-test").await?;
     let replay = RecordingAppender::default();
     reopened.set_stream_appender(Arc::new(replay.clone())).await;
     reopened.drain_outbox().await?;
@@ -283,11 +280,36 @@ async fn appender_failure_holds_effects_and_next_event() -> Result<(), verglas_d
     event
         .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
         .await?;
-    event.commit_and_push().await?;
+    event.commit().await?;
     assert!(store.drain_outbox().await.is_err());
     assert!(matches!(
         store.begin_event().await,
         Err(verglas_do_turso::Error::OutboxInFlight)
+    ));
+    Ok(())
+}
+
+/// Shutdown rolls back an abandoned event and refuses committed outbox work.
+#[tokio::test]
+async fn shutdown_fence_requires_an_empty_outbox() -> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let store = store(&root).await?;
+    let abandoned = store.begin_event().await?;
+    abandoned
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
+        .await?;
+    drop(abandoned);
+    store.shutdown_fence().await?;
+    assert!(store.pending_outbox(1).await?.is_empty());
+
+    let committed = store.begin_event().await?;
+    committed
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 2 })])
+        .await?;
+    committed.commit().await?;
+    assert!(matches!(
+        store.shutdown_fence().await,
+        Err(verglas_do_turso::Error::ShutdownOutboxPending)
     ));
     Ok(())
 }

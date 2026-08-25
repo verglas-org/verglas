@@ -1,4 +1,4 @@
-//! Turso deployment and pipeline binding acceptance tests.
+//! Pipeline binding and local Worker launch acceptance tests.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,26 +26,10 @@ fn manifest_source(extra: &str) -> String {
                 "durable_object":{{"digest":"{DIGEST}","component_dir":"components"}},
                 "stream":{{"digest":"{DIGEST}","component_dir":"components"}}
             }},
-            "data_root": "state",
-            "turso": {{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}
+            "data_root": "state"
             {extra}
         }}"#
     )
-}
-
-/// A deployment-level Turso template resolves the exact Worker launch credentials.
-#[test]
-fn resolves_turso_deployment_for_do_binding() {
-    let manifest = Manifest::parse(&manifest_source("")).expect("manifest");
-    let deployment = manifest.turso_for("COUNTER").expect("Turso deployment");
-    assert_eq!(
-        deployment.url("COUNTER", "do-1"),
-        "https://turso.test/COUNTER/do-1"
-    );
-    assert_eq!(
-        deployment.token_file("COUNTER", "do-1").to_str(),
-        Some("/tokens/COUNTER.token")
-    );
 }
 
 /// Pipeline bindings remain separate from durable-object namespace bindings.
@@ -55,26 +39,20 @@ fn pipeline_binding_resolves_stream_identity() {
     assert!(manifest.binding("STREAM").is_none());
     let pipeline = manifest.pipeline("STREAM").expect("pipeline");
     assert_eq!(pipeline.stream(), "stream-identity");
-    assert!(manifest.turso_for("STREAM").is_ok());
 }
 
-/// Missing Turso deployment credentials fail closed instead of activating local state.
+/// Removed remote deployment fields fail closed as unknown manifest keys.
 #[test]
-fn missing_turso_config_is_rejected() {
-    let source = manifest_source(",\n            \"turso\": null");
-    let error = Manifest::parse(&source).expect_err("missing Turso config");
-    assert!(error.to_string().contains("turso"));
-}
-
-/// Unknown Turso fields fail closed.
-#[test]
-fn unknown_turso_field_is_rejected() {
-    let source = manifest_source("").replace(
-        "\"token_file\":\"/tokens/{binding}.token\"",
-        "\"token_file\":\"/tokens/{binding}.token\",\"fallback\":true",
+fn removed_remote_deployment_fields_are_rejected() {
+    let source = manifest_source(
+        ",\n            \"turso\":{\"url_template\":\"https://turso.test/{binding}/{do_id}\",\"token_file\":\"/tokens/{binding}.token\"}",
     );
-    let error = Manifest::parse(&source).expect_err("unknown Turso field");
-    assert!(error.to_string().contains("unknown turso"));
+    let error = Manifest::parse(&source).expect_err("removed deployment field");
+    assert!(
+        error
+            .to_string()
+            .contains("unknown top-level manifest key: turso")
+    );
 }
 
 #[derive(Default)]
@@ -84,14 +62,6 @@ struct RecordingSpawner;
 impl DoSpawner for RecordingSpawner {
     /// Records no process and returns a deterministic event endpoint for routing tests.
     async fn spawn(&self, request: SpawnRequest) -> Result<std::path::PathBuf, GatewayError> {
-        assert_eq!(
-            request.turso_url(),
-            "https://turso.test/STREAM/stream-identity"
-        );
-        assert_eq!(
-            request.turso_token_file().to_str(),
-            Some("/tokens/STREAM.token")
-        );
         Ok(request.data_root().join("events.sock"))
     }
 }
@@ -228,8 +198,7 @@ fn composition_manifest_source() -> String {
                 "sink":{{"digest":"{SINK_DIGEST}","component_dir":"sink"}},
                 "catalog":{{"digest":"{CATALOG_DIGEST}","component_dir":"catalog"}}
             }},
-            "data_root":"state",
-            "turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}
+            "data_root":"state"
         }}"#
     )
 }
@@ -402,7 +371,7 @@ async fn celld_spawner_forwards_exact_host_service_declaration()
     let event_path = data_root.join(do_id).join("events.sock");
     let listener = UnixListener::bind(&control_path)?;
     let expected_command = format!(
-        "SPAWN_WORKER {do_id} {} https://turso.test/CATALOG/catalog-1 /tokens/CATALOG.token {CATALOG_DIGEST} catalog - {} ICEBERG_COMMIT verglas-runtime",
+        "SPAWN_WORKER {do_id} {} {CATALOG_DIGEST} catalog - {} ICEBERG_COMMIT verglas-runtime",
         data_root.join(do_id).display(),
         event_path.display(),
     );
@@ -430,10 +399,6 @@ async fn celld_spawner_forwards_exact_host_service_declaration()
         artifact.digest().to_owned(),
         PathBuf::from("catalog"),
         data_root,
-    )
-    .with_turso(
-        "https://turso.test/CATALOG/catalog-1",
-        "/tokens/CATALOG.token",
     )
     .with_host_service(manifest.host_services()[0].clone());
     let returned = CelldSpawner::new(control_path).spawn(request).await?;
@@ -488,7 +453,7 @@ async fn product_bindings_forward_distinct_commands_and_restart_identity()
             let control_path = directory.path().join("celld.sock");
             let listener = UnixListener::bind(&control_path)?;
             let expected_command = format!(
-                "SPAWN_WORKER {do_id} {} https://turso.test/{binding}/{object} /tokens/{binding}.token {digest} {component_dir} - {} - -",
+                "SPAWN_WORKER {do_id} {} {digest} {component_dir} - {} - -",
                 data_root.join(&do_id).display(),
                 event_path.display()
             );
@@ -516,10 +481,6 @@ async fn product_bindings_forward_distinct_commands_and_restart_identity()
                 artifact.digest().to_owned(),
                 PathBuf::from(component_dir),
                 data_root,
-            )
-            .with_turso(
-                format!("https://turso.test/{binding}/{object}"),
-                format!("/tokens/{binding}.token"),
             );
             let returned = CelldSpawner::new(control_path).spawn(request).await?;
             assert_eq!(returned, event_path);

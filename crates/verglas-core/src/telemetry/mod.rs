@@ -63,8 +63,6 @@ pub enum Tier {
     Dram,
     /// Local NVMe/disk tier.
     Nvme,
-    /// A peer node's cache.
-    Peer,
     /// A backend cache-fill (a miss that fetched and admitted).
     Backend,
     /// Direct-to-origin passthrough (no cache in the path).
@@ -78,9 +76,8 @@ impl Tier {
         match self {
             Tier::Dram => 0,
             Tier::Nvme => 1,
-            Tier::Peer => 2,
-            Tier::Backend => 3,
-            Tier::Passthrough => 4,
+            Tier::Backend => 2,
+            Tier::Passthrough => 3,
         }
     }
 
@@ -89,9 +86,8 @@ impl Tier {
         match code {
             0 => Some(Tier::Dram),
             1 => Some(Tier::Nvme),
-            2 => Some(Tier::Peer),
-            3 => Some(Tier::Backend),
-            4 => Some(Tier::Passthrough),
+            2 => Some(Tier::Backend),
+            3 => Some(Tier::Passthrough),
             _ => None,
         }
     }
@@ -101,15 +97,14 @@ impl Tier {
         match tier {
             ServedTier::Dram => Tier::Dram,
             ServedTier::Nvme => Tier::Nvme,
-            ServedTier::Peer => Tier::Peer,
             ServedTier::Backend => Tier::Backend,
             ServedTier::Passthrough => Tier::Passthrough,
         }
     }
 
-    /// Whether serving from this tier avoided a backend GET (dram/nvme/peer).
+    /// Whether serving from this local cache tier avoided a backend GET.
     pub fn is_hit(self) -> bool {
-        matches!(self, Tier::Dram | Tier::Nvme | Tier::Peer)
+        matches!(self, Tier::Dram | Tier::Nvme)
     }
 }
 
@@ -249,7 +244,7 @@ impl Telemetry {
 
         let _ = writeln!(
             out,
-            "# HELP verglas_requests_avoided_total Backend GET requests avoided by serving a table's read from cache (dram/nvme/peer)."
+            "# HELP verglas_requests_avoided_total Backend GET requests avoided by serving a table's read from local cache (dram/nvme)."
         );
         let _ = writeln!(out, "# TYPE verglas_requests_avoided_total counter");
         for row in &report.tables {
@@ -387,7 +382,6 @@ mod tests {
         for tier in [
             ServedTier::Dram,
             ServedTier::Nvme,
-            ServedTier::Peer,
             ServedTier::Backend,
             ServedTier::Passthrough,
         ] {

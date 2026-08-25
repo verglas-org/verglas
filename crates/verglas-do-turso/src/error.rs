@@ -23,12 +23,21 @@ pub enum Error {
     /// Reports tenant SQL that attempts to access reserved or internal tables.
     #[error("SQL is not allowed for Durable Object tenant storage: {0}")]
     InvalidSql(String),
+    /// Reports a checkpoint that could not acquire every WAL frame.
+    #[error("embedded Turso WAL checkpoint remained busy ({0})")]
+    CheckpointBusy(i64),
+    /// Reports a checkpoint that returned no completion status.
+    #[error("embedded Turso WAL checkpoint returned no status row")]
+    CheckpointResultMissing,
     /// Reports a transaction that was already finished or moved.
     #[error("Turso event transaction is no longer active")]
     EventFinished,
     /// Reports an enabled outbox without an injected Stream binding.
     #[error("outbox publication requires an injected Stream appender")]
     OutboxUnavailable,
+    /// Reports shutdown attempted while committed Stream work remains unpublished.
+    #[error("shutdown fence found committed outbox work")]
+    ShutdownOutboxPending,
     /// Reports an outbox lease owner mismatch.
     #[error("outbox lease owner does not match the current inflight row")]
     OutboxLeaseMismatch,

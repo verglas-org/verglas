@@ -6,36 +6,33 @@ icon: "cube"
 
 This page describes the target execution shape for the Worker and Durable
 Object primitives. The [Worker primitives platform](/docs/architecture/primitives-platform)
-is normative and its PP1–PP10 criteria are frozen. The hosted component and
-lifecycle work is not claimed as shipped until its acceptance evidence exists.
+is normative and its PP1–PP10 criteria are frozen. The component and lifecycle
+work is not claimed as shipped until its acceptance evidence exists.
 
 A **Worker** is the stateless primitive: a pool-executed `fetch` handler with no
 identity and no storage. A **Durable Object** is a named, stateful Worker class
 reached only through bindings (`env.NS.idFromName` → `get` → stub `fetch`). A DO
-runs strictly serialized events against one embedded Turso `0.7.2` database.
-The local database and its sync sidecars are a working copy; one remote Turso
-database belongs to that DO and is the machine-loss recovery source.
+runs strictly serialized events against one embedded local Turso `0.7.2`
+database under the self-hosted cell data root. The cell filesystem is
+authoritative for that database; DO state has no clustering or replication.
 
 ```text
 gateway (owns HTTP + WebSocket connections)
        │  public request → stateless Worker
        ▼
 Worker ── env bindings ──┬── Durable Object
-                         │      ├── Turso 0.7.2 WAL database
+                         │      ├── local Turso 0.7.2 WAL database
                          │      ├── transactional outbox (optional Stream)
-                         │      └── external lease-fenced sync ingress
+                         │      └── private event endpoint
                          ├── Stream
                          ├── Pipeline
                          ├── Sink
                          └── Catalog
 ```
 
-The sync ingress validates the current placement lease before forwarding a
-Turso push. The lease fences who may open or push a DO database; it does not
-create a second SQL authority. The DO runtime has no custom SQLite pager,
-alternate SQL provider, mutation envelope, direct Iceberg offloader, or
-vector/graph mutation domain. A Pipeline's stateless SQL evaluator is separate
-from DO storage.
+The DO runtime has no custom SQLite pager, alternate SQL provider, mutation
+envelope, direct Iceberg offloader, or vector/graph mutation domain. A
+Pipeline's stateless SQL evaluator is separate from DO storage.
 
 ## The ABI
 
@@ -47,11 +44,10 @@ component contract; the following surfaces describe its target behavior:
   requests, `alarm` handles the DO's durable alarm, and `websocket-message`
   and `websocket-close` handle accepted connections.
 - **`storage` imports** — `get`, `put`, `delete`, `list`, `sql`, and alarm
-  verbs — are host functions bound to the embedded Turso database. A storage
-  call is local to the event executor, never a call to a separate SQL service.
-  Reads see the event's Turso snapshot plus its own staged writes. A successful
-  event requires the local transaction commit and confirmation of the remote
-  Turso `push()` boundary.
+  verbs — are host functions bound to the embedded local Turso database. A
+  storage call is local to the event executor, never a call to a separate SQL
+  service. Reads see the event's Turso snapshot plus its own staged writes. A
+  successful event requires SQL `COMMIT` followed by an explicit WAL checkpoint.
 - **`sockets` imports** — `send`, `close`, `set-attachment`, `get-attachment`,
   and `attached` — stage effects against connections the gateway holds.
   Attachments are bounded at 16 KiB and persist in DO state.
@@ -65,14 +61,14 @@ of DO commit or publication.
 ## Event execution: one at a time, gated
 
 Events execute strictly serialized per DO. The host admits one event, runs the
-handler to completion, commits its Turso transaction, and confirms the remote
-push before releasing the event result and any gated socket effects.
+handler to completion, issues SQL `COMMIT`, and executes an explicit WAL
+checkpoint before releasing the event result or any gated socket effects.
 
 - **Input gate.** No second event observes state between another event's start
   and its Turso commit. Concurrent arrivals wait.
 - **Output gate.** Outbound socket sends staged during an event are released
-  only after the event is durable at the Turso remote boundary. An aborted or
-  unpushed event releases nothing.
+  only after the local Turso `COMMIT` and explicit WAL checkpoint complete. An
+  aborted or incomplete event releases nothing.
 - **Publication gate.** If the DO has a Stream binding, selected committed
   changes first become deterministic outbox rows. The host sends those rows to
   the Stream, which deduplicates `(object-id, event-sequence, record-index)`.
@@ -80,8 +76,8 @@ push before releasing the event result and any gated socket effects.
   an idempotent resend, not a duplicate record or a gap.
 
 A handler failure does not roll back a transaction that already reached the
-Turso durability boundary. Stream unavailability applies backpressure to a
-streaming-enabled DO rather than dropping committed records.
+cell filesystem durability fence. Stream unavailability applies backpressure to
+a streaming-enabled DO rather than dropping committed records.
 
 ## Code artifacts
 
@@ -112,25 +108,25 @@ the component. The gateway:
 5. reads per-connection attachments from DO state on wake so a rehydrated
    Worker can rebuild its session map.
 
-Because attachments and the alarm are committed Turso state, a DO that
-hibernates, migrates, or takes over from a failed owner rebuilds the context
+Because attachments and the alarm are committed local Turso state, a DO that
+hibernates or cold-restarts reopens its existing path and rebuilds the context
 described by its last durable transaction.
 
 ## Alarms
 
 `set-alarm` writes the DO's single alarm row inside the current Turso
-transaction. After the push is confirmed, the supervisor arms a wake at the
-deadline; firing delivers one `alarm` event with the scheduled time. The alarm
-survives hibernation and restore because it is ordinary committed state; the
-timer is derived, never authoritative.
+transaction. After `COMMIT` and the explicit WAL checkpoint complete, the
+supervisor arms a wake at the deadline; firing delivers one `alarm` event with
+the scheduled time. The alarm survives hibernation and cold restart because it
+is ordinary committed state; the timer is derived, never authoritative.
 
 ## Placement substrate
 
-The target lifecycle supervisor provisions one isolated execution environment
-per active DO. A local-process provisioner can support development and tests;
-a microVM provisioner can provide production isolation. Both pass the placement
-lease to the external Turso sync ingress and fence routing after a crash or
-restore. A stale owner cannot open or push the DO's remote database.
+The self-hosted cell lifecycle supervisor creates one isolated execution
+environment per active DO. Local process execution supports development and
+tests; a microVM provides production isolation. Celld assigns each DO's local
+Turso database under the self-hosted cell data root and reopens that same path
+on cold restart. The cell filesystem remains authoritative for state.
 
 Worker execution remains stateless and pool-executed. Stream, Pipeline, Sink,
 and Catalog are prebuilt Worker/DO deployments with their own ownership

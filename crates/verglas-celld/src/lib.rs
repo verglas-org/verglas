@@ -1,8 +1,7 @@
-//! Tenant-cell supervision for one Turso-backed Durable Object Worker per owner.
+//! Tenant-cell supervision for one Durable Object Worker per owner.
 //!
-//! Celld starts and fences resident processes. Cloud placement and the external
-//! lease-validating Turso sync ingress own placement authority; celld has no
-//! replica election or local CAS fallback.
+//! Celld starts and fences resident processes. Placement is an external
+//! responsibility; celld has no replica election or local CAS fallback.
 
 mod alarm;
 mod control;
@@ -20,6 +19,6 @@ pub use placement::HostId;
 pub use provision::{
     ChildCommand, ChildDescriptor, ChildSpec, HostServiceBinding, LocalProcessProvisioner,
     ProvisionError, ProvisionFuture, ProvisionHandle, ProvisionRequest, ProvisionedChild,
-    Provisioner, TursoConfig, WorkerComponent, WorkerResourceLimits,
+    Provisioner, WorkerComponent, WorkerResourceLimits,
 };
 pub use supervisor::{ExitedChild, HostSupervisor, SupervisorError};

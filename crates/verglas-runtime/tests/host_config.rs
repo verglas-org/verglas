@@ -101,15 +101,16 @@ fn rejects_unknown_backend_fields() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A backend that does not serve the exact configured bucket is rejected.
+/// A stable logical Worker bucket may map to one deployment-specific provider bucket.
 #[test]
-fn rejects_backend_bucket_mismatch() -> Result<(), Box<dyn std::error::Error>> {
+fn accepts_exact_physical_bucket_behind_logical_worker_bucket()
+-> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let mut value = document(directory.path());
     value["origin"]["backend"]["bucket"] = Value::String("other".to_owned());
     let config: CatalogHostConfig = serde_json::from_value(value)?;
-    let error = config.validate().expect_err("bucket mismatch");
-    assert!(error.to_string().contains("does not serve bucket `lake`"));
+    config.validate()?;
+    assert_eq!(config.origin().bucket(), "lake");
     Ok(())
 }
 

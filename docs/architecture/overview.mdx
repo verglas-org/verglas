@@ -6,8 +6,9 @@ icon: "compass-drafting"
 
 Verglas has exactly six products: **Worker**, **Durable Object**, **Stream**,
 **Pipeline**, **Sink**, and **Catalog**. Worker is the stateless primitive. DO
-is the stateful primitive, backed by Turso `0.7.2`. Stream, Pipeline, Sink, and
-Catalog are prebuilt Worker/DO deployments with separate ownership boundaries.
+is the stateful primitive, backed by one embedded local Turso `0.7.2` database
+under the self-hosted cell data root. Stream, Pipeline, Sink, and Catalog are
+prebuilt Worker/DO deployments with separate ownership boundaries.
 See the [normative platform page](/docs/architecture/primitives-platform) for
 PP1–PP10.
 
@@ -21,39 +22,45 @@ origin.
 ```mermaid
 flowchart LR
     U["HTTP / bindings"] --> W["Worker\nstateless"]
-    W --> D["Durable Object\nTurso 0.7.2"]
+    W --> D["Durable Object\nlocal Turso 0.7.2"]
     W --> S["Stream\nordered JSON"]
     S --> P["Pipeline\nSQL + batch + retry"]
     P --> K["Sink\nidempotent delivery"]
     K --> C["Catalog\nIceberg REST"]
-    R["verglas-runtime"] --> O["Origin object storage"]
+    R["verglas-runtime"] --> O["S3-compatible bucket\nimmutable Iceberg origin"]
     R --> C
 ```
+
+The serving topology is `edge → verglas-gateway → verglas-celld →
+verglas-runtime`. The cell filesystem is authoritative for local Durable Object
+state. There is no clustering or replication layer. The configured
+S3-compatible bucket is the immutable Iceberg origin, and Foyer contents are
+disposable.
 
 ## Repository boundary
 
 | Repository | Responsibility |
 | --- | --- |
-| `verglas` | Public Worker/Durable Object runtime, Turso/Foyer adapters, Iceberg/Catalog capabilities, clients, documentation, and product contracts. |
-| `verglas-cloud` | Hosted access, product provisioning, placement, lifecycle, integrations, applications, and agent runtime. |
-| `verglas-app` | Private cloud console and workspace client. |
+| `verglas` | Public Worker/Durable Object runtime, local Turso/Foyer adapters, Iceberg/Catalog capabilities, clients, documentation, and product contracts. |
+| Self-hosted deployment | Edge ingress, gateway, celld placement and lifecycle, runtime execution, and operator management. |
+| `verglas-app` | Optional operator console and workspace client. |
 
 The public repository does not add a hidden job runtime, queue service, custom
-DO database, or direct DO-to-Iceberg path. Hosted services consume explicit public
-contracts. Product implementations that are not yet accepted are documented as
-Target or Gap rather than as shipped features.
+DO database, or direct DO-to-Iceberg path. Self-hosted operators consume explicit
+public contracts. Product implementations that are not yet accepted are
+documented as Target or Gap rather than as shipped features.
 
 ## Product and infrastructure roles
 
 | Role | Responsibility |
 | --- | --- |
 | Worker | Stateless ingress and binding calls. |
-| Durable Object | Serialized per-object state in Turso, including KV, SQL, alarms, attachments, and optional Stream outbox rows. |
+| Durable Object | Serialized per-object state in its local Turso database, including KV, SQL, alarms, attachments, and optional Stream outbox rows. SQL `COMMIT` plus an explicit WAL checkpoint fences state on the cell filesystem. |
 | Stream | Ordered durable JSON records and producer-identity deduplication; no offload or consumer offsets. |
 | Pipeline | Stream cursor, stateless SQL transform, batching, retry, and Sink confirmation. |
 | Sink | Idempotent delivery; first adapter writes Parquet and commits Iceberg through Catalog. |
-| Catalog | Iceberg REST and metadata commits using the existing catalog and object-storage libraries. |
-| Runtime | Wasmtime component execution, Turso Durable Object state, Foyer cache tiers, origin access, and narrow privileged capabilities. |
+| Catalog | Iceberg REST and metadata commits using the existing catalog and S3-compatible object-storage libraries. |
+| Runtime | Wasmtime component execution, local Turso Durable Object state, Foyer cache tiers, configured S3 origin access, and narrow privileged capabilities. |
 
 ## Standing requirements
 

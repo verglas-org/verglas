@@ -5,8 +5,6 @@
 //! transactions, output gating, Unix framing, alarms, do-call routing, and
 //! event serialization remain real.
 
-#![cfg(feature = "test-support")]
-
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -244,9 +242,8 @@ async fn start_endpoint_with_dispatcher(
     ),
     Box<dyn Error>,
 > {
-    let store = Arc::new(
-        TursoStore::open_for_test(directory.path().join("worker.db"), "endpoint-test").await?,
-    );
+    let store =
+        Arc::new(TursoStore::open(directory.path().join("worker.db"), "endpoint-test").await?);
     let path = directory.path().join("events.sock");
     let mut endpoint = EventEndpoint::bind(&path, Arc::clone(&store), dispatcher).await?;
     let task = tokio::spawn(async move { endpoint.run().await });
@@ -285,9 +282,8 @@ async fn start_endpoint_with_appender(
     ),
     Box<dyn Error>,
 > {
-    let store = Arc::new(
-        TursoStore::open_for_test(directory.path().join("worker.db"), "endpoint-test").await?,
-    );
+    let store =
+        Arc::new(TursoStore::open(directory.path().join("worker.db"), "endpoint-test").await?);
     store.set_stream_appender(appender).await;
     let path = directory.path().join("events.sock");
     let mut endpoint = EventEndpoint::bind(

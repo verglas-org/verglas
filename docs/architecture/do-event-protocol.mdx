@@ -8,13 +8,14 @@ The gateway and the target DO event executor speak newline-delimited JSON
 (NDJSON, UTF-8) over the DO's private Unix **event socket**. Binary payloads
 are base64 in `*_b64` fields. This is a prototype wire format: it may break
 freely between commits and carries no version negotiation. The DO's storage
-boundary is Turso `0.7.2`; its remote sync ingress is a separate durability
-and lease-fencing path, not a second SQL protocol.
+boundary is one embedded local Turso `0.7.2` database under the self-hosted cell
+data root. SQL `COMMIT` followed by an explicit WAL checkpoint is the durability
+fence; cell filesystem durability is authoritative.
 
 `verglas-runtime` processes events strictly one at a time (the input gate). The
 gateway may pipeline frames; responses and outbound effects are emitted in
 event order. All staged WebSocket effects for an event are written to the
-socket **after the event's transaction is durably committed and before that
+socket **after SQL `COMMIT` and the explicit WAL checkpoint and before that
 event's terminal frame** — a reader that sees `done`/`fetch-result` for event
 N has already seen every send N produced.
 
@@ -61,10 +62,10 @@ result boundary:
 - `sql-rows(statement) -> string` — execute the same statement and return rows
   as one JSON array of objects for componentized JS and Python guests.
 
-Both execute inside the current event's Turso transaction. DML stages in Turso;
-reads see the event's snapshot plus its own staged writes. Turso WAL and the
-remote `push()` boundary provide durability; no Arrow mutation envelope or S3
-CAS is part of DO commit.
+Both execute inside the current event's local Turso transaction. DML stages in
+Turso; reads see the event's snapshot plus its own staged writes. SQL `COMMIT`
+and an explicit WAL checkpoint provide durability; no Arrow mutation envelope or
+object-store CAS is part of DO commit.
 
 ## Acceptance criteria (immutable)
 

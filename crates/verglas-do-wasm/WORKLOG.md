@@ -13,3 +13,4 @@
 - #0: Updated the frozen WIT for PP4: Arrow IPC SQL was deleted, JSON-row SQL is the sole relational surface, and `storage.stream-send` stages logical records in the current event transaction. WorkerHost and stateless WorkerPool now implement the narrowed capability without a compatibility verb.
 - #171: Updated resident-host diagnostics to name the final `verglas-runtime` executable after the old worker daemon name was removed. The WASM capability model and no-network isolation contract are unchanged.
 - #171: Updated the service-world source comment to identify `verglas-runtime` as the sole host. The WIT surface and capability boundaries are unchanged.
+- #171: Bounded Wasmtime's linear-memory reservation and relocation growth reserve for both stateless Workers and resident Durable Objects. This keeps component instantiation inside celld's hard address-space ceiling instead of failing after the event socket accepts a request.

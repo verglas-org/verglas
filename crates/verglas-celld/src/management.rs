@@ -2,8 +2,8 @@
 //!
 //! This module stores uploaded Worker modules and durable-object namespace
 //! metadata. Process launch is deliberately not inferred from management data:
-//! an explicit deployment supplies the Turso URL template and token file, and
-//! the gateway/control plane owns the one active placement owner.
+//! the gateway/control plane owns the one active placement owner and launch
+//! contract.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -662,11 +662,7 @@ async fn create_object_response(
     if let Err(error) = persist_namespaces(state, &snapshot).await {
         return error.into_response();
     }
-    ApiError::Internal(
-        "Turso deployment credentials and component are required before object activation"
-            .to_owned(),
-    )
-    .into_response()
+    ApiError::Internal("component is required before object activation".to_owned()).into_response()
 }
 
 /// Returns one object metadata record without activating a process.

@@ -158,3 +158,4 @@
   deleting the unused core glob module. Bucket-set matching remains exact and
   allocation-bounded without retaining cache-node configuration helpers.
 - #171: Corrected public backend documentation links so strict workspace rustdoc resolves only public items and the owning factory method. Runtime behavior is unchanged.
+- #171: Added an exact logical-to-physical bucket adapter for cloud Durable Objects. Precompiled Workers can retain one stable `s3://lake` contract while every deployment routes that name to its own provider bucket without widening the binding or bucket authority.

@@ -1,9 +1,8 @@
-//! Resident Durable Object Worker process backed by one Turso database.
+//! Resident Durable Object Worker process backed by one embedded Turso database.
 //!
-//! Startup is fail-closed: the process requires an explicit remote Turso URL,
-//! token file, local data root, and DO identity before it opens the event socket.
-//! Component bytes remain digest-verified and optional compiled-cache failures
-//! remain fatal.
+//! Startup is fail-closed: the process requires only a local data root and DO
+//! identity before it opens the event socket. Component bytes remain
+//! digest-verified and optional compiled-cache failures remain fatal.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -22,10 +21,6 @@ struct Config {
     do_id: String,
     /// DO data root containing the local Turso database and sidecars.
     data_dir: PathBuf,
-    /// Remote Turso sync URL.
-    turso_url: String,
-    /// File containing the bearer token, never echoed by the process.
-    turso_token_file: PathBuf,
     /// Optional source component digest.
     component_digest: Option<ComponentDigest>,
     /// Directory containing the digest-named component bytes.
@@ -44,8 +39,6 @@ impl Config {
         let mut arguments = std::env::args().skip(1);
         let mut do_id = None;
         let mut data_dir = None;
-        let mut turso_url = None;
-        let mut turso_token_file = None;
         let mut component_digest = None;
         let mut component_dir = None;
         let mut cwasm_cache_dir = None;
@@ -56,13 +49,6 @@ impl Config {
                 "--do-id" => do_id = Some(next_value(&mut arguments, "--do-id")?),
                 "--data-dir" => {
                     data_dir = Some(PathBuf::from(next_value(&mut arguments, "--data-dir")?));
-                }
-                "--turso-url" => turso_url = Some(next_value(&mut arguments, "--turso-url")?),
-                "--turso-token-file" => {
-                    turso_token_file = Some(PathBuf::from(next_value(
-                        &mut arguments,
-                        "--turso-token-file",
-                    )?));
                 }
                 "--component-digest" => {
                     let value = next_value(&mut arguments, "--component-digest")?;
@@ -96,9 +82,6 @@ impl Config {
         }
         let do_id = required_text(do_id, "--do-id")?;
         let data_dir = data_dir.ok_or_else(|| "missing --data-dir".to_owned())?;
-        let turso_url = required_text(turso_url, "--turso-url")?;
-        let turso_token_file =
-            turso_token_file.ok_or_else(|| "missing --turso-token-file".to_owned())?;
         if component_digest.is_some() != component_dir.is_some() {
             return Err(
                 "--component-digest and --component-dir must be supplied together".to_owned(),
@@ -118,8 +101,6 @@ impl Config {
         Ok(Self {
             do_id,
             data_dir,
-            turso_url,
-            turso_token_file,
             component_digest,
             component_dir,
             cwasm_cache_dir,
@@ -141,21 +122,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
         ),
         None => None,
     };
-    let token = tokio::fs::read_to_string(&config.turso_token_file).await?;
-    let token = token.trim().to_owned();
-    if token.is_empty() {
-        return Err("--turso-token-file contains an empty token".into());
-    }
     let runtime = load_runtime(&config).await?.map(Arc::new);
-    let store = Arc::new(
-        TursoStore::open(
-            config.data_dir.join("turso.db"),
-            config.turso_url.clone(),
-            token,
-            config.do_id.clone(),
-        )
-        .await?,
-    );
+    let store =
+        Arc::new(TursoStore::open(config.data_dir.join("turso.db"), config.do_id.clone()).await?);
     match config.event_socket {
         Some(event_socket) => {
             let runtime = runtime.ok_or("--event-socket requires a verified component")?;
@@ -163,21 +132,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 Some(service) => {
                     EventEndpoint::bind_with_catalog_commit_service(
                         event_socket,
-                        store,
+                        Arc::clone(&store),
                         runtime,
                         service,
                     )
                     .await?
                 }
-                None => EventEndpoint::bind(event_socket, store, runtime).await?,
+                None => EventEndpoint::bind(event_socket, Arc::clone(&store), runtime).await?,
             };
             tokio::select! {
                 result = endpoint.run() => result?,
                 signal = tokio::signal::ctrl_c() => signal?,
             }
+            drop(endpoint);
+            store.shutdown_fence().await?;
         }
         None => {
             tokio::signal::ctrl_c().await?;
+            store.shutdown_fence().await?;
         }
     }
     Ok(())
@@ -223,5 +195,5 @@ fn required_text(value: Option<String>, option: &str) -> Result<String, String> 
 
 /// Describes the accepted runtime argument surface.
 fn usage() -> &'static str {
-    "usage: verglas-runtime --do-id ID --data-dir PATH --turso-url URL --turso-token-file PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH] [--catalog-host-config PATH]"
+    "usage: verglas-runtime --do-id ID --data-dir PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH] [--catalog-host-config PATH]"
 }

@@ -7,7 +7,6 @@ WIT imports at wake time; application code never imports this module directly.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import contextvars
 import hashlib
@@ -1174,12 +1173,13 @@ class ExecutionContext:
             raise TypeError("ExecutionContext.wait_until expects an awaitable")
         self._waits.append(awaitable)
 
-    async def _drain(self) -> None:
-        """Await all queued work before event completion."""
+    def _drain(self) -> None:
+        """Resolve all queued work before event completion."""
         while self._waits:
             waits = self._waits
             self._waits = []
-            await asyncio.gather(*waits)
+            for awaitable in waits:
+                _run_awaitable(awaitable)
 
 
 class DurableObjectState:
@@ -1328,19 +1328,29 @@ class DurableObject:
         self.env = env
 
 
-def invoke_awaitable(value: Any, execution: ExecutionContext | None) -> Any:
-    """Resolve a sync or async handler and drain wait-until work."""
-    if inspect.isawaitable(value):
-        async def resolve() -> Any:
-            result = await value
-            if execution is not None:
-                await execution._drain()
-            return result
+def _run_awaitable(value: Any) -> Any:
+    """Drive one immediate Cloudflare coroutine without a clocked event loop."""
+    iterator = value.__await__()
+    try:
+        yielded = next(iterator)
+        while True:
+            if yielded is None:
+                resolved = None
+            elif inspect.isawaitable(yielded):
+                resolved = _run_awaitable(yielded)
+            else:
+                raise RuntimeError("Cloudflare coroutine suspended on an unsupported scheduler primitive")
+            yielded = iterator.send(resolved)
+    except StopIteration as completed:
+        return completed.value
 
-        return asyncio.run(resolve())
-    if execution is not None and execution._waits:
-        asyncio.run(execution._drain())
-    return value
+
+def invoke_awaitable(value: Any, execution: ExecutionContext | None) -> Any:
+    """Resolve a sync or immediate async handler and drain wait-until work."""
+    result = _run_awaitable(value) if inspect.isawaitable(value) else value
+    if execution is not None:
+        execution._drain()
+    return result
 
 
 def invoke_callback(callback: Any, args: tuple[Any, ...], execution: ExecutionContext | None) -> Any:

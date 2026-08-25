@@ -3,15 +3,18 @@
 /**
  * Build and run the real six-product JavaScript/Python cold-restart proof.
  *
- * This harness deliberately requires production Turso credentials and the
- * production celld/runtime binaries. Set VERGLAS_TURSO_URL_TEMPLATE,
- * VERGLAS_TURSO_TOKEN_FILE, and VERGLAS_RUNTIME_HOST_CONFIG for a real run. It never swaps in the AC1 local
- * store or an in-process product adapter. TRANSCRIPT.md is not written here.
+ * The complete stack is self-hosted: each runtime child owns an embedded Turso
+ * database, while immutable Iceberg objects use a configured S3-compatible
+ * bucket. The harness reads generic S3 configuration from its environment
+ * without logging credentials, generates a run-scoped host configuration, and
+ * never substitutes test stores
+ * or in-process product adapters. TRANSCRIPT.md is not written here.
  */
 
 import { createWriteStream } from 'node:fs';
 import {
   access,
+  cp,
   mkdtemp,
   mkdir,
   readFile,
@@ -21,8 +24,8 @@ import {
 } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { createConnection } from 'node:net';
-import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
 const HERE = resolve(fileURLToPath(new URL('.', import.meta.url)));
@@ -76,6 +79,79 @@ function parseArgs(argv) {
 }
 
 /**
+ * Load one generic S3-compatible bucket configuration without logging credentials.
+ * @returns {Promise<{bucket: string, endpoint: string, accessKeyId: string, secretAccessKey: string}>}
+ */
+async function loadS3Config() {
+  const config = {
+    bucket: process.env.VERGLAS_S3_BUCKET,
+    endpoint: process.env.VERGLAS_S3_ENDPOINT,
+    accessKeyId: process.env.VERGLAS_S3_ACCESS_KEY_ID,
+    secretAccessKey: process.env.VERGLAS_S3_SECRET_ACCESS_KEY,
+  };
+  for (const [name, item] of Object.entries(config)) {
+    if (typeof item !== 'string' || item.trim() === '') {
+      throw new Error(`S3 configuration is missing ${name}`);
+    }
+  }
+  const endpoint = new URL(config.endpoint);
+  if (endpoint.protocol !== 'https:') throw new Error('S3 endpoint must use HTTPS');
+  return config;
+}
+
+/**
+ * Write one run-scoped S3 credential file and strict Catalog host configuration.
+ * @param {string} root
+ * @param {{bucket: string, endpoint: string, accessKeyId: string, secretAccessKey: string}} s3
+ * @param {{warehouse: string, storageBindingId: string}} deployment
+ * @returns {Promise<{path: string, credentialsPath: string}>}
+ */
+async function writeRuntimeHostConfig(root, s3, deployment) {
+  const privateRoot = join(root, 'host');
+  const cacheDir = join(privateRoot, 'foyer');
+  await mkdir(cacheDir, { recursive: true });
+  const credentialsPath = join(privateRoot, 's3-credentials');
+  await writeFile(
+    credentialsPath,
+    `[default]\naws_access_key_id = ${s3.accessKeyId}\naws_secret_access_key = ${s3.secretAccessKey}\n`,
+    { encoding: 'utf8', mode: 0o600 },
+  );
+  const configPath = join(privateRoot, 'catalog-host.json');
+  const config = {
+    origin: {
+      storage_binding_id: deployment.storageBindingId,
+      bucket: s3.bucket,
+      scheme: 's3',
+      backend: {
+        provider: 's3',
+        bucket: s3.bucket,
+        endpoint: s3.endpoint,
+        region: 'auto',
+        allow_http: false,
+        virtual_hosted_style: false,
+        credentials_file: credentialsPath,
+        credentials_profile: 'default',
+      },
+    },
+    cache: {
+      dir: cacheDir,
+      capacity_bytes: '64MB',
+      dram_bytes: '64MB',
+      data_block_bytes: '1MB',
+    },
+    warehouse: deployment.warehouse,
+    sink: {
+      sink_id: 'primary_sink',
+      namespace: 'analytics',
+      table: 'events',
+      compression: 'zstd',
+    },
+  };
+  await writeFile(configPath, `${JSON.stringify(config, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
+  return { path: configPath, credentialsPath };
+}
+
+/**
  * Run one child command and retain its exact output for diagnostics.
  * @param {string} command
  * @param {string[]} args
@@ -114,12 +190,41 @@ async function runCommand(command, args, cwd, label, logPath) {
 }
 
 /**
+ * Stage one product with run-scoped immutable S3 deployment variables.
+ * @param {string} product
+ * @param {string} buildRoot
+ * @param {{bucket: string, warehouse: string}|undefined} deployment
+ * @returns {Promise<string>}
+ */
+async function stageProduct(product, buildRoot, deployment) {
+  const source = PRODUCT_DIRS[product];
+  if (!deployment || (product !== 'sink' && product !== 'catalog')) return source;
+  const staged = join(buildRoot, 'product-source', product);
+  await cp(source, staged, { recursive: true });
+  const manifestPath = join(staged, 'wrangler.jsonc');
+  let manifest = await readFile(manifestPath, 'utf8');
+  const replaceRequired = (needle, replacement) => {
+    if (!manifest.includes(needle)) throw new Error(`${product} manifest is missing ${needle}`);
+    manifest = manifest.replace(needle, replacement);
+  };
+  if (product === 'sink') {
+    replaceRequired('"SINK_BUCKET": "lake"', `"SINK_BUCKET": ${JSON.stringify(deployment.bucket)}`);
+  } else {
+    replaceRequired('"CATALOG_BUCKET": "lake"', `"CATALOG_BUCKET": ${JSON.stringify(deployment.bucket)}`);
+    replaceRequired('"CATALOG_WAREHOUSE": "warehouse"', `"CATALOG_WAREHOUSE": ${JSON.stringify(deployment.warehouse)}`);
+  }
+  await writeFile(manifestPath, manifest, 'utf8');
+  return staged;
+}
+
+/**
  * Build all four prebuilt products and one language Worker component.
  * @param {string} language
  * @param {string} root
- * @returns {Promise<{language: string, root: string, workerManifest: object, products: object}>}
+ * @param {{bucket: string, warehouse: string, storageBindingId: string}|undefined} deployment
+ * @returns {Promise<{language: string, root: string, workerManifest: object, products: object, deployment: object|undefined}>}
  */
-async function buildArtifacts(language, root) {
+async function buildArtifacts(language, root, deployment) {
   const buildRoot = join(root, language);
   await mkdir(buildRoot, { recursive: true });
   const logs = join(buildRoot, 'logs');
@@ -128,9 +233,10 @@ async function buildArtifacts(language, root) {
   for (const product of PRODUCTS) {
     const output = join(buildRoot, product);
     await mkdir(output, { recursive: true });
+    const productSource = await stageProduct(product, buildRoot, deployment);
     await runCommand(
       process.execPath,
-      [JS_BUILDER, PRODUCT_DIRS[product], '--out', output],
+      [JS_BUILDER, productSource, '--out', output],
       REPO,
       `build ${product}`,
       join(logs, `${product}.log`),
@@ -153,7 +259,7 @@ async function buildArtifacts(language, root) {
     join(logs, `${language}-worker.log`),
   );
   const workerManifest = JSON.parse(await readFile(join(workerOutput, 'manifest.out.json'), 'utf8'));
-  return { language, root: buildRoot, workerManifest, products };
+  return { language, root: buildRoot, workerManifest, products, deployment };
 }
 
 /**
@@ -173,16 +279,21 @@ function descriptor(manifest, product) {
 /**
  * Create the aggregate gateway manifest used by the production gateway.
  * @param {{language: string, root: string, workerManifest: object, products: object}} built
- * @param {string} urlTemplate
- * @param {string} tokenFile
  * @returns {object}
  */
-function aggregateManifest(built, urlTemplate, tokenFile) {
-  const worker = descriptor(built.workerManifest, 'worker');
-  const durableObject = descriptor(built.workerManifest, 'durable_object');
+function aggregateManifest(built) {
+  const withCache = (product, value) => ({
+    ...value,
+    cwasm_cache_dir: join(built.root, 'cwasm-cache', product),
+  });
+  const worker = withCache('worker', descriptor(built.workerManifest, 'worker'));
+  const durableObject = withCache(
+    'durable_object',
+    descriptor(built.workerManifest, 'durable_object'),
+  );
   const productArtifacts = Object.fromEntries(PRODUCTS.map((product) => [
     product,
-    descriptor(built.products[product], 'durable_object'),
+    withCache(product, descriptor(built.products[product], 'durable_object')),
   ]));
   const pipelineObject = 'orders';
   return {
@@ -210,7 +321,6 @@ function aggregateManifest(built, urlTemplate, tokenFile) {
       catalog: productArtifacts.catalog,
     },
     data_root: join(built.root, 'data'),
-    turso: { url_template: urlTemplate, token_file: tokenFile },
   };
 }
 
@@ -372,16 +482,14 @@ async function assertProgress(base, count) {
 /**
  * Run one language through increment, process, shutdown, restart, and replay.
  * @param {{language: string, root: string, workerManifest: object, products: object}} built
- * @param {string} urlTemplate
- * @param {string} tokenFile
  * @param {string} gatewayBin
  * @param {string} celldBin
  * @param {string} runtimeBin
  * @param {string} runtimeHostConfig
  * @returns {Promise<object>}
  */
-async function runLanguage(built, urlTemplate, tokenFile, gatewayBin, celldBin, runtimeBin, runtimeHostConfig) {
-  const manifest = aggregateManifest(built, urlTemplate, tokenFile);
+async function runLanguage(built, gatewayBin, celldBin, runtimeBin, runtimeHostConfig) {
+  const manifest = aggregateManifest(built);
   await verifyManifestArtifacts(manifest);
   const manifestPath = join(built.root, 'gateway.json');
   await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
@@ -441,42 +549,49 @@ async function runLanguage(built, urlTemplate, tokenFile, gatewayBin, celldBin, 
 }
 
 /**
- * Build the requested examples, then run only when production prerequisites exist.
+ * Build the requested examples, generate S3 host state, and run the self-hosted stack.
  */
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const buildRoot = await mkdtemp(join(tmpdir(), BUILD_ROOT_PREFIX));
-  const urlTemplate = process.env.VERGLAS_TURSO_URL_TEMPLATE;
-  const tokenFile = process.env.VERGLAS_TURSO_TOKEN_FILE;
-  const runtimeHostConfig = process.env.VERGLAS_RUNTIME_HOST_CONFIG;
+  // Keep celld's per-object Unix sockets below the platform SUN_LEN limit.
+  const buildRoot = await mkdtemp(join(process.env.VERGLAS_E2E_TMPDIR ?? '/tmp', BUILD_ROOT_PREFIX));
   const gatewayBin = process.env.VERGLAS_GATEWAY_BIN ?? DEFAULT_GATEWAY;
   const celldBin = process.env.VERGLAS_CELLD_BIN ?? DEFAULT_CELLD;
   const runtimeBin = process.env.VERGLAS_RUNTIME_BIN ?? DEFAULT_RUNTIME;
   const built = [];
+  const privateFiles = [];
   try {
-    for (const language of options.languages) built.push(await buildArtifacts(language, buildRoot));
+    const s3 = options.buildOnly ? undefined : await loadS3Config();
+    const runId = `${Date.now()}-${randomUUID()}`;
+    for (const language of options.languages) {
+      const deployment = s3 ? {
+        bucket: s3.bucket,
+        warehouse: `s3://${s3.bucket}/verglas/cold-restart/${runId}/${language}`,
+        storageBindingId: `cold-restart-s3-${runId}-${language}`,
+      } : undefined;
+      built.push(await buildArtifacts(language, buildRoot, deployment));
+    }
     process.stdout.write(`built artifacts under ${buildRoot}\n`);
     if (options.buildOnly) return;
-    if (!urlTemplate || !tokenFile || !runtimeHostConfig) {
-      throw new Error('blocked: set VERGLAS_TURSO_URL_TEMPLATE, VERGLAS_TURSO_TOKEN_FILE, and VERGLAS_RUNTIME_HOST_CONFIG for the production cold-restart run');
-    }
-    await access(tokenFile);
-    await access(runtimeHostConfig);
     for (const binary of [gatewayBin, celldBin, runtimeBin]) await access(binary);
     for (const item of built) {
+      const host = await writeRuntimeHostConfig(item.root, s3, item.deployment);
+      privateFiles.push(host.path, host.credentialsPath);
       const result = await runLanguage(
         item,
-        urlTemplate,
-        tokenFile,
         gatewayBin,
         celldBin,
         runtimeBin,
-        runtimeHostConfig,
+        host.path,
       );
-      process.stdout.write(`PASS ${item.language}: ${JSON.stringify(result)}\n`);
+      process.stdout.write(`PASS ${item.language}: ${JSON.stringify({ ...result, warehouse: item.deployment.warehouse })}\n`);
     }
-    process.stdout.write('PASS JS and Python six-product cold-restart runs\n');
+    const completedLanguages = built
+      .map((item) => (item.language === 'js' ? 'JS' : 'Python'))
+      .join(' and ');
+    process.stdout.write(`PASS ${completedLanguages} six-product cold-restart run${built.length === 1 ? '' : 's'}\n`);
   } finally {
+    await Promise.all(privateFiles.map((path) => rm(path, { force: true })));
     if (options.keep) process.stdout.write(`kept build root ${buildRoot}\n`);
     else await rm(buildRoot, { recursive: true, force: true });
   }

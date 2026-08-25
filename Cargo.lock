@@ -2773,7 +2773,6 @@ dependencies = [
  "http 1.5.0",
  "hyper",
  "hyper-util",
- "log",
  "rustls",
  "rustls-native-certs",
  "tokio",
@@ -5028,7 +5027,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "aws-lc-rs",
- "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5893,7 +5891,6 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
- "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",
  "socket2",
@@ -6158,13 +6155,7 @@ version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9491d7a80312c5abe66a4409e4dce02065503a235453c94b9e4133877e39ffc"
 dependencies = [
- "bytes",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
  "thiserror",
- "tokio",
  "tracing",
  "tracing-subscriber",
  "turso_core",
@@ -6680,6 +6671,7 @@ dependencies = [
  "futures",
  "hex",
  "iceberg",
+ "libc",
  "object_store",
  "parquet",
  "serde",
@@ -6691,7 +6683,6 @@ dependencies = [
  "typetag",
  "verglas-backend",
  "verglas-cache",
- "verglas-celld",
  "verglas-core",
  "verglas-do-turso",
  "verglas-do-wasm",

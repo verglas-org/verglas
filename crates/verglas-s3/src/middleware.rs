@@ -2,10 +2,9 @@
 //! HTTP responses like real S3.
 //!
 //! [`trace_request`] runs outermost. It mints one `request_id` per request,
-//! makes it the current [`verglas_core::trace`] id for the whole request future
-//! (so cache-lookup, peer-fetch, and fill logs share it), opens the request's
-//! root tracing span, and — after the inner service answers — returns the same
-//! id to the client. Because the id is generated here, before dispatch, the
+//! makes it the current [`verglas_core::trace`] id for the whole local serving
+//! future, opens the request's root tracing span, and — after the inner service
+//! answers — returns the same id to the client. Because the id is generated here, before dispatch, the
 //! value in `x-amz-request-id` is the value the logs carry: a client error can
 //! be traced straight back into the serving path (#61).
 //!
@@ -53,11 +52,8 @@ fn is_error_status(status: axum::http::StatusCode) -> bool {
 }
 
 /// Outermost request layer (#61): mints the request id, scopes it for the whole
-/// request future so the serving path logs under it, opens the root request
-/// span, and stamps the id onto the response the client sees. The generated id
-/// is the single source of truth — the same value logs, threads through the
-/// peer RPC, and returns in `x-amz-request-id` — so a client-reported id maps
-/// straight to the logs for that request.
+/// local serving future, opens the root request span, and stamps the id onto the
+/// response. A client-reported `x-amz-request-id` maps directly to local logs.
 pub async fn trace_request(request: Request, next: Next) -> Response<Body> {
     let request_id = RequestId::generate();
     // Method only on the span — never the URI path, which carries the object
@@ -69,9 +65,8 @@ pub async fn trace_request(request: Request, next: Next) -> Response<Body> {
         request_id = %request_id,
         method = %method,
     );
-    // Make the id the current trace id for the whole request future (cache
-    // lookup, ring routing, peer fetch, origin fill all read it) and run that
-    // future inside the root span.
+    // Make the id available to local cache and origin diagnostics while the
+    // request future runs inside its root span.
     let response =
         verglas_core::trace::scope(request_id.clone(), next.run(request).instrument(span)).await;
     shape_response(response, request_id.as_str()).await

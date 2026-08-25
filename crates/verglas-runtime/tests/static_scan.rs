@@ -22,6 +22,10 @@ fn workspace_root() -> std::path::PathBuf {
 fn runtime_has_no_old_engine_dependency_or_authority() -> Result<(), Box<dyn std::error::Error>> {
     let manifest = read("Cargo.toml")?;
     assert!(!manifest.contains("verglas-do-engine"));
+    assert!(
+        !manifest.contains("verglas-celld"),
+        "runtime must not depend back on its process supervisor"
+    );
     for relative in [
         "src/lib.rs",
         "src/worker_storage.rs",
@@ -92,6 +96,13 @@ fn workspace_has_one_non_clustered_runtime_surface() -> Result<(), Box<dyn std::
                 .join(retired_core_module)
                 .exists(),
             "retired clustered core module {retired_core_module} still exists"
+        );
+    }
+    for relative in ["read.rs", "telemetry/mod.rs", "telemetry/rollup.rs"] {
+        let source = fs::read_to_string(root.join("crates/verglas-core/src").join(relative))?;
+        assert!(
+            !source.to_ascii_lowercase().contains("peer"),
+            "retired peer serving tier remains in core {relative}"
         );
     }
 

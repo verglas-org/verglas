@@ -5,21 +5,22 @@ icon: "network-wired"
 ---
 
 This page describes the target placement shape for a stateful Durable Object.
-It does not describe a separate database product or a shipped hosted scheduler.
+It does not describe a separate database product or a shipped scheduler.
 The [Worker primitives platform](/docs/architecture/primitives-platform) defines
 the six products and PP1–PP10 acceptance criteria.
 
 A cell runs one active DO event executor in one isolated environment. The DO
-owns one embedded Turso `0.7.2` database and its sync sidecars. Turso's ordinary
-WAL is the local durability path; one remote Turso database per DO is the
-machine-loss recovery source.
+owns one embedded local Turso `0.7.2` database under the self-hosted cell data
+root. Turso's ordinary WAL carries the local transaction, and SQL `COMMIT` plus
+an explicit WAL checkpoint is the durability fence. Cell filesystem durability
+is authoritative for DO state. There is no clustering or replication layer.
 
 ```text
 isolated cell
 └── DO event executor
     ├── one stateful Worker class
     │   └── tenant WASM component (verglas:do-worker world)
-    ├── Turso 0.7.2 WAL database and sync sidecars
+    ├── local Turso 0.7.2 WAL database under the cell data root
     ├── optional transactional Stream outbox
     └── private event endpoint
 ```
@@ -29,23 +30,18 @@ instantiation. CPU, memory, and local disk budgets are hard ceilings. Compiled
 Worker code may be cached outside a cell, but mutable DO state and execution do
 not share a process with another tenant payload.
 
-## Turso durability and sync fencing
+## Turso durability fence
 
-A DO event runs inside one Turso transaction. The host acknowledges the event
-only after the transaction commits locally and `push()` confirms the remote sync
-boundary. The cloud provisions a distinct remote URL and token for every DO.
-An external sync ingress validates the current placement lease before forwarding
-the push, so a stale cell cannot open or push another owner's database.
+A DO event runs inside one local Turso transaction. The host acknowledges the
+event only after SQL `COMMIT` succeeds and the runtime completes an explicit WAL
+checkpoint. The cell filesystem is the authoritative durability boundary for the
+DO database.
 
-The lease is a placement and synchronization fence. It is not a lease-fenced
-object-store write path, a second SQL commit authority, or a custom database
-protocol. The DO runtime retains no custom SQLite pager, alternate SQL provider,
-or direct Iceberg offload path.
-
-A replacement cell first revokes the prior owner, opens the DO's own remote
-Turso database, and restores a local working copy with its sync sidecars. A
-local directory must never be copied between DO identities because it carries
-the persisted Turso sync-client identity.
+Celld assigns one local data path to each object beneath the self-hosted cell
+data root. Cold restart reopens that same path and resumes from its committed
+state. A path is never shared between DO identities. The runtime retains no
+custom SQLite pager, alternate SQL provider, or direct Iceberg offload path.
+DO state has no clustering or replication layer.
 
 ## Optional Stream outbox
 
@@ -64,27 +60,26 @@ committed record.
 
 ## Scale-to-zero
 
-The lifecycle supervisor may suspend an inactive DO after its local sync client
-has pushed through the required durability boundary and no gated publication is
-pending. The remote Turso database remains the recovery source; retaining a
-local working copy only shortens restore.
+The lifecycle supervisor may suspend an inactive DO after its local Turso
+transaction has committed, the explicit WAL checkpoint has completed, and no
+gated publication is pending. The local database remains at its assigned path;
+Foyer contents may be discarded.
 
 ```text
 fence new events
       ↓
 drain required Stream outbox rows
       ↓
-commit and push the final Turso transaction
+commit and checkpoint the final local Turso transaction
       ↓
 suspend the isolated DO environment
       ↓
-next request provisions an owner with a valid placement lease
+next request reopens the same local database path
       ↓
-open the DO's remote database and restore its local working copy
-      ↓
-release the triggering event after the sync boundary
+release the triggering event after the local durability fence
 ```
 
-Cache acceleration, Sink delivery, and Catalog publication remain separate
-from ordinary Durable Object state. A DO does not materialize its database
-directly to Iceberg; Sink and Catalog own that path.
+Foyer is disposable cache acceleration. The configured S3-compatible bucket is
+the immutable Iceberg origin. Sink delivery and Catalog publication remain
+separate from ordinary Durable Object state; a DO does not materialize its
+database directly to Iceberg.

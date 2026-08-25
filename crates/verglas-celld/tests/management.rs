@@ -96,7 +96,7 @@ async fn upload_list_fetch_delete_and_namespace_metadata_work() {
 }
 
 #[tokio::test]
-async fn object_activation_fails_closed_without_explicit_turso_deployment() {
+async fn object_activation_fails_closed_without_component_deployment() {
     let root = tempfile::tempdir().expect("root");
     let app = api(root.path());
     let metadata = r#"{"main_module":"worker.js","bindings":[{"name":"OBJECTS","type":"durable_object_namespace","class_name":"Counter"}]}"#;
@@ -139,6 +139,6 @@ async fn object_activation_fails_closed_without_explicit_turso_deployment() {
         body_json(object).await["errors"][0]["message"]
             .as_str()
             .expect("error")
-            .contains("Turso")
+            .contains("component")
     );
 }

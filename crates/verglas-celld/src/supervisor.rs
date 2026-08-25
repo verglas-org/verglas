@@ -1,9 +1,8 @@
-//! Substrate-agnostic supervision and fenced routing for one Turso Worker.
+//! Substrate-agnostic supervision and fenced routing for one Worker.
 //!
-//! Celld keeps exactly one active process owner for each Durable Object. Lease
-//! validation and placement are cloud responsibilities, including the external
-//! sync ingress that validates the current placement before forwarding Turso
-//! pushes. No in-process CAS fallback exists here.
+//! Celld keeps exactly one active process owner for each Durable Object. Placement
+//! validation is an external responsibility, and no in-process CAS fallback exists
+//! here.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -56,8 +55,8 @@ pub enum SupervisorError {
     /// The DO identity could escape or alias its isolated directory.
     #[error("invalid Durable Object identity: {0}")]
     InvalidDoId(String),
-    /// A launch field violates the one-path Turso contract.
-    #[error("invalid Turso Worker launch: {0}")]
+    /// A launch field violates the local Worker contract.
+    #[error("invalid Worker launch: {0}")]
     InvalidLaunch(String),
     /// A component digest is not 64 hexadecimal characters.
     #[error("invalid component digest: {0}")]
@@ -112,7 +111,7 @@ impl From<ProvisionError> for SupervisorError {
     }
 }
 
-/// One tenant host's registry of isolated Turso Worker children.
+/// One tenant host's registry of isolated Worker children.
 pub struct HostSupervisor {
     host_id: HostId,
     root: PathBuf,
@@ -188,7 +187,7 @@ impl HostSupervisor {
         Ok(())
     }
 
-    /// Launches one isolated Turso Worker and records its lifecycle fence.
+    /// Launches one isolated Worker and records its lifecycle fence.
     pub async fn spawn(&mut self, spec: ChildSpec) -> Result<ChildDescriptor, SupervisorError> {
         if self.children.contains_key(spec.do_id()) {
             return Err(SupervisorError::Duplicate(spec.do_id().to_owned()));
@@ -225,10 +224,20 @@ impl HostSupervisor {
                 .kill(&mut process)
                 .await
                 .map_err(SupervisorError::from)?;
-            let _ = provisioner
+            let status = provisioner
                 .wait(&mut process)
                 .await
                 .map_err(SupervisorError::from)?;
+            if !status.success() {
+                if managed.lifecycle.state() == ChildState::Running {
+                    managed.lifecycle.begin_crash_recovery()?;
+                }
+                return Err(ProvisionError::Exited {
+                    do_id: do_id.to_owned(),
+                    status,
+                }
+                .into());
+            }
         }
         managed.lifecycle = lifecycle;
         Ok(())
@@ -242,7 +251,13 @@ impl HostSupervisor {
             .ok_or_else(|| SupervisorError::Unknown(do_id.to_owned()))?;
         let spec = managed.spec.clone();
         let mut lifecycle = managed.lifecycle;
-        lifecycle.begin_restore()?;
+        match lifecycle.state() {
+            ChildState::Suspended => lifecycle.begin_restore()?,
+            ChildState::Restoring if managed.handle.is_none() => {}
+            ChildState::Running | ChildState::Restoring => {
+                return Err(LifecycleError::InvalidTransition.into());
+            }
+        }
         let child = self.launch(&spec).await?;
         let descriptor = child.descriptor().clone();
         let managed = self
@@ -322,19 +337,29 @@ impl HostSupervisor {
     /// Stops every remaining child before the host process exits.
     pub async fn shutdown(&mut self) -> Result<(), SupervisorError> {
         let provisioner = Arc::clone(&self.provisioner);
+        let mut first_failure = None;
         for managed in self.children.values_mut() {
             if let Some(mut process) = managed.handle.take() {
                 provisioner
                     .kill(&mut process)
                     .await
                     .map_err(SupervisorError::from)?;
-                let _ = provisioner
+                let status = provisioner
                     .wait(&mut process)
                     .await
                     .map_err(SupervisorError::from)?;
+                if !status.success() && first_failure.is_none() {
+                    first_failure = Some(ProvisionError::Exited {
+                        do_id: managed.spec.do_id().to_owned(),
+                        status,
+                    });
+                }
             }
         }
-        Ok(())
+        match first_failure {
+            Some(error) => Err(error.into()),
+            None => Ok(()),
+        }
     }
 
     /// Builds explicit substrate paths and waits for the provisioner's readiness fence.

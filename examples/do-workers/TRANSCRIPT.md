@@ -1,334 +1,141 @@
-# AC5 acceptance transcript
+# Six-product cold-restart acceptance transcript
 
-Captured 2026-08-24 on macOS from `/Users/jfbrown/code/verglas`.
-The component files are intentionally built into `/tmp/verglas-do-poc`; the two
-checked-in `gateway.json` files point at those content-addressed artifacts.
-Output below is trimmed to protocol and acceptance evidence; the long Wasmtime
-cold-start progress emitted by `curl` is omitted.
+Captured on 2026-08-25 from `/Users/jfbrown/code/verglas` on macOS. This
+transcript records real self-hosted `verglas-gateway`, `verglas-celld`, and
+`verglas-runtime` processes. The object store was an S3-compatible R2 fixture;
+no tenant component received its endpoint or credentials.
 
-## Environment and artifacts
+## Toolchain
 
 ```text
-$ pwd
-/Users/jfbrown/code/verglas
-$ node --version && npm --version && python3 --version && cargo --version && rustc --version
+$ node --version
 v25.5.0
-11.8.0
-Python 3.14.6
+$ sdks/worker-py/.venv/bin/python --version
+Python 3.13.12
+$ cargo --version
 cargo 1.96.1 (356927216 2026-06-26)
+$ rustc --version
 rustc 1.96.1 (31fca3adb 2026-06-26)
-$ sdks/worker-py/.venv/bin/componentize-py --version
-componentize-py 0.25.0
 ```
 
-Build commands and digest checks:
+The harness received only the generic `VERGLAS_S3_BUCKET`,
+`VERGLAS_S3_ENDPOINT`, `VERGLAS_S3_ACCESS_KEY_ID`, and
+`VERGLAS_S3_SECRET_ACCESS_KEY` inputs. It generated a temporary mode-0600 AWS
+credentials file for the privileged runtime host configuration and removed both
+private files before exit, including when `--keep` retained public diagnostics.
+
+## Product topology
+
+Both generated aggregate manifests contained exactly these artifact products:
 
 ```text
-$ rm -rf /tmp/verglas-do-poc && mkdir -p /tmp/verglas-do-poc/js-build /tmp/verglas-do-poc/py-build
-$ node sdks/worker-js/bin/build.mjs examples/do-workers/js-counter --out /tmp/verglas-do-poc/js-build --gateway examples/do-workers/js-counter/gateway.json
-<js digest printed by this build>
-$ sdks/worker-py/.venv/bin/python sdks/worker-py/build.py examples/do-workers/py-counter --out /tmp/verglas-do-poc/py-build --gateway examples/do-workers/py-counter/gateway.json
-<python digest printed by this build>
-$ sha256sum /tmp/verglas-do-poc/js-build/*.wasm /tmp/verglas-do-poc/py-build/*.wasm
-$ jq -r '.component_digest, .component_dir' examples/do-workers/js-counter/gateway.json
-$ jq -r '.component_digest, .component_dir' examples/do-workers/py-counter/gateway.json
-$ test -f /tmp/verglas-do-poc/js-build/$(jq -r .component_digest examples/do-workers/js-counter/gateway.json).wasm
-$ test -f /tmp/verglas-do-poc/py-build/$(jq -r .component_digest examples/do-workers/py-counter/gateway.json).wasm
+$ jq '.artifacts | keys' /tmp/verglas-do-cold-chain-iP8G14/js/gateway.json
+[
+  "catalog",
+  "durable_object",
+  "pipeline",
+  "sink",
+  "stream",
+  "worker"
+]
+$ jq '.artifacts | keys' /tmp/verglas-do-cold-chain-iP8G14/py/gateway.json
+[
+  "catalog",
+  "durable_object",
+  "pipeline",
+  "sink",
+  "stream",
+  "worker"
+]
 ```
 
-The builders update the checked-in gateway manifests, including their artifact
-directories, so every replay uses the bytes produced by that invocation. ComponentizeJS
-and componentize-py can emit nondeterministic bytes; the digest values recorded
-in this transcript are historical evidence only, not pinned expectations. Use
-one persistent `/tmp/verglas-do-poc` root through each stop/restart sequence.
+`ICEBERG_COMMIT → verglas-runtime` is a service binding, not another artifact
+product. Requests followed `edge → verglas-gateway → verglas-celld →
+verglas-runtime`.
 
-The gateway manifests are `examples/do-workers/js-counter/gateway.json` and
-`examples/do-workers/py-counter/gateway.json`. Each contains the Wrangler
-`name`, `main`, and binding fields plus `component_digest`, `component_dir`, and
-`data_root`; the source `wrangler.jsonc` files remain the SDK input manifests.
+## Assertions executed for each language
 
-Binaries:
+The harness performed the following sequence against production debug binaries:
+
+1. Build Worker, Durable Object, Stream, Pipeline, Sink, and Catalog components.
+2. Start celld and gateway with a fresh embedded-Turso data root.
+3. Send two Worker `/incr` requests and require counts 1 and 2.
+4. Process Stream records through Pipeline, Sink, and Catalog.
+5. Require Pipeline cursor 2 with no pending batch.
+6. Require exactly one confirmed Sink batch.
+7. Require exactly one Catalog publication.
+8. Send SIGINT to gateway and celld; each child runtime closes admission,
+   rejects pending outbox work, checkpoints its embedded WAL, and exits.
+9. Restart both against the same Turso data root and compiled-component cache.
+10. Require count 2, cursor 2, no pending batch, and the same single Sink and
+    Catalog receipts.
+11. Replay `/process` and require cursor 2 with no duplicate publication.
+
+## JavaScript result
+
+The final combined run used the current runtime shutdown fence and persisted
+compiled-component caches. Its JavaScript phase printed:
 
 ```text
-$ cargo build -p verglas-runtime -p verglas-gateway
-Finished `dev` profile [unoptimized + debuginfo]
+PASS js: {"language":"js","manifestPath":"/tmp/verglas-do-cold-chain-iP8G14/js/gateway.json","dataRoot":"/tmp/verglas-do-cold-chain-iP8G14/js/data","logs":"/tmp/verglas-do-cold-chain-iP8G14/js/logs","warehouse":"s3://cascadelabs/verglas/cold-restart/1787684256328-83215821-5d3b-46f8-976d-5cef6554a486/js"}
 ```
 
-## Integration diagnostics and fixes encountered
+Retained diagnostics: `/tmp/verglas-do-cold-chain-iP8G14/js`.
 
-These were real failures before the final run, not suppressed:
+## Python result
+
+The same process then completed Python initial execution, graceful shutdown,
+full process restart, state recovery, and replay:
 
 ```text
-$ curl -iS -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 502 Bad Gateway
-celld rejected Durable Object spawn: Durable Object COUNTER--global-replica did not become socket-ready
+PASS py: {"language":"py","manifestPath":"/tmp/verglas-do-cold-chain-iP8G14/py/gateway.json","dataRoot":"/tmp/verglas-do-cold-chain-iP8G14/py/data","logs":"/tmp/verglas-do-cold-chain-iP8G14/py/logs","warehouse":"s3://cascadelabs/verglas/cold-restart/1787684256328-83215821-5d3b-46f8-976d-5cef6554a486/py"}
+PASS JS and Python six-product cold-restart runs
 ```
 
-The worker component takes roughly 67–74 seconds to instantiate cold; the old
-2-second celld readiness fence was too short. The readiness regression test was
-first run against the old code and failed with:
+Retained diagnostics: `/tmp/verglas-do-cold-chain-iP8G14/py`.
+
+## Independent S3 publication evidence
+
+A credentialed `aws s3api list-objects-v2` was run after the processes exited.
+Each warehouse contained one immutable data file and the three Iceberg metadata
+objects produced by the runtime proposal.
+
+JavaScript:
 
 ```text
-ReadinessTimeout("slow-worker")
+analytics/events/data/verglas/primary_sink/batch-54fbc020240bc1e018518b5bb3fa6a631b9c05ab60c707a4f03d38b655590266.parquet  1357
+analytics/events/metadata/00000-1acb29d6-dfca-4fac-bb0f-4dff5ebc48c8.metadata.json  1768
+analytics/events/metadata/snap-6361422215090347199-verglas/manifest-list/batch-54fbc020240bc1e018518b5bb3fa6a631b9c05ab60c707a4f03d38b655590266.parquet.avro  1742
+analytics/events/metadata/verglas/manifest/batch-54fbc020240bc1e018518b5bb3fa6a631b9c05ab60c707a4f03d38b655590266.parquet-6361422215090347199.avro  3658
 ```
 
-After the readiness budget was extended, the real replica reached its socket.
-The next real commit exposed the identity seam:
+Python:
 
 ```text
-Error: Host(Backend { message: "commit authority failed: replica endpoint rejected persistence: ERR transaction belongs to DO COUNTER--global, expected COUNTER--global-replica" })
+analytics/events/data/verglas/primary_sink/batch-54fbc020240bc1e018518b5bb3fa6a631b9c05ab60c707a4f03d38b655590266.parquet  1357
+analytics/events/metadata/00000-2d4997d1-7085-41bd-8aa8-ce4939a21eac.metadata.json  1768
+analytics/events/metadata/snap-6361422215090347199-verglas/manifest-list/batch-54fbc020240bc1e018518b5bb3fa6a631b9c05ab60c707a4f03d38b655590266.parquet.avro  1742
+analytics/events/metadata/verglas/manifest/batch-54fbc020240bc1e018518b5bb3fa6a631b9c05ab60c707a4f03d38b655590266.parquet-6361422215090347199.avro  3658
 ```
 
-The gateway now spawns the follower under a host-local pager key while passing
-the exact logical DO identity to both `verglasd` processes. The control test for
-`SPAWN` followed by `SPAWN_WORKER` was written first and failed with:
+The object files are immutable proposals. Catalog visibility and replay state
+remained solely in each Catalog object's embedded Turso database.
 
-```text
-ERR Durable Object agent-pair is already supervised on this host
-```
+## Failures reproduced and fixed
 
-The native SQL DDL bridge was also test-driven. Before it, the first fetch after
-`init` failed with:
+The passing evidence was not produced by suppressing failures. The factual runs
+first reproduced these defects:
 
-```text
-DataFusion operation failed: Error during planning: table 'datafusion.public.counter' not found
-```
+- macOS rejected per-object Unix sockets whose temporary paths exceeded
+  `SUN_LEN`; the harness now uses a short `/tmp` root.
+- Pipeline emitted Sink identity `primary_sink` while the stock Sink expected
+  `primary`; the stock identity now agrees end to end.
+- Catalog and its privileged runtime fence still expected `primary`; both now
+  authorize the same `primary_sink` identity.
+- componentized Python's `asyncio.run` called a trapping WASI monotonic-clock
+  stub. Enabling unrestricted WASI correctly failed against the runtime's
+  no-filesystem policy, so the SDK instead resolves its immediate synchronous
+  WIT-backed coroutines without an event loop.
 
-The bridge registers supported DataFusion `CREATE TABLE` schemas through the
-engine's native `create_table` API. The original examples then reached the
-engine's explicitly unsupported UPDATE path:
-
-```text
-UPDATE operation on table 'counter'
-This feature is not implemented: UPDATE not supported for Base table
-```
-
-Both examples now use the immutable create/insert/select surface: each increment
-appends one `global` row and reads `COUNT(*)`. No SQL path or error was faked.
-Finally, the gateway reads the replica `STATUS` applied fence before launching a
-Worker, so a restart does not falsely require sequence zero.
-
-## JS counter: `js-counter`
-
-The digest printed by the replay build is authoritative; the historical
-transcript value below is evidence from one nondeterministic build:
-`2eff935af3a65f4e4e0e69d0c643943af5b49bdeacb363f5f7973439d958f791`.
-
-Start the whole stack with one persistent root:
-
-```sh
-rm -rf /tmp/verglas-do-poc/js-data /tmp/verglas-do-poc/js-gateway.log /tmp/verglas-do-poc/js-celld.log
-mkdir -p /tmp/verglas-do-poc/js-data
-target/debug/celld-host \
-  --host-id cell-js \
-  --root /tmp/verglas-do-poc/js-data \
-  --child "$PWD/target/debug/verglasd" \
-  --control /tmp/verglas-do-poc/js-data/celld.sock \
-  >/tmp/verglas-do-poc/js-celld.log 2>&1 & CELLD_PID=$!
-while [ ! -S /tmp/verglas-do-poc/js-data/celld.sock ]; do sleep .02; done
-target/debug/verglas-gateway \
-  --manifest examples/do-workers/js-counter/gateway.json \
-  --listen 127.0.0.1:18080 \
-  --celld-control /tmp/verglas-do-poc/js-data/celld.sock \
-  --data-root /tmp/verglas-do-poc/js-data \
-  >/tmp/verglas-do-poc/js-gateway.log 2>&1 & GATEWAY_PID=$!
-```
-
-HTTP increments and read:
-
-```text
-$ time curl -iS --max-time 180 -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 200 OK
-content-type: application/json
-{"count":1}
-
-$ curl -iS -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 200 OK
-{"count":2}
-$ curl -iS -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 200 OK
-{"count":3}
-$ curl -iS http://127.0.0.1:18080/do/COUNTER/global
-HTTP/1.1 200 OK
-{"count":3}
-```
-
-WebSocket echo plus SQL-backed count:
-
-```text
-$ printf 'hello\n' | websocat -q -t -n --max-messages 1 --max-messages-rev 2 ws://127.0.0.1:18080/do/COUNTER/global/ws
-hello
-{"count":3}
-```
-
-Stop, preserving the same root:
-
-```sh
-kill -INT "$CELLD_PID"
-kill -TERM "$GATEWAY_PID"
-wait "$CELLD_PID" "$GATEWAY_PID" 2>/dev/null || true
-# /tmp/verglas-do-poc/js-data/COUNTER--global/1/replica.sqlite remains present
-# /tmp/verglas-do-poc/js-data/COUNTER--global-replica/1/replica.sqlite remains present
-```
-
-Restart with the same root and query again:
-
-```sh
-target/debug/celld-host --host-id cell-js --root /tmp/verglas-do-poc/js-data \
-  --child "$PWD/target/debug/verglasd" \
-  --control /tmp/verglas-do-poc/js-data/celld.sock \
-  >/tmp/verglas-do-poc/js-celld-restart.log 2>&1 & CELLD_PID=$!
-while [ ! -S /tmp/verglas-do-poc/js-data/celld.sock ]; do sleep .02; done
-target/debug/verglas-gateway --manifest examples/do-workers/js-counter/gateway.json \
-  --listen 127.0.0.1:18080 \
-  --celld-control /tmp/verglas-do-poc/js-data/celld.sock \
-  --data-root /tmp/verglas-do-poc/js-data \
-  >/tmp/verglas-do-poc/js-gateway-restart.log 2>&1 & GATEWAY_PID=$!
-time curl -iS --max-time 180 http://127.0.0.1:18080/do/COUNTER/global
-```
-
-Proof:
-
-```text
-HTTP/1.1 200 OK
-content-type: application/json
-{"count":3}
-```
-
-The replica status observed after the restart was `OK replica 10 0 0`; the
-Worker command carried the applied fence read from the replica (`--start-sequence
-8` in the process listing before subsequent restart GET events advanced the
-replica). The count is recovered from committed rows, not process memory.
-
-Stop the JS restart stack:
-
-```sh
-kill -INT "$CELLD_PID"; kill -TERM "$GATEWAY_PID"
-wait "$CELLD_PID" "$GATEWAY_PID" 2>/dev/null || true
-```
-
-## Python counter: `py-counter`
-
-The digest printed by the replay build is authoritative; the historical
-transcript value below is evidence from one nondeterministic build:
-`5a072659ed7a2805765b729a1ff3dfc66f4bc322ddedaf13a27489fbc86d8860`.
-
-Start commands (same gateway port, new persistent root):
-
-```sh
-rm -rf /tmp/verglas-do-poc/py-data /tmp/verglas-do-poc/py-gateway.log /tmp/verglas-do-poc/py-celld.log
-mkdir -p /tmp/verglas-do-poc/py-data
-target/debug/celld-host --host-id cell-py --root /tmp/verglas-do-poc/py-data \
-  --child "$PWD/target/debug/verglasd" \
-  --control /tmp/verglas-do-poc/py-data/celld.sock \
-  >/tmp/verglas-do-poc/py-celld.log 2>&1 & CELLD_PID=$!
-while [ ! -S /tmp/verglas-do-poc/py-data/celld.sock ]; do sleep .02; done
-target/debug/verglas-gateway --manifest examples/do-workers/py-counter/gateway.json \
-  --listen 127.0.0.1:18080 \
-  --celld-control /tmp/verglas-do-poc/py-data/celld.sock \
-  --data-root /tmp/verglas-do-poc/py-data \
-  >/tmp/verglas-do-poc/py-gateway.log 2>&1 & GATEWAY_PID=$!
-```
-
-HTTP proof:
-
-```text
-$ time curl -iS --max-time 240 -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 200 OK
-{"count":1}
-$ curl -iS -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 200 OK
-{"count":2}
-$ curl -iS -X POST http://127.0.0.1:18080/do/COUNTER/global/incr
-HTTP/1.1 200 OK
-{"count":3}
-$ curl -iS http://127.0.0.1:18080/do/COUNTER/global
-HTTP/1.1 200 OK
-{"count":3}
-```
-
-WebSocket proof:
-
-```text
-$ printf 'hello\n' | websocat -q -t -n --max-messages 1 --max-messages-rev 2 ws://127.0.0.1:18080/do/COUNTER/global/ws
-hello
-{"count":3}
-```
-
-Stop and restart on exactly the same Python root:
-
-```sh
-kill -INT "$CELLD_PID"; kill -TERM "$GATEWAY_PID"
-wait "$CELLD_PID" "$GATEWAY_PID" 2>/dev/null || true
-# the worker and replica SQLite pagers remain under /tmp/verglas-do-poc/py-data
-
-target/debug/celld-host --host-id cell-py --root /tmp/verglas-do-poc/py-data \
-  --child "$PWD/target/debug/verglasd" \
-  --control /tmp/verglas-do-poc/py-data/celld.sock \
-  >/tmp/verglas-do-poc/py-celld-restart.log 2>&1 & CELLD_PID=$!
-while [ ! -S /tmp/verglas-do-poc/py-data/celld.sock ]; do sleep .02; done
-target/debug/verglas-gateway --manifest examples/do-workers/py-counter/gateway.json \
-  --listen 127.0.0.1:18080 \
-  --celld-control /tmp/verglas-do-poc/py-data/celld.sock \
-  --data-root /tmp/verglas-do-poc/py-data \
-  >/tmp/verglas-do-poc/py-gateway-restart.log 2>&1 & GATEWAY_PID=$!
-time curl -iS --max-time 240 http://127.0.0.1:18080/do/COUNTER/global
-```
-
-Proof:
-
-```text
-HTTP/1.1 200 OK
-content-type: application/json
-{"count":3}
-```
-
-The replica status observed after the Python restart was `OK replica 9 0 0`.
-The state was replayed from the committed SQLite/replica log in the same root.
-
-```sh
-kill -INT "$CELLD_PID"; kill -TERM "$GATEWAY_PID"
-wait "$CELLD_PID" "$GATEWAY_PID" 2>/dev/null || true
-# Remove /tmp/verglas-do-poc only after replay checks are complete.
-```
-
-## Verification commands
-
-All touched Rust crates were checked without weakening existing assertions:
-
-```text
-$ cargo fmt --all --check
-$ cargo build -p verglas-celld -p verglas-gateway -p verglas-do-engine -p verglas-runtime
-Finished `dev` profile [unoptimized + debuginfo]
-$ cargo test -p verglas-celld
-29 integration tests passed (including slow-start, paired-spawn, CAS, orchestration, and resource-limit regressions)
-$ cargo test -p verglas-gateway -- --test-threads=1
-6 protocol tests, 8 manifest tests, and 1 real-stack AC1 test passed
-$ cargo test -p verglas-do-engine -- --test-threads=1
-All engine targets passed, including `sql_create_table_registers_native_schema`
-$ cargo test -p verglas-runtime -- --test-threads=1
-All runtime targets passed, including real celld acceptance and event tests
-
-The gateway AC1 test is intentionally unignored. It requires the checked-out
-`target/debug/celld-host`, `target/debug/verglasd`, and `node`/the JS SDK build
-tooling; a cold component instantiation took about 90 seconds in this run.
-$ cargo clippy -p verglas-celld --all-targets -- -D warnings
-Finished
-$ cargo clippy -p verglas-gateway --all-targets -- -D warnings
-Finished
-$ cargo clippy -p verglas-do-engine --all-targets -- -D warnings
-Finished
-$ cargo clippy -p verglas-do-wasm --all-targets -- -D warnings
-Finished
-$ cargo clippy -p verglas-runtime --all-targets -- -D warnings
-Finished
-$ npm test                         # from sdks/worker-js
-10 passed
-$ python3 -m unittest discover -s sdks/worker-py/tests -v
-10 tests, OK
-```
-
-The first parallel/default DO-engine run hit the command's 300-second harness
-limit after compiling and starting the suite; the serial rerun above completed
-all targets successfully. No acceptance criterion remained unsatisfied in the
-final run.
+No remote Turso service, fake object store, fallback persistence path, mock
+Catalog authority, or tenant storage credential was used.

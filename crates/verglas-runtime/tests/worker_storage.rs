@@ -3,8 +3,6 @@
 //! The test-only Turso constructor uses a real embedded database and exercises
 //! the same SQL, reserved tables, rollback, and reopen paths as production.
 
-#![cfg(feature = "test-support")]
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -62,11 +60,7 @@ async fn event_storage(
     root: &TempDir,
 ) -> Result<(Arc<verglas_do_turso::TursoStore>, TursoWorkerStorage), Box<dyn std::error::Error>> {
     let store = Arc::new(
-        verglas_do_turso::TursoStore::open_for_test(
-            root.path().join("worker.db"),
-            "runtime-worker",
-        )
-        .await?,
+        verglas_do_turso::TursoStore::open(root.path().join("worker.db"), "runtime-worker").await?,
     );
     let storage = TursoWorkerStorage::begin(Arc::clone(&store)).await?;
     Ok((store, storage))
@@ -200,8 +194,7 @@ async fn handler_error_rolls_back_event_transaction() -> Result<(), Box<dyn std:
 async fn commit_and_reopen_preserves_event_state() -> Result<(), Box<dyn std::error::Error>> {
     let root = tempfile::tempdir()?;
     let path = root.path().join("worker.db");
-    let store =
-        Arc::new(verglas_do_turso::TursoStore::open_for_test(&path, "persistent-worker").await?);
+    let store = Arc::new(verglas_do_turso::TursoStore::open(&path, "persistent-worker").await?);
     let storage = TursoWorkerStorage::begin(Arc::clone(&store)).await?;
     storage
         .put("persisted".to_owned(), b"value".to_vec())
@@ -218,8 +211,7 @@ async fn commit_and_reopen_preserves_event_state() -> Result<(), Box<dyn std::er
     drop(storage);
     drop(store);
 
-    let reopened =
-        Arc::new(verglas_do_turso::TursoStore::open_for_test(&path, "persistent-worker").await?);
+    let reopened = Arc::new(verglas_do_turso::TursoStore::open(&path, "persistent-worker").await?);
     let storage = TursoWorkerStorage::begin(Arc::clone(&reopened)).await?;
     assert_eq!(
         storage.get("persisted".to_owned()).await?,

@@ -1,9 +1,8 @@
-//! AC1-only resident Worker helper with an explicit local Turso test seam.
+//! AC1-only resident Worker helper for the real embedded storage path.
 //!
 //! This binary is available only with the `ac1-test-support` Cargo feature. It
-//! retains the production `WorkerRuntime` and `EventEndpoint` process chain, but
-//! calls `TursoStore::open_for_test` instead of contacting a Turso service. The
-//! feature is not enabled by any production gateway target.
+//! retains the production `WorkerRuntime`, `EventEndpoint`, and embedded
+//! `TursoStore`; only the test's process assembly differs from deployment.
 
 use std::error::Error;
 use std::path::PathBuf;
@@ -27,7 +26,7 @@ struct Config {
 }
 
 impl Config {
-    /// Parses the production launch shape while discarding only network credentials.
+    /// Parses the local launch shape used by the AC1 test helper.
     fn parse() -> Result<Self, String> {
         let mut args = std::env::args().skip(1);
         let mut do_id = None;
@@ -36,8 +35,6 @@ impl Config {
         let mut component_dir = None;
         let mut cache_dir = None;
         let mut event_socket = None;
-        let mut turso_url = None;
-        let mut token_file = None;
         while let Some(argument) = args.next() {
             let value = |args: &mut dyn Iterator<Item = String>, option: &str| {
                 args.next()
@@ -46,10 +43,6 @@ impl Config {
             match argument.as_str() {
                 "--do-id" => do_id = Some(value(&mut args, "--do-id")?),
                 "--data-dir" => data_dir = Some(PathBuf::from(value(&mut args, "--data-dir")?)),
-                "--turso-url" => turso_url = Some(value(&mut args, "--turso-url")?),
-                "--turso-token-file" => {
-                    token_file = Some(PathBuf::from(value(&mut args, "--turso-token-file")?))
-                }
                 "--component-digest" => {
                     let value = value(&mut args, "--component-digest")?;
                     digest =
@@ -66,11 +59,6 @@ impl Config {
                 }
                 other => return Err(format!("unknown argument `{other}`")),
             }
-        }
-        if turso_url.is_none() || token_file.is_none() {
-            return Err(
-                "Turso URL and token-file arguments are required even in AC1 seam".to_owned(),
-            );
         }
         Ok(Self {
             do_id: required_text(do_id, "--do-id")?,
@@ -92,7 +80,7 @@ fn required_text(value: Option<String>, option: &str) -> Result<String, String> 
     Ok(value)
 }
 
-/// Runs the real event endpoint over a local-only Turso test store.
+/// Runs the real event endpoint over the production embedded Turso store.
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::parse().map_err(|error| error.to_string())?;
@@ -110,8 +98,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
         None => WorkerRuntime::load(wasmtime::Config::new(), &bytes)?,
     };
-    let store =
-        Arc::new(TursoStore::open_for_test(config.data_dir.join("turso.db"), config.do_id).await?);
+    let store = Arc::new(TursoStore::open(config.data_dir.join("turso.db"), config.do_id).await?);
     let mut endpoint = EventEndpoint::bind(config.event_socket, store, Arc::new(runtime)).await?;
     tokio::select! {
         result = endpoint.run() => result?,

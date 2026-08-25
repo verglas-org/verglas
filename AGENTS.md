@@ -85,7 +85,7 @@ The point: tests written after code tend to **confirm what the code does**; test
 ## Standing invariants (violations are release-blocking, in any PR)
 
 - **A managed binding is authoritative; a customer binding is not.** Verglas owns the object layout of a bucket it manages, and every read of that bucket routes through Verglas. A customer binding keeps the customer's own layout, and nothing may make serving from it depend on Verglas-only state.
-- **Runtime shutdown is fenced.** Celld stops event admission, waits for the Turso push and Stream outbox fences, closes the event endpoint, and only then stops the child. Foyer contents may be discarded at any time because they are not durable state.
+- **Runtime shutdown is fenced.** Celld stops event admission, waits for the embedded Turso WAL checkpoint and Stream outbox fences, closes the event endpoint, and only then stops the child. Foyer contents may be discarded at any time because they are not durable state.
 - **Never write to customer tables or buckets autonomously.** Every publication is an explicit Sink/Catalog operation authorized by the caller.
 - **Slow is acceptable; wrong is never.** A local cache miss or invalid entry refills from the configured origin. Cached blocks are served only for the exact storage binding, object version, geometry, and range they name.
 - **Budgets are hard ceilings** (DRAM, NVMe, CPU) — especially in colocated mode, where Verglas must be a provably polite tenant.

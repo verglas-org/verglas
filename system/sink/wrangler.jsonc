@@ -12,7 +12,7 @@
     { "tag": "v1", "new_sqlite_classes": ["Sink"] }
   ],
   "vars": {
-    "SINK_ID": "primary",
+    "SINK_ID": "primary_sink",
     "SINK_TYPE": "iceberg",
     "SINK_CATALOG_BINDING": "CATALOG",
     "SINK_CATALOG_OBJECT": "warehouse",

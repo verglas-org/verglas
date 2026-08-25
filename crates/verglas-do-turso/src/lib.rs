@@ -15,4 +15,4 @@ pub use schema::{
     EVENT_SEQUENCE_TABLE, OUTBOX_TABLE, WORKER_ALARM_TABLE, WORKER_ATTACHMENTS_TABLE,
     WORKER_KV_TABLE,
 };
-pub use store::{AuthToken, TursoEvent, TursoStore};
+pub use store::{TursoEvent, TursoStore};

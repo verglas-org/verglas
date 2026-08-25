@@ -15,12 +15,12 @@ this page does not imply that an unmarked row below has shipped.
    identity, no storage. Its `fetch(request, env, ctx)` is the public front
    door.
 2. A **Durable Object** is a stateful Worker class with a name, one embedded
-   Turso `0.7.2` database, and strictly serialized events. The local database is
-   a working copy. One remote Turso database belongs to each DO, and an external
-   lease-fenced sync ingress validates the current placement before forwarding a
-   Turso push. The fence protects placement and synchronization; it is not a
-   second SQL commit authority. Worker code reaches a DO only through env bindings:
-   `env.NS.idFromName(name)`, `env.NS.get(id)`, and `stub.fetch(request)`.
+   local Turso `0.7.2` database under the self-hosted cell data root, and strictly
+   serialized events. SQL `COMMIT` followed by an explicit WAL checkpoint is the
+   durability fence, and cell filesystem durability is authoritative for DO
+   state. Cold restart reopens the same local path. Worker code reaches a DO only
+   through env bindings: `env.NS.idFromName(name)`, `env.NS.get(id)`, and
+   `stub.fetch(request)`. DO state has no clustering or replication layer.
 
 **The spec is Cloudflare's; the SDK is ours.** Cloudflare-style project code
 compiles to Verglas's WASM component ABI. Each language gets a Verglas-owned SDK
@@ -71,7 +71,8 @@ world service {
   do not cross this socket.
 - Worker-tier execution runs **in the gateway process**: pool instantiation per
   request, no DO storage transaction or event gate. DO events keep the full
-  serialized Turso transaction and push path in `verglas-runtime`.
+  serialized Turso transaction, `COMMIT`, and explicit WAL checkpoint path in
+  `verglas-runtime`.
 
 ## Deployment surface
 
@@ -94,9 +95,10 @@ by tenant Workers:
 await env.STREAM.send(records);
 ```
 
-The Stream confirms the append only after its Turso transaction reaches its
-durability boundary. Producer identities make retries idempotent; Stream
-ordering, Pipeline cursors, batching, and Sink delivery are defined by the
+The Stream confirms the append only after its local Turso transaction commits and
+its explicit WAL checkpoint completes. Producer identities make retries
+idempotent; Stream ordering, Pipeline cursors, batching, and Sink delivery are
+defined by the
 [normative platform page](/docs/architecture/primitives-platform), not by the
 Cloudflare Worker/DO API.
 

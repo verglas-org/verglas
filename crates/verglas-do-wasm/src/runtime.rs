@@ -166,7 +166,7 @@ impl WorkerRuntime {
         cache: Option<(&CwasmCache, ComponentDigest)>,
         component_bytes: &[u8],
     ) -> Result<Self, RuntimeError> {
-        enable_async_support(&mut engine_config);
+        configure_worker_engine(&mut engine_config);
         let engine =
             Engine::new(&engine_config).map_err(|source| RuntimeError::Engine { source })?;
         let component = match cache {
@@ -368,10 +368,18 @@ impl WorkerRuntime {
     }
 }
 
-/// Enables asynchronous execution on Wasmtime configurations that expose the setting.
+/// Applies the bounded virtual-memory and asynchronous Worker engine policy.
+///
+/// The reservation stays well below celld's per-process address-space ceiling.
+/// Linear memory may still grow by relocation, while the container and celld
+/// retain the authoritative hard memory budgets.
 #[allow(deprecated)]
-fn enable_async_support(config: &mut Config) {
+pub(crate) fn configure_worker_engine(config: &mut Config) {
     config.async_support(true);
+    config
+        .memory_reservation(64 * 1024 * 1024)
+        .memory_reservation_for_growth(64 * 1024 * 1024)
+        .memory_guard_size(1024 * 1024);
 }
 
 /// Returns the Worker host state used by every generated import binding.
@@ -396,6 +404,22 @@ fn complete_event<T>(
             permit.abort();
             Err(RuntimeError::Invocation { source })
         }
+    }
+}
+
+#[cfg(test)]
+mod engine_config_tests {
+    use super::*;
+
+    /// Worker engines reserve bounded virtual memory so celld's hard process ceiling remains usable.
+    #[test]
+    fn worker_engine_uses_bounded_linear_memory_reservations() {
+        let mut config = Config::new();
+        configure_worker_engine(&mut config);
+        let engine = Engine::new(&config).expect("bounded Worker engine");
+        assert_eq!(engine.get_memory_reservation(), 64 * 1024 * 1024);
+        assert_eq!(engine.get_memory_reservation_for_growth(), 64 * 1024 * 1024);
+        assert_eq!(engine.get_memory_guard_size(), 1024 * 1024);
     }
 }
 

@@ -25,7 +25,7 @@ test('Catalog builds as the Worker/DO service world without WASI', async (t) => 
   ]);
   assert.equal(manifest.vars.CATALOG_AUTHORITY_BINDING, undefined);
   assert.equal(manifest.vars.CATALOG_WAREHOUSE, 'warehouse');
-  assert.equal(manifest.vars.CATALOG_SINK_ID, 'primary');
+  assert.equal(manifest.vars.CATALOG_SINK_ID, 'primary_sink');
 
   const wit = spawnSync(jco, ['wit', result.componentPath], { encoding: 'utf8' });
   assert.equal(wit.status, 0, wit.stderr);

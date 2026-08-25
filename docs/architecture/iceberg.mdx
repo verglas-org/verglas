@@ -12,8 +12,10 @@ data objects. Verglas preserves that distinction across product boundaries.
   Turso.
 - **`verglas-runtime`** owns the narrow privileged commit implementation and
   host-only catalog/object-storage credentials.
-- **Foyer** caches immutable ranges in local DRAM/NVMe but is never authority.
-- **Origin object storage** is authoritative for published files.
+- **Foyer** caches immutable ranges in local DRAM/NVMe, is disposable, and is
+  never authority.
+- **The configured S3-compatible bucket** is the immutable Iceberg origin and
+  is authoritative for published files.
 
 ## Commit path
 
@@ -23,13 +25,13 @@ sequenceDiagram
     participant Sink
     participant Catalog as Catalog DO
     participant Runtime as verglas-runtime
-    participant Origin as Object storage
+    participant Bucket as S3-compatible bucket
 
     Pipeline->>Sink: deterministic batch
     Sink->>Catalog: POST /catalog/commit
     Catalog->>Catalog: check Turso ledger
     Catalog->>Runtime: ICEBERG_COMMIT.fetch
-    Runtime->>Origin: write deterministic Parquet and metadata
+    Runtime->>Bucket: write deterministic Parquet and metadata
     Runtime-->>Catalog: immutable metadata proposal
     Catalog->>Catalog: atomically install pointer and receipt
     Catalog-->>Sink: durable acknowledgement
@@ -49,5 +51,6 @@ that durable receipt without another runtime call.
 ## Cache behavior
 
 Reads use the exact storage binding, object version, geometry, and range as the
-Foyer key. A miss fills from origin. Local DRAM and NVMe contents may disappear
-at any time without changing durable Catalog or Iceberg state.
+Foyer key. A miss fills from the configured S3 origin. Local DRAM and NVMe
+contents may disappear at any time without changing durable Catalog or Iceberg
+state.

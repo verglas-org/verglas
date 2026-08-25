@@ -1,9 +1,9 @@
-//! Turso push and clean event shutdown lifecycle tests.
+//! Durable storage checkpoint and clean event shutdown lifecycle tests.
 
 use verglas_celld::{ChildLifecycle, ChildState, LifecycleError, SuspendFence};
 
 #[test]
-fn child_stops_only_after_push_outbox_drain_and_clean_shutdown() {
+fn child_stops_only_after_storage_checkpoint_outbox_drain_and_clean_shutdown() {
     let mut child = ChildLifecycle::running();
     assert_eq!(
         child.suspend(SuspendFence::new(true, false, true)),

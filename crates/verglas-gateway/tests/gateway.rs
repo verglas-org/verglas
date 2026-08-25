@@ -1,4 +1,4 @@
-//! HTTP, WebSocket, and exact Turso control forwarding tests.
+//! HTTP, WebSocket, and exact control forwarding tests.
 
 use base64::Engine;
 use futures::{SinkExt, StreamExt};
@@ -18,13 +18,13 @@ const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 
 fn manifest_source() -> String {
     format!(
-        r#"{{"name":"counter","main":"src/index.ts","durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},"artifacts":{{"worker":{{"digest":"{DIGEST}","component_dir":"components"}},"durable_object":{{"digest":"{DIGEST}","component_dir":"components"}}}},"data_root":"state","turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}}}"#
+        r#"{{"name":"counter","main":"src/index.ts","durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},"artifacts":{{"worker":{{"digest":"{DIGEST}","component_dir":"components"}},"durable_object":{{"digest":"{DIGEST}","component_dir":"components"}}}},"data_root":"state"}}"#
     )
 }
 
-/// Sends one complete Turso worker command and retries until the event socket binds.
+/// Sends one complete Worker command and retries until the event socket binds.
 #[tokio::test]
-async fn celld_spawner_sends_exact_turso_command_and_waits_for_event_bind()
+async fn celld_spawner_sends_exact_worker_command_and_waits_for_event_bind()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let directory = tempfile::tempdir()?;
     let data_root = directory.path().join("state");
@@ -41,7 +41,7 @@ async fn celld_spawner_sends_exact_turso_command_and_waits_for_event_bind()
         assert_eq!(
             command,
             format!(
-                "SPAWN_WORKER COUNTER--alice {} https://turso.test/COUNTER/alice /tokens/COUNTER.token {DIGEST} components - {} - -",
+                "SPAWN_WORKER COUNTER--alice {} {DIGEST} components - {} - -",
                 expected_data_root.join("COUNTER--alice").display(),
                 expected_event.display()
             )
@@ -68,8 +68,7 @@ async fn celld_spawner_sends_exact_turso_command_and_waits_for_event_bind()
         DIGEST.to_owned(),
         PathBuf::from("components"),
         data_root,
-    )
-    .with_turso("https://turso.test/COUNTER/alice", "/tokens/COUNTER.token");
+    );
     let started = Instant::now();
     let returned = CelldSpawner::new(control_path).spawn(request).await?;
     assert_eq!(returned, event_path);
@@ -77,24 +76,6 @@ async fn celld_spawner_sends_exact_turso_command_and_waits_for_event_bind()
     control_task.await??;
     event_task.await??;
     Ok(())
-}
-
-/// Missing Turso credentials fail closed before opening the control socket.
-#[tokio::test]
-async fn celld_spawner_rejects_missing_turso_credentials() {
-    let request = SpawnRequest::new(
-        "COUNTER--alice".to_owned(),
-        "COUNTER".to_owned(),
-        "alice".to_owned(),
-        DIGEST.to_owned(),
-        PathBuf::from("components"),
-        PathBuf::from("state"),
-    );
-    let error = CelldSpawner::new("missing.sock")
-        .spawn(request)
-        .await
-        .expect_err("missing Turso config must fail");
-    assert!(error.to_string().contains("Turso remote URL"));
 }
 
 /// Routes two HTTP fetches through one fake Turso event endpoint.
@@ -280,7 +261,7 @@ impl Fixture {
             assert_eq!(
                 command,
                 format!(
-                    "SPAWN_WORKER COUNTER--alice {} https://turso.test/COUNTER/alice /tokens/COUNTER.token {DIGEST} components - {} - -",
+                    "SPAWN_WORKER COUNTER--alice {} {DIGEST} components - {} - -",
                     data_root.join("COUNTER--alice").display(),
                     event_path.display()
                 )

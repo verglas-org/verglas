@@ -89,8 +89,8 @@ The JSON request is:
 ```json
 {
   "batch_id": "<deterministic batch id>",
-  "file_id": "verglas/primary/batch-<sha256(batch id)>.parquet",
-  "sink_id": "primary",
+  "file_id": "verglas/primary_sink/batch-<sha256(batch id)>.parquet",
+  "sink_id": "primary_sink",
   "pipeline_id": "orders",
   "sql_digest": "<sql digest>",
   "source": "events",

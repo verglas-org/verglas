@@ -1,8 +1,8 @@
-//! Lifecycle fencing for one resident Turso-backed Durable Object process.
+//! Lifecycle fencing for one resident Durable Object process.
 //!
-//! A process may stop only after its caller confirms the Turso remote push,
-//! drained outbox, and clean event-endpoint shutdown. Placement and lease
-//! validation remain outside this process.
+//! A process may stop only after its caller confirms the durable storage
+//! checkpoint, drained outbox, and clean event-endpoint shutdown. Placement and
+//! lease validation remain outside this process.
 
 /// Confirmations required before a Durable Object process may stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,7 +13,7 @@ pub struct SuspendFence {
 }
 
 impl SuspendFence {
-    /// Creates a fence from the three external Turso/event shutdown confirmations.
+    /// Creates a fence from storage and event shutdown confirmations.
     pub const fn new(pushed: bool, outbox_drained: bool, event_shutdown_clean: bool) -> Self {
         Self {
             pushed,
@@ -22,7 +22,7 @@ impl SuspendFence {
         }
     }
 
-    /// Returns whether local Turso state reached its remote push boundary.
+    /// Returns whether durable storage reached its checkpoint boundary.
     pub const fn pushed(self) -> bool {
         self.pushed
     }
@@ -48,7 +48,7 @@ impl SuspendFence {
 pub enum ChildState {
     /// Process is online and accepts serialized events.
     Running,
-    /// Process is stopped after the Turso/event shutdown fence.
+    /// Process is stopped after the storage/event shutdown fence.
     Suspended,
     /// Process is being restarted and is not routable.
     Restoring,
@@ -57,8 +57,10 @@ pub enum ChildState {
 /// A lifecycle transition that would expose stale or incomplete state.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum LifecycleError {
-    /// The required Turso push, outbox drain, or clean shutdown confirmation is absent.
-    #[error("Turso push, drained outbox, and clean event shutdown are all required before suspend")]
+    /// The required storage checkpoint, outbox drain, or clean shutdown confirmation is absent.
+    #[error(
+        "durable storage checkpoint, drained outbox, and clean event shutdown are all required before suspend"
+    )]
     SuspendUnconfirmed,
     /// The requested transition is illegal from the current state.
     #[error("invalid child lifecycle transition")]
@@ -84,7 +86,7 @@ impl ChildLifecycle {
         self.state
     }
 
-    /// Stops a child only after all Turso and event shutdown confirmations exist.
+    /// Stops a child only after storage and event shutdown confirmations exist.
     pub fn suspend(&mut self, fence: SuspendFence) -> Result<(), LifecycleError> {
         if self.state != ChildState::Running {
             return Err(LifecycleError::InvalidTransition);

@@ -2,8 +2,7 @@
 //!
 //! Durable-object namespaces, Stream bindings, system product services, and the
 //! exact runtime host capability are separate maps. Each selected product resolves
-//! to one immutable artifact and explicit Turso credentials; unknown fields and
-//! incomplete credentials fail before process launch.
+//! to one immutable artifact; unknown fields fail before process launch.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -154,82 +153,6 @@ impl HostServiceBinding {
     }
 }
 
-/// One Turso URL/token mapping used by a deployment or one named binding.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TursoDeployment {
-    url_template: String,
-    token_file: PathBuf,
-}
-
-impl TursoDeployment {
-    /// Creates one explicit Turso URL template and token-file template.
-    pub fn new(
-        url_template: impl Into<String>,
-        token_file: impl Into<PathBuf>,
-    ) -> Result<Self, ManifestError> {
-        let url_template = url_template.into();
-        let token_file = token_file.into();
-        validate_turso_fields(&url_template, &token_file)?;
-        Ok(Self {
-            url_template,
-            token_file,
-        })
-    }
-
-    /// Resolves `{binding}` and `{do_id}` placeholders for one object.
-    pub fn url(&self, binding: &str, do_id: &str) -> String {
-        substitute(&self.url_template, binding, do_id)
-    }
-
-    /// Resolves `{binding}` and `{do_id}` in the token-file path.
-    pub fn token_file(&self, binding: &str, do_id: &str) -> PathBuf {
-        PathBuf::from(substitute(
-            &self.token_file.to_string_lossy(),
-            binding,
-            do_id,
-        ))
-    }
-
-    /// Returns the configured URL template without resolving placeholders.
-    pub fn url_template(&self) -> &str {
-        &self.url_template
-    }
-
-    /// Returns the configured token-file template without resolving placeholders.
-    pub fn token_file_template(&self) -> &Path {
-        &self.token_file
-    }
-}
-
-/// Explicit Turso deployment defaults plus optional per-binding overrides.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TursoConfig {
-    default: Option<TursoDeployment>,
-    bindings: BTreeMap<String, TursoDeployment>,
-}
-
-impl TursoConfig {
-    /// Resolves a named binding or the deployment default, failing closed if absent.
-    pub fn for_binding(&self, binding: &str) -> Result<&TursoDeployment, ManifestError> {
-        self.bindings
-            .get(binding)
-            .or(self.default.as_ref())
-            .ok_or_else(|| ManifestError::MissingTursoDeployment {
-                binding: binding.to_owned(),
-            })
-    }
-
-    /// Returns the deployment-level mapping when one was declared.
-    pub fn default(&self) -> Option<&TursoDeployment> {
-        self.default.as_ref()
-    }
-
-    /// Returns all explicit per-binding mappings.
-    pub fn bindings(&self) -> &BTreeMap<String, TursoDeployment> {
-        &self.bindings
-    }
-}
-
 /// One accepted Durable Object migration declaration from a Wrangler manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Migration {
@@ -276,7 +199,6 @@ pub struct Manifest {
     vars: Map<String, Value>,
     artifacts: BTreeMap<ArtifactProduct, ArtifactDescriptor>,
     data_root: PathBuf,
-    turso: Option<TursoConfig>,
 }
 
 impl Manifest {
@@ -438,16 +360,6 @@ impl Manifest {
         })
     }
 
-    /// Resolves the explicit Turso deployment for one DO or system binding.
-    pub fn turso_for(&self, binding: &str) -> Result<&TursoDeployment, ManifestError> {
-        self.turso
-            .as_ref()
-            .ok_or_else(|| ManifestError::MissingTursoDeployment {
-                binding: binding.to_owned(),
-            })?
-            .for_binding(binding)
-    }
-
     /// Returns the manifest's runtime data root.
     pub fn data_root(&self) -> &Path {
         &self.data_root
@@ -470,7 +382,6 @@ impl Manifest {
             "vars",
             "artifacts",
             "data_root",
-            "turso",
         ]
         .into_iter()
         .collect::<HashSet<_>>();
@@ -519,12 +430,6 @@ impl Manifest {
         let artifacts = required_object(&mut object, "artifacts").and_then(parse_artifacts)?;
         require_artifacts(&artifacts, !bindings.is_empty(), &pipelines, &services)?;
         let data_root = PathBuf::from(required_string(&mut object, "data_root")?);
-        let turso = object.remove("turso").map(parse_turso).transpose()?;
-        if (!bindings.is_empty() || !pipelines.is_empty() || !services.is_empty())
-            && turso.is_none()
-        {
-            return Err(ManifestError::MissingField { field: "turso" });
-        }
         Ok(Self {
             name,
             main,
@@ -538,7 +443,6 @@ impl Manifest {
             vars,
             artifacts,
             data_root,
-            turso,
         })
     }
 }
@@ -643,18 +547,6 @@ pub enum ManifestError {
         /// Requested object identity.
         actual: String,
     },
-    /// A Turso object contains an unknown key.
-    #[error("unknown turso manifest key: {key}")]
-    UnknownTursoKey {
-        /// Key that was not recognized.
-        key: String,
-    },
-    /// A Turso per-binding object contains an unknown key.
-    #[error("unknown turso.bindings key: {key}")]
-    UnknownTursoBindingKey {
-        /// Key that was not recognized.
-        key: String,
-    },
     /// A required field was absent.
     #[error("manifest field {field} is required")]
     MissingField {
@@ -698,18 +590,6 @@ pub enum ManifestError {
     DuplicateServiceBinding {
         /// Name repeated by more than one service.
         name: String,
-    },
-    /// A Turso mapping was missing for one binding.
-    #[error("Turso deployment mapping is missing for binding {binding}")]
-    MissingTursoDeployment {
-        /// Binding that could not resolve a deployment.
-        binding: String,
-    },
-    /// A Turso URL or token file template was invalid.
-    #[error("invalid Turso deployment: {message}")]
-    InvalidTursoDeployment {
-        /// Stable validation detail.
-        message: String,
     },
     /// A migration object contains an unsupported migration kind or key.
     #[error("unknown migrations manifest key: {key}")]
@@ -1038,78 +918,6 @@ fn require_artifacts(
     Ok(())
 }
 
-/// Parses deployment-level and per-binding Turso mappings.
-fn parse_turso(value: Value) -> Result<TursoConfig, ManifestError> {
-    let Value::Object(mut object) = value else {
-        return Err(ManifestError::InvalidType {
-            field: "turso",
-            expected: "object",
-        });
-    };
-    let allowed = ["url_template", "token_file", "bindings"]
-        .into_iter()
-        .collect::<HashSet<_>>();
-    if let Some(key) = object
-        .keys()
-        .find(|key| !allowed.contains(key.as_str()))
-        .cloned()
-    {
-        return Err(ManifestError::UnknownTursoKey { key });
-    }
-    let default = match (object.remove("url_template"), object.remove("token_file")) {
-        (None, None) => None,
-        (Some(url), Some(token)) => Some(TursoDeployment::new(
-            parse_nonempty_string(url, "turso.url_template")?,
-            PathBuf::from(parse_nonempty_string(token, "turso.token_file")?),
-        )?),
-        _ => {
-            return Err(ManifestError::InvalidTursoDeployment {
-                message: "url_template and token_file must be supplied together".to_owned(),
-            });
-        }
-    };
-    let bindings = match object.remove("bindings") {
-        None => BTreeMap::new(),
-        Some(Value::Object(values)) => {
-            let mut mappings = BTreeMap::new();
-            for (name, value) in values {
-                let Value::Object(mut mapping) = value else {
-                    return Err(ManifestError::InvalidType {
-                        field: "turso.bindings[]",
-                        expected: "object",
-                    });
-                };
-                let allowed = ["url_template", "token_file"]
-                    .into_iter()
-                    .collect::<HashSet<_>>();
-                if let Some(key) = mapping
-                    .keys()
-                    .find(|key| !allowed.contains(key.as_str()))
-                    .cloned()
-                {
-                    return Err(ManifestError::UnknownTursoBindingKey { key });
-                }
-                let url = required_string(&mut mapping, "url_template")?;
-                let token = required_string(&mut mapping, "token_file")?;
-                mappings.insert(name, TursoDeployment::new(url, PathBuf::from(token))?);
-            }
-            mappings
-        }
-        Some(_) => {
-            return Err(ManifestError::InvalidType {
-                field: "turso.bindings",
-                expected: "object",
-            });
-        }
-    };
-    if default.is_none() && bindings.is_empty() {
-        return Err(ManifestError::InvalidTursoDeployment {
-            message: "at least one deployment mapping is required".to_owned(),
-        });
-    }
-    Ok(TursoConfig { default, bindings })
-}
-
 /// Extracts a required nonempty string from an object.
 fn required_string(
     object: &mut Map<String, Value>,
@@ -1210,32 +1018,6 @@ fn validate_digest(value: &str) -> Result<(), ManifestError> {
         });
     }
     Ok(())
-}
-
-/// Validates a nonempty URL and token-file template.
-fn validate_turso_fields(url: &str, token_file: &Path) -> Result<(), ManifestError> {
-    if url.is_empty()
-        || url.chars().any(char::is_whitespace)
-        || !url.contains("{binding}")
-        || !url.contains("{do_id}")
-    {
-        return Err(ManifestError::InvalidTursoDeployment {
-            message: "url_template must contain {binding} and {do_id} and no whitespace".to_owned(),
-        });
-    }
-    if token_file.as_os_str().is_empty() {
-        return Err(ManifestError::InvalidTursoDeployment {
-            message: "token_file must be nonempty".to_owned(),
-        });
-    }
-    Ok(())
-}
-
-/// Replaces only the two documented deployment placeholders.
-fn substitute(template: &str, binding: &str, do_id: &str) -> String {
-    template
-        .replace("{binding}", binding)
-        .replace("{do_id}", do_id)
 }
 
 /// Removes comments and trailing commas accepted by Wrangler's JSONC subset.

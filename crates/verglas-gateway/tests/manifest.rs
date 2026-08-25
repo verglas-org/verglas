@@ -1,4 +1,4 @@
-//! Strict Wrangler, Turso, and pipeline manifest acceptance tests.
+//! Strict Wrangler and pipeline manifest acceptance tests.
 
 use tempfile::tempdir;
 use verglas_gateway::{Manifest, ManifestError};
@@ -15,11 +15,7 @@ fn source(extra: &str) -> String {
             "durable_object": {"digest": DIGEST, "component_dir": "./components"},
             "stream": {"digest": DIGEST, "component_dir": "./components"}
         },
-        "data_root": "./state",
-        "turso": {
-            "url_template": "https://turso.test/{binding}/{do_id}",
-            "token_file": "/tokens/{binding}.token"
-        }
+        "data_root": "./state"
     })
     .to_string();
     if !extra.is_empty() {
@@ -34,17 +30,10 @@ fn source(extra: &str) -> String {
 }
 
 #[test]
-fn accepts_jsonc_and_explicit_turso_deployment() {
+fn accepts_jsonc_and_pipeline_bindings() {
     let manifest = Manifest::parse(&source(",\n            // accepted Wrangler comment\n            \"pipelines\":[{\"binding\":\"STREAM\",\"stream\":\"stream-1\"}]")).expect("manifest");
     assert_eq!(manifest.name(), "counter");
     assert_eq!(manifest.bindings()[0].class_name(), "Counter");
-    assert_eq!(
-        manifest
-            .turso_for("COUNTER")
-            .expect("deployment")
-            .url("COUNTER", "a"),
-        "https://turso.test/COUNTER/a"
-    );
     assert_eq!(
         manifest.pipeline("STREAM").expect("pipeline").stream(),
         "stream-1"
@@ -64,29 +53,25 @@ fn compatibility_migrations_and_vars_are_preserved() {
 }
 
 #[test]
-fn missing_turso_for_a_worker_binding_fails_closed() {
-    let mut value: serde_json::Value =
-        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
-    value
-        .as_object_mut()
-        .expect("base test manifest is an object")
-        .remove("turso");
-    let source = value.to_string();
-    assert!(matches!(
-        Manifest::parse(&source),
-        Err(ManifestError::MissingField { field: "turso" })
-    ));
-}
-
-#[test]
-fn unknown_turso_field_fails_closed() {
-    let source = source("").replace(
-        "\"token_file\":\"/tokens/{binding}.token\"",
-        "\"token_file\":\"/tokens/{binding}.token\",\"fallback\":true",
+fn remote_turso_manifest_fields_are_rejected_as_unknown() {
+    let old_manifest = source(
+        ",\n            \"turso\":{\"url_template\":\"https://turso.test/{binding}/{do_id}\",\"token_file\":\"/tokens/{binding}.token\"}",
     );
     assert!(matches!(
-        Manifest::parse(&source),
-        Err(ManifestError::UnknownTursoKey { key }) if key == "fallback"
+        Manifest::parse(&old_manifest),
+        Err(ManifestError::UnknownTopLevelKey { key }) if key == "turso"
+    ));
+
+    let mut value: serde_json::Value =
+        serde_json::from_str(&source("")).expect("base test manifest is valid JSON");
+    let object = value.as_object_mut().expect("manifest object");
+    object.insert(
+        "turso_url".to_owned(),
+        serde_json::Value::String("https://turso.test".to_owned()),
+    );
+    assert!(matches!(
+        Manifest::parse(&value.to_string()),
+        Err(ManifestError::UnknownTopLevelKey { key }) if key == "turso_url"
     ));
 }
 

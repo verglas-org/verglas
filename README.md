@@ -3,8 +3,8 @@
 Verglas has exactly six products, all composed from two primitives:
 
 - **Worker** — stateless, pool-executed ingress with authority only from bindings.
-- **Durable Object** — a serialized stateful Worker class backed by Turso
-  `0.7.2`, with one remote Turso database per object.
+- **Durable Object** — a serialized stateful Worker class backed by one
+  embedded Turso `0.7.2` database in the self-hosted cell data root.
 - **Stream** — a prebuilt Durable Object for durable ordered JSON records.
 - **Pipeline** — a prebuilt Worker/DO with a Stream cursor, stateless SQL
   transforms, batching, and retry.
@@ -51,10 +51,10 @@ Install the TypeScript SDK from npm:
 npm install @verglas/sdk
 ```
 
-The Worker/Durable Object runtime is built from this workspace. Product
+The Worker/Durable Object runtime is self-hosted from this workspace. Product
 components are authored with the JavaScript and Python SDKs and run through the
-Wasmtime host; hosted provisioning and public control-plane APIs live outside
-this repository.
+Wasmtime host. Durable Object state stays in embedded Turso databases under the
+cell data root; the configured S3 origin stores immutable Iceberg objects.
 
 ## Build and test
 

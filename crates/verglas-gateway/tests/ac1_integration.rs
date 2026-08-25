@@ -59,8 +59,8 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
     assert!(components.join(format!("{digest}.wasm")).is_file());
 
     let celld = target_root().join("debug/verglas-celld");
-    // This test-only binary preserves the real EventEndpoint/WorkerRuntime chain
-    // while using TursoStore::open_for_test. Production never enables its feature.
+    // This test-only binary preserves the production EventEndpoint,
+    // WorkerRuntime, and embedded TursoStore chain in one build target.
     let runtime_child = target_root().join("debug/verglas-runtime-test-support");
     assert!(
         celld.is_file(),
@@ -227,10 +227,6 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
                 "durable_object": { "digest": "0".repeat(64), "component_dir": components }
             },
             "data_root": data_root,
-            "turso": {
-                "url_template": "https://ac1.test/{binding}/{do_id}",
-                "token_file": "/dev/null"
-            },
         }))
         .expect("gateway JSON"),
     )

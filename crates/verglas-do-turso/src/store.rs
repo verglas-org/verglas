@@ -1,10 +1,9 @@
-//! One serialized Turso database per Durable Object.
+//! One serialized embedded Turso database per Durable Object.
 //!
-//! Production stores always use Turso sync with an explicit remote URL and
-//! token. The local-only constructor is feature-gated for tests and is never a
-//! runtime fallback. Event transactions use explicit `BEGIN IMMEDIATE`,
-//! `COMMIT`, and `ROLLBACK` on one connection so their lifetime can cross WIT
-//! calls safely.
+//! The local database is the production durability boundary. Event transactions
+//! use explicit `BEGIN IMMEDIATE`, `COMMIT`, and `ROLLBACK` on one connection so
+//! their lifetime can cross WIT calls safely. A successful event commit includes
+//! an explicit Turso WAL checkpoint before effects are released.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,7 +12,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::Value as JsonValue;
 use tokio::sync::{Mutex, OwnedMutexGuard, RwLock};
-use turso::sync::AuthTokenFn;
 use turso::{Connection, Value};
 
 use crate::error::{Error, Result};
@@ -25,78 +23,6 @@ use crate::schema::{
 
 static NEXT_RELAY_ID: AtomicU64 = AtomicU64::new(1);
 
-/// A static or rotating Turso authentication token.
-#[derive(Clone)]
-pub enum AuthToken {
-    /// Uses one bearer token for every sync request.
-    Static(String),
-    /// Calls the provider before every sync request.
-    Provider(AuthTokenFn),
-}
-
-impl From<String> for AuthToken {
-    /// Converts a static owned token into an authentication configuration.
-    fn from(value: String) -> Self {
-        Self::Static(value)
-    }
-}
-
-impl From<&str> for AuthToken {
-    /// Converts a static borrowed token into an authentication configuration.
-    fn from(value: &str) -> Self {
-        Self::Static(value.to_owned())
-    }
-}
-
-impl From<AuthTokenFn> for AuthToken {
-    /// Converts a Turso asynchronous token provider into an authentication configuration.
-    fn from(value: AuthTokenFn) -> Self {
-        Self::Provider(value)
-    }
-}
-
-/// Database backend selected by an explicit production or test constructor.
-#[derive(Clone)]
-enum Backend {
-    /// Turso sync database with remote durability.
-    Remote(turso::sync::Database),
-    /// Local-only database available only through the test-support feature.
-    #[cfg(feature = "test-support")]
-    Local(turso::Database),
-}
-
-impl Backend {
-    /// Opens the shared connection for this backend.
-    async fn connect(&self) -> Result<Connection> {
-        match self {
-            Self::Remote(database) => Ok(database.connect().await?),
-            #[cfg(feature = "test-support")]
-            Self::Local(database) => Ok(database.connect()?),
-        }
-    }
-
-    /// Pulls remote changes before a store is allowed to serve events.
-    async fn pull(&self) -> Result<()> {
-        match self {
-            Self::Remote(database) => {
-                database.pull().await?;
-                Ok(())
-            }
-            #[cfg(feature = "test-support")]
-            Self::Local(_) => Ok(()),
-        }
-    }
-
-    /// Pushes local WAL state to the configured durability boundary.
-    async fn push(&self) -> Result<()> {
-        match self {
-            Self::Remote(database) => Ok(database.push().await?),
-            #[cfg(feature = "test-support")]
-            Self::Local(_) => Ok(()),
-        }
-    }
-}
-
 /// Shared Turso state for one Durable Object identity.
 #[derive(Clone)]
 pub struct TursoStore {
@@ -104,8 +30,8 @@ pub struct TursoStore {
     source_do_id: Arc<str>,
     /// Local database path whose complete sidecar family stays under the DO root.
     local_path: Arc<PathBuf>,
-    /// Explicitly selected Turso local or remote backend.
-    backend: Backend,
+    /// Embedded database kept alive for the lifetime of its shared connection.
+    _database: turso::Database,
     /// One connection shared by all event WIT calls.
     connection: Arc<Mutex<Connection>>,
     /// Serializes event and outbox-control transactions.
@@ -117,76 +43,38 @@ pub struct TursoStore {
 }
 
 impl TursoStore {
-    /// Opens a production Turso database and validates its reserved schema.
+    /// Opens the embedded Turso database and validates its reserved schema.
     ///
-    /// This constructor performs remote bootstrap, an explicit pull, schema
-    /// creation/validation, and a schema push before returning to the caller.
-    /// It never opens a local-only fallback when remote sync fails.
-    pub async fn open<P, U, A, N>(
-        local_path: P,
-        remote_url: U,
-        auth_token: A,
-        client_name: N,
-    ) -> Result<Self>
-    where
-        P: AsRef<Path>,
-        U: Into<String>,
-        A: Into<AuthToken>,
-        N: Into<String>,
-    {
-        let path = local_path.as_ref().to_path_buf();
-        create_parent(&path).await?;
-        let client_name = client_name.into();
-        let mut builder = turso::sync::Builder::new_remote(&path_to_string(&path))
-            .with_remote_url(remote_url)
-            .with_client_name(client_name.clone())
-            .with_logical_mvcc_pull(false);
-        builder = match auth_token.into() {
-            AuthToken::Static(token) => builder.with_auth_token(token),
-            AuthToken::Provider(provider) => builder.with_auth_token_fn(move || {
-                let provider = provider.clone();
-                async move { provider().await }
-            }),
-        };
-        let backend = Backend::Remote(builder.build().await?);
-        let store = Self::new(client_name, path, backend).await?;
-        store.backend.pull().await?;
-        store.ensure_reserved_schema().await?;
-        store.validate_schema().await?;
-        store.backend.push().await?;
-        Ok(store)
-    }
-
-    /// Opens an explicit local-only store for tests and local seam fixtures.
-    #[cfg(feature = "test-support")]
-    pub async fn open_for_test<P, N>(local_path: P, client_name: N) -> Result<Self>
+    /// The local database is production state, not a test fallback. Opening
+    /// performs a serialized local readiness fence, reserved-table bootstrap,
+    /// schema validation, and a WAL checkpoint before returning.
+    pub async fn open<P, N>(local_path: P, client_name: N) -> Result<Self>
     where
         P: AsRef<Path>,
         N: Into<String>,
     {
         let path = local_path.as_ref().to_path_buf();
         create_parent(&path).await?;
-        let backend = Backend::Local(
-            turso::Builder::new_local(&path_to_string(&path))
-                .build()
-                .await?,
-        );
-        let store = Self::new(client_name, path, backend).await?;
+        let database = turso::Builder::new_local(&path_to_string(&path))
+            .build()
+            .await?;
+        let store = Self::new(client_name, path, database).await?;
         store.ensure_reserved_schema().await?;
         store.validate_schema().await?;
+        store.checkpoint().await?;
         Ok(store)
     }
 
-    /// Creates the shared connection and synchronization gates for one backend.
-    async fn new<N>(client_name: N, path: PathBuf, backend: Backend) -> Result<Self>
+    /// Creates the shared connection and synchronization gates for one database.
+    async fn new<N>(client_name: N, path: PathBuf, database: turso::Database) -> Result<Self>
     where
         N: Into<String>,
     {
-        let connection = backend.connect().await?;
+        let connection = database.connect()?;
         Ok(Self {
             source_do_id: Arc::from(client_name.into()),
             local_path: Arc::new(path),
-            backend,
+            _database: database,
             connection: Arc::new(Mutex::new(connection)),
             event_lock: Arc::new(Mutex::new(())),
             appender: Arc::new(RwLock::new(None)),
@@ -228,16 +116,28 @@ impl TursoStore {
         }
     }
 
-    /// Pulls remote state while no event transaction is active.
-    pub async fn pull(&self) -> Result<()> {
+    /// Checkpoints the embedded Turso WAL at an event or shutdown fence.
+    pub async fn checkpoint(&self) -> Result<()> {
         let _guard = self.event_lock.clone().lock_owned().await;
-        self.backend.pull().await
+        let connection = self.connection.lock().await;
+        checkpoint_connection(&connection).await
     }
 
-    /// Pushes local state to the remote Turso durability boundary.
-    pub async fn push(&self) -> Result<()> {
+    /// Closes admission behind the caller, rolls back cancellation, and verifies shutdown durability.
+    pub async fn shutdown_fence(&self) -> Result<()> {
         let _guard = self.event_lock.clone().lock_owned().await;
-        self.backend.push().await
+        let connection = self.connection.lock().await;
+        rollback_dangling(&connection).await?;
+        let mut rows = connection
+            .query(
+                "SELECT 1 FROM __verglas_outbox WHERE state != 'delivered' LIMIT 1",
+                (),
+            )
+            .await?;
+        if rows.next().await?.is_some() {
+            return Err(Error::ShutdownOutboxPending);
+        }
+        checkpoint_connection(&connection).await
     }
 
     /// Returns the currently committed durable alarm.
@@ -302,7 +202,6 @@ impl TursoStore {
         Ok(TursoEvent {
             source_do_id: Arc::clone(&self.source_do_id),
             event_sequence: sequence,
-            backend: self.backend.clone(),
             connection: Arc::clone(&self.connection),
             event_guard,
             next_record_index: AtomicU32::new(0),
@@ -345,9 +244,9 @@ impl TursoStore {
         if pending.is_empty() {
             return Ok(());
         }
-        // A prior source commit may have reached local WAL while its push failed;
-        // never append to Stream until this retry reaches Turso's boundary.
-        self.backend.push().await?;
+        // A prior source commit may have reached WAL while its checkpoint failed;
+        // never append to Stream until this retry reaches the local durability fence.
+        self.checkpoint().await?;
         let appender = self
             .appender
             .read()
@@ -456,7 +355,7 @@ impl TursoStore {
         };
         finish_control(&connection).await?;
         if updated {
-            self.backend.push().await?;
+            checkpoint_connection(&connection).await?;
         }
         Ok(updated)
     }
@@ -491,7 +390,7 @@ impl TursoStore {
         };
         finish_control(&connection).await?;
         if updated {
-            self.backend.push().await?;
+            checkpoint_connection(&connection).await?;
         }
         Ok(updated)
     }
@@ -518,7 +417,7 @@ impl TursoStore {
         };
         finish_control(&connection).await?;
         if updated > 0 {
-            self.backend.push().await?;
+            checkpoint_connection(&connection).await?;
         }
         Ok(updated)
     }
@@ -530,8 +429,6 @@ pub struct TursoEvent {
     source_do_id: Arc<str>,
     /// Event sequence allocated inside this transaction.
     event_sequence: u64,
-    /// Backend used to push after local commit.
-    backend: Backend,
     /// Shared Turso connection used by every event operation.
     connection: Arc<Mutex<Connection>>,
     /// Exclusive event gate held until commit or rollback completes.
@@ -773,17 +670,16 @@ impl TursoEvent {
         Ok(keys)
     }
 
-    /// Commits the local event transaction and pushes it to remote Turso.
-    pub async fn commit_and_push(mut self) -> Result<()> {
+    /// Commits the event transaction and checkpoints the embedded WAL.
+    pub async fn commit(mut self) -> Result<()> {
         self.ensure_active()?;
         let connection = self.connection.lock().await;
         if let Err(error) = connection.execute("COMMIT", ()).await {
             rollback_quiet(&connection).await;
             return Err(error.into());
         }
-        drop(connection);
         self.finished = true;
-        self.backend.push().await
+        checkpoint_connection(&connection).await
     }
 
     /// Rolls back every state and outbox mutation in this event.
@@ -813,6 +709,25 @@ impl Drop for TursoEvent {
         // opening the next event, while the held gate prevents an interleaving.
         let _ = &self.event_guard;
     }
+}
+
+/// Checkpoints every dirty WAL frame and rejects an incomplete busy result.
+async fn checkpoint_connection(connection: &Connection) -> Result<()> {
+    let mut rows = connection
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await?;
+    let mut saw_result = false;
+    while let Some(row) = rows.next().await? {
+        saw_result = true;
+        let busy = row.get::<i64>(0)?;
+        if busy != 0 {
+            return Err(Error::CheckpointBusy(busy));
+        }
+    }
+    if !saw_result {
+        return Err(Error::CheckpointResultMissing);
+    }
+    Ok(())
 }
 
 /// Creates the local parent directory while retaining all Turso sidecars nearby.

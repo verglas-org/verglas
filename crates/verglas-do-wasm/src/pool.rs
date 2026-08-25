@@ -15,6 +15,7 @@ use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use crate::abi::{HostError, Request, Response, WitHandlerError, WorkerBindings, bindings};
+use crate::runtime::configure_worker_engine;
 
 /// Routes a stateless Worker's flattened Durable Object stub call.
 #[async_trait]
@@ -265,7 +266,7 @@ pub struct WorkerPool {
 impl WorkerPool {
     /// Compiles component bytes and prepares the stateless host linker.
     pub fn load(mut engine_config: Config, component_bytes: &[u8]) -> Result<Self, PoolError> {
-        enable_async_support(&mut engine_config);
+        configure_worker_engine(&mut engine_config);
         let engine = Engine::new(&engine_config).map_err(|source| PoolError::Engine { source })?;
         let component = Component::new(&engine, component_bytes)
             .map_err(|source| PoolError::Component { source })?;
@@ -319,12 +320,6 @@ impl WorkerPool {
     ) -> Result<Response, PoolError> {
         self.fetch(router, request).await
     }
-}
-
-/// Enables asynchronous execution on Wasmtime configurations that expose the setting.
-#[allow(deprecated)]
-fn enable_async_support(config: &mut Config) {
-    config.async_support(true);
 }
 
 /// Returns the pool host state used by every generated import binding.

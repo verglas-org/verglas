@@ -14,7 +14,7 @@ pub use error::GatewayError;
 pub use gateway::{Gateway, WorkerExecutor, WorkerPoolExecutor};
 pub use manifest::{
     ArtifactDescriptor, ArtifactProduct, Binding, HostServiceBinding, Manifest, ManifestError,
-    Migration, PipelineBinding, SystemBinding, TursoConfig, TursoDeployment,
+    Migration, PipelineBinding, SystemBinding,
 };
 pub use spawn::{CelldSpawner, DoSpawner, SpawnRequest};
 pub use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};

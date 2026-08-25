@@ -1,4 +1,4 @@
-//! Celld control-plane spawning and bounded Turso event-socket readiness.
+//! Celld control-plane spawning and bounded event-socket readiness.
 //!
 //! The gateway sends one complete `SPAWN_WORKER` request, including the exact
 //! declared host capability when present. It never starts a replica, managed CAS
@@ -21,7 +21,7 @@ const EVENT_SOCKET_TIMEOUT: Duration = Duration::from_secs(2);
 const EVENT_SOCKET_INITIAL_DELAY: Duration = Duration::from_millis(5);
 const EVENT_SOCKET_MAX_DELAY: Duration = Duration::from_millis(50);
 
-/// Inputs required to launch one resident Turso Durable Object process.
+/// Inputs required to launch one resident Durable Object process.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SpawnRequest {
     do_id: String,
@@ -32,17 +32,10 @@ pub struct SpawnRequest {
     cwasm_cache_dir: Option<PathBuf>,
     host_service: Option<HostServiceBinding>,
     data_root: PathBuf,
-    turso_url: String,
-    turso_token_file: PathBuf,
 }
 
 impl SpawnRequest {
-    /// Creates one incomplete request from a routed manifest binding.
-    ///
-    /// Production callers must attach Turso credentials with [`Self::with_turso`]
-    /// before giving the request to [`DoSpawner::spawn`]. Keeping the request
-    /// incomplete makes missing deployment configuration a hard error rather
-    /// than an implicit local-storage path.
+    /// Creates one request from a routed manifest binding.
     pub fn new(
         do_id: String,
         binding: String,
@@ -60,20 +53,7 @@ impl SpawnRequest {
             cwasm_cache_dir: None,
             host_service: None,
             data_root,
-            turso_url: String::new(),
-            turso_token_file: PathBuf::new(),
         }
-    }
-
-    /// Attaches explicit remote Turso URL and token-file deployment credentials.
-    pub fn with_turso(
-        mut self,
-        turso_url: impl Into<String>,
-        turso_token_file: impl Into<PathBuf>,
-    ) -> Self {
-        self.turso_url = turso_url.into();
-        self.turso_token_file = turso_token_file.into();
-        self
     }
 
     /// Attaches an optional Wasmtime compiled component cache directory.
@@ -128,17 +108,7 @@ impl SpawnRequest {
         &self.data_root
     }
 
-    /// Returns the remote Turso URL selected by manifest deployment config.
-    pub fn turso_url(&self) -> &str {
-        &self.turso_url
-    }
-
-    /// Returns the token-file path selected by manifest deployment config.
-    pub fn turso_token_file(&self) -> &Path {
-        &self.turso_token_file
-    }
-
-    /// Returns the local Turso database directory for this object.
+    /// Returns the child-exclusive data directory for this object.
     fn data_dir(&self) -> PathBuf {
         self.data_root.join(&self.do_id)
     }
@@ -206,16 +176,6 @@ impl CelldSpawner {
         request: &SpawnRequest,
         event_socket: &Path,
     ) -> Result<(), GatewayError> {
-        if request.turso_url().is_empty() {
-            return Err(GatewayError::SpawnRejected {
-                message: "Turso remote URL is required".to_owned(),
-            });
-        }
-        if request.turso_token_file().as_os_str().is_empty() {
-            return Err(GatewayError::SpawnRejected {
-                message: "Turso token-file path is required".to_owned(),
-            });
-        }
         if request.component_digest().len() != 64
             || !request
                 .component_digest()
@@ -233,11 +193,9 @@ impl CelldSpawner {
             .host_service()
             .map_or(("-", "-"), |service| (service.binding(), service.service()));
         let command = format!(
-            "SPAWN_WORKER {} {} {} {} {} {} {} {} {} {}",
+            "SPAWN_WORKER {} {} {} {} {} {} {} {}",
             request.do_id(),
             request.data_dir().display(),
-            request.turso_url(),
-            request.turso_token_file().display(),
             request.component_digest(),
             request.component_dir().display(),
             cache,
@@ -284,7 +242,7 @@ impl CelldSpawner {
 
 #[async_trait]
 impl DoSpawner for CelldSpawner {
-    /// Starts one Turso Worker and waits until its event socket is a Unix socket.
+    /// Starts one Worker and waits until its event socket is a Unix socket.
     async fn spawn(&self, request: SpawnRequest) -> Result<PathBuf, GatewayError> {
         if request.do_id().is_empty() {
             return Err(GatewayError::SpawnRejected {

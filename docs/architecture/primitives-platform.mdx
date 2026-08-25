@@ -4,14 +4,14 @@ description: "The six composable products: Worker, Durable Object, Stream, Pipel
 icon: "diagram-project"
 ---
 
-This page is the source of truth for Verglas hosted compute and ingestion. The
-platform has exactly six products. Each product is either tenant Worker code or
-a prebuilt system deployment made from the same Worker and Durable Object
-primitives. There is no separate job runtime, queue service, database runtime,
-or lakehouse path hidden behind these products.
+This page is the source of truth for Verglas self-hosted compute and ingestion.
+The platform has exactly six products. Each product is either tenant Worker code
+or a prebuilt system deployment made from the same Worker and Durable Object
+primitives. There is no separate job runtime, queue service, database runtime, or
+lakehouse path hidden behind these products.
 
 1. **Worker** — stateless public ingress.
-2. **Durable Object** — serialized stateful Worker class backed by Turso.
+2. **Durable Object** — serialized stateful Worker class backed by one embedded local Turso database.
 3. **Stream** — a prebuilt Durable Object that durably appends JSON records.
 4. **Pipeline** — a prebuilt Worker and Durable Object that consume Streams,
    execute stateless SQL transforms, batch records, and checkpoint progress.
@@ -42,7 +42,7 @@ flowchart LR
     S --> P1["Pipeline DO A\ncursor + SQL + batch"]
     S --> P2["Pipeline DO B\nindependent cursor"]
     P1 --> K["Sink DO\nidempotency ledger"]
-    K --> I["Parquet / Iceberg"]
+    K --> I["Parquet / Iceberg in S3-compatible bucket"]
     K --> C["Catalog Worker + DO\nIceberg REST"]
 ```
 
@@ -54,14 +54,15 @@ ordinary bindings and stub calls.
 ## Runtime host
 
 `verglas-runtime` is the only serving runtime. It executes Worker and Durable
-Object components through Wasmtime under celld/Firecracker isolation, owns
-Turso adapters, and uses Foyer memory and disk tiers to cache origin-backed
-bytes and compiled/runtime data. Foyer is a performance cache, never a commit
-authority.
+Object components through Wasmtime under celld/Firecracker isolation, owns local
+Turso adapters, and uses Foyer memory and disk tiers to cache bytes from the
+configured S3 origin and compiled/runtime data. Foyer is disposable performance
+state, never a commit authority.
 
-Machine-loss durability comes from Turso for Durable Objects and from each
-product's named external destination. Origin writes complete at the origin
-before success; local cache contents are disposable.
+Cell filesystem durability is authoritative for Durable Object state. The
+configured S3-compatible bucket is the immutable Iceberg origin and the only
+external dependency in the current architecture; writes complete at the
+configured S3 origin before success. Local cache contents are disposable.
 
 Tenant components receive no raw network, object-store, or filesystem access.
 Narrow host capabilities perform privileged operations such as the Iceberg
@@ -84,23 +85,11 @@ surfaces and are not a tenant API. Worker behavior remains specified by
 ## 2. Durable Object
 
 A Durable Object is a named Worker class with strictly serialized events. Each
-object owns one embedded Turso database. The local database file is a working
-copy; one remote Turso database per DO is the machine-loss recovery source.
-Verglas pins Turso `0.7.2` in ordinary WAL mode: current MVCC and CDC hooks are
-not required for serialized DO execution, and application publication uses an
-explicit outbox rather than Turso's internal CDC tables. An event is not
-successful, and its gated WebSocket effects are not released, until the local
-transaction commits and `push()` confirms the remote sync boundary.
-
-Public Turso sync is local-first, uses last-push-wins conflict handling, and
-carries no Verglas lease generation. Therefore exactly one lease owner may open
-or push a DO database. The cloud provisions a distinct remote URL/token for
-each DO, and its sync ingress validates the current placement lease before
-forwarding a push. A takeover revokes the prior writer before the new owner
-pulls and serves events. This is a fencing/authentication wrapper around Turso,
-not a second SQL commit or storage authority. The complete Turso sidecar set is
-kept together on local NVMe; copying a local directory between DO identities is
-forbidden because it also copies the persisted sync-client identity.
+object owns one embedded local Turso `0.7.2` database under the self-hosted cell
+data root. The database is authoritative DO state. SQL `COMMIT` followed by an
+explicit WAL checkpoint is the durability fence, and cell filesystem durability
+is authoritative. Cold restart reopens the same local path. DO state has no
+clustering or replication.
 
 Reserved Turso tables implement byte KV, the single alarm, WebSocket
 attachments, event sequencing, and the optional Stream outbox. Tenant SQL uses
@@ -108,18 +97,16 @@ the same Turso transaction and supports ordinary SQLite-compatible DDL and DML.
 The host converts rows to the WIT JSON-row boundary; no alternate mutation
 format is part of the DO commit protocol.
 
-The following alternate mechanisms are removed rather than retained as
-fallback paths:
+The runtime has one storage path for DO state:
 
-- a custom SQLite pager or secondary state store;
-- an alternate SQL provider or table layer;
-- alternate transaction envelopes;
-- DO-owned vector/graph mutation domains;
-- direct DO-to-Iceberg offload and archive batching;
-- an object-store write path as the DO SQL commit authority.
+- an embedded local Turso database under the assigned cell data root;
+- SQL `COMMIT` followed by an explicit WAL checkpoint as its durability fence;
+- the cell filesystem as the authority for committed state; and
+- no clustering or replication layer.
 
-Lease fencing still protects placement and execution. It does not invent a
-second database commit protocol around Turso.
+There is no custom SQLite pager, secondary state store, alternate SQL provider,
+alternate transaction envelope, DO-owned vector/graph mutation domain, direct
+DO-to-Iceberg offload, archive batching, or object-store SQL commit path.
 
 ### Optional Stream outbox
 
@@ -129,8 +116,8 @@ committed-change publication for selected DO SQL tables. That facility uses a
 transactional outbox; it is not direct offload.
 
 For event sequence `E`, the Turso transaction writes state and deterministic
-outbox rows identified by `(object-id, E, record-index)`. After the transaction
-reaches the Turso durability boundary, `verglas-runtime` sends pending rows to the
+outbox rows identified by `(object-id, E, record-index)`. After SQL `COMMIT` and
+the explicit WAL checkpoint complete, `verglas-runtime` sends pending rows to the
 bound Stream. The Stream deduplicates those identities. Only after confirmed
 Stream ingestion does the host mark rows delivered and release event effects.
 A crash after Stream ingestion but before the delivered mark causes an
@@ -258,16 +245,17 @@ batch identities.
 
 ## Management and observability
 
-The Verglas Cloud control plane owns the public management API. This repository
-defines and runs the six-product data plane plus the strict provisioning and
-manifest contracts consumed by that control plane; it does not mount a public
-`/pipelines/v1` service.
+The self-hosted operator surface owns the public management API. This
+repository defines and runs the six-product data plane plus the strict manifest
+contracts consumed by that surface; it does not mount a public `/pipelines/v1`
+service.
 
-The Cloud API follows Cloudflare's current resource split under `/pipelines/v1`:
-list/create/get/delete Pipelines, Streams, and Sinks; PATCH is limited to Stream
-HTTP and Worker-binding settings. Stream schemas, Sink configuration, and
-Pipeline SQL are immutable. Unknown fields are hard errors. The Cloud setup
-command creates a Stream, Sink, and Pipeline and emits the Worker binding:
+The management API follows Cloudflare's current resource split under
+`/pipelines/v1`: list/create/get/delete Pipelines, Streams, and Sinks; PATCH is
+limited to Stream HTTP and Worker-binding settings. Stream schemas, Sink
+configuration, and Pipeline SQL are immutable. Unknown fields are hard errors.
+The setup command creates a Stream, Sink, and Pipeline and emits the Worker
+binding:
 
 ```toml
 [[pipelines]]
@@ -301,19 +289,22 @@ deleted, ignored, or stripped of assertions.
   executes in the stateless pool, and reaches state only through bindings.
 - **PP2 — Turso Durable Object.** A literal Cloudflare-style Durable Object
   executes KV, alarm, attachments, and CREATE/INSERT/UPDATE/DELETE/SELECT through
-  one embedded Turso event transaction. State survives process and machine-data
-  cache loss through the configured Turso durability service. No custom pager,
-  alternate SQL provider, alternate mutation format, or direct lake offloader
-  remains in the runtime dependency graph.
+  one embedded local Turso event transaction under the self-hosted cell data root.
+  SQL `COMMIT` plus an explicit WAL checkpoint fences durability, and cold restart
+  reopens the same local path. Cell filesystem durability is authoritative for
+  DO state; no clustering or replication layer, custom pager, alternate SQL
+  provider, alternate mutation format, or direct lake offloader remains in the
+  runtime dependency graph.
 - **PP3 — Stream isolation.** `send(records)` and authenticated HTTP ingestion
   durably append ordered JSON and survive restart. Two Pipelines consume the
   same Stream independently. Static dependency and behavior tests prove the
   Stream has no Sink, Iceberg, catalog, or object-offload code.
-- **PP4 — crash-safe DO publication.** Kill tests cover before Turso commit,
-  after commit before Stream send, after Stream confirmation before delivered
-  mark, and after delivered mark. Every committed selected change eventually
-  appears in the Stream exactly once; no uncommitted change appears; event
-  effects are not released while publication is pending.
+- **PP4 — crash-safe DO publication.** Kill tests cover before SQL `COMMIT`,
+  after `COMMIT` before the explicit WAL checkpoint, after the checkpoint before
+  Stream send, after Stream confirmation before the delivered mark, and after the
+  delivered mark. Every committed selected change eventually appears in the
+  Stream exactly once; no uncommitted change appears; event effects are not
+  released while publication is pending.
 - **PP5 — Pipeline.** Immutable `INSERT INTO ... SELECT ... FROM ...` SQL
   filters/transforms records, fans one Stream to multiple Sinks, flushes by
   configured rolling policy, retries failures, and resumes from its durable
@@ -331,10 +322,10 @@ deleted, ignored, or stripped of assertions.
   deployment on `verglas-runtime`. Retired execution and storage paths are
   absent, and ordinary Durable Objects have no direct Iceberg publication path.
 - **PP9 — Cloudflare-shaped management contract.** Verglas manifests and
-  provisioning inputs support the Cloud control plane's create/list/get/delete
-  API, immutable resource behavior, Stream binding generation, schema
-  validation, limits, and metrics. The public API itself lives in Verglas Cloud;
-  every deliberate extension or documentation gap is labeled.
+  self-hosted operator inputs support the create/list/get/delete API, immutable
+  resource behavior, Stream binding generation, schema validation, limits, and
+  metrics. The public API is an operator surface; every deliberate extension or
+  documentation gap is labeled.
 - **PP10 — end-to-end and regression.** JS and Python examples run Worker → DO
   → Stream → Pipeline → Iceberg Sink → Catalog after cold restart. Existing
   cache/catalog suites remain green; workspace formatting, strict clippy,

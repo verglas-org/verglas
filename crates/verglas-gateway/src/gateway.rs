@@ -303,13 +303,6 @@ impl Gateway {
         if let Some(connection) = connections.get(&key) {
             return Ok(Arc::clone(connection));
         }
-        let deployment =
-            state
-                .manifest
-                .turso_for(binding)
-                .map_err(|error| GatewayError::SpawnRejected {
-                    message: error.to_string(),
-                })?;
         let mut request = SpawnRequest::new(
             do_id,
             binding.to_owned(),
@@ -317,10 +310,6 @@ impl Gateway {
             artifact.digest().to_owned(),
             artifact.component_dir().to_path_buf(),
             state.data_root.clone(),
-        )
-        .with_turso(
-            deployment.url(binding, name),
-            deployment.token_file(binding, name),
         );
         if let Some(cache_dir) = artifact.cwasm_cache_dir() {
             request = request.with_cwasm_cache_dir(cache_dir.to_path_buf());

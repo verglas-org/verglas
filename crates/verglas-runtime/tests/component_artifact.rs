@@ -1,22 +1,18 @@
-//! Acceptance tests for verified component loading before Turso startup.
+//! Acceptance tests for verified component loading before embedded Turso startup.
 //!
-//! The process tests use an unreachable remote URL only after component
-//! validation; they never treat a local database as production success.
+//! The process tests exercise the same local database path used in production;
+//! component validation still happens before any event endpoint bind.
 
 use std::process::{Command, Stdio};
 
 use verglas_do_wasm::ComponentDigest;
 
-/// Builds a command with explicit remote Turso arguments and no legacy options.
+/// Builds a command with the production embedded Turso arguments.
 fn command(directory: &tempfile::TempDir) -> Result<Command, Box<dyn std::error::Error>> {
-    let token_file = directory.path().join("token");
-    std::fs::write(&token_file, b"test-token")?;
     let mut command = Command::new(env!("CARGO_BIN_EXE_verglas-runtime"));
     command
         .args(["--do-id", "artifact-test", "--data-dir"])
         .arg(directory.path().join("data"))
-        .args(["--turso-url", "http://127.0.0.1:1", "--turso-token-file"])
-        .arg(token_file)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -50,7 +46,7 @@ fn event_socket_requires_component_arguments() -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-/// A corrupt digest-named artifact stops a worker before remote startup.
+/// A corrupt digest-named artifact stops a worker before embedded startup.
 #[test]
 fn corrupt_component_exits_before_turso_startup() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
@@ -71,7 +67,7 @@ fn corrupt_component_exits_before_turso_startup() -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-/// A configured cache path that is not a directory fails before remote startup.
+/// A configured cache path that is not a directory fails before embedded startup.
 #[test]
 fn unusable_cwasm_cache_exits_before_turso_startup() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;

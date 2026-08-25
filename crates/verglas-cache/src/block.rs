@@ -5,8 +5,8 @@
 //! # Data-block geometry
 //!
 //! A configured data-block size is the unit of caching, admission, eviction,
-//! backend fills, and (later) peer transfer. It echoes through range-serving,
-//! the future miss-ratio-curve math, and the benchmark suite, so the rationale
+//! and backend fills. It echoes through range-serving, the future
+//! miss-ratio-curve math, and the benchmark suite, so the rationale
 //! is recorded here once:
 //!
 //! - **Fill economics.** A cold read costs at most one origin GET of the

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use verglas_backend::{BackendStore, BackendStores, StartupProbeError};
+use verglas_backend::{BackendStore, BackendStores, BucketAliasStores, StartupProbeError};
 use verglas_core::config::{Backend, Cache};
 use verglas_iceberg::SinkCompression;
 
@@ -59,7 +59,7 @@ impl From<StartupProbeError> for CatalogHostConfigError {
 pub struct CatalogOriginConfig {
     /// Immutable runtime binding identity used in every origin cache key.
     pub storage_binding_id: String,
-    /// Exact bucket that the Catalog warehouse is allowed to use.
+    /// Stable logical bucket visible to the precompiled Catalog component.
     pub bucket: String,
     /// URI scheme accepted by Iceberg locations for this route.
     pub scheme: String,
@@ -153,10 +153,16 @@ impl CatalogHostConfig {
         validate_name("origin storage binding", &self.origin.storage_binding_id)?;
         validate_name("origin bucket", &self.origin.bucket)?;
         validate_scheme(&self.origin.scheme)?;
-        if self.origin.backend.bucket.as_deref() != Some(self.origin.bucket.as_str()) {
+        if self
+            .origin
+            .backend
+            .bucket
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
             return Err(CatalogHostConfigError::Invalid(format!(
-                "backend does not serve bucket `{}`",
-                self.origin.bucket
+                "backend must serve one physical bucket for logical bucket `{}`",
+                self.origin.bucket,
             )));
         }
         if !self.origin.backend.bucket_globs.is_empty() {
@@ -201,7 +207,16 @@ impl CatalogHostConfig {
         let store =
             BackendStore::from_config(self.origin.storage_binding_id.clone(), &self.origin.backend);
         store.probe().await?;
-        let stores: Arc<dyn BackendStores> = store;
+        let physical_bucket = self.origin.backend.bucket.as_deref().ok_or_else(|| {
+            CatalogHostConfigError::Invalid("backend bucket is required".to_owned())
+        })?;
+        let backing: Arc<dyn BackendStores> = store;
+        let stores: Arc<dyn BackendStores> = Arc::new(BucketAliasStores::new(
+            backing,
+            self.origin.storage_binding_id.clone(),
+            self.origin.bucket.clone(),
+            physical_bucket,
+        ));
         let origin_config = OriginStorageConfig::new(
             self.origin.storage_binding_id.clone(),
             self.origin.bucket.clone(),
