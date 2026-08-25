@@ -22,8 +22,8 @@ Worker and Durable Object components, opens Turso state, maintains a local
 Foyer cache, accesses the configured origin, and implements a small set of
 privileged host capabilities. Infrastructure processes are not products.
 
-Verglas deliberately has no distributed storage engine. Durable state belongs
-to Turso or the configured origin. The Foyer DRAM and NVMe tiers are disposable
+Verglas deliberately has no shared durability layer. Durable state belongs to
+Turso or the configured origin. The Foyer DRAM and NVMe tiers are disposable
 performance state and can always refill from the origin. Iceberg publication is
 a narrow runtime capability invoked by Catalog; tenants do not receive raw
 network, object-store, or catalog credentials.
@@ -220,9 +220,9 @@ bindings preserve the customer's object layout. Managed bindings may use a
 Verglas-owned layout only when every read of that binding routes through the
 managed service.
 
-The cache has no peer protocol, ownership map, membership state, remote write
-buffer, or independent commit authority. Machine loss affects warmth, not
-correctness.
+The cache is local acceleration only and has no authority over durable state.
+Machine loss affects warmth, not correctness; missing entries refill from the
+configured origin.
 
 ## 7. Iceberg commit capability
 
@@ -311,11 +311,10 @@ when the corresponding executable path was not exercised.
 
 ## 11. Deliberate non-goals
 
-Verglas does not implement a general distributed database, a custom Durable
-Object SQL engine, an Arrow mutation protocol, a DataFusion transaction provider,
-a direct Durable Object lakehouse offload path, a background job Worker, a block
-device, an NBD endpoint, a standalone Catalog daemon, or a public Pipelines
-control plane.
+Verglas does not implement a custom Durable Object SQL engine, an Arrow
+mutation protocol, a DataFusion transaction provider, a direct Durable Object
+lakehouse offload path, a background job Worker, or a public Pipelines control
+plane. Catalog is a product, not a separate infrastructure daemon.
 
 Streams append. Pipelines transform and checkpoint. Sinks deliver idempotently.
 Catalog owns API and table state. Turso and the origin own durability. Foyer is
