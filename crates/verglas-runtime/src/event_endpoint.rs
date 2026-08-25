@@ -27,6 +27,7 @@ use verglas_do_wasm::{
     WorkerRuntime, WorkerSockets, WorkerStorage,
 };
 
+use crate::catalog_commit::CatalogCommitService;
 use crate::worker_storage::{BindingStreamAppender, TursoWorkerStorage};
 
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
@@ -416,15 +417,33 @@ struct DoCallRouter {
     pending: Arc<PendingDoCalls>,
     /// Endpoint writer channel serviced while dispatch is awaiting a call.
     outbound: mpsc::Sender<OutboundFrame>,
+    /// Exact privileged Catalog service declared for this component, when present.
+    catalog_commit: Option<Arc<dyn CatalogCommitService>>,
 }
 
 impl DoCallRouter {
     /// Creates a router attached to one event socket's writer channel.
-    fn new(outbound: mpsc::Sender<OutboundFrame>) -> Self {
+    fn new(
+        outbound: mpsc::Sender<OutboundFrame>,
+        catalog_commit: Option<Arc<dyn CatalogCommitService>>,
+    ) -> Self {
         Self {
             pending: Arc::new(PendingDoCalls::new()),
             outbound,
+            catalog_commit,
         }
+    }
+
+    /// Returns the path portion of a relative or absolute request URI.
+    fn request_path(uri: &str) -> &str {
+        let path = if let Some((_, authority_and_path)) = uri.split_once("://") {
+            authority_and_path
+                .find('/')
+                .map_or("/", |index| &authority_and_path[index..])
+        } else {
+            uri
+        };
+        path.split('?').next().map_or(path, |value| value)
     }
 
     /// Converts one successful result frame's optional fields into a response.
@@ -459,6 +478,17 @@ impl WorkerBindings for DoCallRouter {
         object: String,
         request: Request,
     ) -> Result<Response, HostError> {
+        if binding == "ICEBERG_COMMIT" && object == "verglas-runtime" {
+            if request.method != "POST" || Self::request_path(&request.uri) != "/catalog/commit" {
+                return Err(HostError::backend(
+                    "reserved ICEBERG_COMMIT request has the wrong method or path",
+                ));
+            }
+            let service = self.catalog_commit.as_ref().ok_or_else(|| {
+                HostError::backend("ICEBERG_COMMIT was not declared for this component")
+            })?;
+            return service.commit(request).await;
+        }
         let (id, permit, receiver) = self.pending.register().await?;
         let frame = OutboundFrame::DoCall {
             id,
@@ -643,6 +673,8 @@ pub struct EventEndpoint {
     sink: Arc<GatewaySocketSink>,
     /// Committed alarm deadline currently armed.
     alarm_deadline: Option<u64>,
+    /// Optional exact runtime-owned Catalog commit capability.
+    catalog_commit: Option<Arc<dyn CatalogCommitService>>,
 }
 
 impl EventEndpoint {
@@ -651,6 +683,26 @@ impl EventEndpoint {
         path: impl AsRef<Path>,
         store: Arc<TursoStore>,
         dispatcher: Arc<dyn EventDispatcher>,
+    ) -> Result<Self, EventEndpointError> {
+        Self::bind_inner(path, store, dispatcher, None).await
+    }
+
+    /// Binds an endpoint with the exact declared Catalog commit capability.
+    pub async fn bind_with_catalog_commit_service(
+        path: impl AsRef<Path>,
+        store: Arc<TursoStore>,
+        dispatcher: Arc<dyn EventDispatcher>,
+        catalog_commit: Arc<dyn CatalogCommitService>,
+    ) -> Result<Self, EventEndpointError> {
+        Self::bind_inner(path, store, dispatcher, Some(catalog_commit)).await
+    }
+
+    /// Performs common listener and event-gate construction.
+    async fn bind_inner(
+        path: impl AsRef<Path>,
+        store: Arc<TursoStore>,
+        dispatcher: Arc<dyn EventDispatcher>,
+        catalog_commit: Option<Arc<dyn CatalogCommitService>>,
     ) -> Result<Self, EventEndpointError> {
         let path = path.as_ref().to_path_buf();
         if let Some(parent) = path.parent() {
@@ -672,6 +724,7 @@ impl EventEndpoint {
             gate,
             sink,
             alarm_deadline: None,
+            catalog_commit,
         })
     }
 
@@ -748,7 +801,10 @@ impl EventEndpoint {
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         let (outbound_sender, mut outbound_receiver) = mpsc::channel(32);
-        let router = Arc::new(DoCallRouter::new(outbound_sender));
+        let router = Arc::new(DoCallRouter::new(
+            outbound_sender,
+            self.catalog_commit.clone(),
+        ));
         self.store
             .set_runtime_stream_appender(Arc::new(BindingStreamAppender::new(router.clone())))
             .await;

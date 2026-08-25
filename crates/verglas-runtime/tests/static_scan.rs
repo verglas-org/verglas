@@ -81,6 +81,19 @@ fn workspace_has_one_non_clustered_runtime_surface() -> Result<(), Box<dyn std::
         !root.join("bins/cache-node").exists(),
         "retired cache-node source still exists"
     );
+    assert!(
+        !root.join("crates/verglas-s3/src/semantic.rs").exists(),
+        "retired graph/vector semantic route still exists"
+    );
+    for retired_core_module in ["node.rs", "peer.rs", "ring.rs"] {
+        assert!(
+            !root
+                .join("crates/verglas-core/src")
+                .join(retired_core_module)
+                .exists(),
+            "retired clustered core module {retired_core_module} still exists"
+        );
+    }
 
     for retired_crate in [
         "verglas-block",
@@ -88,6 +101,18 @@ fn workspace_has_one_non_clustered_runtime_surface() -> Result<(), Box<dyn std::
         "verglas-consensus",
         "verglas-safekeeper",
         "verglas-writeback",
+        "verglas-api",
+        "verglas-graph",
+        "verglas-vector",
+        "verglas-catalog",
+        "verglas-catalog-storage",
+        "verglas-tables",
+        "verglas-kv",
+        "verglas-instance",
+        "verglas-catalog-authz",
+        "verglas-catalog-core",
+        "verglas-catalog-io",
+        "verglas-iceberg-ext",
     ] {
         assert!(
             !root
@@ -108,6 +133,14 @@ fn workspace_has_one_non_clustered_runtime_surface() -> Result<(), Box<dyn std::
         "verglas-consensus",
         "verglas-safekeeper",
         "verglas-writeback",
+        "verglas-api",
+        "verglas-graph",
+        "verglas-vector",
+        "verglas-catalog-authz",
+        "verglas-catalog-core",
+        "verglas-catalog-io",
+        "verglas-iceberg-ext",
+        "iceberg-datafusion",
         "openraft",
     ] {
         assert!(
@@ -117,6 +150,45 @@ fn workspace_has_one_non_clustered_runtime_surface() -> Result<(), Box<dyn std::
         assert!(
             !runtime_manifest.contains(forbidden),
             "runtime manifest contains {forbidden}"
+        );
+    }
+    Ok(())
+}
+
+/// The Catalog capability writes immutable proposals and never owns a catalog head.
+#[test]
+fn catalog_capability_has_no_second_catalog_authority() -> Result<(), Box<dyn std::error::Error>> {
+    let source =
+        fs::read_to_string(workspace_root().join("crates/verglas-runtime/src/catalog_commit.rs"))?;
+    for forbidden in [
+        "Arc<dyn Catalog>",
+        "TableCache",
+        "commit_sink_batch",
+        "open_catalog",
+    ] {
+        assert!(
+            !source.contains(forbidden),
+            "runtime Catalog capability retained second authority surface {forbidden}"
+        );
+    }
+    Ok(())
+}
+
+/// The architecture source of truth contains no retired clustered runtime design.
+#[test]
+fn whitepaper_has_no_clustered_runtime_architecture() -> Result<(), Box<dyn std::error::Error>> {
+    let whitepaper = fs::read_to_string(workspace_root().join("docs/architecture/whitepaper.mdx"))?;
+    for forbidden in [
+        "Multi-Raft",
+        "ReadIndex",
+        "coded Raft",
+        "safekeeper",
+        "write-back fragment",
+        "authoritative ring",
+    ] {
+        assert!(
+            !whitepaper.contains(forbidden),
+            "whitepaper retains retired {forbidden} architecture"
         );
     }
     Ok(())

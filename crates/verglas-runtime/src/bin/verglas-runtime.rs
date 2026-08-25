@@ -14,7 +14,7 @@ use verglas_do_turso::TursoStore;
 use verglas_do_wasm::{
     ArtifactStore, ComponentDigest, CwasmCache, DirArtifactStore, WorkerRuntime,
 };
-use verglas_runtime::EventEndpoint;
+use verglas_runtime::{CatalogHostConfig, EventEndpoint};
 
 /// Command-line configuration for one resident Durable Object process.
 struct Config {
@@ -34,6 +34,8 @@ struct Config {
     cwasm_cache_dir: Option<PathBuf>,
     /// Private NDJSON event socket path.
     event_socket: Option<PathBuf>,
+    /// Optional strict operator configuration for the Catalog host capability.
+    catalog_host_config: Option<PathBuf>,
 }
 
 impl Config {
@@ -48,6 +50,7 @@ impl Config {
         let mut component_dir = None;
         let mut cwasm_cache_dir = None;
         let mut event_socket = None;
+        let mut catalog_host_config = None;
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "--do-id" => do_id = Some(next_value(&mut arguments, "--do-id")?),
@@ -82,6 +85,12 @@ impl Config {
                     event_socket =
                         Some(PathBuf::from(next_value(&mut arguments, "--event-socket")?));
                 }
+                "--catalog-host-config" => {
+                    catalog_host_config = Some(PathBuf::from(next_value(
+                        &mut arguments,
+                        "--catalog-host-config",
+                    )?));
+                }
                 unknown => return Err(format!("unknown argument `{unknown}`")),
             }
         }
@@ -101,6 +110,11 @@ impl Config {
         if event_socket.is_some() && component_digest.is_none() {
             return Err("--event-socket requires a verified component".to_owned());
         }
+        if catalog_host_config.is_some() && event_socket.is_none() {
+            return Err(
+                "--catalog-host-config requires a verified component event socket".to_owned(),
+            );
+        }
         Ok(Self {
             do_id,
             data_dir,
@@ -110,6 +124,7 @@ impl Config {
             component_dir,
             cwasm_cache_dir,
             event_socket,
+            catalog_host_config,
         })
     }
 }
@@ -118,6 +133,14 @@ impl Config {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let config = Config::parse().map_err(|error| format!("{error}\n{}", usage()))?;
+    let catalog_commit = match config.catalog_host_config.as_ref() {
+        Some(path) => Some(
+            CatalogHostConfig::load(path)?
+                .build_catalog_commit_service()
+                .await?,
+        ),
+        None => None,
+    };
     let token = tokio::fs::read_to_string(&config.turso_token_file).await?;
     let token = token.trim().to_owned();
     if token.is_empty() {
@@ -136,7 +159,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match config.event_socket {
         Some(event_socket) => {
             let runtime = runtime.ok_or("--event-socket requires a verified component")?;
-            let mut endpoint = EventEndpoint::bind(event_socket, store, runtime).await?;
+            let mut endpoint = match catalog_commit {
+                Some(service) => {
+                    EventEndpoint::bind_with_catalog_commit_service(
+                        event_socket,
+                        store,
+                        runtime,
+                        service,
+                    )
+                    .await?
+                }
+                None => EventEndpoint::bind(event_socket, store, runtime).await?,
+            };
             tokio::select! {
                 result = endpoint.run() => result?,
                 signal = tokio::signal::ctrl_c() => signal?,
@@ -189,5 +223,5 @@ fn required_text(value: Option<String>, option: &str) -> Result<String, String> 
 
 /// Describes the accepted runtime argument surface.
 fn usage() -> &'static str {
-    "usage: verglas-runtime --do-id ID --data-dir PATH --turso-url URL --turso-token-file PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH]"
+    "usage: verglas-runtime --do-id ID --data-dir PATH --turso-url URL --turso-token-file PATH [--component-digest HEX --component-dir PATH [--cwasm-cache-dir PATH] --event-socket PATH] [--catalog-host-config PATH]"
 }

@@ -13,16 +13,31 @@ test-support = ["verglas-do-turso/test-support"]
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+futures.workspace = true
+hex.workspace = true
+iceberg.workspace = true
+parquet.workspace = true
+typetag.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
+verglas-backend.workspace = true
+verglas-cache.workspace = true
 verglas-celld.workspace = true
+verglas-core.workspace = true
 verglas-do-turso.workspace = true
 verglas-do-wasm.workspace = true
+verglas-iceberg.workspace = true
+verglas-s3.workspace = true
 wasmtime.workspace = true
 tokio = { workspace = true, features = ["process", "sync", "net", "io-util", "fs", "time", "signal", "macros", "rt-multi-thread"] }
 
 [dev-dependencies]
+object_store.workspace = true
 tempfile.workspace = true
 wat.workspace = true
 
