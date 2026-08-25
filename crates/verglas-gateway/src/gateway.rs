@@ -86,6 +86,13 @@ struct GatewayState {
     connections: Mutex<HashMap<DoKey, Arc<DoConnection>>>,
     pending_websockets: Mutex<HashMap<u64, Arc<DoConnection>>>,
     next_websocket: AtomicU64,
+    activity: Option<ActivityReporter>,
+    ingress_token: Option<String>,
+}
+
+#[derive(Clone)]
+struct ActivityReporter {
+    events: tokio::sync::mpsc::Sender<()>,
 }
 
 /// The manifest binding and object name that identify one resident actor.
@@ -186,6 +193,8 @@ impl Gateway {
                 connections: Mutex::new(HashMap::new()),
                 pending_websockets: Mutex::new(HashMap::new()),
                 next_websocket: AtomicU64::new(1),
+                activity: activity_reporter_from_env(),
+                ingress_token: std::env::var("VERGLAS_INGRESS_TOKEN").ok(),
             }),
         }
     }
@@ -342,6 +351,50 @@ impl Gateway {
     }
 }
 
+fn activity_reporter_from_env() -> Option<ActivityReporter> {
+    let url = std::env::var("VERGLAS_ACTIVITY_URL").ok()?;
+    let token = std::env::var("VERGLAS_ACTIVITY_TOKEN").ok()?;
+    let tenant = std::env::var("VERGLAS_TENANT_ID").ok()?;
+    let worker = std::env::var("VERGLAS_WORKER_NAME").ok()?;
+    let (events, mut receiver) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        while receiver.recv().await.is_some() {
+            let _ = client
+                .post(&url)
+                .header("x-verglas-cloud-internal", &token)
+                .json(&serde_json::json!({
+                    "tenant_id": tenant,
+                    "worker_name": worker,
+                }))
+                .send()
+                .await;
+        }
+    });
+    Some(ActivityReporter { events })
+}
+
+fn report_activity(state: &GatewayState) {
+    let Some(activity) = &state.activity else {
+        return;
+    };
+    let _ = activity.events.try_send(());
+}
+
+fn require_ingress(state: &GatewayState, headers: &HeaderMap) -> Result<(), GatewayError> {
+    let Some(expected) = state.ingress_token.as_deref() else {
+        return Ok(());
+    };
+    let presented = headers
+        .get("x-verglas-worker-ingress")
+        .and_then(|value| value.to_str().ok());
+    if presented == Some(expected) {
+        Ok(())
+    } else {
+        Err(GatewayError::UnauthorizedIngress)
+    }
+}
+
 /// Routes Worker and DO binding calls into resident event actors.
 struct GatewayDoRouter {
     state: Arc<GatewayState>,
@@ -356,6 +409,23 @@ impl GatewayDoRouter {
         object: String,
         event: FetchEvent,
     ) -> Result<FetchResponse, GatewayError> {
+        if let Some(origin) = self
+            .state
+            .manifest
+            .origin_for_binding(&binding, &object)
+            .map_err(|error| GatewayError::SpawnRejected {
+                message: error.to_string(),
+            })?
+        {
+            return remote_fetch(
+                origin,
+                &binding,
+                &object,
+                event,
+                self.state.ingress_token.as_deref(),
+            )
+            .await;
+        }
         if let Some(source) = &self.source
             && source.binding == binding
             && source.name == object
@@ -390,6 +460,101 @@ impl GatewayDoRouter {
         }
         Ok(response)
     }
+}
+
+/// Proxies the flattened DO fetch contract to a Worker in another microVM.
+async fn remote_fetch(
+    origin: &str,
+    binding: &str,
+    object: &str,
+    event: FetchEvent,
+    ingress_token: Option<&str>,
+) -> Result<FetchResponse, GatewayError> {
+    if event.ws.is_some() {
+        return Err(GatewayError::RemoteWorker {
+            message: "cross-microVM WebSocket bindings are not supported".to_owned(),
+        });
+    }
+    let request_uri = event
+        .url
+        .parse::<Uri>()
+        .map_err(|error| GatewayError::InvalidHttp {
+            message: format!("remote binding request URI is invalid: {error}"),
+        })?;
+    let suffix = request_uri
+        .path_and_query()
+        .map_or("/", |value| value.as_str());
+    let target = format!(
+        "{origin}/do/{}/{}{suffix}",
+        percent_encode_segment(binding),
+        percent_encode_segment(object),
+    );
+    let method = reqwest::Method::from_bytes(event.method.as_bytes()).map_err(|error| {
+        GatewayError::InvalidHttp {
+            message: format!("remote binding method is invalid: {error}"),
+        }
+    })?;
+    let client = reqwest::Client::new();
+    let mut request = client.request(method, target).body(event.body);
+    if let Some(token) = ingress_token {
+        request = request.header("x-verglas-worker-ingress", token);
+    }
+    for (name, value) in event.headers {
+        if matches!(
+            name.to_ascii_lowercase().as_str(),
+            "host" | "connection" | "content-length" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        request = request.header(&name, &value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|error| GatewayError::RemoteWorker {
+            message: error.to_string(),
+        })?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            Ok((
+                name.as_str().to_owned(),
+                value
+                    .to_str()
+                    .map_err(|error| GatewayError::InvalidHttp {
+                        message: format!("remote response header is invalid: {error}"),
+                    })?
+                    .to_owned(),
+            ))
+        })
+        .collect::<Result<Vec<_>, GatewayError>>()?;
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| GatewayError::RemoteWorker {
+            message: error.to_string(),
+        })?
+        .to_vec();
+    Ok(FetchResponse {
+        status,
+        headers,
+        body,
+        accept_ws: None,
+    })
+}
+
+fn percent_encode_segment(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 #[async_trait]
@@ -473,6 +638,8 @@ async fn public_handler(
     State(state): State<Arc<GatewayState>>,
     request: Request,
 ) -> Result<Response, GatewayError> {
+    require_ingress(&state, request.headers())?;
+    report_activity(&state);
     let (mut parts, body) = request.into_parts();
     let ws_upgrade = if is_websocket_upgrade(&parts.headers) {
         Some(
@@ -594,6 +761,8 @@ async fn forward_http(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, GatewayError> {
+    require_ingress(&state, &headers)?;
+    report_activity(&state);
     let request_headers = request_headers(&headers)?;
     let prefix = format!("/do/{binding}/{name}");
     let suffix = uri

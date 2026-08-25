@@ -290,6 +290,42 @@ fn runtime_commit_service_is_a_narrow_host_capability() {
     assert!(Manifest::parse(&broad).is_err());
 }
 
+#[test]
+fn bindings_can_target_remote_worker_microvms() {
+    let source = composition_manifest_source()
+        .replace(
+            r#"{"name":"COUNTER","class_name":"Counter"}"#,
+            r#"{"name":"COUNTER","class_name":"Counter","origin":"http://counter.internal:8787"}"#,
+        )
+        .replace(
+            r#"{"binding":"STREAM","stream":"stream-1"}"#,
+            r#"{"binding":"STREAM","stream":"stream-1","origin":"http://stream.internal:8787"}"#,
+        )
+        .replace(
+            r#"{"binding":"PIPELINE","service":"pipeline","object":"pipeline-1"}"#,
+            r#"{"binding":"PIPELINE","service":"pipeline","object":"pipeline-1","origin":"http://pipeline.internal:8787"}"#,
+        );
+    let manifest = Manifest::parse(&source).expect("remote Worker manifest");
+    assert_eq!(
+        manifest
+            .origin_for_binding("COUNTER", "global")
+            .expect("DO binding"),
+        Some("http://counter.internal:8787"),
+    );
+    assert_eq!(
+        manifest
+            .origin_for_binding("STREAM", "stream-1")
+            .expect("Stream binding"),
+        Some("http://stream.internal:8787"),
+    );
+    assert_eq!(
+        manifest
+            .origin_for_binding("PIPELINE", "pipeline-1")
+            .expect("service binding"),
+        Some("http://pipeline.internal:8787"),
+    );
+}
+
 /// The gateway carries the exact runtime capability declaration into one spawn request.
 #[tokio::test]
 async fn gateway_forwards_exact_host_service_to_spawn_request()

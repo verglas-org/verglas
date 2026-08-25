@@ -15,6 +15,7 @@ use thiserror::Error;
 pub struct Binding {
     name: String,
     class_name: String,
+    origin: Option<String>,
 }
 
 impl Binding {
@@ -27,6 +28,11 @@ impl Binding {
     pub fn class_name(&self) -> &str {
         &self.class_name
     }
+
+    /// Returns the remote Worker origin when this namespace lives in another microVM.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
 }
 
 /// One Wrangler `pipelines` binding targeting the prebuilt Stream deployment.
@@ -34,6 +40,7 @@ impl Binding {
 pub struct PipelineBinding {
     binding: String,
     stream: String,
+    origin: Option<String>,
 }
 
 impl PipelineBinding {
@@ -45,6 +52,11 @@ impl PipelineBinding {
     /// Returns the Stream object identity used by `PipelineBinding.send`.
     pub fn stream(&self) -> &str {
         &self.stream
+    }
+
+    /// Returns the remote Stream Worker origin, if split from this Worker.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 }
 
@@ -110,6 +122,7 @@ pub struct SystemBinding {
     binding: String,
     product: ArtifactProduct,
     object: String,
+    origin: Option<String>,
 }
 
 impl SystemBinding {
@@ -131,6 +144,11 @@ impl SystemBinding {
     /// Returns the named product object identity.
     pub fn object(&self) -> &str {
         &self.object
+    }
+
+    /// Returns the remote system Worker origin, if split from this Worker.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
     }
 }
 
@@ -292,6 +310,40 @@ impl Manifest {
             .map(|target| target.product)
     }
 
+    /// Resolves a remote Worker origin after enforcing the binding/object identity.
+    pub fn origin_for_binding(
+        &self,
+        binding: &str,
+        object: &str,
+    ) -> Result<Option<&str>, ManifestError> {
+        if let Some(item) = self.bindings.iter().find(|item| item.name == binding) {
+            return Ok(item.origin());
+        }
+        if let Some(item) = self.pipelines.iter().find(|item| item.binding == binding) {
+            if item.stream != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: item.stream.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(item.origin());
+        }
+        if let Some(item) = self.services.iter().find(|item| item.binding == binding) {
+            if item.object != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: item.object.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(item.origin());
+        }
+        Err(ManifestError::UnknownBinding {
+            binding: binding.to_owned(),
+        })
+    }
+
     /// Resolves the immutable artifact selected by one binding and object identity.
     pub fn artifact_for_binding(
         &self,
@@ -428,7 +480,7 @@ impl Manifest {
             .transpose()?
             .unwrap_or_default();
         let artifacts = required_object(&mut object, "artifacts").and_then(parse_artifacts)?;
-        require_artifacts(&artifacts, !bindings.is_empty(), &pipelines, &services)?;
+        require_artifacts(&artifacts, &bindings, &pipelines, &services)?;
         let data_root = PathBuf::from(required_string(&mut object, "data_root")?);
         Ok(Self {
             name,
@@ -567,6 +619,12 @@ pub enum ManifestError {
         /// Field whose value was empty.
         field: &'static str,
     },
+    /// A remote binding origin was not an absolute HTTP(S) origin.
+    #[error("remote Worker origin must start with http:// or https://: {value}")]
+    InvalidRemoteOrigin {
+        /// Rejected origin text.
+        value: String,
+    },
     /// An artifact identity was not exactly 32 bytes of hexadecimal text.
     #[error("artifact digest must be exactly 64 hexadecimal characters: {value}")]
     InvalidComponentDigest {
@@ -702,7 +760,9 @@ fn parse_pipelines(value: Value) -> Result<Vec<PipelineBinding>, ManifestError> 
                 expected: "object",
             });
         };
-        let allowed = ["binding", "stream"].into_iter().collect::<HashSet<_>>();
+        let allowed = ["binding", "stream", "origin"]
+            .into_iter()
+            .collect::<HashSet<_>>();
         if let Some(key) = object
             .keys()
             .find(|key| !allowed.contains(key.as_str()))
@@ -712,10 +772,15 @@ fn parse_pipelines(value: Value) -> Result<Vec<PipelineBinding>, ManifestError> 
         }
         let binding = required_string(&mut object, "binding")?;
         let stream = required_string(&mut object, "stream")?;
+        let origin = optional_origin(&mut object)?;
         if !names.insert(binding.clone()) {
             return Err(ManifestError::DuplicatePipelineBinding { name: binding });
         }
-        pipelines.push(PipelineBinding { binding, stream });
+        pipelines.push(PipelineBinding {
+            binding,
+            stream,
+            origin,
+        });
     }
     Ok(pipelines)
 }
@@ -740,7 +805,7 @@ fn parse_services(
                 expected: "object",
             });
         };
-        let allowed = ["binding", "service", "object"]
+        let allowed = ["binding", "service", "object", "origin"]
             .into_iter()
             .collect::<HashSet<_>>();
         if let Some(key) = object
@@ -752,11 +817,15 @@ fn parse_services(
         }
         let binding = required_string(&mut object, "binding")?;
         let service = required_string(&mut object, "service")?;
+        let origin = optional_origin(&mut object)?;
         if !names.insert(binding.clone()) {
             return Err(ManifestError::DuplicateServiceBinding { name: binding });
         }
         if service == "verglas-runtime" {
             if binding != "ICEBERG_COMMIT" || object.contains_key("object") {
+                return Err(ManifestError::UnknownServiceProduct { product: service });
+            }
+            if origin.is_some() {
                 return Err(ManifestError::UnknownServiceProduct { product: service });
             }
             host_services.push(HostServiceBinding { binding, service });
@@ -773,6 +842,7 @@ fn parse_services(
             binding,
             product,
             object,
+            origin,
         });
     }
     Ok((services, host_services))
@@ -889,7 +959,7 @@ fn parse_artifact_descriptor(value: Value) -> Result<ArtifactDescriptor, Manifes
 /// Requires the Worker and every artifact selected by a declared binding.
 fn require_artifacts(
     artifacts: &BTreeMap<ArtifactProduct, ArtifactDescriptor>,
-    has_durable_objects: bool,
+    bindings: &[Binding],
     pipelines: &[PipelineBinding],
     services: &[SystemBinding],
 ) -> Result<(), ManifestError> {
@@ -898,17 +968,21 @@ fn require_artifacts(
             product: ArtifactProduct::Worker.manifest_key(),
         });
     }
-    if has_durable_objects && !artifacts.contains_key(&ArtifactProduct::DurableObject) {
+    if bindings.iter().any(|binding| binding.origin.is_none())
+        && !artifacts.contains_key(&ArtifactProduct::DurableObject)
+    {
         return Err(ManifestError::MissingArtifact {
             product: ArtifactProduct::DurableObject.manifest_key(),
         });
     }
-    if !pipelines.is_empty() && !artifacts.contains_key(&ArtifactProduct::Stream) {
+    if pipelines.iter().any(|pipeline| pipeline.origin.is_none())
+        && !artifacts.contains_key(&ArtifactProduct::Stream)
+    {
         return Err(ManifestError::MissingArtifact {
             product: ArtifactProduct::Stream.manifest_key(),
         });
     }
-    for service in services {
+    for service in services.iter().filter(|service| service.origin.is_none()) {
         if !artifacts.contains_key(&service.product) {
             return Err(ManifestError::MissingArtifact {
                 product: service.product.manifest_key(),
@@ -997,14 +1071,34 @@ fn parse_binding(value: Value) -> Result<Binding, ManifestError> {
     };
     if let Some(key) = object
         .keys()
-        .find(|key| key.as_str() != "name" && key.as_str() != "class_name")
+        .find(|key| !["name", "class_name", "origin"].contains(&key.as_str()))
         .cloned()
     {
         return Err(ManifestError::UnknownBindingKey { key });
     }
     let name = required_string(&mut object, "name")?;
     let class_name = required_string(&mut object, "class_name")?;
-    Ok(Binding { name, class_name })
+    let origin = optional_origin(&mut object)?;
+    Ok(Binding {
+        name,
+        class_name,
+        origin,
+    })
+}
+
+fn optional_origin(object: &mut Map<String, Value>) -> Result<Option<String>, ManifestError> {
+    let origin = object
+        .remove("origin")
+        .map(|value| parse_nonempty_string(value, "origin"))
+        .transpose()?;
+    if let Some(value) = &origin
+        && !(value.starts_with("http://") || value.starts_with("https://"))
+    {
+        return Err(ManifestError::InvalidRemoteOrigin {
+            value: value.clone(),
+        });
+    }
+    Ok(origin.map(|value| value.trim_end_matches('/').to_owned()))
 }
 
 /// Validates a SHA-256 component identity without a runtime dependency.

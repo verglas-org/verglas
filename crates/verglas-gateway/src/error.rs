@@ -98,6 +98,15 @@ pub enum GatewayError {
         /// Pool error detail.
         message: String,
     },
+    /// A binding target in another Worker microVM could not be reached.
+    #[error("remote Worker request failed: {message}")]
+    RemoteWorker {
+        /// Transport or response conversion detail.
+        message: String,
+    },
+    /// Direct Fly ingress did not carry the control-plane mesh credential.
+    #[error("unauthorized Worker ingress")]
+    UnauthorizedIngress,
 }
 
 impl GatewayError {
@@ -133,6 +142,8 @@ impl GatewayError {
             Self::SelfCallDeadlock { .. } => "self-call-deadlock",
             Self::WorkerUnavailable { .. } => "worker-unavailable",
             Self::WorkerPool { .. } => "worker-pool",
+            Self::RemoteWorker { .. } => "remote-worker",
+            Self::UnauthorizedIngress => "unauthorized-ingress",
         }
     }
 }
@@ -143,6 +154,7 @@ impl IntoResponse for GatewayError {
         let status = match &self {
             Self::UnknownBinding { .. } | Self::UnknownObject { .. } => StatusCode::NOT_FOUND,
             Self::InvalidHttp { .. } => StatusCode::BAD_REQUEST,
+            Self::UnauthorizedIngress => StatusCode::UNAUTHORIZED,
             Self::WorkerError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ControlIo { .. }
             | Self::SpawnRejected { .. }
@@ -153,6 +165,7 @@ impl IntoResponse for GatewayError {
             | Self::SelfCallDeadlock { .. }
             | Self::WorkerUnavailable { .. }
             | Self::WorkerPool { .. } => StatusCode::BAD_GATEWAY,
+            Self::RemoteWorker { .. } => StatusCode::BAD_GATEWAY,
         };
         (status, self.to_string()).into_response()
     }
