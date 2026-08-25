@@ -51,6 +51,27 @@ Pipeline owns its Stream cursor. A Sink owns delivery idempotency. A Catalog
 owns catalog state and the Iceberg REST boundary. Resources compose through
 ordinary bindings and stub calls.
 
+## Runtime host
+
+`verglas-runtime` is the only serving runtime. It executes Worker and Durable
+Object components through Wasmtime under celld/Firecracker isolation, owns
+Turso adapters, and uses Foyer memory and disk tiers to cache origin-backed
+bytes and compiled/runtime data. Foyer is a performance cache, never a commit
+authority.
+
+The runtime is not a storage cluster. It has no Raft, consensus groups, rings,
+quorums, peer replication, membership protocol, safekeeper, distributed WAL,
+erasure-coded write-back, block-device service, or NBD endpoint. Machine-loss
+durability comes from Turso for Durable Objects and from each product's named
+external destination. Origin writes complete at the origin before success.
+
+Tenant components receive no raw network, object-store, or filesystem access.
+Narrow host capabilities perform privileged operations such as the Iceberg
+Catalog commit after validating the caller's declared binding and object
+identity. These are in-process host calls, not hidden services or a seventh
+product. The retired `verglas-cache-node` package, binary, configuration, and
+operational surface do not remain as aliases.
+
 ## 1. Worker
 
 A Worker is the general primitive and public entrypoint. It is stateless,
@@ -308,11 +329,13 @@ deleted, ignored, or stripped of assertions.
 - **PP7 — Catalog product.** Iceberg REST create/load/commit runs through the
   Catalog Worker and named Catalog DO, and the Iceberg Sink uses the same
   binding rather than a private catalog path.
-- **PP8 — six-product closure.** Deployment and architecture inventories expose
-  exactly Worker, Durable Object, Stream, Pipeline, Sink, and Catalog. Every
-  system resource is implemented as a prebuilt Worker/DO deployment. No job
-  Worker, direct DO public route, standalone queue engine, custom DO database,
-  or direct DO-to-Iceberg path remains.
+- **PP8 — six-product and runtime closure.** Deployment and architecture
+  inventories expose exactly Worker, Durable Object, Stream, Pipeline, Sink,
+  and Catalog. Every system resource is implemented as a prebuilt Worker/DO
+  deployment on `verglas-runtime`. No job Worker, direct DO public route,
+  standalone queue engine, custom DO database, clustered cache-node, Raft/ring/
+  peer plane, distributed write-back, block/NBD service, or direct
+  DO-to-Iceberg path remains.
 - **PP9 — Cloudflare-shaped management contract.** Verglas manifests and
   provisioning inputs support the Cloud control plane's create/list/get/delete
   API, immutable resource behavior, Stream binding generation, schema
