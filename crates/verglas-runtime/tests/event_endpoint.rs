@@ -470,6 +470,69 @@ async fn publication_before_commit_has_no_append_or_effect() -> Result<(), Box<d
     Ok(())
 }
 
+/// A live endpoint injects the real binding appender and releases effects only after its ACK.
+#[tokio::test]
+async fn runtime_appender_routes_stream_ack_before_effects() -> Result<(), Box<dyn Error>> {
+    let directory = tempfile::tempdir()?;
+    let (_store, task) = start_endpoint(&directory).await?;
+    let (mut writer, mut reader) = connect(&directory).await?;
+    send_frame(&mut writer, json!({ "type": "ws-open", "ws": 7 })).await?;
+    writer
+        .write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "type": "fetch", "id": 33, "method": "POST", "url": "/publish",
+                    "headers": [], "body_b64": ""
+                })
+            )
+            .as_bytes(),
+        )
+        .await?;
+
+    let append = read_json(&mut reader).await?;
+    assert_eq!(append["type"], "do-call");
+    assert_eq!(append["binding"], "STREAM");
+    assert_eq!(append["object"], "stream-id");
+    assert_eq!(append["method"], "POST");
+    assert_eq!(append["url"], "https://verglas.internal/stream/append");
+    assert_eq!(append["body_b64"], "W3sidmFsdWUiOjF9XQ==");
+    let headers = append["headers"]
+        .as_array()
+        .ok_or("append headers were not an array")?;
+    let identity = headers.iter().find_map(|header| {
+        let values = header.as_array()?;
+        if values.first()?.as_str()? == "x-verglas-producer-event-id" {
+            values.get(1)?.as_str().map(str::to_owned)
+        } else {
+            None
+        }
+    });
+    assert_eq!(identity.as_deref(), Some("[\"endpoint-test:2:0\"]"));
+
+    let withheld = tokio::time::timeout(Duration::from_millis(25), read_json(&mut reader)).await;
+    assert!(withheld.is_err(), "effects escaped before the Stream ACK");
+    writer
+        .write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "type": "do-call-result", "id": append["id"], "status": 202,
+                    "headers": [], "body_b64": ""
+                })
+            )
+            .as_bytes(),
+        )
+        .await?;
+    let effect = read_json(&mut reader).await?;
+    assert_eq!(effect["type"], "ws-send");
+    let result = read_json(&mut reader).await?;
+    assert_eq!(result["type"], "fetch-result");
+    assert_eq!(result["id"], 33);
+    task.abort();
+    Ok(())
+}
+
 /// A failed Stream acknowledgement keeps effects gated and blocks the next event.
 #[tokio::test]
 async fn publication_ack_failure_blocks_effects_and_next_event() -> Result<(), Box<dyn Error>> {

@@ -168,6 +168,27 @@ async fn source_commit_before_stream_send_replays_on_activation()
     Ok(())
 }
 
+/// Beginning the next source event drains a committed outbox before opening it.
+#[tokio::test]
+async fn begin_event_drains_outbox_before_next_source_event() -> Result<(), verglas_do_turso::Error>
+{
+    let root = tempfile::tempdir()?;
+    let store = store(&root).await?;
+    let event = store.begin_event().await?;
+    event
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
+        .await?;
+    event.commit_and_push().await?;
+
+    let appender = RecordingAppender::default();
+    store.set_stream_appender(Arc::new(appender.clone())).await;
+    let next = store.begin_event().await?;
+    assert_eq!(appender.batches.lock().await.len(), 1);
+    next.rollback().await?;
+    assert!(store.pending_outbox(10).await?.is_empty());
+    Ok(())
+}
+
 /// A committed outbox row survives before-send and replays after an expired claim.
 #[tokio::test]
 async fn outbox_crash_windows_are_replayable() -> Result<(), verglas_do_turso::Error> {
@@ -219,6 +240,31 @@ async fn ack_before_delivered_mark_replays_the_same_identity() -> Result<(), ver
     let batches = appender.batches.lock().await;
     assert_eq!(batches.len(), 2);
     assert_eq!(batches[0][0].event_id(), batches[1][0].event_id());
+    Ok(())
+}
+
+/// A delivered row stays suppressed when the source store reopens after the mark.
+#[tokio::test]
+async fn delivered_mark_survives_recovery_without_resend() -> Result<(), verglas_do_turso::Error> {
+    let root = tempfile::tempdir()?;
+    let path = root.path().join("worker.db");
+    let store = TursoStore::open_for_test(&path, "worker-test").await?;
+    let appender = RecordingAppender::default();
+    store.set_stream_appender(Arc::new(appender.clone())).await;
+    let event = store.begin_event().await?;
+    event
+        .append_stream_records("STREAM", "stream-id", vec![json!({ "value": 1 })])
+        .await?;
+    event.commit_and_push().await?;
+    store.drain_outbox().await?;
+    assert_eq!(appender.batches.lock().await.len(), 1);
+    drop(store);
+
+    let reopened = TursoStore::open_for_test(&path, "worker-test").await?;
+    let replay = RecordingAppender::default();
+    reopened.set_stream_appender(Arc::new(replay.clone())).await;
+    reopened.drain_outbox().await?;
+    assert!(replay.batches.lock().await.is_empty());
     Ok(())
 }
 
