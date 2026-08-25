@@ -18,7 +18,7 @@ const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789
 
 fn manifest_source() -> String {
     format!(
-        r#"{{"name":"counter","main":"src/index.ts","durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},"component_digest":"{DIGEST}","component_dir":"components","data_root":"state","turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}}}"#
+        r#"{{"name":"counter","main":"src/index.ts","durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},"artifacts":{{"worker":{{"digest":"{DIGEST}","component_dir":"components"}},"durable_object":{{"digest":"{DIGEST}","component_dir":"components"}}}},"data_root":"state","turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}}}"#
     )
 }
 

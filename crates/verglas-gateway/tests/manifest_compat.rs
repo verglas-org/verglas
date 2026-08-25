@@ -19,8 +19,7 @@ fn accepts_compatibility_migrations_and_vars() {
                 {{"tag": "v2", "new_sqlite_classes": ["SqlCounter"]}}
             ],
             "vars": {{"API_URL": "https://example.test", "LIMIT": 3}},
-            "component_digest": "{DIGEST}",
-            "component_dir": "./components",
+            "artifacts": {{"worker": {{"digest": "{DIGEST}", "component_dir": "./components"}}}},
             "data_root": "./state"
         }}"#
     );
@@ -57,8 +56,7 @@ fn rejects_unsupported_migration_kind() {
             "main": "src/index.ts",
             "durable_objects": {{"bindings": []}},
             "migrations": [{{"tag": "v1", "deleted_classes": ["Counter"]}}],
-            "component_digest": "{DIGEST}",
-            "component_dir": "./components",
+            "artifacts": {{"worker": {{"digest": "{DIGEST}", "component_dir": "./components"}}}},
             "data_root": "./state"
         }}"#
     );

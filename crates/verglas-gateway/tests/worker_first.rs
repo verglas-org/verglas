@@ -115,7 +115,7 @@ impl WorkerExecutor for BindingWorker {
 /// Builds one valid generated gateway manifest while keeping Worker fields minimal.
 fn manifest(path: &Path) -> Manifest {
     Manifest::parse(&format!(
-        r#"{{"name":"counter","main":"worker.js","durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},"component_digest":"{DIGEST}","component_dir":"components","data_root":"{}","turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}}}"#,
+        r#"{{"name":"counter","main":"worker.js","durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},"artifacts":{{"worker":{{"digest":"{DIGEST}","component_dir":"components"}},"durable_object":{{"digest":"{DIGEST}","component_dir":"components"}}}},"data_root":"{}","turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}}}"#,
         path.join("state").display()
     ))
     .expect("valid test manifest")

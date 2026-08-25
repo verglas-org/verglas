@@ -13,7 +13,8 @@ mod spawn;
 pub use error::GatewayError;
 pub use gateway::{Gateway, WorkerExecutor, WorkerPoolExecutor};
 pub use manifest::{
-    Binding, Manifest, ManifestError, Migration, PipelineBinding, TursoConfig, TursoDeployment,
+    ArtifactDescriptor, ArtifactProduct, Binding, Manifest, ManifestError, Migration,
+    PipelineBinding, SystemBinding, TursoConfig, TursoDeployment,
 };
 pub use spawn::{CelldSpawner, DoSpawner, SpawnRequest};
 pub use verglas_do_wasm::{DoRouter, Request as WorkerRequest, Response as WorkerResponse};

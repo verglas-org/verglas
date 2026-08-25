@@ -1,8 +1,9 @@
-//! Strict parsing for the Wrangler manifest and Turso deployment contract.
+//! Strict parsing for the Wrangler manifest and product deployment contract.
 //!
-//! Durable-object namespaces and system pipeline bindings are separate maps. A
-//! deployment carrying either requires an explicit Turso URL template and token
-//! file; unknown fields and incomplete credentials fail before process launch.
+//! Durable-object namespaces, Stream bindings, and system product services are
+//! separate maps. Each selected product resolves to one immutable artifact and
+//! explicit Turso credentials; unknown fields and incomplete credentials fail
+//! before process launch.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -45,6 +46,92 @@ impl PipelineBinding {
     /// Returns the Stream object identity used by `PipelineBinding.send`.
     pub fn stream(&self) -> &str {
         &self.stream
+    }
+}
+
+/// The six and only six product artifact identities in a deployment.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ArtifactProduct {
+    /// Stateless public Worker artifact.
+    Worker,
+    /// Tenant stateful Durable Object artifact.
+    DurableObject,
+    /// Ordered JSON Stream artifact.
+    Stream,
+    /// Stream-consuming Pipeline artifact.
+    Pipeline,
+    /// Idempotent delivery Sink artifact.
+    Sink,
+    /// Iceberg REST Catalog artifact.
+    Catalog,
+}
+
+impl ArtifactProduct {
+    /// Returns the strict manifest key for this product.
+    pub const fn manifest_key(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::DurableObject => "durable_object",
+            Self::Stream => "stream",
+            Self::Pipeline => "pipeline",
+            Self::Sink => "sink",
+            Self::Catalog => "catalog",
+        }
+    }
+}
+
+/// One immutable, digest-addressed WASM artifact descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactDescriptor {
+    digest: String,
+    component_dir: PathBuf,
+    cwasm_cache_dir: Option<PathBuf>,
+}
+
+impl ArtifactDescriptor {
+    /// Returns the verified SHA-256 digest used to select the component.
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    /// Returns the directory containing this product's digest-named component.
+    pub fn component_dir(&self) -> &Path {
+        &self.component_dir
+    }
+
+    /// Returns the optional compiled component cache directory.
+    pub fn cwasm_cache_dir(&self) -> Option<&Path> {
+        self.cwasm_cache_dir.as_deref()
+    }
+}
+
+/// One named system product service binding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SystemBinding {
+    binding: String,
+    product: ArtifactProduct,
+    object: String,
+}
+
+impl SystemBinding {
+    /// Returns the environment binding name exposed to the caller.
+    pub fn binding(&self) -> &str {
+        &self.binding
+    }
+
+    /// Returns the prebuilt product selected by this service binding.
+    pub fn product(&self) -> ArtifactProduct {
+        self.product
+    }
+
+    /// Returns the strict wire product name from the manifest.
+    pub fn service(&self) -> &'static str {
+        self.product.manifest_key()
+    }
+
+    /// Returns the named product object identity.
+    pub fn object(&self) -> &str {
+        &self.object
     }
 }
 
@@ -149,6 +236,12 @@ impl Migration {
     }
 }
 
+/// The product selected after a binding identity check.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BindingTarget {
+    product: ArtifactProduct,
+}
+
 /// The validated subset of a Wrangler-style deployment manifest.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
@@ -158,11 +251,10 @@ pub struct Manifest {
     compatibility_flags: Vec<String>,
     bindings: Vec<Binding>,
     pipelines: Vec<PipelineBinding>,
+    services: Vec<SystemBinding>,
     migrations: Vec<Migration>,
     vars: Map<String, Value>,
-    component_digest: String,
-    component_dir: PathBuf,
-    cwasm_cache_dir: Option<PathBuf>,
+    artifacts: BTreeMap<ArtifactProduct, ArtifactDescriptor>,
     data_root: PathBuf,
     turso: Option<TursoConfig>,
 }
@@ -221,9 +313,46 @@ impl Manifest {
         &self.bindings
     }
 
-    /// Returns all declared system pipeline bindings in manifest order.
+    /// Returns all declared system Stream bindings in manifest order.
     pub fn pipelines(&self) -> &[PipelineBinding] {
         &self.pipelines
+    }
+
+    /// Returns all declared Pipeline, Sink, and Catalog service bindings.
+    pub fn services(&self) -> &[SystemBinding] {
+        &self.services
+    }
+
+    /// Returns the immutable artifact descriptor for one product.
+    pub fn artifact_for_product(
+        &self,
+        product: ArtifactProduct,
+    ) -> Result<&ArtifactDescriptor, ManifestError> {
+        self.artifacts
+            .get(&product)
+            .ok_or(ManifestError::MissingArtifact {
+                product: product.manifest_key(),
+            })
+    }
+
+    /// Resolves the product selected by one binding and object identity.
+    pub fn product_for_binding(
+        &self,
+        binding: &str,
+        object: &str,
+    ) -> Result<ArtifactProduct, ManifestError> {
+        self.binding_target(binding, object)
+            .map(|target| target.product)
+    }
+
+    /// Resolves the immutable artifact selected by one binding and object identity.
+    pub fn artifact_for_binding(
+        &self,
+        binding: &str,
+        object: &str,
+    ) -> Result<&ArtifactDescriptor, ManifestError> {
+        let product = self.product_for_binding(binding, object)?;
+        self.artifact_for_product(product)
     }
 
     /// Returns accepted migration declarations in manifest order.
@@ -248,6 +377,42 @@ impl Manifest {
             .find(|pipeline| pipeline.binding == name)
     }
 
+    /// Resolves one binding while enforcing its declared object identity.
+    fn binding_target(&self, binding: &str, object: &str) -> Result<BindingTarget, ManifestError> {
+        if self.bindings.iter().any(|item| item.name == binding) {
+            return Ok(BindingTarget {
+                product: ArtifactProduct::DurableObject,
+            });
+        }
+        if let Some(stream) = self.pipelines.iter().find(|item| item.binding == binding) {
+            if stream.stream != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: stream.stream.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(BindingTarget {
+                product: ArtifactProduct::Stream,
+            });
+        }
+        if let Some(service) = self.services.iter().find(|item| item.binding == binding) {
+            if service.object != object {
+                return Err(ManifestError::WrongBindingObject {
+                    binding: binding.to_owned(),
+                    expected: service.object.clone(),
+                    actual: object.to_owned(),
+                });
+            }
+            return Ok(BindingTarget {
+                product: service.product,
+            });
+        }
+        Err(ManifestError::UnknownBinding {
+            binding: binding.to_owned(),
+        })
+    }
+
     /// Resolves the explicit Turso deployment for one DO or system binding.
     pub fn turso_for(&self, binding: &str) -> Result<&TursoDeployment, ManifestError> {
         self.turso
@@ -256,21 +421,6 @@ impl Manifest {
                 binding: binding.to_owned(),
             })?
             .for_binding(binding)
-    }
-
-    /// Returns the validated hexadecimal component digest.
-    pub fn component_digest(&self) -> &str {
-        &self.component_digest
-    }
-
-    /// Returns the directory containing immutable component artifacts.
-    pub fn component_dir(&self) -> &Path {
-        &self.component_dir
-    }
-
-    /// Returns the optional Wasmtime compiled component cache directory.
-    pub fn cwasm_cache_dir(&self) -> Option<&Path> {
-        self.cwasm_cache_dir.as_deref()
     }
 
     /// Returns the manifest's runtime data root.
@@ -290,11 +440,10 @@ impl Manifest {
             "compatibility_flags",
             "durable_objects",
             "pipelines",
+            "services",
             "migrations",
             "vars",
-            "component_digest",
-            "component_dir",
-            "cwasm_cache_dir",
+            "artifacts",
             "data_root",
             "turso",
         ]
@@ -326,6 +475,12 @@ impl Manifest {
             .map(parse_pipelines)
             .transpose()?
             .unwrap_or_default();
+        let services = object
+            .remove("services")
+            .map(parse_services)
+            .transpose()?
+            .unwrap_or_default();
+        reject_binding_collisions(&bindings, &pipelines, &services)?;
         let migrations = object
             .remove("migrations")
             .map(parse_migrations)
@@ -336,16 +491,13 @@ impl Manifest {
             .map(parse_vars)
             .transpose()?
             .unwrap_or_default();
-        let component_digest = required_string(&mut object, "component_digest")?;
-        validate_digest(&component_digest)?;
-        let component_dir = PathBuf::from(required_string(&mut object, "component_dir")?);
-        let cwasm_cache_dir = object
-            .remove("cwasm_cache_dir")
-            .map(|value| parse_nonempty_string(value, "cwasm_cache_dir").map(PathBuf::from))
-            .transpose()?;
+        let artifacts = required_object(&mut object, "artifacts").and_then(parse_artifacts)?;
+        require_artifacts(&artifacts, !bindings.is_empty(), &pipelines, &services)?;
         let data_root = PathBuf::from(required_string(&mut object, "data_root")?);
         let turso = object.remove("turso").map(parse_turso).transpose()?;
-        if (!bindings.is_empty() || !pipelines.is_empty()) && turso.is_none() {
+        if (!bindings.is_empty() || !pipelines.is_empty() || !services.is_empty())
+            && turso.is_none()
+        {
             return Err(ManifestError::MissingField { field: "turso" });
         }
         Ok(Self {
@@ -355,11 +507,10 @@ impl Manifest {
             compatibility_flags,
             bindings,
             pipelines,
+            services,
             migrations,
             vars,
-            component_digest,
-            component_dir,
-            cwasm_cache_dir,
+            artifacts,
             data_root,
             turso,
         })
@@ -420,6 +571,52 @@ pub enum ManifestError {
         /// Key that was not recognized.
         key: String,
     },
+    /// A system service binding contains an unknown key.
+    #[error("unknown services manifest key: {key}")]
+    UnknownServiceKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// A system service binding names an unsupported product.
+    #[error("unknown service product: {product}")]
+    UnknownServiceProduct {
+        /// Product string that was not one of the six products.
+        product: String,
+    },
+    /// The artifacts object contains an unknown product key.
+    #[error("unknown artifacts manifest key: {key}")]
+    UnknownArtifactKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// An artifact descriptor contains an unknown key.
+    #[error("unknown artifact descriptor key: {key}")]
+    UnknownArtifactDescriptorKey {
+        /// Key that was not recognized.
+        key: String,
+    },
+    /// A required product artifact is missing.
+    #[error("artifact descriptor is missing for product {product}")]
+    MissingArtifact {
+        /// Product whose descriptor was absent.
+        product: &'static str,
+    },
+    /// A binding and object identity pair was not declared.
+    #[error("unknown service or Durable Object binding: {binding}")]
+    UnknownBinding {
+        /// Binding that was not declared.
+        binding: String,
+    },
+    /// A binding was addressed with a different object identity.
+    #[error("binding {binding} requires object {expected}, not {actual}")]
+    WrongBindingObject {
+        /// Binding whose identity was checked.
+        binding: String,
+        /// Declared object identity.
+        expected: String,
+        /// Requested object identity.
+        actual: String,
+    },
     /// A Turso object contains an unknown key.
     #[error("unknown turso manifest key: {key}")]
     UnknownTursoKey {
@@ -452,14 +649,14 @@ pub enum ManifestError {
         /// Field whose value was empty.
         field: &'static str,
     },
-    /// The component identity was not exactly 32 bytes of hexadecimal text.
-    #[error("component_digest must be exactly 64 hexadecimal characters: {value}")]
+    /// An artifact identity was not exactly 32 bytes of hexadecimal text.
+    #[error("artifact digest must be exactly 64 hexadecimal characters: {value}")]
     InvalidComponentDigest {
         /// Rejected digest text.
         value: String,
     },
     /// A binding did not have a unique URL-visible name.
-    #[error("duplicate Durable Object binding: {name}")]
+    #[error("duplicate environment binding: {name}")]
     DuplicateBinding {
         /// Name repeated by more than one binding.
         name: String,
@@ -468,6 +665,12 @@ pub enum ManifestError {
     #[error("duplicate pipeline binding: {name}")]
     DuplicatePipelineBinding {
         /// Name repeated by more than one pipeline.
+        name: String,
+    },
+    /// A system service binding did not have a unique environment name.
+    #[error("duplicate service binding: {name}")]
+    DuplicateServiceBinding {
+        /// Name repeated by more than one service.
         name: String,
     },
     /// A Turso mapping was missing for one binding.
@@ -609,6 +812,186 @@ fn parse_pipelines(value: Value) -> Result<Vec<PipelineBinding>, ManifestError> 
         pipelines.push(PipelineBinding { binding, stream });
     }
     Ok(pipelines)
+}
+
+/// Parses explicit prebuilt Pipeline, Sink, and Catalog service bindings.
+fn parse_services(value: Value) -> Result<Vec<SystemBinding>, ManifestError> {
+    let Value::Array(values) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "services",
+            expected: "array",
+        });
+    };
+    let mut services = Vec::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
+    for value in values {
+        let Value::Object(mut object) = value else {
+            return Err(ManifestError::InvalidType {
+                field: "services[]",
+                expected: "object",
+            });
+        };
+        let allowed = ["binding", "service", "object"]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if let Some(key) = object
+            .keys()
+            .find(|key| !allowed.contains(key.as_str()))
+            .cloned()
+        {
+            return Err(ManifestError::UnknownServiceKey { key });
+        }
+        let binding = required_string(&mut object, "binding")?;
+        let service = required_string(&mut object, "service")?;
+        let product = match service.as_str() {
+            "pipeline" => ArtifactProduct::Pipeline,
+            "sink" => ArtifactProduct::Sink,
+            "catalog" => ArtifactProduct::Catalog,
+            _ => return Err(ManifestError::UnknownServiceProduct { product: service }),
+        };
+        let object = required_string(&mut object, "object")?;
+        if !names.insert(binding.clone()) {
+            return Err(ManifestError::DuplicateServiceBinding { name: binding });
+        }
+        services.push(SystemBinding {
+            binding,
+            product,
+            object,
+        });
+    }
+    Ok(services)
+}
+
+/// Rejects one environment binding from selecting multiple product namespaces.
+fn reject_binding_collisions(
+    bindings: &[Binding],
+    pipelines: &[PipelineBinding],
+    services: &[SystemBinding],
+) -> Result<(), ManifestError> {
+    let mut names = HashSet::new();
+    for name in bindings.iter().map(|binding| binding.name.as_str()) {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    for name in pipelines.iter().map(|pipeline| pipeline.binding.as_str()) {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    for name in services.iter().map(|service| service.binding.as_str()) {
+        if !names.insert(name) {
+            return Err(ManifestError::DuplicateBinding {
+                name: name.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Parses all explicitly declared product artifact descriptors.
+fn parse_artifacts(
+    object: Map<String, Value>,
+) -> Result<BTreeMap<ArtifactProduct, ArtifactDescriptor>, ManifestError> {
+    let allowed = [
+        "worker",
+        "durable_object",
+        "stream",
+        "pipeline",
+        "sink",
+        "catalog",
+    ]
+    .into_iter()
+    .collect::<HashSet<_>>();
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed.contains(key.as_str()))
+        .cloned()
+    {
+        return Err(ManifestError::UnknownArtifactKey { key });
+    }
+    let mut artifacts = BTreeMap::new();
+    for (key, value) in object {
+        let product = match key.as_str() {
+            "worker" => ArtifactProduct::Worker,
+            "durable_object" => ArtifactProduct::DurableObject,
+            "stream" => ArtifactProduct::Stream,
+            "pipeline" => ArtifactProduct::Pipeline,
+            "sink" => ArtifactProduct::Sink,
+            "catalog" => ArtifactProduct::Catalog,
+            _ => unreachable!("artifact keys were checked above"),
+        };
+        artifacts.insert(product, parse_artifact_descriptor(value)?);
+    }
+    Ok(artifacts)
+}
+
+/// Parses one digest, component directory, and optional compiled-cache descriptor.
+fn parse_artifact_descriptor(value: Value) -> Result<ArtifactDescriptor, ManifestError> {
+    let Value::Object(mut object) = value else {
+        return Err(ManifestError::InvalidType {
+            field: "artifacts[]",
+            expected: "object",
+        });
+    };
+    let allowed = ["digest", "component_dir", "cwasm_cache_dir"]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if let Some(key) = object
+        .keys()
+        .find(|key| !allowed.contains(key.as_str()))
+        .cloned()
+    {
+        return Err(ManifestError::UnknownArtifactDescriptorKey { key });
+    }
+    let digest = required_string(&mut object, "digest")?;
+    validate_digest(&digest)?;
+    let component_dir = PathBuf::from(required_string(&mut object, "component_dir")?);
+    let cwasm_cache_dir = object
+        .remove("cwasm_cache_dir")
+        .map(|value| parse_nonempty_string(value, "artifacts[].cwasm_cache_dir").map(PathBuf::from))
+        .transpose()?;
+    Ok(ArtifactDescriptor {
+        digest,
+        component_dir,
+        cwasm_cache_dir,
+    })
+}
+
+/// Requires the Worker and every artifact selected by a declared binding.
+fn require_artifacts(
+    artifacts: &BTreeMap<ArtifactProduct, ArtifactDescriptor>,
+    has_durable_objects: bool,
+    pipelines: &[PipelineBinding],
+    services: &[SystemBinding],
+) -> Result<(), ManifestError> {
+    if !artifacts.contains_key(&ArtifactProduct::Worker) {
+        return Err(ManifestError::MissingArtifact {
+            product: ArtifactProduct::Worker.manifest_key(),
+        });
+    }
+    if has_durable_objects && !artifacts.contains_key(&ArtifactProduct::DurableObject) {
+        return Err(ManifestError::MissingArtifact {
+            product: ArtifactProduct::DurableObject.manifest_key(),
+        });
+    }
+    if !pipelines.is_empty() && !artifacts.contains_key(&ArtifactProduct::Stream) {
+        return Err(ManifestError::MissingArtifact {
+            product: ArtifactProduct::Stream.manifest_key(),
+        });
+    }
+    for service in services {
+        if !artifacts.contains_key(&service.product) {
+            return Err(ManifestError::MissingArtifact {
+                product: service.product.manifest_key(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Parses deployment-level and per-binding Turso mappings.
@@ -774,7 +1157,10 @@ fn parse_binding(value: Value) -> Result<Binding, ManifestError> {
 
 /// Validates a SHA-256 component identity without a runtime dependency.
 fn validate_digest(value: &str) -> Result<(), ManifestError> {
-    if value.len() != 64 || hex::decode(value).map_or(true, |bytes| bytes.len() != 32) {
+    if value.len() != 64
+        || value != value.to_ascii_lowercase()
+        || hex::decode(value).map_or(true, |bytes| bytes.len() != 32)
+    {
         return Err(ManifestError::InvalidComponentDigest {
             value: value.to_owned(),
         });
@@ -784,9 +1170,13 @@ fn validate_digest(value: &str) -> Result<(), ManifestError> {
 
 /// Validates a nonempty URL and token-file template.
 fn validate_turso_fields(url: &str, token_file: &Path) -> Result<(), ManifestError> {
-    if url.is_empty() || url.chars().any(char::is_whitespace) {
+    if url.is_empty()
+        || url.chars().any(char::is_whitespace)
+        || !url.contains("{binding}")
+        || !url.contains("{do_id}")
+    {
         return Err(ManifestError::InvalidTursoDeployment {
-            message: "url_template must be nonempty and contain no whitespace".to_owned(),
+            message: "url_template must contain {binding} and {do_id} and no whitespace".to_owned(),
         });
     }
     if token_file.as_os_str().is_empty() {

@@ -11,8 +11,11 @@ fn source(extra: &str) -> String {
             "name":"counter",
             "main":"src/index.ts",
             "durable_objects":{{"bindings":[{{"name":"COUNTER","class_name":"Counter"}}]}},
-            "component_digest":"{DIGEST}",
-            "component_dir":"./components",
+            "artifacts":{{
+                "worker":{{"digest":"{DIGEST}","component_dir":"./components"}},
+                "durable_object":{{"digest":"{DIGEST}","component_dir":"./components"}},
+                "stream":{{"digest":"{DIGEST}","component_dir":"./components"}}
+            }},
             "data_root":"./state",
             "turso":{{"url_template":"https://turso.test/{{binding}}/{{do_id}}","token_file":"/tokens/{{binding}}.token"}}
             {extra}
@@ -83,7 +86,7 @@ fn old_managed_cas_shape_is_rejected_as_unknown() {
 #[test]
 fn accepts_json_and_jsonc_paths() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
-    let source = r#"{"name":"counter","main":"src/index.ts","durable_objects":{"bindings":[]},"component_digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","component_dir":"components","data_root":"state"}"#;
+    let source = r#"{"name":"counter","main":"src/index.ts","durable_objects":{"bindings":[]},"artifacts":{"worker":{"digest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","component_dir":"components"}},"data_root":"state"}"#;
     let json_path = directory.path().join("wrangler.json");
     let jsonc_path = directory.path().join("wrangler.jsonc");
     std::fs::write(&json_path, source)?;

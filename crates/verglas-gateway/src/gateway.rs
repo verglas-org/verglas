@@ -18,6 +18,7 @@ use axum::routing::{any, get};
 use axum::{Router, serve};
 use bytes::Bytes;
 use futures::StreamExt;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use verglas_do_wasm::{
@@ -26,7 +27,7 @@ use verglas_do_wasm::{
 
 use crate::connection::{DoCallHandler, DoConnection, FetchEvent};
 use crate::error::GatewayError;
-use crate::manifest::{Binding, Manifest, PipelineBinding};
+use crate::manifest::{Binding, Manifest, PipelineBinding, SystemBinding};
 use crate::protocol::{FetchResponse, WsOutbound};
 use crate::spawn::{CelldSpawner, DoSpawner, SpawnRequest};
 
@@ -239,27 +240,53 @@ impl Gateway {
         Ok(pipeline)
     }
 
+    /// Resolves one explicit Pipeline, Sink, or Catalog service binding.
+    pub fn resolve_service(
+        &self,
+        binding: &str,
+        object: &str,
+    ) -> Result<&SystemBinding, GatewayError> {
+        let service = self
+            .state
+            .manifest
+            .services()
+            .iter()
+            .find(|service| service.binding() == binding)
+            .ok_or_else(|| GatewayError::UnknownBinding {
+                binding: binding.to_owned(),
+            })?;
+        if service.object() != object {
+            return Err(GatewayError::UnknownObject {
+                binding: binding.to_owned(),
+                name: object.to_owned(),
+            });
+        }
+        Ok(service)
+    }
+
     /// Finds or creates the one resident event actor for a route key.
     async fn connection_for(
         state: &Arc<GatewayState>,
         binding: &str,
         name: &str,
     ) -> Result<Arc<DoConnection>, GatewayError> {
-        let is_durable = state.manifest.binding(binding).is_some();
-        let pipeline = state.manifest.pipeline(binding);
-        if !is_durable && pipeline.is_none() {
-            return Err(GatewayError::UnknownBinding {
-                binding: binding.to_owned(),
-            });
-        }
-        if let Some(pipeline) = pipeline
-            && pipeline.stream() != name
-        {
-            return Err(GatewayError::UnknownObject {
-                binding: binding.to_owned(),
-                name: name.to_owned(),
-            });
-        }
+        let artifact = state
+            .manifest
+            .artifact_for_binding(binding, name)
+            .map_err(|error| match error {
+                crate::manifest::ManifestError::UnknownBinding { binding } => {
+                    GatewayError::UnknownBinding { binding }
+                }
+                crate::manifest::ManifestError::WrongBindingObject {
+                    binding, actual, ..
+                } => GatewayError::UnknownObject {
+                    binding,
+                    name: actual,
+                },
+                error => GatewayError::SpawnRejected {
+                    message: error.to_string(),
+                },
+            })?;
         let do_id = do_identity(binding, name)?;
         let key = DoKey {
             binding: binding.to_owned(),
@@ -280,15 +307,15 @@ impl Gateway {
             do_id,
             binding.to_owned(),
             name.to_owned(),
-            state.manifest.component_digest().to_owned(),
-            state.manifest.component_dir().to_path_buf(),
+            artifact.digest().to_owned(),
+            artifact.component_dir().to_path_buf(),
             state.data_root.clone(),
         )
         .with_turso(
             deployment.url(binding, name),
             deployment.token_file(binding, name),
         );
-        if let Some(cache_dir) = state.manifest.cwasm_cache_dir() {
+        if let Some(cache_dir) = artifact.cwasm_cache_dir() {
             request = request.with_cwasm_cache_dir(cache_dir.to_path_buf());
         }
         let event_socket = state.spawner.spawn(request).await?;
@@ -412,12 +439,26 @@ fn worker_response(response: FetchResponse) -> WorkerResponse {
 
 /// Loads the immutable Worker component named by the generated manifest.
 fn load_worker_executor(manifest: &Manifest) -> Result<Arc<dyn WorkerExecutor>, GatewayError> {
-    let path = manifest
+    let artifact = manifest
+        .artifact_for_product(crate::manifest::ArtifactProduct::Worker)
+        .map_err(|error| GatewayError::WorkerUnavailable {
+            message: error.to_string(),
+        })?;
+    let path = artifact
         .component_dir()
-        .join(format!("{}.wasm", manifest.component_digest()));
+        .join(format!("{}.wasm", artifact.digest()));
     let bytes = std::fs::read(&path).map_err(|error| GatewayError::WorkerUnavailable {
         message: format!("read Worker component {}: {error}", path.display()),
     })?;
+    let actual_digest = hex::encode(Sha256::digest(&bytes));
+    if actual_digest != artifact.digest() {
+        return Err(GatewayError::WorkerUnavailable {
+            message: format!(
+                "Worker component digest mismatch: expected {}, got {actual_digest}",
+                artifact.digest()
+            ),
+        });
+    }
     let pool = WorkerPool::load(wasmtime::Config::new(), &bytes).map_err(|error| {
         GatewayError::WorkerUnavailable {
             message: format!("load Worker component {}: {error}", path.display()),

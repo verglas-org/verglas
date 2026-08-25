@@ -6,11 +6,11 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use futures::{SinkExt, StreamExt};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use verglas_gateway::{Gateway, Manifest};
+use verglas_gateway::{ArtifactProduct, Gateway, Manifest};
 
 /// Child process guard that prevents an assertion failure from orphaning celld.
 struct ManagedChild(Child);
@@ -51,7 +51,11 @@ async fn real_stack_websocket_effects_are_commit_gated_and_errors_are_nonfatal()
 
     let manifest_path = project.join("gateway.json");
     let manifest = Manifest::from_path(&manifest_path).expect("built gateway manifest");
-    let digest = manifest.component_digest().to_owned();
+    let digest = manifest
+        .artifact_for_product(ArtifactProduct::Worker)
+        .expect("Worker artifact")
+        .digest()
+        .to_owned();
     assert!(components.join(format!("{digest}.wasm")).is_file());
 
     let celld = target_root().join("debug/celld-host");
@@ -218,8 +222,10 @@ fn write_worker_project(project: &Path, components: &Path, data_root: &Path) {
             "durable_objects": { "bindings": [{ "name": "COUNTER", "class_name": "Counter" }] },
             "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Counter"] }],
             "vars": { "AC1": "worker-first" },
-            "component_digest": "0".repeat(64),
-            "component_dir": components,
+            "artifacts": {
+                "worker": { "digest": "0".repeat(64), "component_dir": components },
+                "durable_object": { "digest": "0".repeat(64), "component_dir": components }
+            },
             "data_root": data_root,
             "turso": {
                 "url_template": "https://ac1.test/{binding}/{do_id}",
@@ -251,6 +257,41 @@ fn build_component(project: &Path, components: &Path) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let artifact = std::fs::read_dir(components)
+        .expect("component directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "wasm")
+        })
+        .expect("built wasm component");
+    let digest = artifact
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .expect("digest-named component")
+        .to_owned();
+    let gateway_path = project.join("gateway.json");
+    let mut manifest: Value = serde_json::from_slice(
+        &std::fs::read(&gateway_path).expect("built gateway manifest bytes"),
+    )
+    .expect("built gateway manifest JSON");
+    let object = manifest.as_object_mut().expect("gateway manifest object");
+    object.remove("component_digest");
+    object.remove("component_dir");
+    object.remove("cwasm_cache_dir");
+    object.insert(
+        "artifacts".to_owned(),
+        json!({
+            "worker": {"digest": digest, "component_dir": components},
+            "durable_object": {"digest": artifact.file_stem().and_then(|value| value.to_str()).expect("digest"), "component_dir": components}
+        }),
+    );
+    std::fs::write(
+        gateway_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode composed gateway manifest"),
+    )
+    .expect("write composed gateway manifest");
 }
 
 /// Returns the cargo target root used by this integration process.
