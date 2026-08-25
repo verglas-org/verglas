@@ -454,9 +454,12 @@ def _run_componentize(
 
 
 def _update_gateway_manifest(
-    gateway_path: Path, output_dir: Path, component_digest: str
+    gateway_path: Path,
+    output_dir: Path,
+    component_digest: str,
+    has_durable_object: bool = True,
 ) -> None:
-    """Update a project's checked-in gateway digest after writing the artifact."""
+    """Update selected nested gateway artifact descriptors after writing bytes."""
     try:
         source = gateway_path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -469,9 +472,30 @@ def _update_gateway_manifest(
         raise BuildError(f"gateway manifest is not valid JSON: {gateway_path}: {error}") from error
     if not isinstance(gateway, dict):
         raise BuildError(f"gateway manifest must contain an object: {gateway_path}")
-    gateway["component_digest"] = component_digest
-    if "component_dir" in gateway:
-        gateway["component_dir"] = str(output_dir)
+    for field in ("component_digest", "component_dir"):
+        if field in gateway:
+            raise BuildError(
+                f"gateway manifest {gateway_path} uses retired top-level {field}; use nested artifacts"
+            )
+    artifacts = gateway.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise BuildError(f"gateway manifest {gateway_path} must contain nested artifacts")
+    products = ["worker"] + (["durable_object"] if has_durable_object else [])
+    for product in products:
+        descriptor = artifacts.get(product)
+        if not isinstance(descriptor, dict):
+            raise BuildError(f"gateway manifest {gateway_path} is missing artifacts.{product}")
+        if (
+            not isinstance(descriptor.get("digest"), str)
+            or not descriptor["digest"]
+            or not isinstance(descriptor.get("component_dir"), str)
+            or not descriptor["component_dir"]
+        ):
+            raise BuildError(
+                f"gateway manifest {gateway_path} artifacts.{product} must contain digest and component_dir"
+            )
+        descriptor["digest"] = component_digest
+        descriptor["component_dir"] = str(output_dir)
     try:
         gateway_path.write_text(json.dumps(gateway, indent=2) + "\n", encoding="utf-8")
     except OSError as error:
@@ -517,14 +541,29 @@ def build_project(
             "durable_objects": {"bindings": manifest.bindings},
             "migrations": manifest.migrations,
             "vars": manifest.vars,
-            "component_digest": component_digest,
+            "artifacts": {
+                "worker": {
+                    "digest": component_digest,
+                    "component_dir": str(output.resolve()),
+                },
+                **(
+                    {
+                        "durable_object": {
+                            "digest": component_digest,
+                            "component_dir": str(output.resolve()),
+                        }
+                    }
+                    if manifest.bindings
+                    else {}
+                ),
+            },
         }
     )
     output_manifest.write_text(
         json.dumps(output_manifest_data, indent=2) + "\n",
         encoding="utf-8",
     )
-    _update_gateway_manifest(gateway, output, component_digest)
+    _update_gateway_manifest(gateway, output, component_digest, bool(manifest.bindings))
     return BuildResult(
         name=manifest.name,
         component_digest=component_digest,

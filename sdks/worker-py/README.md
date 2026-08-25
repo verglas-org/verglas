@@ -50,8 +50,12 @@ The builder invokes `componentize-py` against the `service` world in
 `crates/verglas-do-wasm/wit`. It injects `workers._component`, imports the
 project's `main` module, and exports both the Worker `fetch` surface and the
 Durable Object handler surface. The output directory receives
-`<sha256-of-bytes>.wasm` and `manifest.out.json`; an existing `gateway.json`
-gets the same digest and output-directory update used by the JavaScript builder.
+`<sha256-of-bytes>.wasm` and `manifest.out.json`; its nested
+`artifacts.worker` descriptor (and `artifacts.durable_object` when Durable
+Objects are declared) names the exact digest and output directory. An existing
+`gateway.json` must already use those nested descriptors, which the builder
+updates with the exact SHA-256 bytes. Retired top-level `component_digest` and
+`component_dir` fields are rejected.
 
 The accepted Wrangler JSON/JSONC subset is:
 

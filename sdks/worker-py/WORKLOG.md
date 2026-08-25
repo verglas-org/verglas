@@ -37,3 +37,4 @@
   exact WIT Stream append request without fallback; manifest, mock-host, and
   component verification coverage documents the protocol judgment.
 - #0: Added the PP4 Durable Object Stream path: handler environments route `send(records)` through WIT `storage.stream-send` for transactional staging, while Worker environments retain direct Stream ingestion. The Python transport exposes only JSON-row SQL and has no Arrow IPC compatibility surface.
+- #171: Updated the Python builder to emit and update strict nested `artifacts.worker` and `artifacts.durable_object` descriptors using the exact SHA-256 component bytes. Retired top-level `component_digest` and `component_dir` gateway fields now fail closed, with tests covering nested manifests, digest paths, and rejection of the removed shape.

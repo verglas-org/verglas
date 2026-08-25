@@ -13,6 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from build import (  # noqa: E402
+    BuildError,
     ManifestError,
     _update_gateway_manifest,
     build_project,
@@ -215,9 +216,49 @@ class ManifestTests(unittest.TestCase):
                     {"tag": "v1", "new_sqlite_classes": ["Counter"]}
                 ],
                 "vars": {"GREETING": "hello", "LIMIT": 3},
-                "component_digest": digest,
+                "artifacts": {
+                    "worker": {"digest": digest, "component_dir": str(output.resolve())},
+                    "durable_object": {"digest": digest, "component_dir": str(output.resolve())},
+                },
             },
         )
+
+    def test_gateway_manifest_rejects_retired_top_level_artifacts(self) -> None:
+        """Legacy top-level artifact fields fail instead of being rewritten."""
+        gateway = self.project / "gateway.json"
+        gateway.write_text(
+            json.dumps(
+                {
+                    "name": "counter",
+                    "main": "counter.py",
+                    "component_digest": "0" * 64,
+                    "component_dir": "/stale/output",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(BuildError, "top-level component_"):
+            _update_gateway_manifest(gateway, self.project / "out", "a" * 64)
+
+    def test_gateway_manifest_rejects_malformed_nested_artifacts(self) -> None:
+        """Nested descriptors must retain both strict fields before replacement."""
+        gateway = self.project / "gateway.json"
+        gateway.write_text(
+            json.dumps(
+                {
+                    "name": "counter",
+                    "main": "counter.py",
+                    "artifacts": {"worker": {}, "durable_object": {}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            BuildError, "artifacts.worker must contain digest and component_dir"
+        ):
+            _update_gateway_manifest(gateway, self.project / "out", "a" * 64)
 
     def test_gateway_manifest_tracks_digest_and_output_directory(self) -> None:
         """A checked-in gateway points at the bytes emitted by the builder."""
@@ -227,8 +268,10 @@ class ManifestTests(unittest.TestCase):
                 {
                     "name": "counter",
                     "main": "counter.py",
-                    "component_digest": "0" * 64,
-                    "component_dir": "/stale/output",
+                    "artifacts": {
+                        "worker": {"digest": "0" * 64, "component_dir": "/stale/output"},
+                        "durable_object": {"digest": "0" * 64, "component_dir": "/stale/output"},
+                    },
                     "data_root": "/persistent/data",
                 }
             ),
@@ -239,8 +282,15 @@ class ManifestTests(unittest.TestCase):
         digest = "a" * 64
         _update_gateway_manifest(gateway, output, digest)
         updated = json.loads(gateway.read_text(encoding="utf-8"))
-        self.assertEqual(updated["component_digest"], digest)
-        self.assertEqual(updated["component_dir"], str(output))
+        self.assertNotIn("component_digest", updated)
+        self.assertNotIn("component_dir", updated)
+        self.assertEqual(
+            updated["artifacts"],
+            {
+                "worker": {"digest": digest, "component_dir": str(output)},
+                "durable_object": {"digest": digest, "component_dir": str(output)},
+            },
+        )
         self.assertEqual(updated["data_root"], "/persistent/data")
 
 

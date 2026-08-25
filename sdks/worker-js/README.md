@@ -35,9 +35,12 @@ node sdks/worker-js/bin/build.mjs ./my-worker --out ./build [--gateway <gateway.
 
 The builder bundles the project, aliases the `cloudflare:workers` module, and
 componentizes it against the `service` WIT world. It writes a digest-named
-`<sha256>.wasm` artifact and a Wrangler-shaped `manifest.out.json`. If the
-selected gateway manifest exists, the builder updates its digest and component
-directory and preserves a final newline.
+`<sha256>.wasm` artifact and a Wrangler-shaped `manifest.out.json` whose
+`artifacts.worker` descriptor (and `artifacts.durable_object` when Durable
+Objects are declared) names the exact digest and output directory. If the
+selected gateway manifest exists, it must already use those nested descriptors;
+the builder updates them and preserves a final newline. Retired top-level
+`component_digest` and `component_dir` fields are rejected.
 
 ## Cloudflare authoring surface
 

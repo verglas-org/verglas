@@ -44,8 +44,10 @@ export default {
         name: 'test-worker',
         main: 'worker.js',
         durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
-        component_digest: '0'.repeat(64),
-        component_dir: '/stale/output',
+        artifacts: {
+          worker: { digest: '0'.repeat(64), component_dir: '/stale/output' },
+          durable_object: { digest: '0'.repeat(64), component_dir: '/stale/output' },
+        },
         data_root: '/persistent/data',
       }, null, 2)}\n`,
     );
@@ -86,7 +88,10 @@ test('build output is valid and records digest determinism', async (t) => {
     durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
     migrations: [],
     vars: { GREETING: 'hello' },
-    component_digest: first.componentDigest,
+    artifacts: {
+      worker: { digest: first.componentDigest, component_dir: outputOne },
+      durable_object: { digest: first.componentDigest, component_dir: outputOne },
+    },
   });
 
   const wit = spawnSync(fileURLToPath(jcoPath), ['wit', first.componentPath], { encoding: 'utf8' });
@@ -100,6 +105,50 @@ test('build output is valid and records digest determinism', async (t) => {
 
   t.diagnostic(`component bytes: ${first.componentBytes.byteLength}`);
   t.diagnostic(`component digest: ${first.componentDigest}`);
+});
+
+test('build rejects retired top-level artifact fields', async (t) => {
+  const project = await makeProject();
+  const output = await mkdtemp(join(tmpdir(), 'verglas-worker-js-legacy-gateway-'));
+  const gateway = join(project, 'gateway.json');
+  await writeFile(gateway, `${JSON.stringify({
+    name: 'test-worker',
+    main: 'worker.js',
+    durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
+    component_digest: '0'.repeat(64),
+    component_dir: '/stale/output',
+  }, null, 2)}\n`);
+  t.after(async () => {
+    await Promise.all([
+      rm(project, { recursive: true, force: true }),
+      rm(output, { recursive: true, force: true }),
+    ]);
+  });
+
+  await assert.rejects(buildProject(project, output, gateway), /top-level component_/);
+});
+
+test('build rejects malformed nested artifact descriptors', async (t) => {
+  const project = await makeProject();
+  const output = await mkdtemp(join(tmpdir(), 'verglas-worker-js-malformed-gateway-'));
+  const gateway = join(project, 'gateway.json');
+  await writeFile(gateway, `${JSON.stringify({
+    name: 'test-worker',
+    main: 'worker.js',
+    durable_objects: { bindings: [{ name: 'COUNTER', class_name: 'Counter' }] },
+    artifacts: { worker: {}, durable_object: {} },
+  }, null, 2)}\n`);
+  t.after(async () => {
+    await Promise.all([
+      rm(project, { recursive: true, force: true }),
+      rm(output, { recursive: true, force: true }),
+    ]);
+  });
+
+  await assert.rejects(
+    buildProject(project, output, gateway),
+    /artifacts\.worker must contain digest and component_dir/,
+  );
 });
 
 test('build updates an example gateway manifest to the emitted artifact', async (t) => {
@@ -116,11 +165,17 @@ test('build updates an example gateway manifest to the emitted artifact', async 
   const gatewaySource = await readFile(join(project, 'gateway.json'), 'utf8');
   const gateway = JSON.parse(gatewaySource);
   assert.equal(gatewaySource.endsWith('\n'), true);
-  assert.equal(gateway.component_digest, result.componentDigest);
-  assert.equal(gateway.component_dir, output);
+  assert.equal(Object.hasOwn(gateway, 'component_digest'), false);
+  assert.equal(Object.hasOwn(gateway, 'component_dir'), false);
+  assert.deepEqual(gateway.artifacts, {
+    worker: { digest: result.componentDigest, component_dir: output },
+    durable_object: { digest: result.componentDigest, component_dir: output },
+  });
   assert.equal(gateway.data_root, '/persistent/data');
-  assert.equal(
-    createHash('sha256').update(await readFile(join(output, `${gateway.component_digest}.wasm`))).digest('hex'),
-    gateway.component_digest,
-  );
+  for (const descriptor of Object.values(gateway.artifacts)) {
+    assert.equal(
+      createHash('sha256').update(await readFile(join(descriptor.component_dir, `${descriptor.digest}.wasm`))).digest('hex'),
+      descriptor.digest,
+    );
+  }
 });

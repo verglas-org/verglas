@@ -75,13 +75,14 @@ function parseArguments(args) {
 }
 
 /**
- * Updates a checked-in gateway manifest when the project owns one.
+ * Updates selected nested artifact descriptors in a checked-in gateway manifest.
  * @param {string} gatewayPath
  * @param {string} outputDir
  * @param {string} componentDigest
+ * @param {boolean} hasDurableObject
  * @returns {Promise<void>}
  */
-async function updateGatewayManifest(gatewayPath, outputDir, componentDigest) {
+async function updateGatewayManifest(gatewayPath, outputDir, componentDigest, hasDurableObject) {
   let source;
   try {
     source = await readFile(gatewayPath, 'utf8');
@@ -95,9 +96,31 @@ async function updateGatewayManifest(gatewayPath, outputDir, componentDigest) {
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
     throw new Error(`gateway manifest ${gatewayPath} must contain a JSON object`);
   }
-  manifest.component_digest = componentDigest;
-  if (Object.hasOwn(manifest, 'component_dir')) {
-    manifest.component_dir = resolve(outputDir);
+  for (const field of ['component_digest', 'component_dir']) {
+    if (Object.hasOwn(manifest, field)) {
+      throw new Error(`gateway manifest ${gatewayPath} uses retired top-level ${field}; use nested artifacts`);
+    }
+  }
+  const artifacts = manifest.artifacts;
+  if (!artifacts || typeof artifacts !== 'object' || Array.isArray(artifacts)) {
+    throw new Error(`gateway manifest ${gatewayPath} must contain nested artifacts`);
+  }
+  const products = ['worker', ...(hasDurableObject ? ['durable_object'] : [])];
+  for (const product of products) {
+    const descriptor = artifacts[product];
+    if (!descriptor || typeof descriptor !== 'object' || Array.isArray(descriptor)) {
+      throw new Error(`gateway manifest ${gatewayPath} is missing artifacts.${product}`);
+    }
+    if (
+      typeof descriptor.digest !== 'string' ||
+      !descriptor.digest ||
+      typeof descriptor.component_dir !== 'string' ||
+      !descriptor.component_dir
+    ) {
+      throw new Error(`gateway manifest ${gatewayPath} artifacts.${product} must contain digest and component_dir`);
+    }
+    descriptor.digest = componentDigest;
+    descriptor.component_dir = resolve(outputDir);
   }
   await writeFile(gatewayPath, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
 }
@@ -179,6 +202,12 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
     const outputComponentPath = join(outputDir, `${componentDigest}.wasm`);
     await writeFile(outputComponentPath, componentBytes);
 
+    const artifacts = {
+      worker: { digest: componentDigest, component_dir: resolve(outputDir) },
+      ...(manifest.bindings.length === 0
+        ? {}
+        : { durable_object: { digest: componentDigest, component_dir: resolve(outputDir) } }),
+    };
     const outputManifest = {
       name: manifest.name,
       main: manifest.main,
@@ -188,11 +217,11 @@ export async function buildProject(projectDir, outputDir, gatewayPath = join(pro
       migrations: manifest.migrations,
       vars: manifest.vars,
       ...(manifest.pipelines === undefined ? {} : { pipelines: manifest.pipelines }),
-      component_digest: componentDigest,
+      artifacts,
     };
     const manifestPath = join(outputDir, 'manifest.out.json');
     await writeFile(manifestPath, `${JSON.stringify(outputManifest, null, 2)}\n`, 'utf8');
-    await updateGatewayManifest(gatewayPath, outputDir, componentDigest);
+    await updateGatewayManifest(gatewayPath, outputDir, componentDigest, manifest.bindings.length > 0);
 
     return {
       name: manifest.name,

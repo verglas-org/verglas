@@ -9,7 +9,15 @@
       }
     ]
   },
-  "component_digest": "fa7e69c03e088cbeceba39aa820c6519d1a4b673f4ce838ce65cb588c8f4c11b",
-  "component_dir": "/tmp/verglas-do-poc/js-build",
+  "artifacts": {
+    "worker": {
+      "digest": "fa7e69c03e088cbeceba39aa820c6519d1a4b673f4ce838ce65cb588c8f4c11b",
+      "component_dir": "/tmp/verglas-do-poc/js-build"
+    },
+    "durable_object": {
+      "digest": "fa7e69c03e088cbeceba39aa820c6519d1a4b673f4ce838ce65cb588c8f4c11b",
+      "component_dir": "/tmp/verglas-do-poc/js-build"
+    }
+  },
   "data_root": "/tmp/verglas-do-poc/js-data"
 }
