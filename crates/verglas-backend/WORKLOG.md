@@ -154,3 +154,6 @@
   `verglas-server`. Backend resolution and startup probing are unchanged.
 - #66: Replaced “which cloud” / “real cloud” wording with object-store language in backend docs.
 - #84: Added a fail-closed dynamic registry that routes immutable storage bindings to independent backend clients and applies inserts or removals without a cache restart. Each binding retains its own provider, limiter, breaker, and retry state while the cache above remains shared.
+- #core-cleanup: Moved the small bucket glob matcher into the backend crate before
+  deleting the unused core glob module. Bucket-set matching remains exact and
+  allocation-bounded without retaining cache-node configuration helpers.

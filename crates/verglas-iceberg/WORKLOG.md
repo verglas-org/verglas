@@ -217,3 +217,4 @@
   reporting, and estimate surfaces and their obsolete dependencies. The retained
   path infers bounded primitive schemas, writes deterministic Parquet files, and
   returns replay-safe Iceberg snapshot receipts.
+- #171: Corrected the retained catalog connection contract: host-owned origin publication is authoritative, while local Foyer contents are disposable acceleration and never a write-back authority.

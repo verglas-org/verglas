@@ -37,13 +37,6 @@
           "docs/architecture/cells",
           "docs/architecture/benchmarks"
         ]
-      },
-      {
-        "group": "Reference",
-        "icon": "book",
-        "pages": [
-          "docs/reference/semantic-api"
-        ]
       }
     ]
   },

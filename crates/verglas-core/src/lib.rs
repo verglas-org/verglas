@@ -1,28 +1,19 @@
 //! Core types shared across the Verglas workspace.
 //!
 //! This crate holds the configuration types, error types, logical cache key
-//! definitions, the data-plane interfaces ([`read`]'s `ObjectRead`, [`write`]'s
-//! `ObjectWrite`/`Invalidation`, and [`list`]'s `ObjectList`), and admin API
-//! wire types that every other
-//! Verglas crate builds on. Keeping them here keeps the dependency graph
-//! acyclic: the serving crates depend on `verglas-core`, never on each other's
+//! definitions, and the data-plane interfaces ([`read`]'s `ObjectRead`,
+//! [`mod@write`]'s `ObjectWrite`/`Invalidation`, and [`list`]'s `ObjectList`) that
+//! every serving crate builds on. Keeping them here keeps the dependency graph
+//! acyclic: serving crates depend on `verglas-core`, never on each other's
 //! internals.
 
-pub mod activity;
-pub mod admin;
 pub mod config;
-pub mod config_template;
-pub mod disk;
-pub mod glob;
 pub mod grant;
 pub mod list;
 pub mod medium;
 pub mod metrics;
 
-pub mod node;
-pub mod peer;
 pub mod read;
-pub mod ring;
 pub mod telemetry;
 pub mod trace;
 pub mod write;
@@ -36,11 +27,9 @@ pub const RUN_BEARER_TOKEN_ENV: &str = "VERGLAS_RUN_BEARER_TOKEN";
 /// Logical identity of a cached object: which binding and object a request names,
 /// independent of which version of it currently exists.
 ///
-/// This is the granularity of ring ownership (see [`ring`]) and of
-/// invalidation: binding identity prevents equal bucket/key names at different
-/// origins from colliding, and every request path resolves `owner(&CacheKey)` before
-/// touching any cache state. Versioning lives one level down, in
-/// [`BlockKey`], so that ownership is stable across object overwrites.
+/// This is the granularity of invalidation: binding identity prevents equal
+/// bucket/key names at different origins from colliding. Versioning lives one
+/// level down, in [`BlockKey`], so immutable object versions never alias.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
     /// Immutable storage binding that selects the origin provider and credentials.
@@ -71,9 +60,8 @@ pub struct BlockKey {
     /// the origin reported it (no quote normalization; comparisons are
     /// byte-exact against the same origin's later responses).
     pub etag: String,
-    /// Size of each block in this cache geometry. It travels with peer reads so
-    /// nodes with divergent configuration can only miss, never serve bytes from
-    /// the wrong offset.
+    /// Size of each block in this cache geometry. It prevents persistent entries
+    /// created with different geometry from serving bytes at the wrong offset.
     pub block_bytes: u64,
     /// Zero-based index of the block within the object. Together with
     /// [`BlockKey::block_bytes`] it addresses

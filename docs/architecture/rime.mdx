@@ -69,6 +69,6 @@ The coordinator owns policy, evaluation, wave closure, promotion, and
 cleanup. Mutation workers own exactly one candidate each, in isolated
 workspaces, and report evidence rather than judgments. Host integrations
 (Claude Code, Codex, Cursor, Pi) supply worker execution and worktree
-isolation; the search core assumes none of them. Runs persist through
-`VerglasGraphStore` into the project graph `rime_<project>`, and a create-once
-json-render dashboard replays the population live as waves close.
+isolation; the search core assumes none of them. Runs persist in project-local
+state, and a create-once JSON-render dashboard replays the population live as
+waves close.

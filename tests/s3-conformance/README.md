@@ -91,8 +91,7 @@ it back over HTTPS with `curl --aws-sigv4`:
 ```
 
 Requires docker, openssl, and a `curl` with `--aws-sigv4` (>= 7.75). The
-zero-downtime certificate rotation is covered by the cache-node integration
-tests.
+zero-downtime certificate rotation is covered by the runtime integration tests.
 
 ## Files
 

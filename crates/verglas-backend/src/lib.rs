@@ -251,6 +251,32 @@ pub trait BackendStores: Send + Sync {
     }
 }
 
+/// Matches a bucket pattern where `*` consumes any run of characters.
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut pattern_index, mut text_index) = (0usize, 0usize);
+    let mut star: Option<(usize, usize)> = None;
+    while text_index < text.len() {
+        if pattern_index < pattern.len() && pattern[pattern_index] == '*' {
+            star = Some((pattern_index + 1, text_index));
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == text[text_index] {
+            pattern_index += 1;
+            text_index += 1;
+        } else if let Some((after_star, consumed)) = star {
+            star = Some((after_star, consumed + 1));
+            pattern_index = after_star;
+            text_index = consumed + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[pattern_index..]
+        .iter()
+        .all(|character| *character == '*')
+}
+
 /// The set of buckets a node serves (#235): an optional single `bucket` plus a
 /// list of glob patterns. A request's bucket is served if it equals the single
 /// bucket or matches a glob. This is the one gate every serving path consults.
@@ -287,7 +313,7 @@ impl BucketSet {
         }
         self.globs
             .iter()
-            .any(|pattern| verglas_core::glob::matches(pattern, bucket))
+            .any(|pattern| glob_matches(pattern, bucket))
     }
 
     /// A one-line description for the startup log / error text: the single

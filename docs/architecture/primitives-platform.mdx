@@ -59,18 +59,15 @@ Turso adapters, and uses Foyer memory and disk tiers to cache origin-backed
 bytes and compiled/runtime data. Foyer is a performance cache, never a commit
 authority.
 
-The runtime is not a storage cluster. It has no Raft, consensus groups, rings,
-quorums, peer replication, membership protocol, safekeeper, distributed WAL,
-erasure-coded write-back, block-device service, or NBD endpoint. Machine-loss
-durability comes from Turso for Durable Objects and from each product's named
-external destination. Origin writes complete at the origin before success.
+Machine-loss durability comes from Turso for Durable Objects and from each
+product's named external destination. Origin writes complete at the origin
+before success; local cache contents are disposable.
 
 Tenant components receive no raw network, object-store, or filesystem access.
 Narrow host capabilities perform privileged operations such as the Iceberg
 Catalog commit after validating the caller's declared binding and object
 identity. These are in-process host calls, not hidden services or a seventh
-product. The former clustered cache daemon and its operational surface are not
-part of the platform.
+product.
 
 ## 1. Worker
 
@@ -332,10 +329,8 @@ deleted, ignored, or stripped of assertions.
 - **PP8 — six-product and runtime closure.** Deployment and architecture
   inventories expose exactly Worker, Durable Object, Stream, Pipeline, Sink,
   and Catalog. Every system resource is implemented as a prebuilt Worker/DO
-  deployment on `verglas-runtime`. No job Worker, direct DO public route,
-  standalone queue engine, custom DO database, clustered cache-node, Raft/ring/
-  peer plane, distributed write-back, block/NBD service, or direct
-  DO-to-Iceberg path remains.
+  deployment on `verglas-runtime`. Retired execution and storage engines are
+  absent, and ordinary Durable Objects have no direct Iceberg publication path.
 - **PP9 — Cloudflare-shaped management contract.** Verglas manifests and
   provisioning inputs support the Cloud control plane's create/list/get/delete
   API, immutable resource behavior, Stream binding generation, schema

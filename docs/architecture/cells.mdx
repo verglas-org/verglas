@@ -85,7 +85,6 @@ open the DO's remote database and restore its local working copy
 release the triggering event after the sync boundary
 ```
 
-The cache, Iceberg, Catalog, and semantic graph/vector infrastructure remain
-independent. Sinks own delivery and Iceberg data-file publication; Catalog owns
-Iceberg REST and metadata commits. A DO does not materialize its state directly
-to Iceberg or mutate graph/vector indexes.
+Cache acceleration, Sink delivery, and Catalog publication remain separate
+from ordinary Durable Object state. A DO does not materialize its database
+directly to Iceberg; Sink and Catalog own that path.

@@ -2,9 +2,7 @@
 # feature, which the structured-logging path and the `Valuable` derives on
 # `NamespaceIdent`/`TableIdent` depend on.
 #
-# `tokio_unstable` was here for `tokio-metrics`' runtime collector. That was
-# dropped (see `crates/verglas-catalog-core/src/metrics.rs`): rustflags are global, so one
-# optional gauge set was forcing the whole workspace onto tokio's unstable
-# surface. Do not add it back.
+# `tokio_unstable` is intentionally absent. Rustflags are global; do not force
+# the workspace onto Tokio's unstable surface.
 [build]
 rustflags = ["--cfg", "tracing_unstable"]

@@ -536,3 +536,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   DRAM and NVMe by design, which is the stronger isolation test).
   Reproduced the failure locally under 100 busy-loop hogs (2/12 rounds),
   then 0/16 rounds with the barriers.
+- #cache-cleanup: Reduced the crate to one Foyer DRAM and persistent origin
+  cache with ETag/geometry block keys, admission, recovery, singleflight fills,
+  invalidation, and focused counters. Removed peer, write, materialized, and
+  retired-object machinery so cache state is local and disposable.
+- #cache-cleanup: Added focused behavior coverage for range slicing, DRAM and
+  NVMe hits, ETag isolation, invalidation/refill, concurrent fill coalescing,
+  and hard DRAM/NVMe budget rejection.

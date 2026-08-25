@@ -15,12 +15,6 @@ members = [
     "crates/verglas-runtime",
     "crates/verglas-do-wasm",
     "crates/verglas-gateway",
-
-    # Catalog support used behind the product boundary.
-    "crates/verglas-catalog-authz",
-    "crates/verglas-catalog-core",
-    "crates/verglas-catalog-io",
-    "crates/verglas-iceberg-ext",
 ]
 
 [workspace.package]
@@ -28,9 +22,7 @@ members = [
 # are never deleted or re-pointed once pushed (the tag/version pair names the
 # artifacts forever). The tag must match this version (cargo-dist enforces it).
 #
-# 0.2.0 marks absorbing the Catalog catalog. Its crates were independently
-# versioned at 0.13.1 under their own release-please; they now take this
-# version like every other crate in the repository.
+# 0.2.0 marks the six-product Cloudflare-primitives runtime pivot.
 version = "0.2.0"
 edition = "2024"
 repository = "https://github.com/verglas-org/verglas"

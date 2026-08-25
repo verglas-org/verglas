@@ -1,7 +1,0 @@
-Verglas
-
-This product includes software derived from Lakekeeper, Copyright 2024-2026
-Vakamo Inc., licensed under the Apache License 2.0. The derived code is the
-hosted Iceberg REST catalog in crates/verglas-catalog-core,
-crates/verglas-catalog-io, and crates/verglas-iceberg-ext; it has been
-modified. See LICENSING.md for the crate-by-crate boundary.

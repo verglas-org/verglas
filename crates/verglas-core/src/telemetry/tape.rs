@@ -98,7 +98,7 @@ impl Buffer {
     }
 }
 
-/// A per-core tape: two [`Buffer`]s and an index of which one is currently
+/// A per-core tape: two internal buffers and an index of which one is currently
 /// active for writes. Writers append to the active buffer; the drainer flips
 /// the index and reads the now-inactive one.
 pub struct ShardTape {

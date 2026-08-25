@@ -25,8 +25,8 @@ package are client/tooling surfaces.
 
 - `crates/verglas-runtime`: the Wasmtime Worker/Durable Object host with Turso,
   Foyer tiered caching, origin access, and narrow host capabilities.
-- `crates/verglas-catalog-*` and `crates/verglas-iceberg-ext`: the Verglas
-  Iceberg REST catalog and its extensions.
+- `system/catalog`: the Turso-backed Catalog Worker/Durable Object product.
+- `crates/verglas-iceberg`: the runtime's narrow deterministic commit capability.
 - `sdks/typescript`: the public TypeScript SDK.
 - `rime`: the RIME package for supported agent hosts.
 - The reusable Rust crates that implement the storage, cache, catalog, and
@@ -42,9 +42,6 @@ Verglas is available under the Functional Source License 1.1 with an Apache
 Verglas for permitted purposes, but you may not offer it as a competing
 commercial product or service. Each version becomes available under Apache 2.0
 two years after that version is first made available. See [LICENSE](LICENSE).
-
-The catalog-derived crates have their own licensing boundary. See
-[LICENSING.md](LICENSING.md) for the applicable terms.
 
 ## Install
 

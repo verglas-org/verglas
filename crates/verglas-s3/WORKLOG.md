@@ -316,4 +316,10 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   JSON file rather than a viewer. The cache node's admin listener now serves
   every specification, including this crate's S3/graph/vector contract.
 - #137: Renamed the Graph REST-JSON operations to conventional Graphiti-derived verbs: add nodes and edges, retrieve neighbors, search traversals, describe graphs, and build indexes. The adapter, route contract, generated clients, and protocol tests now share the new names; the former ad-hoc routes are not served.
+- #s3-cleanup: Reduced this crate to strict authenticated S3 frontend and
+  passthrough origin read/write/list adapters. Removed semantic graph, vector,
+  and Iceberg routes, models, tests, and dependencies.
+- #171: Removed the final write-back fragment field from the S3 metrics fixture after deleting that retired distributed-storage metric family from core.
+- #s3-cleanup: Added a static public-surface guard proving semantic mutation
+  routes and dispatch remain absent after the passthrough-only reduction.
 

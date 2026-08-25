@@ -1,17 +1,6 @@
-//! The cache entry models. The hybrid (DRAM+disk) cache stores exactly one
-//! kind of entry — immutable data blocks keyed by [`BlockKey`] — while the
-//! per-object metadata (the key→ETag mapping) lives in its own small
-//! DRAM-only cache with its own budget carve-out (see the engine module for
-//! why the two must not share an eviction domain).
-//!
-//! Encoding notes: the [`Code`] impl below is foyer's on-disk framing for
-//! block keys (block values are [`bytes::Bytes`], covered by foyer's own
-//! codec). Fields are little-endian and strings are u64-length-prefixed. Per
-//! the prototype rules (AGENTS.md) there is deliberately no version tag:
-//! changing this framing is a flag-day re-fill of the disk tier, which is
-//! acceptable pre-release. Metadata never has a codec — it is never
-//! serialized anywhere, which is what guarantees a restart cannot resurrect
-//! a stale mapping.
+//! Cache keys and immutable origin metadata for the one-node Foyer cache.
+//! Block keys carry the object identity, ETag, geometry, and block index, so
+//! recovered bytes can only match the version they were fetched from.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -21,33 +10,12 @@ use foyer::{Code, Error as FoyerError, Result as FoyerResult};
 use verglas_core::read::ObjectMeta;
 use verglas_core::{BlockKey, CacheKey};
 
-/// Key of one block entry in the hybrid cache: a logical [`BlockKey`] plus the
-/// cache **generation** it was admitted under (issue #178). The newtype exists
-/// because the `Code` framing must live in this crate (foyer's trait, core's
-/// type — the orphan rule forbids implementing it directly).
-///
-/// # Generation epoch (the purge mechanism)
-///
-/// `generation` is a node-local physical epoch, **not** part of the object's
-/// logical identity. Every lookup and insert stamps the engine's current
-/// generation ([`crate::engine::HybridCacheEngine::purge`] bumps it); a purge
-/// is therefore an O(1) generation bump that makes every entry written under an
-/// earlier generation instantly unreachable (a lookup at the new generation
-/// misses) without touching the racy foyer store — foyer's `clear()` is banned
-/// on the hot stores because it panics against a concurrent `insert`
-/// (foyer-rs/foyer#1305). Old-generation entries are reclaimed lazily by LRU
-/// aging; the generation is included in the on-disk codec below, so a restart
-/// recovers them faithfully and they remain correctly unreachable garbage.
-///
-/// Extension point (#51 per-table retirement): this global generation is the
-/// degenerate case of a future per-table generation vector — a purge retires
-/// one table by bumping only its counter. Not built here.
+/// Key of one immutable block in the hybrid cache. The wrapper exists because
+/// the Foyer codec is implemented in this crate for the core [`BlockKey`].
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlockEntryKey {
     /// The logical block identity (object + ETag + block index).
     pub block: BlockKey,
-    /// The cache generation this entry was admitted under (see the type doc).
-    pub generation: u64,
 }
 
 /// Whole-object metadata as cached from an origin response — the value type
@@ -183,9 +151,8 @@ pub(crate) fn read_string(reader: &mut impl Read) -> FoyerResult<String> {
 }
 
 impl Code for BlockEntryKey {
-    /// Encodes `(bucket, key, etag, block_index, generation)`, length-prefixed.
-    /// The generation is part of the on-disk framing so restart recovery keeps
-    /// old-generation entries correctly unreachable (see the type doc).
+    /// Encodes the logical object, ETag, geometry, and block index using
+    /// length-prefixed strings and little-endian integers.
     fn encode(&self, writer: &mut impl Write) -> FoyerResult<()> {
         write_bytes(writer, self.block.object.storage_binding_id.as_bytes())?;
         write_bytes(writer, self.block.object.bucket.as_bytes())?;
@@ -196,9 +163,6 @@ impl Code for BlockEntryKey {
             .map_err(FoyerError::io_error)?;
         writer
             .write_all(&self.block.block_index.to_le_bytes())
-            .map_err(FoyerError::io_error)?;
-        writer
-            .write_all(&self.generation.to_le_bytes())
             .map_err(FoyerError::io_error)
     }
 
@@ -217,10 +181,6 @@ impl Code for BlockEntryKey {
         reader
             .read_exact(&mut index)
             .map_err(FoyerError::io_error)?;
-        let mut generation = [0u8; 8];
-        reader
-            .read_exact(&mut generation)
-            .map_err(FoyerError::io_error)?;
         Ok(BlockEntryKey {
             block: BlockKey {
                 object: CacheKey {
@@ -232,12 +192,10 @@ impl Code for BlockEntryKey {
                 block_bytes: u64::from_le_bytes(block_bytes),
                 block_index: u64::from_le_bytes(index),
             },
-            generation: u64::from_le_bytes(generation),
         })
     }
 
-    /// Serialized size, exact: length prefixes + field bytes + geometry +
-    /// index + generation.
+    /// Returns the serialized key size used by Foyer's storage accounting.
     fn estimated_size(&self) -> usize {
         8 + self.block.object.storage_binding_id.len()
             + 8
@@ -246,7 +204,6 @@ impl Code for BlockEntryKey {
             + self.block.object.key.len()
             + 8
             + self.block.etag.len()
-            + 8
             + 8
             + 8
     }

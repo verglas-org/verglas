@@ -79,8 +79,8 @@ dropping a committed record.
 
 ## What the DO does not own
 
-The six-product boundary prevents a DO from becoming a hidden lakehouse or
-semantic engine:
+The six-product boundary prevents an ordinary DO from becoming a hidden
+lakehouse:
 
 - **Pipeline** is a prebuilt Worker/DO that owns its Stream cursor, stateless
   SQL transform, batching, and retry state. It contains no destination-specific
@@ -88,11 +88,9 @@ semantic engine:
 - **Sink** is a prebuilt Worker/DO that owns idempotent delivery. The first Sink
   writes Parquet and commits Iceberg snapshots through a Catalog binding.
 - **Catalog** is a prebuilt Worker/DO that owns Iceberg REST, namespace/table
-  metadata, and the existing Verglas Iceberg and object-storage libraries.
-- **Cache** remains an independent S3/cache and routing infrastructure.
-- **Graph and vector** services remain independent semantic infrastructure over
-  customer-owned Iceberg tables and explicit index builds. They are not DO
-  mutation domains and receive no autonomous DO publication.
+  state, and the commit ledger in Turso. Its narrow runtime capability owns the
+  Iceberg and object-storage libraries.
+- **Cache** remains independent runtime acceleration and routing infrastructure.
 
 A customer binding remains usable without Verglas. A managed binding keeps its
 Verglas-owned object layout and read path. Neither rule gives a DO a direct

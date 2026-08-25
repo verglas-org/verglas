@@ -1397,7 +1397,7 @@ impl ObjectWrite for PassthroughWrite {
 
     /// Forwards the completion manifest. Both completion APIs are positional
     /// (part `i` of the vec must be part number `i+1`), so non-contiguous part
-    /// numbers are rejected by [`contiguous_parts`] instead of being silently
+    /// numbers are rejected by the contiguous-part validator instead of being silently
     /// renumbered — renumbering would make the origin verify the wrong ETags.
     /// Real S3 clients number parts 1..=N. A checksummed completion (per-part
     /// or object-level, issue #208), or a raw-only key (issue #189), completes

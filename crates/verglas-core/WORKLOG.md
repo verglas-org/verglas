@@ -470,3 +470,11 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
 - #171: Removed stale references to the deleted clustered crates and cache-node
   binary from shared core documentation and admin fixtures. The remaining core
   config comments describe runtime batches without naming retired paths.
+- #core-cleanup: Deleted the obsolete admin/activity wire modules and their
+  quiescence tests, removed the cache-node config-template and shared glob
+  module, and kept bucket matching local to the config/backend consumers.
+- #core-cleanup: Replaced the retired cache-node configuration schema with the
+  retained cache, origin, admission, retry, and breaker settings. Removed the
+  listener/catalog/cluster/write-back config, disk budget helpers, and their
+  obsolete integration tests.
+- #171: Deleted the final `node`, `peer`, and rendezvous-ring modules and their tests. Cache identity documentation now describes only immutable binding/version/geometry isolation; no membership, ownership, donor, or peer-fetch seam remains.

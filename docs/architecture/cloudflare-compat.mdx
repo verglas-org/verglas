@@ -27,9 +27,9 @@ compiles to Verglas's WASM component ABI. Each language gets a Verglas-owned SDK
 that implements the Cloudflare spec surface over the `verglas:do-worker` WIT ABI
 and is bundled into the component at build time. Product-specific capabilities
 are separate bindings: Pipeline SQL is a stateless stream transform, Sinks own
-idempotent delivery, Catalog owns Iceberg REST, and cache plus semantic
-graph/vector infrastructure remain independent services. None changes the
-Worker/DO compatibility surface.
+idempotent delivery, Catalog owns Iceberg REST, and Foyer cache acceleration
+remains runtime infrastructure. None changes the Worker/DO compatibility
+surface.
 
 ## WIT world v2 (normative sketch)
 

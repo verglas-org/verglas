@@ -12,19 +12,13 @@ This project is pre-release. The rules that follow from that are strict:
 
 ## Repository layout
 
-One cargo workspace covers the whole repository. `crates/` and `bins/` hold the
-engine. The TypeScript SDK under `sdks/typescript` is a separate package. The
-Verglas fork of [Lakekeeper](https://github.com/lakekeeper/lakekeeper), the Apache Iceberg REST
-catalog, lives in `crates/verglas-catalog-*` and `crates/verglas-iceberg-ext`.
-It moved in from the separate `verglas-org/verglas-catalog` repository, which
-is historical; catalog changes land here.
+One cargo workspace covers the whole repository. `crates/` holds the runtime
+infrastructure and narrow host capabilities. `system/` holds the prebuilt
+Worker/Durable Object products, including the Turso-backed Catalog. The
+TypeScript SDK under `sdks/typescript` is a separate package.
 
-`cargo build --workspace` builds all of it. `just build`, `just test`, and
-`just lint` are the entry points.
-
-The catalog is being adapted heavily and will not stay recognisable as upstream
-Catalog. Treat its code as Verglas code: the standing rules in this file
-(no fallbacks, delete rather than deprecate, tests first) apply there too.
+`cargo build --workspace` builds the Rust workspace. `just build`, `just test`,
+and `just lint` are the entry points.
 
 Things that are easy to get wrong:
 
@@ -36,23 +30,13 @@ Things that are easy to get wrong:
   workspace.** It gates `tracing`/`tracing-subscriber`'s `valuable` feature.
   Rustflags set in the environment *replace* that table rather than merging, so
   exporting `RUSTFLAGS` breaks the build. `tokio_unstable` was deliberately
-  removed — do not reintroduce it (see
-  `crates/verglas-catalog-core/src/metrics.rs`).
+  removed; do not reintroduce it.
 - **One `iceberg`, and it is forked.** `[patch.crates-io]` redirects `iceberg`
   and its three sibling crates to `verglas-org/verglas-iceberg`, whose base is
   the Catalog fork plus a public `TableCommit::from_parts`. All four are
   pinned with `=` requirements: a caret requirement lets the higher crates.io
   0.10.1 outrank the fork's 0.10.0 and the patch silently stops applying.
   Unifying this is what allowed one workspace at all.
-- **`LICENSING.md` governs the catalog crates' licensing** — mostly
-  Apache-2.0, with the Verglas-authored adapters under FSL-1.1-ALv2. The root
-  `LICENSE` does not cover them. The boundary is the *crate*, not the
-  directory: upstream-derived crates declare `license = { workspace = true }`
-  (Apache-2.0) and the Verglas adapters declare FSL explicitly, so a crate
-  keeps its license if it is ever relocated. Never switch one of them to
-  `license-file.workspace` (what engine crates inherit) — that would
-  relicense upstream-derived code.
-
 
 ## Sources of truth
 
@@ -102,7 +86,7 @@ The point: tests written after code tend to **confirm what the code does**; test
 
 - **A managed binding is authoritative; a customer binding is not.** Verglas owns the object layout of a bucket it manages, and every read of that bucket routes through Verglas. A customer binding keeps the customer's own layout, and nothing may make serving from it depend on Verglas-only state.
 - **Runtime shutdown is fenced.** Celld stops event admission, waits for the Turso push and Stream outbox fences, closes the event endpoint, and only then stops the child. Foyer contents may be discarded at any time because they are not durable state.
-- **Never write to customer tables or buckets autonomously.** Explicit customer-invoked index builds may attach derived Puffin statistics files to the target snapshot; no background operation may publish one without that authorization.
+- **Never write to customer tables or buckets autonomously.** Every publication is an explicit Sink/Catalog operation authorized by the caller.
 - **Slow is acceptable; wrong is never.** A local cache miss or invalid entry refills from the configured origin. Cached blocks are served only for the exact storage binding, object version, geometry, and range they name.
 - **Budgets are hard ceilings** (DRAM, NVMe, CPU) — especially in colocated mode, where Verglas must be a provably polite tenant.
 - **Hot paths do not lock, allocate, or aggregate** — record to tapes/snapshots and do the work in the background.
@@ -148,7 +132,7 @@ Runtime notes:
 - Worker and Durable Object components run through the Wasmtime host and use
   Turso for Durable Object state.
 - Foyer is the only runtime cache tier. It fills from the configured origin and
-  never assumes a peer, ring, quorum, or replicated WAL.
+  all local cache contents are disposable.
 - Iceberg Sink commits use the runtime's narrow host capability. Tenant
   components do not receive raw object-store or catalog credentials.
 - Product E2E tests and component tests are self-contained; hosted provisioning

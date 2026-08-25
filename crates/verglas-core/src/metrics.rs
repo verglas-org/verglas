@@ -159,7 +159,7 @@ pub struct MetricsSnapshot {
     /// Bytes served to clients, per tier: `(tier, bytes)`. Rendered as
     /// `verglas_bytes_served_total{tier}`.
     pub bytes_served: Vec<(ServedTier, u64)>,
-    /// Block lookups that hit a cache tier (dram + disk + peer + meta hits).
+    /// Block lookups that hit the DRAM or persistent Foyer tier.
     pub cache_hits: u64,
     /// Block lookups that missed every cache tier and had to fill.
     pub cache_misses: u64,
@@ -184,22 +184,6 @@ pub struct MetricsSnapshot {
     /// The breaker's current coarse state as a stable string
     /// (`closed`/`open`/`half_open`).
     pub breaker_state: &'static str,
-    /// Write-back fragment-integrity counters (#220), present only when the
-    /// write-back tier is enabled. `None` omits the families entirely.
-    pub writeback: Option<WritebackMetricsSnapshot>,
-}
-
-/// The write-back tier's fragment-integrity counters (#220), read at scrape
-/// time from the running coordinator's metrics. Rendered only when the tier is
-/// enabled; the whole struct is optional on [`MetricsSnapshot`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WritebackMetricsSnapshot {
-    /// Fragments the background scrubber verified and re-encoded (#220).
-    pub fragments_repaired: u64,
-    /// Fragments the background scrubber walked and verified (#220).
-    pub fragments_scrubbed: u64,
-    /// Fragments found corrupt during reassembly, repair, or scrub (#220).
-    pub corrupt_fragments_found: u64,
 }
 
 /// A single exposition metric line: `name{labels} value`. Writes the label set
@@ -416,47 +400,6 @@ pub fn render(metrics: &NodeMetrics, snapshot: &MetricsSnapshot) -> String {
         );
     }
 
-    // Write-back fragment-integrity counters (#220), present only when the
-    // write-back tier is enabled.
-    if let Some(wb) = &snapshot.writeback {
-        header(
-            &mut out,
-            "verglas_write_fragments_scrubbed_total",
-            "counter",
-            "Write-back fragments the background scrubber verified (#220).",
-        );
-        line(
-            &mut out,
-            "verglas_write_fragments_scrubbed_total",
-            &[],
-            wb.fragments_scrubbed,
-        );
-        header(
-            &mut out,
-            "verglas_write_fragments_repaired_total",
-            "counter",
-            "Write-back fragments re-encoded after failing verification (#220).",
-        );
-        line(
-            &mut out,
-            "verglas_write_fragments_repaired_total",
-            &[],
-            wb.fragments_repaired,
-        );
-        header(
-            &mut out,
-            "verglas_write_corrupt_fragments_found_total",
-            "counter",
-            "Write-back fragments found corrupt during reassembly, repair, or scrub (#220).",
-        );
-        line(
-            &mut out,
-            "verglas_write_corrupt_fragments_found_total",
-            &[],
-            wb.corrupt_fragments_found,
-        );
-    }
-
     out
 }
 
@@ -499,11 +442,6 @@ mod tests {
             breaker_trips: 1,
             breaker_rejections: 4,
             breaker_state: "closed",
-            writeback: Some(WritebackMetricsSnapshot {
-                fragments_repaired: 6,
-                fragments_scrubbed: 11,
-                corrupt_fragments_found: 3,
-            }),
         }
     }
 
@@ -541,26 +479,9 @@ mod tests {
         assert!(text.contains("verglas_circuit_breaker_state{state=\"closed\"} 1"));
         assert!(text.contains("verglas_circuit_breaker_state{state=\"open\"} 0"));
 
-        // Write-back fragment-integrity families (#220).
-        assert!(text.contains("verglas_write_fragments_scrubbed_total 11"));
-        assert!(text.contains("verglas_write_fragments_repaired_total 6"));
-        assert!(text.contains("verglas_write_corrupt_fragments_found_total 3"));
-
         // Every counter family carries a TYPE header.
         assert!(text.contains("# TYPE verglas_bytes_served_total counter"));
         assert!(text.contains("# TYPE verglas_cache_size_bytes gauge"));
-    }
-
-    /// With no write-back tier the fragment-integrity families are omitted
-    /// entirely — a single-node or write-through node emits none of them (#220).
-    #[test]
-    fn writeback_families_omitted_when_disabled() {
-        let metrics = NodeMetrics::new().expect("build metrics");
-        let mut snap = sample_snapshot();
-        snap.writeback = None;
-        let text = render(&metrics, &snap);
-        assert!(!text.contains("verglas_write_fragments_scrubbed_total"));
-        assert!(!text.contains("verglas_write_corrupt_fragments_found_total"));
     }
 
     /// Counters move as requests are observed: two GETs put a count of 2 under

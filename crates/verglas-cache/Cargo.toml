@@ -25,30 +25,14 @@ thiserror.workspace = true
 # fails is logged with the request id and a redacted key hash, so a failure like
 # #245/#233 is visible instead of degrading silently.
 tracing = "0.1.44"
-# SIMD Reed-Solomon codec for the write-back erasure tier (#180). Chosen over
-# reed-solomon-erasure by the throughput comparison in examples/codec_throughput.rs.
-reed-solomon-simd.workspace = true
-# Per-fragment CRC32C integrity check for the write-back codec (#220): a bad
-# fragment fails verification and is treated as an erasure, so Reed-Solomon
-# reconstructs from the good fragments instead of returning silent garbage.
-crc32c.workspace = true
 # The singleflight fill map (#19) runs each deduplicated fill in a detached
 # task (waiter-cancellation safety) and shares its result across waiters —
 # needs the tokio runtime handle for `spawn`.
 tokio.workspace = true
 
 [dev-dependencies]
-# Tests fill through verglas-s3's passthrough; dev-only, so the library
-# dependency graph stays cache -> core <- s3.
-verglas-s3.workspace = true
-object_store.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
-# Captures the structured fill-failure events for the #61 logging test.
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "json", "env-filter"] }
-serde_json.workspace = true
-# Only for the codec throughput comparison example (#180); never a library dep.
-reed-solomon-erasure.workspace = true
 
 [lints]
 workspace = true
