@@ -1,7 +1,7 @@
 # Ceph s3-tests conformance harness
 
 Runs [ceph/s3-tests](https://github.com/ceph/s3-tests) — the de-facto S3
-compatibility suite — against a live `verglas-cache-node` endpoint backed by MinIO. For
+compatibility suite — against a live `verglas-runtime` endpoint backed by MinIO. For
 Verglas the suite is the **compatibility contract**: the curated skip list plus
 the excluded feature-group markers ARE the documented statement of what
 "S3-compatible" means for the server today (issue #22).
@@ -12,11 +12,11 @@ the excluded feature-group markers ARE the documented statement of what
  pytest (ceph/s3-tests, pinned commit)
         │  S3 requests (SigV4, dev keypair)
         ▼
-   verglas-cache-node  ──(AWS_* env: origin creds)──▶  MinIO  (origin / capacity tier)
+   verglas-runtime  ──(AWS_* env: origin creds)──▶  MinIO  (origin / capacity tier)
    (built from THIS repo — the system under test)
 ```
 
-`docker-compose.yml` owns only **MinIO** (the origin). `verglas-cache-node` is the system
+`docker-compose.yml` owns only **MinIO** (the origin). `verglas-runtime` is the system
 under test, so it is built from this repo and run as a local process by
 `run.sh` (mirroring `verglas dev`); there is no Rust image to build and no
 libc/musl story to manage.
@@ -24,18 +24,18 @@ libc/musl story to manage.
 ## Run it
 
 ```bash
-just s3-tests            # full suite (release verglas-cache-node, MinIO, full ceph suite)
+just s3-tests            # full suite (release verglas-runtime, MinIO, full ceph suite)
 just s3-tests --smoke    # fast subset (smoke-list.txt), seconds
-just s3-tests --debug    # debug build of verglas-cache-node (faster compile, local dev)
+just s3-tests --debug    # debug build of verglas-runtime (faster compile, local dev)
 just s3-tests --list     # collect-only: what WOULD run, no server/docker
-just s3-tests --keep     # leave MinIO + verglas-cache-node up afterwards for poking
+just s3-tests --keep     # leave MinIO + verglas-runtime up afterwards for poking
 
 # equivalently, directly:
 ./tests/s3-conformance/run.sh --full
 ```
 
 `run.sh` is idempotent: it clones the pinned suite into `.work/` (gitignored),
-builds a Python venv, brings up MinIO via compose, builds+starts `verglas-cache-node`, runs
+builds a Python venv, brings up MinIO via compose, builds+starts `verglas-runtime`, runs
 pytest, and tears everything down on exit. Prerequisites: Docker (compose v2),
 `python3.13` (or `python3`), and a Rust toolchain.
 
@@ -80,7 +80,7 @@ a collected test, so the list cannot rot.
 `tls-addressing-smoke.sh` is a separate, self-contained check that the S3
 endpoint serves over TLS and accepts both addressing styles. It generates a
 self-signed cert (SANs for the base domain, a wildcard, and 127.0.0.1), starts
-MinIO and a TLS-configured `verglas-cache-node` against it, seeds one object, then fetches
+MinIO and a TLS-configured `verglas-runtime` against it, seeds one object, then fetches
 it back over HTTPS with `curl --aws-sigv4`:
 
 - path-style with **CA injection** (`--cacert`) and with **`--no-verify`** (`-k`);

@@ -5,11 +5,3 @@ Vakamo Inc., licensed under the Apache License 2.0. The derived code is the
 hosted Iceberg REST catalog in crates/verglas-catalog-core,
 crates/verglas-catalog-io, and crates/verglas-iceberg-ext; it has been
 modified. See LICENSING.md for the crate-by-crate boundary.
-
-This product includes software developed at
-The Apache Software Foundation (http://www.apache.org/)
-
-This product bundles Swagger UI (swagger-ui-dist 5.32.14), Copyright
-SmartBear Software, licensed under the Apache License 2.0. The files are
-vendored unmodified at bins/cache-node/assets/swagger-ui/; see the LICENSE and
-PROVENANCE.md in that directory.

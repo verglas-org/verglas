@@ -1,6 +1,6 @@
 ---
 title: "Runtime roles"
-description: "Keep the six Worker/DO products separate from independent cache, Iceberg, and semantic infrastructure."
+description: "Keep the six Worker/DO products separate from their shared runtime capabilities."
 icon: "server"
 ---
 
@@ -43,16 +43,11 @@ stateless SQL transform only; it is not part of DO storage.
   existing Verglas catalog and object-storage libraries. It owns metadata
   publication, not Pipeline cursors or Sink delivery state.
 
-## Independent engine infrastructure
+## Shared runtime capabilities
 
-The cache remains an independently deployable S3 read/write-through and routing
-layer. Iceberg support, catalog libraries, and semantic graph/vector services
-remain independently useful for self-hosted deployments and external clients.
-Sinks and Catalogs use those libraries where their product boundaries require
-them; a tenant DO does not mutate their state directly. Customer-owned buckets
-and tables remain authoritative and must stay usable without Verglas.
-
-The `verglas-cache-node` process provides cache, ring, storage, and existing
-Iceberg/catalog infrastructure. It does not silently become a hosted job
-runtime, queue engine, or custom DO database. See [architecture
-overview](/docs/architecture/overview) for the repository boundary.
+`verglas-runtime` is the shared Wasmtime host for Worker and Durable Object
+components. It owns the Turso adapter, Foyer memory and disk tiers, origin
+access, and narrow privileged capabilities such as Iceberg Catalog commits.
+Tenant components do not receive raw object-store, filesystem, or network
+authority. See [architecture overview](/docs/architecture/overview) for the
+repository boundary.

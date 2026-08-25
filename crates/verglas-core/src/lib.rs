@@ -5,8 +5,8 @@
 //! `ObjectWrite`/`Invalidation`, and [`list`]'s `ObjectList`), and admin API
 //! wire types that every other
 //! Verglas crate builds on. Keeping them here keeps the dependency graph
-//! acyclic: `verglas-cache`, `verglas-s3`, and `verglas-tables` all depend on
-//! `verglas-core`, never on each other's internals.
+//! acyclic: the serving crates depend on `verglas-core`, never on each other's
+//! internals.
 
 pub mod activity;
 pub mod admin;

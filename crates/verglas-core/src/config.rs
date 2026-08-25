@@ -328,9 +328,7 @@ pub struct Writeback {
     /// accumulated small objects into one packed S3 object (#164 §4). An
     /// object at or above this limit bypasses accumulation and streams to the
     /// origin alone, so a large write never waits behind a buffer of unrelated
-    /// small ones. Mirrors `WAL_SEGMENT_BYTES`
-    /// (`bins/cache-node/src/safekeeper.rs`), the same accumulate/flush shape
-    /// generalized to objects; the 16 MiB default matches it.
+    /// small ones. The 16 MiB default bounds one accumulated object batch.
     #[serde(default = "default_offload_size_limit_bytes")]
     pub offload_size_limit_bytes: ByteSize,
     /// How often, in seconds, the background offload drain loop flushes each
@@ -476,10 +474,8 @@ fn default_scrub_interval_secs() -> u64 {
     6 * 60 * 60
 }
 
-/// The documented default object offload size limit: 16 MiB (#164 §4),
-/// matching `WAL_SEGMENT_BYTES` (`bins/cache-node/src/safekeeper.rs`). The
-/// frozen benchmark protocol in `tests/cluster-local/OBJECTIVE.md` bakes this
-/// exact value into its PUT-count bound.
+/// The documented default object offload size limit: 16 MiB (#164 §4).
+/// The limit bounds the size of one accumulated object batch.
 fn default_offload_size_limit_bytes() -> ByteSize {
     ByteSize(16 * 1024 * 1024)
 }
@@ -491,11 +487,8 @@ fn default_offload_drain_interval_secs() -> u64 {
     5
 }
 
-/// The documented default cap on staged objects per batched consensus
-/// commit. Large enough to absorb a full concurrency-16 burst to one shard
-/// (`OBJECT_CONSENSUS_SHARDS = 4` in `bins/cache-node/src/consensus.rs`) in a
-/// single Raft entry; small enough that one batch's header payload and its
-/// all-or-nothing retry blast radius both stay bounded.
+/// The documented default cap on staged objects per batch commit. The limit
+/// bounds one batch's payload and retry work.
 fn default_object_commit_max_batch() -> usize {
     64
 }
@@ -1541,8 +1534,8 @@ fn parse_bytes(s: &str) -> Result<u64, String> {
 }
 
 impl Config {
-    /// Reads, parses, and validates a config file — the one call `verglas-cache-node`
-    /// startup makes. Any error is ready to print and exit on.
+    /// Reads, parses, and validates a config file for runtime startup. Any error
+    /// is ready to print and exit on.
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         let text =
             std::fs::read_to_string(path).map_err(|e| ConfigError::Read(path.to_owned(), e))?;

@@ -4,842 +4,319 @@ description: "The design, invariants, and reasoning behind Verglas."
 icon: "snowflake"
 ---
 
-**The lakehouse runtime: an Iceberg-aware statekeeper that brings the warehouse to compute**
-
----
+# Verglas architecture
 
 ## Abstract
 
-Iceberg over object storage has become the dominant substrate for analytical data, but object-store latency makes direct reads too slow for interactive queries and low-latency serving. Production estates therefore maintain derived copies in real-time OLAP stores, key-value caches, feature stores, and vector databases. Each copy adds ingest pipelines, synchronization cost, and another source of inconsistency. Format-blind caching can reduce repeated fetches, but cannot infer immutability or table-level change notifications, and so must trade staleness against hit rate through operator tuning.
+Verglas is a Cloudflare-compatible component platform for six products:
+Worker, Durable Object, Stream, Pipeline, Sink, and Catalog. Applications are
+written against familiar Worker and Durable Object APIs, compiled to WebAssembly
+components, and executed by Wasmtime. Durable Object state is ordinary SQL in a
+Turso database. The remaining products are Durable Object components with
+narrow, explicit responsibilities.
+
+The serving path has three infrastructure processes. `verglas-gateway` accepts
+requests and resolves declared bindings. `verglas-celld` supervises isolated
+children and enforces lifecycle and resource limits. `verglas-runtime` executes
+Worker and Durable Object components, opens Turso state, maintains a local
+Foyer cache, accesses the configured origin, and implements a small set of
+privileged host capabilities. Infrastructure processes are not products.
+
+Verglas deliberately has no distributed storage engine. Durable state belongs
+to Turso or the configured origin. The Foyer DRAM and NVMe tiers are disposable
+performance state and can always refill from the origin. Iceberg publication is
+a narrow runtime capability invoked by Catalog; tenants do not receive raw
+network, object-store, or catalog credentials.
 
-We propose Verglas, an Iceberg-aware lakehouse runtime that colocates an S3-compatible cache and Postgres WAL persistence with compute. A shared coded Multi-Raft substrate runs many independent consensus groups across the cache nodes: warehouse groups serialize Iceberg transactions, while timeline groups fence Postgres writers and order WAL. Entry headers and control commands are fully replicated; large immutable payloads are erasure-coded. A write is acknowledged only when the intersection of its durable fragment quorum and every possible future election quorum can reconstruct it. This combines agreement, immediate read availability, and NVMe-latency acknowledgment in one call, while complete segments and Iceberg objects drain to S3 asynchronously. The public repository owns the cache and consensus engine plus its CLI, SDKs, documentation, and RIME package; the hosted control plane owns the authenticated Lakekeeper REST composition, provisioning, and Durable Object platform that consumes those engine contracts.
-
----
-
-## Repository scope
-
-This open-source repository is the Verglas data engine: the Iceberg-aware cache
-node (including WAL and virtual block devices) plus its public clients. Cache
-nodes implement the coded Multi-Raft substrate and
-the typed warehouse and timeline state machines. They expose private engine
-contracts, not hosted identity, provisioning, or public catalog REST modules.
-The hosted Lakekeeper adapter translates authenticated Iceberg REST operations
-into the warehouse state-machine commands defined here. External-catalog
-databases bypass the managed warehouse state machine and retain the semantics
-of their configured catalog.
-
-The public CLI, SDKs, documentation, and RIME package live beside the engine.
-RIME is an evolutionary search over code states; its algorithm and the
-git-SHA evolution record are specified in [RIME architecture](/docs/architecture/rime).
-Hosted access, Durable Object placement and execution, databases, integrations,
-applications, Lakekeeper service, and agent runtime services live in the private
-`verglas-cloud` repository. The private `verglas-app` repository contains only
-the cloud console and workspace client. CI rejects copies of those hosted
-products in this repository.
-
----
-
-## 1 Background
-
-The lakehouse architecture stores analytical tables as open-format files on cloud object storage and lets independent query engines share them. Apache Iceberg has become the leading open specification for this arrangement. Two properties of the resulting stack shape everything deployments build around it: object-store access latency, and the catalog's dependence on a transactional database.
-
-### 1.1 The Iceberg table format
-
-Iceberg tracks the individual data files of a table rather than its directories. Table state lives in an immutable metadata file recording the schema, partition specs, and a log of snapshots, where each snapshot represents the complete table contents at a point in time [1]. The only mutable state is held by a catalog: the location of the current metadata file. Figure 1 shows the resulting structure for a table with two snapshots.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'Inter, ui-sans-serif, system-ui', 'primaryTextColor': '#0f172a', 'lineColor': '#64748b'}}}%%
-flowchart TB
-    CAT[catalog]
-    MD[table metadata]
-    ML0[manifest list]
-    ML1[manifest list]
-    M1[manifest a]
-    M2[manifest b]
-    D1[data files]
-    D2[data files]
-
-    CAT --> MD
-    MD -->|s0| ML0
-    MD -->|s1, current| ML1
-    ML0 --> M1
-    ML1 --> M1
-    ML1 --> M2
-    M1 --> D1
-    M2 --> D2
-
-    classDef catalog fill:#ede9fe,stroke:#7c3aed,color:#2e1065,stroke-width:2px
-    classDef metadata fill:#dbeafe,stroke:#2563eb,color:#172554,stroke-width:2px
-    classDef manifest fill:#cffafe,stroke:#0891b2,color:#164e63,stroke-width:2px
-    classDef data fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
-
-    class CAT catalog
-    class MD metadata
-    class ML0,ML1,M1,M2 manifest
-    class D1,D2 data
-```
-
-*Figure 1: Iceberg metadata for a table with two snapshots. Snapshot s1 reuses manifest a and adds manifest b. The catalog pointer is mutable; the files it references are immutable.*
-
-**Catalog.** The catalog maps a table identifier to the location of its current metadata file. It is the entry point for every table load and the coordination point for commits. Changing this mapping atomically publishes a new table state [1].
-
-**Table metadata.** The metadata file records the table schema, partition specifications, properties, snapshot history, and the identifier of the current snapshot. Each snapshot entry points to its own manifest list. The edges labeled s0 and s1 in Figure 1 represent these references.
-
-**Manifest list.** A manifest list defines the manifests that belong to one snapshot. Its entries include partition summaries and file counts, allowing a query planner to discard irrelevant manifests without fetching them.
-
-**Manifest.** A manifest is an immutable Avro file containing entries for a subset of the table's data or delete files. Each entry records the file path, partition tuple, row count, and column-level metrics used to discard irrelevant files. A manifest may be shared by multiple snapshots. In Figure 1, both s0 and s1 reference manifest a, while only s1 references manifest b.
-
-**Data and delete files.** Data files hold table rows in Parquet, ORC, or Avro. Delete files encode row-level deletions separately from the data files they affect. Both are immutable and are included in a snapshot through manifest entries [1].
-
-Writers create new files instead of modifying existing ones. A commit writes any required data or delete files, manifests, manifest list, and table metadata before atomically updating the catalog to reference the new metadata file. Readers that loaded the previous metadata file continue to see the previous snapshot, while later readers see the new snapshot. This atomic publication provides serializable isolation without modifying files already visible to readers [1].
-
-Query planning follows the same hierarchy. An engine loads the metadata location from the catalog, reads the current snapshot's manifest list, uses its partition summaries to select manifests, and uses manifest metrics to select data and delete files. It may then read format-specific metadata, such as Parquet footers, to select byte ranges. Requests within one level can run concurrently, but each level depends on the results of the preceding level.
-
-### 1.2 Object-store access latency
-
-The metadata tree of §1.1 determines the request pattern of every Iceberg query. Figure 2 shows the calls a single query issues against the catalog and the object store before any result is produced.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'Inter, ui-sans-serif, system-ui', 'actorBkg': '#dbeafe', 'actorBorder': '#2563eb', 'actorTextColor': '#172554', 'signalColor': '#475569', 'signalTextColor': '#0f172a', 'labelBoxBkgColor': '#ede9fe', 'labelBoxBorderColor': '#7c3aed', 'labelTextColor': '#2e1065', 'loopTextColor': '#2e1065'}}}%%
-sequenceDiagram
-    participant Engine
-    participant Catalog
-    participant S3
-
-    Engine->>Catalog: Load table
-    Catalog-->>Engine: Current metadata location
-    Engine->>S3: Get table metadata
-    S3-->>Engine: Current snapshot
-    Engine->>S3: Get manifest list
-    S3-->>Engine: Surviving manifests
-
-    loop For each surviving manifest
-        Engine->>S3: Get manifest
-        S3-->>Engine: Surviving data files
-    end
-
-    loop For each surviving data file
-        Engine->>S3: Get file footer
-        S3-->>Engine: Selected byte ranges
-        Engine->>S3: Get selected byte ranges
-        S3-->>Engine: Data pages
-    end
-```
-
-*Figure 2: Catalog and object-store calls for one Iceberg query. Manifest and data-file requests run concurrently within their respective stages, but each stage depends on the results of the preceding stage.*
-
-The cost of this pattern is well characterized. Durner et al. measure AWS S3 at a median base latency of roughly 30ms per request, with first-byte latency dominating small reads, and show that saturating a 100 Gbit/s instance requires 200–250 concurrent requests [2]. Three consequences follow:
-
-1. **Serial metadata reads pay full round-trips.** Each level in Figure 2 depends on the output of the previous one; concurrency shortens none of the chain. Caching immutable Iceberg manifests inside the engine has been shown to reduce Impala query compilation time by up to 12× on TPC-DS, direct evidence that repeated metadata fetches dominate planning cost [3].
-2. **Selective reads cannot hide latency.** A point lookup or index probe issues few requests, so per-request latency, not bandwidth, bounds its response time.
-3. **Request sizing is an economic trade-off.** Object stores charge per request. Larger reads amortize latency and cost but over-fetch relative to partition, column, and page pruning; smaller reads do the opposite. Cost-model analyses of cloud caching find the break-even points workload-dependent, and observe that object-store caches are near-universal in cloud analytics systems for exactly this reason [4].
-
-Aggregate bandwidth is not the constraint: in-region object-store throughput is high and scales with concurrency [2]. The constraint is latency under repetition. The same manifests, footers, and hot data ranges are fetched by many queries, from many engines, every day, and a cache inside any single engine cannot serve its neighbors.
-
-### 1.3 Workload patterns around the lakehouse
-
-Lakehouse deployments serve heterogeneous consumers, and for many of them the latency floor of §1.2 is disqualifying. The prevailing mitigation is to materialize a derived copy in a system built for the workload's access pattern.
-
-**Interactive analytics.** Dashboards and user-facing analytics require low query latency over recent data. Real-time OLAP systems meet this requirement by continuously ingesting source data into indexed, column-oriented storage designed for high query concurrency. Pinot, for example, combines near-real-time stream ingestion with tens of thousands of analytical queries per second [5]. Freshness therefore depends on the progress and correctness of a separate ingestion path.
-
-The hosted platform serves dashboards as declarative json-render specs whose
-sources are live: commit-driven follow subscriptions on Iceberg tables and
-graph traversal views, so a dashboard is created once and updates as commits
-land. Verglas remains the catalog-aware cache path, and no dashboard registry
-is stored in customer tables.
-
-**Online serving and feature stores.** Applications and ML inference require low-latency retrieval by entity key. Feature-store architectures address this by retaining historical features in an offline store and materializing their latest values into a separate online store. Scheduled or streaming materialization keeps the two stores eventually consistent; failed or partial updates can produce training-serving skew [6].
-
-**Vector retrieval.** Embedding-based search conventionally requires a dedicated vector database that owns its index storage, consistency model, and operational lifecycle, an arrangement at odds with compute-disaggregated analytics, where executors are stateless and read all state from object storage [7]. The embeddings themselves typically originate in lakehouse tables and are copied out at index-build time.
-
-**S3 Vectors and Graph API.** The cache node's S3 listener also owns the exact
-AWS S3 Vectors REST-JSON surface and Verglas Graph REST-JSON surface. They are
-adapters over customer-owned Iceberg node, edge, and vector tables; Puffin
-attachments are snapshot-bound acceleration only. There is no query-node,
-write-node, local vector bucket registry, or second graph database.
-Each vector bucket has a reserved Iceberg control table for its creation fields,
-encryption, tags, and policy; this avoids relying on optional catalog namespace
-mutation and keeps every control-plane read restart-safe.
-
-Verglas instead serializes each Vamana ANN index as a `verglas-vamana-v1` Puffin blob, writes the Puffin file through the source table's `FileIO`, and publishes it as the `StatisticsFile` of the exact Iceberg snapshot it reflects. The catalog therefore exposes the durable snapshot-to-index binding to every Iceberg client; clients that understand the blob type can use it, while other clients ignore it. Verglas fetches the attached Puffin file through its S3 endpoint and retains a decoded local copy for ANN serving, so customer object storage remains authoritative and local DRAM/NVMe remains disposable acceleration. A query never uses an index attached to a different snapshot.
-
-**ML training.** Training jobs repeatedly consume the same dataset across epochs and parameter-search experiments. Quiver reports that deep-learning jobs commonly run 50–100 epochs and that many concurrent jobs may read the same underlying dataset in different random orders, motivating distributed caches between cloud storage and GPU workers [8].
-
-These systems are effective because they change the physical access path: they place selected rows, features, indexes, or training samples on faster media in layouts matched to the workload [5–8]. Their recurring cost is a second data lifecycle. Each derived representation needs a process that selects and transfers updates, recovers from interruption, and exposes its freshness boundary to readers. Unless the source and destination participate in the same commit protocol, publication cannot be atomic across both systems; the design must tolerate lag or add coordination.
-
-### 1.4 Catalog persistence
-
-Iceberg leaves catalog implementation outside the table format but requires it to perform the atomic pointer swap [1]. Production catalogs therefore keep their state in a transactional database. Lakekeeper requires PostgreSQL [9]; Apache Polaris recommends its PostgreSQL JDBC metastore for production [10]; Nessie lists PostgreSQL among its production version stores [11]. Hosted catalogs such as AWS Glue provide the same mutable service behind an API without exposing the database.
-
-A complete lakehouse deployment thus contains two kinds of state: immutable table metadata and data files in object storage, and mutable catalog, authorization, and coordination state in a transactional service. The transactional side is what makes atomic commits possible, but it is provisioned, secured, backed up, and scaled separately from the data it governs. A parallel industry trend couples operational Postgres to lakehouse tables through replication (§2.4), adding a further synchronization boundary between row-oriented and columnar representations of the same data.
-
----
-
-## 2 Related Work
-
-Existing systems address different portions of the problem described in §1: engine-local caches accelerate one runtime, distributed filesystems place a new namespace over object storage, faster storage products change the backing medium, and OLTP–lakehouse products replicate between storage engines. The relevant distinction is not whether each system caches data, but which layer owns naming, consistency, and lifecycle.
-
-### 2.1 Engine-captive caches
-
-Engine-integrated caches exploit information already available to the query runtime: split placement, projected columns, file-format metadata, and the local availability of worker storage. Databricks disk cache, for example, copies remote Parquet data into a proprietary intermediate format on worker SSDs [12]. Trino is a query engine, but its Iceberg connector can cache object-store reads on each worker. The cache uses Alluxio libraries beneath the connector and treats Iceberg metadata and data as files; snapshot and manifest interpretation remains inside Trino. Each worker maintains and evicts its own cache, while scheduling only expresses a preference for workers that may already hold the requested file [13]. Dremio similarly allocates its local cache independently on each executor node [14].
-
-This placement removes an additional network hop and lets the scheduler favor workers that already hold the requested data. The cache, however, exists only on those workers. Replacing the cluster discards it. A second cluster or query engine builds another cache from the same objects, duplicating both remote reads and local storage.
-
-Engine integration also determines which Iceberg operations are available. Iceberg standardizes metadata and commit semantics, not connector feature sets or maintenance policy. For example, Databricks reserves automatic compaction and snapshot expiration for Iceberg tables managed by Unity Catalog. Foreign Iceberg tables remain under their external catalog, are read-only in Databricks, and do not receive those maintenance services [15]. Obtaining managed-table behavior therefore requires adopting Unity Catalog as the table's lifecycle owner, not merely exposing an Iceberg table to Databricks. Dremio makes a similar trade-off. Automatic compaction and cleanup apply to tables in its built-in Open Catalog and run on a Dremio-configured maintenance engine [14]. This reduces manual work inside Dremio, but ties maintenance policy and execution to Dremio's catalog and runtime.
-
-Externally managed tables require an additional synchronization boundary. Snowflake accesses Iceberg through an external volume and catalog integration [16]. It discovers external catalog changes by polling, with a default refresh interval of 30 seconds, and schema changes made only through DDL require a manual refresh [17]. The files remain Iceberg, but visibility and freshness inside the engine depend on its catalog adapter.
-
-Open-source engines expose the same maintenance burden more directly. Trino supplies separate procedures for compacting files, expiring snapshots, and removing orphan files, and recommends that operators run the cleanup procedures regularly [18]. These operations modify shared table state, so their retention settings and schedules must be coordinated with writers and with every other engine that relies on older snapshots.
-
-The central limitation is that storage interoperability stops at the engine boundary. Iceberg files can be read by many engines, but cached bytes, catalog state, and maintenance policy remain private to the engine that produced them. A second engine reading the same table begins cold, builds another cache, and may observe commits through a different refresh path. Engine-captive caching preserves format portability without providing performance portability.
-
-### 2.2 Format-blind neutral caches
-
-Distributed filesystem and data-orchestration systems provide a shared, engine-neutral layer, but their contracts are filesystem contracts rather than table contracts.
-
-**Alluxio** mounts under-file systems into a unified namespace and caches their contents. Its documentation notes that changes made directly in an under-file system can leave the Alluxio namespace out of sync until metadata synchronization runs [19]. This is a valid filesystem contract, but it introduces namespace state that must be reconciled with the object store.
-
-**JuiceFS** takes a different approach: it is an independent filesystem whose clients split files into chunks in object storage while a separate metadata engine records paths, attributes, and chunk mappings [20]. This avoids mirroring an external namespace, but the bucket no longer contains the original files in their original layout. JuiceFS is therefore a primary filesystem over object storage, not a transparent cache for an existing Iceberg warehouse.
-
-Neither design interprets Iceberg snapshots, manifests, or logical file identity. A compaction rewrite consequently appears as unrelated new files, and the system cannot transfer observed heat from old files to their replacements or warm a snapshot from its catalog commit. Adding those behaviors requires a table-aware layer above the filesystem cache.
-
-### 2.3 Faster storage products
-
-Faster object and file stores reduce remote-read latency directly. This is appropriate when the faster store can become the authoritative location. It is less attractive for an existing lakehouse when doing so requires moving data, rewriting producers, or provisioning low-latency capacity for the full dataset rather than its active working set.
-
-Research systems such as AnyBlob instead optimize the object-store client through high concurrency, request sizing, and lower CPU overhead [2]. These techniques improve cold-scan throughput and complement any caching layer, but they do not eliminate repeated remote reads or the latency of serial metadata dependencies. Caching and retrieval optimization address different portions of the path [4].
-
-### 2.4 Lakehouse–OLTP integration via replication
-
-Databricks Lakebase combines disaggregated Postgres with lakehouse data through explicit synchronization. Synced tables copy Unity Catalog tables into Postgres for low-latency serving. Delta sources may use continuous synchronization with a documented minimum 15-second interval, while Iceberg sources currently support snapshot synchronization because they do not expose Delta Change Data Feed [21]. In the other direction, Lakebase Change Data Feed uses logical decoding to batch Postgres WAL changes into managed Delta tables at approximately 15-second intervals [22].
-
-This architecture provides operational and analytical access under one platform, but the row and columnar representations remain separate physical copies with an explicit freshness boundary. Neon's underlying storage architecture independently demonstrates that Postgres compute can be made stateless when durability is delegated to a quorum-acknowledged WAL service, pageservers, and object storage as durable history [23]. This is evidence that the transactional side of the lakehouse does not inherently require a dedicated storage stack.
-
----
-
-## 3. Verglas Overview
-
-Verglas interposes a shared storage and consensus service between engines and object storage. Engines continue to issue S3 requests, and Iceberg remains the table format, but a managed deployment no longer requires a separate transactional database for catalog commits. The same cache nodes that hold hot bytes host many isolated coded Raft groups. These groups order the small mutable state that cannot be made safe by immutable object naming alone: Iceberg catalog transactions, Postgres writer ownership, WAL positions, archive checkpoints, and membership changes.
-
-The design separates unordered immutable reads from ordered mutation streams. Cached immutable reads need no consensus and remain available from any valid copy. Managed catalog and WAL mutations enter the group leader through any ingress, become committed commands in one replicated log, and are applied deterministically. Large WAL or object payloads are erasure-coded across voters while their hashes, terms, indexes, lengths, coding geometry, modes, and request identities are fully replicated. External Iceberg catalogs remain available through database-scoped gateways in eventual mode, but managed catalogs are authoritative Verglas state machines and provide linearizable commits and reads. Logical SQL and table-write requests remain isolated roles whose object I/O returns through the shared S3 surface.
-
-### 3.1 System boundary
-
-Each tenant cache serves a dynamic set of storage bindings through one S3-compatible endpoint. A binding selects an origin provider, scope, and authorized secret resource; adding a database can add a binding without restarting or duplicating the cache. Adoption requires changing the engine's S3 endpoint and supplying endpoint credentials; no engine connector is required. The server resolves origin credentials independently and forwards cache misses through the selected binding to S3-compatible storage, Azure Blob Storage, or Google Cloud Storage. Retry limits and circuit breakers are isolated per binding, while admission and heat remain shared so the tenant's hottest workload wins unless explicitly pinned.
-
-The server implements the S3 object operations Iceberg clients use: signed GET, HEAD, range, LIST, PUT, DELETE, COPY, and multipart requests. Compatibility is exercised by the Ceph `s3-tests` suite. A separate engine matrix compares direct, cold-cache, and warm-cache results from DuckDB and Polars at the Arrow level. Parquet queries are compared end to end; Avro and mixed-format fixtures are additionally compared byte for byte because the tested engine versions do not decode Avro data files.
-
-The server runs as a container. Self-hosted deployments use the published Docker image; production fleets sit behind an L4 load balancer and deploy through container orchestration such as Terraform or Helm. The CLI remains a pure client — of the server's admin API, of the S3 listener's semantic graph and vector surfaces, and of the Iceberg REST catalog directly for table metadata and ingest — and does not manage server processes.
-
-### 3.2 Design requirements
-
-Six requirements constrain the design.
-
-1. **Open durable output.** Verglas does not replace Iceberg objects with a proprietary table representation. Data, manifests, and metadata files drain to ordinary object storage. A deliberate detach first fences new mutations, archives committed WAL, exports and checkpoints the managed catalog, and then redirects clients; after that drain, the lakehouse remains standard Iceberg. Abruptly destroying a quorum while acknowledged state is not yet archived is data loss, not a supported way to stop.
-2. **Version-specific reads.** Cached blocks are identified by object ETag, bucket, key, block geometry, and block index. A mutable read spanning multiple blocks commits to one ETag before streaming, so a response cannot combine cached bytes from one object version with origin bytes from another.
-3. **Shared acceleration.** Cache state belongs to the Verglas nodes rather than to a query-engine process. Any S3 client using the endpoint can reuse blocks populated by another client. Cluster ownership distributes the cache across nodes while preserving a backend path for every miss.
-4. **Bounded resource use.** DRAM, NVMe, metadata, and write-back fragment capacity are configured as ceilings. Admission and background warming operate within those budgets. Property tests exercise the DRAM and disk ceilings under randomized workloads.
-5. **One agreement boundary.** Acknowledgment of managed catalog or WAL state means that the command is durably committed by its coded Raft group. Verglas does not acknowledge from a process-local journal, delegate agreement to PostgreSQL, or run a second proposer quorum above the ring.
-6. **Linearizable multi-ingress operation.** Any ingress may accept a request, but only the current group leader orders it. Committed writer epochs fence stale Postgres computes, catalog compare-and-swap requirements execute in log order, and linearizable reads wait for a ReadIndex fence before observing state.
-
----
-
-## 4. System Architecture
-
-Figure 3 follows one pod-wide miss through the cluster. A request may arrive at any node; the receiving node checks its own tiers, computes the key's owner locally, and asks that owner directly. Ownership is a pure function of the key and the membership set — there is no directory service, no routing tier, and no extra hop to consult.
-
-```mermaid
-sequenceDiagram
-    participant Engine
-    participant N1 as Node 1
-    participant N3 as Node 3 owner
-    participant S3
-
-    Engine->>N1: GET object range
-    Note over N1: DRAM and NVMe miss
-    Note over N1: Weighted rendezvous selects node 3
-    N1->>N3: Request ETag-qualified block
-    Note over N3: DRAM and NVMe miss
-    N3->>S3: GET block range
-    S3-->>N3: Block bytes
-    Note over N3: Admit block
-    N3-->>N1: Block
-    N1-->>Engine: Requested bytes
-```
-
-*Figure 3: One pod-wide miss, the slowest path a read can take. Node 1 misses locally, computes the owner with no lookup hop, and fetches the exact ETag-qualified block from node 3, which fills from the origin once — concurrent requests for the same block coalesce at the owner. A warm read stops at the first or second step; node 1 may retain the returned block as a local replica, subject to admission.*
-
-### 4.1 Cache node
-
-A cache node is one `verglas-cache-node` process. Its S3 front end validates
-SigV4 requests and maps supported operations onto separate read and write
-interfaces. Its private admin listener exposes health, metrics, cache-local
-catalog access, and storage ingress. External Iceberg query and write processes
-remain independently deployable. The cache backend applies concurrency limits,
-retry policy, and circuit breaking before issuing origin requests. Worker/DO
-execution and the Stream-to-Iceberg products use their own bindings; the cache
-engine, Iceberg layer, and semantic services remain independent interfaces.
-
-The data cache divides objects into configurable 1–8 MiB blocks (2 MiB by default) and stores them in a hybrid DRAM and NVMe cache. The default follows a local Iceberg TPC-DS SF1000 measurement: DuckDB's 1–2 MiB Parquet ranges made 8 MiB fills fetch 70.67 GB from S3 to serve 12.61 GB, while 2 MiB blocks fetched 33.29 GB and cut cold wall time from 658.142 s to 329.440 s. Block geometry is part of the block identity, so a divergent peer configuration is a miss rather than a wrong-offset serve. Changing the configured geometry is a pre-release flag day and requires an empty cache directory; Verglas deliberately has no on-disk compatibility layer. A separate hybrid store holds metadata files and bounded Parquet footer suffixes. Separating the stores prevents a data scan from consuming the capacity reserved for planning metadata. Both stores recover their NVMe indexes after restart; a recovery test reopened a 256 MiB cache containing 32 blocks in approximately 11 ms.
-
-Admission is scan resistant after the cache reaches pressure. A compact frequency sketch rejects one-touch blocks unless they meet the configured admission threshold. The metadata store bypasses this admission rule because metadata objects are small and lie on the serial planning path. A constrained SF1 experiment found that probabilistically thinning later admissions to 10% increased backend fills from 317–325 to 493–500, so deterministic second-touch admission is the default; admission policy stays configurable because it is workload dependent.
-
-### 4.2 Cluster organization
-
-Nodes exchange membership and configured cache capacity through gossip. For each `(bucket, key)`, every node computes a deterministic score for every live member from the key, node identity, and advertised capacity. The member with the highest weighted score owns the object. Nodes with more capacity therefore win a proportionally larger share of keys.
-
-This calculation requires no directory lookup or coordination on the request path. Given the same membership view, an ingress node and the selected owner independently reach the same result. Adding, removing, or resizing a node changes only the keys for which the winning score changes. Property tests cover deterministic placement, minimal movement on membership changes, and capacity proportionality; an in-process three-node test covers convergence and failure detection.
-
-Any node may receive a client request, and it checks its own DRAM and NVMe tiers before consulting ownership. The order is safe because ownership is a placement mechanism, not a consistency mechanism: blocks are version-keyed (§5.1), so a locally retained replica is exactly as authoritative as the owner's copy, and there is no freshness question a peer hop could answer that the local lookup cannot. The ring instead determines where the canonical copy lives, where concurrent fills coalesce, and whom a joining node warms from — which copy serves is decided purely by latency. Deterministic placement states where misses converge, not where all copies are: replicas accumulate on non-owners deliberately (a sole owner of a hot block is a NIC bottleneck; retained replicas spread read load), and membership changes reassign ownership instantly while bytes move only as they are re-requested. The local probe that catches these copies is a memory-resident index lookup the node performs to serve from its own tiers at all — roughly nanoseconds against a peer round trip of hundreds of microseconds, a break-even hit rate of a fraction of a percent. On a local miss, the node asks the home node for the exact ETag-qualified block; a peer hit may be retained as a local replica subject to admission, so hot keys stop paying the peer hop. A peer miss or transport failure falls through to the origin rather than failing the read. Concurrent identical backend fills are coalesced by singleflight, with the owning node as the coalescing point: requests for the same cold object converge on its home node, so a request stampede produces one backend fill.
-
-When ownership moves, a joining node requests blocks from its rendezvous predecessor during a bounded warming interval. A draining node remains available as a donor while it is removed from new ownership, so scale-in and replacement transfer warmth instead of discarding it.
-
-### 4.3 Failure behavior
-
-The immutable read-cache path does not require consensus. If a node disappears, gossip removes it from the cache placement view and the ring reassigns its objects. Blocks unavailable from a peer are fetched from the origin. The consequence is lost cache warmth rather than lost table data. Gossip never changes consensus membership and never decides whether a catalog or WAL command is committed.
-
-NVMe entries survive process restart and checksum-failed tail entries are discarded during recovery. A permanent node loss discards that node's cache contents. If all cache nodes are unavailable, clients must use the origin endpoint directly or through deployment-level failover; this transition is not performed by the server.
-
-Host-managed scale-to-zero fences foreground admission and transfers leadership before stopping a node. A node that is still a voter may stop only when the remaining live voters preserve a legal election quorum and every committed coded entry needed for recovery remains reconstructable. Scaling an entire authoritative ring to zero requires an explicit checkpoint: stop new mutations, wait for accepted requests, archive WAL and dirty objects, export a catalog checkpoint to object storage, commit the checkpoint watermarks, and only then stop the final quorum. Retained NVMe can shorten restart, but it is not used to excuse an uncommitted membership change or an unsafe stop.
-
-Consensus-backed write-back changes the failure model because acknowledged catalog and WAL state may not yet exist at the origin; §6 describes its protocol.
-
-### 4.4 Coded Multi-Raft substrate
-
-The cache fleet hosts independent Raft groups for managed warehouse catalog and
-Neon timeline state instead of one global log. Durable Objects are outside that
-substrate: each DO has one isolated event executor and one remote Turso database,
-with pushes admitted only through the external lease-fenced sync ingress.
-Catalog and timeline groups elect leaders and commit concurrently, so one busy
-timeline or warehouse does not serialize unrelated tenants. Requests for those
-groups may arrive at any cache node and are forwarded to the known leader. A
-client retry carries the same request identity and never becomes a second
-command.
-
-Each group has a committed voter configuration. Reconfiguration uses joint consensus; gossip supplies reachability hints only. Terms, votes, log indexes, command kinds, payload lengths and hashes, coding geometry, storage mode, writer epoch, and idempotency identity are fully replicated. Large payloads may be stored as Reed–Solomon fragments, but agreement remains over the complete logical entry identified by its hash.
-
-At staging time an ingress may prefer voters it has recently reached, but the
-candidate pool is the complete committed voter configuration. A failed preferred
-holder therefore causes staging to try another committed voter; it never changes
-membership or treats gossip as a commit decision. The eventual header records
-the exact voters that fsynced the selected representations, making that durable
-certificate immutable after acknowledgement.
-
-Let `N` be the voter count, `q` the smallest legal future election quorum, `k` the number of fragments required to reconstruct a coded entry, and `w` the number of distinct voters that durably store fragments before acknowledgment. A coded entry is eligible to commit only when
+## 1. Scope
+
+This repository owns:
+
+- the Worker and Durable Object component ABI;
+- JavaScript and Python component build pipelines;
+- the gateway, celld supervisor, and runtime host;
+- Turso-backed Durable Object transactions and lifecycle handling;
+- the prebuilt Stream, Pipeline, Sink, and Catalog products;
+- local Foyer caching and origin access;
+- deterministic Parquet and Iceberg commit helpers used by the runtime;
+- hermetic acceptance tests and local examples.
+
+The hosted control plane owns deployment orchestration, authentication,
+provisioning, and the public `/pipelines/v1` management API. Those surfaces do
+not belong in this repository.
+
+This is a prototype. Protocols and on-disk layouts may change between commits.
+There are no compatibility aliases, migration layers, fallback implementations,
+or retired executables.
+
+## 2. Product model
+
+Exactly six component products exist.
+
+### 2.1 Worker
+
+A Worker is stateless request compute. The gateway instantiates the declared
+Worker artifact, supplies only manifest bindings and variables, and dispatches
+`fetch`. Worker instances do not receive Durable Object storage. A Worker may
+call a declared Durable Object, Stream, Pipeline, Sink, or Catalog binding.
+
+### 2.2 Durable Object
+
+A Durable Object is a named, single-threaded event target. The gateway derives a
+stable object identity from the declared namespace and object name. Celld starts
+one isolated runtime child for that identity. The runtime executes events through
+an input gate and opens one Turso database for durable state.
+
+Every event runs in one SQL transaction. Storage changes, alarms, and Stream
+outbox entries commit together. WebSocket effects are withheld until the event
+transaction reaches its durability boundary. A failed handler aborts storage and
+releases no staged effect.
+
+### 2.3 Stream
+
+A Stream accepts append-only records. Each append carries a stable producer,
+event, and record identity. The Stream stores the record and deduplication key in
+one Turso transaction. Replaying an acknowledged identity returns the existing
+position rather than appending a duplicate.
+
+A Stream never transforms records, advances consumer cursors, writes destination
+files, or commits tables.
+
+### 2.4 Pipeline
+
+A Pipeline owns transforms, batches, retries, and cursors. It reads ordered
+Stream positions, applies the declared SQL transform, freezes deterministic
+batches, and delivers each batch to a Sink. It advances its cursor only after
+the Sink confirms the same batch identity.
+
+Retry never creates a new batch identity. A Pipeline does not own destination
+credentials or catalog state.
+
+### 2.5 Sink
+
+A Sink owns destination policy and delivery idempotency. It validates a frozen
+Pipeline batch, derives the deterministic file identity, and calls its declared
+Catalog object. A confirmed batch is recorded in the Sink ledger. Reusing a
+batch identity with different content is a conflict.
+
+A Sink does not transform records or advance Pipeline cursors.
+
+### 2.6 Catalog
+
+Catalog owns the Iceberg API, immutable deployment configuration, namespace and
+table state, and confirmed commit ledger. That state is held in the Catalog
+Durable Object's Turso database. Public catalog requests terminate at the
+Catalog product rather than an infrastructure HTTP daemon.
+
+For an Iceberg data commit, Catalog validates the declared Sink, destination,
+batch identity, and expected table state. It then invokes the runtime's private
+Iceberg commit capability. The capability can write deterministic objects and
+perform the one requested optimistic table update. It cannot select a different
+warehouse, expose provider credentials, or provide tenant-controlled network
+access. Catalog records a receipt only after the capability confirms the exact
+batch and file identity.
+
+## 3. Component contract
+
+All products compile to the `verglas:do` component world named `service`. The
+world exposes stateless Worker entry points, stateful Durable Object entry
+points, SQL storage, alarms, sockets, and declared binding calls.
+
+The host supplies no command-line arguments, environment variables, filesystem
+preopens, clocks beyond declared interfaces, or raw sockets to tenant code.
+Standard output and error may be inherited for diagnostics. Components cannot
+open object storage or a catalog directly.
+
+Bindings are closed over the deployment manifest. A component can call only a
+binding declared for that deployment. Every binding resolves to one of the six
+product artifact types or to a reserved, runtime-owned host capability. A host
+capability is infrastructure and never appears as a seventh artifact product.
+
+Artifact identity is a lowercase SHA-256 digest. The runtime verifies the
+content-addressed component before binding its private event socket. A mismatch,
+missing artifact, unknown product, or undeclared binding fails closed.
+
+## 4. Process topology
 
 ```text
-w + q - N >= k
+edge
+  |
+  v
+verglas-gateway
+  |
+  v
+verglas-celld
+  |
+  v
+verglas-runtime
 ```
 
-so every legal future leader quorum intersects the durable write set in at least `k` fragments. This is the RS-Paxos quorum-intersection condition [32]. The usual Raft majority rule is also required. Configuration validation rejects a geometry that cannot satisfy both constraints. When a majority is available but the coded threshold is not, the leader may append a complete-entry representation to a majority. This CRaft-style fallback [33] preserves Raft liveness without relaxing safety; the chosen storage mode is part of the replicated entry header and cannot change locally after acknowledgment.
-
-A newly elected leader first reconstructs every committed coded entry needed by its state machine and completes Raft's log-matching repair before serving. It may fetch fragments from voters outside its election quorum, but it cannot expose state or acknowledge new entries until its committed prefix is complete. Linearizable reads use Raft ReadIndex (or an equivalent current-term quorum fence) and wait until the local applied index reaches the returned commit index. Session responses carry a commit-index watermark so a client routed to another ingress cannot move backward.
-
----
-
-## 5. Iceberg Awareness
-
-Iceberg awareness contributes four properties to the cache, each unavailable to a system that sees only buckets, keys, and bytes:
-
-1. **Exact consistency without revalidation** (§5.1). Version-keyed block identity plus the format's immutability contract reduce the cache-invalidation problem from every cached object to a single mutable pointer per table.
-2. **Version-atomic reads** (§5.1). A read commits to one object version before it streams, so concurrent overwrites cannot produce a response stitched from two versions.
-3. **Planning-path residency** (§5.2). The metadata that gates every query — about 1% of table bytes, read serially — lives in an isolated store that data scans structurally cannot evict, warmed at commit time rather than on first miss.
-4. **Heat that survives rewrites** (§5.3). Access frequency is recorded against logical identity (table, partition, column), which compaction preserves, rather than physical identity (file, offset), which compaction destroys.
-
-Figure 4 shows the cache's handling of one illustrative range read. An external
-query engine plans through the walk of Figure 2 — manifest pruning selects the
-file, the Parquet footer selects the column chunk's byte range — and issues an
-ordinary range GET. That S3 serving path never parses SQL. DO SQL executes in
-its Turso database, while Pipeline SQL is a separate stateless transform; neither
-turns the cache into a DO table provider. Two things then happen to a range
-request independently: the serving path resolves it to version-keyed blocks,
-and the classification path maps it to its logical table, partition, and column
-and records the access in the heat ledger, off the serving path.
-
-```sql
-SELECT sum(l_extendedprice)
-FROM lineitem
-WHERE l_shipdate >= DATE '1995-01-01'
-  AND l_shipdate <  DATE '1995-02-01';
-```
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'Inter, ui-sans-serif, system-ui', 'primaryTextColor': '#0f172a', 'lineColor': '#64748b'}}}%%
-flowchart TB
-    G[GET lineitem-017.parquet<br/>Range: bytes=25,690,112..26,214,399]
-    ID[Resolve version<br/>bucket, key, ETag, 2 MiB, block 12]
-    K{block 12 resident?}
-    O[(S3)]
-    N[NVMe block 12<br/>bytes 25,165,824..27,262,975]
-    R[Return requested slice]
-
-    CL[Classify<br/>lineitem / 1995-01 / extendedprice]
-    HL[(Heat ledger)]
-
-    G --> ID
-    ID --> K
-    K -->|hit| N
-    K -->|miss| O
-    O -->|2 MiB fill| N
-    N --> R
-
-    G -.-> CL
-    CL -.->|record access| HL
-
-    classDef request fill:#fef3c7,stroke:#d97706,color:#78350f,stroke-width:2px
-    classDef mapping fill:#cffafe,stroke:#0891b2,color:#164e63,stroke-width:2px
-    classDef storage fill:#e2e8f0,stroke:#475569,color:#0f172a,stroke-width:2px
-    classDef hit fill:#dcfce7,stroke:#16a34a,color:#14532d,stroke-width:2px
-    classDef logical fill:#ede9fe,stroke:#7c3aed,color:#2e1065,stroke-width:2px
-
-    class G request
-    class ID,K mapping
-    class O storage
-    class N,R hit
-    class CL,HL logical
-```
-
-*Figure 4: Serving and classification of one range read (offsets illustrative). The solid path serves: the requested 512 KiB column slice resolves to block 12 under `(storage_binding_id, bucket, key, ETag, block_bytes, block_index)`; a miss fills the covering 2 MiB block from that binding's origin, and only the requested slice is returned. The binding ID prevents identical bucket/key names under different providers or credentials from colliding. The dotted path classifies: the same range maps to its database, table, partition, and column, and the access is recorded in the shared heat ledger without touching the serving path — the logical identity that lets heat survive compaction while the physical cache key stays version-exact.*
-
-### 5.1 Versioned block identity
-
-A shared cache must answer one question before serving any byte: are these bytes current? The generic answer is a freshness policy — TTLs and conditional revalidation — which costs origin round-trips proportional to the cached population and still leaves a staleness window between checks (§2.2). Verglas restructures the problem so that, for most of the estate, the question does not arise.
-
-The cache stores blocks under `(bucket, key, etag, block_bytes, block_index)`: the object version and block geometry are part of the identity. An overwrite produces new block identities rather than modifying existing entries, so a cached block cannot hold wrong bytes for its key — it can only be the bytes of the version and byte range named in its key. Staleness is thereby confined to a single small mapping per object, from `(bucket, key)` to the current ETag, and correctness reduces to resolving that mapping. Ring ownership uses `(bucket, key)`, so placement remains stable across versions while stored bytes remain version specific.
-
-The Iceberg contract then eliminates the mapping problem for the bytes that dominate the estate. Data files, delete files, manifests, manifest lists, and metadata files are immutable [1]: once resolved, their mappings are valid forever, with no revalidation traffic at any interval. The consistency workload of the cache collapses from all cached objects, forever to the catalog pointer plus whatever non-Iceberg objects share the bucket — the former invalidated when the private watcher observes commits, the latter given a configurable TTL with `If-None-Match` revalidation. Immutability is classified from object paths and, when the catalog watcher is active, from catalog metadata, which is authoritative.
-
-Version-in-key identity also yields read atomicity. A read resolves the key-to-ETag mapping once, before streaming; every cache hit and origin fill for that read then resolves against the committed ETag. A concurrent overwrite either remains invisible to the read or surfaces as an ETag mismatch — never as a response mixing bytes of two versions across a block boundary. A deterministic regression test and randomized interleaving tests exercise this boundary-crossing overwrite case in addition to ETag isolation, singleflight, post-ack mutation ordering, purge behavior, and resource ceilings.
-
-### 5.2 Metadata isolation and warming
-
-The planning walk of §1.2 is a serial dependency chain: its latency is depth times per-level round-trip, and no concurrency shortens it. The only lever is the per-level latency itself, which makes table metadata — roughly 1% of table bytes that gates 100% of queries — the highest-leverage bytes in the system. Two mechanisms exploit this asymmetry.
-
-**Isolation.** Metadata is admitted into a dedicated store rather than the data-block cache. A shared eviction policy cannot express that a manifest is worth more than a data block of equal recency — under LRU-family policies a large scan evicts both alike. A separate store encodes the priority structurally: no data workload, at any scan rate, can displace planning state. The store bypasses scan-resistant admission for the same reason; metadata objects are small and always on the critical path.
-
-**Commit-driven warming.** A demand cache faults metadata in one miss at a time, on the first query after every change. A managed catalog commit is already an ordered warehouse-group command naming the new immutable metadata location. Applying that command atomically publishes the new catalog snapshot, invalidates prepared responses, emits the data-update event, and schedules the metadata walk. A lagging query node must reach the command's ReadIndex fence before serving a linearizable response. External catalogs use their database binding's polling or notification semantics and remain eventual unless that service independently guarantees more. On startup and after each observed commit, the control path walks the new table metadata, current manifest list, manifests, and Parquet footers through the normal cache interface. Footer warming uses a bounded suffix request, with a second request only when the footer exceeds the initial window. Warming concurrency and byte rate are bounded independently, and if a table's metadata footprint exceeds the configured budget the warmer stops admitting rather than thrashing the store.
-
-The combined effect is that the serial planning walk runs against local media for the first query after a deployment and the first query after every commit — the cases where a demand cache is coldest; §8.1 measures the resulting origin-request elimination.
-
-### 5.3 Snapshot transitions and heat transfer
-
-Compaction is where demand-driven caching fails structurally. An `OPTIMIZE` rewrites data files without changing table contents: every physical identity the cache has learned — file path, ETag, byte offset — is destroyed, while the logical distribution of future accesses is unchanged. A cache that indexes heat by physical identity loses its entire learned working set on the schedule its own table maintenance runs, and relearns it one miss at a time (§2.2).
-
-The algorithm that avoids this separates the two identities. A background heat ledger aggregates accesses under logical coordinates — table, partition, column — which survive any rewrite; the classification from request to logical coordinate is the mapper's job (Figure 4). When the watcher observes a commit, the lifecycle component classifies it from Iceberg snapshot metadata: an append introduces new data, an overwrite changes contents, and a compaction (`replace`) preserves contents under new files. For a compaction, diffing the changed manifests yields the replacement file set, and the prefetcher projects the accumulated logical heat onto it — the heat of a partition's hot columns transfers to the new files that now hold them. Prefetch fetches footers before hot column ranges, shares a byte-rate budget with metadata warming, and yields to foreground requests.
-
-Version-keyed identity also makes the transition itself a non-event for concurrent clients. A commit creates version skew by design: engines that planned against the previous snapshot continue reading the old files, possibly for hours, while new queries read their replacements. Because blocks are keyed by object version (§5.1), the cache serves both file sets hot side by side — there is no invalidation event, no flush, and no revalidation storm at the moment of commit. Each client stays warm on whatever snapshot it is pinned to, and the old files retire on a grace window aligned with snapshot expiry, so time-travel reads stay fast until the snapshots themselves are gone. When the new snapshot does become visible, the first wave of workers faulting the same replacement files coalesces through owner-keyed singleflight into one origin fill per object.
-
-The compaction job itself also runs through the endpoint. Its reads of source files are served from cache rather than the origin, and its rewritten files can enter the write-back path of §6, acknowledged at NVMe latency and propagated in the background. Maintenance therefore runs faster and stops competing with query traffic for origin bandwidth — and a shorter compaction directly shrinks the window in which its commit can conflict with concurrent writers at the catalog.
-
-The S3 serving path pays nothing for any of this. The mapper's index — parsed Iceberg metadata, manifest lists, manifests, and Parquet footers — is immutable in memory; request classification reads it through an atomic snapshot, and catalog updates build a replacement index off the serving path and publish it in one pointer swap. No lock, allocation, or catalog I/O appears on an S3 request. The watcher communicates privately with the customer's catalog service; cache hits require no provider I/O.
-
-A hermetic cache-engine test models a compaction rewrite: with prefetch disabled, the first post-compaction query wave is constrained to at most 5% cache hits; with prefetch enabled, the test requires at least 90% hits before the first query arrives. A live Polaris harness exercises the same watcher and prefetch path end to end.
-
-### 5.4 Format coverage
-
-Manifest entries identify Parquet, ORC, and Avro data files, and the mapper records all three formats. Parquet receives column-chunk classification and footer warming. ORC and Avro use whole-file classification: row-oriented formats do not expose sub-file structure worth keying on, and they still receive metadata warming, snapshot-driven prefetch, and compaction heat transfer. The engine matrix verifies Parquet query results and direct-versus-cached byte identity for Avro and mixed-format snapshots.
-
-The catalog watcher implements the Iceberg REST interface, with Glue following. Puffin deletion-vector warming, persistent Puffin checkpoints for the heat ledger, and prewarm manifests layer onto the same warming pipeline.
-
-LIST requests are forwarded to the origin. Requests that specify an S3 `versionId` are also served directly from the origin and are not admitted to the cache. These choices keep unsupported namespace and version semantics out of the cached read path while the protocol surface is expanded.
-
----
-
-## 6. Consensus-Backed Erasure-Coded Writes
-
-The write path combines Raft agreement and erasure-coded persistence instead of stacking a process-local coordinator above passive fragment holders. A leader proposes one logical command. Voters persist the fully replicated header and either one coded payload fragment or, in fallback mode, the complete payload. A follower acknowledges only after its entry metadata, payload representation, and containing directory are durable. The leader commits only after the normal Raft majority condition and the reconstructability condition in §4.4 both hold. There is no separate local journal whose acknowledgment can outrun group consensus.
-
-### 6.1 Append and commit
-
-Encoding streams one stripe at a time and reserves fragment capacity before accepting an unbounded body. The replicated header binds the term, index, group and configuration generation, command type, payload length, cryptographic hash, `k`, `m`, storage mode, and client request identity. Fragments are deterministically assigned to distinct voters for that configuration. A fragment received under another geometry, generation, term, index, or hash cannot satisfy the proposal.
-
-```mermaid
-sequenceDiagram
-    participant C as Client
-    participant I as Any ingress
-    participant L as Group leader
-    participant A as Voter A
-    participant B as Voter B
-    participant D as Voter C
-    participant S3
-
-    C->>I: Append(command, request ID)
-    I->>L: Route to current leader
-    L->>A: Header + fragment A
-    L->>B: Header + fragment B
-    L->>D: Header + fragment C
-    A-->>L: Durable term/index/hash
-    B-->>L: Durable term/index/hash
-    D-->>L: Durable term/index/hash
-    Note over L: Majority and w+q-N >= k
-    L->>A: Advance commit index
-    L->>B: Advance commit index
-    L-->>I: Committed index + result
-    I-->>C: ACK + session watermark
-    Note over L,S3: Asynchronous archive
-```
-
-*Figure 5: One coded Raft append. The ingress is only a router. The group leader orders the command, voters durably store mutually verifiable representations, and acknowledgment follows the group commit. S3 archival is not on the foreground path.*
-
-The request identity makes retries exact. Repeating an identity with the same group, command, payload hash, and writer epoch returns the original result. Reusing it for different content fails closed. An ingress cannot manufacture success: client-visible success includes the committed group index and is produced only after the state machine applies the command.
-
-### 6.2 Degraded operation and repair
-
-If the coded write threshold cannot be reached but a Raft majority remains, the leader proposes a complete-entry representation to that majority. This is a committed storage-mode decision, not an origin-write fallback. If no majority exists, no managed mutation is acknowledged. A partitioned minority may continue serving immutable origin-backed cache reads, but it refuses catalog writes, WAL writes, and linearizable reads.
-
-Each representation carries a checksum, and the replicated header carries the logical payload hash. Reconstruction verifies both before applying an entry. Corrupt or missing fragments are erasures. Repair runs from committed placement metadata, reconstructs only from verified fragments, and writes replacement fragments under the same logical entry hash. Compaction may rewrite the physical representation after a new safe representation is durable, but cannot change the logical log entry.
-
-Committed immutable object bodies, complete WAL segments, and catalog checkpoints drain to object storage behind the acknowledgment, through the offload path of §6.6. Origin failure consumes the configured dirty-state budget and eventually applies backpressure; it never permits unsafe eviction or an acknowledgment from RAM.
-
-### 6.3 Authoritative Iceberg catalog
-
-Managed catalog state is partitioned into a tenant-root group and one group per warehouse. The root group owns warehouse identity and routing. A warehouse group owns namespaces, table registrations, current metadata locations, optimistic commit requirements, idempotency records, and its applied event stream. Hosted REST handlers authenticate and validate requests, translate each transaction into one typed deterministic engine command batch, and submit it through any cache ingress to the warehouse leader. All compare-and-swap requirements are evaluated at one applied log index, so concurrent commits have one serial order without PostgreSQL.
-
-The hosted catalog module retains Lakekeeper's Iceberg REST surface, domain validation, authorization model, and useful event schemas, but replaces its SQL transaction backend with the public Verglas state-machine client. The hosted module lives in `verglas-cloud`; the command types, consensus implementation, and durable applied state live in this engine. SQL-shaped repository calls are not emulated over a key-value shim. Operations are expressed as typed deterministic commands and reads against an immutable applied snapshot. A committed catalog index is also the outbox sequence: data-update events derive from applied commands and consumers resume by index, eliminating a second transactional outbox database.
-
-Catalog reads are either explicitly stale or linearizable. A linearizable read obtains a ReadIndex fence from the current leader and waits until the serving replica has applied that index. Commit responses include the warehouse index, and a later request carrying that watermark cannot be served from an older view. External catalog bindings keep their existing remote semantics and are never silently upgraded or downgraded to the managed path.
-
-### 6.4 Neon WAL groups
-
-Each Neon timeline is one consensus group. Its state machine owns the PostgreSQL term, writer epoch, WAL start and commit LSNs, append identities, archive checkpoint, and truncation boundary. `AcquireWriter` is a committed command that increments the epoch. Every `Append` carries that epoch, its exact start and end LSN, and a payload hash. The leader rejects stale epochs, gaps, overlaps with different bytes, and conflicting retries before acknowledgment. Consequently, multiple ingresses can accept connections without allowing multiple live writers to commit on one timeline.
-
-Verglas, not compute, runs election, quorum, donor selection, reconstruction, and commit advancement. The Neon fork replaces walproposer's safekeeper election/quorum state machine with a transport client for `OpenTimeline`, `AcquireWriter`, `Append`, `AppendAck`, `ReadWAL`, `ReleaseWriter`, and status operations. Compute may connect through several discovered ingresses and reconnect without changing the timeline's consensus identity. It does not count ingress connections as independent voters.
-
-Pageservers read the committed stream through any ingress. A read carries an LSN range and optional minimum committed index; the serving node waits for that fence, then serves bytes from its local fragment, peer reconstruction, or the object-resident archived prefix. It never exposes uncommitted WAL. Complete 16 MiB segments archive asynchronously; partial tails stay consensus-durable until an explicit checkpoint or lifecycle flush. Truncation advances only after the timeline group commits the verified S3 archive checkpoint.
-
-### 6.5 Safety evaluation
-
-Deterministic model tests enumerate elections, partitions, message reordering, duplicate requests, fragment loss, corrupt fragments, joint membership, and crashes between every persistence and acknowledgment boundary. Integration tests use several independent ingresses and kill leaders during concurrent WAL and catalog writes. Required assertions are: one committed value per group index; every committed coded entry reconstructable by every legal successor quorum; no stale writer acknowledgment; no catalog requirement evaluated against stale state; no linearizable read below its fence; and no truncation beyond a committed archive checkpoint. Performance measurements report foreground acknowledgment latency, encoded bytes per logical byte, recovery time, and throughput per independent group, but no performance result can override a safety failure.
-
-### 6.6 Offload
-
-Offload is one streaming engine shared by immutable object bodies, WAL segments, and catalog checkpoints. A stream accumulates durably staged units and flushes when accumulated bytes reach its size limit or when a caller drains it explicitly. An uploader makes the flushed object visible and verifies its identity, then proposes the committed record for it. Only application of that committed record permits log truncation or release of the last reconstructable local representation.
-
-The three uses differ in three policy values and nothing else: how a flush unit is named and given its idempotent request identity, whether committed records must advance monotonically, and whether a new record supersedes its predecessor fully, partially, or never. WAL requires monotonic records and never supersedes. A catalog checkpoint supersedes its predecessor entirely and does not accumulate, because its export reads applied state directly. Object groups carry no ordering requirement and supersede partially, leaving dead space that a repack reclaims.
-
-Grouping is what makes small writes cheap. An object below the stream's size limit accumulates, so one flush writes many logical objects as a single origin object, and a committed index maps each logical key to its group object, offset, and length. An object above the limit bypasses accumulation and streams to the origin as it is written, so a large write never waits behind a buffer.
-
-Offload uses the whole cluster. Fragments are already distributed across the voter set, so each flush unit is assigned to a node deterministically from its identity, preferring a node that already holds fragments for that unit. Uploads proceed concurrently under a per-node bound, and the group leader remains authoritative for the committed record without carrying the bytes. A unit whose assigned node leaves the live set is reassigned by the same function, and uploads are idempotent, so a brief overlap during reconfiguration still commits one unit.
-
-Offload never materializes a second copy. The offloader receives fragment references rather than bytes, streams the group object from them, uploads it, inserts the decoded bytes into the cache when admission accepts them, and only then releases the fragments. The decode runs once and feeds both consumers. Releasing fragments before the cache insert would make a just-written object cost an origin fetch, so the order is load-bearing; admission rejection under budget pressure is a normal result and does not fail the offload.
-
-Compaction runs before offload rather than after. Grouping reduces origin request count; compaction reduces the number of data files a query plans and reads, which grouping does not change because logical files remain separate inside a group object. Compacting after grouping would leave the group object immediately dead. Since acknowledged data files are staged but not yet persisted, a table over its compaction threshold has its buffered files rewritten first, and the rewritten files exceed the size limit and stream out directly. Files superseded by that rewrite never upload. Grouping then serves what remains genuinely small: manifests, manifest lists, metadata pointers, and delete files.
-
-### 6.7 Managed and customer bindings
-
-A storage binding is either customer-owned or managed, and the two carry different obligations.
-
-A customer binding preserves the customer's object layout, and readers may reach the bucket without Verglas. A table commit against such a binding therefore waits for its referenced data files to reach the origin before it publishes, because a direct reader that followed the catalog would otherwise find a table pointing at absent files.
-
-A managed binding has no direct reader. Verglas owns its object layout, serves every read of it, and returns an acknowledged object from its staged fragments or its group object before the origin has it. The wait is therefore unnecessary, and a commit against a managed binding publishes on the quorum acknowledgment. Grouping and pre-offload compaction apply only to managed bindings, since both change the origin layout.
-
-Leaving a managed binding is an explicit detach, not a shutdown: fence new mutations, archive committed WAL, export and checkpoint the managed catalog, drain buffered objects, then redirect clients. After that drain the result is standard Iceberg in ordinary object storage.
-
----
-
-## 7. The Agent-Data Platform
-
-This section specifies the target hosted platform contract. Hosted access,
-placement, lifecycle, integrations, and agent services live in `verglas-cloud`;
-the public repository supplies the Worker/DO component contract and the
-independent cache, Iceberg, catalog, and semantic infrastructure that products
-use. A target description is not a claim that its acceptance tests have passed.
-
-Verglas has exactly six products, built from two primitives:
-
-1. **Worker** — stateless, pool-executed public ingress. It has no identity or
-   storage; bindings are its authority.
-2. **Durable Object (DO)** — a named stateful Worker class with strictly
-   serialized events and one embedded Turso `0.7.2` database. The local
-   database is a working copy. One remote Turso database belongs to each DO;
-   an external lease-fenced sync ingress validates placement before forwarding
-   `push()`.
-3. **Stream** — a prebuilt DO that durably appends ordered JSON. It does not
-   offload, execute SQL, own consumer offsets, or call Iceberg/Catalog.
-4. **Pipeline** — a prebuilt Worker/DO that owns a Stream cursor, executes
-   stateless SQL transforms, batches records, and retries Sink delivery.
-5. **Sink** — a prebuilt Worker/DO with idempotent delivery. The first adapter
-   writes Parquet and commits Iceberg through a Catalog binding.
-6. **Catalog** — a prebuilt Worker/DO exposing Iceberg REST through the
-   existing Verglas catalog and object-storage libraries.
-
-The platform follows Cloudflare's Worker/DO authoring surface
-([Cloudflare compatibility](/docs/architecture/cloudflare-compat)). The
-normative definitions and immutable PP1–PP10 criteria are in the [Worker
-primitives platform](/docs/architecture/primitives-platform).
-
-The DO boundary keeps user code close to its state without making it a
-lakehouse or semantic authority. Its Turso transaction owns only object state,
-KV, alarms, attachments, and optional Stream outbox rows. A Worker holds no
-capabilities beyond its bindings. Cache, Iceberg, Catalog, and semantic
-graph/vector infrastructure remain independently deployable; Sink and Catalog
-own the Iceberg data and metadata boundaries.
-
-Three doctrines run through the platform:
-
-- **Product separation.** Worker and DO are the primitives. Stream, Pipeline,
-  Sink, and Catalog are explicit prebuilt Worker/DO deployments, not hidden
-  runtimes, queues, databases, or direct offload paths.
-- **Durability before effects.** A DO event commits to Turso WAL and confirms
-  the remote `push()` boundary before releasing gated effects. Selected changes
-  use a transactional outbox; Stream deduplication makes a resend after a
-  crash harmless.
-- **Connections do not pin compute.** HTTP and WebSocket connections terminate
-  at the gateway. The gateway can hold a WebSocket while a DO hibernates and
-  deliver each later message after wake. Catalog and Sink operations use their
-  own bindings rather than DO-to-Iceberg calls.
-
-```mermaid
-%%{init: {'theme': 'base', 'themeVariables': {'fontFamily': 'Inter, ui-sans-serif, system-ui', 'primaryTextColor': '#0f172a', 'lineColor': '#64748b'}}}%%
-flowchart LR
-    U["HTTP / WebSocket"] --> W["Worker\nstateless"]
-    W --> D["Durable Object\nTurso 0.7.2"]
-    W --> S["Stream\nordered durable JSON"]
-    S --> P["Pipeline\nStream cursor + SQL + batch"]
-    P --> K["Sink\nidempotent delivery"]
-    K --> C["Catalog\nIceberg REST"]
-    C --> I["Iceberg libraries"]
-    I --> O[("object storage")]
-    X["independent cache / semantic services"] --> O
-```
-
-*Figure 7: the target product topology. Worker code reaches stateful and
-prebuilt products through bindings. DO state is durable in Turso; Pipeline,
-Sink, and Catalog own the stream-to-Iceberg path, while cache and semantic
-services remain independent infrastructure.*
-
-### 7.1 Deployment records and grants
-
-A target deployment record names a Worker or prebuilt product, its immutable
-component digest, configuration and secret references, bindings, and
-placement. A DO record additionally names the one remote Turso database and
-its sync credentials. Records are the unit for deployment, audit, pause,
-resume, and placement; they do not turn DO state into a separate run log or
-Iceberg catalog.
-
-A grant lists the resources a component may reach. A Worker has only the
-bindings in its environment. A DO grant covers its object state and named
-product bindings; it does not silently grant access to another DO, an Iceberg
-table, or a graph/vector index. Pipeline, Sink, and Catalog records carry the
-bindings needed for their own product boundaries.
-
-### 7.2 DO component and event contract
-
-Tenant code compiles to a WASM component targeting the `verglas:do-worker` WIT
-world. The handler exports `init` before `fetch`, `alarm`,
-`websocket-message`, and `websocket-close`. The host binds `get`, `put`,
-`delete`, `list`, `sql`, and alarm operations to the DO's embedded Turso
-`0.7.2` database. Socket operations bind to gateway connection state. These
-imports are capabilities, not network services.
-
-The input gate admits one HTTP request, alarm, WebSocket message, or close event
-at a time. Turso serializes the event transaction locally; the host confirms
-`push()` through the external lease-fenced sync ingress before releasing the
-event result and gated socket effects. No event observes another event's
-uncommitted state. A handler error cannot undo state that already reached the
-Turso durability boundary.
-
-Selected committed SQL changes may write deterministic outbox rows in the same
-Turso transaction. After push, the host sends them to a bound Stream. Stream
-deduplicates `(object-id, event-sequence, record-index)` identities; marking an
-outbox row delivered happens only after Stream confirmation. This is publication
-coordination, not direct Iceberg offload or a dispatch queue.
-
-The component artifact is immutable and content-addressed. A target host fetches
-it by digest and verifies the digest before instantiation. Compiled artifacts
-may be cached outside the isolation boundary; caching code never changes DO
-state authority. JavaScript and TypeScript use ComponentizeJS/StarlingMonkey,
-while Rust and other component-toolchain languages target the WIT world
-directly. These build and lifecycle details remain Target until their
-corresponding acceptance evidence exists.
-
-### 7.3 Durable state and adjacent infrastructure
-
-A DO's KV, SQL tables, alarm, attachments, and optional outbox are its durable
-cross-event state. `set-alarm` replaces the one alarm row, `get-alarm` reads its
-deadline, and `delete-alarm` clears it in the event transaction. The platform
-derives wake scheduling from that committed row; alarm delivery uses the same
-serialized event path and does not create a separate queue.
-
-The Turso local database uses ordinary `0.7.2` WAL. A remote database dedicated
-to the DO is the machine-loss recovery source. The external sync ingress checks
-the current placement lease before forwarding `push()`. A takeover revokes the
-prior owner before the new owner opens or pushes the database. The Turso fence
-is the only DO durability boundary; the cache ring's independent consensus and
-object-storage offload remain cache infrastructure, not DO commit machinery.
-
-The other data layers keep their existing responsibilities. The cache serves
-S3 ranges, routes ownership, warms metadata, stages managed writes, and drains
-its own objects. Existing Iceberg and catalog libraries provide REST metadata
-and table commits to the Catalog product. Semantic graph/vector services keep
-their independent APIs and explicit index-build rules over Iceberg data. A DO
-cannot publish a table snapshot, Parquet file, graph mutation, or vector index
-as a side effect of its SQL transaction.
-
-### 7.4 Placement, isolation, and scale-to-zero
-
-The target platform runs each active DO in one isolated execution environment.
-The environment owns one event executor, one local Turso working copy and sync
-sidecars, and one private event endpoint. It does not run Raft, elect a DO
-leader, or host a custom pager. The lifecycle supervisor passes the placement
-lease to the external Turso sync ingress and fences routing after a crash or
-restore; a stale owner cannot open or push the DO's remote database.
-
-A microVM can provide the isolation substrate, and suspend/resume can reduce
-cold-start cost. Before suspension, the host drains required Stream outbox rows
-and confirms the final Turso push. On wake, it opens the DO's one remote
-database and restores a local working copy. A retained local copy is an
-acceleration only; remote Turso state remains the recovery source. Mutable state
-and execution are never shared with another tenant payload.
-
-The isolation boundary is a WASM sandbox inside the selected execution
-environment inside the placement fence. Tenant code reaches host state only
-through WIT imports. Cache checkpoints, Iceberg objects, semantic indexes, and
-cache offload are independent lifecycle concerns and never substitute for the
-DO's Turso durability boundary.
-
-### 7.5 Gateway, bindings, and hibernation
-
-HTTP and WebSocket connections terminate at the platform gateway, never inside
-the guest. Public routes execute Worker code first. The gateway resolves a
-binding name to a DO and wakes it on demand; DOs are reachable only through
-Worker or DO bindings, not direct tenant routes. It can hold WebSockets across
-hibernation and deliver each message as a serialized DO event. A connection
-attachment is a small blob, at most 16 KiB, persisted in the DO's Turso state.
-
-The same binding model composes the prebuilt products. A Worker can call
-`env.STREAM.send(records)`. A Pipeline reads its own Stream cursor and calls a
-Sink. A Sink calls the Catalog binding for Iceberg metadata operations. None of
-these calls makes Stream a queue engine or gives a DO a direct Iceberg path.
-Catalog notifications and Sink receipts belong to those products, not to the
-DO event protocol.
-
-### 7.6 Cache-pathed and Iceberg I/O
-
-The cache remains an independent S3 and object-storage layer. Query engines and
-product adapters may route their S3 requests through it, so object-versioned
-cache identity, ring ownership, budgets, staging, and background offload keep
-the guarantees described in §§3–6. This wiring is not a DO storage dependency:
-DO SQL state remains in Turso, and no component assumes that a key is locally
-owned.
-
-Iceberg ingest follows the existing client path. A Sink writes deterministic
-Parquet data files and asks the Catalog binding to publish an Iceberg snapshot.
-The Catalog uses the existing Iceberg and object-storage libraries. A customer
-binding remains authoritative and usable while Verglas is stopped; a managed
-binding keeps its Verglas-owned object layout and read path until explicit
-detach. Neither binding turns a DO transaction into an Iceberg commit or permits
-autonomous graph/vector publication.
-
-### 7.7 Layering
-
-The hosted control plane resolves product resources and DO names to deployment
-records. A Worker is the public ingress and reaches a DO, Stream, Pipeline,
-Sink, or Catalog through an environment binding. A Pipeline consumes ordered
-Stream ranges and advances its cursor only after every targeted Sink confirms a
-deterministic batch. A Sink owns delivery idempotency; the Catalog owns Iceberg
-REST and metadata publication.
-
-The cache, Iceberg, catalog, and semantic graph/vector layers remain available
-to external clients through their existing APIs. Their consistency and
-lifecycle contracts are not silently replaced by DO state. Managed bindings
-retain the cache and detach guarantees of §§3–6; customer bindings retain the
-catalog and object-store semantics of their owners. No product falls back to a
-hidden database, queue engine, direct DO offloader, or autonomous customer-table
-mutation.
-
----
-
-## 8. Benchmarks
-
-Results include an SF1,000 capacity run (§8.1) and a single-node compaction run (§8.2).
-
-### 8.1 SF1,000 query wave (measured)
-
-TPC-DS SF1,000 contains approximately 279 GB of Iceberg/Parquet data in S3 Standard. The representative wave contains three fixed queries: a fact-table count, monthly sales aggregation, and item-revenue aggregation. It is not the full 99-query TPC-DS suite. Each engine ran directly against S3 and through its applicable cache. Cold cache starts with no data blocks resident; warm cache is a replay after population converged. DuckDB has no built-in S3 cache. Speedup compares the warm-cache result with that engine's direct-S3 result.
-
-| Engine | Storage path | Cold Cache | Warm Cache | Speedup |
-|---|---|---:|---:|---:|
-| DuckDB 1.4.5 | S3 direct | 618.098 s | — | 1.00× |
-| DuckDB 1.4.5 | Verglas | 636.725 s | **42.128 s** | **14.67×** |
-| Trino 446 | S3 direct | 296.762 s | — | 1.00× |
-| Trino 446 | own file-system cache | 348.948 s | 69.892 s | 4.25× |
-| Trino 446 | Verglas | 398.269 s | **67.060 s** | **4.43×** |
-| ClickHouse 26.6.1 | S3 direct | 227.043 s | — | 1.00× |
-| ClickHouse 26.6.1 | own file-system cache | 447.397 s | 25.776 s | 8.81× |
-| ClickHouse 26.6.1 | Verglas | 461.587 s | **22.390 s** | **10.14×** |
-
-*Hardware: Mac Studio with an Apple M3 Ultra (28 CPU cores) and 256 GB unified memory. Engines were limited to 48 GB and 24 CPUs and ran one at a time. Cache-owning configurations received the same 400 GB logical cache budget; Verglas used 48 GiB of DRAM and 2 MiB block geometry.*
-
-DuckDB's warm Verglas replay was 14.67× faster than direct S3 and recorded zero backend fills and zero backend bytes. The corrected same-network Trino-through-Verglas warm runs were 67.060, 68.770, and 66.463 seconds; their 67.060-second median was 4.1% faster than Trino's own file-system cache and served 77.5 GB from DRAM with zero backend fills. Trino's catalog-prewarmed empty-data-cache run remained 14.1% slower than Trino's own cold cache because startup warming loaded metadata, manifests, and footers rather than the query's data ranges. The final weighted-egress ClickHouse-through-Verglas runs were 22.390, 21.921, and 23.081 seconds; the 22.390-second median was 13.1% faster than ClickHouse's own cache, again with zero backend data bytes and zero backend fills.
-
-### 8.2 Cache recovery after compaction (measured)
-
-Iceberg compaction rewrites a table into fewer, larger Parquet files. Those files have new S3 object names. A normal file cache indexes bytes by object name, so its entries for the old files are useless after the new snapshot commits. Verglas also sees the catalog commit: it connects the old hot files to their replacements and starts prefetching the replacement ranges before another query asks for them.
-
-The experiment warmed a three-query working set, compacted one target table with `rewrite_data_files`, and measured the same workload after compaction. Each cache used a separate copy of the target table. The Verglas result below is the settled measurement after its catalog watcher prefetched the replacement files.
-
-| Query path | Before compaction | After compaction |
-|---|---:|---:|
-| DuckDB through Verglas | 2.770 s | **2.587 s** |
-| Trino with its file-system cache | 26.967 s | 25.981 s |
-
-Verglas briefly rose to 4.489 seconds while prefetch was still running, then returned to 2.587 seconds with zero origin reads. Trino's result is its first post-compaction query; the improved file layout offset the cost of loading the new paths into its cache on demand. DuckDB through Verglas was 9.7× faster before compaction and 10.0× faster after Verglas recovered the replacement files.
-
-ClickHouse is excluded from the table because the tested Iceberg path did not support compaction and then errored while reading the rewritten table, so it produced no comparable timing. ClickHouse's published Iceberg roadmap lists background merges as future work [29].
-
-*Hardware: one `i4i.2xlarge` in `us-west-2a` with 8 vCPUs, 64 GB DRAM, and 1.75 TB NVMe. The dataset was TPC-DS SF100 in S3 Standard: 28.4 GB across 806 objects and 24 tables.*
-
----
-
-## 9. Conclusion
-
-The lakehouse settled where analytical data lives; it has not settled where hot bytes are served from or where its own transactional state runs. Today those gaps are filled by derived copies — OLAP stores, feature stores, vector databases, replicated Postgres — each with its own pipeline, freshness boundary, and failure modes, and by a managed database quietly required underneath every catalog.
-
-Verglas closes both gaps with one tier. Version-keyed blocks cannot serve bytes from the wrong immutable object version, while coded Multi-Raft gives managed catalog commits and Postgres WAL one agreement and persistence boundary across every ingress. Catalog application warms metadata before queries ask, and WAL is readable as soon as its append commits rather than after S3 archival. Engines adopt the managed service through standard Iceberg REST and the Verglas Neon protocol. A clean checkpoint-and-detach leaves standard Iceberg objects and an exported catalog for another service; an authoritative ring cannot be destroyed like a disposable cache while acknowledged state is still local.
-
-The platform layer applies the same discipline to stateful execution. Each
-Durable Object is a named Worker class backed by Turso `0.7.2`, with one remote
-Turso database and an external lease-fenced sync ingress. Serialized events
-commit KV and SQL state in Turso, and optional Stream publication uses a
-transactional outbox with producer-identity deduplication. Worker, Stream,
-Pipeline, Sink, and Catalog remain separate bindings; none hides a custom pager,
-Arrow commit envelope, direct DO offloader, or semantic mutation domain.
-
----
-
-## 10. References
-
-1. Apache Software Foundation. [*Apache Iceberg Table Specification*](https://iceberg.apache.org/spec/).
-2. Dominik Durner, Viktor Leis, and Thomas Neumann. [*Exploiting Cloud Object Storage for High-Performance Analytics*](https://www.vldb.org/pvldb/vol16/p2769-durner.pdf). PVLDB 16(11), 2023.
-3. Riza Suminto. [*12 Times Faster Query Planning with Iceberg Manifest Caching in Impala*](https://www.cloudera.com/blog/technical/12-times-faster-query-planning-with-iceberg-manifest-caching-in-impala.html). Cloudera, 2023.
-4. Kira Duwe et al. [*The Five-Minute Rule for the Cloud: Caching in Analytics Systems*](https://www.vldb.org/cidrdb/papers/2025/p4-duwe.pdf). CIDR 2025.
-5. Jean-François Im et al. [*Pinot: Realtime OLAP for 530 Million Users*](https://doi.org/10.1145/3183713.3190661). SIGMOD 2018.
-6. Anya Li et al. [*Managed Geo-Distributed Feature Store: Architecture and System Design*](https://arxiv.org/abs/2305.20077). arXiv:2305.20077, 2023.
-7. Artur Borycki. [*Puffin-Backed Vector Indexes: Attaching Approximate Nearest Neighbor Indexes to Apache Iceberg Snapshots for Compute-Disaggregated Query Engines*](https://arxiv.org/abs/2606.04196). arXiv:2606.04196, 2026.
-8. Abhishek Vijaya Kumar and Muthian Sivathanu. [*Quiver: An Informed Storage Cache for Deep Learning*](https://www.usenix.org/conference/fast20/presentation/kumar). FAST 2020.
-9. Lakekeeper. [*Concepts: Persistence Backend*](https://docs.lakekeeper.io/docs/0.11.x/concepts/).
-10. Apache Polaris. [*Metastores*](https://polaris.apache.org/releases/1.5.0/metastores/).
-11. Project Nessie. [*Server Configuration: Version Stores*](https://projectnessie.org/nessie-latest/configuration/).
-12. Databricks. [*Optimize performance with caching on Databricks*](https://docs.databricks.com/aws/en/optimizations/disk-cache).
-13. Trino. [*File system cache*](https://trino.io/docs/current/object-storage/file-system-cache.html).
-14. Dremio. [*Open Catalog*](https://docs.dremio.com/current/data-sources/open-catalog/).
-15. Databricks. [*What is Apache Iceberg in Databricks?*](https://docs.databricks.com/aws/en/iceberg/).
-16. Snowflake. [*Apache Iceberg tables*](https://docs.snowflake.com/en/user-guide/tables-iceberg).
-17. Snowflake. [*Automatically refresh Apache Iceberg tables*](https://docs.snowflake.com/en/user-guide/tables-iceberg-auto-refresh).
-18. Trino. [*Iceberg connector*](https://trino.io/docs/current/connector/iceberg).
-19. Alluxio. [*Unified Namespace and Under File System Namespaces*](https://documentation.alluxio.io/os-en/core-services/unified-namespace).
-20. JuiceFS. [*Architecture*](https://github.com/juicedata/juicefs/blob/main/docs/en/introduction/architecture.md).
-21. Databricks. [*Serve lakehouse data with synced tables*](https://docs.databricks.com/aws/en/oltp/projects/sync-tables).
-22. Databricks. [*Lakebase Change Data Feed*](https://docs.databricks.com/aws/en/oltp/projects/lakebase-cdf).
-23. Neon. [*Architecture overview*](https://neon.com/docs/introduction/architecture-overview).
-24. David K. Gifford. [*Weighted Voting for Replicated Data*](https://doi.org/10.1145/800215.806583). SOSP 1979.
-25. Giuseppe DeCandia et al. [*Dynamo: Amazon's Highly Available Key-value Store*](https://doi.org/10.1145/1294261.1294281). SOSP 2007.
-26. Irving S. Reed and Gustave Solomon. [*Polynomial Codes over Certain Finite Fields*](https://doi.org/10.1137/0108018). Journal of the SIAM 8(2), 1960.
-27. Hakim Weatherspoon and John Kubiatowicz. [*Erasure Coding vs. Replication: A Quantitative Comparison*](https://doi.org/10.1007/3-540-45748-8_31). IPTPS 2002.
-28. Cheng Huang et al. [*Erasure Coding in Windows Azure Storage*](https://www.usenix.org/conference/atc12/technical-sessions/presentation/huang). USENIX ATC 2012.
-29. ClickHouse. [*ClickHouse Release 25.7 Call*](https://presentations.clickhouse.com/2025-release-25.7/).
-30. Apache Software Foundation. [*Kafka Connect*](https://kafka.apache.org/documentation/#connect).
-31. Tyler Akidau et al. [*MillWheel: Fault-Tolerant Stream Processing at Internet Scale*](https://doi.org/10.14778/2536222.2536229). PVLDB 6(11), 2013.
-32. Shuai Mu, Kang Chen, Yongwei Wu, and Weimin Zheng. [*When Paxos Meets Erasure Code: Reduce Network and Storage Cost in State Machine Replication*](https://doi.org/10.1145/2600212.2600218). HPDC 2014.
-33. Zizhong Wang et al. [*CRaft: An Erasure-coding-supported Version of Raft for Reducing Storage Cost and Network Cost*](https://www.usenix.org/conference/fast20/presentation/wang-zizhong). FAST 2020.
+`verglas-gateway` owns public ingress, manifest validation, object-name routing,
+and long-lived event-socket actors. It does not own Durable Object state or
+Iceberg credentials.
+
+`verglas-celld` owns supervision. It creates per-object directories and private
+Unix sockets, launches runtime children with explicit Turso and component
+configuration, enforces resource ceilings, and makes a child routable only after
+its endpoint is ready. Suspension requires a successful Turso push, a drained
+transactional outbox, and clean event-endpoint shutdown.
+
+`verglas-runtime` is the only resident execution binary. It embeds Wasmtime,
+opens Turso, dispatches serialized events, maintains local Foyer stores, accesses
+the configured origin, and serves reserved host capabilities. There is no other
+serving daemon or binary alias.
+
+Firecracker remains the production isolation boundary. Local process provisioning
+implements the same celld contract for development and hermetic tests.
+
+## 5. Durable Object transactions
+
+At activation, the runtime opens the local Turso replica with an explicit remote
+URL and token file. Production startup never treats a local-only database as a
+successful substitute. The runtime verifies the component before accepting an
+event.
+
+For event sequence `E`:
+
+1. the input gate admits exactly one event;
+2. the runtime starts one Turso transaction;
+3. guest SQL, alarm changes, and Stream sends stage in that transaction;
+4. the transaction commits;
+5. Turso `push()` reaches the configured remote durability boundary;
+6. pending Stream outbox rows are delivered idempotently;
+7. acknowledged outbox rows are marked delivered;
+8. staged socket effects and the terminal response are released.
+
+A crash before step 4 leaves no transaction. A crash after step 4 but before
+Stream acknowledgement leaves a durable outbox row. A crash after Stream
+acknowledgement but before the delivered mark causes an idempotent resend.
+Activation drains pending rows before admitting the next tenant event.
+
+Cold restart opens the same object identity and Turso database, verifies the
+artifact again, drains pending work, and resumes at the committed state. No
+custom SQL pager, mutation envelope, local archive, or second data engine is
+part of this path.
+
+## 6. Local cache and origin access
+
+Foyer provides two bounded local tiers:
+
+- DRAM for the hottest blocks and mappings;
+- NVMe for a larger restart-recoverable working set.
+
+Both tiers are caches. Missing, evicted, corrupt, or machine-lost entries refill
+from the configured origin. A cache admission never acknowledges a durable
+mutation and never determines Catalog or Durable Object state.
+
+Object reads are keyed by storage binding, bucket, key, object version, block
+geometry, and block index. A response commits to one object version before
+streaming, so it cannot combine bytes from different versions. Concurrent fills
+for the same key coalesce locally. Hard DRAM, NVMe, fill, and concurrency budgets
+bound resource use.
+
+Whole-object and ranged origin reads use the deployment's host-owned credentials.
+Those credentials are not placed in component variables or WASI state. Customer
+bindings preserve the customer's object layout. Managed bindings may use a
+Verglas-owned layout only when every read of that binding routes through the
+managed service.
+
+The cache has no peer protocol, ownership map, membership state, remote write
+buffer, or independent commit authority. Machine loss affects warmth, not
+correctness.
+
+## 7. Iceberg commit capability
+
+The runtime capability accepts one bounded request from the declared Catalog
+binding. The request fixes:
+
+- Catalog and Sink identity;
+- warehouse, namespace, and table;
+- deterministic batch and file identity;
+- payload digest and row count;
+- compression and bounded records;
+- the expected Catalog state used for optimistic publication.
+
+The runtime validates the request against deployment configuration, writes the
+deterministic Parquet file, and performs the requested Iceberg update. Replaying
+the same identity returns the existing snapshot receipt. Reusing an identity
+with different content is an error. A conflict does not publish a second file
+identity or advance Catalog state.
+
+The capability returns only the confirmed batch identity, file identity,
+snapshot identity, and row count. It is not a general object-store API, query
+engine, ingest service, compactor, retention service, or Catalog REST server.
+
+Exactly-once behavior is composed from deterministic identities and durable
+ledgers:
+
+- Stream deduplicates producer event records;
+- Pipeline freezes batches and advances cursors after Sink acknowledgement;
+- Sink deduplicates destination delivery;
+- Catalog deduplicates Iceberg publication;
+- the runtime capability recognizes an already-published deterministic file.
+
+## 8. Failure and lifecycle behavior
+
+The design prefers a slow correct path over an incorrect fast path.
+
+- A cache miss reads the origin.
+- An unavailable origin fails the operation; stale bytes are not substituted.
+- A Turso push failure keeps the object behind its durability fence.
+- A Stream delivery failure keeps the outbox row and withholds event effects.
+- A Sink or Catalog conflict preserves the Pipeline cursor for retry or operator
+  resolution.
+- A runtime crash is recovered by celld under the same object identity.
+- A corrupt or mismatched component never binds the event socket.
+
+Scale-to-zero is a supervision operation, not a storage transfer protocol.
+Celld stops admitting events, waits for the transaction and outbox fences,
+performs the final Turso push, closes the event endpoint, and stops the child.
+Local cache contents may be retained for faster restart or discarded freely.
+
+## 9. Security and isolation
+
+The gateway validates all public routes and deployment bindings. Celld validates
+all launch fields and creates private per-object paths. The runtime verifies
+artifact digests and grants only the imports required by the component world.
+
+Tenant components receive no provider credentials, host filesystem path, raw
+network capability, or unrestricted subprocess capability. Cross-object and
+host-service calls carry the declared binding identity. The target validates the
+stable object, Sink, Catalog, and destination identities again before mutation.
+
+Resource budgets are hard ceilings. Wasmtime fuel or epoch limits, process CPU
+and memory limits, Turso event serialization, cache capacities, request body
+limits, batch row limits, and origin concurrency limits are enforced at their
+respective boundaries.
+
+## 10. Verification
+
+Acceptance is based on observable behavior rather than type-level substitutes.
+The repository verifies:
+
+- JavaScript and Python component builds with no ambient WASI capability;
+- real gateway → celld → runtime request execution;
+- SQL commit and rollback through Turso;
+- commit-gated WebSocket effects;
+- kill-point recovery of the transactional Stream outbox;
+- deterministic Stream, Pipeline, Sink, and Catalog replay;
+- Foyer DRAM/NVMe hits and origin refill after local loss;
+- Iceberg file and snapshot identity across retry;
+- cold restart of the complete six-product chain;
+- static absence of retired binaries, crates, protocol fields, and products.
+
+The final recorded transcript must contain the commands and outputs from a real
+JavaScript and Python cold-restart run. Documentation is not accepted as proof
+when the corresponding executable path was not exercised.
+
+## 11. Deliberate non-goals
+
+Verglas does not implement a general distributed database, a custom Durable
+Object SQL engine, an Arrow mutation protocol, a DataFusion transaction provider,
+a direct Durable Object lakehouse offload path, a background job Worker, a block
+device, an NBD endpoint, a standalone Catalog daemon, or a public Pipelines
+control plane.
+
+Streams append. Pipelines transform and checkpoint. Sinks deliver idempotently.
+Catalog owns API and table state. Turso and the origin own durability. Foyer is
+only acceleration. These boundaries are the architecture.

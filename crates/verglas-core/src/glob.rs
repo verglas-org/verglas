@@ -1,8 +1,8 @@
 //! Glob-lite matching: `*` matches any run of characters, everything else
 //! matches literally. One shared implementation so the catalog table-name
-//! filter (`verglas-tables`) and the backend bucket-set gate (`verglas-backend`,
-//! #235) match patterns identically — a bucket pattern and a table pattern must
-//! never disagree on what `*` means.
+//! filter and the backend bucket-set gate (`verglas-backend`, #235) match
+//! patterns identically — a bucket pattern and a table pattern must never
+//! disagree on what `*` means.
 
 /// Whether `pattern` matches `text`, with `*` matching any run of characters
 /// (the empty run included) and every other character matching literally.

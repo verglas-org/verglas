@@ -1,6 +1,6 @@
 ---
 title: "Architecture overview"
-description: "Understand the six Worker/DO products and the independent infrastructure beneath them."
+description: "Understand the six Worker/DO products and their shared runtime capabilities."
 icon: "compass-drafting"
 ---
 
@@ -26,16 +26,15 @@ flowchart LR
     S --> P["Pipeline\nSQL + batch + retry"]
     P --> K["Sink\nidempotent delivery"]
     K --> C["Catalog\nIceberg REST"]
-    E["Query engine"] --> X["S3/cache infrastructure"]
-    E --> C
-    X --> O["Object storage"]
+    R["verglas-runtime"] --> O["Origin object storage"]
+    R --> C
 ```
 
 ## Repository boundary
 
 | Repository | Responsibility |
 | --- | --- |
-| `verglas` | Public cache, storage, Iceberg/catalog, semantic infrastructure, clients, documentation, and product contracts. |
+| `verglas` | Public Worker/Durable Object runtime, Turso/Foyer adapters, Iceberg/Catalog capabilities, clients, documentation, and product contracts. |
 | `verglas-cloud` | Hosted access, product provisioning, placement, lifecycle, integrations, applications, and agent runtime. |
 | `verglas-app` | Private cloud console and workspace client. |
 
@@ -54,23 +53,18 @@ Target or Gap rather than as shipped features.
 | Pipeline | Stream cursor, stateless SQL transform, batching, retry, and Sink confirmation. |
 | Sink | Idempotent delivery; first adapter writes Parquet and commits Iceberg through Catalog. |
 | Catalog | Iceberg REST and metadata commits using the existing catalog and object-storage libraries. |
-| Cache | S3 ranges, ownership routing, cache tiers, Iceberg observation, staging, and independent object offload. |
-| Semantic services | Independent graph/vector APIs and explicit index infrastructure over Iceberg data. |
+| Runtime | Wasmtime component execution, Turso Durable Object state, Foyer cache tiers, origin access, and narrow privileged capabilities. |
 
 ## Standing requirements
 
 - A customer binding stays readable through its original catalog and bucket.
 - A managed binding is left through an explicit detach that drains acknowledged
-  state to the origin, never by stopping nodes.
+  state to the origin.
 - Object version participates in cache identity, so stale paths cannot return
   bytes from another generation.
 - DRAM, NVMe, CPU, concurrency, and background work obey hard ceilings.
-- Every operation resolves ownership through the ring, including a one-node
-  deployment.
-- A DO never publishes directly to Iceberg or mutates graph/vector state;
-  Sink, Catalog, and explicit semantic operations own those boundaries.
+- A DO never receives raw object-store or catalog credentials; Sink and Catalog
+  use explicit narrow bindings for privileged operations.
 
-Continue with [cache design](/docs/architecture/cache),
-[Iceberg awareness](/docs/architecture/iceberg),
-[write path](/docs/architecture/writes), and the [product execution
-roles](/docs/architecture/execution).
+Continue with [Iceberg awareness](/docs/architecture/iceberg) and the [product
+execution roles](/docs/architecture/execution).

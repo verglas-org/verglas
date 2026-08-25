@@ -1,6 +1,6 @@
 ---
 title: "Verglas products and infrastructure"
-description: "The six Worker/DO products and the independent cache, Iceberg, catalog, and semantic layers."
+description: "The six Worker/DO products and the shared runtime capabilities beneath them."
 icon: "snowflake"
 ---
 
@@ -11,9 +11,9 @@ Worker/DO deployments. Read the [normative platform
 page](/docs/architecture/primitives-platform) for the complete definitions and
 PP1–PP10 criteria.
 
-The same repository contains independent S3/cache, Iceberg, catalog, and
-semantic graph/vector infrastructure. Those layers remain useful to
-self-hosted query engines and external clients; they are not extra products.
+The same repository contains the Wasmtime runtime, Foyer cache, origin access,
+Iceberg commit capability, and Catalog libraries shared by those products.
+These are implementation layers, not extra products.
 
 ## Install the TypeScript SDK
 
@@ -21,32 +21,13 @@ self-hosted query engines and external clients; they are not extra products.
 npm install @verglas/sdk
 ```
 
-## Run the cache infrastructure
-
-The cache node ships as a container image. Point it at an S3-compatible origin
-and start it:
-
-```sh
-docker pull ghcr.io/verglas-org/verglas-cache-node:latest
-```
-
-The node serves S3 on `:8333` and health, catalog gateway, and metrics on
-`:8334`. See [self-hosting](/docs/get-started/self-host) for provider profiles
-and required environment variables.
-
 ## Where to go next
 
 <CardGroup cols={2}>
   <Card title="Six-product platform" icon="diagram-project" href="/docs/architecture/primitives-platform">
     Follow Worker, Durable Object, Stream, Pipeline, Sink, and Catalog ownership.
   </Card>
-  <Card title="Self-host the cache" icon="server" href="/docs/get-started/self-host">
-    Run a cache node against your origin, then point any S3-compatible client at it.
-  </Card>
   <Card title="Understand the architecture" icon="compass-drafting" href="/docs/architecture/overview">
-    Follow product bindings and the independent cache, Iceberg, catalog, and semantic layers.
-  </Card>
-  <Card title="Graphs and vectors" icon="share-nodes" href="/docs/reference/semantic-api">
-    Use the independent semantic surface over Iceberg tables and explicit index builds.
+    Follow product bindings and the shared runtime capabilities.
   </Card>
 </CardGroup>

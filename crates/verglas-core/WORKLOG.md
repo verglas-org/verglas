@@ -467,3 +467,6 @@ crate adds an entry (see /AGENTS.md, "Worklog discipline").
   The batcher no longer has a time window to configure: a group's batch closes
   when its previous consensus entry commits. A config field does not outlive
   the feature it configured.
+- #171: Removed stale references to the deleted clustered crates and cache-node
+  binary from shared core documentation and admin fixtures. The remaining core
+  config comments describe runtime batches without naming retired paths.

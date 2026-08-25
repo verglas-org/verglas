@@ -1,42 +1,25 @@
 [workspace]
 resolver = "2"
-# One workspace for the whole repository. The Catalog catalog crates live
-# under `catalog/crates/` and are members here — they are not a nested
-# workspace. That became possible once both trees were put on a single
-# `iceberg`: the fork in `[patch.crates-io]` below is the Catalog base plus
-# the Verglas commit constructor, so there is no longer one `iceberg` key
-# wanted by two sources.
+# One workspace for the runtime, product hosts, and retained Catalog support
+# crates. The pinned Iceberg fork supplies the commit constructor used by the
+# narrow runtime capability.
 exclude = ["sdks/typescript"]
 members = [
     "crates/verglas-backend",
     "crates/verglas-core",
-    "crates/verglas-cluster",
     "crates/verglas-cache",
-    "crates/verglas-instance",
     "crates/verglas-s3",
-    "crates/verglas-catalog",
-    "crates/verglas-tables",
-    "crates/verglas-writeback",
-    "crates/verglas-consensus",
-    "crates/verglas-safekeeper",
     "crates/verglas-iceberg",
-    "crates/verglas-graph",
-    "crates/verglas-api",
-    "crates/verglas-vector",
-    "crates/verglas-kv",
-    "bins/cache-node",
-    "crates/verglas-block",
     "crates/verglas-do-turso",
     "crates/verglas-celld",
     "crates/verglas-runtime",
     "crates/verglas-do-wasm",
     "crates/verglas-gateway",
 
-    # Catalog catalog
+    # Catalog support used behind the product boundary.
     "crates/verglas-catalog-authz",
     "crates/verglas-catalog-core",
     "crates/verglas-catalog-io",
-    "crates/verglas-catalog-storage",
     "crates/verglas-iceberg-ext",
 ]
 
@@ -63,59 +46,27 @@ rust-version = "1.94"
 publish = false
 
 [workspace.dependencies]
-# Version alongside path: required for crates.io publishes of verglas-api and
-# verglas-core. The release version sweep must bump these too.
+# Version alongside path is required for crates.io publishes of verglas-core.
+# The release version sweep must bump it too.
 verglas-core = { path = "crates/verglas-core", version = "0.2.0" }
 verglas-backend = { path = "crates/verglas-backend" }
-verglas-cluster = { path = "crates/verglas-cluster" }
 verglas-cache = { path = "crates/verglas-cache" }
-verglas-instance = { path = "crates/verglas-instance" }
 verglas-s3 = { path = "crates/verglas-s3" }
-verglas-catalog = { path = "crates/verglas-catalog" }
-verglas-tables = { path = "crates/verglas-tables" }
-verglas-writeback = { path = "crates/verglas-writeback" }
-verglas-consensus = { path = "crates/verglas-consensus" }
-verglas-safekeeper = { path = "crates/verglas-safekeeper" }
 verglas-iceberg = { path = "crates/verglas-iceberg" }
-verglas-graph = { path = "crates/verglas-graph" }
-verglas-api = { path = "crates/verglas-api", version = "0.2.0" }
-verglas-vector = { path = "crates/verglas-vector" }
-verglas-kv = { path = "crates/verglas-kv" }
-verglas-block = { path = "crates/verglas-block" }
 verglas-do-turso = { path = "crates/verglas-do-turso" }
 verglas-do-wasm = { path = "crates/verglas-do-wasm" }
 verglas-celld = { path = "crates/verglas-celld" }
 verglas-gateway = { path = "crates/verglas-gateway" }
 tonic = "0.13.1"
 prost = "0.13.5"
-# Iceberg read/write and DataFusion integration shared by engine roles.
-#
-# All four are redirected by `[patch.crates-io]` to the Verglas fork, and all
-# four must be, not just `iceberg`: the crates.io copies of the other three
-# require `iceberg ^0.10.1` and would reject the patched one.
-#
-# The version reads backwards on purpose. 0.10.0 here is strictly newer than
-# the 0.10.1 this used to be — upstream 0.10.1 is a patch release off the
-# 0.10.0 line, while the fork now tracks upstream `main` past 0.10.0 and never
-# took the 0.10.1 version bump. See the patch table at the bottom.
+# Iceberg catalog, file I/O, and deterministic Sink writes. All retained crates
+# are redirected by `[patch.crates-io]` to the same pinned Verglas fork.
 iceberg = "=0.10.0"
 iceberg-catalog-rest = "=0.10.0"
-iceberg-datafusion = "=0.10.0"
-# S3/fs/memory storage backends for Iceberg FileIO. RestCatalog requires an
-# explicit StorageFactory; the S3 one routes data-file writes and reads through
-# the configured cache endpoint.
 iceberg-storage-opendal = "=0.10.0"
-# 54, not 53.1: the fork's `iceberg-datafusion` builds against DataFusion 54.
-# Arrow stays on the 58 line across the bump.
-datafusion = "54.0"
-# Arrow at the major version Iceberg 0.9 and DataFusion 52 build against.
 arrow-array = "58"
-arrow-buffer = "58"
-arrow-ipc = "58"
 arrow-schema = "58"
-arrow-csv = "58"
 arrow-json = "58"
-arrow-cast = "58"
 parquet = "58"
 uuid = { version = "1.18", features = ["serde", "v4", "v5", "v7"] }
 axum = "0.8.8"
@@ -148,9 +99,6 @@ aws-smithy-runtime-api = "1.8.7"
 serde = { version = "1.0.228", features = ["derive", "rc"] }
 serde_json = { version = "1.0.149", features = ["raw_value"] }
 serde_yaml = "0.9.34"
-# SHA-256 content addressing for the block-device chunk store (verglas-block,
-# #382): identical 2 MiB chunks hash to one key so they dedup across devices and
-# versions. `hex` renders the digest as the backend object key.
 sha2 = "0.10.9"
 hex = "0.4.3"
 # Tagged (de)serialization for iceberg's `Storage`/`StorageFactory` traits, which
@@ -161,7 +109,7 @@ typetag = "0.2.22"
 schemars = "1.0.4"
 tempfile = "3.20.0"
 thiserror = "2.0.18"
-# Component-model runtime for DO Worker execution (verglas-do-wasm, verglasd).
+# Component-model runtime for Durable Object Worker execution.
 # Tenant Worker code is a WASM component targeting the verglas:do world; the
 # host embeds Wasmtime rather than any JS engine.
 wasmtime = { version = "48.0.0", default-features = false, features = [
@@ -187,7 +135,6 @@ reed-solomon-simd = "3.1.0"
 # Classic GF(2^8) Reed-Solomon, kept only for the codec throughput comparison
 # benchmark (#180) that justifies the SIMD choice; not used on any serving path.
 reed-solomon-erasure = "6.0.0"
-openraft = { version = "0.9.24", features = ["serde", "storage-v2"] }
 # Prometheus exposition (#46): a Registry + TextEncoder for the /metrics endpoint.
 # The `process` feature is off — node-level process stats come from node-exporter,
 # not this in-process registry (see verglas-core::metrics).
@@ -376,22 +323,17 @@ unwrap_used = "warn"
 # one `[workspace.dependencies]` table admits one `iceberg` key, and a patch
 # table cannot redirect a direct git dependency.
 #
-# All four crates are patched together and must stay on the same rev — the
-# crates.io copies of the latter three require `iceberg ^0.10.1` and would
-# reject the patched 0.10.0.
+# The retained Iceberg crates are patched together and stay on the same rev.
 #
 # Pin a SHA — never a floating branch tip. Patch inventory:
 # https://github.com/verglas-org/verglas-iceberg/blob/verglas/v0.10.0/VERGLAS.md
 [patch.crates-io]
 iceberg = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
 iceberg-catalog-rest = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
-iceberg-datafusion = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
 iceberg-storage-opendal = { git = "https://github.com/verglas-org/verglas-iceberg", rev = "ae7972f56003c108afac91a4975aee6a55187887" }
-# VERGLAS PATCH: foyer 0.22.3 from verglas-org/verglas-foyer (branch
-# verglas/v0.22.3) with live disk-resize for the block engine — the watermark
-# model the write-pressure reclamation needs: shrink retires tail partitions
-# and truncates the backing file, grow-back restores them. Pin a SHA — never
-# a floating branch tip. Patch inventory:
+# VERGLAS PATCH: foyer 0.22.3 from verglas-org/verglas-foyer, pinned by SHA.
+# The runtime uses its bounded DRAM and NVMe stores only as local acceleration.
+# Patch inventory:
 # https://github.com/verglas-org/verglas-foyer/blob/verglas/v0.22.3/VERGLAS.md
 foyer = { git = "https://github.com/verglas-org/verglas-foyer", rev = "58a7f001d8cd894423106713904daf948db20e65" }
 
@@ -405,17 +347,3 @@ opt-level = 3
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-# Smallest-footprint profile for the standalone fleet cache image
-# (bins/cache-node). The cache VM targets a 256 MB box, so its binary is built
-# with fat LTO, a single codegen unit, size-optimized codegen, symbols stripped,
-# and panic=abort (no unwinder — a cache node that panics should die and be
-# restarted by the guest init, not unwind). Build with:
-#   cargo build --profile min-size -p verglas-cache-node
-[profile.min-size]
-inherits = "release"
-opt-level = "z"
-lto = "fat"
-codegen-units = 1
-strip = true
-panic = "abort"

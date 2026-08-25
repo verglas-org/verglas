@@ -27,7 +27,6 @@ or restricts the Apache 2.0 rights granted for that code.
 Copyright 2026 Verglas LLC. The following Verglas-authored crates are licensed
 under FSL-1.1-ALv2:
 
-- `verglas-catalog-storage`
 - `verglas-catalog-authz`
 
 Each version converts to Apache 2.0 two years after that version is first made
@@ -35,9 +34,9 @@ available, as specified by those terms.
 
 ## Combined binary
 
-`verglas-cache-node`, which embeds the hosted catalog, assembles
-Apache-licensed Catalog code with the FSL-licensed Verglas adapters. The
-applicable license for a source file or component remains the license of that
-source or component as described above.
+The Worker/Durable Object runtime assembles Apache-licensed Catalog code with
+the FSL-licensed Verglas adapters where the hosted Catalog implementation is
+embedded. The applicable license for a source file or component remains the
+license of that source or component as described above.
 
 Third-party dependencies retain their own licenses.
